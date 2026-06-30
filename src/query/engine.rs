@@ -85,16 +85,34 @@ impl VarLayout {
 
 /// A pattern position resolved to either a constant id or a variable slot.
 #[derive(Clone, Copy)]
-enum Slot {
+pub(crate) enum Slot {
     Const(u32),
     Var(usize),
 }
 
+impl Slot {
+    /// The constant id, if this slot is a constant.
+    pub(crate) fn const_id(&self) -> Option<u32> {
+        match self {
+            Slot::Const(id) => Some(*id),
+            Slot::Var(_) => None,
+        }
+    }
+
+    /// The variable index, if this slot is a variable.
+    pub(crate) fn var(&self) -> Option<usize> {
+        match self {
+            Slot::Var(v) => Some(*v),
+            Slot::Const(_) => None,
+        }
+    }
+}
+
 /// A triple pattern compiled to slots.
-struct PatPlan {
-    s: Slot,
-    p: Slot,
-    o: Slot,
+pub(crate) struct PatPlan {
+    pub(crate) s: Slot,
+    pub(crate) p: Slot,
+    pub(crate) o: Slot,
 }
 
 /// The query evaluator binds a dictionary and a store for the duration of a query.
@@ -381,73 +399,9 @@ impl<'a> Evaluator<'a> {
 
     // ---- plan ordering ----------------------------------------------------
 
-    /// Greedy join order: prefer connected patterns, then more known positions,
-    /// then smaller static cardinality.
+    /// Cost-based left-deep join order (see [`crate::query::optimizer`]).
     fn order_plans(&self, plans: &[PatPlan]) -> Vec<usize> {
-        let n = plans.len();
-        let mut remaining: Vec<usize> = (0..n).collect();
-        let mut order = Vec::with_capacity(n);
-        let mut bound: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-        while !remaining.is_empty() {
-            let first = order.is_empty();
-            let best_pos = remaining
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &pi)| {
-                    let plan = &plans[pi];
-                    let connected = first || self.is_connected(plan, &bound);
-                    let known = self.known_count(plan, &bound);
-                    let card = self.static_card(plan);
-                    // minimize: (not-connected, fewer-known, larger-card)
-                    (!connected as u8, std::cmp::Reverse(known), card)
-                })
-                .map(|(pos, _)| pos)
-                .unwrap();
-            let pi = remaining.remove(best_pos);
-            for slot in [&plans[pi].s, &plans[pi].p, &plans[pi].o] {
-                if let Slot::Var(v) = slot {
-                    bound.insert(*v);
-                }
-            }
-            order.push(pi);
-        }
-        order
-    }
-
-    fn is_connected(&self, plan: &PatPlan, bound: &std::collections::HashSet<usize>) -> bool {
-        [&plan.s, &plan.p, &plan.o].iter().any(|slot| match slot {
-            Slot::Const(_) => true,
-            Slot::Var(v) => bound.contains(v),
-        })
-    }
-
-    fn known_count(&self, plan: &PatPlan, bound: &std::collections::HashSet<usize>) -> usize {
-        [&plan.s, &plan.p, &plan.o]
-            .iter()
-            .filter(|slot| match slot {
-                Slot::Const(_) => true,
-                Slot::Var(v) => bound.contains(v),
-            })
-            .count()
-    }
-
-    /// A static cardinality estimate from constants only (exact where the index
-    /// allows). Ignores runtime bindings — `known_count` already biases for those.
-    fn static_card(&self, plan: &PatPlan) -> u64 {
-        let s = as_const(&plan.s);
-        let p = as_const(&plan.p);
-        let o = as_const(&plan.o);
-        match (s, p, o) {
-            (Some(_), Some(_), Some(_)) => 1,
-            (Some(s), Some(p), None) => self.store.o_by_sp(s, p).len() as u64,
-            (None, Some(p), Some(o)) => self.store.s_by_po(p, o).len() as u64,
-            (Some(s), None, Some(o)) => self.store.p_by_so(s, o).len() as u64,
-            (Some(s), None, None) => self.store.po_by_s(s).len() as u64,
-            (None, Some(p), None) => self.store.so_by_p(p).len() as u64,
-            (None, None, Some(o)) => self.store.ps_by_o(o).len() as u64,
-            (None, None, None) => self.store.triple_count(),
-        }
+        super::optimizer::order_bgp(plans, self.store)
     }
 
     // ---- value resolution -------------------------------------------------
@@ -834,13 +788,6 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
     match slot {
         Slot::Const(id) => Some(*id),
         Slot::Var(v) => binding[*v],
-    }
-}
-
-fn as_const(slot: &Slot) -> Option<u32> {
-    match slot {
-        Slot::Const(id) => Some(*id),
-        Slot::Var(_) => None,
     }
 }
 

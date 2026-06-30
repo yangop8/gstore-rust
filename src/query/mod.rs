@@ -5,6 +5,7 @@
 //! pipeline and `docs/DESIGN.md` §6.
 
 pub mod engine;
+pub mod optimizer;
 pub mod results;
 pub mod value;
 

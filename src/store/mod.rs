@@ -255,6 +255,54 @@ impl TripleStore {
     pub fn predicates(&self) -> impl Iterator<Item = PredId> + '_ {
         self.p2so.keys().copied()
     }
+
+    // ---- statistics (for the cost-based optimizer) -----------------------
+
+    /// Number of distinct subject keys (≈ distinct entities used as subjects).
+    pub fn distinct_subjects(&self) -> usize {
+        self.s2po.len()
+    }
+
+    /// Number of distinct object keys.
+    pub fn distinct_objects(&self) -> usize {
+        self.o2ps.len()
+    }
+
+    /// Number of distinct predicates present.
+    pub fn num_predicates(&self) -> usize {
+        self.p2so.len()
+    }
+
+    /// Number of triples with predicate `p` (gStore: `pre2num`).
+    pub fn pred_card(&self, pred: PredId) -> usize {
+        self.so_by_p(pred).len()
+    }
+
+    /// Distinct subjects appearing with predicate `p` (gStore: `pre2sub`).
+    /// O(card) but allocation-free: `so_by_p` is sorted by `(sub, obj)`, so
+    /// distinct subjects are the count of first-component transitions.
+    pub fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        let pairs = self.so_by_p(pred);
+        let mut count = 0usize;
+        let mut last: Option<u32> = None;
+        for &(s, _) in pairs {
+            if last != Some(s) {
+                count += 1;
+                last = Some(s);
+            }
+        }
+        count
+    }
+
+    /// Distinct objects appearing with predicate `p` (gStore: `pre2obj`).
+    pub fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        // Not sorted by object, so collect distinct via a set.
+        let pairs = self.so_by_p(pred);
+        let mut objs: Vec<u32> = pairs.iter().map(|&(_, o)| o).collect();
+        objs.sort_unstable();
+        objs.dedup();
+        objs.len()
+    }
 }
 
 #[cfg(test)]
