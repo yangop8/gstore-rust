@@ -60,9 +60,11 @@ impl Parser {
         }
     }
 
-    /// Mint a fresh, document-unique blank node for an anonymous construct.
+    /// Mint a fresh, document-unique blank node for an anonymous construct. The
+    /// `~` cannot appear in a parsed `_:` label, so a minted label can never
+    /// collide with an explicit blank node written in the document.
     fn fresh_blank(&mut self) -> Term {
-        let label = format!("genid{}", self.bnode);
+        let label = format!("g~{}", self.bnode);
         self.bnode += 1;
         Term::Blank(label)
     }
@@ -202,12 +204,14 @@ impl Parser {
 
     fn parse_triples_statement(&mut self) -> Result<()> {
         self.skip_ws();
-        // A `[ … ]` / `( … )` subject already emits its own triples, so the
-        // outer predicate-object list is optional (`[ :p :o ] .` is a statement).
-        let subject_is_bracket = matches!(self.peek(), Some('[') | Some('('));
+        // A `[ … ]` blank-node property list subject already emits its own
+        // triples, so the outer predicate-object list is optional (`[ :p :o ] .`
+        // is a complete statement). A collection subject `( … )` is NOT — the
+        // grammar still requires a predicate-object list after it.
+        let subject_is_blank_list = self.peek() == Some('[');
         let subject = self.parse_term(false)?;
         self.skip_ws();
-        if subject_is_bracket && self.peek() == Some('.') {
+        if subject_is_blank_list && self.peek() == Some('.') {
             self.expect_dot()?;
             return Ok(());
         }
@@ -947,5 +951,28 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         // inner: 2 first + 2 rest = 4 ; B :q head ; :s :p B  => 6
         assert_eq!(ts.len(), 6);
+    }
+
+    #[test]
+    fn standalone_collection_subject_is_rejected() {
+        // `( :a :b ) .` has no predicate-object list; only `[ … ]` may stand alone.
+        let doc = "@prefix : <http://e/> . ( :a :b ) .";
+        assert!(parse_str(doc).is_err());
+    }
+
+    #[test]
+    fn minted_blank_cannot_collide_with_explicit() {
+        // An explicit `_:g` blank and a minted one must stay distinct.
+        let doc = "@prefix : <http://e/> . _:g :p [ :q :r ] .";
+        let ts = parse_str(doc).unwrap();
+        // _:g :p B  and  B :q :r  → two distinct blank subjects
+        let blanks: std::collections::HashSet<String> = ts
+            .iter()
+            .filter_map(|t| match &t.subject {
+                Term::Blank(l) => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blanks.len(), 2);
     }
 }

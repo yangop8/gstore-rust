@@ -272,8 +272,11 @@ impl<'a> Evaluator<'a> {
             if let Some(pat) = &d.pattern {
                 let layout = VarLayout::build(pat);
                 let sols = self.eval_pattern(pat, &layout);
+                // Only describe resource-valued columns: predicate-typed columns
+                // hold predicate ids (a different id space), and synthetic ids are
+                // computed values, not stored resources.
                 let want: Vec<usize> = if d.all {
-                    (0..layout.len()).collect()
+                    (0..layout.len()).filter(|&i| !layout.is_pred[i]).collect()
                 } else {
                     d.targets
                         .iter()
@@ -281,12 +284,15 @@ impl<'a> Evaluator<'a> {
                             PatternTerm::Var(v) => layout.index.get(v).copied(),
                             _ => None,
                         })
+                        .filter(|&i| !layout.is_pred[i])
                         .collect()
                 };
                 for s in &sols {
                     for &i in &want {
                         if let Some(id) = s[i] {
-                            add(id, &mut ids);
+                            if !is_synth(id) {
+                                add(id, &mut ids);
+                            }
                         }
                     }
                 }
@@ -1406,30 +1412,142 @@ impl<'a> Evaluator<'a> {
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
-    /// solution compatible with the current binding `b`. We evaluate `pat` under
-    /// a layout that keeps the outer variables at their existing indices and
-    /// appends any EXISTS-only variables, so a candidate solution's first
-    /// `outer.len()` slots line up with `b` for the compatibility test.
+    /// solution compatible with the current binding `b`. We substitute `b`'s
+    /// bound variables into `pat` as constants (so inner FILTER/BIND that
+    /// reference outer variables see their values), then test non-emptiness.
     fn eval_exists(&self, negated: bool, pat: &GraphPattern, b: &Binding, outer: &VarLayout) -> bool {
-        let mut names = outer.names.clone();
-        let mut is_pred = outer.is_pred.clone();
-        let mut inner_vars = Vec::new();
-        pat.collect_vars(&mut inner_vars);
-        for v in inner_vars {
-            if !names.iter().any(|n| n == &v) {
-                names.push(v);
-                is_pred.push(false);
+        let bound = self.subst_pattern(pat, b, outer);
+        let layout = VarLayout::build(&bound);
+        let found = !self.eval_pattern(&bound, &layout).is_empty();
+        found ^ negated
+    }
+
+    /// An id resolved back to its RDF term (synthetic, predicate, or
+    /// entity/literal — routed by `is_pred` exactly as [`resolve_string`]).
+    fn id_to_term(&self, id: u32, is_pred: bool) -> Option<Term> {
+        let s = self.resolve_string(Some(id), is_pred)?;
+        parse_term(&s).ok()
+    }
+
+    /// Clone `gp` with each variable bound by `b` replaced by its constant term
+    /// (resolved in the variable's binding id-space via `layout.is_pred`). Used
+    /// to inject the current solution into an EXISTS sub-pattern.
+    fn subst_pattern(&self, gp: &GraphPattern, b: &Binding, layout: &VarLayout) -> GraphPattern {
+        match gp {
+            GraphPattern::Empty => GraphPattern::Empty,
+            GraphPattern::Bgp(tps) => GraphPattern::Bgp(
+                tps.iter()
+                    .map(|tp| TriplePattern {
+                        subject: self.subst_node(&tp.subject, b, layout),
+                        predicate: self.subst_node(&tp.predicate, b, layout),
+                        object: self.subst_node(&tp.object, b, layout),
+                    })
+                    .collect(),
+            ),
+            GraphPattern::Path(p) => GraphPattern::Path(PathPattern {
+                subject: self.subst_node(&p.subject, b, layout),
+                path: p.path.clone(),
+                object: self.subst_node(&p.object, b, layout),
+            }),
+            GraphPattern::Join(a, c) => GraphPattern::Join(
+                Box::new(self.subst_pattern(a, b, layout)),
+                Box::new(self.subst_pattern(c, b, layout)),
+            ),
+            GraphPattern::Union(a, c) => GraphPattern::Union(
+                Box::new(self.subst_pattern(a, b, layout)),
+                Box::new(self.subst_pattern(c, b, layout)),
+            ),
+            GraphPattern::Minus(a, c) => GraphPattern::Minus(
+                Box::new(self.subst_pattern(a, b, layout)),
+                Box::new(self.subst_pattern(c, b, layout)),
+            ),
+            GraphPattern::LeftJoin(a, c, fs) => GraphPattern::LeftJoin(
+                Box::new(self.subst_pattern(a, b, layout)),
+                Box::new(self.subst_pattern(c, b, layout)),
+                fs.iter().map(|e| self.subst_expr(e, b, layout)).collect(),
+            ),
+            GraphPattern::Filter(fs, inner) => GraphPattern::Filter(
+                fs.iter().map(|e| self.subst_expr(e, b, layout)).collect(),
+                Box::new(self.subst_pattern(inner, b, layout)),
+            ),
+            GraphPattern::Extend(inner, var, e) => GraphPattern::Extend(
+                Box::new(self.subst_pattern(inner, b, layout)),
+                var.clone(),
+                self.subst_expr(e, b, layout),
+            ),
+            // Inline VALUES and sub-SELECT are kept intact (rare inside EXISTS).
+            GraphPattern::Values(v, r) => GraphPattern::Values(v.clone(), r.clone()),
+            GraphPattern::SubSelect(sq) => GraphPattern::SubSelect(sq.clone()),
+        }
+    }
+
+    /// Replace a bound variable position with its constant term.
+    fn subst_node(&self, pt: &PatternTerm, b: &Binding, layout: &VarLayout) -> PatternTerm {
+        if let PatternTerm::Var(name) = pt {
+            if let Some(&i) = layout.index.get(name) {
+                if let Some(id) = b[i] {
+                    if let Some(t) = self.id_to_term(id, layout.is_pred[i]) {
+                        return PatternTerm::Term(t);
+                    }
+                }
             }
         }
-        let combined = VarLayout::from_vars(names, is_pred);
-        let sols = self.eval_pattern(pat, &combined);
-        let found = sols.iter().any(|s| {
-            (0..outer.len()).all(|i| match (b[i], s[i]) {
-                (Some(x), Some(y)) => x == y,
-                _ => true,
-            })
-        });
-        found ^ negated
+        pt.clone()
+    }
+
+    /// Replace bound variable references inside an expression with constants.
+    fn subst_expr(&self, e: &Expr, b: &Binding, layout: &VarLayout) -> Expr {
+        match e {
+            Expr::Var(name) => {
+                if let Some(&i) = layout.index.get(name) {
+                    if let Some(id) = b[i] {
+                        if let Some(t) = self.id_to_term(id, layout.is_pred[i]) {
+                            return Expr::Const(t);
+                        }
+                    }
+                }
+                e.clone()
+            }
+            Expr::Const(_) => e.clone(),
+            Expr::Or(x, y) => Expr::Or(
+                Box::new(self.subst_expr(x, b, layout)),
+                Box::new(self.subst_expr(y, b, layout)),
+            ),
+            Expr::And(x, y) => Expr::And(
+                Box::new(self.subst_expr(x, b, layout)),
+                Box::new(self.subst_expr(y, b, layout)),
+            ),
+            Expr::Not(x) => Expr::Not(Box::new(self.subst_expr(x, b, layout))),
+            Expr::Unary(op, x) => Expr::Unary(*op, Box::new(self.subst_expr(x, b, layout))),
+            Expr::Compare(op, x, y) => Expr::Compare(
+                *op,
+                Box::new(self.subst_expr(x, b, layout)),
+                Box::new(self.subst_expr(y, b, layout)),
+            ),
+            Expr::Arith(op, x, y) => Expr::Arith(
+                *op,
+                Box::new(self.subst_expr(x, b, layout)),
+                Box::new(self.subst_expr(y, b, layout)),
+            ),
+            Expr::Builtin(n, args) => Expr::Builtin(
+                n.clone(),
+                args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
+            ),
+            Expr::Exists(neg, pat) => {
+                Expr::Exists(*neg, Box::new(self.subst_pattern(pat, b, layout)))
+            }
+            Expr::Aggregate {
+                func,
+                distinct,
+                arg,
+                sep,
+            } => Expr::Aggregate {
+                func: *func,
+                distinct: *distinct,
+                arg: arg.as_ref().map(|a| Box::new(self.subst_expr(a, b, layout))),
+                sep: sep.clone(),
+            },
+        }
     }
 
     fn eval_compare(

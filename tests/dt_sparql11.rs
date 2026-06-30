@@ -305,6 +305,38 @@ fn describe_returns_outgoing_triples() {
 }
 
 #[test]
+fn exists_inner_filter_references_outer_var() {
+    let mut db = db();
+    // People who know someone earning more than they do. alice (2500) knows
+    // bob (3000) ⇒ alice qualifies; the inner FILTER references the outer ?s.
+    let got = col0(
+        &mut db,
+        "SELECT ?p WHERE {
+            ?p <http://ex/salary> ?s
+            FILTER EXISTS {
+                ?p <http://ex/knows> ?k . ?k <http://ex/salary> ?ks
+                FILTER(?ks > ?s)
+            }
+         }",
+    );
+    assert_eq!(got, vec!["<http://ex/alice>"]);
+}
+
+#[test]
+fn describe_predicate_variable_yields_nothing() {
+    let mut db = db();
+    // ?p binds predicates (a different id space); DESCRIBE skips predicate-typed
+    // columns, so describing a predicate variable returns no triples.
+    match db
+        .query("DESCRIBE ?p WHERE { ?s ?p ?o }")
+        .unwrap()
+    {
+        QueryResult::Construct(triples) => assert_eq!(triples.len(), 0),
+        other => panic!("expected Construct, got {other:?}"),
+    }
+}
+
+#[test]
 fn describe_star_over_where() {
     let mut db = db();
     // Describe every ?p in dept d1 (alice, bob): their outgoing triples.

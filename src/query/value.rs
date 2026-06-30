@@ -327,7 +327,14 @@ fn parse_xsd_datetime(s: &str) -> Option<f64> {
             _ => return None,
         }
     }
-    if i != b.len() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if i != b.len()
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || hh > 23
+        || mm > 59
+        || ss > 59
+    {
         return None;
     }
     let days = days_from_civil(year, month, day);
@@ -363,6 +370,21 @@ fn digits_to_i64(b: &[u8]) -> Option<i64> {
         v = v.checked_mul(10)?.checked_add(d as i64)?;
     }
     Some(v)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Number of days in month `m` of year `y` (proleptic Gregorian).
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Days from 1970-01-01 to `y-m-d` (proleptic Gregorian; Howard Hinnant's
@@ -517,5 +539,15 @@ mod tests {
         assert_eq!(parse_xsd_datetime("not-a-date"), None);
         assert_eq!(parse_xsd_datetime("2020-13-01T00:00:00Z"), None); // month 13
         assert_eq!(parse_xsd_datetime("2020-01-01T00:00:00XY"), None); // bad tz
+    }
+
+    #[test]
+    fn day_of_month_is_validated() {
+        assert_eq!(parse_xsd_datetime("2020-02-30T00:00:00Z"), None); // Feb 30
+        assert_eq!(parse_xsd_datetime("2021-04-31T00:00:00Z"), None); // Apr 31
+        assert_eq!(parse_xsd_datetime("2021-02-29T00:00:00Z"), None); // 2021 not leap
+        assert!(parse_xsd_datetime("2020-02-29T00:00:00Z").is_some()); // 2020 leap
+        assert_eq!(parse_xsd_datetime("2020-01-01T24:00:00Z"), None); // hour 24
+        assert_eq!(parse_xsd_datetime("2020-01-01T00:60:00Z"), None); // minute 60
     }
 }
