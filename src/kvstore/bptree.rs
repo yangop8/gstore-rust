@@ -14,7 +14,10 @@ use crate::error::{GStoreError, Result};
 
 use super::pager::{PageId, Pager, PAGE_SIZE};
 
-/// A handle to one B+ tree, rooted at a [`Pager`] header slot.
+/// A handle to one B+ tree, rooted at a [`Pager`] header slot. The handle is a
+/// plain slot index (the tree itself lives in pager pages), so it is `Copy` —
+/// cheap to hand a duplicate to e.g. the out-of-core dictionary backend.
+#[derive(Clone, Copy)]
 pub struct BTree {
     root_slot: usize,
 }

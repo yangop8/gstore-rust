@@ -10,8 +10,9 @@
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, DiskTermSource};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
@@ -20,7 +21,9 @@ use crate::query::{Evaluator, QueryResult};
 use crate::store::{TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
-use super::pager::Pager;
+use super::disk_dict::DiskDict;
+use super::pager::{Pager, PAGE_SIZE};
+use super::vlist;
 
 // Header root-slot assignment.
 const SPO: usize = 0;
@@ -36,10 +39,22 @@ const ROOT_TRIPLE_COUNT: usize = 9;
 const ROOT_ENTITY_COUNT: usize = 10;
 const ROOT_LITERAL_COUNT: usize = 11;
 const ROOT_PRED_COUNT: usize = 12;
+/// Root of the optional VList-compressed `(sub, pred) → objects` index.
+const SP2O_VLIST: usize = 13;
+/// `1` once [`DiskStore::compact`] has built `SP2O_VLIST`; cleared by any write.
+const ROOT_COMPACTED: usize = 14;
+
+/// Upper bound on a single VList value so it always fits inline in a B+tree leaf
+/// page. A `(sub, pred)` group whose encoding would exceed this is left out of
+/// the compressed index (reads fall back to the SPO scan); storing arbitrarily
+/// large posting lists is gStore's VList *overflow block* case — see task 4.
+const MAX_VLIST_BYTES: usize = PAGE_SIZE / 2;
 
 /// A disk-backed gStore database (dictionary + six-way triple index).
 pub struct DiskStore {
-    pager: RefCell<Pager>,
+    /// `Arc<Mutex<_>>` (not `RefCell`) so the out-of-core [`DiskDict`] can share
+    /// the very same pager/page-cache, and so the type stays `Send`-able.
+    pager: Arc<Mutex<Pager>>,
     spo: BTree,
     pos: BTree,
     osp: BTree,
@@ -49,10 +64,21 @@ pub struct DiskStore {
     id2entity: BTree,
     id2literal: BTree,
     id2predicate: BTree,
+    /// Optional VList-compressed `(sub, pred) → objects` index (gStore's value
+    /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`/`po_by_s`
+    /// when [`compacted`](Self::compacted) is set.
+    sp2o_vlist: BTree,
     triple_count: u64,
     entity_count: u32,
     literal_count: u32,
     pred_count: u32,
+    /// Whether the VList index is current. Set by `compact`, cleared by any write
+    /// (so reads always fall back to the authoritative SPO scan when stale).
+    compacted: bool,
+    /// Lazily built out-of-core dictionary, reused across queries so its
+    /// materialized-string cache (and thus its leak) stays bounded by the set of
+    /// terms ever touched. Invalidated on any write (counts may have changed).
+    disk_dict: RefCell<Option<Arc<DiskDict>>>,
 }
 
 impl DiskStore {
@@ -63,8 +89,9 @@ impl DiskStore {
         let entity_count = pager.root(ROOT_ENTITY_COUNT) as u32;
         let literal_count = pager.root(ROOT_LITERAL_COUNT) as u32;
         let pred_count = pager.root(ROOT_PRED_COUNT) as u32;
+        let compacted = pager.root(ROOT_COMPACTED) != 0;
         Ok(DiskStore {
-            pager: RefCell::new(pager),
+            pager: Arc::new(Mutex::new(pager)),
             spo: BTree::new(SPO),
             pos: BTree::new(POS),
             osp: BTree::new(OSP),
@@ -74,10 +101,13 @@ impl DiskStore {
             id2entity: BTree::new(ID2ENTITY),
             id2literal: BTree::new(ID2LITERAL),
             id2predicate: BTree::new(ID2PREDICATE),
+            sp2o_vlist: BTree::new(SP2O_VLIST),
             triple_count,
             entity_count,
             literal_count,
             pred_count,
+            compacted,
+            disk_dict: RefCell::new(None),
         })
     }
 
@@ -114,7 +144,8 @@ impl DiskStore {
     // ---- building ---------------------------------------------------------
 
     fn intern_entity(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         if let Some(v) = self.entity2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
@@ -129,7 +160,8 @@ impl DiskStore {
     }
 
     fn intern_literal(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         if let Some(v) = self.literal2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
@@ -144,7 +176,8 @@ impl DiskStore {
     }
 
     fn intern_predicate(&mut self, key: &str) -> Result<PredId> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         if let Some(v) = self.predicate2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
@@ -180,7 +213,8 @@ impl DiskStore {
     // can leave the indexes disagreeing for that one triple. Full per-operation
     // atomicity (a single WAL batch per triple / page pinning) is future work.
     fn insert_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         let spo = key3(t.sub, t.pred, t.obj);
         if self.spo.get(pager, &spo)?.is_some() {
             return Ok(false);
@@ -190,6 +224,11 @@ impl DiskStore {
         self.osp.insert(pager, &key3(t.obj, t.sub, t.pred), b"")?;
         self.triple_count += 1;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
+        if self.compacted {
+            // The VList index no longer reflects the data; reads must rescan.
+            self.compacted = false;
+            pager.set_root(ROOT_COMPACTED, 0);
+        }
         Ok(true)
     }
 
@@ -201,21 +240,24 @@ impl DiskStore {
     /// is absent.
     pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
         let s = {
-            let pager = self.pager.get_mut();
+            let mut guard = self.pager.lock().unwrap();
+            let pager = &mut *guard;
             match self.entity2id.get(pager, t.subject.dict_key().as_bytes())? {
                 Some(v) => de32(&v),
                 None => return Ok(false),
             }
         };
         let p = {
-            let pager = self.pager.get_mut();
+            let mut guard = self.pager.lock().unwrap();
+            let pager = &mut *guard;
             match self.predicate2id.get(pager, t.predicate.dict_key().as_bytes())? {
                 Some(v) => de32(&v),
                 None => return Ok(false),
             }
         };
         let o = {
-            let pager = self.pager.get_mut();
+            let mut guard = self.pager.lock().unwrap();
+            let pager = &mut *guard;
             let tree = if t.object.is_literal() {
                 &self.literal2id
             } else {
@@ -230,7 +272,8 @@ impl DiskStore {
     }
 
     fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         let spo = key3(t.sub, t.pred, t.obj);
         if self.spo.get(pager, &spo)?.is_none() {
             return Ok(false);
@@ -240,12 +283,17 @@ impl DiskStore {
         self.osp.delete(pager, &key3(t.obj, t.sub, t.pred))?;
         self.triple_count -= 1;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
+        if self.compacted {
+            self.compacted = false;
+            pager.set_root(ROOT_COMPACTED, 0);
+        }
         Ok(true)
     }
 
     /// Persist counters and flush all dirty pages.
     pub fn flush(&mut self) -> Result<()> {
-        let pager = self.pager.get_mut();
+        let mut guard = self.pager.lock().unwrap();
+        let pager = &mut *guard;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
         pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
         pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
@@ -272,7 +320,7 @@ impl DiskStore {
 
     pub fn term_id(&self, t: &Term) -> Result<Option<EntityLiteralId>> {
         let key = t.dict_key();
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         let tree = if t.is_literal() {
             &self.literal2id
         } else {
@@ -282,7 +330,7 @@ impl DiskStore {
     }
 
     pub fn predicate_id(&self, dict_key: &str) -> Result<Option<PredId>> {
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         Ok(self
             .predicate2id
             .get(&mut pager, dict_key.as_bytes())?
@@ -290,7 +338,7 @@ impl DiskStore {
     }
 
     pub fn id_to_string(&self, id: EntityLiteralId) -> Result<Option<String>> {
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         let tree = if is_literal_id(id) {
             &self.id2literal
         } else {
@@ -302,7 +350,7 @@ impl DiskStore {
     }
 
     pub fn predicate_to_string(&self, id: PredId) -> Result<Option<String>> {
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         Ok(self
             .id2predicate
             .get(&mut pager, &be32(id))?
@@ -312,7 +360,7 @@ impl DiskStore {
     // ---- access patterns (mirror TripleStore) ----------------------------
 
     pub fn exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> Result<bool> {
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         Ok(self.spo.get(&mut pager, &key3(s, p, o))?.is_some())
     }
 
@@ -325,8 +373,17 @@ impl DiskStore {
             .collect())
     }
 
-    /// `s p ?` → objects.
+    /// `s p ?` → objects. When the store has been [`compact`](Self::compact)ed,
+    /// this is a single point lookup into the VList index + a varint decode,
+    /// instead of a multi-key prefix scan; it transparently falls back to the
+    /// SPO scan for any group not present in the index (absent or oversize).
     pub fn o_by_sp(&self, s: EntityLiteralId, p: PredId) -> Result<Vec<EntityLiteralId>> {
+        if self.compacted {
+            let mut pager = self.pager.lock().unwrap();
+            if let Some(v) = self.sp2o_vlist.get(&mut pager, &cat(s, p))? {
+                return Ok(vlist::decode_u32s(&v).unwrap_or_default());
+            }
+        }
         let rows = self.scan(&self.spo, &cat(s, p))?;
         Ok(rows.iter().map(|k| de32(&k[8..12])).collect())
     }
@@ -374,12 +431,79 @@ impl DiskStore {
     }
 
     fn scan(&self, tree: &BTree, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut pager = self.pager.borrow_mut();
+        let mut pager = self.pager.lock().unwrap();
         Ok(tree
             .scan_prefix(&mut pager, prefix)?
             .into_iter()
             .map(|(k, _)| k)
             .collect())
+    }
+
+    // ---- VList value compaction (gStore value lists) ----------------------
+
+    /// Build (or rebuild) the VList-compressed `(sub, pred) → objects` index from
+    /// the authoritative SPO index, then mark the store compacted so `o_by_sp`
+    /// reads it. Each group's sorted object list is delta+varint encoded (see
+    /// [`vlist`](super::vlist)), trading many tiny per-triple keys for one compact
+    /// value per `(sub, pred)`. Groups whose encoding would exceed
+    /// [`MAX_VLIST_BYTES`] are skipped (kept readable via the SPO scan); storing
+    /// arbitrarily large lists is gStore's VList overflow-block case (task 4).
+    ///
+    /// Any subsequent insert/delete clears the compacted flag, so the index is a
+    /// read-side optimization that never returns stale data.
+    pub fn compact(&mut self) -> Result<()> {
+        // 1. Drop any previous VList entries so vanished groups can't be read.
+        let stale: Vec<Vec<u8>> = {
+            let mut guard = self.pager.lock().unwrap();
+            self.sp2o_vlist
+                .iter_all(&mut guard)?
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        for k in &stale {
+            let mut guard = self.pager.lock().unwrap();
+            self.sp2o_vlist.delete(&mut guard, k)?;
+        }
+
+        // 2. Group the SPO index by (sub, pred); each group's objects are already
+        //    sorted ascending and distinct (SPO key order), ready for encoding.
+        let all = self.scan(&self.spo, &[])?;
+        let mut i = 0;
+        while i < all.len() {
+            let s = de32(&all[i][0..4]);
+            let p = de32(&all[i][4..8]);
+            let mut objs = Vec::new();
+            while i < all.len() && de32(&all[i][0..4]) == s && de32(&all[i][4..8]) == p {
+                objs.push(de32(&all[i][8..12]));
+                i += 1;
+            }
+            let enc = vlist::encode_u32s(&objs);
+            if enc.len() <= MAX_VLIST_BYTES {
+                let mut guard = self.pager.lock().unwrap();
+                self.sp2o_vlist.insert(&mut guard, &cat(s, p), &enc)?;
+            }
+        }
+
+        // 3. Publish: reads may now use the VList index.
+        self.compacted = true;
+        let mut guard = self.pager.lock().unwrap();
+        guard.set_root(ROOT_COMPACTED, 1);
+        Ok(())
+    }
+
+    /// Whether the VList-compressed index is currently valid (set by
+    /// [`compact`](Self::compact), cleared by any write).
+    pub fn is_compacted(&self) -> bool {
+        self.compacted
+    }
+
+    /// Byte length of the stored VList value for `(s, p)` in the compressed
+    /// index, or `None` if absent (not compacted / oversize / empty group).
+    /// Exposes the on-disk encoded size for size/round-trip assertions.
+    pub fn compact_value_len(&self, s: EntityLiteralId, p: PredId) -> Result<Option<usize>> {
+        let mut pager = self.pager.lock().unwrap();
+        Ok(self.sp2o_vlist.get(&mut pager, &cat(s, p))?.map(|v| v.len()))
     }
 
     // ---- bridge to the in-memory engine ----------------------------------
@@ -421,14 +545,68 @@ impl DiskStore {
         Ok(dict)
     }
 
+    /// Get (building once, then reusing) the out-of-core dictionary backend that
+    /// shares this store's pager/page-cache. Rebuilt only if the term counts have
+    /// changed since it was last built (i.e. new terms were interned), so reads
+    /// keep reusing one materialized-string cache.
+    fn disk_backing(&self) -> Arc<DiskDict> {
+        {
+            let cached = self.disk_dict.borrow();
+            if let Some(d) = cached.as_ref() {
+                if d.entity_num() == self.entity_count as usize
+                    && d.literal_num() == self.literal_count as usize
+                    && d.predicate_num() == self.pred_count as usize
+                {
+                    return Arc::clone(d);
+                }
+            }
+        }
+        let d = Arc::new(DiskDict::new(
+            Arc::clone(&self.pager),
+            self.entity2id,
+            self.literal2id,
+            self.predicate2id,
+            self.id2entity,
+            self.id2literal,
+            self.id2predicate,
+            self.entity_count as usize,
+            self.literal_count as usize,
+            self.pred_count as usize,
+        ));
+        *self.disk_dict.borrow_mut() = Some(Arc::clone(&d));
+        d
+    }
+
+    /// An *out-of-core* [`Dictionary`] that resolves str↔id from the on-disk
+    /// B+trees on demand (see [`DiskDict`]). Unlike [`dictionary`](Self::dictionary),
+    /// which eagerly loads every string into RAM, this materializes only the terms
+    /// actually looked up — letting a dictionary larger than RAM back a query.
+    pub fn lazy_dictionary(&self) -> Dictionary {
+        Dictionary::from_backing(self.disk_backing())
+    }
+
+    /// Number of dictionary strings currently resident in RAM via the lazy
+    /// [`lazy_dictionary`](Self::lazy_dictionary) path (0 before any such query).
+    /// A small value relative to [`entity_num`](Self::entity_num) proves the
+    /// dictionary was *not* fully loaded.
+    pub fn resident_string_count(&self) -> usize {
+        self.disk_dict
+            .borrow()
+            .as_ref()
+            .map_or(0, |d| d.resident_string_count())
+    }
+
     /// Answer a SPARQL read query (SELECT/ASK/CONSTRUCT/DESCRIBE) by *streaming*
-    /// matches directly from the on-disk indexes — only the dictionary is held in
-    /// memory; the triple indexes are read on demand through the page cache. This
-    /// lets a database larger than RAM be queried without materializing it (the
+    /// matches directly from the on-disk indexes. Both the triple indexes **and**
+    /// the dictionary are read on demand through the page cache: term→id lookups
+    /// for query constants hit the dictionary B+trees per call, and id→str
+    /// materialization of result rows fetches strings lazily (see
+    /// [`lazy_dictionary`](Self::lazy_dictionary)). So a database whose dictionary
+    /// alone exceeds RAM can still be queried without a full load (the
     /// [`to_memory`](Self::to_memory) path does materialize). Updates and the
     /// VS-tree filter are not available on this read-only streaming path.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
-        let dict = self.dictionary()?;
+        let dict = self.lazy_dictionary();
         let q = sparql::parse(sparql)?;
         Evaluator::new(&dict, self).evaluate(&q)
     }
@@ -665,6 +843,218 @@ mod tests {
         let ds = DiskStore::open(&path, 64).unwrap();
         assert_eq!(ds.triple_count(), 4);
         assert_eq!(ds.iter_all().unwrap().len(), 4);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- out-of-core dictionary (lazy str↔id resolution) ------------------
+
+    #[test]
+    fn lazy_dictionary_resolves_term_and_id_on_demand() {
+        let path = tmp("lazy_dict_direct");
+        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let dict = ds.lazy_dictionary();
+        assert!(dict.is_disk_backed());
+
+        // term → id goes straight to the B+tree and caches no string.
+        let node1 = dict.entity_id(&Term::iri("node1").dict_key()).unwrap();
+        let own = dict.predicate_id(&Term::iri("own").dict_key()).unwrap();
+        assert_eq!(ds.resident_string_count(), 0, "term→id must not materialize");
+
+        // id → str materializes exactly the looked-up strings.
+        assert_eq!(dict.id_to_string(node1), Some("<node1>"));
+        assert_eq!(dict.predicate_to_string(own), Some("<own>"));
+        assert_eq!(ds.resident_string_count(), 2);
+
+        // Re-resolving an already-seen id is free (no extra residency).
+        assert_eq!(dict.id_to_string(node1), Some("<node1>"));
+        assert_eq!(ds.resident_string_count(), 2);
+
+        // Unknown terms/ids resolve to None without panicking.
+        assert_eq!(dict.entity_id(&Term::iri("ghost").dict_key()), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn lazy_query_does_not_load_whole_dictionary() {
+        // A query over a disk store must answer correctly while keeping only the
+        // terms it actually touches resident — not the full dictionary.
+        let path = tmp("lazy_ooc");
+        let n = 300u32;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        let ds = DiskStore::build_str(&path, 64, &content).unwrap();
+        // s0..s(n-1) and o0..o(n-1) are distinct entities; p is a predicate.
+        assert_eq!(ds.entity_num(), 2 * n as usize);
+        assert_eq!(ds.resident_string_count(), 0, "nothing resident before a query");
+
+        let res = ds
+            .query("SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }")
+            .unwrap();
+        match res {
+            QueryResult::Select(rs) => {
+                assert_eq!(rs.row_count(), 1);
+                assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/o5>"));
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+
+        // Only the projected object's string was materialized — a tiny fraction
+        // of the 600-entity dictionary.
+        let resident = ds.resident_string_count();
+        assert!(resident >= 1, "the result row must materialize its string");
+        assert!(
+            resident <= 4,
+            "out-of-core: only looked-up keys resident, got {resident} of {}",
+            ds.entity_num()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn lazy_query_matches_eager_results() {
+        // The lazy (out-of-core) dictionary path must produce the same answers as
+        // resolving against a fully-materialized in-memory dictionary.
+        let path = tmp("lazy_vs_eager");
+        let n = 50u32;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        let ds = DiskStore::build_str(&path, 64, &content).unwrap();
+        let sparql = "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }";
+
+        // Lazy path (DiskStore::query, on-demand dictionary).
+        let lazy = match ds.query(sparql).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        // Eager path (full in-memory dictionary + store).
+        let (dict, mem) = ds.to_memory().unwrap();
+        let q = sparql::parse(sparql).unwrap();
+        let eager = match Evaluator::new(&dict, &mem).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+
+        let norm = |rs: &crate::query::ResultSet| {
+            let mut v: Vec<Vec<Option<String>>> = rs.rows.clone();
+            v.sort();
+            v
+        };
+        assert_eq!(lazy.vars, eager.vars);
+        assert_eq!(norm(&lazy), norm(&eager));
+        assert_eq!(lazy.row_count(), n as usize);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- VList-compressed value index (task 2) ----------------------------
+
+    /// Build a hub subject with `n` objects under one predicate (object ids end
+    /// up consecutive, so the VList compresses to ~1 byte/id).
+    fn hub_store(path: &std::path::Path, n: u32) -> DiskStore {
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("<http://ex/hub> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        DiskStore::build_str(path, 64, &content).unwrap()
+    }
+
+    #[test]
+    fn compact_preserves_o_by_sp_and_compresses() {
+        let path = tmp("vlist_compress");
+        let n = 500u32;
+        let mut ds = hub_store(&path, n);
+        let hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+        let p = ds
+            .predicate_id(&Term::iri("http://ex/p").dict_key())
+            .unwrap()
+            .unwrap();
+
+        // Result before compaction (authoritative SPO scan).
+        let before = ds.o_by_sp(hub, p).unwrap();
+        assert_eq!(before.len(), n as usize);
+        assert!(!ds.is_compacted());
+        assert_eq!(ds.compact_value_len(hub, p).unwrap(), None);
+
+        ds.compact().unwrap();
+        assert!(ds.is_compacted());
+
+        // Same objects, now served from the VList index.
+        let after = ds.o_by_sp(hub, p).unwrap();
+        assert_eq!(after, before);
+
+        // The encoded value is far smaller than a raw 4-byte-per-id array.
+        let raw = n as usize * 4;
+        let enc = ds.compact_value_len(hub, p).unwrap().unwrap();
+        assert!(
+            enc < raw / 3,
+            "VList value should be <1/3 of raw {raw} bytes, got {enc}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn query_correct_after_compact() {
+        let path = tmp("vlist_query");
+        let mut ds = hub_store(&path, 30);
+        ds.compact().unwrap();
+        ds.flush().unwrap();
+        // The query path uses o_by_sp, now backed by the VList index.
+        let res = ds
+            .query("SELECT ?o WHERE { <http://ex/hub> <http://ex/p> ?o }")
+            .unwrap();
+        match res {
+            QueryResult::Select(rs) => assert_eq!(rs.row_count(), 30),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_after_compact_invalidates_index() {
+        let path = tmp("vlist_invalidate");
+        let mut ds = hub_store(&path, 20);
+        ds.compact().unwrap();
+        assert!(ds.is_compacted());
+
+        // A new triple must clear the flag and still read correctly (via scan).
+        let t = Triple::new(
+            Term::iri("http://ex/hub"),
+            Term::iri("http://ex/p"),
+            Term::iri("http://ex/extra"),
+        );
+        assert!(ds.insert_triple(&t).unwrap());
+        assert!(!ds.is_compacted(), "write must invalidate the VList index");
+
+        let hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+        let p = ds
+            .predicate_id(&Term::iri("http://ex/p").dict_key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ds.o_by_sp(hub, p).unwrap().len(), 21);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn compact_persists_across_reopen() {
+        let path = tmp("vlist_reopen");
+        let (hub, p);
+        {
+            let mut ds = hub_store(&path, 40);
+            ds.compact().unwrap();
+            ds.flush().unwrap();
+            hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+            p = ds
+                .predicate_id(&Term::iri("http://ex/p").dict_key())
+                .unwrap()
+                .unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert!(ds.is_compacted(), "compacted flag survives reopen");
+        assert!(ds.compact_value_len(hub, p).unwrap().is_some());
+        assert_eq!(ds.o_by_sp(hub, p).unwrap().len(), 40);
         std::fs::remove_file(&path).ok();
     }
 }

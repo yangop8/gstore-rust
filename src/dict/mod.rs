@@ -12,7 +12,10 @@
 //! Keys are [`Term::dict_key`] strings (full N-Triples surface syntax) so an IRI
 //! `<foo>` never collides with a same-named literal `"foo"`.
 
+pub mod prefix;
+
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +23,39 @@ use crate::model::id::{
     EntityLiteralId, PredId, INVALID_ENTITY_LITERAL_ID, INVALID_PRED_ID, LITERAL_FIRST_ID,
 };
 use crate::model::Term;
+
+/// An *out-of-core* dictionary backend: resolves str↔id against on-disk B+trees
+/// on demand instead of holding every string in RAM. Implemented by the kvstore
+/// (`DiskDict`) so a query over a disk-backed store needs only its touched terms
+/// resident, not the whole dictionary.
+///
+/// Mirrors gStore reading `entity2id`/`id2entity` (etc.) trees through the buffer
+/// cache. A [`Dictionary`] carrying a backing routes its lookups here; an
+/// ordinary in-memory dictionary leaves it `None` and behaves exactly as before.
+///
+/// `id_to_string` / `predicate_to_string` return `&str` valid for the backing's
+/// lifetime; an implementation that fetches lazily from disk is expected to
+/// retain the materialized string (so only *looked-up* keys become resident).
+/// `Send + Sync` is required because a [`Dictionary`] is shared across reader
+/// threads inside a snapshot.
+pub trait DiskTermSource: std::fmt::Debug + Send + Sync {
+    /// Entity term key → entity id, via the on-disk `entity2id` tree.
+    fn entity_id(&self, key: &str) -> Option<EntityLiteralId>;
+    /// Literal term key → public literal id, via the on-disk `literal2id` tree.
+    fn literal_id(&self, key: &str) -> Option<EntityLiteralId>;
+    /// Predicate term key → predicate id, via the on-disk `predicate2id` tree.
+    fn predicate_id(&self, key: &str) -> Option<PredId>;
+    /// Entity/literal id → its surface string (materialized on demand).
+    fn id_to_string(&self, id: EntityLiteralId) -> Option<&str>;
+    /// Predicate id → its surface string (materialized on demand).
+    fn predicate_to_string(&self, id: PredId) -> Option<&str>;
+    fn entity_num(&self) -> usize;
+    fn literal_num(&self) -> usize;
+    fn predicate_num(&self) -> usize;
+    /// Number of strings currently materialized in RAM (for tests / metrics that
+    /// assert only the looked-up subset is resident).
+    fn resident_string_count(&self) -> usize;
+}
 
 /// One half of a dictionary: a forward map `string → index` and a backward
 /// vector `index → string`. Indices are dense and assigned in insertion order.
@@ -55,19 +91,55 @@ impl Interner {
     fn len(&self) -> usize {
         self.backward.len()
     }
+
+    /// All interned strings, in id order.
+    fn strings(&self) -> &[String] {
+        &self.backward
+    }
 }
 
 /// The full RDF dictionary: entities, literals, and predicates.
+///
+/// Two modes share one type so the query engine (which takes `&Dictionary`) runs
+/// over either without change:
+/// * *in-memory* — `backing == None`; the three [`Interner`]s hold every string.
+/// * *out-of-core* — `backing == Some(_)`; the interners stay empty and every
+///   lookup is served from on-disk B+trees on demand (see [`DiskTermSource`]).
+///   Built by `DiskStore` so a disk query never materializes the whole
+///   dictionary in RAM.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Dictionary {
     entities: Interner,
     literals: Interner,
     predicates: Interner,
+    /// Out-of-core backend, when this dictionary is disk-backed. Never persisted
+    /// (it is reconstructed from the on-disk trees), so it is skipped by serde
+    /// and defaults to `None` on load — keeping the in-memory path byte-identical.
+    #[serde(skip)]
+    backing: Option<Arc<dyn DiskTermSource>>,
 }
 
 impl Dictionary {
     pub fn new() -> Dictionary {
         Dictionary::default()
+    }
+
+    /// Build a disk-backed dictionary that resolves str↔id through `backing`
+    /// (the on-disk B+trees) on demand. The in-memory interners stay empty;
+    /// only looked-up terms ever become resident. Used by `DiskStore::query` so
+    /// a database larger than RAM is queryable without a full-dictionary load.
+    pub fn from_backing(backing: Arc<dyn DiskTermSource>) -> Dictionary {
+        Dictionary {
+            entities: Interner::default(),
+            literals: Interner::default(),
+            predicates: Interner::default(),
+            backing: Some(backing),
+        }
+    }
+
+    /// Whether this dictionary resolves lookups from disk on demand.
+    pub fn is_disk_backed(&self) -> bool {
+        self.backing.is_some()
     }
 
     // ---- entity space -----------------------------------------------------
@@ -79,6 +151,9 @@ impl Dictionary {
     }
 
     pub fn entity_id(&self, key: &str) -> Option<EntityLiteralId> {
+        if let Some(b) = &self.backing {
+            return b.entity_id(key);
+        }
         self.entities.get(key)
     }
 
@@ -93,6 +168,9 @@ impl Dictionary {
     }
 
     pub fn literal_id(&self, key: &str) -> Option<EntityLiteralId> {
+        if let Some(b) = &self.backing {
+            return b.literal_id(key);
+        }
         self.literals.get(key).map(|i| {
             i.checked_add(LITERAL_FIRST_ID)
                 .expect("literal id space overflowed EntityLiteralId range")
@@ -106,6 +184,9 @@ impl Dictionary {
     }
 
     pub fn predicate_id(&self, key: &str) -> Option<PredId> {
+        if let Some(b) = &self.backing {
+            return b.predicate_id(key);
+        }
         self.predicates.get(key)
     }
 
@@ -137,6 +218,8 @@ impl Dictionary {
     pub fn id_to_string(&self, id: EntityLiteralId) -> Option<&str> {
         if id == INVALID_ENTITY_LITERAL_ID {
             None
+        } else if let Some(b) = &self.backing {
+            b.id_to_string(id)
         } else if id >= LITERAL_FIRST_ID {
             self.literals.resolve(id - LITERAL_FIRST_ID)
         } else {
@@ -148,6 +231,8 @@ impl Dictionary {
     pub fn predicate_to_string(&self, id: PredId) -> Option<&str> {
         if id == INVALID_PRED_ID {
             None
+        } else if let Some(b) = &self.backing {
+            b.predicate_to_string(id)
         } else {
             self.predicates.resolve(id)
         }
@@ -156,13 +241,60 @@ impl Dictionary {
     // ---- counts (mirror Database::getEntityNum etc.) ----------------------
 
     pub fn entity_num(&self) -> usize {
-        self.entities.len()
+        match &self.backing {
+            Some(b) => b.entity_num(),
+            None => self.entities.len(),
+        }
     }
     pub fn literal_num(&self) -> usize {
-        self.literals.len()
+        match &self.backing {
+            Some(b) => b.literal_num(),
+            None => self.literals.len(),
+        }
     }
     pub fn predicate_num(&self) -> usize {
-        self.predicates.len()
+        match &self.backing {
+            Some(b) => b.predicate_num(),
+            None => self.predicates.len(),
+        }
+    }
+
+    // ---- prefix-compressed (front-coded) export --------------------------
+
+    /// Every dictionary string — entities, literals, and predicates — merged,
+    /// sorted, and de-duplicated. Sorting clusters shared prefixes so the set
+    /// front-codes well. (Disk-backed dictionaries keep no in-memory strings, so
+    /// this is empty for them.)
+    pub fn all_strings_sorted(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::with_capacity(
+            self.entities.len() + self.literals.len() + self.predicates.len(),
+        );
+        v.extend(self.entities.strings().iter().cloned());
+        v.extend(self.literals.strings().iter().cloned());
+        v.extend(self.predicates.strings().iter().cloned());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Front-code (shared-prefix compress) this dictionary's string set into one
+    /// compact block, realizing gStore's bounded-shared-prefix dictionary
+    /// storage. RDF term sets are highly prefix-redundant, so the block is far
+    /// smaller than the concatenated raw strings. Round-trips via
+    /// [`prefix::decode_block`], which returns the strings of
+    /// [`all_strings_sorted`](Self::all_strings_sorted).
+    pub fn front_coded_block(&self) -> Vec<u8> {
+        prefix::encode_block(&self.all_strings_sorted())
+    }
+
+    /// Number of dictionary strings currently materialized in RAM. For an
+    /// in-memory dictionary this is the full count; for a disk-backed one it is
+    /// only the subset looked up so far (used to assert out-of-core behavior).
+    pub fn resident_string_count(&self) -> usize {
+        match &self.backing {
+            Some(b) => b.resident_string_count(),
+            None => self.entities.len() + self.literals.len() + self.predicates.len(),
+        }
     }
 }
 
@@ -243,5 +375,30 @@ mod tests {
         assert_eq!(d.entity_num(), 2);
         assert_eq!(d.literal_num(), 1);
         assert_eq!(d.predicate_num(), 1);
+    }
+
+    #[test]
+    fn front_coded_block_roundtrips_and_compresses() {
+        let mut d = Dictionary::new();
+        // Prefix-heavy IRIs under a shared namespace, plus a predicate.
+        for i in 0..500 {
+            d.intern_entity(&format!("<http://example.org/resource/item_{i:05}>"));
+        }
+        d.intern_predicate("<http://example.org/ns#partOf>");
+        d.intern_literal("\"some literal value\"");
+
+        let sorted = d.all_strings_sorted();
+        let block = d.front_coded_block();
+
+        // Round-trips exactly to the sorted string set.
+        assert_eq!(prefix::decode_block(&block).unwrap(), sorted);
+
+        // Shared prefixes make the block much smaller than the raw strings.
+        let raw = prefix::raw_bytes(&sorted);
+        assert!(
+            block.len() < raw / 2,
+            "front-coded dictionary should be <1/2 of raw {raw} bytes, got {}",
+            block.len()
+        );
     }
 }
