@@ -17,10 +17,12 @@ pub mod config;
 pub mod error;
 pub mod kb;
 pub mod llm;
+pub mod pipeline;
 pub mod secret;
 
 pub use config::Config;
 pub use error::{Error, Result};
-pub use kb::{validate_sparql, GStoreClient, RdfTerm, SparqlAnswer, TermKind};
-pub use llm::{LlmClient, LlmRequest, Message, Role};
+pub use kb::{validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer, TermKind};
+pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
+pub use pipeline::{Answer, AskEngine};
 pub use secret::Secret;

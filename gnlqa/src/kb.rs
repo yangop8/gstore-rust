@@ -4,6 +4,7 @@
 //! building on gStore: we can check (and later repair) an LLM-generated query
 //! for validity before sending it anywhere.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -210,6 +211,59 @@ impl GStoreClient {
     pub fn validate_and_query(&self, sparql: &str) -> Result<SparqlAnswer> {
         validate_sparql(sparql)?;
         self.query(sparql)
+    }
+}
+
+/// Abstraction over a SPARQL-executing backend, so the QA pipeline can run
+/// against a real [`GStoreClient`] in production and a [`MockKb`] in tests.
+pub trait KbClient: Send + Sync {
+    /// Execute a SPARQL query and return the parsed answer.
+    fn query(&self, sparql: &str) -> Result<SparqlAnswer>;
+}
+
+impl KbClient for GStoreClient {
+    fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
+        GStoreClient::query(self, sparql)
+    }
+}
+
+/// A mock KB for tests: returns canned answers in order (cycling) and records
+/// the SPARQL it was asked.
+#[derive(Debug, Default)]
+pub struct MockKb {
+    answers: Vec<SparqlAnswer>,
+    state: Mutex<MockKbState>,
+}
+
+#[derive(Debug, Default)]
+struct MockKbState {
+    next: usize,
+    queries: Vec<String>,
+}
+
+impl MockKb {
+    pub fn new(answers: Vec<SparqlAnswer>) -> MockKb {
+        MockKb { answers, state: Mutex::new(MockKbState::default()) }
+    }
+    /// The most recent SPARQL query the pipeline sent.
+    pub fn last_query(&self) -> Option<String> {
+        self.state.lock().unwrap().queries.last().cloned()
+    }
+    pub fn query_count(&self) -> usize {
+        self.state.lock().unwrap().queries.len()
+    }
+}
+
+impl KbClient for MockKb {
+    fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
+        let mut st = self.state.lock().unwrap();
+        st.queries.push(sparql.to_string());
+        if self.answers.is_empty() {
+            return Err(Error::GStore("MockKb has no canned answers".into()));
+        }
+        let i = st.next % self.answers.len();
+        st.next += 1;
+        Ok(self.answers[i].clone())
     }
 }
 
