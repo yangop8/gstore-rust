@@ -146,3 +146,50 @@ fn load_remote_errors_unless_silent() {
     // SILENT swallows the failure.
     assert_eq!(changed(&mut db, "LOAD SILENT <http://example.org/x.ttl>"), 0);
 }
+
+#[test]
+fn transaction_rollback_reverts_updates() {
+    let mut db = db();
+    let before = count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }");
+    db.begin().unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.query("DELETE WHERE { ?s <http://ex/city> ?c }").unwrap();
+    // changes are visible inside the transaction
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    db.rollback().unwrap();
+    // everything is restored
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 0);
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 3);
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }"), before);
+}
+
+#[test]
+fn transaction_commit_persists_updates() {
+    let mut db = db();
+    db.begin().unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.commit().unwrap();
+    db.rollback().unwrap_err(); // nothing to roll back after commit
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+}
+
+#[test]
+fn rollback_restores_cleared_store() {
+    let mut db = db();
+    db.begin().unwrap();
+    assert_eq!(changed(&mut db, "CLEAR ALL"), 6);
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }"), 0);
+    db.rollback().unwrap();
+    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }"), 6);
+}
+
+#[test]
+fn transaction_misuse_errors() {
+    let mut db = db();
+    assert!(db.commit().is_err()); // no active transaction
+    assert!(db.rollback().is_err());
+    db.begin().unwrap();
+    assert!(db.begin().is_err()); // no nesting
+    db.commit().unwrap();
+}

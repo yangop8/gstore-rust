@@ -81,6 +81,18 @@ pub struct Database {
     /// VS-tree is only used for filtering while valid, and rebuilt on `save`
     /// or `rebuild_index`. (A stale tree is never used, preserving correctness.)
     index_valid: bool,
+    /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
+    /// the inverse of a triple mutation, applied in reverse on rollback.
+    txn: Option<Vec<UndoOp>>,
+}
+
+/// One undo-log entry: the action that reverses a triple mutation.
+#[derive(Debug)]
+enum UndoOp {
+    /// Re-add a triple removed during the transaction.
+    Add(IdTriple),
+    /// Remove a triple added during the transaction.
+    Del(IdTriple),
 }
 
 impl Database {
@@ -92,6 +104,7 @@ impl Database {
             store: TripleStore::new(),
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
+            txn: None,
         }
     }
 
@@ -171,6 +184,9 @@ impl Database {
         let changed = self.store.insert(id);
         if changed {
             self.index_valid = false; // VS-tree now stale
+            if let Some(log) = self.txn.as_mut() {
+                log.push(UndoOp::Del(id)); // rollback removes what we added
+            }
         }
         changed
     }
@@ -185,11 +201,65 @@ impl Database {
         ) else {
             return false;
         };
-        let changed = self.store.remove(IdTriple::new(sub, pred, obj));
+        let id = IdTriple::new(sub, pred, obj);
+        let changed = self.store.remove(id);
         if changed {
             self.index_valid = false;
+            if let Some(log) = self.txn.as_mut() {
+                log.push(UndoOp::Add(id)); // rollback re-adds what we removed
+            }
         }
         changed
+    }
+
+    // ---- transactions -----------------------------------------------------
+
+    /// Begin a transaction (single-writer). Triple mutations are recorded so
+    /// they can be undone with [`rollback`](Self::rollback); [`commit`](Self::commit)
+    /// makes them permanent. Returns an error if a transaction is already active
+    /// (nesting is not supported). Provides atomicity + rollback; full MVCC
+    /// (version chains, locking, GC) is a separate concern (see REFACTOR_BACKLOG).
+    pub fn begin(&mut self) -> Result<()> {
+        if self.txn.is_some() {
+            return Err(GStoreError::Database(
+                "a transaction is already active".into(),
+            ));
+        }
+        self.txn = Some(Vec::new());
+        Ok(())
+    }
+
+    /// Commit the active transaction, discarding its undo log.
+    pub fn commit(&mut self) -> Result<()> {
+        if self.txn.take().is_none() {
+            return Err(GStoreError::Database("no active transaction".into()));
+        }
+        Ok(())
+    }
+
+    /// Roll back the active transaction, undoing every triple mutation made
+    /// since [`begin`](Self::begin) in reverse order.
+    pub fn rollback(&mut self) -> Result<()> {
+        let Some(log) = self.txn.take() else {
+            return Err(GStoreError::Database("no active transaction".into()));
+        };
+        for op in log.into_iter().rev() {
+            match op {
+                UndoOp::Add(id) => {
+                    self.store.insert(id);
+                }
+                UndoOp::Del(id) => {
+                    self.store.remove(id);
+                }
+            }
+        }
+        self.index_valid = false;
+        Ok(())
+    }
+
+    /// Whether a transaction is currently active.
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
     }
 
     fn ground_to_triple(g: &GroundTriple) -> Triple {
@@ -304,6 +374,13 @@ impl Database {
     fn clear_all(&mut self) -> usize {
         let n = self.store.triple_count() as usize;
         if n > 0 {
+            // Record undo entries before discarding the store, so CLEAR inside a
+            // transaction can be rolled back.
+            if let Some(log) = self.txn.as_mut() {
+                for t in self.store.iter_all() {
+                    log.push(UndoOp::Add(t));
+                }
+            }
             self.store = TripleStore::new();
             self.index_valid = false;
         }
@@ -404,6 +481,7 @@ impl Database {
             store,
             vstree: VsTree::new(),
             index_valid: false,
+            txn: None,
         };
         db.rebuild_index();
         Ok(db)
@@ -458,6 +536,7 @@ impl Database {
             store,
             vstree,
             index_valid: true,
+            txn: None,
         })
     }
 }
