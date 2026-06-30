@@ -18,6 +18,7 @@
 //! * [`query`]  — BGP evaluation, joins, FILTER, result sets
 //! * [`db`]     — the [`db::Database`] facade: build / load / save / query / update
 
+pub mod analytics;
 pub mod dict;
 pub mod error;
 pub mod kvstore;
