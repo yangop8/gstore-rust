@@ -58,17 +58,53 @@
 //! [`Role`] for Raft-like leader election, log replication, quorum commit,
 //! heartbeat, failover and follower catch-up.
 //!
-//! ## Scope (still deferred)
+//! ## Elastic membership & rebalancing
 //!
-//! What remains out of scope is **elastic membership / rebalancing of the shard
-//! map**: dynamic node join/leave with partition reassignment, and running the
-//! Raft replication group *per shard* of a [`NetworkShardedStore`]. Remote reads
-//! are *best-effort* — a failed shard RPC is logged and treated as empty rather
-//! than aborting the whole query (the trait methods cannot return errors); routed
-//! [`NetworkShardedStore::insert`] does surface I/O errors to the caller.
+//! Dynamic node join/leave with partition reassignment is implemented:
+//!
+//! * [`ClusterConfig`] — the replicated configuration object (member set + the
+//!   shard→owner assignment, tagged with an `epoch`). Membership changes are
+//!   replicated as Raft **config-change** log entries
+//!   ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
+//!   [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)): committed by quorum and
+//!   applied on every [`ClusterNode`] replica, which therefore converge on an
+//!   identical config (served over [`Request::GetConfig`]).
+//! * [`ShardCluster`] — the data-plane coordinator. It maps shards to owners by
+//!   **rendezvous (consistent) hashing** and, on a join/leave, **migrates the
+//!   reassigned buckets' triples between owners over RPC**
+//!   ([`Request::ScanShard`] → insert → [`Request::PurgeShard`]) before cutting
+//!   over routing — so a joining node receives its shards, a leaving node hands
+//!   them to survivors with no data loss, and writes during/after a rebalance land
+//!   on the correct owner.
+//!
+//! ## Scope (still deferred — with reasons)
+//!
+//! * **One Raft group *per shard*.** A [`ClusterNode`] group currently replicates
+//!   the *whole keyspace* (one group, the minimal level called for); the
+//!   generalization is to back each [`ShardCluster`] endpoint with its own
+//!   replicated group so a shard tolerates a replica failure (the mechanism is
+//!   proven by `replicated_shard_survives_a_replica_failure`). Deferred because it
+//!   multiplies the transport (N groups, per-group leaders) well beyond what one
+//!   module can keep deterministically testable here.
+//! * **Auto-orchestration of migration on commit.** The control plane (agreed
+//!   [`ClusterConfig`]) and data plane ([`ShardCluster`] migration) share the
+//!   [`ClusterConfig`] type but are driven explicitly; wiring a leader to *drive*
+//!   the data migration the instant a config-change commits is left to a
+//!   deployment loop (the enacting step, [`ShardCluster::add_node`]/`remove_node`,
+//!   is the tested unit).
+//! * **Snapshot + config interaction.** Config-change entries live in the same
+//!   replicated log as data writes; a leader that *compacts* past them would drop
+//!   them from the triple-only snapshot. The transport never auto-compacts, so
+//!   config entries reach rejoining nodes by normal log backfill; a
+//!   config-carrying snapshot is the remaining fix.
+//!
+//! Remote reads are *best-effort* — a failed shard RPC is logged and treated as
+//! empty rather than aborting the whole query (the trait methods cannot return
+//! errors); routed [`NetworkShardedStore::insert`] / [`ShardCluster::insert`] do
+//! surface I/O errors to the caller.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -417,17 +453,53 @@ fn dispatch(store: &Mutex<TripleStore>, req: &Request) -> Response {
         Request::Insert { sub, pred, obj } => {
             Response::Bool(store.lock().unwrap().insert(IdTriple::new(sub, pred, obj)))
         }
+        // Shard migration: export / purge one bucket of this node's data.
+        Request::ScanShard { shard, num_shards } => {
+            Response::Triples(scan_bucket(&store.lock().unwrap(), shard, num_shards))
+        }
+        Request::PurgeShard { shard, num_shards } => {
+            Response::Count(purge_bucket(&mut store.lock().unwrap(), shard, num_shards))
+        }
         // Raft / cluster-control RPCs are not part of the plain shard surface; a
         // [`ShardNode`] is a single-replica shard. They are served by
-        // [`ClusterNode`] instead (see below).
+        // [`ClusterNode`] instead (see below). `GetConfig` likewise needs a
+        // replicated config, which a plain shard node does not hold.
         Request::RequestVote { .. }
         | Request::AppendEntries { .. }
         | Request::InstallSnapshot { .. }
         | Request::ClientWrite { .. }
-        | Request::ClusterStatus => {
+        | Request::ClusterStatus
+        | Request::GetConfig => {
             Response::Error("cluster-control RPC sent to a non-replicated shard node".to_string())
         }
     }
+}
+
+/// Collect every triple in `store` whose subject hashes to bucket `shard` out of
+/// `num_shards` — the data unit moved during a rebalance. A zero `num_shards`
+/// yields nothing (a degenerate, member-less config).
+fn scan_bucket(store: &TripleStore, shard: u32, num_shards: u32) -> Vec<IdTriple> {
+    if num_shards == 0 {
+        return Vec::new();
+    }
+    let (shard, n) = (shard as usize, num_shards as usize);
+    store
+        .iter_all()
+        .filter(|t| shard_of(t.sub, n) == shard)
+        .collect()
+}
+
+/// Remove every triple of bucket `shard` (of `num_shards`) from `store`, after it
+/// has been streamed to the bucket's new owner. Returns the number removed.
+fn purge_bucket(store: &mut TripleStore, shard: u32, num_shards: u32) -> u64 {
+    let doomed = scan_bucket(store, shard, num_shards);
+    let mut removed = 0;
+    for t in doomed {
+        if store.remove(t) {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// A TCP client to a [`ShardNode`]. Holds a lazily-opened, reused connection
@@ -532,6 +604,20 @@ impl RemoteShard {
             obj: t.obj,
         })?
         .into_bool()
+    }
+
+    /// Export this remote node's triples for bucket `shard` of `num_shards`
+    /// (migration source side).
+    pub fn scan_shard(&self, shard: u32, num_shards: u32) -> io::Result<Vec<IdTriple>> {
+        self.call(&Request::ScanShard { shard, num_shards })?
+            .into_triples()
+    }
+
+    /// Delete bucket `shard` of `num_shards` from this remote node after its data
+    /// has been migrated away; returns the number removed.
+    pub fn purge_shard(&self, shard: u32, num_shards: u32) -> io::Result<u64> {
+        self.call(&Request::PurgeShard { shard, num_shards })?
+            .into_count()
     }
 }
 
@@ -689,6 +775,22 @@ impl Shard {
         match self {
             Shard::Local(s) => Ok(s.insert(t)),
             Shard::Remote(r) => r.insert(t),
+        }
+    }
+
+    /// Export the triples of bucket `shard` (of `num_shards`) held here.
+    fn scan_shard(&self, shard: u32, num_shards: u32) -> io::Result<Vec<IdTriple>> {
+        match self {
+            Shard::Local(s) => Ok(scan_bucket(s, shard, num_shards)),
+            Shard::Remote(r) => r.scan_shard(shard, num_shards),
+        }
+    }
+
+    /// Delete bucket `shard` (of `num_shards`) from this shard; returns the count.
+    fn purge_shard(&mut self, shard: u32, num_shards: u32) -> io::Result<u64> {
+        match self {
+            Shard::Local(s) => Ok(purge_bucket(s, shard, num_shards)),
+            Shard::Remote(r) => r.purge_shard(shard, num_shards),
         }
     }
 }
@@ -889,6 +991,434 @@ impl TripleSource for NetworkShardedStore {
         // order, exactly as ShardedStore does.
         let mut preds: Vec<PredId> = Vec::new();
         for s in &self.shards {
+            preds.extend(s.predicates());
+        }
+        let preds = sort_dedup(preds);
+        let mut out = Vec::new();
+        for pred in preds {
+            for (sub, obj) in self.so_by_p(pred) {
+                out.push(IdTriple::new(sub, pred, obj));
+            }
+        }
+        out
+    }
+}
+
+// ===========================================================================
+// Elastic cluster membership + shard rebalancing.
+//
+// [`ClusterConfig`] is the cluster's *configuration object*: the set of member
+// nodes (id → address) and the **shard → owner** assignment. Membership changes
+// are replicated as Raft **config-change** log entries
+// ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
+// [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)): committed by quorum and
+// applied by [`ClusterConfig::apply`] on every replica, so all nodes converge on
+// the same membership — see [`ClusterNode`] below, which holds one and serves it
+// over [`Request::GetConfig`].
+//
+// The shard→owner map uses **rendezvous (highest-random-weight) hashing**, a
+// consistent-hashing scheme: adding or removing a node only re-homes the buckets
+// that node owns (minimal movement), and every replica computes the identical map
+// from the same member set. [`ShardCluster`] is the data-plane coordinator: it
+// holds the member shard endpoints, routes each write to its bucket's owner, and
+// on a membership change **migrates the affected buckets' triples over RPC**
+// (stream from old owner → insert on new owner → purge old) before cutting over
+// routing to the new owner — so reads/writes stay correct across a rebalance.
+// ===========================================================================
+
+/// The replicated description of a running cluster: its member nodes (id →
+/// address) plus the shard→owner assignment, tagged with a monotonic `epoch`.
+///
+/// A change is a single config-change committed through the Raft log
+/// ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
+/// [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)); applying the committed
+/// op with [`ClusterConfig::apply`] is deterministic, so every replica that has
+/// seen the same committed prefix holds a byte-identical config. The shard→owner
+/// map is recomputed by rendezvous hashing over the (sorted) member set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClusterConfig {
+    epoch: u64,
+    num_shards: usize,
+    members: BTreeMap<NodeId, SocketAddr>,
+    /// `assignment[i]` is the owner of bucket `i`; empty when there are no
+    /// members (nothing can be routed yet).
+    assignment: Vec<NodeId>,
+}
+
+/// Rendezvous (HRW) owner of `shard` among `members` (must be non-empty): the
+/// member maximizing `hash(shard, member)`. Deterministic and stable — removing a
+/// non-owner leaves a bucket's owner unchanged, so only the departing/arriving
+/// node's buckets move.
+fn rendezvous_owner(shard: usize, members: &[NodeId]) -> NodeId {
+    members
+        .iter()
+        .copied()
+        .max_by_key(|&m| {
+            let mut h = DefaultHasher::new();
+            (shard as u64).hash(&mut h);
+            m.hash(&mut h);
+            h.finish()
+        })
+        .expect("rendezvous_owner requires a non-empty member set")
+}
+
+impl ClusterConfig {
+    /// An empty configuration partitioned into `num_shards` buckets (no members
+    /// yet, so nothing is routable until the first [`ClusterConfig::add_node`]).
+    pub fn new(num_shards: usize) -> ClusterConfig {
+        ClusterConfig {
+            epoch: 0,
+            num_shards,
+            members: BTreeMap::new(),
+            assignment: Vec::new(),
+        }
+    }
+
+    /// The configuration version; bumped by every committed membership change.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    /// Number of shard buckets.
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+    /// Member node ids, ascending.
+    pub fn members(&self) -> Vec<NodeId> {
+        self.members.keys().copied().collect()
+    }
+    /// Member `(id, addr)` pairs, ascending by id.
+    pub fn member_addrs(&self) -> Vec<(NodeId, SocketAddr)> {
+        self.members.iter().map(|(&id, &a)| (id, a)).collect()
+    }
+    /// The address of member `id`, if a member.
+    pub fn addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.members.get(&id).copied()
+    }
+    /// Whether `id` is a member.
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.members.contains_key(&id)
+    }
+    /// The shard→owner assignment (`assignment()[i]` owns bucket `i`).
+    pub fn assignment(&self) -> &[NodeId] {
+        &self.assignment
+    }
+    /// The owner of bucket `shard`, if assigned.
+    pub fn owner(&self, shard: usize) -> Option<NodeId> {
+        self.assignment.get(shard).copied()
+    }
+    /// The owner of the bucket a subject routes to, if any member exists.
+    pub fn owner_of_subject(&self, sub: EntityLiteralId) -> Option<NodeId> {
+        if self.num_shards == 0 || self.members.is_empty() {
+            return None;
+        }
+        self.owner(shard_of(sub, self.num_shards))
+    }
+
+    /// Recompute the shard→owner map by rendezvous hashing over the current
+    /// members (empty when there are none).
+    fn reassign(&mut self) {
+        if self.members.is_empty() {
+            self.assignment = Vec::new();
+            return;
+        }
+        let ms: Vec<NodeId> = self.members.keys().copied().collect();
+        self.assignment = (0..self.num_shards)
+            .map(|s| rendezvous_owner(s, &ms))
+            .collect();
+    }
+
+    /// Admit node `id` (reachable at `addr`). Returns `true` if this changed the
+    /// config (a new member), bumping the epoch and recomputing the assignment;
+    /// `false` if `id` was already a member.
+    pub fn add_node(&mut self, id: NodeId, addr: SocketAddr) -> bool {
+        if self.members.contains_key(&id) {
+            return false;
+        }
+        self.members.insert(id, addr);
+        self.epoch += 1;
+        self.reassign();
+        true
+    }
+
+    /// Evict node `id`. Returns `true` if this changed the config, bumping the
+    /// epoch and recomputing the assignment; `false` if `id` was not a member.
+    pub fn remove_node(&mut self, id: NodeId) -> bool {
+        if self.members.remove(&id).is_none() {
+            return false;
+        }
+        self.epoch += 1;
+        self.reassign();
+        true
+    }
+
+    /// Apply a committed config-change log entry. Data-plane ops are ignored
+    /// (they belong to the triple store, not the membership config).
+    pub fn apply(&mut self, op: &LogOp) -> bool {
+        match *op {
+            LogOp::AddNode { id, addr } => self.add_node(id, addr),
+            LogOp::RemoveNode { id } => self.remove_node(id),
+            LogOp::Insert(_) | LogOp::Delete(_) => false,
+        }
+    }
+}
+
+/// The data-plane coordinator of an **elastic** sharded store: it owns one shard
+/// endpoint ([`Shard`], local or remote) per member node and a [`ClusterConfig`]
+/// describing the shard→owner map. Routing sends each write to its bucket's
+/// owner; reads scatter-gather across all members (the same merge as
+/// [`NetworkShardedStore`], so it is observationally identical to a single
+/// [`TripleStore`]). [`ShardCluster::add_node`] / [`ShardCluster::remove_node`]
+/// re-home the affected buckets by **streaming their triples between owners over
+/// RPC**, then cut over routing — so a node that joins *receives its shards* and a
+/// node that leaves *hands its shards to survivors with no data loss*.
+///
+/// This is the data plane; the control plane (agreeing on the membership itself)
+/// is [`ClusterNode`]'s Raft-replicated [`ClusterConfig`]. A deployment feeds each
+/// committed config-change into [`ShardCluster::add_node`]/`remove_node` to enact
+/// the migration; the two share the [`ClusterConfig`] type.
+#[derive(Debug)]
+pub struct ShardCluster {
+    config: ClusterConfig,
+    endpoints: HashMap<NodeId, Shard>,
+}
+
+impl ShardCluster {
+    /// An empty cluster partitioned into `num_shards` buckets (no members yet).
+    pub fn new(num_shards: usize) -> ShardCluster {
+        ShardCluster {
+            config: ClusterConfig::new(num_shards),
+            endpoints: HashMap::new(),
+        }
+    }
+
+    /// The current (committed) configuration.
+    pub fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+    /// Number of shard buckets.
+    pub fn num_shards(&self) -> usize {
+        self.config.num_shards()
+    }
+    /// Member node ids, ascending.
+    pub fn members(&self) -> Vec<NodeId> {
+        self.config.members()
+    }
+    /// The node a subject's writes route to under the current assignment.
+    pub fn owner_of_subject(&self, sub: EntityLiteralId) -> Option<NodeId> {
+        self.config.owner_of_subject(sub)
+    }
+    /// Borrow a member's shard endpoint (for inspection / tests).
+    pub fn endpoint(&self, id: NodeId) -> Option<&Shard> {
+        self.endpoints.get(&id)
+    }
+
+    /// Admit node `id` (at `addr`) with a freshly bound, empty (or pre-seeded)
+    /// shard `endpoint`, then migrate the buckets that rendezvous now assigns to
+    /// it from their previous owners — so the new node *receives its shards*. The
+    /// first node admitted simply owns every bucket (nothing to migrate yet).
+    pub fn add_node(&mut self, id: NodeId, addr: SocketAddr, endpoint: Shard) -> io::Result<()> {
+        let old = self.config.clone();
+        self.endpoints.insert(id, endpoint);
+        if !self.config.add_node(id, addr) {
+            return Ok(()); // already a member: no rebalance
+        }
+        self.rebalance(&old)
+    }
+
+    /// Evict node `id`: migrate every bucket it owned to that bucket's new
+    /// (survivor) owner — no data loss — then drop its endpoint. A no-op if `id`
+    /// is not a member.
+    pub fn remove_node(&mut self, id: NodeId) -> io::Result<()> {
+        let old = self.config.clone();
+        if !self.config.remove_node(id) {
+            return Ok(());
+        }
+        for shard in 0..self.config.num_shards() {
+            if old.owner(shard) == Some(id) {
+                if let Some(new_owner) = self.config.owner(shard) {
+                    self.migrate_shard(shard, id, new_owner)?;
+                }
+            }
+        }
+        self.endpoints.remove(&id);
+        Ok(())
+    }
+
+    /// Migrate every bucket whose owner changed between `old` and the current
+    /// config (used after admitting a node).
+    fn rebalance(&mut self, old: &ClusterConfig) -> io::Result<()> {
+        for shard in 0..self.config.num_shards() {
+            let new_owner = match self.config.owner(shard) {
+                Some(o) => o,
+                None => continue,
+            };
+            if let Some(old_owner) = old.owner(shard) {
+                if old_owner != new_owner {
+                    self.migrate_shard(shard, old_owner, new_owner)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream bucket `shard` from `from`'s endpoint to `to`'s, then purge it from
+    /// `from` (cut-over). If the source endpoint is gone (e.g. a failed node) the
+    /// migration is skipped rather than erroring.
+    fn migrate_shard(&mut self, shard: usize, from: NodeId, to: NodeId) -> io::Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let n = self.config.num_shards() as u32;
+        let triples = match self.endpoints.get(&from) {
+            Some(ep) => ep.scan_shard(shard as u32, n)?,
+            None => return Ok(()),
+        };
+        if let Some(dst) = self.endpoints.get_mut(&to) {
+            for t in &triples {
+                dst.insert(*t)?;
+            }
+        }
+        if let Some(src) = self.endpoints.get_mut(&from) {
+            src.purge_shard(shard as u32, n)?;
+        }
+        Ok(())
+    }
+
+    /// Route a triple to its bucket's owner and insert it there.
+    pub fn insert(&mut self, t: IdTriple) -> io::Result<bool> {
+        let owner = self.config.owner_of_subject(t.sub).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "cluster has no members to route to")
+        })?;
+        match self.endpoints.get_mut(&owner) {
+            Some(ep) => ep.insert(t),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "routed owner has no registered endpoint",
+            )),
+        }
+    }
+
+    /// Routed bulk insert; returns the number of triples newly added.
+    pub fn insert_all(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> io::Result<u64> {
+        let mut added = 0;
+        for t in triples {
+            if self.insert(t)? {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Run a read query over the cluster using the generic [`Evaluator`] — the
+    /// scatter-gather across members is transparent to the engine.
+    pub fn query(&self, dict: &Dictionary, sparql_text: &str) -> Result<QueryResult> {
+        let q = sparql::parse(sparql_text)?;
+        Evaluator::new(dict, self).evaluate(&q)
+    }
+}
+
+impl TripleSource for ShardCluster {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        self.endpoints.values().any(|s| s.exists(sub, pred, obj))
+    }
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.po_by_s(sub));
+        }
+        sort_dedup(out)
+    }
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.o_by_sp(sub, pred));
+        }
+        sort_dedup(out)
+    }
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.p_by_so(sub, obj));
+        }
+        sort_dedup(out)
+    }
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.ps_by_o(obj));
+        }
+        sort_dedup(out)
+    }
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.s_by_po(pred, obj));
+        }
+        sort_dedup(out)
+    }
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.so_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.subs_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.objs_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn subject_keys(&self) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.subject_keys());
+        }
+        sort_dedup(out)
+    }
+    fn object_keys(&self) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.endpoints.values() {
+            out.extend(s.object_keys());
+        }
+        sort_dedup(out)
+    }
+    fn triple_count(&self) -> u64 {
+        self.endpoints.values().map(Shard::triple_count).sum()
+    }
+    fn distinct_subjects(&self) -> usize {
+        self.subject_keys().len()
+    }
+    fn distinct_objects(&self) -> usize {
+        self.object_keys().len()
+    }
+    fn num_predicates(&self) -> usize {
+        let mut preds: HashSet<PredId> = HashSet::new();
+        for s in self.endpoints.values() {
+            preds.extend(s.predicates());
+        }
+        preds.len()
+    }
+    fn pred_card(&self, pred: PredId) -> usize {
+        self.endpoints.values().map(|s| s.pred_card(pred)).sum()
+    }
+    fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        self.subs_by_p(pred).len()
+    }
+    fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        self.objs_by_p(pred).len()
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        let mut preds: Vec<PredId> = Vec::new();
+        for s in self.endpoints.values() {
             preds.extend(s.predicates());
         }
         let preds = sort_dedup(preds);
@@ -1817,6 +2347,9 @@ pub struct ClusterNode {
     id: NodeId,
     state: Arc<Mutex<RaftState>>,
     store: Arc<Mutex<TripleStore>>,
+    /// The cluster's replicated membership/config, updated as committed
+    /// config-change entries ([`LogOp::AddNode`]/[`LogOp::RemoveNode`]) apply.
+    config: Arc<Mutex<ClusterConfig>>,
     /// id → address of every peer (filled in after binding, since ephemeral
     /// ports are only known post-bind).
     peer_addrs: Mutex<HashMap<NodeId, SocketAddr>>,
@@ -1830,6 +2363,13 @@ pub struct ClusterNode {
 }
 
 impl ClusterNode {
+    /// Default shard-bucket count for the node's replicated [`ClusterConfig`].
+    /// The membership/assignment is what is agreed through the log; the data
+    /// itself is replicated whole-keyspace by this single group (per-shard groups
+    /// are the documented generalization), so this value only sizes the agreed
+    /// shard→owner map that a [`ShardCluster`] data plane would consume.
+    pub const DEFAULT_SHARDS: usize = 16;
+
     /// Bind node `id` with cluster peers `peer_ids` (their addresses are set
     /// later via [`ClusterNode::set_peer_addr`]) and a starting `store`.
     pub fn bind<A: ToSocketAddrs>(
@@ -1846,6 +2386,7 @@ impl ClusterNode {
             id,
             state: Arc::new(Mutex::new(state)),
             store: Arc::new(Mutex::new(store)),
+            config: Arc::new(Mutex::new(ClusterConfig::new(Self::DEFAULT_SHARDS))),
             peer_addrs: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             listener,
@@ -1899,6 +2440,12 @@ impl ClusterNode {
     /// Whether this replica's store contains `t`.
     pub fn store_contains(&self, t: IdTriple) -> bool {
         self.store.lock().unwrap().exists(t.sub, t.pred, t.obj)
+    }
+    /// A snapshot of this node's committed cluster configuration (membership +
+    /// shard→owner assignment). Equal across nodes that have applied the same
+    /// committed config-change prefix.
+    pub fn config(&self) -> ClusterConfig {
+        self.config.lock().unwrap().clone()
     }
 
     /// Submit a mutation to this node. Succeeds (with the assigned log index)
@@ -2070,6 +2617,16 @@ impl ClusterNode {
                     last_log_index: st.log_len(),
                 }
             }
+            // The committed cluster configuration (membership + assignment).
+            Request::GetConfig => {
+                let cfg = self.config.lock().unwrap();
+                Response::Config {
+                    epoch: cfg.epoch(),
+                    num_shards: cfg.num_shards() as u32,
+                    members: cfg.member_addrs(),
+                    assignment: cfg.assignment().to_vec(),
+                }
+            }
             // Read-only shard queries are served from the replicated store.
             other => dispatch(&self.store, &other),
         }
@@ -2166,16 +2723,22 @@ impl ClusterNode {
         if actions.is_empty() {
             return;
         }
-        let mut store = self.store.lock().unwrap();
         for a in actions {
             match a {
                 StoreAction::Apply(LogOp::Insert(t)) => {
-                    store.insert(t);
+                    self.store.lock().unwrap().insert(t);
                 }
                 StoreAction::Apply(LogOp::Delete(t)) => {
-                    store.remove(t);
+                    self.store.lock().unwrap().remove(t);
+                }
+                // A committed membership config-change updates the replicated
+                // [`ClusterConfig`] (not the triple store) — so every node that
+                // applied this committed entry agrees on the membership.
+                StoreAction::Apply(op @ (LogOp::AddNode { .. } | LogOp::RemoveNode { .. })) => {
+                    self.config.lock().unwrap().apply(&op);
                 }
                 StoreAction::Reset(triples) => {
+                    let mut store = self.store.lock().unwrap();
                     *store = TripleStore::new();
                     store.bulk_load(triples);
                 }
@@ -2650,8 +3213,14 @@ mod raft_tests {
     struct Sim {
         nodes: Vec<RaftState>,
         stores: Vec<TripleStore>,
+        /// Per-node replicated cluster config, updated as committed
+        /// config-change entries apply (mirrors [`ClusterNode`]'s config).
+        configs: Vec<ClusterConfig>,
         down: Vec<bool>,
     }
+
+    /// Shard-bucket count used by the deterministic membership simulation.
+    const SIM_SHARDS: usize = 8;
 
     impl Sim {
         fn new(n: usize) -> Sim {
@@ -2665,15 +3234,21 @@ mod raft_tests {
                 })
                 .collect();
             let stores = (0..n).map(|_| TripleStore::new()).collect();
+            let configs = (0..n).map(|_| ClusterConfig::new(SIM_SHARDS)).collect();
             Sim {
                 nodes,
                 stores,
+                configs,
                 down: vec![false; n],
             }
         }
 
         fn node(&self, id: NodeId) -> &RaftState {
             &self.nodes[id as usize]
+        }
+
+        fn config(&self, id: NodeId) -> &ClusterConfig {
+            &self.configs[id as usize]
         }
 
         fn set_down(&mut self, id: NodeId, down: bool) {
@@ -2691,6 +3266,11 @@ mod raft_tests {
                         }
                         StoreAction::Apply(LogOp::Delete(tr)) => {
                             self.stores[i].remove(tr);
+                        }
+                        StoreAction::Apply(
+                            op @ (LogOp::AddNode { .. } | LogOp::RemoveNode { .. }),
+                        ) => {
+                            self.configs[i].apply(&op);
                         }
                         StoreAction::Reset(triples) => {
                             self.stores[i] = TripleStore::new();
@@ -2982,6 +3562,41 @@ mod raft_tests {
         assert_eq!(sim.node(0).commit_index(), 1);
     }
 
+    /// Task 1: cluster membership is a config object replicated *through the Raft
+    /// log*. A leader proposes `AddNode`/`RemoveNode` config-change entries; they
+    /// are committed by quorum and applied on every replica, so all nodes converge
+    /// on a byte-identical [`ClusterConfig`]. Fully deterministic (no clocks).
+    #[test]
+    fn membership_config_changes_replicate_through_the_raft_log() {
+        use std::net::SocketAddr;
+        let a = |p: u16| -> SocketAddr { format!("127.0.0.1:{p}").parse().unwrap() };
+
+        let mut sim = Sim::new(3);
+        sim.elect(0);
+        // Found the cluster (admit the three running nodes), then a fourth joins,
+        // then one leaves — every step a committed config-change entry.
+        sim.propose(0, LogOp::AddNode { id: 0, addr: a(6000) });
+        sim.propose(0, LogOp::AddNode { id: 1, addr: a(6001) });
+        sim.propose(0, LogOp::AddNode { id: 2, addr: a(6002) });
+        sim.propose(0, LogOp::AddNode { id: 3, addr: a(6003) }); // join
+        sim.propose(0, LogOp::RemoveNode { id: 1 }); // leave
+
+        let c0 = sim.config(0).clone();
+        assert_eq!(c0.members(), vec![0, 2, 3], "final membership");
+        assert_eq!(c0.epoch(), 5, "five committed config-changes");
+        // Every replica that applied the same committed prefix agrees exactly.
+        for id in 0..3u64 {
+            assert_eq!(sim.config(id), &c0, "node {id} config diverged");
+        }
+        // The shard→owner map is total and only references current members.
+        assert_eq!(c0.assignment().len(), c0.num_shards());
+        for s in 0..c0.num_shards() {
+            assert!(c0.members().contains(&c0.owner(s).unwrap()));
+        }
+        // The membership changes were committed (by quorum), not merely logged.
+        assert_eq!(sim.node(0).commit_index(), 5);
+    }
+
     // ----- Networked end-to-end (real TCP, background threads) ---------------
 
     fn fast_cfg() -> RaftConfig {
@@ -3164,5 +3779,429 @@ mod raft_tests {
         }
 
         shutdown_all(&nodes);
+    }
+
+    /// Task 3 (per-shard replication, minimal form): a shard backed by a Raft
+    /// replication group keeps serving writes and retains its data when one
+    /// **replica fails**. A 3-node group replicates the whole keyspace; killing a
+    /// follower still leaves a 2/3 quorum, so the leader commits new writes, and
+    /// the revived replica catches up. (The generalization — one such group *per
+    /// shard* — is documented as remaining in the module scope notes.)
+    #[test]
+    fn replicated_shard_survives_a_replica_failure() {
+        let nodes = build_cluster(3, fast_cfg());
+        let deadline = Duration::from_secs(20);
+        assert!(
+            wait_until(deadline, || current_leader(&nodes).is_some()),
+            "no leader elected"
+        );
+        let l = current_leader(&nodes).unwrap();
+
+        // A first write replicates to all three replicas of the shard.
+        let a = t(1, 2, 3);
+        nodes[l].propose(LogOp::Insert(a)).expect("leader accepts write");
+        assert!(
+            wait_until(deadline, || nodes.iter().all(|n| n.store_contains(a))),
+            "initial write did not replicate to every replica"
+        );
+
+        // Fail one replica (a follower, not the leader).
+        let f = (0..3).find(|&i| i != l).unwrap();
+        nodes[f].kill();
+        // The leader retains leadership with the remaining 2/3 quorum.
+        assert!(
+            wait_until(deadline, || nodes[l].is_leader()),
+            "leader lost quorum after a single replica failure"
+        );
+
+        // The shard still accepts and commits a new write on the survivors.
+        let b = t(4, 5, 6);
+        nodes[l].propose(LogOp::Insert(b)).expect("survivors still commit");
+        let survivors: Vec<usize> = (0..3).filter(|&i| i != f).collect();
+        assert!(
+            wait_until(deadline, || survivors.iter().all(|&i| nodes[i].store_contains(b))),
+            "post-failure write did not reach the surviving replicas"
+        );
+
+        // A surviving replica answers a read RPC over the wire (no data lost).
+        let saddr = nodes[survivors[0]].local_addr().unwrap();
+        let mut s = TcpStream::connect(saddr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let resp = crate::rpc::round_trip(&mut s, &Request::TripleCount).unwrap();
+        assert!(matches!(resp, Response::Count(n) if n >= 2), "read served by survivor");
+
+        // The failed replica revives and catches up to both writes.
+        nodes[f].revive();
+        assert!(
+            wait_until(deadline, || nodes[f].store_contains(a) && nodes[f].store_contains(b)),
+            "revived replica did not catch up"
+        );
+
+        shutdown_all(&nodes);
+    }
+
+    /// Task 1, end-to-end over TCP: a membership config-change submitted as a
+    /// `ClientWrite` to the leader is committed through the Raft log and converges
+    /// on every replica's [`ClusterConfig`]; a follower then serves the new
+    /// membership over a `GetConfig` RPC.
+    #[test]
+    fn networked_membership_change_via_client_write_replicates() {
+        use std::net::SocketAddr;
+        let nodes = build_cluster(3, fast_cfg());
+        let deadline = Duration::from_secs(20);
+        assert!(wait_until(deadline, || current_leader(&nodes).is_some()));
+        let l = current_leader(&nodes).unwrap();
+
+        // Submit an AddNode config-change as a wire ClientWrite to the leader.
+        let new_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let laddr = nodes[l].local_addr().unwrap();
+        let mut s = TcpStream::connect(laddr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let resp = crate::rpc::round_trip(
+            &mut s,
+            &Request::ClientWrite {
+                op: LogOp::AddNode { id: 42, addr: new_addr },
+            },
+        )
+        .expect("client config-change round-trip");
+        assert!(
+            matches!(resp, Response::WriteAck { ok: true, .. }),
+            "leader accepts the config-change"
+        );
+
+        // Every replica converges on the new membership.
+        assert!(
+            wait_until(deadline, || nodes.iter().all(|n| n.config().contains(42))),
+            "membership did not replicate to every node"
+        );
+
+        // A follower serves the committed config over the wire.
+        let f = (0..3).find(|&i| i != l).unwrap();
+        let faddr = nodes[f].local_addr().unwrap();
+        let mut sf = TcpStream::connect(faddr).unwrap();
+        sf.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let cfg = crate::rpc::round_trip(&mut sf, &Request::GetConfig).expect("GetConfig round-trip");
+        match cfg {
+            Response::Config {
+                epoch,
+                num_shards,
+                members,
+                assignment,
+            } => {
+                assert!(epoch >= 1, "a committed config-change bumps the epoch");
+                assert!(
+                    members.iter().any(|(id, a)| *id == 42 && *a == new_addr),
+                    "the new member is present with its address"
+                );
+                assert_eq!(assignment.len(), num_shards as usize);
+                // The lone member owns every bucket.
+                assert!(assignment.iter().all(|&o| o == 42));
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+
+        shutdown_all(&nodes);
+    }
+}
+
+/// Pure, deterministic unit tests for the membership/assignment logic in
+/// [`ClusterConfig`] (no clocks, sockets, or threads): rendezvous determinism,
+/// minimal-movement rebalancing, and config-change application parity.
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(p: u16) -> SocketAddr {
+        format!("127.0.0.1:{p}").parse().unwrap()
+    }
+
+    #[test]
+    fn assignment_is_deterministic_total_and_member_owned() {
+        let mut a = ClusterConfig::new(32);
+        let mut b = ClusterConfig::new(32);
+        // Insert in different orders: the assignment must still be identical.
+        for id in [0u64, 1, 2, 3] {
+            a.add_node(id, addr(7000 + id as u16));
+        }
+        for id in [3u64, 1, 0, 2] {
+            b.add_node(id, addr(7000 + id as u16));
+        }
+        assert_eq!(a, b, "same member set => identical config regardless of order");
+        assert_eq!(a.assignment().len(), 32);
+        for s in 0..32 {
+            assert!(
+                a.members().contains(&a.owner(s).unwrap()),
+                "every bucket owned by a member"
+            );
+        }
+        for id in 0..4u64 {
+            assert!(
+                a.assignment().contains(&id),
+                "node {id} should own at least one of 32 buckets"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_a_node_moves_only_buckets_that_become_its_own() {
+        let mut c = ClusterConfig::new(64);
+        for id in 0..3u64 {
+            c.add_node(id, addr(8000 + id as u16));
+        }
+        let before = c.assignment().to_vec();
+        assert!(c.add_node(3, addr(8003)));
+        let after = c.assignment().to_vec();
+        assert_ne!(before, after, "the newcomer should take over some buckets");
+        for s in 0..64 {
+            if before[s] != after[s] {
+                assert_eq!(after[s], 3, "a moved bucket must go to the new node");
+            }
+        }
+        assert!(after.contains(&3));
+    }
+
+    #[test]
+    fn removing_a_node_rehomes_only_its_buckets_with_no_orphans() {
+        let mut c = ClusterConfig::new(64);
+        for id in 0..4u64 {
+            c.add_node(id, addr(9000 + id as u16));
+        }
+        let before = c.assignment().to_vec();
+        assert!(c.remove_node(2));
+        let after = c.assignment().to_vec();
+        for s in 0..64 {
+            if before[s] == 2 {
+                assert_ne!(after[s], 2, "the removed node's bucket is re-homed");
+            } else {
+                assert_eq!(before[s], after[s], "an untouched bucket keeps its owner");
+            }
+        }
+        assert!(
+            !after.contains(&2),
+            "no bucket may be owned by a removed node"
+        );
+        assert!(!c.contains(2));
+    }
+
+    #[test]
+    fn apply_log_op_matches_direct_mutation_and_ignores_data_ops() {
+        let mut viaop = ClusterConfig::new(16);
+        let mut direct = ClusterConfig::new(16);
+        let ops = [
+            LogOp::AddNode { id: 5, addr: addr(1005) },
+            LogOp::AddNode { id: 1, addr: addr(1001) },
+            LogOp::RemoveNode { id: 5 },
+            LogOp::Insert(IdTriple::new(1, 2, 3)), // data op: not a config change
+            LogOp::Delete(IdTriple::new(1, 2, 3)),
+        ];
+        for op in ops {
+            viaop.apply(&op);
+        }
+        direct.add_node(5, addr(1005));
+        direct.add_node(1, addr(1001));
+        direct.remove_node(5);
+        assert_eq!(viaop, direct);
+        assert_eq!(viaop.epoch(), 3, "only the 3 membership changes bump the epoch");
+        assert_eq!(viaop.members(), vec![1]);
+    }
+
+    #[test]
+    fn empty_config_routes_nothing() {
+        let c = ClusterConfig::new(8);
+        assert!(c.owner_of_subject(123).is_none());
+        assert!(c.assignment().is_empty());
+        assert_eq!(c.epoch(), 0);
+    }
+}
+
+/// Networked, end-to-end tests for **elastic rebalancing**: real
+/// [`ShardNode`] servers on ephemeral `127.0.0.1:0` ports in background threads,
+/// with [`ShardCluster`] streaming shard buckets between owners over genuine TCP
+/// when a node joins or leaves. These are deterministic despite using sockets —
+/// every cluster operation is a synchronous request/response, so there is no
+/// wall-clock timing to flake on.
+#[cfg(test)]
+mod shard_cluster_tests {
+    use super::*;
+    use crate::dict::Dictionary;
+    use crate::model::Term;
+    use crate::query::{QueryResult, ResultSet};
+
+    fn fixture() -> (Dictionary, Vec<IdTriple>) {
+        let mut d = Dictionary::new();
+        let knows = d.intern_predicate(&Term::iri("http://ex/knows").dict_key());
+        let typ = d.intern_predicate(&Term::iri("http://ex/type").dict_key());
+        let name = d.intern_predicate(&Term::iri("http://ex/name").dict_key());
+        let person = d.intern_term(&Term::iri("http://ex/Person"));
+        let hub = d.intern_term(&Term::iri("http://ex/hub"));
+        let names = [
+            "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi", "ivan", "judy",
+        ];
+        let people: Vec<EntityLiteralId> = names
+            .iter()
+            .map(|n| d.intern_term(&Term::iri(format!("http://ex/{n}"))))
+            .collect();
+        let mut triples = Vec::new();
+        for (i, &p) in people.iter().enumerate() {
+            triples.push(IdTriple::new(p, typ, person));
+            triples.push(IdTriple::new(p, knows, hub));
+            let next = people[(i + 1) % people.len()];
+            triples.push(IdTriple::new(p, knows, next));
+            let lit = d.intern_term(&Term::plain_literal(*names.get(i).unwrap()));
+            triples.push(IdTriple::new(p, name, lit));
+        }
+        triples.push(IdTriple::new(hub, typ, person));
+        triples.push(IdTriple::new(hub, knows, people[0]));
+        (d, triples)
+    }
+
+    fn rows_sorted(rs: &ResultSet) -> Vec<Vec<Option<String>>> {
+        let mut r = rs.rows.clone();
+        r.sort();
+        r
+    }
+
+    /// Start an empty in-process [`ShardNode`] on an ephemeral port; return its
+    /// address and a [`Shard::Remote`] client to it.
+    fn start_remote() -> (SocketAddr, Shard) {
+        let node = Arc::new(ShardNode::bind(TripleStore::new(), "127.0.0.1:0").expect("bind"));
+        let addr = node.local_addr().expect("addr");
+        thread::spawn(move || node.serve_forever());
+        (addr, Shard::Remote(RemoteShard::connect(addr).expect("connect")))
+    }
+
+    fn endpoint_count(cluster: &ShardCluster, id: NodeId) -> u64 {
+        match cluster.endpoint(id).expect("endpoint registered") {
+            Shard::Remote(r) => r.triple_count().unwrap(),
+            Shard::Local(s) => s.triple_count(),
+        }
+    }
+
+    const BGP: &str = "SELECT ?x ?y WHERE { \
+         ?x <http://ex/knows> ?y . \
+         ?y <http://ex/type> <http://ex/Person> . \
+         ?x <http://ex/name> ?n }";
+
+    fn select_rows(rs: QueryResult) -> Vec<Vec<Option<String>>> {
+        match rs {
+            QueryResult::Select(r) => rows_sorted(&r),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// Task 1+2: a node joins a running cluster and *receives its shards* over RPC.
+    #[test]
+    fn joining_node_receives_its_shards_over_rpc() {
+        let (d, triples) = fixture();
+        let base = ShardedStore::from_triples(1, triples.iter().copied());
+
+        let mut cluster = ShardCluster::new(8);
+        // Two founding members; the whole fixture routed across them.
+        let (a0, e0) = start_remote();
+        cluster.add_node(0, a0, e0).unwrap();
+        let (a1, e1) = start_remote();
+        cluster.add_node(1, a1, e1).unwrap();
+        cluster.insert_all(triples.iter().copied()).unwrap();
+        assert_eq!(
+            TripleSource::triple_count(&cluster),
+            base.triple_count(),
+            "all triples routed, none lost"
+        );
+
+        // A third node joins the running cluster.
+        let (a2, e2) = start_remote();
+        cluster.add_node(2, a2, e2).unwrap();
+
+        // It now owns some buckets and has received their data over the wire.
+        let owns: usize = (0..cluster.num_shards())
+            .filter(|&s| cluster.config().owner(s) == Some(2))
+            .count();
+        assert!(owns > 0, "the joiner should own some buckets");
+        assert!(endpoint_count(&cluster, 2) > 0, "the joiner received its shards");
+
+        // No data was lost or duplicated, and the distributed query is unchanged.
+        assert_eq!(TripleSource::triple_count(&cluster), base.triple_count());
+        assert_eq!(
+            select_rows(cluster.query(&d, BGP).unwrap()),
+            select_rows(base.query(&d, BGP).unwrap()),
+        );
+    }
+
+    /// Task 2: a node leaves and its shards migrate to survivors with no data loss.
+    #[test]
+    fn leaving_node_migrates_its_shards_with_no_data_loss() {
+        let (d, triples) = fixture();
+        let base = ShardedStore::from_triples(1, triples.iter().copied());
+
+        let mut cluster = ShardCluster::new(8);
+        for id in 0..3u64 {
+            let (a, e) = start_remote();
+            cluster.add_node(id, a, e).unwrap();
+        }
+        cluster.insert_all(triples.iter().copied()).unwrap();
+        assert_eq!(TripleSource::triple_count(&cluster), base.triple_count());
+
+        // Node 1 leaves; its buckets move to survivors.
+        cluster.remove_node(1).unwrap();
+        assert_eq!(cluster.members(), vec![0, 2], "node 1 left the membership");
+        for s in 0..cluster.num_shards() {
+            assert_ne!(cluster.config().owner(s), Some(1), "no bucket left on a departed node");
+        }
+        // No data lost and the query is still correct.
+        assert_eq!(
+            TripleSource::triple_count(&cluster),
+            base.triple_count(),
+            "no data lost when a node leaves"
+        );
+        assert_eq!(
+            select_rows(cluster.query(&d, BGP).unwrap()),
+            select_rows(base.query(&d, BGP).unwrap()),
+        );
+    }
+
+    /// Task 3: writes issued *after* a rebalance land on the new owner per the
+    /// current assignment, and are queryable.
+    #[test]
+    fn writes_after_rebalance_land_on_the_new_owner_and_are_queryable() {
+        let (mut d, triples) = fixture();
+
+        let mut cluster = ShardCluster::new(8);
+        for id in 0..2u64 {
+            let (a, e) = start_remote();
+            cluster.add_node(id, a, e).unwrap();
+        }
+        cluster.insert_all(triples.iter().copied()).unwrap();
+
+        // Reshape the cluster: add a node, drop another — buckets reshuffle.
+        let (a2, e2) = start_remote();
+        cluster.add_node(2, a2, e2).unwrap();
+        cluster.remove_node(0).unwrap();
+        assert_eq!(cluster.members(), vec![1, 2]);
+
+        // A fresh write routes to the bucket's *current* owner.
+        let zoe = d.intern_term(&Term::iri("http://ex/zoe"));
+        let knows = d
+            .predicate_id(&Term::iri("http://ex/knows").dict_key())
+            .unwrap();
+        let alice = d.term_id(&Term::iri("http://ex/alice")).unwrap();
+        let nt = IdTriple::new(alice, knows, zoe);
+        let owner = cluster.owner_of_subject(alice).expect("a routable owner");
+        assert!(cluster.insert(nt).unwrap(), "new edge inserted");
+
+        // It landed on exactly the routed owner, and nowhere else.
+        let holders: Vec<NodeId> = cluster
+            .members()
+            .into_iter()
+            .filter(|&id| cluster.endpoint(id).unwrap().exists(alice, knows, zoe))
+            .collect();
+        assert_eq!(holders, vec![owner], "the write lands on exactly its owner");
+
+        // And it is visible to a distributed query.
+        let ask = "ASK { <http://ex/alice> <http://ex/knows> <http://ex/zoe> }";
+        assert!(
+            matches!(cluster.query(&d, ask).unwrap(), QueryResult::Ask(true)),
+            "post-rebalance write is queryable"
+        );
     }
 }

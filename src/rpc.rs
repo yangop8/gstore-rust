@@ -43,6 +43,7 @@
 //! wire surface stays small.
 
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
@@ -61,22 +62,39 @@ pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 /// A node's stable identity within a cluster.
 pub type NodeId = u64;
 
-/// A single replicated mutation: insert or delete one triple. This is the unit
-/// of the replicated log — followers apply committed [`LogOp`]s to their store.
+/// A single replicated log command. Most commands are **data-plane** triple
+/// mutations ([`LogOp::Insert`] / [`LogOp::Delete`]); the **control-plane**
+/// variants ([`LogOp::AddNode`] / [`LogOp::RemoveNode`]) replicate *cluster
+/// membership changes* through the very same Raft log, so every replica converges
+/// on an identical [`ClusterConfig`](crate::cluster::ClusterConfig) (this is the
+/// "config-change entry" mechanism — a membership change is committed by quorum
+/// exactly like a data write). All variants stay `Copy` (a [`SocketAddr`] is
+/// `Copy`), so the proven Raft state machine treats them uniformly and unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogOp {
     /// Add a triple (`store.insert`).
     Insert(IdTriple),
     /// Remove a triple (`store.remove`).
     Delete(IdTriple),
+    /// Membership config-change: admit node `id` (reachable at `addr`).
+    AddNode { id: NodeId, addr: SocketAddr },
+    /// Membership config-change: evict node `id`.
+    RemoveNode { id: NodeId },
 }
 
 impl LogOp {
-    /// The triple this op acts on.
-    pub fn triple(&self) -> IdTriple {
+    /// The triple this op acts on, if it is a data-plane mutation (`None` for a
+    /// membership config-change).
+    pub fn triple(&self) -> Option<IdTriple> {
         match *self {
-            LogOp::Insert(t) | LogOp::Delete(t) => t,
+            LogOp::Insert(t) | LogOp::Delete(t) => Some(t),
+            LogOp::AddNode { .. } | LogOp::RemoveNode { .. } => None,
         }
+    }
+
+    /// Whether this is a control-plane membership config-change.
+    pub fn is_config(&self) -> bool {
+        matches!(self, LogOp::AddNode { .. } | LogOp::RemoveNode { .. })
     }
 }
 
@@ -175,17 +193,33 @@ fn put_i64(buf: &mut Vec<u8>, v: i64) {
     put_u64(buf, v as u64);
 }
 
-/// Encode a [`LogOp`]: a one-byte kind tag (`1` insert, `2` delete) then the
-/// triple's `(sub, pred, obj)`.
+/// Encode a [`LogOp`]: a one-byte kind tag then the variant's body. `1` insert /
+/// `2` delete carry a triple `(sub, pred, obj)`; `3` add-node carries `id` (u64)
+/// + the node address as a string; `4` remove-node carries `id` (u64).
 fn put_op(buf: &mut Vec<u8>, op: &LogOp) {
-    let (kind, t) = match *op {
-        LogOp::Insert(t) => (1u8, t),
-        LogOp::Delete(t) => (2u8, t),
-    };
-    buf.push(kind);
-    put_u32(buf, t.sub);
-    put_u32(buf, t.pred);
-    put_u32(buf, t.obj);
+    match *op {
+        LogOp::Insert(t) => {
+            buf.push(1);
+            put_u32(buf, t.sub);
+            put_u32(buf, t.pred);
+            put_u32(buf, t.obj);
+        }
+        LogOp::Delete(t) => {
+            buf.push(2);
+            put_u32(buf, t.sub);
+            put_u32(buf, t.pred);
+            put_u32(buf, t.obj);
+        }
+        LogOp::AddNode { id, addr } => {
+            buf.push(3);
+            put_u64(buf, id);
+            put_str(buf, &addr.to_string());
+        }
+        LogOp::RemoveNode { id } => {
+            buf.push(4);
+            put_u64(buf, id);
+        }
+    }
 }
 
 /// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op.
@@ -279,10 +313,26 @@ impl<'a> Reader<'a> {
 
     fn op(&mut self) -> io::Result<LogOp> {
         let kind = self.u8()?;
-        let t = IdTriple::new(self.u32()?, self.u32()?, self.u32()?);
         match kind {
-            1 => Ok(LogOp::Insert(t)),
-            2 => Ok(LogOp::Delete(t)),
+            1 => Ok(LogOp::Insert(IdTriple::new(
+                self.u32()?,
+                self.u32()?,
+                self.u32()?,
+            ))),
+            2 => Ok(LogOp::Delete(IdTriple::new(
+                self.u32()?,
+                self.u32()?,
+                self.u32()?,
+            ))),
+            3 => {
+                let id = self.u64()?;
+                let addr = self
+                    .string()?
+                    .parse::<SocketAddr>()
+                    .map_err(|_| bad("rpc add-node addr is not a socket address"))?;
+                Ok(LogOp::AddNode { id, addr })
+            }
+            4 => Ok(LogOp::RemoveNode { id: self.u64()? }),
             _ => Err(bad("unknown log-op kind")),
         }
     }
@@ -393,10 +443,22 @@ pub enum Request {
         triples: Vec<IdTriple>,
     },
     /// A client submits a mutation to the cluster; the leader appends it, a
-    /// follower replies with a redirect hint.
+    /// follower replies with a redirect hint. The mutation may be a data write
+    /// **or** a membership config-change ([`LogOp::AddNode`]/[`LogOp::RemoveNode`]).
     ClientWrite { op: LogOp },
     /// Introspection: ask a node for its raft role / term / commit index.
     ClusterStatus,
+
+    // --- Elastic membership / shard rebalancing (see [`crate::cluster`]). ---
+    /// Ask a node for its current committed [`ClusterConfig`](crate::cluster::ClusterConfig).
+    GetConfig,
+    /// Migration export: return every triple this shard node holds whose subject
+    /// hashes to bucket `shard` out of `num_shards` (the unit of rebalancing).
+    ScanShard { shard: u32, num_shards: u32 },
+    /// Migration cut-over: delete every triple in bucket `shard` of `num_shards`
+    /// from this node (after its data has been streamed to the new owner);
+    /// replies with the number removed.
+    PurgeShard { shard: u32, num_shards: u32 },
 }
 
 impl Request {
@@ -506,6 +568,17 @@ impl Request {
                 put_op(&mut buf, op);
             }
             Request::ClusterStatus => buf.push(20),
+            Request::GetConfig => buf.push(21),
+            Request::ScanShard { shard, num_shards } => {
+                buf.push(22);
+                put_u32(&mut buf, shard);
+                put_u32(&mut buf, num_shards);
+            }
+            Request::PurgeShard { shard, num_shards } => {
+                buf.push(23);
+                put_u32(&mut buf, shard);
+                put_u32(&mut buf, num_shards);
+            }
         }
         buf
     }
@@ -570,6 +643,15 @@ impl Request {
             },
             19 => Request::ClientWrite { op: r.op()? },
             20 => Request::ClusterStatus,
+            21 => Request::GetConfig,
+            22 => Request::ScanShard {
+                shard: r.u32()?,
+                num_shards: r.u32()?,
+            },
+            23 => Request::PurgeShard {
+                shard: r.u32()?,
+                num_shards: r.u32()?,
+            },
             _ => return Err(bad("unknown rpc request tag")),
         };
         Ok(req)
@@ -634,6 +716,17 @@ pub enum Response {
         leader_hint: i64,
         commit_index: u64,
         last_log_index: u64,
+    },
+    /// Reply to [`Request::ScanShard`]: the exported triples of one shard bucket.
+    Triples(Vec<IdTriple>),
+    /// Reply to [`Request::GetConfig`]: a node's committed cluster configuration —
+    /// `epoch`, shard count, the `(node_id, addr)` members, and the `shard→owner`
+    /// assignment (`assignment[i]` owns bucket `i`).
+    Config {
+        epoch: u64,
+        num_shards: u32,
+        members: Vec<(NodeId, SocketAddr)>,
+        assignment: Vec<NodeId>,
     },
 }
 
@@ -705,6 +798,29 @@ impl Response {
                 put_u64(&mut buf, *commit_index);
                 put_u64(&mut buf, *last_log_index);
             }
+            Response::Triples(triples) => {
+                buf.push(11);
+                put_triples(&mut buf, triples);
+            }
+            Response::Config {
+                epoch,
+                num_shards,
+                members,
+                assignment,
+            } => {
+                buf.push(12);
+                put_u64(&mut buf, *epoch);
+                put_u32(&mut buf, *num_shards);
+                put_u32(&mut buf, members.len() as u32);
+                for (id, addr) in members {
+                    put_u64(&mut buf, *id);
+                    put_str(&mut buf, &addr.to_string());
+                }
+                put_u32(&mut buf, assignment.len() as u32);
+                for owner in assignment {
+                    put_u64(&mut buf, *owner);
+                }
+            }
         }
         buf
     }
@@ -741,6 +857,32 @@ impl Response {
                 commit_index: r.u64()?,
                 last_log_index: r.u64()?,
             },
+            11 => Response::Triples(r.triples()?),
+            12 => {
+                let epoch = r.u64()?;
+                let num_shards = r.u32()?;
+                let nmembers = r.u32()? as usize;
+                let mut members = Vec::with_capacity(nmembers.min(1024));
+                for _ in 0..nmembers {
+                    let id = r.u64()?;
+                    let addr = r
+                        .string()?
+                        .parse::<SocketAddr>()
+                        .map_err(|_| bad("rpc config member addr is not a socket address"))?;
+                    members.push((id, addr));
+                }
+                let nassign = r.u32()? as usize;
+                let mut assignment = Vec::with_capacity(nassign.min(1024));
+                for _ in 0..nassign {
+                    assignment.push(r.u64()?);
+                }
+                Response::Config {
+                    epoch,
+                    num_shards,
+                    members,
+                    assignment,
+                }
+            }
             _ => return Err(bad("unknown rpc response tag")),
         };
         Ok(resp)
@@ -780,6 +922,15 @@ impl Response {
             Response::Pairs(v) => Ok(v),
             Response::Error(e) => Err(remote_err(e)),
             _ => Err(bad("expected a Pairs response")),
+        }
+    }
+
+    /// Coerce to a list of triples (a [`Request::ScanShard`] reply).
+    pub fn into_triples(self) -> io::Result<Vec<IdTriple>> {
+        match self {
+            Response::Triples(v) => Ok(v),
+            Response::Error(e) => Err(remote_err(e)),
+            _ => Err(bad("expected a Triples response")),
         }
     }
 }
@@ -902,7 +1053,43 @@ mod tests {
             Request::ClientWrite {
                 op: LogOp::Insert(IdTriple::new(7, 8, 9)),
             },
+            Request::ClientWrite {
+                op: LogOp::AddNode {
+                    id: 7,
+                    addr: "127.0.0.1:7100".parse().unwrap(),
+                },
+            },
+            Request::ClientWrite {
+                op: LogOp::RemoveNode { id: 9 },
+            },
+            // A config-change entry travels in the replicated log too.
+            Request::AppendEntries {
+                term: 3,
+                leader_id: 0,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                leader_commit: 1,
+                entries: vec![
+                    LogEntry::new(
+                        3,
+                        LogOp::AddNode {
+                            id: 2,
+                            addr: "[::1]:7200".parse().unwrap(),
+                        },
+                    ),
+                    LogEntry::new(3, LogOp::RemoveNode { id: 5 }),
+                ],
+            },
             Request::ClusterStatus,
+            Request::GetConfig,
+            Request::ScanShard {
+                shard: 2,
+                num_shards: 4,
+            },
+            Request::PurgeShard {
+                shard: 3,
+                num_shards: 4,
+            },
         ];
         for req in reqs {
             let decoded = Request::decode(&req.encode()).unwrap();
@@ -953,6 +1140,23 @@ mod tests {
                 leader_hint: 1,
                 commit_index: 8,
                 last_log_index: 9,
+            },
+            Response::Triples(vec![]),
+            Response::Triples(vec![IdTriple::new(1, 2, 3), IdTriple::new(4, 5, 6)]),
+            Response::Config {
+                epoch: 0,
+                num_shards: 0,
+                members: vec![],
+                assignment: vec![],
+            },
+            Response::Config {
+                epoch: 7,
+                num_shards: 4,
+                members: vec![
+                    (0, "127.0.0.1:7100".parse().unwrap()),
+                    (1, "[::1]:7101".parse().unwrap()),
+                ],
+                assignment: vec![1, 0, 1, 0],
             },
         ];
         for resp in resps {
