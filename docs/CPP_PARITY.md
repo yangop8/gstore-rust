@@ -76,3 +76,18 @@
 > - **架构观察**(用户提出):gStore核心价值=VS-tree+优化器+图算法,存储后端应可插拔。现`TripleSource` trait已是干净只读seam(返回owned Vec、4实现、查询栈全泛型)。下一步:抽 StorageBackend(读+写+dict)、Database泛型化,先证可插拔(零依赖),再feature门控接入RocksDB(6 column family/复合key前缀range scan)。MySQL/MyRocks定位冷源而非热后端。
 >
 > 剩余大颗粒:可插拔StorageBackend抽象层 + RocksDB后端(下一阶段);完全out-of-core的VS-tree流式过滤;集群副本/容错;HTTPS(TLS反代)。
+>
+> 更新(2026-06-30,**可插拔后端 + 全量C++对标批次**):基于对克隆的C++ master(`pkumod/gStore`,~135K行/14模块)的**逐模块源码对读**(6个只读agent分头核实,跨模块误判已纠正),把三档差距补到对标C++。新增**528→544测试段位、双feature(默认 + `--features rocksdb`)全绿、clippy `--all-targets`零告警**。
+>
+> - **可插拔存储后端**:`store::{MutableStore, StorageBackend, Backend}` 写面seam + 运行期可选后端枚举;`Database` 持 `Backend`(默认内存,`--features rocksdb` 可选RocksDB)。`backend/rocks.rs`:3 column family复合key索引 + 词典CF + 统计计数,持久化/重开/查询parity测试。见 `docs/STORAGE_BACKEND.md`。
+> - **第一档**:补齐内置标量函数(SUBSTR/REPLACE/IF/RAND/NOW/YEAR…SECONDS/TIMEZONE/TZ/UUID/STRUUID/IRI/BNODE/STRDT/STRLANG/LANGMATCHES/ENCODE_FOR_URI + 手写MD5/SHA1/256/384/512,`query/hash.rs`);gStore图函数接入SPARQL(SHORTESTPATHLEN/KHOPREACHABLE/CYCLEBOOLEAN…);**集群HA**(`cluster.rs`:Raft式选举/term/日志复制/quorum/心跳/failover/follower恢复);**用户自定义推理规则**(`reason`:规则定义/启停/effect计数);**PFN→Rust函数注册表**(`query/functions.rs`,替代.so dlopen)。
+> - **第二档**:存储深度(`kvstore/overflow.rs` VList溢出链、增量VS-tree插入/分裂、`kvstore/string_index.rs` 子串二级索引、Pager RwLock细粒度latch);事务(redo日志、隔离级别选择、ID freelist回收、QueryCache LRU淘汰、build进度);查询优化(WCOJoin按对选nested-loop/hash、top-k记忆化树、planner大BGP 2-opt)。
+> - **第三档**:服务API(`http_users.rs`/`http_api.rs`:用户/RBAC/会话、事务overHTTP、DB生命周期端点、backup/restore/export、批量insert/remove、查询/访问/事务日志 + monitor);8个CLI工具(gadd/gsub/gdrop/gshow/gbackup/grestore/gexport/gmonitor);RDF输入格式 N-Quads/TriG/RDF-XML(`parser/{nquads,trig,rdfxml}.rs`,**超过C++**)。
+>
+> **经判定的偏离**(C++机制对安全/轻依赖的Rust重写不合适,故对标能力、偏离机制):
+> - 客户端SDK(C++/Java/Node/PHP/Python 5种):不照搬;Rust HTTP端点讲标准SPARQL 1.1 Protocol,任何HTTP客户端通用。
+> - gRPC/Protobuf:保留零依赖std-TCP RPC(网络RPC+分布式查询能力已对标);gRPC线格式留作未来feature。
+> - PFN .so动态插件:改为安全的Rust进程内函数注册表(不做unsafe dlopen ABI耦合)。
+> - JSON-LD输入:**C++亦无**,非差距,跳过(其余RDF格式已超C++)。
+>
+> 剩余(均为深度/运维项,非功能缺口):完全out-of-core的VS-tree流式过滤;集群副本快照增量同步的生产级细节;HTTPS(TLS反代/未来rustls feature);SITree/IVArray/ISArray按用途的块管理器分化(纯内存微优化)。
