@@ -21,6 +21,7 @@ pub mod kb;
 pub mod link;
 pub mod llm;
 pub mod pipeline;
+pub mod schema;
 pub mod secret;
 
 pub use config::Config;
@@ -35,6 +36,7 @@ pub use kb::{
     TermKind,
 };
 pub use link::{local_name, Candidate, LinkKind, Linker};
+pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
 pub use pipeline::{Answer, AskEngine};
 pub use secret::Secret;
