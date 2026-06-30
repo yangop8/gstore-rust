@@ -10,22 +10,41 @@
 //! | `POST /update` | run a SPARQL UPDATE |
 //! | `GET /status` | report [`DbStats`](crate::db::DbStats) |
 //!
-//! SELECT returns SPARQL 1.1 Query Results JSON, ASK returns the boolean JSON
-//! form, and CONSTRUCT/DESCRIBE return N-Triples. The [`Database`] is shared
-//! behind a [`Mutex`] so connections are serialized (correctness over
+//! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
+//! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
+//! query parameter; CONSTRUCT/DESCRIBE return N-Triples. The [`Database`] is
+//! shared behind a [`Mutex`] so connections are serialized (correctness over
 //! throughput).
 //!
-//! Deferred (see `docs/REFACTOR_BACKLOG.md` F): HTTPS/auth, content negotiation,
-//! gRPC, streaming responses, and clustering/sharding.
+//! Beyond the base protocol this endpoint adds:
+//!
+//! * **HTTP Basic auth** — optional, via [`Server::with_basic_auth`]. When
+//!   configured, every request must carry a valid `Authorization: Basic` header
+//!   or it is answered `401` with `WWW-Authenticate: Basic`. With no credentials
+//!   configured the server stays open (unchanged behavior).
+//! * **Content negotiation** — four SPARQL Results serializations (above).
+//! * **Streaming** — a SELECT with `?stream=true` is sent with
+//!   `Transfer-Encoding: chunked`, emitting rows without buffering the whole
+//!   body. All other responses keep `Content-Length`, so the chunked-unaware
+//!   [`crate::http_client`] (and the `SERVICE` federation path) are unaffected.
+//!
+//! **HTTPS:** real TLS is intentionally out of this zero-dependency crate's
+//! scope. Terminate TLS in front of the endpoint with a reverse proxy (nginx,
+//! Caddy, stunnel, …), or wire in `rustls`/`native-tls` behind a future
+//! optional Cargo feature — nothing here precludes wrapping the accepted
+//! [`TcpStream`] in a TLS stream. Do not send credentials over plain `http://`
+//! in production without such termination.
+//!
+//! Still deferred (see `docs/REFACTOR_BACKLOG.md` F): gRPC and
+//! clustering/sharding.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 
 use crate::db::Database;
-use crate::model::Term;
-use crate::parser::ntriples::parse_term;
-use crate::query::QueryResult;
+use crate::query::{QueryResult, ResultSet};
+use crate::sparql_results::{self, json_str, ResultFormat};
 
 const SPARQL_JSON: &str = "application/sparql-results+json";
 
@@ -33,6 +52,8 @@ const SPARQL_JSON: &str = "application/sparql-results+json";
 pub struct Server {
     db: Mutex<Database>,
     listener: TcpListener,
+    /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
+    auth: Option<(String, String)>,
 }
 
 impl Server {
@@ -43,7 +64,20 @@ impl Server {
         Ok(Server {
             db: Mutex::new(db),
             listener,
+            auth: None,
         })
+    }
+
+    /// Require HTTP Basic auth with these credentials on every request.
+    ///
+    /// ```no_run
+    /// # use gstore::{Database, server::Server};
+    /// # let db = Database::build_from_str("x", "").unwrap();
+    /// let server = Server::bind(db, "127.0.0.1:0").unwrap().with_basic_auth("admin", "s3cret");
+    /// ```
+    pub fn with_basic_auth(mut self, user: &str, pass: &str) -> Server {
+        self.auth = Some((user.to_string(), pass.to_string()));
+        self
     }
 
     /// The actual bound address (useful after binding to port 0).
@@ -64,41 +98,68 @@ impl Server {
             Ok(None) => return Ok(()), // connection closed with no request
             Err(_) => return write_response(&mut stream, 400, "text/plain", b"bad request"),
         };
-        let (status, ctype, body) = self.route(&req);
-        write_response(&mut stream, status, &ctype, &body)
-    }
-
-    fn route(&self, req: &Request) -> (u16, String, Vec<u8>) {
+        // Auth gate: when credentials are configured every request must present
+        // a matching `Authorization: Basic` header.
+        if let Some((user, pass)) = &self.auth {
+            if !req.authorized(user, pass) {
+                return write_response_ext(
+                    &mut stream,
+                    401,
+                    "text/plain",
+                    &[("WWW-Authenticate", "Basic realm=\"gStore\"")],
+                    b"unauthorized",
+                );
+            }
+        }
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET" | "POST", "/sparql") => match req.query_string() {
-                Some(q) => self.run_query(&q),
-                None => (400, SPARQL_JSON.into(), err_json("missing query")),
-            },
-            ("POST", "/update") => self.run_update(&req.body_string()),
-            ("GET", "/status") => self.status_json(),
-            ("GET" | "POST", _) => (404, "text/plain".into(), b"not found".to_vec()),
-            _ => (405, "text/plain".into(), b"method not allowed".to_vec()),
+            ("GET" | "POST", "/sparql") => self.handle_sparql(&mut stream, &req),
+            ("POST", "/update") => {
+                let (s, c, b) = self.run_update(&req.body_string());
+                write_response(&mut stream, s, &c, &b)
+            }
+            ("GET", "/status") => {
+                let (s, c, b) = self.status_json();
+                write_response(&mut stream, s, &c, &b)
+            }
+            ("GET" | "POST", _) => write_response(&mut stream, 404, "text/plain", b"not found"),
+            _ => write_response(&mut stream, 405, "text/plain", b"method not allowed"),
         }
     }
 
-    fn run_query(&self, q: &str) -> (u16, String, Vec<u8>) {
+    /// Run a `/sparql` request: negotiate a result format, then answer with a
+    /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
+    fn handle_sparql(&self, stream: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+        let q = match req.query_string() {
+            Some(q) => q,
+            None => return write_response(stream, 400, SPARQL_JSON, &err_json("missing query")),
+        };
+        let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
         let mut db = self.db.lock().unwrap();
-        match db.query(q) {
-            Ok(QueryResult::Select(rs)) => (200, SPARQL_JSON.into(), select_json(&rs)),
-            Ok(QueryResult::Ask(b)) => (
-                200,
-                SPARQL_JSON.into(),
-                format!("{{\"head\":{{}},\"boolean\":{b}}}").into_bytes(),
-            ),
-            Ok(QueryResult::Construct(ts)) => {
-                (200, "application/n-triples".into(), ntriples_body(&ts))
+        match db.query(&q) {
+            Ok(QueryResult::Select(rs)) => {
+                if req.wants_stream() {
+                    stream_select(stream, fmt, &rs)
+                } else {
+                    let mut buf = Vec::new();
+                    let _ = sparql_results::write_select(fmt, &rs, &mut buf);
+                    write_response(stream, 200, fmt.content_type(), &buf)
+                }
             }
-            Ok(QueryResult::Update { changed }) => (
+            Ok(QueryResult::Ask(b)) => {
+                let mut buf = Vec::new();
+                let _ = sparql_results::write_ask(fmt, b, &mut buf);
+                write_response(stream, 200, fmt.content_type(), &buf)
+            }
+            Ok(QueryResult::Construct(ts)) => {
+                write_response(stream, 200, "application/n-triples", &ntriples_body(&ts))
+            }
+            Ok(QueryResult::Update { changed }) => write_response(
+                stream,
                 200,
-                "application/json".into(),
-                format!("{{\"changed\":{changed}}}").into_bytes(),
+                "application/json",
+                format!("{{\"changed\":{changed}}}").as_bytes(),
             ),
-            Err(e) => (400, SPARQL_JSON.into(), err_json(&e.to_string())),
+            Err(e) => write_response(stream, 400, SPARQL_JSON, &err_json(&e.to_string())),
         }
     }
 
@@ -136,11 +197,13 @@ impl Server {
     }
 }
 
-/// A parsed HTTP request (method, path, query string, body).
+/// A parsed HTTP request (method, path, query string, headers, body).
 struct Request {
     method: String,
     path: String,
     query: Option<String>,
+    /// Header names lowercased for case-insensitive lookup.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -160,6 +223,7 @@ impl Request {
         };
 
         let mut content_length = 0usize;
+        let mut headers = Vec::new();
         loop {
             let mut h = String::new();
             if reader.read_line(&mut h)? == 0 {
@@ -170,9 +234,12 @@ impl Request {
                 break; // end of headers
             }
             if let Some((k, v)) = h.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = v.trim().parse().unwrap_or(0);
+                let k = k.trim();
+                let v = v.trim();
+                if k.eq_ignore_ascii_case("content-length") {
+                    content_length = v.parse().unwrap_or(0);
                 }
+                headers.push((k.to_ascii_lowercase(), v.to_string()));
             }
         }
 
@@ -184,8 +251,58 @@ impl Request {
             method,
             path,
             query,
+            headers,
             body,
         }))
+    }
+
+    /// Look up a header by (case-insensitive) name.
+    fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// True iff the request carries valid `Authorization: Basic` credentials
+    /// equal to `user:pass`.
+    fn authorized(&self, user: &str, pass: &str) -> bool {
+        let token = match self
+            .header("authorization")
+            .and_then(|h| strip_basic_prefix(h))
+        {
+            Some(t) => t.trim(),
+            None => return false,
+        };
+        let decoded = match base64_decode(token) {
+            Some(d) => d,
+            None => return false,
+        };
+        let expected = format!("{user}:{pass}");
+        ct_eq(&decoded, expected.as_bytes())
+    }
+
+    /// The negotiated result format token from `?format=` (URL or form body).
+    fn format_param(&self) -> Option<String> {
+        if let Some(q) = &self.query {
+            if let Some(v) = form_get(q, "format") {
+                return Some(v);
+            }
+        }
+        let b = String::from_utf8_lossy(&self.body);
+        form_get(&b, "format")
+    }
+
+    /// True when the URL query string requests a chunked stream
+    /// (`?stream=true`). Deliberately ignores the body so the chunked-unaware
+    /// `SERVICE` POST path (no query string) is never streamed.
+    fn wants_stream(&self) -> bool {
+        self.query
+            .as_deref()
+            .and_then(|q| form_get(q, "stream"))
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
     }
 
     /// The query text: from the URL `?query=`, a form-encoded `query=` body, or
@@ -217,82 +334,79 @@ impl Request {
 // --- response helpers --------------------------------------------------------
 
 fn write_response(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+    write_response_ext(stream, status, ctype, &[], body)
+}
+
+/// Like [`write_response`], but with additional response headers (e.g.
+/// `WWW-Authenticate` on a `401`).
+fn write_response_ext(
+    stream: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "OK",
     };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for &(k, v) in extra {
+        header.push_str(&format!("{k}: {v}\r\n"));
+    }
+    header.push_str("Connection: close\r\n\r\n");
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
 }
 
-/// SPARQL 1.1 Query Results JSON for a SELECT table.
-fn select_json(rs: &crate::query::ResultSet) -> Vec<u8> {
-    let mut s = String::from("{\"head\":{\"vars\":[");
-    for (i, v) in rs.vars.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&json_str(v));
-    }
-    s.push_str("]},\"results\":{\"bindings\":[");
-    for (ri, row) in rs.rows.iter().enumerate() {
-        if ri > 0 {
-            s.push(',');
-        }
-        s.push('{');
-        let mut first = true;
-        for (ci, cell) in row.iter().enumerate() {
-            if let Some(val) = cell {
-                if !first {
-                    s.push(',');
-                }
-                first = false;
-                s.push_str(&json_str(&rs.vars[ci]));
-                s.push(':');
-                s.push_str(&binding_json(val));
-            }
-        }
-        s.push('}');
-    }
-    s.push_str("]}}");
-    s.into_bytes()
+/// Stream a SELECT result with `Transfer-Encoding: chunked`, framing each
+/// serializer `write_all` (one per row) as its own HTTP chunk.
+fn stream_select(stream: &mut TcpStream, fmt: ResultFormat, rs: &ResultSet) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        fmt.content_type()
+    );
+    stream.write_all(header.as_bytes())?;
+    let mut cw = ChunkedWriter { inner: stream };
+    sparql_results::write_select(fmt, rs, &mut cw)?;
+    cw.finish()
 }
 
-/// One result cell (an N-Triples surface term) as an RDF-term JSON object.
-fn binding_json(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(Term::Iri(s)) => format!("{{\"type\":\"uri\",\"value\":{}}}", json_str(&s)),
-        Ok(Term::Blank(l)) => format!("{{\"type\":\"bnode\",\"value\":{}}}", json_str(&l)),
-        Ok(Term::Literal {
-            value,
-            datatype,
-            lang,
-        }) => {
-            if let Some(l) = lang {
-                format!(
-                    "{{\"type\":\"literal\",\"value\":{},\"xml:lang\":{}}}",
-                    json_str(&value),
-                    json_str(&l)
-                )
-            } else if let Some(dt) = datatype {
-                format!(
-                    "{{\"type\":\"literal\",\"value\":{},\"datatype\":{}}}",
-                    json_str(&value),
-                    json_str(&dt)
-                )
-            } else {
-                format!("{{\"type\":\"literal\",\"value\":{}}}", json_str(&value))
-            }
+/// A [`Write`] adapter that frames each write as one HTTP/1.1 transfer chunk.
+struct ChunkedWriter<'a, W: Write> {
+    inner: &'a mut W,
+}
+
+impl<W: Write> ChunkedWriter<'_, W> {
+    /// Emit the terminating zero-length chunk and flush.
+    fn finish(&mut self) -> io::Result<()> {
+        self.inner.write_all(b"0\r\n\r\n")?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for ChunkedWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
         }
-        Err(_) => format!("{{\"type\":\"literal\",\"value\":{}}}", json_str(cell)),
+        let size_line = format!("{:x}\r\n", buf.len());
+        self.inner.write_all(size_line.as_bytes())?;
+        self.inner.write_all(buf)?;
+        self.inner.write_all(b"\r\n")?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -308,23 +422,58 @@ fn err_json(msg: &str) -> Vec<u8> {
     format!("{{\"error\":{}}}", json_str(msg)).into_bytes()
 }
 
-/// Quote + escape a string as a JSON string literal.
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+// --- HTTP Basic auth ---------------------------------------------------------
+
+/// Strip a case-insensitive `Basic ` scheme prefix from an `Authorization`
+/// header value, returning the credentials token.
+fn strip_basic_prefix(h: &str) -> Option<&str> {
+    let h = h.trim_start();
+    if h.len() >= 6 && h[..6].eq_ignore_ascii_case("basic ") {
+        Some(&h[6..])
+    } else {
+        None
+    }
+}
+
+/// Decode standard (RFC 4648) base64, ignoring ASCII whitespace and stopping at
+/// padding. Returns `None` on an invalid alphabet character.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
         }
     }
-    out.push('"');
-    out
+    Some(out)
+}
+
+/// Length-checked, byte-by-byte equality that does not short-circuit on the
+/// first differing byte (mitigates timing side channels on the credential
+/// compare; the length itself is not hidden).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // --- URL form decoding -------------------------------------------------------
@@ -465,5 +614,196 @@ mod tests {
         let resp = post(&addr, "/sparql", "SELECT this is not sparql");
         assert!(resp.contains("400"));
         assert!(resp.contains("\"error\""));
+    }
+
+    // --- helpers for the auth / negotiation / streaming tests ----------------
+
+    const SELECT_O: &str = "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }";
+
+    /// Like [`start`], but the server requires HTTP Basic `user:pass`.
+    fn start_auth() -> (Arc<Server>, SocketAddr) {
+        let db = Database::build_from_str("srv_auth", DATA).unwrap();
+        let server =
+            Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_basic_auth("user", "pass"));
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        thread::spawn(move || s2.serve_forever());
+        (server, addr)
+    }
+
+    /// Standard (RFC 4648) base64 encode — the client side of [`base64_decode`].
+    fn base64_encode(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn post_auth(addr: &SocketAddr, path: &str, body: &str, user: &str, pass: &str) -> String {
+        let token = base64_encode(format!("{user}:{pass}").as_bytes());
+        let raw = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Basic {token}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        http(addr, &raw)
+    }
+
+    fn post_accept(addr: &SocketAddr, path: &str, body: &str, accept: &str) -> String {
+        let raw = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        http(addr, &raw)
+    }
+
+    /// Split a raw HTTP response into (headers, body).
+    fn split_resp(resp: &str) -> (String, String) {
+        let (h, b) = resp.split_once("\r\n\r\n").expect("header/body delimiter");
+        (h.to_string(), b.to_string())
+    }
+
+    /// Decode an HTTP/1.1 chunked transfer body (ASCII content).
+    fn decode_chunked(body: &str) -> String {
+        let mut out = String::new();
+        let mut rest = body;
+        loop {
+            let nl = rest.find("\r\n").expect("chunk-size line");
+            let size = usize::from_str_radix(rest[..nl].trim(), 16).expect("hex chunk size");
+            rest = &rest[nl + 2..];
+            if size == 0 {
+                break;
+            }
+            out.push_str(&rest[..size]);
+            rest = &rest[size + 2..]; // skip chunk data + trailing CRLF
+        }
+        out
+    }
+
+    #[test]
+    fn base64_roundtrips_and_rejects_garbage() {
+        for s in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "user:pass"] {
+            assert_eq!(
+                base64_decode(&base64_encode(s.as_bytes())).unwrap(),
+                s.as_bytes()
+            );
+        }
+        assert!(base64_decode("not*base64").is_none());
+    }
+
+    #[test]
+    fn auth_401_then_200_with_good_creds() {
+        let (_srv, addr) = start_auth();
+
+        // Missing credentials -> 401 with a Basic challenge.
+        let none = post(&addr, "/sparql", SELECT_O);
+        assert!(none.contains("401 Unauthorized"));
+        assert!(none.contains("WWW-Authenticate: Basic"));
+
+        // Wrong password -> 401.
+        let bad = post_auth(&addr, "/sparql", SELECT_O, "user", "nope");
+        assert!(bad.contains("401 Unauthorized"));
+
+        // Correct credentials -> 200 with the answer.
+        let ok = post_auth(&addr, "/sparql", SELECT_O, "user", "pass");
+        assert!(ok.contains("200 OK"));
+        assert!(ok.contains("http://ex/b"));
+    }
+
+    #[test]
+    fn open_server_ignores_authorization_header() {
+        // With no credentials configured the server stays open even if a client
+        // happens to send (bogus) auth.
+        let (_srv, addr) = start();
+        let ok = post_auth(&addr, "/sparql", SELECT_O, "x", "y");
+        assert!(ok.contains("200 OK"));
+        assert!(ok.contains("http://ex/b"));
+    }
+
+    #[test]
+    fn accept_xml_returns_parsable_xml() {
+        let (_srv, addr) = start();
+        let resp = post_accept(&addr, "/sparql", SELECT_O, "application/sparql-results+xml");
+        let (head, body) = split_resp(&resp);
+        assert!(head.contains("application/sparql-results+xml"));
+        assert!(body.starts_with("<?xml version=\"1.0\"?>"));
+        assert!(body.contains("<variable name=\"o\"/>"));
+        assert!(body.contains("<binding name=\"o\"><uri>http://ex/b</uri></binding>"));
+        assert!(body.trim_end().ends_with("</sparql>"));
+    }
+
+    #[test]
+    fn accept_csv_returns_parsable_csv() {
+        let (_srv, addr) = start();
+        let resp = post_accept(&addr, "/sparql", SELECT_O, "text/csv");
+        let (head, body) = split_resp(&resp);
+        assert!(head.contains("text/csv"));
+        let mut lines = body.split("\r\n");
+        assert_eq!(lines.next().unwrap(), "o"); // header = bare var name
+        assert_eq!(lines.next().unwrap(), "http://ex/b"); // IRI without <>
+    }
+
+    #[test]
+    fn accept_tsv_returns_parsable_tsv() {
+        let (_srv, addr) = start();
+        let resp = post_accept(&addr, "/sparql", SELECT_O, "text/tab-separated-values");
+        let (head, body) = split_resp(&resp);
+        assert!(head.contains("text/tab-separated-values"));
+        let mut lines = body.split('\n');
+        assert_eq!(lines.next().unwrap(), "?o"); // header = ?var
+        assert_eq!(lines.next().unwrap(), "<http://ex/b>"); // Turtle term
+    }
+
+    #[test]
+    fn format_param_overrides_accept_and_default_is_json() {
+        let (_srv, addr) = start();
+        // `format=` wins over an Accept that asks for XML.
+        let csv = post_accept(&addr, "/sparql?format=csv", SELECT_O, "application/sparql-results+xml");
+        assert!(csv.contains("text/csv"));
+        // `*/*` (and no format param) falls back to JSON.
+        let json = post_accept(&addr, "/sparql", SELECT_O, "*/*");
+        assert!(json.contains("application/sparql-results+json"));
+        assert!(json.contains("\"type\":\"uri\""));
+    }
+
+    #[test]
+    fn streaming_chunked_select_decodes() {
+        let (_srv, addr) = start();
+        // Two rows: (<p>,<b>) and (<name>,"Alice").
+        let resp = post(
+            &addr,
+            "/sparql?stream=true&format=csv",
+            "SELECT ?p ?o WHERE { <http://ex/a> ?p ?o }",
+        );
+        let (head, body) = split_resp(&resp);
+        assert!(head.contains("Transfer-Encoding: chunked"));
+        assert!(!head.contains("Content-Length"));
+        assert!(head.contains("text/csv"));
+
+        let decoded = decode_chunked(&body);
+        let mut lines = decoded.lines();
+        assert_eq!(lines.next().unwrap(), "p,o");
+        let rows: Vec<&str> = lines.collect();
+        assert!(rows.iter().any(|r| r.contains("http://ex/b")));
+        assert!(rows.iter().any(|r| r.contains("Alice")));
     }
 }

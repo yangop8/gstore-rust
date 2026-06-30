@@ -31,6 +31,7 @@ pub mod query;
 pub mod reason;
 pub mod server;
 pub mod signature;
+pub mod sparql_results;
 pub mod store;
 
 pub mod db;
