@@ -15,10 +15,12 @@
 
 pub mod config;
 pub mod error;
+pub mod kb;
 pub mod llm;
 pub mod secret;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use kb::{validate_sparql, GStoreClient, RdfTerm, SparqlAnswer, TermKind};
 pub use llm::{LlmClient, LlmRequest, Message, Role};
 pub use secret::Secret;
