@@ -12,7 +12,9 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,8 @@ const STORE_FILE: &str = "store.bin";
 const META_FILE: &str = "meta.bin";
 const VSTREE_FILE: &str = "vstree.bin";
 const NAMED_FILE: &str = "named.bin";
+/// The append-only update log inside a database directory (gStore's update.log).
+const UPDATE_LOG_FILE: &str = "update.log";
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
@@ -99,6 +103,10 @@ pub struct Database {
     /// `QueryCache`), cleared on any store mutation. Interior mutability so a
     /// `&self`/`&mut self` query path can read and populate it.
     query_cache: RefCell<HashMap<String, QueryResult>>,
+    /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
+    /// `update.log`), so the write history can be replayed or audited. `None`
+    /// disables logging (the default).
+    update_log: Option<PathBuf>,
 }
 
 /// A snapshot of database counts and status (gStore `getDBMonitorInfo`).
@@ -147,6 +155,7 @@ impl Database {
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
             query_cache: RefCell::new(HashMap::new()),
+            update_log: None,
         }
     }
 
@@ -502,6 +511,10 @@ impl Database {
                 for op in ops {
                     changed += self.exec_update_op(op)?;
                 }
+                // Append the applied statement to the update log, if enabled.
+                if let Some(path) = self.update_log.clone() {
+                    append_update_log(&path, sparql, changed)?;
+                }
                 Ok(QueryResult::Update { changed })
             }
         }
@@ -711,6 +724,7 @@ impl Database {
             index_valid: false,
             txn: None,
             query_cache: RefCell::new(HashMap::new()),
+            update_log: None,
         };
         db.rebuild_index();
         Ok(db)
@@ -771,8 +785,260 @@ impl Database {
             index_valid: true,
             txn: None,
             query_cache: RefCell::new(HashMap::new()),
+            update_log: None,
         })
     }
+
+    // ---- backup / restore -------------------------------------------------
+
+    /// Back up a consistent snapshot of this database into `backup_dir`
+    /// (gStore `Database::backup`). The snapshot is fully independent of the
+    /// live database; restore it with [`restore`](Self::restore).
+    pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
+        self.save(backup_dir)
+    }
+
+    /// Restore a database from a backup directory created by
+    /// [`backup`](Self::backup) (gStore `Database::restore`).
+    pub fn restore<P: AsRef<Path>>(backup_dir: P) -> Result<Database> {
+        Database::load(backup_dir)
+    }
+
+    /// File-level backup of a *persisted* database directory `src` into `dst`,
+    /// copying every database file present (the bincode snapshot, the on-disk
+    /// KVstore, and the update log) without loading anything into memory. Use
+    /// this to back up an on-disk (`build_disk`) database.
+    pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
+        let (src, dst) = (src.as_ref(), dst.as_ref());
+        if !src.is_dir() {
+            return Err(GStoreError::Database(format!(
+                "backup source '{}' is not a directory",
+                src.display()
+            )));
+        }
+        fs::create_dir_all(dst)?;
+        for name in [
+            DICT_FILE,
+            STORE_FILE,
+            NAMED_FILE,
+            META_FILE,
+            VSTREE_FILE,
+            KV_FILE,
+            UPDATE_LOG_FILE,
+        ] {
+            let s = src.join(name);
+            if s.is_file() {
+                fs::copy(&s, dst.join(name))?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- update log -------------------------------------------------------
+
+    /// Enable update logging to `path`: every subsequent SPARQL UPDATE applied
+    /// through [`query`](Self::query) is appended to the file (gStore
+    /// `update.log`). The file is created on first write.
+    pub fn enable_update_log<P: AsRef<Path>>(&mut self, path: P) {
+        self.update_log = Some(path.as_ref().to_path_buf());
+    }
+
+    /// Enable update logging at the conventional `update.log` inside a database
+    /// directory (created if necessary).
+    pub fn enable_update_log_in<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        self.update_log = Some(dir.join(UPDATE_LOG_FILE));
+        Ok(())
+    }
+
+    /// Disable update logging (subsequent updates are not recorded).
+    pub fn disable_update_log(&mut self) {
+        self.update_log = None;
+    }
+
+    /// Whether update logging is currently enabled.
+    pub fn update_log_enabled(&self) -> bool {
+        self.update_log.is_some()
+    }
+
+    /// Replay every UPDATE statement recorded in an update log `path` against
+    /// this database, in order, returning the number of statements applied.
+    /// Logging is suspended during replay so the log is not rewritten and no
+    /// recursion occurs.
+    pub fn replay_update_log<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
+        let data = fs::read(path)?;
+        let saved = self.update_log.take();
+        let result = self.replay_records(&data);
+        self.update_log = saved;
+        result
+    }
+
+    /// Parse and apply the length-prefixed records of an update log buffer.
+    fn replay_records(&mut self, bytes: &[u8]) -> Result<usize> {
+        let mut pos = 0usize;
+        let mut applied = 0usize;
+        while pos < bytes.len() {
+            // Header line: `REC <millis> <changed> <byte_len>`.
+            let nl = bytes[pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| pos + i)
+                .ok_or_else(|| GStoreError::Database("truncated update.log header".into()))?;
+            let header = std::str::from_utf8(&bytes[pos..nl])
+                .map_err(|_| GStoreError::Database("non-UTF-8 update.log header".into()))?;
+            let mut it = header.split_whitespace();
+            if it.next() != Some("REC") {
+                return Err(GStoreError::Database(format!(
+                    "malformed update.log record header: {header:?}"
+                )));
+            }
+            let _millis = it.next();
+            let _changed = it.next();
+            let len: usize = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| GStoreError::Database("missing length in update.log record".into()))?;
+            let start = nl + 1;
+            let end = start + len;
+            if end > bytes.len() {
+                return Err(GStoreError::Database("truncated update.log body".into()));
+            }
+            let sparql = std::str::from_utf8(&bytes[start..end])
+                .map_err(|_| GStoreError::Database("non-UTF-8 update.log body".into()))?;
+            self.query(sparql)?;
+            applied += 1;
+            // Skip the body and its trailing newline.
+            pos = (end + 1).min(bytes.len());
+        }
+        Ok(applied)
+    }
+
+    // ---- bulk / parallel loaders -----------------------------------------
+
+    /// Build a database from an N-Triples file in bounded-memory batches
+    /// (gStore RDFParser's chunked import): triples are streamed and flushed to
+    /// the store every `batch` triples, so the transient encode buffer never
+    /// exceeds `batch` entries — suitable for files too large to buffer whole.
+    pub fn build_from_ntriples_batched<P: AsRef<Path>>(
+        name: impl Into<String>,
+        path: P,
+        batch: usize,
+    ) -> Result<Database> {
+        let batch = batch.max(1);
+        let mut db = Database::new(name);
+        let mut buf: Vec<IdTriple> = Vec::with_capacity(batch.min(1 << 20));
+        crate::parser::ntriples::for_each_triple_file(path, |t| {
+            let id = db.encode_triple(&t);
+            buf.push(id);
+            if buf.len() >= batch {
+                db.store.bulk_load(buf.drain(..));
+            }
+            Ok(())
+        })?;
+        if !buf.is_empty() {
+            db.store.bulk_load(buf.drain(..));
+        }
+        db.rebuild_index();
+        Ok(db)
+    }
+
+    /// Build a database from an N-Triples file using `threads` parser threads
+    /// (gStore's multi-threaded load). The file is split into line-aligned
+    /// chunks parsed in parallel; interning + indexing run serially afterward
+    /// (the dictionary is the single synchronization point).
+    pub fn build_from_ntriples_parallel<P: AsRef<Path>>(
+        name: impl Into<String>,
+        path: P,
+        threads: usize,
+    ) -> Result<Database> {
+        let content = fs::read_to_string(path)?;
+        Database::build_from_ntriples_str_parallel(name, &content, threads)
+    }
+
+    /// Parallel-parse an in-memory N-Triples document with `threads` threads,
+    /// then intern + index serially. See [`build_from_ntriples_parallel`].
+    pub fn build_from_ntriples_str_parallel(
+        name: impl Into<String>,
+        content: &str,
+        threads: usize,
+    ) -> Result<Database> {
+        let threads = threads.max(1);
+        let chunks = split_lines(content, threads);
+        // Parse each chunk on its own thread; std::thread::scope guarantees the
+        // borrowed `content` outlives every spawned parser.
+        let parsed: Vec<Result<Vec<Triple>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|c| scope.spawn(move || crate::parser::ntriples::parse_str(c)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("parser thread panicked"))
+                .collect()
+        });
+        let mut db = Database::new(name);
+        let mut ids: Vec<IdTriple> = Vec::new();
+        for chunk in parsed {
+            for t in chunk? {
+                ids.push(db.encode_triple(&t));
+            }
+        }
+        db.store.bulk_load(ids);
+        db.rebuild_index();
+        Ok(db)
+    }
+}
+
+/// Append one UPDATE statement to the update log as a length-prefixed record:
+/// `REC <unix_millis> <changed> <byte_len>\n<sparql bytes>\n`. The length prefix
+/// makes the body opaque, so a statement may contain any bytes (including the
+/// record-delimiter text) without corrupting the log.
+fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    writeln!(f, "REC {millis} {changed} {}", sparql.len())?;
+    f.write_all(sparql.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Split `content` into at most `n` line-aligned `&str` chunks (each chunk ends
+/// on a newline boundary, so no N-Triples line is ever cut in two).
+fn split_lines(content: &str, n: usize) -> Vec<&str> {
+    if n <= 1 || content.is_empty() {
+        return vec![content];
+    }
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut chunks: Vec<&str> = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for i in 1..n {
+        if start >= len {
+            break;
+        }
+        let mut cut = (len * i / n).max(start);
+        while cut < len && bytes[cut] != b'\n' {
+            cut += 1;
+        }
+        if cut < len {
+            cut += 1; // include the newline in this chunk
+        }
+        if cut > start {
+            chunks.push(&content[start..cut]);
+            start = cut;
+        }
+    }
+    if start < len {
+        chunks.push(&content[start..]);
+    }
+    if chunks.is_empty() {
+        chunks.push(content);
+    }
+    chunks
 }
 
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
