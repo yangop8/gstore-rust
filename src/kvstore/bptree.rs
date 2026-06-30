@@ -124,10 +124,32 @@ impl Node {
             self.children[i - 1]
         }
     }
+
+    /// Internal: the full child vector `[child0, children…]` (`child0` == `link`),
+    /// of length `keys.len() + 1`. Convenient for delete-time rebalancing, where
+    /// borrow/merge rotate children through the parent separators.
+    fn children_vec(&self) -> Vec<PageId> {
+        let mut v = Vec::with_capacity(self.children.len() + 1);
+        v.push(self.link);
+        v.extend_from_slice(&self.children);
+        v
+    }
+
+    /// Internal: rebuild `link`/`children` from a full child vector.
+    fn set_children_vec(&mut self, all: Vec<PageId>) {
+        self.link = all[0];
+        self.children = all[1..].to_vec();
+    }
 }
 
 /// The outcome of inserting into a subtree: a split that must propagate up.
 type Split = Option<(Vec<u8>, PageId)>;
+
+/// A non-root node holding fewer than this many serialized bytes is "underfull"
+/// after a delete and triggers rebalancing (borrow from a sibling, else merge).
+/// 25% fill mirrors the classic half-merge / quarter-borrow B+ tree policy while
+/// staying robust to gStore's variable-length keys.
+const UNDERFLOW_BYTES: usize = PAGE_SIZE / 4;
 
 impl BTree {
     pub fn new(root_slot: usize) -> BTree {
@@ -316,6 +338,262 @@ impl BTree {
             page = node.child_for(key);
         }
     }
+
+    // ---- deletion (gStore tree node merge / redistribution) ---------------
+
+    /// Remove `key`. Returns `true` if it was present. Empty leaves and
+    /// single-child internal nodes are merged away, shrinking the tree and
+    /// returning freed pages to the pager's free list. The leaf-link chain and
+    /// every separator stay consistent, so subsequent `get`/`scan_prefix` see a
+    /// well-formed tree.
+    pub fn delete(&self, pager: &mut Pager, key: &[u8]) -> Result<bool> {
+        let root = self.root(pager);
+        if root == 0 {
+            return Ok(false);
+        }
+        let removed = self.delete_rec(pager, root, key)?;
+        if !removed {
+            return Ok(false);
+        }
+        // Shrink the root: an empty leaf clears the tree; an internal node that
+        // lost its last separator is replaced by its sole remaining child.
+        let node = Node::parse(&pager.read_page(root)?);
+        if node.is_leaf {
+            if node.keys.is_empty() {
+                pager.free(root)?;
+                self.set_root(pager, 0);
+            }
+        } else if node.keys.is_empty() {
+            let only_child = node.link;
+            self.set_root(pager, only_child);
+            pager.free(root)?;
+        }
+        Ok(true)
+    }
+
+    fn delete_rec(&self, pager: &mut Pager, page: PageId, key: &[u8]) -> Result<bool> {
+        let mut node = Node::parse(&pager.read_page(page)?);
+        if node.is_leaf {
+            return match node.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+                Ok(i) => {
+                    node.keys.remove(i);
+                    node.vals.remove(i);
+                    pager.write_page(page, &node.serialize())?;
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            };
+        }
+        let ci = node.keys.partition_point(|k| k.as_slice() <= key);
+        let child_page = if ci == 0 { node.link } else { node.children[ci - 1] };
+        let removed = self.delete_rec(pager, child_page, key)?;
+        if removed {
+            let child = Node::parse(&pager.read_page(child_page)?);
+            if child.size() < UNDERFLOW_BYTES {
+                self.rebalance(pager, &mut node, page, ci)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Repair an underfull child at index `ci` (in the parent's full child
+    /// vector) by borrowing one entry from a sibling, or merging with one. The
+    /// parent is mutated in place and written back here; sibling/child pages are
+    /// rewritten and any emptied page is freed. Projected sizes are checked
+    /// exactly so a node never overflows its page.
+    fn rebalance(
+        &self,
+        pager: &mut Pager,
+        parent: &mut Node,
+        parent_page: PageId,
+        ci: usize,
+    ) -> Result<()> {
+        let all = parent.children_vec();
+        let child = Node::parse(&pager.read_page(all[ci])?);
+
+        // Borrow from the left sibling.
+        if ci > 0 {
+            let left = Node::parse(&pager.read_page(all[ci - 1])?);
+            if left.keys.len() >= 2 {
+                let entry = boundary_bytes(&left, left.keys.len() - 1);
+                let sep_len = parent.keys[ci - 1].len();
+                let child_gain = if child.is_leaf { entry } else { 6 + sep_len };
+                if left.size() - entry >= UNDERFLOW_BYTES
+                    && child.size() + child_gain <= PAGE_SIZE
+                {
+                    self.borrow_from_left(pager, parent, ci)?;
+                    pager.write_page(parent_page, &parent.serialize())?;
+                    return Ok(());
+                }
+            }
+        }
+        // Borrow from the right sibling.
+        if ci + 1 < all.len() {
+            let right = Node::parse(&pager.read_page(all[ci + 1])?);
+            if right.keys.len() >= 2 {
+                let entry = boundary_bytes(&right, 0);
+                let sep_len = parent.keys[ci].len();
+                let child_gain = if child.is_leaf { entry } else { 6 + sep_len };
+                if right.size() - entry >= UNDERFLOW_BYTES
+                    && child.size() + child_gain <= PAGE_SIZE
+                {
+                    self.borrow_from_right(pager, parent, ci)?;
+                    pager.write_page(parent_page, &parent.serialize())?;
+                    return Ok(());
+                }
+            }
+        }
+        // Merge with the left sibling.
+        if ci > 0 {
+            let left = Node::parse(&pager.read_page(all[ci - 1])?);
+            let merged = if child.is_leaf {
+                left.size() + child.size() - 7
+            } else {
+                left.size() + child.size() - 1 + parent.keys[ci - 1].len()
+            };
+            if merged <= PAGE_SIZE {
+                self.merge_into_left(pager, parent, ci)?;
+                pager.write_page(parent_page, &parent.serialize())?;
+                return Ok(());
+            }
+        }
+        // Merge the right sibling into the child.
+        if ci + 1 < all.len() {
+            let right = Node::parse(&pager.read_page(all[ci + 1])?);
+            let merged = if child.is_leaf {
+                child.size() + right.size() - 7
+            } else {
+                child.size() + right.size() - 1 + parent.keys[ci].len()
+            };
+            if merged <= PAGE_SIZE {
+                self.merge_right_into(pager, parent, ci)?;
+                pager.write_page(parent_page, &parent.serialize())?;
+                return Ok(());
+            }
+        }
+        // No feasible rebalance (e.g. lone huge entries): leave the node
+        // underfull. The tree stays correct, only slightly less compact.
+        Ok(())
+    }
+
+    /// Move the left sibling's last entry into the front of child `ci`.
+    fn borrow_from_left(&self, pager: &mut Pager, parent: &mut Node, ci: usize) -> Result<()> {
+        let all = parent.children_vec();
+        let (lp, cp) = (all[ci - 1], all[ci]);
+        let mut left = Node::parse(&pager.read_page(lp)?);
+        let mut child = Node::parse(&pager.read_page(cp)?);
+        if child.is_leaf {
+            let k = left.keys.pop().unwrap();
+            let v = left.vals.pop().unwrap();
+            child.keys.insert(0, k);
+            child.vals.insert(0, v);
+            parent.keys[ci - 1] = child.keys[0].clone();
+        } else {
+            let sep = parent.keys[ci - 1].clone();
+            let mut left_all = left.children_vec();
+            let moved = left_all.pop().unwrap();
+            let lk = left.keys.pop().unwrap();
+            left.set_children_vec(left_all);
+            child.keys.insert(0, sep);
+            let mut child_all = child.children_vec();
+            child_all.insert(0, moved);
+            child.set_children_vec(child_all);
+            parent.keys[ci - 1] = lk;
+        }
+        pager.write_page(lp, &left.serialize())?;
+        pager.write_page(cp, &child.serialize())?;
+        Ok(())
+    }
+
+    /// Move the right sibling's first entry onto the end of child `ci`.
+    fn borrow_from_right(&self, pager: &mut Pager, parent: &mut Node, ci: usize) -> Result<()> {
+        let all = parent.children_vec();
+        let (cp, rp) = (all[ci], all[ci + 1]);
+        let mut child = Node::parse(&pager.read_page(cp)?);
+        let mut right = Node::parse(&pager.read_page(rp)?);
+        if child.is_leaf {
+            let k = right.keys.remove(0);
+            let v = right.vals.remove(0);
+            child.keys.push(k);
+            child.vals.push(v);
+            parent.keys[ci] = right.keys[0].clone();
+        } else {
+            let sep = parent.keys[ci].clone();
+            child.keys.push(sep);
+            let mut right_all = right.children_vec();
+            let moved = right_all.remove(0);
+            let rk = right.keys.remove(0);
+            right.set_children_vec(right_all);
+            let mut child_all = child.children_vec();
+            child_all.push(moved);
+            child.set_children_vec(child_all);
+            parent.keys[ci] = rk;
+        }
+        pager.write_page(cp, &child.serialize())?;
+        pager.write_page(rp, &right.serialize())?;
+        Ok(())
+    }
+
+    /// Merge child `ci` into its left sibling (`ci-1`); free child `ci`'s page.
+    fn merge_into_left(&self, pager: &mut Pager, parent: &mut Node, ci: usize) -> Result<()> {
+        let all = parent.children_vec();
+        let (lp, cp) = (all[ci - 1], all[ci]);
+        let mut left = Node::parse(&pager.read_page(lp)?);
+        let child = Node::parse(&pager.read_page(cp)?);
+        if child.is_leaf {
+            left.keys.extend(child.keys);
+            left.vals.extend(child.vals);
+            left.link = child.link;
+        } else {
+            let sep = parent.keys[ci - 1].clone();
+            let mut left_all = left.children_vec();
+            left_all.extend(child.children_vec());
+            left.keys.push(sep);
+            left.keys.extend(child.keys);
+            left.set_children_vec(left_all);
+        }
+        parent.keys.remove(ci - 1);
+        parent.children.remove(ci - 1);
+        pager.write_page(lp, &left.serialize())?;
+        pager.free(cp)?;
+        Ok(())
+    }
+
+    /// Merge the right sibling (`ci+1`) into child `ci`; free the right page.
+    fn merge_right_into(&self, pager: &mut Pager, parent: &mut Node, ci: usize) -> Result<()> {
+        let all = parent.children_vec();
+        let (cp, rp) = (all[ci], all[ci + 1]);
+        let mut child = Node::parse(&pager.read_page(cp)?);
+        let right = Node::parse(&pager.read_page(rp)?);
+        if child.is_leaf {
+            child.keys.extend(right.keys);
+            child.vals.extend(right.vals);
+            child.link = right.link;
+        } else {
+            let sep = parent.keys[ci].clone();
+            let mut child_all = child.children_vec();
+            child_all.extend(right.children_vec());
+            child.keys.push(sep);
+            child.keys.extend(right.keys);
+            child.set_children_vec(child_all);
+        }
+        parent.keys.remove(ci);
+        parent.children.remove(ci);
+        pager.write_page(cp, &child.serialize())?;
+        pager.free(rp)?;
+        Ok(())
+    }
+}
+
+/// Serialized byte size of the entry at index `i` (a key+value for a leaf, or a
+/// separator key + one child pointer for an internal node) — used to project a
+/// node's size before borrowing.
+fn boundary_bytes(node: &Node, i: usize) -> usize {
+    if node.is_leaf {
+        2 + node.keys[i].len() + 2 + node.vals[i].len()
+    } else {
+        2 + node.keys[i].len() + 4
+    }
 }
 
 /// Encode a `u32` big-endian (byte order == numeric order, for range scans).
@@ -431,6 +709,115 @@ mod tests {
             let mut pg = Pager::open(&path, 64).unwrap();
             let t = BTree::new(0);
             assert_eq!(t.get(&mut pg, b"k00500").unwrap(), Some(be32(500).to_vec()));
+            assert_eq!(t.iter_all(&mut pg).unwrap().len(), 1000);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_basic_and_missing() {
+        let path = tmp("del_basic");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        t.insert(&mut pg, b"a", b"1").unwrap();
+        t.insert(&mut pg, b"b", b"2").unwrap();
+        t.insert(&mut pg, b"c", b"3").unwrap();
+        assert!(t.delete(&mut pg, b"b").unwrap());
+        assert_eq!(t.get(&mut pg, b"b").unwrap(), None);
+        assert_eq!(t.get(&mut pg, b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(t.get(&mut pg, b"c").unwrap().as_deref(), Some(&b"3"[..]));
+        // deleting an absent key is a no-op false
+        assert!(!t.delete(&mut pg, b"zz").unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_all_clears_tree_and_frees_pages() {
+        let path = tmp("del_all");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        let n = 2000u32;
+        for i in 0..n {
+            t.insert(&mut pg, format!("key{i:08}").as_bytes(), &be32(i))
+                .unwrap();
+        }
+        let peak = pg.page_count();
+        for i in 0..n {
+            assert!(
+                t.delete(&mut pg, format!("key{i:08}").as_bytes()).unwrap(),
+                "delete {i}"
+            );
+        }
+        // every key is gone and the tree is empty
+        for i in 0..n {
+            assert_eq!(t.get(&mut pg, format!("key{i:08}").as_bytes()).unwrap(), None);
+        }
+        assert!(t.iter_all(&mut pg).unwrap().is_empty());
+        assert_eq!(t.root(&pg), 0, "root reset after deleting everything");
+        // re-inserting reuses freed pages rather than growing unbounded
+        for i in 0..n {
+            t.insert(&mut pg, format!("key{i:08}").as_bytes(), &be32(i))
+                .unwrap();
+        }
+        assert!(
+            pg.page_count() <= peak + 1,
+            "freed pages should be reused on re-insert (peak {peak}, now {})",
+            pg.page_count()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_half_keeps_other_half_correct() {
+        let path = tmp("del_half");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        let n = 3000u32;
+        for i in 0..n {
+            t.insert(&mut pg, format!("k{i:08}").as_bytes(), &be32(i))
+                .unwrap();
+        }
+        // delete every even key
+        for i in (0..n).step_by(2) {
+            assert!(t.delete(&mut pg, format!("k{i:08}").as_bytes()).unwrap());
+        }
+        for i in 0..n {
+            let got = t.get(&mut pg, format!("k{i:08}").as_bytes()).unwrap();
+            if i % 2 == 0 {
+                assert_eq!(got, None, "even key {i} should be gone");
+            } else {
+                assert_eq!(got, Some(be32(i).to_vec()), "odd key {i} survives");
+            }
+        }
+        // surviving keys are exactly the odd ones, and the leaf chain is intact
+        let all = t.iter_all(&mut pg).unwrap();
+        assert_eq!(all.len() as u32, n / 2);
+        // ordered + ascending (leaf links consistent after merges)
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_then_reinsert_persists() {
+        let path = tmp("del_persist");
+        {
+            let mut pg = Pager::open(&path, 64).unwrap();
+            let t = BTree::new(0);
+            for i in 0..1500u32 {
+                t.insert(&mut pg, format!("k{i:06}").as_bytes(), &be32(i))
+                    .unwrap();
+            }
+            for i in 500..1000u32 {
+                t.delete(&mut pg, format!("k{i:06}").as_bytes()).unwrap();
+            }
+            pg.flush().unwrap();
+        }
+        {
+            let mut pg = Pager::open(&path, 64).unwrap();
+            let t = BTree::new(0);
+            assert_eq!(t.get(&mut pg, b"k000400").unwrap(), Some(be32(400).to_vec()));
+            assert_eq!(t.get(&mut pg, b"k000700").unwrap(), None);
+            assert_eq!(t.get(&mut pg, b"k001200").unwrap(), Some(be32(1200).to_vec()));
             assert_eq!(t.iter_all(&mut pg).unwrap().len(), 1000);
         }
         std::fs::remove_file(&path).ok();

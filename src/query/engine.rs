@@ -25,6 +25,7 @@ use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::TripleStore;
 
 use super::candidates::{self, Candidates};
+use super::optimizer::{self, ExecPlan, JoinTree};
 use super::results::{QueryResult, ResultSet};
 use super::value::{order_key, Value};
 
@@ -152,6 +153,10 @@ pub struct Evaluator<'a> {
     vstree: Option<&'a VsTree>,
     /// Interner for computed terms produced during evaluation.
     extras: std::cell::RefCell<Extras>,
+    /// Cost-based plan cache (gStore `plan_cache`): structurally-identical BGPs —
+    /// e.g. a BGP repeated across sub-SELECTs — reuse the DP-optimized plan
+    /// instead of re-running plan enumeration. Keyed by the compiled patterns.
+    plan_cache: std::cell::RefCell<HashMap<u64, ExecPlan>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -161,6 +166,7 @@ impl<'a> Evaluator<'a> {
             store,
             vstree: None,
             extras: std::cell::RefCell::new(Extras::default()),
+            plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -175,6 +181,7 @@ impl<'a> Evaluator<'a> {
             store,
             vstree: Some(vstree),
             extras: std::cell::RefCell::new(Extras::default()),
+            plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -929,11 +936,26 @@ impl<'a> Evaluator<'a> {
         let mut candidates = candidates::generate(&plans, self.store);
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
 
-        // Node-based plan (NodeScore heuristic / sampling DP + satellite defer).
-        let order = super::planner::plan(&plans, self.store, &candidates, layout.len());
+        // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
+        // tree when one is strictly cheaper. Memoised so a structurally-identical
+        // BGP reuses the enumeration (gStore `plan_cache`).
+        let key = plans_key(&plans);
+        let plan = self
+            .plan_cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
+            .clone();
 
+        if let Some(tree) = &plan.tree {
+            // Bushy execution: build each side independently, then hash-join.
+            let (sols, _vars) = self.eval_join_tree(tree, &plans, &candidates, layout);
+            return sols;
+        }
+
+        // Left-deep pipeline: extend partial bindings one pattern at a time.
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
-        for &pi in &order {
+        for &pi in &plan.order {
             let plan = &plans[pi];
             let mut next = Vec::new();
             for binding in &solutions {
@@ -945,6 +967,42 @@ impl<'a> Evaluator<'a> {
             }
         }
         solutions
+    }
+
+    /// Execute a binary-join tree: each `Leaf` scans its pattern from scratch and
+    /// each `Join` hash-joins the two sub-results on their shared variables.
+    /// Returns the bindings and the set of variable indices they bind.
+    fn eval_join_tree(
+        &self,
+        tree: &JoinTree,
+        plans: &[PatPlan],
+        cands: &Candidates,
+        layout: &VarLayout,
+    ) -> (Vec<Binding>, Vec<usize>) {
+        match tree {
+            JoinTree::Leaf(i) => {
+                let plan = &plans[*i];
+                let empty = vec![None; layout.len()];
+                let mut out = Vec::new();
+                self.extend(&empty, plan, cands, &mut out);
+                (out, optimizer::plan_vars(plan))
+            }
+            JoinTree::Join(l, r) => {
+                let (lb, lv) = self.eval_join_tree(l, plans, cands, layout);
+                if lb.is_empty() {
+                    return (Vec::new(), lv);
+                }
+                let (rb, rv) = self.eval_join_tree(r, plans, cands, layout);
+                let joined = join_sets(&lb, &lv, &rb, &rv);
+                let mut vars = lv;
+                for v in rv {
+                    if !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                }
+                (joined, vars)
+            }
+        }
     }
 
     /// Intersect the VS-tree's signature candidates into the exact candidate
@@ -1642,6 +1700,31 @@ fn join_sets(
         }
     }
     out
+}
+
+/// A structural hash of compiled patterns, used as the plan-cache key. Two BGPs
+/// with the same slot shape (same constants and same variable indices, in the
+/// same order) optimize to the same plan, so they share a cache entry.
+fn plans_key(plans: &[PatPlan]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    plans.len().hash(&mut h);
+    for p in plans {
+        for (tag, slot) in [(0u8, p.s), (1u8, p.p), (2u8, p.o)] {
+            tag.hash(&mut h);
+            match slot {
+                Slot::Const(id) => {
+                    0u8.hash(&mut h);
+                    id.hash(&mut h);
+                }
+                Slot::Var(v) => {
+                    1u8.hash(&mut h);
+                    v.hash(&mut h);
+                }
+            }
+        }
+    }
+    h.finish()
 }
 
 /// The known id at a slot given the current binding (const, or bound var).

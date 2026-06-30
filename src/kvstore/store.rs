@@ -180,6 +180,55 @@ impl DiskStore {
         Ok(true)
     }
 
+    /// Delete one triple from all three indexes (gStore `KVstore::removeTriple`).
+    /// Returns `true` if it existed. Dictionary entries are intentionally kept
+    /// (gStore does not reclaim string ids on triple deletion); only the triple
+    /// indexes shrink, with the B+ trees merging underfull nodes and freeing
+    /// pages. Returns `false` (no change) if any term is unknown or the triple
+    /// is absent.
+    pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
+        let s = {
+            let pager = self.pager.get_mut();
+            match self.entity2id.get(pager, t.subject.dict_key().as_bytes())? {
+                Some(v) => de32(&v),
+                None => return Ok(false),
+            }
+        };
+        let p = {
+            let pager = self.pager.get_mut();
+            match self.predicate2id.get(pager, t.predicate.dict_key().as_bytes())? {
+                Some(v) => de32(&v),
+                None => return Ok(false),
+            }
+        };
+        let o = {
+            let pager = self.pager.get_mut();
+            let tree = if t.object.is_literal() {
+                &self.literal2id
+            } else {
+                &self.entity2id
+            };
+            match tree.get(pager, t.object.dict_key().as_bytes())? {
+                Some(v) => de32(&v),
+                None => return Ok(false),
+            }
+        };
+        self.delete_ids(IdTriple::new(s, p, o))
+    }
+
+    fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
+        let pager = self.pager.get_mut();
+        let spo = key3(t.sub, t.pred, t.obj);
+        if self.spo.get(pager, &spo)?.is_none() {
+            return Ok(false);
+        }
+        self.spo.delete(pager, &spo)?;
+        self.pos.delete(pager, &key3(t.pred, t.obj, t.sub))?;
+        self.osp.delete(pager, &key3(t.obj, t.sub, t.pred))?;
+        self.triple_count -= 1;
+        Ok(true)
+    }
+
     /// Persist counters and flush all dirty pages.
     pub fn flush(&mut self) -> Result<()> {
         let pager = self.pager.get_mut();
@@ -451,6 +500,50 @@ mod tests {
         let path = tmp("iter");
         let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
         assert_eq!(ds.iter_all().unwrap().len(), 5);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_triple_updates_all_indexes() {
+        let path = tmp("del_triple");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let t = Triple::new(Term::iri("node1"), Term::iri("own"), Term::iri("point0"));
+        assert!(ds.delete_triple(&t).unwrap());
+        assert_eq!(ds.triple_count(), 4);
+        // deleting again is a no-op
+        assert!(!ds.delete_triple(&t).unwrap());
+
+        // the triple is gone from every access pattern
+        let node1 = {
+            let (dict, _) = ds.to_memory().unwrap();
+            dict.entity_id(&Term::iri("node1").dict_key()).unwrap()
+        };
+        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+        let point0 = {
+            let (dict, _) = ds.to_memory().unwrap();
+            dict.entity_id(&Term::iri("point0").dict_key()).unwrap()
+        };
+        assert!(!ds.exists(node1, own, point0).unwrap());
+        let objs = ds.o_by_sp(node1, own).unwrap();
+        assert_eq!(objs.len(), 1, "only point1 remains under (node1, own)");
+        assert!(!objs.contains(&point0));
+        assert!(!ds.s_by_po(own, point0).unwrap().contains(&node1));
+        assert!(!ds.p_by_so(node1, point0).unwrap().contains(&own));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_then_reopen_persists() {
+        let path = tmp("del_reopen");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            let t = Triple::new(Term::iri("root"), Term::iri("contain"), Term::iri("node0"));
+            assert!(ds.delete_triple(&t).unwrap());
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.triple_count(), 4);
+        assert_eq!(ds.iter_all().unwrap().len(), 4);
         std::fs::remove_file(&path).ok();
     }
 }

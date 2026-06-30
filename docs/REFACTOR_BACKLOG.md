@@ -9,7 +9,8 @@
   - `bptree`:磁盘B+树(变长字节key→变长字节value),节点序列化进页、分裂(叶/内部)、有序叶链表、前缀范围扫描、重开后可读。
   - `store::DiskStore`:把上述组合成gStore式KVstore——字典树(entity/literal/predicate的`*2id`与`id2*`共6棵)+ 三元组三序索引(SPO/POS/OSP,12字节复合key),前缀扫描覆盖全部访问模式;构建/落盘/重开;`to_memory()`桥接到内存查询引擎。
   - `Database::build_disk`/`load_disk` + `is_disk`;CLI `gbuild --disk`、`gquery`自动识别磁盘库。DT:`tests/dt_disk.rs`把整个LUBM(10万三元组)建到磁盘B+树、重开、14条查询结果与内存版一致。
-- **后续可优化**:查询直接流式读盘(当前`load_disk`把工作集经页缓存载入内存索引后查询);VList紧凑值编码、mmap、崩溃一致性(WAL)、并发(见E)、磁盘上的VS-tree(见B)。
+- **删除/再平衡**(已补):`BTree::delete` 实现借位(redistribute)+合并(merge)+根收缩,回收页入free-list,投影大小精确校验保证节点不溢页;`DiskStore::delete_triple` 同步删除SPO/POS/OSP三索引并递减计数。UT见`bptree`/`store`测试。
+- **后续可优化**:查询直接流式读盘(当前`load_disk`把工作集经页缓存载入内存索引后查询);VList紧凑值编码、mmap、崩溃一致性(WAL)、并发(见E)、磁盘上的VS-tree(见B)、删除后字典id的freelist复用。
 
 ## B. VS-tree签名索引(gStore的标志性特性) ★中价值 —— ✅ 已完成
 
@@ -19,8 +20,14 @@
 
 ## C. 代价式查询优化器 ★中价值 —— ✅ 已完成
 
-- **已实现**(`src/query/optimizer.rs`):基于谓语统计(pre2num/pre2sub/pre2obj,见`TripleStore`新增的统计方法)的基数估计 + Selinger式子集DP,生成最小化中间结果规模的左深连接顺序;模式数>16时退化为连通+最小基数贪心。已替换引擎里原先的贪心`order_plans`。
-- **后续可优化**:浓密树枚举、直方图/相关性估计、topk优化(原版`topk`/`DFSPlan`)。
+- **候选与启发式**(`src/query/candidates.rs` + `planner.rs`):精确候选生成(常量边求交+选择度传播)、NodeScore启发式、采样基数估计、卫星点延后。模式数>14时由`planner`贪心定序兜底。
+- **DP优化器**(`src/query/optimizer.rs`):
+  - **左深DP**(`n·2ⁿ`子集DP):`dp[S]`=物化`S`内模式的最优代价,逐个追加连通模式,产出最优左深pattern序,替换原贪心序。
+  - **二元(bushy)连接**(`3ⁿ`子集划分DP = gStore `ConsiderBinaryJoin`):枚举把`S`划成两个连通半区的所有方式,得到最优二元连接树`JoinTree`;当其严格比最优左深更省时,由engine的hash-join树执行器(`eval_join_tree`)执行,否则仍走左深流水线。
+  - **System-R代价模型**:模式基数取自要扫的索引区间大小;连接输出基数=`|A|·|B| / Π max(NDV_A(v),NDV_B(v))`,NDV(distinct值数)取自谓语统计`pre2sub`/`pre2obj`并用精确候选集收紧。
+  - **plan_cache**:DP表本身即子计划代价缓存;evaluator另置结构同构BGP的plan缓存(子查询/重复BGP复用枚举结果)。
+  - 验证:`tests/dt_optimizer.rs`(bow-tie二元连接端到端)+ LUBM部分查询实际走bushy且计数全对。
+- **后续可优化**:跨查询持久化plan cache、直方图/相关性估计、topk优化(原版`topk`/`DFSPlan`)、命名物理join算子枚举。
 
 ## D. 完整SPARQL 1.1 ★中价值 —— ✅ 主体已完成
 

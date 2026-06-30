@@ -11,7 +11,7 @@
 | store `KVstore` *ID2values | ⚠️ | 六重访问模式、统计(pre2num/sub/obj) | C++紧凑字节编码(offset数组);字面量单独`objID2values_literal`;`getSubjectPredicateDegree`等度数API |
 | parser SPARQL `Parser/SPARQL` | ⚠️ | SELECT/ASK/CONSTRUCT、BGP/UNION/OPTIONAL/MINUS/FILTER/BIND/VALUES/子查询/聚合/属性路径(`/ ^ \| * +`) | DESCRIBE;GRAPH/SERVICE(命名图);属性路径`?`(词法器`?`当变量前缀冲突);完整UPDATE(LOAD/CLEAR/DROP/ADD/MOVE/COPY/CREATE/DELETE WHERE);30+图算法聚合(gpstore) |
 | query engine+value `Executor`/`EvalMultitypeValue` | ⚠️ | BGP连接、FILTER求值、合并连接、合成id | xsd:dateTime类型;完整数值类型层级(int/long/float/decimal/double分别建模,现仅Int(i64)/Double(f64)) |
-| query planner+candidates `Optimizer`/`PlanGenerator` | ⚠️ | 精确候选生成(常量边求交+传播)、NodeScore启发式、采样基数估计、卫星点延后、策略选择 | 真·DP多计划枚举+plan_cache;**二元(bushy)连接**`ConsiderBinaryJoin`;显式cost字段与边选择度缓存;12种join method显式选择;谓语变量单独采样 |
+| query planner+candidates+optimizer `Optimizer`/`PlanGenerator` | ✅ | 精确候选生成(常量边求交+传播)、NodeScore启发式、采样基数估计、卫星点延后;**真·DP多计划枚举**(左深`n·2ⁿ` DP得最优pattern序)、**二元(bushy)连接**(`3ⁿ`子集划分DP=`ConsiderBinaryJoin`,选出二元连接树由hash-join执行器跑)、**显式System-R代价模型**(NDV取自`pre2sub`/`pre2obj`谓语统计、再用精确候选集收紧)、**plan_cache**(结构同构BGP复用DP结果)。LUBM部分查询已实际走bushy计划且计数正确 | 12种命名物理join method(本引擎每pattern直接选最紧索引,等价);跨查询持久化plan cache(现为单查询evaluator内缓存) |
 | signature `Signature` | ✅ | 944位EntityBitSet三段编码(逐位对齐) | VSTree原版疑似增量插入+分裂(我用bulk聚类构建);**注**:此版本C++主路径其实不用VS-tree |
 | db `Database` | ⚠️ | build/save/load/query/update、磁盘后端、VS-tree重建 | 见下"系统级"大量缺失 |
 
@@ -22,7 +22,7 @@
 | 分页文件+LRU页缓存+B+树 | ✅ | 4KB块、分裂、前缀扫描、持久化/重开 |
 | VList紧凑值编码 | ❌ | C++变长值列表压缩字节流;我直接存B+树value |
 | SITree/IVArray/ISArray分化 | ❌ | C++按用途分化(块管理器);我用单一通用BTree |
-| **删除+下溢合并/再平衡** | ❌ | 我只有insert/get/scan,无B+树删除/merge |
+| **删除+下溢合并/再平衡** | ✅ | `BTree::delete`:借位(redistribute,叶/内部节点经父分隔键旋转)+ 合并(merge,回收页入free-list)+ 根收缩(空叶清树、单孩内部节点降级);投影大小精确校验,节点永不溢页。`DiskStore::delete_triple` 三索引(SPO/POS/OSP)同步删除并递减计数 |
 | 流式磁盘查询 | ❌ | 现`load_disk`先把工作集载入内存索引再查 |
 | WAL/崩溃一致性 | ❌ | 现为写回+最终flush,无恢复 |
 
@@ -45,4 +45,6 @@
 
 22条原始发现 → 对抗式验证确认20条真bug,全部修复(见 `Audit workflow` 提交):大整数(>2⁵³)比较/排序经f64丢精度(真·正确性bug)、`i64::MIN`取负溢出、B+树`split_internal`退化节点、页计数/字面量id/`Vec::len`→u32溢出、词法器多小数点、Turtle相对IRI(RFC3986)、HAVING解析、签名越界断言、load损坏检测加强。190测试全过,clippy零告警。
 
-> 校正一处:审计agent称"planner只有贪心、无DP"——实际我已实现**基于采样的基数估计**做较大查询的连接定序(等价于gStore DP的代价来源);但gStore真正的**多计划DP枚举 + 二元连接**确未实现,仍是有效差距。
+> 更新(2026-06-30):原"仍缺DP多计划枚举+二元连接"已补完。新增 `src/query/optimizer.rs`:左深DP求最优pattern序 + bushy子集划分DP(`ConsiderBinaryJoin`)产出二元连接树,由engine的hash-join树执行器执行;System-R代价模型(NDV取自谓语统计`pre2sub`/`pre2obj`并用候选集收紧);DP表+evaluator级plan_cache。`eval_bgp` 在bushy严格更省时切换到树执行器,否则走原左深流水线。LUBM等真实查询已验证(部分走bushy,计数全对)。
+>
+> 同时补完B+树删除(借位/合并/根收缩+页回收)与 `DiskStore::delete_triple`。
