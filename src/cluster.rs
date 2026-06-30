@@ -54,12 +54,17 @@
 //! with generated protobuf stubs over HTTP/2), leaving the scatter-gather merge
 //! here untouched.
 //!
+//! Replication & fault tolerance **are** implemented: see [`ClusterNode`] /
+//! [`Role`] for Raft-like leader election, log replication, quorum commit,
+//! heartbeat, failover and follower catch-up.
+//!
 //! ## Scope (still deferred)
 //!
-//! What remains out of scope is **membership / rebalancing**: node join/leave,
-//! partition reassignment, replication, and fault tolerance. Remote reads are
-//! *best-effort* — a failed shard RPC is logged and treated as empty rather than
-//! aborting the whole query (the trait methods cannot return errors); routed
+//! What remains out of scope is **elastic membership / rebalancing of the shard
+//! map**: dynamic node join/leave with partition reassignment, and running the
+//! Raft replication group *per shard* of a [`NetworkShardedStore`]. Remote reads
+//! are *best-effort* — a failed shard RPC is logged and treated as empty rather
+//! than aborting the whole query (the trait methods cannot return errors); routed
 //! [`NetworkShardedStore::insert`] does surface I/O errors to the caller.
 
 use std::collections::hash_map::DefaultHasher;

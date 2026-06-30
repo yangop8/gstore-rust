@@ -144,9 +144,10 @@ pub enum SelectItem {
 
 /// A graph-pattern algebra node — the evaluable shape of a WHERE clause.
 ///
-/// gStore models this as a `QueryTree`; here it's a small algebra. `OPTIONAL`
-/// (left join) and `MINUS` are deferred (backlog item D); `UNION`, conjunction
-/// (`Join`), and `FILTER` are supported.
+/// gStore models this as a `QueryTree`; here it's a small algebra covering the
+/// full SPARQL 1.1 shape: conjunction (`Join`), `UNION`, `OPTIONAL` (`LeftJoin`),
+/// `MINUS`, `FILTER`, `BIND`/`Extend`, `VALUES`, sub-`SELECT`, `GRAPH`, `SERVICE`,
+/// property paths, and `EXISTS`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GraphPattern {
     /// Matches the input unchanged (an empty group `{}`).
