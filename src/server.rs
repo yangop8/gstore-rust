@@ -198,17 +198,20 @@ impl Server {
 }
 
 /// A parsed HTTP request (method, path, query string, headers, body).
-struct Request {
-    method: String,
-    path: String,
-    query: Option<String>,
+///
+/// `pub(crate)` so the richer [`crate::http_api`] endpoint can reuse the same
+/// parser and accessors rather than re-implementing HTTP request parsing.
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: Option<String>,
     /// Header names lowercased for case-insensitive lookup.
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Request {
-    fn parse(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+    pub(crate) fn parse(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -257,7 +260,7 @@ impl Request {
     }
 
     /// Look up a header by (case-insensitive) name.
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
         self.headers
             .iter()
@@ -284,7 +287,7 @@ impl Request {
     }
 
     /// The negotiated result format token from `?format=` (URL or form body).
-    fn format_param(&self) -> Option<String> {
+    pub(crate) fn format_param(&self) -> Option<String> {
         if let Some(q) = &self.query {
             if let Some(v) = form_get(q, "format") {
                 return Some(v);
@@ -297,7 +300,7 @@ impl Request {
     /// True when the URL query string requests a chunked stream
     /// (`?stream=true`). Deliberately ignores the body so the chunked-unaware
     /// `SERVICE` POST path (no query string) is never streamed.
-    fn wants_stream(&self) -> bool {
+    pub(crate) fn wants_stream(&self) -> bool {
         self.query
             .as_deref()
             .and_then(|q| form_get(q, "stream"))
@@ -305,9 +308,43 @@ impl Request {
             .unwrap_or(false)
     }
 
+    /// Look up a parameter by name in the URL query string first, then in a
+    /// form-encoded body. Used by [`crate::http_api`] for its `db=`/`name=`/
+    /// `txn=`/`username=` … parameters. Returns `None` when the body is raw
+    /// (non-form) content.
+    pub(crate) fn param(&self, key: &str) -> Option<String> {
+        if let Some(q) = &self.query {
+            if let Some(v) = form_get(q, key) {
+                return Some(v);
+            }
+        }
+        let b = String::from_utf8_lossy(&self.body);
+        form_get(&b, key)
+    }
+
+    /// The raw request body as a UTF-8 (lossy) string.
+    pub(crate) fn body_str(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// Extract a session/bearer token from `Authorization: Bearer …`, the
+    /// `X-Session-Token` header, or a `session=`/`token=` parameter.
+    pub(crate) fn bearer_or_session_token(&self) -> Option<String> {
+        if let Some(h) = self.header("authorization") {
+            let h = h.trim_start();
+            if h.len() >= 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+                return Some(h[7..].trim().to_string());
+            }
+        }
+        if let Some(h) = self.header("x-session-token") {
+            return Some(h.trim().to_string());
+        }
+        self.param("session").or_else(|| self.param("token"))
+    }
+
     /// The query text: from the URL `?query=`, a form-encoded `query=` body, or
     /// (for POST with a `application/sparql-query` body) the raw body.
-    fn query_string(&self) -> Option<String> {
+    pub(crate) fn query_string(&self) -> Option<String> {
         if let Some(q) = &self.query {
             if let Some(v) = form_get(q, "query") {
                 return Some(v);
@@ -333,13 +370,18 @@ impl Request {
 
 // --- response helpers --------------------------------------------------------
 
-fn write_response(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     write_response_ext(stream, status, ctype, &[], body)
 }
 
 /// Like [`write_response`], but with additional response headers (e.g.
 /// `WWW-Authenticate` on a `401`).
-fn write_response_ext(
+pub(crate) fn write_response_ext(
     stream: &mut TcpStream,
     status: u16,
     ctype: &str,
@@ -348,10 +390,14 @@ fn write_response_ext(
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
+        500 => "Internal Server Error",
         _ => "OK",
     };
     let mut header = format!(
@@ -410,7 +456,7 @@ impl<W: Write> Write for ChunkedWriter<'_, W> {
     }
 }
 
-fn ntriples_body(triples: &[crate::model::Triple]) -> Vec<u8> {
+pub(crate) fn ntriples_body(triples: &[crate::model::Triple]) -> Vec<u8> {
     let mut s = String::new();
     for t in triples {
         s.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
@@ -418,8 +464,22 @@ fn ntriples_body(triples: &[crate::model::Triple]) -> Vec<u8> {
     s.into_bytes()
 }
 
-fn err_json(msg: &str) -> Vec<u8> {
+pub(crate) fn err_json(msg: &str) -> Vec<u8> {
     format!("{{\"error\":{}}}", json_str(msg)).into_bytes()
+}
+
+/// Parse HTTP Basic `Authorization` credentials into `(username, password)`.
+/// Shared with [`crate::http_api`], which validates them against its user store
+/// (the simpler [`Server`] compares against a single fixed credential instead).
+pub(crate) fn parse_basic_auth(req: &Request) -> Option<(String, String)> {
+    let token = req
+        .header("authorization")
+        .and_then(strip_basic_prefix)?
+        .trim();
+    let decoded = base64_decode(token)?;
+    let s = String::from_utf8(decoded).ok()?;
+    let (u, p) = s.split_once(':')?;
+    Some((u.to_string(), p.to_string()))
 }
 
 // --- HTTP Basic auth ---------------------------------------------------------
