@@ -32,6 +32,10 @@ pub fn build_prompt(question: &str, links_block: &str, schema_block: &str, n: us
 }
 
 /// Generate up to `n` valid, de-duplicated candidate SPARQL queries.
+///
+/// Returns an **empty Vec** if the model produced no parser-valid candidate
+/// (truncation, malformed JSON, or all-invalid). Callers (self-repair C9 /
+/// picker C10) must treat empty as "needs repair/retry", not index `[0]`.
 pub fn generate_candidates(
     llm: &dyn LlmClient,
     question: &str,
@@ -40,9 +44,12 @@ pub fn generate_candidates(
     n: usize,
     model: Option<&str>,
 ) -> Result<Vec<String>> {
+    // Grow the token budget with the number of requested candidates so the JSON
+    // array doesn't truncate mid-string (which would drop everything).
+    let max_tokens = 512 + (n as u32) * 512;
     let mut req = LlmRequest::prompt(build_prompt(question, links_block, schema_block, n))
         .system(SYS_GENERATE)
-        .max_tokens(2048);
+        .max_tokens(max_tokens);
     if let Some(m) = model {
         req = req.model(m);
     }
@@ -73,17 +80,22 @@ pub fn valid_candidates(raw_candidates: &[String], n: usize) -> Vec<String> {
 pub fn parse_candidates(raw: &str) -> Vec<String> {
     // Try each `[`-started balanced array, returning the first that parses as a
     // list of strings (so brackets in prose, e.g. "[a,b]", don't defeat it).
-    let bytes = raw.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
+    // Among all balanced `[…]` that parse as a string array, prefer the one with
+    // the most elements (a real candidate list beats a small prose array).
+    let mut best: Option<Vec<String>> = None;
+    for (i, &b) in raw.as_bytes().iter().enumerate() {
         if b == b'[' {
             if let Some(end) = matched_bracket(raw, i) {
                 if let Ok(v) = serde_json::from_str::<Vec<String>>(&raw[i..=end]) {
-                    if !v.is_empty() {
-                        return v;
+                    if !v.is_empty() && best.as_ref().is_none_or(|cur| v.len() > cur.len()) {
+                        best = Some(v);
                     }
                 }
             }
         }
+    }
+    if let Some(v) = best {
+        return v;
     }
     let blocks = fenced_blocks(raw);
     if !blocks.is_empty() {
@@ -166,6 +178,15 @@ mod tests {
         let raw = "Consider [a,b]. Here: [\"SELECT ?x WHERE { ?x ?p ?o }\"] done";
         let c = parse_candidates(raw);
         assert_eq!(c.len(), 1);
+        assert!(c[0].starts_with("SELECT"));
+    }
+
+    #[test]
+    fn prefers_largest_parseable_array() {
+        // a small valid prose array before the real (larger) candidate array
+        let raw = "Options: [\"a\"]. Answer: [\"SELECT ?x WHERE { ?x ?p ?o }\", \"ASK { ?s ?p ?o }\"]";
+        let c = parse_candidates(raw);
+        assert_eq!(c.len(), 2);
         assert!(c[0].starts_with("SELECT"));
     }
 
