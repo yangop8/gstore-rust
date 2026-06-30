@@ -13,14 +13,20 @@
 //! betweenness (Brandes) and closeness centrality, Louvain community detection,
 //! and k-core decomposition.
 //!
+//! For predicate-labeled / weighted analysis, [`WeightedGraphView`] keeps a
+//! predicate id and a numeric weight on every edge and adds weighted
+//! single-source shortest paths (Dijkstra), predicate-filtered traversal,
+//! weighted PageRank, and a branch-and-bound top-k subgraph query (mirroring
+//! gStore's `topk` module).  The unweighted [`GraphView`] API is unchanged.
+//!
 //! # Deferred work
-//! * Weighted / labeled edge variants (predicate-aware)
 //! * Directed-modularity Louvain (current implementation symmetrises edges)
-//! * Top-k subgraph-proximity queries (gStore `topk` module)
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
-use crate::model::id::EntityLiteralId;
+use crate::model::id::{EntityLiteralId, PredId};
+use crate::model::IdTriple;
 use crate::store::TripleStore;
 
 // ---------------------------------------------------------------------------
@@ -944,6 +950,812 @@ impl GraphView {
     }
 }
 
+// ===========================================================================
+// WeightedGraphView — predicate-labeled, weighted edges
+// ===========================================================================
+
+/// Lookup of the parallel data edges between an ordered dense pair, used by the
+/// top-k matcher: `(src_dense, dst_dense) → [(predicate, weight), …]`.
+type PairEdges = HashMap<(usize, usize), Vec<(PredId, f64)>>;
+
+/// A single labeled, weighted edge stored in [`WeightedGraphView`]'s CSR arrays.
+///
+/// For an out-edge `node` is the target; for an in-edge `node` is the source.
+#[derive(Copy, Clone, Debug)]
+struct WEdge {
+    node: usize,
+    pred: PredId,
+    weight: f64,
+}
+
+/// Min-heap entry for Dijkstra.
+///
+/// `BinaryHeap` is a max-heap, so [`Ord`] is inverted to pop the *smallest*
+/// tentative distance first.  Ties break on the smaller dense node index, which
+/// (because dense indices follow sorted entity ids) yields stable, id-ordered
+/// results.
+#[derive(Copy, Clone)]
+struct DijkstraItem {
+    dist: f64,
+    node: usize,
+}
+
+impl PartialEq for DijkstraItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for DijkstraItem {}
+impl Ord for DijkstraItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .dist
+            .total_cmp(&self.dist)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+impl PartialOrd for DijkstraItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Total-order wrapper over `f64` scores so they can drive a `BinaryHeap` for
+/// the top-k threshold (NaN is not produced by the supported scoring paths).
+#[derive(Copy, Clone)]
+struct OrdF(f64);
+impl PartialEq for OrdF {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == Ordering::Equal
+    }
+}
+impl Eq for OrdF {}
+impl Ord for OrdF {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+impl PartialOrd for OrdF {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// ---- top-k query types ----------------------------------------------------
+
+/// One edge of a top-k query pattern.
+///
+/// `src` and `dst` index the pattern's variables in `[0, num_vars)`.  `pred`
+/// constrains the data edge: `None` matches any predicate, `Some(p)` matches
+/// only predicate `p`.
+#[derive(Copy, Clone, Debug)]
+pub struct PatternEdge {
+    pub src: usize,
+    pub dst: usize,
+    pub pred: Option<PredId>,
+}
+
+impl PatternEdge {
+    /// Edge constrained to a specific predicate.
+    pub fn labeled(src: usize, dst: usize, pred: PredId) -> PatternEdge {
+        PatternEdge { src, dst, pred: Some(pred) }
+    }
+
+    /// Edge that matches any predicate.
+    pub fn any(src: usize, dst: usize) -> PatternEdge {
+        PatternEdge { src, dst, pred: None }
+    }
+}
+
+/// A connected top-k query pattern over `num_vars` variables.
+#[derive(Clone, Debug)]
+pub struct QueryPattern {
+    pub num_vars: usize,
+    pub edges: Vec<PatternEdge>,
+}
+
+impl QueryPattern {
+    /// Build a pattern from a variable count and its edges.
+    pub fn new(num_vars: usize, edges: Vec<PatternEdge>) -> QueryPattern {
+        QueryPattern { num_vars, edges }
+    }
+}
+
+/// A data edge bound to a pattern edge in a [`SubgraphMatch`].
+#[derive(Copy, Clone, Debug)]
+pub struct MatchedEdge {
+    pub src: EntityLiteralId,
+    pub pred: PredId,
+    pub dst: EntityLiteralId,
+    pub weight: f64,
+}
+
+/// A single subgraph match returned by the top-k query.
+#[derive(Clone, Debug)]
+pub struct SubgraphMatch {
+    /// `vars[i]` is the entity id bound to pattern variable `i`.
+    pub vars: Vec<EntityLiteralId>,
+    /// Matched data edges, in the same order as the pattern's edges.
+    pub edges: Vec<MatchedEdge>,
+    /// Score assigned to this match by the scoring function.
+    pub score: f64,
+}
+
+/// Read-only context shared across the top-k backtracking recursion.
+struct TopkCtx<'a> {
+    pattern: &'a QueryPattern,
+    /// Variables in connectivity-driven matching order.
+    order: &'a [usize],
+    /// `order_pos[var]` = position of `var` within `order`.
+    order_pos: &'a [usize],
+    /// Pattern-edge indices that become fully bound at each order position.
+    closed_at: &'a [Vec<usize>],
+    pair: &'a PairEdges,
+    /// Per-pattern-edge global maximum weight (admissible branch-and-bound bound).
+    max_w: &'a [f64],
+    k: usize,
+    prune: bool,
+    score: &'a dyn Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
+}
+
+/// Mutable state threaded through the top-k backtracking recursion.
+struct TopkState {
+    /// `assign[var]` = bound dense index, or `usize::MAX` if unbound.
+    assign: Vec<usize>,
+    /// Injectivity guard: `used[dense]` is true while a variable holds it.
+    used: Vec<bool>,
+    results: Vec<SubgraphMatch>,
+    /// Min-heap of the best `k` scores seen so far (drives bound pruning).
+    topk: BinaryHeap<Reverse<OrdF>>,
+    /// Sum of weights of already fully-bound pattern edges.
+    partial: f64,
+    /// Sum of `max_w` over not-yet-bound pattern edges.
+    remaining: f64,
+}
+
+/// A directed graph view whose edges carry a predicate id and a numeric weight.
+///
+/// This is a *parallel* view to [`GraphView`]: it is built independently and
+/// leaves the unweighted API untouched.  Unlike `GraphView`, edges are **not**
+/// de-duplicated across predicates — `(s, p₁, o)` and `(s, p₂, o)` are kept as
+/// two distinct labeled edges — so predicate-aware traversal is exact.  Within
+/// each node the CSR adjacency is sorted by `(neighbour, predicate)` for
+/// deterministic iteration.
+///
+/// Construction is O(E log E).  Dijkstra is O(E log V); weighted PageRank is
+/// O(V + E) per iteration; top-k complexity is documented on the query methods.
+pub struct WeightedGraphView {
+    nodes: Vec<EntityLiteralId>,
+    id_to_idx: HashMap<EntityLiteralId, usize>,
+    out_ptr: Vec<usize>,
+    out_edges: Vec<WEdge>,
+    in_ptr: Vec<usize>,
+    in_edges: Vec<WEdge>,
+}
+
+impl WeightedGraphView {
+    /// Build a weighted view, deriving each edge's weight from its triple.
+    ///
+    /// Every triple `(s, p, o)` becomes a labeled edge `s → o` with predicate
+    /// `p` and weight `weight_of(&triple)`.  Identical triples are de-duplicated;
+    /// triples that differ only in predicate stay as separate edges.
+    pub fn from_store_with_weights<F>(store: &TripleStore, weight_of: F) -> Self
+    where
+        F: Fn(&IdTriple) -> f64,
+    {
+        // 1. Raw labeled edges (entity-id space).
+        let raw: Vec<(EntityLiteralId, EntityLiteralId, PredId, f64)> = store
+            .iter_all()
+            .map(|t| (t.sub, t.obj, t.pred, weight_of(&t)))
+            .collect();
+
+        // 2. Sorted, de-duplicated node list + sparse→dense lookup.
+        let mut id_set: Vec<EntityLiteralId> =
+            raw.iter().flat_map(|&(s, o, _, _)| [s, o]).collect();
+        id_set.sort_unstable();
+        id_set.dedup();
+        let n = id_set.len();
+        let id_to_idx: HashMap<EntityLiteralId, usize> =
+            id_set.iter().copied().enumerate().map(|(i, id)| (id, i)).collect();
+
+        // 3. Dense edges, sorted by (s, o, pred) and de-duplicated by (s, p, o).
+        let mut edges: Vec<(usize, usize, PredId, f64)> = raw
+            .iter()
+            .map(|&(s, o, p, w)| (id_to_idx[&s], id_to_idx[&o], p, w))
+            .collect();
+        edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+        let m = edges.len();
+
+        // 4. Out-CSR (edges already in (s, o, pred) order).
+        let mut out_deg = vec![0usize; n];
+        for &(s, _, _, _) in &edges {
+            out_deg[s] += 1;
+        }
+        let mut out_ptr = vec![0usize; n + 1];
+        for i in 0..n {
+            out_ptr[i + 1] = out_ptr[i] + out_deg[i];
+        }
+        let mut out_edges = vec![WEdge { node: 0, pred: 0, weight: 0.0 }; m];
+        {
+            let mut cur = out_ptr[..n].to_vec();
+            for &(s, o, p, w) in &edges {
+                out_edges[cur[s]] = WEdge { node: o, pred: p, weight: w };
+                cur[s] += 1;
+            }
+        }
+
+        // 5. In-CSR (re-sort by (o, s, pred) so each bucket is deterministic).
+        let mut iedges = edges;
+        iedges.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)).then(a.2.cmp(&b.2)));
+        let mut in_deg = vec![0usize; n];
+        for &(_, o, _, _) in &iedges {
+            in_deg[o] += 1;
+        }
+        let mut in_ptr = vec![0usize; n + 1];
+        for i in 0..n {
+            in_ptr[i + 1] = in_ptr[i] + in_deg[i];
+        }
+        let mut in_edges = vec![WEdge { node: 0, pred: 0, weight: 0.0 }; m];
+        {
+            let mut cur = in_ptr[..n].to_vec();
+            for &(s, o, p, w) in &iedges {
+                in_edges[cur[o]] = WEdge { node: s, pred: p, weight: w };
+                cur[o] += 1;
+            }
+        }
+
+        WeightedGraphView { nodes: id_set, id_to_idx, out_ptr, out_edges, in_ptr, in_edges }
+    }
+
+    /// Build a weighted view with unit weight (1.0) on every edge, retaining the
+    /// predicate label.  Useful for predicate-filtered traversal.
+    pub fn from_store(store: &TripleStore) -> Self {
+        Self::from_store_with_weights(store, |_| 1.0)
+    }
+
+    /// Number of nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of labeled edges (parallel predicates counted separately).
+    pub fn edge_count(&self) -> usize {
+        self.out_edges.len()
+    }
+
+    // ---- weighted single-source shortest path (Dijkstra) ------------------
+
+    /// Core Dijkstra over non-negative edge weights from dense source `src_i`.
+    ///
+    /// When `pred_filter` is `Some(set)`, only edges whose predicate is in
+    /// `set` are relaxed.  Returns `(dist, prev)` keyed by dense index; `dist`
+    /// is `INFINITY` for unreachable nodes and `prev` is `usize::MAX` for nodes
+    /// without a predecessor.
+    fn dijkstra(&self, src_i: usize, pred_filter: Option<&HashSet<PredId>>) -> (Vec<f64>, Vec<usize>) {
+        let n = self.nodes.len();
+        let mut dist = vec![f64::INFINITY; n];
+        let mut prev = vec![usize::MAX; n];
+        let mut heap: BinaryHeap<DijkstraItem> = BinaryHeap::new();
+        dist[src_i] = 0.0;
+        heap.push(DijkstraItem { dist: 0.0, node: src_i });
+
+        while let Some(DijkstraItem { dist: d, node: u }) = heap.pop() {
+            if d > dist[u] {
+                continue; // stale heap entry
+            }
+            for e in &self.out_edges[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                if let Some(set) = pred_filter {
+                    if !set.contains(&e.pred) {
+                        continue;
+                    }
+                }
+                let nd = d + e.weight;
+                if nd < dist[e.node] {
+                    dist[e.node] = nd;
+                    prev[e.node] = u;
+                    heap.push(DijkstraItem { dist: nd, node: e.node });
+                }
+            }
+        }
+        (dist, prev)
+    }
+
+    /// Collect finite dense distances into an entity-id-keyed map.
+    fn collect_dist(&self, dist: &[f64]) -> HashMap<EntityLiteralId, f64> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| dist[i].is_finite())
+            .map(|(i, &id)| (id, dist[i]))
+            .collect()
+    }
+
+    /// Weighted single-source shortest-path distances from `src` over
+    /// non-negative edge weights.  Returns `entity_id → distance` for every
+    /// reachable node (including `src` at 0.0), or `None` if `src` is absent.
+    pub fn weighted_distances(&self, src: EntityLiteralId) -> Option<HashMap<EntityLiteralId, f64>> {
+        let s = *self.id_to_idx.get(&src)?;
+        let (dist, _) = self.dijkstra(s, None);
+        Some(self.collect_dist(&dist))
+    }
+
+    /// As [`weighted_distances`](Self::weighted_distances), restricted to edges
+    /// whose predicate is in `preds`.
+    pub fn weighted_distances_filtered(
+        &self,
+        src: EntityLiteralId,
+        preds: &HashSet<PredId>,
+    ) -> Option<HashMap<EntityLiteralId, f64>> {
+        let s = *self.id_to_idx.get(&src)?;
+        let (dist, _) = self.dijkstra(s, Some(preds));
+        Some(self.collect_dist(&dist))
+    }
+
+    fn weighted_path_impl(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        pred_filter: Option<&HashSet<PredId>>,
+    ) -> Option<(f64, Vec<EntityLiteralId>)> {
+        let s = *self.id_to_idx.get(&src)?;
+        let t = *self.id_to_idx.get(&dst)?;
+        if s == t {
+            return Some((0.0, vec![src]));
+        }
+        let (dist, prev) = self.dijkstra(s, pred_filter);
+        if !dist[t].is_finite() {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut cur = t;
+        while cur != s {
+            path.push(self.nodes[cur]);
+            cur = prev[cur];
+        }
+        path.push(self.nodes[s]);
+        path.reverse();
+        Some((dist[t], path))
+    }
+
+    /// Minimum-weight directed path from `src` to `dst` over non-negative edge
+    /// weights.  Returns `(total_weight, path)` with `path` inclusive of both
+    /// endpoints, or `None` if either node is absent or `dst` is unreachable.
+    /// Returns `(0.0, [src])` when `src == dst`.
+    pub fn weighted_shortest_path(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+    ) -> Option<(f64, Vec<EntityLiteralId>)> {
+        self.weighted_path_impl(src, dst, None)
+    }
+
+    /// As [`weighted_shortest_path`](Self::weighted_shortest_path), restricted to
+    /// edges whose predicate is in `preds`.
+    pub fn weighted_shortest_path_filtered(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        preds: &HashSet<PredId>,
+    ) -> Option<(f64, Vec<EntityLiteralId>)> {
+        self.weighted_path_impl(src, dst, Some(preds))
+    }
+
+    // ---- predicate-filtered BFS -------------------------------------------
+
+    /// Single-source BFS hop distances from `src`, traversing only edges whose
+    /// predicate is in `preds`.  Returns `entity_id → hop count`, or `None` if
+    /// `src` is absent.
+    pub fn bfs_distances_filtered(
+        &self,
+        src: EntityLiteralId,
+        preds: &HashSet<PredId>,
+    ) -> Option<HashMap<EntityLiteralId, u32>> {
+        let s = *self.id_to_idx.get(&src)?;
+        let n = self.nodes.len();
+        let mut dist = vec![u32::MAX; n];
+        dist[s] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(s);
+        while let Some(u) = queue.pop_front() {
+            let d = dist[u];
+            for e in &self.out_edges[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                if !preds.contains(&e.pred) {
+                    continue;
+                }
+                if dist[e.node] == u32::MAX {
+                    dist[e.node] = d + 1;
+                    queue.push_back(e.node);
+                }
+            }
+        }
+        Some(
+            self.nodes
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| dist[i] != u32::MAX)
+                .map(|(i, &id)| (id, dist[i]))
+                .collect(),
+        )
+    }
+
+    // ---- weighted PageRank ------------------------------------------------
+
+    /// Weighted PageRank: a node spreads its rank to out-neighbours in
+    /// proportion to edge weight (rather than uniformly).
+    ///
+    /// `damping` is the usual factor (≈0.85); iteration stops once the L₁ change
+    /// drops below `tol` or `max_iters` is reached.  Edge weights must be
+    /// non-negative.  A node whose total out-weight is 0 is treated as dangling
+    /// and redistributes its rank uniformly so that mass is conserved.
+    ///
+    /// Returns `entity_id → score`; scores sum to approximately 1.0.
+    pub fn weighted_pagerank(
+        &self,
+        damping: f64,
+        max_iters: usize,
+        tol: f64,
+    ) -> HashMap<EntityLiteralId, f64> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return HashMap::new();
+        }
+        let init = 1.0 / n as f64;
+        let mut rank = vec![init; n];
+        let mut next = vec![0.0f64; n];
+        let out_w: Vec<f64> = (0..n)
+            .map(|i| {
+                self.out_edges[self.out_ptr[i]..self.out_ptr[i + 1]]
+                    .iter()
+                    .map(|e| e.weight)
+                    .sum()
+            })
+            .collect();
+
+        for _ in 0..max_iters {
+            let dangling_sum: f64 =
+                (0..n).filter(|&i| out_w[i] <= 0.0).map(|i| rank[i]).sum();
+            let base = (1.0 - damping + damping * dangling_sum) / n as f64;
+            for v in next.iter_mut() {
+                *v = base;
+            }
+            for u in 0..n {
+                if out_w[u] > 0.0 {
+                    let scale = damping * rank[u] / out_w[u];
+                    for e in &self.out_edges[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                        next[e.node] += scale * e.weight;
+                    }
+                }
+            }
+            let delta: f64 =
+                rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+            std::mem::swap(&mut rank, &mut next);
+            if delta < tol {
+                break;
+            }
+        }
+
+        self.nodes.iter().enumerate().map(|(i, &id)| (id, rank[i])).collect()
+    }
+
+    // ---- top-k subgraph query ---------------------------------------------
+
+    /// Map of every ordered dense pair to its parallel `(predicate, weight)`
+    /// edges, used for closing-edge checks and representative selection.
+    fn pair_edges(&self) -> PairEdges {
+        let mut map: PairEdges = HashMap::new();
+        for u in 0..self.nodes.len() {
+            for e in &self.out_edges[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                map.entry((u, e.node)).or_default().push((e.pred, e.weight));
+            }
+        }
+        map
+    }
+
+    /// Representative data edge between a fixed pair under a predicate
+    /// constraint: the maximum-weight match, ties broken by the smallest
+    /// predicate id.  `None` if no data edge satisfies the constraint.
+    fn representative(list: Option<&[(PredId, f64)]>, pred: Option<PredId>) -> Option<(PredId, f64)> {
+        let list = list?;
+        let mut best: Option<(PredId, f64)> = None;
+        for &(p, w) in list {
+            if let Some(pc) = pred {
+                if pc != p {
+                    continue;
+                }
+            }
+            best = match best {
+                None => Some((p, w)),
+                Some((bp, bw)) => match w.total_cmp(&bw) {
+                    Ordering::Greater => Some((p, w)),
+                    Ordering::Equal if p < bp => Some((p, w)),
+                    _ => Some((bp, bw)),
+                },
+            };
+        }
+        best
+    }
+
+    /// Connectivity-driven variable order: a BFS over the pattern's variable
+    /// graph so each variable after the first is adjacent to an earlier one
+    /// (disconnected components are appended).  Returns `(order, order_pos)`.
+    fn match_order(pattern: &QueryPattern) -> (Vec<usize>, Vec<usize>) {
+        let nv = pattern.num_vars;
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        for e in &pattern.edges {
+            if e.src != e.dst {
+                adj[e.src].push(e.dst);
+                adj[e.dst].push(e.src);
+            }
+        }
+        let mut visited = vec![false; nv];
+        let mut order = Vec::with_capacity(nv);
+        for start in 0..nv {
+            if visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            let mut queue = VecDeque::new();
+            queue.push_back(start);
+            while let Some(u) = queue.pop_front() {
+                order.push(u);
+                let mut nbrs = adj[u].clone();
+                nbrs.sort_unstable();
+                nbrs.dedup();
+                for v in nbrs {
+                    if !visited[v] {
+                        visited[v] = true;
+                        queue.push_back(v);
+                    }
+                }
+            }
+        }
+        let mut order_pos = vec![0usize; nv];
+        for (i, &v) in order.iter().enumerate() {
+            order_pos[v] = i;
+        }
+        (order, order_pos)
+    }
+
+    /// Candidate dense nodes for the variable being bound at the current depth.
+    ///
+    /// A non-root variable is seeded from the adjacency of one already-bound
+    /// neighbour (out- or in-edges, predicate-filtered), then filtered by its
+    /// remaining constraints and injectivity.  A root variable (no constraint
+    /// to an earlier variable) ranges over all unused nodes.  Candidates are
+    /// returned in ascending dense order for deterministic enumeration.
+    fn candidates(&self, ctx: &TopkCtx, st: &TopkState, var: usize) -> Vec<usize> {
+        let n = self.nodes.len();
+        let mypos = ctx.order_pos[var];
+        // (fixed dense node, fixed_is_src, predicate) for each constraint to an
+        // already-bound variable.
+        let mut constraints: Vec<(usize, bool, Option<PredId>)> = Vec::new();
+        for e in &ctx.pattern.edges {
+            if e.src == e.dst {
+                continue; // self-loops are verified when the edge closes
+            }
+            if e.src == var && ctx.order_pos[e.dst] < mypos {
+                constraints.push((st.assign[e.dst], false, e.pred));
+            } else if e.dst == var && ctx.order_pos[e.src] < mypos {
+                constraints.push((st.assign[e.src], true, e.pred));
+            }
+        }
+
+        if constraints.is_empty() {
+            return (0..n).filter(|&c| !st.used[c]).collect();
+        }
+
+        let (fixed, fixed_is_src, pred0) = constraints[0];
+        let mut base: Vec<usize> = if fixed_is_src {
+            self.out_edges[self.out_ptr[fixed]..self.out_ptr[fixed + 1]]
+                .iter()
+                .filter(|e| pred0.is_none_or(|p| p == e.pred))
+                .map(|e| e.node)
+                .collect()
+        } else {
+            self.in_edges[self.in_ptr[fixed]..self.in_ptr[fixed + 1]]
+                .iter()
+                .filter(|e| pred0.is_none_or(|p| p == e.pred))
+                .map(|e| e.node)
+                .collect()
+        };
+        base.sort_unstable();
+        base.dedup();
+        base.into_iter()
+            .filter(|&c| {
+                if st.used[c] {
+                    return false;
+                }
+                constraints[1..].iter().all(|&(fx, is_src, pred)| {
+                    let (a, b) = if is_src { (fx, c) } else { (c, fx) };
+                    Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), pred).is_some()
+                })
+            })
+            .collect()
+    }
+
+    /// Backtracking core of the top-k matcher (see [`run_topk`](Self::run_topk)).
+    fn topk_rec(&self, ctx: &TopkCtx, st: &mut TopkState, depth: usize) {
+        if depth == ctx.order.len() {
+            let vars: Vec<EntityLiteralId> =
+                st.assign.iter().map(|&d| self.nodes[d]).collect();
+            let mut edges = Vec::with_capacity(ctx.pattern.edges.len());
+            for e in &ctx.pattern.edges {
+                let a = st.assign[e.src];
+                let b = st.assign[e.dst];
+                let (p, w) = Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred)
+                    .expect("closing checks guarantee every pattern edge is bound");
+                edges.push(MatchedEdge { src: self.nodes[a], pred: p, dst: self.nodes[b], weight: w });
+            }
+            let s = (ctx.score)(&vars, &edges);
+            if ctx.prune {
+                if st.topk.len() < ctx.k {
+                    st.topk.push(Reverse(OrdF(s)));
+                } else if s > st.topk.peek().unwrap().0 .0 {
+                    st.topk.pop();
+                    st.topk.push(Reverse(OrdF(s)));
+                }
+            }
+            st.results.push(SubgraphMatch { vars, edges, score: s });
+            return;
+        }
+
+        // Branch-and-bound: prune when the best achievable score (bound on the
+        // sum of edge weights) cannot beat the current k-th best.
+        if ctx.prune && st.topk.len() == ctx.k {
+            let threshold = st.topk.peek().unwrap().0 .0;
+            if st.partial + st.remaining < threshold {
+                return;
+            }
+        }
+
+        let var = ctx.order[depth];
+        for c in self.candidates(ctx, st, var) {
+            st.assign[var] = c;
+            st.used[c] = true;
+
+            // Close every pattern edge whose later endpoint is this variable.
+            let mut closed_ok = true;
+            let mut add_partial = 0.0;
+            let mut sub_remaining = 0.0;
+            for &ei in &ctx.closed_at[depth] {
+                let e = &ctx.pattern.edges[ei];
+                let a = st.assign[e.src];
+                let b = st.assign[e.dst];
+                match Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred) {
+                    Some((_, w)) => {
+                        add_partial += w;
+                        sub_remaining += ctx.max_w[ei];
+                    }
+                    None => {
+                        closed_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if closed_ok {
+                st.partial += add_partial;
+                st.remaining -= sub_remaining;
+                self.topk_rec(ctx, st, depth + 1);
+                st.partial -= add_partial;
+                st.remaining += sub_remaining;
+            }
+
+            st.used[c] = false;
+            st.assign[var] = usize::MAX;
+        }
+    }
+
+    /// Shared top-k driver for both the default and custom-scored entry points.
+    fn run_topk(
+        &self,
+        pattern: &QueryPattern,
+        k: usize,
+        prune: bool,
+        score: &dyn Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
+    ) -> Vec<SubgraphMatch> {
+        if k == 0 || pattern.num_vars == 0 {
+            return Vec::new();
+        }
+        let pair = self.pair_edges();
+        let (order, order_pos) = Self::match_order(pattern);
+
+        let mut closed_at = vec![Vec::new(); pattern.num_vars];
+        for (ei, e) in pattern.edges.iter().enumerate() {
+            let pos = order_pos[e.src].max(order_pos[e.dst]);
+            closed_at[pos].push(ei);
+        }
+
+        // Global max weight per pattern edge: an admissible bound on its
+        // contribution to any match's score.
+        let max_w: Vec<f64> = pattern
+            .edges
+            .iter()
+            .map(|e| {
+                let mx = self
+                    .out_edges
+                    .iter()
+                    .filter(|we| e.pred.is_none_or(|p| p == we.pred))
+                    .map(|we| we.weight)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if mx.is_finite() {
+                    mx
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let total_max: f64 = max_w.iter().sum();
+
+        let ctx = TopkCtx {
+            pattern,
+            order: &order,
+            order_pos: &order_pos,
+            closed_at: &closed_at,
+            pair: &pair,
+            max_w: &max_w,
+            k,
+            prune,
+            score,
+        };
+        let mut st = TopkState {
+            assign: vec![usize::MAX; pattern.num_vars],
+            used: vec![false; self.nodes.len()],
+            results: Vec::new(),
+            topk: BinaryHeap::new(),
+            partial: 0.0,
+            remaining: total_max,
+        };
+        self.topk_rec(&ctx, &mut st, 0);
+
+        // Deterministic top-k: score descending, then assignment lexicographic.
+        let mut results = st.results;
+        results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.vars.cmp(&b.vars)));
+        results.truncate(k);
+        results
+    }
+
+    /// Top-k subgraph matches scored by the **sum of matched edge weights**.
+    ///
+    /// Enumerates injective assignments of the pattern's variables to distinct
+    /// entities such that every pattern edge maps to a data edge satisfying its
+    /// predicate constraint, and returns the `k` highest-scoring matches.  When
+    /// a pattern edge admits several parallel data edges (only possible with an
+    /// unconstrained predicate), the representative is the maximum-weight one
+    /// (ties broken by smallest predicate id), so each assignment yields exactly
+    /// one scored match.
+    ///
+    /// Matching is connectivity-driven: each variable is seeded from a bound
+    /// neighbour's adjacency, so the cost is roughly `O(V · d^{r-1})` for a
+    /// connected `r`-variable pattern with maximum degree `d` (a disconnected
+    /// component restarts at `O(V)`).  A branch-and-bound prune — current
+    /// partial weight plus the per-edge maximum weight of unbound edges, against
+    /// the current k-th best — cuts subtrees that cannot enter the top-k.
+    /// Results are deterministic: score descending, ties by ascending
+    /// assignment.
+    pub fn topk_subgraph(&self, pattern: &QueryPattern, k: usize) -> Vec<SubgraphMatch> {
+        self.run_topk(pattern, k, true, &|_vars, edges| {
+            edges.iter().map(|e| e.weight).sum()
+        })
+    }
+
+    /// Top-k subgraph matches scored by a caller-supplied function over the
+    /// bound variables and matched edges.
+    ///
+    /// Same matching semantics as [`topk_subgraph`](Self::topk_subgraph), but
+    /// the score is arbitrary, so weight-based branch-and-bound is disabled and
+    /// the search fully enumerates structural matches (still pruned by
+    /// connectivity and injectivity) before keeping the `k` best.  Complexity is
+    /// `O(M)` in the number of structural matches `M`, plus `O(M log M)` to rank.
+    pub fn topk_subgraph_by<F>(&self, pattern: &QueryPattern, k: usize, score: F) -> Vec<SubgraphMatch>
+    where
+        F: Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
+    {
+        self.run_topk(pattern, k, false, &score)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,5 +2114,299 @@ mod tests {
         assert_eq!(core[&2], 2);
         assert_eq!(core[&3], 2);
         assert_eq!(core[&4], 1);
+    }
+
+    // =======================================================================
+    // WeightedGraphView
+    // =======================================================================
+
+    /// Hand-checked weighted graph with two predicates.
+    ///
+    /// ```text
+    /// p1 = 1 ("knows", weight 2):  1→2  2→3  3→4  4→5
+    /// p2 = 2 ("shortcut", weight 1): 1→3  3→5
+    /// ```
+    ///
+    /// All-predicate shortest paths from 1 prefer the p2 shortcuts; a p1-only
+    /// filter forces the long chain; a p2-only filter isolates the shortcuts.
+    fn make_weighted() -> WeightedGraphView {
+        let mut s = TripleStore::new();
+        // (sub, pred, obj, weight)
+        let edges: [(u32, u32, u32, f64); 6] = [
+            (1, 1, 2, 2.0),
+            (2, 1, 3, 2.0),
+            (3, 1, 4, 2.0),
+            (4, 1, 5, 2.0),
+            (1, 2, 3, 1.0),
+            (3, 2, 5, 1.0),
+        ];
+        for &(a, p, b, _) in &edges {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        let wmap: HashMap<(u32, u32, u32), f64> =
+            edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
+        WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)])
+    }
+
+    #[test]
+    fn test_weighted_distances() {
+        let g = make_weighted();
+        let d = g.weighted_distances(1).expect("node 1 present");
+        // 1→3 via p2 (1) is cheaper than 1→2→3 (4); 3→5 via p2 (1) gives 5 at 2.
+        assert!(d[&1].abs() < 1e-9);
+        assert!((d[&2] - 2.0).abs() < 1e-9);
+        assert!((d[&3] - 1.0).abs() < 1e-9);
+        assert!((d[&4] - 3.0).abs() < 1e-9, "got {}", d[&4]); // 1→3(1)→4(2)
+        assert!((d[&5] - 2.0).abs() < 1e-9, "got {}", d[&5]); // 1→3(1)→5(1)
+    }
+
+    #[test]
+    fn test_weighted_shortest_path() {
+        let g = make_weighted();
+        let (cost, path) = g.weighted_shortest_path(1, 5).expect("path 1⇝5 exists");
+        assert!((cost - 2.0).abs() < 1e-9, "got {cost}");
+        assert_eq!(path, vec![1, 3, 5]);
+
+        // Trivial same-node path has zero cost.
+        let (c0, p0) = g.weighted_shortest_path(1, 1).expect("self path");
+        assert!(c0.abs() < 1e-9);
+        assert_eq!(p0, vec![1]);
+
+        // 5 is a sink: nothing is reachable from it.
+        assert!(g.weighted_shortest_path(5, 1).is_none());
+        // Unknown node.
+        assert!(g.weighted_shortest_path(1, 999).is_none());
+    }
+
+    #[test]
+    fn test_predicate_filtered_dijkstra() {
+        let g = make_weighted();
+
+        // p1 only: must walk the whole chain, weight 2 per hop.
+        let only_p1: HashSet<PredId> = [1].into_iter().collect();
+        let d1 = g.weighted_distances_filtered(1, &only_p1).expect("node 1");
+        assert!((d1[&5] - 8.0).abs() < 1e-9, "got {}", d1[&5]); // 2+2+2+2
+        let (c1, path1) = g.weighted_shortest_path_filtered(1, 5, &only_p1).unwrap();
+        assert!((c1 - 8.0).abs() < 1e-9);
+        assert_eq!(path1, vec![1, 2, 3, 4, 5]);
+
+        // p2 only: only the shortcuts exist, so 2 and 4 are unreachable.
+        let only_p2: HashSet<PredId> = [2].into_iter().collect();
+        let d2 = g.weighted_distances_filtered(1, &only_p2).expect("node 1");
+        assert!((d2[&3] - 1.0).abs() < 1e-9);
+        assert!((d2[&5] - 2.0).abs() < 1e-9);
+        assert!(!d2.contains_key(&2));
+        assert!(!d2.contains_key(&4));
+    }
+
+    #[test]
+    fn test_predicate_filtered_bfs() {
+        let g = make_weighted();
+
+        let only_p1: HashSet<PredId> = [1].into_iter().collect();
+        let h1 = g.bfs_distances_filtered(1, &only_p1).expect("node 1");
+        assert_eq!(h1[&1], 0);
+        assert_eq!(h1[&2], 1);
+        assert_eq!(h1[&3], 2);
+        assert_eq!(h1[&4], 3);
+        assert_eq!(h1[&5], 4);
+
+        let only_p2: HashSet<PredId> = [2].into_iter().collect();
+        let h2 = g.bfs_distances_filtered(1, &only_p2).expect("node 1");
+        assert_eq!(h2[&1], 0);
+        assert_eq!(h2[&3], 1);
+        assert_eq!(h2[&5], 2);
+        assert!(!h2.contains_key(&2));
+    }
+
+    #[test]
+    fn test_weighted_pagerank_bias() {
+        // S(1) points to X(2) with weight 3 and Y(3) with weight 1; both point
+        // back to S. Weighted PageRank must rank X above Y (more of S's mass
+        // flows to X), whereas the unweighted view ranks them equally.
+        let mut s = TripleStore::new();
+        let p = 1u32;
+        s.insert(IdTriple::new(1, p, 2));
+        s.insert(IdTriple::new(1, p, 3));
+        s.insert(IdTriple::new(2, p, 1));
+        s.insert(IdTriple::new(3, p, 1));
+        let wmap: HashMap<(u32, u32, u32), f64> = [
+            ((1u32, p, 2u32), 3.0),
+            ((1, p, 3), 1.0),
+            ((2, p, 1), 1.0),
+            ((3, p, 1), 1.0),
+        ]
+        .into_iter()
+        .collect();
+        let wg = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+
+        let prw = wg.weighted_pagerank(0.85, 200, 1e-12);
+        assert!(prw[&2] > prw[&3] + 1e-9, "X({}) must outrank Y({})", prw[&2], prw[&3]);
+        let sum: f64 = prw.values().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "weighted PR must sum to 1, got {sum}");
+
+        // Unweighted: X and Y are symmetric, so their ranks coincide.
+        let ug = GraphView::from_store(&s);
+        let pru = ug.pagerank(0.85, 200, 1e-12);
+        assert!((pru[&2] - pru[&3]).abs() < 1e-9, "unweighted X/Y must tie");
+    }
+
+    // ---- top-k subgraph query ---------------------------------------------
+
+    /// Top-k path graph (predicate 1). Two-edge paths a→b→c and their summed
+    /// weights:
+    ///
+    /// ```text
+    /// (1,2,3)=10  (7,2,3)=8  (1,2,6)=7  (7,2,6)=5  (1,4,5)=2  (8,9,10)=10
+    /// ```
+    fn make_topk_paths() -> WeightedGraphView {
+        let mut s = TripleStore::new();
+        let edges: [(u32, u32, u32, f64); 8] = [
+            (1, 1, 2, 5.0),
+            (2, 1, 3, 5.0),
+            (1, 1, 4, 1.0),
+            (4, 1, 5, 1.0),
+            (2, 1, 6, 2.0),
+            (7, 1, 2, 3.0),
+            (8, 1, 9, 5.0),
+            (9, 1, 10, 5.0),
+        ];
+        for &(a, p, b, _) in &edges {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        let wmap: HashMap<(u32, u32, u32), f64> =
+            edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
+        WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)])
+    }
+
+    /// Two-edge path pattern: v0 -p1-> v1 -p1-> v2.
+    fn path_pattern() -> QueryPattern {
+        QueryPattern::new(3, vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)])
+    }
+
+    #[test]
+    fn test_topk_subgraph_default_scoring() {
+        let g = make_topk_paths();
+        let top = g.topk_subgraph(&path_pattern(), 3);
+        assert_eq!(top.len(), 3);
+
+        // (1,2,3) and (8,9,10) tie at 10 → lexicographic order; then (7,2,3)=8.
+        assert_eq!(top[0].vars, vec![1, 2, 3]);
+        assert!((top[0].score - 10.0).abs() < 1e-9);
+        assert_eq!(top[1].vars, vec![8, 9, 10]);
+        assert!((top[1].score - 10.0).abs() < 1e-9);
+        assert_eq!(top[2].vars, vec![7, 2, 3]);
+        assert!((top[2].score - 8.0).abs() < 1e-9);
+
+        // Matched edges carry the right predicate and weight.
+        assert_eq!(top[0].edges.len(), 2);
+        assert_eq!(top[0].edges[0].src, 1);
+        assert_eq!(top[0].edges[0].dst, 2);
+        assert_eq!(top[0].edges[0].pred, 1);
+        assert!((top[0].edges[0].weight - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_topk_ties_and_k_overflow() {
+        let g = make_topk_paths();
+
+        // k = 1 with a tie at 10 resolves deterministically to (1,2,3).
+        let one = g.topk_subgraph(&path_pattern(), 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].vars, vec![1, 2, 3]);
+
+        // k = 2 returns both score-10 matches in lexicographic order.
+        let two = g.topk_subgraph(&path_pattern(), 2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].vars, vec![1, 2, 3]);
+        assert_eq!(two[1].vars, vec![8, 9, 10]);
+        assert!((two[1].score - 10.0).abs() < 1e-9);
+
+        // k far larger than the match count returns every match, fully ranked.
+        let all = g.topk_subgraph(&path_pattern(), 100);
+        assert_eq!(all.len(), 6);
+        let scores: Vec<f64> = all.iter().map(|m| m.score).collect();
+        assert!((scores[0] - 10.0).abs() < 1e-9);
+        assert!((scores[5] - 2.0).abs() < 1e-9); // (1,4,5) is the weakest
+        // Scores are non-increasing.
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1] - 1e-12);
+        }
+
+        // k = 0 is empty.
+        assert!(g.topk_subgraph(&path_pattern(), 0).is_empty());
+    }
+
+    #[test]
+    fn test_topk_custom_scoring() {
+        // Score a path by the minimum of its two edge weights. (1,2,3) and
+        // (8,9,10) tie at 5; lexicographic order keeps (1,2,3) on top.
+        let g = make_topk_paths();
+        let top = g.topk_subgraph_by(&path_pattern(), 1, |_vars, edges| {
+            edges.iter().map(|e| e.weight).fold(f64::INFINITY, f64::min)
+        });
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].vars, vec![1, 2, 3]);
+        assert!((top[0].score - 5.0).abs() < 1e-9, "got {}", top[0].score);
+    }
+
+    #[test]
+    fn test_topk_cycle_pattern() {
+        // Two directed triangles of different weight. The cyclic pattern
+        // v0→v1→v2→v0 must close the back-edge and rank the heavier triangle
+        // first.
+        let mut s = TripleStore::new();
+        let edges: [(u32, u32, u32, f64); 6] = [
+            (1, 1, 2, 1.0),
+            (2, 1, 3, 1.0),
+            (3, 1, 1, 1.0), // triangle A, total 3
+            (4, 1, 5, 2.0),
+            (5, 1, 6, 2.0),
+            (6, 1, 4, 2.0), // triangle B, total 6
+        ];
+        for &(a, p, b, _) in &edges {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        let wmap: HashMap<(u32, u32, u32), f64> =
+            edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
+        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+
+        let pattern = QueryPattern::new(
+            3,
+            vec![
+                PatternEdge::labeled(0, 1, 1),
+                PatternEdge::labeled(1, 2, 1),
+                PatternEdge::labeled(2, 0, 1),
+            ],
+        );
+
+        // Each triangle yields its 3 rotations → 6 matches total.
+        let all = g.topk_subgraph(&pattern, 100);
+        assert_eq!(all.len(), 6);
+
+        // Heaviest match is a rotation of triangle B; lexicographically (4,5,6).
+        let top = g.topk_subgraph(&pattern, 1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].vars, vec![4, 5, 6]);
+        assert!((top[0].score - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_topk_unconstrained_predicate_picks_max_weight() {
+        // Parallel edges 1→2 under two predicates; an unconstrained pattern edge
+        // selects the heavier one as the representative.
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(1, 1, 2));
+        s.insert(IdTriple::new(1, 2, 2));
+        let wmap: HashMap<(u32, u32, u32), f64> =
+            [((1u32, 1u32, 2u32), 4.0), ((1, 2, 2), 9.0)].into_iter().collect();
+        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+
+        let pattern = QueryPattern::new(2, vec![PatternEdge::any(0, 1)]);
+        let top = g.topk_subgraph(&pattern, 5);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].vars, vec![1, 2]);
+        assert_eq!(top[0].edges[0].pred, 2); // the weight-9 predicate wins
+        assert!((top[0].score - 9.0).abs() < 1e-9);
     }
 }
