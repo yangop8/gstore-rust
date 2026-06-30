@@ -7,7 +7,8 @@ use crate::kb::{KbClient, SparqlAnswer, TermKind};
 use crate::llm::{LlmClient, LlmRequest};
 use crate::schema::checked_iri;
 
-/// One supporting triple (string surface forms).
+/// One supporting triple. All three fields are SPARQL/Turtle surface forms
+/// (`<uri>` / `"lit"`), so they render uniformly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Citation {
     pub subject: String,
@@ -15,63 +16,73 @@ pub struct Citation {
     pub object: String,
 }
 
-/// Collect a few supporting triples for the URI entities appearing in `answer`
-/// (`<uri> ?p ?o`), capped per-entity and overall, so an answer can be cited.
+/// Collect related facts about the URI entities in `answer` (`<uri> ?p ?o`,
+/// ordered for determinism), capped per-entity, by number of entities, and
+/// overall. Best-effort: a failing entity query is skipped, not fatal.
+///
+/// Note: these are facts *about* the answer entities, not necessarily the exact
+/// matched evidence (that lives in the executed BGP); they ground the answer and
+/// support a cited explanation.
 pub fn gather_citations(
     kb: &dyn KbClient,
     answer: &SparqlAnswer,
     per_entity: usize,
+    max_entities: usize,
     max_total: usize,
 ) -> Result<Vec<Citation>> {
     let mut out = Vec::new();
-    for uri in answer_uris(answer) {
+    for uri in answer_uris(answer).into_iter().take(max_entities) {
         if out.len() >= max_total {
             break;
         }
         let Ok(uri) = checked_iri(&uri) else { continue };
-        let q = format!("SELECT ?p ?o WHERE {{ <{uri}> ?p ?o }} LIMIT {per_entity}");
-        if let SparqlAnswer::Select { vars, rows } = kb.query(&q)? {
-            let (pi, oi) = (pos(&vars, "p"), pos(&vars, "o"));
-            for r in rows {
-                let (Some(p), Some(o)) = (cell(&r, pi), cell(&r, oi)) else { continue };
-                out.push(Citation { subject: uri.to_string(), predicate: p, object: o });
-                if out.len() >= max_total {
-                    break;
+        let q = format!("SELECT ?p ?o WHERE {{ <{uri}> ?p ?o }} ORDER BY ?p ?o LIMIT {per_entity}");
+        match kb.query(&q) {
+            Ok(SparqlAnswer::Select { vars, rows }) => {
+                let (pi, oi) = (pos(&vars, "p"), pos(&vars, "o"));
+                for r in rows {
+                    let (Some(p), Some(o)) = (cell(&r, pi), cell(&r, oi)) else { continue };
+                    out.push(Citation { subject: format!("<{uri}>"), predicate: p, object: o });
+                    if out.len() >= max_total {
+                        break;
+                    }
                 }
             }
+            Ok(_) => {}
+            Err(e) => eprintln!("gnlqa: warning: citation query for <{uri}>: {e}"),
         }
     }
     Ok(out)
 }
 
-/// Ask the LLM to phrase a grounded natural-language answer from the question,
-/// the raw values, and the citations. Falls back to the raw text on LLM failure.
+/// Ask the LLM to phrase a concise answer grounded strictly in `citations`.
+/// Returns `None` if there are no citations or the LLM call fails (the caller
+/// keeps the raw rendered answer rather than risk ungrounded prose).
 pub fn explain(
     llm: &dyn LlmClient,
     question: &str,
-    raw_answer: &str,
     citations: &[Citation],
-    fallback: &str,
     model: Option<&str>,
-) -> String {
+) -> Option<String> {
+    if citations.is_empty() {
+        return None;
+    }
     let cites = citations
         .iter()
-        .map(|c| format!("<{}> <{}> {}", c.subject, c.predicate, c.object))
+        .map(|c| format!("{} {} {}", c.subject, c.predicate, c.object))
         .collect::<Vec<_>>()
         .join("\n");
-    let sys = "You write a concise, factual natural-language answer to the user's \
+    let sys = "You write a concise, factual natural-language answer to the \
         question using ONLY the supporting triples. Do not add facts not present \
         in them. One or two sentences.";
-    let user = format!(
-        "Question: {question}\n\nRaw result: {raw_answer}\n\nSupporting triples:\n{cites}\n\nAnswer:"
-    );
+    let user = format!("Question: {question}\n\nSupporting triples:\n{cites}\n\nAnswer:");
     let mut req = LlmRequest::prompt(user).system(sys).max_tokens(300);
     if let Some(m) = model {
         req = req.model(m);
     }
     match llm.complete(&req) {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => fallback.to_string(),
+        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -122,9 +133,9 @@ mod tests {
             rows: vec![vec![Some(uterm("http://ex/capitalOf")), Some(uterm("http://ex/Germany"))]],
         };
         let kb = MockKb::new(vec![triples]);
-        let c = gather_citations(&kb, &answer, 10, 50).unwrap();
+        let c = gather_citations(&kb, &answer, 10, 10, 50).unwrap();
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].subject, "http://ex/Berlin");
+        assert_eq!(c[0].subject, "<http://ex/Berlin>");
         assert_eq!(c[0].predicate, "<http://ex/capitalOf>");
         assert_eq!(c[0].object, "<http://ex/Germany>");
     }
@@ -133,17 +144,21 @@ mod tests {
     fn literal_answers_have_no_citations() {
         let answer = SparqlAnswer::Select { vars: vec!["n".into()], rows: vec![vec![Some(lterm("3.4M"))]] };
         let kb = MockKb::new(vec![SparqlAnswer::Boolean(true)]);
-        assert!(gather_citations(&kb, &answer, 10, 50).unwrap().is_empty());
+        assert!(gather_citations(&kb, &answer, 10, 10, 50).unwrap().is_empty());
     }
 
     #[test]
-    fn explain_uses_llm_else_fallback() {
-        let answer = SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![vec![Some(uterm("http://ex/Berlin"))]] };
-        let kb = MockKb::new(vec![SparqlAnswer::Select { vars: vec!["p".into(), "o".into()], rows: vec![] }]);
-        let cites = gather_citations(&kb, &answer, 5, 5).unwrap();
+    fn explain_returns_some_on_success_none_otherwise() {
+        let cites = vec![Citation {
+            subject: "<http://ex/Berlin>".into(),
+            predicate: "<http://ex/capitalOf>".into(),
+            object: "<http://ex/Germany>".into(),
+        }];
         let good = MockLlm::fixed("Berlin is the capital of Germany.");
-        assert_eq!(explain(&good, "capital?", "http://ex/Berlin", &cites, "fallback", None), "Berlin is the capital of Germany.");
-        let bad = MockLlm::new(vec![]); // errors → fallback
-        assert_eq!(explain(&bad, "q", "raw", &cites, "fallback", None), "fallback");
+        assert_eq!(explain(&good, "capital?", &cites, None).as_deref(), Some("Berlin is the capital of Germany."));
+        let bad = MockLlm::new(vec![]); // errors → None
+        assert!(explain(&bad, "q", &cites, None).is_none());
+        // no citations → None (don't risk ungrounded prose)
+        assert!(explain(&good, "q", &[], None).is_none());
     }
 }

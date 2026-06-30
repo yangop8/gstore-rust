@@ -188,16 +188,16 @@ impl SolveEngine {
         match best {
             Some(o) => {
                 let values = answer_values(&o.answer);
-                let mut text = render_answer(&o.answer, &values);
+                let text = render_answer(&o.answer, &values);
                 let citations = if self.cite {
-                    gather_citations(self.kb.as_ref(), &o.answer, 5, 30).unwrap_or_default()
+                    gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
+                // Grounded prose is exposed via `explanation` (only when it could
+                // be grounded on citations); `text` stays the rendered answer.
                 let explanation = if self.explain {
-                    let e = explain(self.llm.as_ref(), question, &text, &citations, &text, model);
-                    text = e.clone();
-                    Some(e)
+                    explain(self.llm.as_ref(), question, &citations, model)
                 } else {
                     None
                 };
