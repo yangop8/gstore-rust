@@ -209,6 +209,10 @@ impl Database {
     pub fn store(&self) -> &TripleStore {
         &self.store
     }
+    /// The named graphs (graph-IRI entity id → store).
+    pub fn named_graphs(&self) -> &BTreeMap<u32, TripleStore> {
+        &self.named
+    }
 
     /// A snapshot of counts and status (gStore `getDBMonitorInfo`).
     pub fn stats(&self) -> DbStats {

@@ -132,7 +132,7 @@ impl TripleSource for TripleStore {
 }
 
 /// The triple store. Holds three redundant sorted indexes plus a triple count.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TripleStore {
     /// sub → sorted [(pred, obj)]
     s2po: AdjMap<EntityLiteralId>,

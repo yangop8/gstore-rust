@@ -23,7 +23,7 @@ use crate::model::Term;
 
 /// One half of a dictionary: a forward map `string → index` and a backward
 /// vector `index → string`. Indices are dense and assigned in insertion order.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Interner {
     forward: HashMap<String, u32>,
     backward: Vec<String>,
@@ -58,7 +58,7 @@ impl Interner {
 }
 
 /// The full RDF dictionary: entities, literals, and predicates.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Dictionary {
     entities: Interner,
     literals: Interner,
