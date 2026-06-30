@@ -24,6 +24,9 @@ pub enum GStoreError {
     Serialize(String),
     /// A database directory was malformed or missing required files.
     Database(String),
+    /// An optimistic transaction aborted: a concurrent commit wrote a triple key
+    /// this transaction also wrote (write-write conflict, first-committer-wins).
+    Conflict(String),
 }
 
 impl fmt::Display for GStoreError {
@@ -37,6 +40,7 @@ impl fmt::Display for GStoreError {
             GStoreError::Query(msg) => write!(f, "query error: {msg}"),
             GStoreError::Serialize(msg) => write!(f, "serialization error: {msg}"),
             GStoreError::Database(msg) => write!(f, "database error: {msg}"),
+            GStoreError::Conflict(msg) => write!(f, "transaction conflict: {msg}"),
         }
     }
 }
