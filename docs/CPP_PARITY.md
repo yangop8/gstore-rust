@@ -9,11 +9,11 @@
 | model `Util/Triple`+`GlobalTypedef` | ✅ | ID区间(LITERAL_FIRST_ID)、实体/字面量判定、`Term`枚举(比C++裸string+类型标志更安全) | C++ predicate id是有符号int(-1无效),Rust用u32+u32::MAX——语义等价,表示相反 |
 | dict `KVstore` *2id/id2* | ⚠️ | string↔id三套独立空间、字面量偏移 | Trie前缀压缩(C++存≤32768前缀,省≥30%才用);磁盘B+树词典见kvstore |
 | store `KVstore` *ID2values | ⚠️ | 六重访问模式、统计(pre2num/sub/obj) | C++紧凑字节编码(offset数组);字面量单独`objID2values_literal`;`getSubjectPredicateDegree`等度数API |
-| parser SPARQL `Parser/SPARQL` | ⚠️ | SELECT/ASK/CONSTRUCT、BGP/UNION/OPTIONAL/MINUS/FILTER/BIND/VALUES/子查询/聚合/属性路径(`/ ^ \| * +`) | DESCRIBE;GRAPH/SERVICE(命名图);属性路径`?`(词法器`?`当变量前缀冲突);完整UPDATE(LOAD/CLEAR/DROP/ADD/MOVE/COPY/CREATE/DELETE WHERE);30+图算法聚合(gpstore) |
-| query engine+value `Executor`/`EvalMultitypeValue` | ⚠️ | BGP连接、FILTER求值、合并连接、合成id | xsd:dateTime类型;完整数值类型层级(int/long/float/decimal/double分别建模,现仅Int(i64)/Double(f64)) |
+| parser SPARQL `Parser/SPARQL` | ✅ | SELECT/ASK/CONSTRUCT/**DESCRIBE**、BGP/UNION/OPTIONAL/MINUS/FILTER/BIND/VALUES/子查询/聚合/**EXISTS·NOT EXISTS**/属性路径(`/ ^ \| * + ?`)、**命名图GRAPH**、**完整UPDATE**(INSERT/DELETE DATA、DELETE/INSERT WHERE、DELETE WHERE、LOAD、CLEAR/DROP/CREATE、`;`序列、WITH/USING) | SERVICE(联邦,需网络→明确报错);30+图算法聚合(gpstore);GRAPH出现在DELETE/INSERT WHERE模板内 |
+| query engine+value `Executor`/`EvalMultitypeValue` | ✅ | BGP连接、FILTER求值、合并连接、合成id、EXISTS(变量代入)、GRAPH(常量/变量图)、**xsd:dateTime/date比较**(解析为UTC瞬时,跨时区按时序;含闰年/日域校验) | 完整数值类型层级(int/long/float/decimal分别建模,现归并为Int(i64)/Double(f64),比较/排序已正确) |
 | query planner+candidates+optimizer `Optimizer`/`PlanGenerator` | ✅ | 精确候选生成(常量边求交+传播)、NodeScore启发式、采样基数估计、卫星点延后;**真·DP多计划枚举**(左深`n·2ⁿ` DP得最优pattern序)、**二元(bushy)连接**(`3ⁿ`子集划分DP=`ConsiderBinaryJoin`,选出二元连接树由hash-join执行器跑)、**显式System-R代价模型**(NDV取自`pre2sub`/`pre2obj`谓语统计、再用精确候选集收紧)、**plan_cache**(结构同构BGP复用DP结果)。LUBM部分查询已实际走bushy计划且计数正确 | 12种命名物理join method(本引擎每pattern直接选最紧索引,等价);跨查询持久化plan cache(现为单查询evaluator内缓存) |
 | signature `Signature` | ✅ | 944位EntityBitSet三段编码(逐位对齐) | VSTree原版疑似增量插入+分裂(我用bulk聚类构建);**注**:此版本C++主路径其实不用VS-tree |
-| db `Database` | ⚠️ | build/save/load/query/update、磁盘后端、VS-tree重建 | 见下"系统级"大量缺失 |
+| db `Database` | ✅ | build/save/load/query/**完整UPDATE**、磁盘后端、VS-tree重建、**命名图**(持久化)、**事务**(begin/commit/rollback)、**QueryCache**、**RDFS推理**、**Schema抽取**、**监控stats** | 见下"系统级"剩余项(并发/集群/服务化等) |
 
 ## 存储引擎 kvstore vs `KVstore/SITree/IVArray/ISArray/VList`
 
@@ -23,23 +23,27 @@
 | VList紧凑值编码 | ❌ | C++变长值列表压缩字节流;我直接存B+树value |
 | SITree/IVArray/ISArray分化 | ❌ | C++按用途分化(块管理器);我用单一通用BTree |
 | **删除+下溢合并/再平衡** | ✅ | `BTree::delete`:借位(redistribute,叶/内部节点经父分隔键旋转)+ 合并(merge,回收页入free-list)+ 根收缩(空叶清树、单孩内部节点降级);投影大小精确校验,节点永不溢页。`DiskStore::delete_triple` 三索引(SPO/POS/OSP)同步删除并递减计数 |
-| 流式磁盘查询 | ❌ | 现`load_disk`先把工作集载入内存索引再查 |
-| WAL/崩溃一致性 | ❌ | 现为写回+最终flush,无恢复 |
+| 流式磁盘查询 | ✅ | `TripleSource` trait抽象访问模式,内存/磁盘统一;`Evaluator<S>`+优化器/候选/planner泛型化。`DiskStore::query` 仅把字典载入内存,三元组索引按需经页缓存流式读取(不全量物化)。**剩余**:字典也留盘(完全out-of-core)、流式路径上的VS-tree过滤 |
+| WAL/崩溃一致性 | ✅ | `flush`为原子提交:头页+脏页先写带CRC+commit标记的`<file>.wal`并fsync,再落主文件fsync,再清日志;`open`时重放完整committed日志(redo)、丢弃残缺日志。脏页只经提交落盘(evict优先清干净页,全脏则先提交) |
 
-## 系统级子系统(整体未做 —— 多数为"合理省略",属REFACTOR_BACKLOG E/F/G)
+## 系统级子系统
 
-| 项 | 对应C++ | 判断 |
-|----|---------|------|
-| MVCC/事务(锁、latch、版本链、GC、rollback/commit) | `Txn_manager`/`GraphLock`/`Latch`/KVstore MVCC | 大功能,需先定隔离级别;合理推迟 |
-| 多线程并发(rwlock+8 mutex)、并行加载(9线程)、OpenMP并行排序 | `Database` | 需先定并发模型;合理推迟 |
-| 备份/恢复 + 更新日志(update.log) | `Database::backup/restore/write_update_log` | 运维特性;合理推迟 |
-| CSR邻接结构 + 图算法套件(PageRank/最短路/介数/louvain等30+) | `src/Query/topk/` | 这是gpstore图计算,非SPARQL查询;合理省略 |
-| Schema抽取/管理 | `Database::updateSchema/getSchemaInfo` | 周边特性;合理推迟 |
-| ID freelist复用(BlockInfo链) | `Database::allocEntityID`等 | 删除后id回收;随"删除支持"一起做 |
-| QueryCache、entity/literal buffer、重要谓语缓存 | `Database`/`QueryCache` | 性能缓存;合理推迟 |
-| 进度上报、统计监控API | `DatabaseProgressStatus`/`getDBMonitorInfo` | 周边;合理推迟 |
-| RDFParser分批(每10M一组)+ 数值范围校验(xsd:int/short/byte边界) | `Parser/RDFParser` | 分批=超大文件;数值范围校验值得补 |
-| Turtle `[ ]` 空节点属性列表 / `( )` 集合 | `TurtleParser` | 值得补(backlog D) |
+| 项 | 状态 | 对应C++ | 判断/说明 |
+|----|------|---------|------|
+| 事务(commit/rollback) | ✅ | `Txn_manager` | `begin/commit/rollback`经undo日志实现原子性+回滚(单写者),覆盖所有UPDATE与命名图 |
+| 完整MVCC(锁、latch、版本链、GC) | ❌ | `GraphLock`/`Latch`/KVstore MVCC | 需先定隔离级别+并发模型;合理推迟 |
+| 多线程并发(rwlock+8 mutex)、并行加载(9线程)、OpenMP并行排序 | ❌ | `Database` | 需先定并发模型;合理推迟 |
+| RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range;`Database::materialize_rdfs` |
+| Schema抽取 | ✅ | `Database::getSchemaInfo` | `Database::schema()` 抽类与属性 |
+| QueryCache | ✅ | `Database`/`QueryCache` | 读查询按SPARQL串缓存,任何写入即失效 |
+| 监控/统计API | ✅ | `getDBMonitorInfo` | `Database::stats()`→`DbStats`(计数+索引/事务状态) |
+| Turtle `[ ]` / `( )` | ✅ | `TurtleParser` | 空节点属性列表 + 集合(降级为rdf:first/rest/nil链),含嵌套 |
+| 备份/恢复 + 更新日志(update.log) | ❌ | `Database::backup/restore/write_update_log` | 运维特性;合理推迟(WAL已提供崩溃一致性) |
+| CSR邻接 + 图算法套件(PageRank/最短路/介数/louvain等30+) | ❌ | `src/Query/topk/` | gpstore图计算,非SPARQL;合理省略 |
+| 服务化:HTTP/gRPC/集群 | ❌ | `src/Server`/`Api`/`GRPC`/`Cluster` | 对外接口+分布式;最后做 |
+| SERVICE联邦查询 | ❌ | — | 需HTTP出网;已解析→明确报错 |
+| ID freelist复用(BlockInfo链) | N/A | `Database::allocEntityID`等 | 仅在删除字典项时才有意义;gStore与本版删除三元组时均保留字典项(id不回收),故不适用 |
+| RDFParser分批(每10M一组)+ 数值范围校验 | ⚠️ | `Parser/RDFParser` | 分批=超大文件(推迟);dateTime日域/时域已校验 |
 
 ## 代码检视结果
 
@@ -48,3 +52,9 @@
 > 更新(2026-06-30):原"仍缺DP多计划枚举+二元连接"已补完。新增 `src/query/optimizer.rs`:左深DP求最优pattern序 + bushy子集划分DP(`ConsiderBinaryJoin`)产出二元连接树,由engine的hash-join树执行器执行;System-R代价模型(NDV取自谓语统计`pre2sub`/`pre2obj`并用候选集收紧);DP表+evaluator级plan_cache。`eval_bgp` 在bushy严格更省时切换到树执行器,否则走原左深流水线。LUBM等真实查询已验证(部分走bushy,计数全对)。
 >
 > 同时补完B+树删除(借位/合并/根收缩+页回收)与 `DiskStore::delete_triple`。
+>
+> 更新(2026-06-30,第一档+第三档批次):
+> - **第一档**:完整UPDATE(DELETE/INSERT WHERE、LOAD、CLEAR/DROP/CREATE、`;`序列);WAL崩溃一致性;事务(commit/rollback);流式磁盘查询(`TripleSource` trait + 泛型引擎,`DiskStore::query`)。
+> - **第三档**:属性路径`?`、EXISTS/NOT EXISTS、DESCRIBE;Turtle `[ ]`/`( )`;xsd:dateTime比较;RDFS推理;QueryCache;Schema抽取;监控stats;命名图GRAPH(查询/四元组更新/CLEAR/持久化)。
+> - 期间跑独立code-reviewer检视并修复2个MEDIUM(EXISTS内层FILTER代入、DESCRIBE谓语列)+若干LOW。
+> - 测试190→**272全过**,clippy零告警。剩余大颗粒:完整MVCC(并发)、服务化/集群、SERVICE联邦、gpstore图算法。

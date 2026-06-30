@@ -29,26 +29,25 @@
   - 验证:`tests/dt_optimizer.rs`(bow-tie二元连接端到端)+ LUBM部分查询实际走bushy且计数全对。
 - **后续可优化**:跨查询持久化plan cache、直方图/相关性估计、topk优化(原版`topk`/`DFSPlan`)、命名物理join算子枚举。
 
-## D. 完整SPARQL 1.1 ★中价值 —— ✅ 主体已完成
+## D. 完整SPARQL 1.1 ★中价值 —— ✅ 已完成
 
-- **已实现**:`SELECT`/`ASK`/`CONSTRUCT`;图模式代数`GraphPattern`含`Bgp`/`Join`/`Union`/`Filter`/`LeftJoin`(OPTIONAL)/`Minus`/`Extend`(BIND)/`Values`/`SubSelect`/`Path`;聚合(`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`SAMPLE`/`GROUP_CONCAT`,含`DISTINCT`)与投影表达式`(expr AS ?v)`;属性路径(`/` `^` `|` `*` `+` `!`);丰富内建函数。计算值(BIND/VALUES/聚合结果)通过每查询的synthetic-id interner流经统一的id连接引擎。DT覆盖见`tests/dt_sparql11.rs`(16个用例)。
-- **缺**:`GRAPH`/`SERVICE`(命名图)、属性路径`?`(zeroOrOne,词法器把`?`当变量前缀,冲突)、`DESCRIBE`、Turtle的`[ ]`/`( )`、完整日期/时区类型体系、`EXISTS`/`NOT EXISTS`、子查询的相关性优化。
-- **后续**:逐项补齐,均可增量加算子/内建并配UT/DT。
+- **已实现**:`SELECT`/`ASK`/`CONSTRUCT`/`DESCRIBE`;图模式代数含`Bgp`/`Join`/`Union`/`Filter`/`LeftJoin`(OPTIONAL)/`Minus`/`Extend`(BIND)/`Values`/`SubSelect`/`Path`/`Graph`(命名图);聚合(`GROUP BY`/`HAVING`/全套agg含`DISTINCT`)与`(expr AS ?v)`;属性路径(`/ ^ | * + ? !`);`EXISTS`/`NOT EXISTS`(变量代入);完整UPDATE(INSERT/DELETE DATA、DELETE/INSERT WHERE、DELETE WHERE、LOAD、CLEAR/DROP/CREATE、`;`序列、WITH/USING);命名图GRAPH(查询/四元组DATA/CLEAR/持久化);xsd:dateTime比较;Turtle `[ ]`/`( )`。DT:`dt_sparql11`/`dt_update`/`dt_graph`/`dt_reason`。
+- **缺(合理推迟/省略)**:`SERVICE`(联邦,需出网→解析即报错);GRAPH出现在DELETE/INSERT WHERE模板内;完整数值类型层级(现Int(i64)/Double(f64),比较正确);子查询相关性优化;30+图算法聚合(gpstore)。
 
-## E. 并发、事务与MVCC ★中价值
+## E. 并发、事务与MVCC ★中价值 —— ⚠️ 事务已完成,并发待做
 
-- **原版**:`Txn_manager`、`GraphLock`、`Latch`、KVstore里的MVCC版本链与两阶段锁。
-- **重构**:为Rust设计基于`RwLock`/版本号的并发模型,或集成现成存储引擎事务。需先明确目标隔离级别。
+- **已实现**:`Database::begin/commit/rollback` —— 经undo日志的单写者事务,提供原子性+回滚,覆盖全部UPDATE与命名图;WAL(`pager`)提供存储层崩溃一致性。
+- **缺**:多读多写并发(`GraphLock`/`Latch`/`RwLock`)、MVCC版本链与快照隔离、GC。需先明确目标隔离级别与并发模型。
 
 ## F. 服务化:HTTP API / gRPC / 控制台 / 集群 ★按需
 
 - **原版**:`src/Server`、`src/Api`、`src/GRPC`、`src/Cluster`(分布式分片),`ghttp`/`grpc`/`gserver`等。
-- **重构**:用`axum`/`tonic`等重建对外接口;集群涉及分片与分布式查询,工作量最大,建议最后做。
+- **重构**:用`axum`/`tonic`等重建对外接口;集群涉及分片与分布式查询,工作量最大,建议最后做。SPARQL `SERVICE`(联邦)同属此类(需HTTP出网),现已解析→明确报错。
 
-## G. 推理(RDFS/OWL) ★低优先
+## G. 推理(RDFS/OWL) ★低优先 —— ✅ RDFS已完成
 
-- **原版**:`src/Reason`(规模较小)。
-- **重构**:基于规则的前向链推理,作为查询前的物化或查询时展开。
+- **已实现**(`src/reason`):前向链物化到不动点 —— 子类传递、rdf:type传播、子属性传递+数据传播、domain/range类型断言;`Database::materialize_rdfs()`。跨实体/谓语id空间用字典桥接。DT:`dt_reason`。
+- **缺**:OWL更丰富的公理(等价类/属性、传递/对称属性、`sameAs`等);查询时展开(现为物化)。
 
 ## 已做的小重构/clean-code(已直接落地,记录备查)
 
