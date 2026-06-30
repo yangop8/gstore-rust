@@ -11,25 +11,41 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::solve::SolveEngine;
 
+/// Max request body (bytes) — bounds attacker-controlled Content-Length.
+const MAX_BODY: usize = 1 << 20; // 1 MiB
+/// Max bytes for a single request/header line.
+const MAX_LINE: usize = 16 * 1024;
+/// Per-connection socket timeout.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// HTTP server wrapping a [`SolveEngine`].
 pub struct HttpServer {
     engine: Arc<SolveEngine>,
     listener: TcpListener,
+    max_conn: usize,
 }
 
 impl HttpServer {
     /// Bind to `addr` (e.g. `127.0.0.1:0` for an ephemeral port).
     pub fn bind(engine: Arc<SolveEngine>, addr: impl ToSocketAddrs) -> Result<HttpServer> {
         let listener = TcpListener::bind(addr).map_err(|e| Error::Http(e.to_string()))?;
-        Ok(HttpServer { engine, listener })
+        Ok(HttpServer { engine, listener, max_conn: 64 })
+    }
+
+    /// Cap the number of concurrently-handled connections (excess → 503).
+    pub fn with_max_conn(mut self, n: usize) -> HttpServer {
+        self.max_conn = n.max(1);
+        self
     }
 
     /// The bound local address (useful after binding to port 0).
@@ -37,13 +53,26 @@ impl HttpServer {
         self.listener.local_addr().map_err(|e| Error::Http(e.to_string()))
     }
 
-    /// Accept and serve connections forever (one thread per connection).
+    /// Accept and serve connections forever. Each connection gets socket
+    /// timeouts (anti-slowloris) and runs on its own thread, with a cap on the
+    /// number of concurrent handlers (excess connections get a 503).
     pub fn serve_forever(&self) {
+        let active = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
-            let Ok(stream) = stream else { continue };
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+
+            if active.load(Ordering::Acquire) >= self.max_conn {
+                let _ = write_json(&mut stream, 503, &json!({"status":"error","message":"server busy"}));
+                continue;
+            }
+            active.fetch_add(1, Ordering::AcqRel);
             let engine = Arc::clone(&self.engine);
+            let active2 = Arc::clone(&active);
             thread::spawn(move || {
                 let _ = handle_connection(stream, &engine);
+                active2.fetch_sub(1, Ordering::AcqRel);
             });
         }
     }
@@ -69,7 +98,9 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                     200,
                     json!({"answer": a.text, "sparql": a.sparql, "values": a.values, "rounds": a.rounds}),
                 ),
-                Err(e) => (200, json!({"status":"error","message": e.to_string()})),
+                // Native endpoint: a real failure is a 500 (proxies/monitoring
+                // can detect it), unlike the gAnswer-compat /gSolve below.
+                Err(e) => (500, json!({"status":"error","message": e.to_string()})),
             },
             None => (400, json!({"status":"error","message":"missing 'question'"})),
         },
@@ -97,27 +128,26 @@ fn question_of(body: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// Read method, path, and (Content-Length) body from an HTTP/1.1 request.
+/// Read method, path, and (Content-Length) body from an HTTP/1.1 request, with
+/// bounded line/body sizes so a malicious client can't exhaust memory.
 fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, String, String)>> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(None);
-    }
+
+    let Some(request_line) = read_line_capped(&mut reader, MAX_LINE)? else {
+        return Ok(None); // empty or over-long
+    };
     let mut parts = request_line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Ok(None);
     };
     let (method, path) = (method.to_string(), target.split('?').next().unwrap_or("/").to_string());
 
-    // Headers → find Content-Length.
+    // Headers → find Content-Length (bounded line length).
     let mut content_length = 0usize;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end();
+        let Some(line) = read_line_capped(&mut reader, MAX_LINE)? else {
+            return Ok(None);
+        };
         if line.is_empty() {
             break;
         }
@@ -128,11 +158,36 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, Strin
         }
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
+    if content_length > MAX_BODY {
+        return Ok(None); // refuse oversized bodies (don't pre-allocate)
     }
+    let mut body = Vec::new();
+    (&mut reader).take(content_length as u64).read_to_end(&mut body)?;
     Ok(Some((method, path, String::from_utf8_lossy(&body).into_owned())))
+}
+
+/// Read one `\n`-terminated line (trailing `\r` stripped), capped at `max`
+/// bytes. Returns `None` on EOF-with-nothing or if the line exceeds `max`.
+fn read_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.len() > max {
+            return Ok(None);
+        }
+    }
+    let s = String::from_utf8_lossy(&buf).trim_end_matches('\r').to_string();
+    Ok(Some(s))
 }
 
 /// Write a JSON response.
@@ -142,6 +197,8 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value) -> std::io::
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let resp = format!(

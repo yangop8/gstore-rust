@@ -15,7 +15,8 @@ fn build_engine(cfg: &Config) -> SolveEngine {
         cfg.anthropic_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
         cfg.anthropic_base_url.clone(),
         cfg.model.clone(),
-    );
+    )
+    .with_timeout(std::time::Duration::from_secs(cfg.timeout_secs));
     let kb = GStoreClient::from_config(cfg);
     SolveEngine::new(Box::new(llm), Box::new(kb))
 }
