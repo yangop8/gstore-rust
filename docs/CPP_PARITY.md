@@ -90,4 +90,11 @@
 > - PFN .so动态插件:改为安全的Rust进程内函数注册表(不做unsafe dlopen ABI耦合)。
 > - JSON-LD输入:**C++亦无**,非差距,跳过(其余RDF格式已超C++)。
 >
-> 剩余(均为深度/运维项,非功能缺口):完全out-of-core的VS-tree流式过滤;集群副本快照增量同步的生产级细节;HTTPS(TLS反代/未来rustls feature);SITree/IVArray/ISArray按用途的块管理器分化(纯内存微优化)。
+> 更新(2026-06-30,**A类接线 + B类深度项**):
+> - A类(实现了但没接线):增量VS-tree已接入`Database`更新路径(不再每次全量重建);有向Louvain(尊重边方向);StringIndex查询加速接线判定为侵入式、暂defer(结构已在)。
+> - B类(最硬深度项):**完全out-of-core VS-tree**(`signature/disk_vstree.rs`:节点落盘+按需流式,查询期只读触达节点)接入磁盘库路径;**整数键IVArray**(`kvstore/ivarray.rs`,稠密定宽);**弹性集群**(`cluster.rs`:Raft config-change动态成员加入/离开 + 分片重平衡数据迁移 + 副本分片容错)。ISArray(字符串键数组)的进一步分化仍按需保留单BTree+overflow(已正确覆盖)。
+> - 测试:默认**578全过**;`--features rocksdb`下lib477+dt_rocksdb4全过;clippy `--all-targets`双feature零告警。
+>
+> **至此对C++的功能差距已基本归零**。剩余仅:HTTPS(TLS反代/未来rustls feature)、ISArray按用途分块的存储微优化、集群副本快照增量同步的生产级硬化、StringIndex接入查询规划——均为深度/运维项,非功能缺口;以及已声明的机制偏离(gRPC线格式 / .so热加载 / 多语言客户端SDK / JSON-LD[C++亦无])。
+>
+> 另:基于`pkumod/gAnswer`源码逆向 + LLM-KBQA调研,产出 `docs/NLQA_DESIGN.md` —— LLM+gStore的自然语言问答系统(gNLQA)设计与开发计划。
