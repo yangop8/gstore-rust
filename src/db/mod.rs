@@ -9,6 +9,8 @@
 //! `vstree.bin` (the signature index). This is the deliberately-simple stand-in
 //! for gStore's on-disk B+ tree KVstore (backlog item A).
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -18,12 +20,17 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::kvstore::DiskStore;
 use crate::model::id::is_entity_id;
-use crate::model::{IdTriple, Triple};
-use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp};
+use crate::model::{IdTriple, Term, Triple};
+use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
 use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::TripleStore;
+
+const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
+const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
+const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 
 const DICT_FILE: &str = "dict.bin";
 const STORE_FILE: &str = "store.bin";
@@ -84,6 +91,34 @@ pub struct Database {
     /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
     /// the inverse of a triple mutation, applied in reverse on rollback.
     txn: Option<Vec<UndoOp>>,
+    /// Cache of read-query results keyed by the SPARQL string (gStore
+    /// `QueryCache`), cleared on any store mutation. Interior mutability so a
+    /// `&self`/`&mut self` query path can read and populate it.
+    query_cache: RefCell<HashMap<String, QueryResult>>,
+}
+
+/// A snapshot of database counts and status (gStore `getDBMonitorInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbStats {
+    pub name: String,
+    pub triple_num: u64,
+    pub entity_num: usize,
+    pub literal_num: usize,
+    pub predicate_num: usize,
+    /// Whether the VS-tree index is consistent with the store.
+    pub index_valid: bool,
+    /// Whether a transaction is currently open.
+    pub in_transaction: bool,
+}
+
+/// Extracted schema vocabulary (gStore `getSchemaInfo`): the classes and
+/// properties mentioned by the data and any RDFS schema.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Schema {
+    /// Class IRIs (rdf:type objects; rdfs:subClassOf operands; domain/range values).
+    pub classes: Vec<String>,
+    /// Property IRIs (predicates used in data; rdfs:subPropertyOf/domain/range subjects).
+    pub properties: Vec<String>,
 }
 
 /// One undo-log entry: the action that reverses a triple mutation.
@@ -105,6 +140,7 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
+            query_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -168,6 +204,73 @@ impl Database {
         &self.store
     }
 
+    /// A snapshot of counts and status (gStore `getDBMonitorInfo`).
+    pub fn stats(&self) -> DbStats {
+        DbStats {
+            name: self.name.clone(),
+            triple_num: self.store.triple_count(),
+            entity_num: self.dict.entity_num(),
+            literal_num: self.dict.literal_num(),
+            predicate_num: self.dict.predicate_num(),
+            index_valid: self.index_valid,
+            in_transaction: self.txn.is_some(),
+        }
+    }
+
+    /// Extract the schema vocabulary — classes and properties — mentioned by the
+    /// data and any RDFS schema triples (gStore `getSchemaInfo`).
+    pub fn schema(&self) -> Schema {
+        let key = |iri: &str| Term::iri(iri).dict_key();
+        let pid = |iri: &str| self.dict.predicate_id(&key(iri));
+
+        // Classes: rdf:type objects; subClassOf operands; domain/range values.
+        let mut class_ids: Vec<u32> = Vec::new();
+        if let Some(tp) = pid(RDF_TYPE) {
+            class_ids.extend(self.store.so_by_p(tp).iter().map(|&(_, o)| o));
+        }
+        if let Some(sco) = pid(RDFS_SUBCLASS) {
+            for &(s, o) in self.store.so_by_p(sco) {
+                class_ids.push(s);
+                class_ids.push(o);
+            }
+        }
+        for iri in [RDFS_DOMAIN, RDFS_RANGE] {
+            if let Some(p) = pid(iri) {
+                class_ids.extend(self.store.so_by_p(p).iter().map(|&(_, c)| c));
+            }
+        }
+        let mut classes: Vec<String> = class_ids
+            .iter()
+            .filter_map(|&id| self.dict.id_to_string(id).map(str::to_owned))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        classes.sort();
+
+        // Properties: predicates used in data; subjects of subProperty/domain/range.
+        let mut props: HashSet<String> = self
+            .store
+            .predicates()
+            .filter_map(|p| self.dict.predicate_to_string(p).map(str::to_owned))
+            .collect();
+        for iri in [RDFS_SUBPROP, RDFS_DOMAIN, RDFS_RANGE] {
+            if let Some(p) = pid(iri) {
+                for &(s, _o) in self.store.so_by_p(p) {
+                    if let Some(name) = self.dict.id_to_string(s) {
+                        props.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+        let mut properties: Vec<String> = props.into_iter().collect();
+        properties.sort();
+
+        Schema {
+            classes,
+            properties,
+        }
+    }
+
     // ---- updates ----------------------------------------------------------
 
     /// Encode a triple to ids, interning any new terms.
@@ -184,6 +287,7 @@ impl Database {
         let changed = self.store.insert(id);
         if changed {
             self.index_valid = false; // VS-tree now stale
+            self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Del(id)); // rollback removes what we added
             }
@@ -205,6 +309,7 @@ impl Database {
         let changed = self.store.remove(id);
         if changed {
             self.index_valid = false;
+            self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Add(id)); // rollback re-adds what we removed
             }
@@ -254,6 +359,7 @@ impl Database {
             }
         }
         self.index_valid = false;
+        self.query_cache.get_mut().clear();
         Ok(())
     }
 
@@ -290,6 +396,7 @@ impl Database {
         let n = crate::reason::materialize(&mut self.dict, &mut self.store);
         if n > 0 {
             self.index_valid = false;
+            self.query_cache.get_mut().clear();
         }
         n
     }
@@ -301,6 +408,11 @@ impl Database {
         let q = sparql::parse(sparql)?;
         match q {
             Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
+                // Serve from the query cache when the same request was already
+                // answered against the current (unchanged) store.
+                if let Some(cached) = self.query_cache.borrow().get(sparql) {
+                    return Ok(cached.clone());
+                }
                 // Use the VS-tree as a candidate filter only while it is
                 // consistent with the store; otherwise evaluate without it.
                 let eval = if self.index_valid {
@@ -308,7 +420,11 @@ impl Database {
                 } else {
                     Evaluator::new(&self.dict, &self.store)
                 };
-                eval.evaluate(&q)
+                let result = eval.evaluate(&q)?;
+                self.query_cache
+                    .borrow_mut()
+                    .insert(sparql.to_string(), result.clone());
+                Ok(result)
             }
             Query::Update(ops) => {
                 let mut changed = 0;
@@ -383,6 +499,7 @@ impl Database {
             }
             self.store = TripleStore::new();
             self.index_valid = false;
+            self.query_cache.get_mut().clear();
         }
         n
     }
@@ -482,6 +599,7 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: false,
             txn: None,
+            query_cache: RefCell::new(HashMap::new()),
         };
         db.rebuild_index();
         Ok(db)
@@ -537,6 +655,7 @@ impl Database {
             vstree,
             index_valid: true,
             txn: None,
+            query_cache: RefCell::new(HashMap::new()),
         })
     }
 }
