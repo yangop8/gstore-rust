@@ -29,6 +29,10 @@ pub struct Answer {
     pub values: Vec<String>,
     /// How many self-repair rounds were spent (0 for the direct path).
     pub rounds: usize,
+    /// Supporting triples grounding the answer (empty if grounding is off).
+    pub citations: Vec<crate::ground::Citation>,
+    /// Optional LLM-phrased natural-language explanation.
+    pub explanation: Option<String>,
 }
 
 /// The QA engine: an LLM front-end + a KB backend.
@@ -66,6 +70,8 @@ impl AskEngine {
             values,
             sparql: Some(sparql),
             rounds: 0,
+            citations: Vec::new(),
+            explanation: None,
         })
     }
 }

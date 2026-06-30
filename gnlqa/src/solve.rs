@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::generate::generate_candidates;
+use crate::ground::{explain, gather_citations};
 use crate::intent::extract_intent;
 use crate::kb::KbClient;
 use crate::link::{LinkKind, Linker};
@@ -62,6 +63,8 @@ pub struct SolveEngine {
     max_rounds: usize,
     sample: usize,
     link_k: usize,
+    cite: bool,
+    explain: bool,
     model: Option<String>,
 }
 
@@ -75,8 +78,20 @@ impl SolveEngine {
             max_rounds: 2,
             sample: 30,
             link_k: 3,
+            cite: true,
+            explain: false,
             model: None,
         }
+    }
+    /// Attach supporting triples to the answer (default on).
+    pub fn with_citations(mut self, on: bool) -> SolveEngine {
+        self.cite = on;
+        self
+    }
+    /// Have the LLM phrase a grounded natural-language answer (default off).
+    pub fn with_explain(mut self, on: bool) -> SolveEngine {
+        self.explain = on;
+        self
     }
     pub fn with_linker(mut self, linker: Linker) -> SolveEngine {
         self.linker = Some(linker);
@@ -173,12 +188,20 @@ impl SolveEngine {
         match best {
             Some(o) => {
                 let values = answer_values(&o.answer);
-                Ok(Answer {
-                    text: render_answer(&o.answer, &values),
-                    values,
-                    sparql: Some(o.sparql),
-                    rounds: o.rounds,
-                })
+                let mut text = render_answer(&o.answer, &values);
+                let citations = if self.cite {
+                    gather_citations(self.kb.as_ref(), &o.answer, 5, 30).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let explanation = if self.explain {
+                    let e = explain(self.llm.as_ref(), question, &text, &citations, &text, model);
+                    text = e.clone();
+                    Some(e)
+                } else {
+                    None
+                };
+                Ok(Answer { text, values, sparql: Some(o.sparql), rounds: o.rounds, citations, explanation })
             }
             None => Err(Error::Sparql("no candidate query produced an answer".into())),
         }

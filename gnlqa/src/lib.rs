@@ -17,6 +17,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod generate;
+pub mod ground;
 pub mod http_server;
 pub mod intent;
 pub mod kb;
@@ -32,6 +33,7 @@ pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
 pub use generate::{generate_candidates, parse_candidates};
+pub use ground::{explain, gather_citations, Citation};
 pub use http_server::HttpServer;
 pub use intent::{
     extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,

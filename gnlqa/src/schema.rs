@@ -14,7 +14,7 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// a query (matches kb.rs's literal-escaping posture). A URI containing
 /// `< > " { } | ^ \` backtick, whitespace, or control chars could otherwise
 /// break out of `<...>` and inject query text.
-fn checked_iri(uri: &str) -> Result<&str> {
+pub(crate) fn checked_iri(uri: &str) -> Result<&str> {
     let bad = uri.is_empty()
         || uri.chars().any(|c| {
             c.is_whitespace()
