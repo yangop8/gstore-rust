@@ -175,6 +175,15 @@ pub enum GraphPattern {
     /// `GRAPH (<iri> | ?g) { … }`: evaluate the inner pattern against a named
     /// graph (or, for a variable, against each named graph, binding it).
     Graph(GraphTerm, Box<GraphPattern>),
+    /// `SERVICE [SILENT] (<iri> | ?svc) { … }`: SPARQL 1.1 federated query — the
+    /// inner pattern is shipped to a remote SPARQL endpoint and its returned
+    /// solutions are joined with the outer ones. `silent` swallows
+    /// connection/parse failures (yielding the identity solution).
+    Service {
+        endpoint: ServiceRef,
+        silent: bool,
+        pattern: Box<GraphPattern>,
+    },
 }
 
 /// The graph reference of a `GRAPH` pattern: a constant IRI or a variable.
@@ -182,6 +191,15 @@ pub enum GraphPattern {
 pub enum GraphTerm {
     Var(String),
     Iri(String),
+}
+
+/// The endpoint reference of a `SERVICE` pattern: a constant IRI or a variable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServiceRef {
+    /// A constant endpoint IRI, e.g. `<http://dbpedia.org/sparql>`.
+    Iri(String),
+    /// A variable endpoint `?svc` (uncommon; resolved per outer solution).
+    Var(String),
 }
 
 impl GraphPattern {
@@ -207,6 +225,7 @@ impl GraphPattern {
                 inner.collect_triples(out)
             }
             GraphPattern::Graph(_, inner) => inner.collect_triples(out),
+            GraphPattern::Service { pattern, .. } => pattern.collect_triples(out),
         }
     }
 
@@ -264,6 +283,14 @@ impl GraphPattern {
                     push(v, out);
                 }
                 inner.collect_vars(out);
+            }
+            GraphPattern::Service {
+                endpoint, pattern, ..
+            } => {
+                if let ServiceRef::Var(v) = endpoint {
+                    push(v, out);
+                }
+                pattern.collect_vars(out);
             }
         }
     }

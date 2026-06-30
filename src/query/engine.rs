@@ -941,7 +941,77 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GraphPattern::SubSelect(sq) => self.eval_subselect(sq, layout),
             GraphPattern::Path(p) => self.eval_path_pattern(p, layout),
             GraphPattern::Graph(g, inner) => self.eval_graph(g, inner, layout),
+            GraphPattern::Service {
+                endpoint,
+                silent,
+                pattern,
+            } => self.eval_service(endpoint, *silent, pattern, layout),
         }
+    }
+
+    /// Evaluate a `SERVICE [SILENT] <iri> { inner }` federated pattern.
+    ///
+    /// The inner pattern is serialized as a `SELECT * WHERE { … }` query, POSTed
+    /// to the remote endpoint over HTTP, and the returned SPARQL-results JSON is
+    /// decoded into bindings over this query's [`VarLayout`] (each returned term
+    /// interned via the shared dictionary/extras so it joins with outer
+    /// solutions). On any failure (variable endpoint, unserializable inner
+    /// pattern, connection or parse error) a non-`SILENT` service yields no
+    /// solutions, while a `SILENT` one yields the single identity solution so the
+    /// outer query still returns.
+    fn eval_service(
+        &self,
+        endpoint: &ServiceRef,
+        silent: bool,
+        inner: &GraphPattern,
+        layout: &VarLayout,
+    ) -> Vec<Binding> {
+        // The identity solution: one all-unbound row (preserves outer bindings
+        // under a join). Returned for SILENT failures.
+        let identity = || vec![vec![None; layout.len()]];
+        let fail = |silent: bool| -> Vec<Binding> {
+            if silent {
+                identity()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Only constant-IRI endpoints are supported; a variable endpoint can't
+        // be resolved without per-solution evaluation (uncommon — see backlog).
+        let url = match endpoint {
+            ServiceRef::Iri(iri) => iri.as_str(),
+            ServiceRef::Var(_) => return fail(silent),
+        };
+
+        // Serialize the inner pattern to a remote SELECT query.
+        let Some(query) = serialize_service_query(inner) else {
+            return fail(silent);
+        };
+
+        // Fetch + parse the remote SPARQL-results JSON.
+        let solutions = match crate::http_client::sparql_post(url, &query)
+            .and_then(|body| crate::http_client::parse_sparql_json(&body))
+        {
+            Ok(sols) => sols,
+            Err(_) => return fail(silent),
+        };
+
+        // Map each returned solution into this query's layout. Variables the
+        // outer layout doesn't know about are ignored; the rest are interned to
+        // ids so they join with outer solutions exactly like local bindings.
+        solutions
+            .into_iter()
+            .map(|row| {
+                let mut b = vec![None; layout.len()];
+                for (var, term) in row {
+                    if let Some(&idx) = layout.index.get(&var) {
+                        b[idx] = Some(self.term_to_id(&term));
+                    }
+                }
+                b
+            })
+            .collect()
     }
 
     /// Build a sub-evaluator over a named graph's store that shares this
@@ -1565,6 +1635,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // Inline VALUES and sub-SELECT are kept intact (rare inside EXISTS).
             GraphPattern::Values(v, r) => GraphPattern::Values(v.clone(), r.clone()),
             GraphPattern::SubSelect(sq) => GraphPattern::SubSelect(sq.clone()),
+            // SERVICE substitutes outer bindings into its inner pattern so the
+            // remote query sees them as constants (its endpoint is unchanged).
+            GraphPattern::Service {
+                endpoint,
+                silent,
+                pattern,
+            } => GraphPattern::Service {
+                endpoint: endpoint.clone(),
+                silent: *silent,
+                pattern: Box::new(self.subst_pattern(pattern, b, layout)),
+            },
         }
     }
 
@@ -2170,4 +2251,56 @@ fn datatype_iri(v: &Value) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// Render a `SERVICE` inner pattern as a remote `SELECT * WHERE { … }` query
+/// string. Supports the BGP subset shipped over federation — basic triple
+/// patterns, conjunctions (`Join`), `UNION`, and empty groups. Returns `None`
+/// for shapes a simple serializer can't faithfully reproduce (paths, OPTIONAL,
+/// FILTER, BIND, VALUES, sub-SELECT, GRAPH, nested SERVICE), so the caller can
+/// fall back gracefully.
+fn serialize_service_query(inner: &GraphPattern) -> Option<String> {
+    let mut body = String::new();
+    serialize_pattern_body(inner, &mut body)?;
+    Some(format!("SELECT * WHERE {{ {body}}}"))
+}
+
+/// Append a graph pattern's surface syntax to `out`; `None` if unsupported.
+fn serialize_pattern_body(gp: &GraphPattern, out: &mut String) -> Option<()> {
+    match gp {
+        GraphPattern::Empty => Some(()),
+        GraphPattern::Bgp(tps) => {
+            for tp in tps {
+                out.push_str(&render_pattern_term(&tp.subject));
+                out.push(' ');
+                out.push_str(&render_pattern_term(&tp.predicate));
+                out.push(' ');
+                out.push_str(&render_pattern_term(&tp.object));
+                out.push_str(" . ");
+            }
+            Some(())
+        }
+        GraphPattern::Join(a, b) => {
+            serialize_pattern_body(a, out)?;
+            serialize_pattern_body(b, out)
+        }
+        GraphPattern::Union(a, b) => {
+            out.push_str("{ ");
+            serialize_pattern_body(a, out)?;
+            out.push_str("} UNION { ");
+            serialize_pattern_body(b, out)?;
+            out.push_str("} ");
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// Render a triple-pattern position as SPARQL: `?var` or its N-Triples term form
+/// (which is itself valid SPARQL for IRIs/literals/blank nodes).
+fn render_pattern_term(pt: &PatternTerm) -> String {
+    match pt {
+        PatternTerm::Var(v) => format!("?{v}"),
+        PatternTerm::Term(t) => t.to_string(),
+    }
 }

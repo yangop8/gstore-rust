@@ -8,7 +8,8 @@
 //! paths (`/ ^ | * + ?`, `!`); solution modifiers (`ORDER BY`/`LIMIT`/`OFFSET`);
 //! `ASK`/`CONSTRUCT`/`DESCRIBE`; and UPDATE (`INSERT/DELETE DATA`,
 //! `DELETE/INSERT … WHERE`, `DELETE WHERE`, `LOAD`, `CLEAR`/`DROP`/`CREATE`,
-//! `;`-separated sequences). Not yet supported: `GRAPH`/`SERVICE` (named graphs).
+//! `;`-separated sequences); named graphs (`GRAPH`); and federated query
+//! (`SERVICE [SILENT] (<iri> | ?var) { … }`).
 
 pub mod ast;
 pub mod lexer;
@@ -418,9 +419,19 @@ impl Parser {
                     current = join_opt(current, GraphPattern::Graph(gterm, Box::new(inner)));
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("SERVICE") => {
-                    return Err(self.err(
-                        "SERVICE (federated query) is not supported — no network access",
-                    ));
+                    self.bump();
+                    flush!();
+                    let silent = self.eat_keyword("SILENT");
+                    let endpoint = self.parse_service_ref()?;
+                    let inner = self.parse_group_graph_pattern()?;
+                    current = join_opt(
+                        current,
+                        GraphPattern::Service {
+                            endpoint,
+                            silent,
+                            pattern: Box::new(inner),
+                        },
+                    );
                 }
                 Token::LBrace => {
                     flush!();
@@ -1279,6 +1290,32 @@ impl Parser {
         }
     }
 
+    /// The endpoint reference of a `SERVICE` pattern: a variable or constant IRI.
+    fn parse_service_ref(&mut self) -> Result<ServiceRef> {
+        match self.peek() {
+            Token::Var(v) => {
+                let v = v.clone();
+                self.bump();
+                Ok(ServiceRef::Var(v))
+            }
+            Token::Iri(_) | Token::PName(_, _) => {
+                let tok = self.peek().clone();
+                match self.token_to_term(&tok)? {
+                    Term::Iri(s) => {
+                        self.bump();
+                        Ok(ServiceRef::Iri(s))
+                    }
+                    other => Err(self.err(format!(
+                        "SERVICE expects an IRI or variable, got {other:?}"
+                    ))),
+                }
+            }
+            other => Err(self.err(format!(
+                "SERVICE expects an IRI or variable, found {other:?}"
+            ))),
+        }
+    }
+
     /// Parse a `{ … }` block of ground quads (no variables): bare triples go to
     /// the default graph; `GRAPH <iri> { … }` blocks tag their triples.
     fn parse_ground_block(&mut self) -> Result<Vec<GroundTriple>> {
@@ -1824,12 +1861,48 @@ mod tests {
     }
 
     #[test]
-    fn service_still_errors() {
-        let e = parse("SELECT * WHERE { SERVICE <http://x> { ?s <p> ?o } }").unwrap_err();
-        match e {
-            GStoreError::SparqlParse(m) => assert!(m.contains("SERVICE")),
-            other => panic!("got {other:?}"),
+    fn service_parses_constant_endpoint() {
+        let q = sel("SELECT * WHERE { SERVICE <http://ex/sparql> { ?s <p> ?o } }");
+        match &q.pattern {
+            GraphPattern::Service {
+                endpoint,
+                silent,
+                pattern,
+            } => {
+                assert_eq!(*endpoint, ServiceRef::Iri("http://ex/sparql".into()));
+                assert!(!silent);
+                assert_eq!(triples(pattern).len(), 1);
+            }
+            other => panic!("expected Service, got {other:?}"),
         }
+        // Variables from the inner pattern are discoverable for SELECT *.
+        assert_eq!(q.result_vars(), vec!["s".to_string(), "o".to_string()]);
+    }
+
+    #[test]
+    fn service_silent_and_variable_endpoint_and_join() {
+        // SILENT flag with a variable endpoint.
+        let q = sel("SELECT * WHERE { ?a <p> ?b SERVICE SILENT ?svc { ?b <q> ?c } }");
+        // The outer BGP joins with the SERVICE node.
+        let mut found = false;
+        fn walk(gp: &GraphPattern, found: &mut bool) {
+            match gp {
+                GraphPattern::Service {
+                    endpoint, silent, ..
+                } => {
+                    assert_eq!(*endpoint, ServiceRef::Var("svc".into()));
+                    assert!(silent);
+                    *found = true;
+                }
+                GraphPattern::Join(a, b) => {
+                    walk(a, found);
+                    walk(b, found);
+                }
+                _ => {}
+            }
+        }
+        walk(&q.pattern, &mut found);
+        assert!(found, "SERVICE node not present in {:?}", q.pattern);
     }
 
     #[test]
