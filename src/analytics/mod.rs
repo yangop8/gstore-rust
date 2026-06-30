@@ -27,7 +27,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
-use crate::store::TripleStore;
+use crate::store::{TripleSource, TripleStore};
 
 // ---------------------------------------------------------------------------
 // Union-find helpers (iterative path-halving + union-by-rank)
@@ -98,10 +98,22 @@ impl GraphView {
     /// differ in predicate, the edge is de-duplicated so each `(s, o)` pair
     /// appears at most once.
     pub fn from_store(store: &TripleStore) -> Self {
-        // Collect raw (sub, obj) pairs from every triple in one pass.
-        let raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)> =
-            store.iter_all().map(|t| (t.sub, t.obj)).collect();
+        Self::from_source(store)
+    }
 
+    /// Build a [`GraphView`] from any [`TripleSource`] (in-memory or on-disk),
+    /// so analytics-backed SPARQL built-ins can run over whatever store the
+    /// query engine currently holds.
+    pub fn from_source<S: TripleSource>(store: &S) -> Self {
+        // Collect raw (sub, obj) pairs from every triple in one pass. The trait
+        // `iter_all` returns an owned Vec (vs `TripleStore`'s inherent iterator).
+        let raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)> =
+            store.iter_all().into_iter().map(|t| (t.sub, t.obj)).collect();
+        Self::from_raw_pairs(raw_pairs)
+    }
+
+    /// Assemble the CSR adjacency from raw `(subject, object)` pairs.
+    fn from_raw_pairs(raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)>) -> Self {
         // 1. Build sorted, de-duplicated node list.
         let mut id_set: Vec<EntityLiteralId> =
             raw_pairs.iter().flat_map(|&(s, o)| [s, o]).collect();
@@ -297,6 +309,75 @@ impl GraphView {
         path.push(self.nodes[src_i]);
         path.reverse();
         Some(path)
+    }
+
+    // ---- thin wrappers backing the gStore graph SPARQL built-ins ----------
+
+    /// Length (in edges) of the shortest directed path `src ⇝ dst`, backing the
+    /// `SHORTESTPATHLEN` built-in. `Some(0)` when `src == dst`; `None` when
+    /// either node is absent or no directed path exists.
+    pub fn shortest_path_len(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+    ) -> Option<usize> {
+        self.shortest_path(src, dst).map(|p| p.len() - 1)
+    }
+
+    /// Whether `dst` is reachable from `src` within `max_hops` directed edges,
+    /// backing the `KHOPREACHABLE` built-in. A node always reaches itself
+    /// (0 hops). `None` when either node is absent.
+    pub fn khop_reachable(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        max_hops: u32,
+    ) -> Option<bool> {
+        let src_i = *self.id_to_idx.get(&src)?;
+        let dst_i = *self.id_to_idx.get(&dst)?;
+        if src_i == dst_i {
+            return Some(true);
+        }
+        let n = self.nodes.len();
+        let mut dist = vec![u32::MAX; n];
+        dist[src_i] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(src_i);
+        while let Some(u) = queue.pop_front() {
+            let d = dist[u];
+            if d >= max_hops {
+                continue; // budget exhausted — do not expand further
+            }
+            for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                if dist[v] == u32::MAX {
+                    if v == dst_i {
+                        return Some(true);
+                    }
+                    dist[v] = d + 1;
+                    queue.push_back(v);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    /// Whether the directed graph contains any cycle, backing the
+    /// `CYCLEBOOLEAN` / `SIMPLECYCLEBOOLEAN` built-ins. True iff some strongly
+    /// connected component spans more than one node, or any node has a
+    /// self-loop edge (`x → x`).
+    pub fn has_cycle(&self) -> bool {
+        // A self-loop is a one-node cycle that Tarjan leaves as a singleton SCC.
+        for (i, _) in self.nodes.iter().enumerate() {
+            if self.out_adj[self.out_ptr[i]..self.out_ptr[i + 1]].contains(&i) {
+                return true;
+            }
+        }
+        let (comp_map, num_comp) = self.strongly_connected_components();
+        let mut sizes = vec![0usize; num_comp];
+        for &c in comp_map.values() {
+            sizes[c] += 1;
+        }
+        sizes.iter().any(|&s| s > 1)
     }
 
     // ---- Weakly connected components --------------------------------------
@@ -1845,6 +1926,56 @@ mod tests {
 
         // No reverse-direction path (directed graph).
         assert!(g.shortest_path(13, 10).is_none());
+    }
+
+    #[test]
+    fn test_shortest_path_len_wrapper() {
+        let g = GraphView::from_store(&make_store());
+        assert_eq!(g.shortest_path_len(10, 13), Some(3));
+        assert_eq!(g.shortest_path_len(10, 10), Some(0));
+        assert_eq!(g.shortest_path_len(10, 20), None); // disconnected
+        assert_eq!(g.shortest_path_len(999, 10), None); // absent node
+    }
+
+    #[test]
+    fn test_khop_reachable_wrapper() {
+        let g = GraphView::from_store(&make_store());
+        // 10 → 13 is 3 hops away.
+        assert_eq!(g.khop_reachable(10, 13, 3), Some(true));
+        assert_eq!(g.khop_reachable(10, 13, 2), Some(false)); // budget too small
+        assert_eq!(g.khop_reachable(10, 10, 0), Some(true)); // self is 0 hops
+        assert_eq!(g.khop_reachable(10, 20, 99), Some(false)); // disconnected
+        assert_eq!(g.khop_reachable(10, 999, 5), None); // absent node
+    }
+
+    #[test]
+    fn test_has_cycle_wrapper() {
+        // Full graph has a 3-cycle (triangle) and a self-loop ⇒ cyclic.
+        let g = GraphView::from_store(&make_store());
+        assert!(g.has_cycle());
+
+        // A pure DAG (just the path component) is acyclic.
+        let mut dag = TripleStore::new();
+        dag.insert(IdTriple::new(1, 9, 2));
+        dag.insert(IdTriple::new(2, 9, 3));
+        dag.insert(IdTriple::new(1, 9, 3));
+        assert!(!GraphView::from_store(&dag).has_cycle());
+
+        // A lone self-loop is a cycle.
+        let mut loopy = TripleStore::new();
+        loopy.insert(IdTriple::new(7, 9, 7));
+        assert!(GraphView::from_store(&loopy).has_cycle());
+    }
+
+    #[test]
+    fn test_from_source_matches_from_store() {
+        // `from_source` (generic over TripleSource) and `from_store` build the
+        // same view: TripleStore is itself a TripleSource.
+        let store = make_store();
+        let a = GraphView::from_store(&store);
+        let b = GraphView::from_source(&store);
+        assert_eq!(a.node_count(), b.node_count());
+        assert_eq!(a.edge_count(), b.edge_count());
     }
 
     #[test]

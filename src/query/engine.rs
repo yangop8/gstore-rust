@@ -13,9 +13,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
+use crate::analytics::GraphView;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::PredId;
@@ -26,9 +29,15 @@ use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
+use super::hash;
 use super::optimizer::{self, ExecPlan, JoinTree};
 use super::results::{QueryResult, ResultSet};
-use super::value::{order_key, Value};
+use super::value::{format_xsd_datetime_utc, order_key, parse_datetime_parts, DateTimeParts, Value};
+
+/// `xsd:dateTime`, the datatype produced by `NOW()`.
+const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+/// `xsd:dayTimeDuration`, the datatype produced by `TIMEZONE()`.
+const XSD_DAYTIMEDURATION: &str = "http://www.w3.org/2001/XMLSchema#dayTimeDuration";
 
 /// A partial/complete solution: `var index → bound id` (None = unbound).
 type Binding = Vec<Option<u32>>;
@@ -165,6 +174,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// e.g. a BGP repeated across sub-SELECTs — reuse the DP-optimized plan
     /// instead of re-running plan enumeration. Keyed by the compiled patterns.
     plan_cache: std::cell::RefCell<HashMap<u64, ExecPlan>>,
+    /// Lazily-built CSR adjacency view, shared across rows so the graph
+    /// built-ins (`SHORTESTPATHLEN`, `KHOPREACHABLE`, `CYCLEBOOLEAN`, …) pay the
+    /// O(E) build cost once per query rather than once per solution.
+    graph_cache: std::cell::RefCell<Option<Rc<GraphView>>>,
 }
 
 impl<'a, S: TripleSource> Evaluator<'a, S> {
@@ -176,6 +189,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
+            graph_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -192,6 +206,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
+            graph_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1036,6 +1051,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             named: Some(named),
             extras: Rc::clone(&self.extras),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
+            graph_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1851,8 +1867,229 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let re = Regex::new(&pat).ok()?;
                 Some(Value::Bool(re.is_match(&text)))
             }
+
+            // ---- strings (SPARQL 1.1) ------------------------------------
+            "SUBSTR" => {
+                let src = self.eval_value(args.first()?, b, l)?;
+                let (s, lang) = str_and_lang(&src);
+                let chars: Vec<char> = s.chars().collect();
+                let total = chars.len() as i64;
+                let start = self.eval_value(args.get(1)?, b, l)?.as_f64()?.round() as i64;
+                // XPath fn:substring semantics: keep 1-based positions `p` with
+                // start <= p < start+length (length defaults to the rest).
+                let end = match args.get(2) {
+                    Some(e) => start + self.eval_value(e, b, l)?.as_f64()?.round() as i64,
+                    None => total + 1,
+                };
+                let from = (start.max(1) - 1).min(total) as usize;
+                let to = (end.max(1) - 1).clamp(0, total) as usize;
+                let value = if to > from {
+                    chars[from..to].iter().collect()
+                } else {
+                    String::new()
+                };
+                Some(Value::Str { value, lang })
+            }
+            "REPLACE" => {
+                let src = self.eval_value(args.first()?, b, l)?;
+                let (text, lang) = str_and_lang(&src);
+                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
+                let rep = self.eval_value(args.get(2)?, b, l)?.lexical();
+                let flags = match args.get(3) {
+                    Some(a) => self.eval_value(a, b, l)?.lexical(),
+                    None => String::new(),
+                };
+                let pat = if flags.contains('i') {
+                    format!("(?i){pat}")
+                } else {
+                    pat
+                };
+                let re = Regex::new(&pat).ok()?;
+                Some(Value::Str {
+                    value: re.replace_all(&text, rep.as_str()).into_owned(),
+                    lang,
+                })
+            }
+            "ENCODE_FOR_URI" => {
+                let s = self.eval_value(args.first()?, b, l)?.lexical();
+                Some(Value::Str {
+                    value: encode_for_uri(&s),
+                    lang: None,
+                })
+            }
+            "STRLANG" => {
+                let s = self.eval_value(args.first()?, b, l)?.lexical();
+                let lang = self.eval_value(args.get(1)?, b, l)?.lexical();
+                Some(Value::Str {
+                    value: s,
+                    lang: Some(lang),
+                })
+            }
+            "STRDT" => {
+                let s = self.eval_value(args.first()?, b, l)?.lexical();
+                let dt = match self.eval_value(args.get(1)?, b, l)? {
+                    Value::Iri(iri) => iri,
+                    other => other.lexical(),
+                };
+                Some(Value::from_term(&Term::Literal {
+                    value: s,
+                    datatype: Some(dt),
+                    lang: None,
+                }))
+            }
+            "LANGMATCHES" => {
+                let tag = self.eval_value(args.first()?, b, l)?.lexical();
+                let range = self.eval_value(args.get(1)?, b, l)?.lexical();
+                Some(Value::Bool(lang_matches(&tag, &range)))
+            }
+            "SIMILARITY" => {
+                let x = self.eval_value(args.first()?, b, l)?.lexical();
+                let y = self.eval_value(args.get(1)?, b, l)?.lexical();
+                Some(Value::Double(jaro_similarity(&x, &y)))
+            }
+
+            // ---- numeric -------------------------------------------------
+            "RAND" => Some(Value::Double(next_rand())),
+
+            // ---- date / time ---------------------------------------------
+            "NOW" => Some(Value::Typed {
+                value: format_xsd_datetime_utc(now_unix_secs()),
+                datatype: XSD_DATETIME.to_string(),
+            }),
+            "YEAR" => self.datetime_field(args, b, l, |p| p.year),
+            "MONTH" => self.datetime_field(args, b, l, |p| p.month),
+            "DAY" => self.datetime_field(args, b, l, |p| p.day),
+            "HOURS" => self.datetime_field(args, b, l, |p| p.hour),
+            "MINUTES" => self.datetime_field(args, b, l, |p| p.minute),
+            "SECONDS" => {
+                let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;
+                if p.frac == 0.0 {
+                    Some(Value::Int(p.second))
+                } else {
+                    Some(Value::Double(p.second as f64 + p.frac))
+                }
+            }
+            "TIMEZONE" => {
+                let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;
+                // No timezone ⇒ error (per SPARQL); excludes the solution.
+                let off = p.tz_offset_secs?;
+                Some(Value::Typed {
+                    value: day_time_duration(off),
+                    datatype: XSD_DAYTIMEDURATION.to_string(),
+                })
+            }
+            "TZ" => {
+                let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;
+                let value = match p.tz_offset_secs {
+                    None => String::new(),
+                    Some(0) => "Z".to_string(),
+                    Some(off) => format_tz(off),
+                };
+                Some(Value::Str { value, lang: None })
+            }
+
+            // ---- constructors / terms ------------------------------------
+            "IRI" | "URI" => match self.eval_value(args.first()?, b, l)? {
+                Value::Iri(s) => Some(Value::Iri(s)),
+                other => Some(Value::Iri(other.lexical())),
+            },
+            "BNODE" => {
+                let label = match args.first() {
+                    Some(a) => format!("b{:016x}", fnv1a(&self.eval_value(a, b, l)?.lexical())),
+                    None => format!("b{}", next_bnode_id()),
+                };
+                Some(Value::Blank(label))
+            }
+            "UUID" => Some(Value::Iri(format!("urn:uuid:{}", gen_uuid()))),
+            "STRUUID" => Some(Value::Str {
+                value: gen_uuid(),
+                lang: None,
+            }),
+            "IF" => {
+                if args.len() != 3 {
+                    return None;
+                }
+                if self.eval_ebv(&args[0], b, l)? {
+                    self.eval_value(&args[1], b, l)
+                } else {
+                    self.eval_value(&args[2], b, l)
+                }
+            }
+
+            // ---- hashing -------------------------------------------------
+            "MD5" => self.hash1(args, b, l, hash::md5_hex),
+            "SHA1" => self.hash1(args, b, l, hash::sha1_hex),
+            "SHA256" => self.hash1(args, b, l, hash::sha256_hex),
+            "SHA384" => self.hash1(args, b, l, hash::sha384_hex),
+            "SHA512" => self.hash1(args, b, l, hash::sha512_hex),
+
+            // ---- gStore graph built-ins ----------------------------------
+            "CYCLEBOOLEAN" | "SIMPLECYCLEBOOLEAN" => {
+                Some(Value::Bool(self.graph_view().has_cycle()))
+            }
+            "SHORTESTPATHLEN" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                let len = self.graph_view().shortest_path_len(a, c);
+                // Unreachable ⇒ -1 sentinel (documented), reachable ⇒ #edges.
+                Some(Value::Int(len.map(|x| x as i64).unwrap_or(-1)))
+            }
+            "KHOPREACHABLE" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                let kf = self.eval_value(args.get(2)?, b, l)?.as_f64()?;
+                let k = if kf < 0.0 { u32::MAX } else { kf as u32 };
+                Some(Value::Bool(
+                    self.graph_view().khop_reachable(a, c, k).unwrap_or(false),
+                ))
+            }
+
             _ => None, // unimplemented builtin ⇒ error (excludes the solution)
         }
+    }
+
+    /// Resolve a graph built-in node argument to its dictionary entity id.
+    /// `None` when the term is not in the store (so it cannot be a graph node).
+    fn node_id(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<u32> {
+        let v = self.eval_value(e, b, l)?;
+        self.dict.term_id(&value_to_term(&v))
+    }
+
+    /// The lazily-built, query-scoped CSR adjacency view backing graph built-ins.
+    fn graph_view(&self) -> Rc<GraphView> {
+        if let Some(g) = self.graph_cache.borrow().as_ref() {
+            return Rc::clone(g);
+        }
+        let g = Rc::new(GraphView::from_source(self.store));
+        *self.graph_cache.borrow_mut() = Some(Rc::clone(&g));
+        g
+    }
+
+    /// Extract an integer field from an `xsd:dateTime` argument.
+    fn datetime_field(
+        &self,
+        args: &[Expr],
+        b: &Binding,
+        l: &VarLayout,
+        f: impl Fn(&DateTimeParts) -> i64,
+    ) -> Option<Value> {
+        let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;
+        Some(Value::Int(f(&p)))
+    }
+
+    /// Hash an argument's lexical form to a lowercase-hex string literal.
+    fn hash1(
+        &self,
+        args: &[Expr],
+        b: &Binding,
+        l: &VarLayout,
+        f: impl Fn(&str) -> String,
+    ) -> Option<Value> {
+        let s = self.eval_value(args.first()?, b, l)?.lexical();
+        Some(Value::Str {
+            value: f(&s),
+            lang: None,
+        })
     }
 
     fn str1(
@@ -1953,6 +2190,205 @@ fn value_to_term(v: &Value) -> Term {
             lang: None,
         },
     }
+}
+
+/// A value's lexical form plus its language tag (preserved by `SUBSTR`/`REPLACE`
+/// when the input is a language-tagged string literal).
+fn str_and_lang(v: &Value) -> (String, Option<String>) {
+    match v {
+        Value::Str { value, lang } => (value.clone(), lang.clone()),
+        other => (other.lexical(), None),
+    }
+}
+
+/// Percent-encode a string for `ENCODE_FOR_URI`: every byte except the URI
+/// unreserved set (`A-Z a-z 0-9 - _ . ~`) becomes `%XX` (uppercase hex).
+fn encode_for_uri(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        let unreserved = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// RFC 4647 basic language-range matching for `LANGMATCHES`. Range `"*"` matches
+/// any non-empty tag; otherwise a case-insensitive equality or `range-` prefix.
+fn lang_matches(tag: &str, range: &str) -> bool {
+    if range == "*" {
+        return !tag.is_empty();
+    }
+    if tag.eq_ignore_ascii_case(range) {
+        return true;
+    }
+    let tag = tag.to_ascii_lowercase();
+    let range = range.to_ascii_lowercase();
+    tag.starts_with(&format!("{range}-"))
+}
+
+/// Format a timezone offset (seconds east of UTC) as `±HH:MM` for `TZ`.
+fn format_tz(off: i64) -> String {
+    let sign = if off < 0 { '-' } else { '+' };
+    let a = off.abs();
+    format!("{}{:02}:{:02}", sign, a / 3600, (a % 3600) / 60)
+}
+
+/// Format a timezone offset (seconds east of UTC) as an `xsd:dayTimeDuration`
+/// lexical (`PT0S`, `-PT5H`, `PT1H30M`, …) for `TIMEZONE`.
+fn day_time_duration(off: i64) -> String {
+    if off == 0 {
+        return "PT0S".to_string();
+    }
+    let sign = if off < 0 { "-" } else { "" };
+    let a = off.abs();
+    let (h, m) = (a / 3600, (a % 3600) / 60);
+    let mut s = format!("{sign}PT");
+    if h > 0 {
+        s.push_str(&format!("{h}H"));
+    }
+    if m > 0 {
+        s.push_str(&format!("{m}M"));
+    }
+    s
+}
+
+/// Current wall-clock time as whole seconds since the Unix epoch (UTC).
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 64-bit FNV-1a hash — a stable label source for `BNODE("x")`.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &byte in s.as_bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Monotonic counter for argument-less `BNODE()` labels.
+static BNODE_COUNTER: AtomicU64 = AtomicU64::new(0);
+fn next_bnode_id() -> u64 {
+    BNODE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// State for a tiny non-cryptographic PRNG (xorshift64*) backing `RAND`, `UUID`,
+/// and `STRUUID`. Seeded lazily from the system clock. NOT suitable for any
+/// security purpose — it exists only so these built-ins return varied values.
+static RNG_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn rng_next_u64() -> u64 {
+    let mut s = RNG_STATE.load(AtomicOrdering::Relaxed);
+    if s == 0 {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        s = seed | 1; // never zero
+    }
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    RNG_STATE.store(s, AtomicOrdering::Relaxed);
+    s.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+/// A pseudo-random double in `[0, 1)` for `RAND` (non-cryptographic).
+fn next_rand() -> f64 {
+    // 53 significant bits → uniform in [0, 1).
+    (rng_next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+/// Generate a random (version-4-shaped) UUID string for `UUID`/`STRUUID`. The
+/// randomness is the non-cryptographic PRNG above, so this is a convenience
+/// identifier, not a guaranteed-unique or secure UUID.
+fn gen_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&rng_next_u64().to_le_bytes());
+    bytes[8..].copy_from_slice(&rng_next_u64().to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h = |b: u8| format!("{b:02x}");
+    format!(
+        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+        h(bytes[0]), h(bytes[1]), h(bytes[2]), h(bytes[3]),
+        h(bytes[4]), h(bytes[5]), h(bytes[6]), h(bytes[7]),
+        h(bytes[8]), h(bytes[9]), h(bytes[10]), h(bytes[11]),
+        h(bytes[12]), h(bytes[13]), h(bytes[14]), h(bytes[15]),
+    )
+}
+
+/// Jaro string similarity in `[0, 1]`, backing the gStore `SIMILARITY` built-in
+/// (ported from `TempResult::doSimilarity`, including its equal/empty/substring
+/// short-cuts so results track the C++ engine).
+fn jaro_similarity(s: &str, t: &str) -> f64 {
+    if s == t {
+        return 1.0;
+    }
+    let sb: Vec<char> = s.chars().collect();
+    let tb: Vec<char> = t.chars().collect();
+    let (s_len, t_len) = (sb.len(), tb.len());
+    if s_len == 0 || t_len == 0 {
+        return 0.0;
+    }
+    if s_len < t_len {
+        return jaro_similarity(t, s); // keep `s` the longer string
+    }
+    if s.contains(t) {
+        return (t_len as f64 / s_len as f64 + 2.0) / 3.0;
+    }
+    let match_dist = t_len as i64 / 2 - 1; // gStore's window: floor(t_len/2) - 1
+    let mut s_match = vec![false; s_len];
+    let mut t_match = vec![false; t_len];
+    let mut m = 0usize;
+    for (i, &sc) in sb.iter().enumerate() {
+        let lo = (i as i64 - match_dist).max(0) as usize;
+        let hi = ((i as i64 + match_dist).min(t_len as i64 - 1)).max(-1);
+        if hi < 0 {
+            continue;
+        }
+        for j in lo..=(hi as usize) {
+            if !t_match[j] && sc == tb[j] {
+                s_match[i] = true;
+                t_match[j] = true;
+                m += 1;
+                break;
+            }
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    let mut k = 0usize;
+    let mut trans = 0usize;
+    for (i, &matched) in s_match.iter().enumerate() {
+        if matched {
+            while k < t_len && !t_match[k] {
+                k += 1;
+            }
+            if k < t_len {
+                if sb[i] != tb[k] {
+                    trans += 1;
+                }
+                k += 1;
+            }
+        }
+    }
+    let trans = (trans / 2) as f64;
+    let m = m as f64;
+    (m / s_len as f64 + m / t_len as f64 + (m - trans) / m) / 3.0
 }
 
 /// Compare two values with a SPARQL relational operator.
@@ -2331,5 +2767,298 @@ fn render_pattern_term(pt: &PatternTerm) -> String {
     match pt {
         PatternTerm::Var(v) => format!("?{v}"),
         PatternTerm::Term(t) => t.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::parser::sparql::parse;
+
+    const DT: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+    /// An `xsd:dateTime` literal in SPARQL surface syntax, used as a constant in
+    /// the date-accessor tests (2011-01-10 14:45:13.815, UTC-5).
+    const DTL: &str =
+        "\"2011-01-10T14:45:13.815-05:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+
+    /// Path `a→b→c→d` (acyclic) with `a name "Hello World"` and `a born <dt>`;
+    /// when `cyclic`, add `d→a` to close the loop.
+    fn fixture(cyclic: bool) -> (Dictionary, TripleStore) {
+        let mut d = Dictionary::new();
+        let a = d.intern_term(&Term::iri("http://ex/a"));
+        let b = d.intern_term(&Term::iri("http://ex/b"));
+        let c = d.intern_term(&Term::iri("http://ex/c"));
+        let dd = d.intern_term(&Term::iri("http://ex/d"));
+        let p = d.intern_predicate(&Term::iri("http://ex/p").dict_key());
+        let name = d.intern_predicate(&Term::iri("http://ex/name").dict_key());
+        let born = d.intern_predicate(&Term::iri("http://ex/born").dict_key());
+        let hello = d.intern_term(&Term::plain_literal("Hello World"));
+        let dtv = d.intern_term(&Term::typed_literal("2011-01-10T14:45:13.815-05:00", DT));
+        let mut s = TripleStore::new();
+        let mut triples = vec![
+            IdTriple::new(a, p, b),
+            IdTriple::new(b, p, c),
+            IdTriple::new(c, p, dd),
+            IdTriple::new(a, name, hello),
+            IdTriple::new(a, born, dtv),
+        ];
+        if cyclic {
+            triples.push(IdTriple::new(dd, p, a));
+        }
+        s.bulk_load(triples);
+        (d, s)
+    }
+
+    /// Evaluate `(expr AS ?r)` over a one-row pattern; return the rendered cell.
+    fn scalar(expr: &str) -> String {
+        scalar_on(false, expr)
+    }
+
+    fn scalar_on(cyclic: bool, expr: &str) -> String {
+        let (d, s) = fixture(cyclic);
+        let q = format!("SELECT ({expr} AS ?r) WHERE {{ <http://ex/a> <http://ex/name> ?n }}");
+        let parsed = parse(&q).unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&parsed).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 1, "expected one row evaluating `{expr}`");
+        rs.rows[0][0]
+            .clone()
+            .unwrap_or_else(|| panic!("`{expr}` produced an unbound result"))
+    }
+
+    /// The lexical value inside a rendered literal `"value"^^<dt>` / `"value"@l`.
+    fn lit(rendered: &str) -> String {
+        let body = rendered.strip_prefix('"').unwrap_or(rendered);
+        match body.find('"') {
+            Some(i) => body[..i].to_string(),
+            None => body.to_string(),
+        }
+    }
+
+    /// How many solutions a WHERE pattern (with FILTERs) yields.
+    fn count(where_clause: &str) -> usize {
+        let (d, s) = fixture(false);
+        let q = format!("SELECT * WHERE {{ {where_clause} }}");
+        let parsed = parse(&q).unwrap();
+        match Evaluator::new(&d, &s).evaluate(&parsed).unwrap() {
+            QueryResult::Select(rs) => rs.row_count(),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    // ---- string functions -------------------------------------------------
+
+    #[test]
+    fn substr_one_and_two_arg() {
+        assert_eq!(scalar(r#"SUBSTR("foobar", 4)"#), r#""bar""#);
+        assert_eq!(scalar(r#"SUBSTR("foobar", 4, 2)"#), r#""ba""#);
+        // XPath edge cases: start < 1 and over-long length clamp.
+        assert_eq!(scalar(r#"SUBSTR("metadata", 4, 3)"#), r#""ada""#);
+        assert_eq!(scalar(r#"SUBSTR("abc", -2, 4)"#), r#""a""#);
+        // language tag is preserved.
+        assert_eq!(scalar(r#"SUBSTR("chat"@fr, 1, 2)"#), r#""ch"@fr"#);
+    }
+
+    #[test]
+    fn replace_plain_and_regex() {
+        assert_eq!(scalar(r#"REPLACE("abcabc", "b", "X")"#), r#""aXcaXc""#);
+        assert_eq!(scalar(r#"REPLACE("Hello", "[aeiou]", "_", "i")"#), r#""H_ll_""#);
+        // group reference $1.
+        assert_eq!(
+            scalar(r#"REPLACE("2024-06-30", "(\\d+)-(\\d+)-(\\d+)", "$3/$2/$1")"#),
+            r#""30/06/2024""#
+        );
+    }
+
+    #[test]
+    fn encode_for_uri_percent_encodes() {
+        assert_eq!(scalar(r#"ENCODE_FOR_URI("a b/c?")"#), r#""a%20b%2Fc%3F""#);
+        assert_eq!(scalar(r#"ENCODE_FOR_URI("keep-_.~")"#), r#""keep-_.~""#);
+    }
+
+    #[test]
+    fn strlang_and_strdt() {
+        assert_eq!(scalar(r#"STRLANG("chat", "en")"#), r#""chat"@en"#);
+        assert_eq!(
+            scalar(r#"STRDT("42", <http://www.w3.org/2001/XMLSchema#integer>)"#),
+            r#""42"^^<http://www.w3.org/2001/XMLSchema#integer>"#
+        );
+    }
+
+    #[test]
+    fn langmatches_basic_ranges() {
+        assert_eq!(lit(&scalar(r#"LANGMATCHES("en-US", "en")"#)), "true");
+        assert_eq!(lit(&scalar(r#"LANGMATCHES("EN", "en")"#)), "true");
+        assert_eq!(lit(&scalar(r#"LANGMATCHES("fr", "en")"#)), "false");
+        assert_eq!(lit(&scalar(r#"LANGMATCHES("en", "*")"#)), "true");
+        assert_eq!(lit(&scalar(r#"LANGMATCHES("", "*")"#)), "false");
+    }
+
+    #[test]
+    fn similarity_jaro() {
+        assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
+        assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "xyz")"#)), "0.0");
+        // "abc" is a substring of "abcdef": (3/6 + 2)/3 = 0.8333…
+        let sub: f64 = lit(&scalar(r#"SIMILARITY("abcdef", "abc")"#)).parse().unwrap();
+        assert!((sub - 0.833_333).abs() < 1e-4, "got {sub}");
+    }
+
+    // ---- numeric ----------------------------------------------------------
+
+    #[test]
+    fn rand_in_unit_interval() {
+        for _ in 0..20 {
+            let r: f64 = lit(&scalar("RAND()")).parse().unwrap();
+            assert!((0.0..1.0).contains(&r), "RAND() out of range: {r}");
+        }
+    }
+
+    // ---- date / time ------------------------------------------------------
+
+    #[test]
+    fn datetime_accessors() {
+        assert_eq!(
+            scalar(&format!("YEAR({DTL})")),
+            r#""2011"^^<http://www.w3.org/2001/XMLSchema#integer>"#
+        );
+        assert_eq!(lit(&scalar(&format!("MONTH({DTL})"))), "1");
+        assert_eq!(lit(&scalar(&format!("DAY({DTL})"))), "10");
+        assert_eq!(lit(&scalar(&format!("HOURS({DTL})"))), "14");
+        assert_eq!(lit(&scalar(&format!("MINUTES({DTL})"))), "45");
+        // fractional seconds → xsd:double
+        assert_eq!(lit(&scalar(&format!("SECONDS({DTL})"))), "13.815");
+    }
+
+    #[test]
+    fn timezone_and_tz() {
+        assert_eq!(
+            scalar(&format!("TIMEZONE({DTL})")),
+            r#""-PT5H"^^<http://www.w3.org/2001/XMLSchema#dayTimeDuration>"#
+        );
+        assert_eq!(scalar(&format!("TZ({DTL})")), r#""-05:00""#);
+        // A zoneless dateTime has an empty TZ.
+        assert_eq!(
+            scalar(r#"TZ("2020-01-01T00:00:00"^^<http://www.w3.org/2001/XMLSchema#dateTime>)"#),
+            r#""""#
+        );
+    }
+
+    #[test]
+    fn now_returns_a_recent_datetime() {
+        let year: i64 = lit(&scalar("YEAR(NOW())")).parse().unwrap();
+        assert!(year >= 2020, "NOW() year looks wrong: {year}");
+    }
+
+    // ---- constructors / terms --------------------------------------------
+
+    #[test]
+    fn iri_and_uri_constructors() {
+        assert_eq!(scalar(r#"IRI("http://ex/z")"#), "<http://ex/z>");
+        assert_eq!(scalar(r#"URI("http://ex/z")"#), "<http://ex/z>");
+        // IRI of an IRI is the IRI unchanged.
+        assert_eq!(scalar("IRI(<http://ex/q>)"), "<http://ex/q>");
+    }
+
+    #[test]
+    fn bnode_uuid_struuid_shapes() {
+        assert!(scalar("BNODE()").starts_with("_:"));
+        assert!(scalar(r#"BNODE("seed")"#).starts_with("_:b"));
+        let uuid = scalar("UUID()");
+        assert!(uuid.starts_with("<urn:uuid:") && uuid.ends_with('>'), "{uuid}");
+        let struuid = lit(&scalar("STRUUID()"));
+        assert_eq!(struuid.len(), 36);
+        assert_eq!(struuid.matches('-').count(), 4);
+        // version-4 nibble.
+        assert_eq!(&struuid[14..15], "4");
+    }
+
+    // ---- hashing ----------------------------------------------------------
+
+    #[test]
+    fn hash_builtins_match_known_vectors() {
+        assert_eq!(lit(&scalar(r#"MD5("abc")"#)), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            lit(&scalar(r#"SHA1("abc")"#)),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            lit(&scalar(r#"SHA256("abc")"#)),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(lit(&scalar(r#"SHA384("abc")"#)).len(), 96);
+        assert_eq!(lit(&scalar(r#"SHA512("abc")"#)).len(), 128);
+    }
+
+    // ---- IF ---------------------------------------------------------------
+
+    #[test]
+    fn if_selects_branch_lazily() {
+        assert_eq!(scalar(r#"IF(2 > 1, "yes", "no")"#), r#""yes""#);
+        assert_eq!(scalar(r#"IF(2 < 1, "yes", "no")"#), r#""no""#);
+        // The untaken branch is not evaluated, so its error does not propagate.
+        assert_eq!(scalar(r#"IF(2 > 1, "ok", 1/0)"#), r#""ok""#);
+    }
+
+    // ---- FILTER integration ----------------------------------------------
+
+    #[test]
+    fn new_builtins_work_inside_filter() {
+        assert_eq!(
+            count(r#"<http://ex/a> <http://ex/name> ?n FILTER(STRSTARTS(SUBSTR(?n,1,5), "Hello"))"#),
+            1
+        );
+        assert_eq!(
+            count(r#"<http://ex/a> <http://ex/name> ?n FILTER(LANGMATCHES("en", "*") && IF(1>0, true, false))"#),
+            1
+        );
+        assert_eq!(
+            count(r#"<http://ex/a> <http://ex/name> ?n FILTER(SIMILARITY(?n, "zzz") > 0.9)"#),
+            0
+        );
+    }
+
+    // ---- gStore graph built-ins ------------------------------------------
+
+    #[test]
+    fn cycleboolean_detects_directed_cycle() {
+        assert_eq!(lit(&scalar_on(false, "CYCLEBOOLEAN()")), "false");
+        assert_eq!(lit(&scalar_on(true, "CYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(true, "SIMPLECYCLEBOOLEAN()")), "true");
+    }
+
+    #[test]
+    fn shortestpathlen_counts_edges() {
+        assert_eq!(
+            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
+            "3"
+        );
+        assert_eq!(
+            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
+            "0"
+        );
+        // d→a is unreachable in the acyclic graph ⇒ -1 sentinel.
+        assert_eq!(
+            lit(&scalar("SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
+            "-1"
+        );
+    }
+
+    #[test]
+    fn khopreachable_respects_budget() {
+        assert_eq!(
+            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
+            "true"
+        );
+        assert_eq!(
+            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
+            "false"
+        );
+        assert_eq!(
+            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
+            "true"
+        );
     }
 }

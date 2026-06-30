@@ -269,8 +269,24 @@ fn datetime_instant(v: &Value) -> Option<f64> {
     parse_xsd_datetime(value)
 }
 
-/// Parse `-?YYYY-MM-DD(Thh:mm:ss(.s+)?)?(Z|±hh:mm)?` to a UTC instant.
-fn parse_xsd_datetime(s: &str) -> Option<f64> {
+/// The decomposed fields of a parsed `xsd:dateTime` / `xsd:date`. Powers the
+/// SPARQL date accessors (`YEAR`, `MONTH`, …, `TIMEZONE`, `TZ`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DateTimeParts {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
+    /// Fractional seconds in `[0, 1)`.
+    pub frac: f64,
+    /// Timezone offset east of UTC in seconds, or `None` when no zone was given.
+    pub tz_offset_secs: Option<i64>,
+}
+
+/// Parse `-?YYYY-MM-DD(Thh:mm:ss(.s+)?)?(Z|±hh:mm)?` into its fields.
+pub fn parse_datetime_parts(s: &str) -> Option<DateTimeParts> {
     let b = s.trim().as_bytes();
     let mut i = 0usize;
     let neg_year = b.first() == Some(&b'-');
@@ -312,17 +328,20 @@ fn parse_xsd_datetime(s: &str) -> Option<f64> {
         }
     }
 
-    let mut tz_off = 0i64; // seconds east of UTC
+    let mut tz_offset_secs = None; // seconds east of UTC
     if i < b.len() {
         match b[i] {
-            b'Z' => i += 1,
+            b'Z' => {
+                i += 1;
+                tz_offset_secs = Some(0);
+            }
             b'+' | b'-' => {
                 let sign = if b[i] == b'+' { 1 } else { -1 };
                 i += 1;
                 let th = take_n_digits(b, &mut i, 2)?;
                 expect_byte(b, &mut i, b':')?;
                 let tm = take_n_digits(b, &mut i, 2)?;
-                tz_off = sign * (th * 3600 + tm * 60);
+                tz_offset_secs = Some(sign * (th * 3600 + tm * 60));
             }
             _ => return None,
         }
@@ -337,9 +356,53 @@ fn parse_xsd_datetime(s: &str) -> Option<f64> {
     {
         return None;
     }
-    let days = days_from_civil(year, month, day);
-    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss - tz_off;
-    Some(secs as f64 + frac)
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour: hh,
+        minute: mm,
+        second: ss,
+        frac,
+        tz_offset_secs,
+    })
+}
+
+/// Parse `-?YYYY-MM-DD(Thh:mm:ss(.s+)?)?(Z|±hh:mm)?` to a UTC instant. A missing
+/// timezone is treated as UTC.
+fn parse_xsd_datetime(s: &str) -> Option<f64> {
+    let p = parse_datetime_parts(s)?;
+    let days = days_from_civil(p.year, p.month, p.day);
+    let tz = p.tz_offset_secs.unwrap_or(0);
+    let secs = days * 86_400 + p.hour * 3600 + p.minute * 60 + p.second - tz;
+    Some(secs as f64 + p.frac)
+}
+
+/// Civil (year, month, day) from a count of days since 1970-01-01 (Howard
+/// Hinnant's inverse of [`days_from_civil`]).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Format a UTC instant (seconds since the epoch) as an `xsd:dateTime` lexical
+/// `YYYY-MM-DDThh:mm:ssZ`. Used by `NOW()`.
+pub fn format_xsd_datetime_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let rem = unix_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 fn expect_byte(b: &[u8], i: &mut usize, c: u8) -> Option<()> {
@@ -539,6 +602,33 @@ mod tests {
         assert_eq!(parse_xsd_datetime("not-a-date"), None);
         assert_eq!(parse_xsd_datetime("2020-13-01T00:00:00Z"), None); // month 13
         assert_eq!(parse_xsd_datetime("2020-01-01T00:00:00XY"), None); // bad tz
+    }
+
+    #[test]
+    fn datetime_parts_extracts_fields() {
+        let p = parse_datetime_parts("2011-01-10T14:45:13.815-05:00").unwrap();
+        assert_eq!((p.year, p.month, p.day), (2011, 1, 10));
+        assert_eq!((p.hour, p.minute, p.second), (14, 45, 13));
+        assert!((p.frac - 0.815).abs() < 1e-9);
+        assert_eq!(p.tz_offset_secs, Some(-5 * 3600));
+    }
+
+    #[test]
+    fn datetime_parts_missing_zone_is_none() {
+        let p = parse_datetime_parts("2020-03-04T05:06:07").unwrap();
+        assert_eq!(p.tz_offset_secs, None);
+        let z = parse_datetime_parts("2020-03-04T05:06:07Z").unwrap();
+        assert_eq!(z.tz_offset_secs, Some(0));
+    }
+
+    #[test]
+    fn format_then_parse_round_trips() {
+        // 2021-06-30T12:34:56Z is a fixed instant; format and re-parse it.
+        let secs = parse_xsd_datetime("2021-06-30T12:34:56Z").unwrap() as i64;
+        let s = format_xsd_datetime_utc(secs);
+        assert_eq!(s, "2021-06-30T12:34:56Z");
+        assert_eq!(parse_xsd_datetime(&s), Some(secs as f64));
+        assert_eq!(format_xsd_datetime_utc(0), "1970-01-01T00:00:00Z");
     }
 
     #[test]

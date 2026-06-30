@@ -1584,6 +1584,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_new_builtin_function_names() {
+        // Every new SPARQL function name must tokenize + parse as a Builtin call
+        // via the generic NAME(args) path — case-insensitively, with zero-arg,
+        // single-arg, and multi-arg shapes all supported.
+        let q = sel(
+            "SELECT (SUBSTR(?s,1,2) AS ?a) (now() AS ?b) (md5(?s) AS ?c)
+                    (SHORTESTPATHLEN(<x>,<y>) AS ?d) (UUID() AS ?e) (if(true,1,2) AS ?f)
+             WHERE { ?s <p> ?o }",
+        );
+        let got: Vec<(String, usize)> = match &q.projection {
+            Projection::Items(items) => items
+                .iter()
+                .filter_map(|it| match it {
+                    SelectItem::Expr(Expr::Builtin(n, args), _) => Some((n.clone(), args.len())),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected projection items"),
+        };
+        assert_eq!(
+            got,
+            vec![
+                ("SUBSTR".to_string(), 3),
+                ("NOW".to_string(), 0),
+                ("MD5".to_string(), 1),
+                ("SHORTESTPATHLEN".to_string(), 2),
+                ("UUID".to_string(), 0),
+                ("IF".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
     fn filter_nested_or_precedence() {
         // mirrors data/num/num2.sql: ?sx > ?sy && (?hx > ?hy || ?hx >= "170.0"^^xsd:float)
         let q = sel(
