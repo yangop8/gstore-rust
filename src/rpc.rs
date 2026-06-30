@@ -53,6 +53,52 @@ use crate::model::IdTriple;
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
+// Cluster / replication wire types (used by the Raft-like layer in
+// [`crate::cluster`]). They live here, beside the codec, so there is a *single*
+// on-wire definition that both the state machine and the transport reuse.
+// ---------------------------------------------------------------------------
+
+/// A node's stable identity within a cluster.
+pub type NodeId = u64;
+
+/// A single replicated mutation: insert or delete one triple. This is the unit
+/// of the replicated log — followers apply committed [`LogOp`]s to their store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOp {
+    /// Add a triple (`store.insert`).
+    Insert(IdTriple),
+    /// Remove a triple (`store.remove`).
+    Delete(IdTriple),
+}
+
+impl LogOp {
+    /// The triple this op acts on.
+    pub fn triple(&self) -> IdTriple {
+        match *self {
+            LogOp::Insert(t) | LogOp::Delete(t) => t,
+        }
+    }
+}
+
+/// One entry of the replicated log: the leader's `term` when it was created plus
+/// the mutation. The `(index, term)` pair is what Raft's consistency check and
+/// commit rule are built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEntry {
+    /// Leader term in which this entry was created.
+    pub term: u64,
+    /// The replicated mutation.
+    pub op: LogOp,
+}
+
+impl LogEntry {
+    /// Construct a log entry.
+    pub fn new(term: u64, op: LogOp) -> LogEntry {
+        LogEntry { term, op }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Framing: u32 BE length + payload.
 // ---------------------------------------------------------------------------
 
@@ -124,6 +170,44 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+/// Encode an `i64` as its two's-complement `u64` bit pattern.
+fn put_i64(buf: &mut Vec<u8>, v: i64) {
+    put_u64(buf, v as u64);
+}
+
+/// Encode a [`LogOp`]: a one-byte kind tag (`1` insert, `2` delete) then the
+/// triple's `(sub, pred, obj)`.
+fn put_op(buf: &mut Vec<u8>, op: &LogOp) {
+    let (kind, t) = match *op {
+        LogOp::Insert(t) => (1u8, t),
+        LogOp::Delete(t) => (2u8, t),
+    };
+    buf.push(kind);
+    put_u32(buf, t.sub);
+    put_u32(buf, t.pred);
+    put_u32(buf, t.obj);
+}
+
+/// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op.
+fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
+    put_u32(buf, entries.len() as u32);
+    for e in entries {
+        put_u64(buf, e.term);
+        put_op(buf, &e.op);
+    }
+}
+
+/// Encode a slice of [`IdTriple`] (snapshot payload) as a `u32` count then each
+/// `(sub, pred, obj)`.
+fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
+    put_u32(buf, triples.len() as u32);
+    for t in triples {
+        put_u32(buf, t.sub);
+        put_u32(buf, t.pred);
+        put_u32(buf, t.obj);
+    }
+}
+
 /// A forward cursor over a byte buffer, returning [`io::Error`] of kind
 /// [`io::ErrorKind::InvalidData`] on truncation — so a malformed frame is a
 /// clean error rather than a panic.
@@ -188,6 +272,40 @@ impl<'a> Reader<'a> {
         let bytes = self.take(n)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| bad("rpc string is not valid UTF-8"))
     }
+
+    fn i64(&mut self) -> io::Result<i64> {
+        Ok(self.u64()? as i64)
+    }
+
+    fn op(&mut self) -> io::Result<LogOp> {
+        let kind = self.u8()?;
+        let t = IdTriple::new(self.u32()?, self.u32()?, self.u32()?);
+        match kind {
+            1 => Ok(LogOp::Insert(t)),
+            2 => Ok(LogOp::Delete(t)),
+            _ => Err(bad("unknown log-op kind")),
+        }
+    }
+
+    fn entries(&mut self) -> io::Result<Vec<LogEntry>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let term = self.u64()?;
+            let op = self.op()?;
+            out.push(LogEntry { term, op });
+        }
+        Ok(out)
+    }
+
+    fn triples(&mut self) -> io::Result<Vec<IdTriple>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            out.push(IdTriple::new(self.u32()?, self.u32()?, self.u32()?));
+        }
+        Ok(out)
+    }
 }
 
 fn bad(msg: &'static str) -> io::Error {
@@ -246,6 +364,39 @@ pub enum Request {
         pred: PredId,
         obj: EntityLiteralId,
     },
+
+    // --- Raft replication / cluster control (see [`crate::cluster`]). ---
+    /// Raft: a candidate solicits a vote for `term`.
+    RequestVote {
+        term: u64,
+        candidate_id: NodeId,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Raft: a leader replicates `entries` (empty = heartbeat) after the
+    /// `(prev_log_index, prev_log_term)` anchor, advertising `leader_commit`.
+    AppendEntries {
+        term: u64,
+        leader_id: NodeId,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        entries: Vec<LogEntry>,
+    },
+    /// Raft: a leader ships a full snapshot (`triples`) to a follower whose log
+    /// has fallen behind the leader's compaction point.
+    InstallSnapshot {
+        term: u64,
+        leader_id: NodeId,
+        last_included_index: u64,
+        last_included_term: u64,
+        triples: Vec<IdTriple>,
+    },
+    /// A client submits a mutation to the cluster; the leader appends it, a
+    /// follower replies with a redirect hint.
+    ClientWrite { op: LogOp },
+    /// Introspection: ask a node for its raft role / term / commit index.
+    ClusterStatus,
 }
 
 impl Request {
@@ -308,6 +459,53 @@ impl Request {
                 put_u32(&mut buf, pred);
                 put_u32(&mut buf, obj);
             }
+            Request::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                buf.push(16);
+                put_u64(&mut buf, term);
+                put_u64(&mut buf, candidate_id);
+                put_u64(&mut buf, last_log_index);
+                put_u64(&mut buf, last_log_term);
+            }
+            Request::AppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                ref entries,
+            } => {
+                buf.push(17);
+                put_u64(&mut buf, term);
+                put_u64(&mut buf, leader_id);
+                put_u64(&mut buf, prev_log_index);
+                put_u64(&mut buf, prev_log_term);
+                put_u64(&mut buf, leader_commit);
+                put_entries(&mut buf, entries);
+            }
+            Request::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                ref triples,
+            } => {
+                buf.push(18);
+                put_u64(&mut buf, term);
+                put_u64(&mut buf, leader_id);
+                put_u64(&mut buf, last_included_index);
+                put_u64(&mut buf, last_included_term);
+                put_triples(&mut buf, triples);
+            }
+            Request::ClientWrite { ref op } => {
+                buf.push(19);
+                put_op(&mut buf, op);
+            }
+            Request::ClusterStatus => buf.push(20),
         }
         buf
     }
@@ -349,6 +547,29 @@ impl Request {
                 pred: r.u32()?,
                 obj: r.u32()?,
             },
+            16 => Request::RequestVote {
+                term: r.u64()?,
+                candidate_id: r.u64()?,
+                last_log_index: r.u64()?,
+                last_log_term: r.u64()?,
+            },
+            17 => Request::AppendEntries {
+                term: r.u64()?,
+                leader_id: r.u64()?,
+                prev_log_index: r.u64()?,
+                prev_log_term: r.u64()?,
+                leader_commit: r.u64()?,
+                entries: r.entries()?,
+            },
+            18 => Request::InstallSnapshot {
+                term: r.u64()?,
+                leader_id: r.u64()?,
+                last_included_index: r.u64()?,
+                last_included_term: r.u64()?,
+                triples: r.triples()?,
+            },
+            19 => Request::ClientWrite { op: r.op()? },
+            20 => Request::ClusterStatus,
             _ => return Err(bad("unknown rpc request tag")),
         };
         Ok(req)
@@ -384,6 +605,36 @@ pub enum Response {
     Pairs(Vec<(u32, u32)>),
     /// A server-side error message.
     Error(String),
+
+    // --- Raft replication / cluster control replies. ---
+    /// Reply to [`Request::RequestVote`].
+    Vote { term: u64, granted: bool },
+    /// Reply to [`Request::AppendEntries`]: `match_index` is the highest log
+    /// index the follower now agrees with the leader on (0 on rejection-hint).
+    AppendAck {
+        term: u64,
+        success: bool,
+        match_index: u64,
+    },
+    /// Reply to [`Request::InstallSnapshot`].
+    SnapshotAck { term: u64 },
+    /// Reply to [`Request::ClientWrite`]: `ok` if appended by the leader;
+    /// `leader_hint` is the known leader id (`-1` if unknown) for a redirect;
+    /// `index` is the assigned log index when `ok`.
+    WriteAck {
+        ok: bool,
+        leader_hint: i64,
+        index: u64,
+    },
+    /// Reply to [`Request::ClusterStatus`]: `role` is `0` follower, `1`
+    /// candidate, `2` leader.
+    Status {
+        term: u64,
+        role: u8,
+        leader_hint: i64,
+        commit_index: u64,
+        last_log_index: u64,
+    },
 }
 
 impl Response {
@@ -411,6 +662,49 @@ impl Response {
                 buf.push(5);
                 put_str(&mut buf, msg);
             }
+            Response::Vote { term, granted } => {
+                buf.push(6);
+                put_u64(&mut buf, *term);
+                buf.push(u8::from(*granted));
+            }
+            Response::AppendAck {
+                term,
+                success,
+                match_index,
+            } => {
+                buf.push(7);
+                put_u64(&mut buf, *term);
+                buf.push(u8::from(*success));
+                put_u64(&mut buf, *match_index);
+            }
+            Response::SnapshotAck { term } => {
+                buf.push(8);
+                put_u64(&mut buf, *term);
+            }
+            Response::WriteAck {
+                ok,
+                leader_hint,
+                index,
+            } => {
+                buf.push(9);
+                buf.push(u8::from(*ok));
+                put_i64(&mut buf, *leader_hint);
+                put_u64(&mut buf, *index);
+            }
+            Response::Status {
+                term,
+                role,
+                leader_hint,
+                commit_index,
+                last_log_index,
+            } => {
+                buf.push(10);
+                put_u64(&mut buf, *term);
+                buf.push(*role);
+                put_i64(&mut buf, *leader_hint);
+                put_u64(&mut buf, *commit_index);
+                put_u64(&mut buf, *last_log_index);
+            }
         }
         buf
     }
@@ -425,6 +719,28 @@ impl Response {
             3 => Response::Ids(r.ids()?),
             4 => Response::Pairs(r.pairs()?),
             5 => Response::Error(r.string()?),
+            6 => Response::Vote {
+                term: r.u64()?,
+                granted: r.u8()? != 0,
+            },
+            7 => Response::AppendAck {
+                term: r.u64()?,
+                success: r.u8()? != 0,
+                match_index: r.u64()?,
+            },
+            8 => Response::SnapshotAck { term: r.u64()? },
+            9 => Response::WriteAck {
+                ok: r.u8()? != 0,
+                leader_hint: r.i64()?,
+                index: r.u64()?,
+            },
+            10 => Response::Status {
+                term: r.u64()?,
+                role: r.u8()?,
+                leader_hint: r.i64()?,
+                commit_index: r.u64()?,
+                last_log_index: r.u64()?,
+            },
             _ => return Err(bad("unknown rpc response tag")),
         };
         Ok(resp)
@@ -551,6 +867,42 @@ mod tests {
                 pred: 2,
                 obj: 2_000_000_000,
             },
+            Request::RequestVote {
+                term: 9,
+                candidate_id: 2,
+                last_log_index: 7,
+                last_log_term: 8,
+            },
+            Request::AppendEntries {
+                term: 9,
+                leader_id: 1,
+                prev_log_index: 3,
+                prev_log_term: 8,
+                leader_commit: 2,
+                entries: vec![
+                    LogEntry::new(8, LogOp::Insert(IdTriple::new(1, 2, 3))),
+                    LogEntry::new(9, LogOp::Delete(IdTriple::new(4, 5, 6))),
+                ],
+            },
+            Request::AppendEntries {
+                term: 9,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: vec![],
+            },
+            Request::InstallSnapshot {
+                term: 9,
+                leader_id: 1,
+                last_included_index: 5,
+                last_included_term: 8,
+                triples: vec![IdTriple::new(1, 2, 3), IdTriple::new(4, 5, 6)],
+            },
+            Request::ClientWrite {
+                op: LogOp::Insert(IdTriple::new(7, 8, 9)),
+            },
+            Request::ClusterStatus,
         ];
         for req in reqs {
             let decoded = Request::decode(&req.encode()).unwrap();
@@ -571,6 +923,37 @@ mod tests {
             Response::Pairs(vec![]),
             Response::Pairs(vec![(1, 2), (3, 4)]),
             Response::Error("boom".to_string()),
+            Response::Vote {
+                term: 4,
+                granted: true,
+            },
+            Response::Vote {
+                term: 4,
+                granted: false,
+            },
+            Response::AppendAck {
+                term: 4,
+                success: true,
+                match_index: 12,
+            },
+            Response::SnapshotAck { term: 4 },
+            Response::WriteAck {
+                ok: true,
+                leader_hint: -1,
+                index: 0,
+            },
+            Response::WriteAck {
+                ok: false,
+                leader_hint: 2,
+                index: 9,
+            },
+            Response::Status {
+                term: 4,
+                role: 2,
+                leader_hint: 1,
+                commit_index: 8,
+                last_log_index: 9,
+            },
         ];
         for resp in resps {
             let decoded = Response::decode(&resp.encode()).unwrap();
