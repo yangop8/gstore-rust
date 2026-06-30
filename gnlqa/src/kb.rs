@@ -227,6 +227,14 @@ impl KbClient for GStoreClient {
     }
 }
 
+/// Forward through shared handles, so a test can keep an `Arc` to inspect a mock
+/// while also handing a boxed clone to the engine.
+impl<T: KbClient + ?Sized> KbClient for std::sync::Arc<T> {
+    fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
+        (**self).query(sparql)
+    }
+}
+
 /// A mock KB for tests: returns canned answers in order (cycling) and records
 /// the SPARQL it was asked.
 #[derive(Debug, Default)]

@@ -5,6 +5,8 @@
 //! renders an answer. Later commits add schema/entity linking, multi-candidate
 //! generation, self-repair, grounding, etc.
 
+use std::collections::HashSet;
+
 use crate::error::Result;
 use crate::kb::{self, KbClient, SparqlAnswer};
 use crate::llm::{LlmClient, LlmRequest};
@@ -56,9 +58,10 @@ impl AskEngine {
         // Validate with gStore's own parser before executing.
         kb::validate_sparql(&sparql)?;
         let answer = self.kb.query(&sparql)?;
+        let values = answer_values(&answer);
         Ok(Answer {
-            text: render_answer(&answer),
-            values: answer_values(&answer),
+            text: render_answer(&answer, &values),
+            values,
             sparql: Some(sparql),
         })
     }
@@ -68,47 +71,58 @@ impl AskEngine {
 /// leaving the bare SPARQL query.
 pub fn extract_sparql(raw: &str) -> String {
     let s = raw.trim();
-    // ```sparql ... ```  or  ``` ... ```
-    if let Some(rest) = s.strip_prefix("```") {
-        // Drop an optional language tag on the first line.
-        let body = match rest.split_once('\n') {
-            Some((_lang, after)) => after,
-            None => rest,
+    // Take whatever is between the first ``` and the next ``` — robust to leading
+    // prose ("Here is the query:"), trailing prose, and multiple blocks (first
+    // wins). "```" is ASCII, so `+ 3` byte indexing is safe.
+    if let Some(open) = s.find("```") {
+        let after_open = &s[open + 3..];
+        // Drop an optional language tag on the fence's first line.
+        let after_tag = match after_open.split_once('\n') {
+            Some((_lang, rest)) => rest,
+            None => after_open,
         };
-        let body = body.strip_suffix("```").unwrap_or(body);
-        let body = body.trim_end().trim_end_matches("```");
+        let body = match after_tag.find("```") {
+            Some(close) => &after_tag[..close],
+            None => after_tag,
+        };
         return body.trim().to_string();
     }
     s.to_string()
 }
 
-/// First-column answer values (URIs/literals) for a SELECT; the boolean for ASK.
+/// Answer values for a SELECT — the first *bound* cell of each row (so a row
+/// whose leading variable is unbound still contributes), de-duplicated in order;
+/// the boolean string for ASK. (Multi-variable rendering is a later phase.)
 fn answer_values(ans: &SparqlAnswer) -> Vec<String> {
     match ans {
-        SparqlAnswer::Select { vars, rows } => {
-            if vars.is_empty() {
-                return Vec::new();
+        SparqlAnswer::Select { rows, .. } => {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for r in rows {
+                if let Some(t) = r.iter().flatten().next() {
+                    if seen.insert(t.value.clone()) {
+                        out.push(t.value.clone());
+                    }
+                }
             }
-            rows.iter()
-                .filter_map(|r| r.first().and_then(|c| c.as_ref()).map(|t| t.value.clone()))
-                .collect()
+            out
         }
         SparqlAnswer::Boolean(b) => vec![b.to_string()],
         SparqlAnswer::Graph(_) => Vec::new(),
     }
 }
 
-/// Render a human-readable answer string.
-fn render_answer(ans: &SparqlAnswer) -> String {
+/// Render a human-readable answer string from the answer and its precomputed
+/// values (avoids recomputing them).
+fn render_answer(ans: &SparqlAnswer, values: &[String]) -> String {
     match ans {
         SparqlAnswer::Boolean(b) => if *b { "Yes" } else { "No" }.to_string(),
         SparqlAnswer::Graph(g) => g.clone(),
         SparqlAnswer::Select { .. } => {
-            let vals = answer_values(ans);
-            if vals.is_empty() {
+            if values.is_empty() {
                 "(no results)".to_string()
             } else {
-                vals.join(", ")
+                values.join(", ")
             }
         }
     }
@@ -132,6 +146,22 @@ mod tests {
             "SELECT ?s WHERE { ?s ?p ?o }"
         );
         assert_eq!(extract_sparql("```\nASK { ?s ?p ?o }\n```"), "ASK { ?s ?p ?o }");
+    }
+
+    #[test]
+    fn extract_sparql_survives_prose_and_multiblock() {
+        // leading prose before the fence
+        assert_eq!(
+            extract_sparql("Here is the query:\n```sparql\nSELECT ?s WHERE { ?s ?p ?o }\n```"),
+            "SELECT ?s WHERE { ?s ?p ?o }"
+        );
+        // trailing prose after the closing fence
+        assert_eq!(
+            extract_sparql("```sparql\nSELECT ?s WHERE { ?s ?p ?o }\n```\nThis lists subjects."),
+            "SELECT ?s WHERE { ?s ?p ?o }"
+        );
+        // multiple blocks — first wins
+        assert_eq!(extract_sparql("```\nASK { ?s ?p ?o }\n```\n```\nSELECT ?x {}\n```"), "ASK { ?s ?p ?o }");
     }
 
     #[test]
@@ -160,12 +190,13 @@ mod tests {
 
     #[test]
     fn invalid_sparql_from_llm_is_rejected_before_execution() {
+        use std::sync::Arc;
         let llm = MockLlm::fixed("this is not sparql");
-        let kb = MockKb::new(vec![SparqlAnswer::Boolean(true)]);
-        let engine = AskEngine::new(Box::new(llm), Box::new(kb));
+        let kb = Arc::new(MockKb::new(vec![SparqlAnswer::Boolean(true)]));
+        let engine = AskEngine::new(Box::new(llm), Box::new(Arc::clone(&kb)));
         let err = engine.ask("q").unwrap_err();
         assert!(matches!(err, crate::error::Error::Sparql(_)));
-        // KB must NOT have been queried with invalid SPARQL.
-        // (can't read MockKb here since it moved; the Sparql error proves the guard)
+        // Directly verify the invalid query never reached the KB.
+        assert_eq!(kb.query_count(), 0, "KB must not be queried with invalid SPARQL");
     }
 }
