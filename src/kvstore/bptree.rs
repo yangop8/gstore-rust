@@ -10,7 +10,7 @@
 //! dictionary strings; values carry ids (as bytes) or, for `id → string`, the
 //! string itself.
 
-use crate::error::Result;
+use crate::error::{GStoreError, Result};
 
 use super::pager::{PageId, Pager, PAGE_SIZE};
 
@@ -223,6 +223,17 @@ impl BTree {
     }
 
     fn split_internal(&self, pager: &mut Pager, page: PageId, mut node: Node) -> Result<Split> {
+        // An internal split pushes exactly one separator up, so a node with a
+        // single separator can't be split into two key-bearing internal nodes:
+        // pushing the lone key up leaves both halves with zero keys (a
+        // degenerate node that no longer routes between children). We only reach
+        // here when the node already overflows a page, so a single separator
+        // means that one key plus its child link is too large to ever fit.
+        if node.keys.len() < 2 {
+            return Err(GStoreError::Serialize(format!(
+                "B+ tree separator key too large to fit in a {PAGE_SIZE}-byte page"
+            )));
+        }
         let mid = node.keys.len() / 2;
         let sep = node.keys[mid].clone();
         let right_keys = node.keys.split_off(mid + 1);

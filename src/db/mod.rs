@@ -343,6 +343,27 @@ impl Database {
                 store.triple_count()
             )));
         }
+        if dict.entity_num() as u64 != meta.entity_num {
+            return Err(GStoreError::Database(format!(
+                "corrupt database: meta says {} entities but dict has {}",
+                meta.entity_num,
+                dict.entity_num()
+            )));
+        }
+        if dict.literal_num() as u64 != meta.literal_num {
+            return Err(GStoreError::Database(format!(
+                "corrupt database: meta says {} literals but dict has {}",
+                meta.literal_num,
+                dict.literal_num()
+            )));
+        }
+        if dict.predicate_num() as u64 != meta.predicate_num {
+            return Err(GStoreError::Database(format!(
+                "corrupt database: meta says {} predicates but dict has {}",
+                meta.predicate_num,
+                dict.predicate_num()
+            )));
+        }
         // The VS-tree is rebuilt from the store if absent or unreadable.
         let vstree = read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
         Ok(Database {

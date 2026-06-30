@@ -241,8 +241,8 @@ impl Parser {
         if self.keyword().as_deref() == Some("HAVING") {
             self.bump();
             having.push(self.parse_constraint()?);
-            // allow multiple bracketed HAVING constraints
-            while matches!(self.peek(), Token::LParen) {
+            // each additional constraint must be preceded by another HAVING keyword
+            while self.eat_keyword("HAVING") {
                 having.push(self.parse_constraint()?);
             }
         }

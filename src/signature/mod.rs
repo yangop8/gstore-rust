@@ -78,6 +78,7 @@ impl Signature {
 
     #[inline]
     pub fn test(&self, bit: usize) -> bool {
+        debug_assert!(bit < ENTITY_SIG_LENGTH, "signature bit {bit} out of range");
         self.bits[bit / 64] & (1u64 << (bit % 64)) != 0
     }
 

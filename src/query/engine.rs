@@ -472,7 +472,11 @@ impl<'a> Evaluator<'a> {
                 match op {
                     UnaryOp::Plus => Some(v),
                     UnaryOp::Neg => match v {
-                        Value::Int(i) => Some(Value::Int(-i)),
+                        Value::Int(i) => Some(
+                            i.checked_neg()
+                                .map(Value::Int)
+                                .unwrap_or_else(|| Value::Double(-(i as f64))),
+                        ),
                         Value::Double(d) => Some(Value::Double(-d)),
                         _ => None,
                     },
@@ -1209,7 +1213,11 @@ impl<'a> Evaluator<'a> {
                 match op {
                     UnaryOp::Plus => Some(v),
                     UnaryOp::Neg => match v {
-                        Value::Int(i) => Some(Value::Int(-i)),
+                        Value::Int(i) => Some(
+                            i.checked_neg()
+                                .map(Value::Int)
+                                .unwrap_or_else(|| Value::Double(-(i as f64))),
+                        ),
                         Value::Double(d) => Some(Value::Double(-d)),
                         _ => None,
                     },

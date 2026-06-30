@@ -455,6 +455,9 @@ impl Parser {
                 break;
             }
         }
+        if s.is_empty() || s.chars().all(|c| c == '+' || c == '-') {
+            return Err(self.err("invalid numeric literal"));
+        }
         let dt = if is_double {
             xsd::DOUBLE
         } else if is_decimal {
@@ -527,22 +530,167 @@ impl Parser {
 
     fn resolve_iri(&self, s: &str) -> String {
         match &self.base {
-            Some(base) if !is_absolute_iri(s) => format!("{base}{s}"),
+            Some(base) if !is_absolute_iri(s) => resolve_reference(base, s),
             _ => s.to_string(),
         }
     }
 }
 
 fn is_absolute_iri(s: &str) -> bool {
-    if let Some(idx) = s.find(':') {
-        let scheme = &s[..idx];
-        !scheme.is_empty()
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
+    match s.find(':') {
+        Some(idx) => is_valid_scheme(&s[..idx]),
+        None => false,
     }
+}
+
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 §3.1).
+/// The first character must be a letter; an empty scheme is invalid.
+fn is_valid_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a relative IRI `reference` against an absolute `base` following the
+/// reference-resolution algorithm of RFC 3986 §5.2 (the relative branches; the
+/// caller guarantees `reference` has no scheme). This fixes the previous naive
+/// concatenation, which produced e.g. `http://ex.com/pathfile` for base
+/// `http://ex.com/path` + `file` instead of the correct `http://ex.com/file`.
+fn resolve_reference(base: &str, reference: &str) -> String {
+    let (b_scheme, b_authority, b_path, b_query, _) = split_iri(base);
+    let (_, r_authority, r_path, r_query, r_fragment) = split_iri(reference);
+
+    let (authority, path, query) = if r_authority.is_some() {
+        (r_authority, remove_dot_segments(r_path), r_query)
+    } else if r_path.is_empty() {
+        let query = if r_query.is_some() { r_query } else { b_query };
+        (b_authority, b_path.to_string(), query)
+    } else if r_path.starts_with('/') {
+        (b_authority, remove_dot_segments(r_path), r_query)
+    } else {
+        let merged = merge_paths(b_authority, b_path, r_path);
+        (b_authority, remove_dot_segments(&merged), r_query)
+    };
+
+    recompose(b_scheme, authority, &path, query, r_fragment)
+}
+
+/// Split an IRI reference into `(scheme, authority, path, query, fragment)`
+/// per RFC 3986 §3. `scheme` and `path` are always present (possibly empty);
+/// `authority`, `query` and `fragment` are present only when their delimiters
+/// (`//`, `?`, `#`) appear.
+#[allow(clippy::type_complexity)]
+fn split_iri(s: &str) -> (&str, Option<&str>, &str, Option<&str>, Option<&str>) {
+    let mut rest = s;
+    let mut fragment = None;
+    if let Some(i) = rest.find('#') {
+        fragment = Some(&rest[i + 1..]);
+        rest = &rest[..i];
+    }
+    let mut query = None;
+    if let Some(i) = rest.find('?') {
+        query = Some(&rest[i + 1..]);
+        rest = &rest[..i];
+    }
+    let mut scheme = "";
+    if let Some(i) = rest.find(':') {
+        if is_valid_scheme(&rest[..i]) {
+            scheme = &rest[..i];
+            rest = &rest[i + 1..];
+        }
+    }
+    let mut authority = None;
+    if let Some(after) = rest.strip_prefix("//") {
+        let end = after.find('/').unwrap_or(after.len());
+        authority = Some(&after[..end]);
+        rest = &after[end..];
+    }
+    (scheme, authority, rest, query, fragment)
+}
+
+/// Merge a relative-path reference onto the base path (RFC 3986 §5.3).
+fn merge_paths(base_authority: Option<&str>, base_path: &str, ref_path: &str) -> String {
+    if base_authority.is_some() && base_path.is_empty() {
+        format!("/{ref_path}")
+    } else if let Some(i) = base_path.rfind('/') {
+        format!("{}{}", &base_path[..=i], ref_path)
+    } else {
+        ref_path.to_string()
+    }
+}
+
+/// Remove `.` and `..` path segments (RFC 3986 §5.2.4).
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path.to_string();
+    let mut output = String::new();
+    while !input.is_empty() {
+        if input.starts_with("../") {
+            input.drain(..3);
+        } else if input.starts_with("./") {
+            input.drain(..2);
+        } else if input.starts_with("/./") {
+            input.replace_range(..3, "/");
+        } else if input == "/." {
+            input.replace_range(..2, "/");
+        } else if input.starts_with("/../") {
+            input.replace_range(..4, "/");
+            remove_last_segment(&mut output);
+        } else if input == "/.." {
+            input.replace_range(..3, "/");
+            remove_last_segment(&mut output);
+        } else if input == "." || input == ".." {
+            input.clear();
+        } else {
+            let start = usize::from(input.starts_with('/'));
+            let end = match input[start..].find('/') {
+                Some(i) => start + i,
+                None => input.len(),
+            };
+            output.push_str(&input[..end]);
+            input.drain(..end);
+        }
+    }
+    output
+}
+
+fn remove_last_segment(output: &mut String) {
+    match output.rfind('/') {
+        Some(i) => output.truncate(i),
+        None => output.clear(),
+    }
+}
+
+/// Recompose components into an IRI string (RFC 3986 §5.3).
+fn recompose(
+    scheme: &str,
+    authority: Option<&str>,
+    path: &str,
+    query: Option<&str>,
+    fragment: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if !scheme.is_empty() {
+        out.push_str(scheme);
+        out.push(':');
+    }
+    if let Some(a) = authority {
+        out.push_str("//");
+        out.push_str(a);
+    }
+    out.push_str(path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -398,7 +398,7 @@ impl Lexer {
             } else if c == '.' {
                 // Only consume '.' as part of the number if a digit follows, so
                 // `3 .` (number then statement dot) is not mis-lexed.
-                if self.peek2().is_some_and(|d| d.is_ascii_digit()) || !is_decimal {
+                if !is_decimal && self.peek2().is_some_and(|d| d.is_ascii_digit()) {
                     is_decimal = true;
                     s.push(c);
                     self.pos += 1;

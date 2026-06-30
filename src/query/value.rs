@@ -148,6 +148,11 @@ impl Value {
     /// SPARQL `=` semantics across value types. `None` means "incomparable"
     /// (a type error), which the caller maps to filter exclusion.
     pub fn sparql_eq(&self, other: &Value) -> Option<bool> {
+        // Compare two integers directly to avoid f64 precision loss for
+        // magnitudes >= 2^53.
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return Some(a == b);
+        }
         if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
             return Some(a == b);
         }
@@ -174,6 +179,11 @@ impl Value {
 
     /// SPARQL ordering relation for `<`, `>`, `<=`, `>=`. `None` = incomparable.
     pub fn sparql_cmp(&self, other: &Value) -> Option<Ordering> {
+        // Compare two integers directly to avoid f64 precision loss for
+        // magnitudes >= 2^53.
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return Some(a.cmp(b));
+        }
         if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
             return a.partial_cmp(&b);
         }
@@ -190,17 +200,19 @@ impl Value {
 /// (unbound <) blank nodes < IRIs < literals; numbers and strings by value.
 /// Used on `Option<Value>` where `None` is "unbound".
 pub fn order_key(v: &Option<Value>) -> impl Ord {
-    // Returns (group, num, text) — compared lexicographically by derive(Ord).
+    // Returns (group, num, int, text) — compared lexicographically by derive(Ord).
     // group: 0 unbound, 1 blank, 2 iri, 3 numeric, 4 boolean, 5 string/other.
+    // `int` is an exact i64 tie-breaker so integers >= 2^53 keep their true
+    // ordering when their f64 approximations collide; it is 0 for non-integers.
     match v {
-        None => (0u8, OrdF64(f64::NEG_INFINITY), String::new()),
-        Some(Value::Blank(s)) => (1, OrdF64(0.0), s.clone()),
-        Some(Value::Iri(s)) => (2, OrdF64(0.0), s.clone()),
-        Some(Value::Int(i)) => (3, OrdF64(*i as f64), String::new()),
-        Some(Value::Double(d)) => (3, OrdF64(*d), String::new()),
-        Some(Value::Bool(b)) => (4, OrdF64(0.0), b.to_string()),
-        Some(Value::Str { value, .. }) => (5, OrdF64(0.0), value.clone()),
-        Some(Value::Typed { value, .. }) => (5, OrdF64(0.0), value.clone()),
+        None => (0u8, OrdF64(f64::NEG_INFINITY), 0i64, String::new()),
+        Some(Value::Blank(s)) => (1, OrdF64(0.0), 0, s.clone()),
+        Some(Value::Iri(s)) => (2, OrdF64(0.0), 0, s.clone()),
+        Some(Value::Int(i)) => (3, OrdF64(*i as f64), *i, String::new()),
+        Some(Value::Double(d)) => (3, OrdF64(*d), 0, String::new()),
+        Some(Value::Bool(b)) => (4, OrdF64(0.0), 0, b.to_string()),
+        Some(Value::Str { value, .. }) => (5, OrdF64(0.0), 0, value.clone()),
+        Some(Value::Typed { value, .. }) => (5, OrdF64(0.0), 0, value.clone()),
     }
 }
 

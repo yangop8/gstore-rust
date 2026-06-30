@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use crate::dict::Dictionary;
-use crate::error::Result;
+use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::turtle;
@@ -129,7 +129,9 @@ impl DiskStore {
         if let Some(v) = self.literal2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
-        let id = LITERAL_FIRST_ID + self.literal_count;
+        let id = LITERAL_FIRST_ID
+            .checked_add(self.literal_count)
+            .ok_or_else(|| GStoreError::Database("literal id space exhausted".to_string()))?;
         self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
         self.id2literal.insert(pager, &be32(id), key.as_bytes())?;
         self.literal_count += 1;
@@ -332,7 +334,10 @@ impl DiskStore {
             }
         }
         for i in 0..self.literal_count {
-            if let Some(s) = self.id_to_string(LITERAL_FIRST_ID + i)? {
+            let lit_id = LITERAL_FIRST_ID
+                .checked_add(i)
+                .ok_or_else(|| GStoreError::Database("literal id space exhausted".to_string()))?;
+            if let Some(s) = self.id_to_string(lit_id)? {
                 dict.intern_literal(&s);
             }
         }

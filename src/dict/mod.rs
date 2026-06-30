@@ -35,7 +35,8 @@ impl Interner {
         if let Some(&id) = self.forward.get(s) {
             return id;
         }
-        let id = self.backward.len() as u32;
+        let id = u32::try_from(self.backward.len())
+            .expect("dictionary interner exceeded u32::MAX distinct strings");
         self.backward.push(s.to_owned());
         self.forward.insert(s.to_owned(), id);
         id
@@ -85,11 +86,17 @@ impl Dictionary {
 
     /// Intern a literal, returning its public id, offset by `LITERAL_FIRST_ID`.
     pub fn intern_literal(&mut self, key: &str) -> EntityLiteralId {
-        self.literals.intern(key) + LITERAL_FIRST_ID
+        self.literals
+            .intern(key)
+            .checked_add(LITERAL_FIRST_ID)
+            .expect("literal id space overflowed EntityLiteralId range")
     }
 
     pub fn literal_id(&self, key: &str) -> Option<EntityLiteralId> {
-        self.literals.get(key).map(|i| i + LITERAL_FIRST_ID)
+        self.literals.get(key).map(|i| {
+            i.checked_add(LITERAL_FIRST_ID)
+                .expect("literal id space overflowed EntityLiteralId range")
+        })
     }
 
     // ---- predicate space --------------------------------------------------

@@ -141,6 +141,11 @@ impl Pager {
 
     /// Write a page (into the cache, marked dirty; persisted on flush/eviction).
     pub fn write_page(&mut self, id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        if id == 0 {
+            return Err(GStoreError::Database(
+                "page 0 is reserved for header".into(),
+            ));
+        }
         self.clock += 1;
         let tick = self.clock;
         if let Some(cp) = self.cache.get_mut(&id) {
@@ -204,7 +209,10 @@ impl Pager {
             Ok(id)
         } else {
             let id = self.page_count;
-            self.page_count += 1;
+            self.page_count = self
+                .page_count
+                .checked_add(1)
+                .ok_or_else(|| GStoreError::Database("page count overflow".into()))?;
             self.write_page(id, &[0u8; PAGE_SIZE])?;
             Ok(id)
         }
@@ -212,6 +220,11 @@ impl Pager {
 
     /// Return a page to the free list.
     pub fn free(&mut self, id: PageId) -> Result<()> {
+        if id == 0 {
+            return Err(GStoreError::Database(
+                "page 0 is reserved for header".into(),
+            ));
+        }
         let mut page = [0u8; PAGE_SIZE];
         page[0..4].copy_from_slice(&self.free_head.to_le_bytes());
         self.write_page(id, &page)?;
