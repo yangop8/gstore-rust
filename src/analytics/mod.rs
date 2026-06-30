@@ -10,8 +10,9 @@
 //!
 //! Implemented metrics: degree, BFS / shortest path, weakly- and
 //! strongly-connected components (iterative Tarjan), PageRank, triangle count,
-//! betweenness (Brandes) and closeness centrality, Louvain community detection,
-//! and k-core decomposition.
+//! betweenness (Brandes) and closeness centrality, Louvain community detection
+//! (undirected [`GraphView::louvain`] and directed-modularity
+//! [`GraphView::louvain_directed`]), and k-core decomposition.
 //!
 //! For predicate-labeled / weighted analysis, [`WeightedGraphView`] keeps a
 //! predicate id and a numeric weight on every edge and adds weighted
@@ -20,7 +21,7 @@
 //! gStore's `topk` module).  The unweighted [`GraphView`] API is unchanged.
 //!
 //! # Deferred work
-//! * Directed-modularity Louvain (current implementation symmetrises edges)
+//! * (none currently tracked here)
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -912,6 +913,212 @@ impl GraphView {
                 }
 
                 sigma_tot[best_comm] += deg[i];
+                comm[i] = best_comm;
+                if best_comm != ci {
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        comm
+    }
+
+    // ---- directed-modularity Louvain --------------------------------------
+
+    /// Community detection via Louvain on **directed modularity**, so edge
+    /// direction matters (unlike [`louvain`](Self::louvain), which symmetrises
+    /// the graph first).
+    ///
+    /// Directed modularity (Leicht & Newman 2008) is
+    ///
+    /// ```text
+    /// Q = (1/m) Σ_{i,j} [ A_ij − k_i^out · k_j^in / m ] δ(c_i, c_j)
+    /// ```
+    ///
+    /// where `m` is the number of directed edges, `A_ij` the weight of edge
+    /// `i → j`, `k_i^out` / `k_j^in` the out- / in-strengths, and `δ` the
+    /// same-community indicator. The null model uses the product of `i`'s
+    /// *out*-degree and `j`'s *in*-degree, so a pair joined only as `i → j`
+    /// counts differently from one joined as `j → i`.
+    ///
+    /// The algorithm alternates a local-moving phase (greedily move each node
+    /// into the neighbouring community of maximum directed-modularity gain) with
+    /// an aggregation phase (collapse each community into a directed super-node,
+    /// preserving in/out edge weights and folding internal edges into a directed
+    /// self-loop), repeating until no node moves.
+    ///
+    /// The gain of moving isolated node `i` into community `C` is
+    ///
+    /// ```text
+    /// ΔQ(C) = (d_{i→C} + d_{C→i}) / m − ( k_i^out·Σ_in(C) + k_i^in·Σ_out(C) ) / m²
+    /// ```
+    ///
+    /// where `d_{i→C}` / `d_{C→i}` are the weights of edges from `i` into `C` /
+    /// from `C` into `i`, and `Σ_out(C)` / `Σ_in(C)` the summed out- / in-degrees
+    /// of `C` (the constant `k_i^out·k_i^in / m²` self-term is dropped, being
+    /// equal for every candidate community).
+    ///
+    /// Returns `entity_id → community id` (0-based, opaque).
+    pub fn louvain_directed(&self) -> HashMap<EntityLiteralId, usize> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return HashMap::new();
+        }
+
+        // --- build the initial directed weighted graph (dense indices) ---
+        // Each de-duplicated CSR edge has unit weight; a directed self-loop is
+        // tracked separately (it contributes to both in- and out-strength).
+        let mut out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut in_: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut self_w = vec![0.0f64; n];
+        let mut m = 0.0f64;
+        for (u, span) in self.out_ptr.windows(2).enumerate() {
+            for &v in &self.out_adj[span[0]..span[1]] {
+                m += 1.0;
+                if u == v {
+                    self_w[u] += 1.0;
+                } else {
+                    out[u].push((v, 1.0));
+                    in_[v].push((u, 1.0));
+                }
+            }
+        }
+        if m == 0.0 {
+            // No edges: every node is its own community.
+            return self
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| (id, i))
+                .collect();
+        }
+
+        let mut k_out: Vec<f64> = (0..n)
+            .map(|i| out[i].iter().map(|&(_, w)| w).sum::<f64>() + self_w[i])
+            .collect();
+        let mut k_in: Vec<f64> = (0..n)
+            .map(|i| in_[i].iter().map(|&(_, w)| w).sum::<f64>() + self_w[i])
+            .collect();
+
+        let mut orig_to_super: Vec<usize> = (0..n).collect();
+        let mut cur_n = n;
+
+        loop {
+            let comm = Self::louvain_one_level_directed(&out, &in_, &k_out, &k_in, m);
+            let (renumbered, k) = Self::renumber(&comm);
+
+            for s in orig_to_super.iter_mut() {
+                *s = renumbered[*s];
+            }
+
+            if k == cur_n {
+                break; // no community merged: converged
+            }
+
+            // --- aggregate communities into directed super-nodes ---
+            let mut new_self = vec![0.0f64; k];
+            let mut new_edge: HashMap<(usize, usize), f64> = HashMap::new();
+            for u in 0..cur_n {
+                let cu = renumbered[u];
+                new_self[cu] += self_w[u];
+                for &(v, w) in &out[u] {
+                    let cv = renumbered[v];
+                    if cu == cv {
+                        new_self[cu] += w; // internal directed edge → self-loop
+                    } else {
+                        *new_edge.entry((cu, cv)).or_insert(0.0) += w;
+                    }
+                }
+            }
+
+            let mut next_out: Vec<Vec<(usize, f64)>> = vec![Vec::new(); k];
+            let mut next_in: Vec<Vec<(usize, f64)>> = vec![Vec::new(); k];
+            for (&(a, b), &w) in &new_edge {
+                next_out[a].push((b, w));
+                next_in[b].push((a, w));
+            }
+            let next_k_out: Vec<f64> = (0..k)
+                .map(|i| next_out[i].iter().map(|&(_, w)| w).sum::<f64>() + new_self[i])
+                .collect();
+            let next_k_in: Vec<f64> = (0..k)
+                .map(|i| next_in[i].iter().map(|&(_, w)| w).sum::<f64>() + new_self[i])
+                .collect();
+
+            out = next_out;
+            in_ = next_in;
+            self_w = new_self;
+            k_out = next_k_out;
+            k_in = next_k_in;
+            cur_n = k;
+        }
+
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, orig_to_super[i]))
+            .collect()
+    }
+
+    /// One directed-Louvain local-moving pass: repeatedly sweep all nodes,
+    /// moving each into the neighbouring community of maximum directed-modularity
+    /// gain, until a full sweep makes no move. Returns the community label per
+    /// node. `out`/`in_` are the directed weighted adjacencies, `k_out`/`k_in`
+    /// the per-node out-/in-strengths (self-loops included), and `m` the total
+    /// directed edge weight.
+    fn louvain_one_level_directed(
+        out: &[Vec<(usize, f64)>],
+        in_: &[Vec<(usize, f64)>],
+        k_out: &[f64],
+        k_in: &[f64],
+        m: f64,
+    ) -> Vec<usize> {
+        let n = out.len();
+        let mut comm: Vec<usize> = (0..n).collect();
+        let mut sigma_out: Vec<f64> = k_out.to_vec(); // Σ out-degree per community
+        let mut sigma_in: Vec<f64> = k_in.to_vec(); // Σ in-degree per community
+        let m_sq = m * m;
+
+        loop {
+            let mut moved = false;
+            for i in 0..n {
+                let ci = comm[i];
+                // Tentatively remove `i` from its community.
+                sigma_out[ci] -= k_out[i];
+                sigma_in[ci] -= k_in[i];
+
+                // Combined directed weight between `i` and each neighbouring
+                // community: out-edges i→C plus in-edges C→i (j == i excluded;
+                // `i` is now isolated).
+                let mut k_to: HashMap<usize, f64> = HashMap::new();
+                for &(j, w) in &out[i] {
+                    if j != i {
+                        *k_to.entry(comm[j]).or_insert(0.0) += w;
+                    }
+                }
+                for &(j, w) in &in_[i] {
+                    if j != i {
+                        *k_to.entry(comm[j]).or_insert(0.0) += w;
+                    }
+                }
+
+                // Baseline: re-joining the original community.
+                let base = k_to.get(&ci).copied().unwrap_or(0.0);
+                let mut best_comm = ci;
+                let mut best_gain =
+                    base / m - (k_out[i] * sigma_in[ci] + k_in[i] * sigma_out[ci]) / m_sq;
+
+                for (&c, &w) in &k_to {
+                    let gain = w / m - (k_out[i] * sigma_in[c] + k_in[i] * sigma_out[c]) / m_sq;
+                    if gain > best_gain + 1e-12 {
+                        best_gain = gain;
+                        best_comm = c;
+                    }
+                }
+
+                sigma_out[best_comm] += k_out[i];
+                sigma_in[best_comm] += k_in[i];
                 comm[i] = best_comm;
                 if best_comm != ci {
                     moved = true;
@@ -2560,6 +2767,52 @@ mod tests {
             assert_eq!(comm[&id], cb, "clique-B node {id} drifted");
         }
         assert_ne!(ca, cb, "the two cliques must be different communities");
+    }
+
+    #[test]
+    fn test_louvain_directed_two_cycles() {
+        // Two directed 3-cycles — A: 1→2→3→1, B: 4→5→6→4 — joined by one
+        // directed bridge 3→4. Each cycle is strongly connected and internally
+        // cohesive, so directed modularity recovers exactly {1,2,3} and {4,5,6}
+        // (merging all six into one community gives Q = 0; the split gives
+        // Q ≈ 0.37, so the split wins).
+        let mut s = TripleStore::new();
+        let p = 1u32;
+        for (a, b) in [(1, 2), (2, 3), (3, 1)] {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        for (a, b) in [(4, 5), (5, 6), (6, 4)] {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        s.insert(IdTriple::new(3, p, 4)); // single directed bridge
+
+        let g = GraphView::from_store(&s);
+        let comm = g.louvain_directed();
+
+        let distinct: std::collections::HashSet<usize> = comm.values().copied().collect();
+        assert_eq!(distinct.len(), 2, "expected exactly two communities");
+
+        let ca = comm[&1];
+        for &id in &[1u32, 2, 3] {
+            assert_eq!(comm[&id], ca, "cycle-A node {id} drifted");
+        }
+        let cb = comm[&4];
+        for &id in &[4u32, 5, 6] {
+            assert_eq!(comm[&id], cb, "cycle-B node {id} drifted");
+        }
+        assert_ne!(ca, cb, "the two cycles must be different communities");
+    }
+
+    #[test]
+    fn test_louvain_directed_single_self_loop() {
+        // A lone node with a directed self-loop is its own community (exercises
+        // the self-loop strength bookkeeping and the single-node convergence).
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(1, 1, 1));
+        let g = GraphView::from_store(&s);
+        let comm = g.louvain_directed();
+        assert_eq!(comm.len(), g.node_count());
+        assert_eq!(comm.len(), 1);
     }
 
     // ---- k-core decomposition ---------------------------------------------

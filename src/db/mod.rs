@@ -583,7 +583,14 @@ impl Database {
         let id = self.encode_triple(t);
         let changed = self.store.insert(id);
         if changed {
-            self.index_valid = false; // VS-tree now stale
+            // While the index is consistent, keep it consistent *incrementally*:
+            // the inserted edge only changes the signatures of its subject (and
+            // its object, when that is an entity), so re-sign just those entities
+            // and update their VS-tree entries in place — no full rebuild. If the
+            // index is already stale we leave it stale and rebuild lazily.
+            if self.index_valid {
+                self.vstree_index_insert(id);
+            }
             self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Del(None, id)); // rollback removes what we added
@@ -591,6 +598,36 @@ impl Database {
             self.record_redo(b'I', None, id);
         }
         changed
+    }
+
+    /// Fold a just-inserted default-graph triple into the VS-tree incrementally
+    /// (called only while the index is valid). The subject — and the object when
+    /// it is an entity — gained an incident edge, so each is re-signed from the
+    /// current store and its tree entry updated (or inserted, if new to the
+    /// tree). Mirrors [`build_vstree`]'s per-entity signing, so the
+    /// incrementally-maintained tree stays equivalent to a freshly-rebuilt one
+    /// and the candidate filter remains a sound superset.
+    fn vstree_index_insert(&mut self, id: IdTriple) {
+        self.upsert_entity_signature(id.sub);
+        // Literal objects are not VS-tree entities (see `build_vstree`).
+        if is_entity_id(id.obj) {
+            self.upsert_entity_signature(id.obj);
+        }
+    }
+
+    /// Recompute entity `e`'s full signature from its current in/out edges and
+    /// update its VS-tree entry in place, inserting it if it is not yet indexed.
+    fn upsert_entity_signature(&mut self, e: u32) {
+        let mut sig = Signature::new();
+        for &(p, o) in &self.store.po_by_s(e) {
+            sig.encode_edge(p, o, EdgeDir::Out);
+        }
+        for &(p, s) in &self.store.ps_by_o(e) {
+            sig.encode_edge(p, s, EdgeDir::In);
+        }
+        if !self.vstree.update(e, sig) {
+            self.vstree.insert(e, sig);
+        }
     }
 
     /// Remove one triple. Returns `true` if it existed. Does not intern: if any
@@ -606,6 +643,14 @@ impl Database {
         let id = IdTriple::new(sub, pred, obj);
         let changed = self.store.remove(id);
         if changed {
+            // Deletes deliberately invalidate (full rebuild on next save / query)
+            // rather than updating incrementally. A removed edge *shrinks* the
+            // subject/object signatures, and while `VsTree::update` stays sound
+            // under a shrink, a delete can also leave an entity with no edges at
+            // all (a phantom tree entry) and can be followed by `reclaim_unused`,
+            // which reuses freed dictionary ids for unrelated terms. Cleanly
+            // handling those would need entry removal + rebalancing the bulk-built
+            // tree, so we keep the simple, always-correct rebuild for deletes.
             self.index_valid = false;
             self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
@@ -1797,6 +1842,123 @@ mod tests {
     fn load_missing_dir_errors() {
         let e = Database::load(std::env::temp_dir().join("gstore_does_not_exist_xyz")).unwrap_err();
         assert!(matches!(e, GStoreError::Database(_)));
+    }
+
+    // ---- incremental VS-tree maintenance ---------------------------------
+
+    /// Inserts must update the VS-tree incrementally (keeping the index valid)
+    /// and the query results must match a freshly-rebuilt baseline at every step.
+    #[test]
+    fn incremental_vstree_keeps_index_valid_and_matches_rebuild() {
+        let mut inc = Database::build_from_str("inc", SMALL).unwrap();
+        assert!(inc.stats().index_valid, "build leaves the index valid");
+
+        // Edges added one at a time; some touch existing entities (signature
+        // grows), some introduce brand-new entities (tree insert).
+        let extra = [
+            ("node0", "own", "point2"),
+            ("node0", "link", "node1"),
+            ("node1", "own", "point2"),
+            ("root", "contain", "node2"),
+            ("node2", "own", "point3"),
+            ("point0", "kind", "leaf"),
+        ];
+
+        let mut accumulated = SMALL.to_string();
+        for (s, p, o) in extra {
+            assert!(inc.insert_triple(&Triple::new(
+                Term::iri(s),
+                Term::iri(p),
+                Term::iri(o)
+            )));
+            // The whole point of task 1: the index is *not* invalidated.
+            assert!(
+                inc.stats().index_valid,
+                "incremental insert must keep the index valid"
+            );
+
+            // Baseline: a fresh DB over all triples so far does a full VS-tree
+            // rebuild. The incremental DB answers via its updated tree.
+            accumulated.push_str(&format!("<{s}> <{p}> <{o}> .\n"));
+            let mut base = Database::build_from_str("base", &accumulated).unwrap();
+
+            for q in [
+                "SELECT ?o WHERE { <root> <contain> ?o }",
+                "SELECT ?s ?o WHERE { ?s <own> ?o }",
+                "SELECT ?s WHERE { ?s <own> <point2> }",
+                "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            ] {
+                let mut a = inc.select(q).unwrap().rows;
+                let mut b = base.select(q).unwrap().rows;
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "query {q:?} diverged after inserting ({s},{p},{o})");
+            }
+        }
+    }
+
+    /// Incremental inserts that force VS-tree leaf/internal splits (more than the
+    /// node fan-out of new entities) stay sound against a full-rebuild baseline.
+    #[test]
+    fn incremental_vstree_sound_under_node_splits() {
+        let mut inc = Database::new("inc");
+        assert!(inc.stats().index_valid);
+
+        let mut accumulated = String::new();
+        let n = 300u32; // well past the VS-tree fan-out (64) ⇒ splits happen
+        for i in 0..n {
+            let s = format!("e{i}");
+            let o = format!("t{}", i % 23);
+            assert!(inc.insert_triple(&Triple::new(
+                Term::iri(&s),
+                Term::iri("p"),
+                Term::iri(&o)
+            )));
+            accumulated.push_str(&format!("<{s}> <p> <{o}> .\n"));
+        }
+        assert!(
+            inc.stats().index_valid,
+            "every incremental insert kept the index valid"
+        );
+
+        let mut base = Database::build_from_str("base", &accumulated).unwrap();
+        for q in [
+            "SELECT ?s WHERE { ?s <p> <t7> }",
+            "SELECT ?s WHERE { ?s <p> <t0> }",
+            "SELECT ?s ?o WHERE { ?s <p> ?o }",
+        ] {
+            let mut a = inc.select(q).unwrap().rows;
+            let mut b = base.select(q).unwrap().rows;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "query {q:?} diverged under incremental splits");
+            assert!(!a.is_empty(), "query {q:?} should return rows");
+        }
+    }
+
+    /// A delete invalidates the index (documented behaviour); a subsequent query
+    /// still returns correct results (it evaluates without the stale tree, or
+    /// after a rebuild on save), and inserts after the delete leave it stale.
+    #[test]
+    fn delete_invalidates_then_results_stay_correct() {
+        let mut db = Database::build_from_str("d", SMALL).unwrap();
+        assert!(db.stats().index_valid);
+        assert!(db.remove_triple(&Triple::new(
+            Term::iri("node1"),
+            Term::iri("own"),
+            Term::iri("point0")
+        )));
+        assert!(!db.stats().index_valid, "a delete invalidates the index");
+
+        let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
+        let got: Vec<_> = rs.rows.iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(got, vec!["<point1>".to_string()], "point0 was deleted");
+
+        // Rebuilding restores a valid index and the same answer.
+        db.rebuild_index();
+        assert!(db.stats().index_valid);
+        let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
+        assert_eq!(rs.row_count(), 1);
     }
 
     // ---- redo log --------------------------------------------------------

@@ -89,6 +89,36 @@ impl Node {
         Some(self.split())
     }
 
+    /// Replace the stored signature of entity `id` (somewhere in this subtree)
+    /// with `new_sig`, unioning `new_sig` into every node on the descent path so
+    /// each node's signature stays a superset of its descendants. Returns `true`
+    /// if `id` was found here. The first matching entry is updated (ids are
+    /// unique in a tree built by [`VsTree::build`] / maintained by
+    /// [`VsTree::update`]).
+    fn update(&mut self, id: EntityLiteralId, new_sig: Signature) -> bool {
+        match self {
+            Node::Leaf { sig, entries } => {
+                for (eid, esig) in entries.iter_mut() {
+                    if *eid == id {
+                        *esig = new_sig;
+                        sig.union_with(&new_sig);
+                        return true;
+                    }
+                }
+                false
+            }
+            Node::Internal { sig, children } => {
+                for child in children.iter_mut() {
+                    if child.update(id, new_sig) {
+                        sig.union_with(&new_sig);
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     /// Split this overflowing node into two, keeping the left half in place and
     /// returning the right half. Both halves' signatures are recomputed as the
     /// exact union of their members, preserving the superset invariant.
@@ -297,6 +327,31 @@ impl VsTree {
         }
     }
 
+    /// Replace the stored signature of an existing entity with `new_sig` — the
+    /// entity's *current* full signature, recomputed from the store after a
+    /// mutation added or removed one of its incident edges. Returns `true` if
+    /// `id` was present (and updated), `false` if it is not in the tree (the
+    /// caller may then [`insert`](Self::insert) it).
+    ///
+    /// This is the incremental-maintenance counterpart of a full rebuild: rather
+    /// than re-signing every entity and rebuilding the tree on each mutation, the
+    /// one affected entity's leaf entry is overwritten and the new bits unioned
+    /// up its path.
+    ///
+    /// Soundness: the target leaf entry is set to *exactly* `new_sig`, while every
+    /// ancestor only ever *gains* bits (a union). So the tree invariant — each
+    /// node's signature ⊇ the union of its descendant entity signatures — is
+    /// preserved whether `new_sig` grew (edge added) or shrank (edge removed)
+    /// relative to the old entry. The candidate filter therefore stays a sound
+    /// superset of the true matches (never a false negative); a shrink merely
+    /// leaves slightly looser ancestor unions, costing only some pruning power.
+    pub fn update(&mut self, id: EntityLiteralId, new_sig: Signature) -> bool {
+        match self.root.as_mut() {
+            None => false,
+            Some(root) => root.update(id, new_sig),
+        }
+    }
+
     /// Height of the tree (0 = empty, 1 = a single leaf). For tests asserting
     /// that incremental insertion actually splits and grows the tree.
     #[cfg(test)]
@@ -502,6 +557,56 @@ mod tests {
                 if sig.contains(&q) {
                     assert!(cands.contains(id), "entity {id} missing after incremental insert");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn update_grows_signature_and_stays_sound() {
+        // Build a tree, then grow one entity's signature with a new edge via
+        // `update`; the new edge must become findable and the entity count must
+        // not change (update is in-place, not an insert).
+        let mut tree = VsTree::new();
+        for i in 0..120u32 {
+            tree.insert(i, esig(&[(1, i, EdgeDir::Out)]));
+        }
+        assert_eq!(tree.entity_count(), 120);
+
+        // Updating an absent entity reports "not found".
+        assert!(!tree.update(9999, esig(&[(7, 7, EdgeDir::Out)])));
+
+        // Grow entity 42 to also have edge (2 -> 99).
+        let grown = esig(&[(1, 42, EdgeDir::Out), (2, 99, EdgeDir::Out)]);
+        assert!(tree.update(42, grown));
+        assert_eq!(tree.entity_count(), 120, "update must not change the count");
+
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(2), Some(99), EdgeDir::Out);
+        assert!(
+            tree.candidates(&q).unwrap().contains(&42),
+            "the freshly-added edge must be findable after update"
+        );
+    }
+
+    #[test]
+    fn update_shrinks_signature_without_false_negatives() {
+        // Every entity starts with two edges; shrink one entity to drop an edge.
+        // The shrunk entity must fall out of that edge's candidate set (the leaf
+        // entry is checked exactly), while every other entity is still found.
+        let mut tree = VsTree::new();
+        for i in 0..60u32 {
+            tree.insert(i, esig(&[(1, i, EdgeDir::Out), (2, 99, EdgeDir::Out)]));
+        }
+        assert!(tree.update(7, esig(&[(1, 7, EdgeDir::Out)])));
+
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(2), Some(99), EdgeDir::Out);
+        let cands: std::collections::HashSet<u32> =
+            tree.candidates(&q).unwrap().into_iter().collect();
+        assert!(!cands.contains(&7), "shrunk entity drops out of the candidate set");
+        for i in 0..60u32 {
+            if i != 7 {
+                assert!(cands.contains(&i), "entity {i} must remain a candidate");
             }
         }
     }
