@@ -74,6 +74,35 @@ fn query1_returns_specific_graduate_students() {
 }
 
 #[test]
+fn vstree_filter_preserves_results() {
+    // The VS-tree is a *filter*: enabling it (db.query path) must yield exactly
+    // the same answers as evaluating without it (Evaluator::new on the raw
+    // store). This proves the signature candidate sets are a sound superset.
+    use gstore::query::{Evaluator, QueryResult};
+
+    let mut db = build();
+    for i in 1..=14 {
+        let file = format!("lubm_q{i}.rq");
+        let q = match std::fs::read_to_string(lubm_dir().join(&file)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // VS-tree ON (Database uses the index when valid).
+        let with = db.select(&q).unwrap().row_count();
+        // VS-tree OFF (plain evaluator over the same dict + store).
+        let parsed = gstore::parser::sparql::parse(&q).unwrap();
+        let without = match Evaluator::new(db.dict(), db.store())
+            .evaluate(&parsed)
+            .unwrap()
+        {
+            QueryResult::Select(rs) => rs.row_count(),
+            other => panic!("{file}: expected SELECT, got {other:?}"),
+        };
+        assert_eq!(with, without, "{file}: VS-tree changed the result count");
+    }
+}
+
+#[test]
 fn save_load_preserves_lubm_query() {
     let dir = std::env::temp_dir().join("gstore_dt_lubm_roundtrip");
     let _ = std::fs::remove_dir_all(&dir);

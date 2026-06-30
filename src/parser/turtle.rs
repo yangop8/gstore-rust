@@ -229,8 +229,7 @@ impl Parser {
     fn parse_verb(&mut self) -> Result<Term> {
         self.skip_ws();
         // 'a' keyword (must be standalone)
-        if self.peek() == Some('a') && self.peek2().map_or(true, |c| c.is_whitespace() || c == '<')
-        {
+        if self.peek() == Some('a') && self.peek2().is_none_or(|c| c.is_whitespace() || c == '<') {
             self.bump();
             return Ok(Term::iri(RDF_TYPE));
         }
@@ -279,7 +278,7 @@ impl Parser {
         while let Some(c) = self.peek() {
             if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
                 // Don't absorb a '.' that terminates the statement.
-                if c == '.' && self.peek2().map_or(true, |n| n.is_whitespace()) {
+                if c == '.' && self.peek2().is_none_or(|n| n.is_whitespace()) {
                     break;
                 }
                 label.push(c);

@@ -4,10 +4,10 @@
 //! triple store, builds from RDF files, applies updates, answers SPARQL, and
 //! persists to / loads from a database directory.
 //!
-//! Persistence (DESIGN §7): a database is a directory holding three
-//! bincode-serialized files — `dict.bin`, `store.bin`, `meta.bin`. This is the
-//! deliberately-simple stand-in for gStore's on-disk B+ tree KVstore (backlog
-//! item A).
+//! Persistence (DESIGN §7): a database is a directory holding four
+//! bincode-serialized files — `dict.bin`, `store.bin`, `meta.bin`, and
+//! `vstree.bin` (the signature index). This is the deliberately-simple stand-in
+//! for gStore's on-disk B+ tree KVstore (backlog item A).
 
 use std::fs;
 use std::path::Path;
@@ -16,15 +16,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
+use crate::model::id::is_entity_id;
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql::ast::{GroundTriple, Query};
 use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, QueryResult};
+use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::TripleStore;
 
 const DICT_FILE: &str = "dict.bin";
 const STORE_FILE: &str = "store.bin";
 const META_FILE: &str = "meta.bin";
+const VSTREE_FILE: &str = "vstree.bin";
+
+/// Build a VS-tree over every entity, signing each by its in/out edges.
+fn build_vstree(store: &TripleStore) -> VsTree {
+    // Entities = everything that is a subject, plus objects that are entities
+    // (literal objects are not indexed by the VS-tree).
+    let mut ids: Vec<u32> = store.subject_keys().collect();
+    ids.extend(store.object_keys().filter(|&o| is_entity_id(o)));
+    ids.sort_unstable();
+    ids.dedup();
+
+    let entries = ids
+        .into_iter()
+        .map(|e| {
+            let mut sig = Signature::new();
+            for &(p, o) in store.po_by_s(e) {
+                sig.encode_edge(p, o, EdgeDir::Out);
+            }
+            for &(p, s) in store.ps_by_o(e) {
+                sig.encode_edge(p, s, EdgeDir::In);
+            }
+            (e, sig)
+        })
+        .collect();
+    VsTree::build(entries)
+}
 
 /// On-disk metadata (kept tiny and human-meaningful).
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,12 +64,18 @@ struct Meta {
     predicate_num: u64,
 }
 
-/// An RDF database: a dictionary plus the six-way triple index.
+/// An RDF database: a dictionary, the six-way triple index, and a VS-tree.
 #[derive(Debug)]
 pub struct Database {
     name: String,
     dict: Dictionary,
     store: TripleStore,
+    /// Signature index for query-time candidate pruning.
+    vstree: VsTree,
+    /// Whether `vstree` is consistent with `store`. Cleared on update; the
+    /// VS-tree is only used for filtering while valid, and rebuilt on `save`
+    /// or `rebuild_index`. (A stale tree is never used, preserving correctness.)
+    index_valid: bool,
 }
 
 impl Database {
@@ -51,7 +85,15 @@ impl Database {
             name: name.into(),
             dict: Dictionary::new(),
             store: TripleStore::new(),
+            vstree: VsTree::new(),
+            index_valid: true, // empty store ⇔ empty tree, trivially consistent
         }
+    }
+
+    /// Rebuild the VS-tree from the current store and mark the index valid.
+    pub fn rebuild_index(&mut self) {
+        self.vstree = build_vstree(&self.store);
+        self.index_valid = true;
     }
 
     /// Build a database by importing one or more N-Triples files.
@@ -67,6 +109,7 @@ impl Database {
             }
         }
         db.store.bulk_load(id_triples);
+        db.rebuild_index();
         Ok(db)
     }
 
@@ -79,6 +122,7 @@ impl Database {
             id_triples.push(db.encode_triple(&t));
         }
         db.store.bulk_load(id_triples);
+        db.rebuild_index();
         Ok(db)
     }
 
@@ -119,7 +163,11 @@ impl Database {
     /// Insert one triple. Returns `true` if it was newly added.
     pub fn insert_triple(&mut self, t: &Triple) -> bool {
         let id = self.encode_triple(t);
-        self.store.insert(id)
+        let changed = self.store.insert(id);
+        if changed {
+            self.index_valid = false; // VS-tree now stale
+        }
+        changed
     }
 
     /// Remove one triple. Returns `true` if it existed. Does not intern: if any
@@ -132,7 +180,11 @@ impl Database {
         ) else {
             return false;
         };
-        self.store.remove(IdTriple::new(sub, pred, obj))
+        let changed = self.store.remove(IdTriple::new(sub, pred, obj));
+        if changed {
+            self.index_valid = false;
+        }
+        changed
     }
 
     fn ground_to_triple(g: &GroundTriple) -> Triple {
@@ -162,7 +214,14 @@ impl Database {
         let q = sparql::parse(sparql)?;
         match q {
             Query::Select(_) | Query::Ask(_) => {
-                Evaluator::new(&self.dict, &self.store).evaluate(&q)
+                // Use the VS-tree as a candidate filter only while it is
+                // consistent with the store; otherwise evaluate without it.
+                let eval = if self.index_valid {
+                    Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
+                } else {
+                    Evaluator::new(&self.dict, &self.store)
+                };
+                eval.evaluate(&q)
             }
             Query::InsertData(triples) => {
                 let changed = self.insert_data(&triples);
@@ -201,6 +260,12 @@ impl Database {
             predicate_num: self.dict.predicate_num() as u64,
         };
         write_bincode(&dir.join(META_FILE), &meta)?;
+        // Persist a fresh VS-tree (rebuild if the in-memory one is stale).
+        if self.index_valid {
+            write_bincode(&dir.join(VSTREE_FILE), &self.vstree)?;
+        } else {
+            write_bincode(&dir.join(VSTREE_FILE), &build_vstree(&self.store))?;
+        }
         Ok(())
     }
 
@@ -224,10 +289,14 @@ impl Database {
                 store.triple_count()
             )));
         }
+        // The VS-tree is rebuilt from the store if absent or unreadable.
+        let vstree = read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
         Ok(Database {
             name: meta.name,
             dict,
             store,
+            vstree,
+            index_valid: true,
         })
     }
 }

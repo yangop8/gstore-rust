@@ -5,12 +5,13 @@
 //!
 //! 1. Resolve each triple pattern's constants to ids (a missing constant makes
 //!    the whole conjunctive BGP empty).
-//! 2. Greedily order patterns (most-constrained / connected first) — a simple
-//!    stand-in for gStore's cost-based `Optimizer` (backlog item C).
-//! 3. Iteratively extend partial bindings by indexed lookups + unification.
-//! 4. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
+//! 2. (Optional) use the VS-tree to pre-compute candidate id sets for entity
+//!    variables — a sound superset filter pushed into the join.
+//! 3. Cost-based join ordering (see [`crate::query::optimizer`]).
+//! 4. Iteratively extend partial bindings by indexed lookups + unification.
+//! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
 
@@ -20,6 +21,7 @@ use crate::model::id::PredId;
 use crate::model::Term;
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
+use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::TripleStore;
 
 use super::results::{QueryResult, ResultSet};
@@ -119,11 +121,30 @@ pub(crate) struct PatPlan {
 pub struct Evaluator<'a> {
     dict: &'a Dictionary,
     store: &'a TripleStore,
+    /// Optional VS-tree for entity-candidate pre-filtering.
+    vstree: Option<&'a VsTree>,
 }
 
 impl<'a> Evaluator<'a> {
     pub fn new(dict: &'a Dictionary, store: &'a TripleStore) -> Evaluator<'a> {
-        Evaluator { dict, store }
+        Evaluator {
+            dict,
+            store,
+            vstree: None,
+        }
+    }
+
+    /// Build an evaluator that uses `vstree` to prune entity-variable bindings.
+    pub fn with_vstree(
+        dict: &'a Dictionary,
+        store: &'a TripleStore,
+        vstree: &'a VsTree,
+    ) -> Evaluator<'a> {
+        Evaluator {
+            dict,
+            store,
+            vstree: Some(vstree),
+        }
     }
 
     /// Evaluate a read query (SELECT / ASK). Updates are handled in the db layer.
@@ -285,12 +306,15 @@ impl<'a> Evaluator<'a> {
 
         let order = self.order_plans(&plans);
 
+        // VS-tree pre-filter: sound candidate id sets for entity variables.
+        let candidates = self.compute_candidates(tps, layout);
+
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
         for &pi in &order {
             let plan = &plans[pi];
             let mut next = Vec::new();
             for binding in &solutions {
-                self.extend(binding, plan, &mut next);
+                self.extend(binding, plan, &candidates, &mut next);
             }
             solutions = next;
             if solutions.is_empty() {
@@ -298,6 +322,76 @@ impl<'a> Evaluator<'a> {
             }
         }
         solutions
+    }
+
+    /// Compute, for each entity variable, the VS-tree candidate id set built
+    /// from its incident triple patterns' constant predicates/neighbours. Only
+    /// variables that appear as a *subject* (hence always entities) are filtered,
+    /// keeping the filter sound for variables that might bind to literals.
+    fn compute_candidates(
+        &self,
+        tps: &[TriplePattern],
+        layout: &VarLayout,
+    ) -> HashMap<usize, HashSet<u32>> {
+        let mut out = HashMap::new();
+        let Some(vstree) = self.vstree else {
+            return out;
+        };
+
+        // Entity-typed variables: those used as a subject somewhere.
+        let mut subj_vars: HashSet<usize> = HashSet::new();
+        for tp in tps {
+            if let PatternTerm::Var(v) = &tp.subject {
+                subj_vars.insert(layout.index[v]);
+            }
+        }
+
+        for &vidx in &subj_vars {
+            let mut sig = Signature::new();
+            for tp in tps {
+                if matches!(&tp.subject, PatternTerm::Var(v) if layout.index[v] == vidx) {
+                    // out-edge: this var is the subject
+                    sig.encode_query_edge(
+                        self.pred_id_of(&tp.predicate),
+                        self.neighbor_id_of(&tp.object),
+                        EdgeDir::Out,
+                    );
+                }
+                if matches!(&tp.object, PatternTerm::Var(v) if layout.index[v] == vidx) {
+                    // in-edge: this var is the object
+                    sig.encode_query_edge(
+                        self.pred_id_of(&tp.predicate),
+                        self.neighbor_id_of(&tp.subject),
+                        EdgeDir::In,
+                    );
+                }
+            }
+            if sig.is_empty() {
+                continue; // nothing constant to filter on
+            }
+            if let Some(cands) = vstree.candidates(&sig) {
+                out.insert(vidx, cands.into_iter().collect());
+            }
+        }
+        out
+    }
+
+    /// The predicate id of a constant-IRI predicate position, if resolvable.
+    fn pred_id_of(&self, pt: &PatternTerm) -> Option<PredId> {
+        match pt {
+            PatternTerm::Term(Term::Iri(iri)) => {
+                self.dict.predicate_id(&Term::iri(iri.clone()).dict_key())
+            }
+            _ => None,
+        }
+    }
+
+    /// The id of a constant neighbour (subject/object) position, if resolvable.
+    fn neighbor_id_of(&self, pt: &PatternTerm) -> Option<u32> {
+        match pt {
+            PatternTerm::Term(t) => self.dict.term_id(t),
+            PatternTerm::Var(_) => None,
+        }
     }
 
     /// Resolve a pattern's constants to ids. Returns `None` if a constant is
@@ -329,7 +423,14 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Extend a partial binding by one pattern, appending results to `out`.
-    fn extend(&self, binding: &Binding, plan: &PatPlan, out: &mut Vec<Binding>) {
+    /// `cands` (possibly empty) restricts entity variables to VS-tree candidates.
+    fn extend(
+        &self,
+        binding: &Binding,
+        plan: &PatPlan,
+        cands: &HashMap<usize, HashSet<u32>>,
+        out: &mut Vec<Binding>,
+    ) {
         let ks = slot_known(&plan.s, binding);
         let kp = slot_known(&plan.p, binding);
         let ko = slot_known(&plan.o, binding);
@@ -387,6 +488,10 @@ impl<'a> Evaluator<'a> {
         };
 
         for (s, p, o) in candidates {
+            // VS-tree filter: an entity variable's value must be a candidate.
+            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
+                continue;
+            }
             let mut nb = binding.clone();
             if unify(&mut nb, &plan.s, s)
                 && unify(&mut nb, &plan.p, p)
@@ -788,6 +893,15 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
     match slot {
         Slot::Const(id) => Some(*id),
         Slot::Var(v) => binding[*v],
+    }
+}
+
+/// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
+/// Constants and variables without a candidate set are always allowed.
+fn cand_ok(slot: &Slot, value: u32, cands: &HashMap<usize, HashSet<u32>>) -> bool {
+    match slot {
+        Slot::Var(v) => cands.get(v).is_none_or(|set| set.contains(&value)),
+        Slot::Const(_) => true,
     }
 }
 

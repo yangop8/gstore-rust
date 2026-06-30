@@ -256,6 +256,16 @@ impl TripleStore {
         self.p2so.keys().copied()
     }
 
+    /// All ids that appear as a subject (always entities), sorted.
+    pub fn subject_keys(&self) -> impl Iterator<Item = EntityLiteralId> + '_ {
+        self.s2po.keys().copied()
+    }
+
+    /// All ids that appear as an object (entities or literals), sorted.
+    pub fn object_keys(&self) -> impl Iterator<Item = EntityLiteralId> + '_ {
+        self.o2ps.keys().copied()
+    }
+
     // ---- statistics (for the cost-based optimizer) -----------------------
 
     /// Number of distinct subject keys (≈ distinct entities used as subjects).
