@@ -21,15 +21,22 @@
 //!   `(sub, pred)` group with an arbitrarily long posting list is written across
 //!   a linked list of pages and referenced from the tree by just its head id.
 //!
-//! ## Deferred (task 5): differentiated block/array management
-//! gStore also splits storage into `IVArray`/`ISArray` (integer- vs string-keyed
-//! array files). Here a single [`bptree::BTree`] serves every index, with
-//! [`overflow`] chains handling long values; separating integer- from
-//! string-keyed arrays is the remaining gStore-faithful refinement and is
-//! intentionally left out of this pass.
+//! ## Differentiated block/array management (gStore IVArray/ISArray)
+//! gStore does not store its *id-keyed* tables in a B+ tree: it keeps an array of
+//! entries indexed directly by the id, each pointing into a block-managed value
+//! file (`IVArray`/`ISArray` + their block managers). [`ivarray::IvArray`] ports
+//! that **integer-keyed dense array** and now backs the `id2entity`/`id2literal`/
+//! `id2predicate` reverse-dictionary stores (see [`store::DiskStore`]). The
+//! *string*-keyed forward dictionary (`entity2id`/…) keeps the variable-key
+//! [`bptree::BTree`] — already the right structure for byte keys — and the
+//! composite-key triple indexes (SPO/POS/OSP) stay on ordered B+ trees because
+//! they need prefix range scans an array can't provide. (gStore's single-id
+//! `IVArray` posting-list layout for the triple values is a deeper refactor; the
+//! [`vlist`]-compressed `sp2o_vlist` index is the closest analogue here.)
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod ivarray;
 pub mod overflow;
 pub mod pager;
 pub mod store;
@@ -37,6 +44,7 @@ pub mod string_index;
 pub mod vlist;
 
 pub use disk_dict::DiskDict;
+pub use ivarray::IvArray;
 pub use pager::{PageId, Pager, PAGE_SIZE};
 pub use store::DiskStore;
 pub use string_index::StringIndex;

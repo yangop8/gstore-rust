@@ -27,9 +27,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::dict::DiskTermSource;
-use crate::model::id::{is_literal_id, EntityLiteralId, PredId};
+use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 
-use super::bptree::{be32, de32, BTree};
+use super::bptree::{de32, BTree};
+use super::ivarray::IvArray;
 use super::pager::Pager;
 
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
@@ -41,9 +42,11 @@ pub struct DiskDict {
     entity2id: BTree,
     literal2id: BTree,
     predicate2id: BTree,
-    id2entity: BTree,
-    id2literal: BTree,
-    id2predicate: BTree,
+    // Reverse (id → string) stores use the integer-keyed dense [`IvArray`],
+    // matching `DiskStore` (gStore's IVArray/ISArray).
+    id2entity: IvArray,
+    id2literal: IvArray,
+    id2predicate: IvArray,
     entity_count: usize,
     literal_count: usize,
     pred_count: usize,
@@ -63,9 +66,9 @@ impl DiskDict {
         entity2id: BTree,
         literal2id: BTree,
         predicate2id: BTree,
-        id2entity: BTree,
-        id2literal: BTree,
-        id2predicate: BTree,
+        id2entity: IvArray,
+        id2literal: IvArray,
+        id2predicate: IvArray,
         entity_count: usize,
         literal_count: usize,
         pred_count: usize,
@@ -96,12 +99,13 @@ impl DiskDict {
             .map(|v| de32(&v))
     }
 
-    /// Fetch the string for `id` from `tree` (an `id2*` reverse tree) and retain
-    /// it (leaked) so the returned reference is valid for the backend's life.
-    fn fetch_str(&self, tree: &BTree, id: u32) -> Option<&'static str> {
+    /// Fetch the string for integer `key` from `arr` (an `id2*` reverse array)
+    /// and retain it (leaked) so the returned reference is valid for the
+    /// backend's life.
+    fn fetch_str(&self, arr: &IvArray, key: u32) -> Option<&'static str> {
         let bytes = {
             let pager = self.pager.read().unwrap();
-            tree.get(&pager, &be32(id)).ok().flatten()?
+            arr.get(&pager, key).ok().flatten()?
         };
         let s = String::from_utf8_lossy(&bytes).into_owned();
         Some(Box::leak(s.into_boxed_str()))
@@ -127,12 +131,14 @@ impl DiskTermSource for DiskDict {
         if let Some(&s) = self.ent_lit_cache.lock().unwrap().get(&id) {
             return Some(s);
         }
-        let tree = if is_literal_id(id) {
-            &self.id2literal
+        // Literals are keyed by their local index (id minus LITERAL_FIRST_ID),
+        // matching `DiskStore::intern_literal`.
+        let (arr, key) = if is_literal_id(id) {
+            (&self.id2literal, id - LITERAL_FIRST_ID)
         } else {
-            &self.id2entity
+            (&self.id2entity, id)
         };
-        let s = self.fetch_str(tree, id)?;
+        let s = self.fetch_str(arr, key)?;
         self.ent_lit_cache.lock().unwrap().insert(id, s);
         Some(s)
     }

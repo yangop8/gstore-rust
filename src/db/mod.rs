@@ -49,16 +49,20 @@ const REDO_LOG_FILE: &str = "redo.log";
 const DEFAULT_QUERY_CACHE_CAP: usize = 256;
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
+/// The on-disk (out-of-core) VS-tree node file inside a disk database directory.
+/// Distinct from the in-memory snapshot's `vstree.bin`: this is the paged node
+/// file a disk database filters through without loading the whole tree.
+const VSTREE_KV_FILE: &str = "vstree.kv";
 /// Sub-directory holding the RocksDB store of a RocksDB-backed database.
 #[cfg(feature = "rocksdb")]
 const ROCKS_SUBDIR: &str = "rocksdb";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
 const DISK_CACHE_PAGES: usize = 4096;
 
-/// Build a VS-tree over every entity, signing each by its in/out edges. Generic
-/// over the [`TripleSource`] so it builds identically from the in-memory store,
-/// the [`Backend`] enum, or any other backend.
-fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
+/// Sign every entity by its in/out edges, returning `(entity_id, signature)`
+/// pairs. Generic over the [`TripleSource`] so it works identically against the
+/// in-memory store, the [`Backend`] enum, or the on-disk store.
+fn vstree_entries<S: TripleSource>(store: &S) -> Vec<(EntityLiteralId, Signature)> {
     // Entities = everything that is a subject, plus objects that are entities
     // (literal objects are not indexed by the VS-tree).
     let mut ids: Vec<u32> = store.subject_keys();
@@ -66,8 +70,7 @@ fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
     ids.sort_unstable();
     ids.dedup();
 
-    let entries = ids
-        .into_iter()
+    ids.into_iter()
         .map(|e| {
             let mut sig = Signature::new();
             for &(p, o) in &store.po_by_s(e) {
@@ -78,8 +81,12 @@ fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
             }
             (e, sig)
         })
-        .collect();
-    VsTree::build(entries)
+        .collect()
+}
+
+/// Build an in-memory VS-tree over every entity (see [`vstree_entries`]).
+fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
+    VsTree::build(vstree_entries(store))
 }
 
 /// On-disk metadata (kept tiny and human-meaningful).
@@ -588,8 +595,16 @@ impl Database {
             // its object, when that is an entity), so re-sign just those entities
             // and update their VS-tree entries in place — no full rebuild. If the
             // index is already stale we leave it stale and rebuild lazily.
+            //
+            // An out-of-core (disk-backed) tree can't be updated in place here
+            // (its nodes live in a paged file), so we instead invalidate it; the
+            // next consistent query rebuilds it in memory (or skips filtering).
             if self.index_valid {
-                self.vstree_index_insert(id);
+                if self.vstree.is_disk_backed() {
+                    self.index_valid = false;
+                } else {
+                    self.vstree_index_insert(id);
+                }
             }
             self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
@@ -1023,8 +1038,11 @@ impl Database {
             predicate_num: self.dict.predicate_num() as u64,
         };
         write_bincode(&dir.join(META_FILE), &meta)?;
-        // Persist a fresh VS-tree (rebuild if the in-memory one is stale).
-        if self.index_valid {
+        // Persist a fresh in-memory VS-tree snapshot. Rebuild it from the store
+        // when the live tree is stale *or* out-of-core (a disk-backed tree holds
+        // no in-memory nodes, so serializing it directly would write an empty
+        // tree — rebuild from the store instead so the snapshot is complete).
+        if self.index_valid && !self.vstree.is_disk_backed() {
             write_bincode(&dir.join(VSTREE_FILE), &self.vstree)?;
         } else {
             write_bincode(&dir.join(VSTREE_FILE), &build_vstree(&self.store))?;
@@ -1040,9 +1058,16 @@ impl Database {
     pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
+        // leftover WAL from a crashed earlier build can't replay into the new file.
         let kv = dir.join(KV_FILE);
-        let _ = fs::remove_file(&kv); // fresh build
-        DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
+        remove_file_and_wal(&kv);
+        let ds = DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
+        // Build the out-of-core VS-tree alongside the store, so a later
+        // `load_disk` filters through it on disk instead of materializing it.
+        let vskv = dir.join(VSTREE_KV_FILE);
+        remove_file_and_wal(&vskv);
+        VsTree::build_disk(&vskv, vstree_entries(&ds))?;
         Ok(())
     }
 
@@ -1070,13 +1095,25 @@ impl Database {
             .file_name()
             .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
             .unwrap_or_else(|| "disk".to_string());
-        let mut db = Database {
+        // Out-of-core VS-tree: open the persisted paged node file (built by
+        // `build_disk`), or build+persist it now if this disk database predates
+        // it. Either way the candidate filter reads only the nodes a query
+        // traverses on disk — the whole tree is never materialized in RAM.
+        let vskv = dir.join(VSTREE_KV_FILE);
+        let vstree = if vskv.is_file() {
+            VsTree::open_disk(&vskv)?
+        } else {
+            VsTree::build_disk(&vskv, vstree_entries(&ds))?
+        };
+        Ok(Database {
             name,
             dict,
             store: Backend::Memory(store),
             named: BTreeMap::new(),
-            vstree: VsTree::new(),
-            index_valid: false,
+            vstree,
+            // The disk-backed tree is consistent with the just-loaded store, so
+            // the query path may use it as a candidate filter.
+            index_valid: true,
             txn: None,
             query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
@@ -1084,9 +1121,7 @@ impl Database {
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
-        };
-        db.rebuild_index();
-        Ok(db)
+        })
     }
 
     /// Load a database from directory `dir`.
@@ -1187,6 +1222,7 @@ impl Database {
             META_FILE,
             VSTREE_FILE,
             KV_FILE,
+            VSTREE_KV_FILE,
             UPDATE_LOG_FILE,
         ] {
             let s = src.join(name);
@@ -1697,6 +1733,16 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     Ok(bincode::deserialize_from(reader)?)
 }
 
+/// Remove a pager-backed file and its sibling `<path>.wal`, ignoring absence.
+/// Used before a fresh disk build so a stale WAL from a crashed prior build can
+/// never replay into the new file (see [`crate::kvstore::pager`] recovery).
+fn remove_file_and_wal(path: &Path) {
+    let _ = fs::remove_file(path);
+    let mut wal = path.as_os_str().to_owned();
+    wal.push(".wal");
+    let _ = fs::remove_file(PathBuf::from(wal));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2126,6 +2172,90 @@ mod tests {
         // Disabling is reflected in the listing and stops further inference.
         assert!(db.disable_rule("anc"));
         assert_eq!(db.list_rules(), vec![("anc".to_string(), false, 1)]);
+    }
+
+    // ---- out-of-core VS-tree disk database (task 1) ----------------------
+
+    /// A disk database must build an on-disk VS-tree, load filtering through it
+    /// (not a materialized copy), and answer queries identically to an in-memory
+    /// build of the same data.
+    #[test]
+    fn disk_database_filters_via_on_disk_vstree() {
+        let dir = temp_dir("disk_vstree");
+        // Enough entities to force a multi-node VS-tree, plus a distinctive edge.
+        let mut content = String::new();
+        for i in 0..400u32 {
+            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
+        let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree.nt");
+        fs::write(&rdf, &content).unwrap();
+
+        Database::build_disk(&dir, &[&rdf]).unwrap();
+        assert!(Database::is_disk(&dir));
+        // The dedicated on-disk VS-tree node file was produced.
+        assert!(dir.join(VSTREE_KV_FILE).is_file(), "build_disk must write the VS-tree node file");
+
+        let mut db = Database::load_disk(&dir).unwrap();
+        assert!(db.vstree.is_disk_backed(), "loaded disk db must use the on-disk VS-tree");
+        assert!(db.stats().index_valid, "the disk-backed index is valid for filtering");
+
+        // In-memory baseline over the same data (full VS-tree rebuild).
+        let mut base = Database::build_from_str("base", &content).unwrap();
+        for q in [
+            "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
+            "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
+            "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
+        ] {
+            let mut a = db.select(q).unwrap().rows;
+            let mut b = base.select(q).unwrap().rows;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "disk-vstree query {q:?} diverged from in-memory baseline");
+        }
+
+        // The distinctive marker query returns exactly the special subject — and
+        // the candidate filter that produced it ran against on-disk nodes.
+        let rs = db
+            .select("SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }")
+            .unwrap();
+        assert_eq!(rs.row_count(), 1);
+        assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
+        // Running the query touched only some VS-tree node pages, not the whole
+        // tree — proving it need not be fully resident.
+        assert!(db.vstree.disk_pages_read() > 0, "the disk VS-tree was actually traversed");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&rdf);
+    }
+
+    /// Mutating a disk-loaded database invalidates the out-of-core index (it
+    /// can't be updated in place), and queries stay correct afterwards.
+    #[test]
+    fn disk_database_mutation_invalidates_then_stays_correct() {
+        let dir = temp_dir("disk_vstree_mut");
+        let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
+        let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
+        fs::write(&rdf, content).unwrap();
+        Database::build_disk(&dir, &[&rdf]).unwrap();
+        let mut db = Database::load_disk(&dir).unwrap();
+        assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
+
+        // An insert can't update the on-disk tree in place ⇒ index invalidates.
+        assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
+        assert!(!db.stats().index_valid, "mutation invalidates the disk-backed index");
+
+        // Query still correct (evaluates without the stale tree).
+        let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
+        got.sort();
+        assert_eq!(got, vec![vec![Some("<d>".to_string())]]);
+
+        // A rebuild restores a valid (now in-memory) index.
+        db.rebuild_index();
+        assert!(db.stats().index_valid && !db.vstree.is_disk_backed());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&rdf);
     }
 
     // ---- build progress reporting ----------------------------------------

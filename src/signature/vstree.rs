@@ -23,10 +23,14 @@
 //! matches — exactly what the engine needs as a filter, whether the tree was
 //! bulk-built, incrementally inserted, or both.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
 use crate::model::id::EntityLiteralId;
 
+use super::disk_vstree::DiskTree;
 use super::Signature;
 
 /// Max entries per leaf / children per internal node (tree fan-out).
@@ -218,10 +222,22 @@ fn seed_split<T>(
 }
 
 /// A signature tree over entity signatures.
+///
+/// By default the tree is fully in memory (`root`), and `bincode`-serializes to
+/// `vstree.bin` for the in-memory database path. It can instead be **out-of-core**
+/// (`disk`): the nodes then live in a dedicated paged file and a candidate scan
+/// reads only the nodes it traverses (see [`DiskTree`]). The `disk` backing is
+/// `#[serde(skip)]`, so the serialized form is byte-identical to the in-memory
+/// tree's — `save`/`load` are unaffected — and is reconstructed from its own file
+/// via [`open_disk`](Self::open_disk).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VsTree {
     root: Option<Box<Node>>,
     entity_count: usize,
+    /// When set, the tree is backed by an on-disk paged node file instead of
+    /// `root`; all reads ([`candidates`](Self::candidates)) go through it.
+    #[serde(skip)]
+    disk: Option<DiskTree>,
 }
 
 impl VsTree {
@@ -230,11 +246,17 @@ impl VsTree {
     }
 
     pub fn entity_count(&self) -> usize {
-        self.entity_count
+        match &self.disk {
+            Some(d) => d.entity_count(),
+            None => self.entity_count,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.root.is_none()
+        match &self.disk {
+            Some(d) => d.is_empty(),
+            None => self.root.is_none(),
+        }
     }
 
     /// Build a VS-tree from `(entity_id, signature)` pairs.
@@ -286,7 +308,54 @@ impl VsTree {
         VsTree {
             root: Some(Box::new(level.pop().unwrap())),
             entity_count,
+            disk: None,
         }
+    }
+
+    /// Bulk-build an **out-of-core** VS-tree at `path` from `(entity_id, signature)`
+    /// pairs: the nodes are written to a dedicated paged file and never held whole
+    /// in memory. The returned tree filters via the on-disk nodes (see
+    /// [`candidates`](Self::candidates)), reading only the nodes a query traverses.
+    /// Equivalent (as a candidate filter) to [`build`](Self::build) over the same
+    /// entries — the result set is identical; only the tree shape and residency
+    /// differ. An existing file at `path` is overwritten.
+    pub fn build_disk<P: AsRef<Path>>(
+        path: P,
+        entries: Vec<(EntityLiteralId, Signature)>,
+    ) -> Result<VsTree> {
+        let disk = DiskTree::build(path.as_ref(), entries)?;
+        Ok(VsTree {
+            root: None,
+            entity_count: 0,
+            disk: Some(disk),
+        })
+    }
+
+    /// Open an existing out-of-core VS-tree previously written by
+    /// [`build_disk`](Self::build_disk).
+    pub fn open_disk<P: AsRef<Path>>(path: P) -> Result<VsTree> {
+        let disk = DiskTree::open(path.as_ref())?;
+        Ok(VsTree {
+            root: None,
+            entity_count: 0,
+            disk: Some(disk),
+        })
+    }
+
+    /// Whether this tree is backed by an on-disk paged node file (out-of-core)
+    /// rather than an in-memory `root`. Such a tree is read-only here: incremental
+    /// [`insert`](Self::insert)/[`update`](Self::update) target the in-memory
+    /// representation, so a disk-backed database invalidates and rebuilds its
+    /// index on mutation instead (see `Database::insert_triple`).
+    pub fn is_disk_backed(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// Cumulative number of on-disk node pages read across candidate scans (0 for
+    /// an in-memory tree). A value far below the tree's page count demonstrates
+    /// that a query touches only the nodes it traverses (not the whole tree).
+    pub fn disk_pages_read(&self) -> u64 {
+        self.disk.as_ref().map_or(0, DiskTree::pages_read)
     }
 
     /// Insert one `(entity_id, signature)` after the tree exists, splitting any
@@ -371,6 +440,12 @@ impl VsTree {
     /// the true matches). If the tree is empty, returns `None` so the caller
     /// can fall back to "no filtering".
     pub fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>> {
+        if let Some(disk) = &self.disk {
+            // An I/O error degrades to "no filtering" (`None`): the engine then
+            // scans without pruning — slower but still correct (never a false
+            // negative). A healthy store does not hit this path.
+            return disk.candidates(query).unwrap_or(None);
+        }
         let root = self.root.as_ref()?;
         let mut out = Vec::new();
         Self::search(root, query, &mut out);
@@ -400,7 +475,8 @@ impl VsTree {
 }
 
 /// Sort key clustering similar signatures together (raw limbs, high bits first).
-fn sig_key(sig: &Signature) -> Vec<u64> {
+/// Shared with the out-of-core builder so both bulk routes cluster identically.
+pub(super) fn sig_key(sig: &Signature) -> Vec<u64> {
     // `Signature` exposes `test`; reconstruct limb words for ordering.
     let mut key = vec![0u64; super::LIMBS];
     for (i, word) in key.iter_mut().enumerate() {
@@ -649,5 +725,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- out-of-core VS-tree (task 1) -------------------------------------
+
+    fn diskvs_tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("gstore_vstree_disk_{tag}.kv"));
+        let _ = std::fs::remove_file(&p);
+        let mut wal = p.clone().into_os_string();
+        wal.push(".wal");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+        p
+    }
+
+    /// The on-disk VS-tree must return *identical* candidate sets to the
+    /// in-memory tree built from the same entries — the core soundness/parity
+    /// guarantee of task 1 (different tree shape, same `{ e : sig(e) ⊇ query }`).
+    #[test]
+    fn disk_candidates_identical_to_in_memory() {
+        let path = diskvs_tmp("parity");
+        let mut all: Vec<(u32, Signature)> = Vec::new();
+        for i in 0..600u32 {
+            let edges = [
+                (i % 7, i, EdgeDir::Out),
+                ((i % 3) + 1, (i * 2) % 50, EdgeDir::In),
+            ];
+            all.push((i, esig(&edges)));
+        }
+        let mem = VsTree::build(all.clone());
+        let disk = VsTree::build_disk(&path, all.clone()).unwrap();
+        assert!(disk.is_disk_backed());
+        assert_eq!(disk.entity_count(), mem.entity_count());
+
+        let queries = [
+            (2u32, 10u32, EdgeDir::Out),
+            (1, 4, EdgeDir::In),
+            (3, 250, EdgeDir::Out),
+            (5, 5, EdgeDir::In),
+        ];
+        for &(pred, nb, dir) in &queries {
+            let mut q = Signature::new();
+            q.encode_query_edge(Some(pred), Some(nb), dir);
+            let mut m = mem.candidates(&q).unwrap();
+            let mut d = disk.candidates(&q).unwrap();
+            m.sort_unstable();
+            d.sort_unstable();
+            assert_eq!(m, d, "candidate sets diverged for ({pred},{nb},{dir:?})");
+            // And both are a sound superset of the brute-force truth.
+            for (id, sig) in &all {
+                if sig.contains(&q) {
+                    assert!(d.binary_search(id).is_ok(), "disk missed true match {id}");
+                }
+            }
+        }
+        // A predicate-only (variable-neighbour) query too.
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(2), None, EdgeDir::Out);
+        let mut m = mem.candidates(&q).unwrap();
+        let mut d = disk.candidates(&q).unwrap();
+        m.sort_unstable();
+        d.sort_unstable();
+        assert_eq!(m, d, "predicate-only candidate sets diverged");
+        std::fs::remove_file(&path).ok();
     }
 }

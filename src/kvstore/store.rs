@@ -21,6 +21,7 @@ use crate::store::{TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
 use super::disk_dict::DiskDict;
+use super::ivarray::IvArray;
 use super::overflow;
 use super::pager::{Pager, PAGE_SIZE};
 use super::vlist;
@@ -72,9 +73,11 @@ pub struct DiskStore {
     entity2id: BTree,
     literal2id: BTree,
     predicate2id: BTree,
-    id2entity: BTree,
-    id2literal: BTree,
-    id2predicate: BTree,
+    // Reverse (id → string) stores are *integer-keyed*, so they use the dense
+    // [`IvArray`] (gStore's IVArray/ISArray) instead of the generic B+ tree.
+    id2entity: IvArray,
+    id2literal: IvArray,
+    id2predicate: IvArray,
     /// Optional VList-compressed `(sub, pred) → objects` index (gStore's value
     /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`/`po_by_s`
     /// when [`compacted`](Self::compacted) is set.
@@ -111,9 +114,9 @@ impl DiskStore {
             entity2id: BTree::new(ENTITY2ID),
             literal2id: BTree::new(LITERAL2ID),
             predicate2id: BTree::new(PREDICATE2ID),
-            id2entity: BTree::new(ID2ENTITY),
-            id2literal: BTree::new(ID2LITERAL),
-            id2predicate: BTree::new(ID2PREDICATE),
+            id2entity: IvArray::new(ID2ENTITY),
+            id2literal: IvArray::new(ID2LITERAL),
+            id2predicate: IvArray::new(ID2PREDICATE),
             sp2o_vlist: BTree::new(SP2O_VLIST),
             triple_count,
             entity_count,
@@ -164,7 +167,8 @@ impl DiskStore {
         }
         let id = self.entity_count;
         self.entity2id.insert(pager, key.as_bytes(), &be32(id))?;
-        self.id2entity.insert(pager, &be32(id), key.as_bytes())?;
+        // id2entity is integer-keyed by the dense entity id.
+        self.id2entity.insert(pager, id, key.as_bytes())?;
         self.entity_count += 1;
         // Keep the count root current so any pager flush (incl. eviction) is
         // crash-consistent with the dictionary trees.
@@ -182,7 +186,9 @@ impl DiskStore {
             .checked_add(self.literal_count)
             .ok_or_else(|| GStoreError::Database("literal id space exhausted".to_string()))?;
         self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
-        self.id2literal.insert(pager, &be32(id), key.as_bytes())?;
+        // id2literal is integer-keyed by the *local* literal index (id minus the
+        // LITERAL_FIRST_ID offset) so the dense array stays compact from 0.
+        self.id2literal.insert(pager, id - LITERAL_FIRST_ID, key.as_bytes())?;
         self.literal_count += 1;
         pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
         Ok(id)
@@ -196,7 +202,8 @@ impl DiskStore {
         }
         let id = self.pred_count;
         self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
-        self.id2predicate.insert(pager, &be32(id), key.as_bytes())?;
+        // id2predicate is integer-keyed by the dense predicate id.
+        self.id2predicate.insert(pager, id, key.as_bytes())?;
         self.pred_count += 1;
         pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
         Ok(id)
@@ -352,13 +359,14 @@ impl DiskStore {
 
     pub fn id_to_string(&self, id: EntityLiteralId) -> Result<Option<String>> {
         let pager = self.pager.read().unwrap();
-        let tree = if is_literal_id(id) {
-            &self.id2literal
+        // Literals are keyed by their local index (see `intern_literal`).
+        let (arr, key) = if is_literal_id(id) {
+            (&self.id2literal, id - LITERAL_FIRST_ID)
         } else {
-            &self.id2entity
+            (&self.id2entity, id)
         };
-        Ok(tree
-            .get(&pager, &be32(id))?
+        Ok(arr
+            .get(&pager, key)?
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
@@ -366,7 +374,7 @@ impl DiskStore {
         let pager = self.pager.read().unwrap();
         Ok(self
             .id2predicate
-            .get(&pager, &be32(id))?
+            .get(&pager, id)?
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
@@ -1283,6 +1291,71 @@ mod tests {
         assert_eq!(ds.compact_value_is_overflow(big, p).unwrap(), Some(true));
         assert_eq!(ds.o_by_sp(small, p).unwrap(), small_before);
         assert_eq!(ds.o_by_sp(big, p).unwrap(), big_before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- integer-keyed id arrays (IVArray, task 2) ------------------------
+
+    #[test]
+    fn ivarray_id_stores_match_memory_dictionary() {
+        // The id→string stores now use the integer-keyed IvArray. Resolving ids
+        // back to strings must be byte-identical to the in-memory dictionary
+        // (rebuilt from the same disk store) for entities, literals, predicates.
+        let path = tmp("ivarray_parity");
+        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let (dict, _mem) = ds.to_memory().unwrap();
+        for id in 0..ds.entity_num() as u32 {
+            assert_eq!(
+                ds.id_to_string(id).unwrap().as_deref(),
+                dict.id_to_string(id),
+                "entity id {id}"
+            );
+        }
+        for i in 0..ds.literal_num() as u32 {
+            let id = LITERAL_FIRST_ID + i;
+            assert_eq!(
+                ds.id_to_string(id).unwrap().as_deref(),
+                dict.id_to_string(id),
+                "literal id {id}"
+            );
+        }
+        for p in 0..ds.predicate_num() as u32 {
+            assert_eq!(
+                ds.predicate_to_string(p).unwrap().as_deref(),
+                dict.predicate_to_string(p),
+                "predicate id {p}"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ivarray_long_strings_roundtrip_through_disk_query() {
+        // A long entity IRI (subject) and a long literal (object) — both far past
+        // the IvArray inline capacity — must round-trip through the id→string
+        // arrays' overflow chains, end to end via a SPARQL query.
+        let path = tmp("ivarray_long");
+        let long_iri = format!("http://ex/{}", "z".repeat(400));
+        let long_lit = "x".repeat(500);
+        let content = format!("<{long_iri}> <http://ex/p> \"{long_lit}\" .\n");
+        let ds = DiskStore::build_str(&path, 64, &content).unwrap();
+
+        // Direct id→string round-trip (entity + literal).
+        let subj = ds.term_id(&Term::iri(&long_iri)).unwrap().unwrap();
+        assert_eq!(ds.id_to_string(subj).unwrap().unwrap(), format!("<{long_iri}>"));
+
+        // Full query path (uses the out-of-core DiskDict, also IvArray-backed).
+        let res = ds
+            .query("SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }")
+            .unwrap();
+        match res {
+            QueryResult::Select(rs) => {
+                assert_eq!(rs.row_count(), 1);
+                assert_eq!(rs.rows[0][0].as_deref(), Some(format!("<{long_iri}>").as_str()));
+                assert_eq!(rs.rows[0][1].as_deref(), Some(format!("\"{long_lit}\"").as_str()));
+            }
+            other => panic!("expected SELECT, got {other:?}"),
+        }
         std::fs::remove_file(&path).ok();
     }
 

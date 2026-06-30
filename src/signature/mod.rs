@@ -13,6 +13,7 @@
 //! the query signature. Search returns a *superset* of the true matches — a
 //! sound candidate filter the query engine intersects into the join.
 
+mod disk_vstree;
 mod vstree;
 
 pub use vstree::VsTree;
@@ -46,6 +47,11 @@ pub const ENTITY_SIG_LENGTH: usize = STR_SIG_LENGTH + EDGE_SIG_LENGTH + STR_AND_
 
 /// Number of 64-bit limbs backing a signature (⌈944/64⌉ = 15 → 960 bits).
 const LIMBS: usize = ENTITY_SIG_LENGTH.div_ceil(64);
+
+/// Raw byte width of a signature's limbs (`LIMBS × 8` = 120). Used by the
+/// out-of-core VS-tree ([`vstree`]/[`disk_vstree`]) to (de)serialize a signature
+/// into a fixed slot inside a paged node.
+pub(crate) const SIG_BYTES: usize = LIMBS * 8;
 
 /// A fixed-width bit signature (gStore `EntityBitSet`).
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +136,25 @@ impl Signature {
             d += (other.bits[i] & !self.bits[i]).count_ones();
         }
         d
+    }
+
+    /// Serialize the raw limbs little-endian into `out` (`out.len()` must be at
+    /// least [`SIG_BYTES`]). The fixed-width encoding lets the out-of-core
+    /// VS-tree store a signature in a constant-size slot inside a paged node.
+    pub(crate) fn write_le(&self, out: &mut [u8]) {
+        for (i, w) in self.bits.iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// Reconstruct a signature from [`write_le`](Self::write_le) output (`b.len()`
+    /// must be at least [`SIG_BYTES`]).
+    pub(crate) fn read_le(b: &[u8]) -> Signature {
+        let mut bits = [0u64; LIMBS];
+        for (i, w) in bits.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        Signature { bits }
     }
 
     // --- encoding (ports of Signature.cpp) --------------------------------
