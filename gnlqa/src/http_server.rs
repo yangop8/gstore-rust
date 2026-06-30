@@ -96,7 +96,15 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
             Some(q) => match engine.ask(&q) {
                 Ok(a) => (
                     200,
-                    json!({"answer": a.text, "sparql": a.sparql, "values": a.values, "rounds": a.rounds}),
+                    json!({
+                        "answer": a.text,
+                        "explanation": a.explanation,
+                        "sparql": a.sparql,
+                        "values": a.values,
+                        "confidence": a.confidence,
+                        "abstained": a.abstained,
+                        "rounds": a.rounds,
+                    }),
                 ),
                 // Native endpoint: a real failure is a 500 (proxies/monitoring
                 // can detect it), unlike the gAnswer-compat /gSolve below.

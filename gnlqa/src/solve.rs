@@ -65,6 +65,7 @@ pub struct SolveEngine {
     link_k: usize,
     cite: bool,
     explain: bool,
+    abstain_below: f32,
     model: Option<String>,
 }
 
@@ -80,8 +81,15 @@ impl SolveEngine {
             link_k: 3,
             cite: true,
             explain: false,
+            abstain_below: 0.0,
             model: None,
         }
+    }
+    /// Abstain (return a low-confidence "not sure" answer) when the winning
+    /// outcome's confidence is below `threshold` (default 0.0 = never abstain).
+    pub fn with_abstain_below(mut self, threshold: f32) -> SolveEngine {
+        self.abstain_below = threshold;
+        self
     }
     /// Attach supporting triples to the answer (default on).
     pub fn with_citations(mut self, on: bool) -> SolveEngine {
@@ -188,6 +196,23 @@ impl SolveEngine {
         match best {
             Some(o) => {
                 let values = answer_values(&o.answer);
+                let confidence = score_outcome(&o).clamp(0.0, 1.0);
+
+                // Abstain when too unsure: keep the SPARQL (transparency) but
+                // don't present a possibly-wrong answer.
+                if confidence < self.abstain_below {
+                    return Ok(Answer {
+                        text: "I'm not confident enough to answer this from the data.".to_string(),
+                        values,
+                        sparql: Some(o.sparql),
+                        rounds: o.rounds,
+                        citations: Vec::new(),
+                        explanation: None,
+                        confidence,
+                        abstained: true,
+                    });
+                }
+
                 let text = render_answer(&o.answer, &values);
                 let citations = if self.cite {
                     gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30).unwrap_or_default()
@@ -201,7 +226,16 @@ impl SolveEngine {
                 } else {
                     None
                 };
-                Ok(Answer { text, values, sparql: Some(o.sparql), rounds: o.rounds, citations, explanation })
+                Ok(Answer {
+                    text,
+                    values,
+                    sparql: Some(o.sparql),
+                    rounds: o.rounds,
+                    citations,
+                    explanation,
+                    confidence,
+                    abstained: false,
+                })
             }
             None => Err(Error::Sparql("no candidate query produced an answer".into())),
         }
@@ -260,6 +294,31 @@ mod tests {
         let a = engine.ask("which x?").unwrap();
         assert_eq!(a.values, vec!["http://ex/a"]);
         assert!(a.sparql.unwrap().contains("<http://ex/p>"));
+    }
+
+    #[test]
+    fn confidence_high_for_nonempty_and_abstains_when_unsure() {
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]);
+        let kb = MockKb::new(vec![nonempty()]);
+        let a = SolveEngine::new(Box::new(llm), Box::new(kb)).with_citations(false).ask("q").unwrap();
+        assert!(a.confidence > 0.9 && !a.abstained);
+
+        // empty result + high abstain threshold → abstain, but SPARQL stays visible
+        let llm2 = MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]);
+        let kb2 = MockKb::new(vec![empty()]);
+        let a2 = SolveEngine::new(Box::new(llm2), Box::new(kb2))
+            .with_max_rounds(0)
+            .with_abstain_below(0.5)
+            .ask("q")
+            .unwrap();
+        assert!(a2.abstained && a2.confidence < 0.5);
+        assert!(a2.sparql.is_some());
     }
 
     #[test]
