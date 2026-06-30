@@ -14,6 +14,7 @@
 //! * [`llm`]    — the [`llm::LlmClient`] trait + an Anthropic (Claude) client and a mock
 
 pub mod config;
+pub mod embed;
 pub mod error;
 pub mod intent;
 pub mod kb;
@@ -22,6 +23,7 @@ pub mod pipeline;
 pub mod secret;
 
 pub use config::Config;
+pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
 pub use intent::{
     extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,
