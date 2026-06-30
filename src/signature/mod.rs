@@ -110,6 +110,28 @@ impl Signature {
         self.bits.iter().map(|w| w.count_ones()).sum()
     }
 
+    /// Hamming distance: popcount of `self XOR other`. Two signatures are "far
+    /// apart" when they share few bits. Used by the VS-tree split heuristic to
+    /// pick the two most dissimilar seeds (gStore's node-split seed selection).
+    pub fn distance(&self, other: &Signature) -> u32 {
+        let mut d = 0;
+        for i in 0..LIMBS {
+            d += (self.bits[i] ^ other.bits[i]).count_ones();
+        }
+        d
+    }
+
+    /// Number of bits set in `other` but not in `self` — the *enlargement* that
+    /// unioning `other` into `self` would cause. Used by VS-tree insertion to
+    /// descend into the child that grows least (minimal signature expansion).
+    pub fn added_bits(&self, other: &Signature) -> u32 {
+        let mut d = 0;
+        for i in 0..LIMBS {
+            d += (other.bits[i] & !self.bits[i]).count_ones();
+        }
+        d
+    }
+
     // --- encoding (ports of Signature.cpp) --------------------------------
 
     /// Encode a predicate bit (gStore `encodePredicate2Entity`, method 1).

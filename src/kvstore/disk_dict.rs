@@ -24,7 +24,7 @@
 //! which this codebase avoids — or a stable string arena; see the backlog note.)
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::dict::DiskTermSource;
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId};
@@ -35,7 +35,9 @@ use super::pager::Pager;
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
 pub struct DiskDict {
     /// Shared with the owning `DiskStore`, so both read through one page cache.
-    pager: Arc<Mutex<Pager>>,
+    /// Dictionary resolution is read-only, so it takes the `RwLock` read guard
+    /// and can run concurrently with other readers (task 4).
+    pager: Arc<RwLock<Pager>>,
     entity2id: BTree,
     literal2id: BTree,
     predicate2id: BTree,
@@ -57,7 +59,7 @@ impl DiskDict {
     /// counts captured when the backend is created.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pager: Arc<Mutex<Pager>>,
+        pager: Arc<RwLock<Pager>>,
         entity2id: BTree,
         literal2id: BTree,
         predicate2id: BTree,
@@ -87,8 +89,8 @@ impl DiskDict {
     /// Resolve `key` to its id through `tree` (a `*2id` forward tree). Hits the
     /// B+tree every call; nothing is cached for the term→id direction.
     fn fetch_id(&self, tree: &BTree, key: &str) -> Option<u32> {
-        let mut pager = self.pager.lock().unwrap();
-        tree.get(&mut pager, key.as_bytes())
+        let pager = self.pager.read().unwrap();
+        tree.get(&pager, key.as_bytes())
             .ok()
             .flatten()
             .map(|v| de32(&v))
@@ -98,8 +100,8 @@ impl DiskDict {
     /// it (leaked) so the returned reference is valid for the backend's life.
     fn fetch_str(&self, tree: &BTree, id: u32) -> Option<&'static str> {
         let bytes = {
-            let mut pager = self.pager.lock().unwrap();
-            tree.get(&mut pager, &be32(id)).ok().flatten()?
+            let pager = self.pager.read().unwrap();
+            tree.get(&pager, &be32(id)).ok().flatten()?
         };
         let s = String::from_utf8_lossy(&bytes).into_owned();
         Some(Box::leak(s.into_boxed_str()))

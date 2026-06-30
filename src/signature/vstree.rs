@@ -1,15 +1,27 @@
 //! The VS-tree: a signature tree over entity signatures.
 //!
 //! gStore's VSTree is a height-balanced S-tree built by incremental insertion
-//! with node splitting. We build the same shape by **bulk loading**: cluster
-//! signature-similar entities into leaves, then build internal levels bottom-up,
-//! each internal node holding the union of its children's signatures. Search
-//! prunes any subtree whose union does not contain the query signature.
+//! with node splitting. This module supports both routes:
+//!
+//! * [`VsTree::build`] **bulk loads**: cluster signature-similar entities into
+//!   leaves, then build internal levels bottom-up, each internal node holding the
+//!   union of its children's signatures.
+//! * [`VsTree::insert`] adds **one entity at a time** after the tree exists,
+//!   matching gStore's online `VSTree` insertion: descend into the child whose
+//!   signature grows least (minimal-enlargement, [`Signature::added_bits`]),
+//!   place the entity in a leaf, and **split** any node that overflows
+//!   [`FANOUT`] — seeding the split with the two most dissimilar members
+//!   ([`Signature::distance`]) and giving each remaining member to the closer
+//!   group. A root split grows the tree by one level. So triples inserted after
+//!   the initial build update the index without a full rebuild.
 //!
 //! Correctness (soundness): a node's signature is the union (superset) of every
-//! descendant entity's signature, so pruning a node where `node.sig ⊉ query`
-//! can never discard a true match. Therefore the returned candidate set is a
-//! superset of the true matches — exactly what the engine needs as a filter.
+//! descendant entity's signature — maintained on every insert (union along the
+//! descent path) and split (each half's signature is the exact union of its
+//! members). Pruning a node where `node.sig ⊉ query` can therefore never discard
+//! a true match, so the returned candidate set stays a superset of the true
+//! matches — exactly what the engine needs as a filter, whether the tree was
+//! bulk-built, incrementally inserted, or both.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +51,140 @@ impl Node {
             Node::Leaf { sig, .. } | Node::Internal { sig, .. } => sig,
         }
     }
+
+    /// Insert `(id, sig)` into this subtree, unioning `sig` along the descent
+    /// path so every node's signature stays a superset of its descendants.
+    /// Returns `Some(right_sibling)` if this node overflowed [`FANOUT`] and split
+    /// (the caller adopts the sibling); `None` otherwise.
+    fn insert(&mut self, id: EntityLiteralId, sig: Signature) -> Option<Node> {
+        match self {
+            Node::Leaf {
+                sig: nsig,
+                entries,
+            } => {
+                entries.push((id, sig));
+                nsig.union_with(&sig);
+                if entries.len() <= FANOUT {
+                    return None;
+                }
+            }
+            Node::Internal {
+                sig: nsig,
+                children,
+            } => {
+                nsig.union_with(&sig);
+                let ci = choose_child(children, &sig);
+                match children[ci].insert(id, sig) {
+                    None => return None,
+                    Some(new_child) => {
+                        // Keep the split-off sibling next to its origin.
+                        children.insert(ci + 1, new_child);
+                        if children.len() <= FANOUT {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(self.split())
+    }
+
+    /// Split this overflowing node into two, keeping the left half in place and
+    /// returning the right half. Both halves' signatures are recomputed as the
+    /// exact union of their members, preserving the superset invariant.
+    fn split(&mut self) -> Node {
+        match self {
+            Node::Leaf { sig, entries } => {
+                let (left, lsig, right, rsig) =
+                    seed_split(std::mem::take(entries), |(_, s)| *s);
+                *entries = left;
+                *sig = lsig;
+                Node::Leaf {
+                    sig: rsig,
+                    entries: right,
+                }
+            }
+            Node::Internal { sig, children } => {
+                let (left, lsig, right, rsig) =
+                    seed_split(std::mem::take(children), |c| *c.sig());
+                *children = left;
+                *sig = lsig;
+                Node::Internal {
+                    sig: rsig,
+                    children: right,
+                }
+            }
+        }
+    }
+}
+
+/// Pick the child whose signature grows least when `sig` is unioned into it
+/// (minimal enlargement); ties go to the child with the smaller signature, which
+/// keeps node signatures tight and pruning effective.
+fn choose_child(children: &[Node], sig: &Signature) -> usize {
+    let mut best = 0;
+    let mut best_added = u32::MAX;
+    let mut best_pop = u32::MAX;
+    for (i, c) in children.iter().enumerate() {
+        let added = c.sig().added_bits(sig);
+        let pop = c.sig().popcount();
+        if added < best_added || (added == best_added && pop < best_pop) {
+            best = i;
+            best_added = added;
+            best_pop = pop;
+        }
+    }
+    best
+}
+
+/// Partition `items` into two groups for a node split. Seeds are the two most
+/// dissimilar members (max [`Signature::distance`]); each remaining member joins
+/// whichever group its signature enlarges less. Returns each group with its
+/// union signature. This mirrors gStore's VSTree split seed selection.
+fn seed_split<T>(
+    items: Vec<T>,
+    sig_of: impl Fn(&T) -> Signature,
+) -> (Vec<T>, Signature, Vec<T>, Signature) {
+    let n = items.len();
+    let sigs: Vec<Signature> = items.iter().map(&sig_of).collect();
+
+    // Seeds: the pair with the greatest Hamming distance.
+    let (mut si, mut sj, mut best) = (0usize, 1usize, 0u32);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = sigs[i].distance(&sigs[j]);
+            if d >= best {
+                best = d;
+                si = i;
+                sj = j;
+            }
+        }
+    }
+
+    let mut left_idx = vec![si];
+    let mut right_idx = vec![sj];
+    let mut lsig = sigs[si];
+    let mut rsig = sigs[sj];
+    for (idx, sigi) in sigs.iter().enumerate() {
+        if idx == si || idx == sj {
+            continue;
+        }
+        let la = lsig.added_bits(sigi);
+        let ra = rsig.added_bits(sigi);
+        if la < ra || (la == ra && left_idx.len() <= right_idx.len()) {
+            lsig.union_with(sigi);
+            left_idx.push(idx);
+        } else {
+            rsig.union_with(sigi);
+            right_idx.push(idx);
+        }
+    }
+
+    // Move items into their groups (each taken exactly once).
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    let left: Vec<T> = left_idx.iter().map(|&i| slots[i].take().unwrap()).collect();
+    let right: Vec<T> = right_idx.iter().map(|&i| slots[i].take().unwrap()).collect();
+    (left, lsig, right, rsig)
 }
 
 /// A signature tree over entity signatures.
@@ -111,6 +257,59 @@ impl VsTree {
             root: Some(Box::new(level.pop().unwrap())),
             entity_count,
         }
+    }
+
+    /// Insert one `(entity_id, signature)` after the tree exists, splitting any
+    /// node that overflows [`FANOUT`] and growing a new root on a root split.
+    /// Equivalent in effect to having included the entity in [`build`](Self::build):
+    /// the candidate filter stays sound (see the module docs). Callers must use
+    /// unique ids (as [`build`](Self::build) assumes); re-inserting an id leaves a
+    /// duplicate entry, which a candidate scan would simply report twice.
+    pub fn insert(&mut self, id: EntityLiteralId, sig: Signature) {
+        match self.root.take() {
+            None => {
+                self.root = Some(Box::new(Node::Leaf {
+                    sig,
+                    entries: vec![(id, sig)],
+                }));
+            }
+            Some(mut root) => {
+                if let Some(sibling) = root.insert(id, sig) {
+                    // Root split: a fresh internal root over the two halves.
+                    let mut s = *root.sig();
+                    s.union_with(sibling.sig());
+                    self.root = Some(Box::new(Node::Internal {
+                        sig: s,
+                        children: vec![*root, sibling],
+                    }));
+                } else {
+                    self.root = Some(root);
+                }
+            }
+        }
+        self.entity_count += 1;
+    }
+
+    /// Insert many `(entity_id, signature)` pairs one by one (see [`insert`](Self::insert)).
+    pub fn insert_all(&mut self, entries: impl IntoIterator<Item = (EntityLiteralId, Signature)>) {
+        for (id, sig) in entries {
+            self.insert(id, sig);
+        }
+    }
+
+    /// Height of the tree (0 = empty, 1 = a single leaf). For tests asserting
+    /// that incremental insertion actually splits and grows the tree.
+    #[cfg(test)]
+    fn height(&self) -> usize {
+        fn depth(node: &Node) -> usize {
+            match node {
+                Node::Leaf { .. } => 1,
+                Node::Internal { children, .. } => {
+                    1 + children.iter().map(depth).max().unwrap_or(0)
+                }
+            }
+        }
+        self.root.as_ref().map_or(0, |r| depth(r))
     }
 
     /// Return all entity ids whose signature contains `query` (a superset of
@@ -214,6 +413,109 @@ mod tests {
         // An all-zero query is contained by every signature.
         let cands = tree.candidates(&Signature::new()).unwrap();
         assert_eq!(cands.len(), 50);
+    }
+
+    // ---- incremental insertion (task 2) -----------------------------------
+
+    #[test]
+    fn pure_incremental_insert_is_sound_and_filters() {
+        // Build the whole tree by one-at-a-time insertion (no bulk build), which
+        // forces leaf and internal splits, then verify the candidate filter.
+        let n = 600u32;
+        let mut all: Vec<(u32, Signature)> = Vec::new();
+        let mut tree = VsTree::new();
+        for i in 0..n {
+            let sig = esig(&[(1, i, EdgeDir::Out), ((i % 5) + 2, i % 40, EdgeDir::In)]);
+            all.push((i, sig));
+            tree.insert(i, sig);
+        }
+        assert_eq!(tree.entity_count(), n as usize);
+        // Splitting must have grown the tree past a single leaf.
+        assert!(tree.height() > 1, "incremental inserts should split the tree");
+
+        // Soundness: for several queries the candidate set is a superset of the
+        // brute-force matches over every inserted entity. Each query is a real
+        // edge of some entity (entity 7's & 500's out-edge `(1, i)`, entity 6's
+        // in-edge `((6%5)+2, 6%40) = (3, 6)`), so a true match is guaranteed.
+        for &(pred, nb, dir) in &[
+            (1u32, 7u32, EdgeDir::Out),
+            (3, 6, EdgeDir::In),
+            (1, 500, EdgeDir::Out),
+        ] {
+            let mut q = Signature::new();
+            q.encode_query_edge(Some(pred), Some(nb), dir);
+            let cands: std::collections::HashSet<u32> =
+                tree.candidates(&q).unwrap().into_iter().collect();
+            let mut truth = 0;
+            for (id, sig) in &all {
+                if sig.contains(&q) {
+                    truth += 1;
+                    assert!(cands.contains(id), "entity {id} missing from candidates");
+                }
+            }
+            // The filter is selective: it prunes far below the full set.
+            assert!(truth >= 1, "query should have at least one true match");
+            assert!(cands.len() < n as usize, "filter should prune some entities");
+        }
+    }
+
+    #[test]
+    fn build_then_insert_no_false_negatives() {
+        // Bulk-build a base set, then add many more incrementally; queries must
+        // still find true matches among *both* the built and inserted entities.
+        let n_base = 80u32;
+        let n_more = 420u32;
+        let mut all: Vec<(u32, Signature)> = Vec::new();
+        for i in 0..n_base {
+            let sig = esig(&[(i % 7, i, EdgeDir::Out)]);
+            all.push((i, sig));
+        }
+        let mut tree = VsTree::build(all.clone());
+        assert_eq!(tree.entity_count(), n_base as usize);
+
+        for i in n_base..(n_base + n_more) {
+            // A distinctive edge on one inserted entity we can later query for.
+            let mut edges = vec![(i % 7, i, EdgeDir::Out)];
+            if i == 300 {
+                edges.push((11, 9999, EdgeDir::In));
+            }
+            let sig = esig(&edges);
+            all.push((i, sig));
+            tree.insert(i, sig);
+        }
+        assert_eq!(tree.entity_count(), (n_base + n_more) as usize);
+
+        // The distinctive inserted entity must be a candidate.
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(11), Some(9999), EdgeDir::In);
+        let cands = tree.candidates(&q).unwrap();
+        assert!(cands.contains(&300), "inserted true match 300 must be a candidate");
+        assert!(cands.len() < (n_base + n_more) as usize, "filter should prune");
+
+        // Full soundness sweep over a few queries.
+        for &(pred, nb, dir) in &[(3u32, 250u32, EdgeDir::Out), (0, 5, EdgeDir::Out)] {
+            let mut q = Signature::new();
+            q.encode_query_edge(Some(pred), Some(nb), dir);
+            let cands: std::collections::HashSet<u32> =
+                tree.candidates(&q).unwrap().into_iter().collect();
+            for (id, sig) in &all {
+                if sig.contains(&q) {
+                    assert!(cands.contains(id), "entity {id} missing after incremental insert");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn insert_into_empty_tree_then_query() {
+        let mut tree = VsTree::new();
+        assert!(tree.is_empty());
+        tree.insert(7, esig(&[(2, 99, EdgeDir::Out)]));
+        assert!(!tree.is_empty());
+        assert_eq!(tree.entity_count(), 1);
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(2), Some(99), EdgeDir::Out);
+        assert_eq!(tree.candidates(&q).unwrap(), vec![7]);
     }
 
     #[test]

@@ -278,8 +278,9 @@ impl BTree {
         Ok(Some((sep, right_id)))
     }
 
-    /// Look up the value for `key`.
-    pub fn get(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Look up the value for `key`. Read-only (`&Pager`), so it can run under a
+    /// shared [`std::sync::RwLock`] read guard concurrently with other readers.
+    pub fn get(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut page = self.root(pager);
         if page == 0 {
             return Ok(None);
@@ -297,8 +298,9 @@ impl BTree {
         }
     }
 
-    /// All entries whose key starts with `prefix`, in key order.
-    pub fn scan_prefix(&self, pager: &mut Pager, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /// All entries whose key starts with `prefix`, in key order. Read-only
+    /// (`&Pager`) so it can run concurrently with other readers.
+    pub fn scan_prefix(&self, pager: &Pager, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
         let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
             return Ok(out);
@@ -323,11 +325,11 @@ impl BTree {
     }
 
     /// All entries in key order.
-    pub fn iter_all(&self, pager: &mut Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn iter_all(&self, pager: &Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix(pager, &[])
     }
 
-    fn find_leaf_ge(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<(PageId, usize)>> {
+    fn find_leaf_ge(&self, pager: &Pager, key: &[u8]) -> Result<Option<(PageId, usize)>> {
         let mut page = self.root(pager);
         if page == 0 {
             return Ok(None);
@@ -628,12 +630,12 @@ mod tests {
         t.insert(&mut pg, b"alice", b"1").unwrap();
         t.insert(&mut pg, b"bob", b"2").unwrap();
         t.insert(&mut pg, b"carol", b"3").unwrap();
-        assert_eq!(t.get(&mut pg, b"bob").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(t.get(&pg, b"bob").unwrap().as_deref(), Some(&b"2"[..]));
         assert_eq!(
-            t.get(&mut pg, b"alice").unwrap().as_deref(),
+            t.get(&pg, b"alice").unwrap().as_deref(),
             Some(&b"1"[..])
         );
-        assert_eq!(t.get(&mut pg, b"dave").unwrap(), None);
+        assert_eq!(t.get(&pg, b"dave").unwrap(), None);
         std::fs::remove_file(&path).ok();
     }
 
@@ -644,7 +646,7 @@ mod tests {
         let t = BTree::new(0);
         t.insert(&mut pg, b"k", b"1").unwrap();
         t.insert(&mut pg, b"k", b"99").unwrap();
-        assert_eq!(t.get(&mut pg, b"k").unwrap().as_deref(), Some(&b"99"[..]));
+        assert_eq!(t.get(&pg, b"k").unwrap().as_deref(), Some(&b"99"[..]));
         std::fs::remove_file(&path).ok();
     }
 
@@ -660,7 +662,7 @@ mod tests {
         }
         for i in 0..n {
             assert_eq!(
-                t.get(&mut pg, format!("key{i:08}").as_bytes()).unwrap(),
+                t.get(&pg, format!("key{i:08}").as_bytes()).unwrap(),
                 Some(be32(i).to_vec()),
                 "key {i}"
             );
@@ -688,12 +690,12 @@ mod tests {
 
         let mut p = Vec::new();
         p.extend_from_slice(&be32(1));
-        assert_eq!(t.scan_prefix(&mut pg, &p).unwrap().len(), 3);
+        assert_eq!(t.scan_prefix(&pg, &p).unwrap().len(), 3);
 
         let mut p2 = Vec::new();
         p2.extend_from_slice(&be32(1));
         p2.extend_from_slice(&be32(10));
-        assert_eq!(t.scan_prefix(&mut pg, &p2).unwrap().len(), 2);
+        assert_eq!(t.scan_prefix(&pg, &p2).unwrap().len(), 2);
         std::fs::remove_file(&path).ok();
     }
 
@@ -710,10 +712,10 @@ mod tests {
             pg.flush().unwrap();
         }
         {
-            let mut pg = Pager::open(&path, 64).unwrap();
+            let pg = Pager::open(&path, 64).unwrap();
             let t = BTree::new(0);
-            assert_eq!(t.get(&mut pg, b"k00500").unwrap(), Some(be32(500).to_vec()));
-            assert_eq!(t.iter_all(&mut pg).unwrap().len(), 1000);
+            assert_eq!(t.get(&pg, b"k00500").unwrap(), Some(be32(500).to_vec()));
+            assert_eq!(t.iter_all(&pg).unwrap().len(), 1000);
         }
         std::fs::remove_file(&path).ok();
     }
@@ -727,9 +729,9 @@ mod tests {
         t.insert(&mut pg, b"b", b"2").unwrap();
         t.insert(&mut pg, b"c", b"3").unwrap();
         assert!(t.delete(&mut pg, b"b").unwrap());
-        assert_eq!(t.get(&mut pg, b"b").unwrap(), None);
-        assert_eq!(t.get(&mut pg, b"a").unwrap().as_deref(), Some(&b"1"[..]));
-        assert_eq!(t.get(&mut pg, b"c").unwrap().as_deref(), Some(&b"3"[..]));
+        assert_eq!(t.get(&pg, b"b").unwrap(), None);
+        assert_eq!(t.get(&pg, b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(t.get(&pg, b"c").unwrap().as_deref(), Some(&b"3"[..]));
         // deleting an absent key is a no-op false
         assert!(!t.delete(&mut pg, b"zz").unwrap());
         std::fs::remove_file(&path).ok();
@@ -754,9 +756,9 @@ mod tests {
         }
         // every key is gone and the tree is empty
         for i in 0..n {
-            assert_eq!(t.get(&mut pg, format!("key{i:08}").as_bytes()).unwrap(), None);
+            assert_eq!(t.get(&pg, format!("key{i:08}").as_bytes()).unwrap(), None);
         }
-        assert!(t.iter_all(&mut pg).unwrap().is_empty());
+        assert!(t.iter_all(&pg).unwrap().is_empty());
         assert_eq!(t.root(&pg), 0, "root reset after deleting everything");
         // re-inserting reuses freed pages rather than growing unbounded
         for i in 0..n {
@@ -786,7 +788,7 @@ mod tests {
             assert!(t.delete(&mut pg, format!("k{i:08}").as_bytes()).unwrap());
         }
         for i in 0..n {
-            let got = t.get(&mut pg, format!("k{i:08}").as_bytes()).unwrap();
+            let got = t.get(&pg, format!("k{i:08}").as_bytes()).unwrap();
             if i % 2 == 0 {
                 assert_eq!(got, None, "even key {i} should be gone");
             } else {
@@ -794,7 +796,7 @@ mod tests {
             }
         }
         // surviving keys are exactly the odd ones, and the leaf chain is intact
-        let all = t.iter_all(&mut pg).unwrap();
+        let all = t.iter_all(&pg).unwrap();
         assert_eq!(all.len() as u32, n / 2);
         // ordered + ascending (leaf links consistent after merges)
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
@@ -817,12 +819,12 @@ mod tests {
             pg.flush().unwrap();
         }
         {
-            let mut pg = Pager::open(&path, 64).unwrap();
+            let pg = Pager::open(&path, 64).unwrap();
             let t = BTree::new(0);
-            assert_eq!(t.get(&mut pg, b"k000400").unwrap(), Some(be32(400).to_vec()));
-            assert_eq!(t.get(&mut pg, b"k000700").unwrap(), None);
-            assert_eq!(t.get(&mut pg, b"k001200").unwrap(), Some(be32(1200).to_vec()));
-            assert_eq!(t.iter_all(&mut pg).unwrap().len(), 1000);
+            assert_eq!(t.get(&pg, b"k000400").unwrap(), Some(be32(400).to_vec()));
+            assert_eq!(t.get(&pg, b"k000700").unwrap(), None);
+            assert_eq!(t.get(&pg, b"k001200").unwrap(), Some(be32(1200).to_vec()));
+            assert_eq!(t.iter_all(&pg).unwrap().len(), 1000);
         }
         std::fs::remove_file(&path).ok();
     }

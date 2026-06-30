@@ -16,24 +16,27 @@
 //!   (only looked-up terms become resident).
 //! * [`vlist`] is the compact delta+varint posting-list codec; `DiskStore::compact`
 //!   wires it into a `(sub, pred) → objects` value index.
+//! * [`overflow`] chains pager pages for VList values too large to fit inline in
+//!   a B+tree leaf, mirroring gStore's separate large-block VList file: a
+//!   `(sub, pred)` group with an arbitrarily long posting list is written across
+//!   a linked list of pages and referenced from the tree by just its head id.
 //!
-//! ## Deferred (task 4): differentiated block/array management
-//! gStore splits storage into `SITree` (the B+tree of fixed-size signature/value
-//! *blocks*), `IVArray`/`ISArray` (integer- vs string-keyed array files), and
-//! VList *overflow blocks* that chain pages for values too large for one node.
-//! Here a single [`bptree::BTree`] serves every index and values must fit inline
-//! in a page, so [`store::DiskStore::compact`] skips any `(sub, pred)` group whose
-//! VList would overflow [`pager::PAGE_SIZE`] (reads fall back to the SPO scan).
-//! Introducing real overflow-block chains (so arbitrarily long posting lists
-//! compress on disk) and separating integer- from string-keyed arrays is the
-//! remaining gStore-faithful step; it is intentionally left out of this pass.
+//! ## Deferred (task 5): differentiated block/array management
+//! gStore also splits storage into `IVArray`/`ISArray` (integer- vs string-keyed
+//! array files). Here a single [`bptree::BTree`] serves every index, with
+//! [`overflow`] chains handling long values; separating integer- from
+//! string-keyed arrays is the remaining gStore-faithful refinement and is
+//! intentionally left out of this pass.
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod overflow;
 pub mod pager;
 pub mod store;
+pub mod string_index;
 pub mod vlist;
 
 pub use disk_dict::DiskDict;
 pub use pager::{PageId, Pager, PAGE_SIZE};
 pub use store::DiskStore;
+pub use string_index::StringIndex;

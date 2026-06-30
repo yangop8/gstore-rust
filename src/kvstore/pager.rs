@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::{GStoreError, Result};
 
@@ -37,15 +38,33 @@ struct CachedPage {
     tick: u64,
 }
 
+/// The mutable buffer-cache state, behind a `Mutex` so cached reads (which only
+/// touch the cache + the file) can run through `&self` and thus concurrently
+/// under a shared [`std::sync::RwLock`] read guard at the layer above.
+struct CacheState {
+    map: HashMap<PageId, CachedPage>,
+    clock: u64,
+}
+
 /// A paged file with a write-back LRU cache.
+///
+/// ## Concurrency (task 4: fine-grained latching)
+/// `read_page` takes `&self`: the page data it returns is an owned copy, and the
+/// only shared mutable state it touches — the buffer cache and the file handle —
+/// lives behind short-held `Mutex`es here. So the layer above can hold the
+/// `Pager` in an `Arc<RwLock<Pager>>` and let **many readers** resolve pages
+/// concurrently (each `RwLock::read`), while mutations (`write_page`/`alloc`/
+/// `free`/`flush`, all `&mut self`) take the exclusive `RwLock::write`. Those
+/// `&mut self` methods reach the cache/file via `get_mut()` (no locking needed —
+/// `&mut self` already proves exclusivity), so the write path keeps the original
+/// strict eviction + WAL commit protocol unchanged.
 pub struct Pager {
-    file: File,
+    file: Mutex<File>,
     page_count: u32,
     free_head: PageId,
     roots: [u64; NROOTS],
-    cache: HashMap<PageId, CachedPage>,
+    cache: Mutex<CacheState>,
     capacity: usize,
-    clock: u64,
     /// Path of the write-ahead log beside the main file (`<file>.wal`).
     wal_path: PathBuf,
 }
@@ -70,13 +89,15 @@ impl Pager {
         if len == 0 {
             // Fresh file: page 0 is the header, data starts at page 1.
             let mut p = Pager {
-                file,
+                file: Mutex::new(file),
                 page_count: 1,
                 free_head: 0,
                 roots: [0; NROOTS],
-                cache: HashMap::new(),
+                cache: Mutex::new(CacheState {
+                    map: HashMap::new(),
+                    clock: 0,
+                }),
                 capacity,
-                clock: 0,
                 wal_path,
             };
             p.write_header()?;
@@ -98,13 +119,15 @@ impl Pager {
                 *r = u64::from_le_bytes(hdr[off..off + 8].try_into().unwrap());
             }
             Ok(Pager {
-                file,
+                file: Mutex::new(file),
                 page_count,
                 free_head,
                 roots,
-                cache: HashMap::new(),
+                cache: Mutex::new(CacheState {
+                    map: HashMap::new(),
+                    clock: 0,
+                }),
                 capacity,
-                clock: 0,
                 wal_path,
             })
         }
@@ -134,24 +157,54 @@ impl Pager {
 
     fn write_header(&mut self) -> Result<()> {
         let hdr = self.header_bytes();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&hdr)?;
+        let f = self.file.get_mut().unwrap();
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&hdr)?;
         Ok(())
     }
 
-    /// Read a page (from cache, else from disk into the cache).
-    pub fn read_page(&mut self, id: PageId) -> Result<[u8; PAGE_SIZE]> {
-        self.clock += 1;
-        let tick = self.clock;
-        if let Some(cp) = self.cache.get_mut(&id) {
-            cp.tick = tick;
-            return Ok(*cp.data);
+    /// Read a page (from cache, else from disk into the cache). Takes `&self`:
+    /// the returned page is an owned copy and the shared mutable state (cache,
+    /// file handle) is touched only under short-held internal `Mutex`es, so many
+    /// readers can run this concurrently (see the type-level concurrency note).
+    pub fn read_page(&self, id: PageId) -> Result<[u8; PAGE_SIZE]> {
+        // Fast path: a cache hit, refreshing the LRU tick.
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.clock += 1;
+            let tick = cache.clock;
+            if let Some(cp) = cache.map.get_mut(&id) {
+                cp.tick = tick;
+                return Ok(*cp.data);
+            }
         }
+        // Miss: read from the file (brief file-lock), then populate the cache.
         let mut buf = [0u8; PAGE_SIZE];
-        self.file
-            .seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
-        self.file.read_exact(&mut buf)?;
-        self.insert_cache(id, buf, false, tick)?;
+        {
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
+            f.read_exact(&mut buf)?;
+        }
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.clock += 1;
+            let tick = cache.clock;
+            // A concurrent reader may have inserted this page meanwhile; that is
+            // harmless (same bytes), so just (re)insert. Evict only *clean* pages
+            // under `&self`; if the cache is full of dirty pages we let it grow
+            // slightly rather than commit on a read (writes flush under &mut).
+            if cache.map.len() >= self.capacity {
+                evict_one_clean(&mut cache);
+            }
+            cache.map.insert(
+                id,
+                CachedPage {
+                    data: Box::new(buf),
+                    dirty: false,
+                    tick,
+                },
+            );
+        }
         Ok(buf)
     }
 
@@ -162,9 +215,11 @@ impl Pager {
                 "page 0 is reserved for header".into(),
             ));
         }
-        self.clock += 1;
-        let tick = self.clock;
-        if let Some(cp) = self.cache.get_mut(&id) {
+        // `&mut self` ⇒ exclusive access; reach the cache without locking.
+        let cache = self.cache.get_mut().unwrap();
+        cache.clock += 1;
+        let tick = cache.clock;
+        if let Some(cp) = cache.map.get_mut(&id) {
             *cp.data = *data;
             cp.dirty = true;
             cp.tick = tick;
@@ -180,10 +235,10 @@ impl Pager {
         dirty: bool,
         tick: u64,
     ) -> Result<()> {
-        if self.cache.len() >= self.capacity {
+        if self.cache.get_mut().unwrap().map.len() >= self.capacity {
             self.evict_one()?;
         }
-        self.cache.insert(
+        self.cache.get_mut().unwrap().map.insert(
             id,
             CachedPage {
                 data: Box::new(data),
@@ -198,24 +253,34 @@ impl Pager {
     /// file only through a committed [`flush`](Self::flush) (preserving the WAL
     /// invariant), so if every cached page is dirty we commit first, then evict.
     fn evict_one(&mut self) -> Result<()> {
-        let clean_lru = self
-            .cache
-            .iter()
-            .filter(|(_, cp)| !cp.dirty)
-            .min_by_key(|(_, cp)| cp.tick)
-            .map(|(&id, _)| id);
+        let clean_lru = {
+            let cache = self.cache.get_mut().unwrap();
+            cache
+                .map
+                .iter()
+                .filter(|(_, cp)| !cp.dirty)
+                .min_by_key(|(_, cp)| cp.tick)
+                .map(|(&id, _)| id)
+        };
         let victim = match clean_lru {
             Some(id) => id,
             None => {
                 // All cached pages are dirty: commit them, then they're clean.
                 self.flush()?;
-                match self.cache.iter().min_by_key(|(_, cp)| cp.tick) {
+                match self
+                    .cache
+                    .get_mut()
+                    .unwrap()
+                    .map
+                    .iter()
+                    .min_by_key(|(_, cp)| cp.tick)
+                {
                     Some((&id, _)) => id,
                     None => return Ok(()),
                 }
             }
         };
-        self.cache.remove(&victim);
+        self.cache.get_mut().unwrap().map.remove(&victim);
         Ok(())
     }
 
@@ -265,30 +330,37 @@ impl Pager {
         // The committed batch: the header (page 0) plus all dirty pages.
         let mut batch: Vec<(PageId, [u8; PAGE_SIZE])> = Vec::new();
         batch.push((0, self.header_bytes()));
-        let dirty: Vec<PageId> = self
-            .cache
-            .iter()
-            .filter(|(_, cp)| cp.dirty)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in &dirty {
-            batch.push((*id, *self.cache.get(id).unwrap().data));
+        {
+            let cache = self.cache.get_mut().unwrap();
+            let dirty: Vec<PageId> = cache
+                .map
+                .iter()
+                .filter(|(_, cp)| cp.dirty)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in &dirty {
+                batch.push((*id, *cache.map.get(id).unwrap().data));
+            }
         }
 
         // 1. Write-ahead: log the batch, then fsync the log.
         write_wal(&self.wal_path, &batch)?;
         // 2. Apply the batch to the main file, then fsync it.
-        for (id, data) in &batch {
-            self.file
-                .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
-            self.file.write_all(data)?;
+        {
+            let f = self.file.get_mut().unwrap();
+            for (id, data) in &batch {
+                f.seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
+                f.write_all(data)?;
+            }
+            f.sync_all()?;
         }
-        self.file.sync_all()?;
         // 3. Drop the log: the main file is now the durable state.
         let _ = std::fs::remove_file(&self.wal_path);
 
-        for id in dirty {
-            self.cache.get_mut(&id).unwrap().dirty = false;
+        // Clear dirty flags on the pages we just committed.
+        let cache = self.cache.get_mut().unwrap();
+        for (_, cp) in cache.map.iter_mut() {
+            cp.dirty = false;
         }
         Ok(())
     }
@@ -296,6 +368,22 @@ impl Pager {
     /// Number of allocated pages (including the header).
     pub fn page_count(&self) -> u32 {
         self.page_count
+    }
+}
+
+/// Evict the least-recently-used *clean* page from `cache`, if any. Used by the
+/// `&self` read path, which must not commit dirty pages (that is the `&mut self`
+/// write path's job via the WAL); if every cached page is dirty this is a no-op
+/// and the cache grows slightly past capacity until the next flush.
+fn evict_one_clean(cache: &mut CacheState) {
+    if let Some(victim) = cache
+        .map
+        .iter()
+        .filter(|(_, cp)| !cp.dirty)
+        .min_by_key(|(_, cp)| cp.tick)
+        .map(|(&id, _)| id)
+    {
+        cache.map.remove(&victim);
     }
 }
 
@@ -436,7 +524,7 @@ mod tests {
             pg.flush().unwrap();
         }
         {
-            let mut pg = Pager::open(&path, 16).unwrap();
+            let pg = Pager::open(&path, 16).unwrap();
             assert_eq!(pg.root(0), 0xDEAD_BEEF);
             let d = pg.read_page(a).unwrap();
             assert_eq!(d[100], 99);
@@ -491,7 +579,7 @@ mod tests {
         write_wal(&wal_path_for(&path), &[(1, marker)]).unwrap();
 
         // Opening must replay the log, then clear it.
-        let mut pg = Pager::open(&path, 16).unwrap();
+        let pg = Pager::open(&path, 16).unwrap();
         let page = pg.read_page(1).unwrap();
         assert_eq!(&page[0..4], &0xDEAD_BEEFu32.to_le_bytes());
         assert!(!wal_path_for(&path).exists(), "replayed log is removed");
@@ -517,7 +605,7 @@ mod tests {
         std::fs::write(&wal, &bytes).unwrap();
 
         // Recovery must reject the torn log and leave page 1 as it was (all 1s).
-        let mut pg = Pager::open(&path, 16).unwrap();
+        let pg = Pager::open(&path, 16).unwrap();
         let page = pg.read_page(1).unwrap();
         assert_eq!(page[0], 1, "torn WAL must not be applied");
         assert!(!wal.exists());
@@ -536,8 +624,75 @@ mod tests {
             pg.write_page(a, &[5u8; PAGE_SIZE]).unwrap(); // dirty, never flushed
             // drop without flushing ⇒ the second write is lost
         }
-        let mut pg = Pager::open(&path, 16).unwrap();
+        let pg = Pager::open(&path, 16).unwrap();
         assert_eq!(pg.read_page(a).unwrap()[0], 9, "uncommitted write must be lost");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn concurrent_reads_and_writes_via_rwlock() {
+        // Many readers (shared `RwLock::read` → `read_page(&self)`) run alongside
+        // a writer (`RwLock::write` → `write_page(&mut self)`). Each page's first
+        // 4 bytes always equal its own id (every writer preserves that), so a
+        // reader must never observe a torn page — proving the latching is correct.
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let path = tmp("concurrent_rw");
+        let npages = 64u32;
+        let mut pg = Pager::open(&path, 256).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..npages {
+            let id = pg.alloc().unwrap();
+            let mut d = [0u8; PAGE_SIZE];
+            d[0..4].copy_from_slice(&id.to_le_bytes());
+            pg.write_page(id, &d).unwrap();
+            ids.push(id);
+        }
+        pg.flush().unwrap();
+        let pager = Arc::new(RwLock::new(pg));
+        let ids = Arc::new(ids);
+
+        let mut handles = Vec::new();
+        // Reader threads: assert the page-id invariant on every read.
+        for _ in 0..6 {
+            let pager = Arc::clone(&pager);
+            let ids = Arc::clone(&ids);
+            handles.push(thread::spawn(move || {
+                for round in 0..2000usize {
+                    let id = ids[round % ids.len()];
+                    let page = pager.read().unwrap().read_page(id).unwrap();
+                    let got = u32::from_le_bytes(page[0..4].try_into().unwrap());
+                    assert_eq!(got, id, "reader saw a torn/incorrect page");
+                }
+            }));
+        }
+        // Writer thread: rewrite pages, bumping a counter byte but preserving the
+        // id invariant.
+        {
+            let pager = Arc::clone(&pager);
+            let ids = Arc::clone(&ids);
+            handles.push(thread::spawn(move || {
+                for round in 0..2000usize {
+                    let id = ids[round % ids.len()];
+                    let mut d = [0u8; PAGE_SIZE];
+                    d[0..4].copy_from_slice(&id.to_le_bytes());
+                    d[4] = (round % 251) as u8;
+                    pager.write().unwrap().write_page(id, &d).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Final state is still consistent and durable.
+        pager.write().unwrap().flush().unwrap();
+        let pager = Arc::try_unwrap(pager).ok().unwrap().into_inner().unwrap();
+        let pg = pager;
+        for &id in ids.iter() {
+            let page = pg.read_page(id).unwrap();
+            assert_eq!(u32::from_le_bytes(page[0..4].try_into().unwrap()), id);
+        }
         std::fs::remove_file(&path).ok();
     }
 

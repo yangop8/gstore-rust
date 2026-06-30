@@ -8,9 +8,8 @@
 //! [`crate::store::TripleStore`] does, but entirely from disk through the page
 //! cache. Data persists and reopens.
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::dict::{Dictionary, DiskTermSource};
 use crate::error::{GStoreError, Result};
@@ -22,6 +21,7 @@ use crate::store::{TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
 use super::disk_dict::DiskDict;
+use super::overflow;
 use super::pager::{Pager, PAGE_SIZE};
 use super::vlist;
 
@@ -44,17 +44,28 @@ const SP2O_VLIST: usize = 13;
 /// `1` once [`DiskStore::compact`] has built `SP2O_VLIST`; cleared by any write.
 const ROOT_COMPACTED: usize = 14;
 
-/// Upper bound on a single VList value so it always fits inline in a B+tree leaf
-/// page. A `(sub, pred)` group whose encoding would exceed this is left out of
-/// the compressed index (reads fall back to the SPO scan); storing arbitrarily
-/// large posting lists is gStore's VList *overflow block* case — see task 4.
-const MAX_VLIST_BYTES: usize = PAGE_SIZE / 2;
+/// Upper bound on a VList value stored *inline* in a B+tree leaf page. A
+/// `(sub, pred)` group whose delta+varint encoding fits within this is stored
+/// inline (tag byte + bytes); a larger one spills into an [`overflow`] page
+/// chain and the leaf keeps only a small head-pointer record. This is gStore's
+/// VList split between in-tree short lists and the separate large-block file.
+const MAX_INLINE_VLIST_BYTES: usize = PAGE_SIZE / 2;
+
+/// First byte of a `sp2o_vlist` value: the encoded VList is stored inline,
+/// directly following this tag.
+const INLINE_TAG: u8 = 0;
+/// First byte of a `sp2o_vlist` value: the encoded VList lives in an [`overflow`]
+/// page chain. The record is `[OVERFLOW_TAG][head: u32 le][byte_len: u32 le]`.
+const OVERFLOW_TAG: u8 = 1;
 
 /// A disk-backed gStore database (dictionary + six-way triple index).
 pub struct DiskStore {
-    /// `Arc<Mutex<_>>` (not `RefCell`) so the out-of-core [`DiskDict`] can share
-    /// the very same pager/page-cache, and so the type stays `Send`-able.
-    pager: Arc<Mutex<Pager>>,
+    /// `Arc<RwLock<_>>` (not `RefCell`) so the out-of-core [`DiskDict`] can share
+    /// the very same pager/page-cache, and so the type stays `Send`-able. The
+    /// `RwLock` (task 4) lets many readers resolve pages concurrently — every
+    /// read path takes `.read()` and the [`Pager`]'s `read_page(&self)` only
+    /// briefly latches its internal cache — while mutations take `.write()`.
+    pager: Arc<RwLock<Pager>>,
     spo: BTree,
     pos: BTree,
     osp: BTree,
@@ -78,7 +89,9 @@ pub struct DiskStore {
     /// Lazily built out-of-core dictionary, reused across queries so its
     /// materialized-string cache (and thus its leak) stays bounded by the set of
     /// terms ever touched. Invalidated on any write (counts may have changed).
-    disk_dict: RefCell<Option<Arc<DiskDict>>>,
+    /// A `Mutex` (not `RefCell`) so `DiskStore` stays `Sync` and many threads can
+    /// share it via `Arc` and read concurrently (task 4).
+    disk_dict: Mutex<Option<Arc<DiskDict>>>,
 }
 
 impl DiskStore {
@@ -91,7 +104,7 @@ impl DiskStore {
         let pred_count = pager.root(ROOT_PRED_COUNT) as u32;
         let compacted = pager.root(ROOT_COMPACTED) != 0;
         Ok(DiskStore {
-            pager: Arc::new(Mutex::new(pager)),
+            pager: Arc::new(RwLock::new(pager)),
             spo: BTree::new(SPO),
             pos: BTree::new(POS),
             osp: BTree::new(OSP),
@@ -107,7 +120,7 @@ impl DiskStore {
             literal_count,
             pred_count,
             compacted,
-            disk_dict: RefCell::new(None),
+            disk_dict: Mutex::new(None),
         })
     }
 
@@ -144,7 +157,7 @@ impl DiskStore {
     // ---- building ---------------------------------------------------------
 
     fn intern_entity(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         if let Some(v) = self.entity2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
@@ -160,7 +173,7 @@ impl DiskStore {
     }
 
     fn intern_literal(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         if let Some(v) = self.literal2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
@@ -176,7 +189,7 @@ impl DiskStore {
     }
 
     fn intern_predicate(&mut self, key: &str) -> Result<PredId> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         if let Some(v) = self.predicate2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
@@ -213,7 +226,7 @@ impl DiskStore {
     // can leave the indexes disagreeing for that one triple. Full per-operation
     // atomicity (a single WAL batch per triple / page pinning) is future work.
     fn insert_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         let spo = key3(t.sub, t.pred, t.obj);
         if self.spo.get(pager, &spo)?.is_some() {
@@ -240,24 +253,24 @@ impl DiskStore {
     /// is absent.
     pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
         let s = {
-            let mut guard = self.pager.lock().unwrap();
-            let pager = &mut *guard;
+            let guard = self.pager.read().unwrap();
+            let pager = &*guard;
             match self.entity2id.get(pager, t.subject.dict_key().as_bytes())? {
                 Some(v) => de32(&v),
                 None => return Ok(false),
             }
         };
         let p = {
-            let mut guard = self.pager.lock().unwrap();
-            let pager = &mut *guard;
+            let guard = self.pager.read().unwrap();
+            let pager = &*guard;
             match self.predicate2id.get(pager, t.predicate.dict_key().as_bytes())? {
                 Some(v) => de32(&v),
                 None => return Ok(false),
             }
         };
         let o = {
-            let mut guard = self.pager.lock().unwrap();
-            let pager = &mut *guard;
+            let guard = self.pager.read().unwrap();
+            let pager = &*guard;
             let tree = if t.object.is_literal() {
                 &self.literal2id
             } else {
@@ -272,7 +285,7 @@ impl DiskStore {
     }
 
     fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         let spo = key3(t.sub, t.pred, t.obj);
         if self.spo.get(pager, &spo)?.is_none() {
@@ -292,7 +305,7 @@ impl DiskStore {
 
     /// Persist counters and flush all dirty pages.
     pub fn flush(&mut self) -> Result<()> {
-        let mut guard = self.pager.lock().unwrap();
+        let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
         pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
@@ -320,48 +333,48 @@ impl DiskStore {
 
     pub fn term_id(&self, t: &Term) -> Result<Option<EntityLiteralId>> {
         let key = t.dict_key();
-        let mut pager = self.pager.lock().unwrap();
+        let pager = self.pager.read().unwrap();
         let tree = if t.is_literal() {
             &self.literal2id
         } else {
             &self.entity2id
         };
-        Ok(tree.get(&mut pager, key.as_bytes())?.map(|v| de32(&v)))
+        Ok(tree.get(&pager, key.as_bytes())?.map(|v| de32(&v)))
     }
 
     pub fn predicate_id(&self, dict_key: &str) -> Result<Option<PredId>> {
-        let mut pager = self.pager.lock().unwrap();
+        let pager = self.pager.read().unwrap();
         Ok(self
             .predicate2id
-            .get(&mut pager, dict_key.as_bytes())?
+            .get(&pager, dict_key.as_bytes())?
             .map(|v| de32(&v)))
     }
 
     pub fn id_to_string(&self, id: EntityLiteralId) -> Result<Option<String>> {
-        let mut pager = self.pager.lock().unwrap();
+        let pager = self.pager.read().unwrap();
         let tree = if is_literal_id(id) {
             &self.id2literal
         } else {
             &self.id2entity
         };
         Ok(tree
-            .get(&mut pager, &be32(id))?
+            .get(&pager, &be32(id))?
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
     pub fn predicate_to_string(&self, id: PredId) -> Result<Option<String>> {
-        let mut pager = self.pager.lock().unwrap();
+        let pager = self.pager.read().unwrap();
         Ok(self
             .id2predicate
-            .get(&mut pager, &be32(id))?
+            .get(&pager, &be32(id))?
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
     // ---- access patterns (mirror TripleStore) ----------------------------
 
     pub fn exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> Result<bool> {
-        let mut pager = self.pager.lock().unwrap();
-        Ok(self.spo.get(&mut pager, &key3(s, p, o))?.is_some())
+        let pager = self.pager.read().unwrap();
+        Ok(self.spo.get(&pager, &key3(s, p, o))?.is_some())
     }
 
     /// `s ? ?` → `(pred, obj)` pairs (sorted by (pred, obj)).
@@ -374,14 +387,16 @@ impl DiskStore {
     }
 
     /// `s p ?` → objects. When the store has been [`compact`](Self::compact)ed,
-    /// this is a single point lookup into the VList index + a varint decode,
-    /// instead of a multi-key prefix scan; it transparently falls back to the
-    /// SPO scan for any group not present in the index (absent or oversize).
+    /// this is a point lookup into the VList index + a varint decode (following
+    /// an [`overflow`] page chain for an oversize group), instead of a multi-key
+    /// prefix scan; it transparently falls back to the SPO scan for any group
+    /// not present in the index.
     pub fn o_by_sp(&self, s: EntityLiteralId, p: PredId) -> Result<Vec<EntityLiteralId>> {
         if self.compacted {
-            let mut pager = self.pager.lock().unwrap();
-            if let Some(v) = self.sp2o_vlist.get(&mut pager, &cat(s, p))? {
-                return Ok(vlist::decode_u32s(&v).unwrap_or_default());
+            let pager = self.pager.read().unwrap();
+            if let Some(rec) = self.sp2o_vlist.get(&pager, &cat(s, p))? {
+                let bytes = materialize_vlist(&pager, &rec)?;
+                return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
             }
         }
         let rows = self.scan(&self.spo, &cat(s, p))?;
@@ -431,9 +446,9 @@ impl DiskStore {
     }
 
     fn scan(&self, tree: &BTree, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut pager = self.pager.lock().unwrap();
+        let pager = self.pager.read().unwrap();
         Ok(tree
-            .scan_prefix(&mut pager, prefix)?
+            .scan_prefix(&pager, prefix)?
             .into_iter()
             .map(|(k, _)| k)
             .collect())
@@ -445,24 +460,34 @@ impl DiskStore {
     /// the authoritative SPO index, then mark the store compacted so `o_by_sp`
     /// reads it. Each group's sorted object list is delta+varint encoded (see
     /// [`vlist`](super::vlist)), trading many tiny per-triple keys for one compact
-    /// value per `(sub, pred)`. Groups whose encoding would exceed
-    /// [`MAX_VLIST_BYTES`] are skipped (kept readable via the SPO scan); storing
-    /// arbitrarily large lists is gStore's VList overflow-block case (task 4).
+    /// value per `(sub, pred)`. A group whose encoding fits in
+    /// [`MAX_INLINE_VLIST_BYTES`] is stored inline; a larger one spills into an
+    /// [`overflow`] page chain (gStore's VList large-block file), so arbitrarily
+    /// long posting lists — e.g. a hub subject or a dense predicate — compress and
+    /// round-trip on disk rather than being skipped.
     ///
     /// Any subsequent insert/delete clears the compacted flag, so the index is a
     /// read-side optimization that never returns stale data.
     pub fn compact(&mut self) -> Result<()> {
-        // 1. Drop any previous VList entries so vanished groups can't be read.
-        let stale: Vec<Vec<u8>> = {
-            let mut guard = self.pager.lock().unwrap();
-            self.sp2o_vlist
-                .iter_all(&mut guard)?
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect()
+        // 0. Mark the index stale up-front: if a crash interrupts the rebuild
+        //    below, the next open falls back to the authoritative SPO scan.
+        {
+            let mut guard = self.pager.write().unwrap();
+            self.compacted = false;
+            guard.set_root(ROOT_COMPACTED, 0);
+        }
+
+        // 1. Drop any previous VList entries so vanished groups can't be read,
+        //    freeing each overflow chain so its pages return to the free list.
+        let stale: Vec<(Vec<u8>, Vec<u8>)> = {
+            let guard = self.pager.read().unwrap();
+            self.sp2o_vlist.iter_all(&guard)?
         };
-        for k in &stale {
-            let mut guard = self.pager.lock().unwrap();
+        for (k, v) in &stale {
+            let mut guard = self.pager.write().unwrap();
+            if let Some(head) = overflow_head(v) {
+                overflow::free_chain(&mut guard, head)?;
+            }
             self.sp2o_vlist.delete(&mut guard, k)?;
         }
 
@@ -479,15 +504,14 @@ impl DiskStore {
                 i += 1;
             }
             let enc = vlist::encode_u32s(&objs);
-            if enc.len() <= MAX_VLIST_BYTES {
-                let mut guard = self.pager.lock().unwrap();
-                self.sp2o_vlist.insert(&mut guard, &cat(s, p), &enc)?;
-            }
+            let mut guard = self.pager.write().unwrap();
+            let rec = encode_vlist_record(&mut guard, &enc)?;
+            self.sp2o_vlist.insert(&mut guard, &cat(s, p), &rec)?;
         }
 
         // 3. Publish: reads may now use the VList index.
+        let mut guard = self.pager.write().unwrap();
         self.compacted = true;
-        let mut guard = self.pager.lock().unwrap();
         guard.set_root(ROOT_COMPACTED, 1);
         Ok(())
     }
@@ -498,12 +522,35 @@ impl DiskStore {
         self.compacted
     }
 
-    /// Byte length of the stored VList value for `(s, p)` in the compressed
-    /// index, or `None` if absent (not compacted / oversize / empty group).
-    /// Exposes the on-disk encoded size for size/round-trip assertions.
+    /// Total allocated page count (for tests asserting no page leaks).
+    #[cfg(test)]
+    fn page_count_for_test(&self) -> u32 {
+        self.pager.read().unwrap().page_count()
+    }
+
+    /// Logical (delta+varint) byte length of the stored VList value for `(s, p)`
+    /// in the compressed index, or `None` if absent (not compacted / empty
+    /// group). This is the encoded payload size whether the value is stored
+    /// inline or in an [`overflow`] chain, so size/round-trip assertions are
+    /// independent of where the bytes physically live.
     pub fn compact_value_len(&self, s: EntityLiteralId, p: PredId) -> Result<Option<usize>> {
-        let mut pager = self.pager.lock().unwrap();
-        Ok(self.sp2o_vlist.get(&mut pager, &cat(s, p))?.map(|v| v.len()))
+        let pager = self.pager.read().unwrap();
+        Ok(self
+            .sp2o_vlist
+            .get(&pager, &cat(s, p))?
+            .map(|v| record_logical_len(&v)))
+    }
+
+    /// Whether the stored VList value for `(s, p)` uses an [`overflow`] page
+    /// chain (i.e. its encoding exceeded [`MAX_INLINE_VLIST_BYTES`]). `None` if
+    /// the group is absent from the compressed index. Exposes the inline/overflow
+    /// decision for tests.
+    pub fn compact_value_is_overflow(&self, s: EntityLiteralId, p: PredId) -> Result<Option<bool>> {
+        let pager = self.pager.read().unwrap();
+        Ok(self
+            .sp2o_vlist
+            .get(&pager, &cat(s, p))?
+            .map(|v| v.first() == Some(&OVERFLOW_TAG)))
     }
 
     // ---- bridge to the in-memory engine ----------------------------------
@@ -550,15 +597,13 @@ impl DiskStore {
     /// changed since it was last built (i.e. new terms were interned), so reads
     /// keep reusing one materialized-string cache.
     fn disk_backing(&self) -> Arc<DiskDict> {
-        {
-            let cached = self.disk_dict.borrow();
-            if let Some(d) = cached.as_ref() {
-                if d.entity_num() == self.entity_count as usize
-                    && d.literal_num() == self.literal_count as usize
-                    && d.predicate_num() == self.pred_count as usize
-                {
-                    return Arc::clone(d);
-                }
+        let mut cached = self.disk_dict.lock().unwrap();
+        if let Some(d) = cached.as_ref() {
+            if d.entity_num() == self.entity_count as usize
+                && d.literal_num() == self.literal_count as usize
+                && d.predicate_num() == self.pred_count as usize
+            {
+                return Arc::clone(d);
             }
         }
         let d = Arc::new(DiskDict::new(
@@ -573,7 +618,7 @@ impl DiskStore {
             self.literal_count as usize,
             self.pred_count as usize,
         ));
-        *self.disk_dict.borrow_mut() = Some(Arc::clone(&d));
+        *cached = Some(Arc::clone(&d));
         d
     }
 
@@ -591,7 +636,8 @@ impl DiskStore {
     /// dictionary was *not* fully loaded.
     pub fn resident_string_count(&self) -> usize {
         self.disk_dict
-            .borrow()
+            .lock()
+            .unwrap()
             .as_ref()
             .map_or(0, |d| d.resident_string_count())
     }
@@ -696,6 +742,62 @@ impl TripleSource for DiskStore {
     }
     fn iter_all(&self) -> Vec<IdTriple> {
         DiskStore::iter_all(self).unwrap_or_default()
+    }
+}
+
+/// Build a `sp2o_vlist` value record for an encoded VList: inline (tag + bytes)
+/// when small enough, else an [`overflow`] chain written here, leaving only a
+/// `[OVERFLOW_TAG][head][byte_len]` head-pointer record in the tree.
+fn encode_vlist_record(pager: &mut Pager, enc: &[u8]) -> Result<Vec<u8>> {
+    if enc.len() <= MAX_INLINE_VLIST_BYTES {
+        let mut rec = Vec::with_capacity(1 + enc.len());
+        rec.push(INLINE_TAG);
+        rec.extend_from_slice(enc);
+        Ok(rec)
+    } else {
+        let head = overflow::write_chain(pager, enc)?;
+        let mut rec = Vec::with_capacity(9);
+        rec.push(OVERFLOW_TAG);
+        rec.extend_from_slice(&head.to_le_bytes());
+        rec.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+        Ok(rec)
+    }
+}
+
+/// Reassemble the encoded VList bytes from a `sp2o_vlist` value record, reading
+/// an [`overflow`] chain when the record is a head pointer. A malformed record
+/// yields empty bytes (decodes to an empty list).
+fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
+    match rec.first() {
+        Some(&INLINE_TAG) => Ok(rec[1..].to_vec()),
+        Some(&OVERFLOW_TAG) if rec.len() >= 9 => {
+            let head = u32::from_le_bytes(rec[1..5].try_into().unwrap());
+            let len = u32::from_le_bytes(rec[5..9].try_into().unwrap()) as usize;
+            overflow::read_chain(pager, head, len)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Logical (encoded) byte length carried by a `sp2o_vlist` value record,
+/// regardless of inline vs overflow storage.
+fn record_logical_len(rec: &[u8]) -> usize {
+    match rec.first() {
+        Some(&INLINE_TAG) => rec.len() - 1,
+        Some(&OVERFLOW_TAG) if rec.len() >= 9 => {
+            u32::from_le_bytes(rec[5..9].try_into().unwrap()) as usize
+        }
+        _ => 0,
+    }
+}
+
+/// The overflow head page id of a `sp2o_vlist` value record, or `None` if the
+/// record is inline (no chain to free).
+fn overflow_head(rec: &[u8]) -> Option<super::pager::PageId> {
+    if rec.first() == Some(&OVERFLOW_TAG) && rec.len() >= 5 {
+        Some(u32::from_le_bytes(rec[1..5].try_into().unwrap()))
+    } else {
+        None
     }
 }
 
@@ -1055,6 +1157,190 @@ mod tests {
         assert!(ds.is_compacted(), "compacted flag survives reopen");
         assert!(ds.compact_value_len(hub, p).unwrap().is_some());
         assert_eq!(ds.o_by_sp(hub, p).unwrap().len(), 40);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- VList overflow chains (task 1) -----------------------------------
+
+    #[test]
+    fn compact_overflow_large_list_roundtrips() {
+        // A single (sub, pred) with thousands of objects: the encoded VList far
+        // exceeds an inline B+tree value, so it must spill into an overflow chain
+        // and still read back exactly — gStore's VList large-block case.
+        let path = tmp("vlist_overflow");
+        let n = 6000u32;
+        let mut ds = hub_store(&path, n);
+        let hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+        let p = ds
+            .predicate_id(&Term::iri("http://ex/p").dict_key())
+            .unwrap()
+            .unwrap();
+
+        let before = ds.o_by_sp(hub, p).unwrap();
+        assert_eq!(before.len(), n as usize);
+
+        ds.compact().unwrap();
+        assert!(ds.is_compacted());
+        // The group is large enough to need an overflow chain spanning >1 page.
+        assert_eq!(ds.compact_value_is_overflow(hub, p).unwrap(), Some(true));
+        let logical = ds.compact_value_len(hub, p).unwrap().unwrap();
+        assert!(
+            logical > super::overflow::CHAIN_PAYLOAD,
+            "encoded VList ({logical} B) should span multiple overflow pages"
+        );
+
+        // Same objects, now served from the overflow-backed VList index.
+        let after = ds.o_by_sp(hub, p).unwrap();
+        assert_eq!(after, before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn overflow_query_correct_after_compact_and_reopen() {
+        // End-to-end: a SPARQL query over an overflowed group must return every
+        // object, both in-process after compaction and after a reopen.
+        let path = tmp("vlist_overflow_query");
+        let n = 5000u32;
+        let (hub, p);
+        {
+            let mut ds = hub_store(&path, n);
+            ds.compact().unwrap();
+            ds.flush().unwrap();
+            hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+            p = ds
+                .predicate_id(&Term::iri("http://ex/p").dict_key())
+                .unwrap()
+                .unwrap();
+            assert_eq!(ds.compact_value_is_overflow(hub, p).unwrap(), Some(true));
+            let res = ds
+                .query("SELECT ?o WHERE { <http://ex/hub> <http://ex/p> ?o }")
+                .unwrap();
+            match res {
+                QueryResult::Select(rs) => assert_eq!(rs.row_count(), n as usize),
+                other => panic!("expected SELECT, got {other:?}"),
+            }
+        }
+        // Reopen: the overflow chain + head record persisted; reads still work.
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert!(ds.is_compacted());
+        assert_eq!(ds.compact_value_is_overflow(hub, p).unwrap(), Some(true));
+        assert_eq!(ds.o_by_sp(hub, p).unwrap().len(), n as usize);
+        let res = ds
+            .query("SELECT ?o WHERE { <http://ex/hub> <http://ex/p> ?o }")
+            .unwrap();
+        match res {
+            QueryResult::Select(rs) => assert_eq!(rs.row_count(), n as usize),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn recompact_frees_overflow_chains_no_unbounded_growth() {
+        // Rebuilding the index must free the previous overflow chain rather than
+        // leaking its pages, so repeated compaction does not grow the file.
+        let path = tmp("vlist_overflow_recompact");
+        let mut ds = hub_store(&path, 6000);
+        ds.compact().unwrap();
+        ds.flush().unwrap();
+        let pages_after_first = ds.page_count_for_test();
+        for _ in 0..3 {
+            ds.compact().unwrap();
+        }
+        ds.flush().unwrap();
+        let pages_after_more = ds.page_count_for_test();
+        assert!(
+            pages_after_more <= pages_after_first,
+            "recompaction leaked overflow pages: {pages_after_first} -> {pages_after_more}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mixed_inline_and_overflow_groups_roundtrip() {
+        // One small group (inline) and one huge group (overflow) in the same
+        // store must both read back correctly after compaction.
+        let path = tmp("vlist_mixed");
+        let mut content = String::new();
+        for i in 0..5u32 {
+            content.push_str(&format!("<http://ex/small> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        for i in 0..6000u32 {
+            content.push_str(&format!("<http://ex/big> <http://ex/p> <http://ex/b{i}> .\n"));
+        }
+        let mut ds = DiskStore::build_str(&path, 64, &content).unwrap();
+        let small = ds.term_id(&Term::iri("http://ex/small")).unwrap().unwrap();
+        let big = ds.term_id(&Term::iri("http://ex/big")).unwrap().unwrap();
+        let p = ds
+            .predicate_id(&Term::iri("http://ex/p").dict_key())
+            .unwrap()
+            .unwrap();
+        let small_before = ds.o_by_sp(small, p).unwrap();
+        let big_before = ds.o_by_sp(big, p).unwrap();
+
+        ds.compact().unwrap();
+        assert_eq!(ds.compact_value_is_overflow(small, p).unwrap(), Some(false));
+        assert_eq!(ds.compact_value_is_overflow(big, p).unwrap(), Some(true));
+        assert_eq!(ds.o_by_sp(small, p).unwrap(), small_before);
+        assert_eq!(ds.o_by_sp(big, p).unwrap(), big_before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- concurrent readers (task 4: RwLock latching) ---------------------
+
+    #[test]
+    fn concurrent_readers_get_consistent_results() {
+        // `DiskStore` is `Send + Sync`, so an `Arc<DiskStore>` can be shared by
+        // many threads that read concurrently through the pager's `RwLock` read
+        // guard. Every thread must get correct query answers with no data race,
+        // deadlock, or panic.
+        use std::sync::Arc;
+        use std::thread;
+
+        // Compile-time proof that DiskStore is shareable across threads.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DiskStore>();
+
+        let path = tmp("concurrent_readers");
+        let n = 200u32;
+        let mut content = String::new();
+        for i in 0..n {
+            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        let mut ds = DiskStore::build_str(&path, 64, &content).unwrap();
+        ds.compact().unwrap();
+        ds.flush().unwrap();
+        let ds = Arc::new(ds);
+
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let ds = Arc::clone(&ds);
+            handles.push(thread::spawn(move || {
+                for round in 0..60usize {
+                    let i = (t * 17 + round) % n as usize;
+                    // Exercises term_id, o_by_sp (VList read), and id_to_string —
+                    // all on the shared read path.
+                    let res = ds
+                        .query(&format!(
+                            "SELECT ?o WHERE {{ <http://ex/s{i}> <http://ex/p> ?o }}"
+                        ))
+                        .unwrap();
+                    match res {
+                        QueryResult::Select(rs) => {
+                            assert_eq!(rs.row_count(), 1);
+                            assert_eq!(
+                                rs.rows[0][0].as_deref(),
+                                Some(format!("<http://ex/o{i}>").as_str())
+                            );
+                        }
+                        other => panic!("expected SELECT, got {other:?}"),
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
         std::fs::remove_file(&path).ok();
     }
 }
