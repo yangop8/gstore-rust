@@ -4,7 +4,6 @@
 //! building on gStore: we can check (and later repair) an LLM-generated query
 //! for validity before sending it anywhere.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -59,15 +58,37 @@ pub enum SparqlAnswer {
     },
     /// ASK.
     Boolean(bool),
+    /// CONSTRUCT/DESCRIBE: the raw RDF graph the server returned (N-Triples).
+    Graph(String),
 }
 
 impl SparqlAnswer {
-    /// Number of rows (0 for an ASK).
+    /// Number of rows (0 for ASK/Graph).
     pub fn row_count(&self) -> usize {
         match self {
             SparqlAnswer::Select { rows, .. } => rows.len(),
-            SparqlAnswer::Boolean(_) => 0,
+            SparqlAnswer::Boolean(_) | SparqlAnswer::Graph(_) => 0,
         }
+    }
+
+    /// The distinct string values bound to `var` across all rows, in order.
+    pub fn column_values(&self, var: &str) -> Vec<String> {
+        let SparqlAnswer::Select { vars, rows } = self else {
+            return Vec::new();
+        };
+        let Some(idx) = vars.iter().position(|v| v == var) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for r in rows {
+            if let Some(Some(t)) = r.get(idx) {
+                if seen.insert(t.value.clone()) {
+                    out.push(t.value.clone());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -80,9 +101,10 @@ pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
         .as_array()
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let bindings = v["results"]["bindings"]
-        .as_array()
-        .ok_or_else(|| Error::GStore(format!("results JSON has neither boolean nor bindings: {v}")))?;
+    let bindings = v["results"]["bindings"].as_array().ok_or_else(|| {
+        let snippet: String = v.to_string().chars().take(200).collect();
+        Error::GStore(format!("results JSON has neither boolean nor bindings: {snippet}"))
+    })?;
     let mut rows = Vec::with_capacity(bindings.len());
     for b in bindings {
         let mut row: Vec<Option<RdfTerm>> = Vec::with_capacity(vars.len());
@@ -97,11 +119,13 @@ pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
 /// Parse one `{"type":..,"value":..,"datatype"?,"xml:lang"?}` binding cell.
 fn parse_binding(b: &Value) -> Option<RdfTerm> {
     let value = b.get("value")?.as_str()?.to_string();
+    // Be explicit: an absent/null/unknown `type` is a malformed cell, not a
+    // literal — coercing it would silently produce wrong SPARQL downstream.
     let kind = match b.get("type").and_then(Value::as_str) {
         Some("uri") => TermKind::Uri,
         Some("bnode") => TermKind::Bnode,
-        // "literal" and "typed-literal" both map to Literal.
-        _ => TermKind::Literal,
+        Some("literal") | Some("typed-literal") => TermKind::Literal,
+        _ => return None,
     };
     Some(RdfTerm {
         kind,
@@ -169,34 +193,23 @@ impl GStoreClient {
             }
             other => Error::GStore(other.to_string()),
         })?;
-        let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
-        parse_results(&v)
+        // SELECT/ASK come back as Results JSON; CONSTRUCT/DESCRIBE as an RDF
+        // graph (N-Triples). Branch on the content type so a graph response is
+        // returned as `Graph(..)` rather than failing JSON parsing.
+        let is_json = resp.content_type().contains("json");
+        if is_json {
+            let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
+            parse_results(&v)
+        } else {
+            let body = resp.into_string().map_err(|e| Error::GStore(e.to_string()))?;
+            Ok(SparqlAnswer::Graph(body))
+        }
     }
 
     /// Validate then execute (fails fast on invalid SPARQL without a round-trip).
     pub fn validate_and_query(&self, sparql: &str) -> Result<SparqlAnswer> {
         validate_sparql(sparql)?;
         self.query(sparql)
-    }
-
-    /// Collect the distinct string values bound to `var` across all rows.
-    pub fn column_values(answer: &SparqlAnswer, var: &str) -> Vec<String> {
-        let SparqlAnswer::Select { vars, rows } = answer else {
-            return Vec::new();
-        };
-        let Some(idx) = vars.iter().position(|v| v == var) else {
-            return Vec::new();
-        };
-        let mut seen = HashMap::new();
-        let mut out = Vec::new();
-        for r in rows {
-            if let Some(Some(t)) = r.get(idx) {
-                if seen.insert(t.value.clone(), ()).is_none() {
-                    out.push(t.value.clone());
-                }
-            }
-        }
-        out
     }
 }
 
@@ -267,7 +280,7 @@ mod tests {
         let v = json!({"head":{"vars":["x"]},"results":{"bindings":[
             {"x":{"type":"uri","value":"u1"}},{"x":{"type":"uri","value":"u1"}},{"x":{"type":"uri","value":"u2"}}]}});
         let ans = parse_results(&v).unwrap();
-        assert_eq!(GStoreClient::column_values(&ans, "x"), vec!["u1", "u2"]);
+        assert_eq!(ans.column_values("x"), vec!["u1", "u2"]);
     }
 
     #[test]
