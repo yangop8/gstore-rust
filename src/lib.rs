@@ -19,6 +19,10 @@
 //! * [`db`]     — the [`db::Database`] facade: build / load / save / query / update
 
 pub mod analytics;
+/// Persistent storage backends (feature-gated). Currently the RocksDB-backed
+/// [`backend::rocks::RocksStore`]; compiled only with `--features rocksdb`.
+#[cfg(feature = "rocksdb")]
+pub mod backend;
 pub mod cluster;
 pub mod concurrent;
 pub mod dict;
@@ -56,5 +60,10 @@ pub use model::{IdTriple, ObjectType, Term, Triple};
 pub use query::{QueryResult, ResultSet};
 /// The pluggable-storage seam: read ([`TripleSource`]), write ([`MutableStore`]),
 /// and the combined writable [`StorageBackend`]. The query/optimizer/VS-tree/
-/// analytics layers run purely over these, so backends are swappable.
-pub use store::{MutableStore, StorageBackend, TripleSource};
+/// analytics layers run purely over these, so backends are swappable. [`Backend`]
+/// is the runtime-selectable enum the [`Database`] holds.
+pub use store::{Backend, MutableStore, StorageBackend, TripleSource};
+
+/// The persistent RocksDB triple store (feature `rocksdb`).
+#[cfg(feature = "rocksdb")]
+pub use backend::rocks::RocksStore;

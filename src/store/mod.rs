@@ -96,6 +96,138 @@ pub trait MutableStore {
 pub trait StorageBackend: TripleSource + MutableStore {}
 impl<T: TripleSource + MutableStore> StorageBackend for T {}
 
+/// The runtime-selectable storage backend the [`Database`](crate::Database)
+/// holds (DESIGN §"Phase 2", route A). It is a [`StorageBackend`] in its own
+/// right: it implements [`TripleSource`] + [`MutableStore`] by **statically**
+/// dispatching to the active variant (a branch, not a vtable), so the query
+/// engine / optimizer / VS-tree / analytics run over it unchanged while the
+/// physical store is chosen at construction time.
+///
+/// The default is `Memory` — every existing constructor wraps a fresh
+/// [`TripleStore`], so behaviour with the `rocksdb` feature *off* is identical.
+#[derive(Debug)]
+pub enum Backend {
+    /// In-memory triple store (the default; three sorted adjacency maps).
+    Memory(TripleStore),
+    /// Persistent RocksDB triple store (feature `rocksdb`).
+    #[cfg(feature = "rocksdb")]
+    Rocks(crate::backend::rocks::RocksStore),
+}
+
+/// Run `$body` against the inner store of whichever [`Backend`] variant is
+/// active, binding it to `$inner`. Pure static dispatch — no trait object.
+macro_rules! backend_dispatch {
+    ($self:expr, $inner:ident, $body:expr) => {
+        match $self {
+            Backend::Memory($inner) => $body,
+            #[cfg(feature = "rocksdb")]
+            Backend::Rocks($inner) => $body,
+        }
+    };
+}
+
+impl Backend {
+    /// The in-memory store, if this is the `Memory` variant. Lets components
+    /// that are intrinsically in-memory (snapshot MVCC, named-graph clones)
+    /// borrow the concrete store without a downcast.
+    pub fn as_memory(&self) -> Option<&TripleStore> {
+        match self {
+            Backend::Memory(s) => Some(s),
+            #[cfg(feature = "rocksdb")]
+            Backend::Rocks(_) => None,
+        }
+    }
+
+    /// All predicate ids present in the store (sorted). Not part of
+    /// [`TripleSource`] (the engine never needs it), but the schema extractor
+    /// does, so it is dispatched here rather than special-cased on the caller.
+    pub fn predicates(&self) -> Vec<PredId> {
+        match self {
+            Backend::Memory(s) => s.predicates().collect(),
+            #[cfg(feature = "rocksdb")]
+            Backend::Rocks(r) => r.predicates(),
+        }
+    }
+}
+
+impl TripleSource for Backend {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        backend_dispatch!(self, s, TripleSource::exists(s, sub, pred, obj))
+    }
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        backend_dispatch!(self, s, TripleSource::po_by_s(s, sub))
+    }
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::o_by_sp(s, sub, pred))
+    }
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
+        backend_dispatch!(self, s, TripleSource::p_by_so(s, sub, obj))
+    }
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        backend_dispatch!(self, s, TripleSource::ps_by_o(s, obj))
+    }
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::s_by_po(s, pred, obj))
+    }
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        backend_dispatch!(self, s, TripleSource::so_by_p(s, pred))
+    }
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::subs_by_p(s, pred))
+    }
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::objs_by_p(s, pred))
+    }
+    fn subject_keys(&self) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::subject_keys(s))
+    }
+    fn object_keys(&self) -> Vec<EntityLiteralId> {
+        backend_dispatch!(self, s, TripleSource::object_keys(s))
+    }
+    fn triple_count(&self) -> u64 {
+        backend_dispatch!(self, s, TripleSource::triple_count(s))
+    }
+    fn distinct_subjects(&self) -> usize {
+        backend_dispatch!(self, s, TripleSource::distinct_subjects(s))
+    }
+    fn distinct_objects(&self) -> usize {
+        backend_dispatch!(self, s, TripleSource::distinct_objects(s))
+    }
+    fn num_predicates(&self) -> usize {
+        backend_dispatch!(self, s, TripleSource::num_predicates(s))
+    }
+    fn pred_card(&self, pred: PredId) -> usize {
+        backend_dispatch!(self, s, TripleSource::pred_card(s, pred))
+    }
+    fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        backend_dispatch!(self, s, TripleSource::pred_distinct_subj(s, pred))
+    }
+    fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        backend_dispatch!(self, s, TripleSource::pred_distinct_obj(s, pred))
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        backend_dispatch!(self, s, TripleSource::iter_all(s))
+    }
+}
+
+impl MutableStore for Backend {
+    fn insert(&mut self, t: IdTriple) -> bool {
+        backend_dispatch!(self, s, MutableStore::insert(s, t))
+    }
+    fn remove(&mut self, t: IdTriple) -> bool {
+        backend_dispatch!(self, s, MutableStore::remove(s, t))
+    }
+    fn bulk_load(&mut self, triples: Vec<IdTriple>) {
+        backend_dispatch!(self, s, MutableStore::bulk_load(s, triples))
+    }
+}
+
+impl Default for Backend {
+    fn default() -> Backend {
+        Backend::Memory(TripleStore::new())
+    }
+}
+
 impl MutableStore for TripleStore {
     fn insert(&mut self, t: IdTriple) -> bool {
         TripleStore::insert(self, t)

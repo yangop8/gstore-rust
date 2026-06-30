@@ -25,7 +25,7 @@ use crate::dict::Dictionary;
 use crate::model::id::PredId;
 use crate::model::{IdTriple, Term};
 use crate::parser::sparql::ast::RDF_TYPE;
-use crate::store::TripleStore;
+use crate::store::{MutableStore, TripleSource};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -35,7 +35,10 @@ const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 /// Materialize the RDFS closure into `store`, returning the triples that were
 /// added (so a caller can record them for transaction rollback). Idempotent:
 /// re-running on a closed store adds nothing.
-pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> Vec<IdTriple> {
+pub fn materialize<S: TripleSource + MutableStore>(
+    dict: &mut Dictionary,
+    store: &mut S,
+) -> Vec<IdTriple> {
     let key = |iri: &str| Term::iri(iri).dict_key();
     let sco_p = dict.predicate_id(&key(RDFS_SUBCLASS));
     let spo_p = dict.predicate_id(&key(RDFS_SUBPROP));
@@ -93,10 +96,12 @@ pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> Vec<IdTrip
 }
 
 /// One forward-chaining round: append all directly-entailed triples to `new`.
+/// Generic over the [`TripleSource`] so it reasons over any backend (the
+/// `so_by_p` accessor returns owned `Vec`s, which we iterate by reference).
 #[allow(clippy::too_many_arguments)]
-fn gather(
+fn gather<S: TripleSource>(
     dict: &Dictionary,
-    store: &TripleStore,
+    store: &S,
     type_p: Option<PredId>,
     sco_p: Option<PredId>,
     spo_p: Option<PredId>,
@@ -108,10 +113,10 @@ fn gather(
     if let Some(sco) = sco_p {
         let pairs = store.so_by_p(sco); // (c, d) meaning c ⊑ d
         let mut sub: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(c, d) in pairs {
+        for &(c, d) in &pairs {
             sub.entry(c).or_default().push(d);
         }
-        for &(c, d) in pairs {
+        for &(c, d) in &pairs {
             if let Some(es) = sub.get(&d) {
                 for &e in es {
                     if c != e {
@@ -121,7 +126,7 @@ fn gather(
             }
         }
         if let Some(tp) = type_p {
-            for &(x, c) in store.so_by_p(tp) {
+            for (x, c) in store.so_by_p(tp) {
                 if let Some(ds) = sub.get(&c) {
                     for &d in ds {
                         new.push(IdTriple::new(x, tp, d));
@@ -135,10 +140,10 @@ fn gather(
     if let Some(spo) = spo_p {
         let pairs = store.so_by_p(spo); // (p, q) meaning p ⊑ₚ q (as entities)
         let mut sub: HashMap<u32, Vec<u32>> = HashMap::new();
-        for &(p, q) in pairs {
+        for &(p, q) in &pairs {
             sub.entry(p).or_default().push(q);
         }
-        for &(p, q) in pairs {
+        for &(p, q) in &pairs {
             if let Some(rs) = sub.get(&q) {
                 for &r in rs {
                     if p != r {
@@ -147,7 +152,7 @@ fn gather(
                 }
             }
         }
-        for &(p_ent, q_ent) in pairs {
+        for &(p_ent, q_ent) in &pairs {
             let (Some(p_pred), Some(q_pred)) =
                 (ent_to_pred(dict, p_ent), ent_to_pred(dict, q_ent))
             else {
@@ -156,7 +161,7 @@ fn gather(
             if p_pred == q_pred {
                 continue;
             }
-            for &(x, y) in store.so_by_p(p_pred) {
+            for (x, y) in store.so_by_p(p_pred) {
                 new.push(IdTriple::new(x, q_pred, y));
             }
         }
@@ -164,9 +169,9 @@ fn gather(
 
     // --- domain: (p domain c), (x p y) ⇒ (x a c) ---
     if let (Some(dom), Some(tp)) = (dom_p, type_p) {
-        for &(p_ent, c) in store.so_by_p(dom) {
+        for (p_ent, c) in store.so_by_p(dom) {
             if let Some(p_pred) = ent_to_pred(dict, p_ent) {
-                for &(x, _y) in store.so_by_p(p_pred) {
+                for (x, _y) in store.so_by_p(p_pred) {
                     new.push(IdTriple::new(x, tp, c));
                 }
             }
@@ -175,9 +180,9 @@ fn gather(
 
     // --- range: (p range c), (x p y) ⇒ (y a c) ---
     if let (Some(rng), Some(tp)) = (rng_p, type_p) {
-        for &(p_ent, c) in store.so_by_p(rng) {
+        for (p_ent, c) in store.so_by_p(rng) {
             if let Some(p_pred) = ent_to_pred(dict, p_ent) {
-                for &(_x, y) in store.so_by_p(p_pred) {
+                for (_x, y) in store.so_by_p(p_pred) {
                     new.push(IdTriple::new(y, tp, c));
                 }
             }
@@ -196,6 +201,7 @@ fn ent_to_pred(dict: &Dictionary, ent: u32) -> Option<PredId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::TripleStore;
 
     /// Intern an entity by IRI.
     fn ent(d: &mut Dictionary, iri: &str) -> u32 {

@@ -12,6 +12,14 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 # Used only by the SPARQL REGEX builtin and string/replace functions.
 regex = "1"
+# Optional persistent storage backend. OFF by default (keeps the build
+# dependency-light and avoids compiling bundled librocksdb C++). Enable with
+# `--features rocksdb` to get the `RocksStore` / Rocks-backed `Database`.
+rocksdb = { version = "0.22", optional = true }
+
+[features]
+# Persistent RocksDB storage backend (see `src/backend/rocks.rs`).
+rocksdb = ["dep:rocksdb"]
 
 [dev-dependencies]
 

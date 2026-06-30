@@ -62,6 +62,19 @@ impl<T: TripleSource + MutableStore> StorageBackend for T {}
 
 MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询后端是次优**:优化器发大量细粒度候选查询,SQL 往返 chatty 开销大。更合适的角色是**冷存储 / source-of-truth / 导入导出连接器**(查询时灌进 RocksDB 或内存)。若只为 RocksDB 的存储收益,直连 RocksDB 即可,无需 SQL 层。
 
+## 实现状态(Phase 2 + Phase 3,已落地)
+
+**Phase 2(Database 接入,路线 A):** 新增 `enum Backend { Memory(TripleStore), #[cfg(feature="rocksdb")] Rocks(RocksStore) }`(`src/store/mod.rs`),对其实现 `TripleSource`+`MutableStore`,用一个 `backend_dispatch!` 宏做**静态分派**(`match` 分支,无 vtable)。`Database` 改为持有 `store: Backend`,默认构造仍走 `Backend::Memory(TripleStore::new())`,故 feature OFF 时行为与既有 393 个测试**逐字节不变**。`build_vstree` / `reason::materialize` 已泛型化为 `<S: TripleSource(+MutableStore)>`,`schema()` 的 `predicates()` 经 `Backend::predicates()` 分派,均不靠 downcast。`Database::store()` 仍返回 `&TripleStore`(经 `Backend::as_memory()`,内存后端专用,供快照 MVCC/测试)。
+
+**Phase 3(RocksDB 后端,`--features rocksdb`):** `src/backend/rocks.rs` 的 `RocksStore` 实现 `StorageBackend`:
+
+- 3 个排列 column family——`spo`(键 `s‖p‖o`)、`pos`(键 `p‖o‖s`)、`osp`(键 `o‖s‖p`),id 用 4 字节**大端** u32,故字节序==数值序,前缀 range scan(`iterator_cf`)即可回答 6 种访问模式,返回已排序结果以与 `TripleStore` 完全对齐。
+- `stats` CF 用**维护式计数器**(引用计数,插入/删除时 O(1) 维护;计数归零即删键)给出**精确**优化器统计:`triple_count`/`distinct_subjects`/`distinct_objects`/`num_predicates`(4 个全局值另缓存于内存)、`pred_card`/`pred_distinct_subj`/`pred_distinct_obj`(逐谓词),避免热路径上的全表扫描。
+- `RocksStore::open(path)` 持久化并可重开;`Database::build_rocksdb_from_str` / `open_rocksdb` / `is_rocksdb` 提供 Rocks 后端的库级 API(三元组存于 `dir/rocksdb`,字典/元数据 bincode 快照于同目录)。
+- 测试 `tests/dt_rocksdb.rs`(feature 门控):泛型 `fn <B: StorageBackend>` 对 `TripleStore` 与 `RocksStore` 跑同一指纹证明结果一致;close→reopen 持久化;以及经 `Evaluator` 跑真实 SPARQL 的行数对拍。
+
+仍未做(backlog):Rocks 后端的字典 out-of-core 化(复用 `DiskTermSource` seam)、merge-operator 式计数、按谓词的 prefix-extractor 调优、Rocks 后端的事务/快照接线。
+
 ## 不变量
 
 任何新后端只需实现 `TripleSource + MutableStore`(即 `StorageBackend`)+ 字典 seam。**VS-tree、优化器、图算法、SPARQL 引擎一行都不改**——这正是本设计要保护的核心资产。

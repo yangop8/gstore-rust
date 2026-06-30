@@ -27,7 +27,7 @@ use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF
 use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
-use crate::store::TripleStore;
+use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -43,15 +43,20 @@ const NAMED_FILE: &str = "named.bin";
 const UPDATE_LOG_FILE: &str = "update.log";
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
+/// Sub-directory holding the RocksDB store of a RocksDB-backed database.
+#[cfg(feature = "rocksdb")]
+const ROCKS_SUBDIR: &str = "rocksdb";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
 const DISK_CACHE_PAGES: usize = 4096;
 
-/// Build a VS-tree over every entity, signing each by its in/out edges.
-fn build_vstree(store: &TripleStore) -> VsTree {
+/// Build a VS-tree over every entity, signing each by its in/out edges. Generic
+/// over the [`TripleSource`] so it builds identically from the in-memory store,
+/// the [`Backend`] enum, or any other backend.
+fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
     // Entities = everything that is a subject, plus objects that are entities
     // (literal objects are not indexed by the VS-tree).
-    let mut ids: Vec<u32> = store.subject_keys().collect();
-    ids.extend(store.object_keys().filter(|&o| is_entity_id(o)));
+    let mut ids: Vec<u32> = store.subject_keys();
+    ids.extend(store.object_keys().into_iter().filter(|&o| is_entity_id(o)));
     ids.sort_unstable();
     ids.dedup();
 
@@ -59,10 +64,10 @@ fn build_vstree(store: &TripleStore) -> VsTree {
         .into_iter()
         .map(|e| {
             let mut sig = Signature::new();
-            for &(p, o) in store.po_by_s(e) {
+            for &(p, o) in &store.po_by_s(e) {
                 sig.encode_edge(p, o, EdgeDir::Out);
             }
-            for &(p, s) in store.ps_by_o(e) {
+            for &(p, s) in &store.ps_by_o(e) {
                 sig.encode_edge(p, s, EdgeDir::In);
             }
             (e, sig)
@@ -86,9 +91,14 @@ struct Meta {
 pub struct Database {
     name: String,
     dict: Dictionary,
-    store: TripleStore,
+    /// The live default-graph store, selected at construction: in-memory
+    /// ([`Backend::Memory`], the default) or persistent RocksDB
+    /// ([`Backend::Rocks`], feature `rocksdb`). All reads/writes go through the
+    /// [`TripleSource`]/[`MutableStore`] seam, so the engine is backend-agnostic.
+    store: Backend,
     /// Named graphs: graph-IRI entity id → its triple store. The default graph
-    /// is `store`; `GRAPH` patterns and quad updates target this map.
+    /// is `store`; `GRAPH` patterns and quad updates target this map. Named
+    /// graphs stay in-memory (DESIGN §"Phase 2").
     named: BTreeMap<u32, TripleStore>,
     /// Signature index for query-time candidate pruning.
     vstree: VsTree,
@@ -149,7 +159,7 @@ impl Database {
         Database {
             name: name.into(),
             dict: Dictionary::new(),
-            store: TripleStore::new(),
+            store: Backend::Memory(TripleStore::new()),
             named: BTreeMap::new(),
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
@@ -195,6 +205,105 @@ impl Database {
         Ok(db)
     }
 
+    // ---- RocksDB-backed database (feature `rocksdb`) ----------------------
+
+    /// Build a **persistent**, RocksDB-backed database in directory `dir` from an
+    /// in-memory RDF document. The triples live in a RocksDB store under
+    /// `dir/rocksdb`; the dictionary and metadata are snapshotted next to it so
+    /// the database can be reopened with [`open_rocksdb`](Self::open_rocksdb).
+    /// The full query engine (optimizer, VS-tree, analytics) runs over it
+    /// unchanged via the [`Backend`] seam.
+    #[cfg(feature = "rocksdb")]
+    pub fn build_rocksdb_from_str<P: AsRef<Path>>(
+        name: impl Into<String>,
+        dir: P,
+        content: &str,
+    ) -> Result<Database> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        let mut dict = Dictionary::new();
+        let mut ids: Vec<IdTriple> = Vec::new();
+        for t in turtle::parse_str(content)? {
+            let sub = dict.intern_entity(&t.subject.dict_key());
+            let pred = dict.intern_predicate(&t.predicate.dict_key());
+            let obj = dict.intern_term(&t.object);
+            ids.push(IdTriple::new(sub, pred, obj));
+        }
+        let mut rocks = crate::backend::rocks::RocksStore::open(dir.join(ROCKS_SUBDIR))?;
+        rocks.bulk_load(ids);
+        rocks.flush()?;
+        let store = Backend::Rocks(rocks);
+
+        let name = name.into();
+        write_bincode(&dir.join(DICT_FILE), &dict)?;
+        let meta = Meta {
+            name: name.clone(),
+            triple_num: store.triple_count(),
+            entity_num: dict.entity_num() as u64,
+            literal_num: dict.literal_num() as u64,
+            predicate_num: dict.predicate_num() as u64,
+        };
+        write_bincode(&dir.join(META_FILE), &meta)?;
+
+        let vstree = build_vstree(&store);
+        Ok(Database {
+            name,
+            dict,
+            store,
+            named: BTreeMap::new(),
+            vstree,
+            index_valid: true,
+            txn: None,
+            query_cache: RefCell::new(HashMap::new()),
+            update_log: None,
+        })
+    }
+
+    /// Whether directory `dir` holds a RocksDB-backed database.
+    #[cfg(feature = "rocksdb")]
+    pub fn is_rocksdb<P: AsRef<Path>>(dir: P) -> bool {
+        dir.as_ref().join(ROCKS_SUBDIR).is_dir()
+    }
+
+    /// Reopen a RocksDB-backed database created by
+    /// [`build_rocksdb_from_str`](Self::build_rocksdb_from_str). The triples are
+    /// read from the RocksDB store on demand; the dictionary is loaded from its
+    /// snapshot and the VS-tree is rebuilt.
+    #[cfg(feature = "rocksdb")]
+    pub fn open_rocksdb<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        let dir = dir.as_ref();
+        let rocks_dir = dir.join(ROCKS_SUBDIR);
+        if !rocks_dir.is_dir() {
+            return Err(GStoreError::Database(format!(
+                "no RocksDB store at '{}'",
+                rocks_dir.display()
+            )));
+        }
+        let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
+        let meta: Meta = read_bincode(&dir.join(META_FILE))?;
+        let rocks = crate::backend::rocks::RocksStore::open(rocks_dir)?;
+        let store = Backend::Rocks(rocks);
+        if store.triple_count() != meta.triple_num {
+            return Err(GStoreError::Database(format!(
+                "corrupt database: meta says {} triples but RocksDB has {}",
+                meta.triple_num,
+                store.triple_count()
+            )));
+        }
+        let vstree = build_vstree(&store);
+        Ok(Database {
+            name: meta.name,
+            dict,
+            store,
+            named: BTreeMap::new(),
+            vstree,
+            index_valid: true,
+            txn: None,
+            query_cache: RefCell::new(HashMap::new()),
+            update_log: None,
+        })
+    }
+
     // ---- accessors --------------------------------------------------------
 
     pub fn name(&self) -> &str {
@@ -215,7 +324,18 @@ impl Database {
     pub fn dict(&self) -> &Dictionary {
         &self.dict
     }
+    /// The in-memory default-graph store. Available for the default
+    /// [`Backend::Memory`] backend (used by snapshot MVCC and tests); panics for
+    /// a RocksDB-backed database, which has no in-RAM store — query it through
+    /// [`query`](Self::query)/[`select`](Self::select) instead.
     pub fn store(&self) -> &TripleStore {
+        self.store
+            .as_memory()
+            .expect("Database::store() requires the in-memory backend")
+    }
+
+    /// The live storage backend (works for any variant).
+    pub fn backend(&self) -> &Backend {
         &self.store
     }
     /// The named graphs (graph-IRI entity id → store).
@@ -248,7 +368,7 @@ impl Database {
             class_ids.extend(self.store.so_by_p(tp).iter().map(|&(_, o)| o));
         }
         if let Some(sco) = pid(RDFS_SUBCLASS) {
-            for &(s, o) in self.store.so_by_p(sco) {
+            for &(s, o) in &self.store.so_by_p(sco) {
                 class_ids.push(s);
                 class_ids.push(o);
             }
@@ -270,11 +390,12 @@ impl Database {
         let mut props: HashSet<String> = self
             .store
             .predicates()
+            .into_iter()
             .filter_map(|p| self.dict.predicate_to_string(p).map(str::to_owned))
             .collect();
         for iri in [RDFS_SUBPROP, RDFS_DOMAIN, RDFS_RANGE] {
             if let Some(p) = pid(iri) {
-                for &(s, _o) in self.store.so_by_p(p) {
+                for &(s, _o) in &self.store.so_by_p(p) {
                     if let Some(name) = self.dict.id_to_string(s) {
                         props.insert(name.to_owned());
                     }
@@ -575,14 +696,25 @@ impl Database {
     fn clear_default(&mut self) -> usize {
         let n = self.store.triple_count() as usize;
         if n > 0 {
-            // Record undo entries before discarding the store, so CLEAR inside a
-            // transaction can be rolled back.
+            // Snapshot the triples once: needed for undo, and (for a persistent
+            // backend) to delete them so the on-disk store is actually cleared.
+            let removed = self.store.iter_all();
             if let Some(log) = self.txn.as_mut() {
-                for t in self.store.iter_all() {
-                    log.push(UndoOp::Add(None, t));
+                for t in &removed {
+                    log.push(UndoOp::Add(None, *t));
                 }
             }
-            self.store = TripleStore::new();
+            if self.store.as_memory().is_some() {
+                // In-memory: discard and replace (cheaper than per-triple delete).
+                self.store = Backend::Memory(TripleStore::new());
+            } else {
+                // Persistent backend: delete every triple through the seam so the
+                // change is durable (don't swap in a Memory store, which would
+                // strand the data on disk).
+                for t in removed {
+                    self.store.remove(t);
+                }
+            }
             self.index_valid = false;
             self.query_cache.get_mut().clear();
         }
@@ -654,11 +786,18 @@ impl Database {
     // ---- persistence ------------------------------------------------------
 
     /// Save the database into directory `dir` (created if necessary).
+    ///
+    /// For the in-memory backend this writes the bincode snapshot exactly as
+    /// before. For a persistent backend the triples already live in their own
+    /// store (e.g. the RocksDB directory), so only the dictionary, named graphs,
+    /// metadata, and VS-tree are snapshotted here.
     pub fn save<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         write_bincode(&dir.join(DICT_FILE), &self.dict)?;
-        write_bincode(&dir.join(STORE_FILE), &self.store)?;
+        if let Some(mem) = self.store.as_memory() {
+            write_bincode(&dir.join(STORE_FILE), mem)?;
+        }
         write_bincode(&dir.join(NAMED_FILE), &self.named)?;
         let meta = Meta {
             name: self.name.clone(),
@@ -718,7 +857,7 @@ impl Database {
         let mut db = Database {
             name,
             dict,
-            store,
+            store: Backend::Memory(store),
             named: BTreeMap::new(),
             vstree: VsTree::new(),
             index_valid: false,
@@ -779,7 +918,7 @@ impl Database {
         Ok(Database {
             name: meta.name,
             dict,
-            store,
+            store: Backend::Memory(store),
             named,
             vstree,
             index_valid: true,
@@ -920,6 +1059,9 @@ impl Database {
     /// (gStore RDFParser's chunked import): triples are streamed and flushed to
     /// the store every `batch` triples, so the transient encode buffer never
     /// exceeds `batch` entries — suitable for files too large to buffer whole.
+    // `drain(..).collect()` (not `mem::take`) is deliberate: it hands the
+    // batch's triples to `bulk_load` while keeping `buf`'s allocation for reuse.
+    #[allow(clippy::drain_collect)]
     pub fn build_from_ntriples_batched<P: AsRef<Path>>(
         name: impl Into<String>,
         path: P,
@@ -932,12 +1074,12 @@ impl Database {
             let id = db.encode_triple(&t);
             buf.push(id);
             if buf.len() >= batch {
-                db.store.bulk_load(buf.drain(..));
+                db.store.bulk_load(buf.drain(..).collect());
             }
             Ok(())
         })?;
         if !buf.is_empty() {
-            db.store.bulk_load(buf.drain(..));
+            db.store.bulk_load(buf.drain(..).collect());
         }
         db.rebuild_index();
         Ok(db)
