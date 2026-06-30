@@ -4,6 +4,8 @@
 //! the LLM and ask for a correction, up to `max_rounds` times. This is the
 //! data-driven disambiguation of gAnswer, closed by an LLM loop.
 
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 use crate::generate::parse_candidates;
 use crate::kb::{self, KbClient, SparqlAnswer};
@@ -36,28 +38,49 @@ pub fn is_empty_answer(ans: &SparqlAnswer) -> bool {
 
 /// Validate → execute → (on invalid / error / empty) repair, looping up to
 /// `max_rounds`. Returns the first non-empty result, else the last successfully
-/// executed (possibly empty) result, else an error.
+/// executed (possibly empty) result, else an error. Stops early if a repair
+/// makes no progress (repeats a tried query) or the LLM call fails; surfaces the
+/// last underlying issue in the final error.
+#[allow(clippy::too_many_arguments)]
 pub fn solve_with_repair(
     llm: &dyn LlmClient,
     kb: &dyn KbClient,
     question: &str,
+    links_block: &str,
     schema_block: &str,
     initial: &str,
     max_rounds: usize,
     model: Option<&str>,
 ) -> Result<RepairOutcome> {
     let mut current = initial.trim().to_string();
-    let mut last_ok: Option<(String, SparqlAnswer)> = None;
+    let mut last_ok: Option<(String, SparqlAnswer, usize)> = None;
+    let mut last_err: Option<String> = None;
+    let mut tried: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(current.clone());
+
+    // Run one repair attempt; on no-progress / LLM failure, return None (stop).
+    let attempt = |tried: &[(String, String)], seen: &mut HashSet<String>| -> Option<String> {
+        match repair(llm, question, links_block, schema_block, tried, model) {
+            Ok(next) if seen.insert(next.clone()) => Some(next),
+            _ => None, // repeated query (no progress) or LLM error
+        }
+    };
 
     for round in 0..=max_rounds {
         let last_round = round == max_rounds;
 
         // 1) Syntactic validity (gStore's parser).
         if let Err(e) = kb::validate_sparql(&current) {
+            last_err = Some(format!("parser error: {e}"));
             if last_round {
                 break;
             }
-            current = repair(llm, question, schema_block, &current, &format!("parser error: {e}"), model)?;
+            tried.push((current.clone(), last_err.clone().unwrap()));
+            match attempt(&tried, &mut seen) {
+                Some(next) => current = next,
+                None => break,
+            }
             continue;
         }
 
@@ -67,50 +90,68 @@ pub fn solve_with_repair(
                 if !is_empty_answer(&ans) {
                     return Ok(RepairOutcome { sparql: current, answer: ans, rounds: round });
                 }
-                last_ok = Some((current.clone(), ans));
+                last_ok = Some((current.clone(), ans, round));
+                last_err = Some("query returned no results".into());
                 if last_round {
                     break;
                 }
-                current = repair(
-                    llm,
-                    question,
-                    schema_block,
-                    &current,
-                    "the query is valid but returned no results; fix it to return an answer",
-                    model,
-                )?;
+                tried.push((current.clone(), "returned no results".into()));
+                match attempt(&tried, &mut seen) {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
             Err(e) => {
+                last_err = Some(format!("execution error: {e}"));
                 if last_round {
                     break;
                 }
-                current = repair(llm, question, schema_block, &current, &format!("execution error: {e}"), model)?;
+                tried.push((current.clone(), last_err.clone().unwrap()));
+                match attempt(&tried, &mut seen) {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
         }
     }
 
-    if let Some((sparql, answer)) = last_ok {
-        return Ok(RepairOutcome { sparql, answer, rounds: max_rounds });
+    if let Some((sparql, answer, round)) = last_ok {
+        return Ok(RepairOutcome { sparql, answer, rounds: round });
     }
-    Err(Error::Sparql("no valid, executable query after repair".into()))
+    Err(Error::Sparql(format!(
+        "no valid, executable query after {max_rounds} repair round(s); last issue: {}",
+        last_err.unwrap_or_else(|| "unknown".into())
+    )))
 }
 
-/// One repair attempt: ask the LLM to correct `bad` given `issue`, return the
-/// corrected SPARQL (first candidate, else the raw reply).
+/// One repair attempt: ask the LLM to correct the most recent failed query
+/// (with the prior attempts listed so it doesn't repeat them) and return the
+/// corrected SPARQL. Uses a little temperature so retries can diverge.
 pub fn repair(
     llm: &dyn LlmClient,
     question: &str,
+    links_block: &str,
     schema_block: &str,
-    bad: &str,
-    issue: &str,
+    tried: &[(String, String)],
     model: Option<&str>,
 ) -> Result<String> {
+    let (bad, issue) = match tried.last() {
+        Some((q, i)) => (q.as_str(), i.as_str()),
+        None => ("", ""),
+    };
+    let prior = if tried.len() > 1 {
+        let list: Vec<String> = tried[..tried.len() - 1].iter().map(|(q, _)| format!("- {q}")).collect();
+        format!("Already tried (do NOT repeat):\n{}\n\n", list.join("\n"))
+    } else {
+        String::new()
+    };
     let user = format!(
-        "Question: {question}\n\nSchema:\n{}\n\nPrevious query:\n{bad}\n\nProblem: {issue}\n\n\
-         Output the corrected SPARQL query.",
-        if schema_block.is_empty() { "(none)" } else { schema_block }
+        "Question: {question}\n\nLinked terms:\n{links}\n\nSchema:\n{schema}\n\n{prior}\
+         Previous query:\n{bad}\n\nProblem: {issue}\n\nOutput the corrected SPARQL query.",
+        links = if links_block.is_empty() { "(none)" } else { links_block },
+        schema = if schema_block.is_empty() { "(none)" } else { schema_block },
     );
-    let mut req = LlmRequest::prompt(user).system(SYS_REPAIR).max_tokens(1024);
+    let mut req = LlmRequest::prompt(user).system(SYS_REPAIR).max_tokens(1024).temperature(0.3);
     if let Some(m) = model {
         req = req.model(m);
     }
@@ -138,7 +179,7 @@ mod tests {
     fn initial_query_works_no_repair() {
         let llm = MockLlm::fixed("unused");
         let kb = MockKb::new(vec![nonempty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
         assert_eq!(out.rounds, 0);
         assert_eq!(out.answer.row_count(), 1);
     }
@@ -148,7 +189,7 @@ mod tests {
         // initial is invalid → LLM returns a valid query → KB returns a row
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x ?p ?o }");
         let kb = MockKb::new(vec![nonempty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "not sparql", 2, None).unwrap();
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "not sparql", 2, None).unwrap();
         assert_eq!(out.rounds, 1);
         assert_eq!(out.sparql, "SELECT ?x WHERE { ?x ?p ?o }");
     }
@@ -158,7 +199,7 @@ mod tests {
         // valid initial → empty → repair → second query returns a row
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x <http://ex/p> ?o }");
         let kb = MockKb::new(vec![empty(), nonempty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
         assert_eq!(out.rounds, 1);
         assert_eq!(out.answer.row_count(), 1);
     }
@@ -168,7 +209,7 @@ mod tests {
         // every attempt is valid but empty → after max_rounds, return last empty
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x ?p ?o }");
         let kb = MockKb::new(vec![empty()]); // cycles → always empty
-        let out = solve_with_repair(&llm, &kb, "q", "", "SELECT ?x WHERE { ?x ?p ?o }", 1, None).unwrap();
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 1, None).unwrap();
         assert!(is_empty_answer(&out.answer));
     }
 
@@ -176,5 +217,39 @@ mod tests {
     fn boolean_is_not_empty() {
         assert!(!is_empty_answer(&SparqlAnswer::Boolean(false)));
         assert!(is_empty_answer(&SparqlAnswer::Graph(" ".into())));
+    }
+
+    #[test]
+    fn repair_llm_failure_keeps_last_ok() {
+        // valid initial → empty (last_ok set); the repair LLM call then fails →
+        // we must return the captured empty answer, not a hard error.
+        let llm = MockLlm::new(vec![]); // complete() errors
+        let kb = MockKb::new(vec![empty()]);
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        assert!(is_empty_answer(&out.answer));
+        assert_eq!(out.rounds, 0);
+    }
+
+    #[test]
+    fn all_invalid_returns_error_with_cause() {
+        // initial invalid, repair yields another invalid (new) query, exhaust → Err
+        let llm = MockLlm::fixed("still not sparql");
+        let kb = MockKb::new(vec![nonempty()]);
+        let err = solve_with_repair(&llm, &kb, "q", "", "", "not sparql", 1, None).unwrap_err();
+        match err {
+            Error::Sparql(m) => assert!(m.contains("parser error")),
+            other => panic!("expected Sparql error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_repeat_stops_early() {
+        // repair returns the SAME query as the (empty) initial → no progress →
+        // stop and return the empty result rather than burning rounds.
+        let llm = MockLlm::fixed("SELECT ?x WHERE { ?x ?p ?o }");
+        let kb = MockKb::new(vec![empty()]);
+        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 5, None).unwrap();
+        assert_eq!(out.rounds, 0); // didn't loop 5 times
+        assert!(is_empty_answer(&out.answer));
     }
 }
