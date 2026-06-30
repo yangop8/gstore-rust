@@ -25,6 +25,7 @@ pub mod pipeline;
 pub mod repair;
 pub mod schema;
 pub mod secret;
+pub mod solve;
 
 pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
@@ -43,4 +44,5 @@ pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaCont
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
 pub use pipeline::{Answer, AskEngine};
 pub use repair::{solve_with_repair, RepairOutcome};
+pub use solve::{best_of, score_outcome, SolveEngine};
 pub use secret::Secret;

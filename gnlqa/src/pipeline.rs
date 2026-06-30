@@ -27,6 +27,8 @@ pub struct Answer {
     pub sparql: Option<String>,
     /// The raw answer values (e.g. bound URIs/literals of the first column).
     pub values: Vec<String>,
+    /// How many self-repair rounds were spent (0 for the direct path).
+    pub rounds: usize,
 }
 
 /// The QA engine: an LLM front-end + a KB backend.
@@ -63,6 +65,7 @@ impl AskEngine {
             text: render_answer(&answer, &values),
             values,
             sparql: Some(sparql),
+            rounds: 0,
         })
     }
 }
@@ -93,7 +96,7 @@ pub fn extract_sparql(raw: &str) -> String {
 /// Answer values for a SELECT — the first *bound* cell of each row (so a row
 /// whose leading variable is unbound still contributes), de-duplicated in order;
 /// the boolean string for ASK. (Multi-variable rendering is a later phase.)
-fn answer_values(ans: &SparqlAnswer) -> Vec<String> {
+pub(crate) fn answer_values(ans: &SparqlAnswer) -> Vec<String> {
     match ans {
         SparqlAnswer::Select { rows, .. } => {
             let mut seen = HashSet::new();
@@ -114,7 +117,7 @@ fn answer_values(ans: &SparqlAnswer) -> Vec<String> {
 
 /// Render a human-readable answer string from the answer and its precomputed
 /// values (avoids recomputing them).
-fn render_answer(ans: &SparqlAnswer, values: &[String]) -> String {
+pub(crate) fn render_answer(ans: &SparqlAnswer, values: &[String]) -> String {
     match ans {
         SparqlAnswer::Boolean(b) => if *b { "Yes" } else { "No" }.to_string(),
         SparqlAnswer::Graph(g) => g.clone(),
