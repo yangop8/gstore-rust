@@ -15,9 +15,18 @@ use crate::schema::SchemaContext;
 
 /// Score a solved outcome for ranking: a non-empty answer dominates an empty
 /// one; each repair round is a small penalty (prefer queries that worked sooner).
+/// The penalty is clamped so a non-empty answer always outranks an empty one,
+/// regardless of `max_rounds`.
 pub fn score_outcome(o: &RepairOutcome) -> f32 {
     let base = if is_empty_answer(&o.answer) { 0.1 } else { 1.0 };
-    base - 0.05 * o.rounds as f32
+    let penalty = (0.05 * o.rounds as f32).min(0.89);
+    base - penalty
+}
+
+/// Order-preserving de-duplication of URIs.
+fn dedup(uris: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    uris.into_iter().filter(|u| seen.insert(u.clone())).collect()
 }
 
 /// Solve every candidate (with repair) and return the highest-scoring outcome.
@@ -52,12 +61,22 @@ pub struct SolveEngine {
     candidates: usize,
     max_rounds: usize,
     sample: usize,
+    link_k: usize,
     model: Option<String>,
 }
 
 impl SolveEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> SolveEngine {
-        SolveEngine { llm, kb, linker: None, candidates: 4, max_rounds: 2, sample: 30, model: None }
+        SolveEngine {
+            llm,
+            kb,
+            linker: None,
+            candidates: 4,
+            max_rounds: 2,
+            sample: 30,
+            link_k: 3,
+            model: None,
+        }
     }
     pub fn with_linker(mut self, linker: Linker) -> SolveEngine {
         self.linker = Some(linker);
@@ -69,6 +88,19 @@ impl SolveEngine {
     }
     pub fn candidates(mut self, n: usize) -> SolveEngine {
         self.candidates = n.max(1);
+        self
+    }
+    pub fn with_max_rounds(mut self, n: usize) -> SolveEngine {
+        self.max_rounds = n;
+        self
+    }
+    pub fn with_sample(mut self, n: usize) -> SolveEngine {
+        self.sample = n.max(1);
+        self
+    }
+    /// Top-k candidates to retrieve per linked mention/relation.
+    pub fn with_link_k(mut self, k: usize) -> SolveEngine {
+        self.link_k = k.max(1);
         self
     }
 
@@ -84,7 +116,7 @@ impl SolveEngine {
         let mut pred_uris = Vec::new();
         if let Some(linker) = &self.linker {
             for m in &intent.mentions {
-                let cands = linker.link_mention(m, 3)?;
+                let cands = linker.link_mention(m, self.link_k)?;
                 if !cands.is_empty() {
                     links.push_str(&format!("{:?} '{}' -> ", m.kind, m.text));
                     links.push_str(&cands.iter().map(|c| c.to_term()).collect::<Vec<_>>().join(", "));
@@ -99,7 +131,7 @@ impl SolveEngine {
                 }
             }
             for r in &intent.relations {
-                let cands = linker.link_predicate(&r.phrase, 3)?;
+                let cands = linker.link_predicate(&r.phrase, self.link_k)?;
                 if !cands.is_empty() {
                     links.push_str(&format!("relation '{}' -> ", r.phrase));
                     links.push_str(&cands.iter().map(|c| c.to_term()).collect::<Vec<_>>().join(", "));
@@ -112,19 +144,21 @@ impl SolveEngine {
                 }
             }
         }
+        // De-duplicate before grounding so we don't run identical schema queries
+        // (and bloat the prompt) for a URI linked by several mentions.
+        let ent_uris = dedup(ent_uris);
+        let pred_uris = dedup(pred_uris);
         let schema = if ent_uris.is_empty() && pred_uris.is_empty() {
             String::new()
         } else {
             SchemaContext::gather(self.kb.as_ref(), &ent_uris, &pred_uris, self.sample)?.render()
         };
 
-        // 4) Generate N candidates, 5) repair-solve each, 6) rank.
-        let mut candidates =
+        // 4) Generate N candidates, 5) repair-solve each, 6) rank. If generation
+        // produced nothing parser-valid, fail honestly rather than fabricating an
+        // answer from a wildcard query.
+        let candidates =
             generate_candidates(self.llm.as_ref(), question, &links, &schema, self.candidates, model)?;
-        // If nothing parser-valid was produced, still try a repair-from-scratch.
-        if candidates.is_empty() {
-            candidates.push("SELECT * WHERE { ?s ?p ?o } LIMIT 1".to_string());
-        }
         let best = best_of(
             self.llm.as_ref(),
             self.kb.as_ref(),
@@ -203,5 +237,14 @@ mod tests {
         let a = engine.ask("which x?").unwrap();
         assert_eq!(a.values, vec!["http://ex/a"]);
         assert!(a.sparql.unwrap().contains("<http://ex/p>"));
+    }
+
+    #[test]
+    fn engine_fails_honestly_when_no_valid_candidate() {
+        // generation yields only an invalid candidate → no fabricated answer
+        let llm = MockLlm::new(vec![r#"{"qtype":"factoid"}"#.to_string(), r#"["not sparql"]"#.to_string()]);
+        let kb = MockKb::new(vec![nonempty()]);
+        let engine = SolveEngine::new(Box::new(llm), Box::new(kb));
+        assert!(engine.ask("q").is_err());
     }
 }
