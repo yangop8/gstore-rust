@@ -48,19 +48,36 @@ pub enum MentionKind {
 }
 
 /// A surface mention to be linked to the KG.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Mention {
+    #[serde(default)]
     pub text: String,
     #[serde(default)]
     pub kind: MentionKind,
 }
 
 /// A relation phrase connecting two arguments (mention texts or `?var`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// All fields default so one malformed relation can't abort the whole parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RelationPhrase {
+    #[serde(default)]
     pub arg1: String,
+    #[serde(default)]
     pub arg2: String,
+    #[serde(default)]
     pub phrase: String,
+}
+
+/// Sort order for an aggregation/`ORDER BY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Order {
+    #[serde(alias = "ascending")]
+    Asc,
+    /// Descending (default; catch-all — must be last for `#[serde(other)]`).
+    #[default]
+    #[serde(alias = "descending", other)]
+    Desc,
 }
 
 /// An aggregation operator.
@@ -86,9 +103,16 @@ pub struct Aggregation {
     #[serde(default)]
     pub by: Option<String>,
     #[serde(default)]
-    pub order: Option<String>, // "asc" | "desc"
+    pub order: Option<Order>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+impl Aggregation {
+    /// Whether this carries any real aggregation/ordering directive.
+    pub fn is_meaningful(&self) -> bool {
+        self.op != AggOp::None || self.by.is_some() || self.order.is_some() || self.limit.is_some()
+    }
 }
 
 /// The structured understanding of a question.
@@ -129,21 +153,75 @@ pub fn extract_intent(llm: &dyn LlmClient, question: &str) -> Result<QuestionInt
     parse_intent(&raw)
 }
 
-/// Parse the model's (possibly fence-wrapped) JSON into a [`QuestionIntent`].
+/// Parse the model's (possibly fence-wrapped, prose-surrounded) JSON into a
+/// [`QuestionIntent`]. Tries each `{`-started balanced object in turn and
+/// returns the first that deserializes, so braces in prose (e.g. `{A,B}`) before
+/// the real object don't defeat parsing.
 pub fn parse_intent(raw: &str) -> Result<QuestionIntent> {
-    let json = extract_json(raw);
-    serde_json::from_str(&json)
-        .map_err(|e| Error::Llm(format!("could not parse intent JSON: {e}; raw was: {json}")))
+    let mut offset = 0;
+    let mut last_err: Option<String> = None;
+    while let Some(rel) = raw[offset..].find('{') {
+        let abs = offset + rel;
+        let obj = extract_json(&raw[abs..]);
+        match serde_json::from_str::<QuestionIntent>(&obj) {
+            Ok(mut intent) => {
+                // A content-free aggregation block normalizes to None, so callers
+                // can treat `aggregation.is_some()` as "there is a real one".
+                if intent.aggregation.as_ref().is_some_and(|a| !a.is_meaningful()) {
+                    intent.aggregation = None;
+                }
+                return Ok(intent);
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                offset = abs + 1;
+            }
+        }
+    }
+    let snippet: String = raw.chars().take(200).collect();
+    Err(Error::Llm(format!(
+        "could not parse intent JSON ({}); raw: {snippet}",
+        last_err.unwrap_or_else(|| "no JSON object found".into())
+    )))
 }
 
-/// Pull the first JSON object out of an LLM response (handles code fences and
-/// surrounding prose) by slicing from the first `{` to the matching last `}`.
+/// Pull the first complete JSON object out of an LLM response — robust to code
+/// fences and surrounding prose (even prose containing `{`/`}`), by scanning
+/// from the first `{` and matching braces while skipping string literals.
 pub fn extract_json(raw: &str) -> String {
-    let s = raw.trim();
-    match (s.find('{'), s.rfind('}')) {
-        (Some(a), Some(b)) if b > a => s[a..=b].to_string(),
-        _ => s.to_string(),
+    let bytes = raw.as_bytes();
+    let Some(start) = raw.find('{') else {
+        return raw.trim().to_string();
+    };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return raw[start..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
+    // Unbalanced — return the tail and let the JSON parser report the error.
+    raw[start..].to_string()
 }
 
 #[cfg(test)]
@@ -165,7 +243,25 @@ mod tests {
         assert_eq!(it.mentions.len(), 2);
         assert_eq!(it.mentions[1].kind, MentionKind::Type);
         assert_eq!(it.relations[0].phrase, "in");
-        assert_eq!(it.aggregation.unwrap().op, AggOp::Count);
+        let agg = it.aggregation.unwrap();
+        assert_eq!(agg.op, AggOp::Count);
+        assert_eq!(agg.order, Some(Order::Desc));
+    }
+
+    #[test]
+    fn parse_intent_skips_prose_braces_and_multiobject() {
+        // a non-JSON brace group before the real object must not defeat parsing
+        let it = parse_intent("Given {A, B}: {\"qtype\":\"count\"} (done)").unwrap();
+        assert_eq!(it.qtype, QType::Count);
+    }
+
+    #[test]
+    fn empty_aggregation_normalizes_to_none() {
+        let it = parse_intent(r#"{"qtype":"factoid","aggregation":{"op":"none"}}"#).unwrap();
+        assert!(it.aggregation.is_none());
+        // partial relation (missing phrase) must not abort the parse
+        let it2 = parse_intent(r#"{"relations":[{"arg1":"X","arg2":"Y"}]}"#).unwrap();
+        assert_eq!(it2.relations[0].phrase, "");
     }
 
     #[test]

@@ -23,7 +23,10 @@ pub mod secret;
 
 pub use config::Config;
 pub use error::{Error, Result};
-pub use intent::{extract_intent, Aggregation, Mention, MentionKind, QType, QuestionIntent};
+pub use intent::{
+    extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,
+    RelationPhrase,
+};
 pub use kb::{validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer, TermKind};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
 pub use pipeline::{Answer, AskEngine};
