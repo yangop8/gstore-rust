@@ -19,6 +19,7 @@
 //! * [`db`]     — the [`db::Database`] facade: build / load / save / query / update
 
 pub mod analytics;
+pub mod cluster;
 pub mod concurrent;
 pub mod dict;
 pub mod error;
