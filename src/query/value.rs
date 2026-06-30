@@ -156,6 +156,10 @@ impl Value {
         if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
             return Some(a == b);
         }
+        // xsd:dateTime / xsd:date compare by their UTC instant.
+        if let (Some(a), Some(b)) = (datetime_instant(self), datetime_instant(other)) {
+            return Some(a == b);
+        }
         match (self, other) {
             (Value::Iri(a), Value::Iri(b)) => Some(a == b),
             (Value::Blank(a), Value::Blank(b)) => Some(a == b),
@@ -187,6 +191,10 @@ impl Value {
         if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
             return a.partial_cmp(&b);
         }
+        // xsd:dateTime / xsd:date order chronologically by their UTC instant.
+        if let (Some(a), Some(b)) = (datetime_instant(self), datetime_instant(other)) {
+            return a.partial_cmp(&b);
+        }
         match (self, other) {
             (Value::Str { value: a, .. }, Value::Str { value: b, .. }) => Some(a.cmp(b)),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
@@ -212,7 +220,11 @@ pub fn order_key(v: &Option<Value>) -> impl Ord {
         Some(Value::Double(d)) => (3, OrdF64(*d), 0, String::new()),
         Some(Value::Bool(b)) => (4, OrdF64(0.0), 0, b.to_string()),
         Some(Value::Str { value, .. }) => (5, OrdF64(0.0), 0, value.clone()),
-        Some(Value::Typed { value, .. }) => (5, OrdF64(0.0), 0, value.clone()),
+        Some(v @ Value::Typed { value, .. }) => match datetime_instant(v) {
+            // dateTimes order chronologically (group 6, after strings).
+            Some(inst) => (6, OrdF64(inst), 0, String::new()),
+            None => (5, OrdF64(0.0), 0, value.clone()),
+        },
     }
 }
 
@@ -237,6 +249,131 @@ impl Ord for OrdF64 {
             }
         })
     }
+}
+
+const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+const XSD_DATE: &str = "http://www.w3.org/2001/XMLSchema#date";
+
+/// The UTC instant (seconds since 1970-01-01T00:00:00Z, possibly fractional /
+/// negative) of an `xsd:dateTime` / `xsd:date` value, if `v` is one and parses.
+/// Lets dateTime comparisons in FILTER/ORDER BY order chronologically — even
+/// across time zones. A missing timezone is treated as UTC (a pragmatic
+/// simplification of SPARQL's indeterminate-comparison rule).
+fn datetime_instant(v: &Value) -> Option<f64> {
+    let Value::Typed { value, datatype } = v else {
+        return None;
+    };
+    if datatype != XSD_DATETIME && datatype != XSD_DATE {
+        return None;
+    }
+    parse_xsd_datetime(value)
+}
+
+/// Parse `-?YYYY-MM-DD(Thh:mm:ss(.s+)?)?(Z|±hh:mm)?` to a UTC instant.
+fn parse_xsd_datetime(s: &str) -> Option<f64> {
+    let b = s.trim().as_bytes();
+    let mut i = 0usize;
+    let neg_year = b.first() == Some(&b'-');
+    if neg_year {
+        i += 1;
+    }
+    // Year: 4+ digits.
+    let y_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i - y_start < 4 {
+        return None;
+    }
+    let mut year = digits_to_i64(&b[y_start..i])?;
+    if neg_year {
+        year = -year;
+    }
+    expect_byte(b, &mut i, b'-')?;
+    let month = take_n_digits(b, &mut i, 2)?;
+    expect_byte(b, &mut i, b'-')?;
+    let day = take_n_digits(b, &mut i, 2)?;
+
+    let (mut hh, mut mm, mut ss, mut frac) = (0i64, 0i64, 0i64, 0f64);
+    if i < b.len() && b[i] == b'T' {
+        i += 1;
+        hh = take_n_digits(b, &mut i, 2)?;
+        expect_byte(b, &mut i, b':')?;
+        mm = take_n_digits(b, &mut i, 2)?;
+        expect_byte(b, &mut i, b':')?;
+        ss = take_n_digits(b, &mut i, 2)?;
+        if i < b.len() && b[i] == b'.' {
+            let f_start = i;
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            frac = std::str::from_utf8(&b[f_start..i]).ok()?.parse().ok()?;
+        }
+    }
+
+    let mut tz_off = 0i64; // seconds east of UTC
+    if i < b.len() {
+        match b[i] {
+            b'Z' => i += 1,
+            b'+' | b'-' => {
+                let sign = if b[i] == b'+' { 1 } else { -1 };
+                i += 1;
+                let th = take_n_digits(b, &mut i, 2)?;
+                expect_byte(b, &mut i, b':')?;
+                let tm = take_n_digits(b, &mut i, 2)?;
+                tz_off = sign * (th * 3600 + tm * 60);
+            }
+            _ => return None,
+        }
+    }
+    if i != b.len() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss - tz_off;
+    Some(secs as f64 + frac)
+}
+
+fn expect_byte(b: &[u8], i: &mut usize, c: u8) -> Option<()> {
+    if *i < b.len() && b[*i] == c {
+        *i += 1;
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn take_n_digits(b: &[u8], i: &mut usize, n: usize) -> Option<i64> {
+    if *i + n > b.len() {
+        return None;
+    }
+    let v = digits_to_i64(&b[*i..*i + n])?;
+    *i += n;
+    Some(v)
+}
+
+fn digits_to_i64(b: &[u8]) -> Option<i64> {
+    if b.is_empty() {
+        return None;
+    }
+    let mut v = 0i64;
+    for &c in b {
+        let d = (c as char).to_digit(10)?;
+        v = v.checked_mul(10)?.checked_add(d as i64)?;
+    }
+    Some(v)
+}
+
+/// Days from 1970-01-01 to `y-m-d` (proleptic Gregorian; Howard Hinnant's
+/// algorithm). Valid for the full xsd:dateTime year range.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 /// Format a double without a trailing `.0`-less integer ambiguity, matching
@@ -327,5 +464,58 @@ mod tests {
         let unbound = order_key(&None);
         let iri = order_key(&Some(Value::Iri("a".into())));
         assert!(unbound < iri);
+    }
+
+    fn dt(s: &str) -> Value {
+        Value::from_term(&Term::typed_literal(s, XSD_DATETIME))
+    }
+
+    #[test]
+    fn datetime_compares_chronologically() {
+        let a = dt("2020-01-01T00:00:00Z");
+        let b = dt("2021-06-15T12:30:00Z");
+        assert_eq!(a.sparql_cmp(&b), Some(Ordering::Less));
+        assert_eq!(a.sparql_eq(&dt("2020-01-01T00:00:00Z")), Some(true));
+    }
+
+    #[test]
+    fn datetime_normalizes_timezone() {
+        // 2020-01-01T12:00:00+02:00 == 2020-01-01T10:00:00Z (same instant).
+        let east = dt("2020-01-01T12:00:00+02:00");
+        let utc = dt("2020-01-01T10:00:00Z");
+        assert_eq!(east.sparql_eq(&utc), Some(true));
+        assert_eq!(east.sparql_cmp(&utc), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn datetime_fraction_and_date_only() {
+        let a = dt("2020-01-01T00:00:00.5Z");
+        let b = dt("2020-01-01T00:00:00Z");
+        assert_eq!(a.sparql_cmp(&b), Some(Ordering::Greater));
+        // xsd:date (no time) parses to midnight UTC.
+        let d = Value::from_term(&Term::typed_literal("2020-01-02", XSD_DATE));
+        assert_eq!(d.sparql_cmp(&b), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn datetime_order_key_is_chronological_not_lexical() {
+        // Lexically "2021…" > "2020…", but chronologically the +10:00 instant
+        // (Dec 31 14:00 UTC) precedes the Z one (Dec 31 23:00 UTC).
+        let chrono_earlier = order_key(&Some(dt("2021-01-01T00:00:00+10:00")));
+        let chrono_later = order_key(&Some(dt("2020-12-31T23:00:00Z")));
+        assert!(chrono_earlier < chrono_later);
+    }
+
+    #[test]
+    fn epoch_is_zero() {
+        assert_eq!(parse_xsd_datetime("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(parse_xsd_datetime("1970-01-02T00:00:00Z"), Some(86_400.0));
+    }
+
+    #[test]
+    fn malformed_datetime_is_none() {
+        assert_eq!(parse_xsd_datetime("not-a-date"), None);
+        assert_eq!(parse_xsd_datetime("2020-13-01T00:00:00Z"), None); // month 13
+        assert_eq!(parse_xsd_datetime("2020-01-01T00:00:00XY"), None); // bad tz
     }
 }

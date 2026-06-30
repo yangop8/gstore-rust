@@ -11,9 +11,8 @@
 //! * prefixed names `p:local`, the `a` keyword (= rdf:type)
 //! * predicate-object lists (`;`) and object lists (`,`)
 //! * IRIs, blank nodes, plain/typed/lang literals, numeric & boolean literals
-//!
-//! Not supported (rare in gStore corpora; see REFACTOR_BACKLOG item D):
-//! `[ … ]` blank-node property lists and `( … )` collections.
+//! * `[ … ]` blank-node property lists and `( … )` collections (lowered to an
+//!   `rdf:first`/`rdf:rest`/`rdf:nil` chain), including nesting
 
 use std::path::Path;
 
@@ -41,7 +40,12 @@ struct Parser {
     prefixes: std::collections::HashMap<String, String>,
     base: Option<String>,
     triples: Vec<Triple>,
+    /// Counter for fresh blank nodes minted by `[ … ]` / `( … )`.
+    bnode: usize,
 }
+
+/// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
+const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 impl Parser {
     fn new(s: &str) -> Parser {
@@ -52,7 +56,15 @@ impl Parser {
             prefixes: std::collections::HashMap::new(),
             base: None,
             triples: Vec::new(),
+            bnode: 0,
         }
+    }
+
+    /// Mint a fresh, document-unique blank node for an anonymous construct.
+    fn fresh_blank(&mut self) -> Term {
+        let label = format!("genid{}", self.bnode);
+        self.bnode += 1;
+        Term::Blank(label)
     }
 
     fn err(&self, msg: impl Into<String>) -> GStoreError {
@@ -189,7 +201,16 @@ impl Parser {
     }
 
     fn parse_triples_statement(&mut self) -> Result<()> {
+        self.skip_ws();
+        // A `[ … ]` / `( … )` subject already emits its own triples, so the
+        // outer predicate-object list is optional (`[ :p :o ] .` is a statement).
+        let subject_is_bracket = matches!(self.peek(), Some('[') | Some('('));
         let subject = self.parse_term(false)?;
+        self.skip_ws();
+        if subject_is_bracket && self.peek() == Some('.') {
+            self.expect_dot()?;
+            return Ok(());
+        }
         self.parse_predicate_object_list(&subject)?;
         self.expect_dot()?;
         Ok(())
@@ -242,6 +263,8 @@ impl Parser {
         match self.peek() {
             Some('<') => Ok(Term::Iri(self.parse_iriref()?)),
             Some('"') | Some('\'') if !verb_pos => self.parse_literal(),
+            Some('[') if !verb_pos => self.parse_blank_node_property_list(),
+            Some('(') if !verb_pos => self.parse_collection(),
             Some('_') => self.parse_blank(),
             Some(c) if (c.is_ascii_digit() || c == '+' || c == '-' || c == '.') && !verb_pos => {
                 self.parse_numeric()
@@ -249,6 +272,62 @@ impl Parser {
             Some(_) => self.parse_prefixed_or_keyword(verb_pos),
             None => Err(self.err("expected a term, found end of input")),
         }
+    }
+
+    /// `[ predicateObjectList? ]` — a fresh blank node carrying the listed
+    /// properties. Returns the blank node so it can fill the enclosing position.
+    fn parse_blank_node_property_list(&mut self) -> Result<Term> {
+        self.expect('[')?;
+        let node = self.fresh_blank();
+        self.skip_ws();
+        if self.peek() == Some(']') {
+            self.bump(); // empty `[]` is just an anonymous blank node
+            return Ok(node);
+        }
+        self.parse_predicate_object_list(&node)?;
+        self.skip_ws();
+        self.expect(']')?;
+        Ok(node)
+    }
+
+    /// `( item* )` — an RDF collection, lowered to an `rdf:first`/`rdf:rest`
+    /// chain terminated by `rdf:nil`. Returns the chain head (`rdf:nil` if empty).
+    fn parse_collection(&mut self) -> Result<Term> {
+        self.expect('(')?;
+        let nil = Term::iri(format!("{RDF_NS}nil"));
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(')') => {
+                    self.bump();
+                    break;
+                }
+                None => return Err(self.err("unterminated collection '('")),
+                _ => items.push(self.parse_term(false)?),
+            }
+        }
+        if items.is_empty() {
+            return Ok(nil);
+        }
+        let first = Term::iri(format!("{RDF_NS}first"));
+        let rest = Term::iri(format!("{RDF_NS}rest"));
+        let head = self.fresh_blank();
+        let mut current = head.clone();
+        let n = items.len();
+        for (i, item) in items.into_iter().enumerate() {
+            self.triples
+                .push(Triple::new(current.clone(), first.clone(), item));
+            let next = if i + 1 < n {
+                self.fresh_blank()
+            } else {
+                nil.clone()
+            };
+            self.triples
+                .push(Triple::new(current.clone(), rest.clone(), next.clone()));
+            current = next;
+        }
+        Ok(head)
     }
 
     fn parse_iriref(&mut self) -> Result<String> {
@@ -790,5 +869,83 @@ mod tests {
         let doc = "# header\n\n@prefix : <http://e/> .\n# mid\n:s :p :o .\n";
         let ts = parse_str(doc).unwrap();
         assert_eq!(ts.len(), 1);
+    }
+
+    #[test]
+    fn blank_node_property_list_as_object() {
+        let doc = "@prefix : <http://e/> . :s :p [ :q :r ; :u :v ] .";
+        let ts = parse_str(doc).unwrap();
+        // (B :q :r), (B :u :v), (:s :p B)
+        assert_eq!(ts.len(), 3);
+        let outer = ts.iter().find(|t| t.predicate == Term::iri("http://e/p")).unwrap();
+        let b = match &outer.object {
+            Term::Blank(l) => l.clone(),
+            other => panic!("expected blank object, got {other:?}"),
+        };
+        // the blank node carries both inner properties
+        assert_eq!(
+            ts.iter()
+                .filter(|t| matches!(&t.subject, Term::Blank(l) if l == &b))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn blank_node_property_list_as_subject_standalone() {
+        let doc = "@prefix : <http://e/> . [ :p :o ; :q :r ] .";
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 2);
+        // both share one blank subject
+        match (&ts[0].subject, &ts[1].subject) {
+            (Term::Blank(a), Term::Blank(b)) => assert_eq!(a, b),
+            other => panic!("expected blank subjects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_blank_node_is_anonymous() {
+        let doc = "@prefix : <http://e/> . :s :p [] .";
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 1);
+        assert!(matches!(ts[0].object, Term::Blank(_)));
+    }
+
+    #[test]
+    fn collection_lowers_to_rdf_list() {
+        let doc = "@prefix : <http://e/> . :s :p ( :a :b :c ) .";
+        let ts = parse_str(doc).unwrap();
+        // 3 first + 3 rest + 1 outer = 7 triples
+        assert_eq!(ts.len(), 7);
+        let first = Term::iri(format!("{RDF_NS}first"));
+        let rest = Term::iri(format!("{RDF_NS}rest"));
+        let nil = Term::iri(format!("{RDF_NS}nil"));
+        assert_eq!(ts.iter().filter(|t| t.predicate == first).count(), 3);
+        assert_eq!(ts.iter().filter(|t| t.predicate == rest).count(), 3);
+        assert!(ts.iter().any(|t| t.object == nil));
+        // the items appear in order as rdf:first objects
+        let firsts: Vec<&Term> = ts
+            .iter()
+            .filter(|t| t.predicate == first)
+            .map(|t| &t.object)
+            .collect();
+        assert!(firsts.contains(&&Term::iri("http://e/a")));
+        assert!(firsts.contains(&&Term::iri("http://e/c")));
+    }
+
+    #[test]
+    fn empty_collection_is_nil() {
+        let doc = "@prefix : <http://e/> . :s :p () .";
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].object, Term::iri(format!("{RDF_NS}nil")));
+    }
+
+    #[test]
+    fn nested_blank_and_collection() {
+        let doc = "@prefix : <http://e/> . :s :p [ :q ( :a :b ) ] .";
+        let ts = parse_str(doc).unwrap();
+        // inner: 2 first + 2 rest = 4 ; B :q head ; :s :p B  => 6
+        assert_eq!(ts.len(), 6);
     }
 }
