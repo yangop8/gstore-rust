@@ -1,0 +1,44 @@
+[package]
+name = "gstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A Rust rewrite of the gStore RDF triple store / graph database (https://github.com/pkumod/gStore)"
+license = "BSD-3-Clause"
+repository = "https://github.com/yangop8/gstore-rust"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+# Used only by the SPARQL REGEX builtin and string/replace functions.
+regex = "1"
+
+[dev-dependencies]
+
+[lib]
+name = "gstore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gbuild"
+path = "src/bin/gbuild.rs"
+
+[[bin]]
+name = "gquery"
+path = "src/bin/gquery.rs"
+
+[[bin]]
+name = "gconsole"
+path = "src/bin/gconsole.rs"
+
+[[bin]]
+name = "gserver"
+path = "src/bin/gserver.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Keep test/dev builds reasonably fast while still exercising real code paths.
+[profile.test]
+opt-level = 1

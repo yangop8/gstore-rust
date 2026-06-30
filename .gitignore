@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+# gStore database directories produced by gbuild (suffix .db)
+*.db/
+/scratch
+
+# OMC orchestration state
+/.omc/
