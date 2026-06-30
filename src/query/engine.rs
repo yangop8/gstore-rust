@@ -24,6 +24,7 @@ use crate::parser::sparql::ast::*;
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::TripleStore;
 
+use super::candidates::{self, Candidates};
 use super::results::{QueryResult, ResultSet};
 use super::value::{order_key, Value};
 
@@ -927,10 +928,13 @@ impl<'a> Evaluator<'a> {
             return vec![vec![None; layout.len()]];
         }
 
-        let order = self.order_plans(&plans);
+        // Exact per-variable candidate sets from constant edges (gStore's
+        // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
+        let mut candidates = candidates::generate(&plans, self.store);
+        self.refine_candidates_with_vstree(&mut candidates, tps, layout);
 
-        // VS-tree pre-filter: sound candidate id sets for entity variables.
-        let candidates = self.compute_candidates(tps, layout);
+        // Cost-based order using exact candidate sizes.
+        let order = super::optimizer::order_bgp(&plans, self.store, &candidates);
 
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
         for &pi in &order {
@@ -947,33 +951,28 @@ impl<'a> Evaluator<'a> {
         solutions
     }
 
-    /// Compute, for each entity variable, the VS-tree candidate id set built
-    /// from its incident triple patterns' constant predicates/neighbours. Only
-    /// variables that appear as a *subject* (hence always entities) are filtered,
-    /// keeping the filter sound for variables that might bind to literals.
-    fn compute_candidates(
+    /// Intersect the VS-tree's signature candidates into the exact candidate
+    /// sets (both are sound supersets, so the intersection stays sound and only
+    /// tightens). Applies to subject variables (always entities).
+    fn refine_candidates_with_vstree(
         &self,
+        candidates: &mut Candidates,
         tps: &[TriplePattern],
         layout: &VarLayout,
-    ) -> HashMap<usize, HashSet<u32>> {
-        let mut out = HashMap::new();
+    ) {
         let Some(vstree) = self.vstree else {
-            return out;
+            return;
         };
-
-        // Entity-typed variables: those used as a subject somewhere.
         let mut subj_vars: HashSet<usize> = HashSet::new();
         for tp in tps {
             if let PatternTerm::Var(v) = &tp.subject {
                 subj_vars.insert(layout.index[v]);
             }
         }
-
         for &vidx in &subj_vars {
             let mut sig = Signature::new();
             for tp in tps {
                 if matches!(&tp.subject, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    // out-edge: this var is the subject
                     sig.encode_query_edge(
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.object),
@@ -981,7 +980,6 @@ impl<'a> Evaluator<'a> {
                     );
                 }
                 if matches!(&tp.object, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    // in-edge: this var is the object
                     sig.encode_query_edge(
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.subject),
@@ -990,13 +988,19 @@ impl<'a> Evaluator<'a> {
                 }
             }
             if sig.is_empty() {
-                continue; // nothing constant to filter on
+                continue;
             }
-            if let Some(cands) = vstree.candidates(&sig) {
-                out.insert(vidx, cands.into_iter().collect());
+            if let Some(mut vs) = vstree.candidates(&sig) {
+                vs.sort_unstable();
+                vs.dedup();
+                match candidates.get_mut(&vidx) {
+                    Some(existing) => existing.retain(|x| vs.binary_search(x).is_ok()),
+                    None => {
+                        candidates.insert(vidx, vs);
+                    }
+                }
             }
         }
-        out
     }
 
     /// The predicate id of a constant-IRI predicate position, if resolvable.
@@ -1051,7 +1055,7 @@ impl<'a> Evaluator<'a> {
         &self,
         binding: &Binding,
         plan: &PatPlan,
-        cands: &HashMap<usize, HashSet<u32>>,
+        cands: &Candidates,
         out: &mut Vec<Binding>,
     ) {
         let ks = slot_known(&plan.s, binding);
@@ -1123,13 +1127,6 @@ impl<'a> Evaluator<'a> {
                 out.push(nb);
             }
         }
-    }
-
-    // ---- plan ordering ----------------------------------------------------
-
-    /// Cost-based left-deep join order (see [`crate::query::optimizer`]).
-    fn order_plans(&self, plans: &[PatPlan]) -> Vec<usize> {
-        super::optimizer::order_bgp(plans, self.store)
     }
 
     // ---- value resolution -------------------------------------------------
@@ -1657,9 +1654,12 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
 
 /// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
 /// Constants and variables without a candidate set are always allowed.
-fn cand_ok(slot: &Slot, value: u32, cands: &HashMap<usize, HashSet<u32>>) -> bool {
+fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
     match slot {
-        Slot::Var(v) => cands.get(v).is_none_or(|set| set.contains(&value)),
+        // Candidate lists are sorted; membership is a binary search.
+        Slot::Var(v) => cands
+            .get(v)
+            .is_none_or(|list| list.binary_search(&value).is_ok()),
         Slot::Const(_) => true,
     }
 }

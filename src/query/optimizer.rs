@@ -17,6 +17,7 @@
 
 use crate::store::TripleStore;
 
+use super::candidates::Candidates;
 use super::engine::{PatPlan, Slot};
 
 /// Above this many patterns, use the greedy fallback instead of exact DP.
@@ -26,8 +27,13 @@ const MAX_DP_PATTERNS: usize = 16;
 /// to push unavoidable cross-products to the end of the plan.
 const CARTESIAN_PENALTY: f64 = 1e12;
 
-/// Compute a left-deep evaluation order for `plans` (indices into `plans`).
-pub(crate) fn order_bgp(plans: &[PatPlan], store: &TripleStore) -> Vec<usize> {
+/// Compute a left-deep evaluation order for `plans` (indices into `plans`),
+/// using exact candidate sizes where available (gStore's `var_to_num`).
+pub(crate) fn order_bgp(
+    plans: &[PatPlan],
+    store: &TripleStore,
+    candidates: &Candidates,
+) -> Vec<usize> {
     let n = plans.len();
     if n <= 1 {
         return (0..n).collect();
@@ -36,14 +42,32 @@ pub(crate) fn order_bgp(plans: &[PatPlan], store: &TripleStore) -> Vec<usize> {
     // Per-pattern variable bitmask; bail to greedy if a var index exceeds 63.
     let num_vars = max_var_index(plans).map_or(0, |m| m + 1);
     if n > MAX_DP_PATTERNS || num_vars > 64 {
-        return greedy_order(plans, store);
+        return greedy_order(plans, store, candidates);
     }
     let varset: Vec<u64> = plans.iter().map(var_mask).collect();
 
-    let base: Vec<f64> = plans.iter().map(|p| base_card(p, store) as f64).collect();
-    let domain = domain_estimates(plans, store, num_vars);
+    let base: Vec<f64> = plans
+        .iter()
+        .map(|p| base_card_eff(p, store, candidates) as f64)
+        .collect();
+    let domain = domain_estimates(plans, store, num_vars, candidates);
 
     dp_order(&base, &varset, &domain)
+}
+
+/// Effective base cardinality: the index estimate, capped by the smallest
+/// candidate set among the pattern's variables (a pattern can't yield more rows
+/// than its most-constrained variable allows).
+fn base_card_eff(plan: &PatPlan, store: &TripleStore, candidates: &Candidates) -> u64 {
+    let mut card = base_card(plan, store);
+    for slot in [&plan.s, &plan.p, &plan.o] {
+        if let Slot::Var(v) = slot {
+            if let Some(c) = candidates.get(v) {
+                card = card.min(c.len() as u64);
+            }
+        }
+    }
+    card.max(1)
 }
 
 /// Selinger DP: `cost[S]` = min total intermediate size to evaluate set `S`.
@@ -116,7 +140,12 @@ fn dp_order(base: &[f64], varset: &[u64], domain: &[f64]) -> Vec<usize> {
 
 /// Estimate, per variable, its number of distinct values (smaller = more
 /// selective). Taken as the minimum over the variable's occurrences.
-fn domain_estimates(plans: &[PatPlan], store: &TripleStore, num_vars: usize) -> Vec<f64> {
+fn domain_estimates(
+    plans: &[PatPlan],
+    store: &TripleStore,
+    num_vars: usize,
+    candidates: &Candidates,
+) -> Vec<f64> {
     let big = (store.triple_count() as f64).max(1.0);
     let mut dom = vec![big; num_vars];
     let mut see = |v: usize, est: f64| {
@@ -148,6 +177,12 @@ fn domain_estimates(plans: &[PatPlan], store: &TripleStore, num_vars: usize) -> 
             see(v, n_pred);
         }
     }
+    // An exact candidate set is the tightest distinct-value bound there is.
+    for (&v, c) in candidates {
+        if v < num_vars {
+            see(v, c.len() as f64);
+        }
+    }
     dom
 }
 
@@ -170,7 +205,7 @@ fn base_card(plan: &PatPlan, store: &TripleStore) -> u64 {
 }
 
 /// Connected, smallest-base-card-first greedy order (fallback for large BGPs).
-fn greedy_order(plans: &[PatPlan], store: &TripleStore) -> Vec<usize> {
+fn greedy_order(plans: &[PatPlan], store: &TripleStore, candidates: &Candidates) -> Vec<usize> {
     let n = plans.len();
     let mut remaining: Vec<usize> = (0..n).collect();
     let mut order = Vec::with_capacity(n);
@@ -188,7 +223,7 @@ fn greedy_order(plans: &[PatPlan], store: &TripleStore) -> Vec<usize> {
                 (
                     !connected as u8,
                     std::cmp::Reverse(known),
-                    base_card(plan, store),
+                    base_card_eff(plan, store, candidates),
                 )
             })
             .map(|(pos, _)| pos)
@@ -282,15 +317,19 @@ mod tests {
         // ?x rare ?y  (card 1)   and   ?x common ?z (card 50), shared var ?x (=0)
         let rare = plan(Slot::Var(0), Slot::Const(0), Slot::Var(1));
         let common = plan(Slot::Var(0), Slot::Const(1), Slot::Var(2));
-        let order = order_bgp(&[common, rare], &s); // pass broad first on purpose
-                                                    // Optimizer should evaluate the rare pattern (index 1) first.
+        let order = order_bgp(&[common, rare], &s, &Candidates::new()); // pass broad first on purpose
+                                                                        // Optimizer should evaluate the rare pattern (index 1) first.
         assert_eq!(order[0], 1, "selective pattern must lead");
     }
 
     #[test]
     fn single_pattern_order_is_trivial() {
         let (_d, s) = store_with_skew();
-        let order = order_bgp(&[plan(Slot::Var(0), Slot::Const(1), Slot::Var(1))], &s);
+        let order = order_bgp(
+            &[plan(Slot::Var(0), Slot::Const(1), Slot::Var(1))],
+            &s,
+            &Candidates::new(),
+        );
         assert_eq!(order, vec![0]);
     }
 
@@ -302,7 +341,7 @@ mod tests {
             plan(Slot::Var(1), Slot::Const(1), Slot::Var(2)),
             plan(Slot::Var(0), Slot::Const(0), Slot::Var(3)),
         ];
-        let mut order = order_bgp(&plans, &s);
+        let mut order = order_bgp(&plans, &s, &Candidates::new());
         order.sort_unstable();
         assert_eq!(order, vec![0, 1, 2]);
     }

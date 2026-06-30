@@ -4,6 +4,7 @@
 //! pieces of `src/Database`. See [`engine::Evaluator`] for the evaluation
 //! pipeline and `docs/DESIGN.md` §6.
 
+pub mod candidates;
 pub mod engine;
 pub mod optimizer;
 pub mod results;
