@@ -26,6 +26,7 @@ pub mod model;
 pub mod parser;
 pub mod query;
 pub mod reason;
+pub mod server;
 pub mod signature;
 pub mod store;
 

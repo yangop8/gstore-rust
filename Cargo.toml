@@ -31,6 +31,10 @@ path = "src/bin/gquery.rs"
 name = "gconsole"
 path = "src/bin/gconsole.rs"
 
+[[bin]]
+name = "gserver"
+path = "src/bin/gserver.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
