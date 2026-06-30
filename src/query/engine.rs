@@ -11,7 +11,7 @@
 //! 4. Iteratively extend partial bindings by indexed lookups + unification.
 //! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use regex::Regex;
 
@@ -151,6 +151,8 @@ pub struct Evaluator<'a> {
     store: &'a TripleStore,
     /// Optional VS-tree for entity-candidate pre-filtering.
     vstree: Option<&'a VsTree>,
+    /// Named graphs (graph-IRI entity id → its store), for `GRAPH` patterns.
+    named: Option<&'a BTreeMap<u32, TripleStore>>,
     /// Interner for computed terms produced during evaluation.
     extras: std::cell::RefCell<Extras>,
     /// Cost-based plan cache (gStore `plan_cache`): structurally-identical BGPs —
@@ -165,6 +167,7 @@ impl<'a> Evaluator<'a> {
             dict,
             store,
             vstree: None,
+            named: None,
             extras: std::cell::RefCell::new(Extras::default()),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
@@ -180,9 +183,16 @@ impl<'a> Evaluator<'a> {
             dict,
             store,
             vstree: Some(vstree),
+            named: None,
             extras: std::cell::RefCell::new(Extras::default()),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Attach named graphs so `GRAPH` patterns can be evaluated.
+    pub fn with_named(mut self, named: &'a BTreeMap<u32, TripleStore>) -> Evaluator<'a> {
+        self.named = Some(named);
+        self
     }
 
     /// Convert a term to an id: its dictionary id if present, else a synthetic
@@ -924,6 +934,42 @@ impl<'a> Evaluator<'a> {
             GraphPattern::Values(vars, rows) => self.eval_values(vars, rows, layout),
             GraphPattern::SubSelect(sq) => self.eval_subselect(sq, layout),
             GraphPattern::Path(p) => self.eval_path_pattern(p, layout),
+            GraphPattern::Graph(g, inner) => self.eval_graph(g, inner, layout),
+        }
+    }
+
+    /// Evaluate a `GRAPH (<iri> | ?g) { inner }` pattern. A constant graph runs
+    /// `inner` against that named graph's store; a variable graph runs it against
+    /// every named graph, binding the variable to each. The default graph is not
+    /// visited (per SPARQL, `GRAPH ?g` ranges over named graphs only).
+    fn eval_graph(&self, g: &GraphTerm, inner: &GraphPattern, layout: &VarLayout) -> Vec<Binding> {
+        let Some(named) = self.named else {
+            return Vec::new();
+        };
+        match g {
+            GraphTerm::Iri(iri) => {
+                let Some(gid) = self.dict.entity_id(&Term::iri(iri.clone()).dict_key()) else {
+                    return Vec::new();
+                };
+                match named.get(&gid) {
+                    Some(gstore) => Evaluator::new(self.dict, gstore)
+                        .with_named(named)
+                        .eval_pattern(inner, layout),
+                    None => Vec::new(),
+                }
+            }
+            GraphTerm::Var(v) => {
+                let vi = layout.index[v];
+                let mut out = Vec::new();
+                for (&gid, gstore) in named {
+                    let sub = Evaluator::new(self.dict, gstore).with_named(named);
+                    for mut b in sub.eval_pattern(inner, layout) {
+                        b[vi] = Some(gid);
+                        out.push(b);
+                    }
+                }
+                out
+            }
         }
     }
 
@@ -1475,6 +1521,22 @@ impl<'a> Evaluator<'a> {
                 var.clone(),
                 self.subst_expr(e, b, layout),
             ),
+            GraphPattern::Graph(g, inner) => {
+                // Substitute a bound graph variable into a constant graph IRI.
+                let g2 = match g {
+                    GraphTerm::Var(name) => match layout
+                        .index
+                        .get(name)
+                        .and_then(|&i| b[i].map(|id| (id, layout.is_pred[i])))
+                        .and_then(|(id, p)| self.id_to_term(id, p))
+                    {
+                        Some(Term::Iri(s)) => GraphTerm::Iri(s),
+                        _ => g.clone(),
+                    },
+                    GraphTerm::Iri(_) => g.clone(),
+                };
+                GraphPattern::Graph(g2, Box::new(self.subst_pattern(inner, b, layout)))
+            }
             // Inline VALUES and sub-SELECT are kept intact (rare inside EXISTS).
             GraphPattern::Values(v, r) => GraphPattern::Values(v.clone(), r.clone()),
             GraphPattern::SubSelect(sq) => GraphPattern::SubSelect(sq.clone()),

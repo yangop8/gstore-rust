@@ -10,7 +10,7 @@
 //! for gStore's on-disk B+ tree KVstore (backlog item A).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -36,6 +36,7 @@ const DICT_FILE: &str = "dict.bin";
 const STORE_FILE: &str = "store.bin";
 const META_FILE: &str = "meta.bin";
 const VSTREE_FILE: &str = "vstree.bin";
+const NAMED_FILE: &str = "named.bin";
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
@@ -82,6 +83,9 @@ pub struct Database {
     name: String,
     dict: Dictionary,
     store: TripleStore,
+    /// Named graphs: graph-IRI entity id → its triple store. The default graph
+    /// is `store`; `GRAPH` patterns and quad updates target this map.
+    named: BTreeMap<u32, TripleStore>,
     /// Signature index for query-time candidate pruning.
     vstree: VsTree,
     /// Whether `vstree` is consistent with `store`. Cleared on update; the
@@ -121,13 +125,14 @@ pub struct Schema {
     pub properties: Vec<String>,
 }
 
-/// One undo-log entry: the action that reverses a triple mutation.
+/// One undo-log entry: the action that reverses a triple mutation, in a given
+/// graph (`None` = the default graph, `Some(gid)` = a named graph).
 #[derive(Debug)]
 enum UndoOp {
     /// Re-add a triple removed during the transaction.
-    Add(IdTriple),
+    Add(Option<u32>, IdTriple),
     /// Remove a triple added during the transaction.
-    Del(IdTriple),
+    Del(Option<u32>, IdTriple),
 }
 
 impl Database {
@@ -137,6 +142,7 @@ impl Database {
             name: name.into(),
             dict: Dictionary::new(),
             store: TripleStore::new(),
+            named: BTreeMap::new(),
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
@@ -289,7 +295,7 @@ impl Database {
             self.index_valid = false; // VS-tree now stale
             self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Del(id)); // rollback removes what we added
+                log.push(UndoOp::Del(None, id)); // rollback removes what we added
             }
         }
         changed
@@ -311,7 +317,7 @@ impl Database {
             self.index_valid = false;
             self.query_cache.get_mut().clear();
             if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Add(id)); // rollback re-adds what we removed
+                log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
             }
         }
         changed
@@ -350,11 +356,19 @@ impl Database {
         };
         for op in log.into_iter().rev() {
             match op {
-                UndoOp::Add(id) => {
+                UndoOp::Add(None, id) => {
                     self.store.insert(id);
                 }
-                UndoOp::Del(id) => {
+                UndoOp::Del(None, id) => {
                     self.store.remove(id);
+                }
+                UndoOp::Add(Some(gid), id) => {
+                    self.named.entry(gid).or_default().insert(id);
+                }
+                UndoOp::Del(Some(gid), id) => {
+                    if let Some(s) = self.named.get_mut(&gid) {
+                        s.remove(id);
+                    }
                 }
             }
         }
@@ -372,11 +386,54 @@ impl Database {
         Triple::new(g.subject.clone(), g.predicate.clone(), g.object.clone())
     }
 
+    /// Insert a triple into a named graph (`None` ⇒ default graph). Returns
+    /// `true` if newly added.
+    fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
+        let Some(g) = graph else {
+            return self.insert_triple(t);
+        };
+        let gid = self.dict.intern_entity(&Term::iri(g).dict_key());
+        let id = self.encode_triple(t);
+        let changed = self.named.entry(gid).or_default().insert(id);
+        if changed {
+            self.query_cache.get_mut().clear();
+            if let Some(log) = self.txn.as_mut() {
+                log.push(UndoOp::Del(Some(gid), id));
+            }
+        }
+        changed
+    }
+
+    /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
+    /// `true` if it existed.
+    fn delete_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
+        let Some(g) = graph else {
+            return self.remove_triple(t);
+        };
+        let (Some(gid), Some(sub), Some(pred), Some(obj)) = (
+            self.dict.entity_id(&Term::iri(g).dict_key()),
+            self.dict.entity_id(&t.subject.dict_key()),
+            self.dict.predicate_id(&t.predicate.dict_key()),
+            self.dict.term_id(&t.object),
+        ) else {
+            return false;
+        };
+        let id = IdTriple::new(sub, pred, obj);
+        let changed = self.named.get_mut(&gid).is_some_and(|s| s.remove(id));
+        if changed {
+            self.query_cache.get_mut().clear();
+            if let Some(log) = self.txn.as_mut() {
+                log.push(UndoOp::Add(Some(gid), id));
+            }
+        }
+        changed
+    }
+
     /// Apply `INSERT DATA`. Returns the number of triples newly added.
     pub fn insert_data(&mut self, triples: &[GroundTriple]) -> usize {
         triples
             .iter()
-            .filter(|g| self.insert_triple(&Self::ground_to_triple(g)))
+            .filter(|g| self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
             .count()
     }
 
@@ -384,7 +441,7 @@ impl Database {
     pub fn delete_data(&mut self, triples: &[GroundTriple]) -> usize {
         triples
             .iter()
-            .filter(|g| self.remove_triple(&Self::ground_to_triple(g)))
+            .filter(|g| self.delete_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
             .count()
     }
 
@@ -415,11 +472,14 @@ impl Database {
                 }
                 // Use the VS-tree as a candidate filter only while it is
                 // consistent with the store; otherwise evaluate without it.
-                let eval = if self.index_valid {
+                let mut eval = if self.index_valid {
                     Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
                 } else {
                     Evaluator::new(&self.dict, &self.store)
                 };
+                if !self.named.is_empty() {
+                    eval = eval.with_named(&self.named);
+                }
                 let result = eval.evaluate(&q)?;
                 self.query_cache
                     .borrow_mut()
@@ -475,26 +535,27 @@ impl Database {
                     }
                 }
             },
-            // We keep a single default graph: DEFAULT/ALL clear it; any named
-            // target refers to a graph that does not exist ⇒ no-op.
             UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
-                GraphTarget::Default | GraphTarget::All => Ok(self.clear_all()),
-                GraphTarget::Named(_) => Ok(0),
+                GraphTarget::Default => Ok(self.clear_default()),
+                GraphTarget::All => Ok(self.clear_default() + self.clear_all_named()),
+                // NAMED keyword (an empty name) ⇒ all named graphs.
+                GraphTarget::Named(g) if g.is_empty() => Ok(self.clear_all_named()),
+                GraphTarget::Named(g) => Ok(self.clear_named(&g)),
             },
-            // CREATE GRAPH has no effect with a single default graph.
+            // CREATE GRAPH only declares an (empty) graph; data ops create it.
             UpdateOp::Create { .. } => Ok(0),
         }
     }
 
-    /// Remove every triple (keeping the dictionary), returning the count cleared.
-    fn clear_all(&mut self) -> usize {
+    /// Clear the default graph, returning the count cleared.
+    fn clear_default(&mut self) -> usize {
         let n = self.store.triple_count() as usize;
         if n > 0 {
             // Record undo entries before discarding the store, so CLEAR inside a
             // transaction can be rolled back.
             if let Some(log) = self.txn.as_mut() {
                 for t in self.store.iter_all() {
-                    log.push(UndoOp::Add(t));
+                    log.push(UndoOp::Add(None, t));
                 }
             }
             self.store = TripleStore::new();
@@ -502,6 +563,43 @@ impl Database {
             self.query_cache.get_mut().clear();
         }
         n
+    }
+
+    /// Clear one named graph, returning the count cleared.
+    fn clear_named(&mut self, graph: &str) -> usize {
+        let Some(gid) = self.dict.entity_id(&Term::iri(graph).dict_key()) else {
+            return 0;
+        };
+        let n = self.named.get(&gid).map_or(0, |s| s.triple_count() as usize);
+        if n > 0 {
+            if let Some(log) = self.txn.as_mut() {
+                if let Some(s) = self.named.get(&gid) {
+                    for t in s.iter_all() {
+                        log.push(UndoOp::Add(Some(gid), t));
+                    }
+                }
+            }
+            self.named.remove(&gid);
+            self.query_cache.get_mut().clear();
+        }
+        n
+    }
+
+    /// Clear every named graph, returning the total count cleared.
+    fn clear_all_named(&mut self) -> usize {
+        let total: usize = self.named.values().map(|s| s.triple_count() as usize).sum();
+        if total > 0 {
+            if let Some(log) = self.txn.as_mut() {
+                for (&gid, s) in &self.named {
+                    for t in s.iter_all() {
+                        log.push(UndoOp::Add(Some(gid), t));
+                    }
+                }
+            }
+            self.named.clear();
+            self.query_cache.get_mut().clear();
+        }
+        total
     }
 
     /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
@@ -537,6 +635,7 @@ impl Database {
         fs::create_dir_all(dir)?;
         write_bincode(&dir.join(DICT_FILE), &self.dict)?;
         write_bincode(&dir.join(STORE_FILE), &self.store)?;
+        write_bincode(&dir.join(NAMED_FILE), &self.named)?;
         let meta = Meta {
             name: self.name.clone(),
             triple_num: self.store.triple_count(),
@@ -596,6 +695,7 @@ impl Database {
             name,
             dict,
             store,
+            named: BTreeMap::new(),
             vstree: VsTree::new(),
             index_valid: false,
             txn: None,
@@ -617,6 +717,9 @@ impl Database {
         let meta: Meta = read_bincode(&dir.join(META_FILE))?;
         let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
         let store: TripleStore = read_bincode(&dir.join(STORE_FILE))?;
+        // Named graphs are optional (older databases / no GRAPH data).
+        let named: BTreeMap<u32, TripleStore> =
+            read_bincode(&dir.join(NAMED_FILE)).unwrap_or_default();
         // Sanity check that the snapshot is internally consistent.
         if store.triple_count() != meta.triple_num {
             return Err(GStoreError::Database(format!(
@@ -652,6 +755,7 @@ impl Database {
             name: meta.name,
             dict,
             store,
+            named,
             vstree,
             index_valid: true,
             txn: None,

@@ -172,6 +172,16 @@ pub enum GraphPattern {
     Values(Vec<String>, Vec<Vec<Option<Term>>>),
     /// A nested `SELECT` sub-query.
     SubSelect(Box<SelectQuery>),
+    /// `GRAPH (<iri> | ?g) { … }`: evaluate the inner pattern against a named
+    /// graph (or, for a variable, against each named graph, binding it).
+    Graph(GraphTerm, Box<GraphPattern>),
+}
+
+/// The graph reference of a `GRAPH` pattern: a constant IRI or a variable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphTerm {
+    Var(String),
+    Iri(String),
 }
 
 impl GraphPattern {
@@ -196,6 +206,7 @@ impl GraphPattern {
             GraphPattern::Filter(_, inner) | GraphPattern::Extend(inner, _, _) => {
                 inner.collect_triples(out)
             }
+            GraphPattern::Graph(_, inner) => inner.collect_triples(out),
         }
     }
 
@@ -247,6 +258,12 @@ impl GraphPattern {
                 for v in sq.result_vars() {
                     push(&v, out);
                 }
+            }
+            GraphPattern::Graph(g, inner) => {
+                if let GraphTerm::Var(v) = g {
+                    push(v, out);
+                }
+                inner.collect_vars(out);
             }
         }
     }
@@ -308,11 +325,13 @@ impl PatternTerm {
 }
 
 /// A ground triple (used by INSERT/DELETE DATA): all positions concrete.
+/// `graph` names the target named graph (`None` = the default graph).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroundTriple {
     pub subject: Term,
     pub predicate: Term,
     pub object: Term,
+    pub graph: Option<String>,
 }
 
 /// One `ORDER BY` key.

@@ -410,12 +410,17 @@ impl Parser {
                     let values = self.parse_inline_values()?;
                     current = join_opt(current, values);
                 }
-                Token::Word(w)
-                    if matches!(w.to_ascii_uppercase().as_str(), "GRAPH" | "SERVICE") =>
-                {
-                    return Err(self.err(format!(
-                        "'{w}' is not supported yet (see REFACTOR_BACKLOG item D)"
-                    )));
+                Token::Word(w) if w.eq_ignore_ascii_case("GRAPH") => {
+                    self.bump();
+                    flush!();
+                    let gterm = self.parse_graph_term()?;
+                    let inner = self.parse_group_graph_pattern()?;
+                    current = join_opt(current, GraphPattern::Graph(gterm, Box::new(inner)));
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("SERVICE") => {
+                    return Err(self.err(
+                        "SERVICE (federated query) is not supported — no network access",
+                    ));
                 }
                 Token::LBrace => {
                     flush!();
@@ -1248,11 +1253,37 @@ impl Parser {
         Ok(())
     }
 
-    /// Parse a `{ … }` block of ground triples (no variables allowed).
+    /// The graph reference of a `GRAPH` pattern: a variable or constant IRI.
+    fn parse_graph_term(&mut self) -> Result<GraphTerm> {
+        match self.peek() {
+            Token::Var(v) => {
+                let v = v.clone();
+                self.bump();
+                Ok(GraphTerm::Var(v))
+            }
+            Token::Iri(_) | Token::PName(_, _) => {
+                let tok = self.peek().clone();
+                match self.token_to_term(&tok)? {
+                    Term::Iri(s) => {
+                        self.bump();
+                        Ok(GraphTerm::Iri(s))
+                    }
+                    other => {
+                        Err(self.err(format!("GRAPH expects an IRI or variable, got {other:?}")))
+                    }
+                }
+            }
+            other => Err(self.err(format!(
+                "GRAPH expects an IRI or variable, found {other:?}"
+            ))),
+        }
+    }
+
+    /// Parse a `{ … }` block of ground quads (no variables): bare triples go to
+    /// the default graph; `GRAPH <iri> { … }` blocks tag their triples.
     fn parse_ground_block(&mut self) -> Result<Vec<GroundTriple>> {
-        let mut patterns = Vec::new();
-        let mut paths = Vec::new();
         self.expect(&Token::LBrace, "'{'")?;
+        let mut out = Vec::new();
         loop {
             match self.peek() {
                 Token::RBrace => {
@@ -1262,24 +1293,59 @@ impl Parser {
                 Token::Dot => {
                     self.bump();
                 }
+                Token::Word(w) if w.eq_ignore_ascii_case("GRAPH") => {
+                    self.bump();
+                    let g = match self.parse_graph_term()? {
+                        GraphTerm::Iri(s) => s,
+                        GraphTerm::Var(v) => {
+                            return Err(
+                                self.err(format!("variable ?{v} graph is not allowed in DATA"))
+                            )
+                        }
+                    };
+                    self.expect(&Token::LBrace, "'{'")?;
+                    loop {
+                        match self.peek() {
+                            Token::RBrace => {
+                                self.bump();
+                                break;
+                            }
+                            Token::Dot => {
+                                self.bump();
+                            }
+                            Token::Eof => return Err(self.err("unterminated GRAPH block")),
+                            _ => self.parse_ground_subject(&mut out, Some(g.as_str()))?,
+                        }
+                    }
+                }
                 Token::Eof => return Err(self.err("unexpected end of query in DATA block")),
-                _ => self.parse_triples_same_subject(&mut patterns, &mut paths)?,
+                _ => self.parse_ground_subject(&mut out, None)?,
             }
         }
+        Ok(out)
+    }
+
+    /// Parse one subject's triples into ground quads tagged with `graph`.
+    fn parse_ground_subject(
+        &mut self,
+        out: &mut Vec<GroundTriple>,
+        graph: Option<&str>,
+    ) -> Result<()> {
+        let mut patterns = Vec::new();
+        let mut paths = Vec::new();
+        self.parse_triples_same_subject(&mut patterns, &mut paths)?;
         if !paths.is_empty() {
             return Err(self.err("property paths are not allowed in a DATA block"));
         }
-        // Convert to ground triples, rejecting variables.
-        patterns
-            .into_iter()
-            .map(|p| {
-                Ok(GroundTriple {
-                    subject: self.require_ground(p.subject)?,
-                    predicate: self.require_ground(p.predicate)?,
-                    object: self.require_ground(p.object)?,
-                })
-            })
-            .collect()
+        for p in patterns {
+            out.push(GroundTriple {
+                subject: self.require_ground(p.subject)?,
+                predicate: self.require_ground(p.predicate)?,
+                object: self.require_ground(p.object)?,
+                graph: graph.map(str::to_owned),
+            });
+        }
+        Ok(())
     }
 
     fn require_ground(&self, pt: PatternTerm) -> Result<Term> {
@@ -1741,11 +1807,39 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_graph_errors_clearly() {
-        let e = parse("SELECT * WHERE { GRAPH ?g { ?s <p> ?o } }").unwrap_err();
+    fn graph_pattern_parses() {
+        let q = sel("SELECT * WHERE { GRAPH ?g { ?s <p> ?o } }");
+        match &q.pattern {
+            GraphPattern::Graph(GraphTerm::Var(g), inner) => {
+                assert_eq!(g, "g");
+                assert_eq!(triples(inner).len(), 1);
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+        let q2 = sel("SELECT * WHERE { GRAPH <http://ex/g> { ?s <p> ?o } }");
+        assert!(matches!(
+            &q2.pattern,
+            GraphPattern::Graph(GraphTerm::Iri(i), _) if i == "http://ex/g"
+        ));
+    }
+
+    #[test]
+    fn service_still_errors() {
+        let e = parse("SELECT * WHERE { SERVICE <http://x> { ?s <p> ?o } }").unwrap_err();
         match e {
-            GStoreError::SparqlParse(m) => assert!(m.contains("GRAPH")),
+            GStoreError::SparqlParse(m) => assert!(m.contains("SERVICE")),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_data_into_graph_parses() {
+        match one_op("INSERT DATA { GRAPH <http://ex/g> { <a> <p> <b> } }") {
+            UpdateOp::InsertData(ts) => {
+                assert_eq!(ts.len(), 1);
+                assert_eq!(ts[0].graph.as_deref(), Some("http://ex/g"));
+            }
+            other => panic!("expected InsertData, got {other:?}"),
         }
     }
 
