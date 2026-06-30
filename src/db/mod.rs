@@ -218,7 +218,7 @@ impl Database {
     pub fn query(&mut self, sparql: &str) -> Result<QueryResult> {
         let q = sparql::parse(sparql)?;
         match q {
-            Query::Select(_) | Query::Ask(_) | Query::Construct(_) => {
+            Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
                 // Use the VS-tree as a candidate filter only while it is
                 // consistent with the store; otherwise evaluate without it.
                 let eval = if self.index_valid {

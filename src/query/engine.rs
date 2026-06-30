@@ -209,6 +209,7 @@ impl<'a> Evaluator<'a> {
                 Ok(QueryResult::Ask(!solutions.is_empty()))
             }
             Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
+            Query::Describe(d) => Ok(QueryResult::Construct(self.eval_describe(d)?)),
             Query::InsertData(_) | Query::DeleteData(_) => Err(GStoreError::Query(
                 "updates must be applied through Database, not the read evaluator".into(),
             )),
@@ -239,6 +240,81 @@ impl<'a> Evaluator<'a> {
                     if seen.insert(t.to_string()) {
                         out.push(t);
                     }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Evaluate DESCRIBE: collect the resource ids (explicit terms + variable
+    /// targets bound by the WHERE pattern) and return every triple having one of
+    /// them as subject (the outgoing description), de-duplicated.
+    fn eval_describe(&self, d: &DescribeQuery) -> Result<Vec<Triple>> {
+        let mut ids: Vec<u32> = Vec::new();
+        let add = |id: u32, ids: &mut Vec<u32>| {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        };
+
+        // Explicit term targets resolve directly through the dictionary.
+        for t in &d.targets {
+            if let PatternTerm::Term(term) = t {
+                if let Some(id) = self.dict.term_id(term) {
+                    add(id, &mut ids);
+                }
+            }
+        }
+
+        // `DESCRIBE *` or variable targets need the WHERE solutions.
+        let needs_vars = d.all || d.targets.iter().any(|t| matches!(t, PatternTerm::Var(_)));
+        if needs_vars {
+            if let Some(pat) = &d.pattern {
+                let layout = VarLayout::build(pat);
+                let sols = self.eval_pattern(pat, &layout);
+                let want: Vec<usize> = if d.all {
+                    (0..layout.len()).collect()
+                } else {
+                    d.targets
+                        .iter()
+                        .filter_map(|t| match t {
+                            PatternTerm::Var(v) => layout.index.get(v).copied(),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                for s in &sols {
+                    for &i in &want {
+                        if let Some(id) = s[i] {
+                            add(id, &mut ids);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Gather outgoing triples for each resource.
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(subj) = self
+                .resolve_string(Some(id), false)
+                .and_then(|s| parse_term(&s).ok())
+            else {
+                continue;
+            };
+            for &(p, o) in self.store.po_by_s(id) {
+                let (Some(pred), Some(obj)) = (
+                    self.resolve_string(Some(p), true)
+                        .and_then(|s| parse_term(&s).ok()),
+                    self.resolve_string(Some(o), false)
+                        .and_then(|s| parse_term(&s).ok()),
+                ) else {
+                    continue;
+                };
+                let triple = Triple::new(subj.clone(), pred, obj);
+                if seen.insert(triple.to_string()) {
+                    out.push(triple);
                 }
             }
         }
@@ -511,6 +587,11 @@ impl<'a> Evaluator<'a> {
             )),
             // Builtins over aggregate context are not supported.
             Expr::Builtin(_, _) => None,
+            // EXISTS in HAVING: test against the group's representative solution.
+            Expr::Exists(neg, pat) => {
+                let rep = *sols.first()?;
+                Some(Value::Bool(self.eval_exists(*neg, pat, rep, layout)))
+            }
         }
     }
 
@@ -1282,9 +1363,37 @@ impl<'a> Evaluator<'a> {
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
+            Expr::Exists(neg, pat) => Some(Value::Bool(self.eval_exists(*neg, pat, b, l))),
             // Aggregates only have meaning in group context (handled elsewhere).
             Expr::Aggregate { .. } => None,
         }
+    }
+
+    /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
+    /// solution compatible with the current binding `b`. We evaluate `pat` under
+    /// a layout that keeps the outer variables at their existing indices and
+    /// appends any EXISTS-only variables, so a candidate solution's first
+    /// `outer.len()` slots line up with `b` for the compatibility test.
+    fn eval_exists(&self, negated: bool, pat: &GraphPattern, b: &Binding, outer: &VarLayout) -> bool {
+        let mut names = outer.names.clone();
+        let mut is_pred = outer.is_pred.clone();
+        let mut inner_vars = Vec::new();
+        pat.collect_vars(&mut inner_vars);
+        for v in inner_vars {
+            if !names.iter().any(|n| n == &v) {
+                names.push(v);
+                is_pred.push(false);
+            }
+        }
+        let combined = VarLayout::from_vars(names, is_pred);
+        let sols = self.eval_pattern(pat, &combined);
+        let found = sols.iter().any(|s| {
+            (0..outer.len()).all(|i| match (b[i], s[i]) {
+                (Some(x), Some(y)) => x == y,
+                _ => true,
+            })
+        });
+        found ^ negated
     }
 
     fn eval_compare(

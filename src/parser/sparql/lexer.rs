@@ -61,6 +61,9 @@ pub enum Token {
     Caret,
     /// `|` — property-path alternative (distinct from `||`).
     Pipe,
+    /// `?` not followed by a name — the zero-or-one property-path modifier
+    /// (a `?` followed by a name is a [`Token::Var`]).
+    Question,
     Eof,
 }
 
@@ -156,7 +159,7 @@ impl Lexer {
                     }
                 }
                 '<' => self.lex_lt_or_iri()?,
-                '?' | '$' => self.lex_var()?,
+                '?' | '$' => self.lex_var(c)?,
                 '"' | '\'' => self.lex_string()?,
                 '_' => self.lex_blank()?,
                 '.' => {
@@ -245,7 +248,7 @@ impl Lexer {
         }
     }
 
-    fn lex_var(&mut self) -> Result<Token> {
+    fn lex_var(&mut self, sigil: char) -> Result<Token> {
         self.bump(); // '?' or '$'
         let mut name = String::new();
         while let Some(c) = self.peek() {
@@ -257,6 +260,10 @@ impl Lexer {
             }
         }
         if name.is_empty() {
+            // A bare `?` is the zero-or-one path modifier; a bare `$` is invalid.
+            if sigil == '?' {
+                return Ok(Token::Question);
+            }
             return Err(self.err("empty variable name"));
         }
         Ok(Token::Var(name))

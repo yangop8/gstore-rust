@@ -24,10 +24,22 @@ pub enum Query {
     Select(SelectQuery),
     Ask(AskQuery),
     Construct(ConstructQuery),
+    Describe(DescribeQuery),
     /// `INSERT DATA { … }` — ground triples to add.
     InsertData(Vec<GroundTriple>),
     /// `DELETE DATA { … }` — ground triples to remove.
     DeleteData(Vec<GroundTriple>),
+}
+
+/// `DESCRIBE (* | (?var | <iri>)+ ) [WHERE { … }]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribeQuery {
+    /// Explicit targets: variables (resolved via the WHERE pattern) or terms.
+    pub targets: Vec<PatternTerm>,
+    /// `DESCRIBE *` — describe every variable bound by the WHERE pattern.
+    pub all: bool,
+    /// Optional WHERE pattern binding variable targets.
+    pub pattern: Option<GraphPattern>,
 }
 
 /// `SELECT [DISTINCT] (…|*) WHERE { … } [GROUP BY …] [HAVING …]
@@ -295,6 +307,9 @@ pub enum Expr {
     Arith(ArithOp, Box<Expr>, Box<Expr>),
     /// A builtin function call, e.g. `ABS`, `STR`, `REGEX`, `BOUND`.
     Builtin(String, Vec<Expr>),
+    /// `EXISTS { … }` / `NOT EXISTS { … }` — true iff the pattern has a solution
+    /// compatible with the current binding. The `bool` is `true` for NOT EXISTS.
+    Exists(bool, Box<GraphPattern>),
     /// An aggregate over a group, e.g. `COUNT(DISTINCT ?x)`, `SUM(?v)`.
     Aggregate {
         func: AggFunc,

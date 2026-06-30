@@ -253,3 +253,69 @@ fn construct_builds_graph() {
         other => panic!("expected Construct, got {other:?}"),
     }
 }
+
+#[test]
+fn exists_keeps_only_knowers() {
+    let mut db = db();
+    // Only people who know someone (alice knows bob).
+    let got = col0(
+        &mut db,
+        "SELECT ?p WHERE { ?p <http://ex/salary> ?s FILTER EXISTS { ?p <http://ex/knows> ?k } }",
+    );
+    assert_eq!(got, vec!["<http://ex/alice>"]);
+}
+
+#[test]
+fn not_exists_removes_knowers() {
+    let mut db = db();
+    let got = col0(
+        &mut db,
+        "SELECT ?p WHERE { ?p <http://ex/salary> ?s FILTER NOT EXISTS { ?p <http://ex/knows> ?k } }",
+    );
+    assert_eq!(got, vec!["<http://ex/bob>", "<http://ex/carol>"]);
+}
+
+#[test]
+fn path_zero_or_one_is_reflexive_plus_one_hop() {
+    let mut db = db();
+    // alice knows? ?o → alice herself (zero hops) and bob (one hop).
+    let got = col0(
+        &mut db,
+        "SELECT ?o WHERE { <http://ex/alice> <http://ex/knows>? ?o }",
+    );
+    assert_eq!(got, vec!["<http://ex/alice>", "<http://ex/bob>"]);
+}
+
+#[test]
+fn describe_returns_outgoing_triples() {
+    let mut db = db();
+    match db.query("DESCRIBE <http://ex/alice>").unwrap() {
+        QueryResult::Construct(triples) => {
+            // alice: dept d1, salary 2500, name "Alice", knows bob.
+            assert_eq!(triples.len(), 4);
+            assert!(triples.iter().all(|t| {
+                matches!(&t.subject, gstore::Term::Iri(i) if i == "http://ex/alice")
+            }));
+            assert!(triples
+                .iter()
+                .any(|t| matches!(&t.predicate, gstore::Term::Iri(i) if i == "http://ex/knows")));
+        }
+        other => panic!("expected Construct, got {other:?}"),
+    }
+}
+
+#[test]
+fn describe_star_over_where() {
+    let mut db = db();
+    // Describe every ?p in dept d1 (alice, bob): their outgoing triples.
+    match db
+        .query("DESCRIBE * WHERE { ?p <http://ex/dept> <http://ex/d1> }")
+        .unwrap()
+    {
+        QueryResult::Construct(triples) => {
+            // alice (4) + bob (3: dept, salary, name) = 7.
+            assert_eq!(triples.len(), 7);
+        }
+        other => panic!("expected Construct, got {other:?}"),
+    }
+}

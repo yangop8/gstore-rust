@@ -111,6 +111,7 @@ impl Parser {
             "SELECT" => Query::Select(self.parse_select()?),
             "ASK" => Query::Ask(self.parse_ask()?),
             "CONSTRUCT" => Query::Construct(self.parse_construct()?),
+            "DESCRIBE" => Query::Describe(self.parse_describe()?),
             "INSERT" => self.parse_insert_data()?,
             "DELETE" => self.parse_delete_data()?,
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
@@ -254,6 +255,48 @@ impl Parser {
             Token::Var(v) => Ok(v),
             other => Err(self.err(format!("expected a ?variable, found {other:?}"))),
         }
+    }
+
+    fn parse_describe(&mut self) -> Result<DescribeQuery> {
+        self.expect_keyword("DESCRIBE")?;
+        let mut targets = Vec::new();
+        let mut all = false;
+        if matches!(self.peek(), Token::Star) {
+            self.bump();
+            all = true;
+        } else {
+            loop {
+                match self.peek() {
+                    Token::Var(v) => {
+                        targets.push(PatternTerm::Var(v.clone()));
+                        self.bump();
+                    }
+                    Token::Iri(_) | Token::PName(_, _) => {
+                        let tok = self.peek().clone();
+                        let term = self.token_to_term(&tok)?;
+                        self.bump();
+                        targets.push(PatternTerm::Term(term));
+                    }
+                    _ => break,
+                }
+            }
+            if targets.is_empty() {
+                return Err(self.err("DESCRIBE expects '*' or one or more ?var / <iri> targets"));
+            }
+        }
+        self.skip_dataset_clauses()?;
+        let pattern = if self.eat_keyword("WHERE") || matches!(self.peek(), Token::LBrace) {
+            Some(self.parse_group_graph_pattern()?)
+        } else {
+            None
+        };
+        // DESCRIBE ignores solution modifiers for our purposes; consume any.
+        self.parse_solution_modifiers()?;
+        Ok(DescribeQuery {
+            targets,
+            all,
+            pattern,
+        })
     }
 
     fn parse_ask(&mut self) -> Result<AskQuery> {
@@ -616,8 +659,8 @@ impl Parser {
 
     fn parse_path_elt(&mut self) -> Result<PathExpr> {
         let mut p = self.parse_path_primary()?;
-        // postfix `*` / `+` modifiers (zero-or-one `?` is not supported: see
-        // REFACTOR_BACKLOG item D — the lexer treats `?` as a variable sigil).
+        // postfix `*` / `+` / `?` modifiers (the lexer emits `?` with no name as
+        // [`Token::Question`], so it no longer collides with the variable sigil).
         loop {
             match self.peek() {
                 Token::Star => {
@@ -627,6 +670,10 @@ impl Parser {
                 Token::Plus => {
                     self.bump();
                     p = PathExpr::OneOrMore(Box::new(p));
+                }
+                Token::Question => {
+                    self.bump();
+                    p = PathExpr::ZeroOrOne(Box::new(p));
                 }
                 _ => break,
             }
@@ -845,6 +892,15 @@ impl Parser {
                 } else if upper == "FALSE" {
                     self.bump();
                     Ok(Expr::Const(Term::typed_literal("false", xsd::BOOLEAN)))
+                } else if upper == "EXISTS" {
+                    self.bump();
+                    let pat = self.parse_group_graph_pattern()?;
+                    Ok(Expr::Exists(false, Box::new(pat)))
+                } else if upper == "NOT" {
+                    self.bump();
+                    self.expect_keyword("EXISTS")?;
+                    let pat = self.parse_group_graph_pattern()?;
+                    Ok(Expr::Exists(true, Box::new(pat)))
                 } else if let Some(func) = agg_func(&upper) {
                     self.bump();
                     self.parse_aggregate(func)
@@ -1451,6 +1507,61 @@ mod tests {
         match e {
             GStoreError::SparqlParse(m) => assert!(m.contains("GRAPH")),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_zero_or_one_parses() {
+        let q = sel("SELECT * WHERE { ?s <http://p>? ?o }");
+        match &q.pattern {
+            GraphPattern::Path(p) => assert!(matches!(p.path, PathExpr::ZeroOrOne(_))),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_zero_or_one_after_group() {
+        let q = sel("SELECT * WHERE { ?s (<http://p>/<http://q>)? ?o }");
+        match &q.pattern {
+            GraphPattern::Path(p) => assert!(matches!(p.path, PathExpr::ZeroOrOne(_))),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exists_filter_parses() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o FILTER EXISTS { ?s <q> ?z } }");
+        match &q.pattern {
+            GraphPattern::Filter(fs, _) => assert!(matches!(fs[0], Expr::Exists(false, _))),
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_exists_filter_parses() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o FILTER NOT EXISTS { ?s <q> ?z } }");
+        match &q.pattern {
+            GraphPattern::Filter(fs, _) => assert!(matches!(fs[0], Expr::Exists(true, _))),
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_targets_and_star() {
+        match parse("DESCRIBE <http://a> <http://b>").unwrap() {
+            Query::Describe(d) => {
+                assert_eq!(d.targets.len(), 2);
+                assert!(!d.all);
+                assert!(d.pattern.is_none());
+            }
+            other => panic!("expected Describe, got {other:?}"),
+        }
+        match parse("DESCRIBE * WHERE { ?s <p> ?o }").unwrap() {
+            Query::Describe(d) => {
+                assert!(d.all);
+                assert!(d.pattern.is_some());
+            }
+            other => panic!("expected Describe, got {other:?}"),
         }
     }
 }
