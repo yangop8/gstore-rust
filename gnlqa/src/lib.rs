@@ -16,7 +16,9 @@
 pub mod config;
 pub mod error;
 pub mod llm;
+pub mod secret;
 
 pub use config::Config;
 pub use error::{Error, Result};
 pub use llm::{LlmClient, LlmRequest, Message, Role};
+pub use secret::Secret;

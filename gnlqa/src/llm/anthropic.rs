@@ -6,31 +6,38 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 
 use super::{LlmClient, LlmRequest};
 
 /// Client for the Anthropic Messages API (`POST {base}/v1/messages`).
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
-    api_key: String,
+    api_key: Secret,
     base_url: String,
     default_model: String,
     timeout: Duration,
 }
 
 impl AnthropicClient {
-    /// Construct directly.
+    /// Construct directly (default 60s timeout; see [`with_timeout`](Self::with_timeout)).
     pub fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         default_model: impl Into<String>,
     ) -> AnthropicClient {
         AnthropicClient {
-            api_key: api_key.into(),
+            api_key: Secret::new(api_key),
             base_url: base_url.into(),
             default_model: default_model.into(),
             timeout: Duration::from_secs(60),
         }
+    }
+
+    /// Override the per-request network timeout (builder-style).
+    pub fn with_timeout(mut self, timeout: Duration) -> AnthropicClient {
+        self.timeout = timeout;
+        self
     }
 
     /// Build from [`Config`]; errors if no API key is set.
@@ -90,12 +97,20 @@ impl LlmClient for AnthropicClient {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = self.request_body(req);
         let resp = ureq::post(&url)
-            .set("x-api-key", &self.api_key)
+            .set("x-api-key", self.api_key.expose())
             .set("anthropic-version", "2023-06-01")
             .set("content-type", "application/json")
             .timeout(self.timeout)
             .send_json(body)
-            .map_err(|e| Error::Http(e.to_string()))?;
+            // On a non-2xx, ureq returns Status(code, response); the Anthropic
+            // JSON error body holds the real reason, so surface it.
+            .map_err(|e| match e {
+                ureq::Error::Status(code, resp) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    Error::Http(format!("HTTP {code}: {body}"))
+                }
+                other => Error::Http(other.to_string()),
+            })?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         AnthropicClient::extract_text(&v)
     }
