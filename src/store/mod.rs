@@ -71,6 +71,43 @@ pub trait TripleSource {
     fn iter_all(&self) -> Vec<IdTriple>;
 }
 
+/// The triple-*mutation* interface — the write counterpart of [`TripleSource`].
+/// Implemented by writable backends (the in-memory [`TripleStore`] today; a
+/// future RocksDB / MySQL backend) so the [`Database`](crate::Database) facade
+/// can insert and delete triples without depending on a concrete storage
+/// representation. Kept object-safe (concrete argument/return types only) so a
+/// backend can also be held behind `dyn`.
+pub trait MutableStore {
+    /// Insert one id-triple; returns `true` if it was newly added.
+    fn insert(&mut self, t: IdTriple) -> bool;
+    /// Remove one id-triple; returns `true` if it existed.
+    fn remove(&mut self, t: IdTriple) -> bool;
+    /// Bulk-load many id-triples (de-duplicated), rebuilding indexes once.
+    fn bulk_load(&mut self, triples: Vec<IdTriple>);
+}
+
+/// A complete, writable storage backend: queryable ([`TripleSource`]) and
+/// mutable ([`MutableStore`]). The query engine, the cost optimizer, the
+/// VS-tree, and the graph-analytics layer all operate purely through these two
+/// traits, so the byte-level storage — in-memory maps today, an on-disk B+ tree,
+/// or a future RocksDB / MySQL backend — is pluggable without touching anything
+/// above this seam. (This is gStore's real core value: the index + optimizer +
+/// algorithms, decoupled from where triples physically live.)
+pub trait StorageBackend: TripleSource + MutableStore {}
+impl<T: TripleSource + MutableStore> StorageBackend for T {}
+
+impl MutableStore for TripleStore {
+    fn insert(&mut self, t: IdTriple) -> bool {
+        TripleStore::insert(self, t)
+    }
+    fn remove(&mut self, t: IdTriple) -> bool {
+        TripleStore::remove(self, t)
+    }
+    fn bulk_load(&mut self, triples: Vec<IdTriple>) {
+        TripleStore::bulk_load(self, triples)
+    }
+}
+
 impl TripleSource for TripleStore {
     fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
         TripleStore::exists(self, sub, pred, obj)
@@ -447,6 +484,25 @@ mod tests {
     fn bulk_load_counts_distinct_triples() {
         let s = sample();
         assert_eq!(s.triple_count(), 7);
+    }
+
+    /// One generic function drives a backend's *write* face ([`MutableStore`])
+    /// and *read* face ([`TripleSource`]) without naming a concrete type — the
+    /// pluggability proof. The same `exercise` body would accept a future
+    /// RocksDB / MySQL `StorageBackend` unchanged.
+    #[test]
+    fn storage_backend_seam_is_generic() {
+        fn exercise<B: StorageBackend>(b: &mut B) {
+            b.bulk_load(vec![IdTriple::new(1, 2, 3), IdTriple::new(1, 2, 4)]);
+            assert!(b.insert(IdTriple::new(1, 2, 5))); // write via MutableStore
+            assert!(!b.insert(IdTriple::new(1, 2, 5))); // duplicate
+            assert!(b.exists(1, 2, 5)); // read via TripleSource
+            assert_eq!(b.o_by_sp(1, 2).len(), 3);
+            assert!(b.remove(IdTriple::new(1, 2, 5)));
+            assert_eq!(b.triple_count(), 2);
+        }
+        let mut s = TripleStore::new();
+        exercise(&mut s);
     }
 
     #[test]

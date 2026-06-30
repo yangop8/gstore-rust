@@ -54,3 +54,7 @@ pub use db::Database;
 pub use error::{GStoreError, Result};
 pub use model::{IdTriple, ObjectType, Term, Triple};
 pub use query::{QueryResult, ResultSet};
+/// The pluggable-storage seam: read ([`TripleSource`]), write ([`MutableStore`]),
+/// and the combined writable [`StorageBackend`]. The query/optimizer/VS-tree/
+/// analytics layers run purely over these, so backends are swappable.
+pub use store::{MutableStore, StorageBackend, TripleSource};
