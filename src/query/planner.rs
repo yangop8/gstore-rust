@@ -121,7 +121,14 @@ pub(crate) fn plan(
         join_vars.clone()
     };
 
-    let var_order = if nodes.len() <= SMALL_QUERY_VAR_NUM {
+    // With no so-vars to order (e.g. a BGP whose patterns are all
+    // `<const> ?p <const>` — only predicates are variables), leave the order
+    // empty; `bridge_to_pattern_order` then emits every pattern via its trailing
+    // "remaining patterns" pass. The ordering routines require a non-empty slice
+    // (they take a max/min first node and would panic on an empty one).
+    let var_order = if nodes.is_empty() {
+        Vec::new()
+    } else if nodes.len() <= SMALL_QUERY_VAR_NUM {
         heuristic_order(&graph, &nodes, store, candidates, &var_num)
     } else {
         sampling_order(&graph, &nodes, store, candidates, &var_num)

@@ -663,8 +663,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         sols: &[&Binding],
         layout: &VarLayout,
     ) -> Option<Value> {
-        // COUNT(*) counts solutions.
+        // COUNT(*) counts solutions; COUNT(DISTINCT *) counts the distinct
+        // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup whole bindings
+        // before counting when the DISTINCT modifier is present.
         if func == AggFunc::Count && arg.is_none() {
+            if distinct {
+                let mut seen: HashSet<&Binding> = HashSet::new();
+                let n = sols.iter().filter(|&&b| seen.insert(b)).count();
+                return Some(Value::Int(n as i64));
+            }
             return Some(Value::Int(sols.len() as i64));
         }
         let arg = arg?;
@@ -1125,7 +1132,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Evaluate a sub-SELECT and lift its result rows into the outer layout.
     fn eval_subselect(&self, sq: &SelectQuery, layout: &VarLayout) -> Vec<Binding> {
-        let (vars, _is_pred, rows) = match self.eval_select_solutions(sq) {
+        let (vars, is_pred, rows) = match self.eval_select_solutions(sq) {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
@@ -1136,7 +1143,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut b = vec![None; layout.len()];
                 for (col, id) in r.into_iter().enumerate() {
                     if let Some(idx) = slots[col] {
-                        b[idx] = id;
+                        // A predicate-typed inner column carries a *predicate*-
+                        // dictionary id, but the outer layout may not know this
+                        // slot is predicate-typed (`collect_triples` does not
+                        // recurse into sub-SELECTs), so resolving it later via the
+                        // entity/literal dictionary would be wrong. Re-mint such a
+                        // value as a synthetic term, which resolves correctly
+                        // regardless of the outer `is_pred` flag and stays
+                        // join-consistent (the interner is idempotent per term).
+                        b[idx] = match id {
+                            Some(pid) if is_pred[col] && !is_synth(pid) => self
+                                .id_to_term(pid, true)
+                                .map(|t| self.extras.borrow_mut().intern(&t)),
+                            other => other,
+                        };
                     }
                 }
                 b
