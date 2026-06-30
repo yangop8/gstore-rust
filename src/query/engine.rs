@@ -240,7 +240,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// it to `with_functions`.
     pub fn with_function<F>(mut self, name: &str, f: F) -> Evaluator<'a, S>
     where
-        F: Fn(&[Value]) -> Option<Value> + 'static,
+        F: Fn(&[Value]) -> Option<Value> + Send + Sync + 'static,
     {
         self.register_function(name, f);
         self
@@ -251,7 +251,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// SPARQL parser). See [`FunctionRegistry`] for the calling convention.
     pub fn register_function<F>(&mut self, name: &str, f: F) -> &mut Self
     where
-        F: Fn(&[Value]) -> Option<Value> + 'static,
+        F: Fn(&[Value]) -> Option<Value> + Send + Sync + 'static,
     {
         Rc::make_mut(&mut self.functions).register(name, f);
         self

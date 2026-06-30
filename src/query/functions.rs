@@ -31,13 +31,15 @@
 //! exactly like a built-in that returns `None`.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::value::Value;
 
 /// A registered scalar function: maps already-evaluated argument values to a
-/// result value, or `None` on error.
-pub type CustomFn = Rc<dyn Fn(&[Value]) -> Option<Value>>;
+/// result value, or `None` on error. `Send + Sync` so a [`FunctionRegistry`]
+/// (and the [`Database`](crate::Database) holding one) stays thread-safe — the
+/// HTTP server and the concurrent database share it across threads.
+pub type CustomFn = Arc<dyn Fn(&[Value]) -> Option<Value> + Send + Sync>;
 
 /// A registry of user-defined scalar functions, keyed by upper-cased name.
 ///
@@ -45,6 +47,14 @@ pub type CustomFn = Rc<dyn Fn(&[Value]) -> Option<Value>>;
 #[derive(Clone, Default)]
 pub struct FunctionRegistry {
     funcs: HashMap<String, CustomFn>,
+}
+
+impl std::fmt::Debug for FunctionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionRegistry")
+            .field("count", &self.funcs.len())
+            .finish()
+    }
 }
 
 impl FunctionRegistry {
@@ -58,9 +68,9 @@ impl FunctionRegistry {
     /// lookups are case-insensitive.
     pub fn register<F>(&mut self, name: &str, f: F)
     where
-        F: Fn(&[Value]) -> Option<Value> + 'static,
+        F: Fn(&[Value]) -> Option<Value> + Send + Sync + 'static,
     {
-        self.funcs.insert(name.to_ascii_uppercase(), Rc::new(f));
+        self.funcs.insert(name.to_ascii_uppercase(), Arc::new(f));
     }
 
     /// Register a function from an already-shared closure handle.

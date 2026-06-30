@@ -25,7 +25,7 @@ use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
 use crate::parser::{sparql, turtle};
-use crate::query::{Evaluator, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
@@ -208,6 +208,10 @@ pub struct Database {
     redo_pending: Vec<RedoRec>,
     /// User-defined forward-chaining reasoning rules (gStore's `ReasonHelper`).
     rules: crate::reason::RuleSet,
+    /// User-defined scalar SPARQL functions (gStore's PFN, as a safe in-process
+    /// registry rather than dlopen `.so` plugins). Passed to every read-query
+    /// evaluator; consulted for any function name that is not a built-in.
+    functions: FunctionRegistry,
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -274,6 +278,7 @@ impl Database {
             redo_log: None,
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
+            functions: FunctionRegistry::new(),
         }
     }
 
@@ -281,6 +286,25 @@ impl Database {
     pub fn rebuild_index(&mut self) {
         self.vstree = build_vstree(&self.store);
         self.index_valid = true;
+    }
+
+    /// Register a user-defined scalar SPARQL function (gStore's PFN, as a safe
+    /// in-process closure rather than a dlopen `.so` plugin). The name is
+    /// case-insensitive; built-ins take precedence. The function becomes visible
+    /// to every subsequent read query run through [`query`](Self::query) /
+    /// [`select`](Self::select). Clears the query cache (results may change).
+    pub fn register_function<F>(&mut self, name: &str, f: F) -> &mut Self
+    where
+        F: Fn(&[crate::query::Value]) -> Option<crate::query::Value> + Send + Sync + 'static,
+    {
+        self.functions.register(name, f);
+        self.query_cache.get_mut().clear();
+        self
+    }
+
+    /// Number of user-defined functions registered.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
     }
 
     /// Build a database by importing one or more N-Triples files.
@@ -384,6 +408,7 @@ impl Database {
             redo_log: None,
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
+            functions: FunctionRegistry::new(),
         })
     }
 
@@ -432,6 +457,7 @@ impl Database {
             redo_log: None,
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
+            functions: FunctionRegistry::new(),
         })
     }
 
@@ -762,6 +788,10 @@ impl Database {
                 if !self.named.is_empty() {
                     eval = eval.with_named(&self.named);
                 }
+                // Make user-defined functions (PFN) visible to this query.
+                if !self.functions.is_empty() {
+                    eval = eval.with_functions(self.functions.clone());
+                }
                 let result = eval.evaluate(&q)?;
                 self.query_cache
                     .borrow_mut()
@@ -1008,6 +1038,7 @@ impl Database {
             redo_log: None,
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
+            functions: FunctionRegistry::new(),
         };
         db.rebuild_index();
         Ok(db)
@@ -1072,6 +1103,7 @@ impl Database {
             redo_log: None,
             redo_pending: Vec::new(),
             rules: crate::reason::RuleSet::new(),
+            functions: FunctionRegistry::new(),
         })
     }
 
@@ -1668,6 +1700,25 @@ mod tests {
         let mut db = Database::build_from_str("t", SMALL).unwrap();
         let rs = db.select("SELECT ?n WHERE { <root> <name> ?n }").unwrap();
         assert_eq!(rs.rows[0][0], Some("\"Bookug Lobert\"".into()));
+    }
+
+    #[test]
+    fn register_function_visible_to_query() {
+        // PFN parity at the Database facade: a registered custom function is
+        // visible to queries run through Database::select.
+        let mut db = Database::build_from_str(
+            "pfn",
+            "<http://ex/alice> <http://ex/salary> \"2500\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        )
+        .unwrap();
+        db.register_function("myDouble", |args| {
+            Some(crate::query::Value::Double(args.first()?.as_f64()? * 2.0))
+        });
+        assert_eq!(db.function_count(), 1);
+        let rs = db
+            .select("SELECT (myDouble(?s) AS ?d) WHERE { ?x <http://ex/salary> ?s }")
+            .unwrap();
+        assert!(rs.rows[0][0].as_ref().unwrap().contains("5000"));
     }
 
     #[test]
