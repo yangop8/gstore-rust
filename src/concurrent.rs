@@ -55,6 +55,23 @@
 //! base plus all committed [`Txn`]s but not legacy writes, so prefer the
 //! transactional path when reading through [`VersionView`].
 //!
+//! Isolation levels: [`begin_with`](ConcurrentDb::begin_with) selects an
+//! [`IsolationLevel`] (gStore's `Txn_manager` `IsolationLevelType`) —
+//! `Snapshot` (the default, write-write checks), `Serializable` (write-write +
+//! read-set / read-write checks, preventing write skew), or `ReadCommitted`
+//! (latest-committed reads, no commit-time conflict abort).
+//!
+//! Reader/writer concurrency (backlog item 7): readers already run fully
+//! concurrently with writers — a reader takes the latest [`Snapshot`] via the
+//! `current` `RwLock` (a brief read-lock, released before evaluation) or pins a
+//! [`VersionView`], and never contends on the writer `Mutex`. The writer path
+//! stays a `Mutex` because committing is intrinsically exclusive (validate →
+//! apply → publish must be atomic); a `RwLock` there would add no reader
+//! concurrency (readers don't use it) and could not admit two concurrent
+//! writers without breaking first-committer-wins. So no change is made to the
+//! writer lock; finer-grained per-key write latching is left to a future MVCC
+//! pass.
+//!
 //! NOT done (see `docs/REFACTOR_BACKLOG.md` E): lock-free reads beyond the
 //! `Arc`-swap / `RwLock`, deadlock detection, and version-chaining the legacy
 //! `update()`/`write()` path.
@@ -73,6 +90,41 @@ use crate::store::TripleStore;
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
 /// form (which round-trips losslessly), used for write-write conflict detection.
 type TripleKey = String;
+
+/// Transaction isolation level, selectable at [`ConcurrentDb::begin_with`]
+/// (gStore's `Txn_manager` `IsolationLevelType`). The levels differ in their
+/// commit-time validation and read visibility:
+///
+/// | level | reads | commit aborts on |
+/// |-------|-------|------------------|
+/// | [`ReadCommitted`](Self::ReadCommitted) | latest committed (re-read each time) | nothing (last-writer-wins) |
+/// | [`Snapshot`](Self::Snapshot) | the snapshot captured at `begin` | a concurrent commit that **wrote** a key this txn also wrote (write-write) |
+/// | [`Serializable`](Self::Serializable) | the snapshot captured at `begin` | write-write **or** a concurrent commit that wrote a key this txn **read** (read-write) |
+///
+/// So `Serializable` is strictly stronger than `Snapshot` (it additionally
+/// prevents write-skew via read-set validation), and `ReadCommitted` is the
+/// weakest (no snapshot stability, no write-write abort).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// Reads observe the latest committed state; commit never aborts on conflict.
+    ReadCommitted,
+    /// Snapshot isolation: stable snapshot reads + write-write conflict checks.
+    #[default]
+    Snapshot,
+    /// Serializable: snapshot reads + write-write **and** read-write checks.
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Whether commit performs write-write conflict validation.
+    fn checks_write_write(self) -> bool {
+        matches!(self, IsolationLevel::Snapshot | IsolationLevel::Serializable)
+    }
+    /// Whether commit performs read-write conflict validation (anti-write-skew).
+    fn checks_read_write(self) -> bool {
+        matches!(self, IsolationLevel::Serializable)
+    }
+}
 
 /// An immutable, consistent view of the data at one committed version.
 pub struct Snapshot {
@@ -394,10 +446,18 @@ impl ConcurrentDb {
 
     // ---- optimistic multi-writer transactions -----------------------------
 
-    /// Begin an optimistic transaction. Captures the current snapshot (version
-    /// `V`) and buffers writes locally; nothing shared is mutated until
-    /// [`Txn::commit`]. Many transactions can run concurrently.
+    /// Begin an optimistic transaction at the default [`IsolationLevel::Snapshot`].
+    /// Captures the current snapshot (version `V`) and buffers writes locally;
+    /// nothing shared is mutated until [`Txn::commit`]. Many transactions can run
+    /// concurrently.
     pub fn begin(&self) -> Txn<'_> {
+        self.begin_with(IsolationLevel::Snapshot)
+    }
+
+    /// Begin an optimistic transaction at a chosen [`IsolationLevel`] (gStore's
+    /// `Txn_manager::Begin(IsolationLevelType)`). The level governs read
+    /// visibility and the commit-time conflict checks — see [`IsolationLevel`].
+    pub fn begin_with(&self, level: IsolationLevel) -> Txn<'_> {
         // Register liveness and capture the snapshot atomically under the OCC
         // lock, so a concurrent commit cannot GC a history entry we will need.
         let mut occ = self.occ.lock().unwrap();
@@ -411,6 +471,8 @@ impl ConcurrentDb {
             start_version,
             ops: Vec::new(),
             keys: HashSet::new(),
+            reads: HashSet::new(),
+            level,
             registered: true,
         }
     }
@@ -510,6 +572,11 @@ pub struct Txn<'a> {
     start_version: u64,
     ops: Vec<TxnOp>,
     keys: HashSet<TripleKey>,
+    /// Triple keys this transaction has *read* (via [`Txn::read`]). Used only by
+    /// [`IsolationLevel::Serializable`] for read-write conflict validation.
+    reads: HashSet<TripleKey>,
+    /// This transaction's isolation level.
+    level: IsolationLevel,
     /// Whether this txn is still counted in `OccState::live_starts`.
     registered: bool,
 }
@@ -525,6 +592,11 @@ impl Txn<'_> {
         &self.snapshot
     }
 
+    /// This transaction's isolation level.
+    pub fn isolation(&self) -> IsolationLevel {
+        self.level
+    }
+
     /// Buffer an insert of `t` into the default graph.
     pub fn insert(&mut self, t: Triple) {
         self.keys.insert(t.to_string());
@@ -537,18 +609,30 @@ impl Txn<'_> {
         self.ops.push(TxnOp::Delete(t));
     }
 
-    /// Read query against the captured snapshot `V` (snapshot isolation). Does
-    /// not reflect this txn's buffered writes — use [`contains`](Txn::contains)
-    /// for read-your-writes point reads.
+    /// Read query. Under [`Snapshot`](IsolationLevel::Snapshot)/
+    /// [`Serializable`](IsolationLevel::Serializable) it runs against the captured
+    /// snapshot `V` (snapshot isolation); under
+    /// [`ReadCommitted`](IsolationLevel::ReadCommitted) it runs against the latest
+    /// committed snapshot (so it observes concurrent commits). It does not reflect
+    /// this txn's own buffered writes — use [`contains`](Txn::contains) for
+    /// read-your-writes point reads.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
-        self.snapshot.query(sparql)
+        match self.level {
+            IsolationLevel::ReadCommitted => self.db.snapshot().query(sparql),
+            _ => self.snapshot.query(sparql),
+        }
     }
 
-    /// Whether `t` is visible to this transaction: the snapshot's state with the
-    /// txn's own buffered writes applied in order (read-your-writes).
+    /// Whether `t` is visible to this transaction: the base state (snapshot `V`
+    /// for snapshot/serializable, or the latest committed snapshot for read
+    /// committed) with the txn's own buffered writes applied in order
+    /// (read-your-writes).
     pub fn contains(&self, t: &Triple) -> bool {
         let key = t.to_string();
-        let mut present = self.snapshot.contains(t);
+        let mut present = match self.level {
+            IsolationLevel::ReadCommitted => self.db.snapshot().contains(t),
+            _ => self.snapshot.contains(t),
+        };
         for op in &self.ops {
             match op {
                 TxnOp::Insert(x) if x.to_string() == key => present = true,
@@ -557,6 +641,16 @@ impl Txn<'_> {
             }
         }
         present
+    }
+
+    /// A *tracked* point read: like [`contains`](Txn::contains) but also records
+    /// `t`'s key in this transaction's read set, so a
+    /// [`Serializable`](IsolationLevel::Serializable) commit will abort if a
+    /// concurrent commit later wrote that key (read-write conflict / anti-write-
+    /// skew). For other levels the read set is ignored.
+    pub fn read(&mut self, t: &Triple) -> bool {
+        self.reads.insert(t.to_string());
+        self.contains(t)
     }
 
     /// Validate and commit. Serializes through the writer lock, so committers run
@@ -568,28 +662,44 @@ impl Txn<'_> {
         let mut db = self.db.writer.lock().unwrap();
         let mut occ = self.db.occ.lock().unwrap();
 
+        // Conflict checks depend on the isolation level (see `IsolationLevel`).
+        let ww = self.level.checks_write_write();
+        let rw = self.level.checks_read_write();
         // A legacy (non-transactional) write during our lifetime is not key-
-        // tracked, so conservatively conflict to avoid a silent lost update.
-        let legacy_during = occ.last_legacy_version > self.start_version;
-        // Otherwise validate against every transactional commit newer than V.
-        let txn_conflict = !legacy_during
+        // tracked, so snapshot/serializable conservatively conflict to avoid a
+        // silent lost update; read-committed tolerates it.
+        let legacy_during = ww && occ.last_legacy_version > self.start_version;
+        // Write-write: a newer commit wrote a key this txn also wrote.
+        let ww_conflict = ww
+            && !legacy_during
             && occ
                 .history
                 .range((self.start_version + 1)..)
                 .any(|(_v, keys)| !self.keys.is_disjoint(keys));
-        if legacy_during || txn_conflict {
+        // Read-write (serializable only): a newer commit wrote a key this txn
+        // read — would break serializability (write skew).
+        let rw_conflict = rw
+            && !legacy_during
+            && !ww_conflict
+            && occ
+                .history
+                .range((self.start_version + 1)..)
+                .any(|(_v, keys)| !self.reads.is_disjoint(keys));
+        if legacy_during || ww_conflict || rw_conflict {
             occ.deregister(self.start_version);
             occ.gc();
             self.db.gc_versions(occ.gc_floor());
             self.registered = false;
+            let kind = if legacy_during {
+                "non-transactional write"
+            } else if rw_conflict {
+                "committed transaction wrote a key this transaction read"
+            } else {
+                "committed transaction"
+            };
             return Err(GStoreError::Conflict(format!(
-                "conflict: a {} after version {} may overlap this transaction's writes",
-                if legacy_during {
-                    "non-transactional write"
-                } else {
-                    "committed transaction"
-                },
-                self.start_version
+                "conflict: a {} after version {} may overlap this transaction",
+                kind, self.start_version
             )));
         }
 
@@ -1293,5 +1403,162 @@ mod tests {
         // Both threads contended on the same keys; conflicts were retried to
         // success via run_txn, so every commit advanced the shared version.
         assert!(c.version() >= 11, "concurrent commits advanced the version");
+    }
+
+    // ---- isolation levels ------------------------------------------------
+
+    fn txn_count(t: &Txn, q: &str) -> usize {
+        match t.query(q).unwrap() {
+            QueryResult::Select(rs) => rs.row_count(),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_defaults_to_snapshot_isolation() {
+        let c = cdb();
+        assert_eq!(c.begin().isolation(), IsolationLevel::Snapshot);
+        assert_eq!(
+            c.begin_with(IsolationLevel::Serializable).isolation(),
+            IsolationLevel::Serializable
+        );
+    }
+
+    /// A txn that *reads* key K1 and *writes* a disjoint key K2, while a
+    /// concurrent committer writes K1. Snapshot isolation does not check read sets
+    /// (so it commits — a write-skew); Serializable does (so it aborts).
+    fn read_write_skew(level: IsolationLevel) -> Result<u64> {
+        let c = cdb();
+        let mut rw = c.begin_with(level); // version 1
+        let k1 = triple("http://ex/x", "http://ex/p", "http://ex/y");
+        let _ = rw.read(&k1); // record a read of K1
+
+        // A concurrent transaction writes K1 and commits.
+        let mut w = c.begin();
+        w.insert(k1.clone());
+        w.commit().unwrap();
+
+        // RW now writes a disjoint key and tries to commit.
+        rw.insert(triple("http://ex/u", "http://ex/p", "http://ex/v"));
+        rw.commit()
+    }
+
+    #[test]
+    fn snapshot_permits_write_skew() {
+        assert!(
+            read_write_skew(IsolationLevel::Snapshot).is_ok(),
+            "snapshot isolation does not validate read sets"
+        );
+    }
+
+    #[test]
+    fn serializable_detects_read_write_conflict() {
+        let res = read_write_skew(IsolationLevel::Serializable);
+        assert!(
+            matches!(res, Err(GStoreError::Conflict(_))),
+            "serializable must abort on a read-write conflict, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn serializable_still_commits_without_read_conflict() {
+        // Serializable must not abort spuriously: if nothing it read was written
+        // by a concurrent commit, it commits.
+        let c = cdb();
+        let mut rw = c.begin_with(IsolationLevel::Serializable);
+        let _ = rw.read(&triple("http://ex/x", "http://ex/p", "http://ex/y"));
+        // Concurrent commit writes a *different* key than RW read or writes.
+        let mut w = c.begin();
+        w.insert(triple("http://ex/m", "http://ex/p", "http://ex/n"));
+        w.commit().unwrap();
+        rw.insert(triple("http://ex/u", "http://ex/p", "http://ex/v"));
+        assert!(rw.commit().is_ok());
+    }
+
+    #[test]
+    fn read_committed_tolerates_write_write_conflict() {
+        // Two read-committed txns write the same key; both commit (no abort),
+        // unlike snapshot isolation where the second would conflict.
+        let c = cdb();
+        let k = triple("http://ex/x", "http://ex/p", "http://ex/y");
+        let mut a = c.begin_with(IsolationLevel::ReadCommitted);
+        let mut b = c.begin_with(IsolationLevel::ReadCommitted);
+        a.insert(k.clone());
+        b.insert(k.clone());
+        assert!(a.commit().is_ok());
+        assert!(
+            b.commit().is_ok(),
+            "read-committed does not abort on write-write"
+        );
+        assert_eq!(c.version(), 3, "both commits advanced the version");
+    }
+
+    #[test]
+    fn read_committed_sees_concurrent_commits_but_snapshot_does_not() {
+        let c = cdb();
+        let rc = c.begin_with(IsolationLevel::ReadCommitted); // version 1
+        let snap = c.begin_with(IsolationLevel::Snapshot); // version 1
+
+        // A concurrent transaction commits a new triple.
+        let mut w = c.begin();
+        w.insert(triple("http://ex/a", "http://ex/p", "http://ex/c"));
+        w.commit().unwrap();
+
+        let q = "SELECT ?o WHERE { ?s ?p ?o }";
+        assert_eq!(
+            txn_count(&rc, q),
+            2,
+            "read-committed observes the concurrent commit"
+        );
+        assert_eq!(
+            txn_count(&snap, q),
+            1,
+            "snapshot isolation keeps its captured view"
+        );
+    }
+
+    // ---- redo log over committed transactions ----------------------------
+
+    #[test]
+    fn redo_log_captures_committed_transactions() {
+        let dir = std::env::temp_dir().join("gstore_conc_redo_ut");
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = cdb();
+        // Enable the redo log on the wrapped database.
+        c.write(|db| db.enable_redo_log_in(&dir)).unwrap();
+
+        // Two committed transactions: one insert, one delete of the base triple.
+        c.run_txn(4, |t| {
+            t.insert(triple("http://ex/k", "http://ex/p", "http://ex/v"));
+            Ok(())
+        })
+        .unwrap();
+        c.run_txn(4, |t| {
+            t.delete(triple("http://ex/a", "http://ex/p", "http://ex/b"));
+            Ok(())
+        })
+        .unwrap();
+
+        // Recover into a fresh database from the same base document.
+        let mut recovered = Database::build_from_str("conc", DATA).unwrap();
+        let applied = recovered.replay_redo_log(dir.join("redo.log")).unwrap();
+        assert_eq!(applied, 2, "both committed transactions were logged");
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <http://ex/k> <http://ex/p> ?o }")
+                .unwrap()
+                .row_count(),
+            1,
+            "the committed insert is replayed"
+        );
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }")
+                .unwrap()
+                .row_count(),
+            0,
+            "the committed delete is replayed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

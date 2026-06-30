@@ -59,21 +59,37 @@ pub trait DiskTermSource: std::fmt::Debug + Send + Sync {
 
 /// One half of a dictionary: a forward map `string → index` and a backward
 /// vector `index → string`. Indices are dense and assigned in insertion order.
+///
+/// Freed ids are *reclaimed*: removing a string leaves a hole (`None`) in
+/// `backward` and pushes the index onto a `free` stack, mirroring gStore's
+/// per-space `freelist` + `limitID`. The next [`intern`](Self::intern) of a
+/// brand-new string pops a freed index before extending `backward`, so ids of
+/// deleted terms are reused instead of growing the id space unbounded.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Interner {
     forward: HashMap<String, u32>,
-    backward: Vec<String>,
+    /// `index → Some(string)`; a `None` slot is a reclaimed (freed) hole.
+    backward: Vec<Option<String>>,
+    /// Reclaimed indices available for reuse (gStore's `freelist`), LIFO.
+    free: Vec<u32>,
 }
 
 impl Interner {
-    /// Intern `s`, returning its (possibly newly allocated) dense index.
+    /// Intern `s`, returning its dense index. Re-interning is idempotent;
+    /// otherwise a freed index is reused before the id space is extended.
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(&id) = self.forward.get(s) {
             return id;
         }
-        let id = u32::try_from(self.backward.len())
-            .expect("dictionary interner exceeded u32::MAX distinct strings");
-        self.backward.push(s.to_owned());
+        let id = if let Some(reused) = self.free.pop() {
+            self.backward[reused as usize] = Some(s.to_owned());
+            reused
+        } else {
+            let id = u32::try_from(self.backward.len())
+                .expect("dictionary interner exceeded u32::MAX distinct strings");
+            self.backward.push(Some(s.to_owned()));
+            id
+        };
         self.forward.insert(s.to_owned(), id);
         id
     }
@@ -83,18 +99,35 @@ impl Interner {
         self.forward.get(s).copied()
     }
 
-    /// Resolve a dense index back to its string.
+    /// Resolve a dense index back to its string (`None` for a freed hole).
     fn resolve(&self, idx: u32) -> Option<&str> {
-        self.backward.get(idx as usize).map(String::as_str)
+        self.backward.get(idx as usize).and_then(Option::as_deref)
     }
 
+    /// Free `s`'s index for reuse, returning it if `s` was interned.
+    fn free(&mut self, s: &str) -> Option<u32> {
+        let idx = self.forward.remove(s)?;
+        self.backward[idx as usize] = None;
+        self.free.push(idx);
+        Some(idx)
+    }
+
+    /// Number of *live* (non-freed) strings.
     fn len(&self) -> usize {
-        self.backward.len()
+        self.forward.len()
     }
 
-    /// All interned strings, in id order.
-    fn strings(&self) -> &[String] {
-        &self.backward
+    /// All live interned strings (skips freed holes), in id order.
+    fn strings(&self) -> impl Iterator<Item = &str> {
+        self.backward.iter().filter_map(Option::as_deref)
+    }
+
+    /// Live `(index, string)` pairs (skips freed holes).
+    fn entries(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.backward
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_deref().map(|s| (i as u32, s)))
     }
 }
 
@@ -269,9 +302,9 @@ impl Dictionary {
         let mut v: Vec<String> = Vec::with_capacity(
             self.entities.len() + self.literals.len() + self.predicates.len(),
         );
-        v.extend(self.entities.strings().iter().cloned());
-        v.extend(self.literals.strings().iter().cloned());
-        v.extend(self.predicates.strings().iter().cloned());
+        v.extend(self.entities.strings().map(str::to_owned));
+        v.extend(self.literals.strings().map(str::to_owned));
+        v.extend(self.predicates.strings().map(str::to_owned));
         v.sort_unstable();
         v.dedup();
         v
@@ -295,6 +328,87 @@ impl Dictionary {
             Some(b) => b.resident_string_count(),
             None => self.entities.len() + self.literals.len() + self.predicates.len(),
         }
+    }
+
+    // ---- id freelist / reclamation (gStore freeEntityID etc.) -------------
+
+    /// Free an entity term's id for reuse, returning it if it was interned.
+    /// The caller must ensure the term is no longer referenced (see
+    /// [`Database::reclaim_unused`](crate::Database::reclaim_unused)).
+    pub fn free_entity(&mut self, key: &str) -> Option<EntityLiteralId> {
+        self.entities.free(key)
+    }
+
+    /// Free a literal term's public id for reuse, if it was interned.
+    pub fn free_literal(&mut self, key: &str) -> Option<EntityLiteralId> {
+        self.literals
+            .free(key)
+            .map(|i| i.checked_add(LITERAL_FIRST_ID).expect("literal id overflow"))
+    }
+
+    /// Free a predicate term's id for reuse, if it was interned.
+    pub fn free_predicate(&mut self, key: &str) -> Option<PredId> {
+        self.predicates.free(key)
+    }
+
+    /// Conservative reclamation pass (gStore's `freelist` rebuild): free every
+    /// interned id that is **not** present in the supplied referenced-id sets, so
+    /// those ids can be reused by future interns. `referenced_ent_lit` holds the
+    /// still-live entity *and* literal ids (object ids, by range); `referenced_pred`
+    /// the still-live predicate ids. Returns the number of ids reclaimed.
+    ///
+    /// Reclamation never touches an id that is still referenced, so the store
+    /// stays internally consistent. No-op on a disk-backed dictionary.
+    pub fn reclaim_unused(
+        &mut self,
+        referenced_ent_lit: &std::collections::HashSet<EntityLiteralId>,
+        referenced_pred: &std::collections::HashSet<PredId>,
+    ) -> usize {
+        if self.backing.is_some() {
+            return 0;
+        }
+        let mut freed = 0usize;
+
+        // Entities: dense index is the public id.
+        let dead_ent: Vec<String> = self
+            .entities
+            .entries()
+            .filter(|&(id, _)| !referenced_ent_lit.contains(&id))
+            .map(|(_, s)| s.to_owned())
+            .collect();
+        for key in dead_ent {
+            if self.entities.free(&key).is_some() {
+                freed += 1;
+            }
+        }
+
+        // Literals: public id = internal index + LITERAL_FIRST_ID.
+        let dead_lit: Vec<String> = self
+            .literals
+            .entries()
+            .filter(|&(i, _)| !referenced_ent_lit.contains(&(i + LITERAL_FIRST_ID)))
+            .map(|(_, s)| s.to_owned())
+            .collect();
+        for key in dead_lit {
+            if self.literals.free(&key).is_some() {
+                freed += 1;
+            }
+        }
+
+        // Predicates: dense index is the predicate id.
+        let dead_pred: Vec<String> = self
+            .predicates
+            .entries()
+            .filter(|&(id, _)| !referenced_pred.contains(&id))
+            .map(|(_, s)| s.to_owned())
+            .collect();
+        for key in dead_pred {
+            if self.predicates.free(&key).is_some() {
+                freed += 1;
+            }
+        }
+
+        freed
     }
 }
 
@@ -375,6 +489,58 @@ mod tests {
         assert_eq!(d.entity_num(), 2);
         assert_eq!(d.literal_num(), 1);
         assert_eq!(d.predicate_num(), 1);
+    }
+
+    #[test]
+    fn freed_entity_id_is_reused_by_next_intern() {
+        let mut d = Dictionary::new();
+        let a = d.intern_entity("<a>");
+        let b = d.intern_entity("<b>");
+        let c = d.intern_entity("<c>");
+        assert_eq!((a, b, c), (0, 1, 2));
+        assert_eq!(d.entity_num(), 3);
+
+        // Free <b>'s id; the count drops and the id becomes unresolvable.
+        assert_eq!(d.free_entity("<b>"), Some(1));
+        assert_eq!(d.entity_num(), 2);
+        assert_eq!(d.entity_id("<b>"), None);
+        assert_eq!(d.id_to_string(1), None);
+
+        // A brand-new term reuses the freed id rather than allocating id 3.
+        let dnew = d.intern_entity("<d>");
+        assert_eq!(dnew, 1, "freed id must be reused");
+        assert_eq!(d.id_to_string(1), Some("<d>"));
+        assert_eq!(d.entity_num(), 3);
+        // The next new term extends the id space again.
+        assert_eq!(d.intern_entity("<e>"), 3);
+    }
+
+    #[test]
+    fn reclaim_unused_frees_only_unreferenced_ids() {
+        use std::collections::HashSet;
+        let mut d = Dictionary::new();
+        let a = d.intern_entity("<a>");
+        let b = d.intern_entity("<b>");
+        let lit = d.intern_literal("\"v\"");
+        let p = d.intern_predicate("<p>");
+        let _q = d.intern_predicate("<q>");
+
+        // Only <a>, "v", and <p> are still referenced.
+        let ent_lit: HashSet<EntityLiteralId> = [a, lit].into_iter().collect();
+        let preds: HashSet<PredId> = [p].into_iter().collect();
+        let freed = d.reclaim_unused(&ent_lit, &preds);
+        assert_eq!(freed, 2, "<b> and <q> must be reclaimed");
+
+        assert_eq!(d.entity_id("<a>"), Some(a));
+        assert_eq!(d.entity_id("<b>"), None);
+        assert_eq!(d.literal_id("\"v\""), Some(lit));
+        assert_eq!(d.predicate_id("<p>"), Some(p));
+        assert_eq!(d.predicate_id("<q>"), None);
+        assert_eq!(d.entity_num(), 1);
+        assert_eq!(d.predicate_num(), 1);
+
+        // The reclaimed entity id is reused.
+        assert_eq!(d.intern_entity("<z>"), b);
     }
 
     #[test]

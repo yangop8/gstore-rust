@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::kvstore::DiskStore;
-use crate::model::id::is_entity_id;
+use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
 use crate::parser::{sparql, turtle};
@@ -41,6 +41,12 @@ const VSTREE_FILE: &str = "vstree.bin";
 const NAMED_FILE: &str = "named.bin";
 /// The append-only update log inside a database directory (gStore's update.log).
 const UPDATE_LOG_FILE: &str = "update.log";
+/// The append-only triple-level redo log inside a database directory. Records
+/// every *committed* mutation so it can be re-applied on recovery (the redo half
+/// of gStore's WAL; the undo half is the per-transaction [`UndoOp`] log).
+const REDO_LOG_FILE: &str = "redo.log";
+/// Default upper bound on cached read-query results before LRU eviction kicks in.
+const DEFAULT_QUERY_CACHE_CAP: usize = 256;
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
 /// Sub-directory holding the RocksDB store of a RocksDB-backed database.
@@ -86,6 +92,82 @@ struct Meta {
     predicate_num: u64,
 }
 
+/// A bounded LRU cache of read-query results, keyed by the SPARQL string
+/// (gStore's `QueryCache`, but with a capacity bound). Each entry carries a
+/// monotonically-increasing access tick; when the cache is full, the entry with
+/// the smallest tick (least-recently used) is evicted to make room. The whole
+/// cache is still cleared on any store mutation (writes invalidate reads).
+#[derive(Debug)]
+struct LruCache {
+    map: HashMap<String, (QueryResult, u64)>,
+    cap: usize,
+    tick: u64,
+}
+
+impl LruCache {
+    fn new(cap: usize) -> LruCache {
+        LruCache {
+            map: HashMap::new(),
+            cap,
+            tick: 0,
+        }
+    }
+
+    /// Look up `key`, refreshing its recency and returning a clone on hit.
+    fn get(&mut self, key: &str) -> Option<QueryResult> {
+        self.tick += 1;
+        let tk = self.tick;
+        let entry = self.map.get_mut(key)?;
+        entry.1 = tk;
+        Some(entry.0.clone())
+    }
+
+    /// Insert `key → value`, evicting the least-recently-used entry if inserting
+    /// a new key would exceed the capacity. A zero capacity disables caching.
+    fn put(&mut self, key: String, value: QueryResult) {
+        if self.cap == 0 {
+            return;
+        }
+        self.tick += 1;
+        let tk = self.tick;
+        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
+            if let Some(lru) = self
+                .map
+                .iter()
+                .min_by_key(|(_, v)| v.1)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&lru);
+            }
+        }
+        self.map.insert(key, (value, tk));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+}
+
+/// One pending/serialized redo-log record: an applied mutation in surface form.
+/// `op` is `b'I'` (insert) or `b'D'` (delete); `graph` is the named-graph IRI
+/// (`None` ⇒ default graph); `triple` is the N-Triples `s p o .` text.
+#[derive(Debug, Clone)]
+struct RedoRec {
+    op: u8,
+    graph: Option<String>,
+    triple: String,
+}
+
 /// An RDF database: a dictionary, the six-way triple index, and a VS-tree.
 #[derive(Debug)]
 pub struct Database {
@@ -109,14 +191,37 @@ pub struct Database {
     /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
     /// the inverse of a triple mutation, applied in reverse on rollback.
     txn: Option<Vec<UndoOp>>,
-    /// Cache of read-query results keyed by the SPARQL string (gStore
-    /// `QueryCache`), cleared on any store mutation. Interior mutability so a
-    /// `&self`/`&mut self` query path can read and populate it.
-    query_cache: RefCell<HashMap<String, QueryResult>>,
+    /// Bounded LRU cache of read-query results keyed by the SPARQL string
+    /// (gStore `QueryCache`), cleared on any store mutation. Interior mutability
+    /// so a `&self`/`&mut self` query path can read and populate it.
+    query_cache: RefCell<LruCache>,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
     update_log: Option<PathBuf>,
+    /// When set, every *committed* triple mutation is appended to this file as a
+    /// redo record so it can be re-applied on recovery. `None` disables it.
+    redo_log: Option<PathBuf>,
+    /// Redo records buffered while a (single-writer) transaction is open; flushed
+    /// to [`redo_log`](Self::redo_log) on commit, discarded on rollback. In
+    /// auto-commit mode records are written through immediately and this stays empty.
+    redo_pending: Vec<RedoRec>,
+    /// User-defined forward-chaining reasoning rules (gStore's `ReasonHelper`).
+    rules: crate::reason::RuleSet,
+}
+
+/// Build-pipeline stage, reported through the progress callback of
+/// [`Database::build_from_str_with_progress`] (gStore's `DatabaseProgressStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildProgress {
+    /// Parsing the RDF document into triples.
+    RdfParse,
+    /// Interning terms into the dictionary (string↔id).
+    Dictionary,
+    /// Building the triple indexes / VS-tree.
+    Index,
+    /// Build complete.
+    Done,
 }
 
 /// A snapshot of database counts and status (gStore `getDBMonitorInfo`).
@@ -164,8 +269,11 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
+            redo_log: None,
+            redo_pending: Vec::new(),
+            rules: crate::reason::RuleSet::new(),
         }
     }
 
@@ -195,13 +303,30 @@ impl Database {
     /// Build a database from an in-memory RDF document (Turtle / N-Triples).
     /// Turtle is a superset of N-Triples, so both bundled formats are accepted.
     pub fn build_from_str(name: impl Into<String>, content: &str) -> Result<Database> {
+        Database::build_from_str_with_progress(name, content, |_| {})
+    }
+
+    /// Like [`build_from_str`](Self::build_from_str) but reports build progress
+    /// through `progress` as it moves through the stages (gStore's
+    /// `DatabaseProgressStatus`): RDF parse → dictionary build → index build →
+    /// done. Useful for a progress bar / status endpoint on large loads.
+    pub fn build_from_str_with_progress<F: FnMut(BuildProgress)>(
+        name: impl Into<String>,
+        content: &str,
+        mut progress: F,
+    ) -> Result<Database> {
         let mut db = Database::new(name);
-        let mut id_triples: Vec<IdTriple> = Vec::new();
-        for t in turtle::parse_str(content)? {
-            id_triples.push(db.encode_triple(&t));
+        progress(BuildProgress::RdfParse);
+        let triples = turtle::parse_str(content)?;
+        progress(BuildProgress::Dictionary);
+        let mut id_triples: Vec<IdTriple> = Vec::with_capacity(triples.len());
+        for t in &triples {
+            id_triples.push(db.encode_triple(t));
         }
         db.store.bulk_load(id_triples);
+        progress(BuildProgress::Index);
         db.rebuild_index();
+        progress(BuildProgress::Done);
         Ok(db)
     }
 
@@ -254,8 +379,11 @@ impl Database {
             vstree,
             index_valid: true,
             txn: None,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
+            redo_log: None,
+            redo_pending: Vec::new(),
+            rules: crate::reason::RuleSet::new(),
         })
     }
 
@@ -299,8 +427,11 @@ impl Database {
             vstree,
             index_valid: true,
             txn: None,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
+            redo_log: None,
+            redo_pending: Vec::new(),
+            rules: crate::reason::RuleSet::new(),
         })
     }
 
@@ -431,6 +562,7 @@ impl Database {
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Del(None, id)); // rollback removes what we added
             }
+            self.record_redo(b'I', None, id);
         }
         changed
     }
@@ -453,6 +585,7 @@ impl Database {
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
             }
+            self.record_redo(b'D', None, id);
         }
         changed
     }
@@ -474,11 +607,14 @@ impl Database {
         Ok(())
     }
 
-    /// Commit the active transaction, discarding its undo log.
+    /// Commit the active transaction, discarding its undo log. Buffered redo
+    /// records (this transaction's mutations) are flushed to the redo log, since
+    /// the transaction is now durable.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn.take().is_none() {
             return Err(GStoreError::Database("no active transaction".into()));
         }
+        self.flush_redo()?;
         Ok(())
     }
 
@@ -488,6 +624,9 @@ impl Database {
         let Some(log) = self.txn.take() else {
             return Err(GStoreError::Database("no active transaction".into()));
         };
+        // The transaction's mutations are being undone, so its buffered redo
+        // records must never reach the log.
+        self.redo_pending.clear();
         for op in log.into_iter().rev() {
             match op {
                 UndoOp::Add(None, id) => {
@@ -534,6 +673,7 @@ impl Database {
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Del(Some(gid), id));
             }
+            self.record_redo(b'I', Some(gid), id);
         }
         changed
     }
@@ -559,6 +699,7 @@ impl Database {
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Add(Some(gid), id));
             }
+            self.record_redo(b'D', Some(gid), id);
         }
         changed
     }
@@ -608,8 +749,8 @@ impl Database {
             Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
                 // Serve from the query cache when the same request was already
                 // answered against the current (unchanged) store.
-                if let Some(cached) = self.query_cache.borrow().get(sparql) {
-                    return Ok(cached.clone());
+                if let Some(cached) = self.query_cache.borrow_mut().get(sparql) {
+                    return Ok(cached);
                 }
                 // Use the VS-tree as a candidate filter only while it is
                 // consistent with the store; otherwise evaluate without it.
@@ -624,7 +765,7 @@ impl Database {
                 let result = eval.evaluate(&q)?;
                 self.query_cache
                     .borrow_mut()
-                    .insert(sparql.to_string(), result.clone());
+                    .put(sparql.to_string(), result.clone());
                 Ok(result)
             }
             Query::Update(ops) => {
@@ -862,8 +1003,11 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: false,
             txn: None,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
+            redo_log: None,
+            redo_pending: Vec::new(),
+            rules: crate::reason::RuleSet::new(),
         };
         db.rebuild_index();
         Ok(db)
@@ -923,8 +1067,11 @@ impl Database {
             vstree,
             index_valid: true,
             txn: None,
-            query_cache: RefCell::new(HashMap::new()),
+            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
             update_log: None,
+            redo_log: None,
+            redo_pending: Vec::new(),
+            rules: crate::reason::RuleSet::new(),
         })
     }
 
@@ -1053,6 +1200,259 @@ impl Database {
         Ok(applied)
     }
 
+    // ---- redo log (the redo half of gStore's WAL) -------------------------
+
+    /// Enable redo logging to `path`: every subsequent *committed* triple
+    /// mutation (insert/delete, default or named graph) is appended as a redo
+    /// record so it can be re-applied on recovery with
+    /// [`replay_redo_log`](Self::replay_redo_log).
+    pub fn enable_redo_log<P: AsRef<Path>>(&mut self, path: P) {
+        self.redo_log = Some(path.as_ref().to_path_buf());
+    }
+
+    /// Enable redo logging at the conventional `redo.log` inside a database
+    /// directory (created if necessary).
+    pub fn enable_redo_log_in<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        self.redo_log = Some(dir.join(REDO_LOG_FILE));
+        Ok(())
+    }
+
+    /// Disable redo logging (subsequent mutations are not recorded). Any buffered
+    /// (uncommitted-transaction) records are dropped.
+    pub fn disable_redo_log(&mut self) {
+        self.redo_log = None;
+        self.redo_pending.clear();
+    }
+
+    /// Whether redo logging is currently enabled.
+    pub fn redo_log_enabled(&self) -> bool {
+        self.redo_log.is_some()
+    }
+
+    /// Record one committed mutation into the redo log. In auto-commit mode the
+    /// record is written through immediately; inside a (single-writer)
+    /// transaction it is buffered until [`commit`](Self::commit). No-op when the
+    /// redo log is disabled. Best-effort on the immediate-write path (an I/O
+    /// error there is swallowed so it never changes a mutation's `bool` result).
+    fn record_redo(&mut self, op: u8, graph: Option<u32>, id: IdTriple) {
+        if self.redo_log.is_none() {
+            return;
+        }
+        let (Some(s), Some(p), Some(o)) = (
+            self.dict.id_to_string(id.sub),
+            self.dict.predicate_to_string(id.pred),
+            self.dict.id_to_string(id.obj),
+        ) else {
+            return;
+        };
+        let triple = format!("{s} {p} {o} .");
+        let graph = graph
+            .and_then(|g| self.dict.id_to_string(g))
+            .map(|g| strip_angle(g).to_owned());
+        self.redo_pending.push(RedoRec { op, graph, triple });
+        if self.txn.is_none() {
+            // Auto-commit: the mutation is already durable, so flush now.
+            let _ = self.flush_redo();
+        }
+    }
+
+    /// Flush buffered redo records to the redo log and clear the buffer.
+    fn flush_redo(&mut self) -> Result<()> {
+        if self.redo_pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(path) = self.redo_log.clone() {
+            append_redo_log(&path, &self.redo_pending)?;
+        }
+        self.redo_pending.clear();
+        Ok(())
+    }
+
+    /// Re-apply every mutation recorded in a redo log `path` against this
+    /// database, in order, returning the number of records applied. Replay onto a
+    /// database in the same state the log began from reconstructs the final
+    /// state. Redo logging is suspended during replay so the log is not rewritten.
+    pub fn replay_redo_log<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
+        let data = fs::read(path)?;
+        let saved = self.redo_log.take();
+        let result = self.apply_redo_records(&data);
+        self.redo_log = saved;
+        result
+    }
+
+    /// Parse and apply the length-prefixed records of a redo log buffer.
+    fn apply_redo_records(&mut self, bytes: &[u8]) -> Result<usize> {
+        let mut pos = 0usize;
+        let mut applied = 0usize;
+        while pos < bytes.len() {
+            // Header line: `REDO <op> <graph_len> <triple_len>`.
+            let nl = bytes[pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| pos + i)
+                .ok_or_else(|| GStoreError::Database("truncated redo.log header".into()))?;
+            let header = std::str::from_utf8(&bytes[pos..nl])
+                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log header".into()))?;
+            let mut it = header.split_whitespace();
+            if it.next() != Some("REDO") {
+                return Err(GStoreError::Database(format!(
+                    "malformed redo.log record header: {header:?}"
+                )));
+            }
+            let op = it
+                .next()
+                .and_then(|s| s.chars().next())
+                .ok_or_else(|| GStoreError::Database("missing op in redo.log record".into()))?;
+            let glen: usize = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| GStoreError::Database("missing graph length in redo.log".into()))?;
+            let tlen: usize = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| GStoreError::Database("missing triple length in redo.log".into()))?;
+            let gstart = nl + 1;
+            let gend = gstart + glen;
+            let tend = gend + tlen;
+            if tend > bytes.len() {
+                return Err(GStoreError::Database("truncated redo.log body".into()));
+            }
+            let graph = std::str::from_utf8(&bytes[gstart..gend])
+                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log graph".into()))?;
+            let triple_str = std::str::from_utf8(&bytes[gend..tend])
+                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log triple".into()))?;
+            let graph_opt = if graph.is_empty() { None } else { Some(graph) };
+            for t in turtle::parse_str(triple_str)? {
+                match op {
+                    'I' => {
+                        self.insert_quad(&t, graph_opt);
+                    }
+                    'D' => {
+                        self.delete_quad(&t, graph_opt);
+                    }
+                    other => {
+                        return Err(GStoreError::Database(format!(
+                            "unknown redo.log op '{other}'"
+                        )))
+                    }
+                }
+            }
+            applied += 1;
+            pos = (tend + 1).min(bytes.len());
+        }
+        Ok(applied)
+    }
+
+    // ---- id freelist reclamation (gStore freeEntityID etc.) ----------------
+
+    /// Conservative id-reclamation pass (gStore's `freelist` rebuild): free the
+    /// dictionary id of every term that no longer appears anywhere — neither in
+    /// the default graph nor any named graph — so those ids can be reused by
+    /// future interns. Returns the number of ids reclaimed.
+    ///
+    /// "Referenced" means: an id used as a subject or object (entity/literal
+    /// space), as a predicate (predicate space), or as a named-graph IRI. Only
+    /// truly-unreferenced ids are freed, so the store stays consistent.
+    pub fn reclaim_unused(&mut self) -> usize {
+        let mut ent_lit: HashSet<EntityLiteralId> = HashSet::new();
+        let mut preds: HashSet<PredId> = HashSet::new();
+
+        // Default graph.
+        for id in self.store.subject_keys() {
+            ent_lit.insert(id);
+        }
+        for id in self.store.object_keys() {
+            ent_lit.insert(id);
+        }
+        for p in self.store.predicates() {
+            preds.insert(p);
+        }
+        // Named graphs, plus their graph-IRI entity ids.
+        for (&gid, s) in &self.named {
+            ent_lit.insert(gid);
+            ent_lit.extend(s.subject_keys());
+            ent_lit.extend(s.object_keys());
+            preds.extend(s.predicates());
+        }
+
+        self.dict.reclaim_unused(&ent_lit, &preds)
+    }
+
+    // ---- user-defined reasoning rules (gStore ReasonHelper) ----------------
+
+    /// Define a forward-chaining rule from its textual `body => head` form
+    /// (see [`crate::reason`]). Errors if the name is taken or the text is
+    /// malformed.
+    pub fn add_rule(&mut self, name: impl Into<String>, text: &str) -> Result<()> {
+        self.rules.add_rule(name, text)
+    }
+
+    /// Remove a rule by name; `true` if it existed.
+    pub fn remove_rule(&mut self, name: &str) -> bool {
+        self.rules.remove(name)
+    }
+
+    /// Enable a rule by name; `true` if it existed.
+    pub fn enable_rule(&mut self, name: &str) -> bool {
+        self.rules.enable(name)
+    }
+
+    /// Disable a rule by name; `true` if it existed.
+    pub fn disable_rule(&mut self, name: &str) -> bool {
+        self.rules.disable(name)
+    }
+
+    /// List rules as `(name, enabled, effect_count)` in definition order.
+    pub fn list_rules(&self) -> Vec<(String, bool, usize)> {
+        self.rules.list()
+    }
+
+    /// The most recent effect count (triples inferred) of a named rule.
+    pub fn rule_effect_count(&self, name: &str) -> Option<usize> {
+        self.rules.effect_count(name)
+    }
+
+    /// Materialize the closure of every enabled user rule into the store,
+    /// updating each rule's effect count. Returns the number of triples inferred;
+    /// inferred triples are recorded for transaction rollback like
+    /// [`materialize_rdfs`](Self::materialize_rdfs).
+    pub fn run_rules(&mut self) -> usize {
+        let added = self.rules.apply(&mut self.dict, &mut self.store);
+        let n = added.len();
+        if n > 0 {
+            self.index_valid = false;
+            self.query_cache.get_mut().clear();
+            if let Some(log) = self.txn.as_mut() {
+                for t in &added {
+                    log.push(UndoOp::Del(None, *t));
+                }
+            }
+        }
+        n
+    }
+
+    // ---- query-cache capacity --------------------------------------------
+
+    /// Resize the read-query LRU cache, clearing it. A capacity of 0 disables
+    /// caching entirely.
+    pub fn set_query_cache_capacity(&mut self, cap: usize) {
+        *self.query_cache.get_mut() = LruCache::new(cap);
+    }
+
+    /// Number of entries currently in the read-query cache (tests).
+    #[cfg(test)]
+    fn query_cache_len(&self) -> usize {
+        self.query_cache.borrow().len()
+    }
+
+    /// Whether a given SPARQL string is currently cached (tests).
+    #[cfg(test)]
+    fn query_cache_contains(&self, sparql: &str) -> bool {
+        self.query_cache.borrow().contains(sparql)
+    }
+
     // ---- bulk / parallel loaders -----------------------------------------
 
     /// Build a database from an N-Triples file in bounded-memory batches
@@ -1146,6 +1546,30 @@ fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
     f.write_all(sparql.as_bytes())?;
     f.write_all(b"\n")?;
     Ok(())
+}
+
+/// Append redo records to the redo log. Each record is length-prefixed:
+/// `REDO <op> <graph_len> <triple_len>\n<graph bytes><triple bytes>\n`. The
+/// lengths make the graph/triple bodies opaque, so they may hold any bytes.
+fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    for r in recs {
+        let g = r.graph.as_deref().unwrap_or("");
+        writeln!(f, "REDO {} {} {}", r.op as char, g.len(), r.triple.len())?;
+        f.write_all(g.as_bytes())?;
+        f.write_all(r.triple.as_bytes())?;
+        f.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Strip a leading `<` and trailing `>` from an IRI dict-key, leaving the raw
+/// IRI (the form named-graph helpers expect). Non-bracketed input is returned
+/// unchanged.
+fn strip_angle(s: &str) -> &str {
+    s.strip_prefix('<')
+        .and_then(|r| r.strip_suffix('>'))
+        .unwrap_or(s)
 }
 
 /// Split `content` into at most `n` line-aligned `&str` chunks (each chunk ends
@@ -1322,5 +1746,193 @@ mod tests {
     fn load_missing_dir_errors() {
         let e = Database::load(std::env::temp_dir().join("gstore_does_not_exist_xyz")).unwrap_err();
         assert!(matches!(e, GStoreError::Database(_)));
+    }
+
+    // ---- redo log --------------------------------------------------------
+
+    #[test]
+    fn redo_log_replays_committed_mutations() {
+        let dir = temp_dir("redo_replay");
+        let mut db = Database::build_from_str("rd", SMALL).unwrap();
+        db.enable_redo_log_in(&dir).unwrap();
+        assert!(db.redo_log_enabled());
+
+        // A mix of auto-commit mutations.
+        db.query("INSERT DATA { <root> <contain> <nodeX> }").unwrap();
+        db.insert_triple(&Triple::new(
+            Term::iri("nodeX"),
+            Term::iri("own"),
+            Term::iri("pointZ"),
+        ));
+        db.query("DELETE DATA { <node1> <own> <point0> }").unwrap();
+        let final_count = db.triple_num();
+
+        // Recover into a fresh database starting from the same base.
+        let mut recovered = Database::build_from_str("rd", SMALL).unwrap();
+        let applied = recovered.replay_redo_log(dir.join(REDO_LOG_FILE)).unwrap();
+        assert_eq!(applied, 3, "three committed mutations recorded");
+        assert_eq!(recovered.triple_num(), final_count);
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <nodeX> <own> ?o }")
+                .unwrap()
+                .row_count(),
+            1
+        );
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <node1> <own> ?o }")
+                .unwrap()
+                .row_count(),
+            1,
+            "point0 was deleted; point1 remains"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn redo_log_omits_rolled_back_transaction() {
+        let dir = temp_dir("redo_rollback");
+        let mut db = Database::build_from_str("rd", SMALL).unwrap();
+        db.enable_redo_log_in(&dir).unwrap();
+
+        // A transaction that rolls back must leave nothing in the redo log.
+        db.begin().unwrap();
+        db.insert_triple(&Triple::new(Term::iri("x"), Term::iri("p"), Term::iri("y")));
+        db.rollback().unwrap();
+
+        // A committed transaction is recorded.
+        db.begin().unwrap();
+        db.insert_triple(&Triple::new(Term::iri("k"), Term::iri("p"), Term::iri("v")));
+        db.commit().unwrap();
+
+        let mut recovered = Database::build_from_str("rd", SMALL).unwrap();
+        recovered.replay_redo_log(dir.join(REDO_LOG_FILE)).unwrap();
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <x> <p> ?o }")
+                .unwrap()
+                .row_count(),
+            0,
+            "the rolled-back mutation must not be replayed"
+        );
+        assert_eq!(
+            recovered
+                .select("SELECT ?o WHERE { <k> <p> ?o }")
+                .unwrap()
+                .row_count(),
+            1,
+            "the committed mutation must be replayed"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- query-cache LRU -------------------------------------------------
+
+    #[test]
+    fn query_cache_lru_evicts_least_recently_used() {
+        let mut db = Database::build_from_str("lru", SMALL).unwrap();
+        db.set_query_cache_capacity(2);
+        let q1 = "SELECT ?o WHERE { <root> <contain> ?o }";
+        let q2 = "SELECT ?n WHERE { <root> <name> ?n }";
+        let q3 = "SELECT ?o WHERE { <node1> <own> ?o }";
+
+        db.query(q1).unwrap();
+        db.query(q2).unwrap();
+        assert_eq!(db.query_cache_len(), 2);
+        // Touch q1 so q2 is now the least-recently used.
+        db.query(q1).unwrap();
+        // Inserting q3 evicts q2.
+        db.query(q3).unwrap();
+        assert_eq!(db.query_cache_len(), 2, "cache stays at capacity");
+        assert!(db.query_cache_contains(q1));
+        assert!(db.query_cache_contains(q3));
+        assert!(!db.query_cache_contains(q2), "q2 was least-recently used");
+    }
+
+    #[test]
+    fn write_invalidates_query_cache() {
+        let mut db = Database::build_from_str("inv", SMALL).unwrap();
+        db.query("SELECT ?o WHERE { <root> <contain> ?o }").unwrap();
+        assert_eq!(db.query_cache_len(), 1);
+        db.query("INSERT DATA { <root> <contain> <nodeZ> }").unwrap();
+        assert_eq!(db.query_cache_len(), 0, "any write clears the cache");
+    }
+
+    // ---- id freelist reclamation -----------------------------------------
+
+    #[test]
+    fn reclaim_unused_reuses_deleted_term_ids() {
+        let mut db = Database::build_from_str("rc", SMALL).unwrap();
+        let before_entities = db.entity_num();
+        let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
+
+        // Delete the only triple using <node0>; its id is not auto-freed.
+        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
+        assert!(db.dict().entity_id(&Term::iri("node0").dict_key()).is_some());
+
+        let freed = db.reclaim_unused();
+        assert_eq!(freed, 1, "only <node0> became unreferenced");
+        assert_eq!(db.entity_num(), before_entities - 1);
+        assert!(
+            db.dict().entity_id(&Term::iri("node0").dict_key()).is_none(),
+            "node0 was reclaimed"
+        );
+
+        // A brand-new term reuses node0's freed id.
+        db.query("INSERT DATA { <root> <contain> <fresh> }").unwrap();
+        assert_eq!(
+            db.dict().entity_id(&Term::iri("fresh").dict_key()),
+            Some(node0_id),
+            "the freed id is reused"
+        );
+    }
+
+    // ---- user-defined rules through the Database facade -------------------
+
+    #[test]
+    fn database_runs_user_rules() {
+        let mut db =
+            Database::build_from_str("rl", "<a> <ancestor> <b> . <b> <ancestor> <c> .").unwrap();
+        db.add_rule(
+            "anc",
+            "?x <ancestor> ?y . ?y <ancestor> ?z => ?x <ancestor> ?z",
+        )
+        .unwrap();
+        let n = db.run_rules();
+        assert_eq!(n, 1, "a→c inferred");
+        assert_eq!(db.rule_effect_count("anc"), Some(1));
+        assert_eq!(
+            db.select("SELECT ?z WHERE { <a> <ancestor> ?z }")
+                .unwrap()
+                .row_count(),
+            2,
+            "a now reaches both b and c"
+        );
+
+        // Disabling is reflected in the listing and stops further inference.
+        assert!(db.disable_rule("anc"));
+        assert_eq!(db.list_rules(), vec![("anc".to_string(), false, 1)]);
+    }
+
+    // ---- build progress reporting ----------------------------------------
+
+    #[test]
+    fn build_reports_progress_stages() {
+        let stages = RefCell::new(Vec::new());
+        let db = Database::build_from_str_with_progress("p", SMALL, |s| {
+            stages.borrow_mut().push(s)
+        })
+        .unwrap();
+        assert_eq!(db.triple_num(), 5);
+        assert_eq!(
+            stages.into_inner(),
+            vec![
+                BuildProgress::RdfParse,
+                BuildProgress::Dictionary,
+                BuildProgress::Index,
+                BuildProgress::Done,
+            ]
+        );
     }
 }
