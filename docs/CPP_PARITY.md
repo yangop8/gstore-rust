@@ -31,16 +31,16 @@
 | 项 | 状态 | 对应C++ | 判断/说明 |
 |----|------|---------|------|
 | 事务(commit/rollback) | ✅ | `Txn_manager` | `begin/commit/rollback`经undo日志实现原子性+回滚(单写者),覆盖所有UPDATE与命名图 |
-| 完整MVCC(锁、latch、版本链、GC) | ❌ | `GraphLock`/`Latch`/KVstore MVCC | 需先定隔离级别+并发模型;合理推迟 |
-| 多线程并发(rwlock+8 mutex)、并行加载(9线程)、OpenMP并行排序 | ❌ | `Database` | 需先定并发模型;合理推迟 |
+| 并发(快照隔离) | ⚠️ | `GraphLock`/`Latch`/KVstore MVCC | `concurrent::ConcurrentDb`:多读并发(无锁评估immutable `Arc<Snapshot>`)+串行写者(写后原子换快照);版本号、读者不被阻塞。缺:每键版本链、多写并发、并行加载(9线程)/OpenMP排序、快照GC |
 | RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range;`Database::materialize_rdfs` |
 | Schema抽取 | ✅ | `Database::getSchemaInfo` | `Database::schema()` 抽类与属性 |
 | QueryCache | ✅ | `Database`/`QueryCache` | 读查询按SPARQL串缓存,任何写入即失效 |
 | 监控/统计API | ✅ | `getDBMonitorInfo` | `Database::stats()`→`DbStats`(计数+索引/事务状态) |
 | Turtle `[ ]` / `( )` | ✅ | `TurtleParser` | 空节点属性列表 + 集合(降级为rdf:first/rest/nil链),含嵌套 |
 | 备份/恢复 + 更新日志(update.log) | ❌ | `Database::backup/restore/write_update_log` | 运维特性;合理推迟(WAL已提供崩溃一致性) |
-| CSR邻接 + 图算法套件(PageRank/最短路/介数/louvain等30+) | ❌ | `src/Query/topk/` | gpstore图计算,非SPARQL;合理省略 |
-| 服务化:HTTP/gRPC/集群 | ❌ | `src/Server`/`Api`/`GRPC`/`Cluster` | 对外接口+分布式;最后做 |
+| CSR邻接 + 图算法 | ⚠️ | `src/Query/topk/` | `src/analytics`(`GraphView`):CSR邻接 + 出/入度、BFS最短路+路径、弱连通分量(union-find)、PageRank(含悬挂节点)、三角计数。缺:介数/接近中心性、Louvain、SCC、加权/带谓语边、topk子图查询 |
+| 服务化:HTTP | ⚠️ | `src/Server`/`Api`/`ghttp` | `src/server`(`gserver`bin):HTTP/1.1 SPARQL端点(GET/POST /sparql→JSON结果、POST /update、GET /status),零依赖。缺:gRPC、HTTPS/鉴权、内容协商、流式 |
+| 集群/分布式分片 | ❌ | `src/Cluster` | 分片+分布式查询;最后做 |
 | SERVICE联邦查询 | ❌ | — | 需HTTP出网;已解析→明确报错 |
 | ID freelist复用(BlockInfo链) | N/A | `Database::allocEntityID`等 | 仅在删除字典项时才有意义;gStore与本版删除三元组时均保留字典项(id不回收),故不适用 |
 | RDFParser分批(每10M一组)+ 数值范围校验 | ⚠️ | `Parser/RDFParser` | 分批=超大文件(推迟);dateTime日域/时域已校验 |
@@ -58,3 +58,10 @@
 > - **第三档**:属性路径`?`、EXISTS/NOT EXISTS、DESCRIBE;Turtle `[ ]`/`( )`;xsd:dateTime比较;RDFS推理;QueryCache;Schema抽取;监控stats;命名图GRAPH(查询/四元组更新/CLEAR/持久化)。
 > - 期间跑独立code-reviewer检视并修复2个MEDIUM(EXISTS内层FILTER代入、DESCRIBE谓语列)+若干LOW。
 > - 测试190→**272全过**,clippy零告警。剩余大颗粒:完整MVCC(并发)、服务化/集群、SERVICE联邦、gpstore图算法。
+>
+> 更新(2026-06-30,三大块批次):
+> - **并发/MVCC**:`src/concurrent`(`ConcurrentDb`)——快照隔离的多读并发+串行写者(写后原子换`Arc<Snapshot>`)。
+> - **服务化HTTP**:`src/server`(`gserver`bin)——零依赖HTTP/1.1 SPARQL端点(/sparql、/update、/status)。
+> - **图算法gpstore**:`src/analytics`(`GraphView`)——CSR + 度/BFS最短路/弱连通分量/PageRank/三角计数。
+> - 经两轮独立code-reviewer检视(第二轮4个MEDIUM已修);图算法块由subagent完成、我做集成检视。
+> - 测试**288全过**,clippy零告警。剩余大颗粒:完整MVCC(每键版本链/多写并发)、gRPC/集群分布式、SERVICE联邦、更多图算法(介数/Louvain/SCC/topk)。

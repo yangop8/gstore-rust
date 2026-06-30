@@ -34,15 +34,20 @@
 - **已实现**:`SELECT`/`ASK`/`CONSTRUCT`/`DESCRIBE`;图模式代数含`Bgp`/`Join`/`Union`/`Filter`/`LeftJoin`(OPTIONAL)/`Minus`/`Extend`(BIND)/`Values`/`SubSelect`/`Path`/`Graph`(命名图);聚合(`GROUP BY`/`HAVING`/全套agg含`DISTINCT`)与`(expr AS ?v)`;属性路径(`/ ^ | * + ? !`);`EXISTS`/`NOT EXISTS`(变量代入);完整UPDATE(INSERT/DELETE DATA、DELETE/INSERT WHERE、DELETE WHERE、LOAD、CLEAR/DROP/CREATE、`;`序列、WITH/USING);命名图GRAPH(查询/四元组DATA/CLEAR/持久化);xsd:dateTime比较;Turtle `[ ]`/`( )`。DT:`dt_sparql11`/`dt_update`/`dt_graph`/`dt_reason`。
 - **缺(合理推迟/省略)**:`SERVICE`(联邦,需出网→解析即报错);GRAPH出现在DELETE/INSERT WHERE模板内;完整数值类型层级(现Int(i64)/Double(f64),比较正确);子查询相关性优化;30+图算法聚合(gpstore)。
 
-## E. 并发、事务与MVCC ★中价值 —— ⚠️ 事务已完成,并发待做
+## E. 并发、事务与MVCC ★中价值 —— ⚠️ 事务+快照隔离已完成,完整MVCC待做
 
-- **已实现**:`Database::begin/commit/rollback` —— 经undo日志的单写者事务,提供原子性+回滚,覆盖全部UPDATE与命名图;WAL(`pager`)提供存储层崩溃一致性。
-- **缺**:多读多写并发(`GraphLock`/`Latch`/`RwLock`)、MVCC版本链与快照隔离、GC。需先明确目标隔离级别与并发模型。
+- **已实现**:`Database::begin/commit/rollback`(undo日志单写者事务,原子+回滚,覆盖全部UPDATE与命名图);WAL(`pager`)存储层崩溃一致性;`concurrent::ConcurrentDb`(`src/concurrent`)—— 快照隔离:多读线程对immutable `Arc<Snapshot>`无锁评估,单写者串行提交后原子换快照,读者永不见半写态、不互相阻塞;`snapshot()`/`version()`/`update()`/`write()`。
+- **缺**:每键版本链/细粒度MVCC、多写并发、并行加载(9线程)/OpenMP并行排序、快照GC(现靠Arc引用计数)、无锁读(现Arc-swap)。
 
-## F. 服务化:HTTP API / gRPC / 控制台 / 集群 ★按需
+## F. 服务化:HTTP API / gRPC / 控制台 / 集群 ★按需 —— ⚠️ HTTP已完成
 
-- **原版**:`src/Server`、`src/Api`、`src/GRPC`、`src/Cluster`(分布式分片),`ghttp`/`grpc`/`gserver`等。
-- **重构**:用`axum`/`tonic`等重建对外接口;集群涉及分片与分布式查询,工作量最大,建议最后做。SPARQL `SERVICE`(联邦)同属此类(需HTTP出网),现已解析→明确报错。
+- **已实现**:`src/server`(`gserver`bin)—— 零依赖HTTP/1.1 SPARQL端点:`GET/POST /sparql`(SELECT→SPARQL JSON、ASK→boolean、CONSTRUCT/DESCRIBE→N-Triples)、`POST /update`、`GET /status`;`Mutex<Database>`共享。
+- **缺**:gRPC(`tonic`)、HTTPS/鉴权、内容协商、流式响应、集群分片与分布式查询(`src/Cluster`,工作量最大)。SPARQL `SERVICE`(联邦,需出网)同属此类,现解析→明确报错。
+
+## H. 图算法(gpstore) ★低优先 —— ⚠️ 核心算法已完成
+
+- **已实现**:`src/analytics`(`GraphView`)—— 从`TripleStore`建CSR邻接(实体为节点、三元组为有向边),提供出/入度、BFS单源最短距离+路径重建、弱连通分量(union-find:路径折半+按秩合并)、PageRank(含悬挂节点均匀再分配+收敛判定)、无向三角计数(排序归并求交)。
+- **缺**:介数/接近中心性、Louvain社区发现、SCC(Tarjan/Kosaraju)、加权/带谓语边变体、topk子图邻近查询(原版`topk`)。
 
 ## G. 推理(RDFS/OWL) ★低优先 —— ✅ RDFS已完成
 
