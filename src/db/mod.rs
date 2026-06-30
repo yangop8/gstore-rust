@@ -19,7 +19,7 @@ use crate::error::{GStoreError, Result};
 use crate::kvstore::DiskStore;
 use crate::model::id::is_entity_id;
 use crate::model::{IdTriple, Triple};
-use crate::parser::sparql::ast::{GroundTriple, Query};
+use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp};
 use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
@@ -228,15 +228,89 @@ impl Database {
                 };
                 eval.evaluate(&q)
             }
-            Query::InsertData(triples) => {
-                let changed = self.insert_data(&triples);
-                Ok(QueryResult::Update { changed })
-            }
-            Query::DeleteData(triples) => {
-                let changed = self.delete_data(&triples);
+            Query::Update(ops) => {
+                let mut changed = 0;
+                for op in ops {
+                    changed += self.exec_update_op(op)?;
+                }
                 Ok(QueryResult::Update { changed })
             }
         }
+    }
+
+    /// Apply one UPDATE operation, returning the number of triples it changed.
+    fn exec_update_op(&mut self, op: UpdateOp) -> Result<usize> {
+        match op {
+            UpdateOp::InsertData(triples) => Ok(self.insert_data(&triples)),
+            UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
+            UpdateOp::Modify {
+                delete,
+                insert,
+                pattern,
+            } => {
+                // Compute the ground delete/insert sets against the *current*
+                // data, then apply deletes before inserts (SPARQL semantics).
+                let (dels, ins) = {
+                    let eval = Evaluator::new(&self.dict, &self.store);
+                    eval.eval_update_modify(&delete, &insert, &pattern)
+                };
+                let mut changed = 0;
+                for t in &dels {
+                    if self.remove_triple(t) {
+                        changed += 1;
+                    }
+                }
+                for t in &ins {
+                    if self.insert_triple(t) {
+                        changed += 1;
+                    }
+                }
+                Ok(changed)
+            }
+            UpdateOp::Load { source, silent } => match self.load_rdf_source(&source) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    if silent {
+                        Ok(0)
+                    } else {
+                        Err(e)
+                    }
+                }
+            },
+            // We keep a single default graph: DEFAULT/ALL clear it; any named
+            // target refers to a graph that does not exist ⇒ no-op.
+            UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
+                GraphTarget::Default | GraphTarget::All => Ok(self.clear_all()),
+                GraphTarget::Named(_) => Ok(0),
+            },
+            // CREATE GRAPH has no effect with a single default graph.
+            UpdateOp::Create { .. } => Ok(0),
+        }
+    }
+
+    /// Remove every triple (keeping the dictionary), returning the count cleared.
+    fn clear_all(&mut self) -> usize {
+        let n = self.store.triple_count() as usize;
+        if n > 0 {
+            self.store = TripleStore::new();
+            self.index_valid = false;
+        }
+        n
+    }
+
+    /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
+    /// graph. Only local sources are fetched — a `file://` IRI or a bare path;
+    /// remote `http(s)://` sources are not retrieved (no network) and error.
+    fn load_rdf_source(&mut self, source: &str) -> Result<usize> {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            return Err(GStoreError::Query(format!(
+                "LOAD of remote source '{source}' is not supported (no network); \
+                 use a local file path or file:// IRI"
+            )));
+        }
+        let path = source.strip_prefix("file://").unwrap_or(source);
+        let triples = turtle::parse_file(path)?;
+        Ok(triples.iter().filter(|t| self.insert_triple(t)).count())
     }
 
     /// Convenience: parse + ensure a SELECT result.

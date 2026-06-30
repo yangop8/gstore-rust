@@ -25,10 +25,41 @@ pub enum Query {
     Ask(AskQuery),
     Construct(ConstructQuery),
     Describe(DescribeQuery),
+    /// A SPARQL UPDATE request: a `;`-separated sequence of operations.
+    Update(Vec<UpdateOp>),
+}
+
+/// One SPARQL UPDATE operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateOp {
     /// `INSERT DATA { … }` — ground triples to add.
     InsertData(Vec<GroundTriple>),
     /// `DELETE DATA { … }` — ground triples to remove.
     DeleteData(Vec<GroundTriple>),
+    /// `[DELETE { … }] [INSERT { … }] WHERE { … }` (and `DELETE WHERE { … }`,
+    /// where `delete` and `pattern` are the same triples). Templates are
+    /// instantiated per WHERE solution; deletes apply before inserts.
+    Modify {
+        delete: Vec<TriplePattern>,
+        insert: Vec<TriplePattern>,
+        pattern: GraphPattern,
+    },
+    /// `LOAD [SILENT] <iri>` — load an RDF document into the default graph.
+    Load { source: String, silent: bool },
+    /// `CLEAR [SILENT] (DEFAULT | NAMED | ALL | GRAPH <iri>)`.
+    Clear { target: GraphTarget, silent: bool },
+    /// `DROP [SILENT] (DEFAULT | NAMED | ALL | GRAPH <iri>)`.
+    Drop { target: GraphTarget, silent: bool },
+    /// `CREATE [SILENT] GRAPH <iri>`.
+    Create { name: String, silent: bool },
+}
+
+/// The target of a `CLEAR`/`DROP` operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphTarget {
+    Default,
+    Named(String),
+    All,
 }
 
 /// `DESCRIBE (* | (?var | <iri>)+ ) [WHERE { … }]`.

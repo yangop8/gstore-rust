@@ -210,7 +210,7 @@ impl<'a> Evaluator<'a> {
             }
             Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
             Query::Describe(d) => Ok(QueryResult::Construct(self.eval_describe(d)?)),
-            Query::InsertData(_) | Query::DeleteData(_) => Err(GStoreError::Query(
+            Query::Update(_) => Err(GStoreError::Query(
                 "updates must be applied through Database, not the read evaluator".into(),
             )),
         }
@@ -319,6 +319,42 @@ impl<'a> Evaluator<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// Compute the ground triples a `DELETE … INSERT … WHERE` modify would
+    /// remove and add: evaluate the WHERE pattern, then instantiate each
+    /// template against every solution (skipping template triples with an
+    /// unbound variable), de-duplicated. The caller (Database) applies deletes
+    /// before inserts. Read-only — does not mutate the store.
+    pub fn eval_update_modify(
+        &self,
+        delete: &[TriplePattern],
+        insert: &[TriplePattern],
+        pattern: &GraphPattern,
+    ) -> (Vec<Triple>, Vec<Triple>) {
+        let layout = VarLayout::build(pattern);
+        let sols = self.eval_pattern(pattern, &layout);
+        let mut dels = Vec::new();
+        let mut ins = Vec::new();
+        let mut seen_d = HashSet::new();
+        let mut seen_i = HashSet::new();
+        for b in &sols {
+            for tp in delete {
+                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                    if seen_d.insert(t.to_string()) {
+                        dels.push(t);
+                    }
+                }
+            }
+            for tp in insert {
+                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                    if seen_i.insert(t.to_string()) {
+                        ins.push(t);
+                    }
+                }
+            }
+        }
+        (dels, ins)
     }
 
     /// Fill a template triple from a solution; `None` if any position is unbound.

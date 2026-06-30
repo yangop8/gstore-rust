@@ -4,10 +4,11 @@
 //! `SPARQLParser`). Supported: prologue (`PREFIX`/`BASE`); `SELECT` (with
 //! `DISTINCT`, projected `(expr AS ?v)`, `GROUP BY`/`HAVING`, aggregates),
 //! `ASK`, `CONSTRUCT`; graph patterns with `FILTER`, `OPTIONAL`, `UNION`,
-//! `MINUS`, `BIND`, `VALUES`, sub-`SELECT`, and property paths (`/ ^ | * + !`);
-//! solution modifiers (`ORDER BY`/`LIMIT`/`OFFSET`); and `INSERT/DELETE DATA`.
-//! Not yet supported: `GRAPH`/`SERVICE`, the `?` path modifier (lexer treats
-//! `?` as a variable sigil), `DESCRIBE`.
+//! `MINUS`, `BIND`, `VALUES`, sub-`SELECT`, `EXISTS`/`NOT EXISTS`, and property
+//! paths (`/ ^ | * + ?`, `!`); solution modifiers (`ORDER BY`/`LIMIT`/`OFFSET`);
+//! `ASK`/`CONSTRUCT`/`DESCRIBE`; and UPDATE (`INSERT/DELETE DATA`,
+//! `DELETE/INSERT … WHERE`, `DELETE WHERE`, `LOAD`, `CLEAR`/`DROP`/`CREATE`,
+//! `;`-separated sequences). Not yet supported: `GRAPH`/`SERVICE` (named graphs).
 
 pub mod ast;
 pub mod lexer;
@@ -112,8 +113,9 @@ impl Parser {
             "ASK" => Query::Ask(self.parse_ask()?),
             "CONSTRUCT" => Query::Construct(self.parse_construct()?),
             "DESCRIBE" => Query::Describe(self.parse_describe()?),
-            "INSERT" => self.parse_insert_data()?,
-            "DELETE" => self.parse_delete_data()?,
+            "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "CREATE" | "WITH" => {
+                Query::Update(self.parse_update_sequence()?)
+            }
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
         };
         Ok(query)
@@ -1069,16 +1071,181 @@ impl Parser {
 
     // ---- updates ----------------------------------------------------------
 
-    fn parse_insert_data(&mut self) -> Result<Query> {
-        self.expect_keyword("INSERT")?;
-        self.expect_keyword("DATA")?;
-        Ok(Query::InsertData(self.parse_ground_block()?))
+    /// `Update1 ( ';' Update1 )*`, with optional prologue between operations.
+    fn parse_update_sequence(&mut self) -> Result<Vec<UpdateOp>> {
+        let mut ops = Vec::new();
+        loop {
+            self.parse_prologue()?;
+            if matches!(self.peek(), Token::Eof) {
+                break;
+            }
+            ops.push(self.parse_update_op()?);
+            if matches!(self.peek(), Token::Semicolon) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        if ops.is_empty() {
+            return Err(self.err("empty UPDATE request"));
+        }
+        Ok(ops)
     }
 
-    fn parse_delete_data(&mut self) -> Result<Query> {
-        self.expect_keyword("DELETE")?;
-        self.expect_keyword("DATA")?;
-        Ok(Query::DeleteData(self.parse_ground_block()?))
+    fn parse_update_op(&mut self) -> Result<UpdateOp> {
+        match self.keyword().as_deref() {
+            Some("INSERT") => {
+                self.bump();
+                if self.eat_keyword("DATA") {
+                    Ok(UpdateOp::InsertData(self.parse_ground_block()?))
+                } else {
+                    let insert = self.parse_triple_template_block()?;
+                    self.skip_using_clauses()?;
+                    self.expect_keyword("WHERE")?;
+                    let pattern = self.parse_group_graph_pattern()?;
+                    Ok(UpdateOp::Modify {
+                        delete: Vec::new(),
+                        insert,
+                        pattern,
+                    })
+                }
+            }
+            Some("DELETE") => {
+                self.bump();
+                if self.eat_keyword("DATA") {
+                    Ok(UpdateOp::DeleteData(self.parse_ground_block()?))
+                } else if self.eat_keyword("WHERE") {
+                    // DELETE WHERE { triples }: the triples are both the match
+                    // pattern and the delete template.
+                    let triples = self.parse_triple_template_block()?;
+                    let pattern = GraphPattern::Bgp(triples.clone());
+                    Ok(UpdateOp::Modify {
+                        delete: triples,
+                        insert: Vec::new(),
+                        pattern,
+                    })
+                } else {
+                    let delete = self.parse_triple_template_block()?;
+                    let insert = if self.eat_keyword("INSERT") {
+                        self.parse_triple_template_block()?
+                    } else {
+                        Vec::new()
+                    };
+                    self.skip_using_clauses()?;
+                    self.expect_keyword("WHERE")?;
+                    let pattern = self.parse_group_graph_pattern()?;
+                    Ok(UpdateOp::Modify {
+                        delete,
+                        insert,
+                        pattern,
+                    })
+                }
+            }
+            Some("WITH") => {
+                // `WITH <iri>` sets the default graph for the modify; with a
+                // single graph it has no effect, so consume and recurse.
+                self.bump();
+                self.expect_graph_iri()?;
+                self.parse_update_op()
+            }
+            Some("LOAD") => {
+                self.bump();
+                let silent = self.eat_keyword("SILENT");
+                let source = self.expect_graph_iri()?;
+                if self.eat_keyword("INTO") {
+                    self.expect_keyword("GRAPH")?;
+                    self.expect_graph_iri()?;
+                }
+                Ok(UpdateOp::Load { source, silent })
+            }
+            Some("CLEAR") => {
+                self.bump();
+                let silent = self.eat_keyword("SILENT");
+                let target = self.parse_graph_target()?;
+                Ok(UpdateOp::Clear { target, silent })
+            }
+            Some("DROP") => {
+                self.bump();
+                let silent = self.eat_keyword("SILENT");
+                let target = self.parse_graph_target()?;
+                Ok(UpdateOp::Drop { target, silent })
+            }
+            Some("CREATE") => {
+                self.bump();
+                let silent = self.eat_keyword("SILENT");
+                self.expect_keyword("GRAPH")?;
+                let name = self.expect_graph_iri()?;
+                Ok(UpdateOp::Create { name, silent })
+            }
+            other => Err(self.err(format!("unsupported update operation {other:?}"))),
+        }
+    }
+
+    /// Parse a `{ … }` block of triple templates (variables allowed, no paths).
+    fn parse_triple_template_block(&mut self) -> Result<Vec<TriplePattern>> {
+        let mut patterns = Vec::new();
+        let mut paths = Vec::new();
+        self.expect(&Token::LBrace, "'{'")?;
+        loop {
+            match self.peek() {
+                Token::RBrace => {
+                    self.bump();
+                    break;
+                }
+                Token::Dot => {
+                    self.bump();
+                }
+                Token::Eof => return Err(self.err("unexpected end of template block")),
+                _ => self.parse_triples_same_subject(&mut patterns, &mut paths)?,
+            }
+        }
+        if !paths.is_empty() {
+            return Err(self.err("property paths are not allowed in an INSERT/DELETE template"));
+        }
+        Ok(patterns)
+    }
+
+    /// `(DEFAULT | NAMED | ALL | GRAPH <iri>)` for CLEAR/DROP.
+    fn parse_graph_target(&mut self) -> Result<GraphTarget> {
+        match self.keyword().as_deref() {
+            Some("DEFAULT") => {
+                self.bump();
+                Ok(GraphTarget::Default)
+            }
+            Some("ALL") => {
+                self.bump();
+                Ok(GraphTarget::All)
+            }
+            // NAMED targets all named graphs; we keep only a default graph, so
+            // an empty-named target stands for "the (empty) set of named graphs".
+            Some("NAMED") => {
+                self.bump();
+                Ok(GraphTarget::Named(String::new()))
+            }
+            Some("GRAPH") => {
+                self.bump();
+                Ok(GraphTarget::Named(self.expect_graph_iri()?))
+            }
+            _ => Err(self.err("expected DEFAULT, NAMED, ALL, or GRAPH <iri>")),
+        }
+    }
+
+    /// Consume and expand an `<iri>` / `prefix:name` graph reference.
+    fn expect_graph_iri(&mut self) -> Result<String> {
+        match self.bump() {
+            Token::Iri(s) => Ok(self.resolve_iri(&s)),
+            Token::PName(p, l) => self.expand_pname(&p, &l),
+            other => Err(self.err(format!("expected a graph <iri>, found {other:?}"))),
+        }
+    }
+
+    /// Skip `USING [NAMED] <iri>` clauses (dataset selection; not modeled).
+    fn skip_using_clauses(&mut self) -> Result<()> {
+        while self.eat_keyword("USING") {
+            self.eat_keyword("NAMED");
+            self.expect_graph_iri()?;
+        }
+        Ok(())
     }
 
     /// Parse a `{ … }` block of ground triples (no variables allowed).
@@ -1346,10 +1513,21 @@ mod tests {
         }
     }
 
+    /// The single update op of a one-operation request.
+    fn one_op(q: &str) -> UpdateOp {
+        match parse(q).unwrap() {
+            Query::Update(mut ops) => {
+                assert_eq!(ops.len(), 1);
+                ops.pop().unwrap()
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_insert_data() {
-        match parse("INSERT DATA { <a> <p> <b> . <a> <p> \"v\" . }").unwrap() {
-            Query::InsertData(ts) => {
+        match one_op("INSERT DATA { <a> <p> <b> . <a> <p> \"v\" . }") {
+            UpdateOp::InsertData(ts) => {
                 assert_eq!(ts.len(), 2);
                 assert_eq!(ts[0].subject, Term::iri("a"));
                 assert_eq!(ts[1].object, Term::plain_literal("v"));
@@ -1360,9 +1538,70 @@ mod tests {
 
     #[test]
     fn parses_delete_data() {
-        match parse("DELETE DATA { <a> <p> <b> }").unwrap() {
-            Query::DeleteData(ts) => assert_eq!(ts.len(), 1),
+        match one_op("DELETE DATA { <a> <p> <b> }") {
+            UpdateOp::DeleteData(ts) => assert_eq!(ts.len(), 1),
             other => panic!("expected DeleteData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_where() {
+        match one_op("DELETE WHERE { ?s <p> ?o }") {
+            UpdateOp::Modify {
+                delete,
+                insert,
+                pattern,
+            } => {
+                assert_eq!(delete.len(), 1);
+                assert!(insert.is_empty());
+                assert!(matches!(pattern, GraphPattern::Bgp(_)));
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_insert_where() {
+        match one_op("DELETE { ?s <old> ?o } INSERT { ?s <new> ?o } WHERE { ?s <old> ?o }") {
+            UpdateOp::Modify {
+                delete, insert, ..
+            } => {
+                assert_eq!(delete.len(), 1);
+                assert_eq!(insert.len(), 1);
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_insert_where_and_clear_load() {
+        assert!(matches!(
+            one_op("INSERT { ?s <a> <b> } WHERE { ?s <p> ?o }"),
+            UpdateOp::Modify { delete, .. } if delete.is_empty()
+        ));
+        assert!(matches!(
+            one_op("CLEAR ALL"),
+            UpdateOp::Clear { target: GraphTarget::All, .. }
+        ));
+        assert!(matches!(
+            one_op("LOAD <file:///tmp/x.ttl>"),
+            UpdateOp::Load { silent: false, .. }
+        ));
+        assert!(matches!(
+            one_op("DROP SILENT DEFAULT"),
+            UpdateOp::Drop { target: GraphTarget::Default, silent: true }
+        ));
+    }
+
+    #[test]
+    fn parses_update_sequence() {
+        match parse("INSERT DATA { <a> <p> <b> } ; DELETE DATA { <a> <p> <b> }").unwrap() {
+            Query::Update(ops) => {
+                assert_eq!(ops.len(), 2);
+                assert!(matches!(ops[0], UpdateOp::InsertData(_)));
+                assert!(matches!(ops[1], UpdateOp::DeleteData(_)));
+            }
+            other => panic!("expected Update, got {other:?}"),
         }
     }
 
