@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
+use crate::kvstore::DiskStore;
 use crate::model::id::is_entity_id;
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql::ast::{GroundTriple, Query};
@@ -28,6 +29,10 @@ const DICT_FILE: &str = "dict.bin";
 const STORE_FILE: &str = "store.bin";
 const META_FILE: &str = "meta.bin";
 const VSTREE_FILE: &str = "vstree.bin";
+/// The on-disk B+ tree KVstore file inside a database directory.
+const KV_FILE: &str = "kvstore.kv";
+/// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
+const DISK_CACHE_PAGES: usize = 4096;
 
 /// Build a VS-tree over every entity, signing each by its in/out edges.
 fn build_vstree(store: &TripleStore) -> VsTree {
@@ -267,6 +272,55 @@ impl Database {
             write_bincode(&dir.join(VSTREE_FILE), &build_vstree(&self.store))?;
         }
         Ok(())
+    }
+
+    // ---- on-disk B+ tree KVstore (backlog item A) -------------------------
+
+    /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
+    /// files. The triples and dictionary are written to `kvstore.kv` through the
+    /// page cache and persisted; nothing is kept in memory.
+    pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+        let kv = dir.join(KV_FILE);
+        let _ = fs::remove_file(&kv); // fresh build
+        DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
+        Ok(())
+    }
+
+    /// Whether directory `dir` holds an on-disk KVstore database.
+    pub fn is_disk<P: AsRef<Path>>(dir: P) -> bool {
+        dir.as_ref().join(KV_FILE).is_file()
+    }
+
+    /// Open an on-disk database and materialize it into the in-memory engine for
+    /// querying. (The disk B+ trees are the source of truth; this loads the
+    /// working set through the page cache — streaming evaluation directly off
+    /// disk is a further optimization, see REFACTOR_BACKLOG item A.)
+    pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        let dir = dir.as_ref();
+        let kv = dir.join(KV_FILE);
+        if !kv.is_file() {
+            return Err(GStoreError::Database(format!(
+                "no on-disk KVstore at '{}'",
+                kv.display()
+            )));
+        }
+        let ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+        let (dict, store) = ds.to_memory()?;
+        let name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
+            .unwrap_or_else(|| "disk".to_string());
+        let mut db = Database {
+            name,
+            dict,
+            store,
+            vstree: VsTree::new(),
+            index_valid: false,
+        };
+        db.rebuild_index();
+        Ok(db)
     }
 
     /// Load a database from directory `dir`.

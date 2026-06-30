@@ -40,7 +40,13 @@ fn main() -> ExitCode {
     };
 
     let dir = db_dir_for(name);
-    let mut db = match Database::load(&dir) {
+    // Auto-detect the backend: an on-disk KVstore directory vs a bincode snapshot.
+    let loaded = if Database::is_disk(&dir) {
+        Database::load_disk(&dir)
+    } else {
+        Database::load(&dir)
+    };
+    let mut db = match loaded {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");

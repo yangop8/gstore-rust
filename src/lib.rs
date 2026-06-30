@@ -20,6 +20,7 @@
 
 pub mod dict;
 pub mod error;
+pub mod kvstore;
 pub mod model;
 pub mod parser;
 pub mod query;

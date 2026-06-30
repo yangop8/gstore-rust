@@ -14,31 +14,55 @@ use std::time::Instant;
 use gstore::{db_dir_for, Database};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // Optional `--disk` flag selects the on-disk B+ tree KVstore backend.
+    let disk = args.iter().any(|a| a == "--disk");
+    args.retain(|a| a != "--disk");
     if args.len() < 3 {
-        eprintln!("usage: {} <db_name> <data.nt> [more.nt ...]", args[0]);
+        eprintln!(
+            "usage: {} [--disk] <db_name> <data.nt> [more.nt ...]",
+            args[0]
+        );
         return ExitCode::FAILURE;
     }
     let name = &args[1];
     let files = &args[2..];
+    let dir = db_dir_for(name);
 
     let started = Instant::now();
-    let db = match Database::build_from_files(name.clone(), files) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("build failed: {e}");
+    if disk {
+        if let Err(e) = Database::build_disk(&dir, files) {
+            eprintln!("disk build failed: {e}");
             return ExitCode::FAILURE;
         }
-    };
-
-    let dir = db_dir_for(name);
-    if let Err(e) = db.save(&dir) {
-        eprintln!("failed to save database to {dir}: {e}");
-        return ExitCode::FAILURE;
+        // Reopen to report stats.
+        match Database::load_disk(&dir) {
+            Ok(db) => print_stats(name, &dir, &db, started, true),
+            Err(e) => {
+                eprintln!("built, but failed to reopen: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let db = match Database::build_from_files(name.clone(), files) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("build failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = db.save(&dir) {
+            eprintln!("failed to save database to {dir}: {e}");
+            return ExitCode::FAILURE;
+        }
+        print_stats(name, &dir, &db, started, false);
     }
+    ExitCode::SUCCESS
+}
 
-    let elapsed = started.elapsed();
-    println!("Built database '{name}' in {dir}");
+fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, disk: bool) {
+    let backend = if disk { "on-disk B+ tree" } else { "in-memory" };
+    println!("Built database '{name}' in {dir} ({backend})");
     println!(
         "  triples={}  entities={}  literals={}  predicates={}",
         db.triple_num(),
@@ -46,6 +70,5 @@ fn main() -> ExitCode {
         db.literal_num(),
         db.predicate_num()
     );
-    println!("  took {:.3}s", elapsed.as_secs_f64());
-    ExitCode::SUCCESS
+    println!("  took {:.3}s", started.elapsed().as_secs_f64());
 }

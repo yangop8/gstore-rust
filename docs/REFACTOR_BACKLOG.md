@@ -2,12 +2,14 @@
 
 这些是超出"主干"范围、或需要重大设计决策的项。主干(导入RDF→存储→SPARQL查询→落盘)已实现;以下按价值/风险排序,逐项可独立推进。
 
-## A. 存储引擎:磁盘原生B+树 + mmap分页 ★高价值
+## A. 存储引擎:磁盘原生B+树 + 页缓存 ★高价值 —— ✅ 已完成
 
-- **现状**:索引常驻内存,落盘用`serde`+`bincode`整体序列化。数据集必须能放进内存。
-- **原版**:`KVstore`基于固定块(4KB)的B+树文件(`SITree`/`IVArray`/`ISArray`),配合LRU缓存与mmap,支持远超内存的数据集(目标42亿三元组)。
-- **重构**:实现块式B+树 + 页缓存 + VList紧凑编码;`get*list*`改为按需读盘。
-- **风险/工作量**:大。需要仔细的页布局、并发与崩溃一致性设计。建议先定块格式与缓存策略再动手。
+- **已实现**(`src/kvstore`):
+  - `pager`:固定4KB块的分页文件 + 写回式LRU页缓存 + 空闲页链表 + 头页(magic/页数/free链/16个root槽),持久化、可重开。
+  - `bptree`:磁盘B+树(变长字节key→变长字节value),节点序列化进页、分裂(叶/内部)、有序叶链表、前缀范围扫描、重开后可读。
+  - `store::DiskStore`:把上述组合成gStore式KVstore——字典树(entity/literal/predicate的`*2id`与`id2*`共6棵)+ 三元组三序索引(SPO/POS/OSP,12字节复合key),前缀扫描覆盖全部访问模式;构建/落盘/重开;`to_memory()`桥接到内存查询引擎。
+  - `Database::build_disk`/`load_disk` + `is_disk`;CLI `gbuild --disk`、`gquery`自动识别磁盘库。DT:`tests/dt_disk.rs`把整个LUBM(10万三元组)建到磁盘B+树、重开、14条查询结果与内存版一致。
+- **后续可优化**:查询直接流式读盘(当前`load_disk`把工作集经页缓存载入内存索引后查询);VList紧凑值编码、mmap、崩溃一致性(WAL)、并发(见E)、磁盘上的VS-tree(见B)。
 
 ## B. VS-tree签名索引(gStore的标志性特性) ★中价值 —— ✅ 已完成
 

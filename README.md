@@ -15,19 +15,33 @@ SPARQL   ─▶ parse ─▶ graph-pattern algebra ─▶ index match + join ─
 It loads RDF (Turtle / N-Triples), encodes it with the same integer-id scheme as
 gStore (entities, literals offset by `LITERAL_FIRST_ID`, separate predicate
 space), stores it in the classic `s2xx` / `o2xx` / `p2xx` indexes, and evaluates
-SPARQL `SELECT`/`ASK` (BGP, UNION, FILTER, ORDER BY, LIMIT/OFFSET, DISTINCT) plus
-`INSERT/DELETE DATA` updates.
+SPARQL queries through a cost-based optimizer and a VS-tree signature filter.
 
-> Scope: this is the **main trunk**. Large gStore subsystems (on-disk B+ tree
-> KVstore, VS-tree signature index, cost-based optimizer, full SPARQL 1.1,
-> HTTP/gRPC server, cluster, MVCC, reasoning) are intentionally deferred and
-> tracked in [`docs/REFACTOR_BACKLOG.md`](docs/REFACTOR_BACKLOG.md).
+Implemented (the gStore subsystems originally deferred are now built):
+
+* **Cost-based optimizer** — Selinger DP join ordering over predicate statistics.
+* **VS-tree signature index** — a faithful port of gStore's 944-bit signatures +
+  signature tree, used as a sound query-time candidate filter.
+* **Full SPARQL 1.1 subset** — `SELECT`/`ASK`/`CONSTRUCT`, BGP, `UNION`,
+  `OPTIONAL`, `MINUS`, `FILTER`, `BIND`, `VALUES`, sub-`SELECT`, aggregates
+  (`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`SAMPLE`/`GROUP_CONCAT`),
+  projected `(expr AS ?v)`, property paths (`/ ^ | * + !`), `ORDER BY`,
+  `LIMIT`/`OFFSET`, `DISTINCT`, and `INSERT/DELETE DATA`.
+* **On-disk B+ tree KVstore** — a paged file (4 KiB blocks) with an LRU page
+  cache, B+ trees for the dictionary and the SPO/POS/OSP triple indexes; build,
+  persist, and reopen a database entirely on disk (`gbuild --disk`).
+
+Still deferred (tracked in [`docs/REFACTOR_BACKLOG.md`](docs/REFACTOR_BACKLOG.md)):
+HTTP/gRPC server, cluster, MVCC/transactions, reasoning, `GRAPH`/`SERVICE`,
+streaming query directly off disk.
 
 ## Status
 
-* **133 tests pass** — 115 unit tests + 18 data/CLI integration tests.
+* **186 tests pass** — 136 unit tests + 50 data/CLI integration tests.
 * The full **LUBM** benchmark (~100k triples, all 14 standard queries) builds in
-  ~0.13s and every query runs in ≤1 ms, returning the published answer counts.
+  ~0.13s in memory and every query runs in ≤1 ms, returning the published answer
+  counts; the same dataset also builds to / queries from the on-disk B+ tree
+  KVstore with identical results.
 
 ## Build & test
 
@@ -43,6 +57,7 @@ Mirrors gStore's CLI. A database is a `<name>.db` directory.
 ```bash
 # Build a database from RDF (Turtle or N-Triples)
 gbuild mydb data.nt
+gbuild --disk mydb data.nt    # build on the on-disk B+ tree KVstore
 
 # Run a SPARQL query (from a file, or inline with -e)
 gquery mydb query.rq
@@ -78,10 +93,12 @@ let db = Database::load("demo.db")?;   // reload
 |---------------|--------------------------------------------|-------------------------------|
 | `model`       | RDF terms, triples, id conventions         | `Util/Triple`, `GlobalTypedef`|
 | `dict`        | bidirectional string↔id dictionaries       | `KVstore` *2id / id2* trees   |
-| `store`       | `s2xx`/`o2xx`/`p2xx` six-way index          | `KVstore` *ID2values          |
+| `store`       | in-memory `s2xx`/`o2xx`/`p2xx` six-way index | `KVstore` *ID2values         |
+| `kvstore`     | on-disk pager + B+ trees + `DiskStore`      | `KVstore` (`Tree`/`IVArray`…) |
+| `signature`   | signatures + VS-tree candidate filter       | `Signature` + VSTree          |
 | `parser`      | N-Triples / Turtle / SPARQL                 | `Parser`                      |
-| `query`       | algebra eval, joins, FILTER, results        | `Query`, `Database/Executor`  |
-| `db`          | `Database` facade + persistence             | `Database`                    |
+| `query`       | algebra eval, joins, optimizer, FILTER      | `Query`, `Database/Executor`, `Optimizer` |
+| `db`          | `Database` facade + persistence (mem & disk) | `Database`                   |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`              | `gbuild`, `gquery`, `gconsole`|
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and the mapping to
