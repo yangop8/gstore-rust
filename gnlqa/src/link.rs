@@ -4,10 +4,12 @@
 //! dictionary. Candidates are later validated against gStore's neighborhood
 //! (C7) and used to ground SPARQL generation (C8).
 
+use std::collections::HashSet;
+
 use crate::embed::{Embedder, VectorIndex};
 use crate::error::Result;
 use crate::intent::{Mention, MentionKind};
-use crate::kb::{KbClient, SparqlAnswer};
+use crate::kb::{sparql_escape_literal, KbClient, SparqlAnswer, TermKind};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -34,22 +36,25 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// SPARQL surface form: `<uri>` for a URI term, a quoted literal otherwise.
+    /// SPARQL surface form: `<uri>` for a URI term, an escaped quoted literal
+    /// otherwise (the literal value can be user text, so it must be escaped).
     pub fn to_term(&self) -> String {
         if self.kind == LinkKind::Literal || self.uri.is_empty() {
-            format!("\"{}\"", self.label)
+            format!("\"{}\"", sparql_escape_literal(&self.label))
         } else {
             format!("<{}>", self.uri)
         }
     }
 }
 
-/// The local name of a URI — the part after the last `#` or `/`.
+/// The local name of a URI — the part after the last `#`, `/`, or `:`, ignoring
+/// a single trailing `/`. Falls back to the whole string if there's no separator.
 pub fn local_name(uri: &str) -> String {
-    let cut = uri.rfind(['#', '/']).map(|i| i + 1).unwrap_or(0);
-    let name = &uri[cut..];
+    let trimmed = uri.strip_suffix('/').unwrap_or(uri);
+    let cut = trimmed.rfind(['#', '/', ':']).map(|i| i + 1).unwrap_or(0);
+    let name = &trimmed[cut..];
     if name.is_empty() {
-        uri.to_string()
+        trimmed.to_string()
     } else {
         name.to_string()
     }
@@ -87,15 +92,25 @@ impl Linker {
         kb: &dyn KbClient,
         embedder: Box<dyn Embedder>,
         min_score: f32,
+        entity_limit: Option<usize>,
     ) -> Result<Linker> {
-        let ent_q = format!("SELECT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l }}");
-        let entities = pairs_with_label(&kb.query(&ent_q)?, "s", "l");
+        // Restrict to en / no-language labels and (optionally) cap the count;
+        // a real KB can have millions of labels (full paging is a later step).
+        let lim = entity_limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+        let ent_q = format!(
+            "SELECT DISTINCT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l \
+             FILTER(lang(?l) = \"\" || lang(?l) = \"en\") }}{lim}"
+        );
+        let ent_ans = kb.query(&ent_q)?;
+        warn_if_no_rows(&ent_ans, "entity label");
+        let entities = pairs_with_label(&ent_ans, "s", "l");
 
-        let pred_q = "SELECT DISTINCT ?p WHERE { ?s ?p ?o }".to_string();
-        let predicates = uris_by_local_name(&kb.query(&pred_q)?, "p");
+        let pred_ans = kb.query("SELECT DISTINCT ?p WHERE { ?s ?p ?o }")?;
+        let predicates = uris_by_local_name(&pred_ans, "p");
 
         let type_q = format!("SELECT DISTINCT ?t WHERE {{ ?s <{RDF_TYPE}> ?t }}");
-        let types = uris_by_local_name(&kb.query(&type_q)?, "t");
+        let type_ans = kb.query(&type_q)?;
+        let types = uris_by_local_name(&type_ans, "t");
 
         Linker::from_labels(embedder, &entities, &predicates, &types, min_score)
     }
@@ -107,11 +122,18 @@ impl Linker {
 
     fn search(&self, index: &VectorIndex, kind: LinkKind, text: &str, k: usize) -> Result<Vec<Candidate>> {
         let hits = index.search_text(self.embedder.as_ref(), text, k)?;
-        Ok(hits
-            .into_iter()
-            .filter(|h| h.score >= self.min_score)
-            .map(|h| Candidate { uri: h.id, label: h.text, kind, score: h.score })
-            .collect())
+        let mk = |h: crate::embed::Scored| Candidate { uri: h.id, label: h.text, kind, score: h.score };
+        let mut kept: Vec<Candidate> =
+            hits.iter().filter(|h| h.score >= self.min_score).cloned().map(mk).collect();
+        // Relaxation (à la gAnswer): if the threshold pruned everything but there
+        // was a best hit, keep it so linking never hard-fails on a real match —
+        // downstream (C7) validates against the KG neighborhood.
+        if kept.is_empty() {
+            if let Some(best) = hits.into_iter().next() {
+                kept.push(mk(best));
+            }
+        }
+        Ok(kept)
     }
 
     /// Link a mention to its top-`k` candidates, routed by [`MentionKind`].
@@ -134,7 +156,9 @@ impl Linker {
     }
 }
 
-/// Build `(uri, label)` pairs from a 2-column SELECT (label = the literal value).
+/// Build de-duplicated `(uri, label)` pairs from a 2-column SELECT (label = the
+/// literal value). Skips blank-node subjects and keeps the first label per URI
+/// (so multilingual duplicates don't inflate the index).
 fn pairs_with_label(ans: &SparqlAnswer, uri_var: &str, label_var: &str) -> Vec<(String, String)> {
     let SparqlAnswer::Select { vars, rows } = ans else {
         return Vec::new();
@@ -145,13 +169,32 @@ fn pairs_with_label(ans: &SparqlAnswer, uri_var: &str, label_var: &str) -> Vec<(
     ) else {
         return Vec::new();
     };
-    rows.iter()
-        .filter_map(|r| {
-            let uri = r.get(ui)?.as_ref()?.value.clone();
-            let label = r.get(li)?.as_ref()?.value.clone();
-            Some((uri, label))
-        })
-        .collect()
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let (Some(Some(ut)), Some(Some(lt))) = (r.get(ui), r.get(li)) else {
+            continue;
+        };
+        if ut.kind == TermKind::Bnode {
+            continue;
+        }
+        if seen.insert(ut.value.clone()) {
+            out.push((ut.value.clone(), lt.value.clone()));
+        }
+    }
+    out
+}
+
+/// Warn (don't fail) when a query expected to return rows returns none / a
+/// non-SELECT shape — a common sign of a misconfigured endpoint or vocabulary.
+fn warn_if_no_rows(ans: &SparqlAnswer, what: &str) {
+    let empty = match ans {
+        SparqlAnswer::Select { rows, .. } => rows.is_empty(),
+        _ => true,
+    };
+    if empty {
+        eprintln!("gnlqa: warning: {what} query returned no rows — linker will be sparse");
+    }
 }
 
 /// Build `(uri, local_name)` pairs from a 1-column SELECT of URIs.
@@ -218,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn min_score_filters() {
+    fn min_score_relaxes_to_best_when_all_pruned() {
         let l = Linker::from_labels(
             Box::new(HashEmbedder::new(128)),
             &[ent("http://ex/Berlin", "Berlin")],
@@ -227,9 +270,27 @@ mod tests {
             0.99, // very high threshold
         )
         .unwrap();
-        // unrelated query → below threshold → no candidates
+        // Everything is below threshold, but relaxation keeps the single best
+        // (recall over a hard zero), and its score is genuinely below the floor.
         let e = l.link_mention(&Mention { text: "xyzzy plugh".into(), kind: MentionKind::Entity }, 5).unwrap();
-        assert!(e.is_empty());
+        assert_eq!(e.len(), 1);
+        assert!(e[0].score < 0.99);
+    }
+
+    #[test]
+    fn literal_to_term_escapes_quotes() {
+        let l = linker();
+        let c = l
+            .link_mention(&Mention { text: "say \"hi\"\nbye".into(), kind: MentionKind::Literal }, 1)
+            .unwrap();
+        // no raw quote/newline can break out of the SPARQL literal
+        assert_eq!(c[0].to_term(), "\"say \\\"hi\\\"\\nbye\"");
+    }
+
+    #[test]
+    fn local_name_handles_urn_and_trailing_slash() {
+        assert_eq!(local_name("http://ex/Berlin/"), "Berlin");
+        assert_eq!(local_name("urn:isbn:0451450523"), "0451450523");
     }
 
     #[test]
@@ -254,7 +315,7 @@ mod tests {
             rows: vec![vec![uri("http://ex/City")]],
         };
         let kb = MockKb::new(vec![entities, predicates, types]);
-        let l = Linker::build_from_kb(&kb, Box::new(HashEmbedder::new(128)), 0.0).unwrap();
+        let l = Linker::build_from_kb(&kb, Box::new(HashEmbedder::new(128)), 0.0, None).unwrap();
         assert_eq!(l.sizes(), (1, 1, 1));
         let p = l.link_predicate("capitalOf", 1).unwrap();
         assert_eq!(p[0].uri, "http://ex/capitalOf"); // local-name label matched

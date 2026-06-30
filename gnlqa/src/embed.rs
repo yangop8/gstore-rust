@@ -250,20 +250,25 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// Build an index by embedding `items` (`(id, text)`) with `embedder`.
+    /// Build an index by embedding `items` (`(id, text)`) with `embedder`,
+    /// batched so a remote embedding endpoint isn't sent everything in one
+    /// request.
     pub fn build(embedder: &dyn Embedder, items: &[(String, String)]) -> Result<VectorIndex> {
+        const BATCH: usize = 512;
         let mut idx = VectorIndex::new(embedder.dim());
-        let texts: Vec<String> = items.iter().map(|(_, t)| t.clone()).collect();
-        let vecs = embedder.embed(&texts)?;
-        if vecs.len() != items.len() {
-            return Err(Error::Llm(format!(
-                "embedder returned {} vectors for {} items",
-                vecs.len(),
-                items.len()
-            )));
-        }
-        for ((id, text), v) in items.iter().zip(vecs) {
-            idx.add(id.clone(), text.clone(), v)?;
+        for chunk in items.chunks(BATCH) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let vecs = embedder.embed(&texts)?;
+            if vecs.len() != chunk.len() {
+                return Err(Error::Llm(format!(
+                    "embedder returned {} vectors for {} items",
+                    vecs.len(),
+                    chunk.len()
+                )));
+            }
+            for ((id, text), v) in chunk.iter().zip(vecs) {
+                idx.add(id.clone(), text.clone(), v)?;
+            }
         }
         Ok(idx)
     }

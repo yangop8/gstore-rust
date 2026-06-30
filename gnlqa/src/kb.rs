@@ -31,22 +31,42 @@ pub struct RdfTerm {
 }
 
 impl RdfTerm {
-    /// Render back to a SPARQL/Turtle surface form (`<uri>`, `"lit"`, `_:b`).
+    /// Render back to a SPARQL/Turtle surface form (`<uri>`, `"lit"`, `_:b`),
+    /// escaping literal contents so embedded quotes/backslashes/newlines can't
+    /// break (or inject into) the query.
     pub fn to_term_string(&self) -> String {
         match self.kind {
             TermKind::Uri => format!("<{}>", self.value),
             TermKind::Bnode => format!("_:{}", self.value),
             TermKind::Literal => {
+                let v = sparql_escape_literal(&self.value);
                 if let Some(l) = &self.lang {
-                    format!("\"{}\"@{}", self.value, l)
+                    format!("\"{v}\"@{l}")
                 } else if let Some(d) = &self.datatype {
-                    format!("\"{}\"^^<{}>", self.value, d)
+                    format!("\"{v}\"^^<{d}>")
                 } else {
-                    format!("\"{}\"", self.value)
+                    format!("\"{v}\"")
                 }
             }
         }
     }
+}
+
+/// Escape a string for use inside a SPARQL double-quoted literal (per the
+/// SPARQL 1.1 STRING_LITERAL grammar).
+pub fn sparql_escape_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The result of a SPARQL query.
@@ -343,6 +363,13 @@ mod tests {
             {"x":{"type":"uri","value":"u1"}},{"x":{"type":"uri","value":"u1"}},{"x":{"type":"uri","value":"u2"}}]}});
         let ans = parse_results(&v).unwrap();
         assert_eq!(ans.column_values("x"), vec!["u1", "u2"]);
+    }
+
+    #[test]
+    fn escape_literal_neutralizes_injection() {
+        assert_eq!(sparql_escape_literal("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        let t = RdfTerm { kind: TermKind::Literal, value: "x\"y".into(), datatype: None, lang: None };
+        assert_eq!(t.to_term_string(), "\"x\\\"y\"");
     }
 
     #[test]

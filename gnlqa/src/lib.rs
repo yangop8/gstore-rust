@@ -30,7 +30,10 @@ pub use intent::{
     extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,
     RelationPhrase,
 };
-pub use kb::{validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer, TermKind};
+pub use kb::{
+    sparql_escape_literal, validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer,
+    TermKind,
+};
 pub use link::{local_name, Candidate, LinkKind, Linker};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
 pub use pipeline::{Answer, AskEngine};
