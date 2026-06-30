@@ -28,29 +28,44 @@
 //! older than the oldest live transaction's start version are garbage-collected
 //! on every commit/abort, so the history never grows unbounded.
 //!
-//! Cost model: publishing a snapshot clones the dictionary + triple indexes
+//! Cost model: publishing a [`Snapshot`] clones the dictionary + triple indexes
 //! (`O(store)` per commit). That keeps published snapshots immutable and the
-//! implementation simple; finer-grained MVCC (per-key version chains,
-//! persistent/shared structures) would avoid the copy.
+//! `query()`/`snapshot()` read path simple.
+//!
+//! On top of that clone-published snapshot, a **per-key version-chain** store
+//! provides finer-grained MVCC *without* a per-snapshot copy. Every transactional
+//! commit appends, for each written triple key, a version record — an `insert` or
+//! a `tombstone` — stamped with the commit version. A version-pinned reader
+//! ([`ConcurrentDb::version_view`] → [`VersionView`]) resolves each key to the
+//! latest record `≤` its pinned version `V`, falling back to a single shared,
+//! immutable base snapshot (captured at construction) for keys it never touched.
+//! So many version-pinned readers *share* one chain structure and merely filter
+//! by version, rather than each holding a full clone: point reads
+//! ([`VersionView::contains`]) clone nothing, and [`VersionView::query`]
+//! materializes the visible state only on demand. Records below the oldest live
+//! reader's version are garbage-collected, so each chain collapses to one record
+//! per key in steady state.
 //!
 //! Scope note: the legacy `update()`/`write()` path stays snapshot-consistent for
 //! readers and records its commit version, so a [`Txn`] whose lifetime overlaps a
 //! legacy write conservatively conflicts on commit (it cannot lose that write
 //! silently). It is conservative — a legacy write conflicts ALL transactions live
 //! at the time, regardless of key overlap, because that path does not record a
-//! per-key write set. Prefer one write path at a time for best throughput.
+//! per-key write set. The version-chain view likewise reflects the construction
+//! base plus all committed [`Txn`]s but not legacy writes, so prefer the
+//! transactional path when reading through [`VersionView`].
 //!
-//! NOT done (see `docs/REFACTOR_BACKLOG.md` E): per-key version chains,
-//! lock-free reads beyond the `Arc`-swap, deadlock detection, and snapshot GC
-//! beyond `Arc` refcounting.
+//! NOT done (see `docs/REFACTOR_BACKLOG.md` E): lock-free reads beyond the
+//! `Arc`-swap / `RwLock`, deadlock detection, and version-chaining the legacy
+//! `update()`/`write()` path.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::db::Database;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
-use crate::model::Triple;
+use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
 use crate::query::{Evaluator, QueryResult};
 use crate::store::TripleStore;
@@ -151,12 +166,131 @@ impl OccState {
         }
     }
 
+    /// The GC floor: the smallest live start/pin version. History entries at or
+    /// below it are unreachable, and version records strictly below each key's
+    /// anchor at it can be reclaimed. `u64::MAX` when nothing is live.
+    fn gc_floor(&self) -> u64 {
+        self.live_starts.keys().next().copied().unwrap_or(u64::MAX)
+    }
+
     /// Drop history entries no live transaction can still need. A txn that
     /// started at `s` only validates versions `> s`, so anything at or below the
     /// smallest live start is unreachable; with no live txns, all of it is.
     fn gc(&mut self) {
-        let floor = self.live_starts.keys().next().copied().unwrap_or(u64::MAX);
+        let floor = self.gc_floor();
         self.history.retain(|&v, _| v > floor);
+    }
+}
+
+/// Whether a version record adds a triple (`Insert`) or removes it (`Tombstone`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainOp {
+    Insert,
+    Tombstone,
+}
+
+/// One entry in a triple key's version chain: the committing transaction's
+/// version and whether that commit left the triple present or absent.
+#[derive(Debug, Clone, Copy)]
+struct VersionRecord {
+    version: u64,
+    op: ChainOp,
+}
+
+/// The version chain for a single triple key. The triple is held once (every
+/// record in the chain shares it); `records` are ordered by ascending version —
+/// commit versions increase monotonically, so appends stay sorted.
+#[derive(Debug)]
+struct Chain {
+    triple: Triple,
+    records: Vec<VersionRecord>,
+}
+
+impl Chain {
+    /// The record visible to a reader at `version`: the latest record with
+    /// `record.version <= version`, or `None` if every record is newer.
+    fn visible(&self, version: u64) -> Option<&VersionRecord> {
+        self.records.iter().rev().find(|r| r.version <= version)
+    }
+}
+
+/// A per-key version-chain store shared (behind an `RwLock`) by every
+/// version-pinned reader. Maps each triple key to its [`Chain`]; readers filter
+/// by version instead of cloning the store.
+#[derive(Debug, Default)]
+struct VersionedStore {
+    chains: HashMap<TripleKey, Chain>,
+}
+
+impl VersionedStore {
+    fn new() -> VersionedStore {
+        VersionedStore::default()
+    }
+
+    /// Append a version record for `triple`'s key at `version`.
+    fn record(&mut self, version: u64, triple: Triple, op: ChainOp) {
+        let key = triple.to_string();
+        self.chains
+            .entry(key)
+            .or_insert_with(|| Chain {
+                triple,
+                records: Vec::new(),
+            })
+            .records
+            .push(VersionRecord { version, op });
+    }
+
+    /// Whether `key` is present at `version`: `Some(true/false)` from the latest
+    /// chain record `<= version`, or `None` when the chain has no such record (the
+    /// caller should then consult the base snapshot).
+    fn visible_present(&self, key: &str, version: u64) -> Option<bool> {
+        self.chains
+            .get(key)
+            .and_then(|c| c.visible(version))
+            .map(|r| r.op == ChainOp::Insert)
+    }
+
+    /// Apply every chain's visible state at `version` onto a base `dict`/`store`
+    /// (clones of the base snapshot): insert visible triples, remove tombstoned
+    /// ones. Keys with no record `<= version` are left to the base untouched.
+    fn materialize_into(&self, version: u64, dict: &mut Dictionary, store: &mut TripleStore) {
+        for chain in self.chains.values() {
+            let Some(rec) = chain.visible(version) else {
+                continue;
+            };
+            let t = &chain.triple;
+            match rec.op {
+                ChainOp::Insert => {
+                    let id = IdTriple::new(
+                        dict.intern_entity(&t.subject.dict_key()),
+                        dict.intern_predicate(&t.predicate.dict_key()),
+                        dict.intern_term(&t.object),
+                    );
+                    store.insert(id);
+                }
+                ChainOp::Tombstone => {
+                    if let (Some(s), Some(p), Some(o)) = (
+                        dict.entity_id(&t.subject.dict_key()),
+                        dict.predicate_id(&t.predicate.dict_key()),
+                        dict.term_id(&t.object),
+                    ) {
+                        store.remove(IdTriple::new(s, p, o));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reclaim records no live reader can observe: for each chain keep the latest
+    /// record `<= floor` (the oldest live reader's anchor) plus everything newer,
+    /// dropping strictly-older records. With no live readers (`floor == u64::MAX`)
+    /// every chain collapses to its single latest record.
+    fn gc(&mut self, floor: u64) {
+        for chain in self.chains.values_mut() {
+            if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
+                chain.records.drain(0..anchor);
+            }
+        }
     }
 }
 
@@ -170,6 +304,12 @@ pub struct ConcurrentDb {
     current: RwLock<Arc<Snapshot>>,
     /// Optimistic-concurrency bookkeeping (commit history + live-txn registry).
     occ: Mutex<OccState>,
+    /// Immutable base snapshot captured at construction. Version-pinned readers
+    /// ([`VersionView`]) fall back to it for keys no transaction has touched, so
+    /// they need not clone the store per snapshot.
+    base: Arc<Snapshot>,
+    /// Per-key version chains backing [`VersionView`] reads.
+    versioned: RwLock<VersionedStore>,
 }
 
 impl ConcurrentDb {
@@ -177,9 +317,11 @@ impl ConcurrentDb {
     pub fn new(db: Database) -> ConcurrentDb {
         let snap = Arc::new(Snapshot::from_db(&db, 1));
         ConcurrentDb {
+            base: Arc::clone(&snap),
             writer: Mutex::new(db),
             current: RwLock::new(snap),
             occ: Mutex::new(OccState::new()),
+            versioned: RwLock::new(VersionedStore::new()),
         }
     }
 
@@ -298,10 +440,64 @@ impl ConcurrentDb {
             .unwrap_or_else(|| GStoreError::Conflict("run_txn exhausted its retry budget".into())))
     }
 
+    // ---- per-key version-chain MVCC reads ---------------------------------
+
+    /// Open a version-pinned reader at the latest committed version. The reader
+    /// shares the per-key version chains (no per-snapshot clone) and resolves
+    /// each key to the version visible at its pin; concurrent commits never
+    /// change what it sees. Registers liveness so GC keeps the versions it needs
+    /// until it is dropped.
+    pub fn version_view(&self) -> VersionView<'_> {
+        // Capture the version + register liveness atomically under the OCC lock,
+        // so a concurrent commit cannot GC a version this view will need.
+        let mut occ = self.occ.lock().unwrap();
+        let version = self.current.read().unwrap().version;
+        occ.register(version);
+        drop(occ);
+        VersionView {
+            db: self,
+            version,
+            registered: true,
+        }
+    }
+
+    /// Open a version-pinned reader at a specific committed `version`
+    /// (time-travel). Like [`version_view`](Self::version_view) it registers
+    /// liveness for GC. `version` should be a committed version `<=` the current
+    /// one; reads resolve through the version chains as of that version.
+    pub fn version_view_at(&self, version: u64) -> VersionView<'_> {
+        let mut occ = self.occ.lock().unwrap();
+        occ.register(version);
+        drop(occ);
+        VersionView {
+            db: self,
+            version,
+            registered: true,
+        }
+    }
+
+    /// Garbage-collect the version chains down to `floor` (the oldest live
+    /// snapshot version). Callers compute `floor` from [`OccState::gc_floor`]
+    /// while holding the OCC lock, preserving the writer → occ → versioned order.
+    fn gc_versions(&self, floor: u64) {
+        self.versioned.write().unwrap().gc(floor);
+    }
+
     /// Number of retained history entries (used by tests to assert GC bounds).
     #[cfg(test)]
     fn history_len(&self) -> usize {
         self.occ.lock().unwrap().history.len()
+    }
+
+    /// Number of version records retained in a triple key's chain (tests).
+    #[cfg(test)]
+    fn chain_len(&self, key: &str) -> usize {
+        self.versioned
+            .read()
+            .unwrap()
+            .chains
+            .get(key)
+            .map_or(0, |c| c.records.len())
     }
 }
 
@@ -384,6 +580,7 @@ impl Txn<'_> {
         if legacy_during || txn_conflict {
             occ.deregister(self.start_version);
             occ.gc();
+            self.db.gc_versions(occ.gc_floor());
             self.registered = false;
             return Err(GStoreError::Conflict(format!(
                 "conflict: a {} after version {} may overlap this transaction's writes",
@@ -409,12 +606,34 @@ impl Txn<'_> {
         }
         let new_version = self.db.publish(&db);
 
+        // Append this commit's per-key version records to the shared chains: one
+        // record per written key, reflecting that key's net final state under
+        // this transaction (a later op for the same key supersedes an earlier).
+        let mut net: BTreeMap<TripleKey, (Triple, ChainOp)> = BTreeMap::new();
+        for op in &self.ops {
+            match op {
+                TxnOp::Insert(t) => {
+                    net.insert(t.to_string(), (t.clone(), ChainOp::Insert));
+                }
+                TxnOp::Delete(t) => {
+                    net.insert(t.to_string(), (t.clone(), ChainOp::Tombstone));
+                }
+            }
+        }
+        {
+            let mut vs = self.db.versioned.write().unwrap();
+            for (_, (triple, op)) in net {
+                vs.record(new_version, triple, op);
+            }
+        }
+
         // Record this version's write set for future validators, then retire
-        // ourselves from the live registry and GC unreachable history.
+        // ourselves from the live registry and GC unreachable history + versions.
         let keys = std::mem::take(&mut self.keys);
         occ.history.insert(new_version, keys);
         occ.deregister(self.start_version);
         occ.gc();
+        self.db.gc_versions(occ.gc_floor());
         self.registered = false;
         Ok(new_version)
     }
@@ -432,6 +651,76 @@ impl Drop for Txn<'_> {
             let mut occ = self.db.occ.lock().unwrap();
             occ.deregister(self.start_version);
             occ.gc();
+            self.db.gc_versions(occ.gc_floor());
+            self.registered = false;
+        }
+    }
+}
+
+/// A version-pinned reader over the per-key version chains. Holding one is cheap
+/// — a borrow plus a version number — so concurrent readers *share* the chain
+/// structure instead of each cloning the store. It resolves each triple key to
+/// the version visible at [`version`](Self::version): the latest chain record
+/// `<= version` (insert ⇒ present, tombstone ⇒ absent), falling back to the
+/// shared immutable base snapshot for keys no transaction has touched. Dropping
+/// it releases its GC pin.
+pub struct VersionView<'a> {
+    db: &'a ConcurrentDb,
+    version: u64,
+    /// Whether this view is still counted in `OccState::live_starts`.
+    registered: bool,
+}
+
+impl VersionView<'_> {
+    /// The version this view is pinned at.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Whether `t` is visible at this view's version. Resolves through the shared
+    /// version chains (latest record `<= version`) and only consults the base
+    /// snapshot for keys with no such record — cloning nothing.
+    pub fn contains(&self, t: &Triple) -> bool {
+        let key = t.to_string();
+        match self
+            .db
+            .versioned
+            .read()
+            .unwrap()
+            .visible_present(&key, self.version)
+        {
+            Some(present) => present,
+            None => self.db.base.contains(t),
+        }
+    }
+
+    /// Run a read query as of this view's version. Materializes the visible
+    /// default-graph state on demand — the base snapshot plus chain overrides
+    /// `<= version` — then evaluates against it.
+    pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        let mut dict = self.db.base.dict.clone();
+        let mut store = self.db.base.store.clone();
+        self.db
+            .versioned
+            .read()
+            .unwrap()
+            .materialize_into(self.version, &mut dict, &mut store);
+        let q = sparql::parse(sparql)?;
+        let mut eval = Evaluator::new(&dict, &store);
+        if !self.db.base.named.is_empty() {
+            eval = eval.with_named(&self.db.base.named);
+        }
+        eval.evaluate(&q)
+    }
+}
+
+impl Drop for VersionView<'_> {
+    fn drop(&mut self) {
+        if self.registered {
+            let mut occ = self.db.occ.lock().unwrap();
+            occ.deregister(self.version);
+            occ.gc();
+            self.db.gc_versions(occ.gc_floor());
             self.registered = false;
         }
     }
@@ -460,6 +749,13 @@ mod tests {
 
     fn snap_count(s: &Snapshot, q: &str) -> usize {
         match s.query(q).unwrap() {
+            QueryResult::Select(rs) => rs.row_count(),
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    fn view_count(v: &VersionView, q: &str) -> usize {
+        match v.query(q).unwrap() {
             QueryResult::Select(rs) => rs.row_count(),
             other => panic!("expected Select, got {other:?}"),
         }
@@ -784,5 +1080,218 @@ mod tests {
         })
         .unwrap();
         assert!(c.history_len() <= 1, "GC after the pin frees history");
+    }
+
+    // ---- per-key version-chain MVCC --------------------------------------
+
+    #[test]
+    fn version_view_pinned_across_commits() {
+        // A long-running version-pinned reader keeps seeing version V even as
+        // transactions commit newer versions onto the shared chains.
+        let c = cdb();
+        let base = triple("http://ex/a", "http://ex/p", "http://ex/b");
+        let view = c.version_view(); // pins version 1 (just the base triple)
+        assert_eq!(view.version(), 1);
+        assert!(view.contains(&base));
+
+        for i in 0..5 {
+            let mut w = c.begin();
+            w.insert(triple(&format!("http://ex/n{i}"), "http://ex/p", "http://ex/o"));
+            w.commit().unwrap();
+        }
+
+        // The pin still resolves to the base state, despite five newer commits.
+        assert!(view.contains(&base));
+        assert!(!view.contains(&triple("http://ex/n0", "http://ex/p", "http://ex/o")));
+        assert_eq!(view.version(), 1);
+
+        // A fresh view sees every committed version.
+        let latest = c.version_view();
+        assert_eq!(latest.version(), 6);
+        assert!(latest.contains(&triple("http://ex/n4", "http://ex/p", "http://ex/o")));
+    }
+
+    #[test]
+    fn version_chain_visible_version_selection() {
+        // One key carries three versions; each pinned version resolves to the
+        // record visible at it (latest <= version).
+        let c = cdb();
+        let k = triple("http://ex/k", "http://ex/p", "http://ex/v");
+        // Pin the base version so GC retains the whole chain while we inspect it.
+        let pin = c.version_view_at(1);
+
+        c.run_txn(4, |t| {
+            t.insert(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v2: insert
+        c.run_txn(4, |t| {
+            t.delete(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v3: tombstone
+        c.run_txn(4, |t| {
+            t.insert(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v4: insert again
+
+        assert_eq!(c.version(), 4);
+        assert_eq!(c.chain_len(&k.to_string()), 3, "all three versions retained");
+
+        assert!(!c.version_view_at(1).contains(&k), "v1: before any record");
+        assert!(c.version_view_at(2).contains(&k), "v2: inserted");
+        assert!(!c.version_view_at(3).contains(&k), "v3: tombstoned");
+        assert!(c.version_view_at(4).contains(&k), "v4: re-inserted");
+
+        drop(pin);
+    }
+
+    #[test]
+    fn version_chain_tombstone_visibility() {
+        // A tombstone masks a base triple for readers at/after the deleting
+        // version; earlier pins still see the base value.
+        let c = cdb();
+        let base = triple("http://ex/a", "http://ex/p", "http://ex/b");
+        let pin = c.version_view_at(1); // retain the chain for inspection
+
+        c.run_txn(4, |t| {
+            t.delete(base.clone());
+            Ok(())
+        })
+        .unwrap(); // v2: tombstone the base triple
+        c.run_txn(4, |t| {
+            t.insert(base.clone());
+            Ok(())
+        })
+        .unwrap(); // v3: re-insert it
+
+        assert_eq!(c.chain_len(&base.to_string()), 2);
+        assert!(c.version_view_at(1).contains(&base), "v1: base present");
+        assert!(!c.version_view_at(2).contains(&base), "v2: tombstoned");
+        assert!(c.version_view_at(3).contains(&base), "v3: re-inserted");
+
+        drop(pin);
+    }
+
+    #[test]
+    fn write_write_conflict_on_same_key() {
+        // Two transactions begin at the same version and write the same key:
+        // first-committer-wins, and exactly one version record is appended.
+        let c = cdb();
+        let k = triple("http://ex/x", "http://ex/p", "http://ex/y");
+        let mut a = c.begin(); // version 1
+        let mut b = c.begin(); // version 1
+        a.insert(k.clone());
+        b.insert(k.clone());
+
+        assert!(a.commit().is_ok(), "first committer wins");
+        let res = b.commit();
+        assert!(
+            matches!(res, Err(GStoreError::Conflict(_))),
+            "the second writer of the same key must conflict, got {res:?}"
+        );
+        assert_eq!(c.version(), 2, "only one commit advanced the version");
+        assert_eq!(
+            c.chain_len(&k.to_string()),
+            1,
+            "only the winner appended a version record"
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_only_below_oldest_live_view() {
+        // While an old view pins the floor, every version at/after it is kept;
+        // once the pin drops, the chain collapses to the single latest record.
+        let c = cdb();
+        let k = triple("http://ex/k", "http://ex/p", "http://ex/v");
+        let pin = c.version_view_at(1);
+
+        c.run_txn(4, |t| {
+            t.insert(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v2
+        c.run_txn(4, |t| {
+            t.delete(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v3
+        c.run_txn(4, |t| {
+            t.insert(k.clone());
+            Ok(())
+        })
+        .unwrap(); // v4
+
+        // Floor pinned at 1 ⇒ nothing below the v1 anchor is reclaimed.
+        assert_eq!(c.chain_len(&k.to_string()), 3);
+
+        // Dropping the pin lowers the floor; the GC run in `drop` collapses the
+        // chain to its latest record (insert at v4).
+        drop(pin);
+        assert_eq!(c.chain_len(&k.to_string()), 1);
+        assert!(c.version_view().contains(&k), "latest record is the insert");
+    }
+
+    #[test]
+    fn version_view_query_reflects_pinned_version() {
+        // SPARQL through a version view materializes the visible state at its pin.
+        let c = cdb();
+        let pin = c.version_view_at(1);
+        c.run_txn(4, |t| {
+            t.insert(triple("http://ex/a", "http://ex/p", "http://ex/c"));
+            Ok(())
+        })
+        .unwrap(); // v2 adds a second object for <a> <p>
+
+        let v1 = c.version_view_at(1);
+        let v2 = c.version_view_at(2);
+        assert_eq!(
+            view_count(&v1, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            1,
+            "v1 sees only the base object"
+        );
+        assert_eq!(
+            view_count(&v2, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            2,
+            "v2 sees the base plus the committed object"
+        );
+        drop(pin);
+    }
+
+    #[test]
+    fn version_view_stable_under_concurrent_commits() {
+        // A pinned view, held while writer threads commit concurrently, still
+        // resolves to exactly its pinned version afterwards. The assertions run
+        // after the threads join, so the test is deterministic.
+        let c = cdb();
+        let base = triple("http://ex/a", "http://ex/p", "http://ex/b");
+        let view = c.version_view(); // pins version 1
+
+        thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for i in 0..10 {
+                        c.run_txn(10_000, |t| {
+                            t.insert(triple(
+                                &format!("http://ex/c{i}"),
+                                "http://ex/p",
+                                "http://ex/o",
+                            ));
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        // Despite the concurrent commits, the pin sees only the base.
+        assert!(view.contains(&base));
+        assert!(!view.contains(&triple("http://ex/c0", "http://ex/p", "http://ex/o")));
+        assert_eq!(view.version(), 1);
+        // Both threads contended on the same keys; conflicts were retried to
+        // success via run_txn, so every commit advanced the shared version.
+        assert!(c.version() >= 11, "concurrent commits advanced the version");
     }
 }
