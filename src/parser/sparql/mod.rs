@@ -1,9 +1,13 @@
 //! SPARQL parser: tokens → [`ast::Query`].
 //!
 //! A hand-written recursive-descent parser (mirroring gStore's hand-written
-//! `SPARQLParser`) for the supported subset: prologue (`PREFIX`/`BASE`),
-//! `SELECT`/`ASK`, a flat basic graph pattern with `FILTER`, solution modifiers
-//! (`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`), and `INSERT DATA`/`DELETE DATA`.
+//! `SPARQLParser`). Supported: prologue (`PREFIX`/`BASE`); `SELECT` (with
+//! `DISTINCT`, projected `(expr AS ?v)`, `GROUP BY`/`HAVING`, aggregates),
+//! `ASK`, `CONSTRUCT`; graph patterns with `FILTER`, `OPTIONAL`, `UNION`,
+//! `MINUS`, `BIND`, `VALUES`, sub-`SELECT`, and property paths (`/ ^ | * + !`);
+//! solution modifiers (`ORDER BY`/`LIMIT`/`OFFSET`); and `INSERT/DELETE DATA`.
+//! Not yet supported: `GRAPH`/`SERVICE`, the `?` path modifier (lexer treats
+//! `?` as a variable sigil), `DESCRIBE`.
 
 pub mod ast;
 pub mod lexer;
@@ -20,6 +24,12 @@ use lexer::{tokenize, Token};
 pub fn parse(input: &str) -> Result<Query> {
     let tokens = tokenize(input)?;
     Parser::new(tokens).parse_request()
+}
+
+/// A parsed predicate position: a plain term, or a property path.
+enum VerbKind {
+    Simple(PatternTerm),
+    Path(PathExpr),
 }
 
 struct Parser {
@@ -43,6 +53,12 @@ impl Parser {
 
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
+    }
+
+    /// Look `n` tokens ahead (clamped to the trailing `Eof`).
+    fn peek_at(&self, n: usize) -> &Token {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[i]
     }
 
     fn bump(&mut self) -> Token {
@@ -94,6 +110,7 @@ impl Parser {
         let query = match kw.as_str() {
             "SELECT" => Query::Select(self.parse_select()?),
             "ASK" => Query::Ask(self.parse_ask()?),
+            "CONSTRUCT" => Query::Construct(self.parse_construct()?),
             "INSERT" => self.parse_insert_data()?,
             "DELETE" => self.parse_delete_data()?,
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
@@ -142,34 +159,101 @@ impl Parser {
             self.eat_keyword("REDUCED");
             false
         };
-        let projection = if matches!(self.peek(), Token::Star) {
-            self.bump();
-            Projection::All
-        } else {
-            let mut vars = Vec::new();
-            while let Token::Var(v) = self.peek() {
-                vars.push(v.clone());
-                self.bump();
-            }
-            if vars.is_empty() {
-                return Err(self.err("SELECT must list variables or '*' (projected expressions are not yet supported)"));
-            }
-            Projection::Vars(vars)
-        };
+        let projection = self.parse_projection()?;
 
         self.skip_dataset_clauses()?;
         self.eat_keyword("WHERE"); // optional
         let pattern = self.parse_group_graph_pattern()?;
+        let (group_by, having) = self.parse_group_having()?;
         let (order_by, limit, offset) = self.parse_solution_modifiers()?;
 
         Ok(SelectQuery {
             distinct,
             projection,
             pattern,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
         })
+    }
+
+    /// `*` or a list of `?v` / `(expr AS ?v)` projection items.
+    fn parse_projection(&mut self) -> Result<Projection> {
+        if matches!(self.peek(), Token::Star) {
+            self.bump();
+            return Ok(Projection::All);
+        }
+        let mut items = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Var(v) => {
+                    items.push(SelectItem::Var(v.clone()));
+                    self.bump();
+                }
+                Token::LParen => {
+                    // (expr AS ?v)
+                    self.bump();
+                    let expr = self.parse_expr()?;
+                    self.expect_keyword("AS")?;
+                    let var = self.expect_var()?;
+                    self.expect(&Token::RParen, "')'")?;
+                    items.push(SelectItem::Expr(expr, var));
+                }
+                _ => break,
+            }
+        }
+        if items.is_empty() {
+            return Err(self.err("SELECT must list variables, (expr AS ?v), or '*'"));
+        }
+        Ok(Projection::Items(items))
+    }
+
+    /// `GROUP BY …` and `HAVING …` clauses (both optional, GROUP before HAVING).
+    fn parse_group_having(&mut self) -> Result<(Vec<Expr>, Vec<Expr>)> {
+        let mut group_by = Vec::new();
+        if self.keyword().as_deref() == Some("GROUP") {
+            self.bump();
+            self.expect_keyword("BY")?;
+            loop {
+                match self.peek() {
+                    Token::Var(v) => {
+                        group_by.push(Expr::Var(v.clone()));
+                        self.bump();
+                    }
+                    Token::LParen => {
+                        self.bump();
+                        let e = self.parse_expr()?;
+                        // optional AS ?v (the bound var is ignored for grouping keys)
+                        self.eat_keyword("AS");
+                        if let Token::Var(_) = self.peek() {
+                            self.bump();
+                        }
+                        self.expect(&Token::RParen, "')'")?;
+                        group_by.push(e);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let mut having = Vec::new();
+        if self.keyword().as_deref() == Some("HAVING") {
+            self.bump();
+            having.push(self.parse_constraint()?);
+            // allow multiple bracketed HAVING constraints
+            while matches!(self.peek(), Token::LParen) {
+                having.push(self.parse_constraint()?);
+            }
+        }
+        Ok((group_by, having))
+    }
+
+    fn expect_var(&mut self) -> Result<String> {
+        match self.bump() {
+            Token::Var(v) => Ok(v),
+            other => Err(self.err(format!("expected a ?variable, found {other:?}"))),
+        }
     }
 
     fn parse_ask(&mut self) -> Result<AskQuery> {
@@ -207,17 +291,28 @@ impl Parser {
     // ---- group graph pattern ---------------------------------------------
 
     /// Parse `{ … }`, returning the graph-pattern algebra for its contents.
+    ///
+    /// Triple patterns accumulate into BGPs; group-level constructs
+    /// (`OPTIONAL`, `MINUS`, `BIND`, sub-groups, `UNION`, sub-`SELECT`,
+    /// `VALUES`) fold into the running conjunction in textual order. All
+    /// `FILTER`s in the group apply to the whole group (wrapped at the end).
     fn parse_group_graph_pattern(&mut self) -> Result<GraphPattern> {
         self.expect(&Token::LBrace, "'{'")?;
-        let mut elements: Vec<GraphPattern> = Vec::new();
+        let mut current = GraphPattern::Empty;
         let mut filters: Vec<Expr> = Vec::new();
         let mut pending: Vec<TriplePattern> = Vec::new();
+        let mut pending_paths: Vec<GraphPattern> = Vec::new();
 
-        // Flush accumulated triple patterns into a single BGP element.
+        // Flush accumulated triples (as one BGP) and any path patterns into
+        // `current`, joined on.
         macro_rules! flush {
             () => {
                 if !pending.is_empty() {
-                    elements.push(GraphPattern::Bgp(std::mem::take(&mut pending)));
+                    let bgp = GraphPattern::Bgp(std::mem::take(&mut pending));
+                    current = join_opt(current, bgp);
+                }
+                for p in std::mem::take(&mut pending_paths) {
+                    current = join_opt(current, p);
                 }
             };
         }
@@ -235,11 +330,43 @@ impl Parser {
                     self.bump();
                     filters.push(self.parse_constraint()?);
                 }
+                Token::Word(w) if w.eq_ignore_ascii_case("OPTIONAL") => {
+                    self.bump();
+                    flush!();
+                    let group = self.parse_group_graph_pattern()?;
+                    // A FILTER directly inside OPTIONAL becomes the left-join
+                    // condition; otherwise the right side is the group as-is.
+                    let (right, lj_filters) = match group {
+                        GraphPattern::Filter(fs, inner) => (*inner, fs),
+                        other => (other, Vec::new()),
+                    };
+                    current =
+                        GraphPattern::LeftJoin(Box::new(current), Box::new(right), lj_filters);
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("MINUS") => {
+                    self.bump();
+                    flush!();
+                    let right = self.parse_group_graph_pattern()?;
+                    current = GraphPattern::Minus(Box::new(current), Box::new(right));
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("BIND") => {
+                    self.bump();
+                    flush!();
+                    self.expect(&Token::LParen, "'('")?;
+                    let expr = self.parse_expr()?;
+                    self.expect_keyword("AS")?;
+                    let var = self.expect_var()?;
+                    self.expect(&Token::RParen, "')'")?;
+                    current = GraphPattern::Extend(Box::new(current), var, expr);
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("VALUES") => {
+                    self.bump();
+                    flush!();
+                    let values = self.parse_inline_values()?;
+                    current = join_opt(current, values);
+                }
                 Token::Word(w)
-                    if matches!(
-                        w.to_ascii_uppercase().as_str(),
-                        "OPTIONAL" | "MINUS" | "GRAPH" | "SERVICE" | "BIND" | "VALUES"
-                    ) =>
+                    if matches!(w.to_ascii_uppercase().as_str(), "GRAPH" | "SERVICE") =>
                 {
                     return Err(self.err(format!(
                         "'{w}' is not supported yet (see REFACTOR_BACKLOG item D)"
@@ -247,25 +374,26 @@ impl Parser {
                 }
                 Token::LBrace => {
                     flush!();
-                    elements.push(self.parse_group_or_union()?);
+                    // `{ SELECT … }` is a sub-query; otherwise a group/UNION.
+                    let node = if self.brace_starts_subselect() {
+                        self.parse_subselect_group()?
+                    } else {
+                        self.parse_group_or_union()?
+                    };
+                    current = join_opt(current, node);
                 }
                 Token::Eof => return Err(self.err("unexpected end of query inside '{ }'")),
                 _ => {
-                    self.parse_triples_same_subject(&mut pending)?;
+                    self.parse_triples_same_subject(&mut pending, &mut pending_paths)?;
                 }
             }
         }
         flush!();
 
-        // Conjoin elements left-to-right, then wrap in a FILTER if any.
-        let mut combined = elements
-            .into_iter()
-            .reduce(|a, b| GraphPattern::Join(Box::new(a), Box::new(b)))
-            .unwrap_or(GraphPattern::Empty);
         if !filters.is_empty() {
-            combined = GraphPattern::Filter(filters, Box::new(combined));
+            current = GraphPattern::Filter(filters, Box::new(current));
         }
-        Ok(combined)
+        Ok(current)
     }
 
     /// `{…} ( UNION {…} )*` — a group, optionally unioned with more groups.
@@ -278,19 +406,133 @@ impl Parser {
         Ok(left)
     }
 
-    /// `subject  verb objlist (';' verb objlist)*` flattened into patterns.
-    fn parse_triples_same_subject(&mut self, out: &mut Vec<TriplePattern>) -> Result<()> {
+    /// Does the upcoming `{` open a sub-`SELECT`? (peek past the brace.)
+    fn brace_starts_subselect(&self) -> bool {
+        matches!(self.peek(), Token::LBrace)
+            && matches!(self.peek_at(1), Token::Word(w) if w.eq_ignore_ascii_case("SELECT"))
+    }
+
+    /// Parse `{ SELECT … }` into a [`GraphPattern::SubSelect`].
+    fn parse_subselect_group(&mut self) -> Result<GraphPattern> {
+        self.expect(&Token::LBrace, "'{'")?;
+        let sq = self.parse_select()?;
+        self.expect(&Token::RBrace, "'}'")?;
+        Ok(GraphPattern::SubSelect(Box::new(sq)))
+    }
+
+    /// Parse an inline `VALUES` block: `VALUES ?v { … }` or
+    /// `VALUES (?a ?b) { (..) (..) }`. `UNDEF` becomes `None`.
+    fn parse_inline_values(&mut self) -> Result<GraphPattern> {
+        let mut vars = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.bump();
+            while let Token::Var(v) = self.peek() {
+                vars.push(v.clone());
+                self.bump();
+            }
+            self.expect(&Token::RParen, "')'")?;
+            self.expect(&Token::LBrace, "'{'")?;
+            let mut rows = Vec::new();
+            while matches!(self.peek(), Token::LParen) {
+                self.bump();
+                let mut row = Vec::with_capacity(vars.len());
+                while !matches!(self.peek(), Token::RParen) {
+                    row.push(self.parse_values_cell()?);
+                }
+                self.bump(); // ')'
+                rows.push(row);
+            }
+            self.expect(&Token::RBrace, "'}'")?;
+            Ok(GraphPattern::Values(vars, rows))
+        } else {
+            // single-variable shorthand
+            let v = self.expect_var()?;
+            vars.push(v);
+            self.expect(&Token::LBrace, "'{'")?;
+            let mut rows = Vec::new();
+            while !matches!(self.peek(), Token::RBrace) {
+                rows.push(vec![self.parse_values_cell()?]);
+            }
+            self.expect(&Token::RBrace, "'}'")?;
+            Ok(GraphPattern::Values(vars, rows))
+        }
+    }
+
+    /// One `VALUES` cell: a term or `UNDEF`.
+    fn parse_values_cell(&mut self) -> Result<Option<Term>> {
+        if self.keyword().as_deref() == Some("UNDEF") {
+            self.bump();
+            return Ok(None);
+        }
+        let tok = self.peek().clone();
+        let term = self.token_to_term(&tok)?;
+        self.bump();
+        Ok(Some(term))
+    }
+
+    // ---- CONSTRUCT --------------------------------------------------------
+
+    fn parse_construct(&mut self) -> Result<ConstructQuery> {
+        self.expect_keyword("CONSTRUCT")?;
+        // CONSTRUCT { template } WHERE { … }
+        let mut template = Vec::new();
+        let mut paths = Vec::new();
+        self.expect(&Token::LBrace, "'{'")?;
+        loop {
+            match self.peek() {
+                Token::RBrace => {
+                    self.bump();
+                    break;
+                }
+                Token::Dot => {
+                    self.bump();
+                }
+                Token::Eof => return Err(self.err("unexpected end of CONSTRUCT template")),
+                _ => self.parse_triples_same_subject(&mut template, &mut paths)?,
+            }
+        }
+        if !paths.is_empty() {
+            return Err(self.err("property paths are not allowed in a CONSTRUCT template"));
+        }
+        self.skip_dataset_clauses()?;
+        self.eat_keyword("WHERE");
+        let pattern = self.parse_group_graph_pattern()?;
+        let (order_by, limit, offset) = self.parse_solution_modifiers()?;
+        Ok(ConstructQuery {
+            template,
+            pattern,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    /// `subject  verb objlist (';' verb objlist)*`. Plain-predicate triples are
+    /// pushed to `bgp`; property-path predicates emit [`GraphPattern::Path`] into
+    /// `paths`.
+    fn parse_triples_same_subject(
+        &mut self,
+        bgp: &mut Vec<TriplePattern>,
+        paths: &mut Vec<GraphPattern>,
+    ) -> Result<()> {
         let subject = self.parse_pattern_term()?;
         loop {
-            let predicate = self.parse_verb()?;
+            let verb = self.parse_path_or_verb()?;
             // object list
             loop {
                 let object = self.parse_pattern_term()?;
-                out.push(TriplePattern {
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object,
-                });
+                match &verb {
+                    VerbKind::Simple(p) => bgp.push(TriplePattern {
+                        subject: subject.clone(),
+                        predicate: p.clone(),
+                        object,
+                    }),
+                    VerbKind::Path(path) => paths.push(GraphPattern::Path(PathPattern {
+                        subject: subject.clone(),
+                        path: path.clone(),
+                        object,
+                    })),
+                }
                 if matches!(self.peek(), Token::Comma) {
                     self.bump();
                 } else {
@@ -299,7 +541,6 @@ impl Parser {
             }
             if matches!(self.peek(), Token::Semicolon) {
                 self.bump();
-                // trailing ';' before end of block or '.' is allowed
                 if self.starts_verb() {
                     continue;
                 }
@@ -310,24 +551,163 @@ impl Parser {
         Ok(())
     }
 
-    /// Could the current token begin a verb (predicate)?
+    /// Could the current token begin a verb (predicate or path)?
     fn starts_verb(&self) -> bool {
         match self.peek() {
-            Token::Var(_) | Token::Iri(_) | Token::PName(_, _) => true,
+            Token::Var(_)
+            | Token::Iri(_)
+            | Token::PName(_, _)
+            | Token::Caret
+            | Token::Not
+            | Token::LParen => true,
             Token::Word(w) => w == "a",
             _ => false,
         }
     }
 
-    /// A predicate: a variable, an IRI/prefixed name, or `a` (= rdf:type).
-    fn parse_verb(&mut self) -> Result<PatternTerm> {
-        if let Token::Word(w) = self.peek() {
-            if w == "a" {
-                self.bump();
-                return Ok(PatternTerm::Term(Term::iri(RDF_TYPE)));
+    /// A predicate that is either a plain term or a property path.
+    fn parse_path_or_verb(&mut self) -> Result<VerbKind> {
+        // A variable predicate is always a plain verb (no paths over variables).
+        if let Token::Var(v) = self.peek() {
+            let v = v.clone();
+            self.bump();
+            return Ok(VerbKind::Simple(PatternTerm::Var(v)));
+        }
+        let path = self.parse_path()?;
+        // A bare single predicate stays a plain BGP triple (fast path).
+        Ok(match path {
+            PathExpr::Pred(iri) => VerbKind::Simple(PatternTerm::Term(Term::iri(iri))),
+            other => VerbKind::Path(other),
+        })
+    }
+
+    // ---- property paths ---------------------------------------------------
+
+    fn parse_path(&mut self) -> Result<PathExpr> {
+        // alternative: seq ( '|' seq )*
+        let mut left = self.parse_path_seq()?;
+        while matches!(self.peek(), Token::Pipe) {
+            self.bump();
+            let right = self.parse_path_seq()?;
+            left = PathExpr::Alt(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_path_seq(&mut self) -> Result<PathExpr> {
+        // sequence: eltOrInverse ( '/' eltOrInverse )*
+        let mut left = self.parse_path_elt_or_inverse()?;
+        while matches!(self.peek(), Token::Slash) {
+            self.bump();
+            let right = self.parse_path_elt_or_inverse()?;
+            left = PathExpr::Seq(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_path_elt_or_inverse(&mut self) -> Result<PathExpr> {
+        if matches!(self.peek(), Token::Caret) {
+            self.bump();
+            Ok(PathExpr::Inverse(Box::new(self.parse_path_elt()?)))
+        } else {
+            self.parse_path_elt()
+        }
+    }
+
+    fn parse_path_elt(&mut self) -> Result<PathExpr> {
+        let mut p = self.parse_path_primary()?;
+        // postfix `*` / `+` modifiers (zero-or-one `?` is not supported: see
+        // REFACTOR_BACKLOG item D — the lexer treats `?` as a variable sigil).
+        loop {
+            match self.peek() {
+                Token::Star => {
+                    self.bump();
+                    p = PathExpr::ZeroOrMore(Box::new(p));
+                }
+                Token::Plus => {
+                    self.bump();
+                    p = PathExpr::OneOrMore(Box::new(p));
+                }
+                _ => break,
             }
         }
-        self.parse_pattern_term()
+        Ok(p)
+    }
+
+    fn parse_path_primary(&mut self) -> Result<PathExpr> {
+        match self.peek().clone() {
+            Token::LParen => {
+                self.bump();
+                let p = self.parse_path()?;
+                self.expect(&Token::RParen, "')'")?;
+                Ok(p)
+            }
+            Token::Not => {
+                self.bump();
+                self.parse_negated_path_set()
+            }
+            Token::Word(w) if w == "a" => {
+                self.bump();
+                Ok(PathExpr::Pred(RDF_TYPE.to_string()))
+            }
+            Token::Iri(_) | Token::PName(_, _) => {
+                let tok = self.peek().clone();
+                let iri = match self.token_to_term(&tok)? {
+                    Term::Iri(s) => s,
+                    other => {
+                        return Err(
+                            self.err(format!("path predicate must be an IRI, got {other:?}"))
+                        )
+                    }
+                };
+                self.bump();
+                Ok(PathExpr::Pred(iri))
+            }
+            other => Err(self.err(format!("expected a path predicate, found {other:?}"))),
+        }
+    }
+
+    /// `!iri`, `!^iri`, or `!( p1 | ^p2 | … )`.
+    fn parse_negated_path_set(&mut self) -> Result<PathExpr> {
+        let mut set = Vec::new();
+        let read_one = |this: &mut Self| -> Result<(String, bool)> {
+            let inverse = if matches!(this.peek(), Token::Caret) {
+                this.bump();
+                true
+            } else {
+                false
+            };
+            let tok = this.peek().clone();
+            let iri = if matches!(tok, Token::Word(ref w) if w == "a") {
+                this.bump();
+                RDF_TYPE.to_string()
+            } else {
+                match this.token_to_term(&tok)? {
+                    Term::Iri(s) => {
+                        this.bump();
+                        s
+                    }
+                    other => {
+                        return Err(this.err(format!("negated path needs an IRI, got {other:?}")))
+                    }
+                }
+            };
+            Ok((iri, inverse))
+        };
+        if matches!(self.peek(), Token::LParen) {
+            self.bump();
+            if !matches!(self.peek(), Token::RParen) {
+                set.push(read_one(self)?);
+                while matches!(self.peek(), Token::Pipe) {
+                    self.bump();
+                    set.push(read_one(self)?);
+                }
+            }
+            self.expect(&Token::RParen, "')'")?;
+        } else {
+            set.push(read_one(self)?);
+        }
+        Ok(PathExpr::NegatedSet(set))
     }
 
     /// A triple-pattern position: a variable or a concrete term.
@@ -465,6 +845,9 @@ impl Parser {
                 } else if upper == "FALSE" {
                     self.bump();
                     Ok(Expr::Const(Term::typed_literal("false", xsd::BOOLEAN)))
+                } else if let Some(func) = agg_func(&upper) {
+                    self.bump();
+                    self.parse_aggregate(func)
                 } else {
                     // Builtin / function call: NAME ( args )
                     self.bump();
@@ -490,6 +873,38 @@ impl Parser {
             }
             other => Err(self.err(format!("unexpected token in expression: {other:?}"))),
         }
+    }
+
+    /// Parse an aggregate call body after the function name: `( [DISTINCT]
+    /// (* | expr) [; SEPARATOR = "…"] )`.
+    fn parse_aggregate(&mut self, func: AggFunc) -> Result<Expr> {
+        self.expect(&Token::LParen, "'('")?;
+        let distinct = self.eat_keyword("DISTINCT");
+        let arg = if func == AggFunc::Count && matches!(self.peek(), Token::Star) {
+            self.bump();
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let mut sep = None;
+        if func == AggFunc::GroupConcat && matches!(self.peek(), Token::Semicolon) {
+            self.bump();
+            self.expect_keyword("SEPARATOR")?;
+            self.expect(&Token::Eq, "'='")?;
+            match self.bump() {
+                Token::Str { value, .. } => sep = Some(value),
+                other => {
+                    return Err(self.err(format!("expected a string separator, found {other:?}")))
+                }
+            }
+        }
+        self.expect(&Token::RParen, "')'")?;
+        Ok(Expr::Aggregate {
+            func,
+            distinct,
+            arg,
+            sep,
+        })
     }
 
     /// `( expr , expr , … )` argument list. Handles `()` and `(*)` (→ no args).
@@ -613,6 +1028,7 @@ impl Parser {
     /// Parse a `{ … }` block of ground triples (no variables allowed).
     fn parse_ground_block(&mut self) -> Result<Vec<GroundTriple>> {
         let mut patterns = Vec::new();
+        let mut paths = Vec::new();
         self.expect(&Token::LBrace, "'{'")?;
         loop {
             match self.peek() {
@@ -624,8 +1040,11 @@ impl Parser {
                     self.bump();
                 }
                 Token::Eof => return Err(self.err("unexpected end of query in DATA block")),
-                _ => self.parse_triples_same_subject(&mut patterns)?,
+                _ => self.parse_triples_same_subject(&mut patterns, &mut paths)?,
             }
+        }
+        if !paths.is_empty() {
+            return Err(self.err("property paths are not allowed in a DATA block"));
         }
         // Convert to ground triples, rejecting variables.
         patterns
@@ -705,6 +1124,28 @@ impl Parser {
 }
 
 /// A cheap absolute-IRI check (has a scheme like `http:` / `urn:`).
+/// Conjoin two patterns, dropping a leading `Empty`.
+fn join_opt(left: GraphPattern, right: GraphPattern) -> GraphPattern {
+    match left {
+        GraphPattern::Empty => right,
+        _ => GraphPattern::Join(Box::new(left), Box::new(right)),
+    }
+}
+
+/// Map an uppercased name to its aggregate function, if it is one.
+fn agg_func(name: &str) -> Option<AggFunc> {
+    Some(match name {
+        "COUNT" => AggFunc::Count,
+        "SUM" => AggFunc::Sum,
+        "AVG" => AggFunc::Avg,
+        "MIN" => AggFunc::Min,
+        "MAX" => AggFunc::Max,
+        "SAMPLE" => AggFunc::Sample,
+        "GROUP_CONCAT" => AggFunc::GroupConcat,
+        _ => return None,
+    })
+}
+
 fn is_absolute_iri(s: &str) -> bool {
     if let Some(idx) = s.find(':') {
         let scheme = &s[..idx];
@@ -751,7 +1192,10 @@ mod tests {
                 ?X rdf:type ub:GraduateStudent .
                 ?X ub:takesCourse <http://ex/c0> .
              }");
-        assert_eq!(q.projection, Projection::Vars(vec!["X".into()]));
+        assert_eq!(
+            q.projection,
+            Projection::Items(vec![SelectItem::Var("X".into())])
+        );
         let tps = triples(&q.pattern);
         assert_eq!(tps.len(), 2);
         // rdf:type expanded
@@ -881,11 +1325,80 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_optional_errors_clearly() {
-        let e = parse("SELECT * WHERE { ?s <p> ?o OPTIONAL { ?s <q> ?z } }").unwrap_err();
-        match e {
-            GStoreError::SparqlParse(m) => assert!(m.contains("OPTIONAL")),
+    fn optional_builds_left_join() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o OPTIONAL { ?s <q> ?z } }");
+        assert!(matches!(q.pattern, GraphPattern::LeftJoin(_, _, _)));
+        assert_eq!(triples(&q.pattern).len(), 2);
+    }
+
+    #[test]
+    fn optional_with_inner_filter() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o OPTIONAL { ?s <q> ?z FILTER(?z > 5) } }");
+        match q.pattern {
+            GraphPattern::LeftJoin(_, _, fs) => assert_eq!(fs.len(), 1),
+            other => panic!("expected LeftJoin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn minus_builds_minus_node() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o MINUS { ?s <q> ?z } }");
+        assert!(matches!(q.pattern, GraphPattern::Minus(_, _)));
+    }
+
+    #[test]
+    fn bind_builds_extend() {
+        let q = sel("SELECT * WHERE { ?s <p> ?o . BIND(?o + 1 AS ?x) }");
+        // Extend wraps the BGP.
+        assert!(matches!(q.pattern, GraphPattern::Extend(_, _, _)));
+    }
+
+    #[test]
+    fn values_block_multi_var() {
+        let q = sel("SELECT * WHERE { VALUES (?a ?b) { (<x> 1) (<y> UNDEF) } }");
+        match &q.pattern {
+            GraphPattern::Values(vars, rows) => {
+                assert_eq!(vars, &vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[1][1], None); // UNDEF
+            }
+            other => panic!("expected Values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subselect_parses() {
+        let q = sel("SELECT ?s WHERE { { SELECT ?s WHERE { ?s <p> ?o } LIMIT 5 } }");
+        assert!(matches!(q.pattern, GraphPattern::SubSelect(_)));
+    }
+
+    #[test]
+    fn aggregate_projection_and_group_by() {
+        let q = sel(
+            "SELECT ?s (COUNT(?o) AS ?c) WHERE { ?s <p> ?o } GROUP BY ?s HAVING(COUNT(?o) > 1)",
+        );
+        assert_eq!(q.group_by.len(), 1);
+        assert_eq!(q.having.len(), 1);
+        match &q.projection {
+            Projection::Items(items) => {
+                assert!(matches!(items[0], SelectItem::Var(_)));
+                assert!(matches!(
+                    items[1],
+                    SelectItem::Expr(Expr::Aggregate { .. }, _)
+                ));
+            }
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construct_parses() {
+        match parse("CONSTRUCT { ?s <knows> ?o } WHERE { ?s <p> ?o }").unwrap() {
+            Query::Construct(c) => {
+                assert_eq!(c.template.len(), 1);
+                assert_eq!(triples(&c.pattern).len(), 1);
+            }
+            other => panic!("expected Construct, got {other:?}"),
         }
     }
 
@@ -933,10 +1446,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_minus_errors_clearly() {
-        let e = parse("SELECT * WHERE { ?s <p> ?o MINUS { ?s <q> ?z } }").unwrap_err();
+    fn unsupported_graph_errors_clearly() {
+        let e = parse("SELECT * WHERE { GRAPH ?g { ?s <p> ?o } }").unwrap_err();
         match e {
-            GStoreError::SparqlParse(m) => assert!(m.contains("MINUS")),
+            GStoreError::SparqlParse(m) => assert!(m.contains("GRAPH")),
             other => panic!("got {other:?}"),
         }
     }

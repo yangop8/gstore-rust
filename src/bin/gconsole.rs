@@ -126,6 +126,12 @@ fn run_query(db: &mut Database, query: &str) {
             println!("[{} row(s)]", rs.row_count());
         }
         Ok(QueryResult::Ask(b)) => println!("{b}"),
+        Ok(QueryResult::Construct(triples)) => {
+            for t in &triples {
+                println!("{t}");
+            }
+            println!("[{} triple(s)]", triples.len());
+        }
         Ok(QueryResult::Update { changed }) => println!("[updated {changed} triple(s)]"),
         Err(e) => eprintln!("error: {e}"),
     }

@@ -20,12 +20,11 @@
 - **已实现**(`src/query/optimizer.rs`):基于谓语统计(pre2num/pre2sub/pre2obj,见`TripleStore`新增的统计方法)的基数估计 + Selinger式子集DP,生成最小化中间结果规模的左深连接顺序;模式数>16时退化为连通+最小基数贪心。已替换引擎里原先的贪心`order_plans`。
 - **后续可优化**:浓密树枚举、直方图/相关性估计、topk优化(原版`topk`/`DFSPlan`)。
 
-## D. 完整SPARQL 1.1 ★中价值
+## D. 完整SPARQL 1.1 ★中价值 —— ✅ 主体已完成
 
-- **现状**:SELECT + ASK + BGP + **UNION/嵌套组** + FILTER + ORDER/LIMIT/OFFSET + DISTINCT + INSERT/DELETE DATA。图模式已是代数树(`Bgp`/`Join`/`Union`/`Filter`),加新算子较顺。
-- **缺**:`OPTIONAL`(左连接)、`MINUS`、子查询、属性路径(`+`/`*`/`/`)、聚合(`GROUP BY`/`COUNT`/`SUM`…)、`CONSTRUCT`/`DESCRIBE`、`BIND`/`VALUES`、Turtle的`[ ]`/`( )`、完整的日期/数值类型体系。
-- **重构**:逐特性扩展AST + 代数算子(LeftJoin/Minus/Aggregate/Path)。可增量推进,每个特性配UT/DT。
-- **已完成(本次)**:`UNION`+嵌套组(代数`GraphPattern::Union`/`Join`)、`ASK`、Turtle导入。LUBM 14条查询(7条含UNION)全部可跑且结果正确。
+- **已实现**:`SELECT`/`ASK`/`CONSTRUCT`;图模式代数`GraphPattern`含`Bgp`/`Join`/`Union`/`Filter`/`LeftJoin`(OPTIONAL)/`Minus`/`Extend`(BIND)/`Values`/`SubSelect`/`Path`;聚合(`GROUP BY`/`HAVING`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`SAMPLE`/`GROUP_CONCAT`,含`DISTINCT`)与投影表达式`(expr AS ?v)`;属性路径(`/` `^` `|` `*` `+` `!`);丰富内建函数。计算值(BIND/VALUES/聚合结果)通过每查询的synthetic-id interner流经统一的id连接引擎。DT覆盖见`tests/dt_sparql11.rs`(16个用例)。
+- **缺**:`GRAPH`/`SERVICE`(命名图)、属性路径`?`(zeroOrOne,词法器把`?`当变量前缀,冲突)、`DESCRIBE`、Turtle的`[ ]`/`( )`、完整日期/时区类型体系、`EXISTS`/`NOT EXISTS`、子查询的相关性优化。
+- **后续**:逐项补齐,均可增量加算子/内建并配UT/DT。
 
 ## E. 并发、事务与MVCC ★中价值
 

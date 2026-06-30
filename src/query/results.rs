@@ -11,6 +11,8 @@ pub enum QueryResult {
     Select(ResultSet),
     /// ASK results: a single boolean.
     Ask(bool),
+    /// CONSTRUCT results: a set of triples.
+    Construct(Vec<crate::model::Triple>),
     /// An update (INSERT/DELETE DATA): the number of triples actually changed.
     Update { changed: usize },
 }

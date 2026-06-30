@@ -68,6 +68,16 @@ fn main() -> ExitCode {
             );
         }
         QueryResult::Ask(b) => println!("{b}"),
+        QueryResult::Construct(triples) => {
+            for t in &triples {
+                println!("{t}");
+            }
+            eprintln!(
+                "[{} triple(s) in {:.3}s]",
+                triples.len(),
+                elapsed.as_secs_f64()
+            );
+        }
         QueryResult::Update { changed } => {
             if let Err(e) = db.save(&dir) {
                 eprintln!("update applied but saving failed: {e}");

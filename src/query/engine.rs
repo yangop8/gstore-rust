@@ -18,7 +18,7 @@ use regex::Regex;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::PredId;
-use crate::model::Term;
+use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
 use crate::signature::{EdgeDir, Signature, VsTree};
@@ -43,36 +43,37 @@ struct VarLayout {
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
-        let mut patterns = Vec::new();
-        pattern.collect_triples(&mut patterns);
-        let mut index = HashMap::new();
+        // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
         let mut names = Vec::new();
-        let mut is_pred = Vec::new();
-        let add = |name: &str,
-                   pred_pos: bool,
-                   index: &mut HashMap<String, usize>,
-                   names: &mut Vec<String>,
-                   is_pred: &mut Vec<bool>| {
-            let i = *index.entry(name.to_string()).or_insert_with(|| {
-                names.push(name.to_string());
-                is_pred.push(false);
-                names.len() - 1
-            });
-            if pred_pos {
-                is_pred[i] = true;
-            }
-        };
-        for p in patterns {
-            if let PatternTerm::Var(v) = &p.subject {
-                add(v, false, &mut index, &mut names, &mut is_pred);
-            }
-            if let PatternTerm::Var(v) = &p.predicate {
-                add(v, true, &mut index, &mut names, &mut is_pred);
-            }
-            if let PatternTerm::Var(v) = &p.object {
-                add(v, false, &mut index, &mut names, &mut is_pred);
+        pattern.collect_vars(&mut names);
+        let index: HashMap<String, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), i))
+            .collect();
+        let mut is_pred = vec![false; names.len()];
+        // Mark variables that appear in predicate position of any triple.
+        let mut tps = Vec::new();
+        pattern.collect_triples(&mut tps);
+        for tp in tps {
+            if let PatternTerm::Var(v) = &tp.predicate {
+                is_pred[index[v]] = true;
             }
         }
+        VarLayout {
+            index,
+            names,
+            is_pred,
+        }
+    }
+
+    /// Build a layout directly from a known variable list (for result rows).
+    fn from_vars(names: Vec<String>, is_pred: Vec<bool>) -> VarLayout {
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), i))
+            .collect();
         VarLayout {
             index,
             names,
@@ -117,12 +118,47 @@ pub(crate) struct PatPlan {
     pub(crate) o: Slot,
 }
 
+/// Synthetic-id base for *computed* terms (BIND/VALUES/aggregate results) that
+/// are not in the dictionary. Bindings stay `u32` ids — keeping the join engine
+/// fast — and computed terms are interned here, above the entity/literal ranges.
+const SYNTH_BASE: u32 = 4_200_000_000;
+
+/// Is `id` a synthetic (computed) term id rather than a dictionary id?
+fn is_synth(id: u32) -> bool {
+    id >= SYNTH_BASE
+}
+
+/// Per-query interner for computed terms, mapping them to synthetic ids so they
+/// flow through the id-based join/binding machinery like any other term.
+#[derive(Default)]
+struct Extras {
+    terms: Vec<Term>,
+    index: HashMap<Term, u32>,
+}
+
+impl Extras {
+    fn intern(&mut self, t: &Term) -> u32 {
+        if let Some(&id) = self.index.get(t) {
+            return id;
+        }
+        let id = SYNTH_BASE + self.terms.len() as u32;
+        self.terms.push(t.clone());
+        self.index.insert(t.clone(), id);
+        id
+    }
+    fn term(&self, id: u32) -> Option<&Term> {
+        self.terms.get((id - SYNTH_BASE) as usize)
+    }
+}
+
 /// The query evaluator binds a dictionary and a store for the duration of a query.
 pub struct Evaluator<'a> {
     dict: &'a Dictionary,
     store: &'a TripleStore,
     /// Optional VS-tree for entity-candidate pre-filtering.
     vstree: Option<&'a VsTree>,
+    /// Interner for computed terms produced during evaluation.
+    extras: std::cell::RefCell<Extras>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -131,6 +167,7 @@ impl<'a> Evaluator<'a> {
             dict,
             store,
             vstree: None,
+            extras: std::cell::RefCell::new(Extras::default()),
         }
     }
 
@@ -144,10 +181,25 @@ impl<'a> Evaluator<'a> {
             dict,
             store,
             vstree: Some(vstree),
+            extras: std::cell::RefCell::new(Extras::default()),
         }
     }
 
-    /// Evaluate a read query (SELECT / ASK). Updates are handled in the db layer.
+    /// Convert a term to an id: its dictionary id if present, else a synthetic
+    /// id (so computed/unknown terms still join and render consistently).
+    fn term_to_id(&self, t: &Term) -> u32 {
+        self.dict
+            .term_id(t)
+            .unwrap_or_else(|| self.extras.borrow_mut().intern(t))
+    }
+
+    /// Intern a runtime [`Value`] as an id (via its term form).
+    fn value_to_id(&self, v: &Value) -> u32 {
+        self.term_to_id(&value_to_term(v))
+    }
+
+    /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
+    /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
@@ -156,56 +208,122 @@ impl<'a> Evaluator<'a> {
                 let solutions = self.eval_pattern(&a.pattern, &layout);
                 Ok(QueryResult::Ask(!solutions.is_empty()))
             }
+            Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
             Query::InsertData(_) | Query::DeleteData(_) => Err(GStoreError::Query(
                 "updates must be applied through Database, not the read evaluator".into(),
             )),
         }
     }
 
-    fn eval_select(&self, q: &SelectQuery) -> Result<ResultSet> {
-        let layout = VarLayout::build(&q.pattern);
-        // FILTERs live inside the pattern algebra and are applied during eval.
-        let mut solutions = self.eval_pattern(&q.pattern, &layout);
-
-        // ORDER BY (over full bindings, before projection/distinct).
-        if !q.order_by.is_empty() {
-            self.sort_solutions(&mut solutions, &q.order_by, &layout);
+    /// Evaluate CONSTRUCT: instantiate the template once per solution, skipping
+    /// any template triple with an unbound variable. Returns de-duplicated triples.
+    fn eval_construct(&self, c: &ConstructQuery) -> Result<Vec<Triple>> {
+        let layout = VarLayout::build(&c.pattern);
+        let mut solutions = self.eval_pattern(&c.pattern, &layout);
+        if !c.order_by.is_empty() {
+            self.sort_solutions(&mut solutions, &c.order_by, &layout);
+        }
+        let offset = c.offset.unwrap_or(0);
+        if offset > 0 {
+            solutions.drain(0..offset.min(solutions.len()));
+        }
+        if let Some(limit) = c.limit {
+            solutions.truncate(limit);
         }
 
-        // Projection columns.
-        let cols: Vec<usize> = match &q.projection {
-            Projection::All => (0..layout.len()).collect(),
-            Projection::Vars(vars) => vars
-                .iter()
-                .map(|v| {
-                    layout.index.get(v).copied().ok_or_else(|| {
-                        GStoreError::Query(format!("SELECT variable ?{v} not used in WHERE"))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
-        let out_vars: Vec<String> = match &q.projection {
-            Projection::All => layout.names.clone(),
-            Projection::Vars(vars) => vars.clone(),
-        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for b in &solutions {
+            for tp in &c.template {
+                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                    if seen.insert(t.to_string()) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 
-        // Materialize rows (id → surface string).
-        let mut rows: Vec<Vec<Option<String>>> = solutions
+    /// Fill a template triple from a solution; `None` if any position is unbound.
+    fn instantiate_template(
+        &self,
+        tp: &TriplePattern,
+        b: &Binding,
+        layout: &VarLayout,
+    ) -> Option<Triple> {
+        let resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
+            match pt {
+                PatternTerm::Term(t) => Some(t.clone()),
+                PatternTerm::Var(v) => {
+                    let idx = *layout.index.get(v)?;
+                    let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
+                    parse_term(&s).ok()
+                }
+            }
+        };
+        Some(Triple::new(
+            resolve(&tp.subject, false)?,
+            resolve(&tp.predicate, true)?,
+            resolve(&tp.object, false)?,
+        ))
+    }
+
+    fn eval_select(&self, q: &SelectQuery) -> Result<ResultSet> {
+        let (vars, is_pred, rows) = self.eval_select_solutions(q)?;
+        let str_rows: Vec<Vec<Option<String>>> = rows
             .iter()
-            .map(|b| {
-                cols.iter()
-                    .map(|&c| self.resolve_string(b[c], layout.is_pred[c]))
+            .map(|r| {
+                r.iter()
+                    .enumerate()
+                    .map(|(i, &id)| self.resolve_string(id, is_pred[i]))
                     .collect()
             })
             .collect();
+        Ok(ResultSet {
+            vars,
+            rows: str_rows,
+        })
+    }
 
-        // DISTINCT (stable: preserves the ORDER BY ordering above).
+    /// Evaluate a SELECT into id-space result rows over its result variables.
+    /// Returns `(result vars, per-column is_pred, rows)`. Used both for the
+    /// top-level result and for sub-`SELECT`s (shared dictionary + extras).
+    #[allow(clippy::type_complexity)]
+    fn eval_select_solutions(
+        &self,
+        q: &SelectQuery,
+    ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
+        let layout = VarLayout::build(&q.pattern);
+        let solutions = self.eval_pattern(&q.pattern, &layout);
+
+        let result_vars = q.result_vars();
+        // A result column is predicate-typed only if it is a plain pattern
+        // variable that occurs in predicate position.
+        let is_pred: Vec<bool> = result_vars
+            .iter()
+            .map(|v| layout.index.get(v).is_some_and(|&i| layout.is_pred[i]))
+            .collect();
+
+        let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
+        let mut rows = if has_agg {
+            self.eval_aggregation(&solutions, &layout, q)?
+        } else {
+            solutions
+                .iter()
+                .map(|b| self.project_items(b, &layout, q))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        // ORDER BY / DISTINCT / OFFSET / LIMIT over the result rows.
+        let result_layout = VarLayout::from_vars(result_vars.clone(), is_pred.clone());
+        if !q.order_by.is_empty() {
+            self.sort_solutions(&mut rows, &q.order_by, &result_layout);
+        }
         if q.distinct {
             let mut seen = std::collections::HashSet::new();
             rows.retain(|r| seen.insert(r.clone()));
         }
-
-        // OFFSET / LIMIT.
         let offset = q.offset.unwrap_or(0);
         if offset > 0 {
             rows.drain(0..offset.min(rows.len()));
@@ -214,10 +332,412 @@ impl<'a> Evaluator<'a> {
             rows.truncate(limit);
         }
 
-        Ok(ResultSet {
-            vars: out_vars,
-            rows,
+        Ok((result_vars, is_pred, rows))
+    }
+
+    /// Project a single solution into result-variable order (no aggregation).
+    fn project_items(
+        &self,
+        b: &Binding,
+        layout: &VarLayout,
+        q: &SelectQuery,
+    ) -> Result<Vec<Option<u32>>> {
+        match &q.projection {
+            Projection::All => Ok(layout.names.iter().map(|v| b[layout.index[v]]).collect()),
+            Projection::Items(items) => items
+                .iter()
+                .map(|it| match it {
+                    SelectItem::Var(v) => Ok(layout.index.get(v).and_then(|&i| b[i])),
+                    SelectItem::Expr(e, _) => {
+                        Ok(self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Group solutions and compute aggregates / projected expressions.
+    fn eval_aggregation(
+        &self,
+        solutions: &[Binding],
+        layout: &VarLayout,
+        q: &SelectQuery,
+    ) -> Result<Vec<Vec<Option<u32>>>> {
+        // Group key = the GROUP BY expression values (empty ⇒ one group).
+        use std::collections::hash_map::Entry;
+        let mut order: Vec<Vec<Option<u32>>> = Vec::new();
+        let mut groups: HashMap<Vec<Option<u32>>, Vec<usize>> = HashMap::new();
+        for (i, b) in solutions.iter().enumerate() {
+            let key: Vec<Option<u32>> = q
+                .group_by
+                .iter()
+                .map(|e| self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
+                .collect();
+            match groups.entry(key.clone()) {
+                Entry::Occupied(mut o) => o.get_mut().push(i),
+                Entry::Vacant(v) => {
+                    order.push(key);
+                    v.insert(vec![i]);
+                }
+            }
+        }
+        // Aggregating with no GROUP BY over zero rows still yields one group.
+        if q.group_by.is_empty() && solutions.is_empty() {
+            order.push(Vec::new());
+            groups.insert(Vec::new(), Vec::new());
+        }
+
+        // Map GROUP BY variables to their key column, for projecting group vars.
+        let mut key_vars: HashMap<String, usize> = HashMap::new();
+        for (ki, e) in q.group_by.iter().enumerate() {
+            if let Expr::Var(v) = e {
+                key_vars.insert(v.clone(), ki);
+            }
+        }
+
+        let items = match &q.projection {
+            Projection::Items(items) => items,
+            Projection::All => {
+                return Err(GStoreError::Query(
+                    "SELECT * with aggregation is not allowed".into(),
+                ))
+            }
+        };
+
+        let mut rows = Vec::new();
+        for key in &order {
+            let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
+            // HAVING: drop groups failing any constraint.
+            let keep = q.having.iter().all(|h| {
+                self.eval_group_expr(h, &sols, layout, &key_vars, key)
+                    .and_then(|v| v.ebv())
+                    == Some(true)
+            });
+            if !keep {
+                continue;
+            }
+            let mut row = Vec::with_capacity(items.len());
+            for it in items {
+                let val = match it {
+                    SelectItem::Var(v) => key_vars.get(v).and_then(|&ki| key[ki]).or_else(|| {
+                        sols.first()
+                            .and_then(|b| layout.index.get(v).and_then(|&i| b[i]))
+                    }),
+                    SelectItem::Expr(e, _) => self
+                        .eval_group_expr(e, &sols, layout, &key_vars, key)
+                        .map(|v| self.value_to_id(&v)),
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    // ---- aggregate / group-expression evaluation -------------------------
+
+    /// Evaluate an expression in group context (may contain aggregates).
+    fn eval_group_expr(
+        &self,
+        e: &Expr,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        key_vars: &HashMap<String, usize>,
+        key: &[Option<u32>],
+    ) -> Option<Value> {
+        match e {
+            Expr::Aggregate {
+                func,
+                distinct,
+                arg,
+                sep,
+            } => self.eval_aggregate(
+                *func,
+                *distinct,
+                arg.as_deref(),
+                sep.as_deref(),
+                sols,
+                layout,
+            ),
+            Expr::Var(name) => {
+                if let Some(&ki) = key_vars.get(name) {
+                    self.id_to_value(key[ki]?, false)
+                } else {
+                    // Non-grouped variable inside an expression ⇒ SAMPLE-like.
+                    let idx = *layout.index.get(name)?;
+                    self.resolve_value(idx, sols.first()?, layout)
+                }
+            }
+            Expr::Const(t) => Some(Value::from_term(t)),
+            Expr::Arith(op, a, b) => {
+                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
+                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
+                eval_arith(*op, x, y)
+            }
+            Expr::Unary(op, x) => {
+                let v = self.eval_group_expr(x, sols, layout, key_vars, key)?;
+                match op {
+                    UnaryOp::Plus => Some(v),
+                    UnaryOp::Neg => match v {
+                        Value::Int(i) => Some(Value::Int(-i)),
+                        Value::Double(d) => Some(Value::Double(-d)),
+                        _ => None,
+                    },
+                }
+            }
+            Expr::Compare(op, a, b) => {
+                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
+                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
+                Some(Value::Bool(compare_values(*op, &x, &y)?))
+            }
+            Expr::And(a, b) => {
+                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
+                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
+                Some(Value::Bool(x? && y?))
+            }
+            Expr::Or(a, b) => {
+                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
+                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
+                Some(Value::Bool(x? || y?))
+            }
+            Expr::Not(x) => Some(Value::Bool(
+                !self
+                    .eval_group_expr(x, sols, layout, key_vars, key)?
+                    .ebv()?,
+            )),
+            // Builtins over aggregate context are not supported.
+            Expr::Builtin(_, _) => None,
+        }
+    }
+
+    /// Compute one aggregate over a group's solutions.
+    fn eval_aggregate(
+        &self,
+        func: AggFunc,
+        distinct: bool,
+        arg: Option<&Expr>,
+        sep: Option<&str>,
+        sols: &[&Binding],
+        layout: &VarLayout,
+    ) -> Option<Value> {
+        // COUNT(*) counts solutions.
+        if func == AggFunc::Count && arg.is_none() {
+            return Some(Value::Int(sols.len() as i64));
+        }
+        let arg = arg?;
+        let mut vals: Vec<Value> = sols
+            .iter()
+            .filter_map(|b| self.eval_value(arg, b, layout))
+            .collect();
+        if distinct {
+            let mut seen: Vec<Value> = Vec::new();
+            vals.retain(|v| {
+                if seen.contains(v) {
+                    false
+                } else {
+                    seen.push(v.clone());
+                    true
+                }
+            });
+        }
+        Some(match func {
+            AggFunc::Count => Value::Int(vals.len() as i64),
+            AggFunc::Sum => sum_values(&vals),
+            AggFunc::Avg => {
+                if vals.is_empty() {
+                    Value::Int(0)
+                } else {
+                    let s = sum_values(&vals).as_f64().unwrap_or(0.0);
+                    Value::Double(s / vals.len() as f64)
+                }
+            }
+            AggFunc::Min => vals.into_iter().reduce(|a, b| {
+                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Less) {
+                    b
+                } else {
+                    a
+                }
+            })?,
+            AggFunc::Max => vals.into_iter().reduce(|a, b| {
+                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Greater) {
+                    b
+                } else {
+                    a
+                }
+            })?,
+            AggFunc::Sample => vals.into_iter().next()?,
+            AggFunc::GroupConcat => {
+                let s = sep.unwrap_or(" ");
+                let joined = vals.iter().map(Value::lexical).collect::<Vec<_>>().join(s);
+                Value::Str {
+                    value: joined,
+                    lang: None,
+                }
+            }
         })
+    }
+
+    // ---- property paths --------------------------------------------------
+
+    /// Evaluate a single property-path pattern into bindings over the layout.
+    fn eval_path_pattern(&self, p: &PathPattern, layout: &VarLayout) -> Vec<Binding> {
+        let subj_const = match &p.subject {
+            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
+            PatternTerm::Var(_) => None,
+        };
+        let obj_const = match &p.object {
+            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
+            PatternTerm::Var(_) => None,
+        };
+        // A constant endpoint absent from the dictionary ⇒ no matches.
+        if matches!(subj_const, Some(None)) || matches!(obj_const, Some(None)) {
+            return Vec::new();
+        }
+        let subj_id = subj_const.flatten();
+        let obj_id = obj_const.flatten();
+
+        let pairs = self.path_pairs(&p.path, subj_id, obj_id);
+
+        pairs
+            .into_iter()
+            .filter_map(|(s, o)| {
+                let mut b = vec![None; layout.len()];
+                if !bind_node(&mut b, &p.subject, s, layout)
+                    || !bind_node(&mut b, &p.object, o, layout)
+                {
+                    return None;
+                }
+                Some(b)
+            })
+            .collect()
+    }
+
+    /// All `(start, end)` pairs matching `path`, constrained by known endpoints.
+    fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> Vec<(u32, u32)> {
+        match (subj, obj) {
+            (Some(s), _) => {
+                let ends = self.path_reach(path, s, false);
+                ends.into_iter()
+                    .filter(|e| obj.is_none_or(|o| o == *e))
+                    .map(|e| (s, e))
+                    .collect()
+            }
+            (None, Some(o)) => {
+                // Walk the path backwards from the object.
+                let starts = self.path_reach(path, o, true);
+                starts.into_iter().map(|s| (s, o)).collect()
+            }
+            (None, None) => {
+                // Both ends free: enumerate from every entity node.
+                let mut nodes: Vec<u32> = self.store.subject_keys().collect();
+                nodes.extend(self.store.object_keys());
+                nodes.sort_unstable();
+                nodes.dedup();
+                let mut out = Vec::new();
+                for s in nodes {
+                    for e in self.path_reach(path, s, false) {
+                        out.push((s, e));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Nodes reachable from `start` by following `path` (or, if `reverse`, the
+    /// nodes from which `start` is reachable via `path`).
+    fn path_reach(
+        &self,
+        path: &PathExpr,
+        start: u32,
+        reverse: bool,
+    ) -> std::collections::HashSet<u32> {
+        let mut out = std::collections::HashSet::new();
+        match path {
+            PathExpr::Pred(iri) => {
+                if let Some(pid) = self.path_pred_id(iri) {
+                    if reverse {
+                        out.extend(self.store.s_by_po(pid, start));
+                    } else {
+                        out.extend(self.store.o_by_sp(start, pid));
+                    }
+                }
+            }
+            PathExpr::Inverse(inner) => return self.path_reach(inner, start, !reverse),
+            PathExpr::Seq(a, b) => {
+                // forward: a then b; reverse: b then a (with reverse traversal).
+                let (first, second) = if reverse { (b, a) } else { (a, b) };
+                for mid in self.path_reach(first, start, reverse) {
+                    out.extend(self.path_reach(second, mid, reverse));
+                }
+            }
+            PathExpr::Alt(a, b) => {
+                out.extend(self.path_reach(a, start, reverse));
+                out.extend(self.path_reach(b, start, reverse));
+            }
+            PathExpr::ZeroOrOne(inner) => {
+                out.insert(start);
+                out.extend(self.path_reach(inner, start, reverse));
+            }
+            PathExpr::ZeroOrMore(inner) => {
+                self.path_closure(inner, start, reverse, true, &mut out);
+            }
+            PathExpr::OneOrMore(inner) => {
+                self.path_closure(inner, start, reverse, false, &mut out);
+            }
+            PathExpr::NegatedSet(preds) => {
+                // One step via any predicate not in the negated set.
+                let banned: std::collections::HashSet<u32> = preds
+                    .iter()
+                    .filter(|(_, inv)| *inv == reverse) // direction match
+                    .filter_map(|(iri, _)| self.path_pred_id(iri))
+                    .collect();
+                if reverse {
+                    for &(p, s) in self.store.ps_by_o(start) {
+                        if !banned.contains(&p) {
+                            out.insert(s);
+                        }
+                    }
+                } else {
+                    for &(p, o) in self.store.po_by_s(start) {
+                        if !banned.contains(&p) {
+                            out.insert(o);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Transitive closure for `*`/`+` via BFS over the inner path.
+    fn path_closure(
+        &self,
+        inner: &PathExpr,
+        start: u32,
+        reverse: bool,
+        reflexive: bool,
+        out: &mut std::collections::HashSet<u32>,
+    ) {
+        let mut frontier = vec![start];
+        let mut visited = std::collections::HashSet::new();
+        if reflexive {
+            out.insert(start);
+            visited.insert(start);
+        }
+        while let Some(n) = frontier.pop() {
+            for next in self.path_reach(inner, n, reverse) {
+                if visited.insert(next) {
+                    out.insert(next);
+                    frontier.push(next);
+                }
+            }
+        }
+    }
+
+    fn path_pred_id(&self, iri: &str) -> Option<PredId> {
+        self.dict
+            .predicate_id(&Term::iri(iri.to_string()).dict_key())
     }
 
     // ---- graph-pattern algebra -------------------------------------------
@@ -251,7 +771,110 @@ impl<'a> Evaluator<'a> {
                 flatten_join(gp, &mut conjuncts);
                 self.eval_join(&conjuncts, layout)
             }
+            GraphPattern::LeftJoin(a, b, filters) => {
+                let left = self.eval_pattern(a, layout);
+                let right = self.eval_pattern(b, layout);
+                self.eval_left_join(left, b, right, filters, layout)
+            }
+            GraphPattern::Minus(a, b) => {
+                let left = self.eval_pattern(a, layout);
+                let right = self.eval_pattern(b, layout);
+                let lvars = pattern_vars(a, layout);
+                let rvars = pattern_vars(b, layout);
+                eval_minus(left, &lvars, right, &rvars)
+            }
+            GraphPattern::Extend(inner, var, expr) => {
+                let mut sols = self.eval_pattern(inner, layout);
+                let vi = layout.index[var];
+                for b in &mut sols {
+                    // BIND error/unbound leaves the variable unbound (no row drop).
+                    if let Some(v) = self.eval_value(expr, b, layout) {
+                        b[vi] = Some(self.value_to_id(&v));
+                    }
+                }
+                sols
+            }
+            GraphPattern::Values(vars, rows) => self.eval_values(vars, rows, layout),
+            GraphPattern::SubSelect(sq) => self.eval_subselect(sq, layout),
+            GraphPattern::Path(p) => self.eval_path_pattern(p, layout),
         }
+    }
+
+    /// OPTIONAL (left outer join). For each left solution, keep all compatible
+    /// right solutions (after applying the OPTIONAL's inner FILTERs to the
+    /// merged binding); if none, keep the left solution unextended.
+    fn eval_left_join(
+        &self,
+        left: Vec<Binding>,
+        b_pat: &GraphPattern,
+        right: Vec<Binding>,
+        filters: &[Expr],
+        layout: &VarLayout,
+    ) -> Vec<Binding> {
+        let lvars: Vec<usize> = (0..layout.len()).collect();
+        let rvars = pattern_vars(b_pat, layout);
+        let _ = &lvars; // left may bind anything; merge handles compatibility
+        let mut out = Vec::new();
+        for l in &left {
+            let mut matched = false;
+            for r in &right {
+                if let Some(m) = merge_bindings(l, r) {
+                    if filters
+                        .iter()
+                        .all(|f| self.eval_ebv(f, &m, layout) == Some(true))
+                    {
+                        out.push(m);
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                out.push(l.clone());
+            }
+        }
+        let _ = rvars;
+        out
+    }
+
+    /// Evaluate an inline VALUES block into bindings over the query layout.
+    fn eval_values(
+        &self,
+        vars: &[String],
+        rows: &[Vec<Option<Term>>],
+        layout: &VarLayout,
+    ) -> Vec<Binding> {
+        rows.iter()
+            .map(|row| {
+                let mut b = vec![None; layout.len()];
+                for (vi, cell) in vars.iter().zip(row.iter()) {
+                    if let (Some(&idx), Some(term)) = (layout.index.get(vi), cell.as_ref()) {
+                        b[idx] = Some(self.term_to_id(term));
+                    }
+                }
+                b
+            })
+            .collect()
+    }
+
+    /// Evaluate a sub-SELECT and lift its result rows into the outer layout.
+    fn eval_subselect(&self, sq: &SelectQuery, layout: &VarLayout) -> Vec<Binding> {
+        let (vars, _is_pred, rows) = match self.eval_select_solutions(sq) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        // Map each sub-query result column to an outer layout slot (by name).
+        let slots: Vec<Option<usize>> = vars.iter().map(|v| layout.index.get(v).copied()).collect();
+        rows.into_iter()
+            .map(|r| {
+                let mut b = vec![None; layout.len()];
+                for (col, id) in r.into_iter().enumerate() {
+                    if let Some(idx) = slots[col] {
+                        b[idx] = id;
+                    }
+                }
+                b
+            })
+            .collect()
     }
 
     /// Evaluate a conjunction of patterns, joining smallest/connected first.
@@ -514,6 +1137,9 @@ impl<'a> Evaluator<'a> {
     /// Resolve a bound id to its surface string for output.
     fn resolve_string(&self, id: Option<u32>, is_pred: bool) -> Option<String> {
         let id = id?;
+        if is_synth(id) {
+            return self.extras.borrow().term(id).map(Term::to_string);
+        }
         if is_pred {
             self.dict.predicate_to_string(id).map(str::to_owned)
         } else {
@@ -523,8 +1149,15 @@ impl<'a> Evaluator<'a> {
 
     /// Resolve a variable to a runtime [`Value`] for expression evaluation.
     fn resolve_value(&self, idx: usize, binding: &Binding, layout: &VarLayout) -> Option<Value> {
-        let id = binding[idx]?;
-        let s = if layout.is_pred[idx] {
+        self.id_to_value(binding[idx]?, layout.is_pred[idx])
+    }
+
+    /// Resolve any id (dictionary or synthetic) to a runtime [`Value`].
+    fn id_to_value(&self, id: u32, is_pred: bool) -> Option<Value> {
+        if is_synth(id) {
+            return self.extras.borrow().term(id).map(Value::from_term);
+        }
+        let s = if is_pred {
             self.dict.predicate_to_string(id)?
         } else {
             self.dict.id_to_string(id)?
@@ -594,6 +1227,8 @@ impl<'a> Evaluator<'a> {
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
+            // Aggregates only have meaning in group context (handled elsewhere).
+            Expr::Aggregate { .. } => None,
         }
     }
 
@@ -607,14 +1242,7 @@ impl<'a> Evaluator<'a> {
     ) -> Option<bool> {
         let a = self.eval_value(x, b, l)?;
         let c = self.eval_value(y, b, l)?;
-        match op {
-            CompareOp::Eq => a.sparql_eq(&c),
-            CompareOp::Ne => a.sparql_eq(&c).map(|v| !v),
-            CompareOp::Lt => a.sparql_cmp(&c).map(|o| o.is_lt()),
-            CompareOp::Gt => a.sparql_cmp(&c).map(|o| o.is_gt()),
-            CompareOp::Le => a.sparql_cmp(&c).map(|o| o.is_le()),
-            CompareOp::Ge => a.sparql_cmp(&c).map(|o| o.is_ge()),
-        }
+        compare_values(op, &a, &c)
     }
 
     fn eval_builtin(&self, name: &str, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
@@ -800,6 +1428,140 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+/// Materialize a runtime [`Value`] as an RDF [`Term`].
+fn value_to_term(v: &Value) -> Term {
+    match v {
+        Value::Iri(s) => Term::Iri(s.clone()),
+        Value::Blank(s) => Term::Blank(s.clone()),
+        Value::Int(i) => Term::typed_literal(i.to_string(), xsd::INTEGER),
+        Value::Double(_) => Term::typed_literal(v.lexical(), xsd::DOUBLE),
+        Value::Bool(bool_v) => Term::typed_literal(bool_v.to_string(), xsd::BOOLEAN),
+        Value::Str { value, lang } => Term::Literal {
+            value: value.clone(),
+            datatype: None,
+            lang: lang.clone(),
+        },
+        Value::Typed { value, datatype } => Term::Literal {
+            value: value.clone(),
+            datatype: Some(datatype.clone()),
+            lang: None,
+        },
+    }
+}
+
+/// Compare two values with a SPARQL relational operator.
+fn compare_values(op: CompareOp, a: &Value, b: &Value) -> Option<bool> {
+    match op {
+        CompareOp::Eq => a.sparql_eq(b),
+        CompareOp::Ne => a.sparql_eq(b).map(|v| !v),
+        CompareOp::Lt => a.sparql_cmp(b).map(|o| o.is_lt()),
+        CompareOp::Gt => a.sparql_cmp(b).map(|o| o.is_gt()),
+        CompareOp::Le => a.sparql_cmp(b).map(|o| o.is_le()),
+        CompareOp::Ge => a.sparql_cmp(b).map(|o| o.is_ge()),
+    }
+}
+
+/// Sum numeric values (integer-preserving until a double appears).
+fn sum_values(vals: &[Value]) -> Value {
+    let mut all_int = true;
+    let mut isum: i64 = 0;
+    let mut fsum: f64 = 0.0;
+    for v in vals {
+        match v {
+            Value::Int(i) => {
+                isum = isum.saturating_add(*i);
+                fsum += *i as f64;
+            }
+            Value::Double(d) => {
+                all_int = false;
+                fsum += d;
+            }
+            _ => {}
+        }
+    }
+    if all_int {
+        Value::Int(isum)
+    } else {
+        Value::Double(fsum)
+    }
+}
+
+/// Does a projection contain any aggregate (⇒ grouping evaluation)?
+fn projection_has_aggregate(p: &Projection) -> bool {
+    match p {
+        Projection::All => false,
+        Projection::Items(items) => items
+            .iter()
+            .any(|it| matches!(it, SelectItem::Expr(e, _) if expr_has_aggregate(e))),
+    }
+}
+
+fn expr_has_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Aggregate { .. } => true,
+        Expr::Or(a, b) | Expr::And(a, b) | Expr::Arith(_, a, b) | Expr::Compare(_, a, b) => {
+            expr_has_aggregate(a) || expr_has_aggregate(b)
+        }
+        Expr::Not(a) | Expr::Unary(_, a) => expr_has_aggregate(a),
+        Expr::Builtin(_, args) => args.iter().any(expr_has_aggregate),
+        _ => false,
+    }
+}
+
+/// Bind a path endpoint (variable or constant) into a binding; false on conflict.
+fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> bool {
+    match pt {
+        PatternTerm::Var(v) => {
+            let i = layout.index[v];
+            match b[i] {
+                Some(x) => x == id,
+                None => {
+                    b[i] = Some(id);
+                    true
+                }
+            }
+        }
+        // Constant endpoints are pre-filtered to match in `path_pairs`.
+        PatternTerm::Term(_) => true,
+    }
+}
+
+/// MINUS: drop left solutions that have a compatible right solution sharing at
+/// least one bound variable (SPARQL `MINUS` semantics).
+fn eval_minus(
+    left: Vec<Binding>,
+    lvars: &[usize],
+    right: Vec<Binding>,
+    rvars: &[usize],
+) -> Vec<Binding> {
+    let shared: Vec<usize> = lvars
+        .iter()
+        .copied()
+        .filter(|v| rvars.contains(v))
+        .collect();
+    if shared.is_empty() {
+        return left; // no shared variables ⇒ MINUS removes nothing
+    }
+    left.into_iter()
+        .filter(|l| {
+            !right.iter().any(|r| {
+                let mut compatible = true;
+                let mut any_shared = false;
+                for &v in &shared {
+                    if let (Some(a), Some(b)) = (l[v], r[v]) {
+                        any_shared = true;
+                        if a != b {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                }
+                compatible && any_shared
+            })
+        })
+        .collect()
+}
+
 /// Flatten a (possibly nested) `Join` tree into its conjuncts.
 fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
     match gp {
@@ -811,18 +1573,15 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
     }
 }
 
-/// The variable indices a pattern structurally binds.
+/// The variable indices a pattern structurally binds (incl. BIND/VALUES/sub-SELECT).
 fn pattern_vars(gp: &GraphPattern, layout: &VarLayout) -> Vec<usize> {
-    let mut tps = Vec::new();
-    gp.collect_triples(&mut tps);
+    let mut names = Vec::new();
+    gp.collect_vars(&mut names);
     let mut vars = Vec::new();
-    for tp in tps {
-        for pos in [&tp.subject, &tp.predicate, &tp.object] {
-            if let Some(v) = pos.as_var() {
-                let idx = layout.index[v];
-                if !vars.contains(&idx) {
-                    vars.push(idx);
-                }
+    for name in names {
+        if let Some(&idx) = layout.index.get(&name) {
+            if !vars.contains(&idx) {
+                vars.push(idx);
             }
         }
     }

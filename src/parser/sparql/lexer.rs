@@ -57,6 +57,10 @@ pub enum Token {
     And,
     Or,
     Not,
+    /// `^` — inverse property path.
+    Caret,
+    /// `|` — property-path alternative (distinct from `||`).
+    Pipe,
     Eof,
 }
 
@@ -134,12 +138,14 @@ impl Lexer {
                 }
                 '|' => {
                     self.bump();
-                    if self.bump() == Some('|') {
+                    if self.peek() == Some('|') {
+                        self.bump();
                         Token::Or
                     } else {
-                        return Err(self.err("expected '||'"));
+                        Token::Pipe // property-path alternative
                     }
                 }
+                '^' => self.single(Token::Caret), // inverse path (^^ handled in strings)
                 '>' => {
                     self.bump();
                     if self.peek() == Some('=') {
