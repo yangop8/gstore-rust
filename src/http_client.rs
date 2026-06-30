@@ -7,7 +7,10 @@
 //!
 //! Scope (mirroring `server.rs`): plain `http://` only (no TLS), `Connection:
 //! close` one-shot requests, and a hand-rolled JSON reader covering the result
-//! shape SPARQL endpoints emit. HTTPS/auth/redirects are out of scope.
+//! shape SPARQL endpoints emit. The body is read to EOF after the headers, so it
+//! assumes a `Content-Length` / connection-close response — `Transfer-Encoding:
+//! chunked` and `gzip` are NOT decoded (works against this crate's own
+//! `server.rs`; some public endpoints chunk). HTTPS/auth/redirects out of scope.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;

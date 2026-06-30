@@ -122,20 +122,31 @@ fn service_silent_dead_endpoint_yields_identity() {
 }
 
 #[test]
-fn service_silent_join_dead_endpoint_does_not_panic() {
+fn service_silent_join_dead_endpoint_preserves_outer_rows() {
     let dead = dead_addr();
     let mut local = Database::build_from_str("svc_silent2", LOCAL).expect("build local db");
 
-    // Joined with an outer pattern, a SILENT failure still completes the query
-    // (no panic, no error propagated).
+    // Per SPARQL 1.1 §18.5, a SILENT failure behaves as the join identity Z, so
+    // Join(Ω, Z) = Ω — the outer solutions MUST be preserved (with the inner
+    // SERVICE variables left unbound), not dropped.
     let query = format!(
         "SELECT ?friend WHERE {{ \
             <http://ex/alice> <http://ex/knows> ?friend . \
             SERVICE SILENT <http://{dead}/sparql> {{ ?friend <http://ex/name> ?o }} \
          }}"
     );
-    let rs = local.select(&query);
-    assert!(rs.is_ok(), "SILENT join must not error: {:?}", rs.err());
+    let rs = local.select(&query).expect("SILENT join must not error");
+    let mut friends: Vec<String> = rs
+        .rows
+        .iter()
+        .map(|r| r[0].clone().unwrap_or_default())
+        .collect();
+    friends.sort();
+    assert_eq!(
+        friends,
+        vec!["<http://ex/bob>".to_string(), "<http://ex/carol>".to_string()],
+        "outer rows must survive a SILENT SERVICE failure"
+    );
 }
 
 #[test]

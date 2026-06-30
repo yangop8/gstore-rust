@@ -2103,8 +2103,17 @@ fn join_sets(
         .collect();
 
     let mut out = Vec::new();
-    if shared.is_empty() {
-        // No shared variable ⇒ cross product (disconnected pattern).
+    // Cross product when there is no shared variable, OR when a shared variable
+    // is left *unbound* (None) on some row: SPARQL compatibility treats an
+    // unbound value as a wildcard that matches anything, which the hash key
+    // (keyed on `Option<u32>`, where `None` is a distinct key) cannot express.
+    // This arises with OPTIONAL results re-joined later and with a SILENT
+    // SERVICE's identity solution. `merge_bindings` does the correct per-pair
+    // compatible-merge (None acts as a wildcard).
+    let unbound_shared = shared
+        .iter()
+        .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
+    if shared.is_empty() || unbound_shared {
         for l in left {
             for r in right {
                 if let Some(m) = merge_bindings(l, r) {

@@ -33,10 +33,12 @@
 //! implementation simple; finer-grained MVCC (per-key version chains,
 //! persistent/shared structures) would avoid the copy.
 //!
-//! Scope note: OCC validation is among [`Txn`] commits. The legacy
-//! `update()`/`write()` path still works and stays snapshot-consistent for
-//! readers, but it does not record a write-key set, so it is not conflict-checked
-//! against concurrent [`Txn`]s — treat the two write paths as separate.
+//! Scope note: the legacy `update()`/`write()` path stays snapshot-consistent for
+//! readers and records its commit version, so a [`Txn`] whose lifetime overlaps a
+//! legacy write conservatively conflicts on commit (it cannot lose that write
+//! silently). It is conservative — a legacy write conflicts ALL transactions live
+//! at the time, regardless of key overlap, because that path does not record a
+//! per-key write set. Prefer one write path at a time for best throughput.
 //!
 //! NOT done (see `docs/REFACTOR_BACKLOG.md` E): per-key version chains,
 //! lock-free reads beyond the `Arc`-swap, deadlock detection, and snapshot GC
@@ -119,6 +121,10 @@ struct OccState {
     /// `start_version → number of live transactions started at that version`.
     /// The minimum key is the GC floor: history at/below it is unreachable.
     live_starts: BTreeMap<u64, usize>,
+    /// Version of the most recent *legacy* (non-transactional) `update()`/`write()`
+    /// commit. Those paths don't record a per-key write set, so a `Txn` whose
+    /// lifetime overlaps one conservatively conflicts (no silent lost update).
+    last_legacy_version: u64,
 }
 
 impl OccState {
@@ -126,6 +132,7 @@ impl OccState {
         OccState {
             history: BTreeMap::new(),
             live_starts: BTreeMap::new(),
+            last_legacy_version: 0,
         }
     }
 
@@ -211,7 +218,11 @@ impl ConcurrentDb {
                 ))
             }
         };
-        self.publish(&db);
+        // Record the legacy-write version under the OCC lock so overlapping
+        // transactions detect it (writer → occ → current order preserved).
+        let mut occ = self.occ.lock().unwrap();
+        let v = self.publish(&db);
+        occ.last_legacy_version = v;
         Ok(changed)
     }
 
@@ -224,7 +235,9 @@ impl ConcurrentDb {
     {
         let mut db = self.writer.lock().unwrap();
         let out = f(&mut db);
-        self.publish(&db);
+        let mut occ = self.occ.lock().unwrap();
+        let v = self.publish(&db);
+        occ.last_legacy_version = v;
         out
     }
 
@@ -359,18 +372,28 @@ impl Txn<'_> {
         let mut db = self.db.writer.lock().unwrap();
         let mut occ = self.db.occ.lock().unwrap();
 
-        // Validate against every commit newer than our start version.
-        for (_v, keys) in occ.history.range((self.start_version + 1)..) {
-            if !self.keys.is_disjoint(keys) {
-                occ.deregister(self.start_version);
-                occ.gc();
-                self.registered = false;
-                return Err(GStoreError::Conflict(format!(
-                    "write-write conflict: a commit after version {} touched a key \
-                     this transaction also wrote",
-                    self.start_version
-                )));
-            }
+        // A legacy (non-transactional) write during our lifetime is not key-
+        // tracked, so conservatively conflict to avoid a silent lost update.
+        let legacy_during = occ.last_legacy_version > self.start_version;
+        // Otherwise validate against every transactional commit newer than V.
+        let txn_conflict = !legacy_during
+            && occ
+                .history
+                .range((self.start_version + 1)..)
+                .any(|(_v, keys)| !self.keys.is_disjoint(keys));
+        if legacy_during || txn_conflict {
+            occ.deregister(self.start_version);
+            occ.gc();
+            self.registered = false;
+            return Err(GStoreError::Conflict(format!(
+                "conflict: a {} after version {} may overlap this transaction's writes",
+                if legacy_during {
+                    "non-transactional write"
+                } else {
+                    "committed transaction"
+                },
+                self.start_version
+            )));
         }
 
         // No conflict: apply the buffered writes to the authoritative database.
@@ -444,6 +467,37 @@ mod tests {
 
     fn triple(s: &str, p: &str, o: &str) -> Triple {
         Triple::new(Term::iri(s), Term::iri(p), Term::iri(o))
+    }
+
+    #[test]
+    fn legacy_write_during_txn_conflicts() {
+        let c = cdb();
+        let mut txn = c.begin(); // starts at version 1
+        // A legacy (non-transactional) update commits during the txn's lifetime.
+        c.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/x> }")
+            .unwrap();
+        txn.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
+        let res = txn.commit();
+        assert!(
+            matches!(res, Err(GStoreError::Conflict(_))),
+            "a legacy write during the txn must conflict, got {res:?}"
+        );
+        // The legacy write persisted; the aborted txn's buffered write did not.
+        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 2);
+        assert_eq!(count(&c, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/r> }"), 0);
+    }
+
+    #[test]
+    fn legacy_write_before_txn_start_does_not_conflict() {
+        let c = cdb();
+        c.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/x> }")
+            .unwrap(); // version 2
+        let mut txn = c.begin(); // starts at version 2, after the legacy write
+        txn.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
+        assert!(
+            txn.commit().is_ok(),
+            "a legacy write before the txn started must not conflict"
+        );
     }
 
     #[test]

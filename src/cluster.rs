@@ -55,6 +55,11 @@ use crate::store::{TripleSource, TripleStore};
 /// A triple set partitioned across `N` [`TripleStore`] shards by
 /// `hash(subject) % N`, queried by scatter-gather. Implements [`TripleSource`]
 /// so the generic [`Evaluator`] runs over it unchanged.
+///
+/// Correctness rests on the by-construction invariant that every triple of a
+/// subject lives on exactly one shard (`shard_of(subject)`); `triple_count` and
+/// `pred_card` sum across shards on that basis. If a routed-`insert` API is ever
+/// added it MUST place triples via `shard_of(sub)`, or those sums silently break.
 #[derive(Debug, Clone)]
 pub struct ShardedStore {
     shards: Vec<TripleStore>,

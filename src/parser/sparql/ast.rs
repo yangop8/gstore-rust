@@ -178,7 +178,16 @@ pub enum GraphPattern {
     /// `SERVICE [SILENT] (<iri> | ?svc) { … }`: SPARQL 1.1 federated query — the
     /// inner pattern is shipped to a remote SPARQL endpoint and its returned
     /// solutions are joined with the outer ones. `silent` swallows
-    /// connection/parse failures (yielding the identity solution).
+    /// connection/parse failures, yielding the join identity (so outer rows are
+    /// preserved).
+    ///
+    /// Scope limitations (see `docs/REFACTOR_BACKLOG.md`): the inner pattern
+    /// serialized to the remote is the BGP/UNION subset (FILTER/OPTIONAL/BIND/
+    /// paths/sub-SELECT are not shipped); a constant `<iri>` endpoint is the
+    /// supported case; and because query evaluation is infallible, a *non*-SILENT
+    /// remote failure or an unsupported inner shape currently yields no rows
+    /// rather than raising an error. The whole inner relation is fetched and
+    /// joined locally (no bound-join pushdown).
     Service {
         endpoint: ServiceRef,
         silent: bool,
