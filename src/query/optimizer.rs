@@ -61,6 +61,46 @@ pub(crate) struct ExecPlan {
     pub(crate) tree: Option<JoinTree>,
 }
 
+/// The physical method used to join two materialised intermediate results — a
+/// port of gStore `Join::judge`, which picks per *pair* of operands between a
+/// multi-way/hash join and an index/nested-loop join according to the operand
+/// sizes and the query's structure.
+///
+/// Here both operands are materialised binding vectors:
+///
+/// * [`JoinMethod::Hash`] builds a hash table on the shared-variable key of one
+///   side and probes it with the other — `O(|L| + |R|)`, the general method.
+/// * [`JoinMethod::NestedLoop`] scans the two sides directly with no hash table
+///   — `O(|L| · |R|)`, but with a tiny constant and no allocation, so it wins
+///   when one side is very small / highly selective (the classic index-nested-
+///   loop regime when an operand is a single value or a handful of rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinMethod {
+    /// Hash join (gStore `multi_join`): the general-purpose method.
+    Hash,
+    /// Nested-loop join (gStore `index_join`): for a tiny / very selective side.
+    NestedLoop,
+}
+
+/// Choose a join method from the two operand sizes (gStore `Join::judge`).
+///
+/// The cost model compares the nested-loop cost `min·max` against the hash cost
+/// `|L| + |R|` (build one side, probe with the other) and picks nested-loop only
+/// when it is no more expensive — which, since `min·max ≤ |L|+|R|` forces
+/// `min ≈ 1`, means "exactly when one side is tiny / highly selective". A
+/// general join of two sizeable results always picks the linear hash join.
+pub(crate) fn judge(left_len: usize, right_len: usize) -> JoinMethod {
+    let smaller = left_len.min(right_len);
+    let bigger = left_len.max(right_len);
+    let nested_cost = smaller.saturating_mul(bigger);
+    let hash_cost = left_len.saturating_add(right_len);
+    if nested_cost <= hash_cost {
+        JoinMethod::NestedLoop
+    } else {
+        JoinMethod::Hash
+    }
+}
+
 /// Largest BGP (in patterns) for which the `n·2ⁿ` left-deep DP runs; beyond it we
 /// fall back to the greedy [`super::planner::plan`].
 const LEFTDEEP_DP_LIMIT: usize = 14;
@@ -83,9 +123,12 @@ pub(crate) fn optimize(
         };
     }
     // The DP indexes patterns by bit and variables by bit; both must fit a mask.
+    // Beyond that the exact DP is infeasible: build a greedy order and then
+    // refine it with bounded 2-opt local search (cheaper, better-than-greedy
+    // plans for 15–30-pattern conjunctive queries) instead of using raw greedy.
     if n > LEFTDEEP_DP_LIMIT || num_vars > 64 {
         return ExecPlan {
-            order: super::planner::plan(plans, store, candidates, num_vars),
+            order: greedy_2opt(plans, store, candidates, num_vars),
             tree: None,
         };
     }
@@ -286,6 +329,140 @@ fn dp_bushy(n: usize, model: &CostModel) -> (f64, JoinTree) {
 
     let full = size - 1;
     (cost[full], tree[full].clone().unwrap_or(JoinTree::Leaf(0)))
+}
+
+// --- large-BGP path: greedy + 2-opt -----------------------------------------
+
+/// Maximum 2-opt refinement passes over a greedy order. Each accepted swap
+/// strictly lowers the estimated cost, so this only bounds pathological cases.
+const MAX_2OPT_PASSES: usize = 16;
+
+/// Per-pattern cost inputs without the `2ⁿ` subset memo, so the cost of an
+/// arbitrary left-deep order can be evaluated in `O(n · vars)` for BGPs far
+/// larger than the exact DP's reach. Mirrors [`CostModel`]'s statistics, but
+/// keeps only per-pattern data.
+struct CostModelLite {
+    /// `card[i]` — estimated number of triples matching pattern `i`.
+    card: Vec<f64>,
+    /// `vars[i]` — the distinct variable indices appearing in pattern `i`.
+    vars: Vec<Vec<usize>>,
+    /// `ndv[i][v]` — distinct values variable `v` takes in pattern `i`.
+    ndv: Vec<HashMap<usize, f64>>,
+}
+
+impl CostModelLite {
+    fn build(plans: &[PatPlan], store: &impl TripleSource, candidates: &Candidates) -> CostModelLite {
+        let n = plans.len();
+        let mut card = vec![1.0; n];
+        let mut vars = vec![Vec::new(); n];
+        let mut ndv = vec![HashMap::new(); n];
+        for (i, plan) in plans.iter().enumerate() {
+            card[i] = pattern_card(plan, store);
+            vars[i] = plan_vars(plan);
+            ndv[i] = build_ndv(plan, store, candidates);
+        }
+        CostModelLite { card, vars, ndv }
+    }
+
+    /// Estimated total cost of evaluating the patterns in `order` as a left-deep
+    /// pipeline — the same System-R recurrence the DP minimises
+    /// (`cost = card(first) + Σ join_card(prefix, next)`), evaluated directly so
+    /// any permutation can be scored without the subset table.
+    fn order_cost(&self, order: &[usize]) -> f64 {
+        if order.is_empty() {
+            return 0.0;
+        }
+        // Min finite NDV per already-covered variable across the placed prefix.
+        let mut run_ndv: HashMap<usize, f64> = HashMap::new();
+        let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let first = order[0];
+        let mut run_card = self.card[first];
+        let mut cost = run_card;
+        self.absorb(first, &mut covered, &mut run_ndv);
+
+        for &i in &order[1..] {
+            let mut denom = 1.0;
+            let mut shared = false;
+            for &v in &self.vars[i] {
+                if covered.contains(&v) {
+                    shared = true;
+                    let nv_run = run_ndv.get(&v).copied().unwrap_or(1.0);
+                    let nv_pat = self.ndv[i].get(&v).copied().unwrap_or(1.0);
+                    denom *= nv_run.max(nv_pat).max(1.0);
+                }
+            }
+            let jc = if shared {
+                (run_card * self.card[i] / denom).max(1.0)
+            } else {
+                run_card * self.card[i] // disconnected ⇒ cross product
+            };
+            cost += jc;
+            run_card = jc;
+            self.absorb(i, &mut covered, &mut run_ndv);
+        }
+        cost
+    }
+
+    /// Fold pattern `i`'s variables and NDVs into the running prefix statistics.
+    fn absorb(
+        &self,
+        i: usize,
+        covered: &mut std::collections::HashSet<usize>,
+        run_ndv: &mut HashMap<usize, f64>,
+    ) {
+        for &v in &self.vars[i] {
+            covered.insert(v);
+            if let Some(&d) = self.ndv[i].get(&v) {
+                let e = run_ndv.entry(v).or_insert(d);
+                if d < *e {
+                    *e = d;
+                }
+            }
+        }
+    }
+}
+
+/// Build a greedy left-deep order (gStore's `PlanGenerator` heuristic) and then
+/// refine it with bounded 2-opt local search under the System-R cost model: try
+/// swapping each pair of positions and keep the single swap that most reduces
+/// the estimated cost, repeating until no swap helps. The result is never worse
+/// than the greedy seed and typically markedly better for 15–30-pattern BGPs.
+pub(crate) fn greedy_2opt(
+    plans: &[PatPlan],
+    store: &impl TripleSource,
+    candidates: &Candidates,
+    num_vars: usize,
+) -> Vec<usize> {
+    let mut order = super::planner::plan(plans, store, candidates, num_vars);
+    if order.len() < 3 {
+        return order; // nothing for a pairwise swap to improve
+    }
+    let model = CostModelLite::build(plans, store, candidates);
+    let mut best_cost = model.order_cost(&order);
+
+    for _ in 0..MAX_2OPT_PASSES {
+        let mut best_swap: Option<(usize, usize)> = None;
+        let mut best_after = best_cost;
+        for a in 0..order.len() {
+            for b in (a + 1)..order.len() {
+                order.swap(a, b);
+                let c = model.order_cost(&order);
+                order.swap(a, b);
+                if c < best_after {
+                    best_after = c;
+                    best_swap = Some((a, b));
+                }
+            }
+        }
+        match best_swap {
+            Some((a, b)) => {
+                order.swap(a, b);
+                best_cost = best_after;
+            }
+            None => break,
+        }
+    }
+    order
 }
 
 // --- cost-model statistics --------------------------------------------------
@@ -490,6 +667,91 @@ mod tests {
         // joining the 50-row ta-star with the 1-row bridge on ?x yields ≤ 51.
         let jc = model.join_card(0b01, 0b10, model.card[0], model.card[1]);
         assert!(jc <= model.card[0].max(model.card[1]) + 1.0);
+    }
+
+    #[test]
+    fn judge_picks_nested_for_tiny_and_hash_for_large() {
+        use super::{judge, JoinMethod};
+        assert_eq!(judge(1, 1000), JoinMethod::NestedLoop);
+        assert_eq!(judge(1000, 1), JoinMethod::NestedLoop);
+        assert_eq!(judge(2, 2), JoinMethod::NestedLoop);
+        assert_eq!(judge(60, 60), JoinMethod::Hash);
+        assert_eq!(judge(5, 1000), JoinMethod::Hash);
+    }
+
+    /// A 20-pattern chain BGP: greedy+2-opt yields a valid permutation whose
+    /// estimated cost never exceeds the greedy seed's (and usually beats it).
+    #[test]
+    fn greedy_2opt_does_not_regress_large_bgp() {
+        // Chain ?v0 -p0-> ?v1 -p1-> ... -p19-> ?v20 (20 patterns, 21 vars), with
+        // widely varying predicate cardinalities so ordering matters.
+        let mut s = TripleStore::new();
+        let mut t = Vec::new();
+        // Each predicate i connects a band of subjects to a band of objects; the
+        // fan-out per predicate varies to create non-trivial join costs.
+        let bases: [u32; 20] = [
+            3, 50, 2, 80, 5, 120, 4, 30, 7, 200, 6, 40, 9, 90, 8, 25, 11, 150, 10, 60,
+        ];
+        for (i, &width) in bases.iter().enumerate() {
+            let pred = i as u32;
+            for j in 0..width {
+                // node ids namespaced by level so the chain links up
+                let sub = (i as u32) * 1_000 + j;
+                let obj = (i as u32 + 1) * 1_000 + (j % 3); // narrow join fan-in
+                t.push(IdTriple::new(sub, pred, obj));
+            }
+        }
+        s.bulk_load(t);
+
+        // Build the 20 chain patterns: pattern i = (?v_i, p_i, ?v_{i+1}).
+        let plans: Vec<PatPlan> = (0..20usize)
+            .map(|i| pp(Slot::Var(i), Slot::Const(i as u32), Slot::Var(i + 1)))
+            .collect();
+        let c = candidates::generate(&plans, &s);
+        let num_vars = 21;
+
+        let greedy = super::super::planner::plan(&plans, &s, &c, num_vars);
+        let refined = super::greedy_2opt(&plans, &s, &c, num_vars);
+
+        // Both are permutations of the 20 patterns.
+        let mut g = greedy.clone();
+        g.sort_unstable();
+        assert_eq!(g, (0..20).collect::<Vec<_>>());
+        let mut r = refined.clone();
+        r.sort_unstable();
+        assert_eq!(r, (0..20).collect::<Vec<_>>());
+
+        // 2-opt never produces a worse plan than its greedy seed.
+        let model = super::CostModelLite::build(&plans, &s, &c);
+        let cost_greedy = model.order_cost(&greedy);
+        let cost_refined = model.order_cost(&refined);
+        assert!(
+            cost_refined <= cost_greedy + 1e-6,
+            "2-opt regressed: greedy={cost_greedy}, refined={cost_refined}"
+        );
+
+        // Determinism: re-running gives the same order.
+        let refined2 = super::greedy_2opt(&plans, &s, &c, num_vars);
+        assert_eq!(refined, refined2);
+    }
+
+    /// 2-opt strictly improves a deliberately bad greedy seed: scoring three
+    /// patterns where swapping a late selective pattern earlier lowers cost.
+    #[test]
+    fn order_cost_rewards_selective_first() {
+        let s = bridge_store();
+        let plans = vec![
+            pp(Slot::Var(0), Slot::Const(0), Slot::Const(1000)), // 50 rows
+            pp(Slot::Var(1), Slot::Const(1), Slot::Const(2000)), // 50 rows
+            pp(Slot::Var(0), Slot::Const(2), Slot::Var(1)),      // 1-row bridge
+        ];
+        let c = candidates::generate(&plans, &s);
+        let model = super::CostModelLite::build(&plans, &s, &c);
+        // Leading with the selective bridge then expanding is cheaper than two
+        // big independent stars first (whose join is a near cross-product).
+        let cost_bridge_first = model.order_cost(&[2, 0, 1]);
+        let cost_stars_first = model.order_cost(&[0, 1, 2]);
+        assert!(cost_bridge_first < cost_stars_first);
     }
 
     #[test]

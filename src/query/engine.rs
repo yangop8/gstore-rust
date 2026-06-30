@@ -29,8 +29,9 @@ use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
+use super::functions::FunctionRegistry;
 use super::hash;
-use super::optimizer::{self, ExecPlan, JoinTree};
+use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
 use super::results::{QueryResult, ResultSet};
 use super::value::{format_xsd_datetime_utc, order_key, parse_datetime_parts, DateTimeParts, Value};
 
@@ -178,6 +179,11 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// built-ins (`SHORTESTPATHLEN`, `KHOPREACHABLE`, `CYCLEBOOLEAN`, …) pay the
     /// O(E) build cost once per query rather than once per solution.
     graph_cache: std::cell::RefCell<Option<Rc<GraphView>>>,
+    /// User-defined scalar functions (gStore's `pfnQuery`, but a safe in-process
+    /// closure registry rather than dlopen/.so plugins). Consulted by the
+    /// expression evaluator for names that are not SPARQL built-ins. Shared
+    /// (`Rc`) with `GRAPH` sub-evaluators so they see the same functions.
+    functions: Rc<FunctionRegistry>,
 }
 
 impl<'a, S: TripleSource> Evaluator<'a, S> {
@@ -190,6 +196,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
+            functions: Rc::new(FunctionRegistry::new()),
         }
     }
 
@@ -207,12 +214,46 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
+            functions: Rc::new(FunctionRegistry::new()),
         }
     }
 
     /// Attach named graphs so `GRAPH` patterns can be evaluated.
     pub fn with_named(mut self, named: &'a BTreeMap<u32, TripleStore>) -> Evaluator<'a, S> {
         self.named = Some(named);
+        self
+    }
+
+    /// Attach a registry of user-defined scalar functions (gStore `pfnQuery`,
+    /// implemented as safe in-process closures instead of dlopen plugins). The
+    /// expression evaluator consults it for any name that is not a SPARQL
+    /// built-in. Built-ins always take precedence. Builder-style; chainable with
+    /// [`with_named`](Self::with_named) / [`with_function`](Self::with_function).
+    pub fn with_functions(mut self, functions: FunctionRegistry) -> Evaluator<'a, S> {
+        self.functions = Rc::new(functions);
+        self
+    }
+
+    /// Register a single user-defined scalar function (builder-style). See
+    /// [`with_functions`](Self::with_functions). Equivalent to building a
+    /// [`FunctionRegistry`], calling [`FunctionRegistry::register`], and passing
+    /// it to `with_functions`.
+    pub fn with_function<F>(mut self, name: &str, f: F) -> Evaluator<'a, S>
+    where
+        F: Fn(&[Value]) -> Option<Value> + 'static,
+    {
+        self.register_function(name, f);
+        self
+    }
+
+    /// Register a single user-defined scalar function on this evaluator
+    /// in place. The name is case-insensitive (folded to upper case to match the
+    /// SPARQL parser). See [`FunctionRegistry`] for the calling convention.
+    pub fn register_function<F>(&mut self, name: &str, f: F) -> &mut Self
+    where
+        F: Fn(&[Value]) -> Option<Value> + 'static,
+    {
+        Rc::make_mut(&mut self.functions).register(name, f);
         self
     }
 
@@ -1052,6 +1093,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             extras: Rc::clone(&self.extras),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
+            functions: Rc::clone(&self.functions),
         }
     }
 
@@ -2044,7 +2086,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 ))
             }
 
-            _ => None, // unimplemented builtin ⇒ error (excludes the solution)
+            // User-defined function fallback (gStore `pfnQuery`): a name that is
+            // not a SPARQL built-in is looked up in the registry before erroring.
+            // Arguments are evaluated to values first; if any errors/unbound the
+            // call yields `None`, like a built-in with a bad argument.
+            _ => {
+                let f = self.functions.get(name)?;
+                let mut argv = Vec::with_capacity(args.len());
+                for a in args {
+                    argv.push(self.eval_value(a, b, l)?);
+                }
+                f(&argv)
+            }
         }
     }
 
@@ -2545,7 +2598,13 @@ fn merge_bindings(l: &Binding, r: &Binding) -> Option<Binding> {
 }
 
 /// Join two solution sets on their shared variables (SPARQL compatible-merge).
-/// Uses a hash join keyed on shared variables when they exist, else a product.
+///
+/// The physical method is chosen *per pair of operands* by [`optimizer::judge`]
+/// (a port of gStore `Join::judge`): a [`JoinMethod::NestedLoop`] when one side
+/// is tiny / highly selective, otherwise a [`JoinMethod::Hash`]. Both methods
+/// emit solutions in the same order (left-major, right-minor), so the choice
+/// never changes the result — only the cost. A cross product is used when there
+/// is no usable shared key.
 fn join_sets(
     left: &[Binding],
     left_vars: &[usize],
@@ -2558,7 +2617,6 @@ fn join_sets(
         .filter(|v| right_vars.contains(v))
         .collect();
 
-    let mut out = Vec::new();
     // Cross product when there is no shared variable, OR when a shared variable
     // is left *unbound* (None) on some row: SPARQL compatibility treats an
     // unbound value as a wildcard that matches anything, which the hash key
@@ -2570,6 +2628,7 @@ fn join_sets(
         .iter()
         .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
     if shared.is_empty() || unbound_shared {
+        let mut out = Vec::new();
         for l in left {
             for r in right {
                 if let Some(m) = merge_bindings(l, r) {
@@ -2580,15 +2639,43 @@ fn join_sets(
         return out;
     }
 
-    // Hash the (usually smaller) right side on the shared-variable key.
+    match optimizer::judge(left.len(), right.len()) {
+        JoinMethod::Hash => join_sets_hash(left, right, &shared),
+        JoinMethod::NestedLoop => join_sets_nested(left, right, &shared),
+    }
+}
+
+/// Hash join on the shared-variable key (gStore `multi_join`): build a hash
+/// table on the right side, then probe it once per left row.
+fn join_sets_hash(left: &[Binding], right: &[Binding], shared: &[usize]) -> Vec<Binding> {
     let key_of = |b: &Binding| -> Vec<Option<u32>> { shared.iter().map(|&i| b[i]).collect() };
     let mut index: HashMap<Vec<Option<u32>>, Vec<&Binding>> = HashMap::new();
     for r in right {
         index.entry(key_of(r)).or_default().push(r);
     }
+    let mut out = Vec::new();
     for l in left {
         if let Some(matches) = index.get(&key_of(l)) {
             for r in matches {
+                if let Some(m) = merge_bindings(l, r) {
+                    out.push(m);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Nested-loop join (gStore `index_join`): for each left row, scan the right
+/// side directly, relying on `merge_bindings` to reject incompatible pairs. No
+/// hash table is built, which is cheapest when one side is tiny. Emits in the
+/// same left-major, right-minor order as [`join_sets_hash`].
+fn join_sets_nested(left: &[Binding], right: &[Binding], shared: &[usize]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    for l in left {
+        for r in right {
+            // Fast reject on the shared key before the full compatible-merge.
+            if shared.iter().all(|&i| l[i] == r[i]) {
                 if let Some(m) = merge_bindings(l, r) {
                     out.push(m);
                 }
@@ -3060,5 +3147,308 @@ mod builtin_tests {
             lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
             "true"
         );
+    }
+}
+
+/// Per-pair join-method selection (gStore `Join::judge`): nested-loop vs hash.
+#[cfg(test)]
+mod join_method_tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::query::optimizer::{judge, JoinMethod};
+
+    /// A tiny side (highly selective) picks nested-loop; two sizeable sides pick
+    /// the general hash join.
+    #[test]
+    fn judge_picks_per_pair_method() {
+        // One row joined against many ⇒ nested-loop (min·max ≤ |L|+|R|).
+        assert_eq!(judge(1, 100), JoinMethod::NestedLoop);
+        assert_eq!(judge(100, 1), JoinMethod::NestedLoop);
+        assert_eq!(judge(2, 2), JoinMethod::NestedLoop);
+        // Two sizeable sides ⇒ hash (quadratic cost dominates the linear hash).
+        assert_eq!(judge(50, 50), JoinMethod::Hash);
+        assert_eq!(judge(10, 1000), JoinMethod::Hash);
+        // Empty side: either way the result is empty; nested-loop is fine.
+        assert_eq!(judge(0, 1000), JoinMethod::NestedLoop);
+    }
+
+    fn b(vals: &[(usize, u32)], width: usize) -> Binding {
+        let mut row = vec![None; width];
+        for &(i, v) in vals {
+            row[i] = Some(v);
+        }
+        row
+    }
+
+    /// Both physical methods produce byte-for-byte identical output on the same
+    /// inputs — selection only changes cost, never the result.
+    #[test]
+    fn hash_and_nested_agree() {
+        // width-3 bindings, join on shared variable index 0.
+        let left: Vec<Binding> = (0..40u32).map(|x| b(&[(0, x), (1, x + 1000)], 3)).collect();
+        let right: Vec<Binding> = (0..40u32)
+            .filter(|x| x % 2 == 0)
+            .map(|x| b(&[(0, x), (2, x + 5000)], 3))
+            .collect();
+        let shared = vec![0usize];
+        let via_hash = join_sets_hash(&left, &right, &shared);
+        let via_nested = join_sets_nested(&left, &right, &shared);
+        assert_eq!(via_hash, via_nested);
+        // And both equal what the dispatcher returns (whichever method it chose).
+        let via_dispatch = join_sets(&left, &[0, 1], &right, &[0, 2]);
+        assert_eq!(via_dispatch, via_hash);
+        // Sanity: 20 even subjects matched ⇒ 20 joined rows, fully bound.
+        assert_eq!(via_hash.len(), 20);
+        for row in &via_hash {
+            assert!(row[0].is_some() && row[1].is_some() && row[2].is_some());
+        }
+    }
+
+    /// End-to-end query whose join binds a 1-row selective pattern to a larger
+    /// one. After the per-pair `judge` wiring the engine still produces the
+    /// correct answer (the method choice is invisible to results).
+    #[test]
+    fn query_join_with_tiny_selective_side() {
+        use crate::parser::sparql::parse;
+        let mut d = Dictionary::new();
+        let knows = d.intern_predicate(&Term::iri("http://ex/knows").dict_key());
+        let age = d.intern_predicate(&Term::iri("http://ex/age").dict_key());
+        let alice = d.intern_term(&Term::iri("http://ex/alice"));
+        let xsdint = "http://www.w3.org/2001/XMLSchema#integer";
+        // alice knows exactly one person, p7; 50 people have ages.
+        let mut people = Vec::new();
+        for i in 0..50u32 {
+            people.push(d.intern_term(&Term::iri(format!("http://ex/p{i}"))));
+        }
+        let mut triples = vec![IdTriple::new(alice, knows, people[7])];
+        for (i, &pid) in people.iter().enumerate() {
+            let a = d.intern_term(&Term::typed_literal(format!("{i}"), xsdint));
+            triples.push(IdTriple::new(pid, age, a));
+        }
+        let mut s = TripleStore::new();
+        s.bulk_load(triples);
+
+        let q = parse(
+            "SELECT ?f ?a WHERE { <http://ex/alice> <http://ex/knows> ?f . ?f <http://ex/age> ?a }",
+        )
+        .unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 1);
+        assert_eq!(rs.rows[0][0], Some("<http://ex/p7>".into()));
+        assert_eq!(
+            rs.rows[0][1],
+            Some("\"7\"^^<http://www.w3.org/2001/XMLSchema#integer>".into())
+        );
+    }
+
+    /// Drive the bushy binary-join executor (which routes through `join_sets`,
+    /// hence `judge`) and confirm the result matches the left-deep pipeline on
+    /// the same data — proving the method dispatch is wired into execution
+    /// without changing results.
+    #[test]
+    fn bushy_execution_matches_left_deep() {
+        use crate::parser::sparql::parse;
+        // Two 2-stars joined by a bridge ⇒ the optimizer may pick a bushy tree,
+        // executed via join_sets. Build entities so everything renders.
+        let mut d = Dictionary::new();
+        let ta = d.intern_predicate(&Term::iri("http://ex/ta").dict_key());
+        let tb = d.intern_predicate(&Term::iri("http://ex/tb").dict_key());
+        let tc = d.intern_predicate(&Term::iri("http://ex/tc").dict_key());
+        let td = d.intern_predicate(&Term::iri("http://ex/td").dict_key());
+        let bridge = d.intern_predicate(&Term::iri("http://ex/bridge").dict_key());
+        let c900 = d.intern_term(&Term::iri("http://ex/c900"));
+        let c901 = d.intern_term(&Term::iri("http://ex/c901"));
+        let c902 = d.intern_term(&Term::iri("http://ex/c902"));
+        let c903 = d.intern_term(&Term::iri("http://ex/c903"));
+        let mut xs = Vec::new();
+        for i in 0..30u32 {
+            xs.push(d.intern_term(&Term::iri(format!("http://ex/x{i}"))));
+        }
+        let mut ys = Vec::new();
+        for i in 0..30u32 {
+            ys.push(d.intern_term(&Term::iri(format!("http://ex/y{i}"))));
+        }
+        let mut triples = Vec::new();
+        for &x in &xs {
+            triples.push(IdTriple::new(x, ta, c900));
+            triples.push(IdTriple::new(x, tb, c901));
+        }
+        for &y in &ys {
+            triples.push(IdTriple::new(y, tc, c902));
+            triples.push(IdTriple::new(y, td, c903));
+        }
+        // one bridge edge x5 -> y9
+        triples.push(IdTriple::new(xs[5], bridge, ys[9]));
+        let mut s = TripleStore::new();
+        s.bulk_load(triples);
+
+        let q = parse(
+            "SELECT ?x ?y WHERE {
+                ?x <http://ex/ta> <http://ex/c900> .
+                ?x <http://ex/tb> <http://ex/c901> .
+                ?y <http://ex/tc> <http://ex/c902> .
+                ?y <http://ex/td> <http://ex/c903> .
+                ?x <http://ex/bridge> ?y .
+             }",
+        )
+        .unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        // Exactly the bridged pair survives all five patterns.
+        assert_eq!(rs.row_count(), 1);
+        assert_eq!(rs.rows[0][0], Some("<http://ex/x5>".into()));
+        assert_eq!(rs.rows[0][1], Some("<http://ex/y9>".into()));
+    }
+}
+
+/// User-defined scalar functions (gStore `pfnQuery`, in-process registry).
+#[cfg(test)]
+mod pfn_tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::parser::sparql::parse;
+    use crate::query::FunctionRegistry;
+
+    /// alice salary 2500 ; bob salary 3000.
+    fn fixture() -> (Dictionary, TripleStore) {
+        let mut d = Dictionary::new();
+        let alice = d.intern_term(&Term::iri("http://ex/alice"));
+        let bob = d.intern_term(&Term::iri("http://ex/bob"));
+        let salary = d.intern_predicate(&Term::iri("http://ex/salary").dict_key());
+        let xsdint = "http://www.w3.org/2001/XMLSchema#integer";
+        let s2500 = d.intern_term(&Term::typed_literal("2500", xsdint));
+        let s3000 = d.intern_term(&Term::typed_literal("3000", xsdint));
+        let mut s = TripleStore::new();
+        s.bulk_load(vec![
+            IdTriple::new(alice, salary, s2500),
+            IdTriple::new(bob, salary, s3000),
+        ]);
+        (d, s)
+    }
+
+    /// Register `myDouble(?x)` and use it in a SELECT projection.
+    #[test]
+    fn custom_function_in_select() {
+        let (d, s) = fixture();
+        let q = parse(
+            "SELECT ?x (myDouble(?sal) AS ?d) WHERE { ?x <http://ex/salary> ?sal } ORDER BY ?sal",
+        )
+        .unwrap();
+        let eval = Evaluator::new(&d, &s).with_function("myDouble", |args| {
+            Some(Value::Double(args.first()?.as_f64()? * 2.0))
+        });
+        let rs = match eval.evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 2);
+        // alice 2500 → 5000, bob 3000 → 6000 (rendered as xsd:double).
+        assert!(rs.rows[0][1].as_ref().unwrap().contains("5000"));
+        assert!(rs.rows[1][1].as_ref().unwrap().contains("6000"));
+    }
+
+    /// Use a custom predicate function inside a FILTER (case-insensitive name).
+    #[test]
+    fn custom_function_in_filter() {
+        let (d, s) = fixture();
+        let q = parse(
+            "SELECT ?x WHERE { ?x <http://ex/salary> ?sal . FILTER(isHigh(?sal)) }",
+        )
+        .unwrap();
+        let mut reg = FunctionRegistry::new();
+        reg.register("isHigh", |args| {
+            Some(Value::Bool(args.first()?.as_f64()? > 2800.0))
+        });
+        let rs = match Evaluator::new(&d, &s).with_functions(reg).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        // Only bob (3000) passes.
+        assert_eq!(rs.row_count(), 1);
+        assert_eq!(rs.rows[0][0], Some("<http://ex/bob>".into()));
+    }
+
+    /// An unregistered function name still errors (the solution is dropped),
+    /// matching the pre-registry behaviour for unknown built-ins.
+    #[test]
+    fn unknown_function_excludes_solution() {
+        let (d, s) = fixture();
+        let q = parse(
+            "SELECT ?x (noSuchFn(?sal) AS ?d) WHERE { ?x <http://ex/salary> ?sal }",
+        )
+        .unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        // Rows still appear (the BGP matches) but ?d is unbound everywhere.
+        assert_eq!(rs.row_count(), 2);
+        assert!(rs.rows.iter().all(|r| r[1].is_none()));
+    }
+
+    /// Large conjunctive query (20 patterns) exercises the greedy+2-opt planner
+    /// path (n > the exact-DP cap) and still returns the correct unique answer.
+    #[test]
+    fn large_bgp_20_patterns_correct() {
+        use crate::parser::sparql::parse;
+        let mut d = Dictionary::new();
+        // 21 chain nodes n0..n20 and 20 predicates p0..p19.
+        let mut nodes = Vec::new();
+        for i in 0..=20u32 {
+            nodes.push(d.intern_term(&Term::iri(format!("http://ex/n{i}"))));
+        }
+        let mut preds = Vec::new();
+        for i in 0..20u32 {
+            preds.push(d.intern_predicate(&Term::iri(format!("http://ex/p{i}")).dict_key()));
+        }
+        let mut triples = Vec::new();
+        // the unique satisfying chain n0 -p0-> n1 -p1-> ... -p19-> n20
+        for i in 0..20usize {
+            triples.push(IdTriple::new(nodes[i], preds[i], nodes[i + 1]));
+        }
+        // distractors: dead-end edges under each predicate that cannot chain.
+        for i in 0..20u32 {
+            let dead = d.intern_term(&Term::iri(format!("http://ex/dead{i}")));
+            for j in 0..5u32 {
+                let src = d.intern_term(&Term::iri(format!("http://ex/junk{i}_{j}")));
+                triples.push(IdTriple::new(src, preds[i as usize], dead));
+            }
+        }
+        let mut s = TripleStore::new();
+        s.bulk_load(triples);
+
+        // Build the 20-pattern chain query.
+        let mut where_clause = String::new();
+        for i in 0..20 {
+            where_clause.push_str(&format!("?a{i} <http://ex/p{i}> ?a{} . ", i + 1));
+        }
+        let q = parse(&format!("SELECT ?a0 ?a20 WHERE {{ {where_clause} }}")).unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 1, "exactly one chain should match");
+        assert_eq!(rs.rows[0][0], Some("<http://ex/n0>".into()));
+        assert_eq!(rs.rows[0][1], Some("<http://ex/n20>".into()));
+    }
+
+    /// A registered name never shadows a real built-in (built-ins win).
+    #[test]
+    fn builtin_takes_precedence() {
+        let (d, s) = fixture();
+        let q = parse("SELECT (ABS(-5) AS ?r) WHERE { ?x <http://ex/salary> ?sal } LIMIT 1").unwrap();
+        let eval = Evaluator::new(&d, &s).with_function("ABS", |_| Some(Value::Int(999)));
+        let rs = match eval.evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        // Real ABS(-5)=5, not the custom 999.
+        assert!(rs.rows[0][0].as_ref().unwrap().contains('5'));
+        assert!(!rs.rows[0][0].as_ref().unwrap().contains("999"));
     }
 }

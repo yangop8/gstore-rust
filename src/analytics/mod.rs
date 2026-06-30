@@ -24,6 +24,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
@@ -1174,9 +1175,45 @@ struct TopkCtx<'a> {
     pair: &'a PairEdges,
     /// Per-pattern-edge global maximum weight (admissible branch-and-bound bound).
     max_w: &'a [f64],
+    /// Spanning-tree parent of each variable (the BFS edge it is reached by),
+    /// used only by the memoized search to seed and cache candidate expansions.
+    /// Empty for the plain backtracking path.
+    tree_parent: &'a [Option<TreeParent>],
     k: usize,
     prune: bool,
     score: &'a dyn Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
+}
+
+/// The spanning-tree edge by which a non-root variable is reached during the
+/// memoized top-k search: its already-bound parent variable and the data-edge
+/// direction/predicate used to expand the parent into this variable's
+/// candidates (the [`TopKTreeNode`]-style `TreeEdge` of gStore's
+/// `TopKSearchPlan`).
+#[derive(Copy, Clone)]
+struct TreeParent {
+    /// The parent variable (bound before this one in BFS order).
+    pvar: usize,
+    /// Whether the parent is the *source* of the tree edge (so the child is
+    /// found among the parent's out-neighbours) rather than the destination.
+    parent_is_src: bool,
+    /// Predicate constraint on the tree edge (`None` = any predicate).
+    pred: Option<PredId>,
+}
+
+/// Cache of parent-node expansions for the memoized search: maps a
+/// `(parent dense node, parent_is_src, predicate)` tree-edge expansion to the
+/// sorted, de-duplicated list of child dense nodes it reaches. Reused whenever
+/// the same parent node recurs (e.g. two pattern children of one variable, or
+/// the same intermediate node revisited across branches), which is the
+/// recomputation the plain backtracking search repeats.
+type ExpansionMemo = HashMap<(usize, bool, Option<PredId>), Rc<Vec<usize>>>;
+
+/// Instrumentation for the memoized search: how often a parent expansion was
+/// served from the cache (`hits`) versus computed afresh (`misses`).
+#[derive(Copy, Clone, Default, Debug)]
+struct MemoStats {
+    hits: usize,
+    misses: usize,
 }
 
 /// Mutable state threaded through the top-k backtracking recursion.
@@ -1769,6 +1806,7 @@ impl WeightedGraphView {
             .collect();
         let total_max: f64 = max_w.iter().sum();
 
+        let no_tree: Vec<Option<TreeParent>> = Vec::new();
         let ctx = TopkCtx {
             pattern,
             order: &order,
@@ -1776,6 +1814,7 @@ impl WeightedGraphView {
             closed_at: &closed_at,
             pair: &pair,
             max_w: &max_w,
+            tree_parent: &no_tree,
             k,
             prune,
             score,
@@ -1834,6 +1873,327 @@ impl WeightedGraphView {
         F: Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
     {
         self.run_topk(pattern, k, false, &score)
+    }
+
+    // ---- memoized (tree-structured) top-k ---------------------------------
+
+    /// Connectivity-driven variable order **with a spanning tree**: like
+    /// [`match_order`](Self::match_order), but also records, for every non-root
+    /// variable, the BFS tree edge it is discovered through (its parent variable
+    /// and that edge's direction/predicate). This is the [`TopKTreeNode`] tree
+    /// of gStore's `TopKSearchPlan`: each node is reached from its parent, and
+    /// the remaining (non-tree) edges are verified as the match closes.
+    ///
+    /// The `order` produced is identical to [`match_order`](Self::match_order),
+    /// so the memoized search visits the same variables in the same sequence and
+    /// therefore yields the same matches.
+    fn match_tree(pattern: &QueryPattern) -> (Vec<usize>, Vec<usize>, Vec<Option<TreeParent>>) {
+        let nv = pattern.num_vars;
+        // Adjacency carries the connecting pattern-edge index so the tree edge's
+        // direction and predicate can be recovered.
+        let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nv];
+        for (ei, e) in pattern.edges.iter().enumerate() {
+            if e.src != e.dst {
+                adj[e.src].push((e.dst, ei));
+                adj[e.dst].push((e.src, ei));
+            }
+        }
+        let mut visited = vec![false; nv];
+        let mut order = Vec::with_capacity(nv);
+        let mut parent: Vec<Option<TreeParent>> = vec![None; nv];
+        for start in 0..nv {
+            if visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            let mut queue = VecDeque::new();
+            queue.push_back(start);
+            while let Some(u) = queue.pop_front() {
+                order.push(u);
+                // Visit neighbours in ascending (var, edge) order — identical to
+                // `match_order`'s sorted-and-deduped traversal — and keep the
+                // first (smallest-index) edge to each as the tree edge.
+                let mut nbrs = adj[u].clone();
+                nbrs.sort_unstable();
+                let mut last_v: Option<usize> = None;
+                for (v, ei) in nbrs {
+                    if Some(v) == last_v {
+                        continue;
+                    }
+                    last_v = Some(v);
+                    if !visited[v] {
+                        visited[v] = true;
+                        let e = &pattern.edges[ei];
+                        parent[v] = Some(TreeParent {
+                            pvar: u,
+                            parent_is_src: e.src == u,
+                            pred: e.pred,
+                        });
+                        queue.push_back(v);
+                    }
+                }
+            }
+        }
+        let mut order_pos = vec![0usize; nv];
+        for (i, &v) in order.iter().enumerate() {
+            order_pos[v] = i;
+        }
+        (order, order_pos, parent)
+    }
+
+    /// The sorted, de-duplicated child dense nodes reached by expanding `fixed`
+    /// along a tree edge `(parent_is_src, pred)` — memoised so a parent node
+    /// expanded more than once (its multiple pattern children, or the same node
+    /// revisited on another branch) costs one adjacency scan, not many.
+    fn expansion(
+        &self,
+        fixed: usize,
+        parent_is_src: bool,
+        pred: Option<PredId>,
+        memo: &mut ExpansionMemo,
+        stats: &mut MemoStats,
+    ) -> Rc<Vec<usize>> {
+        if let Some(v) = memo.get(&(fixed, parent_is_src, pred)) {
+            stats.hits += 1;
+            return Rc::clone(v);
+        }
+        stats.misses += 1;
+        let mut base: Vec<usize> = if parent_is_src {
+            self.out_edges[self.out_ptr[fixed]..self.out_ptr[fixed + 1]]
+                .iter()
+                .filter(|e| pred.is_none_or(|p| p == e.pred))
+                .map(|e| e.node)
+                .collect()
+        } else {
+            self.in_edges[self.in_ptr[fixed]..self.in_ptr[fixed + 1]]
+                .iter()
+                .filter(|e| pred.is_none_or(|p| p == e.pred))
+                .map(|e| e.node)
+                .collect()
+        };
+        base.sort_unstable();
+        base.dedup();
+        let rc = Rc::new(base);
+        memo.insert((fixed, parent_is_src, pred), Rc::clone(&rc));
+        rc
+    }
+
+    /// Memoized analogue of [`candidates`](Self::candidates): seed the variable's
+    /// candidate set from its spanning-tree parent (a cached expansion), then
+    /// filter by injectivity and every other constraint to an already-bound
+    /// variable. The resulting *set* is identical to [`candidates`](Self::candidates)
+    /// — both intersect "adjacent to a bound neighbour" with "satisfies all
+    /// bound-neighbour constraints" — and is returned in the same ascending
+    /// dense order, so the search enumerates the same matches.
+    fn candidates_memo(
+        &self,
+        ctx: &TopkCtx,
+        st: &TopkState,
+        var: usize,
+        memo: &mut ExpansionMemo,
+        stats: &mut MemoStats,
+    ) -> Vec<usize> {
+        let n = self.nodes.len();
+        let mypos = ctx.order_pos[var];
+        let mut constraints: Vec<(usize, bool, Option<PredId>)> = Vec::new();
+        for e in &ctx.pattern.edges {
+            if e.src == e.dst {
+                continue;
+            }
+            if e.src == var && ctx.order_pos[e.dst] < mypos {
+                constraints.push((st.assign[e.dst], false, e.pred));
+            } else if e.dst == var && ctx.order_pos[e.src] < mypos {
+                constraints.push((st.assign[e.src], true, e.pred));
+            }
+        }
+
+        if constraints.is_empty() {
+            return (0..n).filter(|&c| !st.used[c]).collect();
+        }
+
+        // Seed from the spanning-tree parent (cached); fall back to the first
+        // constraint if no tree parent was recorded.
+        let (fixed, fixed_is_src, pred0) = match ctx.tree_parent.get(var).and_then(|p| *p) {
+            Some(tp) => (st.assign[tp.pvar], tp.parent_is_src, tp.pred),
+            None => constraints[0],
+        };
+        let base = self.expansion(fixed, fixed_is_src, pred0, memo, stats);
+        base.iter()
+            .copied()
+            .filter(|&c| {
+                if st.used[c] {
+                    return false;
+                }
+                constraints.iter().all(|&(fx, is_src, pred)| {
+                    let (a, b) = if is_src { (fx, c) } else { (c, fx) };
+                    Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), pred).is_some()
+                })
+            })
+            .collect()
+    }
+
+    /// Memoized counterpart of [`topk_rec`](Self::topk_rec): identical
+    /// branch-and-bound and result collection, but candidates are seeded through
+    /// the cached tree expansion.
+    fn topk_rec_memo(
+        &self,
+        ctx: &TopkCtx,
+        st: &mut TopkState,
+        depth: usize,
+        memo: &mut ExpansionMemo,
+        stats: &mut MemoStats,
+    ) {
+        if depth == ctx.order.len() {
+            let vars: Vec<EntityLiteralId> = st.assign.iter().map(|&d| self.nodes[d]).collect();
+            let mut edges = Vec::with_capacity(ctx.pattern.edges.len());
+            for e in &ctx.pattern.edges {
+                let a = st.assign[e.src];
+                let b = st.assign[e.dst];
+                let (p, w) = Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred)
+                    .expect("closing checks guarantee every pattern edge is bound");
+                edges.push(MatchedEdge { src: self.nodes[a], pred: p, dst: self.nodes[b], weight: w });
+            }
+            let s = (ctx.score)(&vars, &edges);
+            if ctx.prune {
+                if st.topk.len() < ctx.k {
+                    st.topk.push(Reverse(OrdF(s)));
+                } else if s > st.topk.peek().unwrap().0 .0 {
+                    st.topk.pop();
+                    st.topk.push(Reverse(OrdF(s)));
+                }
+            }
+            st.results.push(SubgraphMatch { vars, edges, score: s });
+            return;
+        }
+
+        if ctx.prune && st.topk.len() == ctx.k {
+            let threshold = st.topk.peek().unwrap().0 .0;
+            if st.partial + st.remaining < threshold {
+                return;
+            }
+        }
+
+        let var = ctx.order[depth];
+        for c in self.candidates_memo(ctx, st, var, memo, stats) {
+            st.assign[var] = c;
+            st.used[c] = true;
+
+            let mut closed_ok = true;
+            let mut add_partial = 0.0;
+            let mut sub_remaining = 0.0;
+            for &ei in &ctx.closed_at[depth] {
+                let e = &ctx.pattern.edges[ei];
+                let a = st.assign[e.src];
+                let b = st.assign[e.dst];
+                match Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred) {
+                    Some((_, w)) => {
+                        add_partial += w;
+                        sub_remaining += ctx.max_w[ei];
+                    }
+                    None => {
+                        closed_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if closed_ok {
+                st.partial += add_partial;
+                st.remaining -= sub_remaining;
+                self.topk_rec_memo(ctx, st, depth + 1, memo, stats);
+                st.partial -= add_partial;
+                st.remaining += sub_remaining;
+            }
+
+            st.used[c] = false;
+            st.assign[var] = usize::MAX;
+        }
+    }
+
+    /// Shared driver for the memoized search; returns the matches plus the
+    /// cache statistics (used by tests to prove recomputation is avoided).
+    fn run_topk_memoized(
+        &self,
+        pattern: &QueryPattern,
+        k: usize,
+    ) -> (Vec<SubgraphMatch>, MemoStats) {
+        if k == 0 || pattern.num_vars == 0 {
+            return (Vec::new(), MemoStats::default());
+        }
+        let pair = self.pair_edges();
+        let (order, order_pos, tree_parent) = Self::match_tree(pattern);
+
+        let mut closed_at = vec![Vec::new(); pattern.num_vars];
+        for (ei, e) in pattern.edges.iter().enumerate() {
+            let pos = order_pos[e.src].max(order_pos[e.dst]);
+            closed_at[pos].push(ei);
+        }
+
+        let max_w: Vec<f64> = pattern
+            .edges
+            .iter()
+            .map(|e| {
+                let mx = self
+                    .out_edges
+                    .iter()
+                    .filter(|we| e.pred.is_none_or(|p| p == we.pred))
+                    .map(|we| we.weight)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if mx.is_finite() {
+                    mx
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let total_max: f64 = max_w.iter().sum();
+
+        let score = |_vars: &[EntityLiteralId], edges: &[MatchedEdge]| -> f64 {
+            edges.iter().map(|e| e.weight).sum()
+        };
+        let ctx = TopkCtx {
+            pattern,
+            order: &order,
+            order_pos: &order_pos,
+            closed_at: &closed_at,
+            pair: &pair,
+            max_w: &max_w,
+            tree_parent: &tree_parent,
+            k,
+            prune: true,
+            score: &score,
+        };
+        let mut st = TopkState {
+            assign: vec![usize::MAX; pattern.num_vars],
+            used: vec![false; self.nodes.len()],
+            results: Vec::new(),
+            topk: BinaryHeap::new(),
+            partial: 0.0,
+            remaining: total_max,
+        };
+        let mut memo: ExpansionMemo = HashMap::new();
+        let mut stats = MemoStats::default();
+        self.topk_rec_memo(&ctx, &mut st, 0, &mut memo, &mut stats);
+
+        let mut results = st.results;
+        results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.vars.cmp(&b.vars)));
+        results.truncate(k);
+        (results, stats)
+    }
+
+    /// Top-k subgraph matches scored by the **sum of matched edge weights**,
+    /// computed with a **memoized spanning-tree search** (gStore's
+    /// `TopKSearchPlan` / [`TopKTreeNode`] approach).
+    ///
+    /// Functionally identical to [`topk_subgraph`](Self::topk_subgraph) — same
+    /// matches, same scores, same deterministic ordering (score descending, then
+    /// ascending assignment) — but each variable is expanded from its spanning-
+    /// tree parent through a cache keyed on the parent node and tree edge, so a
+    /// parent reached repeatedly (its several pattern children, or the same
+    /// intermediate node on different branches) is expanded once instead of
+    /// being re-enumerated by the plain backtracking search.
+    pub fn topk_subgraph_memoized(&self, pattern: &QueryPattern, k: usize) -> Vec<SubgraphMatch> {
+        self.run_topk_memoized(pattern, k).0
     }
 }
 
@@ -2539,5 +2899,133 @@ mod tests {
         assert_eq!(top[0].vars, vec![1, 2]);
         assert_eq!(top[0].edges[0].pred, 2); // the weight-9 predicate wins
         assert!((top[0].score - 9.0).abs() < 1e-9);
+    }
+
+    // ---- memoized (tree-structured) top-k equivalence ---------------------
+
+    /// Assert two match lists are element-for-element identical (vars, score,
+    /// and each matched edge), to the f64 epsilon.
+    fn assert_same_matches(a: &[SubgraphMatch], b: &[SubgraphMatch]) {
+        assert_eq!(a.len(), b.len(), "different match counts");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.vars, y.vars, "different variable assignment");
+            assert!((x.score - y.score).abs() < 1e-12, "different score");
+            assert_eq!(x.edges.len(), y.edges.len(), "different edge count");
+            for (ex, ey) in x.edges.iter().zip(y.edges.iter()) {
+                assert_eq!((ex.src, ex.pred, ex.dst), (ey.src, ey.pred, ey.dst));
+                assert!((ex.weight - ey.weight).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// The memoized search returns exactly the same ranked results as the plain
+    /// backtracking search across path, cycle, and overflow-k cases.
+    #[test]
+    fn memoized_equals_bruteforce_paths() {
+        let g = make_topk_paths();
+        for k in [1usize, 2, 3, 6, 100] {
+            let brute = g.topk_subgraph(&path_pattern(), k);
+            let memo = g.topk_subgraph_memoized(&path_pattern(), k);
+            assert_same_matches(&brute, &memo);
+        }
+    }
+
+    #[test]
+    fn memoized_equals_bruteforce_cycle() {
+        // Reuse the two-triangle cycle graph from `test_topk_cycle_pattern`.
+        let mut s = TripleStore::new();
+        let edges: [(u32, u32, u32, f64); 6] = [
+            (1, 1, 2, 1.0),
+            (2, 1, 3, 1.0),
+            (3, 1, 1, 1.0),
+            (4, 1, 5, 2.0),
+            (5, 1, 6, 2.0),
+            (6, 1, 4, 2.0),
+        ];
+        for &(a, p, b, _) in &edges {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        let wmap: HashMap<(u32, u32, u32), f64> =
+            edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
+        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let pattern = QueryPattern::new(
+            3,
+            vec![
+                PatternEdge::labeled(0, 1, 1),
+                PatternEdge::labeled(1, 2, 1),
+                PatternEdge::labeled(2, 0, 1),
+            ],
+        );
+        for k in [1usize, 3, 6, 50] {
+            assert_same_matches(
+                &g.topk_subgraph(&pattern, k),
+                &g.topk_subgraph_memoized(&pattern, k),
+            );
+        }
+    }
+
+    /// On a larger random-ish graph the two searches still agree exactly.
+    #[test]
+    fn memoized_equals_bruteforce_large() {
+        let mut s = TripleStore::new();
+        let mut wmap: HashMap<(u32, u32, u32), f64> = HashMap::new();
+        // A layered graph: layer L (0..20) -> layer M (100..120) -> layer R
+        // (200..220), with deterministic pseudo-weights.
+        let add = |s: &mut TripleStore, w: &mut HashMap<(u32, u32, u32), f64>, a, p, b, wt| {
+            s.insert(IdTriple::new(a, p, b));
+            w.insert((a, p, b), wt);
+        };
+        for i in 0..20u32 {
+            // each L node points to two M nodes
+            add(&mut s, &mut wmap, i, 1, 100 + (i % 10), 1.0 + (i % 5) as f64);
+            add(&mut s, &mut wmap, i, 1, 100 + ((i + 3) % 10), 2.0 + (i % 3) as f64);
+        }
+        for j in 0..10u32 {
+            // each M node points to two R nodes
+            add(&mut s, &mut wmap, 100 + j, 1, 200 + (j % 7), 3.0 + (j % 4) as f64);
+            add(&mut s, &mut wmap, 100 + j, 1, 200 + ((j + 2) % 7), 1.5 + (j % 2) as f64);
+        }
+        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let pattern =
+            QueryPattern::new(3, vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)]);
+        for k in [1usize, 5, 20, 1000] {
+            assert_same_matches(
+                &g.topk_subgraph(&pattern, k),
+                &g.topk_subgraph_memoized(&pattern, k),
+            );
+        }
+    }
+
+    /// A pattern with one variable that is the parent of two children forces the
+    /// same parent-node expansion to be requested repeatedly; the memo serves
+    /// those from cache (hits > 0) while still producing the correct results.
+    #[test]
+    fn memoized_cache_avoids_recompute() {
+        // Hub node 1 fans out to 2..=6 (predicate 1); other nodes are sinks.
+        let mut s = TripleStore::new();
+        let mut wmap: HashMap<(u32, u32, u32), f64> = HashMap::new();
+        for (idx, dst) in (2u32..=6).enumerate() {
+            s.insert(IdTriple::new(1, 1, dst));
+            wmap.insert((1, 1, dst), 1.0 + idx as f64);
+        }
+        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+
+        // v0 -p1-> v1 and v0 -p1-> v2: v0 is the spanning-tree parent of both v1
+        // and v2, so binding v2 re-requests v0's already-cached expansion.
+        let pattern = QueryPattern::new(
+            3,
+            vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(0, 2, 1)],
+        );
+
+        let (memo_res, stats) = g.run_topk_memoized(&pattern, 100);
+        assert!(stats.hits > 0, "expected cache hits, got {stats:?}");
+
+        // Results still match the brute-force search exactly.
+        let brute = g.topk_subgraph(&pattern, 100);
+        assert_same_matches(&brute, &memo_res);
+
+        // Sanity: v0=1, (v1,v2) an ordered pair of distinct children ⇒ 5·4 = 20
+        // matches (the unconstrained injective enumeration over the fan-out).
+        assert_eq!(memo_res.len(), 20);
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod candidates;
 pub mod engine;
+pub mod functions;
 pub mod hash;
 pub mod optimizer;
 pub mod planner;
@@ -13,6 +14,7 @@ pub mod results;
 pub mod value;
 
 pub use engine::Evaluator;
+pub use functions::{CustomFn, FunctionRegistry};
 pub use results::{QueryResult, ResultSet};
 pub use value::Value;
 
