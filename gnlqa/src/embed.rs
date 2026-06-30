@@ -39,8 +39,10 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
-/// Dot product (== cosine similarity for normalized vectors).
+/// Dot product (== cosine similarity for normalized vectors). The inputs must be
+/// the same length (every caller is dim-guarded; checked in debug builds).
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot of mismatched-length vectors");
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
@@ -115,19 +117,47 @@ impl HttpEmbedder {
         json!({ "model": self.model, "input": texts })
     }
 
-    /// Parse `{data:[{embedding:[...]}]}` into vectors (also used by tests).
+    /// Parse `{data:[{embedding:[...],index?}]}` into vectors, in INPUT order.
+    /// Honors the per-entry `index` field (OpenAI/Voyage include it and don't
+    /// guarantee ordering); errors on non-numeric/non-finite components, missing
+    /// embeddings, and duplicate/out-of-range indices. (Also used by tests.)
     pub fn parse_response(v: &Value) -> Result<Vec<Vec<f32>>> {
         let data = v["data"]
             .as_array()
             .ok_or_else(|| Error::Llm(format!("embeddings response has no data array: {}", snippet(v))))?;
-        let mut out = Vec::with_capacity(data.len());
-        for d in data {
+        let n = data.len();
+        let mut slots: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None).take(n).collect();
+        for (pos, d) in data.iter().enumerate() {
             let arr = d["embedding"]
                 .as_array()
                 .ok_or_else(|| Error::Llm("embeddings entry missing 'embedding'".into()))?;
-            out.push(arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect());
+            let mut vec = Vec::with_capacity(arr.len());
+            for x in arr {
+                let f = x
+                    .as_f64()
+                    .ok_or_else(|| Error::Llm("non-numeric embedding component".into()))?;
+                if !f.is_finite() {
+                    return Err(Error::Llm("non-finite embedding component".into()));
+                }
+                vec.push(f as f32);
+            }
+            let idx = match d.get("index").and_then(Value::as_u64) {
+                Some(i) => i as usize,
+                None => pos,
+            };
+            if idx >= n {
+                return Err(Error::Llm(format!("embedding index {idx} out of range (n={n})")));
+            }
+            if slots[idx].is_some() {
+                return Err(Error::Llm(format!("duplicate embedding index {idx}")));
+            }
+            slots[idx] = Some(vec);
         }
-        Ok(out)
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| s.ok_or_else(|| Error::Llm(format!("missing embedding for index {i}"))))
+            .collect()
     }
 }
 
@@ -148,7 +178,24 @@ impl Embedder for HttpEmbedder {
                 other => Error::Http(other.to_string()),
             })?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
-        HttpEmbedder::parse_response(&v)
+        let vecs = HttpEmbedder::parse_response(&v)?;
+        if vecs.len() != texts.len() {
+            return Err(Error::Llm(format!(
+                "embedder returned {} vectors for {} inputs",
+                vecs.len(),
+                texts.len()
+            )));
+        }
+        for vv in &vecs {
+            if vv.len() != self.dim {
+                return Err(Error::Llm(format!(
+                    "embedding dim {} != configured {}",
+                    vv.len(),
+                    self.dim
+                )));
+            }
+        }
+        Ok(vecs)
     }
     fn dim(&self) -> usize {
         self.dim
@@ -164,18 +211,19 @@ pub struct Scored {
 }
 
 /// A brute-force cosine-similarity vector index over `(id, text)` items.
-/// Adequate up to ~10⁵–10⁶ items on one machine; swap for HNSW later.
+/// Vectors are stored contiguously (one flat buffer) for cache-friendly scans;
+/// adequate up to ~10⁵–10⁶ items on one machine. Swap for HNSW later.
 #[derive(Debug, Clone, Default)]
 pub struct VectorIndex {
     dim: usize,
     ids: Vec<String>,
     texts: Vec<String>,
-    vecs: Vec<Vec<f32>>, // each L2-normalized
+    data: Vec<f32>, // ids.len() * dim, each row L2-normalized
 }
 
 impl VectorIndex {
     pub fn new(dim: usize) -> VectorIndex {
-        VectorIndex { dim, ids: Vec::new(), texts: Vec::new(), vecs: Vec::new() }
+        VectorIndex { dim, ids: Vec::new(), texts: Vec::new(), data: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -185,19 +233,20 @@ impl VectorIndex {
         self.ids.is_empty()
     }
 
+    /// The normalized vector of row `i`.
+    fn row(&self, i: usize) -> &[f32] {
+        &self.data[i * self.dim..(i + 1) * self.dim]
+    }
+
     /// Add one already-embedded item (the vector is normalized on insert).
     pub fn add(&mut self, id: impl Into<String>, text: impl Into<String>, mut vec: Vec<f32>) -> Result<()> {
         if vec.len() != self.dim {
-            return Err(Error::Llm(format!(
-                "vector dim {} != index dim {}",
-                vec.len(),
-                self.dim
-            )));
+            return Err(Error::Llm(format!("vector dim {} != index dim {}", vec.len(), self.dim)));
         }
         normalize(&mut vec);
         self.ids.push(id.into());
         self.texts.push(text.into());
-        self.vecs.push(vec);
+        self.data.extend_from_slice(&vec);
         Ok(())
     }
 
@@ -206,36 +255,52 @@ impl VectorIndex {
         let mut idx = VectorIndex::new(embedder.dim());
         let texts: Vec<String> = items.iter().map(|(_, t)| t.clone()).collect();
         let vecs = embedder.embed(&texts)?;
+        if vecs.len() != items.len() {
+            return Err(Error::Llm(format!(
+                "embedder returned {} vectors for {} items",
+                vecs.len(),
+                items.len()
+            )));
+        }
         for ((id, text), v) in items.iter().zip(vecs) {
             idx.add(id.clone(), text.clone(), v)?;
         }
         Ok(idx)
     }
 
-    /// Top-`k` items by cosine similarity to `query` (already the right dim;
-    /// it is normalized here).
+    /// Top-`k` items by cosine similarity to `query`. O(N log k): scores are
+    /// computed without cloning, the top-k selected with `select_nth`, and only
+    /// the survivors materialized. Ties break by ascending id for determinism;
+    /// non-finite scores sink to the bottom.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Scored> {
         if query.len() != self.dim || self.is_empty() || k == 0 {
             return Vec::new();
         }
         let mut q = query.to_vec();
         normalize(&mut q);
-        let mut scored: Vec<Scored> = (0..self.ids.len())
-            .map(|i| Scored {
-                id: self.ids[i].clone(),
-                text: self.texts[i].clone(),
-                score: dot(&q, &self.vecs[i]),
+        let mut scored: Vec<(f32, usize)> = (0..self.ids.len())
+            .map(|i| {
+                let s = dot(&q, self.row(i));
+                (if s.is_finite() { s } else { f32::NEG_INFINITY }, i)
             })
             .collect();
-        // Sort by score desc; ties broken by id for determinism.
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+
+        // Order: score desc, then id asc.
+        let cmp = |a: &(f32, usize), b: &(f32, usize)| {
+            b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        scored.truncate(k);
+                .then_with(|| self.ids[a.1].cmp(&self.ids[b.1]))
+        };
+        let k = k.min(scored.len());
+        if k < scored.len() {
+            scored.select_nth_unstable_by(k - 1, cmp);
+            scored.truncate(k);
+        }
+        scored.sort_by(cmp);
         scored
+            .into_iter()
+            .map(|(score, i)| Scored { id: self.ids[i].clone(), text: self.texts[i].clone(), score })
+            .collect()
     }
 
     /// Embed `query` with `embedder`, then [`search`](Self::search).
@@ -314,5 +379,43 @@ mod tests {
         let vecs = HttpEmbedder::parse_response(&resp).unwrap();
         assert_eq!(vecs.len(), 2);
         assert_eq!(vecs[0], vec![0.1f32, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn parse_response_honors_index_and_rejects_bad() {
+        // out-of-order data carrying `index` is restored to input order
+        let resp = json!({"data": [{"embedding":[2.0],"index":1}, {"embedding":[1.0],"index":0}]});
+        assert_eq!(HttpEmbedder::parse_response(&resp).unwrap(), vec![vec![1.0f32], vec![2.0f32]]);
+        // non-numeric component, out-of-range index, non-finite → errors
+        assert!(HttpEmbedder::parse_response(&json!({"data":[{"embedding":["x"]}]})).is_err());
+        assert!(HttpEmbedder::parse_response(&json!({"data":[{"embedding":[1.0],"index":5}]})).is_err());
+    }
+
+    #[test]
+    fn build_rejects_vector_count_mismatch() {
+        struct BadEmbedder;
+        impl Embedder for BadEmbedder {
+            fn embed(&self, _t: &[String]) -> Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![1.0, 0.0]]) // always one vector
+            }
+            fn dim(&self) -> usize {
+                2
+            }
+        }
+        let items = vec![("a".to_string(), "a".to_string()), ("b".to_string(), "b".to_string())];
+        assert!(VectorIndex::build(&BadEmbedder, &items).is_err());
+    }
+
+    #[test]
+    fn search_k_larger_than_len_and_topk_order() {
+        let e = HashEmbedder::new(64);
+        let items: Vec<(String, String)> =
+            (0..5).map(|i| (format!("e{i}"), format!("token{i} shared"))).collect();
+        let idx = VectorIndex::build(&e, &items).unwrap();
+        let all = idx.search_text(&e, "token2 shared", 99).unwrap(); // k > len
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].id, "e2");
+        // scores are monotonically non-increasing
+        assert!(all.windows(2).all(|w| w[0].score >= w[1].score));
     }
 }
