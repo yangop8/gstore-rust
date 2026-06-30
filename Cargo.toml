@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 description = "A Rust rewrite of the gStore RDF triple store / graph database (https://github.com/pkumod/gStore)"
 license = "BSD-3-Clause"
-repository = "https://github.com/pkumod/gStore"
+repository = "https://github.com/yangop8/gstore-rust"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
