@@ -95,14 +95,6 @@ pub(crate) enum Slot {
 }
 
 impl Slot {
-    /// The constant id, if this slot is a constant.
-    pub(crate) fn const_id(&self) -> Option<u32> {
-        match self {
-            Slot::Const(id) => Some(*id),
-            Slot::Var(_) => None,
-        }
-    }
-
     /// The variable index, if this slot is a variable.
     pub(crate) fn var(&self) -> Option<usize> {
         match self {
@@ -933,8 +925,8 @@ impl<'a> Evaluator<'a> {
         let mut candidates = candidates::generate(&plans, self.store);
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
 
-        // Cost-based order using exact candidate sizes.
-        let order = super::optimizer::order_bgp(&plans, self.store, &candidates);
+        // Node-based plan (NodeScore heuristic / sampling DP + satellite defer).
+        let order = super::planner::plan(&plans, self.store, &candidates, layout.len());
 
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
         for &pi in &order {

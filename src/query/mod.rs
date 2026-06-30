@@ -6,7 +6,7 @@
 
 pub mod candidates;
 pub mod engine;
-pub mod optimizer;
+pub mod planner;
 pub mod results;
 pub mod value;
 
