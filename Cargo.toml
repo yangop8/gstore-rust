@@ -7,6 +7,12 @@ description = "A Rust rewrite of the gStore RDF triple store / graph database (h
 license = "BSD-3-Clause"
 repository = "https://github.com/yangop8/gstore-rust"
 
+# The gNLQA natural-language QA orchestrator lives in its own crate so its
+# heavier deps (HTTPS client for the LLM API, JSON) stay out of the lean gStore
+# crate. Cargo isolates per-crate deps, so `cargo build -p gstore` is unaffected.
+[workspace]
+members = ["gnlqa"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

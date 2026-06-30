@@ -1,0 +1,26 @@
+[package]
+name = "gnlqa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "gNLQA — an LLM + gStore natural-language question-answering system (see docs/NLQA_DESIGN.md)"
+license = "BSD-3-Clause"
+repository = "https://github.com/yangop8/gstore-rust"
+
+[dependencies]
+# The gStore graph database — used for its SPARQL parser (to validate/repair
+# LLM-generated queries), its types, and (via HTTP) query execution.
+gstore = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTPS client for the Anthropic Messages API and (optionally) an
+# embedding service. rustls keeps it dependency-light (no system OpenSSL).
+ureq = { version = "2", features = ["json", "tls"], default-features = false }
+
+[lib]
+name = "gnlqa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gnlqa"
+path = "src/main.rs"
