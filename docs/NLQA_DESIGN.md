@@ -219,4 +219,35 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 ## 附:本设计的来源与待补
 - gAnswer 架构:对 `pkumod/gAnswer` 的源码级逆向(qa/paradict/fgmt/lcn/nlp/rdf/application/jgsc 四组模块,见 §2)。
 - LLM-KBQA 调研维度:Text-to-SPARQL(schema linking / 受约束解码 / 自修复)、GraphRAG(向量+图遍历混合)、agentic KGQA + 评测基准(QALD/LC-QuAD/WebQSP/GrailQA)。
-- 待补:为 §5/§6 的具体技术选型补充最新论文与基准分数的在线引用(本轮 workflow 的联网调研 agent 未能回传正文,已转由领域知识撰写;后续可加 WebSearch 引用强化)。
+- §11 已补充联网调研(2025–2026)得到的最新论文与基准 SOTA。
+
+---
+
+## 11. 参考文献与基准 SOTA(联网调研,2025–2026)
+
+### 11.1 KGQA 基准当前 SOTA(用于 §5 评测口径)
+
+| 基准 | KG | 难度 | 当前 SOTA(系统 / 分数) | 备注 |
+|---|---|---|---|---|
+| **QALD-9** | DBpedia | 中(多语言,408 训练/150 测试) | 早期强基线 ~0.67 F1;LLM 方法持续刷新 | 经典多语言基准 |
+| **QALD-10** | Wikidata | 中(从 DBpedia 迁到 Wikidata) | COT-SPARQL(D'Abramo 2025,CoT + 实体/关系提示) | 现行主流 LLM 基准 |
+| **LC-QuAD 2.0** | Wikidata | 较易(≤2 跳) | DeSQ ~95%/70%(Raw/Reformulated 执行 F1);Diallo 2024 ~94% | 执行式 F1 已很高 |
+| **WebQSP** | Freebase | 较易(≤2 跳) | GraphWalker(agentic,2026);ChatKBQA / TFS-KBQA(微调 LLM 产逻辑形式) | |
+| **GrailQA** | Freebase | 难(i.i.d./组合/零样本泛化) | ~79%(SG-KBQA,Gao 2025,schema-guided + LLaMA-3.1-8B);前 SOTA Pangu | 主力泛化基准 |
+
+> 建议:gNLQA 评测先打 **QALD-9/10**(与 gAnswer 同源,DBpedia/Wikidata,可直接对比),再上 **LC-QuAD 2.0 / WebQSP / GrailQA**(泛化)。指标:执行式 Precision/Recall/F1 + 答案引用正确率。
+
+### 11.2 与本设计相关的关键方法(印证 §4 管线)
+
+- **Text-to-SPARQL / 受约束生成**:in-context learning(检索 top-k 相似 NL-SPARQL 示例注入提示,LLM 生成多候选后由引擎全部执行)是当前主流——与本设计 §4.3「N 候选 + gStore 执行择优」一致。schema-guided 生成(SG-KBQA,[arXiv:2502.12737](https://arxiv.org/pdf/2502.12737))把 schema 上下文喂给较小 LLM 即达 GrailQA SOTA,印证 §4.2「gStore 邻域作 schema 上下文」的有效性。
+- **agentic KGQA(ReAct + 自修复)**:ARUQULA(ReAct + KG 探索的 Text2SPARQL)、GraphWalker([arXiv:2603.28533](https://arxiv.org/html/2603.28533v2))、KnowCoder-A1([arXiv:2510.25101](https://arxiv.org/pdf/2510.25101))、ODA 观察驱动 agent([arXiv:2404.07677](https://arxiv.org/pdf/2404.07677))——印证 §4.4「执行反馈 + 自修复回路」。
+- **GraphRAG**:Microsoft [Project GraphRAG](https://www.microsoft.com/en-us/research/project/graphrag/)(2024,实体抽取 + Leiden 社区聚类 + 分层摘要;LazyGraphRAG)与综述印证 §4.6「子图取回兜底」;注意 KG-RAG 数据集存在质量陷阱([arXiv:2505.23495](https://arxiv.org/pdf/2505.23495)),评测需谨慎。
+- **综述**:*Large Language Models Meet Knowledge Graphs for Question Answering: Synthesis and Opportunities*([arXiv:2505.20099](https://arxiv.org/pdf/2505.20099))——LLM×KG QA 全景,可作技术选型背书。
+- **Text-to-SPARQL 专题**:[SPARQL-LLM 实时生成](https://arxiv.org/pdf/2512.14277)、[Investigating LLMs for Text-to-SPARQL](https://aclanthology.org/2025.knowledgenlp-1.5.pdf)、[Text-to-SPARQL 综述/topic](https://www.emergentmind.com/topics/text-to-sparql)。
+
+### 11.3 对本设计的校准结论
+1. 主流已收敛到「**schema-grounded 生成 + 多候选 + 执行校验 + 自修复**」——正是本设计 §4 的骨架;**我们自有 SPARQL parser** 让"执行前语法校验/修复"比依赖端点 `ASK` 探测更高效,是差异化优势。
+2. LC-QuAD/WebQSP 这类 ≤2 跳基准执行 F1 已达 90%+,gNLQA 的 MVP 应能较快接近;GrailQA 的零样本/组合泛化是难点,需 schema 检索 + agentic 自修复重点投入。
+3. GraphRAG 适合长尾/开放问题兜底,但不替代精确 SPARQL;本设计的三路由(SPARQL / 图分析 / GraphRAG)与社区共识一致。
+
+> Sources: 见上各 arXiv/官方链接;另:[QALD-10 论文](https://www.researchgate.net/publication/376009186)、[Beyond Seen Data (schema-guided)](https://arxiv.org/pdf/2502.12737)、[DeSQ](https://arxiv.org/html/2606.00203)、[KGQA benchmarks 概览](https://www.emergentmind.com/topics/knowledge-graph-question-answering-kgqa-benchmarks)。
