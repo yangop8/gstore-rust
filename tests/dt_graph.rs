@@ -137,6 +137,28 @@ fn named_graphs_persist_across_save_load() {
 }
 
 #[test]
+fn graph_bind_computed_term_resolves() {
+    // A BIND inside GRAPH mints a synthetic id; it must resolve in the outer
+    // evaluator (GRAPH sub-evaluators share the extras interner).
+    let mut db = Database::new("g_bind");
+    db.query("INSERT DATA { GRAPH <http://ex/g> { <http://ex/x> <http://ex/age> 30 } }")
+        .unwrap();
+    let rs = db
+        .select(
+            "SELECT ?b WHERE {
+               GRAPH <http://ex/g> { ?s <http://ex/age> ?a . BIND(?a + 1 AS ?b) }
+             }",
+        )
+        .unwrap();
+    assert_eq!(rs.row_count(), 1);
+    assert!(
+        rs.rows[0][0].as_deref().unwrap_or("").contains("31"),
+        "computed ?b should resolve to 31, got {:?}",
+        rs.rows[0][0]
+    );
+}
+
+#[test]
 fn graph_update_rolls_back() {
     let mut db = db();
     db.begin().unwrap();

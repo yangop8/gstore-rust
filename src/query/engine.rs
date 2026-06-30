@@ -12,6 +12,7 @@
 //! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use regex::Regex;
 
@@ -156,8 +157,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     vstree: Option<&'a VsTree>,
     /// Named graphs (graph-IRI entity id → its store), for `GRAPH` patterns.
     named: Option<&'a BTreeMap<u32, TripleStore>>,
-    /// Interner for computed terms produced during evaluation.
-    extras: std::cell::RefCell<Extras>,
+    /// Interner for computed terms produced during evaluation. Shared (`Rc`) with
+    /// `GRAPH` sub-evaluators so synthetic ids minted inside a `GRAPH { … }` block
+    /// resolve back in the outer evaluator.
+    extras: Rc<std::cell::RefCell<Extras>>,
     /// Cost-based plan cache (gStore `plan_cache`): structurally-identical BGPs —
     /// e.g. a BGP repeated across sub-SELECTs — reuse the DP-optimized plan
     /// instead of re-running plan enumeration. Keyed by the compiled patterns.
@@ -171,7 +174,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             store,
             vstree: None,
             named: None,
-            extras: std::cell::RefCell::new(Extras::default()),
+            extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
@@ -187,7 +190,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             store,
             vstree: Some(vstree),
             named: None,
-            extras: std::cell::RefCell::new(Extras::default()),
+            extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
@@ -941,6 +944,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
+    /// Build a sub-evaluator over a named graph's store that shares this
+    /// evaluator's `extras` interner, so computed terms (BIND/VALUES/aggregates)
+    /// produced inside the `GRAPH` block resolve back here.
+    fn graph_sub_evaluator<'b>(
+        &'b self,
+        gstore: &'a TripleStore,
+        named: &'a BTreeMap<u32, TripleStore>,
+    ) -> Evaluator<'a, TripleStore> {
+        Evaluator {
+            dict: self.dict,
+            store: gstore,
+            vstree: None,
+            named: Some(named),
+            extras: Rc::clone(&self.extras),
+            plan_cache: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
     /// Evaluate a `GRAPH (<iri> | ?g) { inner }` pattern. A constant graph runs
     /// `inner` against that named graph's store; a variable graph runs it against
     /// every named graph, binding the variable to each. The default graph is not
@@ -955,8 +976,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     return Vec::new();
                 };
                 match named.get(&gid) {
-                    Some(gstore) => Evaluator::new(self.dict, gstore)
-                        .with_named(named)
+                    Some(gstore) => self
+                        .graph_sub_evaluator(gstore, named)
                         .eval_pattern(inner, layout),
                     None => Vec::new(),
                 }
@@ -965,7 +986,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let vi = layout.index[v];
                 let mut out = Vec::new();
                 for (&gid, gstore) in named {
-                    let sub = Evaluator::new(self.dict, gstore).with_named(named);
+                    let sub = self.graph_sub_evaluator(gstore, named);
                     for mut b in sub.eval_pattern(inner, layout) {
                         b[vi] = Some(gid);
                         out.push(b);

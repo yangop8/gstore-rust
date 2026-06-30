@@ -259,7 +259,8 @@ impl Pager {
     /// write-ahead log and fsynced, then applied to the main file and fsynced,
     /// then the log is cleared. A crash at any point leaves either the old state
     /// (log torn/absent) or the new state (log replayed on next open) — never a
-    /// partial mix.
+    /// partial mix *of this page batch*. (A higher-level operation spanning
+    /// several flushes is not itself atomic; see `DiskStore::insert_ids`.)
     pub fn flush(&mut self) -> Result<()> {
         // The committed batch: the header (page 0) plus all dirty pages.
         let mut batch: Vec<(PageId, [u8; PAGE_SIZE])> = Vec::new();

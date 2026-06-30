@@ -122,6 +122,9 @@ impl DiskStore {
         self.entity2id.insert(pager, key.as_bytes(), &be32(id))?;
         self.id2entity.insert(pager, &be32(id), key.as_bytes())?;
         self.entity_count += 1;
+        // Keep the count root current so any pager flush (incl. eviction) is
+        // crash-consistent with the dictionary trees.
+        pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
         Ok(id)
     }
 
@@ -136,6 +139,7 @@ impl DiskStore {
         self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
         self.id2literal.insert(pager, &be32(id), key.as_bytes())?;
         self.literal_count += 1;
+        pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
         Ok(id)
     }
 
@@ -148,6 +152,7 @@ impl DiskStore {
         self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
         self.id2predicate.insert(pager, &be32(id), key.as_bytes())?;
         self.pred_count += 1;
+        pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
         Ok(id)
     }
 
@@ -168,6 +173,12 @@ impl DiskStore {
         self.insert_ids(IdTriple::new(s, p, o))
     }
 
+    // Crash-consistency scope: the WAL makes each *pager flush* atomic, and the
+    // count roots above are kept current so they never lag the trees. But a
+    // logical triple is three B+ tree inserts (SPO/POS/OSP); under cache pressure
+    // an eviction-triggered flush can land between them, so a crash mid-insert
+    // can leave the indexes disagreeing for that one triple. Full per-operation
+    // atomicity (a single WAL batch per triple / page pinning) is future work.
     fn insert_ids(&mut self, t: IdTriple) -> Result<bool> {
         let pager = self.pager.get_mut();
         let spo = key3(t.sub, t.pred, t.obj);
@@ -178,6 +189,7 @@ impl DiskStore {
         self.pos.insert(pager, &key3(t.pred, t.obj, t.sub), b"")?;
         self.osp.insert(pager, &key3(t.obj, t.sub, t.pred), b"")?;
         self.triple_count += 1;
+        pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
         Ok(true)
     }
 
@@ -227,6 +239,7 @@ impl DiskStore {
         self.pos.delete(pager, &key3(t.pred, t.obj, t.sub))?;
         self.osp.delete(pager, &key3(t.obj, t.sub, t.pred))?;
         self.triple_count -= 1;
+        pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
         Ok(true)
     }
 

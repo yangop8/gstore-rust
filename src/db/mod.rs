@@ -450,10 +450,17 @@ impl Database {
     /// typing. Returns the number of inferred triples added; the VS-tree is
     /// invalidated (and rebuilt lazily on save / next consistent query).
     pub fn materialize_rdfs(&mut self) -> usize {
-        let n = crate::reason::materialize(&mut self.dict, &mut self.store);
+        let added = crate::reason::materialize(&mut self.dict, &mut self.store);
+        let n = added.len();
         if n > 0 {
             self.index_valid = false;
             self.query_cache.get_mut().clear();
+            // Record inferred triples so reasoning inside a transaction rolls back.
+            if let Some(log) = self.txn.as_mut() {
+                for t in &added {
+                    log.push(UndoOp::Del(None, *t));
+                }
+            }
         }
         n
     }

@@ -32,9 +32,10 @@ const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
 const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
 const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 
-/// Materialize the RDFS closure into `store`, returning the number of triples
-/// added. Idempotent: re-running on a closed store adds nothing.
-pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> usize {
+/// Materialize the RDFS closure into `store`, returning the triples that were
+/// added (so a caller can record them for transaction rollback). Idempotent:
+/// re-running on a closed store adds nothing.
+pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> Vec<IdTriple> {
     let key = |iri: &str| Term::iri(iri).dict_key();
     let sco_p = dict.predicate_id(&key(RDFS_SUBCLASS));
     let spo_p = dict.predicate_id(&key(RDFS_SUBPROP));
@@ -43,7 +44,7 @@ pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> usize {
 
     // No RDFS schema vocabulary ⇒ nothing to infer.
     if sco_p.is_none() && spo_p.is_none() && dom_p.is_none() && rng_p.is_none() {
-        return 0;
+        return Vec::new();
     }
     // Subclass/domain/range rules assert `rdf:type` triples, so the type
     // predicate must exist (intern it if the data never used it directly).
@@ -73,22 +74,22 @@ pub fn materialize(dict: &mut Dictionary, store: &mut TripleStore) -> usize {
         }
     }
 
-    let mut total = 0usize;
+    let mut added_all: Vec<IdTriple> = Vec::new();
     loop {
         let mut new: Vec<IdTriple> = Vec::new();
         gather(dict, store, type_p, sco_p, spo_p, dom_p, rng_p, &mut new);
         let mut added = 0usize;
         for t in new {
             if store.insert(t) {
+                added_all.push(t);
                 added += 1;
             }
         }
-        total += added;
         if added == 0 {
             break; // fixpoint reached
         }
     }
-    total
+    added_all
 }
 
 /// One forward-chaining round: append all directly-entailed triples to `new`.
@@ -222,13 +223,13 @@ mod tests {
         s.insert(IdTriple::new(alice, typ, grad));
 
         let added = materialize(&mut d, &mut s);
-        assert!(added > 0);
+        assert!(!added.is_empty());
         // alice is a Student and a Person; GradStudent ⊑ Person (transitivity).
         assert!(s.exists(alice, typ, student));
         assert!(s.exists(alice, typ, person));
         assert!(s.exists(grad, sco, person));
         // idempotent
-        assert_eq!(materialize(&mut d, &mut s), 0);
+        assert!(materialize(&mut d, &mut s).is_empty());
     }
 
     #[test]
@@ -246,7 +247,7 @@ mod tests {
         s.insert(IdTriple::new(alice, mother_p, bob));
 
         let added = materialize(&mut d, &mut s);
-        assert!(added > 0);
+        assert!(!added.is_empty());
         assert!(s.exists(alice, parent_p, bob)); // mother ⊑ₚ parent
     }
 
@@ -277,7 +278,7 @@ mod tests {
         let (a, b) = (ent(&mut d, "a"), ent(&mut d, "b"));
         let mut s = TripleStore::new();
         s.insert(IdTriple::new(a, p, b));
-        assert_eq!(materialize(&mut d, &mut s), 0);
+        assert!(materialize(&mut d, &mut s).is_empty());
         assert_eq!(s.triple_count(), 1);
     }
 }
