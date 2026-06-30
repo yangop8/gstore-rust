@@ -5,5 +5,8 @@
 //! engine supports (see `docs/REFACTOR_BACKLOG.md` item D for what is deferred).
 
 pub mod ntriples;
+pub mod nquads;
+pub mod rdfxml;
 pub mod sparql;
+pub mod trig;
 pub mod turtle;

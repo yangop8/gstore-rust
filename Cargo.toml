@@ -47,6 +47,38 @@ path = "src/bin/gserver.rs"
 name = "gnode"
 path = "src/bin/gnode.rs"
 
+[[bin]]
+name = "gadd"
+path = "src/bin/gadd.rs"
+
+[[bin]]
+name = "gsub"
+path = "src/bin/gsub.rs"
+
+[[bin]]
+name = "gdrop"
+path = "src/bin/gdrop.rs"
+
+[[bin]]
+name = "gshow"
+path = "src/bin/gshow.rs"
+
+[[bin]]
+name = "gbackup"
+path = "src/bin/gbackup.rs"
+
+[[bin]]
+name = "grestore"
+path = "src/bin/grestore.rs"
+
+[[bin]]
+name = "gexport"
+path = "src/bin/gexport.rs"
+
+[[bin]]
+name = "gmonitor"
+path = "src/bin/gmonitor.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
