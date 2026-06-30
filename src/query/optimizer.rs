@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use crate::store::TripleStore;
+use crate::store::TripleSource;
 
 use super::candidates::Candidates;
 use super::engine::{PatPlan, Slot};
@@ -71,7 +71,7 @@ const BUSHY_DP_LIMIT: usize = 10;
 /// binary-join tree when one is strictly cheaper.
 pub(crate) fn optimize(
     plans: &[PatPlan],
-    store: &TripleStore,
+    store: &impl TripleSource,
     candidates: &Candidates,
     num_vars: usize,
 ) -> ExecPlan {
@@ -125,7 +125,7 @@ struct CostModel {
 }
 
 impl CostModel {
-    fn build(plans: &[PatPlan], store: &TripleStore, candidates: &Candidates) -> CostModel {
+    fn build(plans: &[PatPlan], store: &impl TripleSource, candidates: &Candidates) -> CostModel {
         let n = plans.len();
         let mut pvars = vec![0u64; n];
         let mut card = vec![1.0; n];
@@ -305,7 +305,7 @@ pub(crate) fn plan_vars(plan: &PatPlan) -> Vec<usize> {
 
 /// Estimated number of triples matching a pattern's constants — the size of the
 /// index range the executor would scan for it.
-fn pattern_card(plan: &PatPlan, store: &TripleStore) -> f64 {
+fn pattern_card(plan: &PatPlan, store: &impl TripleSource) -> f64 {
     use Slot::{Const, Var};
     let c = match (plan.s, plan.p, plan.o) {
         (Const(_), Const(_), Const(_)) => 1usize,
@@ -322,7 +322,7 @@ fn pattern_card(plan: &PatPlan, store: &TripleStore) -> f64 {
 
 /// Per-variable NDV (number of distinct values) for one pattern, from predicate
 /// statistics and tightened by the exact candidate sets.
-fn build_ndv(plan: &PatPlan, store: &TripleStore, cand: &Candidates) -> HashMap<usize, f64> {
+fn build_ndv(plan: &PatPlan, store: &impl TripleSource, cand: &Candidates) -> HashMap<usize, f64> {
     use Slot::{Const, Var};
     let mut m: HashMap<usize, f64> = HashMap::new();
     let mut put = |v: usize, d: usize| {
@@ -340,7 +340,7 @@ fn build_ndv(plan: &PatPlan, store: &TripleStore, cand: &Candidates) -> HashMap<
         let d = match (plan.p, plan.o) {
             (Const(p), Const(o)) => store.s_by_po(p, o).len(),
             (Const(p), Var(_)) => store.pred_distinct_subj(p),
-            (Var(_), Const(o)) => distinct_first(store.ps_by_o(o)), // distinct subjects of o
+            (Var(_), Const(o)) => distinct_first(&store.ps_by_o(o)), // distinct subjects of o
             (Var(_), Var(_)) => store.distinct_subjects(),
         };
         put(v, d);
@@ -357,8 +357,8 @@ fn build_ndv(plan: &PatPlan, store: &TripleStore, cand: &Candidates) -> HashMap<
     if let Var(v) = plan.p {
         let d = match (plan.s, plan.o) {
             (Const(s), Const(o)) => store.p_by_so(s, o).len(),
-            (Const(s), Var(_)) => distinct_first(store.po_by_s(s)), // distinct preds of s
-            (Var(_), Const(o)) => distinct_first(store.ps_by_o(o)), // distinct preds of o
+            (Const(s), Var(_)) => distinct_first(&store.po_by_s(s)), // distinct preds of s
+            (Var(_), Const(o)) => distinct_first(&store.ps_by_o(o)), // distinct preds of o
             (Var(_), Var(_)) => store.num_predicates(),
         };
         put(v, d);
@@ -384,6 +384,7 @@ mod tests {
     use super::*;
     use crate::model::IdTriple;
     use crate::query::candidates;
+    use crate::store::TripleStore;
 
     fn pp(s: Slot, p: Slot, o: Slot) -> PatPlan {
         PatPlan { s, p, o }

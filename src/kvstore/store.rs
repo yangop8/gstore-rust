@@ -15,8 +15,9 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
-use crate::parser::turtle;
-use crate::store::TripleStore;
+use crate::parser::{sparql, turtle};
+use crate::query::{Evaluator, QueryResult};
+use crate::store::{TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
 use super::pager::Pager;
@@ -375,8 +376,17 @@ impl DiskStore {
     /// identical to having built in memory — allowing the existing query engine
     /// (and VS-tree) to run against a disk-built database.
     pub fn to_memory(&self) -> Result<(Dictionary, TripleStore)> {
+        let dict = self.dictionary()?;
+        let mut store = TripleStore::new();
+        store.bulk_load(self.iter_all()?);
+        Ok((dict, store))
+    }
+
+    /// Reconstruct just the in-memory [`Dictionary`] (ids in disk order, so they
+    /// line up with the on-disk triple indexes). Used by [`query`](Self::query)
+    /// to answer reads while leaving the triples on disk.
+    pub fn dictionary(&self) -> Result<Dictionary> {
         let mut dict = Dictionary::new();
-        // Rebuild the dictionary in id order so ids line up exactly.
         for id in 0..self.entity_count {
             if let Some(s) = self.id_to_string(id)? {
                 dict.intern_entity(&s);
@@ -395,9 +405,106 @@ impl DiskStore {
                 dict.intern_predicate(&s);
             }
         }
-        let mut store = TripleStore::new();
-        store.bulk_load(self.iter_all()?);
-        Ok((dict, store))
+        Ok(dict)
+    }
+
+    /// Answer a SPARQL read query (SELECT/ASK/CONSTRUCT/DESCRIBE) by *streaming*
+    /// matches directly from the on-disk indexes — only the dictionary is held in
+    /// memory; the triple indexes are read on demand through the page cache. This
+    /// lets a database larger than RAM be queried without materializing it (the
+    /// [`to_memory`](Self::to_memory) path does materialize). Updates and the
+    /// VS-tree filter are not available on this read-only streaming path.
+    pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        let dict = self.dictionary()?;
+        let q = sparql::parse(sparql)?;
+        Evaluator::new(&dict, self).evaluate(&q)
+    }
+}
+
+/// Distinct first / second components of `(a, b)` pairs.
+fn distinct_a(pairs: &[(u32, u32)]) -> Vec<u32> {
+    let mut v: Vec<u32> = pairs.iter().map(|&(a, _)| a).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+fn distinct_b(pairs: &[(u32, u32)]) -> Vec<u32> {
+    let mut v: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Let the query engine evaluate directly against the on-disk store, *streaming*
+/// the index ranges each pattern touches through the page cache rather than
+/// materializing the whole graph in memory. IO errors degrade to empty results
+/// (a read-only path; a healthy store never hits them). Cardinality stats use
+/// the O(1) dictionary counters as estimates, avoiding full scans on the hot
+/// optimizer path.
+impl TripleSource for DiskStore {
+    fn exists(&self, s: u32, p: u32, o: u32) -> bool {
+        DiskStore::exists(self, s, p, o).unwrap_or(false)
+    }
+    fn po_by_s(&self, s: u32) -> Vec<(u32, u32)> {
+        DiskStore::po_by_s(self, s).unwrap_or_default()
+    }
+    fn o_by_sp(&self, s: u32, p: u32) -> Vec<u32> {
+        DiskStore::o_by_sp(self, s, p).unwrap_or_default()
+    }
+    fn p_by_so(&self, s: u32, o: u32) -> Vec<u32> {
+        DiskStore::p_by_so(self, s, o).unwrap_or_default()
+    }
+    fn ps_by_o(&self, o: u32) -> Vec<(u32, u32)> {
+        DiskStore::ps_by_o(self, o).unwrap_or_default()
+    }
+    fn s_by_po(&self, p: u32, o: u32) -> Vec<u32> {
+        DiskStore::s_by_po(self, p, o).unwrap_or_default()
+    }
+    fn so_by_p(&self, p: u32) -> Vec<(u32, u32)> {
+        DiskStore::so_by_p(self, p).unwrap_or_default()
+    }
+    fn subs_by_p(&self, p: u32) -> Vec<u32> {
+        distinct_a(&DiskStore::so_by_p(self, p).unwrap_or_default())
+    }
+    fn objs_by_p(&self, p: u32) -> Vec<u32> {
+        distinct_b(&DiskStore::so_by_p(self, p).unwrap_or_default())
+    }
+    fn subject_keys(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.iter_all().unwrap_or_default().iter().map(|t| t.sub).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    fn object_keys(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.iter_all().unwrap_or_default().iter().map(|t| t.obj).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    fn triple_count(&self) -> u64 {
+        DiskStore::triple_count(self)
+    }
+    // Counter-based estimates (upper bounds) keep the cost model O(1) on disk.
+    fn distinct_subjects(&self) -> usize {
+        self.entity_num().max(1)
+    }
+    fn distinct_objects(&self) -> usize {
+        self.entity_num() + self.literal_num()
+    }
+    fn num_predicates(&self) -> usize {
+        self.predicate_num()
+    }
+    fn pred_card(&self, p: u32) -> usize {
+        DiskStore::so_by_p(self, p).unwrap_or_default().len()
+    }
+    fn pred_distinct_subj(&self, p: u32) -> usize {
+        distinct_a(&DiskStore::so_by_p(self, p).unwrap_or_default()).len()
+    }
+    fn pred_distinct_obj(&self, p: u32) -> usize {
+        distinct_b(&DiskStore::so_by_p(self, p).unwrap_or_default()).len()
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        DiskStore::iter_all(self).unwrap_or_default()
     }
 }
 

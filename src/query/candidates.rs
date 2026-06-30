@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::store::TripleStore;
+use crate::store::TripleSource;
 
 use super::engine::{PatPlan, Slot};
 
@@ -21,7 +21,7 @@ use super::engine::{PatPlan, Slot};
 pub(crate) type Candidates = HashMap<usize, Vec<u32>>;
 
 /// Generate candidate id sets for the BGP's variables.
-pub(crate) fn generate(plans: &[PatPlan], store: &TripleStore) -> Candidates {
+pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidates {
     let mut cand: Candidates = HashMap::new();
 
     // Pass 1 — constant-neighbour edges give an exact list per variable.
@@ -30,7 +30,7 @@ pub(crate) fn generate(plans: &[PatPlan], store: &TripleStore) -> Candidates {
         if let (Slot::Var(sv), Slot::Const(o)) = (&plan.s, &plan.o) {
             let list = match plan.p {
                 Slot::Const(p) => store.s_by_po(p, *o),
-                Slot::Var(_) => distinct_seconds(store.ps_by_o(*o)), // subjects of o (any pred)
+                Slot::Var(_) => distinct_seconds(&store.ps_by_o(*o)), // subjects of o (any pred)
             };
             intersect_into(&mut cand, *sv, list);
         }
@@ -38,7 +38,7 @@ pub(crate) fn generate(plans: &[PatPlan], store: &TripleStore) -> Candidates {
         if let (Slot::Const(s), Slot::Var(ov)) = (&plan.s, &plan.o) {
             let list = match plan.p {
                 Slot::Const(p) => store.o_by_sp(*s, p),
-                Slot::Var(_) => distinct_seconds(store.po_by_s(*s)), // objects of s (any pred)
+                Slot::Var(_) => distinct_seconds(&store.po_by_s(*s)), // objects of s (any pred)
             };
             intersect_into(&mut cand, *ov, list);
         }
@@ -124,6 +124,7 @@ fn sorted_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
 mod tests {
     use super::*;
     use crate::model::IdTriple;
+    use crate::store::TripleStore;
 
     fn store() -> TripleStore {
         // preds: type=0, takesCourse=1, name=2

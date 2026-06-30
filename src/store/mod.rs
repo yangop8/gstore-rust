@@ -25,6 +25,112 @@ use crate::model::IdTriple;
 /// A sorted, de-duplicated adjacency map `key → Vec<(a, b)>`.
 type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 
+/// The triple-access interface the query engine evaluates against. Implemented
+/// by the in-memory [`TripleStore`] and the on-disk `DiskStore`, so the same
+/// optimizer + executor can run either fully in memory or *streaming* from disk
+/// (reading only the index ranges a query touches). Owned `Vec`s keep the disk
+/// implementation simple; the in-memory one clones its (small per-key) slices.
+pub trait TripleSource {
+    /// `s p o` — does this exact triple exist?
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool;
+    /// `s ? ?` — `(pred, obj)` pairs for a subject.
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)>;
+    /// `s p ?` — objects of `(sub, pred)`.
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId>;
+    /// `s ? o` — predicates linking a subject to an object.
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId>;
+    /// `? ? o` — `(pred, sub)` pairs for an object.
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)>;
+    /// `? p o` — subjects of `(pred, obj)`.
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId>;
+    /// `? p ?` — `(sub, obj)` pairs for a predicate.
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)>;
+    /// Distinct subjects appearing with a predicate.
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId>;
+    /// Distinct objects appearing with a predicate.
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId>;
+    /// All ids that appear as a subject.
+    fn subject_keys(&self) -> Vec<EntityLiteralId>;
+    /// All ids that appear as an object.
+    fn object_keys(&self) -> Vec<EntityLiteralId>;
+    /// Total triple count.
+    fn triple_count(&self) -> u64;
+    /// Number of distinct subject keys.
+    fn distinct_subjects(&self) -> usize;
+    /// Number of distinct object keys.
+    fn distinct_objects(&self) -> usize;
+    /// Number of distinct predicates present.
+    fn num_predicates(&self) -> usize;
+    /// Number of triples with a predicate (gStore `pre2num`).
+    fn pred_card(&self, pred: PredId) -> usize;
+    /// Distinct subjects of a predicate (gStore `pre2sub`).
+    fn pred_distinct_subj(&self, pred: PredId) -> usize;
+    /// Distinct objects of a predicate (gStore `pre2obj`).
+    fn pred_distinct_obj(&self, pred: PredId) -> usize;
+    /// Every triple (for the all-variable `? ? ?` scan).
+    fn iter_all(&self) -> Vec<IdTriple>;
+}
+
+impl TripleSource for TripleStore {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        TripleStore::exists(self, sub, pred, obj)
+    }
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        TripleStore::po_by_s(self, sub).to_vec()
+    }
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
+        TripleStore::o_by_sp(self, sub, pred)
+    }
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
+        TripleStore::p_by_so(self, sub, obj)
+    }
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        TripleStore::ps_by_o(self, obj).to_vec()
+    }
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
+        TripleStore::s_by_po(self, pred, obj)
+    }
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        TripleStore::so_by_p(self, pred).to_vec()
+    }
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        TripleStore::subs_by_p(self, pred)
+    }
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        TripleStore::objs_by_p(self, pred)
+    }
+    fn subject_keys(&self) -> Vec<EntityLiteralId> {
+        TripleStore::subject_keys(self).collect()
+    }
+    fn object_keys(&self) -> Vec<EntityLiteralId> {
+        TripleStore::object_keys(self).collect()
+    }
+    fn triple_count(&self) -> u64 {
+        TripleStore::triple_count(self)
+    }
+    fn distinct_subjects(&self) -> usize {
+        TripleStore::distinct_subjects(self)
+    }
+    fn distinct_objects(&self) -> usize {
+        TripleStore::distinct_objects(self)
+    }
+    fn num_predicates(&self) -> usize {
+        TripleStore::num_predicates(self)
+    }
+    fn pred_card(&self, pred: PredId) -> usize {
+        TripleStore::pred_card(self, pred)
+    }
+    fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        TripleStore::pred_distinct_subj(self, pred)
+    }
+    fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        TripleStore::pred_distinct_obj(self, pred)
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        TripleStore::iter_all(self).collect()
+    }
+}
+
 /// The triple store. Holds three redundant sorted indexes plus a triple count.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TripleStore {

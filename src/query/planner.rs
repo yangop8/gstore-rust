@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 
-use crate::store::TripleStore;
+use crate::store::TripleSource;
 
 use super::candidates::Candidates;
 use super::engine::{PatPlan, Slot};
@@ -83,7 +83,7 @@ impl Graph {
 /// Compute the pattern evaluation order for a BGP.
 pub(crate) fn plan(
     plans: &[PatPlan],
-    store: &TripleStore,
+    store: &impl TripleSource,
     candidates: &Candidates,
     num_vars: usize,
 ) -> Vec<usize> {
@@ -149,7 +149,7 @@ fn node_score(
     graph: &Graph,
     v: usize,
     placed: &HashSet<usize>,
-    store: &TripleStore,
+    store: &impl TripleSource,
     var_num: &impl Fn(usize) -> usize,
 ) -> f64 {
     let mut score = 1.0;
@@ -174,7 +174,7 @@ fn node_score(
 fn heuristic_order(
     graph: &Graph,
     nodes: &[usize],
-    store: &TripleStore,
+    store: &impl TripleSource,
     _candidates: &Candidates,
     var_num: &impl Fn(usize) -> usize,
 ) -> Vec<usize> {
@@ -222,7 +222,7 @@ fn heuristic_order(
 fn sampling_order(
     graph: &Graph,
     nodes: &[usize],
-    store: &TripleStore,
+    store: &impl TripleSource,
     candidates: &Candidates,
     var_num: &impl Fn(usize) -> usize,
 ) -> Vec<usize> {
@@ -277,7 +277,7 @@ fn best_edge_selectivity(
     graph: &Graph,
     w: usize,
     placed: &HashSet<usize>,
-    store: &TripleStore,
+    store: &impl TripleSource,
     candidates: &Candidates,
     samples: &[Vec<u32>],
 ) -> f64 {
@@ -355,7 +355,7 @@ fn id_cache_sample(cache: &[u32]) -> Vec<u32> {
 }
 
 /// Whole-DB size estimate for a variable with no candidates.
-fn whole_db_size(store: &TripleStore, graph: &Graph, v: usize) -> usize {
+fn whole_db_size(store: &impl TripleSource, graph: &Graph, v: usize) -> usize {
     // If the variable is ever a subject it's an entity; otherwise it may also be
     // a literal, so include the object population.
     let only_subject = graph.edges[v].iter().all(|e| e.is_subject);
@@ -391,7 +391,7 @@ fn neighbors_in(
 fn bridge_to_pattern_order(
     plans: &[PatPlan],
     var_order: &[usize],
-    store: &TripleStore,
+    store: &impl TripleSource,
     candidates: &Candidates,
 ) -> Vec<usize> {
     let mut bound: HashSet<usize> = HashSet::new();
@@ -439,7 +439,7 @@ fn bridge_to_pattern_order(
 /// The index-scan size a pattern would fetch (used to order patterns that
 /// become ready at the same step — fetch the smallest index first; the
 /// candidate filter then prunes the results).
-fn pattern_cost(plan: &PatPlan, store: &TripleStore, _candidates: &Candidates) -> u64 {
+fn pattern_cost(plan: &PatPlan, store: &impl TripleSource, _candidates: &Candidates) -> u64 {
     match (plan.s, plan.p, plan.o) {
         (Slot::Const(_), Slot::Const(_), Slot::Const(_)) => 1,
         (Slot::Const(s), Slot::Const(p), Slot::Var(_)) => store.o_by_sp(s, p).len() as u64,
@@ -459,6 +459,7 @@ mod tests {
     use crate::dict::Dictionary;
     use crate::model::{IdTriple, Term};
     use crate::query::candidates;
+    use crate::store::TripleStore;
 
     fn pp(s: Slot, p: Slot, o: Slot) -> PatPlan {
         PatPlan { s, p, o }

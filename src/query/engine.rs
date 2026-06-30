@@ -22,7 +22,7 @@ use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
 use crate::signature::{EdgeDir, Signature, VsTree};
-use crate::store::TripleStore;
+use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
 use super::optimizer::{self, ExecPlan, JoinTree};
@@ -145,10 +145,13 @@ impl Extras {
     }
 }
 
-/// The query evaluator binds a dictionary and a store for the duration of a query.
-pub struct Evaluator<'a> {
+/// The query evaluator binds a dictionary and a store for the duration of a
+/// query. It is generic over the [`TripleSource`] so the same optimizer and
+/// executor run against the in-memory [`TripleStore`] or the on-disk store,
+/// streaming index ranges from disk in the latter case.
+pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     dict: &'a Dictionary,
-    store: &'a TripleStore,
+    store: &'a S,
     /// Optional VS-tree for entity-candidate pre-filtering.
     vstree: Option<&'a VsTree>,
     /// Named graphs (graph-IRI entity id → its store), for `GRAPH` patterns.
@@ -161,8 +164,8 @@ pub struct Evaluator<'a> {
     plan_cache: std::cell::RefCell<HashMap<u64, ExecPlan>>,
 }
 
-impl<'a> Evaluator<'a> {
-    pub fn new(dict: &'a Dictionary, store: &'a TripleStore) -> Evaluator<'a> {
+impl<'a, S: TripleSource> Evaluator<'a, S> {
+    pub fn new(dict: &'a Dictionary, store: &'a S) -> Evaluator<'a, S> {
         Evaluator {
             dict,
             store,
@@ -176,9 +179,9 @@ impl<'a> Evaluator<'a> {
     /// Build an evaluator that uses `vstree` to prune entity-variable bindings.
     pub fn with_vstree(
         dict: &'a Dictionary,
-        store: &'a TripleStore,
+        store: &'a S,
         vstree: &'a VsTree,
-    ) -> Evaluator<'a> {
+    ) -> Evaluator<'a, S> {
         Evaluator {
             dict,
             store,
@@ -190,7 +193,7 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Attach named graphs so `GRAPH` patterns can be evaluated.
-    pub fn with_named(mut self, named: &'a BTreeMap<u32, TripleStore>) -> Evaluator<'a> {
+    pub fn with_named(mut self, named: &'a BTreeMap<u32, TripleStore>) -> Evaluator<'a, S> {
         self.named = Some(named);
         self
     }
@@ -319,7 +322,7 @@ impl<'a> Evaluator<'a> {
             else {
                 continue;
             };
-            for &(p, o) in self.store.po_by_s(id) {
+            for (p, o) in self.store.po_by_s(id) {
                 let (Some(pred), Some(obj)) = (
                     self.resolve_string(Some(p), true)
                         .and_then(|s| parse_term(&s).ok()),
@@ -766,7 +769,7 @@ impl<'a> Evaluator<'a> {
             }
             (None, None) => {
                 // Both ends free: enumerate from every entity node.
-                let mut nodes: Vec<u32> = self.store.subject_keys().collect();
+                let mut nodes: Vec<u32> = self.store.subject_keys();
                 nodes.extend(self.store.object_keys());
                 nodes.sort_unstable();
                 nodes.dedup();
@@ -830,13 +833,13 @@ impl<'a> Evaluator<'a> {
                     .filter_map(|(iri, _)| self.path_pred_id(iri))
                     .collect();
                 if reverse {
-                    for &(p, s) in self.store.ps_by_o(start) {
+                    for (p, s) in self.store.ps_by_o(start) {
                         if !banned.contains(&p) {
                             out.insert(s);
                         }
                     }
                 } else {
-                    for &(p, o) in self.store.po_by_s(start) {
+                    for (p, o) in self.store.po_by_s(start) {
                         if !banned.contains(&p) {
                             out.insert(o);
                         }
@@ -1333,6 +1336,7 @@ impl<'a> Evaluator<'a> {
             (None, None, None) => self
                 .store
                 .iter_all()
+                .into_iter()
                 .map(|t| (t.sub, t.pred, t.obj))
                 .collect(),
         };

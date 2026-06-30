@@ -3,7 +3,8 @@
 
 use std::path::PathBuf;
 
-use gstore::Database;
+use gstore::kvstore::DiskStore;
+use gstore::{Database, QueryResult};
 
 fn lubm_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/lubm/lubm.nt")
@@ -40,6 +41,35 @@ fn disk_build_reopen_query_small() {
     assert_eq!(rs.row_count(), 8);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disk_streaming_query_off_disk() {
+    // DiskStore::query streams matches straight from the on-disk indexes — only
+    // the dictionary is loaded into memory, the triples stay on disk.
+    let path = std::env::temp_dir().join("gstore_dt_stream.kv");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("kv.wal"));
+    let ds = DiskStore::build_files(&path, 256, &[small_nt()]).unwrap();
+
+    match ds.query("SELECT ?o WHERE { <root> <contain> ?o }").unwrap() {
+        QueryResult::Select(rs) => assert_eq!(rs.row_count(), 5),
+        other => panic!("expected Select, got {other:?}"),
+    }
+    // A two-hop join, streamed (optimizer + executor run against the disk store).
+    match ds
+        .query("SELECT ?pt WHERE { <root> <contain> ?n . ?n <own> ?pt }")
+        .unwrap()
+    {
+        QueryResult::Select(rs) => assert_eq!(rs.row_count(), 8),
+        other => panic!("expected Select, got {other:?}"),
+    }
+    match ds.query("ASK { <root> <contain> ?o }").unwrap() {
+        QueryResult::Ask(b) => assert!(b),
+        other => panic!("expected Ask, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(path.with_extension("kv.wal")).ok();
 }
 
 #[test]
