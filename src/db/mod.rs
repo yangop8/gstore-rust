@@ -212,6 +212,18 @@ impl Database {
             .count()
     }
 
+    /// Materialize the RDFS closure over the current data (gStore `src/Reason`):
+    /// subclass/subproperty transitivity, type propagation, and domain/range
+    /// typing. Returns the number of inferred triples added; the VS-tree is
+    /// invalidated (and rebuilt lazily on save / next consistent query).
+    pub fn materialize_rdfs(&mut self) -> usize {
+        let n = crate::reason::materialize(&mut self.dict, &mut self.store);
+        if n > 0 {
+            self.index_valid = false;
+        }
+        n
+    }
+
     // ---- query ------------------------------------------------------------
 
     /// Parse and run a SPARQL request. SELECT/ASK read; INSERT/DELETE DATA write.

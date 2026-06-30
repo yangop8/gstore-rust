@@ -24,6 +24,7 @@ pub mod kvstore;
 pub mod model;
 pub mod parser;
 pub mod query;
+pub mod reason;
 pub mod signature;
 pub mod store;
 
