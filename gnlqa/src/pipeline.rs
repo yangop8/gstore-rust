@@ -18,6 +18,39 @@ for an RDF graph. Output ONLY the SPARQL query — no explanation, no markdown \
 prose. Use SELECT for entity/list/factoid questions and ASK for yes/no \
 questions.";
 
+/// Where an answer came from — a trust *and data-egress* signal, not just
+/// attribution. `GStore` means the underlying data never left the machine (only
+/// the question + schema went to the LLM); `GraphRag` and `Llm` involved sending
+/// content to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Structured SPARQL result or graph-analytics computed locally by gStore.
+    GStore,
+    /// LLM answer composed from private triples retrieved from gStore (GraphRAG).
+    GraphRag,
+    /// LLM answered from its own general knowledge; no KB data involved.
+    Llm,
+}
+
+impl Provenance {
+    /// A short user-facing "provided by …" label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provenance::GStore => "gStore",
+            Provenance::GraphRag => "gStore+LLM (GraphRAG)",
+            Provenance::Llm => "LLM",
+        }
+    }
+    /// Stable machine token (for JSON / MCP).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Provenance::GStore => "gstore",
+            Provenance::GraphRag => "graphrag",
+            Provenance::Llm => "llm",
+        }
+    }
+}
+
 /// A produced answer.
 #[derive(Debug, Clone)]
 pub struct Answer {
@@ -39,6 +72,8 @@ pub struct Answer {
     pub confidence: f32,
     /// Whether the system abstained (confidence below the configured threshold).
     pub abstained: bool,
+    /// Where the answer came from (trust / data-egress signal).
+    pub provenance: Provenance,
 }
 
 /// The QA engine: an LLM front-end + a KB backend.
@@ -83,6 +118,7 @@ impl AskEngine {
             explanation: None,
             confidence,
             abstained: false,
+            provenance: Provenance::GStore,
         })
     }
 }

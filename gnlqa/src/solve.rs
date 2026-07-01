@@ -12,8 +12,8 @@ use crate::ground::{explain, gather_citations};
 use crate::intent::{extract_intent, QType, QuestionIntent};
 use crate::kb::KbClient;
 use crate::link::{LinkKind, Linker};
-use crate::llm::LlmClient;
-use crate::pipeline::{answer_values, render_answer, Answer};
+use crate::llm::{LlmClient, LlmRequest};
+use crate::pipeline::{answer_values, render_answer, Answer, Provenance};
 use crate::repair::{is_empty_answer, solve_with_repair, RepairOutcome};
 use crate::schema::SchemaContext;
 
@@ -86,6 +86,44 @@ impl Cache {
     }
 }
 
+/// Which answering path(s) the user allows for a question. This is a
+/// privacy/trust control as much as a routing one (see [`Provenance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Structured SPARQL, then a GraphRAG fallback; never pure LLM. (default)
+    #[default]
+    Auto,
+    /// Structured SPARQL / graph-analytics only — the data never leaves the
+    /// machine; abstain if it can't be answered that way.
+    Structured,
+    /// Retrieve a private subgraph from gStore and let the LLM answer from it.
+    GraphRag,
+    /// Answer purely from the LLM's general knowledge; ignore the KB entirely.
+    Open,
+}
+
+impl Mode {
+    /// Parse a mode name (for the `/mode` command / `GNLQA_MODE`).
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" => Some(Mode::Auto),
+            "structured" | "sparql" | "strict" => Some(Mode::Structured),
+            "graphrag" | "rag" | "local" => Some(Mode::GraphRag),
+            "open" | "llm" | "direct" => Some(Mode::Open),
+            _ => None,
+        }
+    }
+    /// Lowercase name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::Structured => "structured",
+            Mode::GraphRag => "graphrag",
+            Mode::Open => "open",
+        }
+    }
+}
+
 /// The full QA engine: LLM + KB + (optional) linker.
 pub struct SolveEngine {
     llm: Box<dyn LlmClient>,
@@ -105,6 +143,7 @@ pub struct SolveEngine {
     rag: crate::graphrag::RetrievalCfg,
     analytics: bool,
     analytics_cfg: crate::analytics::AnalyticsCfg,
+    progress: bool,
 }
 
 /// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
@@ -135,6 +174,20 @@ impl SolveEngine {
             rag: crate::graphrag::RetrievalCfg::default(),
             analytics: true,
             analytics_cfg: crate::analytics::AnalyticsCfg::default(),
+            progress: false,
+        }
+    }
+    /// Emit short stage logs to stderr (what's executing: model vs gStore), so an
+    /// interactive user has an explicit "waiting target". Off by default.
+    pub fn with_progress(mut self, on: bool) -> SolveEngine {
+        self.progress = on;
+        self
+    }
+
+    /// Emit a progress note when enabled.
+    fn note(&self, msg: &str) {
+        if self.progress {
+            eprintln!("[gnlqa] {msg}");
         }
     }
     /// Enable/disable graph-analytics routing for `analytics`-typed questions
@@ -235,20 +288,27 @@ impl SolveEngine {
         self.analytics_cfg
     }
 
-    /// Answer a question end-to-end (cache-aware).
+    /// Answer a question end-to-end in [`Mode::Auto`] (cache-aware).
     pub fn ask(&self, question: &str) -> Result<Answer> {
-        let key = question.trim();
+        self.ask_with_mode(question, Mode::Auto)
+    }
+
+    /// Answer a question, constraining which path(s) are allowed (cache-aware).
+    /// The cache key includes the mode, so the same question in different modes
+    /// doesn't collide.
+    pub fn ask_with_mode(&self, question: &str, mode: Mode) -> Result<Answer> {
+        let key = format!("{}\u{1f}{}", mode.name(), question.trim());
         if let Some(cache) = &self.cache {
-            if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
+            if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
                 return Ok(hit);
             }
         }
-        let answer = self.solve_inner(question)?;
+        let answer = self.solve_inner(question, mode)?;
         // Don't cache abstentions (a borderline "not sure" shouldn't be sticky).
         if let Some(cache) = &self.cache {
             if !answer.abstained {
                 let val = answer.clone(); // clone outside the lock
-                cache.lock().unwrap_or_else(|e| e.into_inner()).put(key.to_string(), val);
+                cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, val);
             }
         }
         Ok(answer)
@@ -271,9 +331,14 @@ impl SolveEngine {
         self.ask(&standalone)
     }
 
-    fn solve_inner(&self, question: &str) -> Result<Answer> {
+    fn solve_inner(&self, question: &str, mode: Mode) -> Result<Answer> {
+        // Open mode: answer purely from the LLM's general knowledge, no KB.
+        if mode == Mode::Open {
+            return self.answer_direct(question);
+        }
         // 1) Understand. Intent is a cheap classification → run it on the fast
         // model. A parse failure shouldn't kill the query — degrade.
+        self.note("understanding question… (model)");
         let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
         let intent =
             extract_intent(self.llm.as_ref(), question, intent_model.as_deref()).unwrap_or_default();
@@ -285,6 +350,7 @@ impl SolveEngine {
         let model = model_owned.as_deref();
 
         // 2) Link + 3) ground (only if a linker is configured).
+        self.note("linking entities…");
         let mut links = String::new();
         let mut ent_uris = Vec::new();
         let mut pred_uris = Vec::new();
@@ -323,6 +389,18 @@ impl SolveEngine {
         let ent_uris = dedup(ent_uris);
         let pred_uris = dedup(pred_uris);
 
+        // GraphRag mode: skip Text-to-SPARQL entirely — retrieve a private
+        // subgraph and let the LLM answer from it (abstain if it can't).
+        if mode == Mode::GraphRag {
+            self.note("retrieving subgraph & composing answer… (gStore + model)");
+            if !ent_uris.is_empty() {
+                if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
+                    return Ok(ans);
+                }
+            }
+            return Ok(self.abstain_answer(&lang, None, RAG_CONFIDENCE));
+        }
+
         // Graph-analytics routing: shortest path / centrality / PageRank /
         // communities / triangles aren't a single BGP — run gStore's analytics
         // engine over a retrieved edge sample. Gated by the abstain threshold for
@@ -332,6 +410,7 @@ impl SolveEngine {
             && intent.qtype == QType::Analytics
             && ANALYTICS_CONFIDENCE >= self.abstain_below
         {
+            self.note("running graph analytics… (gStore)");
             match crate::analytics::run_analytics(
                 self.kb.as_ref(),
                 question,
@@ -356,6 +435,7 @@ impl SolveEngine {
                         explanation: None,
                         confidence: ANALYTICS_CONFIDENCE,
                         abstained: false,
+                        provenance: Provenance::GStore,
                     });
                 }
                 // Don't mask the failure silently — surface it, then fall through
@@ -367,14 +447,17 @@ impl SolveEngine {
         let schema = if ent_uris.is_empty() && pred_uris.is_empty() {
             String::new()
         } else {
+            self.note("gathering schema… (gStore)");
             SchemaContext::gather(self.kb.as_ref(), &ent_uris, &pred_uris, self.sample)?.render()
         };
 
         // 4) Generate N candidates, 5) repair-solve each, 6) rank. If generation
         // produced nothing parser-valid, fail honestly rather than fabricating an
         // answer from a wildcard query.
+        self.note("generating SPARQL… (model)");
         let candidates =
             generate_candidates(self.llm.as_ref(), question, &links, &schema, self.candidates, model)?;
+        self.note("querying gStore…");
         let best = best_of(
             self.llm.as_ref(),
             self.kb.as_ref(),
@@ -390,14 +473,18 @@ impl SolveEngine {
         // answer, retrieve a subgraph around the linked entities and let the LLM
         // answer from it (open/relational questions a single BGP can't express).
         let structured_ok = best.as_ref().is_some_and(|o| !is_empty_answer(&o.answer));
-        // Skip the fallback when its fixed confidence couldn't clear the caller's
-        // abstain threshold — otherwise we'd present a RAG answer the structured
-        // path would have withheld. Falling through lets `match best` abstain.
-        if !structured_ok
+        // Auto mode only: when the structured path produced no non-empty answer,
+        // fall back to GraphRAG. (Structured mode never leaves the SPARQL path.)
+        // Skip when its fixed confidence couldn't clear the caller's abstain
+        // threshold — otherwise we'd present a RAG answer the structured path
+        // would have withheld. Falling through lets `match best` abstain.
+        if mode == Mode::Auto
+            && !structured_ok
             && self.graphrag
             && !ent_uris.is_empty()
             && RAG_CONFIDENCE >= self.abstain_below
         {
+            self.note("no direct result — trying GraphRAG… (gStore + model)");
             if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
                 return Ok(ans);
             }
@@ -411,16 +498,9 @@ impl SolveEngine {
                 // Abstain when too unsure: keep the SPARQL (transparency) but
                 // don't present a possibly-wrong answer.
                 if confidence < self.abstain_below {
-                    return Ok(Answer {
-                        text: crate::lang::abstain_message(&lang).to_string(),
-                        values: Vec::new(), // suppress the withheld answer
-                        sparql: Some(o.sparql),
-                        rounds: o.rounds,
-                        citations: Vec::new(),
-                        explanation: None,
-                        confidence,
-                        abstained: true,
-                    });
+                    let mut a = self.abstain_answer(&lang, Some(o.sparql), confidence);
+                    a.rounds = o.rounds;
+                    return Ok(a);
                 }
 
                 let text = render_answer(&o.answer, &values);
@@ -445,10 +525,52 @@ impl SolveEngine {
                     explanation,
                     confidence,
                     abstained: false,
+                    provenance: Provenance::GStore,
                 })
             }
             None => Err(Error::Sparql("no candidate query produced an answer".into())),
         }
+    }
+
+    /// A "not confident enough" answer (values withheld, SPARQL kept for
+    /// transparency). Provenance is `GStore`: it came from evaluating the local
+    /// structured path and deciding not to answer.
+    fn abstain_answer(&self, lang: &str, sparql: Option<String>, confidence: f32) -> Answer {
+        Answer {
+            text: crate::lang::abstain_message(lang).to_string(),
+            values: Vec::new(),
+            sparql,
+            rounds: 0,
+            citations: Vec::new(),
+            explanation: None,
+            confidence,
+            abstained: true,
+            provenance: Provenance::GStore,
+        }
+    }
+
+    /// Answer purely from the LLM's general knowledge (Mode::Open) — no KB, no
+    /// grounding. Marked `Provenance::Llm` and confidence 0 (not KB-verified).
+    fn answer_direct(&self, question: &str) -> Result<Answer> {
+        self.note("open answer… (model, no KB)");
+        let sys = "You are a helpful assistant. Answer the user's question directly \
+            and concisely. If you are not sure, say so rather than inventing facts.";
+        let mut req = LlmRequest::prompt(question.to_string()).system(sys).max_tokens(1024);
+        if let Some(m) = &self.model {
+            req = req.model(m.clone());
+        }
+        let text = self.llm.complete(&req)?;
+        Ok(Answer {
+            text: text.trim().to_string(),
+            values: Vec::new(),
+            sparql: None,
+            rounds: 0,
+            citations: Vec::new(),
+            explanation: None,
+            confidence: 0.0, // ungrounded world knowledge
+            abstained: false,
+            provenance: Provenance::Llm,
+        })
     }
 
     /// Retrieve a subgraph around `seeds` and let the LLM answer from it. Returns
@@ -482,6 +604,7 @@ impl SolveEngine {
             explanation: None,
             confidence: RAG_CONFIDENCE,
             abstained: false,
+            provenance: Provenance::GraphRag,
         })
     }
 }

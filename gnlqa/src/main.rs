@@ -6,16 +6,22 @@
 //! * `gnlqa mcp`                 — run the MCP server over stdio.
 //! * `gnlqa eval <qald|lcquad> <file>` — score against a benchmark dataset.
 //! * `gnlqa` (no args)           — print configuration/readiness.
+//!
+//! Answering mode (`GNLQA_MODE` / `/mode` in chat): `auto` (structured then
+//! GraphRAG), `structured` (SPARQL only — data never leaves), `graphrag`
+//! (private subgraph → LLM), `open` (LLM general knowledge, no KB).
 
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use gnlqa::{
     load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
-    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, OpenAiClient, Session, SolveEngine,
+    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session, SolveEngine,
 };
 
-fn build_engine(cfg: &Config) -> SolveEngine {
+/// Build the engine. `progress` turns on stage logging (for interactive use;
+/// off for serve/mcp/eval).
+fn build_engine(cfg: &Config, progress: bool) -> SolveEngine {
     // The KB client is always available; the LLM client errors at call time if
     // no API key is set, so build it leniently here. Pick the backend by provider.
     let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
@@ -53,35 +59,48 @@ fn build_engine(cfg: &Config) -> SolveEngine {
     let mut engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
         .with_model(cfg.model.clone())
         .with_fast_model(cfg.fast_model.clone())
-        .with_cache(256);
+        .with_cache(256)
+        .with_progress(progress);
     if let Some(l) = linker {
         engine = engine.with_linker(l);
     }
     engine
 }
 
-/// Interactive multi-turn REPL: each line is answered in the context of the
-/// conversation so far (via [`Session`]). `:reset` starts a fresh topic,
-/// `:quit`/`:q`/EOF exits.
-fn run_chat(cfg: &Config) {
-    let engine = build_engine(cfg);
+/// Print one answer with its provenance (answer to stdout; meta to stderr).
+fn print_answer(a: &gnlqa::Answer) {
+    println!("{}", a.text);
+    if let Some(s) = &a.sparql {
+        eprintln!("[sparql] {s}");
+    }
+    eprintln!(
+        "[provided by {}]  confidence {:.2}{}",
+        a.provenance.label(),
+        a.confidence,
+        if a.abstained { "  [abstained]" } else { "" },
+    );
+}
+
+/// Interactive multi-turn REPL. Commands: `/mode <auto|structured|graphrag|open>`,
+/// `:reset` (new topic), `:quit`/`:q`/EOF (exit).
+fn run_chat(cfg: &Config, mut mode: Mode) {
+    let engine = build_engine(cfg, true);
     let mut sess = Session::new(&engine);
-    eprintln!("gNLQA chat — ask a question; :reset to clear context, :quit to exit.");
+    eprintln!("gNLQA chat — ask a question; /mode <auto|structured|graphrag|open> to switch,");
+    eprintln!("            :reset to clear context, :quit to exit. (mode: {})", mode.name());
     if !cfg.has_api_key() {
-        eprintln!("warning: ANTHROPIC_API_KEY not set — live answers will fail.");
+        eprintln!("warning: no API key set — live answers will fail.");
     }
     let stdin = io::stdin();
     let mut consecutive_errors = 0u32;
     loop {
-        print!("> ");
+        print!("[{}]> ", mode.name());
         let _ = io::stdout().flush();
         let mut line = String::new();
         match stdin.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => consecutive_errors = 0,
             Err(e) => {
-                // A single bad line (e.g. non-UTF-8) shouldn't tear down the
-                // chat — skip it. Bail only if the stream is persistently broken.
                 eprintln!("input error: {e}");
                 consecutive_errors += 1;
                 if consecutive_errors >= 3 {
@@ -99,15 +118,23 @@ fn run_chat(cfg: &Config) {
                 eprintln!("(context cleared)");
                 continue;
             }
+            _ if q.starts_with("/mode") => {
+                match q.strip_prefix("/mode").unwrap().trim() {
+                    "" => eprintln!("mode: {} (auto|structured|graphrag|open)", mode.name()),
+                    m => match Mode::parse(m) {
+                        Some(new) => {
+                            mode = new;
+                            eprintln!("mode → {}", mode.name());
+                        }
+                        None => eprintln!("unknown mode '{m}' (auto|structured|graphrag|open)"),
+                    },
+                }
+                continue;
+            }
             _ => {}
         }
-        match sess.ask(q) {
-            Ok(a) => {
-                println!("{}", a.text);
-                if let Some(s) = &a.sparql {
-                    eprintln!("[sparql] {s}");
-                }
-            }
+        match sess.ask_with_mode(q, mode) {
+            Ok(a) => print_answer(&a),
             Err(e) => eprintln!("error: {e}"),
         }
     }
@@ -142,7 +169,7 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
             std::process::exit(1);
         }
     };
-    let engine = build_engine(cfg);
+    let engine = build_engine(cfg, false);
     let opts = EvalOptions { limit: None, resolve_gold_via_kb };
     let report = run_eval(&engine, &questions, &opts);
     println!("{}", report.summary());
@@ -150,6 +177,7 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
 
 fn main() {
     let cfg = Config::from_env();
+    let mode = Mode::parse(&cfg.mode).unwrap_or(Mode::Auto);
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
@@ -160,21 +188,24 @@ fn main() {
             eprintln!("  gnlqa mcp               run the MCP server over stdio");
             eprintln!("  gnlqa eval <qald|lcquad> <file>   score against a benchmark dataset");
             eprintln!("  gnlqa serve [addr]      run the HTTP server (default 127.0.0.1:9100)");
-            eprintln!("  model={}  gstore={}", cfg.model, cfg.gstore_endpoint);
+            eprintln!(
+                "  provider={}  model={}  mode={}  gstore={}",
+                cfg.llm_provider, cfg.model, mode.name(), cfg.gstore_endpoint
+            );
             if !cfg.has_api_key() {
-                eprintln!("  warning: ANTHROPIC_API_KEY not set — live answers will fail.");
+                eprintln!("  warning: no API key set for provider '{}' — live answers will fail.", cfg.llm_provider);
             }
         }
-        Some("chat") => run_chat(&cfg),
+        Some("chat") => run_chat(&cfg, mode),
         Some("mcp") => {
-            let engine = Arc::new(build_engine(&cfg));
+            let engine = Arc::new(build_engine(&cfg, false));
             eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
             McpServer::new(engine).serve_stdio();
         }
         Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
             let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9100".to_string());
-            let engine = Arc::new(build_engine(&cfg));
+            let engine = Arc::new(build_engine(&cfg, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {
                     eprintln!("gNLQA serving on http://{addr}  (POST /ask, /gSolve; GET /health)");
@@ -188,14 +219,9 @@ fn main() {
         }
         Some(_) => {
             let question = args.join(" ");
-            let engine = build_engine(&cfg);
-            match engine.ask(&question) {
-                Ok(a) => {
-                    println!("{}", a.text);
-                    if let Some(s) = &a.sparql {
-                        eprintln!("[sparql] {s}");
-                    }
-                }
+            let engine = build_engine(&cfg, true);
+            match engine.ask_with_mode(&question, mode) {
+                Ok(a) => print_answer(&a),
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

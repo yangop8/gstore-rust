@@ -38,6 +38,8 @@ pub struct Config {
     pub temperature: f32,
     /// Per-request network timeout, seconds.
     pub timeout_secs: u64,
+    /// Default answering mode (`GNLQA_MODE`): `auto`|`structured`|`graphrag`|`open`.
+    pub mode: String,
 }
 
 impl Config {
@@ -67,6 +69,7 @@ impl Config {
             max_tokens: parse_or(get("GNLQA_MAX_TOKENS"), 1024),
             temperature: parse_or(get("GNLQA_TEMPERATURE"), 0.0),
             timeout_secs: parse_or(get("GNLQA_TIMEOUT_SECS"), 60),
+            mode: get("GNLQA_MODE").unwrap_or_else(|| "auto".to_string()),
         }
     }
 
@@ -97,6 +100,7 @@ impl Default for Config {
             max_tokens: 1024,
             temperature: 0.0,
             timeout_secs: 60,
+            mode: "auto".to_string(),
         }
     }
 }

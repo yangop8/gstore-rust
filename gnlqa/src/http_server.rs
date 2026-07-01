@@ -104,6 +104,7 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                         "confidence": round3(a.confidence),
                         "abstained": a.abstained,
                         "rounds": a.rounds,
+                        "provenance": a.provenance.tag(),
                     }),
                 ),
                 // Native endpoint: a real failure is a 500 (proxies/monitoring

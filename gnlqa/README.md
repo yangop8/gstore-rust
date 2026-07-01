@@ -96,6 +96,43 @@ gnlqa serve 127.0.0.1:9100           # HTTP SPARQL-QA server (see below)
 gnlqa                                # print configuration/readiness
 ```
 
+While a question runs, gNLQA prints short stage logs to stderr (e.g.
+`[gnlqa] generating SPARQL… (model)`, `[gnlqa] querying gStore…`) so you can see
+whether it's waiting on the model or on gStore.
+
+## Answering modes & provenance
+
+Every answer is tagged with where it came from — a **trust and data-egress**
+signal, not just attribution:
+
+- **`gStore`** — structured SPARQL / graph-analytics computed locally; the
+  underlying **data never left the machine** (only the question + schema went to
+  the LLM).
+- **`gStore+LLM (GraphRAG)`** — the LLM composed the answer from private triples
+  **retrieved from gStore and sent to the LLM**.
+- **`LLM`** — the LLM answered from its **general knowledge**; no KB data involved.
+
+You choose which path(s) are allowed with `GNLQA_MODE` (or `/mode` in chat):
+
+| Mode         | Behaviour | Provenance |
+|--------------|-----------|------------|
+| `auto` (default) | structured SPARQL, then GraphRAG fallback; **never** pure LLM | gStore / GraphRAG |
+| `structured` | SPARQL / analytics **only** — data never leaves; abstains otherwise | gStore |
+| `graphrag`   | retrieve a private subgraph → LLM answers from it | GraphRAG |
+| `open`       | answer from the LLM's general knowledge; ignore the KB | LLM |
+
+> Design note: a SPARQL-generation *failure* on an in-domain question is **not**
+> silently answered from LLM world-knowledge (that risks confident hallucination
+> on private-data questions) — `auto` falls back to GraphRAG or abstains. LLM-direct
+> only happens when you explicitly choose `open`.
+
+```sh
+gnlqa chat
+[auto]> /mode structured      # data never leaves the machine
+[structured]> who directed Alien?
+[open]> what is SPARQL?        # /mode open → answered from the LLM
+```
+
 ## HTTP server
 
 `gnlqa serve [addr]` (default `127.0.0.1:9100`) exposes:
@@ -159,6 +196,7 @@ same names work as env vars.
 | `GNLQA_MAX_TOKENS`   | `1024`                             | default completion cap |
 | `GNLQA_TEMPERATURE`  | `0.0`                              | default sampling temperature |
 | `GNLQA_TIMEOUT_SECS` | `60`                               | per-request HTTP timeout |
+| `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above) |
 
 ## Library
 

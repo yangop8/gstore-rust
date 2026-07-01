@@ -8,7 +8,7 @@
 use crate::error::Result;
 use crate::llm::{LlmClient, LlmRequest};
 use crate::pipeline::Answer;
-use crate::solve::SolveEngine;
+use crate::solve::{Mode, SolveEngine};
 
 /// System prompt for the rewrite step: resolve pronouns/ellipsis against the
 /// conversation, output nothing but the rewritten question.
@@ -142,8 +142,13 @@ impl<'a> Session<'a> {
     /// stays resolved) plus a bounded snapshot of the answer, so the rewriter
     /// gets stable grounding without unbounded prompt growth.
     pub fn ask(&mut self, question: &str) -> Result<Answer> {
+        self.ask_with_mode(question, Mode::Auto)
+    }
+
+    /// Like [`ask`](Self::ask) but constrains the answering path (see [`Mode`]).
+    pub fn ask_with_mode(&mut self, question: &str, mode: Mode) -> Result<Answer> {
         let standalone = self.engine.rewrite_followup_question(&self.history, question);
-        let answer = self.engine.ask(&standalone)?;
+        let answer = self.engine.ask_with_mode(&standalone, mode)?;
         self.history.push((standalone, summarize_answer(&answer)));
         self.trim_history();
         Ok(answer)

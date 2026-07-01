@@ -159,6 +159,7 @@ impl McpServer {
             out.push_str(&format!("\n\n[sparql] {s}"));
         }
         out.push_str(&format!("\n[confidence] {:.2}", a.confidence));
+        out.push_str(&format!("  [provided by {}]", a.provenance.label()));
         if a.abstained {
             out.push_str(" [abstained]");
         }
