@@ -246,10 +246,17 @@ impl GStoreClient {
         // (ureq's into_json/into_string read the whole body unbounded).
         use std::io::Read;
         let mut buf = Vec::new();
+        // Read one past the cap so we can tell "hit the limit" from "exactly at
+        // it", and fail rather than silently returning a truncated result.
         resp.into_reader()
-            .take(MAX_RESPONSE_BYTES)
+            .take(MAX_RESPONSE_BYTES + 1)
             .read_to_end(&mut buf)
             .map_err(|e| Error::GStore(e.to_string()))?;
+        if buf.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(Error::GStore(format!(
+                "response exceeds the {MAX_RESPONSE_BYTES}-byte limit"
+            )));
+        }
         if is_json {
             let v: Value = serde_json::from_slice(&buf).map_err(|e| Error::Json(e.to_string()))?;
             parse_results(&v)

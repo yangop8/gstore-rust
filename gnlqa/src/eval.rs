@@ -150,11 +150,11 @@ fn qald_answers(q: &Value) -> Option<HashSet<String>> {
             }
         }
     }
-    if set.is_empty() {
-        None
-    } else {
-        Some(set)
-    }
+    // The `answers` field is present (we got past the `?`), so this is real gold —
+    // return it even when empty (an explicit "the answer is nothing"), so it's
+    // scored under the QALD empty-set convention rather than silently skipped.
+    // (`None`, i.e. skip, is reserved for an absent answers field — handled above.)
+    Some(set)
 }
 
 fn value_to_string(v: &Value) -> String {
@@ -325,6 +325,16 @@ mod tests {
         assert_eq!(qs[0].question, "Who directed Alien?"); // en preferred
         assert!(qs[0].gold_sparql.as_deref().unwrap().contains("SELECT"));
         assert!(qs[0].gold_answers.as_ref().unwrap().contains("http://dbpedia.org/resource/Ridley_Scott"));
+    }
+
+    #[test]
+    fn qald_present_but_empty_gold_is_scored_not_skipped() {
+        // answers field present but with no bindings → Some(empty) gold (an
+        // explicit "nothing"), so run_eval scores it rather than skipping.
+        let json = r#"{"questions":[{"id":"1","question":[{"language":"en","string":"none?"}],
+            "answers":[{"head":{"vars":["x"]},"results":{"bindings":[]}}]}]}"#;
+        let qs = load_qald(json).unwrap();
+        assert_eq!(qs[0].gold_answers, Some(HashSet::new()));
     }
 
     #[test]

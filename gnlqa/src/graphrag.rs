@@ -215,7 +215,6 @@ pub fn is_dont_know(s: &str) -> bool {
         "não sei",          // pt
         "ich weiß es nicht", // de
         "ich weiss es nicht",
-        "非常抱歉",          // zh (polite refusal prefix)
         "我不知道",          // zh
         "不知道",            // zh
         "わかりません",       // ja
