@@ -25,9 +25,13 @@ fn is_iso_code(s: &str) -> bool {
 pub fn detect_script_lang(text: &str) -> Option<&'static str> {
     let (mut han, mut kana, mut hangul, mut cyr, mut arab, mut total) = (0, 0, 0, 0, 0, 0usize);
     for c in text.chars() {
-        if c.is_alphabetic() {
-            total += 1;
+        // Only letters count toward a script — this excludes CJK punctuation
+        // (e.g. the katakana middle dot U+30FB, inside the kana block but not
+        // alphabetic) so a Latin string with a stray `・` isn't misread as ja.
+        if !c.is_alphabetic() {
+            continue;
         }
+        total += 1;
         match c {
             '\u{3040}'..='\u{30FF}' => kana += 1,   // Hiragana + Katakana
             '\u{AC00}'..='\u{D7AF}' => hangul += 1,  // Hangul syllables
@@ -99,7 +103,13 @@ pub fn abstain_message(code: &str) -> &'static str {
         "es" => "No tengo suficiente confianza para responder esto con los datos.",
         "fr" => "Je ne suis pas assez sûr pour répondre à partir des données.",
         "de" => "Ich bin nicht sicher genug, um dies aus den Daten zu beantworten.",
+        "it" => "Non ho abbastanza certezza per rispondere in base ai dati.",
+        "pt" => "Não tenho confiança suficiente para responder isto com os dados.",
+        "nl" => "Ik ben er niet zeker genoeg van om dit uit de gegevens te beantwoorden.",
         "ru" => "У меня недостаточно уверенности, чтобы ответить на основе данных.",
+        "ar" => "لست واثقًا بما يكفي للإجابة عن هذا من البيانات.",
+        "hi" => "मेरे पास इस डेटा से इसका उत्तर देने के लिए पर्याप्त निश्चितता नहीं है।",
+        "tr" => "Bunu verilerden yanıtlayacak kadar emin değilim.",
         _ => "I'm not confident enough to answer this from the data.",
     }
 }
@@ -131,6 +141,8 @@ mod tests {
         assert_eq!(detect_script_lang("Это русский"), Some("ru"));
         assert_eq!(detect_script_lang("hello world"), None);
         assert_eq!(detect_script_lang("123 !!!"), None); // no letters
+        // stray CJK punctuation (katakana middle dot) in Latin text ≠ Japanese
+        assert_eq!(detect_script_lang("A・B testing"), None);
     }
 
     #[test]
