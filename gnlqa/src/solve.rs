@@ -4,9 +4,12 @@
 //! the LLM and validated against gStore.
 
 use crate::error::{Error, Result};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+
 use crate::generate::generate_candidates;
 use crate::ground::{explain, gather_citations};
-use crate::intent::extract_intent;
+use crate::intent::{extract_intent, QType, QuestionIntent};
 use crate::kb::KbClient;
 use crate::link::{LinkKind, Linker};
 use crate::llm::LlmClient;
@@ -55,6 +58,34 @@ pub fn best_of(
     best.map(|(o, _)| o)
 }
 
+/// A small bounded answer cache (FIFO eviction). gNLQA does not mutate the KB,
+/// but the KB may change externally, so caching is opt-in and staleness-bounded.
+struct Cache {
+    cap: usize,
+    map: HashMap<String, Answer>,
+    order: VecDeque<String>,
+}
+
+impl Cache {
+    fn new(cap: usize) -> Cache {
+        Cache { cap: cap.max(1), map: HashMap::new(), order: VecDeque::new() }
+    }
+    fn get(&self, k: &str) -> Option<Answer> {
+        self.map.get(k).cloned()
+    }
+    fn put(&mut self, k: String, v: Answer) {
+        if self.map.insert(k.clone(), v).is_some() {
+            return; // already present, order unchanged
+        }
+        self.order.push_back(k);
+        while self.map.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
 /// The full QA engine: LLM + KB + (optional) linker.
 pub struct SolveEngine {
     llm: Box<dyn LlmClient>,
@@ -68,6 +99,8 @@ pub struct SolveEngine {
     explain: bool,
     abstain_below: f32,
     model: Option<String>,
+    fast_model: Option<String>,
+    cache: Option<Mutex<Cache>>,
 }
 
 impl SolveEngine {
@@ -84,6 +117,29 @@ impl SolveEngine {
             explain: false,
             abstain_below: 0.0,
             model: None,
+            fast_model: None,
+            cache: None,
+        }
+    }
+    /// Cheaper model for simple questions (factoid/list/count/boolean); complex
+    /// ones (analytics/path/compare/open) still use the primary model.
+    pub fn with_fast_model(mut self, model: impl Into<String>) -> SolveEngine {
+        self.fast_model = Some(model.into());
+        self
+    }
+    /// Enable a bounded answer cache of `capacity` questions (0 disables).
+    pub fn with_cache(mut self, capacity: usize) -> SolveEngine {
+        self.cache = (capacity > 0).then(|| Mutex::new(Cache::new(capacity)));
+        self
+    }
+
+    /// Pick the model for generation/repair based on question difficulty.
+    fn route_model(&self, intent: &QuestionIntent) -> Option<String> {
+        let hard = matches!(intent.qtype, QType::Analytics | QType::Path | QType::Compare | QType::Open);
+        if hard {
+            self.model.clone()
+        } else {
+            self.fast_model.clone().or_else(|| self.model.clone())
         }
     }
     /// Abstain (return a low-confidence "not sure" answer) when the winning
@@ -128,11 +184,26 @@ impl SolveEngine {
         self
     }
 
-    /// Answer a question end-to-end.
+    /// Answer a question end-to-end (cache-aware).
     pub fn ask(&self, question: &str) -> Result<Answer> {
-        let model = self.model.as_deref();
+        if let Some(cache) = &self.cache {
+            if let Some(hit) = cache.lock().unwrap().get(question) {
+                return Ok(hit);
+            }
+        }
+        let answer = self.solve_inner(question)?;
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().put(question.to_string(), answer.clone());
+        }
+        Ok(answer)
+    }
+
+    fn solve_inner(&self, question: &str) -> Result<Answer> {
         // 1) Understand. A parse failure shouldn't kill the query — degrade.
         let intent = extract_intent(self.llm.as_ref(), question).unwrap_or_default();
+        // Route generation/repair to the fast or primary model by difficulty.
+        let model_owned = self.route_model(&intent);
+        let model = model_owned.as_deref();
 
         // 2) Link + 3) ground (only if a linker is configured).
         let mut links = String::new();
@@ -320,6 +391,35 @@ mod tests {
             .unwrap();
         assert!(a2.abstained && a2.confidence < 0.5);
         assert!(a2.sparql.is_some());
+    }
+
+    #[test]
+    fn cache_serves_repeat_without_recompute() {
+        use std::sync::Arc;
+        let llm = Arc::new(MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]));
+        let kb = MockKb::new(vec![nonempty()]);
+        let engine = SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(kb))
+            .with_citations(false)
+            .with_cache(8);
+        let a1 = engine.ask("q").unwrap();
+        let a2 = engine.ask("q").unwrap(); // from cache
+        assert_eq!(a1.values, a2.values);
+        assert_eq!(llm.call_count(), 2, "second ask must be served from cache");
+    }
+
+    #[test]
+    fn model_routing_by_difficulty() {
+        use crate::intent::{QType, QuestionIntent};
+        let e = SolveEngine::new(Box::new(MockLlm::fixed("x")), Box::new(MockKb::new(vec![])))
+            .with_model("opus-primary")
+            .with_fast_model("sonnet-fast");
+        let factoid = QuestionIntent { qtype: QType::Factoid, ..Default::default() };
+        let analytics = QuestionIntent { qtype: QType::Analytics, ..Default::default() };
+        assert_eq!(e.route_model(&factoid).as_deref(), Some("sonnet-fast"));
+        assert_eq!(e.route_model(&analytics).as_deref(), Some("opus-primary"));
     }
 
     #[test]

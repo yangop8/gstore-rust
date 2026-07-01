@@ -19,6 +19,9 @@ fn build_engine(cfg: &Config) -> SolveEngine {
     .with_timeout(std::time::Duration::from_secs(cfg.timeout_secs));
     let kb = GStoreClient::from_config(cfg);
     SolveEngine::new(Box::new(llm), Box::new(kb))
+        .with_model(cfg.model.clone())
+        .with_fast_model(cfg.fast_model.clone())
+        .with_cache(256)
 }
 
 fn main() {

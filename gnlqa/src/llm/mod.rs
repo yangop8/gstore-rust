@@ -100,3 +100,11 @@ pub trait LlmClient: Send + Sync {
     /// Run one completion, returning the assistant's text.
     fn complete(&self, req: &LlmRequest) -> Result<String>;
 }
+
+/// Forward through shared handles (lets a test keep an `Arc` to inspect a mock
+/// while handing a boxed clone to the engine).
+impl<T: LlmClient + ?Sized> LlmClient for std::sync::Arc<T> {
+    fn complete(&self, req: &LlmRequest) -> Result<String> {
+        (**self).complete(req)
+    }
+}
