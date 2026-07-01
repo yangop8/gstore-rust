@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::kb::SparqlAnswer;
 use crate::solve::SolveEngine;
 
 /// Precision / recall / F1 for one comparison (all in `[0, 1]`).
@@ -66,26 +65,6 @@ pub fn normalize_answer(s: &str) -> String {
         }
     }
     t.trim().to_string()
-}
-
-/// Collect the answer set from a SPARQL result (all bound cells; booleans as
-/// "true"/"false"), normalized.
-fn answer_set(ans: &SparqlAnswer) -> HashSet<String> {
-    let mut set = HashSet::new();
-    match ans {
-        SparqlAnswer::Select { rows, .. } => {
-            for r in rows {
-                for c in r.iter().flatten() {
-                    set.insert(normalize_answer(&c.value));
-                }
-            }
-        }
-        SparqlAnswer::Boolean(b) => {
-            set.insert(b.to_string());
-        }
-        SparqlAnswer::Graph(_) => {}
-    }
-    set
 }
 
 /// Load a QALD-format dataset (`{"questions":[{id, question:[{language,string}],
@@ -211,7 +190,8 @@ pub struct QuestionScore {
 /// The aggregate outcome of an evaluation run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalReport {
-    /// Total questions in the dataset.
+    /// Questions considered this run: `min(limit, dataset size)` (dataset size
+    /// already excludes rows dropped at load time for an empty question string).
     pub total: usize,
     /// Questions actually scored (gold available).
     pub evaluated: usize,
@@ -245,7 +225,16 @@ fn resolve_gold(engine: &SolveEngine, q: &EvalQuestion, opts: &EvalOptions) -> O
     if opts.resolve_gold_via_kb {
         if let Some(sq) = &q.gold_sparql {
             if let Ok(ans) = engine.kb().query(sq) {
-                return Some(answer_set(&ans));
+                // Extract gold the SAME way predictions are (answer_values: one
+                // bound cell per row, booleans as true/false) so pred and gold
+                // are symmetric. An empty gold set means the query matched
+                // nothing in this KB → unresolvable, so skip rather than let the
+                // both-empty convention score a spurious 1.0.
+                let s: HashSet<String> = crate::pipeline::answer_values(&ans)
+                    .iter()
+                    .map(|v| normalize_answer(v))
+                    .collect();
+                return if s.is_empty() { None } else { Some(s) };
             }
         }
     }
@@ -293,7 +282,7 @@ pub fn run_eval(engine: &SolveEngine, questions: &[EvalQuestion], opts: &EvalOpt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kb::{MockKb, RdfTerm, TermKind};
+    use crate::kb::{MockKb, RdfTerm, SparqlAnswer, TermKind};
     use crate::llm::MockLlm;
 
     fn set(items: &[&str]) -> HashSet<String> {
@@ -410,5 +399,39 @@ mod tests {
         let report = run_eval(&engine, &questions, &EvalOptions::default());
         assert_eq!(report.evaluated, 0);
         assert_eq!(report.skipped, 1);
+    }
+
+    #[test]
+    fn kb_resolved_empty_gold_is_skipped_not_perfect() {
+        // gold SPARQL executes but matches nothing → skip, NOT a spurious 1.0.
+        let llm = MockLlm::fixed("unused"); // ask never runs for a skipped question
+        let kb = MockKb::new(vec![SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![] }]);
+        let engine = SolveEngine::new(Box::new(llm), Box::new(kb));
+        let questions = vec![EvalQuestion {
+            id: "q1".into(),
+            question: "which x?".into(),
+            gold_answers: None,
+            gold_sparql: Some("SELECT ?x WHERE { ?x <http://ex/p> ?o }".into()),
+        }];
+        let report =
+            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        assert_eq!(report.evaluated, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.macro_metrics.f1, 0.0); // not inflated
+    }
+
+    #[test]
+    fn kb_resolved_gold_scores_matching_prediction() {
+        let engine = answering_engine();
+        let questions = vec![EvalQuestion {
+            id: "q1".into(),
+            question: "which x?".into(),
+            gold_answers: None,
+            gold_sparql: Some("SELECT ?x WHERE { ?x <http://ex/p> ?o }".into()),
+        }];
+        let report =
+            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        assert_eq!(report.evaluated, 1);
+        assert!((report.macro_metrics.f1 - 1.0).abs() < 1e-9);
     }
 }
