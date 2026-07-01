@@ -313,7 +313,14 @@ impl SolveEngine {
         // answer, retrieve a subgraph around the linked entities and let the LLM
         // answer from it (open/relational questions a single BGP can't express).
         let structured_ok = best.as_ref().is_some_and(|o| !is_empty_answer(&o.answer));
-        if !structured_ok && self.graphrag && !ent_uris.is_empty() {
+        // Skip the fallback when its fixed confidence couldn't clear the caller's
+        // abstain threshold — otherwise we'd present a RAG answer the structured
+        // path would have withheld. Falling through lets `match best` abstain.
+        if !structured_ok
+            && self.graphrag
+            && !ent_uris.is_empty()
+            && RAG_CONFIDENCE >= self.abstain_below
+        {
             if let Some(ans) = self.graphrag_answer(question, &ent_uris, model) {
                 return Ok(ans);
             }
@@ -550,5 +557,36 @@ mod tests {
         assert!(a.sparql.is_none()); // GraphRAG path exposes no single query
         assert!(!a.citations.is_empty()); // grounded on the retrieved triple
         assert!((a.confidence - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn graphrag_respects_abstain_threshold() {
+        use crate::embed::HashEmbedder;
+        use crate::link::Linker;
+        let linker = Linker::from_labels(
+            Box::new(HashEmbedder::new(64)),
+            &[("http://ex/Alien".to_string(), "Alien".to_string())],
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        // A *valid* query that returns empty → structured Some(empty), conf ~0.1.
+        // RAG_CONFIDENCE (0.5) is below abstain_below (0.7), so the fallback must
+        // be skipped and the engine must abstain rather than emit a RAG answer.
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"open","mentions":[{"text":"Alien","kind":"entity"}]}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+            "SHOULD NOT BE CALLED — RAG must be skipped".to_string(),
+        ]);
+        let kb = MockKb::new(vec![empty()]);
+        let a = SolveEngine::new(Box::new(llm), Box::new(kb))
+            .with_linker(linker)
+            .with_max_rounds(0)
+            .with_abstain_below(0.7)
+            .ask("tell me about Alien")
+            .unwrap();
+        assert!(a.abstained, "sub-threshold RAG must not override the abstain policy");
+        assert!(a.confidence < 0.7);
     }
 }
