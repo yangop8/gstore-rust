@@ -251,3 +251,40 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 3. GraphRAG 适合长尾/开放问题兜底,但不替代精确 SPARQL;本设计的三路由(SPARQL / 图分析 / GraphRAG)与社区共识一致。
 
 > Sources: 见上各 arXiv/官方链接;另:[QALD-10 论文](https://www.researchgate.net/publication/376009186)、[Beyond Seen Data (schema-guided)](https://arxiv.org/pdf/2502.12737)、[DeSQ](https://arxiv.org/html/2606.00203)、[KGQA benchmarks 概览](https://www.emergentmind.com/topics/knowledge-graph-question-answering-kgqa-benchmarks)。
+
+## 12. 实现补充(as-built,在 §3–§7 骨架之上落地的能力)
+
+以下几项是实现阶段在原设计之上补齐的能力,均已落在 `gnlqa` crate 与 CLI 中(见 `gnlqa/README.md`)。
+
+### 12.1 问答模式(Mode)——把路由做成用户可控的隐私/信任开关
+§4 的三路由(结构化 SPARQL / 图分析 / GraphRAG)默认由意图分类自动选择;实现中把它进一步暴露为**用户可选的模式**(`GNLQA_MODE` 或 chat 里 `/mode`),因为"走哪条路"本质是一个**数据是否出域**的决定,应交给用户:
+
+| 模式 | 允许的路径 | 语义 |
+|------|-----------|------|
+| `auto`(默认) | 结构化 → 不行再 GraphRAG;**绝不**纯 LLM | 安全默认 |
+| `structured` | 仅结构化 SPARQL / 图分析,**数据绝不出域**,否则拒答 | 强隐私 |
+| `graphrag` | 取私域子图 → 交 LLM 作答 | 中间档 |
+| `open` | 纯 LLM 世界知识,不碰 KB(`answer_direct`) | 无私域数据 |
+
+**红线**:一条 in-domain 问题「SPARQL 生成失败」≠「可用 LLM 世界知识作答」——否则会在私域问题上产生自信的幻觉。因此 `auto` 失败只回退 GraphRAG 或拒答,**只有显式 `open` 才会纯 LLM 直答**。
+
+### 12.2 Provenance(答案来源)——数据出域边界,而不只是署名
+每个答案带一个 `Provenance` 标签,三档正好对齐"隐私 + 可信度":
+
+- **`gStore`**:结构化 SPARQL / 图分析,本地计算,**底层数据从未离开本机**(只有问题 + schema 发给 LLM)。
+- **`gStore+LLM (GraphRAG)`**:答案由 LLM 从 gStore 取回的**私域三元组**综合而来(这些三元组发给了 LLM)。
+- **`LLM`**:LLM 用自身世界知识作答,**不涉及任何 KB 数据**。
+
+CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 附带来源。这让"用本地存储保护私域数据"的初衷有了**可观测、可审计**的边界。
+
+### 12.3 可插拔 LLM 后端(§6 技术选型的落地)
+`LlmClient` trait 之下现有两个实现:`AnthropicClient`(Claude Messages API)与 `OpenAiClient`(OpenAI 兼容 `/chat/completions`,适配 OpenAI / **DeepSeek** / Together / 本地 vLLM 等)。经 `GNLQA_LLM_PROVIDER` 选择;推荐/默认后端为 DeepSeek(OpenAI 兼容)。注意点:推理型模型(如 `deepseek-v4-pro`)会先花 completion token 做隐藏推理再产出可见答案,故 `OpenAiClient` 对 `max_tokens` 设了下限(`MIN_MAX_TOKENS`)以免答案为空。
+
+### 12.4 配置文件与容错
+- **配置文件** `gnlqa.conf`(`KEY=VALUE`,路径可用 `GNLQA_CONFIG` 覆盖;env 优先于文件)让配置一次落盘、无需每次 export。仓库只提交假的 `gnlqa.conf.example`,真实 `gnlqa.conf`(含 key)被 gitignore。
+- **异常兜底**:`GNLQA_LLM_PROVIDER` 规范化(trim/小写/别名),未知值**告警并回退** anthropic;`GNLQA_MODE` 未知值告警回退 auto;空配置值按缺失处理→用默认;不可解析的数值告警回退默认;缺 key 启动告警 + 调用时优雅 `Err`;KB 启动不可达则降级为无 linker;推理模型空 content 视为失败以便降级。
+
+### 12.5 进度日志
+交互式(CLI 单问 / chat)默认开启阶段日志(stderr),明确当前在"问模型"还是"查 gStore"(`understanding…(model)` / `gathering schema…(gStore)` / `generating SPARQL…(model)` / `querying gStore…` …),给用户一个显式的等待目标;serve/mcp/eval 默认关闭。
+
+> 落地映射见 `gnlqa/src/{solve,pipeline,config,llm/openai,session,mcp,http_server,main}.rs`;评测 harness 见 `gnlqa/src/eval.rs`(QALD/LC-QuAD + P/R/F1)。
