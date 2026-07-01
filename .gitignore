@@ -10,3 +10,9 @@ Cargo.lock.orig
 
 # Claude Code agent worktrees / local state
 .claude/
+
+# Local gNLQA config (holds API keys) — commit gnlqa.conf.example instead
+gnlqa.conf
+
+# CCB control-plane runtime state
+/.ccb/

@@ -1,6 +1,7 @@
 //! Runtime configuration, sourced from the environment so secrets are never
 //! hard-coded. Read it once at startup with [`Config::from_env`].
 
+use std::collections::HashMap;
 use std::env;
 
 use crate::secret::Secret;
@@ -40,28 +41,32 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build a config from environment variables, falling back to sensible
-    /// defaults. Model IDs default to the latest Claude family.
+    /// Build a config from a config file plus environment variables (env wins),
+    /// falling back to sensible defaults. The file (default `gnlqa.conf` in the
+    /// working dir, or the path in `GNLQA_CONFIG`) is a simple `KEY=VALUE` list
+    /// using the same names as the env vars — so you configure once instead of
+    /// exporting every session. See `gnlqa.conf.example`.
     pub fn from_env() -> Config {
+        let file = load_config_file();
+        // env takes precedence over the file, so a one-off `KEY=… gnlqa …` still works.
+        let get = |k: &str| env::var(k).ok().or_else(|| file.get(k).cloned());
         Config {
-            anthropic_api_key: non_empty(env::var("ANTHROPIC_API_KEY").ok()).map(Secret::new),
-            anthropic_base_url: env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
-            llm_provider: env::var("GNLQA_LLM_PROVIDER")
-                .unwrap_or_else(|_| "anthropic".to_string()),
-            openai_api_key: non_empty(env::var("OPENAI_API_KEY").ok()).map(Secret::new),
-            openai_base_url: env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            model: env::var("GNLQA_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string()),
-            fast_model: env::var("GNLQA_FAST_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
-            gstore_endpoint: env::var("GSTORE_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:9000/sparql".to_string()),
-            gstore_user: non_empty(env::var("GSTORE_USER").ok()),
-            gstore_password: non_empty(env::var("GSTORE_PASSWORD").ok()).map(Secret::new),
-            max_tokens: env_parse("GNLQA_MAX_TOKENS", 1024),
-            temperature: env_parse("GNLQA_TEMPERATURE", 0.0),
-            timeout_secs: env_parse("GNLQA_TIMEOUT_SECS", 60),
+            anthropic_api_key: non_empty(get("ANTHROPIC_API_KEY")).map(Secret::new),
+            anthropic_base_url: get("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+            llm_provider: get("GNLQA_LLM_PROVIDER").unwrap_or_else(|| "anthropic".to_string()),
+            openai_api_key: non_empty(get("OPENAI_API_KEY")).map(Secret::new),
+            openai_base_url: get("OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            model: get("GNLQA_MODEL").unwrap_or_else(|| "claude-opus-4-8".to_string()),
+            fast_model: get("GNLQA_FAST_MODEL").unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+            gstore_endpoint: get("GSTORE_ENDPOINT")
+                .unwrap_or_else(|| "http://127.0.0.1:9000/sparql".to_string()),
+            gstore_user: non_empty(get("GSTORE_USER")),
+            gstore_password: non_empty(get("GSTORE_PASSWORD")).map(Secret::new),
+            max_tokens: parse_or(get("GNLQA_MAX_TOKENS"), 1024),
+            temperature: parse_or(get("GNLQA_TEMPERATURE"), 0.0),
+            timeout_secs: parse_or(get("GNLQA_TIMEOUT_SECS"), 60),
         }
     }
 
@@ -101,17 +106,85 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// Parse an env var, falling back to `default`. A *present but unparseable*
-/// value is a likely typo, so warn rather than silently ignore it.
-fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    match env::var(key) {
-        Ok(s) => match s.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("gnlqa: warning: env {key}={s:?} is not parseable; using default");
-                default
+/// Parse an optional value, falling back to `default`. A *present but
+/// unparseable* value is a likely typo, so warn rather than silently ignore it.
+fn parse_or<T: std::str::FromStr>(v: Option<String>, default: T) -> T {
+    let Some(s) = v else { return default };
+    match s.parse() {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln!("gnlqa: warning: value {s:?} is not parseable; using default");
+            default
+        }
+    }
+}
+
+/// Load a `KEY=VALUE` config file (`GNLQA_CONFIG` path, else `gnlqa.conf` in the
+/// working dir). Blank lines and `#` comments are ignored; surrounding quotes are
+/// stripped. Missing file → empty map (env-only, as before).
+fn load_config_file() -> HashMap<String, String> {
+    let path = env::var("GNLQA_CONFIG").unwrap_or_else(|_| "gnlqa.conf".to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(content) => parse_config(&content),
+        Err(_) => HashMap::new(), // missing file → env-only, as before
+    }
+}
+
+/// Parse a `KEY=VALUE` config body. Blank lines and `#` comments are ignored;
+/// surrounding quotes are stripped.
+fn parse_config(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.to_string());
             }
-        },
-        Err(_) => default,
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_reads_pairs_comments_and_quotes() {
+        let body = "\
+            # a comment\n\
+            GNLQA_LLM_PROVIDER=openai\n\
+            OPENAI_BASE_URL = https://api.deepseek.com \n\
+            OPENAI_API_KEY=\"sk-abc\"\n\
+            \n\
+            GNLQA_MODEL='deepseek-v4-pro'\n\
+            no_equals_line\n";
+        let m = parse_config(body);
+        assert_eq!(m.get("GNLQA_LLM_PROVIDER").unwrap(), "openai");
+        assert_eq!(m.get("OPENAI_BASE_URL").unwrap(), "https://api.deepseek.com"); // trimmed
+        assert_eq!(m.get("OPENAI_API_KEY").unwrap(), "sk-abc"); // quotes stripped
+        assert_eq!(m.get("GNLQA_MODEL").unwrap(), "deepseek-v4-pro");
+        assert!(!m.contains_key("no_equals_line"));
+        assert_eq!(m.len(), 4);
+    }
+
+    #[test]
+    fn parse_or_warns_and_defaults_on_garbage() {
+        assert_eq!(parse_or(Some("42".to_string()), 0u32), 42);
+        assert_eq!(parse_or(None, 7u32), 7);
+        assert_eq!(parse_or(Some("nope".to_string()), 9u32), 9); // unparseable → default
+    }
+
+    #[test]
+    fn default_provider_is_anthropic_and_openai_fields_present() {
+        let c = Config::default();
+        assert_eq!(c.llm_provider, "anthropic");
+        assert!(c.openai_api_key.is_none());
+        assert_eq!(c.openai_base_url, "https://api.openai.com/v1");
     }
 }

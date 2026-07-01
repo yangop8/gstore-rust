@@ -43,17 +43,46 @@ Fallbacks and routing layered on top:
 - **Confidence & abstention** — a ranking-derived confidence; below a configurable
   threshold the engine withholds the answer (still exposing the SPARQL).
 
-## Install / build
+## Quick start
 
-Part of the gStore Cargo workspace:
+gNLQA reads a **`gnlqa.conf`** file at startup (a simple `KEY=VALUE` list; real env
+vars override it), so you configure once instead of exporting every session. The
+default backend is **DeepSeek** (an OpenAI-compatible endpoint):
 
 ```sh
 cargo build -p gnlqa --release
-export ANTHROPIC_API_KEY=sk-ant-...      # required for live answers
+cp gnlqa.conf.example gnlqa.conf     # then edit gnlqa.conf: set OPENAI_API_KEY=<your key>
 ```
 
+`gnlqa.conf` is git-ignored (it holds your key); only the fake `gnlqa.conf.example`
+is committed. It presets:
+
+```ini
+GNLQA_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.deepseek.com
+GNLQA_MODEL=deepseek-v4-pro
+GNLQA_FAST_MODEL=deepseek-v4-flash
+GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
+```
+
+Load some RDF and serve it, then ask a question:
+
+```sh
+cargo run -q -p gstore --bin gbuild  -- movies movies.nt      # build movies.db
+cargo run -q -p gstore --bin gserver -- movies.db --port 9000 # serve SPARQL
+cargo run -q -p gnlqa  -- "who directed Inception?"           # → Christopher Nolan
+```
+
+To use **Anthropic (Claude)** instead, set `GNLQA_LLM_PROVIDER=anthropic` and
+`ANTHROPIC_API_KEY` (models e.g. `claude-opus-4-8` / `claude-sonnet-4-6`).
+
+> `deepseek-v4-pro` is a *reasoning* model — accurate but slow (~1–2 min/question,
+> since the full pipeline makes several calls). Use `deepseek-v4-flash` for the
+> fast path (already the default `GNLQA_FAST_MODEL`), or set both to flash for speed.
+
 The LLM and embedding clients are trait objects with mocks, so the crate compiles
-and its tests run **without** an API key.
+and its tests run **without** any API key.
 
 ## CLI
 
@@ -107,14 +136,23 @@ convention), macro-averaged over the questions:
   resolved locally are **skipped** (not scored), so the reported F1 isn't
   inflated by data the KB simply doesn't contain.
 
-## Configuration (environment)
+## Configuration
+
+Settings come from **`gnlqa.conf`** (a `KEY=VALUE` file; path overridable with
+`GNLQA_CONFIG`) with **environment variables taking precedence** — so you can keep
+your defaults in the file and still override one for a single run
+(`GNLQA_MODEL=… gnlqa …`). Copy `gnlqa.conf.example` to `gnlqa.conf` to start. The
+same names work as env vars.
 
 | Variable             | Default                            | Meaning |
 |----------------------|------------------------------------|---------|
-| `ANTHROPIC_API_KEY`  | — (required for live answers)      | Claude API key (never logged; held in a redacted `Secret`) |
+| `GNLQA_LLM_PROVIDER` | `anthropic`                        | LLM backend: `anthropic`, or `openai` for any OpenAI-compatible endpoint (DeepSeek, OpenAI, …) |
+| `OPENAI_API_KEY`     | — (required when provider=openai)  | key for the OpenAI-compatible backend (redacted `Secret`) |
+| `OPENAI_BASE_URL`    | `https://api.openai.com/v1`        | base URL for it, e.g. `https://api.deepseek.com` |
+| `ANTHROPIC_API_KEY`  | — (required when provider=anthropic)| Claude API key (never logged; held in a redacted `Secret`) |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com`        | API base URL |
-| `GNLQA_MODEL`        | `claude-opus-4-8`                  | primary model (hard questions) |
-| `GNLQA_FAST_MODEL`   | `claude-sonnet-4-6`                | fast model (intent, follow-up rewrite, simple questions) |
+| `GNLQA_MODEL`        | `claude-opus-4-8`                  | primary model (hard questions), e.g. `deepseek-v4-pro` |
+| `GNLQA_FAST_MODEL`   | `claude-sonnet-4-6`                | fast model (intent, follow-up rewrite, simple questions), e.g. `deepseek-v4-flash` |
 | `GSTORE_ENDPOINT`    | `http://127.0.0.1:9000/sparql`     | gStore SPARQL endpoint |
 | `GSTORE_USER`        | —                                  | optional HTTP Basic user |
 | `GSTORE_PASSWORD`    | —                                  | optional HTTP Basic password (redacted `Secret`) |

@@ -1,0 +1,28 @@
+# gNLQA configuration — copy this file to `gnlqa.conf` and fill in your API key.
+#
+#   cp gnlqa.conf.example gnlqa.conf   &&   $EDITOR gnlqa.conf
+#
+# gNLQA reads `gnlqa.conf` (or the path in $GNLQA_CONFIG) at startup, so you
+# configure once instead of exporting env vars every session. Real env vars
+# still override the file. `gnlqa.conf` is git-ignored (it holds your key);
+# only this fake example is committed. See gnlqa/README.md.
+
+# ---- LLM backend: DeepSeek (OpenAI-compatible) — the default ----
+GNLQA_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+OPENAI_BASE_URL=https://api.deepseek.com
+GNLQA_MODEL=deepseek-v4-pro
+GNLQA_FAST_MODEL=deepseek-v4-flash
+# deepseek-v4-pro is a reasoning model (slow); give calls plenty of time.
+GNLQA_TIMEOUT_SECS=180
+
+# ---- Alternative backend: Anthropic (Claude) ----
+# GNLQA_LLM_PROVIDER=anthropic
+# ANTHROPIC_API_KEY=sk-ant-...
+# GNLQA_MODEL=claude-opus-4-8
+# GNLQA_FAST_MODEL=claude-sonnet-4-6
+
+# ---- gStore SPARQL endpoint ----
+GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
+# GSTORE_USER=
+# GSTORE_PASSWORD=
