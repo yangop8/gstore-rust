@@ -25,6 +25,7 @@ pub mod intent;
 pub mod kb;
 pub mod link;
 pub mod llm;
+pub mod mcp;
 pub mod pipeline;
 pub mod repair;
 pub mod schema;
@@ -51,6 +52,7 @@ pub use kb::{
     TermKind,
 };
 pub use link::{local_name, Candidate, LinkKind, Linker};
+pub use mcp::McpServer;
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
 pub use pipeline::{Answer, AskEngine};

@@ -3,12 +3,13 @@
 //! * `gnlqa "<question>"`        — answer one question (full pipeline) and print it.
 //! * `gnlqa chat`                — interactive multi-turn conversation (REPL).
 //! * `gnlqa serve [addr]`        — run the HTTP server (default 127.0.0.1:9100).
+//! * `gnlqa mcp`                 — run the MCP server over stdio.
 //! * `gnlqa` (no args)           — print configuration/readiness.
 
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use gnlqa::{AnthropicClient, Config, GStoreClient, HttpServer, Session, SolveEngine};
+use gnlqa::{AnthropicClient, Config, GStoreClient, HttpServer, McpServer, Session, SolveEngine};
 
 fn build_engine(cfg: &Config) -> SolveEngine {
     // The KB client is always available; the LLM client errors at call time if
@@ -88,6 +89,7 @@ fn main() {
             eprintln!("gNLQA — usage:");
             eprintln!("  gnlqa \"<question>\"     answer one question");
             eprintln!("  gnlqa chat              interactive multi-turn conversation");
+            eprintln!("  gnlqa mcp               run the MCP server over stdio");
             eprintln!("  gnlqa serve [addr]      run the HTTP server (default 127.0.0.1:9100)");
             eprintln!("  model={}  gstore={}", cfg.model, cfg.gstore_endpoint);
             if !cfg.has_api_key() {
@@ -95,6 +97,11 @@ fn main() {
             }
         }
         Some("chat") => run_chat(&cfg),
+        Some("mcp") => {
+            let engine = Arc::new(build_engine(&cfg));
+            eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
+            McpServer::new(engine).serve_stdio();
+        }
         Some("serve") => {
             let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9100".to_string());
             let engine = Arc::new(build_engine(&cfg));

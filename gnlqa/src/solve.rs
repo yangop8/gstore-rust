@@ -222,6 +222,19 @@ impl SolveEngine {
         self
     }
 
+    /// The KB client, for direct SPARQL / analytics access (e.g. the MCP server).
+    pub fn kb(&self) -> &dyn KbClient {
+        self.kb.as_ref()
+    }
+    /// The configured entity linker, if any.
+    pub fn linker(&self) -> Option<&Linker> {
+        self.linker.as_ref()
+    }
+    /// The analytics retrieval configuration.
+    pub fn analytics_cfg(&self) -> crate::analytics::AnalyticsCfg {
+        self.analytics_cfg
+    }
+
     /// Answer a question end-to-end (cache-aware).
     pub fn ask(&self, question: &str) -> Result<Answer> {
         let key = question.trim();
