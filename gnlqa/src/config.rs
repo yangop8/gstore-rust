@@ -52,24 +52,25 @@ impl Config {
         let file = load_config_file();
         // env takes precedence over the file, so a one-off `KEY=… gnlqa …` still works.
         let get = |k: &str| env::var(k).ok().or_else(|| file.get(k).cloned());
+        // A blank/whitespace value (e.g. `GNLQA_MODEL=` in the file) is treated as
+        // absent, falling back to the default rather than an empty string that
+        // would make the LLM/model call fail.
+        let or = |v: Option<String>, d: &str| non_empty(v).unwrap_or_else(|| d.to_string());
         Config {
             anthropic_api_key: non_empty(get("ANTHROPIC_API_KEY")).map(Secret::new),
-            anthropic_base_url: get("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
-            llm_provider: get("GNLQA_LLM_PROVIDER").unwrap_or_else(|| "anthropic".to_string()),
+            anthropic_base_url: or(get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com"),
+            llm_provider: normalize_provider(get("GNLQA_LLM_PROVIDER")),
             openai_api_key: non_empty(get("OPENAI_API_KEY")).map(Secret::new),
-            openai_base_url: get("OPENAI_BASE_URL")
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            model: get("GNLQA_MODEL").unwrap_or_else(|| "claude-opus-4-8".to_string()),
-            fast_model: get("GNLQA_FAST_MODEL").unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
-            gstore_endpoint: get("GSTORE_ENDPOINT")
-                .unwrap_or_else(|| "http://127.0.0.1:9000/sparql".to_string()),
+            openai_base_url: or(get("OPENAI_BASE_URL"), "https://api.openai.com/v1"),
+            model: or(get("GNLQA_MODEL"), "claude-opus-4-8"),
+            fast_model: or(get("GNLQA_FAST_MODEL"), "claude-sonnet-4-6"),
+            gstore_endpoint: or(get("GSTORE_ENDPOINT"), "http://127.0.0.1:9000/sparql"),
             gstore_user: non_empty(get("GSTORE_USER")),
             gstore_password: non_empty(get("GSTORE_PASSWORD")).map(Secret::new),
             max_tokens: parse_or(get("GNLQA_MAX_TOKENS"), 1024),
             temperature: parse_or(get("GNLQA_TEMPERATURE"), 0.0),
             timeout_secs: parse_or(get("GNLQA_TIMEOUT_SECS"), 60),
-            mode: get("GNLQA_MODE").unwrap_or_else(|| "auto".to_string()),
+            mode: or(get("GNLQA_MODE"), "auto"),
         }
     }
 
@@ -108,6 +109,27 @@ impl Default for Config {
 /// Treat empty strings as absent.
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
+}
+
+/// Canonicalize the LLM provider to `"anthropic"` or `"openai"` (the only two
+/// [`from_env`](Config::from_env)/build_engine understand). Absent → `anthropic`;
+/// case/whitespace-insensitive; common aliases accepted; an unrecognized value
+/// warns and falls back to `anthropic` rather than silently misrouting.
+fn normalize_provider(v: Option<String>) -> String {
+    match non_empty(v) {
+        None => "anthropic".to_string(),
+        Some(s) => match s.trim().to_lowercase().as_str() {
+            "anthropic" | "claude" => "anthropic".to_string(),
+            "openai" | "oai" | "deepseek" | "compatible" => "openai".to_string(),
+            other => {
+                eprintln!(
+                    "gnlqa: warning: unknown GNLQA_LLM_PROVIDER {other:?}; \
+                     using 'anthropic' (valid: anthropic, openai)"
+                );
+                "anthropic".to_string()
+            }
+        },
+    }
 }
 
 /// Parse an optional value, falling back to `default`. A *present but
@@ -190,5 +212,22 @@ mod tests {
         assert_eq!(c.llm_provider, "anthropic");
         assert!(c.openai_api_key.is_none());
         assert_eq!(c.openai_base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn normalize_provider_canonicalizes_and_defaults() {
+        assert_eq!(normalize_provider(None), "anthropic");
+        assert_eq!(normalize_provider(Some("   ".into())), "anthropic"); // blank → default
+        assert_eq!(normalize_provider(Some("OpenAI".into())), "openai"); // case-insensitive
+        assert_eq!(normalize_provider(Some(" deepseek ".into())), "openai"); // alias + trim
+        assert_eq!(normalize_provider(Some("claude".into())), "anthropic"); // alias
+        assert_eq!(normalize_provider(Some("gpt5".into())), "anthropic"); // unknown → safe default
+    }
+
+    #[test]
+    fn non_empty_treats_blank_as_absent() {
+        assert!(non_empty(Some("".into())).is_none());
+        assert!(non_empty(Some("   ".into())).is_none());
+        assert_eq!(non_empty(Some("x".into())).as_deref(), Some("x"));
     }
 }
