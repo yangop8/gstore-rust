@@ -101,7 +101,13 @@ pub struct SolveEngine {
     model: Option<String>,
     fast_model: Option<String>,
     cache: Option<Mutex<Cache>>,
+    graphrag: bool,
+    rag: crate::graphrag::RetrievalCfg,
 }
+
+/// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
+/// KB-verified the way a SELECT result is. Kept below the structured-answer band.
+const RAG_CONFIDENCE: f32 = 0.5;
 
 impl SolveEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> SolveEngine {
@@ -119,7 +125,20 @@ impl SolveEngine {
             model: None,
             fast_model: None,
             cache: None,
+            graphrag: true,
+            rag: crate::graphrag::RetrievalCfg::default(),
         }
+    }
+    /// Enable/disable the GraphRAG fallback for open questions and empty
+    /// structured results (default on).
+    pub fn with_graphrag(mut self, on: bool) -> SolveEngine {
+        self.graphrag = on;
+        self
+    }
+    /// BFS depth for GraphRAG subgraph retrieval (≥1).
+    pub fn with_rag_hops(mut self, hops: usize) -> SolveEngine {
+        self.rag.hops = hops.max(1);
+        self
     }
     /// Cheaper model for simple questions (factoid/list/count/boolean); complex
     /// ones (analytics/path/compare/open) still use the primary model.
@@ -290,6 +309,16 @@ impl SolveEngine {
             model,
         );
 
+        // GraphRAG fallback: when the structured path produced no non-empty
+        // answer, retrieve a subgraph around the linked entities and let the LLM
+        // answer from it (open/relational questions a single BGP can't express).
+        let structured_ok = best.as_ref().is_some_and(|o| !is_empty_answer(&o.answer));
+        if !structured_ok && self.graphrag && !ent_uris.is_empty() {
+            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model) {
+                return Ok(ans);
+            }
+        }
+
         match best {
             Some(o) => {
                 let values = answer_values(&o.answer);
@@ -336,6 +365,34 @@ impl SolveEngine {
             }
             None => Err(Error::Sparql("no candidate query produced an answer".into())),
         }
+    }
+
+    /// Retrieve a subgraph around `seeds` and let the LLM answer from it. Returns
+    /// `None` when nothing was retrieved or the model declined ("I don't know"),
+    /// so the caller can fall through to the honest structured result/error.
+    fn graphrag_answer(&self, question: &str, seeds: &[String], model: Option<&str>) -> Option<Answer> {
+        use crate::graphrag::{answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph};
+        let triples = retrieve_subgraph(self.kb.as_ref(), seeds, self.rag);
+        if triples.is_empty() {
+            return None;
+        }
+        let subgraph = render_subgraph(&triples);
+        let raw = answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model).ok()?;
+        if is_dont_know(&raw) {
+            return None;
+        }
+        let citations =
+            if self.cite { triples.iter().take(30).map(|t| t.to_citation()).collect() } else { Vec::new() };
+        Some(Answer {
+            text: raw.trim().to_string(),
+            values: Vec::new(),
+            sparql: None, // GraphRAG has no single query to expose
+            rounds: 0,
+            citations,
+            explanation: None,
+            confidence: RAG_CONFIDENCE,
+            abstained: false,
+        })
     }
 }
 
@@ -449,10 +506,49 @@ mod tests {
 
     #[test]
     fn engine_fails_honestly_when_no_valid_candidate() {
-        // generation yields only an invalid candidate → no fabricated answer
+        // generation yields only an invalid candidate, GraphRAG disabled → no
+        // fabricated answer
         let llm = MockLlm::new(vec![r#"{"qtype":"factoid"}"#.to_string(), r#"["not sparql"]"#.to_string()]);
         let kb = MockKb::new(vec![nonempty()]);
-        let engine = SolveEngine::new(Box::new(llm), Box::new(kb));
+        let engine = SolveEngine::new(Box::new(llm), Box::new(kb)).with_graphrag(false);
         assert!(engine.ask("q").is_err());
+    }
+
+    #[test]
+    fn graphrag_fallback_when_no_structured_answer() {
+        use crate::embed::HashEmbedder;
+        use crate::link::Linker;
+        // linker maps "Alien" → a URI so the entity becomes a GraphRAG seed
+        let linker = Linker::from_labels(
+            Box::new(HashEmbedder::new(64)),
+            &[("http://ex/Alien".to_string(), "Alien".to_string())],
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        // LLM: intent (open + Alien mention), generation (no valid query), RAG answer.
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"open","mentions":[{"text":"Alien","kind":"entity"}]}"#.to_string(),
+            r#"["not a query"]"#.to_string(),
+            "Ridley Scott directed Alien.".to_string(),
+        ]);
+        // Every KB query returns a (p, o) row (schema gather + GraphRAG outgoing).
+        let po = SparqlAnswer::Select {
+            vars: vec!["p".into(), "o".into()],
+            rows: vec![vec![
+                Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/directed".into(), datatype: None, lang: None }),
+                Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/RidleyScott".into(), datatype: None, lang: None }),
+            ]],
+        };
+        let kb = MockKb::new(vec![po]);
+        let engine = SolveEngine::new(Box::new(llm), Box::new(kb))
+            .with_linker(linker)
+            .with_model("primary");
+        let a = engine.ask("tell me about Alien").unwrap();
+        assert_eq!(a.text, "Ridley Scott directed Alien.");
+        assert!(a.sparql.is_none()); // GraphRAG path exposes no single query
+        assert!(!a.citations.is_empty()); // grounded on the retrieved triple
+        assert!((a.confidence - 0.5).abs() < 1e-6);
     }
 }

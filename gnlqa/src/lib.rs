@@ -17,6 +17,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod generate;
+pub mod graphrag;
 pub mod ground;
 pub mod http_server;
 pub mod intent;
@@ -34,6 +35,9 @@ pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
 pub use generate::{generate_candidates, parse_candidates};
+pub use graphrag::{
+    answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, RetrievalCfg, Triple,
+};
 pub use ground::{explain, gather_citations, Citation};
 pub use http_server::HttpServer;
 pub use intent::{
