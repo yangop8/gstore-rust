@@ -35,37 +35,57 @@ pub enum AnalyticsOp {
 
 /// Classify the analytics operation from the question text (keyword heuristic;
 /// the LLM already tagged the question `analytics`, this picks *which* one).
-pub fn classify_op(question: &str) -> AnalyticsOp {
+/// `seed_count` is how many entities were linked: shortest-path needs two, so a
+/// path-phrased question with fewer falls through to a graph-wide metric.
+pub fn classify_op(question: &str, seed_count: usize) -> AnalyticsOp {
     let q = question.to_lowercase();
     let has = |p: &str| q.contains(p);
-    if has("shortest path") || has("path between") || has("path from") || has("connect") && has("to")
-    {
+    // A question about communities/components should never be read as a path,
+    // even if it happens to contain "connected"/"related".
+    let component_q = has("communit") || has("cluster") || has("component");
+    // Phrase-level path triggers — avoid bare substrings like "to" that match
+    // almost any sentence. Only route to ShortestPath with two endpoints.
+    let path_phrase = has("shortest path")
+        || has("path between")
+        || has("path from")
+        || has("connected to")
+        || has("connection between")
+        || has("related to")
+        || has("relationship between");
+    if path_phrase && seed_count >= 2 && !component_q {
         AnalyticsOp::ShortestPath
     } else if has("triangle") {
         AnalyticsOp::Triangles
-    } else if has("communit") || has("cluster") || has("connected component") || has("component") {
+    } else if component_q || has("connected component") {
         AnalyticsOp::Components
-    } else if has("pagerank") || has("page rank") || has("influential") || has("important") {
-        AnalyticsOp::PageRank
     } else if has("central") || has("most connected") || has("highest degree") || has("hub") {
         AnalyticsOp::Centrality
     } else {
-        AnalyticsOp::PageRank // sensible default: importance ranking
+        // PageRank keywords (pagerank / influential / important) and the default
+        // both land here: importance ranking is the sensible fallback.
+        AnalyticsOp::PageRank
     }
 }
+
+/// A hard upper bound on the retrieved edge count, regardless of caller config,
+/// so a large `max_edges` can't materialize an entire store in memory.
+pub const MAX_EDGES_CEILING: usize = 200_000;
 
 /// Bounds for analytics retrieval.
 #[derive(Debug, Clone, Copy)]
 pub struct AnalyticsCfg {
-    /// Cap on edges pulled from the KB (analytics runs over this sample).
+    /// Cap on edges pulled from the KB (analytics runs over this sample). Clamped
+    /// to [`MAX_EDGES_CEILING`] at use.
     pub max_edges: usize,
     /// How many nodes to list for ranking operations.
     pub top_k: usize,
+    /// BFS depth for seed-anchored shortest-path retrieval (from each endpoint).
+    pub path_hops: usize,
 }
 
 impl Default for AnalyticsCfg {
     fn default() -> Self {
-        AnalyticsCfg { max_edges: 50_000, top_k: 10 }
+        AnalyticsCfg { max_edges: 50_000, top_k: 10, path_hops: 3 }
     }
 }
 
@@ -138,10 +158,13 @@ fn edge_query(limit: usize) -> String {
     format!("SELECT ?s ?o WHERE {{ ?s ?p ?o }} LIMIT {limit}")
 }
 
-/// Retrieve the edge sample and build the projected graph.
+/// Retrieve a graph-wide edge sample and build the projected graph. Used by the
+/// metrics that need the whole graph (PageRank / centrality / components /
+/// triangles). Fetches `limit + 1` so hitting the cap is detectable exactly.
 fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
-    let limit = cfg.max_edges.max(1);
-    let ans = kb.query(&edge_query(limit))?;
+    let limit = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
+    // Ask for one extra row so `rows > limit` means "there was more".
+    let ans = kb.query(&edge_query(limit + 1))?;
     let SparqlAnswer::Select { vars, rows } = &ans else {
         return Err(Error::GStore("analytics edge query did not return a SELECT".into()));
     };
@@ -150,11 +173,11 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     else {
         return Err(Error::GStore("analytics edge query must bind ?s and ?o".into()));
     };
-    let truncated = rows.len() >= limit;
+    let truncated = rows.len() > limit;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
     let mut term_of: Vec<String> = Vec::new();
-    let mut triples: Vec<IdTriple> = Vec::with_capacity(rows.len());
-    for r in rows {
+    let mut triples: Vec<IdTriple> = Vec::with_capacity(rows.len().min(limit));
+    for r in rows.iter().take(limit) {
         if let (Some(Some(s)), Some(Some(o))) = (r.get(si), r.get(oi)) {
             let sid = intern(&mut id_of, &mut term_of, s.to_term_string());
             let oid = intern(&mut id_of, &mut term_of, o.to_term_string());
@@ -164,6 +187,32 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     let src = EdgeListSource { triples };
     let view = GraphView::from_source(&src);
     Ok(ProjectedGraph { view, id_of, term_of, truncated })
+}
+
+/// Build a projected graph anchored on the seed entities (a bounded k-hop
+/// neighbourhood around each), for shortest-path. A blind `LIMIT` sample would
+/// usually miss both endpoints on a large store; anchoring guarantees they're
+/// present if connected within reach. Edges are added in **both** directions so
+/// the directed `GraphView::shortest_path` yields *undirected* reachability
+/// ("how is X related to Y" ignores edge orientation).
+fn project_seeded(kb: &dyn KbClient, seeds: &[String], cfg: AnalyticsCfg) -> ProjectedGraph {
+    use crate::graphrag::{retrieve_subgraph, RetrievalCfg};
+    let total = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
+    let rcfg = RetrievalCfg { hops: cfg.path_hops.max(1), per_node: 128, total };
+    let subgraph = retrieve_subgraph(kb, seeds, rcfg);
+    let truncated = subgraph.len() >= total;
+    let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
+    let mut term_of: Vec<String> = Vec::new();
+    let mut triples: Vec<IdTriple> = Vec::with_capacity(subgraph.len() * 2);
+    for t in &subgraph {
+        let sid = intern(&mut id_of, &mut term_of, t.s.to_term_string());
+        let oid = intern(&mut id_of, &mut term_of, t.o.to_term_string());
+        triples.push(IdTriple::new(sid, 0, oid));
+        triples.push(IdTriple::new(oid, 0, sid)); // undirected reachability
+    }
+    let src = EdgeListSource { triples };
+    let view = GraphView::from_source(&src);
+    ProjectedGraph { view, id_of, term_of, truncated }
 }
 
 /// Render a `(id, score)` ranking as a top-k list of surface forms.
@@ -238,11 +287,26 @@ pub fn run_analytics(
     seeds: &[String],
     cfg: AnalyticsCfg,
 ) -> Result<AnalyticsResult> {
-    let op = classify_op(question);
+    let op = classify_op(question, seeds.len());
+
+    // Shortest path uses a seed-anchored, undirected subgraph (a blind LIMIT
+    // sample would usually miss the endpoints); the graph-wide metrics use the
+    // capped edge sample.
+    if op == AnalyticsOp::ShortestPath {
+        let g = project_seeded(kb, seeds, cfg);
+        return Ok(AnalyticsResult {
+            text: shortest_path_answer(&g, seeds),
+            op,
+            node_count: g.view.node_count(),
+            edge_count: g.view.edge_count(),
+            truncated: g.truncated,
+        });
+    }
+
     let g = project(kb, cfg)?;
     let k = cfg.top_k.max(1);
     let text = match op {
-        AnalyticsOp::ShortestPath => shortest_path_answer(&g, seeds),
+        AnalyticsOp::ShortestPath => unreachable!("handled above"),
         AnalyticsOp::PageRank => {
             let scores: Vec<(EntityLiteralId, f64)> =
                 g.view.pagerank(0.85, 100, 1e-6).into_iter().collect();
@@ -272,7 +336,8 @@ mod tests {
         RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None }
     }
 
-    /// A directed chain A → B → C plus A → C, as a single ?s ?o SELECT answer.
+    /// A directed chain A → B → C plus A → C, as a single ?s ?o SELECT answer
+    /// (the graph-wide `project` shape used by PageRank/centrality/etc.).
     fn chain_kb() -> MockKb {
         let rows = vec![
             vec![Some(t_uri("http://ex/A")), Some(t_uri("http://ex/B"))],
@@ -282,19 +347,43 @@ mod tests {
         MockKb::new(vec![SparqlAnswer::Select { vars: vec!["s".into(), "o".into()], rows }])
     }
 
-    #[test]
-    fn classify_covers_each_op() {
-        assert_eq!(classify_op("shortest path from A to B"), AnalyticsOp::ShortestPath);
-        assert_eq!(classify_op("how many triangles are there?"), AnalyticsOp::Triangles);
-        assert_eq!(classify_op("what communities exist?"), AnalyticsOp::Components);
-        assert_eq!(classify_op("who is the most influential person?"), AnalyticsOp::PageRank);
-        assert_eq!(classify_op("which node is most central?"), AnalyticsOp::Centrality);
-        assert_eq!(classify_op("rank the nodes"), AnalyticsOp::PageRank); // default
+    /// Seed-anchored retrieval issues graphrag out-queries (`?p ?o`); this canned
+    /// answer makes every entity link to C so a path exists. In-queries (`?s ?p`)
+    /// don't match this shape and yield nothing.
+    fn out_to_c_kb() -> MockKb {
+        MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["p".into(), "o".into()],
+            rows: vec![vec![Some(t_uri("http://ex/directed")), Some(t_uri("http://ex/C"))]],
+        }])
+    }
+
+    /// Seed-anchored retrieval that returns no edges (endpoints absent).
+    fn empty_po_kb() -> MockKb {
+        MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["p".into(), "o".into()],
+            rows: vec![],
+        }])
     }
 
     #[test]
-    fn shortest_path_over_projected_graph() {
-        let kb = chain_kb();
+    fn classify_covers_each_op() {
+        assert_eq!(classify_op("shortest path from A to B", 2), AnalyticsOp::ShortestPath);
+        // path phrase but only one linked entity → not shortest path
+        assert_eq!(classify_op("shortest path from A to B", 1), AnalyticsOp::PageRank);
+        assert_eq!(classify_op("how many triangles are there?", 0), AnalyticsOp::Triangles);
+        assert_eq!(classify_op("what communities exist?", 0), AnalyticsOp::Components);
+        assert_eq!(classify_op("who is the most influential person?", 0), AnalyticsOp::PageRank);
+        assert_eq!(classify_op("which node is most central?", 0), AnalyticsOp::Centrality);
+        assert_eq!(classify_op("rank the nodes", 0), AnalyticsOp::PageRank); // default
+        // a component question with two seeds must NOT be read as a path
+        assert_eq!(classify_op("what components is X related to?", 2), AnalyticsOp::Components);
+        // "most connected" with no path phrase is centrality, not a path
+        assert_eq!(classify_op("which node is most connected?", 0), AnalyticsOp::Centrality);
+    }
+
+    #[test]
+    fn shortest_path_over_seeded_subgraph() {
+        let kb = out_to_c_kb();
         let res = run_analytics(
             &kb,
             "shortest path from A to C",
@@ -303,18 +392,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res.op, AnalyticsOp::ShortestPath);
-        // A -> C is a direct edge → 1 hop.
+        // A links directly to C in the seeded subgraph → 1 hop.
         assert!(res.text.contains("1 hop"), "text: {}", res.text);
         assert!(res.text.contains("<http://ex/A>") && res.text.contains("<http://ex/C>"));
     }
 
     #[test]
-    fn shortest_path_needs_two_entities() {
-        let kb = chain_kb();
-        let res =
-            run_analytics(&kb, "shortest path", &["http://ex/A".into()], AnalyticsCfg::default())
-                .unwrap();
-        assert!(res.text.contains("needs two entities"));
+    fn shortest_path_absent_endpoints_are_graceful() {
+        let kb = empty_po_kb();
+        let res = run_analytics(
+            &kb,
+            "shortest path from A to B",
+            &["http://ex/A".into(), "http://ex/B".into()],
+            AnalyticsCfg::default(),
+        )
+        .unwrap();
+        assert_eq!(res.op, AnalyticsOp::ShortestPath);
+        assert!(res.text.contains("not present"), "text: {}", res.text);
     }
 
     #[test]
@@ -348,13 +442,16 @@ mod tests {
 
     #[test]
     fn truncated_flag_when_sample_hits_cap() {
-        let kb = chain_kb();
-        // cap of 3 with 3 rows → hit the cap → truncated.
+        // 4 edges available, cap of 3 → project fetches LIMIT 4, sees > 3 → flags.
+        let rows: Vec<_> = (0..4)
+            .map(|i| vec![Some(t_uri(&format!("http://ex/s{i}"))), Some(t_uri("http://ex/o"))])
+            .collect();
+        let kb = MockKb::new(vec![SparqlAnswer::Select { vars: vec!["s".into(), "o".into()], rows }]);
         let res = run_analytics(
             &kb,
             "rank nodes",
             &[],
-            AnalyticsCfg { max_edges: 3, top_k: 10 },
+            AnalyticsCfg { max_edges: 3, top_k: 10, path_hops: 3 },
         )
         .unwrap();
         assert!(res.truncated);

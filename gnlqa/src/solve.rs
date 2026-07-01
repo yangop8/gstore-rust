@@ -316,30 +316,35 @@ impl SolveEngine {
             && intent.qtype == QType::Analytics
             && ANALYTICS_CONFIDENCE >= self.abstain_below
         {
-            if let Ok(res) = crate::analytics::run_analytics(
+            match crate::analytics::run_analytics(
                 self.kb.as_ref(),
                 question,
                 &ent_uris,
                 self.analytics_cfg,
             ) {
-                let text = if res.truncated {
-                    format!(
-                        "{}\n(computed over a capped sample of {} edges / {} nodes)",
-                        res.text, res.edge_count, res.node_count
-                    )
-                } else {
-                    res.text
-                };
-                return Ok(Answer {
-                    text,
-                    values: Vec::new(),
-                    sparql: None,
-                    rounds: 0,
-                    citations: Vec::new(),
-                    explanation: None,
-                    confidence: ANALYTICS_CONFIDENCE,
-                    abstained: false,
-                });
+                Ok(res) => {
+                    let text = if res.truncated {
+                        format!(
+                            "{}\n(computed over a capped sample of {} edges / {} nodes)",
+                            res.text, res.edge_count, res.node_count
+                        )
+                    } else {
+                        res.text
+                    };
+                    return Ok(Answer {
+                        text,
+                        values: Vec::new(),
+                        sparql: None,
+                        rounds: 0,
+                        citations: Vec::new(),
+                        explanation: None,
+                        confidence: ANALYTICS_CONFIDENCE,
+                        abstained: false,
+                    });
+                }
+                // Don't mask the failure silently — surface it, then fall through
+                // to the Text-to-SPARQL path (which may still answer or abstain).
+                Err(e) => eprintln!("gnlqa: analytics routing failed, falling back to SPARQL: {e}"),
             }
         }
 
