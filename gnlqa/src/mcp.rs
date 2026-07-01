@@ -38,8 +38,24 @@ impl McpServer {
     pub fn serve_stdio(&self) {
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout();
+        let mut consecutive_errors = 0u32;
+        // `lines()` yields `None` at EOF (loop ends) and `Err` only on a real read
+        // failure (invalid UTF-8, transient IO). Skip a bad line rather than
+        // killing the whole session; bail only if the stream is persistently broken.
         for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
+            let line = match line {
+                Ok(l) => {
+                    consecutive_errors = 0;
+                    l
+                }
+                Err(_) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 3 {
+                        break;
+                    }
+                    continue;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -59,8 +75,18 @@ impl McpServer {
             Ok(v) => v,
             Err(e) => return Some(err_response(&Value::Null, -32700, &format!("parse error: {e}"))),
         };
+        // Valid JSON that isn't a request/notification object (a batch array, or
+        // a bare scalar) is an Invalid Request — reply so a client isn't left
+        // waiting on silence. (We don't implement JSON-RPC batching.)
+        if !req.is_object() {
+            return Some(err_response(&Value::Null, -32600, "invalid request: expected a JSON-RPC object"));
+        }
         let id = req.get("id").cloned();
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+        let Some(method) = req.get("method").and_then(Value::as_str) else {
+            // An object with no `method` is malformed regardless of id.
+            let id = id.unwrap_or(Value::Null);
+            return Some(err_response(&id, -32600, "invalid request: missing method"));
+        };
         match method {
             "initialize" => Some(ok_response(&id.unwrap_or(Value::Null), self.initialize_result())),
             "ping" => Some(ok_response(&id.unwrap_or(Value::Null), json!({}))),
@@ -362,6 +388,25 @@ mod tests {
         let srv = McpServer::new(engine());
         let resp = srv.handle_message("{not json").unwrap();
         assert_eq!(parse(&resp)["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn non_object_and_batch_are_invalid_request() {
+        let srv = McpServer::new(engine());
+        // bare scalar
+        assert_eq!(parse(&srv.handle_message("42").unwrap())["error"]["code"], -32600);
+        // batch array (unsupported) → must reply, not hang
+        let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
+        assert_eq!(parse(&srv.handle_message(batch).unwrap())["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn object_without_method_is_invalid_request() {
+        let srv = McpServer::new(engine());
+        let resp = srv.handle_message(r#"{"jsonrpc":"2.0","id":9}"#).unwrap();
+        let v = parse(&resp);
+        assert_eq!(v["error"]["code"], -32600);
+        assert_eq!(v["id"], 9); // id echoed back
     }
 
     #[test]
