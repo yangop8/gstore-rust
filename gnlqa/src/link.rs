@@ -86,20 +86,38 @@ impl Linker {
     }
 
     /// Build the indexes by querying gStore for entity labels (`rdfs:label`),
-    /// distinct predicates, and distinct types. Predicates/types are labeled by
-    /// their URI local name (data rarely carries `rdfs:label` for them).
+    /// distinct predicates, and distinct types. Restricts labels to English /
+    /// no-language tags. See [`build_from_kb_langs`](Self::build_from_kb_langs)
+    /// for multilingual coverage.
     pub fn build_from_kb(
         kb: &dyn KbClient,
         embedder: Box<dyn Embedder>,
         min_score: f32,
         entity_limit: Option<usize>,
     ) -> Result<Linker> {
-        // Restrict to en / no-language labels and (optionally) cap the count;
-        // a real KB can have millions of labels (full paging is a later step).
+        Self::build_from_kb_langs(kb, embedder, min_score, entity_limit, &["en"])
+    }
+
+    /// Multilingual variant of [`build_from_kb`](Self::build_from_kb): index entity
+    /// labels whose language tag is empty or in `languages`, so questions in those
+    /// languages link against native labels rather than only English. Predicates
+    /// and types are labeled by their URI local name (data rarely carries
+    /// `rdfs:label` for them, and those names are language-neutral).
+    pub fn build_from_kb_langs(
+        kb: &dyn KbClient,
+        embedder: Box<dyn Embedder>,
+        min_score: f32,
+        entity_limit: Option<usize>,
+        languages: &[&str],
+    ) -> Result<Linker> {
+        // Restrict to the requested languages (+ no-language) and (optionally) cap
+        // the count; a real KB can have millions of labels (full paging is a later
+        // step).
         let lim = entity_limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
         let ent_q = format!(
             "SELECT DISTINCT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l \
-             FILTER(lang(?l) = \"\" || lang(?l) = \"en\") }}{lim}"
+             FILTER({}) }}{lim}",
+            lang_filter_clause(languages)
         );
         let ent_ans = kb.query(&ent_q)?;
         warn_if_no_rows(&ent_ans, "entity label");
@@ -154,6 +172,22 @@ impl Linker {
     pub fn link_predicate(&self, phrase: &str, k: usize) -> Result<Vec<Candidate>> {
         self.search(&self.predicates, LinkKind::Predicate, phrase, k)
     }
+}
+
+/// Build a `FILTER` disjunction over language tags: always allows no-language
+/// (`""`) labels, plus each requested code. Codes are sanitized to `[A-Za-z0-9-]`
+/// (dropping anything else) so a resolved/config language can't inject into the
+/// SPARQL FILTER; empties are skipped.
+fn lang_filter_clause(languages: &[&str]) -> String {
+    let mut clauses = vec!["lang(?l) = \"\"".to_string()];
+    for l in languages {
+        let code: String =
+            l.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_lowercase();
+        if !code.is_empty() {
+            clauses.push(format!("lang(?l) = \"{code}\""));
+        }
+    }
+    clauses.join(" || ")
 }
 
 /// Build de-duplicated `(uri, label)` pairs from a 2-column SELECT (label = the
@@ -319,5 +353,49 @@ mod tests {
         assert_eq!(l.sizes(), (1, 1, 1));
         let p = l.link_predicate("capitalOf", 1).unwrap();
         assert_eq!(p[0].uri, "http://ex/capitalOf"); // local-name label matched
+    }
+
+    #[test]
+    fn lang_filter_always_includes_empty_and_sanitizes() {
+        let c = lang_filter_clause(&["en", "zh"]);
+        assert!(c.contains(r#"lang(?l) = """#)); // no-language always allowed
+        assert!(c.contains(r#"lang(?l) = "en""#));
+        assert!(c.contains(r#"lang(?l) = "zh""#));
+        // injection attempt is stripped to safe chars ([A-Za-z0-9-]) and
+        // case-normalized, collapsing to one harmless code — no query structure
+        // (quotes/braces/UNION/spaces) survives to break out of the FILTER.
+        let evil = lang_filter_clause(&[r#"en") } UNION { ?s ?p ?o . FILTER("#]);
+        assert!(evil.contains(r#"lang(?l) = "enunionspofilter""#));
+        assert!(!evil.contains('}') && !evil.contains("UNION") && !evil.contains(" ?"));
+    }
+
+    #[test]
+    fn build_from_kb_langs_filters_by_language() {
+        fn uri(v: &str) -> Option<RdfTerm> {
+            Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })
+        }
+        fn lit_lang(v: &str, l: &str) -> Option<RdfTerm> {
+            Some(RdfTerm { kind: TermKind::Literal, value: v.into(), datatype: None, lang: Some(l.into()) })
+        }
+        // Entity labels in Chinese; the ?s ?l answer is what our FILTER'd query
+        // would return. Ordering: entities, predicates, types.
+        let entities = SparqlAnswer::Select {
+            vars: vec!["s".into(), "l".into()],
+            rows: vec![vec![uri("http://ex/Beijing"), lit_lang("北京", "zh")]],
+        };
+        let predicates = SparqlAnswer::Select { vars: vec!["p".into()], rows: vec![] };
+        let types = SparqlAnswer::Select { vars: vec!["t".into()], rows: vec![] };
+        let kb = MockKb::new(vec![entities, predicates, types]);
+        let l = Linker::build_from_kb_langs(
+            &kb,
+            Box::new(HashEmbedder::new(128)),
+            0.0,
+            None,
+            &["zh"],
+        )
+        .unwrap();
+        assert_eq!(l.sizes().0, 1); // the Chinese-labeled entity was indexed
+        let hits = l.link_mention(&Mention { text: "北京".into(), kind: MentionKind::Entity }, 1).unwrap();
+        assert_eq!(hits[0].uri, "http://ex/Beijing");
     }
 }

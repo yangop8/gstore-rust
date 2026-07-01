@@ -23,6 +23,7 @@ pub mod ground;
 pub mod http_server;
 pub mod intent;
 pub mod kb;
+pub mod lang;
 pub mod link;
 pub mod llm;
 pub mod mcp;
@@ -51,6 +52,7 @@ pub use kb::{
     sparql_escape_literal, validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer,
     TermKind,
 };
+pub use lang::{abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang};
 pub use link::{local_name, Candidate, LinkKind, Linker};
 pub use mcp::McpServer;
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};

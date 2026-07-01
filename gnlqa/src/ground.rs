@@ -63,6 +63,7 @@ pub fn explain(
     question: &str,
     citations: &[Citation],
     model: Option<&str>,
+    lang: &str,
 ) -> Option<String> {
     if citations.is_empty() {
         return None;
@@ -72,9 +73,12 @@ pub fn explain(
         .map(|c| format!("{} {} {}", c.subject, c.predicate, c.object))
         .collect::<Vec<_>>()
         .join("\n");
-    let sys = "You write a concise, factual natural-language answer to the \
-        question using ONLY the supporting triples. Do not add facts not present \
-        in them. One or two sentences.";
+    let sys = format!(
+        "You write a concise, factual natural-language answer to the question \
+        using ONLY the supporting triples. Do not add facts not present in them. \
+        One or two sentences.{}",
+        crate::lang::lang_instruction(lang)
+    );
     let user = format!("Question: {question}\n\nSupporting triples:\n{cites}\n\nAnswer:");
     let mut req = LlmRequest::prompt(user).system(sys).max_tokens(300);
     if let Some(m) = model {
@@ -155,10 +159,10 @@ mod tests {
             object: "<http://ex/Germany>".into(),
         }];
         let good = MockLlm::fixed("Berlin is the capital of Germany.");
-        assert_eq!(explain(&good, "capital?", &cites, None).as_deref(), Some("Berlin is the capital of Germany."));
+        assert_eq!(explain(&good, "capital?", &cites, None, "en").as_deref(), Some("Berlin is the capital of Germany."));
         let bad = MockLlm::new(vec![]); // errors → None
-        assert!(explain(&bad, "q", &cites, None).is_none());
+        assert!(explain(&bad, "q", &cites, None, "en").is_none());
         // no citations → None (don't risk ungrounded prose)
-        assert!(explain(&good, "q", &[], None).is_none());
+        assert!(explain(&good, "q", &[], None, "en").is_none());
     }
 }

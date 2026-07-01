@@ -277,6 +277,9 @@ impl SolveEngine {
         let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
         let intent =
             extract_intent(self.llm.as_ref(), question, intent_model.as_deref()).unwrap_or_default();
+        // Resolve the answer language (LLM tag → script fallback → English) so
+        // LLM-generated answers come back in the user's language.
+        let lang = crate::lang::resolve_lang(&intent.lang, question);
         // Route generation/repair to the fast or primary model by difficulty.
         let model_owned = self.route_model(&intent);
         let model = model_owned.as_deref();
@@ -395,7 +398,7 @@ impl SolveEngine {
             && !ent_uris.is_empty()
             && RAG_CONFIDENCE >= self.abstain_below
         {
-            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model) {
+            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
                 return Ok(ans);
             }
         }
@@ -409,7 +412,7 @@ impl SolveEngine {
                 // don't present a possibly-wrong answer.
                 if confidence < self.abstain_below {
                     return Ok(Answer {
-                        text: "I'm not confident enough to answer this from the data.".to_string(),
+                        text: crate::lang::abstain_message(&lang).to_string(),
                         values: Vec::new(), // suppress the withheld answer
                         sparql: Some(o.sparql),
                         rounds: o.rounds,
@@ -429,7 +432,7 @@ impl SolveEngine {
                 // Grounded prose is exposed via `explanation` (only when it could
                 // be grounded on citations); `text` stays the rendered answer.
                 let explanation = if self.explain {
-                    explain(self.llm.as_ref(), question, &citations, model)
+                    explain(self.llm.as_ref(), question, &citations, model, &lang)
                 } else {
                     None
                 };
@@ -451,14 +454,20 @@ impl SolveEngine {
     /// Retrieve a subgraph around `seeds` and let the LLM answer from it. Returns
     /// `None` when nothing was retrieved or the model declined ("I don't know"),
     /// so the caller can fall through to the honest structured result/error.
-    fn graphrag_answer(&self, question: &str, seeds: &[String], model: Option<&str>) -> Option<Answer> {
+    fn graphrag_answer(
+        &self,
+        question: &str,
+        seeds: &[String],
+        model: Option<&str>,
+        lang: &str,
+    ) -> Option<Answer> {
         use crate::graphrag::{answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph};
         let triples = retrieve_subgraph(self.kb.as_ref(), seeds, self.rag);
         if triples.is_empty() {
             return None;
         }
         let subgraph = render_subgraph(&triples);
-        let raw = answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model).ok()?;
+        let raw = answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model, lang).ok()?;
         if is_dont_know(&raw) {
             return None;
         }

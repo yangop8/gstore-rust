@@ -185,9 +185,11 @@ pub fn answer_from_subgraph(
     question: &str,
     subgraph: &str,
     model: Option<&str>,
+    lang: &str,
 ) -> Result<String> {
     let user = format!("Subgraph:\n{subgraph}\n\nQuestion: {question}\n\nAnswer:");
-    let mut req = LlmRequest::prompt(user).system(SYS_RAG).max_tokens(512);
+    let sys = format!("{SYS_RAG}{}", crate::lang::lang_instruction(lang));
+    let mut req = LlmRequest::prompt(user).system(sys).max_tokens(512);
     if let Some(m) = model {
         req = req.model(m);
     }
@@ -284,7 +286,7 @@ mod tests {
     #[test]
     fn answer_from_subgraph_calls_llm() {
         let llm = MockLlm::fixed("Ridley Scott directed it.");
-        let out = answer_from_subgraph(&llm, "who?", "<a> <b> <c> .", None).unwrap();
+        let out = answer_from_subgraph(&llm, "who?", "<a> <b> <c> .", None, "en").unwrap();
         assert_eq!(out, "Ridley Scott directed it.");
     }
 
