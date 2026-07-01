@@ -17,7 +17,8 @@ use crate::schema::SchemaContext;
 /// Score a solved outcome for ranking: a non-empty answer dominates an empty
 /// one; each repair round is a small penalty (prefer queries that worked sooner).
 /// The penalty is clamped so a non-empty answer always outranks an empty one,
-/// regardless of `max_rounds`.
+/// regardless of `max_rounds`. This is a *ranking* heuristic reused as a rough
+/// confidence — it is NOT a calibrated correctness probability.
 pub fn score_outcome(o: &RepairOutcome) -> f32 {
     let base = if is_empty_answer(&o.answer) { 0.1 } else { 1.0 };
     let penalty = (0.05 * o.rounds as f32).min(0.89);
@@ -203,7 +204,7 @@ impl SolveEngine {
                 if confidence < self.abstain_below {
                     return Ok(Answer {
                         text: "I'm not confident enough to answer this from the data.".to_string(),
-                        values,
+                        values: Vec::new(), // suppress the withheld answer
                         sparql: Some(o.sparql),
                         rounds: o.rounds,
                         citations: Vec::new(),

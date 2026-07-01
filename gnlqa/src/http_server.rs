@@ -101,7 +101,7 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                         "explanation": a.explanation,
                         "sparql": a.sparql,
                         "values": a.values,
-                        "confidence": a.confidence,
+                        "confidence": round3(a.confidence),
                         "abstained": a.abstained,
                         "rounds": a.rounds,
                     }),
@@ -114,10 +114,18 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
         },
         ("POST", "/gSolve") => match question_of(body) {
             Some(q) => match engine.ask(&q) {
-                // gAnswer-compatible subset.
+                // gAnswer-compatible subset. Honor abstention: withhold answers
+                // (they're already empty) and flag it so a client can't mistake a
+                // suppressed guess for a confident result.
                 Ok(a) => (
                     200,
-                    json!({"status":"ok","question": q, "sparql": a.sparql, "answers": a.values}),
+                    json!({
+                        "status": if a.abstained { "abstained" } else { "ok" },
+                        "question": q,
+                        "sparql": a.sparql,
+                        "answers": a.values,
+                        "confidence": round3(a.confidence),
+                    }),
                 ),
                 Err(e) => (200, json!({"status":"error","question": q, "message": e.to_string()})),
             },
@@ -125,6 +133,11 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
         },
         _ => (404, json!({"status":"error","message":"not found"})),
     }
+}
+
+/// Round an f32 to 3 decimals as f64, so JSON doesn't print f32 widening noise.
+fn round3(x: f32) -> f64 {
+    ((x * 1000.0).round() / 1000.0) as f64
 }
 
 /// Extract `question` from a JSON body (or a raw non-JSON body as the question).

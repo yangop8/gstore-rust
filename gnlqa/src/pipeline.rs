@@ -33,7 +33,9 @@ pub struct Answer {
     pub citations: Vec<crate::ground::Citation>,
     /// Optional LLM-phrased natural-language explanation.
     pub explanation: Option<String>,
-    /// Confidence in [0,1] (non-empty result, fewer repairs, grounded → higher).
+    /// Heuristic confidence in [0,1]: higher for a non-empty result reached with
+    /// fewer self-repair rounds. NOT calibrated and NOT a correctness probability
+    /// — a valid-but-semantically-wrong query that returns rows still scores ~1.0.
     pub confidence: f32,
     /// Whether the system abstained (confidence below the configured threshold).
     pub abstained: bool,
@@ -69,7 +71,8 @@ impl AskEngine {
         kb::validate_sparql(&sparql)?;
         let answer = self.kb.query(&sparql)?;
         let values = answer_values(&answer);
-        let confidence = if crate::repair::is_empty_answer(&answer) { 0.2 } else { 1.0 };
+        // Aligned with solve's score_outcome bands (empty 0.1, non-empty 1.0).
+        let confidence = if crate::repair::is_empty_answer(&answer) { 0.1 } else { 1.0 };
         Ok(Answer {
             text: render_answer(&answer, &values),
             values,
