@@ -13,6 +13,7 @@
 //! * [`error`]  — the crate error type
 //! * [`llm`]    — the [`llm::LlmClient`] trait + an Anthropic (Claude) client and a mock
 
+pub mod analytics;
 pub mod config;
 pub mod embed;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod secret;
 pub mod session;
 pub mod solve;
 
+pub use analytics::{run_analytics, AnalyticsCfg, AnalyticsOp, AnalyticsResult};
 pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};

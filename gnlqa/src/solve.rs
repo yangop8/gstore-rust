@@ -103,11 +103,17 @@ pub struct SolveEngine {
     cache: Option<Mutex<Cache>>,
     graphrag: bool,
     rag: crate::graphrag::RetrievalCfg,
+    analytics: bool,
+    analytics_cfg: crate::analytics::AnalyticsCfg,
 }
 
 /// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
 /// KB-verified the way a SELECT result is. Kept below the structured-answer band.
 const RAG_CONFIDENCE: f32 = 0.5;
+
+/// Confidence for a graph-analytics answer: a deterministic computation, but over
+/// a capped edge sample — high, not certain.
+const ANALYTICS_CONFIDENCE: f32 = 0.85;
 
 impl SolveEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> SolveEngine {
@@ -127,7 +133,20 @@ impl SolveEngine {
             cache: None,
             graphrag: true,
             rag: crate::graphrag::RetrievalCfg::default(),
+            analytics: true,
+            analytics_cfg: crate::analytics::AnalyticsCfg::default(),
         }
+    }
+    /// Enable/disable graph-analytics routing for `analytics`-typed questions
+    /// (shortest path, centrality, PageRank, communities, triangles; default on).
+    pub fn with_analytics(mut self, on: bool) -> SolveEngine {
+        self.analytics = on;
+        self
+    }
+    /// Cap on edges pulled from the KB for an analytics run.
+    pub fn with_analytics_max_edges(mut self, max_edges: usize) -> SolveEngine {
+        self.analytics_cfg.max_edges = max_edges.max(1);
+        self
     }
     /// Enable/disable the GraphRAG fallback for open questions and empty
     /// structured results (default on).
@@ -287,6 +306,43 @@ impl SolveEngine {
         // (and bloat the prompt) for a URI linked by several mentions.
         let ent_uris = dedup(ent_uris);
         let pred_uris = dedup(pred_uris);
+
+        // Graph-analytics routing: shortest path / centrality / PageRank /
+        // communities / triangles aren't a single BGP — run gStore's analytics
+        // engine over a retrieved edge sample. Gated by the abstain threshold for
+        // the same reason as the GraphRAG fallback. On any error, fall through to
+        // the normal Text-to-SPARQL pipeline.
+        if self.analytics
+            && intent.qtype == QType::Analytics
+            && ANALYTICS_CONFIDENCE >= self.abstain_below
+        {
+            if let Ok(res) = crate::analytics::run_analytics(
+                self.kb.as_ref(),
+                question,
+                &ent_uris,
+                self.analytics_cfg,
+            ) {
+                let text = if res.truncated {
+                    format!(
+                        "{}\n(computed over a capped sample of {} edges / {} nodes)",
+                        res.text, res.edge_count, res.node_count
+                    )
+                } else {
+                    res.text
+                };
+                return Ok(Answer {
+                    text,
+                    values: Vec::new(),
+                    sparql: None,
+                    rounds: 0,
+                    citations: Vec::new(),
+                    explanation: None,
+                    confidence: ANALYTICS_CONFIDENCE,
+                    abstained: false,
+                });
+            }
+        }
+
         let schema = if ent_uris.is_empty() && pred_uris.is_empty() {
             String::new()
         } else {
