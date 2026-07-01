@@ -186,21 +186,29 @@ impl SolveEngine {
 
     /// Answer a question end-to-end (cache-aware).
     pub fn ask(&self, question: &str) -> Result<Answer> {
+        let key = question.trim();
         if let Some(cache) = &self.cache {
-            if let Some(hit) = cache.lock().unwrap().get(question) {
+            if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
                 return Ok(hit);
             }
         }
         let answer = self.solve_inner(question)?;
+        // Don't cache abstentions (a borderline "not sure" shouldn't be sticky).
         if let Some(cache) = &self.cache {
-            cache.lock().unwrap().put(question.to_string(), answer.clone());
+            if !answer.abstained {
+                let val = answer.clone(); // clone outside the lock
+                cache.lock().unwrap_or_else(|e| e.into_inner()).put(key.to_string(), val);
+            }
         }
         Ok(answer)
     }
 
     fn solve_inner(&self, question: &str) -> Result<Answer> {
-        // 1) Understand. A parse failure shouldn't kill the query — degrade.
-        let intent = extract_intent(self.llm.as_ref(), question).unwrap_or_default();
+        // 1) Understand. Intent is a cheap classification → run it on the fast
+        // model. A parse failure shouldn't kill the query — degrade.
+        let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
+        let intent =
+            extract_intent(self.llm.as_ref(), question, intent_model.as_deref()).unwrap_or_default();
         // Route generation/repair to the fast or primary model by difficulty.
         let model_owned = self.route_model(&intent);
         let model = model_owned.as_deref();

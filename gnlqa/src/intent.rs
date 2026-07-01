@@ -146,9 +146,17 @@ Identify entity/type/literal mentions and the relation phrases between them. \
 Use \"analytics\" for shortest-path/centrality/community questions, \"open\" if \
 it cannot be answered by a structured graph query.";
 
-/// Extract a [`QuestionIntent`] from a question using the LLM.
-pub fn extract_intent(llm: &dyn LlmClient, question: &str) -> Result<QuestionIntent> {
-    let req = LlmRequest::prompt(question.to_string()).system(SYS_INTENT);
+/// Extract a [`QuestionIntent`] from a question using the LLM. `model` overrides
+/// the client default (intent is a cheap classification — route it to a fast model).
+pub fn extract_intent(
+    llm: &dyn LlmClient,
+    question: &str,
+    model: Option<&str>,
+) -> Result<QuestionIntent> {
+    let mut req = LlmRequest::prompt(question.to_string()).system(SYS_INTENT);
+    if let Some(m) = model {
+        req = req.model(m);
+    }
     let raw = llm.complete(&req)?;
     parse_intent(&raw)
 }
@@ -288,7 +296,7 @@ mod tests {
     #[test]
     fn extract_intent_via_mock_llm() {
         let llm = MockLlm::fixed(r#"{"qtype":"factoid","target":"director"}"#);
-        let it = extract_intent(&llm, "who directed it?").unwrap();
+        let it = extract_intent(&llm, "who directed it?", None).unwrap();
         assert_eq!(it.qtype, QType::Factoid);
         assert_eq!(it.target.as_deref(), Some("director"));
     }
