@@ -135,24 +135,18 @@ fn qald_question_text(q: &Value) -> Option<String> {
     entry.get("string").and_then(Value::as_str).map(str::to_string)
 }
 
-/// The gold answer set embedded in a QALD question (`None` if absent).
+/// The gold answer set embedded in a QALD question (`None` if absent/empty).
+/// QALD answer entries are SPARQL Results JSON, so we parse them with the same
+/// `parse_results` + `answer_values` path predictions use — keeping gold and
+/// prediction extraction symmetric (one bound cell per row; booleans as
+/// true/false), rather than collecting every binding cell.
 fn qald_answers(q: &Value) -> Option<HashSet<String>> {
     let answers = q.get("answers").and_then(Value::as_array)?;
     let mut set = HashSet::new();
     for a in answers {
-        if let Some(b) = a.get("boolean").and_then(Value::as_bool) {
-            set.insert(b.to_string());
-            continue;
-        }
-        if let Some(bindings) = a.pointer("/results/bindings").and_then(Value::as_array) {
-            for binding in bindings {
-                if let Some(obj) = binding.as_object() {
-                    for cell in obj.values() {
-                        if let Some(val) = cell.get("value").and_then(Value::as_str) {
-                            set.insert(normalize_answer(val));
-                        }
-                    }
-                }
+        if let Ok(ans) = crate::kb::parse_results(a) {
+            for v in crate::pipeline::answer_values(&ans) {
+                set.insert(normalize_answer(&v));
             }
         }
     }

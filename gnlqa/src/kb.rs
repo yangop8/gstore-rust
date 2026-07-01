@@ -113,6 +113,11 @@ impl SparqlAnswer {
     }
 }
 
+/// Cap on a KB response body (bytes) and on parsed result rows — bounds memory
+/// against a wildcard/huge result set.
+const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RESULT_ROWS: usize = 100_000;
+
 /// Parse a SPARQL 1.1 Results JSON document into a [`SparqlAnswer`].
 pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
     if let Some(b) = v.get("boolean").and_then(Value::as_bool) {
@@ -126,8 +131,8 @@ pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
         let snippet: String = v.to_string().chars().take(200).collect();
         Error::GStore(format!("results JSON has neither boolean nor bindings: {snippet}"))
     })?;
-    let mut rows = Vec::with_capacity(bindings.len());
-    for b in bindings {
+    let mut rows = Vec::with_capacity(bindings.len().min(MAX_RESULT_ROWS));
+    for b in bindings.iter().take(MAX_RESULT_ROWS) {
         let mut row: Vec<Option<RdfTerm>> = Vec::with_capacity(vars.len());
         for var in &vars {
             row.push(b.get(var).and_then(parse_binding));
@@ -162,6 +167,25 @@ pub fn validate_sparql(sparql: &str) -> Result<()> {
     gstore::parser::sparql::parse(sparql)
         .map(|_| ())
         .map_err(|e| Error::Sparql(e.to_string()))
+}
+
+/// Like [`validate_sparql`], but also enforces that the query is **read-only and
+/// answer-shaped**: only `SELECT`/`ASK` are accepted. "Parser-valid" is NOT
+/// "safe to execute" — the shared parser also accepts SPARQL UPDATE
+/// (`INSERT`/`DELETE`/`DROP`/`LOAD`/`CLEAR`/…), which would mutate the store. Any
+/// generated or self-repaired candidate must pass this before it is executed, so
+/// an adversarial/hallucinated `DELETE WHERE { ?s ?p ?o }` can never run.
+pub fn validate_readonly_sparql(sparql: &str) -> Result<()> {
+    use gstore::parser::sparql::ast::Query;
+    match gstore::parser::sparql::parse(sparql).map_err(|e| Error::Sparql(e.to_string()))? {
+        Query::Select(_) | Query::Ask(_) => Ok(()),
+        Query::Construct(_) | Query::Describe(_) => {
+            Err(Error::Sparql("only SELECT/ASK queries are allowed for question answering".into()))
+        }
+        Query::Update(_) => Err(Error::Sparql(
+            "refusing to execute a SPARQL UPDATE — question answering is read-only".into(),
+        )),
+    }
 }
 
 /// HTTP client for a gStore SPARQL endpoint.
@@ -218,12 +242,19 @@ impl GStoreClient {
         // graph (N-Triples). Branch on the content type so a graph response is
         // returned as `Graph(..)` rather than failing JSON parsing.
         let is_json = resp.content_type().contains("json");
+        // Bound the response body so a wildcard/huge result can't OOM the client
+        // (ureq's into_json/into_string read the whole body unbounded).
+        use std::io::Read;
+        let mut buf = Vec::new();
+        resp.into_reader()
+            .take(MAX_RESPONSE_BYTES)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::GStore(e.to_string()))?;
         if is_json {
-            let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
+            let v: Value = serde_json::from_slice(&buf).map_err(|e| Error::Json(e.to_string()))?;
             parse_results(&v)
         } else {
-            let body = resp.into_string().map_err(|e| Error::GStore(e.to_string()))?;
-            Ok(SparqlAnswer::Graph(body))
+            Ok(SparqlAnswer::Graph(String::from_utf8_lossy(&buf).into_owned()))
         }
     }
 

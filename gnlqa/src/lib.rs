@@ -54,8 +54,8 @@ pub use intent::{
     RelationPhrase,
 };
 pub use kb::{
-    sparql_escape_literal, validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer,
-    TermKind,
+    sparql_escape_literal, validate_readonly_sparql, validate_sparql, GStoreClient, KbClient,
+    MockKb, RdfTerm, SparqlAnswer, TermKind,
 };
 pub use lang::{abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang};
 pub use link::{local_name, Candidate, LinkKind, Linker};

@@ -253,7 +253,7 @@ mod tests {
     fn session_tracks_history_across_turns() {
         // MockLlm returns the same string for every call; that's fine — we only
         // assert the session records turns and stays consistent.
-        let llm = MockLlm::fixed(r#"SELECT ?x WHERE { ?x ?y ?z }"#);
+        let llm = MockLlm::fixed(r#"SELECT ?x WHERE { ?x <http://ex/p> ?o }"#);
         let ans = SparqlAnswer::Select {
             vars: vec!["x".to_string()],
             rows: vec![vec![Some(RdfTerm {

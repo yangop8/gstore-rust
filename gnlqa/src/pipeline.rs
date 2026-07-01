@@ -67,8 +67,9 @@ impl AskEngine {
         }
         let raw = self.llm.complete(&req)?;
         let sparql = extract_sparql(&raw);
-        // Validate with gStore's own parser before executing.
-        kb::validate_sparql(&sparql)?;
+        // Validate with gStore's own parser AND enforce read-only (reject SPARQL
+        // UPDATE) before executing.
+        kb::validate_readonly_sparql(&sparql)?;
         let answer = self.kb.query(&sparql)?;
         let values = answer_values(&answer);
         // Aligned with solve's score_outcome bands (empty 0.1, non-empty 1.0).

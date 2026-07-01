@@ -64,7 +64,13 @@ pub fn valid_candidates(raw_candidates: &[String], n: usize) -> Vec<String> {
     let mut seen = HashSet::new();
     for c in raw_candidates {
         let c = c.trim().to_string();
-        if c.is_empty() || kb::validate_sparql(&c).is_err() || !seen.insert(c.clone()) {
+        // Read-only (reject SPARQL UPDATE), grounded (reference a concrete term,
+        // not an all-variable wildcard), and de-duplicated.
+        if c.is_empty()
+            || kb::validate_readonly_sparql(&c).is_err()
+            || !is_grounded(&c)
+            || !seen.insert(c.clone())
+        {
             continue;
         }
         out.push(c);
@@ -73,6 +79,14 @@ pub fn valid_candidates(raw_candidates: &[String], n: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether a candidate references at least one concrete term — an IRI (`<...>`)
+/// or a literal (`"..."`). A pure all-variable BGP like
+/// `SELECT ?x WHERE { ?x ?p ?o }` is ungrounded: it returns arbitrary rows and
+/// can outrank a precise (empty) answer, so it is rejected.
+fn is_grounded(sparql: &str) -> bool {
+    sparql.contains('<') || sparql.contains('"')
 }
 
 /// Parse candidate SPARQL strings from the model output: a JSON array of strings
@@ -206,14 +220,30 @@ mod tests {
     #[test]
     fn valid_candidates_filters_and_dedups() {
         let cands = vec![
-            "SELECT ?x WHERE { ?x ?p ?o }".to_string(),
-            "not sparql".to_string(),                 // invalid → dropped
-            "SELECT ?x WHERE { ?x ?p ?o }".to_string(), // dup → dropped
-            "ASK { ?s ?p ?o }".to_string(),
+            "SELECT ?x WHERE { ?x <http://ex/p> ?o }".to_string(),
+            "not sparql".to_string(),                              // invalid → dropped
+            "SELECT ?x WHERE { ?x <http://ex/p> ?o }".to_string(), // dup → dropped
+            "ASK { ?s <http://ex/p> \"v\" }".to_string(),
         ];
         let v = valid_candidates(&cands, 10);
         assert_eq!(v.len(), 2);
         assert!(v[0].starts_with("SELECT") && v[1].starts_with("ASK"));
+    }
+
+    #[test]
+    fn valid_candidates_rejects_update_and_ungrounded() {
+        let cands = vec![
+            // read-only enforcement: a mutating UPDATE must be rejected
+            "DELETE WHERE { ?s ?p ?o }".to_string(),
+            "DROP DEFAULT".to_string(),
+            "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }".to_string(),
+            // ungrounded all-variable wildcard must be rejected
+            "SELECT ?x WHERE { ?x ?p ?o }".to_string(),
+            // a grounded read-only query survives
+            "SELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }".to_string(),
+        ];
+        let v = valid_candidates(&cands, 10);
+        assert_eq!(v, vec!["SELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }".to_string()]);
     }
 
     #[test]

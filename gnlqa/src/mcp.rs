@@ -11,7 +11,7 @@
 //! only serde_json. [`McpServer::handle_message`] is the pure, testable core;
 //! [`McpServer::serve_stdio`] is the transport loop.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -23,6 +23,10 @@ use crate::solve::SolveEngine;
 
 /// MCP protocol version this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Max bytes for one JSON-RPC message over stdio — bounds memory against a
+/// client that sends a huge line with no newline.
+const MAX_MSG_BYTES: usize = 1 << 20;
 
 /// An MCP server backed by a [`SolveEngine`].
 pub struct McpServer {
@@ -37,29 +41,50 @@ impl McpServer {
     /// Serve MCP over stdio until EOF: one JSON-RPC message per line.
     pub fn serve_stdio(&self) {
         let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
         let mut stdout = std::io::stdout();
         let mut consecutive_errors = 0u32;
-        // `lines()` yields `None` at EOF (loop ends) and `Err` only on a real read
-        // failure (invalid UTF-8, transient IO). Skip a bad line rather than
-        // killing the whole session; bail only if the stream is persistently broken.
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => {
-                    consecutive_errors = 0;
-                    l
-                }
+        loop {
+            let mut buf = Vec::new();
+            // Read one message, bounded so a huge line (no newline) can't OOM us.
+            match (&mut reader).take(MAX_MSG_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => consecutive_errors = 0,
                 Err(_) => {
+                    // Skip a transient/bad read; bail only if persistently broken.
                     consecutive_errors += 1;
                     if consecutive_errors >= 3 {
                         break;
                     }
                     continue;
                 }
-            };
-            if line.trim().is_empty() {
+            }
+            // Hit the cap without a terminating newline ⇒ oversize message. Drain
+            // the rest of the line (in bounded chunks) and reply with a parse
+            // error rather than processing a partial message.
+            if buf.len() > MAX_MSG_BYTES && buf.last() != Some(&b'\n') {
+                loop {
+                    let mut sink = Vec::new();
+                    match (&mut reader).take(MAX_MSG_BYTES as u64).read_until(b'\n', &mut sink) {
+                        Ok(0) => break,
+                        Ok(_) if sink.last() == Some(&b'\n') => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                let resp = err_response(&Value::Null, -32700, "message exceeds maximum size");
+                if writeln!(stdout, "{resp}").is_err() {
+                    break;
+                }
+                let _ = stdout.flush();
                 continue;
             }
-            if let Some(resp) = self.handle_message(&line) {
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(resp) = self.handle_message(line) {
                 if writeln!(stdout, "{resp}").is_err() {
                     break;
                 }
@@ -81,23 +106,19 @@ impl McpServer {
         if !req.is_object() {
             return Some(err_response(&Value::Null, -32600, "invalid request: expected a JSON-RPC object"));
         }
-        let id = req.get("id").cloned();
+        // A message without `id` is a JSON-RPC notification — never respond, even
+        // to a known method (`?` returns None here). A present-but-null id is
+        // still a request.
+        let id = req.get("id").cloned()?;
         let Some(method) = req.get("method").and_then(Value::as_str) else {
-            // An object with no `method` is malformed regardless of id.
-            let id = id.unwrap_or(Value::Null);
             return Some(err_response(&id, -32600, "invalid request: missing method"));
         };
         match method {
-            "initialize" => Some(ok_response(&id.unwrap_or(Value::Null), self.initialize_result())),
-            "ping" => Some(ok_response(&id.unwrap_or(Value::Null), json!({}))),
-            "tools/list" => Some(ok_response(&id.unwrap_or(Value::Null), tools_list())),
-            "tools/call" => {
-                let id = id.unwrap_or(Value::Null);
-                Some(self.tools_call(&id, req.get("params")))
-            }
-            // Notifications carry no id and expect no response.
-            _ if id.is_none() => None,
-            other => Some(err_response(&id.unwrap(), -32601, &format!("method not found: {other}"))),
+            "initialize" => Some(ok_response(&id, self.initialize_result())),
+            "ping" => Some(ok_response(&id, json!({}))),
+            "tools/list" => Some(ok_response(&id, tools_list())),
+            "tools/call" => Some(self.tools_call(&id, req.get("params"))),
+            other => Some(err_response(&id, -32601, &format!("method not found: {other}"))),
         }
     }
 
