@@ -4,9 +4,11 @@
 
 pub mod anthropic;
 pub mod mock;
+pub mod openai;
 
 pub use anthropic::AnthropicClient;
 pub use mock::MockLlm;
+pub use openai::OpenAiClient;
 
 use crate::error::Result;
 

@@ -61,7 +61,7 @@ pub use lang::{abstain_message, detect_script_lang, lang_instruction, language_n
 pub use link::{local_name, Candidate, LinkKind, Linker};
 pub use mcp::McpServer;
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
-pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, Role};
+pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, OpenAiClient, Role};
 pub use pipeline::{Answer, AskEngine};
 pub use repair::{solve_with_repair, RepairOutcome};
 pub use session::{rewrite_followup, Session};

@@ -11,24 +11,53 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use gnlqa::{
-    load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient, HttpServer,
-    McpServer, Session, SolveEngine,
+    load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
+    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, OpenAiClient, Session, SolveEngine,
 };
 
 fn build_engine(cfg: &Config) -> SolveEngine {
     // The KB client is always available; the LLM client errors at call time if
-    // no API key is set, so build it leniently here.
-    let llm = AnthropicClient::new(
-        cfg.anthropic_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
-        cfg.anthropic_base_url.clone(),
-        cfg.model.clone(),
+    // no API key is set, so build it leniently here. Pick the backend by provider.
+    let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
+    let llm: Box<dyn LlmClient> = if cfg.llm_provider == "openai" {
+        Box::new(
+            OpenAiClient::new(
+                cfg.openai_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
+                cfg.openai_base_url.clone(),
+                cfg.model.clone(),
+            )
+            .with_timeout(timeout),
+        )
+    } else {
+        Box::new(
+            AnthropicClient::new(
+                cfg.anthropic_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
+                cfg.anthropic_base_url.clone(),
+                cfg.model.clone(),
+            )
+            .with_timeout(timeout),
+        )
+    };
+    // Build a linker from the KB so generation is grounded in the store's ACTUAL
+    // vocabulary — without it the LLM guesses URIs (e.g. DBpedia) and misses.
+    // HashEmbedder is offline (no embedding API needed); swap for HttpEmbedder
+    // for stronger semantic linking. Best-effort: if the KB is unreachable at
+    // startup, degrade to no linker.
+    let linker = Linker::build_from_kb(
+        &GStoreClient::from_config(cfg),
+        Box::new(HashEmbedder::new(256)),
+        0.0,
+        Some(10_000),
     )
-    .with_timeout(std::time::Duration::from_secs(cfg.timeout_secs));
-    let kb = GStoreClient::from_config(cfg);
-    SolveEngine::new(Box::new(llm), Box::new(kb))
+    .ok();
+    let mut engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
         .with_model(cfg.model.clone())
         .with_fast_model(cfg.fast_model.clone())
-        .with_cache(256)
+        .with_cache(256);
+    if let Some(l) = linker {
+        engine = engine.with_linker(l);
+    }
+    engine
 }
 
 /// Interactive multi-turn REPL: each line is answered in the context of the
