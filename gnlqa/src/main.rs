@@ -37,16 +37,23 @@ fn run_chat(cfg: &Config) {
         eprintln!("warning: ANTHROPIC_API_KEY not set — live answers will fail.");
     }
     let stdin = io::stdin();
+    let mut consecutive_errors = 0u32;
     loop {
         print!("> ");
         let _ = io::stdout().flush();
         let mut line = String::new();
         match stdin.read_line(&mut line) {
             Ok(0) => break, // EOF
-            Ok(_) => {}
+            Ok(_) => consecutive_errors = 0,
             Err(e) => {
+                // A single bad line (e.g. non-UTF-8) shouldn't tear down the
+                // chat — skip it. Bail only if the stream is persistently broken.
                 eprintln!("input error: {e}");
-                break;
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 {
+                    break;
+                }
+                continue;
             }
         }
         let q = line.trim();

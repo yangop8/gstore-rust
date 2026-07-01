@@ -203,13 +203,20 @@ impl SolveEngine {
         Ok(answer)
     }
 
+    /// Rewrite a follow-up into a standalone question using prior `(question,
+    /// answer)` turns (routed to the fast model), falling back to the raw
+    /// question on any error. Exposed so a [`Session`](crate::session::Session)
+    /// can record the *resolved* question rather than the elliptical one.
+    pub fn rewrite_followup_question(&self, history: &[(String, String)], question: &str) -> String {
+        let m = self.fast_model.clone().or_else(|| self.model.clone());
+        crate::session::rewrite_followup(self.llm.as_ref(), history, question, m.as_deref())
+            .unwrap_or_else(|_| question.to_string())
+    }
+
     /// Answer a follow-up given prior `(question, answer)` turns: rewrite the
     /// (possibly elliptical) question into a standalone one, then [`ask`](Self::ask).
     pub fn ask_followup(&self, history: &[(String, String)], question: &str) -> Result<Answer> {
-        let m = self.fast_model.clone().or_else(|| self.model.clone());
-        let standalone =
-            crate::session::rewrite_followup(self.llm.as_ref(), history, question, m.as_deref())
-                .unwrap_or_else(|_| question.to_string());
+        let standalone = self.rewrite_followup_question(history, question);
         self.ask(&standalone)
     }
 

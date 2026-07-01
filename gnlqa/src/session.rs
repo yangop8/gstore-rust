@@ -48,28 +48,79 @@ pub fn rewrite_followup(
         req = req.model(m);
     }
     let raw = llm.complete(&req)?;
-    // Models sometimes still wrap in a fence or add a leading label — take the
-    // first non-empty line and strip a surrounding pair of quotes.
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("```"))
-        .unwrap_or("")
-        .trim();
-    let cleaned = line
-        .strip_prefix("Standalone question:")
-        .unwrap_or(line)
-        .trim()
-        .trim_matches('"')
-        .trim();
+    let cleaned = clean_rewrite(&raw);
     // If the model returned nothing usable, fall back to the raw question rather
     // than sending an empty query downstream.
     if cleaned.is_empty() {
         Ok(question.to_string())
     } else {
-        Ok(cleaned.to_string())
+        Ok(cleaned)
     }
 }
+
+/// The label some models prefix onto the rewritten question.
+const REWRITE_LABEL: &str = "standalone question:";
+
+/// Extract the rewritten question from the model's raw output. Robust to:
+/// code fences; a `Standalone question:` label whether inline or **on its own
+/// line** (that line strips to empty and we keep scanning — otherwise the label
+/// would be mistaken for the answer and the rewrite silently lost); and a
+/// *balanced* surrounding quote pair (embedded/dangling quotes are left intact,
+/// so `"Blade Runner" director?` is not mangled).
+fn clean_rewrite(raw: &str) -> String {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        let body = strip_label(line);
+        if body.is_empty() {
+            continue; // the line was only the label — keep scanning
+        }
+        let body = if body.len() >= 2 && body.starts_with('"') && body.ends_with('"') {
+            body[1..body.len() - 1].trim()
+        } else {
+            body
+        };
+        return body.to_string();
+    }
+    String::new()
+}
+
+/// Case-insensitively strip a leading [`REWRITE_LABEL`] (and following spaces).
+/// Uses `get(..)` so a multibyte char at the boundary can't panic.
+fn strip_label(s: &str) -> &str {
+    match s.get(..REWRITE_LABEL.len()) {
+        Some(head) if head.eq_ignore_ascii_case(REWRITE_LABEL) => s[REWRITE_LABEL.len()..].trim(),
+        _ => s,
+    }
+}
+
+/// A bounded, rewrite-friendly snapshot of an answer to fold into later prompts.
+/// Long list answers are truncated (the rewrite prompt input is otherwise
+/// uncapped); non-answers (abstained / no results) become empty so they don't
+/// mislead pronoun resolution.
+fn summarize_answer(a: &Answer) -> String {
+    if a.abstained {
+        return String::new();
+    }
+    let t = a.text.trim();
+    if t.is_empty() || t == "(no results)" {
+        return String::new();
+    }
+    const CAP: usize = 240;
+    if t.chars().count() > CAP {
+        let s: String = t.chars().take(CAP).collect();
+        format!("{s}…")
+    } else {
+        t.to_string()
+    }
+}
+
+/// Hard cap on retained turns. Only the last [`HISTORY_WINDOW`] feed the
+/// rewriter, but we keep a bit more for [`Session::history`] introspection
+/// without growing unbounded over a long-running chat.
+const MAX_TURNS: usize = 64;
 
 /// A stateful multi-turn conversation over a [`SolveEngine`]. Each [`ask`](Self::ask)
 /// rewrites the question against the accumulated history, solves it, and records
@@ -87,12 +138,23 @@ impl<'a> Session<'a> {
     }
 
     /// Ask the next turn: rewrite against history, solve, and record the turn.
-    /// The recorded answer text is the user-facing rendering, so the rewriter
-    /// sees what the user saw.
+    /// We record the **resolved** standalone question (so multi-hop ellipsis
+    /// stays resolved) plus a bounded snapshot of the answer, so the rewriter
+    /// gets stable grounding without unbounded prompt growth.
     pub fn ask(&mut self, question: &str) -> Result<Answer> {
-        let answer = self.engine.ask_followup(&self.history, question)?;
-        self.history.push((question.to_string(), answer.text.clone()));
+        let standalone = self.engine.rewrite_followup_question(&self.history, question);
+        let answer = self.engine.ask(&standalone)?;
+        self.history.push((standalone, summarize_answer(&answer)));
+        self.trim_history();
         Ok(answer)
+    }
+
+    /// Drop the oldest turns once retention exceeds [`MAX_TURNS`].
+    fn trim_history(&mut self) {
+        let n = self.history.len();
+        if n > MAX_TURNS {
+            self.history.drain(0..n - MAX_TURNS);
+        }
     }
 
     /// The accumulated `(question, answer)` turns.
@@ -148,6 +210,23 @@ mod tests {
     }
 
     #[test]
+    fn label_on_its_own_line_is_not_mistaken_for_the_answer() {
+        // MEDIUM fix: the label alone strips to empty; scanning must continue.
+        let llm = MockLlm::fixed("Standalone question:\nWho directed Alien?");
+        let history = vec![("What is Alien?".into(), "a film".into())];
+        let out = rewrite_followup(&llm, &history, "who directed it?", None).unwrap();
+        assert_eq!(out, "Who directed Alien?");
+    }
+
+    #[test]
+    fn does_not_mangle_leading_quoted_phrase() {
+        // Only a *balanced* wrapping quote pair is stripped; a leading quote with
+        // a trailing '?' must be left intact.
+        assert_eq!(clean_rewrite("\"Blade Runner\" director?"), "\"Blade Runner\" director?");
+        assert_eq!(clean_rewrite("\"Who directed Alien?\""), "Who directed Alien?");
+    }
+
+    #[test]
     fn blank_rewrite_falls_back_to_original() {
         let llm = MockLlm::fixed("   \n  ");
         let history = vec![("x".into(), "y".into())];
@@ -191,8 +270,9 @@ mod tests {
         let _ = sess.ask("first?").unwrap();
         let _ = sess.ask("and then?").unwrap();
         assert_eq!(sess.len(), 2);
-        assert_eq!(sess.history()[0].0, "first?");
-        assert_eq!(sess.history()[1].0, "and then?");
+        assert_eq!(sess.history()[0].0, "first?"); // empty history → verbatim
+        // Turn 2 records the *resolved* standalone question, not the raw one.
+        assert!(!sess.history()[1].0.is_empty());
         sess.clear();
         assert!(sess.is_empty());
     }
