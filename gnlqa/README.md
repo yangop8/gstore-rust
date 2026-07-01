@@ -31,7 +31,7 @@ question
 Fallbacks and routing layered on top:
 
 - **Graph analytics** — `analytics`-typed questions (shortest path, centrality,
-  PageRank, communities, triangles) run over `gstore::analytics::GraphView`
+  PageRank, connected components ("communities"), triangles) run over `gstore::analytics::GraphView`
   built from a retrieved edge sample, rather than Text-to-SPARQL.
 - **GraphRAG** — when no structured query returns anything, retrieve a bounded
   subgraph around the linked entities and answer from it (cited, or "I don't
@@ -75,7 +75,7 @@ gnlqa                                # print configuration/readiness
 |--------|-----------|--------------------------|----------|
 | POST   | `/ask`    | `{"question": "..."}`    | `{answer, sparql, confidence, abstained, explanation, ...}` |
 | POST   | `/gSolve` | `{"question": "..."}`    | gAnswer-compatible shape (honours abstention with status `"abstained"`) |
-| GET    | `/health` | —                        | `ok` |
+| GET    | `/health` | —                        | `{"status":"ok"}` |
 
 The server bounds request size and connection count and applies read/write
 timeouts.
