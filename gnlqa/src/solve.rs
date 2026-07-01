@@ -203,6 +203,16 @@ impl SolveEngine {
         Ok(answer)
     }
 
+    /// Answer a follow-up given prior `(question, answer)` turns: rewrite the
+    /// (possibly elliptical) question into a standalone one, then [`ask`](Self::ask).
+    pub fn ask_followup(&self, history: &[(String, String)], question: &str) -> Result<Answer> {
+        let m = self.fast_model.clone().or_else(|| self.model.clone());
+        let standalone =
+            crate::session::rewrite_followup(self.llm.as_ref(), history, question, m.as_deref())
+                .unwrap_or_else(|_| question.to_string());
+        self.ask(&standalone)
+    }
+
     fn solve_inner(&self, question: &str) -> Result<Answer> {
         // 1) Understand. Intent is a cheap classification → run it on the fast
         // model. A parse failure shouldn't kill the query — degrade.
