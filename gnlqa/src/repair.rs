@@ -70,8 +70,9 @@ pub fn solve_with_repair(
     for round in 0..=max_rounds {
         let last_round = round == max_rounds;
 
-        // 1) Syntactic validity (gStore's parser).
-        if let Err(e) = kb::validate_sparql(&current) {
+        // 1) Syntactic validity AND read-only enforcement (reject SPARQL UPDATE)
+        // before executing anything against the store.
+        if let Err(e) = kb::validate_readonly_sparql(&current) {
             last_err = Some(format!("parser error: {e}"));
             if last_round {
                 break;

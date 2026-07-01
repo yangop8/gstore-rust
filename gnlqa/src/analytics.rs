@@ -35,16 +35,18 @@ pub enum AnalyticsOp {
 
 /// Classify the analytics operation from the question text (keyword heuristic;
 /// the LLM already tagged the question `analytics`, this picks *which* one).
-/// `seed_count` is how many entities were linked: shortest-path needs two, so a
-/// path-phrased question with fewer falls through to a graph-wide metric.
-pub fn classify_op(question: &str, seed_count: usize) -> AnalyticsOp {
+/// Path-phrased questions map to `ShortestPath` regardless of how many entities
+/// were linked; [`run_analytics`] then abstains (falls through) when fewer than
+/// two endpoints can actually be resolved — so a path question never silently
+/// degrades into an unrelated PageRank ranking.
+pub fn classify_op(question: &str) -> AnalyticsOp {
     let q = question.to_lowercase();
     let has = |p: &str| q.contains(p);
     // A question about communities/components should never be read as a path,
     // even if it happens to contain "connected"/"related".
     let component_q = has("communit") || has("cluster") || has("component");
     // Phrase-level path triggers — avoid bare substrings like "to" that match
-    // almost any sentence. Only route to ShortestPath with two endpoints.
+    // almost any sentence.
     let path_phrase = has("shortest path")
         || has("path between")
         || has("path from")
@@ -52,7 +54,7 @@ pub fn classify_op(question: &str, seed_count: usize) -> AnalyticsOp {
         || has("connection between")
         || has("related to")
         || has("relationship between");
-    if path_phrase && seed_count >= 2 && !component_q {
+    if path_phrase && !component_q {
         AnalyticsOp::ShortestPath
     } else if has("triangle") {
         AnalyticsOp::Triangles
@@ -287,13 +289,26 @@ pub fn run_analytics(
     seeds: &[String],
     cfg: AnalyticsCfg,
 ) -> Result<AnalyticsResult> {
-    let op = classify_op(question, seeds.len());
+    let op = classify_op(question);
 
     // Shortest path uses a seed-anchored, undirected subgraph (a blind LIMIT
     // sample would usually miss the endpoints); the graph-wide metrics use the
-    // capped edge sample.
+    // capped edge sample. If fewer than two endpoints resolve into that subgraph,
+    // we return Err so the caller falls through / abstains rather than presenting
+    // an unrelated ranking as if it answered the path question.
     if op == AnalyticsOp::ShortestPath {
+        if seeds.len() < 2 {
+            return Err(Error::GStore(
+                "shortest-path needs two linked entities as endpoints".into(),
+            ));
+        }
         let g = project_seeded(kb, seeds, cfg);
+        let (a_key, b_key) = (format!("<{}>", seeds[0]), format!("<{}>", seeds[1]));
+        if !g.id_of.contains_key(&a_key) || !g.id_of.contains_key(&b_key) {
+            return Err(Error::GStore(
+                "shortest-path endpoints are not present in the retrieved graph".into(),
+            ));
+        }
         return Ok(AnalyticsResult {
             text: shortest_path_answer(&g, seeds),
             op,
@@ -367,18 +382,18 @@ mod tests {
 
     #[test]
     fn classify_covers_each_op() {
-        assert_eq!(classify_op("shortest path from A to B", 2), AnalyticsOp::ShortestPath);
-        // path phrase but only one linked entity → not shortest path
-        assert_eq!(classify_op("shortest path from A to B", 1), AnalyticsOp::PageRank);
-        assert_eq!(classify_op("how many triangles are there?", 0), AnalyticsOp::Triangles);
-        assert_eq!(classify_op("what communities exist?", 0), AnalyticsOp::Components);
-        assert_eq!(classify_op("who is the most influential person?", 0), AnalyticsOp::PageRank);
-        assert_eq!(classify_op("which node is most central?", 0), AnalyticsOp::Centrality);
-        assert_eq!(classify_op("rank the nodes", 0), AnalyticsOp::PageRank); // default
-        // a component question with two seeds must NOT be read as a path
-        assert_eq!(classify_op("what components is X related to?", 2), AnalyticsOp::Components);
+        // Path phrasing → ShortestPath regardless of seed count (run_analytics
+        // decides whether it can be satisfied).
+        assert_eq!(classify_op("shortest path from A to B"), AnalyticsOp::ShortestPath);
+        assert_eq!(classify_op("how many triangles are there?"), AnalyticsOp::Triangles);
+        assert_eq!(classify_op("what communities exist?"), AnalyticsOp::Components);
+        assert_eq!(classify_op("who is the most influential person?"), AnalyticsOp::PageRank);
+        assert_eq!(classify_op("which node is most central?"), AnalyticsOp::Centrality);
+        assert_eq!(classify_op("rank the nodes"), AnalyticsOp::PageRank); // default
+        // a component question must NOT be read as a path even with path wording
+        assert_eq!(classify_op("what components is X related to?"), AnalyticsOp::Components);
         // "most connected" with no path phrase is centrality, not a path
-        assert_eq!(classify_op("which node is most connected?", 0), AnalyticsOp::Centrality);
+        assert_eq!(classify_op("which node is most connected?"), AnalyticsOp::Centrality);
     }
 
     #[test]
@@ -398,17 +413,26 @@ mod tests {
     }
 
     #[test]
-    fn shortest_path_absent_endpoints_are_graceful() {
+    fn shortest_path_absent_endpoints_fall_through() {
+        // endpoints not in the retrieved subgraph → Err so the caller abstains /
+        // falls through, rather than presenting an unrelated ranking.
         let kb = empty_po_kb();
         let res = run_analytics(
             &kb,
             "shortest path from A to B",
             &["http://ex/A".into(), "http://ex/B".into()],
             AnalyticsCfg::default(),
-        )
-        .unwrap();
-        assert_eq!(res.op, AnalyticsOp::ShortestPath);
-        assert!(res.text.contains("not present"), "text: {}", res.text);
+        );
+        assert!(res.is_err(), "absent endpoints must Err (fall through)");
+    }
+
+    #[test]
+    fn shortest_path_without_two_seeds_falls_through_not_pagerank() {
+        // The C17-regression fix: a path question with <2 linked entities must
+        // Err (→ fall through), NOT silently become a PageRank answer.
+        let kb = out_to_c_kb();
+        let res = run_analytics(&kb, "shortest path from A to B", &[], AnalyticsCfg::default());
+        assert!(res.is_err(), "path question with no seeds must not degrade to PageRank");
     }
 
     #[test]

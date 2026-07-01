@@ -197,10 +197,34 @@ pub fn answer_from_subgraph(
     llm.complete(&req)
 }
 
-/// Whether a RAG reply is a non-answer ("I don't know" / empty).
+/// Whether a RAG reply is a non-answer ("I don't know" / empty). `SYS_RAG` pins
+/// the ASCII phrase, but a model may still localize its refusal, so we also match
+/// common localized variants (defense in depth) — a matched non-answer falls
+/// through to the structured result / abstention instead of being surfaced.
 pub fn is_dont_know(s: &str) -> bool {
-    let t = s.trim().trim_end_matches(['.', '!', ' ']).trim();
-    t.is_empty() || t.eq_ignore_ascii_case("i don't know") || t.eq_ignore_ascii_case("i do not know")
+    let t = s.trim().trim_end_matches(['.', '!', '。', '！', ' ']).trim().to_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    const NEEDLES: &[&str] = &[
+        "i don't know",
+        "i do not know",
+        "je ne sais pas",   // fr
+        "no lo sé",         // es
+        "no lo se",
+        "não sei",          // pt
+        "ich weiß es nicht", // de
+        "ich weiss es nicht",
+        "非常抱歉",          // zh (polite refusal prefix)
+        "我不知道",          // zh
+        "不知道",            // zh
+        "わかりません",       // ja
+        "分かりません",       // ja
+        "모르겠",            // ko
+        "не знаю",          // ru
+        "لا أعرف",          // ar
+    ];
+    NEEDLES.iter().any(|n| t == *n || t.starts_with(n))
 }
 
 #[cfg(test)]
@@ -297,6 +321,11 @@ mod tests {
         assert!(is_dont_know("i don't know."));
         assert!(is_dont_know("  I do not know!  "));
         assert!(is_dont_know(""));
+        // localized refusals (model ignored the ASCII pin) are still caught
+        assert!(is_dont_know("Je ne sais pas."));
+        assert!(is_dont_know("我不知道。"));
+        assert!(is_dont_know("わかりません"));
         assert!(!is_dont_know("Ridley Scott"));
+        assert!(!is_dont_know("Berlin"));
     }
 }
