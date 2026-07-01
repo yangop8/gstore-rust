@@ -17,6 +17,7 @@ pub mod analytics;
 pub mod config;
 pub mod embed;
 pub mod error;
+pub mod eval;
 pub mod generate;
 pub mod graphrag;
 pub mod ground;
@@ -38,6 +39,10 @@ pub use analytics::{run_analytics, AnalyticsCfg, AnalyticsOp, AnalyticsResult};
 pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
+pub use eval::{
+    load_lcquad, load_qald, normalize_answer, prf1, run_eval, EvalOptions, EvalQuestion, EvalReport,
+    Metrics,
+};
 pub use generate::{generate_candidates, parse_candidates};
 pub use graphrag::{
     answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, RetrievalCfg, Triple,

@@ -4,12 +4,16 @@
 //! * `gnlqa chat`                — interactive multi-turn conversation (REPL).
 //! * `gnlqa serve [addr]`        — run the HTTP server (default 127.0.0.1:9100).
 //! * `gnlqa mcp`                 — run the MCP server over stdio.
+//! * `gnlqa eval <qald|lcquad> <file>` — score against a benchmark dataset.
 //! * `gnlqa` (no args)           — print configuration/readiness.
 
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use gnlqa::{AnthropicClient, Config, GStoreClient, HttpServer, McpServer, Session, SolveEngine};
+use gnlqa::{
+    load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient, HttpServer,
+    McpServer, Session, SolveEngine,
+};
 
 fn build_engine(cfg: &Config) -> SolveEngine {
     // The KB client is always available; the LLM client errors at call time if
@@ -80,6 +84,41 @@ fn run_chat(cfg: &Config) {
     }
 }
 
+/// `gnlqa eval <qald|lcquad> <file>`: load a benchmark dataset and score gnlqa.
+/// LC-QuAD ships only gold queries, so gold answers are resolved via the KB.
+fn run_eval_cmd(cfg: &Config, args: &[String]) {
+    let (Some(fmt), Some(path)) = (args.get(1), args.get(2)) else {
+        eprintln!("usage: gnlqa eval <qald|lcquad> <file.json>");
+        std::process::exit(2);
+    };
+    let json = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (questions, resolve_gold_via_kb) = match fmt.as_str() {
+        "qald" => (load_qald(&json), false),
+        "lcquad" => (load_lcquad(&json), true),
+        other => {
+            eprintln!("error: unknown dataset format '{other}' (expected qald or lcquad)");
+            std::process::exit(2);
+        }
+    };
+    let questions = match questions {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let engine = build_engine(cfg);
+    let opts = EvalOptions { limit: None, resolve_gold_via_kb };
+    let report = run_eval(&engine, &questions, &opts);
+    println!("{}", report.summary());
+}
+
 fn main() {
     let cfg = Config::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,6 +129,7 @@ fn main() {
             eprintln!("  gnlqa \"<question>\"     answer one question");
             eprintln!("  gnlqa chat              interactive multi-turn conversation");
             eprintln!("  gnlqa mcp               run the MCP server over stdio");
+            eprintln!("  gnlqa eval <qald|lcquad> <file>   score against a benchmark dataset");
             eprintln!("  gnlqa serve [addr]      run the HTTP server (default 127.0.0.1:9100)");
             eprintln!("  model={}  gstore={}", cfg.model, cfg.gstore_endpoint);
             if !cfg.has_api_key() {
@@ -102,6 +142,7 @@ fn main() {
             eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
             McpServer::new(engine).serve_stdio();
         }
+        Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
             let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9100".to_string());
             let engine = Arc::new(build_engine(&cfg));
