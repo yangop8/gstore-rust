@@ -48,6 +48,76 @@ use crate::sparql_results::{self, json_str, ResultFormat};
 
 const SPARQL_JSON: &str = "application/sparql-results+json";
 
+/// A minimal, self-contained (inline CSS/JS, no external assets) single-page
+/// web console served at `GET /` and `GET /console`: a textarea to run
+/// SPARQL against this endpoint's single database via `/sparql`, plus a short
+/// reference of the available routes. See [`crate::http_api::CONSOLE_HTML`]
+/// for the richer multi-database console served by [`crate::http_api`].
+pub const CONSOLE_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gStore console</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 2rem; background: #f7f7f9; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  textarea { width: 100%; height: 8rem; font-family: monospace; font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; }
+  button { margin-top: 0.5rem; padding: 0.4rem 1rem; font-size: 0.9rem; cursor: pointer; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 1rem; overflow: auto; max-height: 30rem; white-space: pre-wrap; word-break: break-word; }
+  .row { display: flex; gap: 0.5rem; align-items: center; }
+  code { background: #eee; padding: 0 0.25rem; }
+  .endpoints { font-size: 0.85rem; line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>gStore console</h1>
+<p>SPARQL query:</p>
+<textarea id="q">SELECT * WHERE { ?s ?p ?o } LIMIT 20</textarea>
+<div class="row">
+  <button id="run">Run</button>
+  <span id="runStatus"></span>
+</div>
+<pre id="out">(results appear here)</pre>
+<h2>Endpoints</h2>
+<p class="endpoints">
+  <code>GET|POST /sparql?query=...</code> — run a SPARQL query
+  (SELECT/ASK/CONSTRUCT/DESCRIBE)<br>
+  <code>POST /update</code> — run a SPARQL UPDATE<br>
+  <code>GET /status</code> — database stats (JSON)<br>
+  If this server was started with HTTP Basic auth, your browser will prompt
+  for credentials on the first request below.
+</p>
+<script>
+document.getElementById('run').addEventListener('click', function () {
+  var q = document.getElementById('q').value;
+  var out = document.getElementById('out');
+  var runStatus = document.getElementById('runStatus');
+  runStatus.textContent = 'running...';
+  fetch('/sparql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'query=' + encodeURIComponent(q)
+  }).then(function (r) {
+    runStatus.textContent = 'HTTP ' + r.status;
+    return r.text();
+  }).then(function (text) {
+    try {
+      out.textContent = JSON.stringify(JSON.parse(text), null, 2);
+    } catch (e) {
+      out.textContent = text;
+    }
+  }).catch(function (e) {
+    runStatus.textContent = 'error';
+    out.textContent = String(e);
+  });
+});
+</script>
+</body>
+</html>
+"##;
+
 /// An HTTP SPARQL server wrapping a [`Database`].
 pub struct Server {
     db: Mutex<Database>,
@@ -121,6 +191,12 @@ impl Server {
                 let (s, c, b) = self.status_json();
                 write_response(&mut stream, s, &c, &b)
             }
+            ("GET", "/" | "/console") => write_response(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                CONSOLE_HTML.as_bytes(),
+            ),
             ("GET" | "POST", _) => write_response(&mut stream, 404, "text/plain", b"not found"),
             _ => write_response(&mut stream, 405, "text/plain", b"method not allowed"),
         }
@@ -656,6 +732,20 @@ mod tests {
         let raw = format!("GET /sparql?query={q} HTTP/1.1\r\nConnection: close\r\n\r\n");
         let resp = http(&addr, &raw);
         assert!(resp.contains("\"boolean\":true"));
+    }
+
+    #[test]
+    fn console_served_at_root_and_console_path() {
+        let (_srv, addr) = start();
+        let resp = http(&addr, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(resp.contains("200 OK"), "{resp}");
+        assert!(resp.contains("text/html"), "{resp}");
+        assert!(resp.contains("gStore console"), "{resp}");
+        assert!(resp.contains("/sparql"), "endpoint note present: {resp}");
+
+        let resp2 = http(&addr, "GET /console HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(resp2.contains("200 OK"));
+        assert!(resp2.contains("gStore console"));
     }
 
     #[test]
