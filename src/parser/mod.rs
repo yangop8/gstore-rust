@@ -4,8 +4,10 @@
 //! grammar; the Rust trunk implements N-Triples plus the SPARQL subset the query
 //! engine supports (see `docs/REFACTOR_BACKLOG.md` item D for what is deferred).
 
-pub mod ntriples;
+pub mod jsonld;
 pub mod nquads;
+pub mod ntriples;
+pub mod rdfa;
 pub mod rdfxml;
 pub mod sparql;
 pub mod trig;
