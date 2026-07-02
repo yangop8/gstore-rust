@@ -751,15 +751,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let v = self.eval_group_expr(x, sols, layout, key_vars, key)?;
                 match op {
                     UnaryOp::Plus => Some(v),
-                    UnaryOp::Neg => match v {
-                        Value::Int(i) => Some(
-                            i.checked_neg()
-                                .map(Value::Int)
-                                .unwrap_or_else(|| Value::Double(-(i as f64))),
-                        ),
-                        Value::Double(d) => Some(Value::Double(-d)),
-                        _ => None,
-                    },
+                    UnaryOp::Neg => v.negate(),
                 }
             }
             Expr::Compare(op, a, b) => {
@@ -1776,15 +1768,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let v = self.eval_value(x, b, l)?;
                 match op {
                     UnaryOp::Plus => Some(v),
-                    UnaryOp::Neg => match v {
-                        Value::Int(i) => Some(
-                            i.checked_neg()
-                                .map(Value::Int)
-                                .unwrap_or_else(|| Value::Double(-(i as f64))),
-                        ),
-                        Value::Double(d) => Some(Value::Double(-d)),
-                        _ => None,
-                    },
+                    UnaryOp::Neg => v.negate(),
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
@@ -2009,6 +1993,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "ISLITERAL" => Some(Value::Bool(matches!(
                 self.eval_value(&args[0], b, l)?,
                 Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Decimal(_)
                     | Value::Double(_)
                     | Value::Bool(_)
                     | Value::Str { .. }
@@ -2698,6 +2684,8 @@ fn value_to_term(v: &Value) -> Term {
         Value::Iri(s) => Term::Iri(s.clone()),
         Value::Blank(s) => Term::Blank(s.clone()),
         Value::Int(i) => Term::typed_literal(i.to_string(), xsd::INTEGER),
+        Value::BigInt(_) => Term::typed_literal(v.lexical(), xsd::INTEGER),
+        Value::Decimal(_) => Term::typed_literal(v.lexical(), xsd::DECIMAL),
         Value::Double(_) => Term::typed_literal(v.lexical(), xsd::DOUBLE),
         Value::Bool(bool_v) => Term::typed_literal(bool_v.to_string(), xsd::BOOLEAN),
         Value::Str { value, lang } => Term::Literal {
@@ -3277,50 +3265,17 @@ fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
 
 /// Numeric arithmetic with integer fast-path and f64 fallback.
 fn eval_arith(op: ArithOp, a: Value, b: Value) -> Option<Value> {
-    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
-        let (x, y) = (*x, *y);
-        return Some(match op {
-            ArithOp::Add => x
-                .checked_add(y)
-                .map(Value::Int)
-                .unwrap_or(Value::Double(x as f64 + y as f64)),
-            ArithOp::Sub => x
-                .checked_sub(y)
-                .map(Value::Int)
-                .unwrap_or(Value::Double(x as f64 - y as f64)),
-            ArithOp::Mul => x
-                .checked_mul(y)
-                .map(Value::Int)
-                .unwrap_or(Value::Double(x as f64 * y as f64)),
-            ArithOp::Div => {
-                if y == 0 {
-                    return None;
-                }
-                // SPARQL integer division yields a decimal.
-                Value::Double(x as f64 / y as f64)
-            }
-        });
-    }
-    let x = a.as_f64()?;
-    let y = b.as_f64()?;
-    Some(Value::Double(match op {
-        ArithOp::Add => x + y,
-        ArithOp::Sub => x - y,
-        ArithOp::Mul => x * y,
-        ArithOp::Div => {
-            if y == 0.0 {
-                return None;
-            }
-            x / y
-        }
-    }))
+    // The numeric tower (Int/BigInt/Decimal/Double promotion, exact where
+    // possible) lives on Value; see [`Value::arith`].
+    a.arith(op, &b)
 }
 
 /// The datatype IRI for `DATATYPE()`.
 fn datatype_iri(v: &Value) -> Option<String> {
     Some(
         match v {
-            Value::Int(_) => xsd::INTEGER,
+            Value::Int(_) | Value::BigInt(_) => xsd::INTEGER,
+            Value::Decimal(_) => xsd::DECIMAL,
             Value::Double(_) => xsd::DOUBLE,
             Value::Bool(_) => xsd::BOOLEAN,
             Value::Str { lang: None, .. } => xsd::STRING,
