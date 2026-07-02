@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::model::id::EntityLiteralId;
 
 use super::disk_vstree::DiskTree;
-use super::Signature;
+use super::{SigFilter, Signature};
 
 /// Max entries per leaf / children per internal node (tree fan-out).
 const FANOUT: usize = 64;
@@ -441,10 +441,11 @@ impl VsTree {
     /// can fall back to "no filtering".
     pub fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>> {
         if let Some(disk) = &self.disk {
-            // An I/O error degrades to "no filtering" (`None`): the engine then
-            // scans without pruning — slower but still correct (never a false
-            // negative). A healthy store does not hit this path.
-            return disk.candidates(query).unwrap_or(None);
+            // Out-of-core: delegate to the streaming backend through the shared
+            // [`SigFilter`] seam. Its impl degrades an I/O error to "no filtering"
+            // (`None`) — the engine then scans without pruning, slower but still
+            // correct (never a false negative). A healthy store never hits that.
+            return SigFilter::candidates(disk, query);
         }
         let root = self.root.as_ref()?;
         let mut out = Vec::new();
@@ -471,6 +472,29 @@ impl VsTree {
                 }
             }
         }
+    }
+}
+
+/// The VS-tree as a [`SigFilter`]. This is the in-memory implementation of the
+/// seam (and transparently delegates to the out-of-core backend when the tree is
+/// disk-backed, via the inherent methods), so the query path can hold either an
+/// in-memory or a streaming tree behind a single `&dyn SigFilter` and prune
+/// candidates identically.
+impl SigFilter for VsTree {
+    fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>> {
+        VsTree::candidates(self, query)
+    }
+
+    fn entity_count(&self) -> usize {
+        VsTree::entity_count(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        VsTree::is_empty(self)
+    }
+
+    fn pages_read(&self) -> u64 {
+        VsTree::disk_pages_read(self)
     }
 }
 
@@ -786,6 +810,61 @@ mod tests {
         m.sort_unstable();
         d.sort_unstable();
         assert_eq!(m, d, "predicate-only candidate sets diverged");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Both backends behind a single `&dyn SigFilter`: a caller can hold the
+    /// trait object and get *identical* candidate sets from the in-memory tree
+    /// and the streaming (out-of-core) tree — the unified-seam guarantee that
+    /// lets the query path use either uniformly. The streaming filter pages
+    /// nodes from disk (`pages_read > 0`) while the in-memory one never reads a
+    /// page, proving the tree need not be resident.
+    #[test]
+    fn sigfilter_seam_parity_in_memory_vs_streaming() {
+        use crate::signature::SigFilter;
+        let path = diskvs_tmp("seam_parity");
+        let mut all: Vec<(u32, Signature)> = Vec::new();
+        for i in 0..600u32 {
+            let edges = [
+                (i % 7, i, EdgeDir::Out),
+                ((i % 3) + 1, (i * 2) % 50, EdgeDir::In),
+            ];
+            all.push((i, esig(&edges)));
+        }
+        let mem = VsTree::build(all.clone());
+        let streaming = VsTree::build_disk(&path, all.clone()).unwrap();
+        // Consume both purely through the trait object.
+        let filters: [&dyn SigFilter; 2] = [&mem, &streaming];
+        assert_eq!(filters[0].entity_count(), filters[1].entity_count());
+        assert!(!filters[0].is_empty() && !filters[1].is_empty());
+
+        for &(pred, nb, dir) in &[
+            (2u32, 10u32, EdgeDir::Out),
+            (1, 4, EdgeDir::In),
+            (3, 250, EdgeDir::Out),
+            (5, 5, EdgeDir::In),
+        ] {
+            let mut q = Signature::new();
+            q.encode_query_edge(Some(pred), Some(nb), dir);
+            let mut m = filters[0].candidates(&q).unwrap();
+            let mut s = filters[1].candidates(&q).unwrap();
+            m.sort_unstable();
+            s.sort_unstable();
+            assert_eq!(m, s, "seam candidates diverged for ({pred},{nb},{dir:?})");
+        }
+        // A predicate-only (variable-neighbour) query too.
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(2), None, EdgeDir::Out);
+        let mut m = filters[0].candidates(&q).unwrap();
+        let mut s = filters[1].candidates(&q).unwrap();
+        m.sort_unstable();
+        s.sort_unstable();
+        assert_eq!(m, s, "predicate-only seam candidates diverged");
+
+        // The streaming filter actually paged nodes from disk; the in-memory
+        // filter never reads a page.
+        assert_eq!(filters[0].pages_read(), 0, "in-memory filter reads no pages");
+        assert!(filters[1].pages_read() > 0, "streaming filter must page from disk");
         std::fs::remove_file(&path).ok();
     }
 }

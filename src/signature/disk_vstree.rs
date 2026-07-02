@@ -40,7 +40,7 @@ use crate::kvstore::pager::{PageId, Pager, PAGE_SIZE};
 use crate::model::id::EntityLiteralId;
 
 use super::vstree::sig_key;
-use super::{Signature, SIG_BYTES};
+use super::{SigFilter, Signature, SIG_BYTES};
 
 /// Pager header slot holding the root node's page id (`0` = empty tree).
 const ROOT_SLOT: usize = 0;
@@ -225,6 +225,28 @@ impl DiskTree {
             }
         }
         Ok(())
+    }
+}
+
+/// The out-of-core VS-tree as a [`SigFilter`]: identical candidate semantics to
+/// the in-memory tree, but reading only the nodes a query traverses from disk.
+/// An I/O error during a scan degrades to `None` ("no filtering") — still
+/// correct (unpruned, never a false negative); a healthy store never hits it.
+impl SigFilter for DiskTree {
+    fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>> {
+        DiskTree::candidates(self, query).unwrap_or(None)
+    }
+
+    fn entity_count(&self) -> usize {
+        DiskTree::entity_count(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        DiskTree::is_empty(self)
+    }
+
+    fn pages_read(&self) -> u64 {
+        DiskTree::pages_read(self)
     }
 }
 

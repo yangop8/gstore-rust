@@ -22,6 +22,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId};
 
+/// The VS-tree candidate-filter seam.
+///
+/// Given a query signature, return a *sound superset* of the entity ids whose
+/// signature contains it — i.e. `{ e : sig(e) ⊇ query }` plus possibly a few
+/// false positives the join later discards, never a false negative. `None`
+/// means "no filtering" (e.g. an empty tree), so the caller scans unpruned.
+///
+/// This is the single interface the query/candidate path consults, implemented
+/// by **both** backends so pruning is identical regardless of residency:
+/// * the in-memory VS-tree ([`VsTree`]), which holds every node in RAM, and
+/// * the out-of-core, streaming VS-tree (`disk_vstree::DiskTree`, reached
+///   through a disk-backed [`VsTree`]), which pages in only the nodes a query
+///   traverses.
+///
+/// Both return the same candidate set for the same entries (only tree shape and
+/// residency differ), so a database can swap one for the other transparently —
+/// e.g. a large in-memory store can opt into the streaming filter without
+/// materializing the whole tree. The trait is object-safe: a caller can hold a
+/// `&dyn SigFilter` and treat either backend uniformly.
+pub trait SigFilter {
+    /// Entity ids whose signature contains `query` (a sound superset), or `None`
+    /// for "no filtering".
+    fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>>;
+    /// Number of entities indexed by this filter.
+    fn entity_count(&self) -> usize;
+    /// Whether the filter is empty (no entities indexed).
+    fn is_empty(&self) -> bool;
+    /// Cumulative on-disk node pages read by candidate scans so far — `0` for a
+    /// fully in-memory filter, positive once a streaming filter has paged nodes
+    /// from disk. Lets a caller prove a query touched only part of the tree.
+    fn pages_read(&self) -> u64 {
+        0
+    }
+}
+
 /// Edge direction, as in gStore (`EDGE_IN` / `EDGE_OUT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeDir {
