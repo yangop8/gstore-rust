@@ -88,9 +88,9 @@ impl Value {
             if let Ok(i) = t.parse::<i128>() {
                 return Value::BigInt(i);
             }
-            if let Ok(f) = t.parse::<f64>() {
-                return Value::Double(f);
-            }
+            // An xsd:integer lexical that is not an integer ("1.5", "1e10",
+            // "NaN", "inf", or one beyond i128) is ill-typed — it is NOT a
+            // double. Fall through to a plain Typed literal (non-numeric).
         }
         // xsd:decimal is held exactly (mantissa + scale), not as lossy f64.
         if dt == xsd::DECIMAL {
@@ -765,6 +765,19 @@ mod tests {
     fn typed_float_becomes_double() {
         let v = Value::from_term(&Term::typed_literal("161.5", xsd::DOUBLE));
         assert_eq!(v, Value::Double(161.5));
+    }
+
+    #[test]
+    fn invalid_integer_lexical_is_not_a_double() {
+        // An ill-typed xsd:integer ("1.5", "1e10", "NaN") must not be accepted as
+        // a numeric double — it stays a (non-numeric) typed literal.
+        for bad in ["1.5", "1e10", "NaN", "inf", "  "] {
+            let v = Value::from_term(&Term::typed_literal(bad, xsd::INTEGER));
+            assert!(!v.is_numeric(), "{bad:?} must not be numeric, got {v:?}");
+            assert!(matches!(v, Value::Typed { .. }), "{bad:?} → {v:?}");
+        }
+        // A valid one is still an integer.
+        assert_eq!(Value::from_term(&Term::typed_literal("42", xsd::INTEGER)), Value::Int(42));
     }
 
     #[test]

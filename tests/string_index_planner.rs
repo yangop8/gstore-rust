@@ -61,6 +61,30 @@ fn contains_filter_is_accelerated_and_correct() {
 }
 
 #[test]
+fn contains_is_sound_for_escaped_characters() {
+    // The dictionary stores a value with a newline in N-Triples-escaped form
+    // ("foo\nbar"), but CONTAINS matches the *unescaped* value. The planner's
+    // StringIndex is keyed by the lexical value, so a needle containing the real
+    // newline must still match — indexing the escaped dict form would drop it.
+    // >64 entries keeps the index active.
+    let mut s = String::new();
+    for i in 0..80 {
+        s.push_str(&format!(
+            "<http://ex/n{i}> <http://ex/label> \"plain label {i}\" .\n"
+        ));
+    }
+    // n7's tag value is "foo\nbar" with a real line feed.
+    s.push_str("<http://ex/n7> <http://ex/tag> \"foo\\nbar\" .\n");
+    let mut db = Database::build_from_str("esc", &s).unwrap();
+    // Needle "o\nb" (o, LF, b) — a 3-byte substring of the unescaped value.
+    let n = count(
+        &mut db,
+        "SELECT ?s WHERE { ?s <http://ex/tag> ?o . FILTER(CONTAINS(STR(?o), \"o\\nb\")) }",
+    );
+    assert_eq!(n, 1, "an escaped-character needle must match the unescaped value");
+}
+
+#[test]
 fn strstarts_on_subject_iri_is_correct() {
     let mut db = Database::build_from_str("t", &dataset()).unwrap();
     // n9, n90..n99 → 11 subjects start with "http://ex/n9".

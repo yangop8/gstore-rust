@@ -1473,12 +1473,31 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// [`string_index`](Self#structfield.string_index) field). `None` when it
     /// would not help: a disk-backed dictionary (no in-memory strings ⇒ empty
     /// entries) or one too small for indexing to beat a linear scan.
+    ///
+    /// The index is keyed by each term's **`STR()`/lexical value** — the exact
+    /// string a substring `FILTER` compares against — NOT the raw N-Triples dict
+    /// key. This keeps candidate pruning sound: indexing the escaped/quoted dict
+    /// form would miss a needle containing an escaped character (`"`, `\`, a
+    /// newline) or a numeric whose canonical lexical differs from its stored form,
+    /// silently dropping true matches. A term whose dict string somehow fails to
+    /// re-parse falls back to its raw form (a term the dictionary stored always
+    /// re-parses, so this is only a safety net).
     fn string_index(&self) -> Option<Rc<StringIndex>> {
         if !self.string_index_tried.get() {
             self.string_index_tried.set(true);
-            let entries = self.dict.entity_literal_entries();
-            if entries.len() >= STRING_INDEX_MIN_ENTRIES {
-                *self.string_index.borrow_mut() = Some(Rc::new(StringIndex::build(entries)));
+            let raw = self.dict.entity_literal_entries();
+            if raw.len() >= STRING_INDEX_MIN_ENTRIES {
+                let lexical: Vec<(u32, String)> = raw
+                    .iter()
+                    .map(|(id, s)| {
+                        let key = parse_term(s)
+                            .ok()
+                            .map(|t| Value::from_term(&t).lexical())
+                            .unwrap_or_else(|| (*s).to_string());
+                        (*id, key)
+                    })
+                    .collect();
+                *self.string_index.borrow_mut() = Some(Rc::new(StringIndex::build(lexical)));
             }
         }
         self.string_index.borrow().clone()
@@ -2651,7 +2670,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         match self.eval_value(&args[0], b, l)? {
             Value::Int(i) => Some(Value::Int(fi(i))),
             Value::Double(d) => Some(Value::Double(ff(d))),
-            _ => None,
+            // BigInt / Decimal have no i64/f64-native fast path here; evaluate in
+            // f64 (as they were before the numeric tower split) rather than
+            // type-erroring. Non-numeric operands stay a type error (None).
+            v => v.as_f64().map(|x| Value::Double(ff(x))),
         }
     }
 
@@ -2914,27 +2936,18 @@ fn compare_values(op: CompareOp, a: &Value, b: &Value) -> Option<bool> {
 
 /// Sum numeric values (integer-preserving until a double appears).
 fn sum_values(vals: &[Value]) -> Value {
-    let mut all_int = true;
-    let mut isum: i64 = 0;
-    let mut fsum: f64 = 0.0;
+    // Accumulate through the numeric tower so decimals and big integers are
+    // summed exactly (not silently skipped) and any double promotes the result.
+    // Non-numeric values are not summable and are skipped (as before).
+    let mut acc = Value::Int(0);
     for v in vals {
-        match v {
-            Value::Int(i) => {
-                isum = isum.saturating_add(*i);
-                fsum += *i as f64;
+        if v.is_numeric() {
+            if let Some(next) = acc.arith(ArithOp::Add, v) {
+                acc = next;
             }
-            Value::Double(d) => {
-                all_int = false;
-                fsum += d;
-            }
-            _ => {}
         }
     }
-    if all_int {
-        Value::Int(isum)
-    } else {
-        Value::Double(fsum)
-    }
+    acc
 }
 
 /// Does a projection contain any aggregate (⇒ grouping evaluation)?
@@ -3347,6 +3360,21 @@ mod builtin_tests {
     use super::*;
     use crate::model::IdTriple;
     use crate::parser::sparql::parse;
+
+    #[test]
+    fn sum_values_includes_decimal_and_bigint() {
+        // #6: SUM must fold decimals and big integers through the numeric tower,
+        // not silently skip them (which returned 0 for an all-decimal group).
+        let decimals = vec![
+            Value::from_term(&Term::typed_literal("1.5", xsd::DECIMAL)),
+            Value::from_term(&Term::typed_literal("2.25", xsd::DECIMAL)),
+        ];
+        assert_eq!(sum_values(&decimals).lexical(), "3.75");
+        // Mixed int/bigint stays exact.
+        assert_eq!(sum_values(&[Value::BigInt(5), Value::Int(2)]).lexical(), "7");
+        // Empty group is still 0.
+        assert_eq!(sum_values(&[]), Value::Int(0));
+    }
 
     #[test]
     fn substring_filter_constraints_are_sound() {
