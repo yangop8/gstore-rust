@@ -241,6 +241,12 @@ struct ApiInner {
 enum Dispatch {
     Done(Resp),
     Query(QueryJob),
+    /// A response whose (possibly db-lock-contended) work runs with the
+    /// `ApiState` lock released — the closure captures cloned `Arc<Mutex<Database>>`
+    /// handles and does the locking itself. Used by the read-only monitoring
+    /// endpoints so a slow query holding one db's lock cannot wedge the state lock
+    /// and make `POST /cancel` undeliverable.
+    Deferred(Box<dyn FnOnce() -> Resp + Send>),
 }
 
 /// A query handed out of [`ApiInner::dispatch`] to run without the `ApiState`
@@ -371,6 +377,7 @@ impl ApiInner {
         let resp = match dispatch {
             Dispatch::Done(r) => r,
             Dispatch::Query(job) => self.execute_query_job(job),
+            Dispatch::Deferred(f) => f(),
         };
 
         // Access log. Written off-lock (O_APPEND keeps each line atomic); strict
@@ -501,6 +508,11 @@ impl ApiInner {
                 };
             }
             ("POST", "/tquery") => return self.handle_tquery(st, req, &user),
+            // Read-only monitoring endpoints defer their db reads off the state
+            // lock (see Dispatch::Deferred) so they never wedge POST /cancel.
+            ("GET", "/status") => return self.handle_status(st),
+            ("GET", "/monitor") => return self.handle_monitor(st),
+            ("GET" | "POST", "/show") => return self.handle_show(st),
             _ => {}
         }
 
@@ -520,7 +532,6 @@ impl ApiInner {
             ("POST", "/drop") => self.guarded(st, &user, Privilege::Unload, |s, st| {
                 s.handle_drop(st, req)
             }),
-            ("GET" | "POST", "/show") => self.handle_show(st),
             ("POST", "/begin") => self.guarded(st, &user, Privilege::Update, |s, st| {
                 s.handle_begin(st, req, &user)
             }),
@@ -548,8 +559,6 @@ impl ApiInner {
             ("POST", "/batchRemove") => self.guarded(st, &user, Privilege::Update, |s, st| {
                 s.handle_batch(st, req, &user, false)
             }),
-            ("GET", "/status") => self.handle_status(st),
-            ("GET", "/monitor") => self.handle_monitor(st),
             ("POST", "/user/create") => self.guarded(st, &user, Privilege::Admin, |s, st| {
                 s.handle_user_create(st, req)
             }),
@@ -904,46 +913,55 @@ impl ApiInner {
         Resp::ok(&format!("database '{name}' dropped"))
     }
 
-    fn handle_show(&self, st: &mut ApiState) -> Resp {
-        let mut names: Vec<String> = Vec::new();
-        // On-disk databases (directories ending in the .db suffix).
-        if let Ok(rd) = fs::read_dir(&st.root) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    let fname = entry.file_name().to_string_lossy().into_owned();
-                    if let Some(stripped) = fname.strip_suffix(crate::DB_SUFFIX) {
-                        names.push(stripped.to_string());
+    fn handle_show(&self, st: &ApiState) -> Dispatch {
+        // Snapshot the loaded-db handles + in-transaction names under the state
+        // lock; the directory scan and per-db triple counts run with the state
+        // lock released (see Dispatch::Deferred).
+        let root = st.root.clone();
+        let loaded: HashMap<String, Arc<Mutex<Database>>> =
+            st.dbs.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
+        let in_txn: std::collections::HashSet<String> = st.db_txn.keys().cloned().collect();
+        Dispatch::Deferred(Box::new(move || {
+            let mut names: Vec<String> = Vec::new();
+            // On-disk databases (directories ending in the .db suffix).
+            if let Ok(rd) = fs::read_dir(&root) {
+                for entry in rd.flatten() {
+                    if entry.path().is_dir() {
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        if let Some(stripped) = fname.strip_suffix(crate::DB_SUFFIX) {
+                            names.push(stripped.to_string());
+                        }
                     }
                 }
             }
-        }
-        // Plus any loaded-but-not-yet-persisted databases.
-        for k in st.dbs.keys() {
-            if !names.contains(k) {
-                names.push(k.clone());
+            // Plus any loaded-but-not-yet-persisted databases.
+            for k in loaded.keys() {
+                if !names.contains(k) {
+                    names.push(k.clone());
+                }
             }
-        }
-        names.sort();
-        names.dedup();
-        let mut items = Vec::new();
-        for n in &names {
-            let loaded = st.dbs.contains_key(n);
-            let triples = st.dbs.get(n).map(|d| d.lock().unwrap().triple_num());
-            let in_txn = st.db_txn.contains_key(n);
-            let triples_field = match triples {
-                Some(t) => t.to_string(),
-                None => "null".to_string(),
-            };
-            items.push(format!(
-                "{{\"name\":{},\"loaded\":{loaded},\"in_transaction\":{in_txn},\"triples\":{triples_field}}}",
-                json_str(n)
-            ));
-        }
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"success\",\"databases\":[{}]}}",
-            items.join(",")
-        );
-        Resp::new(200, JSON, body.into_bytes())
+            names.sort();
+            names.dedup();
+            let mut items = Vec::new();
+            for n in &names {
+                let is_loaded = loaded.contains_key(n);
+                let triples = loaded.get(n).map(|d| locked(d).triple_num());
+                let in_transaction = in_txn.contains(n);
+                let triples_field = match triples {
+                    Some(t) => t.to_string(),
+                    None => "null".to_string(),
+                };
+                items.push(format!(
+                    "{{\"name\":{},\"loaded\":{is_loaded},\"in_transaction\":{in_transaction},\"triples\":{triples_field}}}",
+                    json_str(n)
+                ));
+            }
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"success\",\"databases\":[{}]}}",
+                items.join(",")
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     // ---- transactions -----------------------------------------------------
@@ -1003,7 +1021,29 @@ impl ApiInner {
         if !st.users.has_priv(user, need) {
             return Dispatch::Done(self.forbidden());
         }
-        self.run_query(st, &name, &sparql, req, user)
+        // Execute the transactional statement SYNCHRONOUSLY, still holding the
+        // ApiState lock, so a concurrent /commit or /rollback cannot slip between
+        // the transaction lookup above and this execution — a TOCTOU that would
+        // otherwise apply the statement non-transactionally (after a rollback that
+        // already returned OK) or record it in a different transaction's undo log.
+        // Unlike a read query it is NOT deferred: transactional statements are
+        // bounded writes, so the brief lock hold is an acceptable trade for
+        // atomicity. (A deferred query still cannot be cancelled mid-flight here,
+        // but a bounded write does not need /cancel the way a long SELECT does.)
+        append_log(
+            &st.root,
+            "query.log",
+            &format!("{}\t{}\t{}\t{}", now_millis(), name, user, sparql.replace('\n', " ")),
+        );
+        let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
+        };
+        let result = locked(&dbh).query(&sparql);
+        Dispatch::Done(match result {
+            Ok(r) => render_result(fmt, &r),
+            Err(e) => Resp::new(400, "application/sparql-results+json", err_json(&e.to_string())),
+        })
     }
 
     fn handle_txn_end(&self, st: &mut ApiState, req: &Request, user: &str, commit: bool) -> Resp {
@@ -1179,46 +1219,56 @@ impl ApiInner {
 
     // ---- monitoring -------------------------------------------------------
 
-    fn handle_status(&self, st: &mut ApiState) -> Resp {
-        let total_triples: u64 = st.dbs.values().map(|d| d.lock().unwrap().triple_num()).sum();
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"running\",\"databases_loaded\":{},\"total_triples\":{},\"open_transactions\":{},\"users\":{},\"requests\":{},\"uptime_secs\":{}}}",
-            st.dbs.len(),
-            total_triples,
-            st.txns.len(),
-            st.users.count(),
-            st.requests,
-            st.started.elapsed().as_secs(),
-        );
-        Resp::new(200, JSON, body.into_bytes())
+    fn handle_status(&self, st: &ApiState) -> Dispatch {
+        // Snapshot registry scalars under the state lock; clone the db handles so
+        // the (lock-contended) triple counts are read with the state lock released.
+        let dbs: Vec<Arc<Mutex<Database>>> = st.dbs.values().cloned().collect();
+        let ndbs = st.dbs.len();
+        let ntxns = st.txns.len();
+        let nusers = st.users.count();
+        let nreq = st.requests;
+        let uptime = st.started.elapsed().as_secs();
+        Dispatch::Deferred(Box::new(move || {
+            let total_triples: u64 = dbs.iter().map(|d| locked(d).triple_num()).sum();
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"running\",\"databases_loaded\":{ndbs},\"total_triples\":{total_triples},\"open_transactions\":{ntxns},\"users\":{nusers},\"requests\":{nreq},\"uptime_secs\":{uptime}}}"
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
-    fn handle_monitor(&self, st: &mut ApiState) -> Resp {
-        let mut dbs = Vec::new();
-        let mut names: Vec<&String> = st.dbs.keys().collect();
-        names.sort();
-        for n in names {
-            let s = st.dbs[n].lock().unwrap().stats();
-            dbs.push(format!(
-                "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
-                json_str(&s.name),
-                s.triple_num,
-                s.entity_num,
-                s.literal_num,
-                s.predicate_num,
-                s.index_valid,
-                s.in_transaction,
-            ));
-        }
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"success\",\"uptime_secs\":{},\"requests\":{},\"users\":{},\"open_transactions\":{},\"databases\":[{}]}}",
-            st.started.elapsed().as_secs(),
-            st.requests,
-            st.users.count(),
-            st.txns.len(),
-            dbs.join(","),
-        );
-        Resp::new(200, JSON, body.into_bytes())
+    fn handle_monitor(&self, st: &ApiState) -> Dispatch {
+        let mut entries: Vec<(String, Arc<Mutex<Database>>)> = st
+            .dbs
+            .iter()
+            .map(|(n, d)| (n.clone(), Arc::clone(d)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let uptime = st.started.elapsed().as_secs();
+        let nreq = st.requests;
+        let nusers = st.users.count();
+        let ntxns = st.txns.len();
+        Dispatch::Deferred(Box::new(move || {
+            let mut dbs = Vec::new();
+            for (_n, d) in &entries {
+                let s = locked(d).stats();
+                dbs.push(format!(
+                    "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
+                    json_str(&s.name),
+                    s.triple_num,
+                    s.entity_num,
+                    s.literal_num,
+                    s.predicate_num,
+                    s.index_valid,
+                    s.in_transaction,
+                ));
+            }
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"success\",\"uptime_secs\":{uptime},\"requests\":{nreq},\"users\":{nusers},\"open_transactions\":{ntxns},\"databases\":[{}]}}",
+                dbs.join(","),
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     fn read_log(&self, st: &mut ApiState, file: &str) -> Resp {
@@ -1835,6 +1885,51 @@ mod tests {
             .collect::<String>()
             .parse()
             .ok()
+    }
+
+    #[test]
+    fn tquery_runs_in_the_transaction_and_rollback_discards_it() {
+        // #3: a /tquery statement must execute inside its transaction (so a
+        // rollback discards it), not non-transactionally. Executing it
+        // synchronously under the state lock also closes the commit/rollback
+        // TOCTOU; here we assert the transactional semantics directly.
+        let (_srv, addr) = start("tq");
+        let root = basic("root", "root");
+        let post = |target: &str, body: &str| -> (u16, String) {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&root), body))
+        };
+        assert_eq!(post("/build?db_name=t", "").0, 200);
+        let (s, body) = post("/begin?db_name=t", "");
+        assert_eq!(s, 200);
+        let tid = body
+            .split("\"TID\":\"")
+            .nth(1)
+            .and_then(|x| x.split('"').next())
+            .expect("TID in begin response")
+            .to_string();
+        // Insert within the transaction, then roll back.
+        assert_eq!(
+            post(
+                &format!("/tquery?tid={tid}"),
+                "INSERT DATA { <http://a> <http://b> <http://c> }"
+            )
+            .0,
+            200
+        );
+        assert_eq!(post(&format!("/rollback?tid={tid}"), "").0, 200);
+        // The rolled-back insert must not persist.
+        let (s, body) = split_status_body(&raw_request(
+            &addr,
+            "GET",
+            "/sparql?db_name=t",
+            Some(&root),
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ));
+        assert_eq!(s, 200);
+        assert!(
+            !body.contains("http://a"),
+            "a rolled-back tquery insert must not persist: {body}"
+        );
     }
 
     #[test]
