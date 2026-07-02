@@ -522,8 +522,12 @@ struct Extractor {
 }
 
 impl Extractor {
+    /// Mint a fresh, document-unique blank node for a `@typeof`/`@rel` chain.
+    /// The `~` cannot appear in a parsed `_:` CURIE reference (an NCName), so a
+    /// minted label can never collide with an author-written `_:` blank node —
+    /// mirrors the Turtle (`g~`) and JSON-LD (`jld~`) parsers.
     fn fresh_blank(&mut self) -> Term {
-        let t = Term::Blank(format!("rdfa{}", self.bnode));
+        let t = Term::Blank(format!("rdfa~{}", self.bnode));
         self.bnode += 1;
         t
     }
@@ -1134,6 +1138,28 @@ mod tests {
         assert_eq!(types.len(), 1);
         assert_eq!(types[0].subject, Term::iri("http://ex/b"), "type must be on the rel object");
         assert_eq!(types[0].object, Term::iri("http://ex/Person"));
+    }
+
+    #[test]
+    fn minted_blank_never_collides_with_author_blank() {
+        // #1 (LOW): an author-written `_:rdfa0` must stay distinct from a blank the
+        // parser mints. The minted label carries a `~` (not a valid `_:` CURIE
+        // char), so the two can never be unified into one node.
+        let doc = r#"
+        <div>
+          <span about="_:rdfa0" property="http://ex/p">authored</span>
+          <span typeof="http://ex/T"></span>
+        </div>"#;
+        let ts = parse_str(doc).unwrap();
+        let authored = find(&ts, "http://ex/p");
+        assert_eq!(authored[0].subject, Term::Blank("rdfa0".into()), "author label preserved");
+        let types = find(&ts, RDF_TYPE);
+        assert_eq!(types.len(), 1);
+        let Term::Blank(minted) = &types[0].subject else {
+            panic!("bare @typeof must mint a blank subject");
+        };
+        assert!(minted.starts_with("rdfa~"), "minted label must use the ~ separator: {minted}");
+        assert_ne!(&types[0].subject, &authored[0].subject, "minted must not equal author blank");
     }
 
     #[test]

@@ -413,6 +413,11 @@ impl Processor {
                         "@vocab" => ctx.vocab = as_opt_string(v),
                         "@language" => ctx.language = as_opt_string(v),
                         _ if k.starts_with('@') => {}
+                        // `"term": null` explicitly removes the mapping (JSON-LD
+                        // context term deletion) rather than defining a dead term.
+                        _ if matches!(v, Json::Null) => {
+                            ctx.terms.remove(k);
+                        }
                         _ => {
                             ctx.terms.insert(k.clone(), self.build_term_def(&ctx, v));
                         }
@@ -990,6 +995,23 @@ mod tests {
         assert_eq!(firsts.len(), 2);
         assert!(firsts.contains(&&Term::plain_literal("a")));
         assert!(firsts.contains(&&Term::plain_literal("b")));
+    }
+
+    #[test]
+    fn context_term_null_removes_mapping() {
+        // #3 (LOW): `"term": null` in a layered context deletes the mapping, so the
+        // term no longer resolves to its former IRI and falls back to @vocab.
+        let doc = r#"{
+            "@context": [
+                {"@vocab": "http://ex/", "keep": "http://other/keep"},
+                {"keep": null}
+            ],
+            "@id": "http://ex/s",
+            "keep": "v"
+        }"#;
+        let ts = parse_str(doc).unwrap();
+        assert!(find(&ts, "http://other/keep").is_empty(), "nulled term mapping must be removed");
+        assert_eq!(find(&ts, "http://ex/keep").len(), 1, "term falls back to @vocab expansion");
     }
 
     #[test]

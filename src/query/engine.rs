@@ -2211,7 +2211,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
                 let n = self.graph_view().count_shortest_paths(a, c)?;
-                Some(Value::Int(n as i64))
+                // The number of distinct shortest paths grows combinatorially and
+                // can exceed i64::MAX; saturate rather than wrap to a negative.
+                Some(Value::Int(n.min(i64::MAX as u64) as i64))
             }
             // KHOPCOUNT(a, k): #nodes at exactly k out-hops of a.
             "KHOPCOUNT" => {

@@ -1361,9 +1361,16 @@ impl Database {
     ) -> Result<Database> {
         let base_dir = base_dir.as_ref();
         let mut db = Database::load(base_dir)?;
-        // The base's checkpoint is where the first increment must begin. Absent a
-        // marker (e.g. a backup taken without logging), treat it as 0.
-        let mut expected = read_backup_offset(&base_dir.join(BACKUP_OFFSET_FILE)).unwrap_or(0);
+        // The base's checkpoint is where the first increment must begin. A missing
+        // marker (a backup taken without logging) legitimately means offset 0, but
+        // a marker that exists yet cannot be read is a corrupt base — surface that
+        // rather than silently pretending the checkpoint was 0.
+        let marker = base_dir.join(BACKUP_OFFSET_FILE);
+        let mut expected = if marker.exists() {
+            read_backup_offset(&marker)?
+        } else {
+            0
+        };
         // Replaying must not re-log; a freshly loaded db has no redo log anyway.
         let saved = db.redo_log.take();
         let outcome = (|| {
@@ -2437,6 +2444,35 @@ mod tests {
             "incremental backup without a redo log must error, got {err:?}"
         );
         let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn restore_incremental_rejects_corrupt_base_marker() {
+        // #7 (LOW): a base whose BACKUP_OFFSET marker exists but cannot be parsed
+        // must fail the restore rather than silently defaulting the checkpoint to 0
+        // (which would accept a mis-aligned increment chain).
+        let base_dir = temp_dir("bk_corrupt_base");
+        let incr_dir = temp_dir("bk_corrupt_incr");
+        let db_dir = temp_dir("bk_corrupt_db");
+
+        let mut db = Database::build_from_str("bk", SMALL).unwrap();
+        db.enable_redo_log_in(&db_dir).unwrap();
+        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+        db.backup(&base_dir).unwrap();
+        db.query("INSERT DATA { <root> <contain> <n1> }").unwrap();
+        db.backup_incremental(&incr_dir).unwrap();
+
+        // Present-but-unparseable marker (not an absent one, which is a legit 0).
+        fs::write(base_dir.join(BACKUP_OFFSET_FILE), b"garbage not a marker\n").unwrap();
+        let err = Database::restore_incremental(&base_dir, &[&incr_dir]).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::Database(_)),
+            "a corrupt base checkpoint marker must error, got {err:?}"
+        );
+
+        for d in [&base_dir, &incr_dir, &db_dir] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     #[test]

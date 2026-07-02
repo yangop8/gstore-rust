@@ -98,6 +98,12 @@ fn main() {
 /// (default the current directory), with users/RBAC and the web console.
 fn run_api(db_dir: Option<String>, password: &str, host: &str, port: u16) {
     let root = db_dir.unwrap_or_else(|| ".".to_string());
+    if password == "123456" {
+        eprintln!(
+            "warning: root is using the default password '123456'; \
+             pass --password to set a strong one before exposing this server"
+        );
+    }
     let server = match ApiServer::bind(&root, password, (host, port)) {
         Ok(s) => s,
         Err(e) => {

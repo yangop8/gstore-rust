@@ -468,12 +468,11 @@ impl ApiServer {
                 s.handle_tasklist(st)
             }),
             ("POST", "/cancel") => {
-                // Either privilege can cancel: Update (you can cancel your own
-                // long-running work) or Admin (an operator cancelling anyone's).
-                if st.users.has_priv(&user, Privilege::Admin)
-                    || st.users.has_priv(&user, Privilege::Update)
-                {
-                    self.handle_cancel(st, req)
+                // Either privilege can cancel: Update (only your *own* long-running
+                // work) or Admin (an operator cancelling anyone's).
+                let is_admin = st.users.has_priv(&user, Privilege::Admin);
+                if is_admin || st.users.has_priv(&user, Privilege::Update) {
+                    self.handle_cancel(st, req, &user, is_admin)
                 } else {
                     self.forbidden()
                 }
@@ -641,7 +640,7 @@ impl ApiServer {
         Resp::new(200, JSON, body.into_bytes())
     }
 
-    fn handle_cancel(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_cancel(&self, st: &mut ApiState, req: &Request, user: &str, is_admin: bool) -> Resp {
         let Some(id) = req
             .param("id")
             .or_else(|| req.param("task_id"))
@@ -652,6 +651,10 @@ impl ApiServer {
         };
         match st.tasks.get(&id) {
             Some(t) => {
+                // A non-admin may only cancel tasks they started; admins cancel any.
+                if !is_admin && t.user != user {
+                    return Resp::fail(403, &format!("task {id} belongs to another user"));
+                }
                 t.cancel.store(true, Ordering::Relaxed);
                 Resp::ok(&format!("cancel requested for task {id}"))
             }
@@ -1657,5 +1660,56 @@ mod tests {
         let writer = basic("writer", "pw");
         let (status, _) = split_status_body(&raw_request(&addr, "POST", "/cancel?id=999999", Some(&writer), ""));
         assert_eq!(status, 404, "update-privileged user must reach the handler, not be forbidden");
+    }
+
+    #[test]
+    fn cancel_enforces_task_ownership() {
+        // #4 (LOW): a non-admin may cancel only tasks they started; another
+        // non-admin is 403; an admin may cancel anyone's. The registry is
+        // populated directly (a real query completes synchronously, leaving no
+        // residue), then driven through the real served /cancel path.
+        use crate::http_users::Privilege;
+        use std::collections::BTreeSet;
+        let (server, addr) = start("cancel_own");
+        {
+            let mut st = server.state.lock().unwrap();
+            st.users.add("alice", "pw", BTreeSet::from([Privilege::Update])).unwrap();
+            st.users.add("bob", "pw", BTreeSet::from([Privilege::Update])).unwrap();
+            st.tasks.insert(
+                42,
+                TaskEntry {
+                    db: "d".into(),
+                    query: "q".into(),
+                    user: "alice".into(),
+                    started: Instant::now(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        let cancel_as = |user: &str, pass: &str| -> u16 {
+            let auth = basic(user, pass);
+            let (status, _) =
+                split_status_body(&raw_request(&addr, "POST", "/cancel?id=42", Some(&auth), ""));
+            status
+        };
+        let flag = || server.state.lock().unwrap().tasks[&42].cancel.load(Ordering::Relaxed);
+        let reset = || server
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .get_mut(&42)
+            .unwrap()
+            .cancel
+            .store(false, Ordering::Relaxed);
+
+        assert_eq!(cancel_as("bob", "pw"), 403, "non-owner non-admin must be forbidden");
+        assert!(!flag(), "a forbidden cancel must not set the flag");
+        assert_eq!(cancel_as("alice", "pw"), 200, "the owner may cancel");
+        assert!(flag(), "owner's cancel sets the flag");
+        // Admin can cancel anyone's — reset and cancel alice's task as root.
+        reset();
+        assert_eq!(cancel_as("root", "root"), 200, "admin may cancel any task");
+        assert!(flag(), "admin's cancel sets the flag");
     }
 }

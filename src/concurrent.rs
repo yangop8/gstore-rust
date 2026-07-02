@@ -582,6 +582,13 @@ impl ConcurrentDb {
     /// (time-travel). Like [`version_view`](Self::version_view) it registers
     /// liveness for GC. `version` should be a committed version `<=` the current
     /// one; reads resolve through the version chains as of that version.
+    ///
+    /// PRECONDITION: `version` must still be *retained* — at or above the current
+    /// GC floor (the oldest version any live view has pinned). Registration here
+    /// pins `version` going forward, but it cannot resurrect version records that
+    /// an earlier GC already reclaimed: pinning a `version` below the floor at
+    /// call time yields a view that silently omits keys whose old records were
+    /// collected. Pin the version *before* dropping the reader that keeps it live.
     pub fn version_view_at(&self, version: u64) -> VersionView<'_> {
         let mut occ = self.occ.lock().unwrap();
         occ.register(version);
