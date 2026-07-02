@@ -292,6 +292,24 @@ impl Dictionary {
         }
     }
 
+    /// Live `(id, string)` pairs for entities and literals — the id space that
+    /// binds subject/object variables (predicates are excluded: separate space).
+    /// Entity ids are their interner index; literal ids are offset by
+    /// [`LITERAL_FIRST_ID`], matching [`id_to_string`](Self::id_to_string).
+    ///
+    /// Empty for a disk-backed dictionary (its strings live on disk, not in the
+    /// interners); callers treat that as "no in-memory string index available"
+    /// and fall back to a scan.
+    pub fn entity_literal_entries(&self) -> Vec<(EntityLiteralId, &str)> {
+        if self.backing.is_some() {
+            return Vec::new();
+        }
+        let mut v = Vec::with_capacity(self.entities.len() + self.literals.len());
+        v.extend(self.entities.entries());
+        v.extend(self.literals.entries().map(|(i, s)| (i + LITERAL_FIRST_ID, s)));
+        v
+    }
+
     // ---- prefix-compressed (front-coded) export --------------------------
 
     /// Every dictionary string — entities, literals, and predicates — merged,

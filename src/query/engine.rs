@@ -21,6 +21,7 @@ use regex::Regex;
 use crate::analytics::GraphView;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
+use crate::kvstore::StringIndex;
 use crate::model::id::PredId;
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
@@ -195,6 +196,15 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// source node. Shared with `GRAPH` sub-evaluators is NOT desired (they run
     /// over a different store), so each evaluator gets its own.
     algo_cache: std::cell::RefCell<AlgoCache>,
+    /// Lazily-built substring/prefix index over the (in-memory) dictionary, used
+    /// to prune candidate sets for mandatory-substring `FILTER`s
+    /// (`CONTAINS`/`STRSTARTS`/`STRENDS`/plain `REGEX`). Built at most once per
+    /// query, the first time such a filter is seen. Stays `None` (disabled) for a
+    /// disk-backed dictionary (no in-memory strings) or a dictionary too small
+    /// for indexing to beat a scan; [`string_index_tried`](Self::string_index)
+    /// guards against rebuilding.
+    string_index: std::cell::RefCell<Option<Rc<StringIndex>>>,
+    string_index_tried: std::cell::Cell<bool>,
 }
 
 /// Per-query memoization of whole-graph analytics results (see
@@ -227,6 +237,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             functions: Rc::new(FunctionRegistry::new()),
             cancel: None,
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
+            string_index: std::cell::RefCell::new(None),
+            string_index_tried: std::cell::Cell::new(false),
         }
     }
 
@@ -247,6 +259,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             functions: Rc::new(FunctionRegistry::new()),
             cancel: None,
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
+            string_index: std::cell::RefCell::new(None),
+            string_index_tried: std::cell::Cell::new(false),
         }
     }
 
@@ -1033,7 +1047,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 left
             }
             GraphPattern::Filter(filters, inner) => {
-                let mut r = self.eval_pattern(inner, layout);
+                // When the filtered pattern is a plain BGP, push mandatory-substring
+                // constraints (CONTAINS/STRSTARTS/…) into candidate generation so
+                // the StringIndex can prune before the join. The exact filters below
+                // still run, so this is purely an acceleration.
+                let mut r = match inner.as_ref() {
+                    GraphPattern::Bgp(tps) => {
+                        let cons = self.filter_string_constraints(filters, layout);
+                        self.eval_bgp_constrained(tps, layout, &cons)
+                    }
+                    _ => self.eval_pattern(inner, layout),
+                };
                 r.retain(|b| {
                     // Cooperative cancellation between rows: once requested, drop
                     // remaining rows instead of evaluating (possibly expensive)
@@ -1172,6 +1196,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             functions: Rc::clone(&self.functions),
             cancel: self.cancel.clone(), // cancellation propagates into GRAPH blocks
             algo_cache: std::cell::RefCell::new(AlgoCache::default()), // per-graph, not shared
+            string_index: std::cell::RefCell::new(None), // per-graph store, own index
+            string_index_tried: std::cell::Cell::new(false),
         }
     }
 
@@ -1338,6 +1364,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Evaluate a basic graph pattern from scratch (index-pushed, ordered).
     fn eval_bgp(&self, tps: &[TriplePattern], layout: &VarLayout) -> Vec<Binding> {
+        self.eval_bgp_constrained(tps, layout, &HashMap::new())
+    }
+
+    /// [`eval_bgp`](Self::eval_bgp) with mandatory-substring `FILTER` constraints
+    /// (variable index → substrings its value must contain) pushed down into
+    /// candidate generation, so `FILTER(CONTAINS(?v, "…"))` prunes/seeds `?v`'s
+    /// candidates via the dictionary [`StringIndex`] before the join. The exact
+    /// filter still runs afterwards, so this only reduces work, never results.
+    fn eval_bgp_constrained(
+        &self,
+        tps: &[TriplePattern],
+        layout: &VarLayout,
+        str_constraints: &HashMap<usize, Vec<String>>,
+    ) -> Vec<Binding> {
         // Compile patterns; a missing constant ⇒ the conjunction is empty.
         let mut plans = Vec::with_capacity(tps.len());
         for tp in tps {
@@ -1354,6 +1394,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
         let mut candidates = candidates::generate(&plans, self.store);
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
+        // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
+        // plain REGEX) prune or seed candidate sets — a sound superset, so only
+        // the join shrinks (the exact FILTER still verifies each row).
+        if !str_constraints.is_empty() {
+            if let Some(idx) = self.string_index() {
+                candidates::refine_with_substrings(&mut candidates, str_constraints, &idx, &plans);
+            }
+        }
 
         // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
         // tree when one is strictly cheaper. Memoised so a structurally-identical
@@ -1427,6 +1475,39 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 (joined, vars)
             }
         }
+    }
+
+    /// The dictionary substring index, built once per query on first use (see the
+    /// [`string_index`](Self#structfield.string_index) field). `None` when it
+    /// would not help: a disk-backed dictionary (no in-memory strings ⇒ empty
+    /// entries) or one too small for indexing to beat a linear scan.
+    fn string_index(&self) -> Option<Rc<StringIndex>> {
+        if !self.string_index_tried.get() {
+            self.string_index_tried.set(true);
+            let entries = self.dict.entity_literal_entries();
+            if entries.len() >= STRING_INDEX_MIN_ENTRIES {
+                *self.string_index.borrow_mut() = Some(Rc::new(StringIndex::build(entries)));
+            }
+        }
+        self.string_index.borrow().clone()
+    }
+
+    /// Extract mandatory-substring constraints (variable index → substrings) from
+    /// `FILTER` expressions, for [`StringIndex`]-accelerated candidate pruning.
+    /// Only conjuncts whose truth *requires* the variable's string value to hold a
+    /// fixed ≥3-byte substring are collected — `CONTAINS`/`STRSTARTS`/`STRENDS` of
+    /// `?v` or `STR(?v)` against a literal, and metacharacter-free `REGEX(?v,
+    /// "lit")` — so the index candidates stay a sound superset.
+    fn filter_string_constraints(
+        &self,
+        filters: &[Expr],
+        layout: &VarLayout,
+    ) -> HashMap<usize, Vec<String>> {
+        let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+        for f in filters {
+            collect_substr_constraints(f, layout, &mut out);
+        }
+        out
     }
 
     /// Intersect the VS-tree's signature candidates into the exact candidate
@@ -3117,6 +3198,68 @@ fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
     }
 }
 
+/// Minimum dictionary size (entities + literals) below which the substring index
+/// is not built — a linear scan beats indexing for a tiny dictionary.
+const STRING_INDEX_MIN_ENTRIES: usize = 64;
+
+/// Walk a `FILTER` expression collecting mandatory-substring constraints for
+/// StringIndex pruning (see [`Evaluator::filter_string_constraints`]). Recurses
+/// through top-level `AND`; a disjunction (`OR`) is not mandatory, so skipped.
+fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<usize, Vec<String>>) {
+    match e {
+        Expr::And(a, b) => {
+            collect_substr_constraints(a, layout, out);
+            collect_substr_constraints(b, layout, out);
+        }
+        Expr::Builtin(name, args) => {
+            let needle = match name.as_str() {
+                "CONTAINS" | "STRSTARTS" | "STRENDS" if args.len() == 2 => const_string(&args[1]),
+                // A metacharacter-free regex pattern is just a literal substring.
+                // Only the plain two-arg form: a flags arg (e.g. "i") could break
+                // byte-substring soundness.
+                "REGEX" if args.len() == 2 => {
+                    const_string(&args[1]).filter(|p| is_plain_literal_regex(p))
+                }
+                _ => None,
+            };
+            if let (Some(vi), Some(n)) = (substr_target_var(&args[0], layout), needle) {
+                if n.len() >= 3 {
+                    out.entry(vi).or_default().push(n);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The variable index a substring builtin's first argument denotes, if it is a
+/// bare variable or `STR(?v)` (both preserve the value's bytes). Case-folding
+/// wrappers (`LCASE`/`UCASE`) yield `None`: their substring is not the variable's
+/// own bytes, so index pruning would be unsound.
+fn substr_target_var(e: &Expr, layout: &VarLayout) -> Option<usize> {
+    match e {
+        Expr::Var(v) => layout.index.get(v).copied(),
+        Expr::Builtin(name, args) if name == "STR" && args.len() == 1 => {
+            substr_target_var(&args[0], layout)
+        }
+        _ => None,
+    }
+}
+
+/// The lexical value of a constant expression, for use as a substring needle.
+fn const_string(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Const(t) => Some(Value::from_term(t).lexical()),
+        _ => None,
+    }
+}
+
+/// Whether `p` is a plain literal (no regex metacharacters), so it can be treated
+/// as a mandatory substring for candidate pruning.
+fn is_plain_literal_regex(p: &str) -> bool {
+    !p.is_empty() && !p.bytes().any(|b| b".^$*+?()[]{}|\\".contains(&b))
+}
+
 /// Unify a slot against a concrete id, mutating the binding. Returns false on
 /// conflict (a variable already bound to a different id).
 fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
@@ -3249,6 +3392,77 @@ mod builtin_tests {
     use super::*;
     use crate::model::IdTriple;
     use crate::parser::sparql::parse;
+
+    #[test]
+    fn substring_filter_constraints_are_sound() {
+        // #4: only filters whose truth *requires* a fixed ≥3-byte substring of a
+        // subject/object variable's value are extracted (sound supersets); every
+        // other shape is ignored so the exact FILTER remains the source of truth.
+        let layout = VarLayout {
+            index: HashMap::from([("s".to_string(), 0usize), ("o".to_string(), 1usize)]),
+            names: vec!["s".into(), "o".into()],
+            is_pred: vec![false, false],
+        };
+        let lit = |s: &str| Expr::Const(Term::plain_literal(s));
+
+        // CONTAINS(?o, "marker") → constraint on ?o (index 1).
+        let mut out = HashMap::new();
+        collect_substr_constraints(
+            &Expr::Builtin("CONTAINS".into(), vec![Expr::Var("o".into()), lit("marker")]),
+            &layout,
+            &mut out,
+        );
+        assert_eq!(out.get(&1), Some(&vec!["marker".to_string()]));
+
+        // STR(?s) wrapper + STRSTARTS, and a metacharacter-free REGEX, both extract.
+        let mut out2 = HashMap::new();
+        collect_substr_constraints(
+            &Expr::And(
+                Box::new(Expr::Builtin(
+                    "STRSTARTS".into(),
+                    vec![
+                        Expr::Builtin("STR".into(), vec![Expr::Var("s".into())]),
+                        lit("http://ex/"),
+                    ],
+                )),
+                Box::new(Expr::Builtin(
+                    "REGEX".into(),
+                    vec![Expr::Var("o".into()), lit("plain")],
+                )),
+            ),
+            &layout,
+            &mut out2,
+        );
+        assert_eq!(out2.get(&0), Some(&vec!["http://ex/".to_string()]));
+        assert_eq!(out2.get(&1), Some(&vec!["plain".to_string()]));
+
+        // Skipped: metachar REGEX, case-folding wrapper, <3B needle, disjunction.
+        let mut out3 = HashMap::new();
+        for e in [
+            Expr::Builtin("REGEX".into(), vec![Expr::Var("o".into()), lit("a.c")]),
+            Expr::Builtin(
+                "CONTAINS".into(),
+                vec![
+                    Expr::Builtin("LCASE".into(), vec![Expr::Var("o".into())]),
+                    lit("marker"),
+                ],
+            ),
+            Expr::Builtin("CONTAINS".into(), vec![Expr::Var("o".into()), lit("ab")]),
+            Expr::Or(
+                Box::new(Expr::Builtin(
+                    "CONTAINS".into(),
+                    vec![Expr::Var("o".into()), lit("marker")],
+                )),
+                Box::new(Expr::Builtin(
+                    "CONTAINS".into(),
+                    vec![Expr::Var("s".into()), lit("other")],
+                )),
+            ),
+        ] {
+            collect_substr_constraints(&e, &layout, &mut out3);
+        }
+        assert!(out3.is_empty(), "unsound/unhelpful filters extract nothing: {out3:?}");
+    }
 
     const DT: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
     /// An `xsd:dateTime` literal in SPARQL surface syntax, used as a constant in

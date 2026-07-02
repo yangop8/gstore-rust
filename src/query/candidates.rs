@@ -11,8 +11,9 @@
 //! intersection only shrinks, so the result is exactly the set of ids that
 //! satisfy all the variable's constant-edge constraints — sound and precise.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::kvstore::StringIndex;
 use crate::store::TripleSource;
 
 use super::engine::{PatPlan, Slot};
@@ -64,6 +65,64 @@ pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidat
     }
 
     cand
+}
+
+/// Tighten (or seed) candidate sets using mandatory-substring FILTER constraints
+/// via the dictionary [`StringIndex`].
+///
+/// `constraints` maps a variable index to the substrings its string value MUST
+/// contain (extracted from `CONTAINS`/`STRSTARTS`/`STRENDS`/plain-`REGEX`
+/// filters). For a variable bound only to entity/literal ids — one used only in
+/// subject/object positions — the ids whose dictionary string contains such a
+/// substring are a **sound superset** of its valid bindings (a lexical substring
+/// is also a substring of the serialized term), so intersecting them in (or
+/// seeding, when the variable had no candidates) only prunes. Predicate-position
+/// variables are skipped: they bind a separate id space the index doesn't cover.
+/// The exact FILTER still runs downstream, so results never change — only work.
+pub(crate) fn refine_with_substrings(
+    cand: &mut Candidates,
+    constraints: &HashMap<usize, Vec<String>>,
+    idx: &StringIndex,
+    plans: &[PatPlan],
+) {
+    if constraints.is_empty() {
+        return;
+    }
+    // A variable is safe to constrain only if it binds entity/literal ids: it
+    // appears in some subject/object slot and never in a predicate slot.
+    let mut so_vars: HashSet<usize> = HashSet::new();
+    let mut pred_vars: HashSet<usize> = HashSet::new();
+    for p in plans {
+        if let Slot::Var(v) = &p.s {
+            so_vars.insert(*v);
+        }
+        if let Slot::Var(v) = &p.o {
+            so_vars.insert(*v);
+        }
+        if let Slot::Var(v) = &p.p {
+            pred_vars.insert(*v);
+        }
+    }
+    for (&v, needles) in constraints {
+        if !so_vars.contains(&v) || pred_vars.contains(&v) {
+            continue;
+        }
+        // Intersect the per-needle candidate supersets (every needle is mandatory).
+        let mut set: Option<Vec<u32>> = None;
+        for n in needles {
+            let c = idx.contains_candidates(n);
+            set = Some(match set {
+                None => c,
+                Some(prev) => sorted_intersect(&prev, &c),
+            });
+            if set.as_deref().is_some_and(<[u32]>::is_empty) {
+                break;
+            }
+        }
+        if let Some(s) = set {
+            intersect_into(cand, v, s);
+        }
+    }
 }
 
 /// Only propagate when the variable already has candidates and the predicate is
@@ -173,6 +232,37 @@ mod tests {
         let plans = vec![pp(Slot::Const(2), Slot::Const(1), Slot::Var(0))];
         let c = generate(&plans, &s);
         assert_eq!(c.get(&0), Some(&vec![200]));
+    }
+
+    #[test]
+    fn substring_index_seeds_and_tightens_candidates() {
+        use crate::kvstore::StringIndex;
+        // Index over dictionary strings; ids 10 and 12 contain "MARK".
+        let idx = StringIndex::build([
+            (10u32, "\"alpha MARKER\""),
+            (11u32, "\"beta\""),
+            (12u32, "\"MARK gamma\""),
+            (13u32, "\"delta\""),
+        ]);
+        // BGP `?s ?p ?o`: ?s(0),?o(2) in subject/object slots, ?p(1) predicate.
+        let plans = vec![pp(Slot::Var(0), Slot::Var(1), Slot::Var(2))];
+
+        // Seeds ?o (had no candidates) with the "MARK" superset {10,12}.
+        let cons = HashMap::from([(2usize, vec!["MARK".to_string()])]);
+        let mut cand: Candidates = HashMap::new();
+        refine_with_substrings(&mut cand, &cons, &idx, &plans);
+        assert_eq!(cand.get(&2), Some(&vec![10, 12]));
+
+        // A predicate-position variable is skipped (separate id space).
+        let cons_p = HashMap::from([(1usize, vec!["MARK".to_string()])]);
+        let mut cand_p: Candidates = HashMap::new();
+        refine_with_substrings(&mut cand_p, &cons_p, &idx, &plans);
+        assert!(!cand_p.contains_key(&1));
+
+        // Tightens an existing candidate set: {10,11} ∩ {10,12} = {10}.
+        let mut cand_t: Candidates = HashMap::from([(2usize, vec![10, 11])]);
+        refine_with_substrings(&mut cand_t, &cons, &idx, &plans);
+        assert_eq!(cand_t.get(&2), Some(&vec![10]));
     }
 
     #[test]
