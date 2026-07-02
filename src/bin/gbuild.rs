@@ -3,10 +3,12 @@
 //! Mirrors gStore's `gbuild`:
 //!
 //! ```text
-//! gbuild <db_name> <data.nt> [more.nt ...]
+//! gbuild [--disk | --rocksdb] <db_name> <data.nt> [more.nt ...]
 //! ```
 //!
 //! Produces a `<db_name>.db` directory holding the dictionary and indexes.
+//! `--disk` selects the on-disk B+ tree KVstore; `--rocksdb` (requires building
+//! with `--features rocksdb`) selects the persistent RocksDB backend.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -15,12 +17,17 @@ use gstore::{db_dir_for, Database};
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
-    // Optional `--disk` flag selects the on-disk B+ tree KVstore backend.
+    // Optional flags select an alternative storage backend.
     let disk = args.iter().any(|a| a == "--disk");
-    args.retain(|a| a != "--disk");
+    let rocksdb = args.iter().any(|a| a == "--rocksdb");
+    args.retain(|a| a != "--disk" && a != "--rocksdb");
+    if disk && rocksdb {
+        eprintln!("gbuild: choose at most one of --disk / --rocksdb");
+        return ExitCode::FAILURE;
+    }
     if args.len() < 3 {
         eprintln!(
-            "usage: {} [--disk] <db_name> <data.nt> [more.nt ...]",
+            "usage: {} [--disk | --rocksdb] <db_name> <data.nt> [more.nt ...]",
             args[0]
         );
         return ExitCode::FAILURE;
@@ -30,6 +37,9 @@ fn main() -> ExitCode {
     let dir = db_dir_for(name);
 
     let started = Instant::now();
+    if rocksdb {
+        return build_rocksdb(name, &dir, files, started);
+    }
     if disk {
         if let Err(e) = Database::build_disk(&dir, files) {
             eprintln!("disk build failed: {e}");
@@ -37,7 +47,7 @@ fn main() -> ExitCode {
         }
         // Reopen to report stats.
         match Database::load_disk(&dir) {
-            Ok(db) => print_stats(name, &dir, &db, started, true),
+            Ok(db) => print_stats(name, &dir, &db, started, "on-disk B+ tree"),
             Err(e) => {
                 eprintln!("built, but failed to reopen: {e}");
                 return ExitCode::FAILURE;
@@ -55,13 +65,49 @@ fn main() -> ExitCode {
             eprintln!("failed to save database to {dir}: {e}");
             return ExitCode::FAILURE;
         }
-        print_stats(name, &dir, &db, started, false);
+        print_stats(name, &dir, &db, started, "in-memory");
     }
     ExitCode::SUCCESS
 }
 
-fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, disk: bool) {
-    let backend = if disk { "on-disk B+ tree" } else { "in-memory" };
+/// Build a RocksDB-backed database. `build_rocksdb_from_str` takes RDF text, so we
+/// concatenate the input files first. Gated on the `rocksdb` feature.
+#[cfg(feature = "rocksdb")]
+fn build_rocksdb(name: &str, dir: &str, files: &[String], started: Instant) -> ExitCode {
+    let mut content = String::new();
+    for f in files {
+        match std::fs::read_to_string(f) {
+            Ok(s) => {
+                content.push_str(&s);
+                content.push('\n');
+            }
+            Err(e) => {
+                eprintln!("cannot read {f}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Err(e) = Database::build_rocksdb_from_str(name.to_string(), dir, &content) {
+        eprintln!("rocksdb build failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    match Database::open_rocksdb(dir) {
+        Ok(db) => print_stats(name, dir, &db, started, "RocksDB"),
+        Err(e) => {
+            eprintln!("built, but failed to reopen: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(feature = "rocksdb"))]
+fn build_rocksdb(_name: &str, _dir: &str, _files: &[String], _started: Instant) -> ExitCode {
+    eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
+    ExitCode::FAILURE
+}
+
+fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: &str) {
     println!("Built database '{name}' in {dir} ({backend})");
     println!(
         "  triples={}  entities={}  literals={}  predicates={}",

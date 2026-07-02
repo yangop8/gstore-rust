@@ -107,7 +107,8 @@ optimizer and a VS-tree signature filter.
   property paths (`/ ^ | * + !`), `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and
   SPARQL UPDATE (`INSERT`/`DELETE`).
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
-  (`--features rocksdb`) — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
+  (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
+  — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
 * **HTTP server** with content negotiation, users/auth, and streaming
   (`server` / `http_api` / `http_users`).
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected

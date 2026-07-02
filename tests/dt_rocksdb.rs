@@ -243,3 +243,37 @@ fn rocksdb_database_build_query_reopen() {
     assert_eq!(rs.row_count(), 2);
     cleanup(&dir);
 }
+
+/// End-to-end via the *binaries*: `gbuild --rocksdb` builds a Rocks-backed DB on
+/// disk, which then reopens (the `gserver --rocksdb` path) and answers SPARQL.
+/// Guards the CLI wiring the HTTP / NLQA stack points at.
+#[test]
+fn gbuild_cli_rocksdb_builds_reopenable_db() {
+    use std::process::Command;
+    let base = tmp("cli");
+    std::fs::create_dir_all(&base).unwrap();
+    let nt = base.join("data.nt");
+    std::fs::write(
+        &nt,
+        "<http://ex/Inception> <http://ex/directedBy> <http://ex/Nolan> .\n\
+         <http://ex/Interstellar> <http://ex/directedBy> <http://ex/Nolan> .\n",
+    )
+    .unwrap();
+    let name = base.join("movies");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+        .args(["--rocksdb", name.to_str().unwrap(), nt.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "gbuild --rocksdb exited with failure");
+
+    let db_dir = base.join("movies.db");
+    assert!(Database::is_rocksdb(&db_dir), "gbuild --rocksdb did not create a RocksDB store");
+
+    // The gserver --rocksdb path: reopen from disk and run a real query.
+    let mut db = Database::open_rocksdb(&db_dir).unwrap();
+    assert_eq!(db.triple_num(), 2);
+    let rs = db.select("SELECT ?d WHERE { ?m <http://ex/directedBy> ?d }").unwrap();
+    assert_eq!(rs.row_count(), 2);
+    cleanup(&base);
+}

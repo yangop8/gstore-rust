@@ -71,7 +71,8 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 - 3 个排列 column family——`spo`(键 `s‖p‖o`)、`pos`(键 `p‖o‖s`)、`osp`(键 `o‖s‖p`),id 用 4 字节**大端** u32,故字节序==数值序,前缀 range scan(`iterator_cf`)即可回答 6 种访问模式,返回已排序结果以与 `TripleStore` 完全对齐。
 - `stats` CF 用**维护式计数器**(引用计数,插入/删除时 O(1) 维护;计数归零即删键)给出**精确**优化器统计:`triple_count`/`distinct_subjects`/`distinct_objects`/`num_predicates`(4 个全局值另缓存于内存)、`pred_card`/`pred_distinct_subj`/`pred_distinct_obj`(逐谓词),避免热路径上的全表扫描。
 - `RocksStore::open(path)` 持久化并可重开;`Database::build_rocksdb_from_str` / `open_rocksdb` / `is_rocksdb` 提供 Rocks 后端的库级 API(三元组存于 `dir/rocksdb`,字典/元数据 bincode 快照于同目录)。
-- 测试 `tests/dt_rocksdb.rs`(feature 门控):泛型 `fn <B: StorageBackend>` 对 `TripleStore` 与 `RocksStore` 跑同一指纹证明结果一致;close→reopen 持久化;以及经 `Evaluator` 跑真实 SPARQL 的行数对拍。
+- **CLI 入口**:`gbuild --rocksdb <name> <data.nt>` 建库、`gserver <dir> --rocksdb` 起 HTTP 服务(均需 `--features rocksdb` 编译);feature OFF 时给出明确报错。gNLQA 通过 HTTP SPARQL 指向该服务即可端到端跑在 RocksDB 上(与后端无关)。
+- 测试 `tests/dt_rocksdb.rs`(feature 门控):泛型 `fn <B: StorageBackend>` 对 `TripleStore` 与 `RocksStore` 跑同一指纹证明结果一致;close→reopen 持久化;经 `Evaluator` 跑真实 SPARQL 的行数对拍;以及经 `gbuild --rocksdb` 二进制建库、`open_rocksdb` 重开查询的 CLI 端到端用例。
 
 仍未做(backlog):Rocks 后端的字典 out-of-core 化(复用 `DiskTermSource` seam)、merge-operator 式计数、按谓词的 prefix-extractor 调优、Rocks 后端的事务/快照接线。
 

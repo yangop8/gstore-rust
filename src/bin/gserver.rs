@@ -1,9 +1,11 @@
 //! `gserver` — serve a gStore database over HTTP (SPARQL Protocol subset).
 //!
-//! Usage: `gserver [db_dir] [--port N] [--addr HOST]`
-//!   - `db_dir`  : load this database directory (default: a fresh empty DB)
-//!   - `--port N`: TCP port (default 7000)
-//!   - `--addr H`: bind host (default 127.0.0.1)
+//! Usage: `gserver [db_dir] [--rocksdb] [--port N] [--addr HOST]`
+//!
+//! - `db_dir`: load this database directory (default: a fresh empty DB)
+//! - `--rocksdb`: open `db_dir` as a RocksDB-backed database (needs `--features rocksdb`)
+//! - `--port N`: TCP port (default 7000)
+//! - `--addr H`: bind host (default 127.0.0.1)
 //!
 //! Endpoints: `GET/POST /sparql`, `POST /update`, `GET /status` (see
 //! [`gstore::server`]).
@@ -16,6 +18,7 @@ fn main() {
     let mut db_dir: Option<String> = None;
     let mut port: u16 = 7000;
     let mut host = String::from("127.0.0.1");
+    let mut rocksdb = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -30,8 +33,9 @@ fn main() {
                     host = h.clone();
                 }
             }
+            "--rocksdb" => rocksdb = true,
             "-h" | "--help" => {
-                eprintln!("usage: gserver [db_dir] [--port N] [--addr HOST]");
+                eprintln!("usage: gserver [db_dir] [--rocksdb] [--port N] [--addr HOST]");
                 return;
             }
             other => db_dir = Some(other.to_string()),
@@ -40,6 +44,7 @@ fn main() {
     }
 
     let db = match &db_dir {
+        Some(dir) if rocksdb => open_rocksdb_or_exit(dir),
         Some(dir) => Database::load(dir).unwrap_or_else(|e| {
             eprintln!("could not load '{dir}' ({e}); serving a fresh empty database");
             Database::new("gserver")
@@ -59,4 +64,19 @@ fn main() {
         Err(_) => println!("gserver listening on {host}:{port}"),
     }
     server.serve_forever();
+}
+
+/// Open a RocksDB-backed database (feature `rocksdb`), or exit with a message.
+#[cfg(feature = "rocksdb")]
+fn open_rocksdb_or_exit(dir: &str) -> Database {
+    Database::open_rocksdb(dir).unwrap_or_else(|e| {
+        eprintln!("could not open RocksDB database '{dir}': {e}");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(not(feature = "rocksdb"))]
+fn open_rocksdb_or_exit(_dir: &str) -> Database {
+    eprintln!("gserver: --rocksdb requires building with `--features rocksdb`");
+    std::process::exit(1);
 }
