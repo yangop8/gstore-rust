@@ -77,15 +77,42 @@
 //!   them to survivors with no data loss, and writes during/after a rebalance land
 //!   on the correct owner.
 //!
+//! ## Per-shard replica groups (each shard highly available)
+//!
+//! Every shard bucket is its own **replicated group** of `N` replicas, so a
+//! shard survives up to `floor((N-1)/2)` replica failures while a quorum keeps
+//! serving:
+//!
+//! * [`ReplicaGroup`] — one shard bucket replicated across `N` replicas, each
+//!   running the proven pure [`RaftState`] over its own [`TripleStore`] copy.
+//!   Writes commit through the group's Raft log (quorum), a lagging/rejoining
+//!   replica catches up by log backfill or — past the leader's compaction point
+//!   — by a snapshot install, and leadership fails over within the group. The
+//!   group also **auto-compacts** each replica's committed log into a snapshot
+//!   once it grows past a threshold, so a long-running shard keeps a bounded
+//!   in-memory log and a far-behind replica is caught up by
+//!   [`Request::InstallSnapshot`] rather than unbounded replay.
+//! * [`ShardedRaftCluster`] — the multi-group analogue of a single-group
+//!   [`ClusterNode`]: one [`ReplicaGroup`] per bucket. Writes route by
+//!   `hash(subject) % N` to the owning bucket's group and commit through *its*
+//!   Raft log; reads scatter-gather across every bucket's serving replica and
+//!   re-establish the [`TripleSource`] contract, so the whole cluster is both
+//!   **sharded** (data partitioned across buckets) and **replicated** (each
+//!   bucket fault-tolerant) while staying observationally identical to a single
+//!   [`TripleStore`]. Like the Raft state machine it is driven by explicit
+//!   logical ticks and synchronous message delivery, so every scenario —
+//!   election, quorum commit, snapshot install, failover, rejoin — is fully
+//!   deterministic with no threads or sockets. A deployment wraps each replica
+//!   in a [`ClusterNode`]-style transport exactly as the single-group path does.
+//!
 //! ## Scope (still deferred — with reasons)
 //!
-//! * **One Raft group *per shard*.** A [`ClusterNode`] group currently replicates
-//!   the *whole keyspace* (one group, the minimal level called for); the
-//!   generalization is to back each [`ShardCluster`] endpoint with its own
-//!   replicated group so a shard tolerates a replica failure (the mechanism is
-//!   proven by `replicated_shard_survives_a_replica_failure`). Deferred because it
-//!   multiplies the transport (N groups, per-group leaders) well beyond what one
-//!   module can keep deterministically testable here.
+//! * **A multi-group *network* transport.** [`ShardedRaftCluster`] is the
+//!   in-process correctness core (per-shard Raft groups, snapshot catch-up,
+//!   failover); binding each of its replicas to a live TCP [`ClusterNode`]
+//!   endpoint (N groups × N replicas of listeners + per-group leader routing) is
+//!   the remaining deployment glue. The single-group [`ClusterNode`] transport
+//!   is fully wired (see `networked_cluster_replicates_then_fails_over_then_recovers`).
 //! * **Auto-orchestration of migration on commit.** The control plane (agreed
 //!   [`ClusterConfig`]) and data plane ([`ShardCluster`] migration) share the
 //!   [`ClusterConfig`] type but are driven explicitly; wiring a leader to *drive*
@@ -2747,6 +2774,599 @@ impl ClusterNode {
     }
 }
 
+// ===========================================================================
+// Per-shard replica groups: one Raft group *per shard bucket* (the documented
+// generalization of the single whole-keyspace [`ClusterNode`] group).
+//
+// [`ReplicaGroup`] replicates ONE shard bucket across `n` replicas, each running
+// the proven pure [`RaftState`] over its own [`TripleStore`] copy; a bucket then
+// tolerates up to floor((n-1)/2) replica failures while a quorum still serves.
+// [`ShardedRaftCluster`] stacks one such group per bucket and routes writes by
+// hash(subject) to the owning group, so the whole store is both *sharded* (data
+// partitioned across buckets) and *replicated* (each bucket highly available).
+//
+// Like the deterministic Raft test harness, the group driver delivers messages
+// synchronously and only advances the logical clock of the replica(s) it is
+// asked to `tick`, so every scenario — election, replication, quorum commit,
+// snapshot install, failover and rejoin — is fully reproducible with no threads
+// or sockets. This is the in-process correctness core; a deployment would wrap
+// each replica in a [`ClusterNode`]-style transport exactly as the single-group
+// path already does.
+// ===========================================================================
+
+/// One shard bucket replicated across `n` replicas: a self-contained Raft group
+/// of `n` [`RaftState`] machines, each over its own [`TripleStore`] copy. The
+/// group tolerates up to `floor((n-1)/2)` replica failures while a majority
+/// remains — the per-shard analogue of a single-group cluster.
+///
+/// The driver is **deterministic**: messages are delivered synchronously and
+/// only the replica(s) you `tick` advance their logical clock, so elections,
+/// quorum commit, snapshot install, failover and rejoin are all reproducible
+/// with no threads or clocks (the same discipline as the Raft simulation tests).
+///
+/// Once a replica has applied more than `compact_threshold` entries past its
+/// snapshot base it folds them into a fresh snapshot (log compaction); a replica
+/// that then falls behind the leader's compaction point is caught up by an
+/// [`Request::InstallSnapshot`] rather than an unbounded log replay, and resumes
+/// incremental replication from the snapshot base.
+#[derive(Debug)]
+pub struct ReplicaGroup {
+    /// The shard bucket this group owns.
+    shard: usize,
+    /// The replica ids, in a stable order (parallel to `states`/`stores`/`down`).
+    replicas: Vec<NodeId>,
+    /// Per-replica Raft state machines.
+    states: Vec<RaftState>,
+    /// Per-replica materialized triple stores.
+    stores: Vec<TripleStore>,
+    /// Per-replica failed flag (a killed replica neither serves nor advances).
+    down: Vec<bool>,
+    /// Applied-entries-past-snapshot-base a replica keeps before it compacts
+    /// (0 disables auto-compaction).
+    compact_threshold: u64,
+}
+
+impl ReplicaGroup {
+    /// Build a group replicating bucket `shard` across the replicas named by
+    /// `replicas` (each a distinct [`NodeId`]; at least one). `compact_threshold`
+    /// bounds each replica's in-memory log — see the type docs.
+    pub fn new(
+        shard: usize,
+        replicas: Vec<NodeId>,
+        cfg: &RaftConfig,
+        compact_threshold: u64,
+    ) -> ReplicaGroup {
+        assert!(
+            !replicas.is_empty(),
+            "a replica group needs at least one replica"
+        );
+        let states = replicas
+            .iter()
+            .map(|&id| {
+                let peers: Vec<NodeId> = replicas.iter().copied().filter(|&p| p != id).collect();
+                RaftState::new(id, peers, cfg)
+            })
+            .collect();
+        let stores = replicas.iter().map(|_| TripleStore::new()).collect();
+        let down = vec![false; replicas.len()];
+        ReplicaGroup {
+            shard,
+            replicas,
+            states,
+            stores,
+            down,
+            compact_threshold,
+        }
+    }
+
+    /// The shard bucket this group replicates.
+    pub fn shard(&self) -> usize {
+        self.shard
+    }
+    /// The replica ids in this group.
+    pub fn replicas(&self) -> &[NodeId] {
+        &self.replicas
+    }
+    /// The replication factor (number of replicas).
+    pub fn replication_factor(&self) -> usize {
+        self.replicas.len()
+    }
+
+    /// The internal index of replica `id` (panics if `id` is not in the group).
+    fn pos(&self, id: NodeId) -> usize {
+        self.replicas
+            .iter()
+            .position(|&r| r == id)
+            .expect("replica id is not a member of this group")
+    }
+
+    /// Whether replica `id` is currently failed (killed).
+    pub fn is_down(&self, id: NodeId) -> bool {
+        self.down[self.pos(id)]
+    }
+
+    /// Fail (`down = true`, a simulated crash) or restore (`down = false`, a
+    /// restart) replica `id`. A restored replica resets its election timer so it
+    /// does not immediately campaign with a stale elapsed counter — mirroring
+    /// [`ClusterNode::revive`].
+    pub fn set_down(&mut self, id: NodeId, down: bool) {
+        let i = self.pos(id);
+        if self.down[i] && !down {
+            self.states[i].note_revived();
+        }
+        self.down[i] = down;
+    }
+
+    /// Borrow replica `id`'s Raft state machine (inspection / tests).
+    pub fn state(&self, id: NodeId) -> &RaftState {
+        &self.states[self.pos(id)]
+    }
+    /// Borrow replica `id`'s materialized store (inspection / tests).
+    pub fn store(&self, id: NodeId) -> &TripleStore {
+        &self.stores[self.pos(id)]
+    }
+
+    /// The current leader replica — an up replica claiming leadership in the
+    /// highest term — if the group has one. (After a failover the killed old
+    /// leader may still *believe* it leads until it hears the new leader; it is
+    /// excluded here because it is down, and steps down on revival.)
+    pub fn leader(&self) -> Option<NodeId> {
+        (0..self.replicas.len())
+            .filter(|&i| !self.down[i] && self.states[i].is_leader())
+            .max_by_key(|&i| self.states[i].current_term())
+            .map(|i| self.replicas[i])
+    }
+
+    /// A replica whose store may serve reads: the leader if one is up, else any
+    /// up replica (a committed-prefix follower read), else `None` (all down).
+    pub fn readable_store(&self) -> Option<&TripleStore> {
+        let idx = match self.leader() {
+            Some(l) => self.pos(l),
+            None => (0..self.replicas.len()).find(|&i| !self.down[i])?,
+        };
+        Some(&self.stores[idx])
+    }
+
+    /// Committed triples in this bucket (read from a serving replica; 0 if every
+    /// replica is down).
+    pub fn triple_count(&self) -> u64 {
+        self.readable_store().map(|s| s.triple_count()).unwrap_or(0)
+    }
+
+    /// Apply each replica's freshly committed mutations to its store, then run
+    /// log compaction on any replica whose in-memory log has grown past the
+    /// threshold.
+    fn sync_apply(&mut self) {
+        for i in 0..self.states.len() {
+            let actions = self.states[i].drain_apply();
+            for a in actions {
+                match a {
+                    StoreAction::Apply(LogOp::Insert(tr)) => {
+                        self.stores[i].insert(tr);
+                    }
+                    StoreAction::Apply(LogOp::Delete(tr)) => {
+                        self.stores[i].remove(tr);
+                    }
+                    // A per-shard *data* group never replicates membership ops
+                    // (those belong to the cluster-control [`ClusterConfig`]).
+                    StoreAction::Apply(LogOp::AddNode { .. } | LogOp::RemoveNode { .. }) => {}
+                    StoreAction::Reset(triples) => {
+                        self.stores[i] = TripleStore::new();
+                        self.stores[i].bulk_load(triples);
+                    }
+                }
+            }
+        }
+        self.maybe_compact();
+    }
+
+    /// Fold each up replica's committed log into a snapshot once it exceeds the
+    /// compaction threshold. The snapshot is that replica's own materialized
+    /// store at `last_applied` (which equals its committed prefix), so a snapshot
+    /// install reproduces the exact state — while the individual entries are
+    /// discarded, bounding the in-memory log.
+    fn maybe_compact(&mut self) {
+        if self.compact_threshold == 0 {
+            return;
+        }
+        for i in 0..self.states.len() {
+            if self.down[i] {
+                continue;
+            }
+            let applied = self.states[i].last_applied();
+            let logged = applied.saturating_sub(self.states[i].base_index());
+            if logged > self.compact_threshold {
+                let triples: Vec<IdTriple> = self.stores[i].iter_all().collect();
+                self.states[i].compact(applied, triples);
+            }
+        }
+    }
+
+    /// Synchronously deliver `outs` (emitted by `src`), feeding each reply back
+    /// into the sender and processing any follow-up messages (catch-up, snapshot
+    /// install, commit propagation), then apply committed entries. A down replica
+    /// neither answers a request nor processes a reply, modelling a dropped link.
+    fn deliver(&mut self, src: NodeId, outs: Vec<Outgoing>) {
+        let mut q: VecDeque<(NodeId, Outgoing)> = outs.into_iter().map(|o| (src, o)).collect();
+        let mut guard = 0usize;
+        while let Some((from, o)) = q.pop_front() {
+            guard += 1;
+            if guard > 100_000 {
+                break;
+            }
+            let to = o.to;
+            let (fi, ti) = (self.pos(from), self.pos(to));
+            if self.down[ti] || self.down[fi] {
+                continue;
+            }
+            let reply = self.states[ti].handle(o.msg);
+            let more = self.states[fi].handle_reply(to, reply);
+            for m in more {
+                q.push_back((from, m));
+            }
+        }
+        self.sync_apply();
+    }
+
+    /// Advance replica `id`'s logical clock by one tick and deliver whatever it
+    /// emits (a leader heartbeats / catches up followers; a follower may start an
+    /// election). A down replica does not tick.
+    pub fn tick(&mut self, id: NodeId) {
+        let i = self.pos(id);
+        if self.down[i] {
+            return;
+        }
+        let outs = self.states[i].tick();
+        self.deliver(id, outs);
+    }
+
+    /// Drive replica `id` to leadership by ticking *only* it (so no other replica
+    /// times out — a deterministic election). Panics if it cannot win within a
+    /// bounded number of ticks (e.g. no quorum of up replicas).
+    pub fn elect(&mut self, id: NodeId) {
+        for _ in 0..1000 {
+            let i = self.pos(id);
+            if !self.down[i] && self.states[i].is_leader() {
+                return;
+            }
+            self.tick(id);
+        }
+        panic!(
+            "replica {id} failed to become leader of shard {}",
+            self.shard
+        );
+    }
+
+    /// Ensure the group has a leader, electing the lowest-id up replica if none
+    /// currently leads. Returns the leader's id.
+    pub fn ensure_leader(&mut self) -> NodeId {
+        if let Some(l) = self.leader() {
+            return l;
+        }
+        let cand = *self
+            .replicas
+            .iter()
+            .find(|&&id| !self.down[self.pos(id)])
+            .expect("no up replica available to elect a leader");
+        self.elect(cand);
+        cand
+    }
+
+    /// Propose a mutation to the current leader and replicate it to the up
+    /// replicas immediately. Returns `(leader, index)`, or `None` if the group
+    /// has no leader right now. Commit still requires a quorum to acknowledge; a
+    /// write that cannot reach quorum is appended but never applied.
+    pub fn propose(&mut self, op: LogOp) -> Option<(NodeId, u64)> {
+        let leader = self.leader()?;
+        let li = self.pos(leader);
+        let idx = self.states[li].propose(op)?;
+        let outs = self.states[li].replicate_now();
+        self.deliver(leader, outs);
+        Some((leader, idx))
+    }
+
+    /// Tick the current leader `rounds` times so pending work — heartbeats,
+    /// backfill to a rejoined follower, an [`Request::InstallSnapshot`] to a
+    /// replica behind the compaction point — flushes through. A no-op once the
+    /// group has no leader.
+    pub fn settle(&mut self, rounds: usize) {
+        for _ in 0..rounds {
+            match self.leader() {
+                Some(l) => self.tick(l),
+                None => break,
+            }
+        }
+    }
+}
+
+/// A fully replicated, sharded triple store: **one Raft replica group per shard
+/// bucket**. Each bucket's data lives on its own [`ReplicaGroup`] of `N`
+/// replicas, so a bucket survives up to `floor((N-1)/2)` replica failures with a
+/// quorum still serving. Writes route by `hash(subject) % num_shards` to the
+/// owning bucket's group and commit through *that* group's Raft log; reads
+/// scatter-gather across every bucket's serving replica and re-establish the
+/// [`TripleSource`] contract — so the cluster is observationally identical to a
+/// single [`TripleStore`] over the same triples, exactly as [`ShardedStore`] is.
+///
+/// It implements [`TripleSource`], so the generic [`Evaluator`] runs over a
+/// sharded-and-replicated deployment unchanged. The multi-group analogue of the
+/// single-group [`ClusterNode`], it is built on the pure [`RaftState`] + the
+/// synchronous [`ReplicaGroup`] driver, so it is fully deterministic and
+/// in-process (no threads, clocks, or sockets).
+#[derive(Debug)]
+pub struct ShardedRaftCluster {
+    num_shards: usize,
+    replication_factor: usize,
+    groups: Vec<ReplicaGroup>,
+}
+
+impl ShardedRaftCluster {
+    /// Default applied-entries-past-base a replica keeps before it compacts its
+    /// log into a snapshot. Small so a long-running cluster bounds its in-memory
+    /// log; a far-behind replica then catches up by snapshot install.
+    pub const DEFAULT_COMPACT_THRESHOLD: u64 = 64;
+
+    /// Build a cluster of `num_shards` buckets, each replicated across
+    /// `replication_factor` replicas (each clamped to at least one). Replica `k`
+    /// of bucket `g` is given the distinct global id `g * replication_factor + k`.
+    pub fn new(
+        num_shards: usize,
+        replication_factor: usize,
+        cfg: RaftConfig,
+    ) -> ShardedRaftCluster {
+        Self::with_compaction(
+            num_shards,
+            replication_factor,
+            cfg,
+            Self::DEFAULT_COMPACT_THRESHOLD,
+        )
+    }
+
+    /// Like [`ShardedRaftCluster::new`] but with an explicit per-replica log
+    /// compaction threshold (0 disables auto-compaction — a lagging replica then
+    /// only ever catches up by log backfill).
+    pub fn with_compaction(
+        num_shards: usize,
+        replication_factor: usize,
+        cfg: RaftConfig,
+        compact_threshold: u64,
+    ) -> ShardedRaftCluster {
+        let num_shards = num_shards.max(1);
+        let rf = replication_factor.max(1);
+        let groups = (0..num_shards)
+            .map(|g| {
+                let replicas: Vec<NodeId> = (0..rf).map(|k| (g * rf + k) as NodeId).collect();
+                ReplicaGroup::new(g, replicas, &cfg, compact_threshold)
+            })
+            .collect();
+        ShardedRaftCluster {
+            num_shards,
+            replication_factor: rf,
+            groups,
+        }
+    }
+
+    /// Number of shard buckets.
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+    /// Replicas per bucket.
+    pub fn replication_factor(&self) -> usize {
+        self.replication_factor
+    }
+    /// Borrow bucket `shard`'s replica group.
+    pub fn group(&self, shard: usize) -> &ReplicaGroup {
+        &self.groups[shard]
+    }
+    /// Mutably borrow bucket `shard`'s replica group (drive its clock / inject
+    /// failures directly).
+    pub fn group_mut(&mut self, shard: usize) -> &mut ReplicaGroup {
+        &mut self.groups[shard]
+    }
+    /// The shard bucket a subject routes to.
+    pub fn shard_of_subject(&self, sub: EntityLiteralId) -> usize {
+        shard_of(sub, self.num_shards)
+    }
+
+    /// Elect a leader in every bucket's group (deterministically, the lowest-id
+    /// up replica). Call once before serving writes.
+    pub fn bootstrap(&mut self) {
+        for g in &mut self.groups {
+            g.ensure_leader();
+        }
+    }
+
+    /// Fail / restore replica `id` of bucket `shard` (a simulated crash /
+    /// restart of that shard replica).
+    pub fn set_replica_down(&mut self, shard: usize, id: NodeId, down: bool) {
+        self.groups[shard].set_down(id, down);
+    }
+
+    /// Route a triple to its bucket's group and commit it through that group's
+    /// Raft log. Returns `Some(true)` if newly added, `Some(false)` if already
+    /// present, or `None` if the owning group currently has no leader to accept
+    /// it. The check against the leader's committed store keeps the op idempotent
+    /// (a duplicate is not re-logged).
+    pub fn insert(&mut self, t: IdTriple) -> Option<bool> {
+        let g = shard_of(t.sub, self.num_shards);
+        if let Some(store) = self.groups[g].readable_store() {
+            if store.exists(t.sub, t.pred, t.obj) {
+                return Some(false);
+            }
+        }
+        self.groups[g].propose(LogOp::Insert(t)).map(|_| true)
+    }
+
+    /// Routed bulk insert; returns the number of triples newly committed.
+    pub fn insert_all(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> u64 {
+        let mut added = 0;
+        for t in triples {
+            if self.insert(t) == Some(true) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Route a delete to its bucket's group and commit it. Returns `Some(true)`
+    /// if the triple was present (and is now removed), `Some(false)` if it was
+    /// absent, or `None` if the group has no leader.
+    pub fn remove(&mut self, t: IdTriple) -> Option<bool> {
+        let g = shard_of(t.sub, self.num_shards);
+        let present = self.groups[g]
+            .readable_store()
+            .map(|s| s.exists(t.sub, t.pred, t.obj))
+            .unwrap_or(false);
+        if !present {
+            return Some(false);
+        }
+        self.groups[g].propose(LogOp::Delete(t)).map(|_| true)
+    }
+
+    /// Tick every bucket's leader `rounds` times so any pending catch-up /
+    /// snapshot installs to rejoined replicas flush through.
+    pub fn settle(&mut self, rounds: usize) {
+        for g in &mut self.groups {
+            g.settle(rounds);
+        }
+    }
+
+    /// The per-bucket serving replica stores, skipping any bucket with every
+    /// replica down (a best-effort read, like the remote scatter-gather).
+    fn readable_stores(&self) -> Vec<&TripleStore> {
+        self.groups
+            .iter()
+            .filter_map(|g| g.readable_store())
+            .collect()
+    }
+
+    /// Run a read query over the replicated, sharded cluster using the generic
+    /// [`Evaluator`] — the per-bucket replication and the scatter-gather are both
+    /// transparent to the engine.
+    pub fn query(&self, dict: &Dictionary, sparql_text: &str) -> Result<QueryResult> {
+        let q = sparql::parse(sparql_text)?;
+        Evaluator::new(dict, self).evaluate(&q)
+    }
+}
+
+impl TripleSource for ShardedRaftCluster {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        self.readable_stores().iter().any(|s| s.exists(sub, pred, obj))
+    }
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend_from_slice(s.po_by_s(sub));
+        }
+        sort_dedup(out)
+    }
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.o_by_sp(sub, pred));
+        }
+        sort_dedup(out)
+    }
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.p_by_so(sub, obj));
+        }
+        sort_dedup(out)
+    }
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend_from_slice(s.ps_by_o(obj));
+        }
+        sort_dedup(out)
+    }
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.s_by_po(pred, obj));
+        }
+        sort_dedup(out)
+    }
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend_from_slice(s.so_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.subs_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.objs_by_p(pred));
+        }
+        sort_dedup(out)
+    }
+    fn subject_keys(&self) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.subject_keys());
+        }
+        sort_dedup(out)
+    }
+    fn object_keys(&self) -> Vec<EntityLiteralId> {
+        let mut out = Vec::new();
+        for s in self.readable_stores() {
+            out.extend(s.object_keys());
+        }
+        sort_dedup(out)
+    }
+    fn triple_count(&self) -> u64 {
+        // Each triple lives in exactly one bucket → the per-bucket sum is global.
+        self.readable_stores().iter().map(|s| s.triple_count()).sum()
+    }
+    fn distinct_subjects(&self) -> usize {
+        self.subject_keys().len()
+    }
+    fn distinct_objects(&self) -> usize {
+        self.object_keys().len()
+    }
+    fn num_predicates(&self) -> usize {
+        let mut preds: HashSet<PredId> = HashSet::new();
+        for s in self.readable_stores() {
+            preds.extend(s.predicates());
+        }
+        preds.len()
+    }
+    fn pred_card(&self, pred: PredId) -> usize {
+        self.readable_stores().iter().map(|s| s.pred_card(pred)).sum()
+    }
+    fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        self.subs_by_p(pred).len()
+    }
+    fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        self.objs_by_p(pred).len()
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        // Reproduce a single TripleStore's predicate-major (pred, sub, obj)
+        // order, exactly as ShardedStore does.
+        let mut preds: Vec<PredId> = Vec::new();
+        for s in self.readable_stores() {
+            preds.extend(s.predicates());
+        }
+        let preds = sort_dedup(preds);
+        let mut out = Vec::new();
+        for pred in preds {
+            for (sub, obj) in self.so_by_p(pred) {
+                out.push(IdTriple::new(sub, pred, obj));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4203,5 +4823,382 @@ mod shard_cluster_tests {
             matches!(cluster.query(&d, ask).unwrap(), QueryResult::Ask(true)),
             "post-rebalance write is queryable"
         );
+    }
+}
+
+/// Deterministic, in-process tests for the **per-shard replica groups** layer
+/// ([`ReplicaGroup`] / [`ShardedRaftCluster`]): one Raft group per shard bucket,
+/// each replicated `N`-ways. Every scenario drives the pure state machines by
+/// hand (no threads, clocks, or sockets), so it is fully reproducible. Covers
+/// (a) a shard surviving `floor((N-1)/2)` replica failures with a quorum still
+/// serving, (b) a far-behind replica caught up by a snapshot install then
+/// resuming incremental replication, (c) a rejoined replica converging by log
+/// backfill, plus intra-group leader failover and scatter-gather read parity.
+#[cfg(test)]
+mod replicated_shard_tests {
+    use super::*;
+    use crate::dict::Dictionary;
+    use crate::model::Term;
+    use crate::query::{QueryResult, ResultSet};
+
+    fn t(s: u32, p: u32, o: u32) -> IdTriple {
+        IdTriple::new(s, p, o)
+    }
+
+    /// The same connected fixture graph as the other cluster tests, rebuilt here
+    /// (each test module's `fixture` is private to it).
+    fn fixture() -> (Dictionary, Vec<IdTriple>) {
+        let mut d = Dictionary::new();
+        let knows = d.intern_predicate(&Term::iri("http://ex/knows").dict_key());
+        let typ = d.intern_predicate(&Term::iri("http://ex/type").dict_key());
+        let name = d.intern_predicate(&Term::iri("http://ex/name").dict_key());
+        let person = d.intern_term(&Term::iri("http://ex/Person"));
+        let hub = d.intern_term(&Term::iri("http://ex/hub"));
+        let names = [
+            "alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi", "ivan", "judy",
+        ];
+        let people: Vec<EntityLiteralId> = names
+            .iter()
+            .map(|n| d.intern_term(&Term::iri(format!("http://ex/{n}"))))
+            .collect();
+        let mut triples = Vec::new();
+        for (i, &p) in people.iter().enumerate() {
+            triples.push(IdTriple::new(p, typ, person));
+            triples.push(IdTriple::new(p, knows, hub));
+            let next = people[(i + 1) % people.len()];
+            triples.push(IdTriple::new(p, knows, next));
+            let lit = d.intern_term(&Term::plain_literal(*names.get(i).unwrap()));
+            triples.push(IdTriple::new(p, name, lit));
+        }
+        triples.push(IdTriple::new(hub, typ, person));
+        triples.push(IdTriple::new(hub, knows, people[0]));
+        (d, triples)
+    }
+
+    fn single(triples: &[IdTriple]) -> TripleStore {
+        let mut s = TripleStore::new();
+        s.bulk_load(triples.iter().copied());
+        s
+    }
+
+    fn rows_sorted(rs: &ResultSet) -> Vec<Vec<Option<String>>> {
+        let mut r = rs.rows.clone();
+        r.sort();
+        r
+    }
+
+    const BGP: &str = "SELECT ?x ?y WHERE { \
+         ?x <http://ex/knows> ?y . \
+         ?y <http://ex/type> <http://ex/Person> . \
+         ?x <http://ex/name> ?n }";
+
+    fn select_rows(rs: QueryResult) -> Vec<Vec<Option<String>>> {
+        match rs {
+            QueryResult::Select(r) => rows_sorted(&r),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    /// Evaluate a SELECT against a plain [`TripleStore`] baseline (which has no
+    /// `query` convenience) via the generic engine, returning its sorted rows.
+    fn base_select(d: &Dictionary, store: &TripleStore, q: &str) -> Vec<Vec<Option<String>>> {
+        let parsed = sparql::parse(q).unwrap();
+        select_rows(Evaluator::new(d, store).evaluate(&parsed).unwrap())
+    }
+
+    /// A follower replica of `shard` other than its current leader.
+    fn a_follower(cluster: &ShardedRaftCluster, shard: usize) -> NodeId {
+        let leader = cluster.group(shard).leader().expect("a leader");
+        cluster
+            .group(shard)
+            .replicas()
+            .iter()
+            .copied()
+            .find(|&r| r != leader)
+            .expect("a follower")
+    }
+
+    /// Every access pattern of a sharded-and-replicated cluster (4 buckets × 3
+    /// replicas) matches a single [`TripleStore`] over the same triples — the
+    /// replication and the scatter-gather are both transparent.
+    #[test]
+    fn scatter_gather_over_replica_groups_matches_single_store() {
+        let (d, triples) = fixture();
+        let base = single(&triples);
+
+        let mut cluster = ShardedRaftCluster::new(4, 3, RaftConfig::default());
+        cluster.bootstrap();
+        let added = cluster.insert_all(triples.iter().copied());
+        assert_eq!(added, base.triple_count(), "all triples committed, none lost");
+        // A duplicate routed insert is idempotent (already committed).
+        assert_eq!(cluster.insert(triples[0]), Some(false));
+
+        assert_eq!(
+            TripleSource::triple_count(&cluster),
+            base.triple_count(),
+            "triple_count"
+        );
+        assert_eq!(
+            cluster.distinct_subjects(),
+            base.distinct_subjects(),
+            "distinct_subjects"
+        );
+        assert_eq!(
+            cluster.distinct_objects(),
+            base.distinct_objects(),
+            "distinct_objects"
+        );
+        assert_eq!(
+            cluster.num_predicates(),
+            base.num_predicates(),
+            "num_predicates"
+        );
+        assert_eq!(
+            TripleSource::iter_all(&cluster),
+            base.iter_all().collect::<Vec<_>>(),
+            "iter_all"
+        );
+
+        // Per-predicate and subject-/object-rooted accesses.
+        let mut ids: Vec<EntityLiteralId> = base.subject_keys().collect();
+        ids.extend(base.object_keys());
+        ids = sort_dedup(ids);
+        for &p in &base.predicates().collect::<Vec<_>>() {
+            assert_eq!(TripleSource::so_by_p(&cluster, p), base.so_by_p(p).to_vec());
+            assert_eq!(cluster.subs_by_p(p), base.subs_by_p(p));
+            assert_eq!(cluster.objs_by_p(p), base.objs_by_p(p));
+            assert_eq!(cluster.pred_card(p), base.pred_card(p));
+        }
+        for &s in &ids {
+            assert_eq!(TripleSource::po_by_s(&cluster, s), base.po_by_s(s).to_vec());
+            assert_eq!(TripleSource::ps_by_o(&cluster, s), base.ps_by_o(s).to_vec());
+        }
+
+        // A multi-pattern BGP evaluated by the same engine yields identical rows.
+        assert_eq!(
+            select_rows(cluster.query(&d, BGP).unwrap()),
+            base_select(&d, &base, BGP),
+        );
+    }
+
+    /// (a) A shard tolerates `floor((N-1)/2)` replica failures: with N=5 the
+    /// group keeps a 3/5 quorum after 2 failures and still commits + serves;
+    /// a 3rd failure loses quorum, so nothing new commits.
+    #[test]
+    fn shard_survives_n_over_2_replica_failures_with_quorum() {
+        let mut cluster = ShardedRaftCluster::with_compaction(1, 5, RaftConfig::default(), 0);
+        cluster.bootstrap();
+        let leader = cluster.group(0).leader().unwrap();
+        assert_eq!(cluster.insert(t(1, 2, 3)), Some(true));
+
+        // Fail floor((5-1)/2) = 2 followers; a 3/5 quorum remains.
+        let followers: Vec<NodeId> = cluster
+            .group(0)
+            .replicas()
+            .iter()
+            .copied()
+            .filter(|&r| r != leader)
+            .collect();
+        cluster.set_replica_down(0, followers[0], true);
+        cluster.set_replica_down(0, followers[1], true);
+
+        // The shard still commits a new write on the survivors, and serves reads.
+        assert_eq!(cluster.insert(t(4, 5, 6)), Some(true));
+        assert_eq!(cluster.group(0).triple_count(), 2, "quorum committed the write");
+        assert!(TripleSource::exists(&cluster, 4, 5, 6));
+        assert_eq!(cluster.group(0).leader(), Some(leader), "leader retained");
+
+        // A 3rd failure drops below majority: the leader appends but cannot
+        // commit, so nothing new is applied.
+        cluster.set_replica_down(0, followers[2], true);
+        let before = cluster.group(0).state(leader).commit_index();
+        assert_eq!(cluster.insert(t(7, 8, 9)), Some(true), "leader still appends");
+        let after = cluster.group(0).state(leader).commit_index();
+        assert_eq!(before, after, "no quorum => nothing new commits");
+        assert!(
+            !TripleSource::exists(&cluster, 7, 8, 9),
+            "an uncommitted write is never applied"
+        );
+    }
+
+    /// (b) A replica that falls behind the leader's compaction point is caught up
+    /// by a snapshot install, then resumes *incremental* log replication for the
+    /// tail — not an unbounded replay.
+    #[test]
+    fn lagging_replica_catches_up_via_snapshot_then_incremental() {
+        // A small compaction threshold forces the leader to snapshot while the
+        // follower is offline.
+        let mut cluster = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 2);
+        cluster.bootstrap();
+        let leader = cluster.group(0).leader().unwrap();
+        let follower = a_follower(&cluster, 0);
+
+        // Take a follower down, then commit several writes on the 2/3 survivors.
+        cluster.set_replica_down(0, follower, true);
+        let triples = [t(1, 9, 1), t(2, 9, 2), t(3, 9, 3), t(5, 9, 5), t(6, 9, 6)];
+        for &tr in &triples {
+            assert_eq!(cluster.insert(tr), Some(true));
+        }
+        // The leader compacted past index 0 while the follower was away.
+        let base = cluster.group(0).state(leader).base_index();
+        assert!(base > 0, "leader compacted its committed log into a snapshot");
+        assert_eq!(
+            cluster.group(0).store(follower).triple_count(),
+            0,
+            "the offline replica missed every write"
+        );
+
+        // Revive the follower and let the leader drive catch-up. The only way
+        // past the compaction point is an InstallSnapshot, then the tail entries.
+        cluster.set_replica_down(0, follower, false);
+        cluster.group_mut(0).settle(5);
+        assert_eq!(
+            cluster.group(0).store(follower).triple_count(),
+            triples.len() as u64,
+            "follower recovered its full state via snapshot + tail"
+        );
+        assert_eq!(
+            cluster.group(0).state(follower).base_index(),
+            base,
+            "follower adopted the leader's snapshot base"
+        );
+        for &tr in &triples {
+            assert!(cluster.group(0).store(follower).exists(tr.sub, tr.pred, tr.obj));
+        }
+
+        // A subsequent write reaches the recovered follower by ordinary
+        // incremental replication (no further snapshot needed).
+        assert_eq!(cluster.insert(t(7, 9, 7)), Some(true));
+        cluster.group_mut(0).settle(2);
+        assert!(
+            cluster.group(0).store(follower).exists(7, 9, 7),
+            "incremental replication resumes after the snapshot install"
+        );
+    }
+
+    /// (c) A rejoined replica converges by log backfill when the leader has NOT
+    /// compacted past its next index (auto-compaction disabled).
+    #[test]
+    fn rejoined_replica_converges_by_log_backfill() {
+        let mut cluster = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        cluster.bootstrap();
+        let follower = a_follower(&cluster, 0);
+
+        cluster.set_replica_down(0, follower, true);
+        let triples = [t(1, 1, 1), t(2, 2, 2), t(3, 3, 3)];
+        for &tr in &triples {
+            assert_eq!(cluster.insert(tr), Some(true));
+        }
+        assert_eq!(cluster.group(0).store(follower).triple_count(), 0);
+
+        cluster.set_replica_down(0, follower, false);
+        cluster.group_mut(0).settle(5);
+        assert_eq!(
+            cluster.group(0).store(follower).triple_count(),
+            3,
+            "rejoined replica caught up"
+        );
+        assert_eq!(
+            cluster.group(0).state(follower).base_index(),
+            0,
+            "caught up by backfill, not a snapshot"
+        );
+        for &tr in &triples {
+            assert!(cluster.group(0).store(follower).exists(tr.sub, tr.pred, tr.obj));
+        }
+    }
+
+    /// Leader failover *within a shard group*: the leader dies, a survivor is
+    /// elected in a higher term, keeps serving writes, and the old leader —
+    /// once revived — steps down and converges on the new leader's data.
+    #[test]
+    fn leader_failover_within_a_shard_group_keeps_data_consistent() {
+        let mut cluster = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        cluster.bootstrap();
+        let old = cluster.group(0).leader().unwrap();
+        assert_eq!(cluster.insert(t(1, 2, 3)), Some(true));
+        let old_term = cluster.group(0).state(old).current_term();
+
+        // Kill the leader; elect a survivor.
+        cluster.set_replica_down(0, old, true);
+        let survivor = cluster
+            .group(0)
+            .replicas()
+            .iter()
+            .copied()
+            .find(|&r| r != old)
+            .unwrap();
+        cluster.group_mut(0).elect(survivor);
+        assert_eq!(cluster.group(0).leader(), Some(survivor));
+        assert!(
+            cluster.group(0).state(survivor).current_term() > old_term,
+            "a failover bumps the term"
+        );
+
+        // The shard still accepts writes on the new leader.
+        assert_eq!(cluster.insert(t(4, 5, 6)), Some(true));
+
+        // The old leader restarts, steps down, and catches up to both writes.
+        cluster.set_replica_down(0, old, false);
+        cluster.group_mut(0).settle(8);
+        assert_eq!(
+            cluster.group(0).state(old).role(),
+            Role::Follower,
+            "the stale leader steps down"
+        );
+        assert!(cluster.group(0).store(old).exists(1, 2, 3));
+        assert!(cluster.group(0).store(old).exists(4, 5, 6));
+        assert_eq!(cluster.group(0).store(old).triple_count(), 2);
+    }
+
+    /// Reads stay correct after one replica per bucket fails: each bucket keeps a
+    /// quorum, so the scatter-gather is still served and matches a single store.
+    #[test]
+    fn reads_served_after_one_replica_per_bucket_fails() {
+        let (d, triples) = fixture();
+        let base = single(&triples);
+
+        let mut cluster = ShardedRaftCluster::new(4, 3, RaftConfig::default());
+        cluster.bootstrap();
+        cluster.insert_all(triples.iter().copied());
+
+        for g in 0..cluster.num_shards() {
+            let f = a_follower(&cluster, g);
+            cluster.set_replica_down(g, f, true);
+        }
+
+        assert_eq!(
+            TripleSource::triple_count(&cluster),
+            base.triple_count(),
+            "no data lost when a replica per bucket fails"
+        );
+        assert_eq!(
+            TripleSource::iter_all(&cluster),
+            base.iter_all().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            select_rows(cluster.query(&d, BGP).unwrap()),
+            base_select(&d, &base, BGP),
+        );
+    }
+
+    /// A committed delete replicates across a bucket's replica group.
+    #[test]
+    fn delete_replicates_across_the_group() {
+        let mut cluster = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        cluster.bootstrap();
+        let a = t(1, 2, 3);
+        assert_eq!(cluster.insert(a), Some(true));
+        for &r in cluster.group(0).replicas() {
+            assert!(cluster.group(0).store(r).exists(1, 2, 3));
+        }
+        assert_eq!(cluster.remove(a), Some(true));
+        for &r in cluster.group(0).replicas() {
+            assert!(
+                !cluster.group(0).store(r).exists(1, 2, 3),
+                "replica {r} should have applied the delete"
+            );
+        }
+        assert_eq!(cluster.remove(a), Some(false), "removing an absent triple");
     }
 }

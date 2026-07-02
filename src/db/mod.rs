@@ -313,6 +313,38 @@ impl Database {
         self.index_valid = true;
     }
 
+    /// Opt this database into an **out-of-core** (streaming) VS-tree, even while
+    /// the triple store itself stays in memory. The signature index is written
+    /// to a paged node file at `path`, and every candidate filter then streams
+    /// in only the nodes a query traverses — so a large index need not stay
+    /// resident in RAM. Only the VS-tree becomes out-of-core; the store is
+    /// untouched.
+    ///
+    /// The in-memory tree remains the default; call this to opt in. Query
+    /// results are unchanged: the streaming filter returns candidate sets
+    /// identical to the in-memory tree (both satisfy
+    /// [`crate::signature::SigFilter`]), so this is purely a residency/space
+    /// trade-off. The rebuilt index is left valid; a later mutation invalidates
+    /// it (an out-of-core tree can't be updated in place — see
+    /// [`insert_triple`](Self::insert_triple)), and
+    /// [`rebuild_index`](Self::rebuild_index) restores an in-memory one.
+    pub fn use_streaming_vstree<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        // Ensure the parent directory exists (the pager creates the file, not
+        // the directory tree above it).
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        // Fresh build: drop any prior node file (and its WAL) at this path.
+        remove_file_and_wal(path);
+        self.vstree = VsTree::build_disk(path, vstree_entries(&self.store))?;
+        self.index_valid = true;
+        self.query_cache.get_mut().clear();
+        Ok(())
+    }
+
     /// Register a user-defined scalar SPARQL function (gStore's PFN, as a safe
     /// in-process closure rather than a dlopen `.so` plugin). The name is
     /// case-insensitive; built-ins take precedence. The function becomes visible
@@ -2724,6 +2756,52 @@ mod tests {
         assert!(db.stats().index_valid && !db.vstree.is_disk_backed());
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&rdf);
+    }
+
+    /// An **in-memory** database can opt into an out-of-core (streaming) VS-tree
+    /// and answer queries identically to the default in-memory tree, while the
+    /// filter streams nodes from disk (proving the whole tree need not be
+    /// resident). This is the in-memory query path using the out-of-core seam.
+    #[test]
+    fn streaming_vstree_matches_in_memory_path() {
+        let mut content = String::new();
+        for i in 0..400u32 {
+            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+        }
+        content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
+
+        // Baseline: default in-memory VS-tree.
+        let mut base = Database::build_from_str("mem", &content).unwrap();
+        assert!(!base.vstree.is_disk_backed());
+
+        // Same data, then opt into the streaming (out-of-core) VS-tree.
+        let mut streamed = Database::build_from_str("stream", &content).unwrap();
+        let dir = temp_dir("stream_vstree");
+        let path = dir.join(VSTREE_KV_FILE);
+        streamed.use_streaming_vstree(&path).unwrap();
+        assert!(streamed.vstree.is_disk_backed(), "opted into out-of-core VS-tree");
+        assert!(streamed.stats().index_valid, "streaming index is valid for filtering");
+        // The store stayed in memory; only the filter went out-of-core.
+        assert!(matches!(streamed.store, Backend::Memory(_)));
+
+        for q in [
+            "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
+            "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
+            "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
+        ] {
+            let mut a = streamed.select(q).unwrap().rows;
+            let mut b = base.select(q).unwrap().rows;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "streaming-vstree query {q:?} diverged from in-memory");
+        }
+        // The candidate filter actually paged VS-tree nodes off disk.
+        assert!(
+            streamed.vstree.disk_pages_read() > 0,
+            "streaming VS-tree was traversed on disk"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- build progress reporting ----------------------------------------
