@@ -32,11 +32,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
@@ -44,7 +45,8 @@ use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::Triple;
 use crate::query::QueryResult;
 use crate::server::{
-    err_json, ntriples_body, parse_basic_auth, write_response_ext, Request,
+    err_json, ntriples_body, parse_basic_auth, write_response_ext, write_response_maybe_gzip,
+    Request,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 
@@ -182,10 +184,11 @@ struct Txn {
 /// One in-flight query/update task, tracked so `/tasklist` can list it and
 /// `/cancel` can flag it for cancellation.
 ///
-/// INTEGRATION: `cancel` is a cooperative-cancellation flag. Nothing in the
-/// query engine consults it yet — see the `INTEGRATION` comment at the
-/// `db.query(...)` call site in [`ApiServer::run_query`] for where a future
-/// `Database::query_cancellable` hook should poll it.
+/// `cancel` is a live cooperative-cancellation flag: it is cloned into the
+/// [`QueryJob`] that runs the query (off the [`ApiState`] lock) and threaded
+/// into [`Database::query_cancellable`], which polls it and aborts an in-flight
+/// read with [`GStoreError::Cancelled`](crate::GStoreError::Cancelled). A
+/// concurrent `POST /cancel` sets it while the query is still executing.
 struct TaskEntry {
     db: String,
     /// A short, log-safe snippet of the query text (newlines flattened,
@@ -196,13 +199,18 @@ struct TaskEntry {
     cancel: Arc<AtomicBool>,
 }
 
-/// Mutable server state guarded by a single mutex (correctness over throughput,
-/// matching [`crate::server::Server`]'s single `Mutex<Database>`).
+/// Mutable server state guarded by a single mutex. The registries here are all
+/// cheap to touch, so this lock is only ever held briefly; the *databases* live
+/// behind their own per-db locks ([`ApiState::dbs`]) so a long query holds only
+/// that db's lock and leaves this one free — which is what lets a concurrent
+/// `POST /cancel` reach the task registry while a query runs.
 struct ApiState {
     root: PathBuf,
     users: UserStore,
-    /// Loaded, in-memory databases by name.
-    dbs: HashMap<String, Database>,
+    /// Loaded, in-memory databases by name. Each is behind its own `Mutex` (and
+    /// an `Arc` so a worker can clone the handle and run a query without holding
+    /// the outer `ApiState` lock).
+    dbs: HashMap<String, Arc<Mutex<Database>>>,
     /// Open transactions by id.
     txns: HashMap<u64, Txn>,
     /// The single open transaction per database (single-writer), if any.
@@ -215,10 +223,39 @@ struct ApiState {
 
 /// The parity HTTP API server. Construct with [`ApiServer::bind`], then drive it
 /// with [`serve_forever`](ApiServer::serve_forever) (e.g. in a background
-/// thread).
+/// thread). Each accepted connection is handled on its own worker thread.
 pub struct ApiServer {
-    state: Mutex<ApiState>,
+    /// Shared with every connection worker (behind an `Arc`).
+    inner: Arc<ApiInner>,
     listener: TcpListener,
+}
+
+/// The shared, thread-safe part of an [`ApiServer`]: everything a connection
+/// worker needs. Held behind an `Arc` so a worker only clones a pointer.
+struct ApiInner {
+    state: Mutex<ApiState>,
+}
+
+/// The outcome of routing a request: either a fully-built response, or a query
+/// deferred to run *after* the [`ApiState`] lock is released — so a concurrent
+/// `POST /cancel` can reach the task registry while the query executes.
+enum Dispatch {
+    Done(Resp),
+    Query(QueryJob),
+}
+
+/// A query handed out of [`ApiInner::dispatch`] to run without the `ApiState`
+/// lock held. It carries its own database handle and cancel flag.
+struct QueryJob {
+    /// The target database (its own lock, independent of `ApiState`).
+    db: Arc<Mutex<Database>>,
+    /// Shared with the [`TaskEntry`] in [`ApiState::tasks`]; a concurrent
+    /// `/cancel` flips it and [`Database::query_cancellable`] observes it.
+    cancel: Arc<AtomicBool>,
+    /// The registry id to unregister once the query finishes.
+    task_id: u64,
+    sparql: String,
+    fmt: ResultFormat,
 }
 
 impl ApiServer {
@@ -235,15 +272,17 @@ impl ApiServer {
         let users = UserStore::open(root.join("users.db"), root_password)?;
         let listener = TcpListener::bind(addr)?;
         Ok(ApiServer {
-            state: Mutex::new(ApiState {
-                root,
-                users,
-                dbs: HashMap::new(),
-                txns: HashMap::new(),
-                db_txn: HashMap::new(),
-                tasks: HashMap::new(),
-                started: Instant::now(),
-                requests: 0,
+            inner: Arc::new(ApiInner {
+                state: Mutex::new(ApiState {
+                    root,
+                    users,
+                    dbs: HashMap::new(),
+                    txns: HashMap::new(),
+                    db_txn: HashMap::new(),
+                    tasks: HashMap::new(),
+                    started: Instant::now(),
+                    requests: 0,
+                }),
             }),
             listener,
         })
@@ -254,17 +293,14 @@ impl ApiServer {
         self.listener.local_addr()
     }
 
-    /// INTEGRATION: the live cancel flag for an in-flight task, if it still
-    /// exists. A future cooperative-cancellation hook in the query engine
-    /// (e.g. `Database::query_cancellable(&mut self, sparql: &str, cancel:
-    /// &AtomicBool) -> Result<QueryResult>`, polling `cancel.load(Ordering::
-    /// Relaxed)` between operator steps and aborting early with a dedicated
-    /// error) can fetch the flag for a task id — reported by `/tasklist` and
-    /// set by `POST /cancel` — via this accessor and pass it through to the
-    /// engine. `run_query` does not yet call any such hook: today `/cancel`
-    /// only sets the flag, nothing reads it.
+    /// The live cancel flag for an in-flight task, if it still exists. The
+    /// engine's cooperative-cancellation hook ([`Database::query_cancellable`])
+    /// already consults this flag: `run_query` clones it into the [`QueryJob`]
+    /// that runs the query, `POST /cancel` sets it, and `/tasklist` reports it.
+    /// This accessor lets an embedder reach the same flag directly.
     pub fn task_cancel_flag(&self, task_id: u64) -> Option<Arc<AtomicBool>> {
-        self.state
+        self.inner
+            .state
             .lock()
             .unwrap()
             .tasks
@@ -272,14 +308,40 @@ impl ApiServer {
             .map(|t| Arc::clone(&t.cancel))
     }
 
-    /// Accept and handle connections forever (one request each).
+    /// Accept connections forever, handling each on its own worker thread. A
+    /// long-running query on one connection holds only its database's lock, so
+    /// concurrent requests — crucially `POST /cancel` — proceed on other
+    /// workers.
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
-            let _ = self.handle(stream);
+            let inner = Arc::clone(&self.inner);
+            thread::spawn(move || {
+                let _ = inner.handle(stream);
+            });
         }
     }
 
-    fn handle(&self, mut stream: TcpStream) -> std::io::Result<()> {
+    /// Like [`serve_forever`](Self::serve_forever) but terminates TLS in-process
+    /// using `config` (see [`crate::server::load_tls_config`]). Requires the
+    /// `tls` feature.
+    #[cfg(feature = "tls")]
+    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
+        for stream in self.listener.incoming().flatten() {
+            let inner = Arc::clone(&self.inner);
+            let config = Arc::clone(&config);
+            thread::spawn(move || {
+                if let Ok(conn) = rustls::ServerConnection::new(config) {
+                    let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
+                }
+            });
+        }
+    }
+}
+
+impl ApiInner {
+    /// Handle one connection (one request). Generic over the transport so the
+    /// same path serves plain TCP and `rustls` TLS streams.
+    fn handle<S: Read + Write>(&self, mut stream: S) -> std::io::Result<()> {
         let req = match Request::parse(&mut stream) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()),
@@ -288,34 +350,70 @@ impl ApiServer {
             }
         };
 
-        let resp = {
+        // Short critical section: count the request, resolve the caller, route.
+        // A query endpoint returns `Dispatch::Query` so the actual (possibly
+        // long) execution happens below with the `ApiState` lock released. The
+        // log root is captured here so the access line can be written after.
+        let (dispatch, user_disp, root) = {
             let mut st = self.state.lock().unwrap();
             st.requests += 1;
+            let root = st.root.clone();
             let user = self.resolve_user(&mut st, &req);
             let user_disp = user.clone().unwrap_or_else(|| "-".to_string());
-            let resp = self.dispatch(&mut st, &req, user);
-            // Access log (inside the lock so the log order matches request order).
-            append_log(
-                &st.root,
-                "access.log",
-                &format!(
-                    "{ts}\t{method}\t{path}\t{user}\t{status}",
-                    ts = now_millis(),
-                    method = req.method,
-                    path = req.path,
-                    user = user_disp,
-                    status = resp.status,
-                ),
-            );
-            resp
+            let dispatch = self.dispatch(&mut st, &req, user);
+            (dispatch, user_disp, root)
         };
 
+        // Run any deferred query with NO `ApiState` lock held: this is what
+        // makes a concurrent `POST /cancel` (which needs that lock) deliverable
+        // while the query runs.
+        let resp = match dispatch {
+            Dispatch::Done(r) => r,
+            Dispatch::Query(job) => self.execute_query_job(job),
+        };
+
+        // Access log. Written off-lock (O_APPEND keeps each line atomic); strict
+        // request ordering is neither achievable nor needed once connections run
+        // concurrently.
+        append_log(
+            &root,
+            "access.log",
+            &format!(
+                "{ts}\t{method}\t{path}\t{user}\t{status}",
+                ts = now_millis(),
+                method = req.method,
+                path = req.path,
+                user = user_disp,
+                status = resp.status,
+            ),
+        );
+
+        let enc = req.header("accept-encoding");
         let extra: Vec<(&str, &str)> = resp
             .extra
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        write_response_ext(&mut stream, resp.status, &resp.ctype, &extra, &resp.body)
+        write_response_maybe_gzip(&mut stream, resp.status, &resp.ctype, &extra, &resp.body, enc)
+    }
+
+    /// Run a deferred [`QueryJob`] with only the target database's lock held
+    /// (the `ApiState` lock is free), then unregister the task.
+    fn execute_query_job(&self, job: QueryJob) -> Resp {
+        let result = {
+            let mut db = job.db.lock().unwrap();
+            db.query_cancellable(&job.sparql, job.cancel)
+        };
+        // Drop the task from the registry under a short `ApiState` lock.
+        self.unregister_task(&mut self.state.lock().unwrap(), job.task_id);
+        match result {
+            Ok(result) => render_result(job.fmt, &result),
+            Err(e) => Resp::new(
+                400,
+                "application/sparql-results+json",
+                err_json(&e.to_string()),
+            ),
+        }
     }
 
     /// Resolve the caller's identity from Basic auth or a session token.
@@ -361,7 +459,7 @@ impl ApiServer {
         }
     }
 
-    fn dispatch(&self, st: &mut ApiState, req: &Request, user: Option<String>) -> Resp {
+    fn dispatch(&self, st: &mut ApiState, req: &Request, user: Option<String>) -> Dispatch {
         let method = req.method.as_str();
         let path = req.path.as_str();
 
@@ -369,30 +467,43 @@ impl ApiServer {
         // endpoints — the console itself only ever *reads* by calling back
         // into the (still auth-gated) `/sparql` from the browser.
         if path == "/login" {
-            return self.handle_login(st, req);
+            return Dispatch::Done(self.handle_login(st, req));
         }
         if path == "/logout" {
             if let Some(tok) = req.bearer_or_session_token() {
                 st.users.logout(&tok);
             }
-            return Resp::ok("logged out");
+            return Dispatch::Done(Resp::ok("logged out"));
         }
         if method == "GET" && (path == "/" || path == "/console") {
-            return Resp::new(200, "text/html; charset=utf-8", CONSOLE_HTML.as_bytes().to_vec());
+            return Dispatch::Done(Resp::new(
+                200,
+                "text/html; charset=utf-8",
+                CONSOLE_HTML.as_bytes().to_vec(),
+            ));
         }
 
         let user = match user {
             Some(u) => u,
-            None => return self.unauthorized(),
+            None => return Dispatch::Done(self.unauthorized()),
         };
 
+        // Query endpoints defer execution (`Dispatch::Query`) so the query runs
+        // with the `ApiState` lock released; everything else runs under it here.
         match (method, path) {
-            ("GET" | "POST", "/sparql") => self.handle_query(st, req, &user),
+            ("GET" | "POST", "/sparql") => return self.handle_query(st, req, &user),
             ("POST", "/update") => {
-                self.guarded(st, &user, Privilege::Update, |s, st| {
-                    s.handle_update(st, req, &user)
-                })
+                return if st.users.has_priv(&user, Privilege::Update) {
+                    self.handle_update(st, req, &user)
+                } else {
+                    Dispatch::Done(self.forbidden())
+                };
             }
+            ("POST", "/tquery") => return self.handle_tquery(st, req, &user),
+            _ => {}
+        }
+
+        let resp = match (method, path) {
             ("POST", "/build") => self.guarded(st, &user, Privilege::Load, |s, st| {
                 s.handle_build(st, req)
             }),
@@ -412,7 +523,6 @@ impl ApiServer {
             ("POST", "/begin") => self.guarded(st, &user, Privilege::Update, |s, st| {
                 s.handle_begin(st, req, &user)
             }),
-            ("POST", "/tquery") => self.handle_tquery(st, req, &user),
             ("POST", "/commit") => self.guarded(st, &user, Privilege::Update, |s, st| {
                 s.handle_txn_end(st, req, &user, true)
             }),
@@ -478,7 +588,8 @@ impl ApiServer {
                 }
             }
             _ => Resp::fail(404, "not found"),
-        }
+        };
+        Dispatch::Done(resp)
     }
 
     // ---- auth -------------------------------------------------------------
@@ -508,9 +619,9 @@ impl ApiServer {
 
     // ---- query / update ---------------------------------------------------
 
-    fn handle_query(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    fn handle_query(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(sparql) = req.param("sparql").or_else(|| req.query_string()) else {
-            return Resp::fail(400, "missing sparql/query parameter");
+            return Dispatch::Done(Resp::fail(400, "missing sparql/query parameter"));
         };
         // A read endpoint: an UPDATE-shaped statement additionally needs Update.
         let need = if is_update_sparql(&sparql) {
@@ -519,30 +630,34 @@ impl ApiServer {
             Privilege::Query
         };
         if !st.users.has_priv(user, need) {
-            return self.forbidden();
+            return Dispatch::Done(self.forbidden());
         }
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
         self.run_query(st, &name, &sparql, req, user)
     }
 
-    fn handle_update(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    fn handle_update(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(sparql) = req
             .param("sparql")
             .or_else(|| req.param("update"))
             .or_else(|| Some(req.body_str()).filter(|s| !s.trim().is_empty()))
         else {
-            return Resp::fail(400, "missing update statement");
+            return Dispatch::Done(Resp::fail(400, "missing update statement"));
         };
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
         self.run_query(st, &name, &sparql, req, user)
     }
 
-    /// Run a SPARQL request against loaded database `name`, content-negotiating
-    /// the result, and append it to the query log.
+    /// Set up a SPARQL request against loaded database `name`: register the task,
+    /// clone the target database handle + cancel flag, and return a
+    /// [`Dispatch::Query`] so [`execute_query_job`](Self::execute_query_job) can
+    /// run it *without* the `ApiState` lock held (letting a concurrent
+    /// `POST /cancel` reach the task). Content negotiation is captured now; the
+    /// query log is appended here too.
     fn run_query(
         &self,
         st: &mut ApiState,
@@ -550,41 +665,31 @@ impl ApiServer {
         sparql: &str,
         req: &Request,
         user: &str,
-    ) -> Resp {
+    ) -> Dispatch {
         append_log(
             &st.root,
             "query.log",
             &format!("{}\t{}\t{}\t{}", now_millis(), name, user, sparql.replace('\n', " ")),
         );
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
+        // Clone the target database handle — it has its own lock, independent of
+        // the `ApiState` lock, so the query runs without blocking `/cancel`.
+        let Some(db) = st.dbs.get(name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
+        };
         let task_id = self.register_task(st, name, sparql, user);
-        // This task's cancel flag (settable via POST /cancel), threaded into the
-        // engine's cooperative-cancellation hook. Cloned before the &mut borrow.
-        let cancel = st.tasks.get(&task_id).map(|t| t.cancel.clone());
-        let Some(db) = st.dbs.get_mut(name) else {
-            self.unregister_task(st, task_id);
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
-        };
-        // The query engine now honors the cancel flag (aborting at pattern/phase
-        // boundaries with GStoreError::Cancelled). Caveat: this bundled server is
-        // single-threaded and holds the state lock for the whole request, so it
-        // cannot itself deliver a concurrent POST /cancel while this query
-        // occupies the thread — cancellation is effective for library embedders
-        // that run Database::query_cancellable on their own threads, and readies a
-        // future multi-threaded front-end. See Database::query_cancellable.
-        let result = match cancel {
-            Some(flag) => db.query_cancellable(sparql, flag),
-            None => db.query(sparql),
-        };
-        self.unregister_task(st, task_id);
-        match result {
-            Ok(result) => render_result(fmt, &result),
-            Err(e) => Resp::new(
-                400,
-                "application/sparql-results+json",
-                err_json(&e.to_string()),
-            ),
-        }
+        let cancel = st
+            .tasks
+            .get(&task_id)
+            .map(|t| Arc::clone(&t.cancel))
+            .expect("task just registered");
+        Dispatch::Query(QueryJob {
+            db,
+            cancel,
+            task_id,
+            sparql: sparql.to_string(),
+            fmt,
+        })
     }
 
     // ---- task registry / cancellation --------------------------------------
@@ -686,7 +791,7 @@ impl ApiServer {
             return Resp::fail(500, &format!("save failed: {e}"));
         }
         let triples = db.triple_num();
-        st.dbs.insert(name.clone(), db);
+        st.dbs.insert(name.clone(), Arc::new(Mutex::new(db)));
         Resp::ok(&format!("database '{name}' built ({triples} triples)"))
     }
 
@@ -700,7 +805,7 @@ impl ApiServer {
         }
         match Database::load(&dir) {
             Ok(db) => {
-                st.dbs.insert(name.clone(), db);
+                st.dbs.insert(name.clone(), Arc::new(Mutex::new(db)));
                 Resp::ok(&format!("database '{name}' loaded"))
             }
             Err(e) => Resp::fail(500, &format!("load failed: {e}")),
@@ -740,16 +845,17 @@ impl ApiServer {
             };
             match opened {
                 Ok(db) => {
-                    st.dbs.insert(name.clone(), db);
+                    st.dbs.insert(name.clone(), Arc::new(Mutex::new(db)));
                 }
                 Err(e) => return Resp::fail(500, &format!("upload failed to open database: {e}")),
             }
         }
         let inserted = {
-            let db = st
+            let dbh = st
                 .dbs
-                .get_mut(&name)
+                .get(&name)
                 .expect("just inserted or already loaded above");
+            let mut db = dbh.lock().unwrap();
             triples.iter().filter(|t| db.insert_triple(t)).count()
         };
         // (Lifecycle endpoints like /build and /load don't append to
@@ -821,7 +927,7 @@ impl ApiServer {
         let mut items = Vec::new();
         for n in &names {
             let loaded = st.dbs.contains_key(n);
-            let triples = st.dbs.get(n).map(|d| d.triple_num());
+            let triples = st.dbs.get(n).map(|d| d.lock().unwrap().triple_num());
             let in_txn = st.db_txn.contains_key(n);
             let triples_field = match triples {
                 Some(t) => t.to_string(),
@@ -851,10 +957,10 @@ impl ApiServer {
         if st.db_txn.contains_key(&name) {
             return Resp::fail(409, "a transaction is already open on this database");
         }
-        if let Some(db) = st.dbs.get_mut(&name) {
-            if let Err(e) = db.begin() {
-                return Resp::fail(500, &format!("begin failed: {e}"));
-            }
+        // Clone the handle so the db borrow ends before we mutate the registries.
+        let dbh = Arc::clone(st.dbs.get(&name).expect("existence checked above"));
+        if let Err(e) = dbh.lock().unwrap().begin() {
+            return Resp::fail(500, &format!("begin failed: {e}"));
         }
         let mut tid = new_id();
         while st.txns.contains_key(&tid) {
@@ -874,19 +980,19 @@ impl ApiServer {
         Resp::new(200, JSON, body.into_bytes())
     }
 
-    fn handle_tquery(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    fn handle_tquery(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(tid) = self.txn_id(req) else {
-            return Resp::fail(400, "missing or malformed tid/txn parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
         let Some(name) = st.txns.get(&tid).map(|t| t.db.clone()) else {
-            return Resp::fail(404, &format!("no open transaction {tid}"));
+            return Dispatch::Done(Resp::fail(404, &format!("no open transaction {tid}")));
         };
         let Some(sparql) = req
             .param("sparql")
             .or_else(|| req.query_string())
             .or_else(|| Some(req.body_str()).filter(|s| !s.trim().is_empty()))
         else {
-            return Resp::fail(400, "missing sparql parameter");
+            return Dispatch::Done(Resp::fail(400, "missing sparql parameter"));
         };
         let need = if is_update_sparql(&sparql) {
             Privilege::Update
@@ -894,7 +1000,7 @@ impl ApiServer {
             Privilege::Query
         };
         if !st.users.has_priv(user, need) {
-            return self.forbidden();
+            return Dispatch::Done(self.forbidden());
         }
         self.run_query(st, &name, &sparql, req, user)
     }
@@ -907,7 +1013,8 @@ impl ApiServer {
             return Resp::fail(404, &format!("no open transaction {tid}"));
         };
         st.db_txn.remove(&txn.db);
-        let result = st.dbs.get_mut(&txn.db).map(|db| {
+        let result = st.dbs.get(&txn.db).map(|dbh| {
+            let mut db = dbh.lock().unwrap();
             if commit {
                 db.commit()
             } else {
@@ -932,10 +1039,10 @@ impl ApiServer {
             return Resp::fail(400, "missing or ambiguous db parameter");
         };
         let dir = st.root.join(crate::db_dir_for(&name));
-        let Some(db) = st.dbs.get(&name) else {
+        let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match db.save(&dir) {
+        match dbh.lock().unwrap().save(&dir) {
             Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
             Err(e) => Resp::fail(500, &format!("checkpoint failed: {e}")),
         }
@@ -952,10 +1059,10 @@ impl ApiServer {
             .or_else(|| req.param("backup_path"))
             .map(PathBuf::from)
             .unwrap_or_else(|| st.root.join(format!("{name}.backup")));
-        let Some(db) = st.dbs.get(&name) else {
+        let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match db.backup(&path) {
+        match dbh.lock().unwrap().backup(&path) {
             Ok(()) => {
                 let body = format!(
                     "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
@@ -983,7 +1090,7 @@ impl ApiServer {
                 if let Err(e) = db.save(&dir) {
                     return Resp::fail(500, &format!("restore persist failed: {e}"));
                 }
-                st.dbs.insert(name.clone(), db);
+                st.dbs.insert(name.clone(), Arc::new(Mutex::new(db)));
                 Resp::ok(&format!("database '{name}' restored"))
             }
             Err(e) => Resp::fail(500, &format!("restore failed: {e}")),
@@ -998,10 +1105,14 @@ impl ApiServer {
         let Some(name) = self.pick_db(st, req) else {
             return Resp::fail(400, "missing or ambiguous db parameter");
         };
-        let Some(db) = st.dbs.get_mut(&name) else {
+        let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match db.query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }") {
+        let exported = dbh
+            .lock()
+            .unwrap()
+            .query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+        match exported {
             Ok(QueryResult::Construct(ts)) => {
                 let mut resp = Resp::new(200, "application/n-triples", ntriples_body(&ts));
                 let disposition = if wants_inline(req) { "inline" } else { "attachment" };
@@ -1048,10 +1159,11 @@ impl ApiServer {
                 stmt.replace('\n', " ")
             ),
         );
-        let Some(db) = st.dbs.get_mut(&name) else {
+        let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match db.query(&stmt) {
+        let outcome = dbh.lock().unwrap().query(&stmt);
+        match outcome {
             Ok(QueryResult::Update { changed }) => {
                 let op = if insert { "inserted" } else { "removed" };
                 let body = format!(
@@ -1067,7 +1179,7 @@ impl ApiServer {
     // ---- monitoring -------------------------------------------------------
 
     fn handle_status(&self, st: &mut ApiState) -> Resp {
-        let total_triples: u64 = st.dbs.values().map(|d| d.triple_num()).sum();
+        let total_triples: u64 = st.dbs.values().map(|d| d.lock().unwrap().triple_num()).sum();
         let body = format!(
             "{{\"StatusCode\":0,\"StatusMsg\":\"running\",\"databases_loaded\":{},\"total_triples\":{},\"open_transactions\":{},\"users\":{},\"requests\":{},\"uptime_secs\":{}}}",
             st.dbs.len(),
@@ -1085,7 +1197,7 @@ impl ApiServer {
         let mut names: Vec<&String> = st.dbs.keys().collect();
         names.sort();
         for n in names {
-            let s = st.dbs[n].stats();
+            let s = st.dbs[n].lock().unwrap().stats();
             dbs.push(format!(
                 "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
                 json_str(&s.name),
@@ -1423,7 +1535,7 @@ mod tests {
     // --- in-process HTTP client tests: upload, export download, console,
     // task registry (mirrors the pattern in tests/dt_http_parity.rs) --------
 
-    use std::io::Read as _;
+    use std::net::TcpStream;
     use std::thread;
 
     /// A unique temp directory for one server's databases + logs + user store.
@@ -1672,7 +1784,7 @@ mod tests {
         use std::collections::BTreeSet;
         let (server, addr) = start("cancel_own");
         {
-            let mut st = server.state.lock().unwrap();
+            let mut st = server.inner.state.lock().unwrap();
             st.users.add("alice", "pw", BTreeSet::from([Privilege::Update])).unwrap();
             st.users.add("bob", "pw", BTreeSet::from([Privilege::Update])).unwrap();
             st.tasks.insert(
@@ -1692,8 +1804,9 @@ mod tests {
                 split_status_body(&raw_request(&addr, "POST", "/cancel?id=42", Some(&auth), ""));
             status
         };
-        let flag = || server.state.lock().unwrap().tasks[&42].cancel.load(Ordering::Relaxed);
+        let flag = || server.inner.state.lock().unwrap().tasks[&42].cancel.load(Ordering::Relaxed);
         let reset = || server
+            .inner
             .state
             .lock()
             .unwrap()
@@ -1711,5 +1824,82 @@ mod tests {
         reset();
         assert_eq!(cancel_as("root", "root"), 200, "admin may cancel any task");
         assert!(flag(), "admin's cancel sets the flag");
+    }
+
+    /// Extract the first `"id":<n>` from a `/tasklist` JSON body.
+    fn first_task_id(tasklist_json: &str) -> Option<u64> {
+        let i = tasklist_json.find("\"id\":")? + "\"id\":".len();
+        tasklist_json[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    #[test]
+    fn concurrent_cancel_aborts_running_query() {
+        // THE core multi-threading goal: while one worker runs a slow query, a
+        // concurrent POST /cancel (on another worker) must be deliverable and
+        // must abort the query. This is only possible because the query runs
+        // with the ApiState lock released — proven here by /tasklist being
+        // answerable (it needs that lock) *while* the query is in flight.
+        let (_srv, addr) = start("cancel_live");
+        let root = basic("root", "root");
+
+        // 100 triples -> the unconstrained 3-way self-join materializes ~1e6
+        // rows, which takes long enough for the cancel to land mid-flight.
+        let mut ttl = String::from("@prefix : <http://ex/> .\n");
+        for i in 0..100 {
+            ttl.push_str(&format!(":s{i} :p :o{i} .\n"));
+        }
+        let (status, body) =
+            split_status_body(&raw_request(&addr, "POST", "/build?db_name=slow", Some(&root), &ttl));
+        assert_eq!(status, 200, "build: {body}");
+
+        // Kick off the slow query on its own thread.
+        let addr_q = addr;
+        let root_q = root.clone();
+        let query_thread = thread::spawn(move || {
+            raw_request(
+                &addr_q,
+                "POST",
+                "/sparql?db_name=slow",
+                Some(&root_q),
+                "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }",
+            )
+        });
+
+        // Concurrently poll /tasklist until the running task appears (proving the
+        // ApiState lock is free during execution), then cancel it.
+        let mut task_id = None;
+        for _ in 0..3000 {
+            let (_s, body) =
+                split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+            if let Some(id) = first_task_id(&body) {
+                task_id = Some(id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let task_id = task_id.expect("the running query must be visible in /tasklist mid-flight");
+
+        let (cstatus, cbody) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            &format!("/cancel?id={task_id}"),
+            Some(&root),
+            "",
+        ));
+        assert_eq!(cstatus, 200, "the concurrent cancel must be accepted: {cbody}");
+
+        // The query, whose cancel flag was flipped while it ran, returns the
+        // cancellation error (HTTP 400 + "query cancelled").
+        let (qstatus, qbody) = split_status_body(&query_thread.join().unwrap());
+        assert_eq!(qstatus, 400, "a cancelled query returns 400: {qbody}");
+        assert!(
+            qbody.to_lowercase().contains("cancel"),
+            "expected a cancellation error, got: {qbody}"
+        );
     }
 }

@@ -2,7 +2,8 @@
 //! `src/Server` / `ghttp`.
 //!
 //! This is a dependency-free, blocking HTTP/1.1 server (one request per
-//! connection) implementing a useful subset of the SPARQL 1.1 Protocol:
+//! connection, each connection handled on its own worker thread) implementing a
+//! useful subset of the SPARQL 1.1 Protocol:
 //!
 //! | route | does |
 //! |-------|------|
@@ -12,9 +13,11 @@
 //!
 //! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
 //! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
-//! query parameter; CONSTRUCT/DESCRIBE return N-Triples. The [`Database`] is
-//! shared behind a [`Mutex`] so connections are serialized (correctness over
-//! throughput).
+//! query parameter; CONSTRUCT/DESCRIBE return N-Triples. Connections run
+//! concurrently (a worker thread each), but the [`Database`] is shared behind a
+//! [`Mutex`] so the actual query/update execution is serialized (correctness
+//! over throughput); everything up to and after that — parsing, auth,
+//! serialization, response compression — runs off the lock.
 //!
 //! Beyond the base protocol this endpoint adds:
 //!
@@ -27,20 +30,26 @@
 //!   `Transfer-Encoding: chunked`, emitting rows without buffering the whole
 //!   body. All other responses keep `Content-Length`, so the chunked-unaware
 //!   [`crate::http_client`] (and the `SERVICE` federation path) are unaffected.
+//! * **Compression** (feature `gzip`) — buffered responses honour a client
+//!   `Accept-Encoding: gzip`/`deflate`, setting `Content-Encoding` accordingly.
+//!   Without the feature the default build stays dependency-free and sends
+//!   bodies verbatim. Streamed (`chunked`) responses are never compressed.
 //!
-//! **HTTPS:** real TLS is intentionally out of this zero-dependency crate's
-//! scope. Terminate TLS in front of the endpoint with a reverse proxy (nginx,
-//! Caddy, stunnel, …), or wire in `rustls`/`native-tls` behind a future
-//! optional Cargo feature — nothing here precludes wrapping the accepted
-//! [`TcpStream`] in a TLS stream. Do not send credentials over plain `http://`
-//! in production without such termination.
+//! **HTTPS:** with the optional `tls` feature, [`Server::serve_forever_tls`]
+//! (and its [`ApiServer`](crate::http_api::ApiServer) counterpart) terminate
+//! TLS in-process via `rustls` — build a [`rustls::ServerConfig`] from a
+//! cert+key PEM with [`load_tls_config`]. The default (zero-dependency) build
+//! omits TLS: terminate HTTPS in front of the endpoint with a reverse proxy
+//! (nginx, Caddy, stunnel, …) instead, and do not send credentials over plain
+//! `http://` in production without such termination.
 //!
 //! Still deferred (see `docs/REFACTOR_BACKLOG.md` F): gRPC and
 //! clustering/sharding.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::db::Database;
 use crate::query::{QueryResult, ResultSet};
@@ -126,8 +135,17 @@ document.getElementById('run').addEventListener('click', function () {
 
 /// An HTTP SPARQL server wrapping a [`Database`].
 pub struct Server {
-    db: Mutex<Database>,
+    /// The shared, thread-safe part handed to each connection's worker thread.
+    inner: Arc<ServerInner>,
     listener: TcpListener,
+}
+
+/// The part of a [`Server`] shared across connection worker threads (behind an
+/// `Arc`): the [`Database`] (serialized by its `Mutex`) and the optional Basic
+/// credentials. Kept separate from the non-`Send` bookkeeping so a worker only
+/// needs to clone this `Arc`.
+struct ServerInner {
+    db: Mutex<Database>,
     /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
     auth: Option<(String, String)>,
 }
@@ -138,9 +156,11 @@ impl Server {
     pub fn bind<A: ToSocketAddrs>(db: Database, addr: A) -> std::io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
         Ok(Server {
-            db: Mutex::new(db),
+            inner: Arc::new(ServerInner {
+                db: Mutex::new(db),
+                auth: None,
+            }),
             listener,
-            auth: None,
         })
     }
 
@@ -152,7 +172,13 @@ impl Server {
     /// let server = Server::bind(db, "127.0.0.1:0").unwrap().with_basic_auth("admin", "s3cret");
     /// ```
     pub fn with_basic_auth(mut self, user: &str, pass: &str) -> Server {
-        self.auth = Some((user.to_string(), pass.to_string()));
+        // This builder runs right after `bind`, before the inner `Arc` is
+        // shared with any worker thread, so it is uniquely owned and `get_mut`
+        // succeeds. (If it were somehow already shared we'd silently keep the
+        // open config, but the builder contract prevents that.)
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.auth = Some((user.to_string(), pass.to_string()));
+        }
         self
     }
 
@@ -161,14 +187,39 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Accept and handle connections forever (one request each).
+    /// Accept connections forever, handling each on its own worker thread so a
+    /// slow query on one connection does not block the others (the [`Database`]
+    /// itself is still serialized behind its `Mutex`).
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
-            let _ = self.handle(stream);
+            let inner = Arc::clone(&self.inner);
+            thread::spawn(move || {
+                let _ = inner.handle(stream);
+            });
         }
     }
 
-    fn handle(&self, mut stream: TcpStream) -> std::io::Result<()> {
+    /// Like [`serve_forever`](Self::serve_forever) but terminates TLS
+    /// in-process, wrapping every accepted connection in a `rustls` stream built
+    /// from `config` (see [`load_tls_config`]). Requires the `tls` feature.
+    #[cfg(feature = "tls")]
+    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
+        for stream in self.listener.incoming().flatten() {
+            let inner = Arc::clone(&self.inner);
+            let config = Arc::clone(&config);
+            thread::spawn(move || {
+                if let Ok(conn) = rustls::ServerConnection::new(config) {
+                    let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
+                }
+            });
+        }
+    }
+}
+
+impl ServerInner {
+    /// Handle one connection (one request). Generic over the transport so the
+    /// same code path serves plain [`TcpStream`]s and `rustls` TLS streams.
+    fn handle<S: Read + Write>(&self, mut stream: S) -> std::io::Result<()> {
         let req = match Request::parse(&mut stream) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()), // connection closed with no request
@@ -187,21 +238,26 @@ impl Server {
                 );
             }
         }
+        // The client's `Accept-Encoding` (used to optionally compress buffered
+        // bodies under the `gzip` feature; ignored without it).
+        let enc = req.header("accept-encoding");
         match (req.method.as_str(), req.path.as_str()) {
             ("GET" | "POST", "/sparql") => self.handle_sparql(&mut stream, &req),
             ("POST", "/update") => {
                 let (s, c, b) = self.run_update(&req.body_string());
-                write_response(&mut stream, s, &c, &b)
+                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
             }
             ("GET", "/status") => {
                 let (s, c, b) = self.status_json();
-                write_response(&mut stream, s, &c, &b)
+                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
             }
-            ("GET", "/" | "/console") => write_response(
+            ("GET", "/" | "/console") => write_response_maybe_gzip(
                 &mut stream,
                 200,
                 "text/html; charset=utf-8",
+                &[],
                 CONSOLE_HTML.as_bytes(),
+                enc,
             ),
             ("GET" | "POST", _) => write_response(&mut stream, 404, "text/plain", b"not found"),
             _ => write_response(&mut stream, 405, "text/plain", b"method not allowed"),
@@ -210,36 +266,53 @@ impl Server {
 
     /// Run a `/sparql` request: negotiate a result format, then answer with a
     /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
-    fn handle_sparql(&self, stream: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    /// The [`Database`] lock is released before any serialization or network
+    /// write, so it is held only for the query itself.
+    fn handle_sparql<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        req: &Request,
+    ) -> std::io::Result<()> {
         let q = match req.query_string() {
             Some(q) => q,
             None => return write_response(stream, 400, SPARQL_JSON, &err_json("missing query")),
         };
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
-        let mut db = self.db.lock().unwrap();
-        match db.query(&q) {
+        let enc = req.header("accept-encoding");
+        let result = {
+            let mut db = self.db.lock().unwrap();
+            db.query(&q)
+        };
+        match result {
             Ok(QueryResult::Select(rs)) => {
                 if req.wants_stream() {
                     stream_select(stream, fmt, &rs)
                 } else {
                     let mut buf = Vec::new();
                     let _ = sparql_results::write_select(fmt, &rs, &mut buf);
-                    write_response(stream, 200, fmt.content_type(), &buf)
+                    write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
                 }
             }
             Ok(QueryResult::Ask(b)) => {
                 let mut buf = Vec::new();
                 let _ = sparql_results::write_ask(fmt, b, &mut buf);
-                write_response(stream, 200, fmt.content_type(), &buf)
+                write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
             }
-            Ok(QueryResult::Construct(ts)) => {
-                write_response(stream, 200, "application/n-triples", &ntriples_body(&ts))
-            }
-            Ok(QueryResult::Update { changed }) => write_response(
+            Ok(QueryResult::Construct(ts)) => write_response_maybe_gzip(
+                stream,
+                200,
+                "application/n-triples",
+                &[],
+                &ntriples_body(&ts),
+                enc,
+            ),
+            Ok(QueryResult::Update { changed }) => write_response_maybe_gzip(
                 stream,
                 200,
                 "application/json",
+                &[],
                 format!("{{\"changed\":{changed}}}").as_bytes(),
+                enc,
             ),
             Err(e) => write_response(stream, 400, SPARQL_JSON, &err_json(&e.to_string())),
         }
@@ -293,7 +366,7 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    pub(crate) fn parse(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+    pub(crate) fn parse<R: Read>(stream: &mut R) -> std::io::Result<Option<Request>> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -463,8 +536,8 @@ impl Request {
 
 // --- response helpers --------------------------------------------------------
 
-pub(crate) fn write_response(
-    stream: &mut TcpStream,
+pub(crate) fn write_response<W: Write>(
+    stream: &mut W,
     status: u16,
     ctype: &str,
     body: &[u8],
@@ -472,10 +545,39 @@ pub(crate) fn write_response(
     write_response_ext(stream, status, ctype, &[], body)
 }
 
+/// Write a buffered response, optionally gzip/deflate-compressing the body when
+/// the client's `Accept-Encoding` permits it and the `gzip` feature is enabled.
+/// Sets `Content-Encoding` (and `Vary: Accept-Encoding`) on the compressed path.
+/// Without the feature `accept_encoding` is ignored and the body is sent
+/// verbatim, so the default build stays dependency-free.
+pub(crate) fn write_response_maybe_gzip<W: Write>(
+    stream: &mut W,
+    status: u16,
+    ctype: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+    accept_encoding: Option<&str>,
+) -> std::io::Result<()> {
+    #[cfg(feature = "gzip")]
+    {
+        if let Some(enc) = pick_encoding(accept_encoding) {
+            if let Some(compressed) = compress(body, enc) {
+                let mut hdrs: Vec<(&str, &str)> = extra.to_vec();
+                hdrs.push(("Content-Encoding", enc));
+                hdrs.push(("Vary", "Accept-Encoding"));
+                return write_response_ext(stream, status, ctype, &hdrs, &compressed);
+            }
+        }
+    }
+    #[cfg(not(feature = "gzip"))]
+    let _ = accept_encoding;
+    write_response_ext(stream, status, ctype, extra, body)
+}
+
 /// Like [`write_response`], but with additional response headers (e.g.
 /// `WWW-Authenticate` on a `401`).
-pub(crate) fn write_response_ext(
-    stream: &mut TcpStream,
+pub(crate) fn write_response_ext<W: Write>(
+    stream: &mut W,
     status: u16,
     ctype: &str,
     extra: &[(&str, &str)],
@@ -508,7 +610,11 @@ pub(crate) fn write_response_ext(
 
 /// Stream a SELECT result with `Transfer-Encoding: chunked`, framing each
 /// serializer `write_all` (one per row) as its own HTTP chunk.
-fn stream_select(stream: &mut TcpStream, fmt: ResultFormat, rs: &ResultSet) -> std::io::Result<()> {
+fn stream_select<W: Write>(
+    stream: &mut W,
+    fmt: ResultFormat,
+    rs: &ResultSet,
+) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         fmt.content_type()
@@ -547,6 +653,96 @@ impl<W: Write> Write for ChunkedWriter<'_, W> {
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+}
+
+// --- response compression (feature `gzip`) -----------------------------------
+
+/// Choose a supported `Content-Encoding` from the client's `Accept-Encoding`.
+/// Prefers `gzip`, then `deflate`; ignores q-values (a token match is enough for
+/// our clients). Returns `None` when neither is offered.
+#[cfg(feature = "gzip")]
+fn pick_encoding(accept_encoding: Option<&str>) -> Option<&'static str> {
+    let ae = accept_encoding?.to_ascii_lowercase();
+    let has = |name: &str| {
+        ae.split(',')
+            .any(|t| t.trim().split(';').next().map(str::trim) == Some(name))
+    };
+    if has("gzip") {
+        Some("gzip")
+    } else if has("deflate") {
+        Some("deflate")
+    } else {
+        None
+    }
+}
+
+/// Compress `body` with the chosen encoding. `"deflate"` uses the zlib wrapper
+/// (RFC 1950), which is what HTTP's `deflate` content-coding specifies.
+#[cfg(feature = "gzip")]
+fn compress(body: &[u8], enc: &str) -> Option<Vec<u8>> {
+    use flate2::write::{GzEncoder, ZlibEncoder};
+    use flate2::Compression;
+    let mut buf = Vec::new();
+    match enc {
+        "gzip" => {
+            let mut e = GzEncoder::new(&mut buf, Compression::default());
+            e.write_all(body).ok()?;
+            e.finish().ok()?;
+        }
+        "deflate" => {
+            let mut e = ZlibEncoder::new(&mut buf, Compression::default());
+            e.write_all(body).ok()?;
+            e.finish().ok()?;
+        }
+        _ => return None,
+    }
+    Some(buf)
+}
+
+// --- TLS (feature `tls`) -----------------------------------------------------
+
+/// Build a [`rustls::ServerConfig`] (wrapped in an `Arc`, ready for
+/// [`Server::serve_forever_tls`] / [`ApiServer::serve_forever_tls`](crate::http_api::ApiServer::serve_forever_tls))
+/// from a PEM certificate chain and PKCS#8/SEC1/PKCS#1 private key on disk. Uses
+/// the pure-`ring` crypto backend (no `aws-lc-rs`/bindgen). Requires the `tls`
+/// feature.
+///
+/// ```no_run
+/// # #[cfg(feature = "tls")] {
+/// use gstore::{Database, server::{Server, load_tls_config}};
+/// let db = Database::build_from_str("x", "").unwrap();
+/// let server = Server::bind(db, "127.0.0.1:8443").unwrap();
+/// let config = load_tls_config("cert.pem", "key.pem").unwrap();
+/// // server.serve_forever_tls(config); // serves HTTPS
+/// # let _ = (server, config);
+/// # }
+/// ```
+#[cfg(feature = "tls")]
+pub fn load_tls_config(
+    cert_pem: impl AsRef<std::path::Path>,
+    key_pem: impl AsRef<std::path::Path>,
+) -> std::io::Result<Arc<rustls::ServerConfig>> {
+    use std::fs::File;
+    let mut cr = BufReader::new(File::open(cert_pem)?);
+    let certs = rustls_pemfile::certs(&mut cr).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no certificates found in the certificate PEM",
+        ));
+    }
+    let mut kr = BufReader::new(File::open(key_pem)?);
+    let key = rustls_pemfile::private_key(&mut kr)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "no private key found in the key PEM")
+    })?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Arc::new(config))
 }
 
 pub(crate) fn ntriples_body(triples: &[crate::model::Triple]) -> Vec<u8> {
@@ -972,5 +1168,164 @@ mod tests {
         let rows: Vec<&str> = lines.collect();
         assert!(rows.iter().any(|r| r.contains("http://ex/b")));
         assert!(rows.iter().any(|r| r.contains("Alice")));
+    }
+
+    // --- multi-threading: a slow connection must not block a second one ------
+
+    #[test]
+    fn concurrent_connections_are_not_serialized() {
+        // Two clients connect at once; both must be served. This mainly proves
+        // the accept loop spawns a worker per connection rather than handling
+        // them strictly one-at-a-time on the accept thread.
+        let (_srv, addr) = start();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(thread::spawn(move || {
+                let resp = post(&addr, "/sparql", SELECT_O);
+                assert!(resp.contains("200 OK"), "{resp}");
+                assert!(resp.contains("http://ex/b"), "{resp}");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    // --- gzip response compression (feature `gzip`) --------------------------
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn gzip_compresses_when_accepted() {
+        use std::io::Read as _;
+        let (_srv, addr) = start();
+        let mut s = TcpStream::connect(addr).unwrap();
+        let raw = format!(
+            "POST /sparql HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            SELECT_O.len(),
+            SELECT_O
+        );
+        s.write_all(raw.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).unwrap();
+        let sep = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header/body separator");
+        let head = String::from_utf8_lossy(&resp[..sep]).to_string();
+        let body = &resp[sep + 4..];
+        assert!(head.contains("Content-Encoding: gzip"), "headers: {head}");
+        assert!(head.contains("Vary: Accept-Encoding"), "headers: {head}");
+        // The body is real gzip: decode it and check the payload survived.
+        let mut d = flate2::read::GzDecoder::new(body);
+        let mut out = String::new();
+        d.read_to_string(&mut out).unwrap();
+        assert!(out.contains("http://ex/b"), "decompressed body: {out}");
+    }
+
+    #[cfg(not(feature = "gzip"))]
+    #[test]
+    fn without_gzip_feature_body_is_uncompressed() {
+        // The default (dependency-free) build must ignore Accept-Encoding.
+        let (_srv, addr) = start();
+        let raw = format!(
+            "POST /sparql HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            SELECT_O.len(),
+            SELECT_O
+        );
+        let resp = http(&addr, &raw);
+        assert!(!resp.contains("Content-Encoding"), "must not compress: {resp}");
+        assert!(resp.contains("http://ex/b"), "{resp}");
+    }
+
+    // --- TLS (feature `tls`) -------------------------------------------------
+    //
+    // A self-signed EC end-entity cert (CN=localhost, SAN DNS:localhost + IP
+    // 127.0.0.1, CA:FALSE, EKU serverAuth) generated with openssl. Being a leaf
+    // (not a CA) it is valid as the server's presented cert, and the client
+    // trusts it by pinning the same cert as a root.
+
+    #[cfg(feature = "tls")]
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvTCCAWOgAwIBAgIUKHclqAxNOvVOQ3kWyfFT+rCJUHwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMjIwMjkyMFoXDTM2MDYyOTIw
+MjkyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYHEfrA2tZnM3sdpdua9aH0oSv8G2EmRrc10JlY7xgVO8+6VoyIJqtvH5
+AxyPvu6UfMZMa+/UFLAmk+WCYEKCi6OBkjCBjzAdBgNVHQ4EFgQUJOZ8AYKC5S5i
+QJhbdtMpHgmjlaowHwYDVR0jBBgwFoAUJOZ8AYKC5S5iQJhbdtMpHgmjlaowGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIQCo
+ndoh3KosHMemvMMbjxtaNbbXmxGjfsgme3rBkLuziQIgFeUx/cU+Fpw/Dl5McuKP
+cCWfronEM/ASghi4/9ldMUI=
+-----END CERTIFICATE-----
+";
+
+    #[cfg(feature = "tls")]
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUBOdoa9/azwl851s
+NPlNYkOXVnBaUKf3fk8J38AOaYehRANCAARgcR+sDa1mczex2l25r1ofShK/wbYS
+ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
+-----END PRIVATE KEY-----
+";
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_https_round_trip() {
+        use std::io::{Read as _, Write as _};
+        // Write the embedded cert+key to temp files and load them through the
+        // crate's real `load_tls_config` path.
+        let dir = std::env::temp_dir().join(format!("gstore_tls_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        std::fs::write(&key, KEY_PEM).unwrap();
+        let config = load_tls_config(&cert, &key).expect("load_tls_config");
+
+        // Serve HTTPS on an ephemeral port.
+        let db = Database::build_from_str("tls", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let cfg = Arc::clone(&config);
+        thread::spawn(move || s2.serve_forever_tls(cfg));
+
+        // A rustls client that trusts the self-signed cert (added as a root).
+        let mut roots = rustls::RootCertStore::empty();
+        let cert_der = rustls_pemfile::certs(&mut std::io::BufReader::new(CERT_PEM.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(cert_der).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+
+        let raw = format!(
+            "POST /sparql HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            SELECT_O.len(),
+            SELECT_O
+        );
+        tls.write_all(raw.as_bytes()).unwrap();
+        tls.flush().unwrap();
+        let mut resp = Vec::new();
+        // The server drops the connection without a TLS close_notify, which
+        // rustls reports as an EOF error *after* delivering all application
+        // data; ignore it and assert on what was decrypted.
+        let _ = tls.read_to_end(&mut resp);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("200 OK"), "TLS response: {text}");
+        assert!(text.contains("http://ex/b"), "TLS response: {text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
