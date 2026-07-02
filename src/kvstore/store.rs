@@ -8,6 +8,7 @@
 //! [`crate::store::TripleStore`] does, but entirely from disk through the page
 //! cache. Data persists and reopens.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -44,6 +45,20 @@ const ROOT_PRED_COUNT: usize = 12;
 const SP2O_VLIST: usize = 13;
 /// `1` once [`DiskStore::compact`] has built `SP2O_VLIST`; cleared by any write.
 const ROOT_COMPACTED: usize = 14;
+/// Root of the maintained per-predicate statistics [`IvArray`] (gStore
+/// `pre2num`/`pre2sub`/`pre2obj`): predicate id → 12-byte record
+/// `[num: u32][distinct_subj: u32][distinct_obj: u32]`, all little-endian. A
+/// non-zero root here is also the sentinel that the maintained stats exist (used
+/// by [`DiskStore::open`] to lazily rebuild them for a pre-statistics file).
+const PRED_STATS: usize = 15;
+/// Maintained count of distinct ids that appear as a subject (exact; the
+/// in-memory counterpart of `TripleStore::distinct_subjects`).
+const ROOT_DISTINCT_SUBJ: usize = 16;
+/// Maintained count of distinct ids that appear as an object (exact).
+const ROOT_DISTINCT_OBJ: usize = 17;
+
+/// Bytes of a per-predicate stats record (`num`, `distinct_subj`, `distinct_obj`).
+const PRED_STAT_LEN: usize = 12;
 
 /// Upper bound on a VList value stored *inline* in a B+tree leaf page. A
 /// `(sub, pred)` group whose delta+varint encoding fits within this is stored
@@ -82,10 +97,22 @@ pub struct DiskStore {
     /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`/`po_by_s`
     /// when [`compacted`](Self::compacted) is set.
     sp2o_vlist: BTree,
+    /// Maintained per-predicate statistics (gStore `pre2num`/`pre2sub`/`pre2obj`),
+    /// an integer-keyed dense [`IvArray`] of fixed 12-byte counter records. Kept
+    /// current on every insert/delete so the optimizer reads `pred_card` /
+    /// `pred_distinct_subj` / `pred_distinct_obj` in `O(1)` instead of scanning a
+    /// whole predicate's triples.
+    pred_stats: IvArray,
     triple_count: u64,
     entity_count: u32,
     literal_count: u32,
     pred_count: u32,
+    /// Exact distinct-subject / distinct-object counts, maintained on
+    /// insert/delete via cheap B+tree prefix-existence probes (no per-entity
+    /// storage — literal object ids are too large for a dense array). Persisted in
+    /// [`ROOT_DISTINCT_SUBJ`] / [`ROOT_DISTINCT_OBJ`].
+    distinct_subj: u32,
+    distinct_obj: u32,
     /// Whether the VList index is current. Set by `compact`, cleared by any write
     /// (so reads always fall back to the authoritative SPO scan when stale).
     compacted: bool,
@@ -106,7 +133,16 @@ impl DiskStore {
         let literal_count = pager.root(ROOT_LITERAL_COUNT) as u32;
         let pred_count = pager.root(ROOT_PRED_COUNT) as u32;
         let compacted = pager.root(ROOT_COMPACTED) != 0;
-        Ok(DiskStore {
+        let distinct_subj = pager.root(ROOT_DISTINCT_SUBJ) as u32;
+        let distinct_obj = pager.root(ROOT_DISTINCT_OBJ) as u32;
+        // A file written before the maintained statistics existed has triples but
+        // no `pred_stats` array (its root slot is still zero). Detect that and
+        // rebuild the stats once, so an old on-disk database still gets O(1)
+        // optimizer statistics. A store built by current code always has a
+        // non-zero `pred_stats` root once it holds a triple, so this never fires
+        // on the normal build→reopen path.
+        let needs_rebuild = triple_count > 0 && pager.root(PRED_STATS) == 0;
+        let mut store = DiskStore {
             pager: Arc::new(RwLock::new(pager)),
             spo: BTree::new(SPO),
             pos: BTree::new(POS),
@@ -118,13 +154,20 @@ impl DiskStore {
             id2literal: IvArray::new(ID2LITERAL),
             id2predicate: IvArray::new(ID2PREDICATE),
             sp2o_vlist: BTree::new(SP2O_VLIST),
+            pred_stats: IvArray::new(PRED_STATS),
             triple_count,
             entity_count,
             literal_count,
             pred_count,
+            distinct_subj,
+            distinct_obj,
             compacted,
             disk_dict: Mutex::new(None),
-        })
+        };
+        if needs_rebuild {
+            store.rebuild_stats()?;
+        }
+        Ok(store)
     }
 
     /// Build a disk store from RDF (Turtle/N-Triples) files.
@@ -239,11 +282,41 @@ impl DiskStore {
         if self.spo.get(pager, &spo)?.is_some() {
             return Ok(false);
         }
+        // Detect statistics transitions *before* inserting, while the trees still
+        // reflect the pre-insert state: whether `sub` is a brand-new subject, `obj`
+        // a brand-new object, and whether this is the first triple for `(sub,pred)`
+        // / `(pred,obj)` (which move the per-predicate distinct-subject/object
+        // counts). Each is a single O(height) prefix probe, not a scan.
+        let sub_is_new = !self.spo.prefix_exists(pager, &be32(t.sub))?;
+        let obj_is_new = !self.osp.prefix_exists(pager, &be32(t.obj))?;
+        let sp_is_new = !self.spo.prefix_exists(pager, &cat(t.sub, t.pred))?;
+        let po_is_new = !self.pos.prefix_exists(pager, &cat(t.pred, t.obj))?;
+
         self.spo.insert(pager, &spo, b"")?;
         self.pos.insert(pager, &key3(t.pred, t.obj, t.sub), b"")?;
         self.osp.insert(pager, &key3(t.obj, t.sub, t.pred), b"")?;
         self.triple_count += 1;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
+
+        // Fold the transitions into the maintained statistics.
+        if sub_is_new {
+            self.distinct_subj += 1;
+            pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
+        }
+        if obj_is_new {
+            self.distinct_obj += 1;
+            pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
+        }
+        let (num, dsub, dobj) = read_pred_stat(&self.pred_stats, pager, t.pred)?;
+        write_pred_stat(
+            &self.pred_stats,
+            pager,
+            t.pred,
+            num + 1,
+            dsub + sp_is_new as u32,
+            dobj + po_is_new as u32,
+        )?;
+
         if self.compacted {
             // The VList index no longer reflects the data; reads must rescan.
             self.compacted = false;
@@ -303,6 +376,32 @@ impl DiskStore {
         self.osp.delete(pager, &key3(t.obj, t.sub, t.pred))?;
         self.triple_count -= 1;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
+
+        // Mirror the insert transitions: probe *after* deletion to see whether the
+        // last triple carrying each aggregate is gone, and step the maintained
+        // statistics down accordingly.
+        let sub_gone = !self.spo.prefix_exists(pager, &be32(t.sub))?;
+        let obj_gone = !self.osp.prefix_exists(pager, &be32(t.obj))?;
+        let sp_gone = !self.spo.prefix_exists(pager, &cat(t.sub, t.pred))?;
+        let po_gone = !self.pos.prefix_exists(pager, &cat(t.pred, t.obj))?;
+        if sub_gone {
+            self.distinct_subj = self.distinct_subj.saturating_sub(1);
+            pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
+        }
+        if obj_gone {
+            self.distinct_obj = self.distinct_obj.saturating_sub(1);
+            pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
+        }
+        let (num, dsub, dobj) = read_pred_stat(&self.pred_stats, pager, t.pred)?;
+        write_pred_stat(
+            &self.pred_stats,
+            pager,
+            t.pred,
+            num.saturating_sub(1),
+            dsub.saturating_sub(sp_gone as u32),
+            dobj.saturating_sub(po_gone as u32),
+        )?;
+
         if self.compacted {
             self.compacted = false;
             pager.set_root(ROOT_COMPACTED, 0);
@@ -318,6 +417,8 @@ impl DiskStore {
         pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
         pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
         pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
+        pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
+        pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
         pager.flush()
     }
 
@@ -334,6 +435,122 @@ impl DiskStore {
     }
     pub fn predicate_num(&self) -> usize {
         self.pred_count as usize
+    }
+
+    // ---- degree / cardinality statistics (gStore KVstore degree APIs) -----
+    //
+    // These mirror gStore's degree/statistics surface. The per-predicate and
+    // global distinct counts are read from maintained counters in O(1); the
+    // per-key degree lookups are degree-bounded prefix counts over the triple
+    // B+trees (the analogue of reading a gStore value-list length), never a
+    // whole-table scan.
+
+    /// Out-degree of `sub`: number of triples with `sub` as subject (gStore
+    /// `getEntityOutDegree`). Degree-bounded prefix count over SPO.
+    pub fn subject_degree(&self, sub: EntityLiteralId) -> Result<usize> {
+        let pager = self.pager.read().unwrap();
+        self.spo.count_prefix(&pager, &be32(sub))
+    }
+
+    /// In-degree of `obj`: number of triples with `obj` as object (gStore
+    /// `getEntityInDegree`). Degree-bounded prefix count over OSP.
+    pub fn object_degree(&self, obj: EntityLiteralId) -> Result<usize> {
+        let pager = self.pager.read().unwrap();
+        self.osp.count_prefix(&pager, &be32(obj))
+    }
+
+    /// Number of objects for `(sub, pred)` — gStore `getSubjectPredicateDegree`.
+    /// Degree-bounded prefix count over SPO (independent of VList compaction,
+    /// since SPO is always authoritative).
+    pub fn subject_predicate_degree(&self, sub: EntityLiteralId, pred: PredId) -> Result<usize> {
+        let pager = self.pager.read().unwrap();
+        self.spo.count_prefix(&pager, &cat(sub, pred))
+    }
+
+    /// Number of subjects for `(obj, pred)` — gStore `getObjectPredicateDegree`.
+    /// Degree-bounded prefix count over POS.
+    pub fn object_predicate_degree(&self, obj: EntityLiteralId, pred: PredId) -> Result<usize> {
+        let pager = self.pager.read().unwrap();
+        self.pos.count_prefix(&pager, &cat(pred, obj))
+    }
+
+    /// Triples with predicate `pred` (gStore `pre2num`) — maintained, O(1).
+    pub fn pred_num(&self, pred: PredId) -> usize {
+        let pager = self.pager.read().unwrap();
+        read_pred_stat(&self.pred_stats, &pager, pred)
+            .map(|(n, _, _)| n as usize)
+            .unwrap_or(0)
+    }
+
+    /// Distinct subjects with predicate `pred` (gStore `pre2sub`) — maintained.
+    pub fn pred_subject_count(&self, pred: PredId) -> usize {
+        let pager = self.pager.read().unwrap();
+        read_pred_stat(&self.pred_stats, &pager, pred)
+            .map(|(_, s, _)| s as usize)
+            .unwrap_or(0)
+    }
+
+    /// Distinct objects with predicate `pred` (gStore `pre2obj`) — maintained.
+    pub fn pred_object_count(&self, pred: PredId) -> usize {
+        let pager = self.pager.read().unwrap();
+        read_pred_stat(&self.pred_stats, &pager, pred)
+            .map(|(_, _, o)| o as usize)
+            .unwrap_or(0)
+    }
+
+    /// Distinct ids appearing as a subject (exact, maintained).
+    pub fn distinct_subject_count(&self) -> usize {
+        self.distinct_subj as usize
+    }
+
+    /// Distinct ids appearing as an object (exact, maintained).
+    pub fn distinct_object_count(&self) -> usize {
+        self.distinct_obj as usize
+    }
+
+    /// Recompute every maintained statistic (per-predicate `pre2num`/`pre2sub`/
+    /// `pre2obj` and the distinct subject/object counts) from the authoritative
+    /// SPO index. Called automatically by [`open`](Self::open) for a database
+    /// written before the statistics existed; also usable as an explicit repair
+    /// after an out-of-band bulk load. Idempotent (recomputing yields the values
+    /// the incremental path already maintains).
+    pub fn rebuild_stats(&mut self) -> Result<()> {
+        // 1. Aggregate from the authoritative triples (one SPO scan).
+        let all = self.iter_all()?;
+        let np = self.pred_count as usize;
+        let mut num = vec![0u32; np];
+        let mut psub: Vec<HashSet<u32>> = vec![HashSet::new(); np];
+        let mut pobj: Vec<HashSet<u32>> = vec![HashSet::new(); np];
+        let mut subs: HashSet<u32> = HashSet::new();
+        let mut objs: HashSet<u32> = HashSet::new();
+        for t in &all {
+            subs.insert(t.sub);
+            objs.insert(t.obj);
+            if let Some(p) = num.get_mut(t.pred as usize) {
+                *p += 1;
+                psub[t.pred as usize].insert(t.sub);
+                pobj[t.pred as usize].insert(t.obj);
+            }
+        }
+
+        // 2. Write the recomputed statistics under a single write guard.
+        let mut guard = self.pager.write().unwrap();
+        let pager = &mut *guard;
+        for p in 0..np as u32 {
+            write_pred_stat(
+                &self.pred_stats,
+                pager,
+                p,
+                num[p as usize],
+                psub[p as usize].len() as u32,
+                pobj[p as usize].len() as u32,
+            )?;
+        }
+        self.distinct_subj = subs.len() as u32;
+        self.distinct_obj = objs.len() as u32;
+        pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
+        pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
+        Ok(())
     }
 
     // ---- dictionary resolution -------------------------------------------
@@ -729,24 +946,26 @@ impl TripleSource for DiskStore {
     fn triple_count(&self) -> u64 {
         DiskStore::triple_count(self)
     }
-    // Counter-based estimates (upper bounds) keep the cost model O(1) on disk.
+    // Maintained counters keep every statistic O(1) on the hot planning path —
+    // and, unlike the previous dictionary-count estimates / per-predicate scans,
+    // these are *exact* (they track the triples actually present, incrementally).
     fn distinct_subjects(&self) -> usize {
-        self.entity_num().max(1)
+        self.distinct_subject_count().max(1)
     }
     fn distinct_objects(&self) -> usize {
-        self.entity_num() + self.literal_num()
+        self.distinct_object_count()
     }
     fn num_predicates(&self) -> usize {
         self.predicate_num()
     }
     fn pred_card(&self, p: u32) -> usize {
-        DiskStore::so_by_p(self, p).unwrap_or_default().len()
+        self.pred_num(p)
     }
     fn pred_distinct_subj(&self, p: u32) -> usize {
-        distinct_a(&DiskStore::so_by_p(self, p).unwrap_or_default()).len()
+        self.pred_subject_count(p)
     }
     fn pred_distinct_obj(&self, p: u32) -> usize {
-        distinct_b(&DiskStore::so_by_p(self, p).unwrap_or_default()).len()
+        self.pred_object_count(p)
     }
     fn iter_all(&self) -> Vec<IdTriple> {
         DiskStore::iter_all(self).unwrap_or_default()
@@ -807,6 +1026,42 @@ fn overflow_head(rec: &[u8]) -> Option<super::pager::PageId> {
     } else {
         None
     }
+}
+
+/// Read a predicate's `(num, distinct_subj, distinct_obj)` stats record from the
+/// maintained [`IvArray`], returning `(0, 0, 0)` for a predicate not yet present.
+fn read_pred_stat(stats: &IvArray, pager: &Pager, pred: PredId) -> Result<(u32, u32, u32)> {
+    match stats.get(pager, pred)? {
+        Some(rec) if rec.len() >= PRED_STAT_LEN => Ok((
+            u32::from_le_bytes(rec[0..4].try_into().unwrap()),
+            u32::from_le_bytes(rec[4..8].try_into().unwrap()),
+            u32::from_le_bytes(rec[8..12].try_into().unwrap()),
+        )),
+        _ => Ok((0, 0, 0)),
+    }
+}
+
+/// Write a predicate's `(num, distinct_subj, distinct_obj)` stats record. A
+/// predicate whose triple count has fallen to zero is removed from the array
+/// (its distinct counts are zero too), keeping the array sparse over live
+/// predicates.
+fn write_pred_stat(
+    stats: &IvArray,
+    pager: &mut Pager,
+    pred: PredId,
+    num: u32,
+    dsub: u32,
+    dobj: u32,
+) -> Result<()> {
+    if num == 0 {
+        stats.delete(pager, pred)?;
+        return Ok(());
+    }
+    let mut rec = [0u8; PRED_STAT_LEN];
+    rec[0..4].copy_from_slice(&num.to_le_bytes());
+    rec[4..8].copy_from_slice(&dsub.to_le_bytes());
+    rec[8..12].copy_from_slice(&dobj.to_le_bytes());
+    stats.insert(pager, pred, &rec)
 }
 
 /// 12-byte composite key from three ids (big-endian, ordering-preserving).
@@ -1356,6 +1611,187 @@ mod tests {
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- maintained degree / cardinality statistics -----------------------
+
+    /// Authoritative (scan-based) recomputation of every statistic, to check the
+    /// maintained counters against. Independent of the maintained state.
+    fn scan_stats(ds: &DiskStore) -> (u32, u32, Vec<(u32, u32, u32)>) {
+        let all = ds.iter_all().unwrap();
+        let subs: std::collections::HashSet<u32> = all.iter().map(|t| t.sub).collect();
+        let objs: std::collections::HashSet<u32> = all.iter().map(|t| t.obj).collect();
+        let np = ds.predicate_num();
+        let mut per_pred = Vec::with_capacity(np);
+        for p in 0..np as u32 {
+            let group: Vec<_> = all.iter().filter(|t| t.pred == p).collect();
+            let num = group.len() as u32;
+            let ds_: std::collections::HashSet<u32> = group.iter().map(|t| t.sub).collect();
+            let do_: std::collections::HashSet<u32> = group.iter().map(|t| t.obj).collect();
+            per_pred.push((num, ds_.len() as u32, do_.len() as u32));
+        }
+        (subs.len() as u32, objs.len() as u32, per_pred)
+    }
+
+    /// Assert the maintained statistics equal the authoritative scan.
+    fn assert_stats_consistent(ds: &DiskStore) {
+        let (subs, objs, per_pred) = scan_stats(ds);
+        assert_eq!(ds.distinct_subject_count(), subs as usize, "distinct subjects");
+        assert_eq!(ds.distinct_object_count(), objs as usize, "distinct objects");
+        for (p, &(num, dsub, dobj)) in per_pred.iter().enumerate() {
+            let p = p as u32;
+            assert_eq!(ds.pred_num(p), num as usize, "pre2num({p})");
+            assert_eq!(ds.pred_subject_count(p), dsub as usize, "pre2sub({p})");
+            assert_eq!(ds.pred_object_count(p), dobj as usize, "pre2obj({p})");
+            // TripleSource facade must agree with the inherent getters.
+            assert_eq!(TripleSource::pred_card(ds, p), num as usize);
+            assert_eq!(TripleSource::pred_distinct_subj(ds, p), dsub as usize);
+            assert_eq!(TripleSource::pred_distinct_obj(ds, p), dobj as usize);
+        }
+    }
+
+    #[test]
+    fn maintained_stats_match_scan_after_build() {
+        let path = tmp("stats_build");
+        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        assert_stats_consistent(&ds);
+        // Spot-check exact values for the known SMALL shape.
+        // subjects: root, node1 → 2 distinct; contain has 2 objs (node0,node1).
+        let contain = ds.predicate_id(&Term::iri("contain").dict_key()).unwrap().unwrap();
+        assert_eq!(ds.pred_num(contain), 2);
+        assert_eq!(ds.pred_subject_count(contain), 1); // only <root>
+        assert_eq!(ds.pred_object_count(contain), 2); // node0, node1
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn maintained_stats_track_inserts_and_deletes() {
+        let path = tmp("stats_mutate");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        // Insert a fresh triple reusing an existing subject+predicate but a new obj.
+        let t = Triple::new(Term::iri("root"), Term::iri("contain"), Term::iri("node9"));
+        assert!(ds.insert_triple(&t).unwrap());
+        assert_stats_consistent(&ds);
+        // Re-inserting the same triple is a no-op and must not double-count.
+        assert!(!ds.insert_triple(&t).unwrap());
+        assert_stats_consistent(&ds);
+        // Delete it again — the (contain,node9) object should drop out of pre2obj.
+        assert!(ds.delete_triple(&t).unwrap());
+        assert_stats_consistent(&ds);
+        // Delete a whole predicate group down to nothing.
+        for o in ["point0", "point1"] {
+            let t = Triple::new(Term::iri("node1"), Term::iri("own"), Term::iri(o));
+            assert!(ds.delete_triple(&t).unwrap());
+        }
+        assert_stats_consistent(&ds);
+        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+        assert_eq!(ds.pred_num(own), 0, "own group fully deleted");
+        assert_eq!(ds.pred_subject_count(own), 0);
+        assert_eq!(ds.pred_object_count(own), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn maintained_stats_survive_random_churn() {
+        // A deterministic pseudo-random insert/delete churn; the maintained stats
+        // must equal the authoritative scan at every checkpoint.
+        let path = tmp("stats_churn");
+        let mut ds = DiskStore::open(&path, 128).unwrap();
+        let mut state: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut seed: u64 = 0x1234_5678;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for step in 0..400 {
+            // Small id space so subjects/objects/preds recur (drives transitions).
+            let s = (rng() % 8) as u32;
+            let p = (rng() % 4) as u32;
+            let o = (rng() % 8) as u32 + 100; // disjoint object id space
+            let t = Triple::new(
+                Term::iri(format!("s{s}")),
+                Term::iri(format!("p{p}")),
+                Term::iri(format!("o{o}")),
+            );
+            if rng() % 2 == 0 {
+                ds.insert_triple(&t).unwrap();
+                state.insert((s, p));
+            } else {
+                ds.delete_triple(&t).unwrap();
+            }
+            if step % 40 == 0 {
+                assert_stats_consistent(&ds);
+            }
+        }
+        assert_stats_consistent(&ds);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn maintained_stats_persist_across_reopen() {
+        let path = tmp("stats_reopen");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            ds.insert_triple(&Triple::new(
+                Term::iri("root"),
+                Term::iri("own"),
+                Term::iri("pointX"),
+            ))
+            .unwrap();
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_stats_consistent(&ds);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rebuild_stats_is_idempotent_and_matches_scan() {
+        let path = tmp("stats_rebuild");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let before_subj = ds.distinct_subject_count();
+        let before_obj = ds.distinct_object_count();
+        ds.rebuild_stats().unwrap();
+        assert_eq!(ds.distinct_subject_count(), before_subj);
+        assert_eq!(ds.distinct_object_count(), before_obj);
+        assert_stats_consistent(&ds);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn degree_apis_match_access_patterns() {
+        let path = tmp("degree");
+        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let root = ds.term_id(&Term::iri("root")).unwrap().unwrap();
+        let node1 = ds.term_id(&Term::iri("node1")).unwrap().unwrap();
+        let point0 = ds.term_id(&Term::iri("point0")).unwrap().unwrap();
+        let contain = ds.predicate_id(&Term::iri("contain").dict_key()).unwrap().unwrap();
+        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+
+        // subject_degree = number of triples with that subject (out-degree).
+        assert_eq!(ds.subject_degree(root).unwrap(), ds.po_by_s(root).unwrap().len());
+        assert_eq!(ds.subject_degree(root).unwrap(), 3); // name + contain*2
+        assert_eq!(ds.subject_degree(node1).unwrap(), 2); // own*2
+        // object_degree = in-degree.
+        assert_eq!(ds.object_degree(point0).unwrap(), 1);
+        assert_eq!(ds.object_degree(root).unwrap(), 0); // root never an object
+        // getSubjectPredicateDegree / getObjectPredicateDegree.
+        assert_eq!(
+            ds.subject_predicate_degree(root, contain).unwrap(),
+            ds.o_by_sp(root, contain).unwrap().len()
+        );
+        assert_eq!(ds.subject_predicate_degree(root, contain).unwrap(), 2);
+        assert_eq!(ds.subject_predicate_degree(node1, own).unwrap(), 2);
+        assert_eq!(
+            ds.object_predicate_degree(point0, own).unwrap(),
+            ds.s_by_po(own, point0).unwrap().len()
+        );
+        assert_eq!(ds.object_predicate_degree(point0, own).unwrap(), 1);
+        // Absent combinations are zero, not errors.
+        assert_eq!(ds.subject_predicate_degree(node1, contain).unwrap(), 0);
         std::fs::remove_file(&path).ok();
     }
 

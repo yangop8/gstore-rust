@@ -27,7 +27,15 @@ const COMMIT_MAGIC: &[u8; 8] = b"GSTORECM";
 pub type PageId = u32;
 
 /// Number of `u64` root slots in the header for higher layers (tree roots, etc.).
-pub const NROOTS: usize = 16;
+///
+/// The header lives in page 0 and uses only bytes `0..16 + NROOTS*8` (well under
+/// [`PAGE_SIZE`]); every other header byte is written as zero. Growing this
+/// constant is therefore backward-compatible: an older file created with fewer
+/// roots has its extra slots read back as `0` (unallocated), exactly as a fresh
+/// file would. Slots `0..=14` back the `DiskStore` triple indexes / dictionary /
+/// counters; `15..` back the maintained optimizer statistics (see
+/// [`store`](super::store)).
+pub const NROOTS: usize = 24;
 
 const MAGIC: &[u8; 8] = b"GSTOREKV";
 

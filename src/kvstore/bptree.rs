@@ -329,6 +329,61 @@ impl BTree {
         self.scan_prefix(pager, &[])
     }
 
+    /// Number of entries whose key starts with `prefix`, without materializing
+    /// keys/values. This is the degree-bounded counterpart of
+    /// [`scan_prefix`](Self::scan_prefix): it walks the same contiguous leaf run
+    /// but only counts, so a "degree" query (e.g. how many objects a `(sub, pred)`
+    /// has) costs `O(height + matches)` and allocates nothing. Read-only.
+    pub fn count_prefix(&self, pager: &Pager, prefix: &[u8]) -> Result<usize> {
+        let mut n = 0usize;
+        let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
+            return Ok(0);
+        };
+        loop {
+            let node = Node::parse(&pager.read_page(page)?);
+            while idx < node.keys.len() {
+                let k = &node.keys[idx];
+                if k.starts_with(prefix) {
+                    n += 1;
+                } else if k.as_slice() > prefix {
+                    return Ok(n);
+                }
+                idx += 1;
+            }
+            if node.link == 0 {
+                return Ok(n);
+            }
+            page = node.link;
+            idx = 0;
+        }
+    }
+
+    /// Whether *any* entry has a key starting with `prefix`. Descends to the first
+    /// key `>= prefix` and checks it — `O(height)`, touching a single leaf — so it
+    /// is far cheaper than [`scan_prefix`](Self::scan_prefix) when the caller only
+    /// needs a yes/no (e.g. maintaining a distinct-count on insert/delete).
+    /// Read-only.
+    pub fn prefix_exists(&self, pager: &Pager, prefix: &[u8]) -> Result<bool> {
+        let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
+            return Ok(false);
+        };
+        loop {
+            let node = Node::parse(&pager.read_page(page)?);
+            if idx < node.keys.len() {
+                // The first key `>= prefix` is a prefix match iff the whole
+                // (contiguous) matching run is non-empty.
+                return Ok(node.keys[idx].starts_with(prefix));
+            }
+            // `prefix` sorts after every key in this leaf; the first candidate is
+            // the next leaf's first key.
+            if node.link == 0 {
+                return Ok(false);
+            }
+            page = node.link;
+            idx = 0;
+        }
+    }
+
     fn find_leaf_ge(&self, pager: &Pager, key: &[u8]) -> Result<Option<(PageId, usize)>> {
         let mut page = self.root(pager);
         if page == 0 {
@@ -636,6 +691,85 @@ mod tests {
             Some(&b"1"[..])
         );
         assert_eq!(t.get(&pg, b"dave").unwrap(), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn count_and_exists_prefix_match_scan() {
+        // count_prefix / prefix_exists must agree with a full scan_prefix over
+        // composite (a, b, c) keys, including empty and absent prefixes.
+        let path = tmp("count_exists");
+        let mut pg = Pager::open(&path, 128).unwrap();
+        let t = BTree::new(0);
+        // (a, b, c): a in {1,2}, b in 0..3, c in 0..4 → 2*3*4 = 24 keys.
+        for a in 1u32..=2 {
+            for b in 0u32..3 {
+                for c in 0u32..4 {
+                    let mut k = [0u8; 12];
+                    k[0..4].copy_from_slice(&be32(a));
+                    k[4..8].copy_from_slice(&be32(b));
+                    k[8..12].copy_from_slice(&be32(c));
+                    t.insert(&mut pg, &k, b"").unwrap();
+                }
+            }
+        }
+        let count_via_scan = |prefix: &[u8]| t.scan_prefix(&pg, prefix).unwrap().len();
+        for prefix in [
+            &[][..],
+            &be32(1)[..],           // a = 1  → 12
+            &be32(2)[..],           // a = 2  → 12
+            &be32(3)[..],           // absent → 0
+            &{
+                let mut p = [0u8; 8];
+                p[0..4].copy_from_slice(&be32(1));
+                p[4..8].copy_from_slice(&be32(2));
+                p
+            }[..], // (1,2) → 4
+        ] {
+            assert_eq!(
+                t.count_prefix(&pg, prefix).unwrap(),
+                count_via_scan(prefix),
+                "count_prefix disagrees for {prefix:?}"
+            );
+            assert_eq!(
+                t.prefix_exists(&pg, prefix).unwrap(),
+                count_via_scan(prefix) > 0,
+                "prefix_exists disagrees for {prefix:?}"
+            );
+        }
+        assert_eq!(t.count_prefix(&pg, &[]).unwrap(), 24);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn count_and_exists_track_deletes_across_splits() {
+        // After enough inserts to split, and after deleting a whole prefix group,
+        // count_prefix / prefix_exists stay exact.
+        let path = tmp("count_delete");
+        let mut pg = Pager::open(&path, 128).unwrap();
+        let t = BTree::new(0);
+        let n = 2000u32;
+        for i in 0..n {
+            // group = i / 100, so 20 groups of 100, keyed (group, i).
+            let mut k = [0u8; 8];
+            k[0..4].copy_from_slice(&be32(i / 100));
+            k[4..8].copy_from_slice(&be32(i));
+            t.insert(&mut pg, &k, b"").unwrap();
+        }
+        assert_eq!(t.count_prefix(&pg, &be32(5)).unwrap(), 100);
+        assert!(t.prefix_exists(&pg, &be32(5)).unwrap());
+        // Delete group 5 entirely.
+        for i in 500..600u32 {
+            let mut k = [0u8; 8];
+            k[0..4].copy_from_slice(&be32(5));
+            k[4..8].copy_from_slice(&be32(i));
+            assert!(t.delete(&mut pg, &k).unwrap());
+        }
+        assert_eq!(t.count_prefix(&pg, &be32(5)).unwrap(), 0);
+        assert!(!t.prefix_exists(&pg, &be32(5)).unwrap());
+        // A neighbouring group is untouched.
+        assert_eq!(t.count_prefix(&pg, &be32(6)).unwrap(), 100);
+        assert!(t.prefix_exists(&pg, &be32(6)).unwrap());
         std::fs::remove_file(&path).ok();
     }
 
