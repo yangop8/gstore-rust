@@ -184,6 +184,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// expression evaluator for names that are not SPARQL built-ins. Shared
     /// (`Rc`) with `GRAPH` sub-evaluators so they see the same functions.
     functions: Rc<FunctionRegistry>,
+    /// Optional cooperative-cancellation flag (gStore's task-cancel). When set to
+    /// `true`, a running read aborts at the next pattern/phase boundary with
+    /// [`GStoreError::Cancelled`] (see [`with_cancel`](Self::with_cancel)).
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<'a, S: TripleSource> Evaluator<'a, S> {
@@ -197,6 +201,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::new(FunctionRegistry::new()),
+            cancel: None,
         }
     }
 
@@ -215,6 +220,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::new(FunctionRegistry::new()),
+            cancel: None,
         }
     }
 
@@ -232,6 +238,33 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     pub fn with_functions(mut self, functions: FunctionRegistry) -> Evaluator<'a, S> {
         self.functions = Rc::new(functions);
         self
+    }
+
+    /// Attach a cooperative-cancellation flag (gStore's task cancel). Setting the
+    /// flag to `true` from another thread aborts an in-progress read at the next
+    /// pattern/phase boundary with [`GStoreError::Cancelled`]. Checked at query
+    /// entry, between BGP join patterns, and after pattern evaluation — so a large
+    /// multi-pattern join is cancellable, though a single unbounded scan is not
+    /// preempted mid-scan.
+    pub fn with_cancel(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Evaluator<'a, S> {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// Whether cancellation has been requested.
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `Err(Cancelled)` if cancellation was requested, else `Ok(())`.
+    fn check_cancel(&self) -> Result<()> {
+        if self.cancelled() {
+            Err(GStoreError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     /// Register a single user-defined scalar function (builder-style). See
@@ -273,11 +306,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        self.check_cancel()?;
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
                 let layout = VarLayout::build(&a.pattern);
                 let solutions = self.eval_pattern(&a.pattern, &layout);
+                self.check_cancel()?; // a mid-run cancel short-circuits to empty; report it
                 Ok(QueryResult::Ask(!solutions.is_empty()))
             }
             Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
@@ -486,6 +521,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
         let layout = VarLayout::build(&q.pattern);
         let solutions = self.eval_pattern(&q.pattern, &layout);
+        // A cancelled join short-circuits to empty bindings; surface it as an
+        // error rather than a spurious empty result set.
+        self.check_cancel()?;
 
         let result_vars = q.result_vars();
         // A result column is predicate-typed only if it is a plain pattern
@@ -1094,6 +1132,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             plan_cache: std::cell::RefCell::new(HashMap::new()),
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::clone(&self.functions),
+            cancel: self.cancel.clone(), // cancellation propagates into GRAPH blocks
         }
     }
 
@@ -1297,6 +1336,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // Left-deep pipeline: extend partial bindings one pattern at a time.
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
         for &pi in &plan.order {
+            // Cooperative cancellation: bail between join patterns (short-circuit
+            // to empty; the Result-returning caller turns this into Cancelled).
+            if self.cancelled() {
+                return Vec::new();
+            }
             let plan = &plans[pi];
             let mut next = Vec::new();
             for binding in &solutions {
@@ -3141,6 +3185,21 @@ mod builtin_tests {
             Some(i) => body[..i].to_string(),
             None => body.to_string(),
         }
+    }
+
+    #[test]
+    fn cancel_flag_aborts_read_with_cancelled_error() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (d, s) = fixture(false);
+        let q = parse("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").unwrap();
+        // A pre-set cancel flag aborts the read with Cancelled.
+        let flag = Arc::new(AtomicBool::new(true));
+        let err = Evaluator::new(&d, &s).with_cancel(flag).evaluate(&q).unwrap_err();
+        assert!(matches!(err, GStoreError::Cancelled), "expected Cancelled, got {err:?}");
+        // An unset flag runs to completion.
+        let ok = Arc::new(AtomicBool::new(false));
+        assert!(Evaluator::new(&d, &s).with_cancel(ok).evaluate(&q).is_ok());
     }
 
     /// How many solutions a WHERE pattern (with FILTERs) yields.

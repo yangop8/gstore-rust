@@ -559,21 +559,24 @@ impl ApiServer {
         );
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
         let task_id = self.register_task(st, name, sparql, user);
+        // This task's cancel flag (settable via POST /cancel), threaded into the
+        // engine's cooperative-cancellation hook. Cloned before the &mut borrow.
+        let cancel = st.tasks.get(&task_id).map(|t| t.cancel.clone());
         let Some(db) = st.dbs.get_mut(name) else {
             self.unregister_task(st, task_id);
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        // INTEGRATION: this runs the query to completion without consulting
-        // the cancel flag registered above (retrievable via
-        // `ApiServer::task_cancel_flag(task_id)`, and settable by `POST
-        // /cancel`). When the query engine grows a cooperative-cancellation
-        // hook — e.g. `Database::query_cancellable(&mut self, sparql: &str,
-        // cancel: &AtomicBool) -> Result<QueryResult>` that polls
-        // `cancel.load(Ordering::Relaxed)` between VS-tree/join steps and
-        // aborts early — call it here instead of `db.query`, passing the
-        // flag through. Until then `/cancel` only marks the flag; nothing
-        // reads it.
-        let result = db.query(sparql);
+        // The query engine now honors the cancel flag (aborting at pattern/phase
+        // boundaries with GStoreError::Cancelled). Caveat: this bundled server is
+        // single-threaded and holds the state lock for the whole request, so it
+        // cannot itself deliver a concurrent POST /cancel while this query
+        // occupies the thread — cancellation is effective for library embedders
+        // that run Database::query_cancellable on their own threads, and readies a
+        // future multi-threaded front-end. See Database::query_cancellable.
+        let result = match cancel {
+            Some(flag) => db.query_cancellable(sparql, flag),
+            None => db.query(sparql),
+        };
         self.unregister_task(st, task_id);
         match result {
             Ok(result) => render_result(fmt, &result),
@@ -1301,10 +1304,12 @@ fn parse_rdf(format: &str, content: &str) -> crate::error::Result<Vec<Triple>> {
         "nquads" | "nq" | "n-quads" => crate::parser::nquads::parse_str_triples(content),
         "rdfxml" | "rdf" | "xml" => crate::parser::rdfxml::parse_str(content),
         "trig" => crate::parser::trig::parse_str_triples(content),
+        "jsonld" | "json" | "json-ld" => crate::parser::jsonld::parse_str(content),
+        "rdfa" | "html" | "xhtml" => crate::parser::rdfa::parse_str(content),
         other => Err(crate::error::GStoreError::RdfParse {
             line: 0,
             msg: format!(
-                "unknown RDF format '{other}' (expected turtle, ntriples, nquads, rdfxml, or trig)"
+                "unknown RDF format '{other}' (expected turtle, ntriples, nquads, rdfxml, trig, jsonld, or rdfa)"
             ),
         }),
     }

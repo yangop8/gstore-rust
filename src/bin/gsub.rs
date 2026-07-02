@@ -7,14 +7,13 @@
 //! ```
 //!
 //! The input format is chosen by file extension, exactly as `gadd`: `.nt`,
-//! `.ttl`, `.nq`, `.trig`, `.rdf`/`.xml`/`.owl`; anything else is parsed as
-//! Turtle. Quad formats are flattened to the default graph.
+//! `.ttl`, `.nq`, `.trig`, `.rdf`/`.xml`/`.owl`, `.jsonld`/`.json`,
+//! `.html`/`.xhtml`; anything else is parsed as Turtle. Quad formats are
+//! flattened to the default graph.
 
-use std::path::Path;
 use std::process::ExitCode;
 
 use gstore::model::Triple;
-use gstore::parser::{nquads, ntriples, rdfxml, trig, turtle};
 use gstore::{db_dir_for, Database, Result};
 
 fn main() -> ExitCode {
@@ -65,19 +64,8 @@ fn load_any(dir: &str) -> Result<Database> {
     }
 }
 
-/// Read triples from an RDF file, dispatching on the file extension.
+/// Read triples from an RDF file, dispatching on the file extension (quad
+/// formats flattened to the default graph). See [`gstore::parser::parse_file_by_ext`].
 fn read_triples(path: &str) -> Result<Vec<Triple>> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "nt" => ntriples::parse_file(path),
-        "ttl" | "turtle" => turtle::parse_file(path),
-        "nq" | "nquads" => Ok(nquads::parse_file(path)?.iter().map(|q| q.to_triple()).collect()),
-        "trig" => Ok(trig::parse_file(path)?.iter().map(|q| q.to_triple()).collect()),
-        "rdf" | "xml" | "owl" | "rdfs" => rdfxml::parse_file(path),
-        _ => turtle::parse_file(path),
-    }
+    gstore::parser::parse_file_by_ext(path)
 }

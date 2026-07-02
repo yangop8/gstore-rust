@@ -106,11 +106,22 @@ optimizer and a VS-tree signature filter.
   `OPTIONAL`, `MINUS`, `FILTER`, `BIND`, `VALUES`, sub-`SELECT`, aggregates,
   property paths (`/ ^ | * + !`), `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and
   SPARQL UPDATE (`INSERT`/`DELETE`).
+* **RDF input formats** — N-Triples, Turtle, N-Quads, TriG, RDF/XML, and
+  (dependency-free, common-subset) **JSON-LD** and **RDFa**; detected by file
+  extension (`parser::parse_file_by_ext`).
+* **Graph functions callable in SPARQL** (24) — `SSSP`/`SSSPLEN`, `KHOPCOUNT`/
+  `KHOPNEIGHBOR`/`KHOPREACHABLE`, `WCC`, `LOUVAIN`, `LABELPROP`,
+  `BETWEENNESSCENTRALITY`, `CLOSENESSCENTRALITY`, `TRIANGLECOUNTING`,
+  `CLUSTERINGCOEFF`, `PPR`, `JACCARDSIMILARITY`, `DIAMETERESTIMATION`, … (gStore's
+  built-in graph-analysis functions).
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
   — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
-* **HTTP server** with content negotiation, users/auth, and streaming
-  (`server` / `http_api` / `http_users`).
+* **HTTP server** with content negotiation, users/auth, streaming, file
+  upload/download, a built-in web console (`GET /`), and a task registry with
+  cancellation (`server` / `http_api` / `http_users`).
+* **Transactions** — commit/rollback, per-key MVCC + snapshot isolation, four
+  named isolation levels, and full + **incremental** backup/restore.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
@@ -177,7 +188,7 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `store`       | in-memory `s2xx`/`o2xx`/`p2xx` six-way index           |
 | `kvstore` / `backend` | on-disk pager + B+ trees; RocksDB backend      |
 | `signature`   | signatures + VS-tree candidate filter                  |
-| `parser`      | N-Triples / Turtle / SPARQL (query + update)           |
+| `parser`      | N-Triples/Turtle/N-Quads/TriG/RDF-XML/JSON-LD/RDFa; SPARQL (query + update) |
 | `query`       | algebra eval, joins, optimizer, FILTER, aggregates     |
 | `analytics`   | CSR graph algorithms (paths, centrality, communities)  |
 | `server` / `http_api` / `http_users` | HTTP SPARQL server, conneg, auth |

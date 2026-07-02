@@ -98,3 +98,16 @@
 > **至此对C++的功能差距已基本归零**。剩余仅:HTTPS(TLS反代/未来rustls feature)、ISArray按用途分块的存储微优化、集群副本快照增量同步的生产级硬化、StringIndex接入查询规划——均为深度/运维项,非功能缺口;以及已声明的机制偏离(gRPC线格式 / .so热加载 / 多语言客户端SDK / JSON-LD[C++亦无])。
 >
 > 另:基于`pkumod/gAnswer`源码逆向 + LLM-KBQA调研,产出 `docs/NLQA_DESIGN.md` —— LLM+gStore的自然语言问答系统(gNLQA)设计与开发计划。
+>
+> 更新(2026-07-02,**独立复检 + 补齐剩余gStore侧缺口**批次 —— 4个worktree子agent并行 + 集成):基于对官方 `pkumod/gStore` 与 `pkumod/gAnswer` README 的独立复核(不再只信本doc自评),定位并补齐了几处真实差距。
+> - **两处本doc旧表述纠错**(与官方README矛盾):(1)官方README称C++ gStore "excludes property paths",而**本Rust版完整支持属性路径**(`/ ^ | * + ? !`)——此项我们**领先**;(2)官方README列出JSON-LD为受支持输入格式,故此前"JSON-LD C++亦无"的说法**有误**——现我们也补上了JSON-LD。
+> - **图函数作为SPARQL内建:4 → 24**(`src/query/engine.rs`+`analytics`):`SSSP/SSSPLEN`、`KHOPCOUNT/KHOPNEIGHBOR/KHOPALLNEIGHBORS/KHOPENUMERATEPATH/KHOPREACHABLE`、`WCC/LOUVAIN/LABELPROP`、`BETWEENNESSCENTRALITY/CLOSENESSCENTRALITY`、`TRIANGLECOUNTING/CLUSTERINGCOEFF`、`PPR`(个性化PageRank)、`JACCARDSIMILARITY/SIMILARITY/DEGREECORRELATION/DIAMETERESTIMATION/BFSCOUNT`、`SHORTESTPATHS`、`CYCLEBOOLEAN/SIMPLECYCLEBOOLEAN`。已对齐/超过C++的~21个内建;并补齐了此前`analytics`库缺的算法(clusteringCoeff/diameter/Jaccard/degree-correlation/labelProp/PPR/similarity/k-hop枚举)。
+> - **RDF输入格式补齐**:`src/parser/{jsonld,rdfa}.rs`(零依赖、手写、common-subset,与既有hand-rolled parser风格一致)。`parser::parse_file_by_ext` 统一按扩展名分派(gbuild/gadd/gsub 共用);http_api `/upload` 与 `parse_rdf` 也支持。至此输入格式:N-Triples/N-Quads/Turtle/TriG/RDF-XML/**JSON-LD**/**RDFa**(仅RDFa相对官方仍属子集)。
+> - **服务化HTTP**:`/upload`(上传RDF入库)、`/export` 下载头、内置**Web控制台**(`GET /`·`/console`,`http_api`+`server` 均可)、**任务注册表 + `/tasklist` + `/cancel`**。
+> - **事务**:四级命名隔离(`IsolationLevel`:ReadUncommitted/ReadCommitted/RepeatableRead/Serializable,`concurrent.rs`);**增量备份/恢复**(`Database::backup_incremental`/`restore_incremental`,基于update.log checkpoint)。
+> - **查询取消**:引擎级协作式取消(`Evaluator::with_cancel` + `Database::query_cancellable`,在pattern/phase边界检查,`GStoreError::Cancelled`);已接入http_api `/sparql`。**注**:内置HTTP服务是单线程、整请求持state锁,故它自身无法在一条查询运行中投递并发`/cancel`——取消对"自驱线程的库使用者"及未来多线程前端有效(见 `Database::query_cancellable` 文档)。
+> - 测试:默认 **803全过**;`--features rocksdb` **650全过**;clippy `--all-targets` 双feature零告警。图函数经`gquery`真端到端冒烟(SSSPLEN/TRIANGLECOUNTING/CLOSENESS/PPR/JACCARD…)。
+>
+> **仍属刻意偏离(不补)**:gRPC线格式、多语言客户端SDK(5种)、.so动态编译UDF(改用安全Rust函数注册表)、发行工程(Docker/RPM/DEB/loongarch)。**仍为深度/子集项**:RDFa/JSON-LD的完整1.1语义(现为common-subset)、gzip/异步/回调HTTP(手写DEFLATE性价比低,留feature)、内置HTTP服务多线程化(使在途查询的HTTP `/cancel` 可投递)。
+>
+> gAnswer侧:gNLQA 是**换代实现**(LLM Text-to-SPARQL 取代词典+子图匹配),非同款算法移植;能力对比见 `docs/NLQA_DESIGN.md`。

@@ -27,6 +27,9 @@ pub enum GStoreError {
     /// An optimistic transaction aborted: a concurrent commit wrote a triple key
     /// this transaction also wrote (write-write conflict, first-committer-wins).
     Conflict(String),
+    /// A read query was cooperatively cancelled (its cancel flag was set) and
+    /// aborted at a pattern/phase boundary before completing.
+    Cancelled,
 }
 
 impl fmt::Display for GStoreError {
@@ -41,6 +44,7 @@ impl fmt::Display for GStoreError {
             GStoreError::Serialize(msg) => write!(f, "serialization error: {msg}"),
             GStoreError::Database(msg) => write!(f, "database error: {msg}"),
             GStoreError::Conflict(msg) => write!(f, "transaction conflict: {msg}"),
+            GStoreError::Cancelled => write!(f, "query cancelled"),
         }
     }
 }

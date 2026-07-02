@@ -332,7 +332,9 @@ impl Database {
         self.functions.len()
     }
 
-    /// Build a database by importing one or more N-Triples files.
+    /// Build a database by importing one or more RDF files. The format of each
+    /// file is detected by extension (N-Triples/Turtle/N-Quads/TriG/RDF-XML/
+    /// JSON-LD/RDFa; unknown → Turtle) via [`parser::parse_file_by_ext`].
     pub fn build_from_files<P: AsRef<Path>>(
         name: impl Into<String>,
         files: &[P],
@@ -340,7 +342,7 @@ impl Database {
         let mut db = Database::new(name);
         let mut id_triples: Vec<IdTriple> = Vec::new();
         for f in files {
-            for t in turtle::parse_file(f)? {
+            for t in crate::parser::parse_file_by_ext(f)? {
                 id_triples.push(db.encode_triple(&t));
             }
         }
@@ -850,6 +852,33 @@ impl Database {
 
     /// Parse and run a SPARQL request. SELECT/ASK read; INSERT/DELETE DATA write.
     pub fn query(&mut self, sparql: &str) -> Result<QueryResult> {
+        self.query_inner(sparql, None)
+    }
+
+    /// Like [`query`](Self::query) but cooperatively cancellable: when `cancel`
+    /// flips to `true` (from another thread), an in-flight read aborts at the next
+    /// pattern/phase boundary with [`GStoreError::Cancelled`]. Updates ignore the
+    /// flag. Mirrors gStore's task cancellation.
+    ///
+    /// Note: the bundled single-threaded HTTP server (`src/http_api.rs`,
+    /// `src/server.rs`) processes requests sequentially and holds its state lock
+    /// for the whole request, so it cannot deliver a `/cancel` while a query it is
+    /// running occupies that single thread — cancellation is effective for library
+    /// embedders that run queries on their own threads (and for a future
+    /// multi-threaded front-end). See the note at the `/cancel` handler.
+    pub fn query_cancellable(
+        &mut self,
+        sparql: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<QueryResult> {
+        self.query_inner(sparql, Some(cancel))
+    }
+
+    fn query_inner(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<QueryResult> {
         let q = sparql::parse(sparql)?;
         match q {
             Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
@@ -871,6 +900,9 @@ impl Database {
                 // Make user-defined functions (PFN) visible to this query.
                 if !self.functions.is_empty() {
                     eval = eval.with_functions(self.functions.clone());
+                }
+                if let Some(c) = cancel {
+                    eval = eval.with_cancel(c);
                 }
                 let result = eval.evaluate(&q)?;
                 self.query_cache

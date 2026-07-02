@@ -56,6 +56,7 @@ pub fn db_dir_for(name: &str) -> String {
     }
 }
 
+pub use concurrent::{ConcurrentDb, IsolationLevel};
 pub use db::Database;
 pub use error::{GStoreError, Result};
 pub use model::{IdTriple, ObjectType, Term, Triple};
