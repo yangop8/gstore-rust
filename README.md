@@ -141,7 +141,9 @@ A database is a `<name>.db` directory. Main tools (there are more — `gadd`,
 gbuild mydb data.nt          # build a DB from RDF (add --disk for the on-disk B+ tree)
 gquery mydb query.rq         # run a SPARQL query (or -e "…" inline)
 gconsole mydb                # interactive REPL (end a query with ';')
-gserver mydb.db --port 9000  # HTTP SPARQL server
+gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
+gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
+                             # tasks, backup/restore); default login root / 123456
 ```
 
 ### Library API

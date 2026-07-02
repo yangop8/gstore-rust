@@ -1,15 +1,24 @@
-//! `gserver` — serve a gStore database over HTTP (SPARQL Protocol subset).
+//! `gserver` — serve a gStore database over HTTP.
 //!
-//! Usage: `gserver [db_dir] [--rocksdb] [--port N] [--addr HOST]`
+//! Usage: `gserver [db_dir] [--api] [--rocksdb] [--password PW] [--port N] [--addr HOST]`
 //!
-//! - `db_dir`: load this database directory (default: a fresh empty DB)
-//! - `--rocksdb`: open `db_dir` as a RocksDB-backed database (needs `--features rocksdb`)
+//! Two modes:
+//!
+//! - default (single database): serve one database over the SPARQL-protocol
+//!   subset — `GET/POST /sparql`, `POST /update`, `GET /status`, and a web
+//!   console at `GET /`. `db_dir` loads that database (`--rocksdb` opens it as a
+//!   RocksDB-backed database; needs `--features rocksdb`).
+//! - `--api` (full multi-database API): serve [`gstore::http_api::ApiServer`]
+//!   rooted at `db_dir` (default `.`): users/RBAC (default user `root`, password
+//!   from `--password`, default `123456`, mirroring gStore), `/login`, `/build`,
+//!   `/load`, `/upload`, `/export`, `/backup`, `/restore`, transactions,
+//!   `/tasklist`, `/cancel`, and the web console at `/`. Databases live under the
+//!   root directory and are created/loaded at runtime via the API.
+//!
 //! - `--port N`: TCP port (default 7000)
 //! - `--addr H`: bind host (default 127.0.0.1)
-//!
-//! Endpoints: `GET/POST /sparql`, `POST /update`, `GET /status` (see
-//! [`gstore::server`]).
 
+use gstore::http_api::ApiServer;
 use gstore::server::Server;
 use gstore::Database;
 
@@ -19,6 +28,8 @@ fn main() {
     let mut port: u16 = 7000;
     let mut host = String::from("127.0.0.1");
     let mut rocksdb = false;
+    let mut api = false;
+    let mut password = String::from("123456"); // gStore's default root password
 
     let mut i = 1;
     while i < args.len() {
@@ -33,14 +44,31 @@ fn main() {
                     host = h.clone();
                 }
             }
+            "--password" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    password = p.clone();
+                }
+            }
             "--rocksdb" => rocksdb = true,
+            "--api" => api = true,
             "-h" | "--help" => {
-                eprintln!("usage: gserver [db_dir] [--rocksdb] [--port N] [--addr HOST]");
+                eprintln!(
+                    "usage: gserver [db_dir] [--api] [--rocksdb] [--password PW] [--port N] [--addr HOST]"
+                );
                 return;
             }
             other => db_dir = Some(other.to_string()),
         }
         i += 1;
+    }
+
+    if api {
+        if rocksdb {
+            eprintln!("gserver: --rocksdb is ignored in --api mode (the API manages its own databases)");
+        }
+        run_api(db_dir, &password, &host, port);
+        return;
     }
 
     let db = match &db_dir {
@@ -60,8 +88,29 @@ fn main() {
         }
     };
     match server.local_addr() {
-        Ok(a) => println!("gserver listening on http://{a}  (POST /sparql, /update; GET /status)"),
+        Ok(a) => println!("gserver listening on http://{a}  (web console at /, POST /sparql, /update; GET /status)"),
         Err(_) => println!("gserver listening on {host}:{port}"),
+    }
+    server.serve_forever();
+}
+
+/// Serve the full multi-database API ([`ApiServer`]) rooted at `db_dir`
+/// (default the current directory), with users/RBAC and the web console.
+fn run_api(db_dir: Option<String>, password: &str, host: &str, port: u16) {
+    let root = db_dir.unwrap_or_else(|| ".".to_string());
+    let server = match ApiServer::bind(&root, password, (host, port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to start API server at {host}:{port}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match server.local_addr() {
+        Ok(a) => println!(
+            "gserver (API mode) on http://{a}  root={root}  user=root  \
+             (web console at /, POST /login /sparql /update /upload …; see /status)"
+        ),
+        Err(_) => println!("gserver (API mode) on {host}:{port}  root={root}"),
     }
     server.serve_forever();
 }
