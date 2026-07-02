@@ -1248,16 +1248,22 @@ impl Database {
     /// database; restore it with [`restore`](Self::restore).
     ///
     /// This also establishes the *incremental-backup baseline*: it records the
-    /// current update-log length as the checkpoint (and writes a small
+    /// current **redo-log** length as the checkpoint (and writes a small
     /// `BACKUP_OFFSET` marker into `backup_dir`), so a later
-    /// [`backup_incremental`](Self::backup_incremental) captures only the update
-    /// records appended after this point. The full snapshot already reflects every
-    /// update logged up to the checkpoint, so base + subsequent increments
-    /// reconstruct the latest state without overlap or gap.
+    /// [`backup_incremental`](Self::backup_incremental) captures only the triple
+    /// mutations committed after this point. The full snapshot already reflects
+    /// every mutation up to the checkpoint, so base + subsequent increments
+    /// reconstruct the latest committed state without overlap or gap.
+    ///
+    /// (Incremental backup is redo-log based — it captures *all* committed triple
+    /// mutations, including direct-API and [`ConcurrentDb`](crate::concurrent::ConcurrentDb)
+    /// transactions, and rolled-back transactions are excluded — so enable redo
+    /// logging, not the SPARQL-statement update log, if you intend to take
+    /// increments. See [`enable_redo_log_in`](Self::enable_redo_log_in).)
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
         self.save(backup_dir)?;
-        let off = self.update_log_len();
+        let off = self.redo_log_len();
         self.backup_offset.set(off);
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
         Ok(())
@@ -1269,18 +1275,18 @@ impl Database {
         Database::load(backup_dir)
     }
 
-    /// The current incremental-backup checkpoint: the update-log byte offset that
+    /// The current incremental-backup checkpoint: the redo-log byte offset that
     /// the most recent full/incremental backup ended at (0 before any backup).
     pub fn backup_checkpoint(&self) -> u64 {
         self.backup_offset.get()
     }
 
-    /// Byte length of the update log, or 0 when logging is disabled or the file
+    /// Byte length of the redo log, or 0 when logging is disabled or the file
     /// does not exist yet. This is the incremental-backup checkpoint unit: the
-    /// update log is append-only and every record is written whole, so its length
+    /// redo log is append-only and every record is written whole, so its length
     /// is always a clean record boundary.
-    fn update_log_len(&self) -> u64 {
-        self.update_log
+    fn redo_log_len(&self) -> u64 {
+        self.redo_log
             .as_ref()
             .and_then(|p| fs::metadata(p).ok())
             .map(|m| m.len())
@@ -1289,38 +1295,44 @@ impl Database {
 
     /// Produce an **incremental** backup into `out_dir`: the delta relative to the
     /// most recent full ([`backup`](Self::backup)) or incremental backup
-    /// (C++ gStore's full + incremental backup pairing). It copies the update-log
+    /// (C++ gStore's full + incremental backup pairing). It copies the **redo-log**
     /// records appended since the last checkpoint into `out_dir/incr.log` and
     /// writes an `INCREMENTAL` marker recording the `[base_offset, end_offset)`
     /// byte range it covers, then advances the checkpoint — so successive
     /// incrementals chain contiguously.
     ///
-    /// Requires update logging to be enabled (`enable_update_log*`); the delta is
-    /// exactly the SPARQL UPDATE statements logged since the base. Reconstruct the
-    /// latest state with [`restore_incremental`](Self::restore_incremental).
+    /// Requires **redo** logging to be enabled (`enable_redo_log*`). The delta is
+    /// the concrete triple mutations (insert/delete, default or named graph)
+    /// committed since the base — so it faithfully captures *every* committed
+    /// mutation regardless of its source (SPARQL UPDATE, direct-API
+    /// insert/remove, and [`ConcurrentDb`](crate::concurrent::ConcurrentDb)
+    /// transactions), excludes rolled-back transactions (their redo records are
+    /// discarded), and replays deterministically (no re-reading of external `LOAD`
+    /// sources). Reconstruct the latest committed state with
+    /// [`restore_incremental`](Self::restore_incremental).
     ///
     /// Format of `out_dir`:
-    /// * `incr.log` — the raw bytes of the update log for `[base, end)`, in the
-    ///   same length-prefixed `REC <millis> <changed> <len>\n<sparql>\n` record
-    ///   format, so it replays through the ordinary update-log machinery.
+    /// * `incr.log` — the raw bytes of the redo log for `[base, end)`, in the same
+    ///   length-prefixed `REDO <op> <graph_len> <triple_len>\n…` record format, so
+    ///   it replays through the ordinary redo-log machinery.
     /// * `INCREMENTAL` — a UTF-8 marker: `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
-        let Some(log_path) = self.update_log.clone() else {
+        let Some(log_path) = self.redo_log.clone() else {
             return Err(GStoreError::Database(
-                "backup_incremental requires update logging to be enabled \
-                 (call enable_update_log / enable_update_log_in first)"
+                "backup_incremental requires redo logging to be enabled \
+                 (call enable_redo_log / enable_redo_log_in first)"
                     .into(),
             ));
         };
         let base = self.backup_offset.get();
         // Missing log ⇒ no records yet (treat as empty), so an incremental taken
-        // before any logged update is simply an empty (but valid) delta.
+        // before any logged mutation is simply an empty (but valid) delta.
         let data = fs::read(&log_path).unwrap_or_default();
         let end = data.len() as u64;
         if end < base {
             return Err(GStoreError::Database(format!(
-                "update log ({end} bytes) shrank below the backup checkpoint ({base}); \
+                "redo log ({end} bytes) shrank below the backup checkpoint ({base}); \
                  the log was truncated or replaced since the last backup"
             )));
         }
@@ -1352,8 +1364,8 @@ impl Database {
         // The base's checkpoint is where the first increment must begin. Absent a
         // marker (e.g. a backup taken without logging), treat it as 0.
         let mut expected = read_backup_offset(&base_dir.join(BACKUP_OFFSET_FILE)).unwrap_or(0);
-        // Replaying must not re-log; a freshly loaded db has no update log anyway.
-        let saved = db.update_log.take();
+        // Replaying must not re-log; a freshly loaded db has no redo log anyway.
+        let saved = db.redo_log.take();
         let outcome = (|| {
             for dir in incr_dirs {
                 let dir = dir.as_ref();
@@ -1367,12 +1379,12 @@ impl Database {
                     )));
                 }
                 let bytes = fs::read(dir.join(INCREMENTAL_LOG_FILE))?;
-                db.replay_records(&bytes)?;
+                db.apply_redo_records(&bytes)?;
                 expected = end;
             }
             Ok(())
         })();
-        db.update_log = saved;
+        db.redo_log = saved;
         db.backup_offset.set(expected);
         outcome.map(|()| db)
     }
@@ -2335,14 +2347,14 @@ mod tests {
         let incr2_dir = temp_dir("bk_incr2");
         let db_dir = temp_dir("bk_db");
 
-        // Live database with update logging enabled inside its own directory.
+        // Live database with redo logging enabled inside its own directory.
         let mut db = Database::build_from_str("bk", SMALL).unwrap();
-        db.enable_update_log_in(&db_dir).unwrap();
+        db.enable_redo_log_in(&db_dir).unwrap();
 
         // An update BEFORE the full backup: captured by the base snapshot itself.
         db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
 
-        // Full backup: base snapshot + checkpoint at the current update-log length.
+        // Full backup: base snapshot + checkpoint at the current redo-log length.
         db.backup(&base_dir).unwrap();
         let base_ck = db.backup_checkpoint();
         assert!(base_ck > 0, "checkpoint records the pre-backup update");
@@ -2416,15 +2428,53 @@ mod tests {
     }
 
     #[test]
-    fn backup_incremental_requires_update_log() {
+    fn backup_incremental_requires_redo_log() {
         let db = Database::build_from_str("bk", SMALL).unwrap();
         let out = temp_dir("bk_no_log");
         let err = db.backup_incremental(&out).unwrap_err();
         assert!(
             matches!(err, GStoreError::Database(_)),
-            "incremental backup without an update log must error, got {err:?}"
+            "incremental backup without a redo log must error, got {err:?}"
         );
         let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn incremental_backup_excludes_rolled_back_and_captures_direct_api() {
+        // Regression for the redo-log re-basing (findings #8/#12): a rolled-back
+        // transaction must NOT appear in the increment, and a direct-API mutation
+        // (no SPARQL statement) MUST appear.
+        let base_dir = temp_dir("bk_rb_base");
+        let incr_dir = temp_dir("bk_rb_incr");
+        let db_dir = temp_dir("bk_rb_db");
+
+        let mut db = Database::build_from_str("bk_rb", SMALL).unwrap();
+        db.enable_redo_log_in(&db_dir).unwrap();
+        db.backup(&base_dir).unwrap();
+
+        // (a) direct-API insert (bypasses the SPARQL update path entirely)
+        db.insert_triple(&Triple::new(Term::iri("root"), Term::iri("contain"), Term::iri("api_node")));
+        // (b) a transaction that is rolled back — must leave no trace
+        db.begin().unwrap();
+        db.query("INSERT DATA { <root> <contain> <ghost> }").unwrap();
+        db.rollback().unwrap();
+
+        db.backup_incremental(&incr_dir).unwrap();
+        let mut restored = Database::restore_incremental(&base_dir, &[&incr_dir]).unwrap();
+
+        assert_eq!(
+            restored.select("SELECT ?s WHERE { ?s <contain> <api_node> }").unwrap().row_count(),
+            1,
+            "direct-API insert must be captured by the redo-based increment"
+        );
+        assert_eq!(
+            restored.select("SELECT ?s WHERE { ?s <contain> <ghost> }").unwrap().row_count(),
+            0,
+            "a rolled-back transaction must NOT be resurrected by restore"
+        );
+        for d in [&base_dir, &incr_dir, &db_dir] {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     #[test]
@@ -2436,7 +2486,7 @@ mod tests {
         let incr: Vec<_> = (0..3).map(|i| temp_dir(&format!("bk2_incr{i}"))).collect();
 
         let mut db = Database::build_from_str("bk2", SMALL).unwrap();
-        db.enable_update_log_in(&db_dir).unwrap();
+        db.enable_redo_log_in(&db_dir).unwrap();
         db.backup(&base_dir).unwrap();
 
         let mut prev_end = db.backup_checkpoint();

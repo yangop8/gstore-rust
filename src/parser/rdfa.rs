@@ -405,6 +405,11 @@ fn is_void_element(name: &str) -> bool {
     )
 }
 
+/// Maximum element nesting depth retained when building the tree. Deeper elements
+/// are flattened (attached childless to the current parent) so the recursive tree
+/// walks and drop cannot overflow the stack on adversarial input.
+const MAX_TREE_DEPTH: usize = 256;
+
 /// Build a tree from the flat token stream, auto-closing mismatched/omitted end
 /// tags and treating void/self-closing elements as childless.
 fn build_tree(tokens: Vec<Token>) -> Node {
@@ -426,6 +431,13 @@ fn build_tree(tokens: Vec<Token>) -> Node {
                     children: Vec::new(),
                 };
                 if self_closing || is_void_element(&name) {
+                    stack.last_mut().unwrap().children.push(Child::Element(node));
+                } else if stack.len() >= MAX_TREE_DEPTH {
+                    // Bound nesting: past the cap, attach the element (childless) to
+                    // the current parent instead of descending, so pathological
+                    // input (e.g. a megabyte of `<div>`) cannot grow an unbounded
+                    // tree that overflows the recursive walks (find_base/process/
+                    // collect_text) or the recursive `Node` drop.
                     stack.last_mut().unwrap().children.push(Child::Element(node));
                 } else {
                     stack.push(node);
@@ -635,18 +647,28 @@ impl Extractor {
             } else {
                 ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
             };
-            if has_typeof {
-                typed_resource = if el.attr("about").is_some() {
-                    new_subject.clone()
-                } else {
-                    Some(self.fresh_blank())
-                };
-            }
+            // The current object resource comes from @resource/@href/@src.
             current_object_resource = el
                 .attr("resource")
                 .and_then(|r| resolve_resource(r, &local))
                 .or_else(|| el.attr("href").map(|h| Term::Iri(resolve_iri(&base, h))))
                 .or_else(|| el.attr("src").map(|s| Term::Iri(resolve_iri(&base, s))));
+            if has_typeof {
+                // Per RDFa Core 1.1 step 6 the typed resource IS the current
+                // object resource: with @about it is new_subject; otherwise it is
+                // the @resource/@href/@src target — minting ONE fresh bnode into
+                // BOTH when none is given, so the rdf:type triple and the rel/rev
+                // triple share that node instead of typing a disconnected bnode
+                // (and losing the rel triple to a never-completed incomplete list).
+                typed_resource = if el.attr("about").is_some() {
+                    new_subject.clone()
+                } else {
+                    if current_object_resource.is_none() {
+                        current_object_resource = Some(self.fresh_blank());
+                    }
+                    current_object_resource.clone()
+                };
+            }
         }
 
         // Step 7: emit rdf:type for @typeof.
@@ -719,7 +741,7 @@ impl Extractor {
         // Step 11: @property literals / resources.
         if has_property {
             if let Some(subj) = &new_subject {
-                let obj = self.property_object(el, &local, &lang, &typed_resource);
+                let obj = self.property_object(el, &local, &lang, &typed_resource, has_rel || has_rev);
                 if let (Some(obj), Some(prop)) = (obj, el.attr("property")) {
                     for tok in prop.split_whitespace() {
                         if let Some(p) = resolve_term_or_curie(tok, &local) {
@@ -764,13 +786,19 @@ impl Extractor {
         }
     }
 
-    /// Compute the object of an `@property` (step 11 object rules).
+    /// Compute the object of an `@property` (step 11 object rules). When the
+    /// element also carries `@rel`/`@rev`, its `@resource`/`@href`/`@src` (and its
+    /// `@typeof` chaining resource) belong to the rel/rev triple — per RDFa Core
+    /// 1.1 step 11 they are NOT the property value — so `@property` falls through
+    /// to the element's `@content`/text as a literal instead of duplicating the
+    /// link target.
     fn property_object(
         &self,
         el: &Node,
         local: &LocalCtx,
         lang: &Option<String>,
         typed_resource: &Option<Term>,
+        has_rel_or_rev: bool,
     ) -> Option<Term> {
         let datatype = el
             .attr("datatype")
@@ -790,17 +818,21 @@ impl Extractor {
             });
         }
         // No content, no datatype: a pointed-to resource, else a text literal.
-        if let Some(r) = el.attr("resource") {
-            return resolve_resource(r, local);
-        }
-        if let Some(h) = el.attr("href") {
-            return Some(Term::Iri(resolve_iri(local.base, h)));
-        }
-        if let Some(s) = el.attr("src") {
-            return Some(Term::Iri(resolve_iri(local.base, s)));
-        }
-        if el.attr("typeof").is_some() && el.attr("about").is_none() {
-            return typed_resource.clone();
+        // The resource/href/src and typeof-chaining arms apply only when @rel/@rev
+        // are absent (otherwise that target is the rel/rev object, not the value).
+        if !has_rel_or_rev {
+            if let Some(r) = el.attr("resource") {
+                return resolve_resource(r, local);
+            }
+            if let Some(h) = el.attr("href") {
+                return Some(Term::Iri(resolve_iri(local.base, h)));
+            }
+            if let Some(s) = el.attr("src") {
+                return Some(Term::Iri(resolve_iri(local.base, s)));
+            }
+            if el.attr("typeof").is_some() && el.attr("about").is_none() {
+                return typed_resource.clone();
+            }
         }
         Some(make_literal(&el.text_content(), None, lang))
     }
@@ -1076,6 +1108,45 @@ mod tests {
         assert_eq!(knows.len(), 1);
         assert_eq!(knows[0].subject, Term::iri("http://ex/a"));
         assert_eq!(knows[0].object, Term::iri("http://ex/b"));
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow() {
+        // #5: pathological nesting is flattened past the depth cap, so the
+        // recursive walks/drop don't overflow the stack — parsing simply returns.
+        let doc = "<div>".repeat(3000);
+        let _ = parse_str(&doc).unwrap();
+    }
+
+    #[test]
+    fn rel_typeof_without_about_types_the_object() {
+        // #6: with @rel + @typeof and no @about, the type must land on the object
+        // (the @href target), not on a disconnected fresh bnode.
+        let doc = r#"
+        <div about="http://ex/a">
+          <a rel="http://ex/knows" href="http://ex/b" typeof="http://ex/Person">x</a>
+        </div>"#;
+        let ts = parse_str(doc).unwrap();
+        let knows = find(&ts, "http://ex/knows");
+        assert_eq!(knows.len(), 1);
+        assert_eq!(knows[0].object, Term::iri("http://ex/b"));
+        let types = find(&ts, RDF_TYPE);
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].subject, Term::iri("http://ex/b"), "type must be on the rel object");
+        assert_eq!(types[0].object, Term::iri("http://ex/Person"));
+    }
+
+    #[test]
+    fn property_with_rel_uses_text_not_href() {
+        // #13: @property alongside @rel must take the element's text as a literal,
+        // not reuse the @href (which is the rel triple's object).
+        let doc = r#"<a about="http://ex/a" rel="http://ex/next" property="http://ex/ref" href="http://ex/y">text</a>"#;
+        let ts = parse_str(doc).unwrap();
+        let next = find(&ts, "http://ex/next");
+        assert_eq!(next[0].object, Term::iri("http://ex/y"), "rel object is the href target");
+        let refs = find(&ts, "http://ex/ref");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].object, Term::plain_literal("text"), "property value is the text literal");
     }
 
     #[test]

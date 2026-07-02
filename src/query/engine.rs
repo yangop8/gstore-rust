@@ -188,6 +188,30 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// `true`, a running read aborts at the next pattern/phase boundary with
     /// [`GStoreError::Cancelled`] (see [`with_cancel`](Self::with_cancel)).
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Memoized whole-graph analytics results (WCC/Louvain/betweenness/…), so a
+    /// graph built-in used in a per-row `FILTER`/projection computes its
+    /// full-graph pass **once per query** instead of once per row. Keyed only by
+    /// algorithm (the graph is fixed for the query's lifetime); PPR is keyed by
+    /// source node. Shared with `GRAPH` sub-evaluators is NOT desired (they run
+    /// over a different store), so each evaluator gets its own.
+    algo_cache: std::cell::RefCell<AlgoCache>,
+}
+
+/// Per-query memoization of whole-graph analytics results (see
+/// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
+/// ([`EntityLiteralId`](crate::model::id::EntityLiteralId) = `u32`).
+#[derive(Default)]
+struct AlgoCache {
+    wcc: Option<Rc<HashMap<u32, u32>>>,
+    louvain: Option<Rc<HashMap<u32, usize>>>,
+    labelprop: Option<Rc<HashMap<u32, usize>>>,
+    betweenness: Option<Rc<HashMap<u32, f64>>>,
+    closeness: Option<Rc<HashMap<u32, f64>>>,
+    ppr: HashMap<u32, Rc<HashMap<u32, f64>>>,
+    degree_assortativity: Option<f64>,
+    diameter: Option<u32>,
+    global_clustering: Option<f64>,
+    triangle_count: Option<u64>,
 }
 
 impl<'a, S: TripleSource> Evaluator<'a, S> {
@@ -202,6 +226,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::new(FunctionRegistry::new()),
             cancel: None,
+            algo_cache: std::cell::RefCell::new(AlgoCache::default()),
         }
     }
 
@@ -221,6 +246,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::new(FunctionRegistry::new()),
             cancel: None,
+            algo_cache: std::cell::RefCell::new(AlgoCache::default()),
         }
     }
 
@@ -328,6 +354,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn eval_construct(&self, c: &ConstructQuery) -> Result<Vec<Triple>> {
         let layout = VarLayout::build(&c.pattern);
         let mut solutions = self.eval_pattern(&c.pattern, &layout);
+        // A mid-run cancel short-circuits eval_pattern to empty; surface it as an
+        // error rather than a bogus empty CONSTRUCT (which would also poison the
+        // query cache). Mirrors eval_select_solutions / the ASK path.
+        self.check_cancel()?;
         if !c.order_by.is_empty() {
             self.sort_solutions(&mut solutions, &c.order_by, &layout);
         }
@@ -379,6 +409,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             if let Some(pat) = &d.pattern {
                 let layout = VarLayout::build(pat);
                 let sols = self.eval_pattern(pat, &layout);
+                self.check_cancel()?; // convert a mid-run cancel into Cancelled, not an empty describe
                 // Only describe resource-valued columns: predicate-typed columns
                 // hold predicate ids (a different id space), and synthetic ids are
                 // computed values, not stored resources.
@@ -1004,6 +1035,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GraphPattern::Filter(filters, inner) => {
                 let mut r = self.eval_pattern(inner, layout);
                 r.retain(|b| {
+                    // Cooperative cancellation between rows: once requested, drop
+                    // remaining rows instead of evaluating (possibly expensive)
+                    // filters; the Result-returning caller turns the truncated
+                    // result into GStoreError::Cancelled via check_cancel().
+                    if self.cancelled() {
+                        return false;
+                    }
                     filters
                         .iter()
                         .all(|f| self.eval_ebv(f, b, layout) == Some(true))
@@ -1133,6 +1171,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             graph_cache: std::cell::RefCell::new(None),
             functions: Rc::clone(&self.functions),
             cancel: self.cancel.clone(), // cancellation propagates into GRAPH blocks
+            algo_cache: std::cell::RefCell::new(AlgoCache::default()), // per-graph, not shared
         }
     }
 
@@ -2029,21 +2068,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(lang_matches(&tag, &range)))
             }
             "SIMILARITY" => {
-                // Polymorphic: when both arguments resolve to graph nodes, this
-                // is a node similarity (neighbour-set cosine overlap); otherwise
-                // it is the original Jaro string similarity (so the string API,
-                // and its tests, keep working unchanged).
-                if let (Some(a), Some(c)) = (
-                    self.node_id(args.first()?, b, l),
-                    self.node_id(args.get(1)?, b, l),
-                ) {
-                    if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
-                        return Some(Value::Double(sim));
+                // Polymorphic, but dispatched on IRI-ness (NOT mere dictionary
+                // membership): node similarity (neighbour-set cosine overlap) only
+                // when BOTH arguments are IRIs naming graph nodes; otherwise the
+                // original Jaro string similarity. This keeps string similarity
+                // working for literals — a stored literal must never be silently
+                // reinterpreted as a graph node (which would make SIMILARITY on
+                // data-bound strings data-dependent and non-compositional).
+                let av = self.eval_value(args.first()?, b, l)?;
+                let cv = self.eval_value(args.get(1)?, b, l)?;
+                if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
+                    if let (Some(a), Some(c)) =
+                        (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
+                    {
+                        if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
+                            return Some(Value::Double(sim));
+                        }
                     }
                 }
-                let x = self.eval_value(args.first()?, b, l)?.lexical();
-                let y = self.eval_value(args.get(1)?, b, l)?.lexical();
-                Some(Value::Double(jaro_similarity(&x, &y)))
+                Some(Value::Double(jaro_similarity(&av.lexical(), &cv.lexical())))
             }
 
             // ---- numeric -------------------------------------------------
@@ -2217,8 +2260,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // WCC(a) ⇒ size of a's weakly-connected component (int).
             "WCC" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let g = self.graph_view();
-                let (comp, _) = g.weakly_connected_components();
+                let comp = self.wcc_cached();
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -2237,7 +2279,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // LOUVAIN(a) ⇒ size of a's community (int).
             "LOUVAIN" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let comm = self.graph_view().louvain();
+                let comm = self.louvain_cached();
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -2256,7 +2298,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // LABELPROP(a) ⇒ size of a's community (int).
             "LABELPROP" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let comm = self.graph_view().label_propagation();
+                let comm = self.labelprop_cached();
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -2274,19 +2316,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // BETWEENNESSCENTRALITY(a): Brandes betweenness of node a.
             "BETWEENNESSCENTRALITY" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let bc = self.graph_view().betweenness_centrality();
+                let bc = self.betweenness_cached();
                 Some(Value::Double(bc.get(&a).copied().unwrap_or(0.0)))
             }
             // CLOSENESSCENTRALITY(a): Wasserman–Faust closeness of node a.
             "CLOSENESSCENTRALITY" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let cc = self.graph_view().closeness_centrality();
+                let cc = self.closeness_cached();
                 Some(Value::Double(cc.get(&a).copied().unwrap_or(0.0)))
             }
             // TRIANGLECOUNTING(): global triangle count;
             // TRIANGLECOUNTING(a): triangles through node a.
             "TRIANGLECOUNTING" => match args.first() {
-                None => Some(Value::Int(self.graph_view().triangle_count() as i64)),
+                None => Some(Value::Int(self.triangle_count_cached() as i64)),
                 Some(e) => {
                     let a = self.node_id(e, b, l)?;
                     Some(Value::Int(
@@ -2297,7 +2339,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // CLUSTERINGCOEFF(): global transitivity;
             // CLUSTERINGCOEFF(a): local clustering coefficient of node a.
             "CLUSTERINGCOEFF" => match args.first() {
-                None => Some(Value::Double(self.graph_view().global_clustering_coefficient())),
+                None => Some(Value::Double(self.global_clustering_cached())),
                 Some(e) => {
                     let a = self.node_id(e, b, l)?;
                     Some(Value::Double(
@@ -2310,7 +2352,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "PPR" => {
                 let src = self.node_id(args.first()?, b, l)?;
                 let target = self.node_id(args.get(1)?, b, l)?;
-                let ppr = self.graph_view().personalized_pagerank(&[src], 0.85, 100, 1e-9);
+                let ppr = self.ppr_cached(src);
                 Some(Value::Double(ppr.get(&target).copied().unwrap_or(0.0)))
             }
             // JACCARDSIMILARITY(a, b): Jaccard index of the two neighbour sets.
@@ -2322,13 +2364,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 ))
             }
             // DEGREECORRELATION(): Newman degree assortativity of the graph.
-            "DEGREECORRELATION" => {
-                Some(Value::Double(self.graph_view().degree_assortativity()))
-            }
+            "DEGREECORRELATION" => Some(Value::Double(self.degree_assortativity_cached())),
             // DIAMETERESTIMATION(): double-sweep BFS diameter estimate.
-            "DIAMETERESTIMATION" => {
-                Some(Value::Int(self.graph_view().diameter_estimate() as i64))
-            }
+            "DIAMETERESTIMATION" => Some(Value::Int(self.diameter_cached() as i64)),
 
             // User-defined function fallback (gStore `pfnQuery`): a name that is
             // not a SPARQL built-in is looked up in the registry before erroring.
@@ -2360,6 +2398,91 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let g = Rc::new(GraphView::from_source(self.store));
         *self.graph_cache.borrow_mut() = Some(Rc::clone(&g));
         g
+    }
+
+    // ---- memoized whole-graph analytics (computed once per query) ------------
+    // Each computes its full-graph pass on first use and caches the result, so a
+    // graph built-in inside a per-row FILTER/projection doesn't rerun it per row.
+
+    fn wcc_cached(&self) -> Rc<HashMap<u32, u32>> {
+        if let Some(r) = self.algo_cache.borrow().wcc.clone() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().weakly_connected_components().0);
+        self.algo_cache.borrow_mut().wcc = Some(Rc::clone(&r));
+        r
+    }
+    fn louvain_cached(&self) -> Rc<HashMap<u32, usize>> {
+        if let Some(r) = self.algo_cache.borrow().louvain.clone() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().louvain());
+        self.algo_cache.borrow_mut().louvain = Some(Rc::clone(&r));
+        r
+    }
+    fn labelprop_cached(&self) -> Rc<HashMap<u32, usize>> {
+        if let Some(r) = self.algo_cache.borrow().labelprop.clone() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().label_propagation());
+        self.algo_cache.borrow_mut().labelprop = Some(Rc::clone(&r));
+        r
+    }
+    fn betweenness_cached(&self) -> Rc<HashMap<u32, f64>> {
+        if let Some(r) = self.algo_cache.borrow().betweenness.clone() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().betweenness_centrality());
+        self.algo_cache.borrow_mut().betweenness = Some(Rc::clone(&r));
+        r
+    }
+    fn closeness_cached(&self) -> Rc<HashMap<u32, f64>> {
+        if let Some(r) = self.algo_cache.borrow().closeness.clone() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().closeness_centrality());
+        self.algo_cache.borrow_mut().closeness = Some(Rc::clone(&r));
+        r
+    }
+    fn ppr_cached(&self, src: u32) -> Rc<HashMap<u32, f64>> {
+        if let Some(r) = self.algo_cache.borrow().ppr.get(&src).cloned() {
+            return r;
+        }
+        let r = Rc::new(self.graph_view().personalized_pagerank(&[src], 0.85, 100, 1e-9));
+        self.algo_cache.borrow_mut().ppr.insert(src, Rc::clone(&r));
+        r
+    }
+    fn degree_assortativity_cached(&self) -> f64 {
+        if let Some(v) = self.algo_cache.borrow().degree_assortativity {
+            return v;
+        }
+        let v = self.graph_view().degree_assortativity();
+        self.algo_cache.borrow_mut().degree_assortativity = Some(v);
+        v
+    }
+    fn diameter_cached(&self) -> u32 {
+        if let Some(v) = self.algo_cache.borrow().diameter {
+            return v;
+        }
+        let v = self.graph_view().diameter_estimate();
+        self.algo_cache.borrow_mut().diameter = Some(v);
+        v
+    }
+    fn global_clustering_cached(&self) -> f64 {
+        if let Some(v) = self.algo_cache.borrow().global_clustering {
+            return v;
+        }
+        let v = self.graph_view().global_clustering_coefficient();
+        self.algo_cache.borrow_mut().global_clustering = Some(v);
+        v
+    }
+    fn triangle_count_cached(&self) -> u64 {
+        if let Some(v) = self.algo_cache.borrow().triangle_count {
+            return v;
+        }
+        let v = self.graph_view().triangle_count();
+        self.algo_cache.borrow_mut().triangle_count = Some(v);
+        v
     }
 
     /// Render a graph node's entity id back to its dictionary term string
@@ -3519,18 +3642,25 @@ mod builtin_tests {
 
     #[test]
     fn jaccard_and_node_similarity() {
+        // JACCARDSIMILARITY is a dedicated graph function (literal-as-node is fine):
         // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
         assert_eq!(
             lit(&scalar(r#"JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
             "0.5"
         );
-        // Node-mode SIMILARITY: both objects of a ⇒ identical neighbour set.
-        assert_eq!(
-            lit(&scalar(
-                r#"SIMILARITY("Hello World", "2011-01-10T14:45:13.815-05:00"^^<http://www.w3.org/2001/XMLSchema#dateTime>)"#
-            )),
-            "1.0"
-        );
+        // Node-mode SIMILARITY requires BOTH args to be IRIs naming graph nodes;
+        // a node vs itself has an identical neighbour set ⇒ 1.0.
+        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        // Regression (#3): two STORED LITERALS must use STRING similarity, not
+        // node cosine. Both are objects of <a>, so node mode would wrongly report
+        // a cosine of 1.0; string (Jaro) similarity of these very different
+        // lexical forms is low.
+        let s: f64 = lit(&scalar(
+            r#"SIMILARITY("Hello World", "2011-01-10T14:45:13.815-05:00"^^<http://www.w3.org/2001/XMLSchema#dateTime>)"#
+        ))
+        .parse()
+        .unwrap();
+        assert!(s < 0.7, "stored literals must use string similarity, got {s}");
         // String-mode SIMILARITY still works for non-node arguments.
         assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
     }

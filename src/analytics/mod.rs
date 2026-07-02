@@ -1639,6 +1639,14 @@ impl GraphView {
     /// depth `k`), in ascending id order. `k == 0` yields `[src]`. Empty when
     /// `src` is absent or the frontier is empty.
     pub fn khop_neighbors(&self, src: EntityLiteralId, k: u32) -> Vec<EntityLiteralId> {
+        // `u32::MAX` is `bounded_out_bfs`'s unreachable-distance sentinel; an
+        // exact frontier at that depth is meaningless (matching it would return
+        // the *unreachable* set instead), so treat it as an empty frontier. This
+        // also handles a caller passing a negative/overflowing hop count that
+        // saturates to `u32::MAX`.
+        if k == u32::MAX {
+            return Vec::new();
+        }
         let Some(&si) = self.id_to_idx.get(&src) else {
             return Vec::new();
         };
@@ -3096,6 +3104,11 @@ mod tests {
         // Absent node.
         assert!(g.khop_neighbors(999, 1).is_empty());
         assert_eq!(g.bfs_count(999, 3), 0);
+        // #2: k == u32::MAX (the unreachable-distance sentinel, e.g. from a
+        // negative/overflowing hop arg) must NOT select the unreachable set — the
+        // exact-frontier queries return empty, not "everything not reachable".
+        assert!(g.khop_neighbors(10, u32::MAX).is_empty());
+        assert_eq!(g.khop_count(10, u32::MAX), 0);
     }
 
     #[test]

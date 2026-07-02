@@ -81,6 +81,10 @@ struct JsonReader {
     pos: usize,
 }
 
+/// Maximum JSON nesting depth accepted (guards the recursive reader/processor/
+/// drop against stack overflow on adversarial input; see `parse_value`).
+const MAX_JSON_DEPTH: usize = 256;
+
 impl JsonReader {
     fn new(s: &str) -> JsonReader {
         JsonReader {
@@ -121,7 +125,7 @@ impl JsonReader {
 
     fn parse(&mut self) -> Result<Json> {
         self.skip_ws();
-        let v = self.parse_value()?;
+        let v = self.parse_value(0)?;
         self.skip_ws();
         if self.peek().is_some() {
             return Err(self.err("trailing content after JSON value"));
@@ -129,11 +133,17 @@ impl JsonReader {
         Ok(v)
     }
 
-    fn parse_value(&mut self) -> Result<Json> {
+    fn parse_value(&mut self, depth: usize) -> Result<Json> {
+        // Bound nesting so a pathological input (e.g. a megabyte of `[`) cannot
+        // overflow the stack — the parser, the downstream node processor, and the
+        // recursive `Json` drop all descend at most this far.
+        if depth > MAX_JSON_DEPTH {
+            return Err(self.err("JSON nesting too deep"));
+        }
         self.skip_ws();
         match self.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
+            Some('{') => self.parse_object(depth),
+            Some('[') => self.parse_array(depth),
             Some('"') => Ok(Json::Str(self.parse_string()?)),
             Some('t') | Some('f') => self.parse_bool(),
             Some('n') => self.parse_null(),
@@ -142,7 +152,7 @@ impl JsonReader {
         }
     }
 
-    fn parse_object(&mut self) -> Result<Json> {
+    fn parse_object(&mut self, depth: usize) -> Result<Json> {
         self.bump(); // '{'
         let mut pairs = Vec::new();
         self.skip_ws();
@@ -160,7 +170,7 @@ impl JsonReader {
             if self.bump() != Some(':') {
                 return Err(self.err("expected ':' after object key"));
             }
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             pairs.push((key, value));
             self.skip_ws();
             match self.bump() {
@@ -172,7 +182,7 @@ impl JsonReader {
         Ok(Json::Obj(pairs))
     }
 
-    fn parse_array(&mut self) -> Result<Json> {
+    fn parse_array(&mut self, depth: usize) -> Result<Json> {
         self.bump(); // '['
         let mut items = Vec::new();
         self.skip_ws();
@@ -181,7 +191,7 @@ impl JsonReader {
             return Ok(Json::Arr(items));
         }
         loop {
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             items.push(value);
             self.skip_ws();
             match self.bump() {
@@ -269,6 +279,13 @@ impl JsonReader {
         }
         if s.is_empty() {
             return Err(self.err("invalid number"));
+        }
+        // Validate the collected run against a basic JSON number shape: it must
+        // parse as f64 and must not carry a leading '+' (JSON forbids it, though
+        // Rust's float parser accepts it). This rejects garbage like `1-2`, `-`,
+        // and `1.2.3` instead of storing it as an xsd:integer/double literal.
+        if s.starts_with('+') || s.parse::<f64>().is_err() {
+            return Err(self.err(format!("invalid number literal {s:?}")));
         }
         Ok(Json::Num(s))
     }
@@ -828,6 +845,28 @@ mod tests {
         assert_eq!(types[0].object, Term::iri("http://ex/Person"));
         let names = find(&ts, "http://ex/name");
         assert_eq!(names[0].object, Term::plain_literal("Alice"));
+    }
+
+    #[test]
+    fn deep_nesting_is_rejected_not_overflowed() {
+        // Pathological nesting is refused with an error, not a stack overflow
+        // (guards the recursive reader / node processor / Json drop) — #4.
+        let doc = "[".repeat(5000);
+        assert!(parse_str(&doc).is_err());
+    }
+
+    #[test]
+    fn invalid_number_literals_are_rejected() {
+        // #11: malformed numbers must not be stored as xsd:integer/double literals.
+        for bad in [
+            r#"{"@id":"http://ex/a","http://ex/v": 1-2}"#,
+            r#"{"@id":"http://ex/a","http://ex/v": -}"#,
+            r#"{"@id":"http://ex/a","http://ex/v": 1.2.3}"#,
+        ] {
+            assert!(parse_str(bad).is_err(), "should reject: {bad}");
+        }
+        // a well-formed number still parses
+        assert!(parse_str(r#"{"@id":"http://ex/a","http://ex/v": 42}"#).is_ok());
     }
 
     #[test]

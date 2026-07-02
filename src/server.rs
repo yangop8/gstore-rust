@@ -48,6 +48,12 @@ use crate::sparql_results::{self, json_str, ResultFormat};
 
 const SPARQL_JSON: &str = "application/sparql-results+json";
 
+/// Maximum accepted request-body size (`Content-Length`). Bounds the pre-auth
+/// allocation in [`Request::parse`] so a single header can't make the server
+/// reserve arbitrary memory or panic on capacity overflow. Shared by the simple
+/// server and the multi-DB `http_api` server (which reuses `Request::parse`).
+const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// A minimal, self-contained (inline CSS/JS, no external assets) single-page
 /// web console served at `GET /` and `GET /console`: a textarea to run
 /// SPARQL against this endpoint's single database via `/sparql`, plus a short
@@ -322,6 +328,17 @@ impl Request {
             }
         }
 
+        // Refuse an oversized (or absurd, e.g. u64::MAX) Content-Length BEFORE
+        // allocating, so a client cannot make the server reserve arbitrary memory
+        // (or panic on capacity overflow) with a single header — this runs before
+        // authentication, so the cap is the only guard. Large RDF ingests should
+        // use file-based tools (gbuild/gadd) or the server-side `/load` path.
+        if content_length > MAX_REQUEST_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request body exceeds the maximum size",
+            ));
+        }
         let mut body = vec![0u8; content_length];
         if content_length > 0 {
             reader.read_exact(&mut body)?;

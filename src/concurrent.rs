@@ -105,7 +105,7 @@ type TripleKey = String;
 /// | [`ReadUncommitted`](Self::ReadUncommitted) | latest committed, re-read per operation | nothing |
 /// | [`ReadCommitted`](Self::ReadCommitted) | latest committed, re-read per operation | nothing (last-writer-wins) |
 /// | [`RepeatableRead`](Self::RepeatableRead) | the snapshot captured at `begin` (stable) | a concurrent commit that **wrote** a key this txn also wrote (write-write) |
-/// | [`Serializable`](Self::Serializable) | the snapshot captured at `begin` (stable) | write-write **or** a concurrent commit that wrote a key this txn **read** (read-write) |
+/// | [`Serializable`](Self::Serializable) | the snapshot captured at `begin` (stable) | write-write **or** a concurrent commit that wrote a key this txn read via [`Txn::read`](Txn::read) (read-write; SPARQL `query()` reads are **not** tracked) |
 ///
 /// Precise guarantees in *this* model:
 ///
@@ -127,9 +127,16 @@ type TripleKey = String;
 ///   read set, so *write skew is possible* — use `Serializable` to prevent it.
 ///   Being snapshot-based it additionally avoids the phantom reads a lock-based
 ///   REPEATABLE READ would permit.
-/// * **Serializable** — snapshot reads plus **both** write-write and read-write
-///   (read-set) validation at commit, rejecting write skew; committed
-///   transactions are serializable. The strongest level.
+/// * **Serializable** — snapshot reads plus write-write **and** read-write
+///   (read-set) validation at commit. **Important scope:** the read set is
+///   tracked only for explicit point reads via [`Txn::read`](Txn::read); SPARQL
+///   [`Txn::query`](Txn::query) reads are **not** tracked (there is no predicate
+///   or range locking in this model). So write skew / phantoms are prevented for
+///   decisions based on `read()`, but a transaction that decides based purely on
+///   `query()` results is **not** guaranteed serializable — bring the keys it
+///   depends on under validation by also `read()`-ing them. It is the strongest
+///   level available here; full predicate-lock serializability for arbitrary
+///   SPARQL reads is out of scope for a snapshot + OCC engine.
 ///
 /// Strength ordering: `ReadUncommitted ≈ ReadCommitted < RepeatableRead <
 /// Serializable`. The [default](Default) is `RepeatableRead`, which preserves the
@@ -145,7 +152,9 @@ pub enum IsolationLevel {
     /// The default — preserves the historical `begin()` behavior.
     #[default]
     RepeatableRead,
-    /// Serializable: snapshot reads + write-write **and** read-write checks.
+    /// Serializable: snapshot reads + write-write **and** read-write checks. The
+    /// read set covers explicit [`Txn::read`](Txn::read) point reads only, not
+    /// SPARQL `query()` reads (no predicate/range locking) — see the type docs.
     Serializable,
 }
 
