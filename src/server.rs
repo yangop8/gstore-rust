@@ -50,6 +50,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::db::Database;
 use crate::query::{QueryResult, ResultSet};
@@ -192,8 +193,9 @@ impl Server {
     /// itself is still serialized behind its `Mutex`).
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
             let inner = Arc::clone(&self.inner);
-            thread::spawn(move || {
+            spawn_worker(move || {
                 let _ = inner.handle(stream);
             });
         }
@@ -205,15 +207,38 @@ impl Server {
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
         for stream in self.listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
-            thread::spawn(move || {
+            spawn_worker(move || {
                 if let Ok(conn) = rustls::ServerConnection::new(config) {
                     let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
                 }
             });
         }
     }
+}
+
+/// Idle read timeout applied to every accepted connection: a client that opens a
+/// socket and then sends nothing (a slowloris) times out in `Request::parse`
+/// instead of pinning its worker thread and fd forever.
+pub(crate) const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Spawn a per-connection worker that can never take down the accept loop: a
+/// failed spawn (e.g. the OS thread limit under a connection flood) drops just
+/// this connection instead of panicking the accepting thread and exiting the
+/// process.
+pub(crate) fn spawn_worker<F: FnOnce() + Send + 'static>(f: F) {
+    let _ = thread::Builder::new().spawn(f);
+}
+
+/// Lock a mutex, tolerating poisoning: if a previous worker panicked while
+/// holding it, recover the guard rather than cascading the panic (which would
+/// otherwise zombify the whole server — accepting connections but answering
+/// none). Reads/writes after a recovered panic may see partial state, but the
+/// server stays available.
+pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ServerInner {
@@ -280,7 +305,7 @@ impl ServerInner {
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
         let enc = req.header("accept-encoding");
         let result = {
-            let mut db = self.db.lock().unwrap();
+            let mut db = locked(&self.db);
             db.query(&q)
         };
         match result {
@@ -319,7 +344,7 @@ impl ServerInner {
     }
 
     fn run_update(&self, u: &str) -> (u16, String, Vec<u8>) {
-        let mut db = self.db.lock().unwrap();
+        let mut db = locked(&self.db);
         match db.query(u) {
             Ok(QueryResult::Update { changed }) => (
                 200,
@@ -336,7 +361,7 @@ impl ServerInner {
     }
 
     fn status_json(&self) -> (u16, String, Vec<u8>) {
-        let db = self.db.lock().unwrap();
+        let db = locked(&self.db);
         let s = db.stats();
         let body = format!(
             "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
@@ -885,6 +910,19 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn locked_recovers_from_a_poisoned_mutex() {
+        // A worker that panics while holding a lock must not brick the server:
+        // locked() recovers the guard instead of cascading the panic.
+        let m = Mutex::new(5);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = m.lock().unwrap();
+            panic!("poison the mutex");
+        }));
+        assert!(m.is_poisoned());
+        assert_eq!(*locked(&m), 5, "locked() recovers a poisoned guard");
+    }
 
     const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n";
 

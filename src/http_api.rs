@@ -37,7 +37,6 @@ use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
@@ -45,8 +44,8 @@ use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::Triple;
 use crate::query::QueryResult;
 use crate::server::{
-    err_json, ntriples_body, parse_basic_auth, write_response_ext, write_response_maybe_gzip,
-    Request,
+    err_json, locked, ntriples_body, parse_basic_auth, spawn_worker, write_response_ext,
+    write_response_maybe_gzip, Request, CONN_READ_TIMEOUT,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 
@@ -314,8 +313,9 @@ impl ApiServer {
     /// workers.
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
             let inner = Arc::clone(&self.inner);
-            thread::spawn(move || {
+            spawn_worker(move || {
                 let _ = inner.handle(stream);
             });
         }
@@ -327,9 +327,10 @@ impl ApiServer {
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
         for stream in self.listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
-            thread::spawn(move || {
+            spawn_worker(move || {
                 if let Ok(conn) = rustls::ServerConnection::new(config) {
                     let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
                 }
@@ -355,7 +356,7 @@ impl ApiInner {
         // long) execution happens below with the `ApiState` lock released. The
         // log root is captured here so the access line can be written after.
         let (dispatch, user_disp, root) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = locked(&self.state);
             st.requests += 1;
             let root = st.root.clone();
             let user = self.resolve_user(&mut st, &req);
@@ -401,11 +402,11 @@ impl ApiInner {
     /// (the `ApiState` lock is free), then unregister the task.
     fn execute_query_job(&self, job: QueryJob) -> Resp {
         let result = {
-            let mut db = job.db.lock().unwrap();
+            let mut db = locked(&job.db);
             db.query_cancellable(&job.sparql, job.cancel)
         };
         // Drop the task from the registry under a short `ApiState` lock.
-        self.unregister_task(&mut self.state.lock().unwrap(), job.task_id);
+        self.unregister_task(&mut locked(&self.state), job.task_id);
         match result {
             Ok(result) => render_result(job.fmt, &result),
             Err(e) => Resp::new(
@@ -1536,7 +1537,6 @@ mod tests {
     // task registry (mirrors the pattern in tests/dt_http_parity.rs) --------
 
     use std::net::TcpStream;
-    use std::thread;
 
     /// A unique temp directory for one server's databases + logs + user store.
     fn tmp_root(tag: &str) -> PathBuf {
@@ -1554,7 +1554,7 @@ mod tests {
         let server = Arc::new(ApiServer::bind(&root, "root", "127.0.0.1:0").expect("bind"));
         let addr = server.local_addr().expect("addr");
         let s2 = Arc::clone(&server);
-        thread::spawn(move || s2.serve_forever());
+        std::thread::spawn(move || s2.serve_forever());
         (server, addr)
     }
 
@@ -1860,7 +1860,7 @@ mod tests {
         // Kick off the slow query on its own thread.
         let addr_q = addr;
         let root_q = root.clone();
-        let query_thread = thread::spawn(move || {
+        let query_thread = std::thread::spawn(move || {
             raw_request(
                 &addr_q,
                 "POST",

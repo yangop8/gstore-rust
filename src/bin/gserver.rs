@@ -68,6 +68,18 @@ fn main() {
                 i += 1;
                 tls_key = args.get(i).cloned();
             }
+            // Without the `tls` feature these flags are unknown; consume the
+            // flag AND its value with a clear message, so the value is not
+            // silently mistaken for the positional db_dir.
+            #[cfg(not(feature = "tls"))]
+            "--tls-cert" | "--tls-key" => {
+                eprintln!(
+                    "warning: {} ignored — gserver was built without the `tls` feature \
+                     (rebuild with `--features tls` to serve HTTPS)",
+                    args[i]
+                );
+                i += 1; // skip the flag's value
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: gserver [db_dir] [--api] [--rocksdb] [--password PW] [--port N] [--addr HOST]"
