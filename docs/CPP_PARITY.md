@@ -111,3 +111,17 @@
 > **仍属刻意偏离(不补)**:gRPC线格式、多语言客户端SDK(5种)、.so动态编译UDF(改用安全Rust函数注册表)、发行工程(Docker/RPM/DEB/loongarch)。**仍为深度/子集项**:RDFa/JSON-LD的完整1.1语义(现为common-subset)、gzip/异步/回调HTTP(手写DEFLATE性价比低,留feature)、内置HTTP服务多线程化(使在途查询的HTTP `/cancel` 可投递)。
 >
 > gAnswer侧:gNLQA 是**换代实现**(LLM Text-to-SPARQL 取代词典+子图匹配),非同款算法移植;能力对比见 `docs/NLQA_DESIGN.md`。
+>
+> 更新(2026-07-02,**深度/生产硬化批次** —— 4个worktree子agent并行 + 主线程集成):把此前列为"深度/子集项"的一档全部补齐(除刻意偏离项)。8项:
+> - **HTTP多线程化 + 并发`/cancel`**:`Server`/`ApiServer` 改 per-connection worker(`Arc`共享state),请求不再全程持state锁——在途查询运行时并发`POST /cancel`可投递并中止之(`concurrent_cancel_aborts_running_query`),协作式取消端到端闭环。
+> - **HTTP gzip**(feature `gzip`,`flate2` 纯Rust `miniz_oxide` 后端,默认关):按`Accept-Encoding`压缩缓冲响应;默认构建仍零依赖不压缩。
+> - **HTTPS/TLS**(feature `tls`,`rustls` ring后端 + `rustls-pemfile`,默认关):`serve_forever_tls`/`load_tls_config`,`gserver` cfg门控`--tls-cert/--tls-key`;`tls_https_round_trip` 真HTTPS往返。
+> - **StringIndex接查询规划**:`CONTAINS`/`STRSTARTS`/`STRENDS`(及无元字符`REGEX`)对 s/o 变量经字典trigram索引剪/播候选(sound超集,精确FILTER兜底),补齐 `kvstore::string_index` 的"wiring follow-up"。
+> - **集群副本容错生产级硬化**:per-shard N副本组(容忍 ⌊(N-1)/2⌋ 故障)+ 日志压缩快照 + InstallSnapshot式落后follower追赶 + 副本重入收敛。
+> - **out-of-core VS-tree内存路径**:统一签名过滤seam(内存树/磁盘流式树同实现),内存库也可走流式过滤;候选集与内存树逐一等价验证。
+> - **store按用途分块 + 度数API**:IVArray(定宽稠密)/ISArray(字符串键,新增)分化 + subject/object度数、pre2sub/pre2obj/pre2num、getSubjectPredicateDegree 维护式统计。
+> - **数值类型分层**:Int(i64)→BigInt(i128)→Decimal(精确mantissa×10⁻ˢᶜᵃˡᵉ)→Double(f64) 数值塔 + XPath类型提升;超i64整数与xsd:decimal的比较/排序/±× 精确(0.1+0.2==0.3、1.0==1.00),÷ 与含double走f64。
+> - 4个子agent各owns不相交文件集(server+http_api / cluster+rpc / signature / kvstore),我owns查询侧(StringIndex+数值塔),集成用整文件覆盖 + db/mod.rs按hunk合并,全部干净。
+> - 测试:默认workspace **689全过**;`--features rocksdb` 编译+lib全过;`--features gzip`/`tls` 各自编译+测试(含 `gzip_compresses_when_accepted`/`tls_https_round_trip`)+ clippy `--all-targets` 零告警(默认/gzip/tls/rocksdb 四组合)。
+>
+> **至此原"深度/子集项"仅剩**:RDFa/JSON-LD的完整1.1语义(仍common-subset);Decimal为i128界(非任意精度,刻意零依赖界)、÷与SUM走f64;StringIndex惰性按查询构建(未做持久化Database级索引)。**刻意偏离仍不补**:gRPC线格式、多语言客户端SDK、.so热加载UDF、发行工程。
