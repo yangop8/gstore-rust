@@ -218,6 +218,15 @@ fn resolve_gold(engine: &SolveEngine, q: &EvalQuestion, opts: &EvalOptions) -> O
     }
     if opts.resolve_gold_via_kb {
         if let Some(sq) = &q.gold_sparql {
+            // The gold query comes from a dataset file (possibly downloaded); never
+            // execute a mutating statement against the store while "resolving gold".
+            if crate::kb::validate_readonly_sparql(sq).is_err() {
+                eprintln!(
+                    "gnlqa: eval: skipping non-read-only gold query for question {:?}",
+                    q.id
+                );
+                return None;
+            }
             if let Ok(ans) = engine.kb().query(sq) {
                 // Extract gold the SAME way predictions are (answer_values: one
                 // bound cell per row, booleans as true/false) so pred and gold
@@ -422,6 +431,25 @@ mod tests {
         assert_eq!(report.evaluated, 0);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.macro_metrics.f1, 0.0); // not inflated
+    }
+
+    #[test]
+    fn mutating_gold_query_is_skipped_and_never_executed() {
+        use std::sync::Arc;
+        let llm = MockLlm::fixed("unused"); // ask never runs for a skipped question
+        let kb = Arc::new(MockKb::new(vec![SparqlAnswer::Boolean(true)]));
+        let engine = SolveEngine::new(Box::new(llm), Box::new(Arc::clone(&kb)));
+        let questions = vec![EvalQuestion {
+            id: "evil".into(),
+            question: "which x?".into(),
+            gold_answers: None,
+            gold_sparql: Some("DELETE WHERE { ?s ?p ?o }".into()),
+        }];
+        let report =
+            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.evaluated, 0);
+        assert_eq!(kb.query_count(), 0, "a mutating gold query must never reach the store");
     }
 
     #[test]

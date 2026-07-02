@@ -146,8 +146,21 @@ impl<'a> Session<'a> {
     }
 
     /// Like [`ask`](Self::ask) but constrains the answering path (see [`Mode`]).
+    ///
+    /// Data-egress: the follow-up rewrite is an LLM call. In [`Mode::Structured`]
+    /// — whose contract is that KB *result data* never leaves the machine — the
+    /// prior **answers** (KB values) are dropped from the history the rewriter
+    /// sees; only prior questions (already user-supplied) are sent. Other modes
+    /// already permit egress, so they keep the full history for better ellipsis
+    /// resolution.
     pub fn ask_with_mode(&mut self, question: &str, mode: Mode) -> Result<Answer> {
-        let standalone = self.engine.rewrite_followup_question(&self.history, question);
+        let standalone = if mode == Mode::Structured {
+            let redacted: Vec<(String, String)> =
+                self.history.iter().map(|(q, _)| (q.clone(), String::new())).collect();
+            self.engine.rewrite_followup_question(&redacted, question)
+        } else {
+            self.engine.rewrite_followup_question(&self.history, question)
+        };
         let answer = self.engine.ask_with_mode(&standalone, mode)?;
         self.history.push((standalone, summarize_answer(&answer)));
         self.trim_history();
@@ -280,6 +293,79 @@ mod tests {
         assert!(!sess.history()[1].0.is_empty());
         sess.clear();
         assert!(sess.is_empty());
+    }
+
+    /// Records every user prompt it sees and replies with queued responses in
+    /// order (empty once drained).
+    struct SeqRecLlm {
+        queue: Mutex<std::collections::VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+    impl SeqRecLlm {
+        fn new(responses: Vec<&str>) -> Arc<SeqRecLlm> {
+            Arc::new(SeqRecLlm {
+                queue: Mutex::new(responses.into_iter().map(String::from).collect()),
+                prompts: Mutex::new(Vec::new()),
+            })
+        }
+        fn saw(&self, needle: &str) -> bool {
+            self.prompts.lock().unwrap().iter().any(|p| p.contains(needle))
+        }
+    }
+    impl LlmClient for SeqRecLlm {
+        fn complete(&self, req: &LlmRequest) -> Result<String> {
+            if let Some(m) = req.messages.last() {
+                self.prompts.lock().unwrap().push(m.content.clone());
+            }
+            Ok(self.queue.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+
+    fn secret_kb() -> crate::kb::MockKb {
+        crate::kb::MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![vec![Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: "http://ex/SECRETVALUE".into(),
+                datatype: None,
+                lang: None,
+            })]],
+        }])
+    }
+
+    /// Two structured turns: the follow-up rewrite must NOT carry the prior KB
+    /// answer value off-box; contrast with Auto, which (by contract) may.
+    fn run_two_turns(mode: Mode) -> Arc<SeqRecLlm> {
+        // per turn: intent, generation; plus a rewrite call on turn 2.
+        let llm = SeqRecLlm::new(vec![
+            r#"{"qtype":"list"}"#,
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#,
+            "standalone follow-up?",
+            r#"{"qtype":"list"}"#,
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#,
+        ]);
+        let engine =
+            SolveEngine::new(Box::new(llm.clone()), Box::new(secret_kb())).with_citations(false);
+        let mut sess = Session::new(&engine);
+        let a1 = sess.ask_with_mode("who?", mode).unwrap();
+        assert!(a1.text.contains("SECRETVALUE"));
+        let _ = sess.ask_with_mode("and then?", mode).unwrap();
+        assert!(llm.saw("and then?"), "the rewrite step must have run on turn 2");
+        llm
+    }
+
+    #[test]
+    fn structured_mode_rewrite_omits_prior_answer_data() {
+        let llm = run_two_turns(Mode::Structured);
+        assert!(!llm.saw("SECRETVALUE"), "structured mode leaked a KB answer value to the LLM");
+    }
+
+    #[test]
+    fn auto_mode_rewrite_includes_prior_answer() {
+        // Contrast: confirms the redaction above is real (not that the value is
+        // simply never present). Auto permits egress, so it carries the answer.
+        let llm = run_two_turns(Mode::Auto);
+        assert!(llm.saw("SECRETVALUE"), "auto mode should fold the prior answer into the rewrite");
     }
 
     use std::sync::{Arc, Mutex};

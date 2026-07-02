@@ -6,6 +6,7 @@
 use crate::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::generate::generate_candidates;
 use crate::ground::{explain, gather_citations};
@@ -35,6 +36,10 @@ fn dedup(uris: Vec<String>) -> Vec<String> {
 }
 
 /// Solve every candidate (with repair) and return the highest-scoring outcome.
+/// A per-candidate query/repair failure is skipped (try the next), but a
+/// transport failure ([`Error::Http`] — the endpoint is unreachable) is fatal and
+/// propagated so the caller reports the outage instead of masking it as "no
+/// candidate produced an answer".
 #[allow(clippy::too_many_arguments)]
 pub fn best_of(
     llm: &dyn LlmClient,
@@ -45,37 +50,54 @@ pub fn best_of(
     candidates: &[String],
     max_rounds: usize,
     model: Option<&str>,
-) -> Option<RepairOutcome> {
+) -> Result<Option<RepairOutcome>> {
     let mut best: Option<(RepairOutcome, f32)> = None;
     for c in candidates {
-        if let Ok(o) = solve_with_repair(llm, kb, question, links, schema, c, max_rounds, model) {
-            let s = score_outcome(&o);
-            if best.as_ref().is_none_or(|(_, bs)| s > *bs) {
-                best = Some((o, s));
+        match solve_with_repair(llm, kb, question, links, schema, c, max_rounds, model) {
+            Ok(o) => {
+                let s = score_outcome(&o);
+                if best.as_ref().is_none_or(|(_, bs)| s > *bs) {
+                    best = Some((o, s));
+                }
             }
+            // Endpoint unreachable — no point trying the remaining candidates.
+            Err(e @ Error::Http(_)) => return Err(e),
+            // Invalid/unanswerable for this candidate — try the next one.
+            Err(_) => {}
         }
     }
-    best.map(|(o, _)| o)
+    Ok(best.map(|(o, _)| o))
 }
 
 /// A small bounded answer cache (FIFO eviction). gNLQA does not mutate the KB,
-/// but the KB may change externally, so caching is opt-in and staleness-bounded.
+/// but the KB may change externally, so entries can carry a TTL (staleness bound)
+/// and the whole cache can be cleared (e.g. on a chat `:reset`).
 struct Cache {
     cap: usize,
-    map: HashMap<String, Answer>,
+    /// Optional entry lifetime; `None` = no expiry (bounded only by capacity).
+    ttl: Option<Duration>,
+    map: HashMap<String, (Answer, Instant)>,
     order: VecDeque<String>,
 }
 
 impl Cache {
     fn new(cap: usize) -> Cache {
-        Cache { cap: cap.max(1), map: HashMap::new(), order: VecDeque::new() }
+        Cache { cap: cap.max(1), ttl: None, map: HashMap::new(), order: VecDeque::new() }
     }
     fn get(&self, k: &str) -> Option<Answer> {
-        self.map.get(k).cloned()
+        let (v, at) = self.map.get(k)?;
+        // Expired entries are treated as a miss (and refreshed on the next `put`),
+        // so a long-running server doesn't serve pre-update answers forever.
+        if let Some(ttl) = self.ttl {
+            if at.elapsed() > ttl {
+                return None;
+            }
+        }
+        Some(v.clone())
     }
     fn put(&mut self, k: String, v: Answer) {
-        if self.map.insert(k.clone(), v).is_some() {
-            return; // already present, order unchanged
+        if self.map.insert(k.clone(), (v, Instant::now())).is_some() {
+            return; // already present, order unchanged (value/timestamp refreshed)
         }
         self.order.push_back(k);
         while self.map.len() > self.cap {
@@ -83,6 +105,10 @@ impl Cache {
                 self.map.remove(&old);
             }
         }
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 }
 
@@ -144,6 +170,9 @@ pub struct SolveEngine {
     analytics: bool,
     analytics_cfg: crate::analytics::AnalyticsCfg,
     progress: bool,
+    /// The mode used by [`ask`](Self::ask) (and every server surface that calls
+    /// it: HTTP `/ask`, `/gSolve`, MCP `ask_kg`). Defaults to [`Mode::Auto`].
+    default_mode: Mode,
 }
 
 /// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
@@ -175,6 +204,7 @@ impl SolveEngine {
             analytics: true,
             analytics_cfg: crate::analytics::AnalyticsCfg::default(),
             progress: false,
+            default_mode: Mode::Auto,
         }
     }
     /// Emit short stage logs to stderr (what's executing: model vs gStore), so an
@@ -224,6 +254,31 @@ impl SolveEngine {
         self
     }
 
+    /// Give cached answers a time-to-live in seconds (0 = no expiry). Bounds
+    /// staleness when the KB can change under a long-running server.
+    pub fn with_cache_ttl(self, secs: u64) -> SolveEngine {
+        if secs > 0 {
+            if let Some(c) = &self.cache {
+                c.lock().unwrap_or_else(|e| e.into_inner()).ttl = Some(Duration::from_secs(secs));
+            }
+        }
+        self
+    }
+
+    /// The default answering mode for [`ask`](Self::ask) (and the server surfaces
+    /// that call it). See [`Mode`].
+    pub fn with_mode(mut self, mode: Mode) -> SolveEngine {
+        self.default_mode = mode;
+        self
+    }
+
+    /// Drop all cached answers (e.g. on a chat `:reset`, or after the KB changed).
+    pub fn clear_cache(&self) {
+        if let Some(c) = &self.cache {
+            c.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
     /// Pick the model for generation/repair based on question difficulty.
     fn route_model(&self, intent: &QuestionIntent) -> Option<String> {
         let hard = matches!(intent.qtype, QType::Analytics | QType::Path | QType::Compare | QType::Open);
@@ -245,6 +300,11 @@ impl SolveEngine {
         self
     }
     /// Have the LLM phrase a grounded natural-language answer (default off).
+    ///
+    /// Data-egress note: enabling this sends the answer's supporting **KB triples**
+    /// to the LLM (to phrase the explanation), even on the structured path whose
+    /// provenance is [`Provenance::GStore`](crate::pipeline::Provenance::GStore).
+    /// Leave it off if the structured "result data stays local" guarantee matters.
     pub fn with_explain(mut self, on: bool) -> SolveEngine {
         self.explain = on;
         self
@@ -288,9 +348,11 @@ impl SolveEngine {
         self.analytics_cfg
     }
 
-    /// Answer a question end-to-end in [`Mode::Auto`] (cache-aware).
+    /// Answer a question end-to-end in the engine's [`default_mode`](Self::with_mode)
+    /// (cache-aware). Used by every server surface (HTTP `/ask`, `/gSolve`, MCP
+    /// `ask_kg`), so `GNLQA_MODE` applies there too — not just in `chat`.
     pub fn ask(&self, question: &str) -> Result<Answer> {
-        self.ask_with_mode(question, Mode::Auto)
+        self.ask_with_mode(question, self.default_mode)
     }
 
     /// Answer a question, constraining which path(s) are allowed (cache-aware).
@@ -354,6 +416,11 @@ impl SolveEngine {
         let mut links = String::new();
         let mut ent_uris = Vec::new();
         let mut pred_uris = Vec::new();
+        // One endpoint per DISTINCT mention (its top-1 entity/type candidate), used
+        // for analytics shortest-path so the two endpoints are two different
+        // mentions — not two disambiguation candidates of the same one (which the
+        // flat `ent_uris` list would make seeds[0]/seeds[1] on a link_k > 1 run).
+        let mut analytics_seeds: Vec<String> = Vec::new();
         if let Some(linker) = &self.linker {
             for m in &intent.mentions {
                 let cands = linker.link_mention(m, self.link_k)?;
@@ -361,6 +428,14 @@ impl SolveEngine {
                     links.push_str(&format!("{:?} '{}' -> ", m.kind, m.text));
                     links.push_str(&cands.iter().map(|c| c.to_term()).collect::<Vec<_>>().join(", "));
                     links.push('\n');
+                }
+                if let Some(rep) = cands
+                    .iter()
+                    .find(|c| matches!(c.kind, LinkKind::Entity | LinkKind::Type) && !c.uri.is_empty())
+                {
+                    if !analytics_seeds.contains(&rep.uri) {
+                        analytics_seeds.push(rep.uri.clone());
+                    }
                 }
                 for c in cands {
                     match c.kind {
@@ -392,6 +467,12 @@ impl SolveEngine {
         // GraphRag mode: skip Text-to-SPARQL entirely — retrieve a private
         // subgraph and let the LLM answer from it (abstain if it can't).
         if mode == Mode::GraphRag {
+            // Honor the abstain policy: a fixed-confidence RAG answer that couldn't
+            // clear the threshold must be withheld here too (as the Auto-mode
+            // fallback and the structured path already do), not returned unabstained.
+            if RAG_CONFIDENCE < self.abstain_below {
+                return Ok(self.abstain_answer(&lang, None, RAG_CONFIDENCE));
+            }
             self.note("retrieving subgraph & composing answer… (gStore + model)");
             if !ent_uris.is_empty() {
                 if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
@@ -414,7 +495,7 @@ impl SolveEngine {
             match crate::analytics::run_analytics(
                 self.kb.as_ref(),
                 question,
-                &ent_uris,
+                &analytics_seeds,
                 self.analytics_cfg,
             ) {
                 Ok(res) => {
@@ -458,6 +539,8 @@ impl SolveEngine {
         let candidates =
             generate_candidates(self.llm.as_ref(), question, &links, &schema, self.candidates, model)?;
         self.note("querying gStore…");
+        // `?` propagates a transport outage (endpoint unreachable) as a real error
+        // instead of letting it look like "no candidate produced an answer".
         let best = best_of(
             self.llm.as_ref(),
             self.kb.as_ref(),
@@ -467,7 +550,7 @@ impl SolveEngine {
             &candidates,
             self.max_rounds,
             model,
-        );
+        )?;
 
         // GraphRAG fallback: when the structured path produced no non-empty
         // answer, retrieve a subgraph around the linked entities and let the LLM
@@ -644,9 +727,102 @@ mod tests {
             "SELECT ?x WHERE { ?x <http://ex/p1> ?o }".to_string(),
             "SELECT ?x WHERE { ?x <http://ex/p2> ?o }".to_string(),
         ];
-        let best = best_of(&llm, &kb, "q", "", "", &cands, 0, None).unwrap();
+        let best = best_of(&llm, &kb, "q", "", "", &cands, 0, None).unwrap().unwrap();
         assert!(!is_empty_answer(&best.answer));
         assert!(best.sparql.contains("p2"));
+    }
+
+    /// A KB whose every query fails with a transport error (endpoint unreachable).
+    struct DeadKb;
+    impl KbClient for DeadKb {
+        fn query(&self, _sparql: &str) -> Result<SparqlAnswer> {
+            Err(Error::Http("gStore endpoint unreachable: Connection refused".into()))
+        }
+    }
+
+    #[test]
+    fn best_of_propagates_transport_outage_without_repair_storm() {
+        use std::sync::Arc;
+        let llm = Arc::new(MockLlm::fixed("SELECT ?x WHERE { ?x <http://ex/p> ?o }"));
+        let cands = vec!["SELECT ?x WHERE { ?x <http://ex/p> ?o }".to_string()];
+        // A dead endpoint must surface as Err(Http), not None, and must NOT burn
+        // repair LLM calls trying to "fix" a query against a dead socket.
+        let err = best_of(&Arc::clone(&llm), &DeadKb, "q", "", "", &cands, 3, None).unwrap_err();
+        assert!(matches!(err, Error::Http(_)));
+        assert_eq!(llm.call_count(), 0, "no repair calls against an unreachable endpoint");
+    }
+
+    #[test]
+    fn ask_reports_endpoint_outage_instead_of_no_answer() {
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]);
+        let engine = SolveEngine::new(Box::new(llm), Box::new(DeadKb));
+        let err = engine.ask("which x?").unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "outage must propagate, got {err:?}");
+    }
+
+    #[test]
+    fn graphrag_mode_respects_abstain_threshold() {
+        use crate::embed::HashEmbedder;
+        use crate::link::Linker;
+        let linker = Linker::from_labels(
+            Box::new(HashEmbedder::new(64)),
+            &[("http://ex/Alien".to_string(), "Alien".to_string())],
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        // Explicit graphrag mode + abstain_below above RAG_CONFIDENCE (0.5): the
+        // fixed-confidence RAG answer must be withheld (the LLM must not be called).
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"open","mentions":[{"text":"Alien","kind":"entity"}]}"#.to_string(),
+            "SHOULD NOT BE CALLED — RAG must abstain first".to_string(),
+        ]);
+        let kb = MockKb::new(vec![nonempty()]);
+        let a = SolveEngine::new(Box::new(llm), Box::new(kb))
+            .with_linker(linker)
+            .with_abstain_below(0.7)
+            .ask_with_mode("tell me about Alien", Mode::GraphRag)
+            .unwrap();
+        assert!(a.abstained, "sub-threshold graphrag answer must abstain");
+    }
+
+    #[test]
+    fn clear_cache_forces_recompute() {
+        use std::sync::Arc;
+        let llm = Arc::new(MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+            // second full solve after the cache is cleared
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]));
+        let kb = MockKb::new(vec![nonempty()]);
+        let engine = SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(kb))
+            .with_citations(false)
+            .with_cache(8);
+        let _ = engine.ask("q").unwrap();
+        assert_eq!(llm.call_count(), 2);
+        let _ = engine.ask("q").unwrap(); // cached — no new calls
+        assert_eq!(llm.call_count(), 2);
+        engine.clear_cache();
+        let _ = engine.ask("q").unwrap(); // recomputed after clear
+        assert_eq!(llm.call_count(), 4);
+    }
+
+    #[test]
+    fn default_mode_applies_to_ask() {
+        // ask() honors the engine default mode: Open answers from the LLM, no KB.
+        let llm = MockLlm::fixed("SPARQL is a query language for RDF.");
+        let kb = MockKb::new(vec![]);
+        let a = SolveEngine::new(Box::new(llm), Box::new(kb))
+            .with_mode(Mode::Open)
+            .ask("what is SPARQL?")
+            .unwrap();
+        assert_eq!(a.provenance, Provenance::Llm);
     }
 
     #[test]

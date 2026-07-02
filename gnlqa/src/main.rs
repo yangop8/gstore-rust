@@ -19,9 +19,10 @@ use gnlqa::{
     HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session, SolveEngine,
 };
 
-/// Build the engine. `progress` turns on stage logging (for interactive use;
-/// off for serve/mcp/eval).
-fn build_engine(cfg: &Config, progress: bool) -> SolveEngine {
+/// Build the engine. `mode` is the default answering mode (so `GNLQA_MODE` applies
+/// on every surface, not just chat); `progress` turns on stage logging (for
+/// interactive use; off for serve/mcp/eval).
+fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
     // The KB client is always available; the LLM client errors at call time if
     // no API key is set, so build it leniently here. Pick the backend by provider.
     let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
@@ -32,7 +33,8 @@ fn build_engine(cfg: &Config, progress: bool) -> SolveEngine {
                 cfg.openai_base_url.clone(),
                 cfg.model.clone(),
             )
-            .with_timeout(timeout),
+            .with_timeout(timeout)
+            .with_max_tokens(cfg.max_tokens),
         )
     } else {
         Box::new(
@@ -41,7 +43,8 @@ fn build_engine(cfg: &Config, progress: bool) -> SolveEngine {
                 cfg.anthropic_base_url.clone(),
                 cfg.model.clone(),
             )
-            .with_timeout(timeout),
+            .with_timeout(timeout)
+            .with_max_tokens(cfg.max_tokens),
         )
     };
     // Build a linker from the KB so generation is grounded in the store's ACTUAL
@@ -59,7 +62,9 @@ fn build_engine(cfg: &Config, progress: bool) -> SolveEngine {
     let mut engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
         .with_model(cfg.model.clone())
         .with_fast_model(cfg.fast_model.clone())
-        .with_cache(256)
+        .with_mode(mode)
+        .with_cache(cfg.cache_capacity)
+        .with_cache_ttl(cfg.cache_ttl_secs)
         .with_progress(progress);
     if let Some(l) = linker {
         engine = engine.with_linker(l);
@@ -79,12 +84,21 @@ fn print_answer(a: &gnlqa::Answer) {
         a.confidence,
         if a.abstained { "  [abstained]" } else { "" },
     );
+    if !a.citations.is_empty() {
+        eprintln!("[citations] {} supporting triple(s):", a.citations.len());
+        for c in a.citations.iter().take(5) {
+            eprintln!("  {} {} {}", c.subject, c.predicate, c.object);
+        }
+        if a.citations.len() > 5 {
+            eprintln!("  … ({} more)", a.citations.len() - 5);
+        }
+    }
 }
 
 /// Interactive multi-turn REPL. Commands: `/mode <auto|structured|graphrag|open>`,
 /// `:reset` (new topic), `:quit`/`:q`/EOF (exit).
 fn run_chat(cfg: &Config, mut mode: Mode) {
-    let engine = build_engine(cfg, true);
+    let engine = build_engine(cfg, mode, true);
     let mut sess = Session::new(&engine);
     eprintln!("gNLQA chat — ask a question; /mode <auto|structured|graphrag|open> to switch,");
     eprintln!("            :reset to clear context, :quit to exit. (mode: {})", mode.name());
@@ -115,6 +129,7 @@ fn run_chat(cfg: &Config, mut mode: Mode) {
             ":quit" | ":q" | ":exit" => break,
             ":reset" => {
                 sess.clear();
+                engine.clear_cache(); // a fresh topic shouldn't replay cached answers
                 eprintln!("(context cleared)");
                 continue;
             }
@@ -169,7 +184,7 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
             std::process::exit(1);
         }
     };
-    let engine = build_engine(cfg, false);
+    let engine = build_engine(cfg, Mode::Auto, false);
     let opts = EvalOptions { limit: None, resolve_gold_via_kb };
     let report = run_eval(&engine, &questions, &opts);
     println!("{}", report.summary());
@@ -205,14 +220,14 @@ fn main() {
         }
         Some("chat") => run_chat(&cfg, mode),
         Some("mcp") => {
-            let engine = Arc::new(build_engine(&cfg, false));
+            let engine = Arc::new(build_engine(&cfg, mode, false));
             eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
             McpServer::new(engine).serve_stdio();
         }
         Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
             let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9100".to_string());
-            let engine = Arc::new(build_engine(&cfg, false));
+            let engine = Arc::new(build_engine(&cfg, mode, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {
                     eprintln!("gNLQA serving on http://{addr}  (POST /ask, /gSolve; GET /health)");
@@ -226,7 +241,7 @@ fn main() {
         }
         Some(_) => {
             let question = args.join(" ");
-            let engine = build_engine(&cfg, true);
+            let engine = build_engine(&cfg, mode, true);
             match engine.ask_with_mode(&question, mode) {
                 Ok(a) => print_answer(&a),
                 Err(e) => {

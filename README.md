@@ -62,8 +62,10 @@ cargo run -q -p gnlqa -- chat                             # interactive, multi-t
 ```
 
 `gnlqa.conf` holds your key and is git-ignored; only the fake `gnlqa.conf.example`
-is committed. To use Claude instead, set `GNLQA_LLM_PROVIDER=anthropic` +
-`ANTHROPIC_API_KEY`. Full details: **[`gnlqa/README.md`](gnlqa/README.md)**.
+is committed. To use Claude instead, switch the whole backend block in
+`gnlqa.conf` — `GNLQA_LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`, **and** the
+model names (`GNLQA_MODEL`/`GNLQA_FAST_MODEL`), since the example pins DeepSeek
+models. Full details: **[`gnlqa/README.md`](gnlqa/README.md)**.
 
 ### Answering modes & privacy
 
@@ -71,12 +73,18 @@ Because gStore is often used to keep **private data local**, every gNLQA answer 
 tagged with where it came from — a *data-egress* signal, not just attribution —
 and you choose which paths are allowed (`GNLQA_MODE`, or `/mode` in chat):
 
-| Mode | Path | Data leaves the box? | Provenance |
+| Mode | Path | Does result data leave the box? | Provenance |
 |------|------|----------------------|------------|
 | `auto` (default) | structured SPARQL → GraphRAG fallback; never pure LLM | only on the GraphRAG fallback | `gStore` / `GraphRAG` |
-| `structured` | SPARQL / analytics only; abstain otherwise | **no** — result computed locally | `gStore` |
+| `structured` | SPARQL / analytics only; abstain otherwise | **no** — the answer rows stay local | `gStore` |
 | `graphrag` | retrieve a private subgraph → LLM answers from it | yes (triples sent to the LLM) | `GraphRAG` |
 | `open` | LLM general knowledge; ignore the KB | no KB data involved | `LLM` |
+
+In every mode the LLM sees the question (and, to build a query, the linked
+entity/predicate URIs, their labels, and small schema samples). The distinction
+above is about the **answer data** — the result rows/triples: `structured` keeps
+them local, `graphrag` sends a retrieved subgraph, `open` uses no KB at all.
+`GNLQA_MODE` applies on every surface (CLI, chat, `serve`, `mcp`).
 
 A SPARQL-generation *failure* is never silently answered from LLM world-knowledge
 (that risks confident hallucination on private-data questions) — LLM-direct only

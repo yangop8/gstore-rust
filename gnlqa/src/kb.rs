@@ -233,10 +233,15 @@ impl GStoreClient {
             req = req.set("Authorization", auth.expose());
         }
         let resp = req.send_string(sparql).map_err(|e| match e {
+            // An HTTP status (4xx/5xx) is a *query/server* error — repairable, so
+            // keep it as `GStore`. A transport failure (connection refused, DNS,
+            // TLS, timeout) means the endpoint is unreachable — a distinct
+            // `Http` error so callers can fail fast instead of "repairing" a dead
+            // socket (see solve::best_of / repair::solve_with_repair).
             ureq::Error::Status(code, r) => {
                 Error::GStore(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
             }
-            other => Error::GStore(other.to_string()),
+            other => Error::Http(format!("gStore endpoint unreachable: {other}")),
         })?;
         // SELECT/ASK come back as Results JSON; CONSTRUCT/DESCRIBE as an RDF
         // graph (N-Triples). Branch on the content type so a graph response is

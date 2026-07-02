@@ -131,20 +131,26 @@ impl McpServer {
     }
 
     fn tools_call(&self, id: &Value, params: Option<&Value>) -> String {
-        let Some(params) = params else {
-            return err_response(id, -32602, "missing params");
+        // Protocol faults (invalid params, unknown tool) are JSON-RPC -32602 per
+        // the MCP spec — not isError tool results (which are reserved for failures
+        // *inside* a correctly-invoked tool, so a client can tell an integration
+        // bug from a runtime tool error).
+        let Some(params) = params.filter(|p| p.is_object()) else {
+            return err_response(id, -32602, "invalid params: expected an object with a 'name'");
         };
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return err_response(id, -32602, "invalid params: missing tool 'name'");
+        };
         let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let result = match name {
             "ask_kg" => self.tool_ask_kg(&args),
             "run_sparql" => self.tool_run_sparql(&args),
             "link_entity" => self.tool_link_entity(&args),
             "graph_analytics" => self.tool_graph_analytics(&args),
-            other => Err(format!("unknown tool: {other}")),
+            other => return err_response(id, -32602, &format!("unknown tool: {other}")),
         };
-        // MCP convention: tool-level failures are a normal result with isError,
-        // not a JSON-RPC error (which is reserved for protocol faults).
+        // Tool-level failures (bad arguments, engine/KB errors) are a normal result
+        // with isError, so the calling model sees the message as tool output.
         match result {
             Ok(text) => ok_response(id, tool_content(&text, false)),
             Err(e) => ok_response(id, tool_content(&e, true)),
@@ -163,11 +169,21 @@ impl McpServer {
         if a.abstained {
             out.push_str(" [abstained]");
         }
+        if !a.citations.is_empty() {
+            out.push_str(&format!("\n[citations] {} supporting triple(s):", a.citations.len()));
+            for c in a.citations.iter().take(10) {
+                out.push_str(&format!("\n  {} {} {}", c.subject, c.predicate, c.object));
+            }
+        }
         Ok(out)
     }
 
     fn tool_run_sparql(&self, args: &Value) -> Result<String, String> {
         let q = str_arg(args, "query")?;
+        // The query text comes straight from an (untrusted, prompt-injectable) MCP
+        // client, so enforce the SAME read-only gate every generated-query path
+        // uses — an UPDATE/DELETE/LOAD/DROP must never reach the store.
+        crate::kb::validate_readonly_sparql(q).map_err(|e| e.to_string())?;
         let ans = self.engine.kb().query(q).map_err(|e| e.to_string())?;
         Ok(render_sparql_answer(&ans))
     }
@@ -230,10 +246,10 @@ fn tools_list() -> Value {
             },
             {
                 "name": "run_sparql",
-                "description": "Execute a raw SPARQL query against the graph store and return the results.",
+                "description": "Execute a read-only SPARQL query (SELECT/ASK only) against the graph store and return the results. Mutating operations (UPDATE/INSERT/DELETE/DROP/LOAD) are rejected.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "query": { "type": "string", "description": "A SPARQL 1.1 query." } },
+                    "properties": { "query": { "type": "string", "description": "A read-only SPARQL 1.1 query (SELECT or ASK)." } },
                     "required": ["query"]
                 }
             },
@@ -390,11 +406,32 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_is_tool_error() {
+    fn unknown_tool_is_protocol_error() {
+        // MCP spec: an unknown tool name is a protocol fault (JSON-RPC -32602),
+        // not an isError tool result.
         let srv = McpServer::new(engine());
         let req = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#;
         let v = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn non_object_params_is_protocol_error() {
+        let srv = McpServer::new(engine());
+        let req = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":5}"#;
+        let v = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn run_sparql_rejects_update() {
+        // A mutating query from an MCP client must be refused before it reaches the
+        // store (read-only gate), surfaced as an isError tool result.
+        let srv = McpServer::new(engine());
+        let req = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_sparql","arguments":{"query":"DELETE WHERE { ?s ?p ?o }"}}}"#;
+        let v = parse(&srv.handle_message(req).unwrap());
         assert_eq!(v["result"]["isError"], true);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().to_lowercase().contains("read-only"));
     }
 
     #[test]

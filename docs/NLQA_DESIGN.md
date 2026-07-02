@@ -111,6 +111,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 - 提供 "SPARQL 可见"(把生成的查询返回给用户,可解释、可审计)。
 
 ### 4.6 GraphRAG 兜底(④c)与图分析路由(④b)
+> 实现现状见 §12.8:分析实际是"边采样 + 进程内 GraphView",并非下推 SPARQL 函数。
 - **图分析型问题**(最短路、中心性、社区、可达性)→ 路由到 gStore 图分析(已实现 `SHORTESTPATHLEN/KHOPREACHABLE/PageRank/top-k 子图`,且已接入 SPARQL 函数),而非硬塞 SPARQL。
 - **SPARQL 难以表达/开放型问题** → 用 gStore 以链接实体为中心做 k-hop 子图取回(BFS/analytics),把子图三元组喂给 LLM 自由作答(带引用)。这是经典 KBQA 覆盖不到的长尾。
 
@@ -122,7 +123,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 2. **答案解释与引用**:每个答案附支撑三元组与生成的 SPARQL(可审计、抗幻觉)。
 3. **混合检索**:SPARQL(精确)+ GraphRAG(长尾)+ 图分析(结构型)三路由,覆盖面远超纯子图匹配。
 4. **多语言**:LLM 原生多语言,去掉英文限定与语言相关的拆分启发式。
-5. **置信度与拒答**:无高分有效候选时显式"不确定/拒答",而非强行返回(gAnswer 总会给一个嵌入类型三元组的答案)。
+5. **置信度与拒答**:无高分有效候选时显式"不确定/拒答",而非强行返回(gAnswer 总会给一个嵌入类型三元组的答案)。(实现现状见 §12.7:拒答基于置信度阈值,默认阈值 0.0 = 不拒答,需显式配置。)
 6. **图分析型问题**:把 gStore 的图算法能力暴露为自然语言可问(gAnswer 无)。
 7. **自动评测闭环**:内建 QALD-9/10、LC-QuAD 2.0、WebQSP、GrailQA 评测,指标 P/R/F1、执行准确率、引用正确率(gAnswer 仅离线评测)。
 8. **零人工词典 / 自适应新 schema**:向量链接 + 自有 parser 校验,接入新数据集无需重建释义词典与 fragment(gAnswer 需 ~10h、20GB)。
@@ -147,6 +148,8 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 
 ## 7. 对外 API
 
+> 本节是设计草案里的**目标** API;**实现现状以 §12.6 为准**(字段/端点有出入)。
+
 ### 7.1 gNLQA 原生
 - `POST /ask` `{question, lang?, session_id?, top_k?, explain?}` → `{answer, citations:[{triple, uri}], sparql, confidence, candidates?, latency_ms}`
 - `POST /ask/stream`(SSE 流式答案)
@@ -163,7 +166,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 
 | 风险 | 对策 |
 |---|---|
-| LLM 幻觉(编造实体/谓语/答案) | 强制 schema-grounded 生成 + 自有 parser 校验 + gStore 执行验证 + 答案必须有支撑三元组引用,否则拒答 |
+| LLM 幻觉(编造实体/谓语/答案) | 强制 schema-grounded 生成 + 自有 parser 校验 + gStore 执行验证 + 答案附支撑三元组引用(**实现现状见 §12.7**:引用是尽力接地而非硬性拒答门槛,拒答基于置信度阈值且默认关闭) |
 | 生成 SPARQL 无效/语义错 | parser 即时校验 + 自我修复回路(报错回灌)+ 多候选择优 |
 | 实体/谓语链接召回不足 | 向量检索 + 别名表 + 释义先验 + gStore 模糊回查(StringIndex 子串/前缀,待接线) |
 | 延迟/成本(多次 LLM 调用) | 路由分级(简单问题走 Sonnet 单次)、候选数自适应、SPARQL/答案缓存(gStore QueryCache + 编排器缓存)、schema 上下文裁剪 |
@@ -271,20 +274,36 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 ### 12.2 Provenance(答案来源)——数据出域边界,而不只是署名
 每个答案带一个 `Provenance` 标签,三档正好对齐"隐私 + 可信度":
 
-- **`gStore`**:结构化 SPARQL / 图分析,本地计算,**底层数据从未离开本机**(只有问题 + schema 发给 LLM)。
+- **`gStore`**:结构化 SPARQL / 图分析,本地计算,**答案数据(结果行/三元组)从未离开本机**。精确地说:为了*生成* SPARQL,发给 LLM 的是问题 + 链接到的实体/谓语 URI 及其 label + 少量 schema 采样,但**不含答案行**。(`with_explain` 开启时会把答案的支撑三元组也发给 LLM 来措辞解释,默认关闭。)
 - **`gStore+LLM (GraphRAG)`**:答案由 LLM 从 gStore 取回的**私域三元组**综合而来(这些三元组发给了 LLM)。
 - **`LLM`**:LLM 用自身世界知识作答,**不涉及任何 KB 数据**。
 
-CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 附带来源。这让"用本地存储保护私域数据"的初衷有了**可观测、可审计**的边界。
+CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 附带来源。这让"用本地存储保护私域数据"的初衷有了**可观测、可审计**的边界。多轮改写:`structured` 模式下 follow-up 改写(一次 LLM 调用)会**剔除历史里的答案文本**(只带历史问题),以免把上一轮的 KB 结果值带出域。
 
 ### 12.3 可插拔 LLM 后端(§6 技术选型的落地)
 `LlmClient` trait 之下现有两个实现:`AnthropicClient`(Claude Messages API)与 `OpenAiClient`(OpenAI 兼容 `/chat/completions`,适配 OpenAI / **DeepSeek** / Together / 本地 vLLM 等)。经 `GNLQA_LLM_PROVIDER` 选择;推荐/默认后端为 DeepSeek(OpenAI 兼容)。注意点:推理型模型(如 `deepseek-v4-pro`)会先花 completion token 做隐藏推理再产出可见答案,故 `OpenAiClient` 对 `max_tokens` 设了下限(`MIN_MAX_TOKENS`)以免答案为空。
 
 ### 12.4 配置文件与容错
-- **配置文件** `gnlqa.conf`(`KEY=VALUE`,路径可用 `GNLQA_CONFIG` 覆盖;env 优先于文件)让配置一次落盘、无需每次 export。仓库只提交假的 `gnlqa.conf.example`,真实 `gnlqa.conf`(含 key)被 gitignore。
-- **异常兜底**:`GNLQA_LLM_PROVIDER` 规范化(trim/小写/别名),未知值**告警并回退** anthropic;`GNLQA_MODE` 未知值告警回退 auto;空配置值按缺失处理→用默认;不可解析的数值告警回退默认;缺 key 启动告警 + 调用时优雅 `Err`;KB 启动不可达则降级为无 linker;推理模型空 content 视为失败以便降级。
+- **配置文件** `gnlqa.conf`(`KEY=VALUE`,路径可用 `GNLQA_CONFIG` 覆盖;env 优先于文件)让配置一次落盘、无需每次 export。仓库只提交假的 `gnlqa.conf.example`,真实 `gnlqa.conf`(含 key)被 gitignore。启动时会向 stderr 打印**实际加载了哪个配置文件**——从当前目录拾取的 `gnlqa.conf` 可能来自不受信任的 checkout(可改写 `OPENAI_BASE_URL`/`GSTORE_ENDPOINT` 从而窃取 key 或改变出域),因此不再静默;用 `GNLQA_CONFIG` 钉一个可信路径可避免 CWD 拾取。
+- **缓存旋钮**:`GNLQA_CACHE`(容量,0 关闭)与 `GNLQA_CACHE_TTL_SECS`(条目 TTL,0 不过期)。长时间运行的 serve/mcp 若 KB 会被外部改动,设 TTL 可限定陈旧;chat 的 `:reset` 也会清空引擎缓存。
+- **token 下限**:`GNLQA_MAX_TOKENS` 作为每次请求的 `max_tokens` **下限**接到两个后端(OpenAI 兼容后端不低于 `MIN_MAX_TOKENS`),给推理型模型足够预算以免答案为空。
+- **异常兜底**:`GNLQA_LLM_PROVIDER` 规范化(trim/小写/别名),未知值**告警并回退** anthropic;`GNLQA_MODE` 未知值告警回退 auto;**空/空白配置值按缺失处理**(包括设为空串的环境变量,不会遮蔽文件里的有效值);不可解析的数值告警回退默认;缺 key 启动告警 + 调用时优雅 `Err`;KB 启动不可达则降级为无 linker;推理模型空 content 视为失败以便降级;**KB 中途不可达**(传输层错误)会快速失败并把"endpoint unreachable"透传给调用方,而不是伪装成"无候选产生答案"或空烧修复轮次。
 
 ### 12.5 进度日志
 交互式(CLI 单问 / chat)默认开启阶段日志(stderr),明确当前在"问模型"还是"查 gStore"(`understanding…(model)` / `gathering schema…(gStore)` / `generating SPARQL…(model)` / `querying gStore…` …),给用户一个显式的等待目标;serve/mcp/eval 默认关闭。
 
-> 落地映射见 `gnlqa/src/{solve,pipeline,config,llm/openai,session,mcp,http_server,main}.rs`;评测 harness 见 `gnlqa/src/eval.rs`(QALD/LC-QuAD + P/R/F1)。
+### 12.6 对外 API 现状(修正 §7.1)
+§7.1 是设计草案里的**目标** API;当前实现的实际契约以此处为准:
+- `POST /ask` `{question}` → `{answer, explanation, sparql, values, citations, confidence, abstained, rounds, provenance}`。`citations` 是 `{subject, predicate, object}` 数组(引擎本就计算,现已在 HTTP/CLI/MCP 三个出口都暴露)。**尚未实现**:`lang`/`session_id`/`top_k`/`explain` 请求字段、`latency_ms`/`candidates` 响应字段、`/ask/stream`(SSE)、`GET /info`/`GET /gInfo`。
+- `POST /gSolve` `{question}` → gAnswer 兼容子集 `{status, question, sparql, answers, confidence}`(`status` 为 `ok`/`abstained`/`error`)。
+- `GET /health` → `{"status":"ok"}`。
+- MCP:`ask_kg`/`run_sparql`/`link_entity`/`graph_analytics`;`run_sparql` 强制只读闸门(仅 SELECT/ASK),未知工具/非法参数返回 JSON-RPC `-32602`。
+
+### 12.7 抗幻觉现状(修正 §8 / §5.5)
+- **引用是尽力而为的接地**,不是硬门槛:答案不会因"无支撑三元组"而拒答(字面量答案本就没有引用)。真正的抗幻觉手段是:schema-grounded 生成 + 自有 parser 只读校验 + gStore 执行验证 + GraphRAG 的"I don't know"识别 + 无候选时诚实 `Err`。
+- **拒答是基于置信度阈值且默认关闭**:`with_abstain_below` 默认 0.0(从不拒答);未在 CLI/HTTP/MCP 里接成配置项。`graphrag` 与结构化路径在阈值之上时会遵守它(含显式 `graphrag` 模式)。
+
+### 12.8 图分析的实际机制(修正 §4.6)
+分析型问题**并非**下推到 gStore 的 `SHORTESTPATHLEN/KHOPREACHABLE/…` SPARQL 函数,而是:用普通 SPARQL 取一份**有上限的边采样**(`SELECT ?s ?o WHERE { ?s ?p ?o } LIMIT n`,默认 5 万、硬顶 20 万),在 gnlqa 进程内用 `gstore::analytics::GraphView` 计算;最短路则以两个端点为种子做 k-hop 邻域取回(无向)。支持的算子:最短路 / PageRank / 度中心性 / 弱连通分量 / 三角形;超过采样上限时结果基于子图并在文本中标注。最短路的两个端点取自**两个不同 mention** 的 top-1 候选(而非同一 mention 的多个消歧候选),否则 `run_analytics` 因端点不足两个而返回 `Err`→回退。
+
+> 落地映射见 `gnlqa/src/{solve,pipeline,config,analytics,link,llm/openai,llm/anthropic,repair,session,mcp,http_server,main}.rs`;评测 harness 见 `gnlqa/src/eval.rs`(QALD/LC-QuAD + P/R/F1)。

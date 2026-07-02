@@ -102,6 +102,11 @@ pub fn solve_with_repair(
                     None => break,
                 }
             }
+            // A transport failure (endpoint unreachable) is not a query defect —
+            // repairing the SPARQL can't fix a dead socket, and every round would
+            // burn an LLM call + another dead connection. Fail fast and surface
+            // the real cause instead of masking it as "no answer".
+            Err(e @ Error::Http(_)) => return Err(e),
             Err(e) => {
                 last_err = Some(format!("execution error: {e}"));
                 if last_round {
@@ -241,6 +246,33 @@ mod tests {
             Error::Sparql(m) => assert!(m.contains("parser error")),
             other => panic!("expected Sparql error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transport_error_fails_fast_without_repair() {
+        use std::sync::Arc;
+        // The endpoint is unreachable (Error::Http). Repairing SPARQL can't fix a
+        // dead socket, so we must return the error immediately, with NO LLM calls.
+        struct DeadKb;
+        impl KbClient for DeadKb {
+            fn query(&self, _sparql: &str) -> Result<SparqlAnswer> {
+                Err(Error::Http("gStore endpoint unreachable: Connection refused".into()))
+            }
+        }
+        let llm = Arc::new(MockLlm::fixed("SELECT ?x WHERE { ?x <http://ex/p> ?o }"));
+        let err = solve_with_repair(
+            &Arc::clone(&llm),
+            &DeadKb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x <http://ex/p> ?o }",
+            3,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Http(_)));
+        assert_eq!(llm.call_count(), 0, "no repair calls against an unreachable endpoint");
     }
 
     #[test]

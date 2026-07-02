@@ -29,6 +29,9 @@ pub struct OpenAiClient {
     base_url: String,
     default_model: String,
     timeout: Duration,
+    /// Minimum `max_tokens` floored onto every request (never below
+    /// [`MIN_MAX_TOKENS`]). Raised via `GNLQA_MAX_TOKENS` for reasoning models.
+    max_tokens_floor: u32,
 }
 
 impl OpenAiClient {
@@ -43,12 +46,21 @@ impl OpenAiClient {
             base_url: base_url.into(),
             default_model: default_model.into(),
             timeout: Duration::from_secs(60),
+            max_tokens_floor: MIN_MAX_TOKENS,
         }
     }
 
     /// Override the per-request network timeout (builder-style).
     pub fn with_timeout(mut self, timeout: Duration) -> OpenAiClient {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the minimum completion-token budget floored onto every request
+    /// (clamped to at least [`MIN_MAX_TOKENS`], so reasoning models still return
+    /// content). Wired from `GNLQA_MAX_TOKENS`.
+    pub fn with_max_tokens(mut self, floor: u32) -> OpenAiClient {
+        self.max_tokens_floor = floor.max(MIN_MAX_TOKENS);
         self
     }
 
@@ -63,6 +75,7 @@ impl OpenAiClient {
             base_url: cfg.openai_base_url.clone(),
             default_model: cfg.model.clone(),
             timeout: Duration::from_secs(cfg.timeout_secs),
+            max_tokens_floor: cfg.max_tokens.max(MIN_MAX_TOKENS),
         })
     }
 
@@ -79,7 +92,7 @@ impl OpenAiClient {
         }
         json!({
             "model": model,
-            "max_tokens": req.max_tokens.max(MIN_MAX_TOKENS),
+            "max_tokens": req.max_tokens.max(self.max_tokens_floor),
             "temperature": req.temperature,
             "messages": messages,
         })
@@ -148,6 +161,18 @@ mod tests {
         assert_eq!(b["model"], "deepseek-v4-flash");
         assert_eq!(b["messages"][0]["role"], "user"); // no system message prepended
         assert_eq!(b["max_tokens"], 4096); // larger budget preserved
+    }
+
+    #[test]
+    fn with_max_tokens_raises_the_floor() {
+        // GNLQA_MAX_TOKENS wiring: a higher floor lifts small requests to it.
+        let c = OpenAiClient::new("k", "u", "m").with_max_tokens(8192);
+        assert_eq!(c.request_body(&LlmRequest::prompt("x").max_tokens(64))["max_tokens"], 8192);
+        // a request already above the floor is preserved
+        assert_eq!(c.request_body(&LlmRequest::prompt("x").max_tokens(9000))["max_tokens"], 9000);
+        // the floor can never drop below the reasoning-model minimum
+        let low = OpenAiClient::new("k", "u", "m").with_max_tokens(10);
+        assert_eq!(low.request_body(&LlmRequest::prompt("x").max_tokens(1))["max_tokens"], MIN_MAX_TOKENS);
     }
 
     #[test]

@@ -17,6 +17,9 @@ pub struct AnthropicClient {
     base_url: String,
     default_model: String,
     timeout: Duration,
+    /// Minimum `max_tokens` floored onto every request (1 = effectively none).
+    /// Wired from `GNLQA_MAX_TOKENS`.
+    max_tokens_floor: u32,
 }
 
 impl AnthropicClient {
@@ -31,12 +34,20 @@ impl AnthropicClient {
             base_url: base_url.into(),
             default_model: default_model.into(),
             timeout: Duration::from_secs(60),
+            max_tokens_floor: 1,
         }
     }
 
     /// Override the per-request network timeout (builder-style).
     pub fn with_timeout(mut self, timeout: Duration) -> AnthropicClient {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the minimum completion-token budget floored onto every request
+    /// (clamped to ≥1). Wired from `GNLQA_MAX_TOKENS`.
+    pub fn with_max_tokens(mut self, floor: u32) -> AnthropicClient {
+        self.max_tokens_floor = floor.max(1);
         self
     }
 
@@ -51,6 +62,7 @@ impl AnthropicClient {
             base_url: cfg.anthropic_base_url.clone(),
             default_model: cfg.model.clone(),
             timeout: Duration::from_secs(cfg.timeout_secs),
+            max_tokens_floor: cfg.max_tokens.max(1),
         })
     }
 
@@ -64,7 +76,7 @@ impl AnthropicClient {
             .collect();
         let mut body = json!({
             "model": model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": req.max_tokens.max(self.max_tokens_floor),
             "temperature": req.temperature,
             "messages": messages,
         });

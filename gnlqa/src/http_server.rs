@@ -9,12 +9,12 @@
 //! The handler holds an [`Arc<SolveEngine>`] and answers each connection on its
 //! own thread.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -25,8 +25,15 @@ use crate::solve::SolveEngine;
 const MAX_BODY: usize = 1 << 20; // 1 MiB
 /// Max bytes for a single request/header line.
 const MAX_LINE: usize = 16 * 1024;
-/// Per-connection socket timeout.
+/// Per-read socket timeout: bounds a single stalled `recv`.
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Absolute deadline for reading a whole request. Combined with [`IO_TIMEOUT`]
+/// this defeats slowloris: a per-read timeout can be reset by a trickle of bytes,
+/// but this hard wall-clock cap can't — so a slow-drip client can't pin a
+/// connection (and its `max_conn` slot) open indefinitely.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// Max number of header lines accepted (bounds an unbounded header flood).
+const MAX_HEADERS: usize = 100;
 
 /// HTTP server wrapping a [`SolveEngine`].
 pub struct HttpServer {
@@ -80,7 +87,8 @@ impl HttpServer {
 
 /// Parse one request, route it, and write the response.
 fn handle_connection(mut stream: TcpStream, engine: &SolveEngine) -> std::io::Result<()> {
-    let Some((method, path, body)) = read_request(&mut stream)? else {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let Some((method, path, body)) = read_request(&mut stream, deadline)? else {
         return write_json(&mut stream, 400, &json!({"status":"error","message":"bad request"}));
     };
 
@@ -101,6 +109,7 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                         "explanation": a.explanation,
                         "sparql": a.sparql,
                         "values": a.values,
+                        "citations": citations_json(&a.citations),
                         "confidence": round3(a.confidence),
                         "abstained": a.abstained,
                         "rounds": a.rounds,
@@ -141,6 +150,17 @@ fn round3(x: f32) -> f64 {
     ((x * 1000.0).round() / 1000.0) as f64
 }
 
+/// Serialize the supporting triples so a client can audit the answer (the engine
+/// already gathered them; the previous response silently dropped the field).
+fn citations_json(citations: &[crate::ground::Citation]) -> Value {
+    Value::Array(
+        citations
+            .iter()
+            .map(|c| json!({ "subject": c.subject, "predicate": c.predicate, "object": c.object }))
+            .collect(),
+    )
+}
+
 /// Extract `question` from a JSON body (or a raw non-JSON body as the question).
 fn question_of(body: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
@@ -152,11 +172,14 @@ fn question_of(body: &str) -> Option<String> {
 
 /// Read method, path, and (Content-Length) body from an HTTP/1.1 request, with
 /// bounded line/body sizes so a malicious client can't exhaust memory.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, String, String)>> {
+fn read_request(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> std::io::Result<Option<(String, String, String)>> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    let Some(request_line) = read_line_capped(&mut reader, MAX_LINE)? else {
-        return Ok(None); // empty or over-long
+    let Some(request_line) = read_line_capped(&mut reader, MAX_LINE, deadline)? else {
+        return Ok(None); // empty, over-long, or past the request deadline
     };
     let mut parts = request_line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
@@ -164,14 +187,19 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, Strin
     };
     let (method, path) = (method.to_string(), target.split('?').next().unwrap_or("/").to_string());
 
-    // Headers → find Content-Length (bounded line length).
+    // Headers → find Content-Length (bounded line length AND header count).
     let mut content_length = 0usize;
+    let mut headers = 0usize;
     loop {
-        let Some(line) = read_line_capped(&mut reader, MAX_LINE)? else {
+        let Some(line) = read_line_capped(&mut reader, MAX_LINE, deadline)? else {
             return Ok(None);
         };
         if line.is_empty() {
             break;
+        }
+        headers += 1;
+        if headers > MAX_HEADERS {
+            return Ok(None); // header flood (slowloris variant) — refuse
         }
         if let Some(v) = line.split_once(':') {
             if v.0.trim().eq_ignore_ascii_case("content-length") {
@@ -183,17 +211,48 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, Strin
     if content_length > MAX_BODY {
         return Ok(None); // refuse oversized bodies (don't pre-allocate)
     }
-    let mut body = Vec::new();
-    (&mut reader).take(content_length as u64).read_to_end(&mut body)?;
+    let Some(body) = read_body(&mut reader, content_length, deadline)? else {
+        return Ok(None); // slow-drip body past the deadline
+    };
     Ok(Some((method, path, String::from_utf8_lossy(&body).into_owned())))
 }
 
+/// Read exactly `len` body bytes, giving up once the request `deadline` passes so
+/// a slow-drip body can't hold the connection open forever.
+fn read_body<R: BufRead>(reader: &mut R, len: usize, deadline: Instant) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::with_capacity(len.min(8192));
+    let mut chunk = [0u8; 4096];
+    let mut got = 0usize;
+    while got < len {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let want = (len - got).min(chunk.len());
+        let n = reader.read(&mut chunk[..want])?;
+        if n == 0 {
+            break; // EOF before Content-Length; return what we have
+        }
+        body.extend_from_slice(&chunk[..n]);
+        got += n;
+    }
+    Ok(Some(body))
+}
+
 /// Read one `\n`-terminated line (trailing `\r` stripped), capped at `max`
-/// bytes. Returns `None` on EOF-with-nothing or if the line exceeds `max`.
-fn read_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
+/// bytes. Returns `None` on EOF-with-nothing, if the line exceeds `max`, or once
+/// the request `deadline` has passed (checked between bytes so a byte-per-timeout
+/// trickle can't extend the read indefinitely).
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+    deadline: Instant,
+) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
         if reader.read(&mut byte)? == 0 {
             if buf.is_empty() {
                 return Ok(None);
@@ -236,6 +295,7 @@ mod tests {
     use super::*;
     use crate::kb::{MockKb, RdfTerm, SparqlAnswer, TermKind};
     use crate::llm::MockLlm;
+    use std::io::Read; // the in-test HTTP client reads the response body
 
     fn answer_row(v: &str) -> Vec<Option<RdfTerm>> {
         vec![Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })]
@@ -281,6 +341,23 @@ mod tests {
         let a: Value = serde_json::from_str(&request(addr, "POST", "/ask", r#"{"question":"which x?"}"#)).unwrap();
         assert_eq!(a["values"][0], "http://ex/a");
         assert!(a["sparql"].as_str().unwrap().contains("<http://ex/p>"));
+        // citations are now surfaced (was silently dropped) — always an array.
+        assert!(a["citations"].is_array());
+    }
+
+    #[test]
+    fn header_flood_is_rejected() {
+        let addr = start();
+        let mut s = TcpStream::connect(addr).unwrap();
+        let mut req = String::from("POST /ask HTTP/1.1\r\nHost: x\r\n");
+        for i in 0..(MAX_HEADERS + 5) {
+            req.push_str(&format!("X-Pad-{i}: y\r\n"));
+        }
+        req.push_str("\r\n"); // end of headers
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("bad request"), "expected 400 for a header flood, got: {resp}");
     }
 
     #[test]

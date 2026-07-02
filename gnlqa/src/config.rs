@@ -32,14 +32,18 @@ pub struct Config {
     /// Optional gStore Basic-auth credentials.
     pub gstore_user: Option<String>,
     pub gstore_password: Option<Secret>,
-    /// Max tokens for an LLM completion.
+    /// Minimum completion-token budget floored onto every LLM request
+    /// (`GNLQA_MAX_TOKENS`). Raise it for reasoning models that spend tokens on
+    /// hidden reasoning before the visible answer.
     pub max_tokens: u32,
-    /// Sampling temperature (low — we want deterministic SPARQL).
-    pub temperature: f32,
     /// Per-request network timeout, seconds.
     pub timeout_secs: u64,
     /// Default answering mode (`GNLQA_MODE`): `auto`|`structured`|`graphrag`|`open`.
     pub mode: String,
+    /// Answer-cache capacity in questions (`GNLQA_CACHE`; 0 disables the cache).
+    pub cache_capacity: usize,
+    /// Cache entry time-to-live in seconds (`GNLQA_CACHE_TTL_SECS`; 0 = no expiry).
+    pub cache_ttl_secs: u64,
 }
 
 impl Config {
@@ -50,8 +54,11 @@ impl Config {
     /// exporting every session. See `gnlqa.conf.example`.
     pub fn from_env() -> Config {
         let file = load_config_file();
-        // env takes precedence over the file, so a one-off `KEY=… gnlqa …` still works.
-        let get = |k: &str| env::var(k).ok().or_else(|| file.get(k).cloned());
+        // env takes precedence over the file, so a one-off `KEY=… gnlqa …` still
+        // works. A *blank* env var (`KEY=`, common in shell profiles / compose
+        // files) is treated as absent so it can't shadow a real value in the file
+        // and silently drop us back to the built-in default.
+        let get = |k: &str| non_empty(env::var(k).ok()).or_else(|| file.get(k).cloned());
         // A blank/whitespace value (e.g. `GNLQA_MODEL=` in the file) is treated as
         // absent, falling back to the default rather than an empty string that
         // would make the LLM/model call fail.
@@ -68,9 +75,10 @@ impl Config {
             gstore_user: non_empty(get("GSTORE_USER")),
             gstore_password: non_empty(get("GSTORE_PASSWORD")).map(Secret::new),
             max_tokens: parse_or(get("GNLQA_MAX_TOKENS"), 1024),
-            temperature: parse_or(get("GNLQA_TEMPERATURE"), 0.0),
             timeout_secs: parse_or(get("GNLQA_TIMEOUT_SECS"), 60),
             mode: or(get("GNLQA_MODE"), "auto"),
+            cache_capacity: parse_or(get("GNLQA_CACHE"), 256),
+            cache_ttl_secs: parse_or(get("GNLQA_CACHE_TTL_SECS"), 0),
         }
     }
 
@@ -99,9 +107,10 @@ impl Default for Config {
             gstore_user: None,
             gstore_password: None,
             max_tokens: 1024,
-            temperature: 0.0,
             timeout_secs: 60,
             mode: "auto".to_string(),
+            cache_capacity: 256,
+            cache_ttl_secs: 0,
         }
     }
 }
@@ -148,10 +157,32 @@ fn parse_or<T: std::str::FromStr>(v: Option<String>, default: T) -> T {
 /// Load a `KEY=VALUE` config file (`GNLQA_CONFIG` path, else `gnlqa.conf` in the
 /// working dir). Blank lines and `#` comments are ignored; surrounding quotes are
 /// stripped. Missing file → empty map (env-only, as before).
+///
+/// The loaded path is printed to stderr so a config picked up from the *current
+/// directory* (which could be an untrusted checkout shipping its own `gnlqa.conf`
+/// that redirects `OPENAI_BASE_URL`/`GSTORE_ENDPOINT`) is never silent. Pin a
+/// trusted location with `GNLQA_CONFIG` to avoid CWD pickup.
 fn load_config_file() -> HashMap<String, String> {
-    let path = env::var("GNLQA_CONFIG").unwrap_or_else(|_| "gnlqa.conf".to_string());
+    let (path, from_env_var) = match env::var("GNLQA_CONFIG") {
+        Ok(p) => (p, true),
+        Err(_) => ("gnlqa.conf".to_string(), false),
+    };
     match std::fs::read_to_string(&path) {
-        Ok(content) => parse_config(&content),
+        Ok(content) => {
+            let map = parse_config(&content);
+            if !map.is_empty() {
+                if from_env_var {
+                    eprintln!("gnlqa: loaded {} setting(s) from {path} (GNLQA_CONFIG)", map.len());
+                } else {
+                    eprintln!(
+                        "gnlqa: loaded {} setting(s) from ./{path} in the current directory \
+                         (set GNLQA_CONFIG to pin a trusted path)",
+                        map.len()
+                    );
+                }
+            }
+            map
+        }
         Err(_) => HashMap::new(), // missing file → env-only, as before
     }
 }
@@ -229,5 +260,13 @@ mod tests {
         assert!(non_empty(Some("".into())).is_none());
         assert!(non_empty(Some("   ".into())).is_none());
         assert_eq!(non_empty(Some("x".into())).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn default_has_cache_and_token_floor() {
+        let c = Config::default();
+        assert_eq!(c.cache_capacity, 256);
+        assert_eq!(c.cache_ttl_secs, 0);
+        assert_eq!(c.max_tokens, 1024);
     }
 }

@@ -42,26 +42,31 @@ pub enum AnalyticsOp {
 pub fn classify_op(question: &str) -> AnalyticsOp {
     let q = question.to_lowercase();
     let has = |p: &str| q.contains(p);
-    // A question about communities/components should never be read as a path,
-    // even if it happens to contain "connected"/"related".
+    // Peel off the graph-wide ops FIRST so their keywords ("connected component",
+    // "most connected") are never misread as a two-entity path below.
     let component_q = has("communit") || has("cluster") || has("component");
-    // Phrase-level path triggers — avoid bare substrings like "to" that match
-    // almost any sentence.
+    let centrality_q =
+        has("central") || has("most connected") || has("highly connected") || has("highest degree") || has("hub");
+    // Path/connection phrasings between two entities. Broad on purpose: an
+    // unmatched path question would otherwise fall to the PageRank default and
+    // silently answer with an unrelated ranking. ShortestPath self-guards in
+    // [`run_analytics`] (needs two distinct endpoints, else Err → fall through),
+    // so over-triggering here degrades safely to Text-to-SPARQL, never to a wrong
+    // confident answer.
     let path_phrase = has("shortest path")
-        || has("path between")
-        || has("path from")
-        || has("connected to")
-        || has("connection between")
-        || has("related to")
-        || has("relationship between");
-    if path_phrase && !component_q {
-        AnalyticsOp::ShortestPath
+        || has("path between") || has("path from") || has("path to") || has("path connecting")
+        || has("connected") || has("connection")
+        || has("related") || has("relationship") || has("relate")
+        || has("linked") || has("link between")
+        || has("route") || has("hops") || has("reachable") || has("reach");
+    if component_q {
+        AnalyticsOp::Components
     } else if has("triangle") {
         AnalyticsOp::Triangles
-    } else if component_q || has("connected component") {
-        AnalyticsOp::Components
-    } else if has("central") || has("most connected") || has("highest degree") || has("hub") {
+    } else if centrality_q {
         AnalyticsOp::Centrality
+    } else if path_phrase {
+        AnalyticsOp::ShortestPath
     } else {
         // PageRank keywords (pagerank / influential / important) and the default
         // both land here: importance ranking is the sensible fallback.
@@ -394,6 +399,26 @@ mod tests {
         assert_eq!(classify_op("what components is X related to?"), AnalyticsOp::Components);
         // "most connected" with no path phrase is centrality, not a path
         assert_eq!(classify_op("which node is most connected?"), AnalyticsOp::Centrality);
+    }
+
+    #[test]
+    fn broadened_path_phrasings_no_longer_fall_to_pagerank() {
+        // Common connection questions that used to slip past the narrow trigger
+        // list and get answered with a PageRank ranking must now route to a path.
+        for q in [
+            "how are Alice and Bob connected?",
+            "are Alice and Bob related?",
+            "how do Alice and Bob relate?",
+            "what is the route between Alice and Bob?",
+            "how many hops from Alice to Bob?",
+            "is Alice linked to Bob?",
+        ] {
+            assert_eq!(classify_op(q), AnalyticsOp::ShortestPath, "misrouted: {q}");
+        }
+        // ranking/centrality/component questions are still classified correctly
+        assert_eq!(classify_op("who is the most influential node?"), AnalyticsOp::PageRank);
+        assert_eq!(classify_op("which node is most connected?"), AnalyticsOp::Centrality);
+        assert_eq!(classify_op("how many communities are there?"), AnalyticsOp::Components);
     }
 
     #[test]

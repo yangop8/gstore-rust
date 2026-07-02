@@ -74,8 +74,12 @@ cargo run -q -p gstore --bin gserver -- movies.db --port 9000 # serve SPARQL
 cargo run -q -p gnlqa  -- "who directed Inception?"           # → Christopher Nolan
 ```
 
-To use **Anthropic (Claude)** instead, set `GNLQA_LLM_PROVIDER=anthropic` and
-`ANTHROPIC_API_KEY` (models e.g. `claude-opus-4-8` / `claude-sonnet-4-6`).
+To use **Anthropic (Claude)** instead, switch the whole backend block in
+`gnlqa.conf`: set `GNLQA_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`, **and
+also change the model names** — the example file pins DeepSeek models, so leaving
+`GNLQA_MODEL=deepseek-v4-pro` in place would send a DeepSeek model id to the
+Anthropic API and fail. Comment out the DeepSeek lines and uncomment the Anthropic
+block (`GNLQA_MODEL=claude-opus-4-8`, `GNLQA_FAST_MODEL=claude-sonnet-4-6`).
 
 > `deepseek-v4-pro` is a *reasoning* model — accurate but slow (~1–2 min/question,
 > since the full pipeline makes several calls). Use `deepseek-v4-flash` for the
@@ -105,9 +109,12 @@ whether it's waiting on the model or on gStore.
 Every answer is tagged with where it came from — a **trust and data-egress**
 signal, not just attribution:
 
-- **`gStore`** — structured SPARQL / graph-analytics computed locally; the
-  underlying **data never left the machine** (only the question + schema went to
-  the LLM).
+- **`gStore`** — structured SPARQL / graph-analytics computed locally; the query
+  **result data stays on the machine**. To *generate* the SPARQL, the LLM does
+  receive the question, the linked entity/predicate URIs and their labels, and
+  small schema samples — but never the answer rows/triples. (Enabling
+  `with_explain` additionally sends the answer's supporting triples to the LLM to
+  phrase an explanation; it's off by default.)
 - **`gStore+LLM (GraphRAG)`** — the LLM composed the answer from private triples
   **retrieved from gStore and sent to the LLM**.
 - **`LLM`** — the LLM answered from its **general knowledge**; no KB data involved.
@@ -117,9 +124,13 @@ You choose which path(s) are allowed with `GNLQA_MODE` (or `/mode` in chat):
 | Mode         | Behaviour | Provenance |
 |--------------|-----------|------------|
 | `auto` (default) | structured SPARQL, then GraphRAG fallback; **never** pure LLM | gStore / GraphRAG |
-| `structured` | SPARQL / analytics **only** — data never leaves; abstains otherwise | gStore |
+| `structured` | SPARQL / analytics **only** — result data stays local; abstains otherwise | gStore |
 | `graphrag`   | retrieve a private subgraph → LLM answers from it | GraphRAG |
 | `open`       | answer from the LLM's general knowledge; ignore the KB | LLM |
+
+`GNLQA_MODE` (and `/mode` in chat) applies on **every** surface — the one-shot CLI,
+`chat`, `serve`, and `mcp` — so a server started with `GNLQA_MODE=structured`
+keeps its result data local too.
 
 > Design note: a SPARQL-generation *failure* on an in-domain question is **not**
 > silently answered from LLM world-knowledge (that risks confident hallucination
@@ -139,7 +150,7 @@ gnlqa chat
 
 | Method | Path      | Body                     | Response |
 |--------|-----------|--------------------------|----------|
-| POST   | `/ask`    | `{"question": "..."}`    | `{answer, sparql, confidence, abstained, explanation, ...}` |
+| POST   | `/ask`    | `{"question": "..."}`    | `{answer, sparql, values, citations, confidence, abstained, explanation, rounds, provenance}` |
 | POST   | `/gSolve` | `{"question": "..."}`    | gAnswer-compatible shape (honours abstention with status `"abstained"`) |
 | GET    | `/health` | —                        | `{"status":"ok"}` |
 
@@ -158,9 +169,10 @@ timeouts.
 | `link_entity`     | `mention`, `kind?`, `k?`               | mention → KG candidates |
 | `graph_analytics` | `question`, `seeds?`                    | shortest path / centrality / … |
 
-Tool-level failures are returned as `isError` content; protocol faults as
-JSON-RPC errors. Point `run_sparql` at a **read-only** endpoint if untrusted
-clients may call it.
+Failures *inside* a correctly-invoked tool are returned as `isError` content;
+protocol faults (unknown tool, malformed params) are JSON-RPC `-32602` errors.
+`run_sparql` enforces a read-only gate (SELECT/ASK only — UPDATE/DELETE/DROP/LOAD
+are rejected before reaching the store), so an injected mutation can't run.
 
 ## Evaluation
 
@@ -193,10 +205,11 @@ same names work as env vars.
 | `GSTORE_ENDPOINT`    | `http://127.0.0.1:9000/sparql`     | gStore SPARQL endpoint |
 | `GSTORE_USER`        | —                                  | optional HTTP Basic user |
 | `GSTORE_PASSWORD`    | —                                  | optional HTTP Basic password (redacted `Secret`) |
-| `GNLQA_MAX_TOKENS`   | `1024`                             | default completion cap |
-| `GNLQA_TEMPERATURE`  | `0.0`                              | default sampling temperature |
+| `GNLQA_MAX_TOKENS`   | `1024`                             | minimum completion-token budget floored onto every LLM request (raise it for reasoning models that spend tokens on hidden reasoning) |
 | `GNLQA_TIMEOUT_SECS` | `60`                               | per-request HTTP timeout |
-| `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above) |
+| `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above); applies to CLI, chat, serve, and mcp |
+| `GNLQA_CACHE`        | `256`                              | answer-cache capacity in questions (`0` disables the cache) |
+| `GNLQA_CACHE_TTL_SECS` | `0`                              | cache entry lifetime in seconds (`0` = no expiry; set it when the KB changes under a long-running server) |
 
 ## Library
 

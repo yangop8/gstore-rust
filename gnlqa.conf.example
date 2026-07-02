@@ -26,3 +26,9 @@ GNLQA_TIMEOUT_SECS=180
 GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GSTORE_USER=
 # GSTORE_PASSWORD=
+
+# ---- optional ----
+# GNLQA_MODE=auto            # auto | structured | graphrag | open (applies to CLI, chat, serve, mcp)
+# GNLQA_CACHE=256            # answer-cache capacity (0 disables)
+# GNLQA_CACHE_TTL_SECS=0     # cache entry lifetime (0 = no expiry; set it if the KB changes under a long-running server)
+# GNLQA_MAX_TOKENS=1024      # minimum completion-token budget per request (raise for reasoning models)

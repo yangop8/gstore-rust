@@ -14,6 +14,11 @@ use crate::kb::{sparql_escape_literal, KbClient, SparqlAnswer, TermKind};
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
+/// The smallest similarity that counts as evidence of a match. A hit at or below
+/// this (no shared token under [`HashEmbedder`], or an anti-correlated embedding)
+/// is treated as "no candidate" rather than linked to an arbitrary entity.
+const MIN_EVIDENCE: f32 = 1e-6;
+
 /// What a linked candidate is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkKind {
@@ -141,14 +146,23 @@ impl Linker {
     fn search(&self, index: &VectorIndex, kind: LinkKind, text: &str, k: usize) -> Result<Vec<Candidate>> {
         let hits = index.search_text(self.embedder.as_ref(), text, k)?;
         let mk = |h: crate::embed::Scored| Candidate { uri: h.id, label: h.text, kind, score: h.score };
+        // A zero (or negative) score means no lexical/semantic overlap at all —
+        // there is no evidence, so it must never link (otherwise a mention with no
+        // matching label deterministically links to the lexicographically-first
+        // entity, feeding a bogus seed to GraphRAG / analytics). Keep the primary
+        // threshold, but never below this evidence floor.
+        let floor = self.min_score.max(MIN_EVIDENCE);
         let mut kept: Vec<Candidate> =
-            hits.iter().filter(|h| h.score >= self.min_score).cloned().map(mk).collect();
+            hits.iter().filter(|h| h.score >= floor).cloned().map(mk).collect();
         // Relaxation (à la gAnswer): if the threshold pruned everything but there
-        // was a best hit, keep it so linking never hard-fails on a real match —
-        // downstream (C7) validates against the KG neighborhood.
+        // was a best hit *with real evidence*, keep it so linking never hard-fails
+        // on a genuine but low-scoring match — downstream (C7) validates against
+        // the KG neighborhood. A zero-evidence best hit is still dropped.
         if kept.is_empty() {
             if let Some(best) = hits.into_iter().next() {
-                kept.push(mk(best));
+                if best.score >= MIN_EVIDENCE {
+                    kept.push(mk(best));
+                }
             }
         }
         Ok(kept)
@@ -191,8 +205,10 @@ fn lang_filter_clause(languages: &[&str]) -> String {
 }
 
 /// Build de-duplicated `(uri, label)` pairs from a 2-column SELECT (label = the
-/// literal value). Skips blank-node subjects and keeps the first label per URI
-/// (so multilingual duplicates don't inflate the index).
+/// literal value). Skips blank-node subjects and de-duplicates on the *(uri,
+/// label)* pair — so every distinct label of a URI is indexed (e.g. both
+/// `"Beijing"@en` and `"北京"@zh`), which is the whole point of multilingual
+/// linking. The vector index supports several rows per URI.
 fn pairs_with_label(ans: &SparqlAnswer, uri_var: &str, label_var: &str) -> Vec<(String, String)> {
     let SparqlAnswer::Select { vars, rows } = ans else {
         return Vec::new();
@@ -212,7 +228,7 @@ fn pairs_with_label(ans: &SparqlAnswer, uri_var: &str, label_var: &str) -> Vec<(
         if ut.kind == TermKind::Bnode {
             continue;
         }
-        if seen.insert(ut.value.clone()) {
+        if seen.insert((ut.value.clone(), lt.value.clone())) {
             out.push((ut.value.clone(), lt.value.clone()));
         }
     }
@@ -298,17 +314,35 @@ mod tests {
     fn min_score_relaxes_to_best_when_all_pruned() {
         let l = Linker::from_labels(
             Box::new(HashEmbedder::new(128)),
-            &[ent("http://ex/Berlin", "Berlin")],
+            &[ent("http://ex/Berlin", "Berlin Germany capital")],
             &[],
             &[],
             0.99, // very high threshold
         )
         .unwrap();
-        // Everything is below threshold, but relaxation keeps the single best
-        // (recall over a hard zero), and its score is genuinely below the floor.
-        let e = l.link_mention(&Mention { text: "xyzzy plugh".into(), kind: MentionKind::Entity }, 5).unwrap();
+        // A partial match ("Germany" shares a token with the label) scores below
+        // the 0.99 threshold but has real evidence, so relaxation keeps it.
+        let e = l.link_mention(&Mention { text: "Germany".into(), kind: MentionKind::Entity }, 5).unwrap();
         assert_eq!(e.len(), 1);
-        assert!(e[0].score < 0.99);
+        assert!(e[0].score > 0.0 && e[0].score < 0.99);
+    }
+
+    #[test]
+    fn zero_evidence_mention_yields_no_candidate() {
+        // No shared token with any label → no evidence → NO link (not the
+        // lexicographically-first entity). Guards GraphRAG/analytics from bogus
+        // seeds. A large bucket space keeps this deterministic (no hash-collision
+        // between the distinctive mention token and the label tokens).
+        let l = Linker::from_labels(
+            Box::new(HashEmbedder::new(1 << 20)),
+            &[ent("http://ex/Aardvark", "aardvark"), ent("http://ex/Berlin", "berlin")],
+            &[],
+            &[],
+            0.0, // the shipped default: even here a zero-overlap hit must be dropped
+        )
+        .unwrap();
+        let e = l.link_mention(&Mention { text: "zzqxwv".into(), kind: MentionKind::Entity }, 5).unwrap();
+        assert!(e.is_empty(), "zero-overlap mention must not link to an arbitrary entity");
     }
 
     #[test]
