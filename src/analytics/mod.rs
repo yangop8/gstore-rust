@@ -1237,6 +1237,547 @@ impl GraphView {
 
         self.nodes.iter().enumerate().map(|(i, &id)| (id, core[i])).collect()
     }
+
+    // =======================================================================
+    // Extended analytics (back the additional gStore graph SPARQL built-ins).
+    //
+    // All results are deterministic (stable tie-breaks) and bounded. Methods
+    // that take a hop budget expand at most that many BFS levels; path
+    // enumeration is additionally capped by an explicit `max_paths`.
+    // =======================================================================
+
+    // ---- low-level neighbourhood / adjacency helpers ----------------------
+
+    /// Whether a directed edge `u → v` exists (dense indices). O(log d) via
+    /// binary search over the per-node CSR slice, which `from_raw_pairs` leaves
+    /// sorted ascending by target.
+    fn has_edge(&self, u: usize, v: usize) -> bool {
+        self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]]
+            .binary_search(&v)
+            .is_ok()
+    }
+
+    /// Whether `a` and `b` are adjacent in the undirected view (edge either way).
+    fn undirected_adjacent(&self, a: usize, b: usize) -> bool {
+        self.has_edge(a, b) || self.has_edge(b, a)
+    }
+
+    /// Undirected neighbour set of dense node `i` (out ∪ in), excluding `i`.
+    /// Returned sorted and de-duplicated so callers can sorted-merge.
+    fn undirected_neighbors(&self, i: usize) -> Vec<usize> {
+        let mut ns: Vec<usize> = self.out_adj[self.out_ptr[i]..self.out_ptr[i + 1]]
+            .iter()
+            .chain(self.in_adj[self.in_ptr[i]..self.in_ptr[i + 1]].iter())
+            .copied()
+            .filter(|&v| v != i)
+            .collect();
+        ns.sort_unstable();
+        ns.dedup();
+        ns
+    }
+
+    /// Unbounded single-source BFS over out-edges; dense distances, `u32::MAX`
+    /// for unreachable nodes.
+    fn out_bfs_dist(&self, src_i: usize) -> Vec<u32> {
+        self.bounded_out_bfs(src_i, u32::MAX)
+    }
+
+    /// Single-source BFS over out-edges expanding at most `max_hops` levels.
+    /// Nodes beyond the budget keep `u32::MAX`.
+    fn bounded_out_bfs(&self, src_i: usize, max_hops: u32) -> Vec<u32> {
+        let n = self.nodes.len();
+        let mut dist = vec![u32::MAX; n];
+        dist[src_i] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(src_i);
+        while let Some(u) = queue.pop_front() {
+            let d = dist[u];
+            if d >= max_hops {
+                continue; // budget exhausted — do not expand further
+            }
+            for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                if dist[v] == u32::MAX {
+                    dist[v] = d + 1;
+                    queue.push_back(v);
+                }
+            }
+        }
+        dist
+    }
+
+    /// Undirected BFS from dense `src`; returns `(farthest_dense, farthest_dist,
+    /// distances)` with `u32::MAX` for unreachable nodes. The farthest node is
+    /// the smallest dense index attaining the maximum distance (deterministic).
+    fn undirected_bfs(&self, src: usize) -> (usize, u32, Vec<u32>) {
+        let n = self.nodes.len();
+        let mut dist = vec![u32::MAX; n];
+        dist[src] = 0;
+        let mut queue = VecDeque::new();
+        queue.push_back(src);
+        while let Some(u) = queue.pop_front() {
+            let d = dist[u];
+            for &v in self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]]
+                .iter()
+                .chain(self.in_adj[self.in_ptr[u]..self.in_ptr[u + 1]].iter())
+            {
+                if dist[v] == u32::MAX {
+                    dist[v] = d + 1;
+                    queue.push_back(v);
+                }
+            }
+        }
+        let (mut far, mut far_d) = (src, 0u32);
+        for (i, &d) in dist.iter().enumerate() {
+            if d != u32::MAX && d > far_d {
+                far_d = d;
+                far = i;
+            }
+        }
+        (far, far_d, dist)
+    }
+
+    // ---- clustering coefficient -------------------------------------------
+
+    /// Local clustering coefficient of `id`: the fraction of pairs among `id`'s
+    /// undirected neighbours that are themselves adjacent. `Some(0.0)` when `id`
+    /// has fewer than two neighbours; `None` if `id` is not a node.
+    pub fn local_clustering_coefficient(&self, id: EntityLiteralId) -> Option<f64> {
+        let i = *self.id_to_idx.get(&id)?;
+        let nbrs = self.undirected_neighbors(i);
+        let k = nbrs.len();
+        if k < 2 {
+            return Some(0.0);
+        }
+        let mut links = 0usize;
+        for (ai, &a) in nbrs.iter().enumerate() {
+            for &b in &nbrs[ai + 1..] {
+                if self.undirected_adjacent(a, b) {
+                    links += 1;
+                }
+            }
+        }
+        let possible = k * (k - 1) / 2;
+        Some(links as f64 / possible as f64)
+    }
+
+    /// Global clustering coefficient (transitivity): `3 · triangles / wedges`,
+    /// where a wedge is an undirected path of length two centred on a node.
+    /// `0.0` when the graph has no wedges.
+    pub fn global_clustering_coefficient(&self) -> f64 {
+        let n = self.nodes.len();
+        let mut wedges = 0u64;
+        for i in 0..n {
+            let k = self.undirected_neighbors(i).len() as u64;
+            wedges += k * k.saturating_sub(1) / 2;
+        }
+        if wedges == 0 {
+            return 0.0;
+        }
+        (3 * self.triangle_count()) as f64 / wedges as f64
+    }
+
+    /// Number of triangles through `id` (undirected). `None` if `id` is absent.
+    pub fn node_triangle_count(&self, id: EntityLiteralId) -> Option<u64> {
+        let i = *self.id_to_idx.get(&id)?;
+        let nbrs = self.undirected_neighbors(i);
+        let mut t = 0u64;
+        for (ai, &a) in nbrs.iter().enumerate() {
+            for &b in &nbrs[ai + 1..] {
+                if self.undirected_adjacent(a, b) {
+                    t += 1;
+                }
+            }
+        }
+        Some(t)
+    }
+
+    // ---- diameter estimation ----------------------------------------------
+
+    /// Estimate the graph diameter (longest shortest-path length) with the
+    /// double-sweep BFS heuristic on the **undirected** view, repeated from a
+    /// few deterministic seed nodes. The result is a lower bound on the true
+    /// diameter (usually tight); exact computation is O(V·(V+E)) and avoided.
+    /// Returns 0 for an empty or single-node graph.
+    pub fn diameter_estimate(&self) -> u32 {
+        let n = self.nodes.len();
+        if n <= 1 {
+            return 0;
+        }
+        let mut best = 0u32;
+        let samples = 4usize.min(n);
+        let step = (n / samples).max(1);
+        for s in 0..samples {
+            let seed = (s * step).min(n - 1);
+            let (u, _, _) = self.undirected_bfs(seed);
+            let (_, d, _) = self.undirected_bfs(u);
+            best = best.max(d);
+        }
+        best
+    }
+
+    // ---- neighbour-set similarity -----------------------------------------
+
+    /// Jaccard similarity of the undirected neighbour sets of `a` and `b`:
+    /// `|N(a) ∩ N(b)| / |N(a) ∪ N(b)|`. `None` if either node is absent;
+    /// `Some(0.0)` when the union is empty.
+    pub fn jaccard_similarity(&self, a: EntityLiteralId, b: EntityLiteralId) -> Option<f64> {
+        let ia = *self.id_to_idx.get(&a)?;
+        let ib = *self.id_to_idx.get(&b)?;
+        let (na, nb) = (self.undirected_neighbors(ia), self.undirected_neighbors(ib));
+        let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
+        while i < na.len() && j < nb.len() {
+            match na[i].cmp(&nb[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    inter += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        let union = na.len() + nb.len() - inter;
+        if union == 0 {
+            return Some(0.0);
+        }
+        Some(inter as f64 / union as f64)
+    }
+
+    /// Cosine (overlap) similarity of two nodes' undirected neighbour sets:
+    /// `|N(a) ∩ N(b)| / sqrt(|N(a)|·|N(b)|)`. Chosen over SimRank for O(deg)
+    /// cost and determinism. `None` if either node is absent; `Some(0.0)` when
+    /// either neighbourhood is empty. Backs the node-similarity path of the
+    /// `SIMILARITY` built-in.
+    pub fn neighbor_cosine_similarity(
+        &self,
+        a: EntityLiteralId,
+        b: EntityLiteralId,
+    ) -> Option<f64> {
+        let ia = *self.id_to_idx.get(&a)?;
+        let ib = *self.id_to_idx.get(&b)?;
+        let (na, nb) = (self.undirected_neighbors(ia), self.undirected_neighbors(ib));
+        if na.is_empty() || nb.is_empty() {
+            return Some(0.0);
+        }
+        let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
+        while i < na.len() && j < nb.len() {
+            match na[i].cmp(&nb[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    inter += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        Some(inter as f64 / ((na.len() * nb.len()) as f64).sqrt())
+    }
+
+    // ---- degree assortativity ---------------------------------------------
+
+    /// Degree assortativity (Newman's degree correlation coefficient) in
+    /// `[-1, 1]`: the Pearson correlation between the total (in+out) degrees at
+    /// the two ends of each stored directed edge. Positive ⇒ high-degree nodes
+    /// attach to high-degree nodes. Returns 0.0 for an edgeless graph or when
+    /// every endpoint has identical degree (undefined correlation).
+    pub fn degree_assortativity(&self) -> f64 {
+        let n = self.nodes.len();
+        let deg = |i: usize| -> f64 {
+            ((self.out_ptr[i + 1] - self.out_ptr[i]) + (self.in_ptr[i + 1] - self.in_ptr[i])) as f64
+        };
+        let m = self.out_adj.len() as f64;
+        if m == 0.0 {
+            return 0.0;
+        }
+        let (mut s_jk, mut s_sum, mut s_sq) = (0.0f64, 0.0f64, 0.0f64);
+        for u in 0..n {
+            let j = deg(u);
+            for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                let k = deg(v);
+                s_jk += j * k;
+                s_sum += 0.5 * (j + k);
+                s_sq += 0.5 * (j * j + k * k);
+            }
+        }
+        let mean = s_sum / m;
+        let num = s_jk / m - mean * mean;
+        let den = s_sq / m - mean * mean;
+        if den.abs() < f64::EPSILON {
+            0.0
+        } else {
+            num / den
+        }
+    }
+
+    // ---- label propagation communities ------------------------------------
+
+    /// Community detection via (deterministic) label propagation.
+    ///
+    /// Every node starts in its own community. Each round, nodes are visited in
+    /// ascending dense-index order and each adopts the label that is most
+    /// frequent among its undirected neighbours, breaking ties toward the
+    /// smallest label id. Rounds repeat until no node changes (or a fixed
+    /// iteration cap). Final labels are compacted to 0-based community ids in
+    /// first-seen order. Returns `entity_id → community id`.
+    pub fn label_propagation(&self) -> HashMap<EntityLiteralId, usize> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return HashMap::new();
+        }
+        let mut label: Vec<usize> = (0..n).collect();
+        const MAX_ITERS: usize = 100;
+        for _ in 0..MAX_ITERS {
+            let mut changed = false;
+            for u in 0..n {
+                let nbrs = self.undirected_neighbors(u);
+                if nbrs.is_empty() {
+                    continue;
+                }
+                // Sorted neighbour labels ⇒ scan runs for the plurality label,
+                // keeping the smallest label on ties (only replace on strictly
+                // greater count).
+                let mut labs: Vec<usize> = nbrs.iter().map(|&v| label[v]).collect();
+                labs.sort_unstable();
+                let (mut best_label, mut best_count) = (labs[0], 0usize);
+                let (mut cur, mut cnt) = (labs[0], 0usize);
+                for &l in &labs {
+                    if l == cur {
+                        cnt += 1;
+                    } else {
+                        if cnt > best_count {
+                            best_count = cnt;
+                            best_label = cur;
+                        }
+                        cur = l;
+                        cnt = 1;
+                    }
+                }
+                if cnt > best_count {
+                    best_label = cur;
+                }
+                if label[u] != best_label {
+                    label[u] = best_label;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut remap: HashMap<usize, usize> = HashMap::new();
+        let mut result = HashMap::with_capacity(n);
+        for (i, &id) in self.nodes.iter().enumerate() {
+            let next = remap.len();
+            let cid = *remap.entry(label[i]).or_insert(next);
+            result.insert(id, cid);
+        }
+        result
+    }
+
+    // ---- personalized PageRank --------------------------------------------
+
+    /// Personalized PageRank: PageRank whose teleport (restart) distribution is
+    /// concentrated uniformly on `sources` rather than spread over all nodes;
+    /// dangling mass is redistributed to the same source set. Returns
+    /// `entity_id → score`. Source ids that are not graph nodes are ignored; if
+    /// none of `sources` are nodes the result is empty.
+    pub fn personalized_pagerank(
+        &self,
+        sources: &[EntityLiteralId],
+        damping: f64,
+        max_iters: usize,
+        tol: f64,
+    ) -> HashMap<EntityLiteralId, f64> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return HashMap::new();
+        }
+        let src_idx: Vec<usize> =
+            sources.iter().filter_map(|s| self.id_to_idx.get(s).copied()).collect();
+        if src_idx.is_empty() {
+            return HashMap::new();
+        }
+        let mut teleport = vec![0.0f64; n];
+        let share = 1.0 / src_idx.len() as f64;
+        for &s in &src_idx {
+            teleport[s] += share;
+        }
+        let out_deg: Vec<usize> =
+            (0..n).map(|i| self.out_ptr[i + 1] - self.out_ptr[i]).collect();
+        let mut rank = teleport.clone();
+        let mut next = vec![0.0f64; n];
+        for _ in 0..max_iters {
+            let dangling_sum: f64 =
+                (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
+            // Restart + dangling mass both land on the source set.
+            let base = (1.0 - damping) + damping * dangling_sum;
+            for i in 0..n {
+                next[i] = base * teleport[i];
+            }
+            for u in 0..n {
+                if out_deg[u] > 0 {
+                    let contrib = damping * rank[u] / out_deg[u] as f64;
+                    for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                        next[v] += contrib;
+                    }
+                }
+            }
+            let delta: f64 =
+                rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+            std::mem::swap(&mut rank, &mut next);
+            if delta < tol {
+                break;
+            }
+        }
+        self.nodes.iter().enumerate().map(|(i, &id)| (id, rank[i])).collect()
+    }
+
+    // ---- k-hop neighbourhood queries --------------------------------------
+
+    /// Entity ids at **exactly** `k` out-hops from `src` (the BFS frontier at
+    /// depth `k`), in ascending id order. `k == 0` yields `[src]`. Empty when
+    /// `src` is absent or the frontier is empty.
+    pub fn khop_neighbors(&self, src: EntityLiteralId, k: u32) -> Vec<EntityLiteralId> {
+        let Some(&si) = self.id_to_idx.get(&src) else {
+            return Vec::new();
+        };
+        let dist = self.bounded_out_bfs(si, k);
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| dist[i] == k)
+            .map(|(_, &id)| id)
+            .collect()
+    }
+
+    /// Entity ids **within** `k` out-hops of `src` (distances `1..=k`), excluding
+    /// `src`, in ascending id order. Empty when `src` is absent.
+    pub fn khop_all_neighbors(&self, src: EntityLiteralId, k: u32) -> Vec<EntityLiteralId> {
+        let Some(&si) = self.id_to_idx.get(&src) else {
+            return Vec::new();
+        };
+        let dist = self.bounded_out_bfs(si, k);
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| dist[i] != u32::MAX && dist[i] >= 1)
+            .map(|(_, &id)| id)
+            .collect()
+    }
+
+    /// Number of entities at exactly `k` out-hops of `src`. `0` if `src` absent.
+    pub fn khop_count(&self, src: EntityLiteralId, k: u32) -> usize {
+        self.khop_neighbors(src, k).len()
+    }
+
+    /// Number of entities reachable from `src` within `max_hops` out-hops,
+    /// excluding `src`. `max_hops == u32::MAX` ⇒ every reachable node. `0` if
+    /// `src` is absent.
+    pub fn bfs_count(&self, src: EntityLiteralId, max_hops: u32) -> usize {
+        let Some(&si) = self.id_to_idx.get(&src) else {
+            return 0;
+        };
+        let dist = if max_hops == u32::MAX {
+            self.out_bfs_dist(si)
+        } else {
+            self.bounded_out_bfs(si, max_hops)
+        };
+        (0..self.nodes.len()).filter(|&i| i != si && dist[i] != u32::MAX).count()
+    }
+
+    /// Every simple directed path starting at `src` with `1..=k` edges, each as
+    /// an ordered entity-id list including `src`. Deterministic DFS in
+    /// ascending-neighbour order; paths are simple (no repeated node). Bounded
+    /// by `k` and by `max_paths` (emission stops once `max_paths` is reached).
+    /// Empty when `src` is absent or `k == 0`.
+    pub fn khop_enumerate_paths(
+        &self,
+        src: EntityLiteralId,
+        k: u32,
+        max_paths: usize,
+    ) -> Vec<Vec<EntityLiteralId>> {
+        let mut out = Vec::new();
+        let Some(&si) = self.id_to_idx.get(&src) else {
+            return out;
+        };
+        if k == 0 || max_paths == 0 {
+            return out;
+        }
+        let n = self.nodes.len();
+        let mut visited = vec![false; n];
+        let mut stack = vec![si];
+        visited[si] = true;
+        self.enum_paths_dfs(si, k, &mut visited, &mut stack, &mut out, max_paths);
+        out
+    }
+
+    /// Recursive helper for [`GraphView::khop_enumerate_paths`]. Emits the path
+    /// to each newly visited descendant before recursing deeper.
+    fn enum_paths_dfs(
+        &self,
+        u: usize,
+        remaining: u32,
+        visited: &mut [bool],
+        stack: &mut Vec<usize>,
+        out: &mut Vec<Vec<EntityLiteralId>>,
+        max_paths: usize,
+    ) {
+        if remaining == 0 || out.len() >= max_paths {
+            return;
+        }
+        for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+            if out.len() >= max_paths {
+                return;
+            }
+            if visited[v] {
+                continue;
+            }
+            visited[v] = true;
+            stack.push(v);
+            out.push(stack.iter().map(|&d| self.nodes[d]).collect());
+            self.enum_paths_dfs(v, remaining - 1, visited, stack, out, max_paths);
+            stack.pop();
+            visited[v] = false;
+        }
+    }
+
+    // ---- shortest-path counting -------------------------------------------
+
+    /// Number of distinct shortest directed paths from `src` to `dst` (BFS
+    /// path-counting à la Brandes). `Some(1)` when `src == dst`; `Some(0)` when
+    /// `dst` is unreachable; `None` if either node is absent. Saturates rather
+    /// than overflowing on pathological fan-out.
+    pub fn count_shortest_paths(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+    ) -> Option<u64> {
+        let si = *self.id_to_idx.get(&src)?;
+        let di = *self.id_to_idx.get(&dst)?;
+        if si == di {
+            return Some(1);
+        }
+        let n = self.nodes.len();
+        let mut dist = vec![-1i64; n];
+        let mut sigma = vec![0u64; n];
+        dist[si] = 0;
+        sigma[si] = 1;
+        let mut queue = VecDeque::new();
+        queue.push_back(si);
+        while let Some(u) = queue.pop_front() {
+            for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+                if dist[v] < 0 {
+                    dist[v] = dist[u] + 1;
+                    queue.push_back(v);
+                }
+                if dist[v] == dist[u] + 1 {
+                    sigma[v] = sigma[v].saturating_add(sigma[u]);
+                }
+            }
+        }
+        Some(if dist[di] < 0 { 0 } else { sigma[di] })
+    }
 }
 
 // ===========================================================================
@@ -2532,6 +3073,144 @@ mod tests {
         let mut loopy = TripleStore::new();
         loopy.insert(IdTriple::new(7, 9, 7));
         assert!(GraphView::from_store(&loopy).has_cycle());
+    }
+
+    // ---- extended analytics ------------------------------------------------
+
+    #[test]
+    fn test_khop_neighborhoods() {
+        let g = GraphView::from_store(&make_store());
+        // Path 10→11→12→13: frontier at each depth.
+        assert_eq!(g.khop_neighbors(10, 0), vec![10]);
+        assert_eq!(g.khop_neighbors(10, 1), vec![11]);
+        assert_eq!(g.khop_neighbors(10, 2), vec![12]);
+        assert_eq!(g.khop_neighbors(10, 3), vec![13]);
+        assert!(g.khop_neighbors(10, 4).is_empty());
+        // Within ≤ k, excluding the source.
+        assert_eq!(g.khop_all_neighbors(10, 2), vec![11, 12]);
+        assert_eq!(g.khop_all_neighbors(10, 9), vec![11, 12, 13]);
+        // Counts.
+        assert_eq!(g.khop_count(10, 2), 1);
+        assert_eq!(g.bfs_count(10, u32::MAX), 3);
+        assert_eq!(g.bfs_count(10, 2), 2);
+        // Absent node.
+        assert!(g.khop_neighbors(999, 1).is_empty());
+        assert_eq!(g.bfs_count(999, 3), 0);
+    }
+
+    #[test]
+    fn test_enumerate_paths_bounded() {
+        let g = GraphView::from_store(&make_store());
+        let paths = g.khop_enumerate_paths(10, 3, 1024);
+        assert_eq!(
+            paths,
+            vec![vec![10, 11], vec![10, 11, 12], vec![10, 11, 12, 13]]
+        );
+        // Triangle: DFS stops at the already-visited start (simple paths only).
+        let tri = g.khop_enumerate_paths(20, 3, 1024);
+        assert_eq!(tri, vec![vec![20, 21], vec![20, 21, 22]]);
+        // The path cap bounds the number of emitted paths.
+        assert_eq!(g.khop_enumerate_paths(10, 3, 1).len(), 1);
+        // k == 0 ⇒ no paths.
+        assert!(g.khop_enumerate_paths(10, 0, 1024).is_empty());
+    }
+
+    #[test]
+    fn test_count_shortest_paths() {
+        let g = GraphView::from_store(&make_store());
+        assert_eq!(g.count_shortest_paths(10, 13), Some(1));
+        assert_eq!(g.count_shortest_paths(10, 10), Some(1));
+        assert_eq!(g.count_shortest_paths(10, 20), Some(0)); // disconnected
+        assert_eq!(g.count_shortest_paths(10, 999), None); // absent
+
+        // Diamond 1→2→4, 1→3→4 has two distinct shortest paths 1⇝4.
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(1, 9, 2));
+        s.insert(IdTriple::new(1, 9, 3));
+        s.insert(IdTriple::new(2, 9, 4));
+        s.insert(IdTriple::new(3, 9, 4));
+        let d = GraphView::from_store(&s);
+        assert_eq!(d.count_shortest_paths(1, 4), Some(2));
+    }
+
+    #[test]
+    fn test_clustering_and_triangles() {
+        let g = GraphView::from_store(&make_store());
+        // Triangle node: its two neighbours are adjacent ⇒ coefficient 1.0.
+        assert_eq!(g.local_clustering_coefficient(20), Some(1.0));
+        // Path interior node: neighbours not adjacent ⇒ 0.0.
+        assert_eq!(g.local_clustering_coefficient(11), Some(0.0));
+        // Fewer than two neighbours ⇒ 0.0.
+        assert_eq!(g.local_clustering_coefficient(10), Some(0.0));
+        assert_eq!(g.local_clustering_coefficient(999), None);
+        // Per-node triangle counts.
+        assert_eq!(g.node_triangle_count(20), Some(1));
+        assert_eq!(g.node_triangle_count(10), Some(0));
+        // Transitivity = 3·triangles / wedges = 3·1 / 5 = 0.6.
+        assert!((g.global_clustering_coefficient() - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_similarity_measures() {
+        let g = GraphView::from_store(&make_store());
+        // N(20)={21,22}, N(21)={20,22}: intersection {22}, union {20,21,22}.
+        assert!((g.jaccard_similarity(20, 21).unwrap() - 1.0 / 3.0).abs() < 1e-9);
+        // Cosine: 1 / sqrt(2·2) = 0.5.
+        assert!((g.neighbor_cosine_similarity(20, 21).unwrap() - 0.5).abs() < 1e-9);
+        // Disjoint neighbourhoods.
+        assert_eq!(g.jaccard_similarity(11, 12), Some(0.0));
+        assert_eq!(g.jaccard_similarity(11, 999), None);
+    }
+
+    #[test]
+    fn test_diameter_estimate() {
+        let g = GraphView::from_store(&make_store());
+        // Longest shortest path is the undirected 4-node path 10–11–12–13.
+        assert_eq!(g.diameter_estimate(), 3);
+        // Single node ⇒ 0.
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(1, 9, 1));
+        assert_eq!(GraphView::from_store(&s).diameter_estimate(), 0);
+    }
+
+    #[test]
+    fn test_degree_assortativity_bounded() {
+        let g = GraphView::from_store(&make_store());
+        let r = g.degree_assortativity();
+        assert!(r.is_finite());
+        assert!((-1.0..=1.0).contains(&r), "assortativity out of range: {r}");
+    }
+
+    #[test]
+    fn test_label_propagation_components() {
+        let g = GraphView::from_store(&make_store());
+        let comm = g.label_propagation();
+        // The path collapses to one community.
+        assert_eq!(comm[&10], comm[&11]);
+        assert_eq!(comm[&11], comm[&12]);
+        assert_eq!(comm[&12], comm[&13]);
+        // The triangle collapses to one community.
+        assert_eq!(comm[&20], comm[&21]);
+        assert_eq!(comm[&21], comm[&22]);
+        // Distinct components ⇒ distinct communities.
+        assert_ne!(comm[&10], comm[&20]);
+        // The self-loop-only node is its own singleton community.
+        assert_ne!(comm[&30], comm[&10]);
+        assert_ne!(comm[&30], comm[&20]);
+    }
+
+    #[test]
+    fn test_personalized_pagerank_localizes() {
+        let g = GraphView::from_store(&make_store());
+        let ppr = g.personalized_pagerank(&[10], 0.85, 100, 1e-12);
+        // The source ranks highest within its reachable component.
+        assert!(ppr[&10] > ppr[&11]);
+        assert!(ppr[&11] >= ppr[&13]);
+        // Unreachable component and dead source set get no mass.
+        assert_eq!(ppr[&20], 0.0);
+        assert_eq!(ppr[&30], 0.0);
+        // Unknown source ⇒ empty result.
+        assert!(g.personalized_pagerank(&[999], 0.85, 100, 1e-12).is_empty());
     }
 
     #[test]

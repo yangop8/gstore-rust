@@ -1617,6 +1617,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_graph_analytics_function_names() {
+        // The extended graph-analytics built-ins reach the evaluator through the
+        // same generic NAME(args) path — uppercased and case-insensitive — with
+        // zero-, one-, and two-argument shapes all supported.
+        let q = sel(
+            "SELECT (SSSP(<a>,<b>) AS ?p) (khopCount(<a>,2) AS ?k)
+                    (TriangleCounting() AS ?t) (PPR(<a>,<b>) AS ?r)
+                    (DIAMETERESTIMATION() AS ?d) (BfsCount(<a>) AS ?c)
+             WHERE { ?s <p> ?o }",
+        );
+        let got: Vec<(String, usize)> = match &q.projection {
+            Projection::Items(items) => items
+                .iter()
+                .filter_map(|it| match it {
+                    SelectItem::Expr(Expr::Builtin(n, args), _) => Some((n.clone(), args.len())),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected projection items"),
+        };
+        assert_eq!(
+            got,
+            vec![
+                ("SSSP".to_string(), 2),
+                ("KHOPCOUNT".to_string(), 2),
+                ("TRIANGLECOUNTING".to_string(), 0),
+                ("PPR".to_string(), 2),
+                ("DIAMETERESTIMATION".to_string(), 0),
+                ("BFSCOUNT".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn filter_nested_or_precedence() {
         // mirrors data/num/num2.sql: ?sx > ?sy && (?hx > ?hy || ?hx >= "170.0"^^xsd:float)
         let q = sel(

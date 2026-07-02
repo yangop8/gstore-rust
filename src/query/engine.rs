@@ -1985,6 +1985,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(lang_matches(&tag, &range)))
             }
             "SIMILARITY" => {
+                // Polymorphic: when both arguments resolve to graph nodes, this
+                // is a node similarity (neighbour-set cosine overlap); otherwise
+                // it is the original Jaro string similarity (so the string API,
+                // and its tests, keep working unchanged).
+                if let (Some(a), Some(c)) = (
+                    self.node_id(args.first()?, b, l),
+                    self.node_id(args.get(1)?, b, l),
+                ) {
+                    if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
+                        return Some(Value::Double(sim));
+                    }
+                }
                 let x = self.eval_value(args.first()?, b, l)?.lexical();
                 let y = self.eval_value(args.get(1)?, b, l)?.lexical();
                 Some(Value::Double(jaro_similarity(&x, &y)))
@@ -2086,6 +2098,194 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 ))
             }
 
+            // ---- extended graph-analytics built-ins ----------------------
+            // Every node-valued argument resolves to a dictionary entity id;
+            // scalar results are xsd-typed literals (Int/Double/Bool) and
+            // set/path results are space-serialised term strings (a bound "" when
+            // empty), matching the SHORTESTPATHLEN return convention.
+
+            // SSSP(a, b): shortest directed path a⇝b as space-joined terms;
+            // "" when unreachable.
+            "SSSP" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                let path = self.graph_view().shortest_path(a, c).unwrap_or_default();
+                Some(Value::Str { value: self.serialize_nodes(&path), lang: None })
+            }
+            // SSSPLEN(a, b): alias of SHORTESTPATHLEN — #edges, -1 if unreachable.
+            "SSSPLEN" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                let len = self.graph_view().shortest_path_len(a, c);
+                Some(Value::Int(len.map(|x| x as i64).unwrap_or(-1)))
+            }
+            // SHORTESTPATHS(a, b): number of distinct shortest paths a⇝b.
+            "SHORTESTPATHS" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                let n = self.graph_view().count_shortest_paths(a, c)?;
+                Some(Value::Int(n as i64))
+            }
+            // KHOPCOUNT(a, k): #nodes at exactly k out-hops of a.
+            "KHOPCOUNT" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let k = self.hop_arg(args.get(1)?, b, l)?;
+                Some(Value::Int(self.graph_view().khop_count(a, k) as i64))
+            }
+            // KHOPNEIGHBOR(a, k): nodes at exactly k out-hops, serialised.
+            "KHOPNEIGHBOR" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let k = self.hop_arg(args.get(1)?, b, l)?;
+                let ids = self.graph_view().khop_neighbors(a, k);
+                Some(Value::Str { value: self.serialize_nodes(&ids), lang: None })
+            }
+            // KHOPALLNEIGHBORS(a, k): nodes within ≤ k out-hops (excl. a).
+            "KHOPALLNEIGHBORS" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let k = self.hop_arg(args.get(1)?, b, l)?;
+                let ids = self.graph_view().khop_all_neighbors(a, k);
+                Some(Value::Str { value: self.serialize_nodes(&ids), lang: None })
+            }
+            // KHOPENUMERATEPATH(a, k): simple paths of ≤ k edges from a; paths
+            // separated by " ; ", nodes by " " (bounded to 1024 paths).
+            "KHOPENUMERATEPATH" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let k = self.hop_arg(args.get(1)?, b, l)?;
+                let paths = self.graph_view().khop_enumerate_paths(a, k, 1024);
+                let s = paths
+                    .iter()
+                    .map(|p| self.serialize_nodes(p))
+                    .collect::<Vec<_>>()
+                    .join(" ; ");
+                Some(Value::Str { value: s, lang: None })
+            }
+            // BFSCOUNT(a [, k]): #nodes within ≤ k out-hops (excl. a); no k or
+            // k < 0 ⇒ all reachable.
+            "BFSCOUNT" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let k = match args.get(1) {
+                    Some(e) => self.hop_arg(e, b, l)?,
+                    None => u32::MAX,
+                };
+                Some(Value::Int(self.graph_view().bfs_count(a, k) as i64))
+            }
+            // WCC(a, b) ⇒ same weakly-connected component (bool);
+            // WCC(a) ⇒ size of a's weakly-connected component (int).
+            "WCC" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let g = self.graph_view();
+                let (comp, _) = g.weakly_connected_components();
+                match args.get(1) {
+                    Some(e) => {
+                        let c = self.node_id(e, b, l)?;
+                        Some(Value::Bool(matches!(
+                            (comp.get(&a), comp.get(&c)),
+                            (Some(x), Some(y)) if x == y
+                        )))
+                    }
+                    None => {
+                        let rep = comp.get(&a)?;
+                        Some(Value::Int(comp.values().filter(|&r| r == rep).count() as i64))
+                    }
+                }
+            }
+            // LOUVAIN(a, b) ⇒ same Louvain community (bool);
+            // LOUVAIN(a) ⇒ size of a's community (int).
+            "LOUVAIN" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let comm = self.graph_view().louvain();
+                match args.get(1) {
+                    Some(e) => {
+                        let c = self.node_id(e, b, l)?;
+                        Some(Value::Bool(matches!(
+                            (comm.get(&a), comm.get(&c)),
+                            (Some(x), Some(y)) if x == y
+                        )))
+                    }
+                    None => {
+                        let cid = comm.get(&a)?;
+                        Some(Value::Int(comm.values().filter(|&x| x == cid).count() as i64))
+                    }
+                }
+            }
+            // LABELPROP(a, b) ⇒ same label-propagation community (bool);
+            // LABELPROP(a) ⇒ size of a's community (int).
+            "LABELPROP" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let comm = self.graph_view().label_propagation();
+                match args.get(1) {
+                    Some(e) => {
+                        let c = self.node_id(e, b, l)?;
+                        Some(Value::Bool(matches!(
+                            (comm.get(&a), comm.get(&c)),
+                            (Some(x), Some(y)) if x == y
+                        )))
+                    }
+                    None => {
+                        let cid = comm.get(&a)?;
+                        Some(Value::Int(comm.values().filter(|&x| x == cid).count() as i64))
+                    }
+                }
+            }
+            // BETWEENNESSCENTRALITY(a): Brandes betweenness of node a.
+            "BETWEENNESSCENTRALITY" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let bc = self.graph_view().betweenness_centrality();
+                Some(Value::Double(bc.get(&a).copied().unwrap_or(0.0)))
+            }
+            // CLOSENESSCENTRALITY(a): Wasserman–Faust closeness of node a.
+            "CLOSENESSCENTRALITY" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let cc = self.graph_view().closeness_centrality();
+                Some(Value::Double(cc.get(&a).copied().unwrap_or(0.0)))
+            }
+            // TRIANGLECOUNTING(): global triangle count;
+            // TRIANGLECOUNTING(a): triangles through node a.
+            "TRIANGLECOUNTING" => match args.first() {
+                None => Some(Value::Int(self.graph_view().triangle_count() as i64)),
+                Some(e) => {
+                    let a = self.node_id(e, b, l)?;
+                    Some(Value::Int(
+                        self.graph_view().node_triangle_count(a).unwrap_or(0) as i64,
+                    ))
+                }
+            },
+            // CLUSTERINGCOEFF(): global transitivity;
+            // CLUSTERINGCOEFF(a): local clustering coefficient of node a.
+            "CLUSTERINGCOEFF" => match args.first() {
+                None => Some(Value::Double(self.graph_view().global_clustering_coefficient())),
+                Some(e) => {
+                    let a = self.node_id(e, b, l)?;
+                    Some(Value::Double(
+                        self.graph_view().local_clustering_coefficient(a).unwrap_or(0.0),
+                    ))
+                }
+            },
+            // PPR(src, target): personalized-PageRank score of `target` when the
+            // random walk restarts at `src`.
+            "PPR" => {
+                let src = self.node_id(args.first()?, b, l)?;
+                let target = self.node_id(args.get(1)?, b, l)?;
+                let ppr = self.graph_view().personalized_pagerank(&[src], 0.85, 100, 1e-9);
+                Some(Value::Double(ppr.get(&target).copied().unwrap_or(0.0)))
+            }
+            // JACCARDSIMILARITY(a, b): Jaccard index of the two neighbour sets.
+            "JACCARDSIMILARITY" => {
+                let a = self.node_id(args.first()?, b, l)?;
+                let c = self.node_id(args.get(1)?, b, l)?;
+                Some(Value::Double(
+                    self.graph_view().jaccard_similarity(a, c).unwrap_or(0.0),
+                ))
+            }
+            // DEGREECORRELATION(): Newman degree assortativity of the graph.
+            "DEGREECORRELATION" => {
+                Some(Value::Double(self.graph_view().degree_assortativity()))
+            }
+            // DIAMETERESTIMATION(): double-sweep BFS diameter estimate.
+            "DIAMETERESTIMATION" => {
+                Some(Value::Int(self.graph_view().diameter_estimate() as i64))
+            }
+
             // User-defined function fallback (gStore `pfnQuery`): a name that is
             // not a SPARQL built-in is looked up in the registry before erroring.
             // Arguments are evaluated to values first; if any errors/unbound the
@@ -2116,6 +2316,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let g = Rc::new(GraphView::from_source(self.store));
         *self.graph_cache.borrow_mut() = Some(Rc::clone(&g));
         g
+    }
+
+    /// Render a graph node's entity id back to its dictionary term string
+    /// (`<iri>` / `"literal"`) for serialised set/path built-in results.
+    fn node_label(&self, id: u32) -> String {
+        self.resolve_string(Some(id), false).unwrap_or_default()
+    }
+
+    /// Serialise an entity-id list as space-separated term strings.
+    fn serialize_nodes(&self, ids: &[u32]) -> String {
+        ids.iter().map(|&id| self.node_label(id)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Evaluate a SPARQL numeric argument into a hop budget: a negative value
+    /// (e.g. `-1`) means "unbounded" (`u32::MAX`), mirroring `KHOPREACHABLE`.
+    fn hop_arg(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<u32> {
+        let kf = self.eval_value(e, b, l)?.as_f64()?;
+        Some(if kf < 0.0 { u32::MAX } else { kf as u32 })
     }
 
     /// Extract an integer field from an `xsd:dateTime` argument.
@@ -3146,6 +3364,140 @@ mod builtin_tests {
         assert_eq!(
             lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
             "true"
+        );
+    }
+
+    // ---- extended graph-analytics built-ins ------------------------------
+
+    #[test]
+    fn sssp_serializes_the_path() {
+        assert_eq!(
+            lit(&scalar("SSSP(<http://ex/a>, <http://ex/d>)")),
+            "<http://ex/a> <http://ex/b> <http://ex/c> <http://ex/d>"
+        );
+        // Unreachable ⇒ empty (but bound) string.
+        assert_eq!(lit(&scalar("SSSP(<http://ex/d>, <http://ex/a>)")), "");
+    }
+
+    #[test]
+    fn sssplen_aliases_shortestpathlen() {
+        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
+        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
+    }
+
+    #[test]
+    fn shortestpaths_counts_distinct_paths() {
+        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
+        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
+    }
+
+    #[test]
+    fn khop_count_and_neighbor_and_all() {
+        // a's out-edges: b, "Hello World", <dt> ⇒ 3 nodes at exactly 1 hop.
+        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 1)")), "3");
+        // Exactly 2 hops from a is just {c}.
+        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 2)")), "1");
+        assert_eq!(
+            lit(&scalar("KHOPNEIGHBOR(<http://ex/a>, 2)")),
+            "<http://ex/c>"
+        );
+        assert_eq!(lit(&scalar("KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
+    }
+
+    #[test]
+    fn bfscount_counts_reachable() {
+        // All reachable from a (excl. a): b, c, d, "Hello World", <dt> ⇒ 5.
+        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>)")), "5");
+        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 2)")), "4");
+    }
+
+    #[test]
+    fn khop_enumerate_paths_serializes() {
+        // From b: b→c and b→c→d.
+        assert_eq!(
+            lit(&scalar("KHOPENUMERATEPATH(<http://ex/b>, 2)")),
+            "<http://ex/b> <http://ex/c> ; <http://ex/b> <http://ex/c> <http://ex/d>"
+        );
+    }
+
+    #[test]
+    fn wcc_membership_and_size() {
+        // Every node hangs off a ⇒ one weakly-connected component of 6 nodes.
+        assert_eq!(lit(&scalar("WCC(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("WCC(<http://ex/a>)")), "6");
+    }
+
+    #[test]
+    fn community_builtins_group_the_graph() {
+        // The whole graph is one connected blob ⇒ same label-prop community.
+        assert_eq!(lit(&scalar("LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
+        // Louvain returns a community size (≥ 1) for a known node.
+        let sz: usize = lit(&scalar("LOUVAIN(<http://ex/a>)")).parse().unwrap();
+        assert!(sz >= 1);
+    }
+
+    #[test]
+    fn triangle_and_clustering_are_zero_on_a_tree() {
+        assert_eq!(lit(&scalar("TRIANGLECOUNTING()")), "0");
+        assert_eq!(lit(&scalar("TRIANGLECOUNTING(<http://ex/a>)")), "0");
+        // Acyclic fan/path ⇒ no closed triples ⇒ transitivity 0.0.
+        assert_eq!(lit(&scalar("CLUSTERINGCOEFF()")), "0.0");
+        assert_eq!(lit(&scalar("CLUSTERINGCOEFF(<http://ex/a>)")), "0.0");
+    }
+
+    #[test]
+    fn centrality_builtins_rank_intermediate_nodes() {
+        // A source node is never an intermediary ⇒ betweenness 0.
+        let bc_a: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let bc_b: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
+        assert_eq!(bc_a, 0.0);
+        assert!(bc_b > 0.0);
+        // a reaches five nodes ⇒ positive closeness.
+        let cc_a: f64 = lit(&scalar("CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        assert!(cc_a > 0.0);
+    }
+
+    #[test]
+    fn jaccard_and_node_similarity() {
+        // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
+        assert_eq!(
+            lit(&scalar(r#"JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
+            "0.5"
+        );
+        // Node-mode SIMILARITY: both objects of a ⇒ identical neighbour set.
+        assert_eq!(
+            lit(&scalar(
+                r#"SIMILARITY("Hello World", "2011-01-10T14:45:13.815-05:00"^^<http://www.w3.org/2001/XMLSchema#dateTime>)"#
+            )),
+            "1.0"
+        );
+        // String-mode SIMILARITY still works for non-node arguments.
+        assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
+    }
+
+    #[test]
+    fn degree_correlation_and_diameter() {
+        let r: f64 = lit(&scalar("DEGREECORRELATION()")).parse().unwrap();
+        assert!(r.is_finite() && (-1.0..=1.0).contains(&r));
+        // Undirected longest shortest path: leaf → a → b → c → d = 4.
+        assert_eq!(lit(&scalar("DIAMETERESTIMATION()")), "4");
+    }
+
+    #[test]
+    fn ppr_prefers_the_source() {
+        let self_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
+        let far_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
+        assert!(self_score > far_score);
+        assert!(far_score >= 0.0);
+    }
+
+    #[test]
+    fn graph_builtin_inside_filter() {
+        // Keep only rows where a can reach d within 3 hops (it can).
+        assert_eq!(
+            count("<http://ex/a> <http://ex/name> ?n FILTER(SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
+            1
         );
     }
 }
