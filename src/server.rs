@@ -683,18 +683,30 @@ impl<W: Write> Write for ChunkedWriter<'_, W> {
 // --- response compression (feature `gzip`) -----------------------------------
 
 /// Choose a supported `Content-Encoding` from the client's `Accept-Encoding`.
-/// Prefers `gzip`, then `deflate`; ignores q-values (a token match is enough for
-/// our clients). Returns `None` when neither is offered.
+/// Prefers `gzip`, then `deflate`. Honors an explicit `q=0` (the client refusing
+/// a coding); other q-values are treated as "acceptable". Returns `None` when
+/// neither is offered (or both are refused).
 #[cfg(feature = "gzip")]
 fn pick_encoding(accept_encoding: Option<&str>) -> Option<&'static str> {
     let ae = accept_encoding?.to_ascii_lowercase();
-    let has = |name: &str| {
-        ae.split(',')
-            .any(|t| t.trim().split(';').next().map(str::trim) == Some(name))
+    let acceptable = |name: &str| {
+        ae.split(',').any(|tok| {
+            let mut parts = tok.trim().split(';');
+            if parts.next().map(str::trim) != Some(name) {
+                return false;
+            }
+            // A `q=0` weight means the client explicitly refuses this coding.
+            !parts.any(|p| {
+                p.trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f64>().ok())
+                    .is_some_and(|v| v <= 0.0)
+            })
+        })
     };
-    if has("gzip") {
+    if acceptable("gzip") {
         Some("gzip")
-    } else if has("deflate") {
+    } else if acceptable("deflate") {
         Some("deflate")
     } else {
         None
@@ -910,6 +922,20 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::Arc;
     use std::thread;
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn pick_encoding_honors_q_zero() {
+        assert_eq!(pick_encoding(Some("gzip")), Some("gzip"));
+        assert_eq!(pick_encoding(Some("gzip, deflate")), Some("gzip"));
+        // An explicit q=0 refuses that coding.
+        assert_eq!(pick_encoding(Some("gzip;q=0")), None);
+        assert_eq!(pick_encoding(Some("gzip;q=0, deflate")), Some("deflate"));
+        assert_eq!(pick_encoding(Some("gzip;q=0, deflate;q=0")), None);
+        // A non-zero weight is acceptable.
+        assert_eq!(pick_encoding(Some("gzip;q=0.5")), Some("gzip"));
+        assert_eq!(pick_encoding(None), None);
+    }
 
     #[test]
     fn locked_recovers_from_a_poisoned_mutex() {

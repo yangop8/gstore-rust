@@ -93,6 +93,14 @@ fn main() {
         i += 1;
     }
 
+    // HTTPS needs BOTH a cert and a key; one without the other would otherwise
+    // silently fall back to plaintext HTTP.
+    #[cfg(feature = "tls")]
+    if tls_cert.is_some() != tls_key.is_some() {
+        eprintln!("error: --tls-cert and --tls-key must be supplied together to serve HTTPS");
+        std::process::exit(2);
+    }
+
     if api {
         if rocksdb {
             eprintln!("gserver: --rocksdb is ignored in --api mode (the API manages its own databases)");

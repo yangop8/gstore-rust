@@ -426,8 +426,11 @@ impl Decimal {
     }
 
     fn negated(self) -> Decimal {
+        // saturating (not wrapping): negating i128::MIN would otherwise wrap back
+        // to i128::MIN, making -x == x. i128::MIN is unreachable from parsing but
+        // guard anyway.
         Decimal {
-            mant: self.mant.wrapping_neg(),
+            mant: self.mant.saturating_neg(),
             scale: self.scale,
         }
     }
@@ -527,7 +530,13 @@ impl Decimal {
 /// `Value`'s derived `PartialEq`).
 impl PartialEq for Decimal {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp_exact(*other) == Some(Ordering::Equal)
+        match self.cmp_exact(*other) {
+            Some(o) => o == Ordering::Equal,
+            // Scale alignment overflowed i128 (≥~39 fractional digits): fall back
+            // to f64 so equality stays consistent with `sparql_cmp`, which also
+            // resolves that case via f64.
+            None => self.to_f64() == other.to_f64(),
+        }
     }
 }
 
