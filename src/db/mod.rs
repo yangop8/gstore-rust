@@ -9,7 +9,7 @@
 //! `vstree.bin` (the signature index). This is the deliberately-simple stand-in
 //! for gStore's on-disk B+ tree KVstore (backlog item A).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -41,6 +41,16 @@ const VSTREE_FILE: &str = "vstree.bin";
 const NAMED_FILE: &str = "named.bin";
 /// The append-only update log inside a database directory (gStore's update.log).
 const UPDATE_LOG_FILE: &str = "update.log";
+/// Marker file inside a *full* backup directory recording the update-log
+/// checkpoint (byte length) captured at backup time. Lets a later incremental
+/// backup know where its delta begins; ignored by [`Database::load`].
+const BACKUP_OFFSET_FILE: &str = "BACKUP_OFFSET";
+/// Marker file inside an *incremental* backup directory describing its delta
+/// (the base/end update-log byte offsets it covers).
+const INCREMENTAL_MARKER_FILE: &str = "INCREMENTAL";
+/// The copied slice of the update log inside an incremental backup directory —
+/// the raw length-prefixed UPDATE records for `[base_offset, end_offset)`.
+const INCREMENTAL_LOG_FILE: &str = "incr.log";
 /// The append-only triple-level redo log inside a database directory. Records
 /// every *committed* mutation so it can be re-applied on recovery (the redo half
 /// of gStore's WAL; the undo half is the per-transaction [`UndoOp`] log).
@@ -213,6 +223,13 @@ pub struct Database {
     /// to [`redo_log`](Self::redo_log) on commit, discarded on rollback. In
     /// auto-commit mode records are written through immediately and this stays empty.
     redo_pending: Vec<RedoRec>,
+    /// Incremental-backup checkpoint: the update-log byte offset the most recent
+    /// full ([`backup`](Self::backup)) or incremental
+    /// ([`backup_incremental`](Self::backup_incremental)) backup ended at. The
+    /// next incremental captures update-log records from here onward, so
+    /// successive incrementals chain contiguously. Interior-mutable because both
+    /// backup methods take `&self`.
+    backup_offset: Cell<u64>,
     /// User-defined forward-chaining reasoning rules (gStore's `ReasonHelper`).
     rules: crate::reason::RuleSet,
     /// User-defined scalar SPARQL functions (gStore's PFN, as a safe in-process
@@ -284,6 +301,7 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
+            backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
         }
@@ -414,6 +432,7 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
+            backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
         })
@@ -463,6 +482,7 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
+            backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
         })
@@ -1119,6 +1139,7 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
+            backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
         })
@@ -1182,6 +1203,7 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
+            backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
         })
@@ -1189,17 +1211,138 @@ impl Database {
 
     // ---- backup / restore -------------------------------------------------
 
-    /// Back up a consistent snapshot of this database into `backup_dir`
-    /// (gStore `Database::backup`). The snapshot is fully independent of the
-    /// live database; restore it with [`restore`](Self::restore).
+    /// Back up a consistent **full** snapshot of this database into `backup_dir`
+    /// (gStore `Database::backup`). The snapshot is fully independent of the live
+    /// database; restore it with [`restore`](Self::restore).
+    ///
+    /// This also establishes the *incremental-backup baseline*: it records the
+    /// current update-log length as the checkpoint (and writes a small
+    /// `BACKUP_OFFSET` marker into `backup_dir`), so a later
+    /// [`backup_incremental`](Self::backup_incremental) captures only the update
+    /// records appended after this point. The full snapshot already reflects every
+    /// update logged up to the checkpoint, so base + subsequent increments
+    /// reconstruct the latest state without overlap or gap.
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
-        self.save(backup_dir)
+        let backup_dir = backup_dir.as_ref();
+        self.save(backup_dir)?;
+        let off = self.update_log_len();
+        self.backup_offset.set(off);
+        write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
+        Ok(())
     }
 
-    /// Restore a database from a backup directory created by
+    /// Restore a database from a full backup directory created by
     /// [`backup`](Self::backup) (gStore `Database::restore`).
     pub fn restore<P: AsRef<Path>>(backup_dir: P) -> Result<Database> {
         Database::load(backup_dir)
+    }
+
+    /// The current incremental-backup checkpoint: the update-log byte offset that
+    /// the most recent full/incremental backup ended at (0 before any backup).
+    pub fn backup_checkpoint(&self) -> u64 {
+        self.backup_offset.get()
+    }
+
+    /// Byte length of the update log, or 0 when logging is disabled or the file
+    /// does not exist yet. This is the incremental-backup checkpoint unit: the
+    /// update log is append-only and every record is written whole, so its length
+    /// is always a clean record boundary.
+    fn update_log_len(&self) -> u64 {
+        self.update_log
+            .as_ref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Produce an **incremental** backup into `out_dir`: the delta relative to the
+    /// most recent full ([`backup`](Self::backup)) or incremental backup
+    /// (C++ gStore's full + incremental backup pairing). It copies the update-log
+    /// records appended since the last checkpoint into `out_dir/incr.log` and
+    /// writes an `INCREMENTAL` marker recording the `[base_offset, end_offset)`
+    /// byte range it covers, then advances the checkpoint — so successive
+    /// incrementals chain contiguously.
+    ///
+    /// Requires update logging to be enabled (`enable_update_log*`); the delta is
+    /// exactly the SPARQL UPDATE statements logged since the base. Reconstruct the
+    /// latest state with [`restore_incremental`](Self::restore_incremental).
+    ///
+    /// Format of `out_dir`:
+    /// * `incr.log` — the raw bytes of the update log for `[base, end)`, in the
+    ///   same length-prefixed `REC <millis> <changed> <len>\n<sparql>\n` record
+    ///   format, so it replays through the ordinary update-log machinery.
+    /// * `INCREMENTAL` — a UTF-8 marker: `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
+    pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
+        let out_dir = out_dir.as_ref();
+        let Some(log_path) = self.update_log.clone() else {
+            return Err(GStoreError::Database(
+                "backup_incremental requires update logging to be enabled \
+                 (call enable_update_log / enable_update_log_in first)"
+                    .into(),
+            ));
+        };
+        let base = self.backup_offset.get();
+        // Missing log ⇒ no records yet (treat as empty), so an incremental taken
+        // before any logged update is simply an empty (but valid) delta.
+        let data = fs::read(&log_path).unwrap_or_default();
+        let end = data.len() as u64;
+        if end < base {
+            return Err(GStoreError::Database(format!(
+                "update log ({end} bytes) shrank below the backup checkpoint ({base}); \
+                 the log was truncated or replaced since the last backup"
+            )));
+        }
+        fs::create_dir_all(out_dir)?;
+        let slice = &data[base as usize..end as usize];
+        fs::write(out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
+        self.backup_offset.set(end);
+        Ok(())
+    }
+
+    /// Restore from a full base backup and then apply incremental deltas in
+    /// order, reconstructing the state captured by the last incremental
+    /// (C++ gStore's incremental-restore path).
+    ///
+    /// `base_dir` is a directory produced by [`backup`](Self::backup); each entry
+    /// of `incr_dirs` is a directory produced by
+    /// [`backup_incremental`](Self::backup_incremental), in chronological order.
+    /// The base snapshot is loaded, then each delta's `incr.log` is replayed onto
+    /// it. Deltas are checked for contiguity: each must begin exactly where the
+    /// previous one ended (starting from the base's recorded checkpoint), so an
+    /// out-of-order or gapped chain is rejected rather than silently misapplied.
+    pub fn restore_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
+        base_dir: P,
+        incr_dirs: &[Q],
+    ) -> Result<Database> {
+        let base_dir = base_dir.as_ref();
+        let mut db = Database::load(base_dir)?;
+        // The base's checkpoint is where the first increment must begin. Absent a
+        // marker (e.g. a backup taken without logging), treat it as 0.
+        let mut expected = read_backup_offset(&base_dir.join(BACKUP_OFFSET_FILE)).unwrap_or(0);
+        // Replaying must not re-log; a freshly loaded db has no update log anyway.
+        let saved = db.update_log.take();
+        let outcome = (|| {
+            for dir in incr_dirs {
+                let dir = dir.as_ref();
+                let (base, end) =
+                    read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE))?;
+                if base != expected {
+                    return Err(GStoreError::Database(format!(
+                        "incremental backup '{}' starts at offset {base} but {expected} \
+                         was expected (out-of-order or gapped increment chain)",
+                        dir.display()
+                    )));
+                }
+                let bytes = fs::read(dir.join(INCREMENTAL_LOG_FILE))?;
+                db.replay_records(&bytes)?;
+                expected = end;
+            }
+            Ok(())
+        })();
+        db.update_log = saved;
+        db.backup_offset.set(expected);
+        outcome.map(|()| db)
     }
 
     /// File-level backup of a *persisted* database directory `src` into `dst`,
@@ -1676,6 +1819,60 @@ fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
     Ok(())
 }
 
+/// Parse `key <u64>` out of a simple `MAGIC 1\n<key> <value>\n…` marker text,
+/// returning the value for `key`. Used by the backup-marker readers below.
+fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
+    if header.split_whitespace().next() != Some(magic) {
+        return Err(GStoreError::Database(format!(
+            "not a {magic} marker (bad header {header:?})"
+        )));
+    }
+    for line in lines {
+        let mut it = line.split_whitespace();
+        if it.next() == Some(key) {
+            return it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| GStoreError::Database(format!("marker field '{key}' is not a u64")));
+        }
+    }
+    Err(GStoreError::Database(format!(
+        "marker field '{key}' not found"
+    )))
+}
+
+/// Write a full-backup checkpoint marker: `GSTORE-BACKUP 1\noffset <N>\n`.
+fn write_backup_offset(path: &Path, offset: u64) -> Result<()> {
+    fs::write(path, format!("GSTORE-BACKUP 1\noffset {offset}\n"))?;
+    Ok(())
+}
+
+/// Read a full-backup checkpoint marker's `offset`.
+fn read_backup_offset(path: &Path) -> Result<u64> {
+    let text = fs::read_to_string(path)?;
+    marker_field(&text, "GSTORE-BACKUP", "offset")
+}
+
+/// Write an incremental-backup marker:
+/// `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
+fn write_incremental_marker(path: &Path, base: u64, end: u64) -> Result<()> {
+    fs::write(
+        path,
+        format!("GSTORE-INCREMENTAL 1\nbase_offset {base}\nend_offset {end}\n"),
+    )?;
+    Ok(())
+}
+
+/// Read an incremental-backup marker's `(base_offset, end_offset)`.
+fn read_incremental_marker(path: &Path) -> Result<(u64, u64)> {
+    let text = fs::read_to_string(path)?;
+    let base = marker_field(&text, "GSTORE-INCREMENTAL", "base_offset")?;
+    let end = marker_field(&text, "GSTORE-INCREMENTAL", "end_offset")?;
+    Ok((base, end))
+}
+
 /// Strip a leading `<` and trailing `>` from an IRI dict-key, leaving the raw
 /// IRI (the form named-graph helpers expect). Non-bracketed input is returned
 /// unchanged.
@@ -2084,6 +2281,159 @@ mod tests {
             "the committed mutation must be replayed"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- full + incremental backup / restore -----------------------------
+
+    /// Every `(s, p, o)` triple in the default graph, sorted — used to compare
+    /// the exact triple set of two databases.
+    fn sorted_triples(db: &mut Database) -> Vec<Vec<Option<String>>> {
+        let mut rows = db
+            .select("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+            .unwrap()
+            .rows;
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn full_then_incremental_backup_restore_roundtrip() {
+        let base_dir = temp_dir("bk_base");
+        let incr1_dir = temp_dir("bk_incr1");
+        let incr2_dir = temp_dir("bk_incr2");
+        let db_dir = temp_dir("bk_db");
+
+        // Live database with update logging enabled inside its own directory.
+        let mut db = Database::build_from_str("bk", SMALL).unwrap();
+        db.enable_update_log_in(&db_dir).unwrap();
+
+        // An update BEFORE the full backup: captured by the base snapshot itself.
+        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+
+        // Full backup: base snapshot + checkpoint at the current update-log length.
+        db.backup(&base_dir).unwrap();
+        let base_ck = db.backup_checkpoint();
+        assert!(base_ck > 0, "checkpoint records the pre-backup update");
+
+        // Updates AFTER the full backup ⇒ first increment (insert + delete).
+        db.query("INSERT DATA { <root> <contain> <n1> . <n1> <own> <p1> }")
+            .unwrap();
+        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
+        db.backup_incremental(&incr1_dir).unwrap();
+        let ck1 = db.backup_checkpoint();
+        assert!(ck1 > base_ck, "checkpoint advanced past the base");
+
+        // More updates ⇒ second increment, contiguous with the first.
+        db.query("INSERT DATA { <n1> <own> <p2> }").unwrap();
+        db.backup_incremental(&incr2_dir).unwrap();
+        assert!(db.backup_checkpoint() > ck1);
+
+        // The live database's exact triple set.
+        let live = sorted_triples(&mut db);
+        let live_count = db.triple_num();
+
+        // Restore base + both increments in order ⇒ exact reproduction.
+        let mut restored =
+            Database::restore_incremental(&base_dir, &[&incr1_dir, &incr2_dir]).unwrap();
+        assert_eq!(
+            sorted_triples(&mut restored),
+            live,
+            "base + increments reproduce the exact triple set"
+        );
+        assert_eq!(restored.triple_num(), live_count);
+        // The post-backup insert and delete are both reflected.
+        assert_eq!(
+            restored
+                .select("SELECT ?o WHERE { <n1> <own> ?o }")
+                .unwrap()
+                .row_count(),
+            2,
+            "both p1 and p2 restored"
+        );
+        assert_eq!(
+            restored
+                .select("SELECT ?o WHERE { <root> <contain> <node0> }")
+                .unwrap()
+                .row_count(),
+            0,
+            "the incremental delete is applied"
+        );
+
+        // Restoring ONLY the base reproduces the pre-increment state.
+        let mut base_only = Database::restore(&base_dir).unwrap();
+        assert!(base_only.triple_num() < live_count, "base predates the increments");
+        assert_eq!(
+            base_only
+                .select("SELECT ?o WHERE { <n1> <own> ?o }")
+                .unwrap()
+                .row_count(),
+            0,
+            "the base does not contain post-backup inserts"
+        );
+
+        // An out-of-order increment chain is rejected (gap/contiguity check).
+        let err = Database::restore_incremental(&base_dir, &[&incr2_dir, &incr1_dir]).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::Database(_)),
+            "out-of-order increments must be rejected, got {err:?}"
+        );
+
+        for d in [&base_dir, &incr1_dir, &incr2_dir, &db_dir] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn backup_incremental_requires_update_log() {
+        let db = Database::build_from_str("bk", SMALL).unwrap();
+        let out = temp_dir("bk_no_log");
+        let err = db.backup_incremental(&out).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::Database(_)),
+            "incremental backup without an update log must error, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn successive_incrementals_are_contiguous() {
+        // Three increments back to back with no intervening full backup each pick
+        // up exactly where the previous ended; restore replays the whole chain.
+        let base_dir = temp_dir("bk2_base");
+        let db_dir = temp_dir("bk2_db");
+        let incr: Vec<_> = (0..3).map(|i| temp_dir(&format!("bk2_incr{i}"))).collect();
+
+        let mut db = Database::build_from_str("bk2", SMALL).unwrap();
+        db.enable_update_log_in(&db_dir).unwrap();
+        db.backup(&base_dir).unwrap();
+
+        let mut prev_end = db.backup_checkpoint();
+        for (i, dir) in incr.iter().enumerate() {
+            db.query(&format!("INSERT DATA {{ <root> <seq> <s{i}> }}"))
+                .unwrap();
+            db.backup_incremental(dir).unwrap();
+            let (base, end) = read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE)).unwrap();
+            assert_eq!(base, prev_end, "increment {i} starts where the last ended");
+            assert!(end > base, "increment {i} covers new records");
+            prev_end = end;
+        }
+
+        let refs: Vec<&std::path::PathBuf> = incr.iter().collect();
+        let mut restored = Database::restore_incremental(&base_dir, &refs).unwrap();
+        assert_eq!(
+            restored
+                .select("SELECT ?o WHERE { <root> <seq> ?o }")
+                .unwrap()
+                .row_count(),
+            3,
+            "all three sequential increments were replayed"
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+        let _ = fs::remove_dir_all(&db_dir);
+        for d in &incr {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     // ---- query-cache LRU -------------------------------------------------
