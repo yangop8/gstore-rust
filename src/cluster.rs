@@ -2337,9 +2337,19 @@ impl RaftState {
         self.snapshot = triples;
     }
 
-    /// Reset the election timer (used by the transport when a node is revived,
-    /// so it doesn't immediately campaign with a stale elapsed counter).
+    /// Handle revival after a crash: step down from any (now stale) leadership
+    /// and reset the election timer.
+    ///
+    /// A node that was down cannot still legitimately lead — a newer leader may
+    /// have been elected in a higher term while it was gone. Keeping `Role::Leader`
+    /// would let a revived old leader be picked by [`ReplicaGroup::leader`] once the
+    /// real leader is down, serving stale reads and accepting writes that can never
+    /// commit (a lost write). It rejoins as a follower and re-learns the current
+    /// term/leader from the next `AppendEntries`.
     fn note_revived(&mut self) {
+        if self.role == Role::Leader {
+            self.role = Role::Follower;
+        }
         self.reset_election_timeout();
     }
 }
@@ -3037,17 +3047,33 @@ impl ReplicaGroup {
         );
     }
 
-    /// Ensure the group has a leader, electing the lowest-id up replica if none
-    /// currently leads. Returns the leader's id.
+    /// Ensure the group has a leader, electing one if none currently leads.
+    /// Returns the leader's id.
+    ///
+    /// Elects the **most up-to-date** up replica (greatest `(last_log_term,
+    /// last_log_index)`), not the lowest-id one: Raft grants a vote only to a
+    /// candidate whose log is at least as up-to-date as the voter's, so a replica
+    /// with a stale log (e.g. one that missed commits while down) can be
+    /// permanently unelectable even when a quorum is up. The most up-to-date up
+    /// replica dominates every other up replica's log and therefore always wins
+    /// the quorum.
     pub fn ensure_leader(&mut self) -> NodeId {
         if let Some(l) = self.leader() {
             return l;
         }
-        let cand = *self
-            .replicas
-            .iter()
-            .find(|&&id| !self.down[self.pos(id)])
+        // Most up-to-date log wins; ties break to the lowest id so an all-empty
+        // bootstrap still deterministically elects the lowest-id replica.
+        let ci = (0..self.replicas.len())
+            .filter(|&i| !self.down[i])
+            .max_by_key(|&i| {
+                (
+                    self.states[i].last_log_term(),
+                    self.states[i].last_log_index(),
+                    std::cmp::Reverse(self.replicas[i]),
+                )
+            })
             .expect("no up replica available to elect a leader");
+        let cand = self.replicas[ci];
         self.elect(cand);
         cand
     }
@@ -3213,6 +3239,11 @@ impl ShardedRaftCluster {
     /// absent, or `None` if the group has no leader.
     pub fn remove(&mut self, t: IdTriple) -> Option<bool> {
         let g = shard_of(t.sub, self.num_shards);
+        // Decide presence only against the leader. With no leader, a probe would
+        // read a possibly-stale follower and could report a committed triple as
+        // "absent" (Some(false)) — a silently-lost delete the caller never
+        // retries. Report "no leader" (None) instead, matching insert().
+        self.groups[g].leader()?;
         let present = self.groups[g]
             .readable_store()
             .map(|s| s.exists(t.sub, t.pred, t.obj))
@@ -5149,6 +5180,74 @@ mod replicated_shard_tests {
         assert!(cluster.group(0).store(old).exists(1, 2, 3));
         assert!(cluster.group(0).store(old).exists(4, 5, 6));
         assert_eq!(cluster.group(0).store(old).triple_count(), 2);
+    }
+
+    /// A killed leader that REVIVES while the newer leader is down must not be
+    /// picked as leader (it never heard an AppendEntries to step down through the
+    /// normal path). Otherwise it would shadow a committed write and acknowledge
+    /// a write that can never commit. (Regression: note_revived stepping down.)
+    #[test]
+    fn revived_stale_leader_does_not_shadow_a_committed_write() {
+        let mut c = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        c.bootstrap();
+        let old = c.group(0).leader().unwrap();
+        c.set_replica_down(0, old, true);
+        let survivor = c
+            .group(0)
+            .replicas()
+            .iter()
+            .copied()
+            .find(|&r| r != old)
+            .unwrap();
+        c.group_mut(0).elect(survivor);
+        assert_eq!(c.insert(t(4, 5, 6)), Some(true)); // committed in the higher term
+
+        // Old leader revives (steps down) while the new leader dies: no
+        // AppendEntries will reach it, so only note_revived can demote it.
+        c.set_replica_down(0, old, false);
+        c.set_replica_down(0, survivor, true);
+        assert_ne!(c.group(0).leader(), Some(old), "a revived stale leader must not lead");
+
+        // Failover to the most up-to-date survivor still sees the committed write.
+        let leader = c.group_mut(0).ensure_leader();
+        assert!(
+            c.group(0).store(leader).exists(4, 5, 6),
+            "committed write must survive the failover"
+        );
+    }
+
+    /// `ensure_leader` must elect an *electable* (up-to-date) up replica, not the
+    /// lowest-id one — a stale rejoined replica can never win a vote, so electing
+    /// it would spin and panic even though a quorum is up. (Regression #13.)
+    #[test]
+    fn ensure_leader_elects_an_up_to_date_replica_not_a_stale_one() {
+        let mut c = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        c.bootstrap();
+        assert_eq!(c.group(0).leader(), Some(0));
+        c.set_replica_down(0, 1, true); // node 1 misses the commit
+        assert_eq!(c.insert(t(7, 8, 9)), Some(true)); // commits on {0, 2}
+        c.set_replica_down(0, 0, true); // kill leader
+        c.set_replica_down(0, 1, false); // revive the stale node 1
+        // up = {1 (stale), 2 (has the entry)} — node 2 must be elected.
+        let leader = c.group_mut(0).ensure_leader();
+        assert_eq!(leader, 2, "the up-to-date replica is elected, no panic");
+        assert!(c.group(0).store(2).exists(7, 8, 9));
+    }
+
+    /// `remove` on a leaderless group must report `None` ("no leader"), not
+    /// `Some(false)` ("absent"), for a committed triple — the latter is a
+    /// silently-lost delete the caller never retries. (Regression #14.)
+    #[test]
+    fn remove_reports_no_leader_not_false_for_a_committed_triple() {
+        let mut c = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        c.bootstrap();
+        c.set_replica_down(0, 1, true);
+        let tr = t(7, 8, 9);
+        assert_eq!(c.insert(tr), Some(true)); // committed on {0, 2}
+        c.set_replica_down(0, 0, true); // kill leader
+        c.set_replica_down(0, 1, false); // revive stale node 1 (empty store)
+        assert_eq!(c.group(0).leader(), None, "group is leaderless");
+        assert_eq!(c.remove(tr), None, "no leader ⇒ None, not a spurious 'absent'");
     }
 
     /// Reads stay correct after one replica per bucket fails: each bucket keeps a
