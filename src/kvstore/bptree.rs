@@ -169,6 +169,18 @@ impl BTree {
 
     /// Insert or replace `key → val`.
     pub fn insert(&self, pager: &mut Pager, key: &[u8], val: &[u8]) -> Result<()> {
+        // A single entry must fit within one page. A leaf node reserves 7 bytes
+        // of header (is_leaf + link + count) plus a 2-byte length prefix for the
+        // key and another for the value. Reject an oversized entry up front:
+        // otherwise `split_leaf` would try to serialise a lone entry that cannot
+        // fit and write past the fixed-size page buffer (a panic).
+        if 7 + 2 + key.len() + 2 + val.len() > PAGE_SIZE {
+            return Err(GStoreError::Serialize(format!(
+                "B+ tree entry ({}-byte key + {}-byte value) too large for a {PAGE_SIZE}-byte page",
+                key.len(),
+                val.len()
+            )));
+        }
         let root = self.root(pager);
         if root == 0 {
             let id = pager.alloc()?;

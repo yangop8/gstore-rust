@@ -119,6 +119,12 @@ impl Parser {
             }
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
         };
+        // A well-formed request consumes all of its input. Reject trailing
+        // tokens so a second statement smuggled after the query — e.g.
+        // `SELECT … } ; DROP ALL` — is a parse error rather than being silently
+        // dropped (the read-only gate in gnlqa/kb.rs and the HTTP privilege
+        // check both rely on the parse faithfully reflecting the whole string).
+        self.expect(&Token::Eof, "end of query")?;
         Ok(query)
     }
 
@@ -1508,6 +1514,16 @@ mod tests {
             GraphPattern::Filter(fs, _) => fs,
             _ => &[],
         }
+    }
+
+    #[test]
+    fn trailing_tokens_after_a_query_are_rejected() {
+        // A smuggled second statement after a complete query must be a parse
+        // error, not silently dropped (read-only gates rely on this).
+        assert!(parse("SELECT * WHERE { ?s ?p ?o } ; DROP ALL").is_err());
+        assert!(parse("ASK { ?s ?p ?o } garbage").is_err());
+        // A well-formed query followed by only whitespace still parses.
+        assert!(parse("SELECT * WHERE { ?s ?p ?o }\n  ").is_ok());
     }
 
     #[test]
