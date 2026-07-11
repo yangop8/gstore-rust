@@ -1184,7 +1184,7 @@ impl ClusterConfig {
         match *op {
             LogOp::AddNode { id, addr } => self.add_node(id, addr),
             LogOp::RemoveNode { id } => self.remove_node(id),
-            LogOp::Insert(_) | LogOp::Delete(_) => false,
+            LogOp::Insert(_) | LogOp::Delete(_) | LogOp::Noop => false,
         }
     }
 }
@@ -1941,6 +1941,16 @@ impl RaftState {
     fn become_leader(&mut self) -> Vec<Outgoing> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
+        // Append a current-term no-op when the log tail is uncommitted, so those
+        // earlier-term entries become committable again. `advance_commit` only
+        // counts entries of the current term (Raft's leader-completeness rule),
+        // so without this a value committed-and-served just before a failover
+        // could stay invisible cluster-wide until the next client write. Skipped
+        // when everything is already committed, which keeps a freshly-elected
+        // leader's log byte-identical to its followers' in the common case.
+        if self.last_log_index() > self.commit_index {
+            self.log.push(LogEntry::new(self.current_term, LogOp::Noop));
+        }
         let nli = self.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
@@ -2114,15 +2124,19 @@ impl RaftState {
         self.leader_id = Some(leader_id);
         self.reset_election_timeout();
 
-        if last_included_index > self.base_index {
+        // Only install a snapshot that carries the log *past* what we have
+        // already committed. A snapshot with `last_included_index <=
+        // commit_index` would clear the log and reset `last_applied` backwards to
+        // an older materialized state, silently dropping committed entries that
+        // `drain_apply` can then no longer replay (the log is gone). Guarding on
+        // `commit_index` (>= `base_index`) keeps already-committed data.
+        if last_included_index > self.commit_index {
             self.base_index = last_included_index;
             self.base_term = last_included_term;
             self.log.clear();
             self.snapshot = triples.clone();
             self.pending_reset = Some(triples);
-            if self.commit_index < last_included_index {
-                self.commit_index = last_included_index;
-            }
+            self.commit_index = last_included_index;
             self.last_applied = last_included_index;
         }
         RaftReply::Snapshot {
@@ -2384,6 +2398,11 @@ pub struct ClusterNode {
     id: NodeId,
     state: Arc<Mutex<RaftState>>,
     store: Arc<Mutex<TripleStore>>,
+    /// Serializes the whole drain-and-apply critical section. `apply_actions`
+    /// drains committed entries under the state lock, releases it, then writes
+    /// them to the store — two threads (e.g. a connection handler and the tick
+    /// driver) could otherwise interleave and apply out of commit order.
+    apply_lock: Mutex<()>,
     /// The cluster's replicated membership/config, updated as committed
     /// config-change entries ([`LogOp::AddNode`]/[`LogOp::RemoveNode`]) apply.
     config: Arc<Mutex<ClusterConfig>>,
@@ -2423,6 +2442,7 @@ impl ClusterNode {
             id,
             state: Arc::new(Mutex::new(state)),
             store: Arc::new(Mutex::new(store)),
+            apply_lock: Mutex::new(()),
             config: Arc::new(Mutex::new(ClusterConfig::new(Self::DEFAULT_SHARDS))),
             peer_addrs: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -2756,6 +2776,10 @@ impl ClusterNode {
     }
 
     fn apply_actions(&self) {
+        // Hold `apply_lock` across the entire drain+apply so a concurrent caller
+        // blocks here rather than draining a later prefix and racing us to the
+        // store — which would apply committed entries out of order.
+        let _apply = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
         let actions = { self.state.lock().unwrap().drain_apply() };
         if actions.is_empty() {
             return;
@@ -2768,6 +2792,8 @@ impl ClusterNode {
                 StoreAction::Apply(LogOp::Delete(t)) => {
                     self.store.lock().unwrap().remove(t);
                 }
+                // A committed no-op term-marker carries no state change.
+                StoreAction::Apply(LogOp::Noop) => {}
                 // A committed membership config-change updates the replicated
                 // [`ClusterConfig`] (not the triple store) — so every node that
                 // applied this committed entry agrees on the membership.
@@ -2958,8 +2984,11 @@ impl ReplicaGroup {
                         self.stores[i].remove(tr);
                     }
                     // A per-shard *data* group never replicates membership ops
-                    // (those belong to the cluster-control [`ClusterConfig`]).
-                    StoreAction::Apply(LogOp::AddNode { .. } | LogOp::RemoveNode { .. }) => {}
+                    // (those belong to the cluster-control [`ClusterConfig`]);
+                    // a no-op term-marker carries no state change either.
+                    StoreAction::Apply(
+                        LogOp::AddNode { .. } | LogOp::RemoveNode { .. } | LogOp::Noop,
+                    ) => {}
                     StoreAction::Reset(triples) => {
                         self.stores[i] = TripleStore::new();
                         self.stores[i].bulk_load(triples);
@@ -3923,6 +3952,8 @@ mod raft_tests {
                         ) => {
                             self.configs[i].apply(&op);
                         }
+                        // A no-op term-marker carries no state change.
+                        StoreAction::Apply(LogOp::Noop) => {}
                         StoreAction::Reset(triples) => {
                             self.stores[i] = TripleStore::new();
                             self.stores[i].bulk_load(triples);
@@ -4051,6 +4082,89 @@ mod raft_tests {
         assert_eq!(sim.node(0).current_term(), 1);
         assert_eq!(sim.node(1).role(), Role::Follower);
         assert_eq!(sim.node(2).role(), Role::Follower);
+    }
+
+    #[test]
+    fn committed_entry_stays_visible_after_failover_without_a_new_write() {
+        // node0 commits an entry, then dies before telling the followers it is
+        // committed. The new leader must make it visible cluster-wide *without* a
+        // new client write — which requires committing a no-op of its own term.
+        let mut sim = Sim::new(3);
+        sim.elect(0);
+        let tri = t(7, 8, 9);
+        let idx = sim.nodes[0]
+            .propose(LogOp::Insert(tri))
+            .expect("leader accepts write");
+
+        // Replicate the entry to node1 (node0+node1 = a majority) and let node0
+        // learn it committed — but deliver nothing to node2 and drop node0's
+        // commit broadcast, modelling a leader that dies right after committing.
+        let appends: Vec<Outgoing> = sim.nodes[0]
+            .tick()
+            .into_iter()
+            .filter(|o| o.to == 1)
+            .collect();
+        assert!(!appends.is_empty(), "leader emits an AppendEntries to node1");
+        for o in appends {
+            let reply = sim.nodes[1].handle(o.msg);
+            let _dropped = sim.nodes[0].handle_reply(1, reply);
+        }
+        assert_eq!(sim.nodes[0].commit_index(), idx, "leader committed the entry");
+        assert_eq!(sim.nodes[1].commit_index(), 0, "follower not told it committed");
+
+        // node0 dies; node1 (whose log holds the entry) wins the next election and
+        // is driven until its own commit covers the entry — with no new write.
+        sim.set_down(0, true);
+        sim.elect(1);
+        for _ in 0..500 {
+            if sim.nodes[1].commit_index() >= idx {
+                break;
+            }
+            sim.tick(1);
+        }
+        assert!(
+            sim.nodes[1].commit_index() >= idx,
+            "new leader must commit the pre-failover entry via a current-term no-op"
+        );
+        assert!(
+            sim.stores[1].exists(tri.sub, tri.pred, tri.obj),
+            "the committed triple is visible after failover with no new client write"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_at_or_below_commit_is_ignored() {
+        // Two entries are committed and applied everywhere. A stale InstallSnapshot
+        // whose last-included index is at/below the follower's commit index must be
+        // ignored: installing it would clear the log and reset the store to an
+        // older state, dropping the already-committed second triple.
+        let mut sim = Sim::new(3);
+        sim.elect(0);
+        sim.propose(0, LogOp::Insert(t(1, 1, 1)));
+        sim.propose(0, LogOp::Insert(t(2, 2, 2)));
+        let commit_before = sim.nodes[1].commit_index();
+        assert!(commit_before >= 2, "both entries committed on the follower");
+        assert!(sim.stores[1].exists(1, 1, 1) && sim.stores[1].exists(2, 2, 2));
+
+        let stale = RaftMsg::InstallSnapshot {
+            term: sim.nodes[1].current_term(),
+            leader_id: 0,
+            last_included_index: 1, // <= the follower's commit index
+            last_included_term: 1,
+            triples: vec![t(1, 1, 1)], // store *as of* index 1 — missing t(2,2,2)
+        };
+        let _ = sim.nodes[1].handle(stale);
+        sim.sync_apply();
+
+        assert_eq!(
+            sim.nodes[1].commit_index(),
+            commit_before,
+            "a stale snapshot must not move commit backwards"
+        );
+        assert!(
+            sim.stores[1].exists(2, 2, 2),
+            "a committed triple must survive a stale snapshot install"
+        );
     }
 
     #[test]
