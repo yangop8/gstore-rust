@@ -80,15 +80,20 @@ pub enum LogOp {
     AddNode { id: NodeId, addr: SocketAddr },
     /// Membership config-change: evict node `id`.
     RemoveNode { id: NodeId },
+    /// A term-marker entry carrying no state change. A new leader appends one so
+    /// that entries committed under an earlier term become committable again
+    /// (Raft's leader-completeness rule: a leader may only advance `commit_index`
+    /// over an entry of its *own* term). Applying it is a no-op.
+    Noop,
 }
 
 impl LogOp {
     /// The triple this op acts on, if it is a data-plane mutation (`None` for a
-    /// membership config-change).
+    /// membership config-change or a no-op).
     pub fn triple(&self) -> Option<IdTriple> {
         match *self {
             LogOp::Insert(t) | LogOp::Delete(t) => Some(t),
-            LogOp::AddNode { .. } | LogOp::RemoveNode { .. } => None,
+            LogOp::AddNode { .. } | LogOp::RemoveNode { .. } | LogOp::Noop => None,
         }
     }
 
@@ -219,6 +224,9 @@ fn put_op(buf: &mut Vec<u8>, op: &LogOp) {
             buf.push(4);
             put_u64(buf, id);
         }
+        LogOp::Noop => {
+            buf.push(5);
+        }
     }
 }
 
@@ -333,6 +341,7 @@ impl<'a> Reader<'a> {
                 Ok(LogOp::AddNode { id, addr })
             }
             4 => Ok(LogOp::RemoveNode { id: self.u64()? }),
+            5 => Ok(LogOp::Noop),
             _ => Err(bad("unknown log-op kind")),
         }
     }

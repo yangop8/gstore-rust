@@ -392,12 +392,27 @@ impl VersionedStore {
     /// record `<= floor` (the oldest live reader's anchor) plus everything newer,
     /// dropping strictly-older records. With no live readers (`floor == u64::MAX`)
     /// every chain collapses to its single latest record.
-    fn gc(&mut self, floor: u64) {
-        for chain in self.chains.values_mut() {
+    ///
+    /// A chain that has collapsed to a single record whose visible state matches
+    /// the `base` snapshot is then dropped from the map entirely: a read would
+    /// fall back to `base` and get the same answer, so keeping the entry only
+    /// grows memory without bound under a churny insert/delete workload.
+    fn gc(&mut self, floor: u64, base: &Snapshot) {
+        self.chains.retain(|_key, chain| {
             if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
                 chain.records.drain(0..anchor);
             }
-        }
+            match chain.records.as_slice() {
+                // No surviving record ⇒ nothing to observe; drop it.
+                [] => false,
+                // A single surviving record that agrees with the base snapshot is
+                // redundant (a base fallback yields the same present/absent
+                // answer) and every live reader is at/after it, so drop the entry.
+                [only] => (only.op == ChainOp::Insert) != base.contains(&chain.triple),
+                // Multiple versions are still distinguishable by live readers.
+                _ => true,
+            }
+        });
     }
 }
 
@@ -604,7 +619,7 @@ impl ConcurrentDb {
     /// snapshot version). Callers compute `floor` from [`OccState::gc_floor`]
     /// while holding the OCC lock, preserving the writer → occ → versioned order.
     fn gc_versions(&self, floor: u64) {
-        self.versioned.write().unwrap().gc(floor);
+        self.versioned.write().unwrap().gc(floor, &self.base);
     }
 
     /// Number of retained history entries (used by tests to assert GC bounds).
@@ -1372,6 +1387,34 @@ mod tests {
             1,
             "only the winner appended a version record"
         );
+    }
+
+    #[test]
+    fn gc_reclaims_chains_that_match_the_base_snapshot() {
+        // A key inserted then deleted ends absent — same as the (empty) base. Once
+        // no live view pins its history, its version chain is redundant and must
+        // be dropped, not retained forever (an unbounded-growth guard).
+        let c = cdb();
+        let k = triple("http://ex/churn", "http://ex/p", "http://ex/v");
+        let pin = c.version_view(); // pins current version so records are kept for now
+        c.run_txn(4, |t| {
+            t.insert(k.clone());
+            Ok(())
+        })
+        .unwrap();
+        c.run_txn(4, |t| {
+            t.delete(k.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(c.chain_len(&k.to_string()) > 0, "records retained while pinned");
+        drop(pin); // floor rises to u64::MAX; GC runs
+        assert_eq!(
+            c.chain_len(&k.to_string()),
+            0,
+            "a tombstone chain matching the base snapshot is reclaimed"
+        );
+        assert!(!c.version_view().contains(&k), "the key is still absent");
     }
 
     #[test]

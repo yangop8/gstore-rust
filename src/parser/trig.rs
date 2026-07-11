@@ -40,11 +40,14 @@ pub fn parse_str(content: &str) -> Result<Vec<Quad>> {
         out.push(Quad::new(t.subject, t.predicate, t.object, None));
     }
 
-    // Named graphs: each block parsed against the same directive preamble.
-    for (label_text, inner) in parts.named {
+    // Named graphs: each block parsed against the same directive preamble. Each
+    // block gets a distinct blank-node scope (`g1`, `g2`, …, none of which is the
+    // default graph's `g`) so an anonymous `[ … ]` / `( … )` in one block cannot
+    // collide with one in another — they would otherwise both restart at `g~0`.
+    for (i, (label_text, inner)) in parts.named.into_iter().enumerate() {
         let label = resolve_label(&parts.preamble, &label_text)?;
         let doc = format!("{}\n{}", parts.preamble, inner);
-        for t in turtle::parse_str(&doc)? {
+        for t in turtle::parse_str_scoped(&doc, &format!("g{}", i + 1))? {
             out.push(Quad::new(
                 t.subject,
                 t.predicate,
@@ -444,6 +447,26 @@ mod tests {
         let qs = parse_str(doc).unwrap();
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].graph, Some(Term::iri("http://e/café")));
+    }
+
+    #[test]
+    fn anonymous_blank_nodes_do_not_collide_across_named_graphs() {
+        // Each block is parsed separately; without a per-block blank-node scope
+        // both `[ … ]` would restart at `g~0` and merge into one node.
+        let doc = "@prefix : <http://e/> .\n\
+                   :g1 { :s :p [ :a :b ] }\n\
+                   :g2 { :x :y [ :c :d ] }";
+        let qs = parse_str(doc).unwrap();
+        let blank_of = |pred: &str| {
+            qs.iter()
+                .find(|q| q.predicate == Term::iri(format!("http://e/{pred}")))
+                .map(|q| q.object.clone())
+                .unwrap()
+        };
+        let b1 = blank_of("p"); // the [ … ] in :g1
+        let b2 = blank_of("y"); // the [ … ] in :g2
+        assert!(matches!(b1, Term::Blank(_)) && matches!(b2, Term::Blank(_)));
+        assert_ne!(b1, b2, "anonymous nodes in different graphs must stay distinct");
     }
 
     #[test]

@@ -22,7 +22,17 @@ use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 
 /// Parse a Turtle document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
-    let mut p = Parser::new(content);
+    parse_str_scoped(content, "g")
+}
+
+/// Like [`parse_str`], but mints anonymous blank nodes under `bnode_scope`. A
+/// caller that parses several documents into one graph — e.g. TriG parsing each
+/// `{ … }` block separately — passes a distinct scope per document so their
+/// anonymous `[ … ]` / `( … )` nodes stay distinct instead of both restarting at
+/// `g~0` and colliding. `~` cannot appear in a parsed `_:` label, so a minted
+/// label never collides with an explicit blank node either.
+pub fn parse_str_scoped(content: &str, bnode_scope: &str) -> Result<Vec<Triple>> {
+    let mut p = Parser::new(content, bnode_scope);
     p.parse_document()?;
     Ok(p.triples)
 }
@@ -42,13 +52,23 @@ struct Parser {
     triples: Vec<Triple>,
     /// Counter for fresh blank nodes minted by `[ … ]` / `( … )`.
     bnode: usize,
+    /// Scope prefix for minted blank labels (`<scope>~<n>`), kept distinct across
+    /// documents parsed into one graph (see [`parse_str_scoped`]).
+    bnode_scope: String,
+    /// Current `[ … ]` / `( … )` nesting depth, bounded by `MAX_NESTING_DEPTH` so
+    /// adversarially deep input errors out instead of overflowing the stack.
+    depth: usize,
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
+/// Maximum `[ … ]` / `( … )` nesting depth (guards the recursive term parser
+/// against a stack overflow on pathological input, mirroring the JSON-LD reader).
+const MAX_NESTING_DEPTH: usize = 256;
+
 impl Parser {
-    fn new(s: &str) -> Parser {
+    fn new(s: &str, bnode_scope: &str) -> Parser {
         Parser {
             chars: s.chars().collect(),
             pos: 0,
@@ -57,6 +77,8 @@ impl Parser {
             base: None,
             triples: Vec::new(),
             bnode: 0,
+            bnode_scope: bnode_scope.to_string(),
+            depth: 0,
         }
     }
 
@@ -64,7 +86,7 @@ impl Parser {
     /// `~` cannot appear in a parsed `_:` label, so a minted label can never
     /// collide with an explicit blank node written in the document.
     fn fresh_blank(&mut self) -> Term {
-        let label = format!("g~{}", self.bnode);
+        let label = format!("{}~{}", self.bnode_scope, self.bnode);
         self.bnode += 1;
         Term::Blank(label)
     }
@@ -264,7 +286,15 @@ impl Parser {
     /// Parse a term. `verb_pos` is true when parsing a predicate (no literals).
     fn parse_term(&mut self, verb_pos: bool) -> Result<Term> {
         self.skip_ws();
-        match self.peek() {
+        // Every `[ … ]` / `( … )` nesting level enters through exactly one
+        // `parse_term`, so bounding depth here bounds the whole recursion. On the
+        // error path the count is not restored, but that only aborts the parse;
+        // the success path below decrements so sibling terms are unaffected.
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(self.err("blank-node / collection nesting too deep"));
+        }
+        let out = match self.peek() {
             Some('<') => Ok(Term::Iri(self.parse_iriref()?)),
             Some('"') | Some('\'') if !verb_pos => self.parse_literal(),
             Some('[') if !verb_pos => self.parse_blank_node_property_list(),
@@ -275,7 +305,9 @@ impl Parser {
             }
             Some(_) => self.parse_prefixed_or_keyword(verb_pos),
             None => Err(self.err("expected a term, found end of input")),
-        }
+        };
+        self.depth -= 1;
+        out
     }
 
     /// `[ predicateObjectList? ]` — a fresh blank node carrying the listed
@@ -943,6 +975,18 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].object, Term::iri(format!("{RDF_NS}nil")));
+    }
+
+    #[test]
+    fn deeply_nested_collection_errors_instead_of_overflowing() {
+        // Far more nesting than MAX_NESTING_DEPTH: must return an error rather
+        // than recurse until the stack overflows and aborts the process.
+        let doc = format!(
+            "@prefix : <http://e/> .\n:s :p {}{}",
+            "(".repeat(400),
+            ")".repeat(400)
+        );
+        assert!(parse_str(&doc).is_err(), "pathologically deep nesting must be rejected");
     }
 
     #[test]

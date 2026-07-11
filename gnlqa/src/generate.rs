@@ -81,12 +81,34 @@ pub fn valid_candidates(raw_candidates: &[String], n: usize) -> Vec<String> {
     out
 }
 
-/// Whether a candidate references at least one concrete term — an IRI (`<...>`)
-/// or a literal (`"..."`). A pure all-variable BGP like
-/// `SELECT ?x WHERE { ?x ?p ?o }` is ungrounded: it returns arbitrary rows and
-/// can outrank a precise (empty) answer, so it is rejected.
+/// Whether a candidate anchors a **triple position** on a concrete IRI or
+/// literal. A pure all-variable BGP like `SELECT ?x WHERE { ?x ?p ?o }` is
+/// ungrounded: it returns arbitrary rows and can outrank a precise (empty)
+/// answer, so it is rejected. Checked against the parsed pattern rather than by
+/// substring, so a concrete term that appears only in a FILTER (e.g.
+/// `FILTER(?x != <urn:x>)`) — or a bare `<`/`>` comparison operator — does not
+/// count as grounding.
 fn is_grounded(sparql: &str) -> bool {
-    sparql.contains('<') || sparql.contains('"')
+    use gstore::model::Term;
+    use gstore::parser::sparql::ast::{PatternTerm, Query};
+
+    let Ok(query) = gstore::parser::sparql::parse(sparql) else {
+        return false;
+    };
+    let pattern = match &query {
+        Query::Select(s) => &s.pattern,
+        Query::Ask(a) => &a.pattern,
+        _ => return false,
+    };
+    let mut triples = Vec::new();
+    pattern.collect_triples(&mut triples);
+    // A blank node in a triple position is existential (like a variable), so
+    // only IRIs and literals ground the query.
+    triples.iter().any(|t| {
+        [&t.subject, &t.predicate, &t.object]
+            .iter()
+            .any(|p| matches!(p, PatternTerm::Term(Term::Iri(_) | Term::Literal { .. })))
+    })
 }
 
 /// Parse candidate SPARQL strings from the model output: a JSON array of strings
@@ -177,6 +199,20 @@ fn fenced_blocks(raw: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::llm::MockLlm;
+
+    #[test]
+    fn is_grounded_checks_triple_positions_not_substrings() {
+        // A concrete term in a triple position grounds the query.
+        assert!(is_grounded("SELECT ?o WHERE { <http://a> <http://b> ?o }"));
+        assert!(is_grounded("ASK { ?s ?p \"lit\" }"));
+        // A pure all-variable BGP is ungrounded even when a concrete IRI or a
+        // bare `<`/`>` comparison appears only inside a FILTER.
+        assert!(!is_grounded("SELECT ?x WHERE { ?x ?p ?o }"));
+        assert!(!is_grounded(
+            "SELECT ?x WHERE { ?x ?p ?o . FILTER(?x != <urn:x>) }"
+        ));
+        assert!(!is_grounded("SELECT ?x WHERE { ?x ?p ?o . FILTER(?o < 5) }"));
+    }
 
     #[test]
     fn parse_json_array_of_candidates() {
