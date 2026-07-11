@@ -865,7 +865,7 @@ impl ApiInner {
                 .dbs
                 .get(&name)
                 .expect("just inserted or already loaded above");
-            let mut db = dbh.lock().unwrap();
+            let mut db = locked(dbh);
             triples.iter().filter(|t| db.insert_triple(t)).count()
         };
         // (Lifecycle endpoints like /build and /load don't append to
@@ -978,7 +978,7 @@ impl ApiInner {
         }
         // Clone the handle so the db borrow ends before we mutate the registries.
         let dbh = Arc::clone(st.dbs.get(&name).expect("existence checked above"));
-        if let Err(e) = dbh.lock().unwrap().begin() {
+        if let Err(e) = locked(&dbh).begin() {
             return Resp::fail(500, &format!("begin failed: {e}"));
         }
         let mut tid = new_id();
@@ -1055,7 +1055,7 @@ impl ApiInner {
         };
         st.db_txn.remove(&txn.db);
         let result = st.dbs.get(&txn.db).map(|dbh| {
-            let mut db = dbh.lock().unwrap();
+            let mut db = locked(dbh);
             if commit {
                 db.commit()
             } else {
@@ -1083,7 +1083,7 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match dbh.lock().unwrap().save(&dir) {
+        match locked(dbh).save(&dir) {
             Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
             Err(e) => Resp::fail(500, &format!("checkpoint failed: {e}")),
         }
@@ -1103,7 +1103,7 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        match dbh.lock().unwrap().backup(&path) {
+        match locked(dbh).backup(&path) {
             Ok(()) => {
                 let body = format!(
                     "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
@@ -1203,7 +1203,7 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name) else {
             return Resp::fail(404, &format!("database '{name}' is not loaded"));
         };
-        let outcome = dbh.lock().unwrap().query(&stmt);
+        let outcome = locked(dbh).query(&stmt);
         match outcome {
             Ok(QueryResult::Update { changed }) => {
                 let op = if insert { "inserted" } else { "removed" };
@@ -1433,29 +1433,16 @@ fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
 /// Whether a SPARQL request is an UPDATE (mutating) statement, skipping any
 /// leading `PREFIX`/`BASE` declarations.
 fn is_update_sparql(s: &str) -> bool {
-    let mut toks = s.split_whitespace().peekable();
-    while let Some(t) = toks.peek() {
-        match t.to_ascii_uppercase().as_str() {
-            "PREFIX" => {
-                toks.next();
-                toks.next();
-                toks.next();
-            }
-            "BASE" => {
-                toks.next();
-                toks.next();
-            }
-            _ => break,
-        }
-    }
-    match toks.peek() {
-        Some(t) => matches!(
-            t.to_ascii_uppercase().as_str(),
-            "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "CREATE" | "ADD" | "MOVE" | "COPY"
-                | "WITH"
-        ),
-        None => false,
-    }
+    // Classify by the *parser*, not a whitespace token scan. A leading
+    // `# comment` line (the lexer skips comments) or unusual whitespace must not
+    // be able to hide an UPDATE keyword from this check — otherwise a query-only
+    // user could smuggle `# x\nINSERT DATA { … }` past the privilege gate and
+    // have `run_query` execute it. A parse failure is treated as non-update: it
+    // will fail to parse again in `run_query` and therefore never execute.
+    matches!(
+        crate::parser::sparql::parse(s),
+        Ok(crate::parser::sparql::ast::Query::Update(_))
+    )
 }
 
 /// Parse an RDF document of the named `format` into triples, dispatching to
@@ -1568,8 +1555,15 @@ mod tests {
         assert!(is_update_sparql(
             "PREFIX : <http://x/> INSERT DATA { :a :b :c }"
         ));
+        // A leading comment must not hide an UPDATE from the privilege gate:
+        // the lexer skips `#…` comments, so `run_query` would execute this.
+        assert!(is_update_sparql("# harmless?\nINSERT DATA { <a> <b> <c> }"));
+        assert!(is_update_sparql("  # x\n  DROP ALL"));
         assert!(!is_update_sparql("SELECT * WHERE { ?s ?p ?o }"));
         assert!(!is_update_sparql("ASK { ?s ?p ?o }"));
+        // A SELECT with a trailing smuggled UPDATE must not parse (so it is
+        // neither classified as, nor executed as, an update).
+        assert!(!is_update_sparql("SELECT * WHERE { ?s ?p ?o } ; DROP ALL"));
         assert!(!is_update_sparql(
             "PREFIX : <http://x/> SELECT * WHERE { ?s ?p ?o }"
         ));

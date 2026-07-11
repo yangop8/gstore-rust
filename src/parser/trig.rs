@@ -418,7 +418,7 @@ fn ensure_terminated(body: &str) -> String {
 /// Strip a leading `GRAPH` keyword (case-insensitive) from a label region,
 /// leaving just the label token (possibly empty for the default graph).
 fn strip_graph_keyword(before: &str) -> &str {
-    if before.len() >= 5 && before[..5].eq_ignore_ascii_case("graph") {
+    if before.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("graph")) {
         let rest = &before[5..];
         if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
             return rest.trim();
@@ -434,6 +434,16 @@ mod tests {
 
     fn graphs_of(qs: &[Quad]) -> Vec<Option<Term>> {
         qs.iter().map(|q| q.graph.clone()).collect()
+    }
+
+    #[test]
+    fn non_ascii_graph_label_does_not_panic() {
+        // The graph-label region `:café` is >= 5 bytes but byte 5 falls inside
+        // the `é`; `strip_graph_keyword` must not slice on a non-char boundary.
+        let doc = "@prefix : <http://e/> .\n:café { :s :p :o }";
+        let qs = parse_str(doc).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].graph, Some(Term::iri("http://e/café")));
     }
 
     #[test]

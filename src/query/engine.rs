@@ -564,8 +564,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         &self,
         q: &SelectQuery,
     ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
-        let layout = VarLayout::build(&q.pattern);
-        let solutions = self.eval_pattern(&q.pattern, &layout);
+        let mut layout = VarLayout::build(&q.pattern);
+        let mut solutions = self.eval_pattern(&q.pattern, &layout);
         // A cancelled join short-circuits to empty bindings; surface it as an
         // error rather than a spurious empty result set.
         self.check_cancel()?;
@@ -580,19 +580,48 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
         let mut rows = if has_agg {
-            self.eval_aggregation(&solutions, &layout, q)?
+            let mut rows = self.eval_aggregation(&solutions, &layout, q)?;
+            // Aggregated rows are ordered over the projected result layout —
+            // ORDER BY here references group keys / aggregate aliases.
+            if !q.order_by.is_empty() {
+                let result_layout = VarLayout::from_vars(result_vars.clone(), is_pred.clone());
+                self.sort_solutions(&mut rows, &q.order_by, &result_layout);
+            }
+            rows
         } else {
+            // SPARQL evaluates ORDER BY over the *pre-projection* solution
+            // sequence, so it may sort by a pattern variable that is not selected
+            // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
+            // alias. Extend the layout + bindings with the aliases, sort, then
+            // project — a stable sort preserves the resulting order.
+            if !q.order_by.is_empty() {
+                if let Projection::Items(items) = &q.projection {
+                    for it in items {
+                        if let SelectItem::Expr(e, alias) = it {
+                            if !layout.index.contains_key(alias) {
+                                let idx = layout.names.len();
+                                layout.index.insert(alias.clone(), idx);
+                                layout.names.push(alias.clone());
+                                layout.is_pred.push(false);
+                                for b in solutions.iter_mut() {
+                                    let v =
+                                        self.eval_value(e, b, &layout).map(|v| self.value_to_id(&v));
+                                    b.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.sort_solutions(&mut solutions, &q.order_by, &layout);
+            }
             solutions
                 .iter()
                 .map(|b| self.project_items(b, &layout, q))
                 .collect::<Result<Vec<_>>>()?
         };
 
-        // ORDER BY / DISTINCT / OFFSET / LIMIT over the result rows.
-        let result_layout = VarLayout::from_vars(result_vars.clone(), is_pred.clone());
-        if !q.order_by.is_empty() {
-            self.sort_solutions(&mut rows, &q.order_by, &result_layout);
-        }
+        // DISTINCT / OFFSET / LIMIT over the projected result rows (ORDER BY was
+        // applied above — before projection for the non-aggregate path).
         if q.distinct {
             let mut seen = std::collections::HashSet::new();
             rows.retain(|r| seen.insert(r.clone()));
@@ -1996,7 +2025,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
-            "ABS" => self.num1(args, b, l, f64::abs, i64::abs),
+            "ABS" => match self.eval_value(&args[0], b, l)? {
+                // `i64::abs(i64::MIN)` overflows (panics in debug, wraps to a
+                // negative value in release); widen to `BigInt` like `negate`.
+                Value::Int(i) => Some(
+                    i.checked_abs()
+                        .map(Value::Int)
+                        .unwrap_or(Value::BigInt((i as i128).abs())),
+                ),
+                Value::Double(d) => Some(Value::Double(d.abs())),
+                v => v.as_f64().map(|x| Value::Double(x.abs())),
+            },
             "CEIL" => self.num1(args, b, l, f64::ceil, |i| i),
             "FLOOR" => self.num1(args, b, l, f64::floor, |i| i),
             "ROUND" => self.num1(args, b, l, f64::round, |i| i),
@@ -4090,6 +4129,45 @@ mod pfn_tests {
         // alice 2500 → 5000, bob 3000 → 6000 (rendered as xsd:double).
         assert!(rs.rows[0][1].as_ref().unwrap().contains("5000"));
         assert!(rs.rows[1][1].as_ref().unwrap().contains("6000"));
+    }
+
+    /// ORDER BY may sort by a variable that is *not* in the projection; the
+    /// sort must happen before projection so LIMIT keeps the right row.
+    #[test]
+    fn order_by_non_projected_var_with_limit() {
+        let (d, s) = fixture();
+        let q = parse(
+            "SELECT ?x WHERE { ?x <http://ex/salary> ?sal } ORDER BY DESC(?sal) LIMIT 1",
+        )
+        .unwrap();
+        let eval = Evaluator::new(&d, &s);
+        let rs = match eval.evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 1);
+        // bob (3000) sorts above alice (2500) on ?sal, even though ?sal is not
+        // selected — so the single kept row must be bob.
+        assert!(rs.rows[0][0].as_ref().unwrap().contains("bob"));
+    }
+
+    /// ABS(i64::MIN) must widen instead of panicking (debug) / wrapping (release).
+    #[test]
+    fn abs_of_i64_min_widens_without_panic() {
+        let mut d = Dictionary::new();
+        let n = d.intern_term(&Term::iri("http://ex/n"));
+        let p = d.intern_predicate(&Term::iri("http://ex/v").dict_key());
+        let xsdint = "http://www.w3.org/2001/XMLSchema#integer";
+        let min = d.intern_term(&Term::typed_literal("-9223372036854775808", xsdint));
+        let mut s = TripleStore::new();
+        s.bulk_load(vec![IdTriple::new(n, p, min)]);
+        let q = parse("SELECT (ABS(?x) AS ?a) WHERE { ?s <http://ex/v> ?x }").unwrap();
+        let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
+            QueryResult::Select(rs) => rs,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        assert_eq!(rs.row_count(), 1);
+        assert!(rs.rows[0][0].as_ref().unwrap().contains("9223372036854775808"));
     }
 
     /// Use a custom predicate function inside a FILTER (case-insensitive name).
