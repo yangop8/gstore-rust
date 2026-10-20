@@ -86,16 +86,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::GStoreConfig;
 use crate::db::{Database, LoadPolicy};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
+use crate::query::hash::md5_hex;
 use crate::query::{Evaluator, QueryResult};
 use crate::server::{
-    err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, spawn_worker,
-    write_response_ext, write_response_maybe_gzip, Lifecycle, Request, ShutdownHandle,
-    ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
+    ct_eq, err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
+    write_response_ext, write_response_maybe_gzip, BadRequest, ConnMeta, HttpOptions, Lifecycle,
+    Request, ShutdownHandle, ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::{TripleSource, TripleStore};
@@ -634,8 +636,10 @@ impl ApiState {
 
 /// The parity HTTP API server. Construct with [`ApiServer::bind`], then drive it
 /// with [`serve_forever`](ApiServer::serve_forever) (e.g. in a background
-/// thread) until [`shutdown`](ApiServer::shutdown). Each accepted connection is
-/// handled on its own worker thread.
+/// thread) until [`shutdown`](ApiServer::shutdown). Connections are served by a
+/// bounded worker pool with HTTP/1.1 keep-alive (see [`HttpOptions`] and
+/// [`crate::server`]); configure it from `conf.ini` with
+/// [`with_config`](ApiServer::with_config).
 pub struct ApiServer {
     /// Shared with every connection worker (behind an `Arc`).
     inner: Arc<ApiInner>,
@@ -643,6 +647,8 @@ pub struct ApiServer {
     listener: Mutex<Option<TcpListener>>,
     addr: SocketAddr,
     life: Arc<Lifecycle>,
+    /// Worker pool, keep-alive, CORS and body-size settings.
+    http: HttpOptions,
 }
 
 /// The shared, thread-safe part of an [`ApiServer`]: everything a connection
@@ -662,6 +668,18 @@ struct ApiInner {
     /// transaction may begin — so a write still in flight when the shutdown's
     /// final save runs cannot be acknowledged and then lost.
     closing: AtomicBool,
+    /// The server's lifecycle (shared with [`ApiServer`]), so the `/shutdown`
+    /// and `/restart` routes can stop it.
+    life: Arc<Lifecycle>,
+    /// The `conf.ini` settings this server runs with (built-in defaults unless
+    /// [`ApiServer::with_config`] supplied a file's). Read it through
+    /// [`ApiInner::config`].
+    config: GStoreConfig,
+    /// Password of the `system` user (`system_username`) for `/shutdown` and
+    /// `/restart`: random per run unless set with
+    /// [`ApiServer::with_system_password`]; `gserver` writes it to the second
+    /// line of its pid file, as upstream does.
+    system_password: String,
 }
 
 impl ApiInner {
@@ -669,6 +687,13 @@ impl ApiInner {
     /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
     fn save_writes(&self) -> bool {
         self.check_point || self.closing.load(Ordering::SeqCst)
+    }
+
+    /// The `conf.ini` settings in effect (e.g. `max_output_size`, the IP list
+    /// paths, log/backup/upload settings) for the request handlers.
+    #[allow(dead_code)]
+    pub(crate) fn config(&self) -> &GStoreConfig {
+        &self.config
     }
 
     /// Stop serving `name` (if loaded) *without* saving: take its handle out
@@ -766,6 +791,7 @@ impl ApiServer {
         let users = UserStore::open(root.join("users.db"), root_password)?;
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
+        let life = Lifecycle::new(addr);
         Ok(ApiServer {
             inner: Arc::new(ApiInner {
                 state: Mutex::new(ApiState {
@@ -785,11 +811,76 @@ impl ApiServer {
                 check_point: true,
                 grace: DEFAULT_SHUTDOWN_GRACE,
                 closing: AtomicBool::new(false),
+                life: Arc::clone(&life),
+                config: GStoreConfig::default(),
+                system_password: new_system_password(),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
-            life: Lifecycle::new(addr),
+            life,
+            http: HttpOptions::default(),
         })
+    }
+
+    /// Bind as `gserver` does from a [`GStoreConfig`]: databases under
+    /// `config.db_home`, the root user seeded with `config.root_password`,
+    /// listening on `config.listen_addr:config.port` — then
+    /// [`with_config`](Self::with_config).
+    pub fn bind_with_config(config: GStoreConfig) -> std::io::Result<ApiServer> {
+        let addr = (config.listen_addr.clone(), config.port);
+        let server = ApiServer::bind(&config.db_home, &config.root_password, addr)?;
+        Ok(server.with_config(config))
+    }
+
+    /// Run with `conf.ini` settings: the worker pool (`thread_num`,
+    /// `queue_size`), keep-alive, CORS and request body cap
+    /// (`upload_max_body_size`) via [`GStoreConfig::http_options`], the
+    /// `check_point` policy, and the `system_username` accepted by
+    /// `/shutdown`. The whole configuration stays readable by the request
+    /// handlers (e.g. `max_output_size`, the IP list paths). `root_password` and
+    /// `db_home` are [`bind`](Self::bind)'s arguments (or use
+    /// [`bind_with_config`](Self::bind_with_config)). Apply other builders
+    /// (`with_check_point`, `with_http_options`) after this one to override it.
+    pub fn with_config(mut self, config: GStoreConfig) -> ApiServer {
+        self.http = config.http_options();
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.check_point = config.check_point;
+            inner.config = config;
+        }
+        self
+    }
+
+    /// The `conf.ini` settings this server runs with.
+    pub fn config(&self) -> &GStoreConfig {
+        &self.inner.config
+    }
+
+    /// Replace the connection settings (worker-pool size, keep-alive, CORS,
+    /// timeouts, body cap; default [`HttpOptions::default`]).
+    pub fn with_http_options(mut self, opts: HttpOptions) -> ApiServer {
+        self.http = opts;
+        self
+    }
+
+    /// The connection settings in effect.
+    pub fn http_options(&self) -> &HttpOptions {
+        &self.http
+    }
+
+    /// Fix the `system` user's password for `/shutdown` and `/restart`
+    /// (default: random per run, see [`system_password`](Self::system_password)).
+    pub fn with_system_password(mut self, password: &str) -> ApiServer {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.system_password = password.to_string();
+        }
+        self
+    }
+
+    /// The password the `system` user (`conf.ini`'s `system_username`) must
+    /// present to `/shutdown` or `/restart`. Upstream writes it to the second
+    /// line of the pid file; `gserver` does the same.
+    pub fn system_password(&self) -> &str {
+        &self.inner.system_password
     }
 
     /// Turn gStore's `check_point` policy on (the default) or off. When on,
@@ -866,18 +957,20 @@ impl ApiServer {
             .map(|t| Arc::clone(&t.cancel))
     }
 
-    /// Accept connections until [`shutdown`](Self::shutdown), handling each on
-    /// its own worker thread. A long-running query on one connection holds only
+    /// Accept connections until [`shutdown`](Self::shutdown) (or `/shutdown`,
+    /// `/restart`), serving them on the bounded worker pool with keep-alive
+    /// (see [`HttpOptions`]). A long-running query on one connection holds only
     /// its database's lock, so concurrent requests — crucially `POST /cancel` —
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, |stream, guard| {
+        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
-            spawn_worker(move || {
-                let _in_flight = guard;
-                let mut stream = stream;
-                let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut stream)));
-            });
+            Box::new(move || {
+                let ctl = acc.stream.try_clone().ok();
+                serve_connection(acc.stream, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
+                    inner.handle(s, req, meta)
+                });
+            })
         });
         self.finish_shutdown(drained)
     }
@@ -887,16 +980,19 @@ impl ApiServer {
     /// `tls` feature.
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, |stream, guard| {
+        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
-            spawn_worker(move || {
-                let _in_flight = guard;
-                if let Ok(conn) = rustls::ServerConnection::new(config) {
-                    let mut tls = rustls::StreamOwned::new(conn, stream);
-                    let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut tls)));
-                }
-            });
+            Box::new(move || {
+                let Ok(conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let ctl = acc.stream.try_clone().ok();
+                let tls = rustls::StreamOwned::new(conn, acc.stream);
+                serve_connection(tls, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
+                    inner.handle(s, req, meta)
+                });
+            })
         });
         self.finish_shutdown(drained)
     }
@@ -961,16 +1057,26 @@ impl ApiServer {
 }
 
 impl ApiInner {
-    /// Handle one connection (one request). Generic over the transport so the
-    /// same path serves plain TCP and `rustls` TLS streams. Everything between
-    /// parsing and writing runs under `catch_unwind`: a panicking handler
-    /// answers `500` (JSON) and the locks it poisoned are recovered by
-    /// [`locked`], so the server keeps serving.
-    fn handle<S: Read + Write>(&self, stream: &mut S) -> std::io::Result<()> {
-        let req = match Request::parse(stream) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(()),
-            Err(_) => return write_response_ext(stream, 400, JSON, &[], &err_json("bad request")),
+    /// Handle one request read by [`serve_connection`] and write its response
+    /// (adding the connection's [`ConnMeta`] headers: keep-alive, CORS).
+    /// Generic over the transport so the same path serves plain TCP and
+    /// `rustls` TLS streams. Everything between parsing and writing runs under
+    /// `catch_unwind`: a panicking handler answers `500` (JSON) and the locks it
+    /// poisoned are recovered by [`locked`], so the server keeps serving.
+    /// Returns whether the response honoured keep-alive.
+    fn handle<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        req: Result<Request, BadRequest>,
+        meta: &ConnMeta,
+    ) -> std::io::Result<bool> {
+        let req = match req {
+            Ok(r) => r,
+            Err(bad) => {
+                let body = err_json(bad.message);
+                write_response_ext(stream, bad.status, JSON, &meta.headers(&[]), &body)?;
+                return Ok(false);
+            }
         };
 
         let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req)))
@@ -998,7 +1104,9 @@ impl ApiInner {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        write_response_maybe_gzip(stream, resp.status, &resp.ctype, &extra, &resp.body, enc)
+        let headers = meta.headers(&extra);
+        write_response_maybe_gzip(stream, resp.status, &resp.ctype, &headers, &resp.body, enc)?;
+        Ok(true)
     }
 
     /// Route and execute one request, returning the response and the caller's
@@ -1157,6 +1265,19 @@ impl ApiInner {
             }
             return Dispatch::Done(Resp::ok("logged out"));
         }
+        // Upstream's path routes `/shutdown` and `/restart` (also under the
+        // documented `/grpc/` prefix): they check their own credentials.
+        if matches!(method, "GET" | "POST") {
+            match path {
+                "/shutdown" | "/grpc/shutdown" => {
+                    return Dispatch::Done(self.handle_stop_route(st, req, false))
+                }
+                "/restart" | "/grpc/restart" => {
+                    return Dispatch::Done(self.handle_stop_route(st, req, true))
+                }
+                _ => {}
+            }
+        }
         if method == "GET" && (path == "/" || path == "/console") {
             return Dispatch::Done(Resp::new(
                 200,
@@ -1300,6 +1421,71 @@ impl ApiInner {
                 Resp::new(200, JSON, body.into_bytes())
             }
             None => Resp::fail(401, "invalid username or password"),
+        }
+    }
+
+    // ---- /shutdown and /restart -------------------------------------------
+
+    /// `/shutdown` and `/restart` — upstream `shutdown()` / `restart()` in
+    /// `src/Main/grpc.cpp`. API-level outcomes are HTTP 200 with the gStore
+    /// envelope `{"StatusCode":…,"StatusMsg":…}` (codes from upstream
+    /// `ServerStatusCode.h`).
+    ///
+    /// Credentials (`username`, `password`) come from the query string, a JSON
+    /// or form body, or request headers (upstream's `/shutdown` reads headers;
+    /// its docs say parameters — both work). Accepted callers:
+    ///
+    /// * the `system` user (`conf.ini`'s `system_username`) with this run's
+    ///   [system password](ApiServer::system_password) — what upstream's
+    ///   `gserver -t` sends, read from the pid file — `encryption=1` meaning the
+    ///   client sent its MD5 hex digest;
+    /// * `root` with its real password. (Upstream's `/restart` accepts any
+    ///   valid user; here both routes are root/system only.)
+    ///
+    /// On success the response is written first, then the server shuts down
+    /// gracefully exactly as on `SIGTERM` (in-flight requests finish, open
+    /// transactions roll back, dirty databases are saved); `/restart` also sets
+    /// [`ShutdownHandle::restart_requested`], on which `gserver` re-executes
+    /// itself.
+    fn handle_stop_route(&self, st: &mut ApiState, req: &Request, restart: bool) -> Resp {
+        let envelope = |code: i64, msg: &str| Resp::new(200, JSON, status_json(code, msg));
+        if self.life.stopping() || self.closing.load(Ordering::SeqCst) {
+            // Upstream answers StatusIPBlocked (1101) with this message.
+            return envelope(1101, "server is stopping, please waitting !");
+        }
+        let username = req.merged_param("username").unwrap_or_default();
+        let password = req.merged_param("password").unwrap_or_default();
+        if username.is_empty() {
+            return envelope(1003, "the value of username can not be empty!");
+        }
+        if password.is_empty() {
+            return envelope(1003, "the value of password can not be empty!");
+        }
+        let encrypted = req.merged_param("encryption").as_deref() == Some("1");
+        let authenticated = if username == self.config.system_username {
+            let (presented, expected) = if encrypted {
+                (password.to_ascii_lowercase(), md5_hex(&self.system_password))
+            } else {
+                (password.clone(), self.system_password.clone())
+            };
+            ct_eq(presented.as_bytes(), expected.as_bytes())
+        } else if username == ROOT_USER {
+            // The user store keeps salted PBKDF2 hashes, so an MD5 digest of
+            // the password (`encryption=1`) cannot be checked against it here.
+            !encrypted && st.users.verify_and_upgrade(&username, &password)
+        } else {
+            let action = if restart { "restart" } else { "stop" };
+            return envelope(1001, &format!("You have no rights to {action} the server."));
+        };
+        if !authenticated {
+            return envelope(1001, "Username or password is wrong.");
+        }
+        if restart {
+            self.life.request_restart();
+            envelope(0, "Server restarted successfully.")
+        } else {
+            self.life.request_stop();
+            envelope(0, "Server stopped successfully.")
         }
     }
 
@@ -2777,6 +2963,14 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// A fresh random password for the `system` user (decimal digits, like
+/// upstream's `to_string(IdUtil::randNum())`).
+fn new_system_password() -> String {
+    let mut b = [0u8; 8];
+    crate::http_users::random_bytes(&mut b);
+    u64::from_le_bytes(b).to_string()
 }
 
 /// A fresh, non-zero transaction id.

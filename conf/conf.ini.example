@@ -1,0 +1,110 @@
+# gStore server configuration (conf.ini) -- example shipped with gstore-rust.
+#
+# This mirrors upstream gStore 1.4's conf/conf.ini key for key and value for
+# value. Copy it to conf/conf.ini (gserver reads ./conf/conf.ini when it exists)
+# or pass it explicitly:  gserver -c conf/conf.ini
+#
+# Syntax: [section] headers, key=value lines; whitespace around keys and values
+# is trimmed and double quotes are removed from values. Lines starting with '#'
+# or ';' are comments, and so is the rest of an unquoted value after
+# whitespace + '#' or ';'. An empty value (key=) means "use the built-in
+# default". If a key appears twice, the first one wins. Unknown keys are
+# reported as warnings and ignored.
+#
+# Precedence: command-line flag (e.g. -p/--port, --password, --no-checkpoint,
+# --addr, or a database directory argument) > this file > built-in default.
+# Relative paths are relative to the directory gserver is started from.
+
+[server]
+# the http api port
+port=9000
+# the socket api port (upstream's socket API is not built in 1.4; parsed only)
+tcp_port=9100
+# worker threads serving HTTP requests
+thread_num=30
+max_database_num=100
+max_user_num=1000
+# use deamon thread to run the server, values: on or off
+# (on: a supervisor process restarts gserver if it crashes; spelled "deamon"
+# as upstream, "daemon" is accepted too)
+deamon=off
+# the maximum output result, default 100000
+# max_output_size=100000
+# ip_allow_path first if both path are configured
+ip_allow_path=
+ip_deny_path="./conf/ipDeny.config"
+
+# ---- gstore-rust extensions (not in upstream conf.ini) ----
+# address the HTTP listener binds; upstream listens on every interface,
+# set 0.0.0.0 to do the same (default 127.0.0.1)
+# listen_addr=127.0.0.1
+# keep-alive idle timeout in seconds, 0 turns keep-alive off (default 60)
+# keep_alive_timeout=60
+# maximum requests served on one connection (default 100)
+# keep_alive_max=100
+# accepted connections that may wait for a free worker thread before the
+# server stops accepting more (default 128)
+# queue_size=128
+# send CORS headers (Access-Control-Allow-Origin: *) and answer OPTIONS
+# preflight requests, values: on or off (default on)
+# cors=on
+
+[system]
+# unit MB
+min_memory=1024
+min_million_disk=200
+min_million_memory=200
+resource_check=off
+# the directory do you want to place your database in
+# NOTICE:the position is ideally in the root of system directory
+# (gserver also keeps its pid file, gserver.pid, and the log of a background
+# start, gserver.log, in this directory)
+# db_home="./dbhome/"
+
+# which suffix do you want to add to your database name? please set it here
+# NOTICE:all database name ends with ".db" by default, but you shouldn't add ".db" to the name you pass to system
+# db_suffix=".db"
+
+# root username
+root_username="root"
+# root default password (used when the user store is first created)
+root_password="123456"
+# system username for shutdown (its password is generated at every start and
+# written to the second line of the pid file)
+system_username="system"
+# auto check point, default on
+check_point=on
+# build use multi thread increase efficiency
+build_multi_thread=off
+[log]
+# choose the system core log output model
+# config/slog.stdout.properties for console
+# config/slog.properties for file
+log_mode="./conf/slog.properties"
+# save the query log
+# 0: not save
+# 1: save the log
+querylog_mode=1
+querylog_path="logs/endpoint/"
+querylog_days=30
+# you can choose whether to record the operation log, by default it is opened.
+# If it is closed(that is, the option is uncommented and set to 0), then system will run fatser but maybe not safe and recoverable
+accesslog_mode=1
+accesslog_path="logs/ipaccess/"
+accesslog_days=30
+
+[backup]
+# backup database path
+backup_path="./backups/"
+# max backups file, if the number of backup files more than the value, system will remove the old backup files.
+max_backups=3
+
+[upload]
+upload_path = "./upload/"
+# max body size, 1 GB = 1024 MB = 1048576 KB(1M=1024KB) = 1073741824 B(1KB=1024B)
+# (gstore-rust also caps every HTTP request body at this size)
+upload_max_body_size = 1073741824
+# allow extensions
+upload_allow_extensions = "nt|ttl|n3|rdf|txt"
+# allow compress package
+upload_allow_compress_packages = "zip"
