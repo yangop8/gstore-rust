@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
@@ -267,6 +268,11 @@ pub struct Database {
     /// Advances on every applied data mutation (see
     /// [`mutation_count`](Self::mutation_count)).
     mutations: u64,
+    /// The per-predicate CSR of the default graph used by the advanced graph
+    /// functions (upstream `GeneralEvaluation::csr`), built lazily and keyed
+    /// by [`mutations`](Self::mutations) so any data change invalidates it
+    /// (see [`csr`](Self::csr)).
+    csr_cache: CsrCache,
     /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
     /// failed (e.g. interned by a reasoner run whose term write failed). The
     /// next insert that uses one writes it first, so no persisted triple ever
@@ -346,6 +352,7 @@ impl Database {
             persist_error: RefCell::new(None),
             load_policy: LoadPolicy::default(),
             mutations: 0,
+            csr_cache: CsrCache::new(),
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
         }
@@ -360,6 +367,33 @@ impl Database {
     /// treat the database as modified.
     pub fn mutation_count(&self) -> u64 {
         self.mutations
+    }
+
+    /// The per-predicate CSR of the **default graph** (named graphs are not
+    /// part of it — upstream has none) that gStore's advanced graph functions
+    /// run on; see [`CsrGraph`].
+    ///
+    /// Built on first use and cached; the cache is keyed by
+    /// [`mutation_count`](Self::mutation_count), so the next call after any
+    /// applied insert, delete, `CLEAR`/`DROP`, `LOAD`, inference or rollback
+    /// rebuilds it (upstream rebuilds in `prepPathQuery` when the KVstore's
+    /// CSR-dirty flag is set, GeneralEvaluation.cpp:262-271). A named-graph
+    /// mutation also advances the counter and so triggers a (redundant but
+    /// harmless) rebuild. Thread-safe: concurrent callers share one build.
+    pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
+        self.csr_cache
+            .get_or_build(self.mutations, || CsrGraph::build(&self.store))
+    }
+
+    /// Build the CSR now instead of on the first graph-function query —
+    /// upstream's `loadcsr` operation and `load` with `csr=1` / `gserver -c 1`.
+    pub fn preload_csr(&self) -> Result<()> {
+        self.csr().map(|_| ())
+    }
+
+    /// Whether a CSR for the current data is cached (no rebuild needed).
+    pub fn csr_is_cached(&self) -> bool {
+        self.csr_cache.peek(self.mutations).is_some()
     }
 
     /// Record an applied data mutation: invalidate cached query results and
