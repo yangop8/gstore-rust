@@ -4,10 +4,12 @@
 //! triple store, builds from RDF files, applies updates, answers SPARQL, and
 //! persists to / loads from a database directory.
 //!
-//! Persistence (DESIGN §7): a database is a directory holding four
-//! bincode-serialized files — `dict.bin`, `store.bin`, `meta.bin`, and
-//! `vstree.bin` (the signature index). This is the deliberately-simple stand-in
-//! for gStore's on-disk B+ tree KVstore (backlog item A).
+//! Persistence (DESIGN §7): a database is a directory in one of three layouts
+//! (see [`StorageKind`] and the `persist` submodule) — a bincode snapshot
+//! (`dict.bin`, `store.bin`, `named.bin`, `meta.bin`, `vstree.bin`, written as
+//! one crash-atomic set), the on-disk B+ tree KVstore (`kvstore.kv`, updated by
+//! write-through), or a RocksDB store (`rocksdb/`, feature `rocksdb`).
+//! [`Database::open`] detects the layout.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -20,7 +22,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
-use crate::kvstore::DiskStore;
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
@@ -28,6 +29,11 @@ use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, FunctionRegistry, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
+
+mod fsutil;
+mod persist;
+
+pub use persist::StorageKind;
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -63,8 +69,8 @@ const KV_FILE: &str = "kvstore.kv";
 /// Distinct from the in-memory snapshot's `vstree.bin`: this is the paged node
 /// file a disk database filters through without loading the whole tree.
 const VSTREE_KV_FILE: &str = "vstree.kv";
-/// Sub-directory holding the RocksDB store of a RocksDB-backed database.
-#[cfg(feature = "rocksdb")]
+/// Sub-directory holding the RocksDB store of a RocksDB-backed database
+/// (detected with or without the `rocksdb` feature).
 const ROCKS_SUBDIR: &str = "rocksdb";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
 const DISK_CACHE_PAGES: usize = 4096;
@@ -236,6 +242,18 @@ pub struct Database {
     /// registry rather than dlopen `.so` plugins). Passed to every read-query
     /// evaluator; consulted for any function name that is not a built-in.
     functions: FunctionRegistry,
+    /// The directory this database was opened from / built into (`None` for a
+    /// database that only ever lived in memory). Persistent layouts write their
+    /// committed updates here.
+    home: Option<PathBuf>,
+    /// Write-through state of an on-disk (`kvstore.kv`) database: every
+    /// committed mutation of the in-memory working set is mirrored to the
+    /// [`DiskStore`](crate::kvstore::DiskStore). A `RefCell` so `save(&self)`
+    /// can commit it.
+    disk: RefCell<Option<persist::DiskSink>>,
+    /// The first persistence failure (RocksDB dictionary / named-graph write)
+    /// since the last commit point, reported by the next one.
+    persist_error: RefCell<Option<String>>,
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -304,6 +322,9 @@ impl Database {
             backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
             functions: FunctionRegistry::new(),
+            home: None,
+            disk: RefCell::new(None),
+            persist_error: RefCell::new(None),
         }
     }
 
@@ -413,114 +434,7 @@ impl Database {
         Ok(db)
     }
 
-    // ---- RocksDB-backed database (feature `rocksdb`) ----------------------
-
-    /// Build a **persistent**, RocksDB-backed database in directory `dir` from an
-    /// in-memory RDF document. The triples live in a RocksDB store under
-    /// `dir/rocksdb`; the dictionary and metadata are snapshotted next to it so
-    /// the database can be reopened with [`open_rocksdb`](Self::open_rocksdb).
-    /// The full query engine (optimizer, VS-tree, analytics) runs over it
-    /// unchanged via the [`Backend`] seam.
-    #[cfg(feature = "rocksdb")]
-    pub fn build_rocksdb_from_str<P: AsRef<Path>>(
-        name: impl Into<String>,
-        dir: P,
-        content: &str,
-    ) -> Result<Database> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        let mut dict = Dictionary::new();
-        let mut ids: Vec<IdTriple> = Vec::new();
-        for t in turtle::parse_str(content)? {
-            let sub = dict.intern_entity(&t.subject.dict_key());
-            let pred = dict.intern_predicate(&t.predicate.dict_key());
-            let obj = dict.intern_term(&t.object);
-            ids.push(IdTriple::new(sub, pred, obj));
-        }
-        let mut rocks = crate::backend::rocks::RocksStore::open(dir.join(ROCKS_SUBDIR))?;
-        rocks.bulk_load(ids);
-        rocks.flush()?;
-        let store = Backend::Rocks(rocks);
-
-        let name = name.into();
-        write_bincode(&dir.join(DICT_FILE), &dict)?;
-        let meta = Meta {
-            name: name.clone(),
-            triple_num: store.triple_count(),
-            entity_num: dict.entity_num() as u64,
-            literal_num: dict.literal_num() as u64,
-            predicate_num: dict.predicate_num() as u64,
-        };
-        write_bincode(&dir.join(META_FILE), &meta)?;
-
-        let vstree = build_vstree(&store);
-        Ok(Database {
-            name,
-            dict,
-            store,
-            named: BTreeMap::new(),
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
-    }
-
-    /// Whether directory `dir` holds a RocksDB-backed database.
-    #[cfg(feature = "rocksdb")]
-    pub fn is_rocksdb<P: AsRef<Path>>(dir: P) -> bool {
-        dir.as_ref().join(ROCKS_SUBDIR).is_dir()
-    }
-
-    /// Reopen a RocksDB-backed database created by
-    /// [`build_rocksdb_from_str`](Self::build_rocksdb_from_str). The triples are
-    /// read from the RocksDB store on demand; the dictionary is loaded from its
-    /// snapshot and the VS-tree is rebuilt.
-    #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        let rocks_dir = dir.join(ROCKS_SUBDIR);
-        if !rocks_dir.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "no RocksDB store at '{}'",
-                rocks_dir.display()
-            )));
-        }
-        let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
-        let meta: Meta = read_bincode(&dir.join(META_FILE))?;
-        let rocks = crate::backend::rocks::RocksStore::open(rocks_dir)?;
-        let store = Backend::Rocks(rocks);
-        if store.triple_count() != meta.triple_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} triples but RocksDB has {}",
-                meta.triple_num,
-                store.triple_count()
-            )));
-        }
-        let vstree = build_vstree(&store);
-        Ok(Database {
-            name: meta.name,
-            dict,
-            store,
-            named: BTreeMap::new(),
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
-    }
+    // (RocksDB / on-disk / snapshot persistence lives in `persist.rs`.)
 
     // ---- accessors --------------------------------------------------------
 
@@ -543,9 +457,11 @@ impl Database {
         &self.dict
     }
     /// The in-memory default-graph store. Available for the default
-    /// [`Backend::Memory`] backend (used by snapshot MVCC and tests); panics for
-    /// a RocksDB-backed database, which has no in-RAM store — query it through
-    /// [`query`](Self::query)/[`select`](Self::select) instead.
+    /// [`Backend::Memory`] backend — which an on-disk database also uses for its
+    /// working set (used by snapshot MVCC and tests); panics for a
+    /// RocksDB-backed database, which has no in-RAM store — query it through
+    /// [`query`](Self::query)/[`select`](Self::select) or use
+    /// [`backend`](Self::backend) instead.
     pub fn store(&self) -> &TripleStore {
         self.store
             .as_memory()
@@ -639,9 +555,14 @@ impl Database {
         IdTriple::new(sub, pred, obj)
     }
 
-    /// Insert one triple. Returns `true` if it was newly added.
+    /// Insert one triple. Returns `true` if it was newly added. On a persistent
+    /// layout the insert is also written through to disk (see
+    /// [`StorageKind`]); a persistence failure is reported by the next commit
+    /// point (an auto-commit UPDATE, [`commit`](Self::commit), [`save`](Self::save)).
     pub fn insert_triple(&mut self, t: &Triple) -> bool {
-        let id = self.encode_triple(t);
+        let Some((_, id)) = self.intern_for_insert(t, None) else {
+            return false;
+        };
         let changed = self.store.insert(id);
         if changed {
             // While the index is consistent, keep it consistent *incrementally*:
@@ -665,6 +586,7 @@ impl Database {
                 log.push(UndoOp::Del(None, id)); // rollback removes what we added
             }
             self.record_redo(b'I', None, id);
+            self.persist_mutation(true, None, id);
         }
         changed
     }
@@ -726,6 +648,7 @@ impl Database {
                 log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
             }
             self.record_redo(b'D', None, id);
+            self.persist_mutation(false, None, id);
         }
         changed
     }
@@ -750,12 +673,16 @@ impl Database {
     /// Commit the active transaction, discarding its undo log. Buffered redo
     /// records (this transaction's mutations) are flushed to the redo log, since
     /// the transaction is now durable.
+    ///
+    /// On a persistent layout this is a commit point: the transaction's queued
+    /// write-through reaches the store and is made durable (see [`StorageKind`]).
     pub fn commit(&mut self) -> Result<()> {
         if self.txn.take().is_none() {
             return Err(GStoreError::Database("no active transaction".into()));
         }
+        self.disk_commit_pending();
         self.flush_redo()?;
-        Ok(())
+        self.commit_point()
     }
 
     /// Roll back the active transaction, undoing every triple mutation made
@@ -765,8 +692,10 @@ impl Database {
             return Err(GStoreError::Database("no active transaction".into()));
         };
         // The transaction's mutations are being undone, so its buffered redo
-        // records must never reach the log.
+        // records must never reach the log, nor its queued write-through the
+        // on-disk store (which never saw them).
         self.redo_pending.clear();
+        self.disk_discard_pending();
         for op in log.into_iter().rev() {
             match op {
                 UndoOp::Add(None, id) => {
@@ -776,11 +705,13 @@ impl Database {
                     self.store.remove(id);
                 }
                 UndoOp::Add(Some(gid), id) => {
-                    self.named.entry(gid).or_default().insert(id);
+                    if self.named.entry(gid).or_default().insert(id) {
+                        self.persist_named_quad(true, gid, id);
+                    }
                 }
                 UndoOp::Del(Some(gid), id) => {
-                    if let Some(s) = self.named.get_mut(&gid) {
-                        s.remove(id);
+                    if self.named.get_mut(&gid).is_some_and(|s| s.remove(id)) {
+                        self.persist_named_quad(false, gid, id);
                     }
                 }
             }
@@ -805,8 +736,9 @@ impl Database {
         let Some(g) = graph else {
             return self.insert_triple(t);
         };
-        let gid = self.dict.intern_entity(&Term::iri(g).dict_key());
-        let id = self.encode_triple(t);
+        let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g)) else {
+            return false;
+        };
         let changed = self.named.entry(gid).or_default().insert(id);
         if changed {
             self.query_cache.get_mut().clear();
@@ -814,6 +746,7 @@ impl Database {
                 log.push(UndoOp::Del(Some(gid), id));
             }
             self.record_redo(b'I', Some(gid), id);
+            self.persist_mutation(true, Some(gid), id);
         }
         changed
     }
@@ -840,6 +773,7 @@ impl Database {
                 log.push(UndoOp::Add(Some(gid), id));
             }
             self.record_redo(b'D', Some(gid), id);
+            self.persist_mutation(false, Some(gid), id);
         }
         changed
     }
@@ -865,6 +799,7 @@ impl Database {
     /// typing. Returns the number of inferred triples added; the VS-tree is
     /// invalidated (and rebuilt lazily on save / next consistent query).
     pub fn materialize_rdfs(&mut self) -> usize {
+        let terms_before = self.dict_term_count();
         let added = crate::reason::materialize(&mut self.dict, &mut self.store);
         let n = added.len();
         if n > 0 {
@@ -876,8 +811,15 @@ impl Database {
                     log.push(UndoOp::Del(None, *t));
                 }
             }
+            let grew = self.dict_term_count() != terms_before;
+            self.persist_inferred(&added, grew);
         }
         n
+    }
+
+    /// Total number of live dictionary terms (all three id spaces).
+    fn dict_term_count(&self) -> usize {
+        self.dict.entity_num() + self.dict.literal_num() + self.dict.predicate_num()
     }
 
     // ---- query ------------------------------------------------------------
@@ -951,6 +893,11 @@ impl Database {
                 if let Some(path) = self.update_log.clone() {
                     append_update_log(&path, sparql, changed)?;
                 }
+                // Outside a transaction each UPDATE request is a commit point:
+                // its write-through is made durable before it is acknowledged.
+                if self.txn.is_none() {
+                    self.commit_point()?;
+                }
                 Ok(QueryResult::Update { changed })
             }
         }
@@ -1022,6 +969,12 @@ impl Database {
             if self.store.as_memory().is_some() {
                 // In-memory: discard and replace (cheaper than per-triple delete).
                 self.store = Backend::Memory(TripleStore::new());
+                // An on-disk database must still delete them from its store.
+                if self.is_disk_backed() {
+                    for &t in &removed {
+                        self.persist_mutation(false, None, t);
+                    }
+                }
             } else {
                 // Persistent backend: delete every triple through the seam so the
                 // change is durable (don't swap in a Memory store, which would
@@ -1050,7 +1003,11 @@ impl Database {
                     }
                 }
             }
-            self.named.remove(&gid);
+            if let Some(removed) = self.named.remove(&gid) {
+                for t in removed.iter_all() {
+                    self.persist_mutation(false, Some(gid), t);
+                }
+            }
             self.query_cache.get_mut().clear();
         }
         n
@@ -1067,7 +1024,11 @@ impl Database {
                     }
                 }
             }
-            self.named.clear();
+            for (gid, removed) in std::mem::take(&mut self.named) {
+                for t in removed.iter_all() {
+                    self.persist_mutation(false, Some(gid), t);
+                }
+            }
             self.query_cache.get_mut().clear();
         }
         total
@@ -1096,181 +1057,6 @@ impl Database {
                 "expected a SELECT query, got {other:?}"
             ))),
         }
-    }
-
-    // ---- persistence ------------------------------------------------------
-
-    /// Save the database into directory `dir` (created if necessary).
-    ///
-    /// For the in-memory backend this writes the bincode snapshot exactly as
-    /// before. For a persistent backend the triples already live in their own
-    /// store (e.g. the RocksDB directory), so only the dictionary, named graphs,
-    /// metadata, and VS-tree are snapshotted here.
-    pub fn save<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        write_bincode(&dir.join(DICT_FILE), &self.dict)?;
-        if let Some(mem) = self.store.as_memory() {
-            write_bincode(&dir.join(STORE_FILE), mem)?;
-        }
-        write_bincode(&dir.join(NAMED_FILE), &self.named)?;
-        let meta = Meta {
-            name: self.name.clone(),
-            triple_num: self.store.triple_count(),
-            entity_num: self.dict.entity_num() as u64,
-            literal_num: self.dict.literal_num() as u64,
-            predicate_num: self.dict.predicate_num() as u64,
-        };
-        write_bincode(&dir.join(META_FILE), &meta)?;
-        // Persist a fresh in-memory VS-tree snapshot. Rebuild it from the store
-        // when the live tree is stale *or* out-of-core (a disk-backed tree holds
-        // no in-memory nodes, so serializing it directly would write an empty
-        // tree — rebuild from the store instead so the snapshot is complete).
-        if self.index_valid && !self.vstree.is_disk_backed() {
-            write_bincode(&dir.join(VSTREE_FILE), &self.vstree)?;
-        } else {
-            write_bincode(&dir.join(VSTREE_FILE), &build_vstree(&self.store))?;
-        }
-        Ok(())
-    }
-
-    // ---- on-disk B+ tree KVstore (backlog item A) -------------------------
-
-    /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
-    /// files. The triples and dictionary are written to `kvstore.kv` through the
-    /// page cache and persisted; nothing is kept in memory.
-    pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
-        // leftover WAL from a crashed earlier build can't replay into the new file.
-        let kv = dir.join(KV_FILE);
-        remove_file_and_wal(&kv);
-        let ds = DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
-        // Build the out-of-core VS-tree alongside the store, so a later
-        // `load_disk` filters through it on disk instead of materializing it.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        remove_file_and_wal(&vskv);
-        VsTree::build_disk(&vskv, vstree_entries(&ds))?;
-        Ok(())
-    }
-
-    /// Whether directory `dir` holds an on-disk KVstore database.
-    pub fn is_disk<P: AsRef<Path>>(dir: P) -> bool {
-        dir.as_ref().join(KV_FILE).is_file()
-    }
-
-    /// Open an on-disk database and materialize it into the in-memory engine for
-    /// querying. (The disk B+ trees are the source of truth; this loads the
-    /// working set through the page cache — streaming evaluation directly off
-    /// disk is a further optimization, see REFACTOR_BACKLOG item A.)
-    pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        let kv = dir.join(KV_FILE);
-        if !kv.is_file() {
-            return Err(GStoreError::Database(format!(
-                "no on-disk KVstore at '{}'",
-                kv.display()
-            )));
-        }
-        let ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
-        let (dict, store) = ds.to_memory()?;
-        let name = dir
-            .file_name()
-            .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
-            .unwrap_or_else(|| "disk".to_string());
-        // Out-of-core VS-tree: open the persisted paged node file (built by
-        // `build_disk`), or build+persist it now if this disk database predates
-        // it. Either way the candidate filter reads only the nodes a query
-        // traverses on disk — the whole tree is never materialized in RAM.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        let vstree = if vskv.is_file() {
-            VsTree::open_disk(&vskv)?
-        } else {
-            VsTree::build_disk(&vskv, vstree_entries(&ds))?
-        };
-        Ok(Database {
-            name,
-            dict,
-            store: Backend::Memory(store),
-            named: BTreeMap::new(),
-            vstree,
-            // The disk-backed tree is consistent with the just-loaded store, so
-            // the query path may use it as a candidate filter.
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
-    }
-
-    /// Load a database from directory `dir`.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        if !dir.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "database directory '{}' does not exist",
-                dir.display()
-            )));
-        }
-        let meta: Meta = read_bincode(&dir.join(META_FILE))?;
-        let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
-        let store: TripleStore = read_bincode(&dir.join(STORE_FILE))?;
-        // Named graphs are optional (older databases / no GRAPH data).
-        let named: BTreeMap<u32, TripleStore> =
-            read_bincode(&dir.join(NAMED_FILE)).unwrap_or_default();
-        // Sanity check that the snapshot is internally consistent.
-        if store.triple_count() != meta.triple_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} triples but store has {}",
-                meta.triple_num,
-                store.triple_count()
-            )));
-        }
-        if dict.entity_num() as u64 != meta.entity_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} entities but dict has {}",
-                meta.entity_num,
-                dict.entity_num()
-            )));
-        }
-        if dict.literal_num() as u64 != meta.literal_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} literals but dict has {}",
-                meta.literal_num,
-                dict.literal_num()
-            )));
-        }
-        if dict.predicate_num() as u64 != meta.predicate_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} predicates but dict has {}",
-                meta.predicate_num,
-                dict.predicate_num()
-            )));
-        }
-        // The VS-tree is rebuilt from the store if absent or unreadable.
-        let vstree = read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
-        Ok(Database {
-            name: meta.name,
-            dict,
-            store: Backend::Memory(store),
-            named,
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
     }
 
     // ---- backup / restore -------------------------------------------------
@@ -1302,9 +1088,15 @@ impl Database {
     }
 
     /// Restore a database from a full backup directory created by
-    /// [`backup`](Self::backup) (gStore `Database::restore`).
+    /// [`backup`](Self::backup) (gStore `Database::restore`), whatever its layout.
+    ///
+    /// A snapshot backup is loaded into memory (the backup directory is never
+    /// written). An on-disk or RocksDB backup is *opened in place*, so later
+    /// updates would be written into the backup itself — to restore one into a
+    /// database directory, use [`restore_into`](Self::restore_into) and open the
+    /// target instead.
     pub fn restore<P: AsRef<Path>>(backup_dir: P) -> Result<Database> {
-        Database::load(backup_dir)
+        Database::open(backup_dir)
     }
 
     /// The current incremental-backup checkpoint: the redo-log byte offset that
@@ -1370,7 +1162,7 @@ impl Database {
         }
         fs::create_dir_all(out_dir)?;
         let slice = &data[base as usize..end as usize];
-        fs::write(out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
         self.backup_offset.set(end);
         Ok(())
@@ -1383,16 +1175,18 @@ impl Database {
     /// `base_dir` is a directory produced by [`backup`](Self::backup); each entry
     /// of `incr_dirs` is a directory produced by
     /// [`backup_incremental`](Self::backup_incremental), in chronological order.
-    /// The base snapshot is loaded, then each delta's `incr.log` is replayed onto
-    /// it. Deltas are checked for contiguity: each must begin exactly where the
-    /// previous one ended (starting from the base's recorded checkpoint), so an
-    /// out-of-order or gapped chain is rejected rather than silently misapplied.
+    /// The base (any layout) is loaded and detached into memory — the backup
+    /// directories are never modified — then each delta's `incr.log` is replayed
+    /// onto it. Deltas are checked for contiguity: each must begin exactly where
+    /// the previous one ended (starting from the base's recorded checkpoint), so
+    /// an out-of-order or gapped chain is rejected rather than silently
+    /// misapplied. Persist the result with [`save`](Self::save).
     pub fn restore_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
         base_dir: P,
         incr_dirs: &[Q],
     ) -> Result<Database> {
         let base_dir = base_dir.as_ref();
-        let mut db = Database::load(base_dir)?;
+        let mut db = Database::open(base_dir)?.into_memory()?;
         // The base's checkpoint is where the first increment must begin. A missing
         // marker (a backup taken without logging) legitimately means offset 0, but
         // a marker that exists yet cannot be read is a corrupt base — surface that
@@ -1426,37 +1220,6 @@ impl Database {
         db.redo_log = saved;
         db.backup_offset.set(expected);
         outcome.map(|()| db)
-    }
-
-    /// File-level backup of a *persisted* database directory `src` into `dst`,
-    /// copying every database file present (the bincode snapshot, the on-disk
-    /// KVstore, and the update log) without loading anything into memory. Use
-    /// this to back up an on-disk (`build_disk`) database.
-    pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
-        let (src, dst) = (src.as_ref(), dst.as_ref());
-        if !src.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "backup source '{}' is not a directory",
-                src.display()
-            )));
-        }
-        fs::create_dir_all(dst)?;
-        for name in [
-            DICT_FILE,
-            STORE_FILE,
-            NAMED_FILE,
-            META_FILE,
-            VSTREE_FILE,
-            KV_FILE,
-            VSTREE_KV_FILE,
-            UPDATE_LOG_FILE,
-        ] {
-            let s = src.join(name);
-            if s.is_file() {
-                fs::copy(&s, dst.join(name))?;
-            }
-        }
-        Ok(())
     }
 
     // ---- update log -------------------------------------------------------
@@ -1716,7 +1479,11 @@ impl Database {
             preds.extend(s.predicates());
         }
 
-        self.dict.reclaim_unused(&ent_lit, &preds)
+        let freed = self.dict.reclaim_unused(&ent_lit, &preds);
+        if freed > 0 {
+            self.persist_dictionary_rewrite();
+        }
+        freed
     }
 
     // ---- user-defined reasoning rules (gStore ReasonHelper) ----------------
@@ -1758,6 +1525,7 @@ impl Database {
     /// inferred triples are recorded for transaction rollback like
     /// [`materialize_rdfs`](Self::materialize_rdfs).
     pub fn run_rules(&mut self) -> usize {
+        let terms_before = self.dict_term_count();
         let added = self.rules.apply(&mut self.dict, &mut self.store);
         let n = added.len();
         if n > 0 {
@@ -1768,6 +1536,8 @@ impl Database {
                     log.push(UndoOp::Del(None, *t));
                 }
             }
+            let grew = self.dict_term_count() != terms_before;
+            self.persist_inferred(&added, grew);
         }
         n
     }
@@ -1928,8 +1698,10 @@ fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
 
 /// Write a full-backup checkpoint marker: `GSTORE-BACKUP 1\noffset <N>\n`.
 fn write_backup_offset(path: &Path, offset: u64) -> Result<()> {
-    fs::write(path, format!("GSTORE-BACKUP 1\noffset {offset}\n"))?;
-    Ok(())
+    fsutil::atomic_write(
+        path,
+        format!("GSTORE-BACKUP 1\noffset {offset}\n").as_bytes(),
+    )
 }
 
 /// Read a full-backup checkpoint marker's `offset`.
@@ -1941,11 +1713,10 @@ fn read_backup_offset(path: &Path) -> Result<u64> {
 /// Write an incremental-backup marker:
 /// `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
 fn write_incremental_marker(path: &Path, base: u64, end: u64) -> Result<()> {
-    fs::write(
+    fsutil::atomic_write(
         path,
-        format!("GSTORE-INCREMENTAL 1\nbase_offset {base}\nend_offset {end}\n"),
-    )?;
-    Ok(())
+        format!("GSTORE-INCREMENTAL 1\nbase_offset {base}\nend_offset {end}\n").as_bytes(),
+    )
 }
 
 /// Read an incremental-backup marker's `(base_offset, end_offset)`.
@@ -1998,19 +1769,6 @@ fn split_lines(content: &str, n: usize) -> Vec<&str> {
         chunks.push(content);
     }
     chunks
-}
-
-fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let file = fs::File::create(path)?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, value)?;
-    Ok(())
-}
-
-fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let file = fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    Ok(bincode::deserialize_from(reader)?)
 }
 
 /// Remove a pager-backed file and its sibling `<path>.wal`, ignoring absence.

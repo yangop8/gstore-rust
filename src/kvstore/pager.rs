@@ -33,7 +33,8 @@ pub type PageId = u32;
 /// constant is therefore backward-compatible: an older file created with fewer
 /// roots has its extra slots read back as `0` (unallocated), exactly as a fresh
 /// file would. Slots `0..=14` back the `DiskStore` triple indexes / dictionary /
-/// counters; `15..` back the maintained optimizer statistics (see
+/// counters; `15..=17` back the maintained optimizer statistics; `18..=20` back
+/// the named-graph quad index, its count, and the VS-tree staleness flag (see
 /// [`store`](super::store)).
 pub const NROOTS: usize = 24;
 

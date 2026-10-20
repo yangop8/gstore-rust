@@ -10,6 +10,9 @@
 //! | `pos`         | `p ‖ o ‖ s`                | `s_by_po`, `so_by_p`, `*_by_p`   |
 //! | `osp`         | `o ‖ s ‖ p`                | `ps_by_o`, `p_by_so`, `object_keys` |
 //! | `stats`       | tagged counter keys        | optimizer statistics             |
+//! | `dict`        | `space ‖ id`               | the string dictionary (`id → key`) |
+//! | `gspo`        | `g ‖ s ‖ p ‖ o`            | named-graph quads                |
+//! | `meta`        | UTF-8 name                 | database name, layout markers    |
 //!
 //! Each id component is a 4-byte **big-endian** `u32`, so RocksDB's byte order
 //! equals numeric order and a prefix range scan over an ordering returns exactly
@@ -41,11 +44,31 @@
 //! `predicates` can be read by scanning the relevant `stats` prefix. This trades
 //! a handful of extra `stats` writes per triple for O(1), *exact* statistics
 //! (unlike the disk B+tree store, whose counter-based stats are estimates).
+//!
+//! ## Durability of the dictionary and named graphs
+//!
+//! A RocksDB-backed [`Database`](crate::Database) keeps its whole persistent
+//! state in this one RocksDB instance: besides the triple orderings, the `dict`
+//! CF holds every dictionary term (`E`/`L`/`P` space tag + 4-byte big-endian
+//! id → the term's dictionary key) and the `gspo` CF holds the named-graph
+//! quads. New terms are written *before* the first triple that references them
+//! (an orphan term is harmless; a triple whose term is missing is not), so the
+//! state RocksDB recovers after a crash is always self-consistent and nothing
+//! depends on a separately-saved `dict.bin`.
+//!
+//! ## Write errors
+//!
+//! [`MutableStore`] returns a plain `bool`, so a failed RocksDB write cannot be
+//! returned from `insert`/`remove`. Instead the write is reported as "not
+//! applied" (`false`), the in-memory counters are left untouched, and the error
+//! is kept until [`RocksStore::take_error`] collects it — the `Database` facade
+//! surfaces it at its next commit point. Nothing panics on an I/O failure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rocksdb::{
-    ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode, Options, WriteBatch, DB,
+    checkpoint::Checkpoint, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
+    Options, WriteBatch, DB,
 };
 
 use crate::error::{GStoreError, Result};
@@ -57,6 +80,39 @@ const CF_SPO: &str = "spo";
 const CF_POS: &str = "pos";
 const CF_OSP: &str = "osp";
 const CF_STATS: &str = "stats";
+const CF_DICT: &str = "dict";
+const CF_GSPO: &str = "gspo";
+const CF_META: &str = "meta";
+
+/// Which id space a dictionary term belongs to (the `dict` CF key tag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TermSpace {
+    /// IRIs and blank nodes (ids `< LITERAL_FIRST_ID`).
+    Entity,
+    /// Literals (public ids `>= LITERAL_FIRST_ID`).
+    Literal,
+    /// Predicates (their own id space).
+    Predicate,
+}
+
+impl TermSpace {
+    fn tag(self) -> u8 {
+        match self {
+            TermSpace::Entity => b'E',
+            TermSpace::Literal => b'L',
+            TermSpace::Predicate => b'P',
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<TermSpace> {
+        match tag {
+            b'E' => Some(TermSpace::Entity),
+            b'L' => Some(TermSpace::Literal),
+            b'P' => Some(TermSpace::Predicate),
+            _ => None,
+        }
+    }
+}
 
 // Global counter keys (single byte).
 const K_TRIPLES: &[u8] = b"T";
@@ -84,6 +140,8 @@ pub struct RocksStore {
     num_predicates: u64,
     distinct_subjects: u64,
     distinct_objects: u64,
+    /// The first write failure not yet collected by [`take_error`](Self::take_error).
+    error: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for RocksStore {
@@ -108,6 +166,9 @@ impl RocksStore {
             ColumnFamilyDescriptor::new(CF_POS, triple_cf_opts()),
             ColumnFamilyDescriptor::new(CF_OSP, triple_cf_opts()),
             ColumnFamilyDescriptor::new(CF_STATS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_DICT, Options::default()),
+            ColumnFamilyDescriptor::new(CF_GSPO, triple_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ];
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
             .map_err(|e| GStoreError::Database(format!("rocksdb open: {e}")))?;
@@ -118,6 +179,7 @@ impl RocksStore {
             num_predicates: 0,
             distinct_subjects: 0,
             distinct_objects: 0,
+            error: std::sync::Mutex::new(None),
         };
         store.triple_count = store.get_u64(K_TRIPLES);
         store.num_predicates = store.get_u64(K_PREDS);
@@ -126,11 +188,184 @@ impl RocksStore {
         Ok(store)
     }
 
-    /// Flush memtables to SST so all data is durable on disk.
+    /// Flush memtables to SST so all data is durable on disk (every column
+    /// family: triples, statistics, dictionary, named graphs and metadata).
     pub fn flush(&self) -> Result<()> {
+        for name in [CF_SPO, CF_POS, CF_OSP, CF_STATS, CF_DICT, CF_GSPO, CF_META] {
+            self.db
+                .flush_cf(self.cf(name))
+                .map_err(|e| GStoreError::Database(format!("rocksdb flush: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Fsync RocksDB's write-ahead log: every write acknowledged so far survives
+    /// a power failure, not only a process crash. Cheaper than [`flush`](Self::flush)
+    /// (no memtable → SST compaction); the `Database` facade calls it at each
+    /// commit point.
+    pub fn sync_wal(&self) -> Result<()> {
         self.db
-            .flush()
-            .map_err(|e| GStoreError::Database(format!("rocksdb flush: {e}")))
+            .flush_wal(true)
+            .map_err(|e| GStoreError::Database(format!("rocksdb WAL sync: {e}")))
+    }
+
+    /// The directory this RocksDB store lives in.
+    pub fn path(&self) -> PathBuf {
+        self.db.path().to_path_buf()
+    }
+
+    /// Write a consistent, openable point-in-time copy of the whole store (all
+    /// column families) into the **new** directory `dest` via a RocksDB
+    /// checkpoint (hard-linked SST files where possible). `dest` must not exist.
+    pub fn checkpoint_to<P: AsRef<Path>>(&self, dest: P) -> Result<()> {
+        let cp = Checkpoint::new(&self.db)
+            .map_err(|e| GStoreError::Database(format!("rocksdb checkpoint: {e}")))?;
+        cp.create_checkpoint(dest.as_ref())
+            .map_err(|e| GStoreError::Database(format!("rocksdb checkpoint: {e}")))
+    }
+
+    /// Collect (and clear) the first write error recorded since the last call.
+    /// `insert`/`remove` report a failed write as "not applied" and stash the
+    /// error here instead of panicking.
+    pub fn take_error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn record_error(&self, what: &str, e: rocksdb::Error) {
+        let mut slot = self
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(format!("rocksdb write ({what}): {e}"));
+        }
+    }
+
+    // ---- dictionary (dict CF) ---------------------------------------------
+
+    /// Persist dictionary terms `(space, id, key)` in one atomic batch
+    /// (overwriting any previous term stored under the same id).
+    pub fn put_terms(&self, terms: &[(TermSpace, u32, &str)]) -> Result<()> {
+        if terms.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_DICT);
+        let mut wb = WriteBatch::default();
+        for (space, id, key) in terms {
+            wb.put_cf(cf, tag1(space.tag(), *id), key.as_bytes());
+        }
+        self.db
+            .write(wb)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
+    }
+
+    /// Replace the entire stored dictionary with `terms`, atomically (used after
+    /// id reclamation and when migrating a legacy `dict.bin`).
+    pub fn replace_dictionary<'a, I>(&self, terms: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (TermSpace, u32, &'a str)>,
+    {
+        let cf = self.cf(CF_DICT);
+        let mut wb = WriteBatch::default();
+        // Every dict key is 5 bytes `tag ‖ be(id)`; this range covers them all.
+        wb.delete_range_cf(cf, vec![0u8; 5], vec![0xFFu8; 6]);
+        for (space, id, key) in terms {
+            wb.put_cf(cf, tag1(space.tag(), id), key.as_bytes());
+        }
+        self.db
+            .write(wb)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
+    }
+
+    /// Every stored dictionary term as `(space, id, key)`, in `(space, id)` order.
+    pub fn load_terms(&self) -> Result<Vec<(TermSpace, u32, String)>> {
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_DICT), IteratorMode::Start) {
+            let (k, v) =
+                item.map_err(|e| GStoreError::Database(format!("rocksdb read (dictionary): {e}")))?;
+            let space = (k.len() == 5)
+                .then(|| TermSpace::from_tag(k[0]))
+                .flatten()
+                .ok_or_else(|| GStoreError::Database("corrupt rocksdb dictionary key".into()))?;
+            let key = String::from_utf8(v.to_vec())
+                .map_err(|_| GStoreError::Database("non-UTF-8 rocksdb dictionary term".into()))?;
+            out.push((space, de(&k[1..5]), key));
+        }
+        Ok(out)
+    }
+
+    // ---- named graphs (gspo CF) --------------------------------------------
+
+    /// Insert a quad (graph-IRI entity id + triple). Returns `true` if new.
+    pub fn insert_quad(&self, g: u32, t: IdTriple) -> Result<bool> {
+        let cf = self.cf(CF_GSPO);
+        let key = key4(g, t.sub, t.pred, t.obj);
+        let present = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| GStoreError::Database(format!("rocksdb read (quad): {e}")))?
+            .is_some();
+        if present {
+            return Ok(false);
+        }
+        self.db
+            .put_cf(cf, key, b"")
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
+        Ok(true)
+    }
+
+    /// Remove a quad. Returns `true` if it existed.
+    pub fn remove_quad(&self, g: u32, t: IdTriple) -> Result<bool> {
+        let cf = self.cf(CF_GSPO);
+        let key = key4(g, t.sub, t.pred, t.obj);
+        let present = self
+            .db
+            .get_cf(cf, key)
+            .map_err(|e| GStoreError::Database(format!("rocksdb read (quad): {e}")))?
+            .is_some();
+        if !present {
+            return Ok(false);
+        }
+        self.db
+            .delete_cf(cf, key)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
+        Ok(true)
+    }
+
+    /// Every named-graph quad as `(graph_id, triple)`, sorted.
+    pub fn quads(&self) -> Result<Vec<(u32, IdTriple)>> {
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_GSPO), IteratorMode::Start) {
+            let (k, _) =
+                item.map_err(|e| GStoreError::Database(format!("rocksdb read (quads): {e}")))?;
+            if k.len() != 16 {
+                return Err(GStoreError::Database("corrupt rocksdb quad key".into()));
+            }
+            out.push((
+                de(&k[0..4]),
+                IdTriple::new(de(&k[4..8]), de(&k[8..12]), de(&k[12..16])),
+            ));
+        }
+        Ok(out)
+    }
+
+    // ---- metadata (meta CF) ------------------------------------------------
+
+    /// Store a metadata value (database name, layout markers).
+    pub fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.db
+            .put_cf(self.cf(CF_META), key.as_bytes(), value)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (meta): {e}")))
+    }
+
+    /// Read a metadata value.
+    pub fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.db
+            .get_cf(self.cf(CF_META), key.as_bytes())
+            .map_err(|e| GStoreError::Database(format!("rocksdb read (meta): {e}")))
     }
 
     // ---- column-family handles -------------------------------------------
@@ -161,7 +396,7 @@ impl RocksStore {
     /// transitions that move a distinct-count.
     fn step(&self, wb: &mut WriteBatch, key: &[u8], up: bool) -> (u64, u64) {
         let old = self.get_u64(key);
-        let new = if up { old + 1 } else { old - 1 };
+        let new = if up { old + 1 } else { old.saturating_sub(1) };
         let cf = self.cf(CF_STATS);
         if new == 0 {
             wb.delete_cf(cf, key);
@@ -238,22 +473,27 @@ impl RocksStore {
         wb.put_cf(self.cf(CF_POS), key3(pred, obj, sub), b"");
         wb.put_cf(self.cf(CF_OSP), key3(obj, sub, pred), b"");
 
-        self.triple_count += 1;
-        self.set_global(&mut wb, K_TRIPLES, self.triple_count);
+        // The cached global counters only advance once the batch is durable, so
+        // a failed write leaves them (and the store) exactly as they were.
+        let triples = self.triple_count + 1;
+        let mut preds = self.num_predicates;
+        let mut subjects = self.distinct_subjects;
+        let mut objects = self.distinct_objects;
+        self.set_global(&mut wb, K_TRIPLES, triples);
 
         // predicate cardinality + distinct-predicate transition
         if self.step(&mut wb, &tag1(T_CARD, pred), true).0 == 0 {
-            self.num_predicates += 1;
-            self.set_global(&mut wb, K_PREDS, self.num_predicates);
+            preds += 1;
+            self.set_global(&mut wb, K_PREDS, preds);
         }
         // distinct subjects / objects
         if self.step(&mut wb, &tag1(T_SUB, sub), true).0 == 0 {
-            self.distinct_subjects += 1;
-            self.set_global(&mut wb, K_SUBJECTS, self.distinct_subjects);
+            subjects += 1;
+            self.set_global(&mut wb, K_SUBJECTS, subjects);
         }
         if self.step(&mut wb, &tag1(T_OBJ, obj), true).0 == 0 {
-            self.distinct_objects += 1;
-            self.set_global(&mut wb, K_OBJECTS, self.distinct_objects);
+            objects += 1;
+            self.set_global(&mut wb, K_OBJECTS, objects);
         }
         // per-predicate distinct subjects / objects
         if self.step(&mut wb, &tag2(T_PS, pred, sub), true).0 == 0 {
@@ -263,7 +503,14 @@ impl RocksStore {
             self.step(&mut wb, &tag1(T_POBJ, pred), true);
         }
 
-        self.db.write(wb).expect("rocksdb write (insert)");
+        if let Err(e) = self.db.write(wb) {
+            self.record_error("insert", e);
+            return false;
+        }
+        self.triple_count = triples;
+        self.num_predicates = preds;
+        self.distinct_subjects = subjects;
+        self.distinct_objects = objects;
         true
     }
 
@@ -277,20 +524,23 @@ impl RocksStore {
         wb.delete_cf(self.cf(CF_POS), key3(pred, obj, sub));
         wb.delete_cf(self.cf(CF_OSP), key3(obj, sub, pred));
 
-        self.triple_count -= 1;
-        self.set_global(&mut wb, K_TRIPLES, self.triple_count);
+        let triples = self.triple_count.saturating_sub(1);
+        let mut preds = self.num_predicates;
+        let mut subjects = self.distinct_subjects;
+        let mut objects = self.distinct_objects;
+        self.set_global(&mut wb, K_TRIPLES, triples);
 
         if self.step(&mut wb, &tag1(T_CARD, pred), false).1 == 0 {
-            self.num_predicates -= 1;
-            self.set_global(&mut wb, K_PREDS, self.num_predicates);
+            preds = preds.saturating_sub(1);
+            self.set_global(&mut wb, K_PREDS, preds);
         }
         if self.step(&mut wb, &tag1(T_SUB, sub), false).1 == 0 {
-            self.distinct_subjects -= 1;
-            self.set_global(&mut wb, K_SUBJECTS, self.distinct_subjects);
+            subjects = subjects.saturating_sub(1);
+            self.set_global(&mut wb, K_SUBJECTS, subjects);
         }
         if self.step(&mut wb, &tag1(T_OBJ, obj), false).1 == 0 {
-            self.distinct_objects -= 1;
-            self.set_global(&mut wb, K_OBJECTS, self.distinct_objects);
+            objects = objects.saturating_sub(1);
+            self.set_global(&mut wb, K_OBJECTS, objects);
         }
         if self.step(&mut wb, &tag2(T_PS, pred, sub), false).1 == 0 {
             self.step(&mut wb, &tag1(T_PSUBJ, pred), false);
@@ -299,7 +549,14 @@ impl RocksStore {
             self.step(&mut wb, &tag1(T_POBJ, pred), false);
         }
 
-        self.db.write(wb).expect("rocksdb write (remove)");
+        if let Err(e) = self.db.write(wb) {
+            self.record_error("remove", e);
+            return false;
+        }
+        self.triple_count = triples;
+        self.num_predicates = preds;
+        self.distinct_subjects = subjects;
+        self.distinct_objects = objects;
         true
     }
 }
@@ -492,6 +749,15 @@ fn key3(a: u32, b: u32, c: u32) -> [u8; 12] {
     k[0..4].copy_from_slice(&be(a));
     k[4..8].copy_from_slice(&be(b));
     k[8..12].copy_from_slice(&be(c));
+    k
+}
+
+/// 16-byte quad key `g ‖ s ‖ p ‖ o`.
+#[inline]
+fn key4(g: u32, s: u32, p: u32, o: u32) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[0..4].copy_from_slice(&be(g));
+    k[4..16].copy_from_slice(&key3(s, p, o));
     k
 }
 

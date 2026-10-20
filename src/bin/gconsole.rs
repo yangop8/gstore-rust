@@ -6,11 +6,15 @@
 //! gconsole <db_name>     # load existing <db_name>.db, or start a fresh one
 //! ```
 //!
+//! Any database layout is opened ([`Database::open`]): on an on-disk or RocksDB
+//! database each update is written through to its store as it is applied.
+//!
 //! Type a SPARQL query terminated by `;` (or a blank line) to run it. Dot
 //! commands: `help`, `stats`, `save`, `load <name>`, `import <file.nt>`,
 //! `quit`/`exit`.
 
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 use gstore::{db_dir_for, Database, QueryResult};
 
@@ -22,19 +26,25 @@ fn main() {
         .unwrap_or_else(|| "scratch".to_string());
 
     let dir = db_dir_for(&name);
-    let mut db = match Database::load(&dir) {
-        Ok(db) => {
-            println!(
-                "Loaded database '{}' ({} triples).",
-                db.name(),
-                db.triple_num()
-            );
-            db
+    let mut db = if std::path::Path::new(&dir).is_dir() {
+        match Database::open(&dir) {
+            Ok(db) => {
+                println!(
+                    "Loaded database '{}' ({} triples, {}).",
+                    db.name(),
+                    db.triple_num(),
+                    db.storage()
+                );
+                db
+            }
+            Err(e) => {
+                eprintln!("cannot open database '{dir}': {e}");
+                std::process::exit(1);
+            }
         }
-        Err(_) => {
-            println!("No database at '{dir}'. Started a new in-memory database '{name}'.");
-            Database::new(name.clone())
-        }
+    } else {
+        println!("No database at '{dir}'. Started a new in-memory database '{name}'.");
+        Database::new(name.clone())
     };
 
     println!("gStore-rust console. End a query with ';'. Type 'help' for commands.");
@@ -72,9 +82,14 @@ fn main() {
                     continue;
                 }
                 "save" => {
-                    let dir = db_dir_for(db.name());
+                    // Persist where the database lives (its home directory),
+                    // falling back to `<name>.db` for a fresh in-memory one.
+                    let dir = db
+                        .home()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(db_dir_for(db.name())));
                     match db.save(&dir) {
-                        Ok(()) => println!("saved to {dir}"),
+                        Ok(()) => println!("saved to {}", dir.display()),
                         Err(e) => eprintln!("save failed: {e}"),
                     }
                     print_prompt(&buffer);
@@ -88,7 +103,7 @@ fn main() {
                 }
                 cmd if cmd.starts_with("load ") => {
                     let other = cmd["load ".len()..].trim();
-                    match Database::load(db_dir_for(other)) {
+                    match Database::open(db_dir_for(other)) {
                         Ok(loaded) => {
                             db = loaded;
                             println!("loaded '{}' ({} triples)", db.name(), db.triple_num());

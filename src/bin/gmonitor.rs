@@ -1,7 +1,7 @@
 //! `gmonitor` — print monitoring information about a database.
 //!
 //! Mirrors gStore's `gmonitor` (`getDBMonitorInfo`): counts, index/transaction
-//! state, and on-disk size.
+//! state, storage layout, and on-disk size (including a RocksDB store).
 //!
 //! ```text
 //! gmonitor <db_name>
@@ -20,12 +20,7 @@ fn main() -> ExitCode {
     }
     let dir = db_dir_for(&args[1]);
 
-    let db = if Database::is_disk(&dir) {
-        Database::load_disk(&dir)
-    } else {
-        Database::load(&dir)
-    };
-    let db = match db {
+    let db = match Database::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
@@ -37,9 +32,10 @@ fn main() -> ExitCode {
     let backend = db.backend();
     let disk = dir_size(&dir);
 
-    let rows: [(&str, String); 12] = [
+    let rows: [(&str, String); 13] = [
         ("database", s.name.clone()),
         ("directory", dir.clone()),
+        ("storage", db.storage().to_string()),
         ("triple_num", s.triple_num.to_string()),
         ("entity_num", s.entity_num.to_string()),
         ("literal_num", s.literal_num.to_string()),
@@ -61,14 +57,17 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Total byte size of the regular files directly inside `dir`.
-fn dir_size(dir: &str) -> u64 {
+/// Total byte size of the regular files inside `dir`, recursively (so a
+/// RocksDB database's `rocksdb/` store is counted).
+fn dir_size(dir: impl AsRef<Path>) -> u64 {
     let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(Path::new(dir)) {
+    if let Ok(entries) = std::fs::read_dir(dir.as_ref()) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     total += meta.len();
+                } else if meta.is_dir() {
+                    total += dir_size(entry.path());
                 }
             }
         }

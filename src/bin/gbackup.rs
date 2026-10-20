@@ -8,10 +8,15 @@
 //!
 //! For an in-memory (bincode) database this writes a consistent snapshot into
 //! `<backup_dir>`. For an on-disk (KVstore) database it copies the database
-//! files verbatim via [`Database::backup_dir`].
+//! files — including any pending write-ahead logs — verbatim via
+//! [`Database::backup_dir`], without loading the data. For a RocksDB database
+//! (built with `--features rocksdb`) it writes a RocksDB checkpoint, a
+//! consistent copy of every column family; without the feature the store
+//! directory is copied file by file (only safe while no process has it open).
 
 use std::process::ExitCode;
 
+use gstore::db::StorageKind;
 use gstore::{db_dir_for, Database};
 
 fn main() -> ExitCode {
@@ -28,17 +33,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let result = if Database::is_disk(&dir) {
+    let result = match Database::storage_kind(&dir) {
         // On-disk store: copy the files directly (no in-RAM materialization).
-        Database::backup_dir(&dir, backup)
-    } else {
-        match Database::load(&dir) {
+        Some(StorageKind::Disk) => Database::backup_dir(&dir, backup),
+        Some(StorageKind::RocksDb) if !cfg!(feature = "rocksdb") => {
+            Database::backup_dir(&dir, backup)
+        }
+        _ => match Database::open(&dir) {
             Ok(db) => db.backup(backup),
             Err(e) => {
                 eprintln!("cannot load database '{dir}': {e}");
                 return ExitCode::FAILURE;
             }
-        }
+        },
     };
     if let Err(e) = result {
         eprintln!("backup of '{dir}' failed: {e}");

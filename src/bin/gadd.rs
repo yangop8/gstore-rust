@@ -11,6 +11,10 @@
 //! `.jsonld`/`.json` (JSON-LD), `.html`/`.xhtml` (RDFa); anything else is parsed
 //! as Turtle (a superset of N-Triples). Quad formats (N-Quads / TriG) are
 //! flattened into the default graph.
+//!
+//! Any database layout is accepted ([`Database::open`] detects it): for an
+//! in-memory snapshot the database is re-saved; for an on-disk (`gbuild --disk`)
+//! or RocksDB database the change is written through to its store.
 
 use std::process::ExitCode;
 
@@ -26,7 +30,7 @@ fn main() -> ExitCode {
     let dir = db_dir_for(&args[1]);
     let file = &args[2];
 
-    let mut db = match load_any(&dir) {
+    let mut db = match Database::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
@@ -54,15 +58,6 @@ fn main() -> ExitCode {
         db.triple_num()
     );
     ExitCode::SUCCESS
-}
-
-/// Load a database, auto-detecting the on-disk vs in-memory backend (as gquery).
-fn load_any(dir: &str) -> Result<Database> {
-    if Database::is_disk(dir) {
-        Database::load_disk(dir)
-    } else {
-        Database::load(dir)
-    }
 }
 
 /// Read triples from an RDF file, dispatching on the file extension (quad

@@ -21,12 +21,7 @@ fn main() -> ExitCode {
     }
     let dir = db_dir_for(&args[1]);
 
-    let db = if Database::is_disk(&dir) {
-        Database::load_disk(&dir)
-    } else {
-        Database::load(&dir)
-    };
-    let db = match db {
+    let db = match Database::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
@@ -37,6 +32,7 @@ fn main() -> ExitCode {
     let s = db.stats();
     println!("database  : {}", s.name);
     println!("directory : {dir}");
+    println!("storage   : {}", db.storage());
     println!("triples   : {}", s.triple_num);
     println!("entities  : {}", s.entity_num);
     println!("literals  : {}", s.literal_num);

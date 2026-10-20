@@ -89,7 +89,7 @@ use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
 use crate::query::{Evaluator, QueryResult};
-use crate::store::TripleStore;
+use crate::store::{TripleSource, TripleStore};
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
 /// form (which round-trips losslessly), used for write-write conflict detection.
@@ -190,10 +190,22 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Capture `db`'s committed state. An in-memory (or on-disk working-set)
+    /// store is cloned; a store with no in-RAM copy (RocksDB) is materialized
+    /// explicitly from its triples — O(triples) per published version, but never
+    /// a panic.
     fn from_db(db: &Database, version: u64) -> Snapshot {
+        let store = match db.backend().as_memory() {
+            Some(mem) => mem.clone(),
+            None => {
+                let mut mem = TripleStore::new();
+                mem.bulk_load(db.backend().iter_all());
+                mem
+            }
+        };
         Snapshot {
             dict: db.dict().clone(),
-            store: db.store().clone(),
+            store,
             named: db.named_graphs().clone(),
             version,
         }

@@ -7,8 +7,18 @@
 //! over these orderings answer every access pattern, exactly as the in-memory
 //! [`crate::store::TripleStore`] does, but entirely from disk through the page
 //! cache. Data persists and reopens.
+//!
+//! Named graphs live in a fourth B+ tree, GSPO, keyed by the 16-byte
+//! `graph|subject|predicate|object` quad (the graph IRI is an entity id), so a
+//! database's named graphs persist in the same `kvstore.kv` file, under the same
+//! WAL-protected flush, as its default graph.
+//!
+//! The store also carries a *VS-tree staleness* flag in its header: every
+//! default-graph mutation sets it, in the same pager commit as the mutated pages,
+//! so a `vstree.kv` signature index built beside the store is known to be out of
+//! date after any update that reached disk (see [`DiskStore::vstree_stale`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -18,7 +28,7 @@ use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID}
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, QueryResult};
-use crate::store::{TripleSource, TripleStore};
+use crate::store::{MutableStore, TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
 use super::disk_dict::DiskDict;
@@ -56,6 +66,15 @@ const PRED_STATS: usize = 15;
 const ROOT_DISTINCT_SUBJ: usize = 16;
 /// Maintained count of distinct ids that appear as an object (exact).
 const ROOT_DISTINCT_OBJ: usize = 17;
+/// Root of the named-graph quad index: 16-byte `g|s|p|o` keys, empty values.
+const GSPO: usize = 18;
+/// Maintained number of quads (named-graph triples) in [`GSPO`].
+const ROOT_QUAD_COUNT: usize = 19;
+/// `1` once a default-graph mutation has made a separately-built VS-tree file
+/// stale; cleared by [`DiskStore::mark_vstree_fresh`]. `0` (the value of a file
+/// written before this flag existed, which was never mutated after its build)
+/// means "fresh".
+const ROOT_VSTREE_STALE: usize = 20;
 
 /// Bytes of a per-predicate stats record (`num`, `distinct_subj`, `distinct_obj`).
 const PRED_STAT_LEN: usize = 12;
@@ -97,6 +116,12 @@ pub struct DiskStore {
     /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`/`po_by_s`
     /// when [`compacted`](Self::compacted) is set.
     sp2o_vlist: BTree,
+    /// Named-graph quads, keyed `graph|sub|pred|obj` (all big-endian ids).
+    gspo: BTree,
+    quad_count: u64,
+    /// Whether a default-graph mutation happened since the VS-tree file beside
+    /// this store was last rebuilt (persisted in [`ROOT_VSTREE_STALE`]).
+    vstree_stale: bool,
     /// Maintained per-predicate statistics (gStore `pre2num`/`pre2sub`/`pre2obj`),
     /// an integer-keyed dense [`IvArray`] of fixed 12-byte counter records. Kept
     /// current on every insert/delete so the optimizer reads `pred_card` /
@@ -135,6 +160,8 @@ impl DiskStore {
         let compacted = pager.root(ROOT_COMPACTED) != 0;
         let distinct_subj = pager.root(ROOT_DISTINCT_SUBJ) as u32;
         let distinct_obj = pager.root(ROOT_DISTINCT_OBJ) as u32;
+        let quad_count = pager.root(ROOT_QUAD_COUNT);
+        let vstree_stale = pager.root(ROOT_VSTREE_STALE) != 0;
         // A file written before the maintained statistics existed has triples but
         // no `pred_stats` array (its root slot is still zero). Detect that and
         // rebuild the stats once, so an old on-disk database still gets O(1)
@@ -154,6 +181,9 @@ impl DiskStore {
             id2literal: IvArray::new(ID2LITERAL),
             id2predicate: IvArray::new(ID2PREDICATE),
             sp2o_vlist: BTree::new(SP2O_VLIST),
+            gspo: BTree::new(GSPO),
+            quad_count,
+            vstree_stale,
             pred_stats: IvArray::new(PRED_STATS),
             triple_count,
             entity_count,
@@ -170,7 +200,11 @@ impl DiskStore {
         Ok(store)
     }
 
-    /// Build a disk store from RDF (Turtle/N-Triples) files.
+    /// Build a disk store from RDF files. The format of each file is detected by
+    /// its extension exactly as for an in-memory build (N-Triples / Turtle /
+    /// N-Quads / TriG / RDF-XML / JSON-LD / RDFa; unknown → Turtle), via
+    /// [`crate::parser::parse_file_by_ext`]; quad formats are flattened into the
+    /// default graph, matching `Database::build_from_files`.
     pub fn build_files<P1: AsRef<Path>, P2: AsRef<Path>>(
         path: P1,
         cache_pages: usize,
@@ -178,7 +212,7 @@ impl DiskStore {
     ) -> Result<DiskStore> {
         let mut store = DiskStore::open(path, cache_pages)?;
         for f in rdf_files {
-            for t in turtle::parse_file(f)? {
+            for t in crate::parser::parse_file_by_ext(f)? {
                 store.insert_triple(&t)?;
             }
         }
@@ -252,21 +286,189 @@ impl DiskStore {
         Ok(id)
     }
 
-    fn intern_term(&mut self, t: &Term) -> Result<EntityLiteralId> {
-        let key = t.dict_key();
-        if t.is_literal() {
-            self.intern_literal(&key)
+    /// Intern an object key in the literal or the entity space.
+    fn intern_object(&mut self, key: &str, is_literal: bool) -> Result<EntityLiteralId> {
+        if is_literal {
+            self.intern_literal(key)
         } else {
-            self.intern_entity(&key)
+            self.intern_entity(key)
         }
     }
 
     /// Insert one triple; returns `true` if newly added.
     pub fn insert_triple(&mut self, t: &Triple) -> Result<bool> {
-        let s = self.intern_entity(&t.subject.dict_key())?;
-        let p = self.intern_predicate(&t.predicate.dict_key())?;
-        let o = self.intern_term(&t.object)?;
+        self.insert_keys(
+            &t.subject.dict_key(),
+            &t.predicate.dict_key(),
+            &t.object.dict_key(),
+            t.object.is_literal(),
+        )
+    }
+
+    /// Insert one default-graph triple given its dictionary keys (the
+    /// [`Term::dict_key`] surface forms); `o_is_literal` selects the object's id
+    /// space. New terms are interned in this store's own dictionary. Returns
+    /// `true` if the triple was newly added. This is the write-through entry
+    /// point the `Database` facade uses: it works on strings, so the in-memory
+    /// working set's ids need not line up with this store's ids.
+    pub fn insert_keys(&mut self, s: &str, p: &str, o: &str, o_is_literal: bool) -> Result<bool> {
+        let s = self.intern_entity(s)?;
+        let p = self.intern_predicate(p)?;
+        let o = self.intern_object(o, o_is_literal)?;
         self.insert_ids(IdTriple::new(s, p, o))
+    }
+
+    /// Delete one default-graph triple given its dictionary keys (see
+    /// [`insert_keys`](Self::insert_keys)). Returns `false` if any term is
+    /// unknown or the triple is absent. Dictionary entries are kept.
+    pub fn delete_keys(&mut self, s: &str, p: &str, o: &str, o_is_literal: bool) -> Result<bool> {
+        match self.lookup_keys(s, p, o, o_is_literal)? {
+            Some(t) => self.delete_ids(t),
+            None => Ok(false),
+        }
+    }
+
+    /// Resolve a triple's keys to ids without interning (`None` if any term is
+    /// unknown to this store's dictionary).
+    fn lookup_keys(
+        &self,
+        s: &str,
+        p: &str,
+        o: &str,
+        o_is_literal: bool,
+    ) -> Result<Option<IdTriple>> {
+        let guard = self.pager.read().unwrap();
+        let pager = &*guard;
+        let Some(s) = self.entity2id.get(pager, s.as_bytes())? else {
+            return Ok(None);
+        };
+        let Some(p) = self.predicate2id.get(pager, p.as_bytes())? else {
+            return Ok(None);
+        };
+        let otree = if o_is_literal {
+            &self.literal2id
+        } else {
+            &self.entity2id
+        };
+        let Some(o) = otree.get(pager, o.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(Some(IdTriple::new(de32(&s), de32(&p), de32(&o))))
+    }
+
+    // ---- named graphs (GSPO quad index) -----------------------------------
+
+    /// Insert a triple into the named graph `g` (the graph IRI's dictionary key,
+    /// e.g. `<http://ex/g>`). Returns `true` if the quad was newly added.
+    pub fn insert_quad_keys(
+        &mut self,
+        g: &str,
+        s: &str,
+        p: &str,
+        o: &str,
+        o_is_literal: bool,
+    ) -> Result<bool> {
+        let g = self.intern_entity(g)?;
+        let s = self.intern_entity(s)?;
+        let p = self.intern_predicate(p)?;
+        let o = self.intern_object(o, o_is_literal)?;
+        let key = key4(g, s, p, o);
+        let mut guard = self.pager.write().unwrap();
+        let pager = &mut *guard;
+        if self.gspo.get(pager, &key)?.is_some() {
+            return Ok(false);
+        }
+        self.gspo.insert(pager, &key, b"")?;
+        self.quad_count += 1;
+        pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        Ok(true)
+    }
+
+    /// Delete a triple from the named graph `g` (see
+    /// [`insert_quad_keys`](Self::insert_quad_keys)). Returns `false` if any
+    /// term is unknown or the quad is absent.
+    pub fn delete_quad_keys(
+        &mut self,
+        g: &str,
+        s: &str,
+        p: &str,
+        o: &str,
+        o_is_literal: bool,
+    ) -> Result<bool> {
+        let Some(t) = self.lookup_keys(s, p, o, o_is_literal)? else {
+            return Ok(false);
+        };
+        let gid = {
+            let guard = self.pager.read().unwrap();
+            match self.entity2id.get(&guard, g.as_bytes())? {
+                Some(v) => de32(&v),
+                None => return Ok(false),
+            }
+        };
+        let key = key4(gid, t.sub, t.pred, t.obj);
+        let mut guard = self.pager.write().unwrap();
+        let pager = &mut *guard;
+        if !self.gspo.delete(pager, &key)? {
+            return Ok(false);
+        }
+        self.quad_count = self.quad_count.saturating_sub(1);
+        pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        Ok(true)
+    }
+
+    /// Every named-graph quad as `(graph_id, triple)` in this store's id space,
+    /// sorted by graph then `(s, p, o)`.
+    pub fn quads(&self) -> Result<Vec<(EntityLiteralId, IdTriple)>> {
+        let rows = self.scan(&self.gspo, &[])?;
+        Ok(rows
+            .iter()
+            .map(|k| {
+                (
+                    de32(&k[0..4]),
+                    IdTriple::new(de32(&k[4..8]), de32(&k[8..12]), de32(&k[12..16])),
+                )
+            })
+            .collect())
+    }
+
+    /// Number of named-graph quads stored.
+    pub fn quad_count(&self) -> u64 {
+        self.quad_count
+    }
+
+    /// The named graphs as in-memory stores keyed by graph-IRI entity id (ids in
+    /// this store's id space, so they line up with [`to_memory`](Self::to_memory)).
+    pub fn named_to_memory(&self) -> Result<BTreeMap<u32, TripleStore>> {
+        let mut grouped: BTreeMap<u32, Vec<IdTriple>> = BTreeMap::new();
+        for (g, t) in self.quads()? {
+            grouped.entry(g).or_default().push(t);
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(g, ts)| {
+                let mut st = TripleStore::new();
+                MutableStore::bulk_load(&mut st, ts);
+                (g, st)
+            })
+            .collect())
+    }
+
+    // ---- VS-tree staleness -------------------------------------------------
+
+    /// Whether a default-graph insert/delete happened since the last
+    /// [`mark_vstree_fresh`](Self::mark_vstree_fresh): a VS-tree file built over
+    /// this store's default graph must then be rebuilt before it is trusted as a
+    /// candidate filter. The flag lives in the header, so it reaches disk in the
+    /// same WAL-protected commit as the mutation that set it.
+    pub fn vstree_stale(&self) -> bool {
+        self.vstree_stale
+    }
+
+    /// Record that the VS-tree file beside this store was rebuilt from the
+    /// current default graph (persisted on the next [`flush`](Self::flush)).
+    pub fn mark_vstree_fresh(&mut self) {
+        self.vstree_stale = false;
+        self.pager.write().unwrap().set_root(ROOT_VSTREE_STALE, 0);
     }
 
     // Crash-consistency scope: the WAL makes each *pager flush* atomic, and the
@@ -292,6 +494,10 @@ impl DiskStore {
         let sp_is_new = !self.spo.prefix_exists(pager, &cat(t.sub, t.pred))?;
         let po_is_new = !self.pos.prefix_exists(pager, &cat(t.pred, t.obj))?;
 
+        // Flag a beside-the-store VS-tree as stale *before* touching any page,
+        // so whichever pager commit first carries this mutation carries the flag.
+        self.vstree_stale = true;
+        pager.set_root(ROOT_VSTREE_STALE, 1);
         self.spo.insert(pager, &spo, b"")?;
         self.pos.insert(pager, &key3(t.pred, t.obj, t.sub), b"")?;
         self.osp.insert(pager, &key3(t.obj, t.sub, t.pred), b"")?;
@@ -332,36 +538,12 @@ impl DiskStore {
     /// pages. Returns `false` (no change) if any term is unknown or the triple
     /// is absent.
     pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
-        let s = {
-            let guard = self.pager.read().unwrap();
-            let pager = &*guard;
-            match self.entity2id.get(pager, t.subject.dict_key().as_bytes())? {
-                Some(v) => de32(&v),
-                None => return Ok(false),
-            }
-        };
-        let p = {
-            let guard = self.pager.read().unwrap();
-            let pager = &*guard;
-            match self.predicate2id.get(pager, t.predicate.dict_key().as_bytes())? {
-                Some(v) => de32(&v),
-                None => return Ok(false),
-            }
-        };
-        let o = {
-            let guard = self.pager.read().unwrap();
-            let pager = &*guard;
-            let tree = if t.object.is_literal() {
-                &self.literal2id
-            } else {
-                &self.entity2id
-            };
-            match tree.get(pager, t.object.dict_key().as_bytes())? {
-                Some(v) => de32(&v),
-                None => return Ok(false),
-            }
-        };
-        self.delete_ids(IdTriple::new(s, p, o))
+        self.delete_keys(
+            &t.subject.dict_key(),
+            &t.predicate.dict_key(),
+            &t.object.dict_key(),
+            t.object.is_literal(),
+        )
     }
 
     fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
@@ -371,6 +553,8 @@ impl DiskStore {
         if self.spo.get(pager, &spo)?.is_none() {
             return Ok(false);
         }
+        self.vstree_stale = true;
+        pager.set_root(ROOT_VSTREE_STALE, 1);
         self.spo.delete(pager, &spo)?;
         self.pos.delete(pager, &key3(t.pred, t.obj, t.sub))?;
         self.osp.delete(pager, &key3(t.obj, t.sub, t.pred))?;
@@ -419,6 +603,8 @@ impl DiskStore {
         pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
         pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
         pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
+        pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        pager.set_root(ROOT_VSTREE_STALE, self.vstree_stale as u64);
         pager.flush()
     }
 
@@ -1073,6 +1259,14 @@ fn key3(a: u32, b: u32, c: u32) -> [u8; 12] {
     k
 }
 
+/// 16-byte quad key `g|s|p|o` (big-endian, ordering-preserving).
+fn key4(g: u32, s: u32, p: u32, o: u32) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[0..4].copy_from_slice(&be32(g));
+    k[4..16].copy_from_slice(&key3(s, p, o));
+    k
+}
+
 /// 8-byte two-id prefix.
 fn cat(a: u32, b: u32) -> [u8; 8] {
     let mut k = [0u8; 8];
@@ -1209,6 +1403,100 @@ mod tests {
         assert_eq!(ds.triple_count(), 4);
         assert_eq!(ds.iter_all().unwrap().len(), 4);
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- key-level writes, named-graph quads, VS-tree staleness ------------
+
+    #[test]
+    fn key_level_writes_persist_with_their_terms() {
+        let path = tmp("keys");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap());
+            assert!(!ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap(), "dup");
+            assert!(ds.delete_keys("<root>", "<contain>", "<node0>", false).unwrap());
+            // Unknown terms and wrong id spaces are simply absent.
+            assert!(!ds.delete_keys("<ghost>", "<contain>", "<node0>", false).unwrap());
+            assert!(!ds.delete_keys("<new>", "<rel>", "\"lit\"@en", false).unwrap());
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.triple_count(), 5);
+        let (dict, mem) = ds.to_memory().unwrap();
+        let s = dict.entity_id("<new>").unwrap();
+        let p = dict.predicate_id("<rel>").unwrap();
+        let o = dict.literal_id("\"lit\"@en").unwrap();
+        assert!(mem.exists(s, p, o));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn named_graph_quads_persist_and_reload() {
+        let path = tmp("quads");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap());
+            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
+            assert!(ds.insert_quad_keys("<g2>", "<root>", "<contain>", "<node0>", false).unwrap());
+            assert!(!ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap(), "dup");
+            assert!(ds.delete_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
+            assert!(!ds.delete_quad_keys("<g9>", "<a>", "<p>", "<b>", false).unwrap());
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.quad_count(), 2);
+        // Quads never touch the default graph.
+        assert_eq!(ds.triple_count(), 5);
+        let (dict, _) = ds.to_memory().unwrap();
+        let named = ds.named_to_memory().unwrap();
+        assert_eq!(named.len(), 2);
+        let g1 = dict.entity_id("<g1>").unwrap();
+        let (a, p, b) = (
+            dict.entity_id("<a>").unwrap(),
+            dict.predicate_id("<p>").unwrap(),
+            dict.entity_id("<b>").unwrap(),
+        );
+        assert!(named[&g1].exists(a, p, b));
+        assert_eq!(named[&g1].triple_count(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vstree_staleness_flag_tracks_default_graph_writes() {
+        let path = tmp("stale_flag");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.vstree_stale(), "a build's inserts mark it stale");
+            ds.mark_vstree_fresh();
+            ds.flush().unwrap();
+        }
+        {
+            let mut ds = DiskStore::open(&path, 64).unwrap();
+            assert!(!ds.vstree_stale(), "fresh persists");
+            // A named-graph write does not affect the default-graph index …
+            ds.insert_quad_keys("<g>", "<a>", "<p>", "<b>", false).unwrap();
+            assert!(!ds.vstree_stale());
+            // … a default-graph delete does, and the flag is committed with it.
+            ds.delete_keys("<node1>", "<own>", "<point0>", false).unwrap();
+            assert!(ds.vstree_stale());
+            ds.flush().unwrap();
+        }
+        assert!(DiskStore::open(&path, 64).unwrap().vstree_stale());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn build_files_dispatches_on_extension() {
+        let dir = std::env::temp_dir().join("gstore_disk_formats_ut");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl = dir.join("d.ttl");
+        std::fs::write(&ttl, "@prefix ex: <http://ex/> .\nex:a ex:p ex:b , ex:c .\n").unwrap();
+        let nq = dir.join("d.nq");
+        std::fs::write(&nq, "<http://ex/d> <http://ex/p> <http://ex/e> <http://ex/g> .\n").unwrap();
+        let ds = DiskStore::build_files(dir.join("kv"), 64, &[&ttl, &nq]).unwrap();
+        assert_eq!(ds.triple_count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- out-of-core dictionary (lazy str↔id resolution) ------------------

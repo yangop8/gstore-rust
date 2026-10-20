@@ -1,0 +1,476 @@
+//! Crash-safe file primitives used by database persistence.
+//!
+//! * **Single files** are replaced atomically: the new content goes to
+//!   `<file>.tmp` in the same directory, is flushed and `fsync`ed, renamed over
+//!   the target, and the directory is `fsync`ed (unix) so the rename itself is
+//!   durable. A crash at any point leaves either the old or the new file — never
+//!   a truncated one.
+//! * **Snapshot sets** (`dict.bin`, `store.bin`, … — several files that are only
+//!   meaningful together) are committed with [`SnapshotWriter`]: every member is
+//!   first written to its `.tmp` file and synced, then a small commit record
+//!   (`SNAPSHOT.commit`) is written atomically, then the members are renamed into
+//!   place and the record is removed. [`recover_snapshot`] — run before every
+//!   snapshot read or write — rolls an interrupted commit forward once its
+//!   record exists, or discards the half-written temp files of one that never
+//!   reached it. So a crash mid-save leaves the old snapshot or the new one,
+//!   never a mix.
+//! * **Directories** (a RocksDB store copied into a backup) are staged as
+//!   `<dir>.tmp`, renamed to `<dir>.new` once complete, then swapped in;
+//!   [`recover_dir_swap`] finishes an interrupted swap.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+use crate::error::{GStoreError, Result};
+
+/// Suffix of the temporary file/directory a write is staged in.
+pub(crate) const TMP_SUFFIX: &str = ".tmp";
+/// Suffix of a fully-staged directory waiting to be swapped in.
+const NEW_SUFFIX: &str = ".new";
+/// Suffix of the directory being swapped out.
+const OLD_SUFFIX: &str = ".old";
+/// The commit record of a multi-file snapshot write (see [`SnapshotWriter`]).
+pub(crate) const SNAPSHOT_COMMIT_FILE: &str = "SNAPSHOT.commit";
+
+/// `path` with `suffix` appended to its final component.
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// The staging path of `path` (`<path>.tmp`).
+pub(crate) fn tmp_path(path: &Path) -> PathBuf {
+    with_suffix(path, TMP_SUFFIX)
+}
+
+/// The directory containing `path` (`.` for a bare file name).
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// `fsync` a directory so renames/unlinks inside it are durable. A no-op off
+/// unix, where directories cannot be opened for syncing.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Remove a file, treating "not found" as success.
+pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove a directory tree, treating "not found" as success.
+pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `<path>.tmp` through `fill`, then flush and `fsync` it, returning the
+/// temp path. On any failure the temp file is removed and the target untouched.
+fn write_tmp<F>(path: &Path, fill: F) -> Result<PathBuf>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let tmp = tmp_path(path);
+    let written = (|| -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        let mut w = BufWriter::new(file);
+        fill(&mut w)?;
+        let file = w.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        if tmp.is_file() {
+            let _ = fs::remove_file(&tmp);
+        }
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Atomically replace `path` with whatever `fill` writes (temp file in the same
+/// directory → write → fsync → rename → fsync directory).
+pub(crate) fn atomic_write_with<F>(path: &Path, fill: F) -> Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let tmp = write_tmp(path, fill)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_dir(parent_of(path))
+}
+
+/// Atomically replace `path` with `bytes`.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, |w| {
+        w.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+/// Atomically replace `path` with the bincode encoding of `value`.
+#[cfg(test)]
+pub(crate) fn write_bincode_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    atomic_write_with(path, |w| {
+        bincode::serialize_into(w, value)?;
+        Ok(())
+    })
+}
+
+/// Read a bincode-encoded value from `path`.
+pub(crate) fn read_bincode<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T> {
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+    Ok(bincode::deserialize_from(reader)?)
+}
+
+/// Atomically replace `dst` with a copy of the file `src`.
+pub(crate) fn copy_file_atomic(src: &Path, dst: &Path) -> Result<()> {
+    let mut input = File::open(src)?;
+    atomic_write_with(dst, |w| {
+        io::copy(&mut input, w)?;
+        Ok(())
+    })
+}
+
+/// Whether `a` and `b` name the same directory (after resolving symlinks and
+/// relative components). A path that cannot be resolved only equals itself.
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+// ---- multi-file snapshot commit --------------------------------------------
+
+/// Stages the members of a snapshot set and commits them together (see the
+/// module docs). Dropping a writer without [`commit`](Self::commit)ting removes
+/// its staged temp files, leaving the previous snapshot untouched.
+pub(crate) struct SnapshotWriter<'a> {
+    dir: &'a Path,
+    /// Every name that may belong to this kind of snapshot (used to validate a
+    /// commit record and to clean up stray temp files).
+    members: &'a [&'a str],
+    staged: Vec<&'a str>,
+    committed: bool,
+}
+
+impl<'a> SnapshotWriter<'a> {
+    /// Start a snapshot write into `dir` (created if needed), first finishing or
+    /// discarding any interrupted earlier write.
+    pub(crate) fn begin(dir: &'a Path, members: &'a [&'a str]) -> Result<SnapshotWriter<'a>> {
+        fs::create_dir_all(dir)?;
+        recover_snapshot(dir, members)?;
+        Ok(SnapshotWriter {
+            dir,
+            members,
+            staged: Vec::new(),
+            committed: false,
+        })
+    }
+
+    /// Write member `name` (bincode of `value`) to its temp file and sync it.
+    pub(crate) fn stage<T: Serialize>(&mut self, name: &'a str, value: &T) -> Result<()> {
+        debug_assert!(self.members.contains(&name));
+        write_tmp(&self.dir.join(name), |w| {
+            bincode::serialize_into(w, value)?;
+            Ok(())
+        })?;
+        self.staged.push(name);
+        Ok(())
+    }
+
+    /// Publish every staged member at once.
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let record = self.staged.join("\n");
+        atomic_write(&self.dir.join(SNAPSHOT_COMMIT_FILE), record.as_bytes())?;
+        // From here on the new set *is* the snapshot: a crash below is rolled
+        // forward by `recover_snapshot`, so the temp files must not be removed.
+        self.committed = true;
+        let names: Vec<String> = self.staged.iter().map(|s| s.to_string()).collect();
+        finish_snapshot_commit(self.dir, &names)
+    }
+}
+
+impl Drop for SnapshotWriter<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            for name in &self.staged {
+                let _ = fs::remove_file(tmp_path(&self.dir.join(name)));
+            }
+        }
+    }
+}
+
+/// Rename every staged member into place, then retire the commit record.
+fn finish_snapshot_commit(dir: &Path, names: &[String]) -> Result<()> {
+    for name in names {
+        let tmp = tmp_path(&dir.join(name));
+        if tmp.is_file() {
+            fs::rename(&tmp, dir.join(name))?;
+        }
+    }
+    sync_dir(dir)?;
+    remove_file_if_exists(&dir.join(SNAPSHOT_COMMIT_FILE))?;
+    sync_dir(dir)
+}
+
+/// Finish (roll forward) a snapshot commit interrupted after its commit record
+/// was written, or discard the temp files of one interrupted before it. Only
+/// names listed in `members` are ever touched.
+pub(crate) fn recover_snapshot(dir: &Path, members: &[&str]) -> Result<()> {
+    let record = dir.join(SNAPSHOT_COMMIT_FILE);
+    match fs::read_to_string(&record) {
+        Ok(text) => {
+            let names: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|n| members.contains(n))
+                .map(str::to_owned)
+                .collect();
+            finish_snapshot_commit(dir, &names)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            for name in members {
+                let tmp = tmp_path(&dir.join(name));
+                if tmp.is_file() {
+                    let _ = fs::remove_file(&tmp);
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(GStoreError::Database(format!(
+            "cannot read snapshot commit record '{}': {e}",
+            record.display()
+        ))),
+    }
+}
+
+// ---- directory staging ------------------------------------------------------
+
+/// Recursively copy directory `src` into the (new) directory `dst`, syncing
+/// every copied file.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+            File::open(&to)?.sync_all()?;
+        }
+    }
+    sync_dir(dst)
+}
+
+/// Install a fully-populated staging directory `staged` as `target`, replacing
+/// any existing `target`: `staged` → `target.new` → (`target` → `target.old`)
+/// → `target`. Interrupted swaps are completed by [`recover_dir_swap`].
+pub(crate) fn install_staged_dir(staged: &Path, target: &Path) -> Result<()> {
+    let new = with_suffix(target, NEW_SUFFIX);
+    let old = with_suffix(target, OLD_SUFFIX);
+    remove_dir_if_exists(&new)?;
+    fs::rename(staged, &new)?;
+    sync_dir(parent_of(target))?;
+    remove_dir_if_exists(&old)?;
+    if target.exists() {
+        fs::rename(target, &old)?;
+    }
+    fs::rename(&new, target)?;
+    sync_dir(parent_of(target))?;
+    remove_dir_if_exists(&old)?;
+    Ok(())
+}
+
+/// Replace directory `dst` by a recursive copy of `src` (staged, then swapped
+/// in with [`install_staged_dir`]).
+pub(crate) fn replace_dir_with_copy(src: &Path, dst: &Path) -> Result<()> {
+    let staged = tmp_path(dst);
+    remove_dir_if_exists(&staged)?;
+    copy_dir_all(src, &staged)?;
+    install_staged_dir(&staged, dst)
+}
+
+/// Complete or clean up an interrupted [`install_staged_dir`] of `target`: a
+/// complete `target.new` is moved into place when `target` is missing; stale
+/// `target.tmp` / `target.old` leftovers are removed.
+pub(crate) fn recover_dir_swap(target: &Path) -> Result<()> {
+    let new = with_suffix(target, NEW_SUFFIX);
+    if !target.exists() && new.is_dir() {
+        fs::rename(&new, target)?;
+        sync_dir(parent_of(target))?;
+    }
+    remove_dir_if_exists(&new)?;
+    remove_dir_if_exists(&with_suffix(target, OLD_SUFFIX))?;
+    remove_dir_if_exists(&tmp_path(target))?;
+    Ok(())
+}
+
+/// Whether a (possibly not yet swapped-in) directory exists for `target`.
+pub(crate) fn dir_or_staged_exists(target: &Path) -> bool {
+    target.is_dir() || with_suffix(target, NEW_SUFFIX).is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gstore_fsutil_{tag}"));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A value whose serialization writes some bytes and then fails — the
+    /// stand-in for a crash or I/O error in the middle of a save.
+    struct FailsMidway;
+    impl Serialize for FailsMidway {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+            use serde::ser::{Error, SerializeSeq};
+            let mut seq = s.serialize_seq(Some(3))?;
+            seq.serialize_element(&1u64)?;
+            seq.serialize_element(&2u64)?;
+            Err(S::Error::custom("simulated failure mid-write"))
+        }
+    }
+
+    #[test]
+    fn atomic_write_failure_leaves_old_file_intact() {
+        let dir = tmp_dir("atomic_fail");
+        let target = dir.join("store.bin");
+        write_bincode_atomic(&target, &vec![7u32, 8, 9]).unwrap();
+        let before = fs::read(&target).unwrap();
+
+        assert!(write_bincode_atomic(&target, &FailsMidway).is_err());
+        assert_eq!(fs::read(&target).unwrap(), before, "old content survives");
+        assert!(!tmp_path(&target).exists(), "the temp file is cleaned up");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_writer_abort_keeps_previous_set() {
+        let dir = tmp_dir("snap_abort");
+        let members: &[&str] = &["a.bin", "b.bin"];
+        let mut w = SnapshotWriter::begin(&dir, members).unwrap();
+        w.stage("a.bin", &1u32).unwrap();
+        w.stage("b.bin", &1u32).unwrap();
+        w.commit().unwrap();
+
+        let mut w = SnapshotWriter::begin(&dir, members).unwrap();
+        w.stage("a.bin", &2u32).unwrap();
+        assert!(w.stage("b.bin", &FailsMidway).is_err());
+        drop(w); // aborted: nothing published
+
+        let a: u32 = bincode::deserialize(&fs::read(dir.join("a.bin")).unwrap()).unwrap();
+        let b: u32 = bincode::deserialize(&fs::read(dir.join("b.bin")).unwrap()).unwrap();
+        assert_eq!((a, b), (1, 1), "the previous set is untouched");
+        assert!(!tmp_path(&dir.join("a.bin")).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_snapshot_commit_rolls_forward() {
+        let dir = tmp_dir("snap_rollfwd");
+        let members: &[&str] = &["a.bin", "b.bin"];
+        let mut w = SnapshotWriter::begin(&dir, members).unwrap();
+        w.stage("a.bin", &1u32).unwrap();
+        w.stage("b.bin", &1u32).unwrap();
+        w.commit().unwrap();
+
+        // Simulate a crash after the commit record was written and one member
+        // was renamed, but before the other was.
+        write_tmp(&dir.join("a.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
+        write_tmp(&dir.join("b.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
+        atomic_write(&dir.join(SNAPSHOT_COMMIT_FILE), b"a.bin\nb.bin").unwrap();
+        fs::rename(tmp_path(&dir.join("a.bin")), dir.join("a.bin")).unwrap();
+
+        recover_snapshot(&dir, members).unwrap();
+        let a: u32 = bincode::deserialize(&fs::read(dir.join("a.bin")).unwrap()).unwrap();
+        let b: u32 = bincode::deserialize(&fs::read(dir.join("b.bin")).unwrap()).unwrap();
+        assert_eq!((a, b), (2, 2), "the committed set is completed");
+        assert!(!dir.join(SNAPSHOT_COMMIT_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_prepare_is_discarded() {
+        let dir = tmp_dir("snap_discard");
+        let members: &[&str] = &["a.bin"];
+        write_bincode_atomic(&dir.join("a.bin"), &1u32).unwrap();
+        // A temp file without a commit record: the prepare never finished.
+        write_tmp(&dir.join("a.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
+        recover_snapshot(&dir, members).unwrap();
+        let a: u32 = bincode::deserialize(&fs::read(dir.join("a.bin")).unwrap()).unwrap();
+        assert_eq!(a, 1);
+        assert!(!tmp_path(&dir.join("a.bin")).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_directory_swap_and_recovery() {
+        let dir = tmp_dir("dir_swap");
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("f"), b"new").unwrap();
+        fs::write(src.join("sub/g"), b"deep").unwrap();
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("f"), b"old").unwrap();
+
+        replace_dir_with_copy(&src, &target).unwrap();
+        assert_eq!(fs::read(target.join("f")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("sub/g")).unwrap(), b"deep");
+
+        // Interrupted between "target → target.old" and "target.new → target".
+        fs::rename(&target, with_suffix(&target, OLD_SUFFIX)).unwrap();
+        copy_dir_all(&src, &with_suffix(&target, NEW_SUFFIX)).unwrap();
+        assert!(dir_or_staged_exists(&target));
+        recover_dir_swap(&target).unwrap();
+        assert_eq!(fs::read(target.join("f")).unwrap(), b"new");
+        assert!(!with_suffix(&target, OLD_SUFFIX).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
