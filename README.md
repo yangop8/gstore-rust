@@ -159,6 +159,17 @@ db.save("demo.db")?;                 // persist
 let db = Database::load("demo.db")?; // reload
 ```
 
+### Experimental: cluster
+
+The `cluster` / `rpc` modules and the `gnode` binary (sharded scatter-gather
+over TCP, Raft-style replication, elastic membership) are an **experimental
+library feature**: they are not wired into `gserver` or the HTTP API, keep all
+state in memory, speak an unauthenticated wire protocol that may change, and
+have no counterpart in upstream gStore 1.4 (whose `src/Cluster` is not built,
+and whose distributed edition is not open source). A shard that cannot answer
+fails the query with an error rather than yielding a partial result. Use it for
+experiments, not for data you need to keep.
+
 ---
 
 ## gNLQA (natural-language QA)

@@ -16,3 +16,6 @@ gnlqa.conf
 
 # CCB control-plane runtime state
 /.ccb/
+
+# macOS Finder metadata
+.DS_Store

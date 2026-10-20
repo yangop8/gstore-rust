@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch / PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# No rustfmt check yet: the tree is not rustfmt-clean. A later change formats
+# the code base and adds a `cargo fmt --all -- --check` job.
+jobs:
+  clippy:
+    name: clippy (workspace, all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (workspace, default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - run: cargo test --workspace
+
+  features:
+    name: test (gstore, --features ${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [gzip, tls]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-${{ matrix.feature }}
+      - name: build
+        run: cargo build -p gstore --all-targets --features ${{ matrix.feature }}
+      - name: test
+        run: cargo test -p gstore --features ${{ matrix.feature }}
+
+  rocksdb:
+    name: test (gstore, --features rocksdb)
+    runs-on: ubuntu-latest
+    # The bundled librocksdb C++ build dominates; allow for a cold cache.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang (librocksdb-sys bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rocksdb
+      - run: cargo test -p gstore --features rocksdb

@@ -1,5 +1,18 @@
 //! A sharded / distributed-query core: an **in-process** scatter-gather
-//! [`TripleSource`] over `N` partitioned [`TripleStore`]s.
+//! [`TripleSource`] over `N` partitioned [`TripleStore`]s, plus an
+//! experimental network transport, Raft-like replication and elastic
+//! membership on top of it.
+//!
+//! # Experimental
+//!
+//! Everything in this module except the in-process [`ShardedStore`] is an
+//! **experimental library feature**: it is not wired into `gserver` or the HTTP
+//! API, its wire protocol ([`crate::rpc`]) and APIs may change without notice,
+//! and it has no persistence (a [`ClusterNode`]'s Raft log and store live in
+//! memory only). It is **not** a port of upstream gStore: upstream 1.4's
+//! `src/Cluster` (leader/follower replication) is not compiled into its
+//! release, and the distributed gStore edition is not open source. Use it for
+//! experiments and tests, not production data.
 //!
 //! Corresponds, in spirit, to gStore's distributed deployment (gStore + the
 //! `gStore`-on-cluster work): the triple set is **partitioned** across shards
@@ -37,7 +50,7 @@
 //! a **real network transport** so shards can live in separate processes/hosts:
 //!
 //! * [`ShardNode`] — a server that owns one local [`TripleStore`] shard and
-//!   answers per-shard RPCs over TCP (the [`crate::bin::gnode`] binary is a thin
+//!   answers per-shard RPCs over TCP (the `gnode` binary is a thin
 //!   wrapper around it; see `src/bin/gnode.rs`).
 //! * [`RemoteShard`] — a TCP client to a [`ShardNode`], speaking the
 //!   length-prefixed binary protocol in [`crate::rpc`].
@@ -46,6 +59,20 @@
 //!   running the *same* scatter-gather merge (so it is observationally identical
 //!   to a single [`TripleStore`]) plus **routed inserts** (each triple is placed
 //!   on `hash(subject) % N`, shipped over RPC for a remote shard).
+//!
+//! ## Shard failures are errors
+//!
+//! A distributed read can fail part-way: a remote shard may be unreachable, or
+//! every replica of a bucket may be down. Merging such a shard in as *empty*
+//! would make a query return a partial answer indistinguishable from a complete
+//! one, so the distributed stores ([`NetworkShardedStore`], [`ShardCluster`],
+//! [`ShardedRaftCluster`]) do **not** implement the infallible
+//! [`TripleSource`]. They implement [`TryTripleSource`], whose `try_*` reads
+//! return `Err` naming the failed shard, and their `query` methods evaluate
+//! through a [`Checked`] view that aborts the evaluation on the first shard
+//! failure and returns it as [`GStoreError::Io`]. Routed writes
+//! ([`NetworkShardedStore::insert`], [`ShardCluster::insert`]) surface I/O
+//! errors as before.
 //!
 //! The wire codec is hand-rolled `std`-only TCP, not gRPC/protobuf — that is a
 //! deliberate **zero-dependency** choice (see [`crate::rpc`]). gRPC would occupy
@@ -65,8 +92,8 @@
 //! * [`ClusterConfig`] — the replicated configuration object (member set + the
 //!   shard→owner assignment, tagged with an `epoch`). Membership changes are
 //!   replicated as Raft **config-change** log entries
-//!   ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
-//!   [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)): committed by quorum and
+//!   ([`LogOp::AddNode`] /
+//!   [`LogOp::RemoveNode`]): committed by quorum and
 //!   applied on every [`ClusterNode`] replica, which therefore converge on an
 //!   identical config (served over [`Request::GetConfig`]).
 //! * [`ShardCluster`] — the data-plane coordinator. It maps shards to owners by
@@ -124,11 +151,9 @@
 //!   them from the triple-only snapshot. The transport never auto-compacts, so
 //!   config entries reach rejoining nodes by normal log backfill; a
 //!   config-carrying snapshot is the remaining fix.
-//!
-//! Remote reads are *best-effort* — a failed shard RPC is logged and treated as
-//! empty rather than aborting the whole query (the trait methods cannot return
-//! errors); routed [`NetworkShardedStore::insert`] / [`ShardCluster::insert`] do
-//! surface I/O errors to the caller.
+//! * **Persistence and server integration.** Nothing here is durable, and the
+//!   cluster is not reachable from `gserver` / the HTTP API (see *Experimental*
+//!   above).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -139,7 +164,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::dict::Dictionary;
-use crate::error::Result;
+use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 use crate::parser::sparql;
@@ -432,6 +457,9 @@ impl ShardNode {
     /// Accept connections forever, handling each on its own thread.
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
+            // Request/response traffic: push each small reply frame out at once
+            // rather than letting Nagle hold it for the client's delayed ACK.
+            let _ = stream.set_nodelay(true);
             let store = Arc::clone(&self.store);
             thread::spawn(move || serve_connection(store, stream));
         }
@@ -532,13 +560,24 @@ fn purge_bucket(store: &mut TripleStore, shard: u32, num_shards: u32) -> u64 {
 /// A TCP client to a [`ShardNode`]. Holds a lazily-opened, reused connection
 /// behind a [`Mutex`] (so the read methods can take `&self` and still be `Sync`);
 /// a broken connection is dropped and re-established on the next call.
+///
+/// Every connect, read and write is bounded by a timeout
+/// ([`RemoteShard::DEFAULT_TIMEOUT`], overridable with
+/// [`RemoteShard::with_timeout`]), so a hung node surfaces as an error instead
+/// of blocking the coordinator forever.
 #[derive(Debug)]
 pub struct RemoteShard {
     addr: SocketAddr,
+    timeout: Duration,
     conn: Mutex<Option<TcpStream>>,
 }
 
 impl RemoteShard {
+    /// Default bound on connecting to, writing to, or waiting for a reply from a
+    /// shard node. Generous, because a migration scan of a large bucket is a
+    /// single request; an unresponsive node still fails rather than hangs.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Resolve `addr` to a concrete [`SocketAddr`] now; the TCP connection is
     /// opened lazily on the first call (so a coordinator can be assembled before
     /// every node is up).
@@ -549,8 +588,16 @@ impl RemoteShard {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no socket address"))?;
         Ok(RemoteShard {
             addr,
+            timeout: Self::DEFAULT_TIMEOUT,
             conn: Mutex::new(None),
         })
+    }
+
+    /// Use `timeout` (clamped to at least 1 ms) for connecting and for every
+    /// read/write on the connection.
+    pub fn with_timeout(mut self, timeout: Duration) -> RemoteShard {
+        self.timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// The node address this client targets.
@@ -561,12 +608,14 @@ impl RemoteShard {
     /// Round-trip one request, opening the connection if needed and retrying
     /// once on a fresh connection if the existing one is broken.
     fn call(&self, req: &Request) -> io::Result<Response> {
-        let mut guard = self.conn.lock().unwrap();
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         for attempt in 0..2 {
             if guard.is_none() {
-                *guard = Some(TcpStream::connect(self.addr)?);
+                let stream = TcpStream::connect_timeout(&self.addr, self.timeout)?;
+                rpc::tune_stream(&stream, Some(self.timeout))?;
+                *guard = Some(stream);
             }
-            let stream = guard.as_mut().unwrap();
+            let stream = guard.as_mut().expect("connection was just established");
             match rpc::round_trip(stream, req) {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
@@ -580,47 +629,26 @@ impl RemoteShard {
         unreachable!("the loop returns on the second attempt")
     }
 
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> io::Result<bool> {
-        self.call(&Request::Exists { sub, pred, obj })?.into_bool()
+    /// Issue one *read* RPC and decode its answer, labelling any failure with
+    /// this shard's address and the operation so the error a query surfaces
+    /// says which shard could not answer.
+    fn read<T>(
+        &self,
+        op: &'static str,
+        req: Request,
+        decode: impl FnOnce(Response) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.call(&req).and_then(decode).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("shard {} could not answer {op}: {e}", self.addr),
+            )
+        })
     }
-    fn po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(u32, u32)>> {
-        self.call(&Request::PoByS { sub })?.into_pairs()
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<u32>> {
-        self.call(&Request::OBySp { sub, pred })?.into_ids()
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<u32>> {
-        self.call(&Request::PBySo { sub, obj })?.into_ids()
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> io::Result<Vec<(u32, u32)>> {
-        self.call(&Request::PsByO { obj })?.into_pairs()
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> io::Result<Vec<u32>> {
-        self.call(&Request::SByPo { pred, obj })?.into_ids()
-    }
-    fn so_by_p(&self, pred: PredId) -> io::Result<Vec<(u32, u32)>> {
-        self.call(&Request::SoByP { pred })?.into_pairs()
-    }
-    fn subs_by_p(&self, pred: PredId) -> io::Result<Vec<u32>> {
-        self.call(&Request::SubsByP { pred })?.into_ids()
-    }
-    fn objs_by_p(&self, pred: PredId) -> io::Result<Vec<u32>> {
-        self.call(&Request::ObjsByP { pred })?.into_ids()
-    }
-    fn subject_keys(&self) -> io::Result<Vec<u32>> {
-        self.call(&Request::SubjectKeys)?.into_ids()
-    }
-    fn object_keys(&self) -> io::Result<Vec<u32>> {
-        self.call(&Request::ObjectKeys)?.into_ids()
-    }
-    fn predicates(&self) -> io::Result<Vec<u32>> {
-        self.call(&Request::Predicates)?.into_ids()
-    }
-    fn triple_count(&self) -> io::Result<u64> {
-        self.call(&Request::TripleCount)?.into_count()
-    }
-    fn pred_card(&self, pred: PredId) -> io::Result<u64> {
-        self.call(&Request::PredCard { pred })?.into_count()
+
+    /// Total triples held by the remote shard.
+    pub fn triple_count(&self) -> io::Result<u64> {
+        self.read_triple_count()
     }
 
     /// Insert a routed triple on the remote shard; returns whether it was new.
@@ -648,10 +676,133 @@ impl RemoteShard {
     }
 }
 
+/// The fallible per-shard read primitives a scatter-gather fans out to — one
+/// access pattern each, mirroring the [`Request`] read set. An in-process
+/// [`TripleStore`] never fails; a [`RemoteShard`] fails when its RPC does, and
+/// that failure must reach the caller rather than be merged in as an empty
+/// answer.
+trait ShardRead {
+    fn read_exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId)
+        -> io::Result<bool>;
+    fn read_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>>;
+    fn read_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<PredId>>;
+    fn read_ps_by_o(&self, obj: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>>;
+    fn read_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_so_by_p(&self, pred: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>>;
+    fn read_subs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_objs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_object_keys(&self) -> io::Result<Vec<EntityLiteralId>>;
+    fn read_predicates(&self) -> io::Result<Vec<PredId>>;
+    fn read_triple_count(&self) -> io::Result<u64>;
+    fn read_pred_card(&self, pred: PredId) -> io::Result<u64>;
+}
+
+impl ShardRead for TripleStore {
+    fn read_exists(
+        &self,
+        sub: EntityLiteralId,
+        pred: PredId,
+        obj: EntityLiteralId,
+    ) -> io::Result<bool> {
+        Ok(self.exists(sub, pred, obj))
+    }
+    fn read_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        Ok(self.po_by_s(sub).to_vec())
+    }
+    fn read_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.o_by_sp(sub, pred))
+    }
+    fn read_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<PredId>> {
+        Ok(self.p_by_so(sub, obj))
+    }
+    fn read_ps_by_o(&self, obj: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        Ok(self.ps_by_o(obj).to_vec())
+    }
+    fn read_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.s_by_po(pred, obj))
+    }
+    fn read_so_by_p(&self, pred: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
+        Ok(self.so_by_p(pred).to_vec())
+    }
+    fn read_subs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.subs_by_p(pred))
+    }
+    fn read_objs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.objs_by_p(pred))
+    }
+    fn read_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.subject_keys().collect())
+    }
+    fn read_object_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        Ok(self.object_keys().collect())
+    }
+    fn read_predicates(&self) -> io::Result<Vec<PredId>> {
+        Ok(self.predicates().collect())
+    }
+    fn read_triple_count(&self) -> io::Result<u64> {
+        Ok(self.triple_count())
+    }
+    fn read_pred_card(&self, pred: PredId) -> io::Result<u64> {
+        Ok(self.pred_card(pred) as u64)
+    }
+}
+
+impl ShardRead for RemoteShard {
+    fn read_exists(
+        &self,
+        sub: EntityLiteralId,
+        pred: PredId,
+        obj: EntityLiteralId,
+    ) -> io::Result<bool> {
+        self.read("exists", Request::Exists { sub, pred, obj }, Response::into_bool)
+    }
+    fn read_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        self.read("po_by_s", Request::PoByS { sub }, Response::into_pairs)
+    }
+    fn read_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("o_by_sp", Request::OBySp { sub, pred }, Response::into_ids)
+    }
+    fn read_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<PredId>> {
+        self.read("p_by_so", Request::PBySo { sub, obj }, Response::into_ids)
+    }
+    fn read_ps_by_o(&self, obj: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        self.read("ps_by_o", Request::PsByO { obj }, Response::into_pairs)
+    }
+    fn read_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("s_by_po", Request::SByPo { pred, obj }, Response::into_ids)
+    }
+    fn read_so_by_p(&self, pred: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
+        self.read("so_by_p", Request::SoByP { pred }, Response::into_pairs)
+    }
+    fn read_subs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("subs_by_p", Request::SubsByP { pred }, Response::into_ids)
+    }
+    fn read_objs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("objs_by_p", Request::ObjsByP { pred }, Response::into_ids)
+    }
+    fn read_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("subject_keys", Request::SubjectKeys, Response::into_ids)
+    }
+    fn read_object_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        self.read("object_keys", Request::ObjectKeys, Response::into_ids)
+    }
+    fn read_predicates(&self) -> io::Result<Vec<PredId>> {
+        self.read("predicates", Request::Predicates, Response::into_ids)
+    }
+    fn read_triple_count(&self) -> io::Result<u64> {
+        self.read("triple_count", Request::TripleCount, Response::into_count)
+    }
+    fn read_pred_card(&self, pred: PredId) -> io::Result<u64> {
+        self.read("pred_card", Request::PredCard { pred }, Response::into_count)
+    }
+}
+
 /// One shard of a [`NetworkShardedStore`]: an **in-process** [`TripleStore`] or
-/// a **remote** [`RemoteShard`] reached over TCP. The read helpers return plain
-/// values (collapsing a remote I/O error to an empty / zero result, logged to
-/// stderr) so they slot directly into the scatter-gather merge.
+/// a **remote** [`RemoteShard`] reached over TCP. Reads go through the fallible
+/// scatter-gather ([`TryTripleSource`]), so a remote shard that cannot answer
+/// fails the read instead of contributing an empty answer.
 #[derive(Debug)]
 pub enum Shard {
     /// An in-process shard.
@@ -660,140 +811,12 @@ pub enum Shard {
     Remote(RemoteShard),
 }
 
-/// Log a best-effort scatter-gather drop of a remote shard (the trait methods
-/// cannot return errors, so a failed RPC degrades to an empty answer).
-fn warn_remote(r: &RemoteShard, op: &str, e: &io::Error) {
-    eprintln!(
-        "gstore::cluster: best-effort scatter-gather dropped shard {} on {op}: {e}",
-        r.addr()
-    );
-}
-
 impl Shard {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+    /// This shard's fallible read surface.
+    fn reader(&self) -> &dyn ShardRead {
         match self {
-            Shard::Local(s) => s.exists(sub, pred, obj),
-            Shard::Remote(r) => r.exists(sub, pred, obj).unwrap_or_else(|e| {
-                warn_remote(r, "exists", &e);
-                false
-            }),
-        }
-    }
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        match self {
-            Shard::Local(s) => s.po_by_s(sub).to_vec(),
-            Shard::Remote(r) => r.po_by_s(sub).unwrap_or_else(|e| {
-                warn_remote(r, "po_by_s", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.o_by_sp(sub, pred),
-            Shard::Remote(r) => r.o_by_sp(sub, pred).unwrap_or_else(|e| {
-                warn_remote(r, "o_by_sp", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        match self {
-            Shard::Local(s) => s.p_by_so(sub, obj),
-            Shard::Remote(r) => r.p_by_so(sub, obj).unwrap_or_else(|e| {
-                warn_remote(r, "p_by_so", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        match self {
-            Shard::Local(s) => s.ps_by_o(obj).to_vec(),
-            Shard::Remote(r) => r.ps_by_o(obj).unwrap_or_else(|e| {
-                warn_remote(r, "ps_by_o", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.s_by_po(pred, obj),
-            Shard::Remote(r) => r.s_by_po(pred, obj).unwrap_or_else(|e| {
-                warn_remote(r, "s_by_po", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        match self {
-            Shard::Local(s) => s.so_by_p(pred).to_vec(),
-            Shard::Remote(r) => r.so_by_p(pred).unwrap_or_else(|e| {
-                warn_remote(r, "so_by_p", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.subs_by_p(pred),
-            Shard::Remote(r) => r.subs_by_p(pred).unwrap_or_else(|e| {
-                warn_remote(r, "subs_by_p", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.objs_by_p(pred),
-            Shard::Remote(r) => r.objs_by_p(pred).unwrap_or_else(|e| {
-                warn_remote(r, "objs_by_p", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.subject_keys().collect(),
-            Shard::Remote(r) => r.subject_keys().unwrap_or_else(|e| {
-                warn_remote(r, "subject_keys", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        match self {
-            Shard::Local(s) => s.object_keys().collect(),
-            Shard::Remote(r) => r.object_keys().unwrap_or_else(|e| {
-                warn_remote(r, "object_keys", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn predicates(&self) -> Vec<PredId> {
-        match self {
-            Shard::Local(s) => s.predicates().collect(),
-            Shard::Remote(r) => r.predicates().unwrap_or_else(|e| {
-                warn_remote(r, "predicates", &e);
-                Vec::new()
-            }),
-        }
-    }
-    fn triple_count(&self) -> u64 {
-        match self {
-            Shard::Local(s) => s.triple_count(),
-            Shard::Remote(r) => r.triple_count().unwrap_or_else(|e| {
-                warn_remote(r, "triple_count", &e);
-                0
-            }),
-        }
-    }
-    fn pred_card(&self, pred: PredId) -> usize {
-        match self {
-            Shard::Local(s) => s.pred_card(pred),
-            Shard::Remote(r) => r.pred_card(pred).map(|n| n as usize).unwrap_or_else(|e| {
-                warn_remote(r, "pred_card", &e);
-                0
-            }),
+            Shard::Local(s) => s,
+            Shard::Remote(r) => r,
         }
     }
 
@@ -822,17 +845,351 @@ impl Shard {
     }
 }
 
+// ===========================================================================
+// Fallible scatter-gather: shard failures are errors, never empty answers.
+// ===========================================================================
+
+/// One scatter-gather fan-out: the per-shard read endpoints a single read of a
+/// distributed store touches, as resolved by [`TryTripleSource::scatter`]. The
+/// merge re-establishes the [`TripleSource`] contract (sorted, de-duplicated
+/// `Vec`s; global-distinct counts) — and **fails** as soon as a shard the answer
+/// depends on fails, rather than merging it in as empty. Opaque: only this
+/// module's distributed stores construct one.
+pub struct Scatter<'a> {
+    shards: Vec<&'a dyn ShardRead>,
+}
+
+impl std::fmt::Debug for Scatter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scatter")
+            .field("shards", &self.shards.len())
+            .finish()
+    }
+}
+
+impl<'a> Scatter<'a> {
+    fn new(shards: Vec<&'a dyn ShardRead>) -> Scatter<'a> {
+        Scatter { shards }
+    }
+
+    /// `true` as soon as any shard holds the triple (a found triple is found no
+    /// matter what another shard says); `false` only when *every* shard
+    /// answered "absent"; otherwise the first shard error.
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> io::Result<bool> {
+        let mut first_err = None;
+        for s in &self.shards {
+            match s.read_exists(sub, pred, obj) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(false),
+        }
+    }
+
+    /// Concatenate every shard's list and restore the sorted-unique contract;
+    /// the first shard error aborts the gather.
+    fn gather<T: Ord>(
+        &self,
+        read: impl Fn(&dyn ShardRead) -> io::Result<Vec<T>>,
+    ) -> io::Result<Vec<T>> {
+        let mut out = Vec::new();
+        for s in &self.shards {
+            out.extend(read(*s)?);
+        }
+        Ok(sort_dedup(out))
+    }
+
+    /// Sum a per-shard count (counts partition cleanly by subject); the first
+    /// shard error aborts the sum.
+    fn sum(&self, read: impl Fn(&dyn ShardRead) -> io::Result<u64>) -> io::Result<u64> {
+        let mut total = 0;
+        for s in &self.shards {
+            total += read(*s)?;
+        }
+        Ok(total)
+    }
+}
+
+/// The **fallible** read surface of a distributed (scatter-gather) store: one
+/// method per [`TripleSource`] method, returning `Err` when a shard the read
+/// needs cannot answer — an unreachable / failed remote shard, or a bucket whose
+/// every replica is down — instead of merging that shard in as empty, which
+/// would make a query return a *partial* answer that looks complete.
+///
+/// The distributed stores ([`NetworkShardedStore`], [`ShardCluster`],
+/// [`ShardedRaftCluster`]) implement this **instead of** [`TripleSource`]. To run
+/// the generic [`Evaluator`] over one, use its `query` method or a [`Checked`]
+/// view; both turn a shard failure into an `Err` result.
+///
+/// Only [`TryTripleSource::scatter`] is required (and only this module can build
+/// a [`Scatter`]); every `try_*` method is derived from it.
+pub trait TryTripleSource {
+    /// Resolve the shard endpoints one read fans out to. `Err` if a shard cannot
+    /// be served at all (e.g. every replica of a bucket is down).
+    fn scatter(&self) -> io::Result<Scatter<'_>>;
+
+    /// Fallible [`TripleSource::exists`].
+    fn try_exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> io::Result<bool> {
+        self.scatter()?.exists(sub, pred, obj)
+    }
+    /// Fallible [`TripleSource::po_by_s`].
+    fn try_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        self.scatter()?.gather(|s| s.read_po_by_s(sub))
+    }
+    /// Fallible [`TripleSource::o_by_sp`].
+    fn try_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_o_by_sp(sub, pred))
+    }
+    /// Fallible [`TripleSource::p_by_so`].
+    fn try_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<PredId>> {
+        self.scatter()?.gather(|s| s.read_p_by_so(sub, obj))
+    }
+    /// Fallible [`TripleSource::ps_by_o`].
+    fn try_ps_by_o(&self, obj: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        self.scatter()?.gather(|s| s.read_ps_by_o(obj))
+    }
+    /// Fallible [`TripleSource::s_by_po`].
+    fn try_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_s_by_po(pred, obj))
+    }
+    /// Fallible [`TripleSource::so_by_p`].
+    fn try_so_by_p(&self, pred: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
+        self.scatter()?.gather(|s| s.read_so_by_p(pred))
+    }
+    /// Fallible [`TripleSource::subs_by_p`].
+    fn try_subs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_subs_by_p(pred))
+    }
+    /// Fallible [`TripleSource::objs_by_p`].
+    fn try_objs_by_p(&self, pred: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_objs_by_p(pred))
+    }
+    /// Fallible [`TripleSource::subject_keys`].
+    fn try_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_subject_keys())
+    }
+    /// Fallible [`TripleSource::object_keys`].
+    fn try_object_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        self.scatter()?.gather(|s| s.read_object_keys())
+    }
+    /// Fallible [`TripleSource::triple_count`]. Each triple lives on exactly one
+    /// shard, so the per-shard sum is the global count.
+    fn try_triple_count(&self) -> io::Result<u64> {
+        self.scatter()?.sum(|s| s.read_triple_count())
+    }
+    /// Fallible [`TripleSource::distinct_subjects`] (global-distinct, not a sum).
+    fn try_distinct_subjects(&self) -> io::Result<usize> {
+        Ok(self.try_subject_keys()?.len())
+    }
+    /// Fallible [`TripleSource::distinct_objects`] (objects repeat across shards,
+    /// so this de-duplicates rather than sums).
+    fn try_distinct_objects(&self) -> io::Result<usize> {
+        Ok(self.try_object_keys()?.len())
+    }
+    /// Fallible [`TripleSource::num_predicates`] (predicates repeat across shards).
+    fn try_num_predicates(&self) -> io::Result<usize> {
+        Ok(self.scatter()?.gather(|s| s.read_predicates())?.len())
+    }
+    /// Fallible [`TripleSource::pred_card`] (triple counts partition cleanly).
+    fn try_pred_card(&self, pred: PredId) -> io::Result<usize> {
+        Ok(self.scatter()?.sum(|s| s.read_pred_card(pred))? as usize)
+    }
+    /// Fallible [`TripleSource::pred_distinct_subj`].
+    fn try_pred_distinct_subj(&self, pred: PredId) -> io::Result<usize> {
+        Ok(self.try_subs_by_p(pred)?.len())
+    }
+    /// Fallible [`TripleSource::pred_distinct_obj`].
+    fn try_pred_distinct_obj(&self, pred: PredId) -> io::Result<usize> {
+        Ok(self.try_objs_by_p(pred)?.len())
+    }
+    /// Fallible [`TripleSource::iter_all`], in a single [`TripleStore`]'s
+    /// predicate-major `(pred, sub, obj)` order: for each distinct predicate
+    /// ascending, the merged sorted-unique `(sub, obj)` pairs.
+    fn try_iter_all(&self) -> io::Result<Vec<IdTriple>> {
+        let scatter = self.scatter()?;
+        let preds = scatter.gather(|s| s.read_predicates())?;
+        let mut out = Vec::new();
+        for pred in preds {
+            for (sub, obj) in scatter.gather(|s| s.read_so_by_p(pred))? {
+                out.push(IdTriple::new(sub, pred, obj));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// An infallible [`TripleSource`] view over a [`TryTripleSource`], for driving
+/// the generic [`Evaluator`] over a distributed store **without** risking a
+/// silently partial answer.
+///
+/// The first shard read error is captured and the view's cancellation flag is
+/// raised: every later read short-circuits to an empty answer (no further RPCs)
+/// and an evaluator built with [`Evaluator::with_cancel`]`(view.cancel_flag())`
+/// aborts at its next pattern boundary. [`Checked::finish`] then replaces
+/// whatever the evaluator produced with that error — so always pass the
+/// evaluator's result through `finish` (the distributed stores' `query` methods
+/// do exactly this).
+pub struct Checked<'a, T: TryTripleSource + ?Sized> {
+    src: &'a T,
+    cancel: Arc<AtomicBool>,
+    error: Mutex<Option<io::Error>>,
+}
+
+impl<T: TryTripleSource + ?Sized> std::fmt::Debug for Checked<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Checked")
+            .field("failed", &self.failed())
+            .finish()
+    }
+}
+
+impl<'a, T: TryTripleSource + ?Sized> Checked<'a, T> {
+    /// Wrap `src` for one evaluation.
+    pub fn new(src: &'a T) -> Checked<'a, T> {
+        Checked {
+            src,
+            cancel: Arc::new(AtomicBool::new(false)),
+            error: Mutex::new(None),
+        }
+    }
+
+    /// The flag this view raises on the first shard failure; attach it with
+    /// [`Evaluator::with_cancel`] so evaluation stops early.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// Whether a shard read has failed during this view's lifetime.
+    pub fn failed(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Take the captured shard error, if any.
+    pub fn take_error(&self) -> Option<io::Error> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Resolve an evaluation run over this view: the captured shard error (as
+    /// [`GStoreError::Io`]) if any read failed, otherwise `result` unchanged.
+    pub fn finish<R>(&self, result: Result<R>) -> Result<R> {
+        match self.take_error() {
+            Some(e) => Err(GStoreError::Io(e)),
+            None => result,
+        }
+    }
+
+    /// Run one fallible read; on failure record the first error, raise the
+    /// cancel flag and yield an empty answer (which `finish` later overrides).
+    fn guard<R: Default>(&self, read: impl FnOnce(&T) -> io::Result<R>) -> R {
+        if self.failed() {
+            return R::default();
+        }
+        match read(self.src) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
+                slot.get_or_insert(e);
+                self.cancel.store(true, Ordering::SeqCst);
+                R::default()
+            }
+        }
+    }
+}
+
+impl<T: TryTripleSource + ?Sized> TripleSource for Checked<'_, T> {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        self.guard(|s| s.try_exists(sub, pred, obj))
+    }
+    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        self.guard(|s| s.try_po_by_s(sub))
+    }
+    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_o_by_sp(sub, pred))
+    }
+    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
+        self.guard(|s| s.try_p_by_so(sub, obj))
+    }
+    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+        self.guard(|s| s.try_ps_by_o(obj))
+    }
+    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_s_by_po(pred, obj))
+    }
+    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        self.guard(|s| s.try_so_by_p(pred))
+    }
+    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_subs_by_p(pred))
+    }
+    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_objs_by_p(pred))
+    }
+    fn subject_keys(&self) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_subject_keys())
+    }
+    fn object_keys(&self) -> Vec<EntityLiteralId> {
+        self.guard(|s| s.try_object_keys())
+    }
+    fn triple_count(&self) -> u64 {
+        self.guard(|s| s.try_triple_count())
+    }
+    fn distinct_subjects(&self) -> usize {
+        self.guard(|s| s.try_distinct_subjects())
+    }
+    fn distinct_objects(&self) -> usize {
+        self.guard(|s| s.try_distinct_objects())
+    }
+    fn num_predicates(&self) -> usize {
+        self.guard(|s| s.try_num_predicates())
+    }
+    fn pred_card(&self, pred: PredId) -> usize {
+        self.guard(|s| s.try_pred_card(pred))
+    }
+    fn pred_distinct_subj(&self, pred: PredId) -> usize {
+        self.guard(|s| s.try_pred_distinct_subj(pred))
+    }
+    fn pred_distinct_obj(&self, pred: PredId) -> usize {
+        self.guard(|s| s.try_pred_distinct_obj(pred))
+    }
+    fn iter_all(&self) -> Vec<IdTriple> {
+        self.guard(|s| s.try_iter_all())
+    }
+}
+
+/// Parse and evaluate a read query over a distributed store through a
+/// [`Checked`] view: a shard that fails mid-query turns the whole query into an
+/// `Err` (naming the shard), never a silently partial result.
+fn query_checked<T: TryTripleSource + ?Sized>(
+    src: &T,
+    dict: &Dictionary,
+    sparql_text: &str,
+) -> Result<QueryResult> {
+    let q = sparql::parse(sparql_text)?;
+    let view = Checked::new(src);
+    let result = Evaluator::new(dict, &view)
+        .with_cancel(view.cancel_flag())
+        .evaluate(&q);
+    view.finish(result)
+}
+
 /// A triple set partitioned across `N` shards — a mix of **in-process**
 /// ([`Shard::Local`]) and **remote, TCP-served** ([`Shard::Remote`]) shards —
 /// queried by the same scatter-gather as [`ShardedStore`] and supporting routed
-/// inserts. Implements [`TripleSource`] so the generic [`Evaluator`] runs over a
-/// genuinely distributed deployment unchanged.
+/// inserts. Reads go through [`TryTripleSource`] (a failed remote shard is an
+/// error, not an empty answer); [`NetworkShardedStore::query`] runs the generic
+/// [`Evaluator`] over a genuinely distributed deployment unchanged.
 ///
 /// The partition rule is identical to [`ShardedStore`] (`hash(subject) % N`), so
 /// every subject's adjacency co-locates on one shard and the per-shard counts
 /// sum cleanly; the merge re-establishes the trait's sorted/de-duplicated `Vec`
 /// contract so this store is observationally identical to a single
-/// [`TripleStore`] holding the same triples.
+/// [`TripleStore`] holding the same triples — whenever every shard answers.
 #[derive(Debug)]
 pub struct NetworkShardedStore {
     shards: Vec<Shard>,
@@ -867,7 +1224,7 @@ impl NetworkShardedStore {
 
     /// Route a triple to `hash(subject) % N` and insert it on that shard (over
     /// RPC for a remote shard). Returns whether it was newly added. I/O errors
-    /// to a remote shard are surfaced to the caller (unlike best-effort reads).
+    /// to a remote shard are surfaced to the caller.
     pub fn insert(&mut self, t: IdTriple) -> io::Result<bool> {
         let idx = shard_of(t.sub, self.shards.len());
         self.shards[idx].insert(t)
@@ -889,145 +1246,17 @@ impl NetworkShardedStore {
 
     /// Run a read query over this distributed store using the generic
     /// [`Evaluator`] — the scatter-gather (local + remote) is transparent to the
-    /// engine. Convenience wrapper over `Evaluator::new(dict, self)`.
+    /// engine. If any shard cannot answer, the query fails with
+    /// [`GStoreError::Io`] naming that shard rather than returning a partial
+    /// result.
     pub fn query(&self, dict: &Dictionary, sparql_text: &str) -> Result<QueryResult> {
-        let q = sparql::parse(sparql_text)?;
-        Evaluator::new(dict, self).evaluate(&q)
+        query_checked(self, dict, sparql_text)
     }
 }
 
-impl TripleSource for NetworkShardedStore {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        self.shards.iter().any(|s| s.exists(sub, pred, obj))
-    }
-
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.po_by_s(sub));
-        }
-        sort_dedup(out)
-    }
-
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.o_by_sp(sub, pred));
-        }
-        sort_dedup(out)
-    }
-
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.p_by_so(sub, obj));
-        }
-        sort_dedup(out)
-    }
-
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.ps_by_o(obj));
-        }
-        sort_dedup(out)
-    }
-
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.s_by_po(pred, obj));
-        }
-        sort_dedup(out)
-    }
-
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.so_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.subs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.objs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.subject_keys());
-        }
-        sort_dedup(out)
-    }
-
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in &self.shards {
-            out.extend(s.object_keys());
-        }
-        sort_dedup(out)
-    }
-
-    fn triple_count(&self) -> u64 {
-        self.shards.iter().map(Shard::triple_count).sum()
-    }
-
-    fn distinct_subjects(&self) -> usize {
-        self.subject_keys().len()
-    }
-
-    fn distinct_objects(&self) -> usize {
-        self.object_keys().len()
-    }
-
-    fn num_predicates(&self) -> usize {
-        let mut preds: HashSet<PredId> = HashSet::new();
-        for s in &self.shards {
-            preds.extend(s.predicates());
-        }
-        preds.len()
-    }
-
-    fn pred_card(&self, pred: PredId) -> usize {
-        self.shards.iter().map(|s| s.pred_card(pred)).sum()
-    }
-
-    fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        self.subs_by_p(pred).len()
-    }
-
-    fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        self.objs_by_p(pred).len()
-    }
-
-    fn iter_all(&self) -> Vec<IdTriple> {
-        // Reproduce a single TripleStore's predicate-major (pred, sub, obj)
-        // order, exactly as ShardedStore does.
-        let mut preds: Vec<PredId> = Vec::new();
-        for s in &self.shards {
-            preds.extend(s.predicates());
-        }
-        let preds = sort_dedup(preds);
-        let mut out = Vec::new();
-        for pred in preds {
-            for (sub, obj) in self.so_by_p(pred) {
-                out.push(IdTriple::new(sub, pred, obj));
-            }
-        }
-        out
+impl TryTripleSource for NetworkShardedStore {
+    fn scatter(&self) -> io::Result<Scatter<'_>> {
+        Ok(Scatter::new(self.shards.iter().map(Shard::reader).collect()))
     }
 }
 
@@ -1057,8 +1286,8 @@ impl TripleSource for NetworkShardedStore {
 /// address) plus the shard→owner assignment, tagged with a monotonic `epoch`.
 ///
 /// A change is a single config-change committed through the Raft log
-/// ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
-/// [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)); applying the committed
+/// ([`LogOp::AddNode`] /
+/// [`LogOp::RemoveNode`]); applying the committed
 /// op with [`ClusterConfig::apply`] is deterministic, so every replica that has
 /// seen the same committed prefix holds a byte-identical config. The shard→owner
 /// map is recomputed by rendezvous hashing over the (sorted) member set.
@@ -1337,125 +1566,17 @@ impl ShardCluster {
     }
 
     /// Run a read query over the cluster using the generic [`Evaluator`] — the
-    /// scatter-gather across members is transparent to the engine.
+    /// scatter-gather across members is transparent to the engine. A member
+    /// endpoint that cannot answer fails the query with [`GStoreError::Io`]
+    /// rather than yielding a partial result.
     pub fn query(&self, dict: &Dictionary, sparql_text: &str) -> Result<QueryResult> {
-        let q = sparql::parse(sparql_text)?;
-        Evaluator::new(dict, self).evaluate(&q)
+        query_checked(self, dict, sparql_text)
     }
 }
 
-impl TripleSource for ShardCluster {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        self.endpoints.values().any(|s| s.exists(sub, pred, obj))
-    }
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.po_by_s(sub));
-        }
-        sort_dedup(out)
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.o_by_sp(sub, pred));
-        }
-        sort_dedup(out)
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.p_by_so(sub, obj));
-        }
-        sort_dedup(out)
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.ps_by_o(obj));
-        }
-        sort_dedup(out)
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.s_by_po(pred, obj));
-        }
-        sort_dedup(out)
-    }
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.so_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.subs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.objs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.subject_keys());
-        }
-        sort_dedup(out)
-    }
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.endpoints.values() {
-            out.extend(s.object_keys());
-        }
-        sort_dedup(out)
-    }
-    fn triple_count(&self) -> u64 {
-        self.endpoints.values().map(Shard::triple_count).sum()
-    }
-    fn distinct_subjects(&self) -> usize {
-        self.subject_keys().len()
-    }
-    fn distinct_objects(&self) -> usize {
-        self.object_keys().len()
-    }
-    fn num_predicates(&self) -> usize {
-        let mut preds: HashSet<PredId> = HashSet::new();
-        for s in self.endpoints.values() {
-            preds.extend(s.predicates());
-        }
-        preds.len()
-    }
-    fn pred_card(&self, pred: PredId) -> usize {
-        self.endpoints.values().map(|s| s.pred_card(pred)).sum()
-    }
-    fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        self.subs_by_p(pred).len()
-    }
-    fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        self.objs_by_p(pred).len()
-    }
-    fn iter_all(&self) -> Vec<IdTriple> {
-        let mut preds: Vec<PredId> = Vec::new();
-        for s in self.endpoints.values() {
-            preds.extend(s.predicates());
-        }
-        let preds = sort_dedup(preds);
-        let mut out = Vec::new();
-        for pred in preds {
-            for (sub, obj) in self.so_by_p(pred) {
-                out.push(IdTriple::new(sub, pred, obj));
-            }
-        }
-        out
+impl TryTripleSource for ShardCluster {
+    fn scatter(&self) -> io::Result<Scatter<'_>> {
+        Ok(Scatter::new(self.endpoints.values().map(Shard::reader).collect()))
     }
 }
 
@@ -1478,11 +1599,14 @@ impl TripleSource for ShardCluster {
 // explicit logical `tick`s and message handlers, with no clocks or sockets, so
 // it is exhaustively and *deterministically* testable — and a **transport**
 // ([`ClusterNode`]) that wraps it with the same `std`-only length-prefixed RPC
-// ([`crate::rpc`]) used by the sharding layer, a background tick driver, and a
-// kill/revive switch for fault-injection tests. This mirrors gStore's C++
-// `Cluster` (ClusterManager term/quorum/election, ClusterEntityLeader heartbeat/
-// append/failover, ClusterEntityFollower, ClusterLog) within this crate's
-// zero-extra-dependency stance.
+// ([`crate::rpc`]) used by the sharding layer, a background tick driver, one
+// sender thread per peer (so a slow peer only delays itself), and a
+// kill/revive switch for fault-injection tests. Its vocabulary is loosely
+// modelled on upstream gStore's `src/Cluster` sources (ClusterManager
+// term/quorum/election, ClusterEntityLeader heartbeat/append/failover,
+// ClusterEntityFollower, ClusterLog) — which upstream 1.4 does not compile into
+// its release — within this crate's zero-extra-dependency stance. Experimental:
+// see the module docs.
 // ===========================================================================
 
 use std::collections::{HashMap, VecDeque};
@@ -2096,8 +2220,13 @@ impl RaftState {
         }
 
         let new_match = prev_log_index + entries.len() as u64;
-        if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(self.last_log_index());
+        // Raft's receiver rule: commit up to min(leaderCommit, index of the last
+        // entry *this message* verified). Clamping to our own last index instead
+        // would also commit any unverified suffix we still hold beyond the
+        // message (e.g. stale entries from a deposed leader).
+        let verified_commit = leader_commit.min(new_match);
+        if verified_commit > self.commit_index {
+            self.commit_index = verified_commit;
         }
         RaftReply::Append {
             term: self.current_term,
@@ -2179,8 +2308,12 @@ impl RaftState {
                     return Vec::new();
                 }
                 if success {
-                    self.match_index.insert(from, match_index);
-                    self.next_index.insert(from, match_index + 1);
+                    // Within one term a follower's agreed prefix only grows, so
+                    // a late reply to an older AppendEntries must not move
+                    // `match_index` (and with it the commit count) backwards.
+                    let matched = self.match_index.get(&from).copied().unwrap_or(0).max(match_index);
+                    self.match_index.insert(from, matched);
+                    self.next_index.insert(from, matched + 1);
                     let advanced = self.advance_commit();
                     let next = *self.next_index.get(&from).unwrap_or(&0);
                     if next <= self.last_log_index() {
@@ -2351,6 +2484,19 @@ impl RaftState {
         self.snapshot = triples;
     }
 
+    /// The fate of the entry this node appended at `index` during `term`:
+    /// `Some(true)` once it is committed, `Some(false)` once a *different* entry
+    /// is committed at that index (it was overwritten after a leadership
+    /// change), `None` while undecided. An `(index, term)` pair names a unique
+    /// entry (log matching), so comparing terms is exact; an index already folded
+    /// into a snapshot (other than the base itself) is reported undecided.
+    fn entry_outcome(&self, index: u64, term: u64) -> Option<bool> {
+        if index == 0 || self.commit_index < index || index < self.base_index {
+            return None;
+        }
+        Some(self.term_at(index) == term)
+    }
+
     /// Handle revival after a crash: step down from any (now stale) leadership
     /// and reset the election timer.
     ///
@@ -2374,6 +2520,12 @@ impl RaftState {
 pub enum ProposeError {
     /// This node is not the leader; the believed leader (if known) is enclosed.
     NotLeader(Option<NodeId>),
+    /// The leader appended the write but could not confirm it **committed** in
+    /// time (no quorum reachable, or leadership changed underneath it). The
+    /// outcome is unknown — it may still commit under a later leader — so the
+    /// client should retry (every [`LogOp`] is idempotent when re-applied). The
+    /// currently believed leader (if known) is enclosed.
+    NotCommitted(Option<NodeId>),
 }
 
 impl std::fmt::Display for ProposeError {
@@ -2381,18 +2533,45 @@ impl std::fmt::Display for ProposeError {
         match self {
             ProposeError::NotLeader(Some(l)) => write!(f, "not leader; try node {l}"),
             ProposeError::NotLeader(None) => write!(f, "not leader; leader unknown"),
+            ProposeError::NotCommitted(Some(l)) => write!(
+                f,
+                "write not confirmed committed (outcome unknown, retry); leader is node {l}"
+            ),
+            ProposeError::NotCommitted(None) => write!(
+                f,
+                "write not confirmed committed (outcome unknown, retry); leader unknown"
+            ),
         }
     }
 }
 
 impl std::error::Error for ProposeError {}
 
+/// The outbound replication channel to one peer: a single-slot mailbox holding
+/// the **newest** Raft message for that peer, drained by that peer's dedicated
+/// sender thread.
+///
+/// One slot (overwrite, not a queue) is enough because every message the state
+/// machine emits for a peer is built from its *current* view of that peer
+/// (`next_index`, commit index, term), so a newer message supersedes an older,
+/// unsent one; and it keeps a slow peer from accumulating an unbounded backlog.
+#[derive(Debug, Default)]
+struct PeerLink {
+    pending: Mutex<Option<RaftMsg>>,
+    ready: std::sync::Condvar,
+}
+
 /// A cluster node: a [`RaftState`] plus a replicated [`TripleStore`], wrapped in
 /// the same `std`-only length-prefixed RPC transport ([`crate::rpc`]) as the
 /// sharding layer. It runs a TCP server (answering Raft RPCs, client writes,
-/// status, and read-only shard queries against the replicated store) and a
-/// background **driver** that ticks the state machine and delivers the messages
-/// it emits. A kill/revive switch simulates node failure for tests.
+/// status, and read-only shard queries against the replicated store), a
+/// background **driver** that ticks the state machine, and one **sender**
+/// thread per peer that delivers the messages addressed to it. A kill/revive
+/// switch simulates node failure for tests.
+///
+/// Delivery is per peer and asynchronous: a slow, hung or unreachable peer only
+/// delays its own sender, never heartbeats or commits to the rest of the
+/// cluster — so a quorum keeps a stable leader while a minority is unresponsive.
 #[derive(Debug)]
 pub struct ClusterNode {
     id: NodeId,
@@ -2409,13 +2588,17 @@ pub struct ClusterNode {
     /// id → address of every peer (filled in after binding, since ephemeral
     /// ports are only known post-bind).
     peer_addrs: Mutex<HashMap<NodeId, SocketAddr>>,
-    /// Cached outbound connections, one per peer.
-    clients: Mutex<HashMap<NodeId, TcpStream>>,
+    /// One outbound mailbox per peer (fixed at bind time), each drained by its
+    /// own sender thread that also owns the connection to that peer.
+    links: HashMap<NodeId, Arc<PeerLink>>,
     listener: TcpListener,
     alive: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     tick_interval: Duration,
     io_timeout: Duration,
+    /// How long a [`Request::ClientWrite`] waits for its entry to commit before
+    /// answering "not confirmed".
+    commit_timeout: Mutex<Duration>,
 }
 
 impl ClusterNode {
@@ -2425,6 +2608,11 @@ impl ClusterNode {
     /// are the documented generalization), so this value only sizes the agreed
     /// shard→owner map that a [`ShardCluster`] data plane would consume.
     pub const DEFAULT_SHARDS: usize = 16;
+
+    /// Default bound on how long a [`Request::ClientWrite`] waits for its entry
+    /// to commit (see [`ClusterNode::set_commit_timeout`]). Clients should use a
+    /// longer read timeout than this.
+    pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Bind node `id` with cluster peers `peer_ids` (their addresses are set
     /// later via [`ClusterNode::set_peer_addr`]) and a starting `store`.
@@ -2437,6 +2625,11 @@ impl ClusterNode {
     ) -> io::Result<Arc<ClusterNode>> {
         let listener = TcpListener::bind(addr)?;
         let tick_interval = cfg.tick_interval;
+        let links = peer_ids
+            .iter()
+            .filter(|&&p| p != id)
+            .map(|&p| (p, Arc::new(PeerLink::default())))
+            .collect();
         let state = RaftState::new(id, peer_ids, &cfg);
         Ok(Arc::new(ClusterNode {
             id,
@@ -2445,13 +2638,25 @@ impl ClusterNode {
             apply_lock: Mutex::new(()),
             config: Arc::new(Mutex::new(ClusterConfig::new(Self::DEFAULT_SHARDS))),
             peer_addrs: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
+            links,
             listener,
             alive: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_interval,
             io_timeout: Duration::from_millis(300),
+            commit_timeout: Mutex::new(Self::DEFAULT_COMMIT_TIMEOUT),
         }))
+    }
+
+    /// Bound how long a [`Request::ClientWrite`] served by this node waits for
+    /// its entry to commit before replying `ok: false` (outcome unknown).
+    pub fn set_commit_timeout(&self, timeout: Duration) {
+        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    /// The current [`Request::ClientWrite`] commit-wait bound.
+    pub fn commit_timeout(&self) -> Duration {
+        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Register a peer's resolved address (call once per peer before
@@ -2507,27 +2712,81 @@ impl ClusterNode {
 
     /// Submit a mutation to this node. Succeeds (with the assigned log index)
     /// only on the leader; otherwise returns [`ProposeError::NotLeader`] with a
-    /// redirect hint. On success the entry is replicated immediately.
+    /// redirect hint. On success the entry is handed to every peer's sender at
+    /// once (replication proceeds asynchronously; this call never blocks on the
+    /// network).
+    ///
+    /// `Ok` means **appended to the leader's log**, not committed: if the leader
+    /// loses its quorum or its leadership before a majority stores the entry,
+    /// a later leader may discard it. Use [`ClusterNode::propose_and_wait`] when
+    /// the caller needs to know the write is durable cluster-wide.
     pub fn propose(&self, op: LogOp) -> std::result::Result<u64, ProposeError> {
-        let idx = {
+        self.submit(op).map(|(idx, _term)| idx)
+    }
+
+    /// Submit a mutation and wait up to `timeout` until it is **committed** by a
+    /// quorum and applied to this node's store; returns its log index.
+    ///
+    /// Fails with [`ProposeError::NotLeader`] if this node is not the leader, or
+    /// [`ProposeError::NotCommitted`] if commitment is not confirmed in time — the
+    /// leader could not reach a quorum, or a different entry was committed at
+    /// that index after a leadership change. Retrying is safe: every [`LogOp`]
+    /// is idempotent when re-applied (set-semantics triples, membership changes).
+    pub fn propose_and_wait(
+        &self,
+        op: LogOp,
+        timeout: Duration,
+    ) -> std::result::Result<u64, ProposeError> {
+        let (idx, term) = self.submit(op)?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                // Under the apply lock, so "applied" really means "in the store":
+                // a concurrent drain that has already advanced `last_applied`
+                // finishes writing the store before we can get the lock.
+                let _apply = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.apply_actions_locked();
+                let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match st.entry_outcome(idx, term) {
+                    Some(true) if st.last_applied() >= idx => return Ok(idx),
+                    Some(false) => return Err(ProposeError::NotCommitted(st.leader_id())),
+                    _ => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ProposeError::NotCommitted(st.leader_id()));
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Append `op` to the leader's log and push it to the followers at once.
+    /// Returns the entry's `(index, term)`, which identify it uniquely (Raft's
+    /// log-matching property).
+    fn submit(&self, op: LogOp) -> std::result::Result<(u64, u64), ProposeError> {
+        let (idx, term) = {
             let mut st = self.state.lock().unwrap();
             match st.propose(op) {
-                Some(i) => i,
+                Some(i) => (i, st.current_term()),
                 None => return Err(ProposeError::NotLeader(st.leader_id())),
             }
         };
         let outs = { self.state.lock().unwrap().replicate_now() };
-        self.dispatch_outgoing(outs);
+        self.route(outs);
         self.apply_actions();
-        Ok(idx)
+        Ok((idx, term))
     }
 
-    /// Simulate a crash: stop ticking, refuse to serve, and drop cached
-    /// connections. In-memory state is retained (a later [`ClusterNode::revive`]
-    /// models a restart that reloaded persistent state).
+    /// Simulate a crash: stop ticking, sending and serving; each peer sender
+    /// drops its connection and any unsent message. In-memory state is retained
+    /// (a later [`ClusterNode::revive`] models a restart that reloaded
+    /// persistent state).
     pub fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        self.clients.lock().unwrap().clear();
+        for link in self.links.values() {
+            link.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            link.ready.notify_one();
+        }
     }
     /// Bring a killed node back: resume ticking/serving and reset its election
     /// timer.
@@ -2544,14 +2803,20 @@ impl ClusterNode {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Spawn the server and driver threads. Returns their join handles (callers
-    /// may ignore them; threads exit on [`ClusterNode::shutdown`]).
+    /// Spawn the server, driver and per-peer sender threads. Returns their join
+    /// handles (callers may ignore them; threads exit on
+    /// [`ClusterNode::shutdown`]).
     pub fn start(self: &Arc<Self>) -> Vec<thread::JoinHandle<()>> {
         let server = Arc::clone(self);
-        let h1 = thread::spawn(move || server.run_server());
+        let mut handles = vec![thread::spawn(move || server.run_server())];
         let driver = Arc::clone(self);
-        let h2 = thread::spawn(move || driver.run_driver());
-        vec![h1, h2]
+        handles.push(thread::spawn(move || driver.run_driver()));
+        for (&peer, link) in &self.links {
+            let me = Arc::clone(self);
+            let link = Arc::clone(link);
+            handles.push(thread::spawn(move || me.run_peer_sender(peer, &link)));
+        }
+        handles
     }
 
     fn run_server(self: Arc<Self>) {
@@ -2579,8 +2844,7 @@ impl ClusterNode {
     }
 
     fn handle_conn(self: Arc<Self>, mut stream: TcpStream) {
-        let _ = stream.set_read_timeout(Some(self.io_timeout));
-        let _ = stream.set_write_timeout(Some(self.io_timeout));
+        let _ = rpc::tune_stream(&stream, Some(self.io_timeout));
         loop {
             if self.shutdown.load(Ordering::SeqCst) || !self.alive.load(Ordering::SeqCst) {
                 return; // killed/stopped: drop the connection (peer sees EOF)
@@ -2689,18 +2953,25 @@ impl ClusterNode {
         }
     }
 
+    /// Serve a client write: acknowledge `ok: true` only once the entry is
+    /// **committed** and applied here. (Acknowledging on append alone would tell
+    /// the client a write succeeded that a leadership change could still
+    /// discard.) A non-leader, or a leader that cannot confirm the commit within
+    /// the commit timeout, answers `ok: false` with its best leader hint.
     fn client_write_response(&self, op: LogOp) -> Response {
-        match self.propose(op) {
+        match self.propose_and_wait(op, self.commit_timeout()) {
             Ok(index) => Response::WriteAck {
                 ok: true,
                 leader_hint: self.id as i64,
                 index,
             },
-            Err(ProposeError::NotLeader(hint)) => Response::WriteAck {
-                ok: false,
-                leader_hint: hint.map(|h| h as i64).unwrap_or(-1),
-                index: 0,
-            },
+            Err(ProposeError::NotLeader(hint) | ProposeError::NotCommitted(hint)) => {
+                Response::WriteAck {
+                    ok: false,
+                    leader_hint: hint.map(|h| h as i64).unwrap_or(-1),
+                    index: 0,
+                }
+            }
         }
     }
 
@@ -2714,58 +2985,91 @@ impl ClusterNode {
                 continue;
             }
             let outs = { self.state.lock().unwrap().tick() };
-            self.dispatch_outgoing(outs);
+            self.route(outs);
             self.apply_actions();
         }
     }
 
-    /// Deliver outgoing messages, feeding each reply back into the state machine
-    /// (which may produce further messages — catch-up, commit propagation —
-    /// processed in the same drain). Iterative with a hard guard so a flapping
-    /// peer can never spin forever.
-    fn dispatch_outgoing(&self, initial: Vec<Outgoing>) {
-        let mut queue: VecDeque<Outgoing> = initial.into_iter().collect();
-        let mut guard = 0usize;
-        while let Some(o) = queue.pop_front() {
-            guard += 1;
-            if guard > 100_000 || !self.alive.load(Ordering::SeqCst) {
-                return;
-            }
-            match self.send_msg(o.to, &o.msg) {
-                Ok(reply) => {
-                    let more = self.state.lock().unwrap().handle_reply(o.to, reply);
-                    self.apply_actions();
-                    queue.extend(more);
-                }
-                Err(_) => { /* peer unreachable; best-effort, retried next tick */ }
+    /// Hand each outgoing message to its peer's mailbox (replacing any older,
+    /// still-unsent message for that peer) and wake the peer's sender. Never
+    /// blocks on the network, so the tick driver and client writes are never held
+    /// up by a slow peer.
+    fn route(&self, outs: Vec<Outgoing>) {
+        for o in outs {
+            if let Some(link) = self.links.get(&o.to) {
+                *link.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(o.msg);
+                link.ready.notify_one();
             }
         }
     }
 
-    fn send_msg(&self, to: NodeId, msg: &RaftMsg) -> io::Result<RaftReply> {
+    /// The sender thread for one peer: deliver the newest message in its mailbox
+    /// over this thread's own connection, feed the reply back into the state
+    /// machine, and route whatever that produces (catch-up for this peer, a
+    /// commit broadcast, a fresh leader's heartbeats). Blocking I/O here only
+    /// ever delays traffic to *this* peer.
+    fn run_peer_sender(self: Arc<Self>, peer: NodeId, link: &PeerLink) {
+        let mut conn: Option<TcpStream> = None;
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let msg = {
+                let mut slot = link.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_none() {
+                    slot = link
+                        .ready
+                        .wait_timeout(slot, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                slot.take()
+            };
+            if !self.alive.load(Ordering::SeqCst) {
+                conn = None; // a crashed node holds no connections and sends nothing
+                continue;
+            }
+            let Some(msg) = msg else { continue };
+            let Ok(reply) = self.send_to(&mut conn, peer, &msg) else {
+                continue; // unreachable: dropped; the next heartbeat retries
+            };
+            if !self.alive.load(Ordering::SeqCst) {
+                continue; // crashed while waiting for the reply
+            }
+            let more = self.state.lock().unwrap().handle_reply(peer, reply);
+            self.apply_actions();
+            self.route(more);
+        }
+    }
+
+    /// One request/reply exchange with `peer` over the sender's connection
+    /// `conn`, (re)connecting as needed and retrying once on a fresh connection
+    /// if the cached one turns out to be broken (e.g. closed by the peer while
+    /// idle).
+    fn send_to(
+        &self,
+        conn: &mut Option<TcpStream>,
+        peer: NodeId,
+        msg: &RaftMsg,
+    ) -> io::Result<RaftReply> {
         let addr = {
             let addrs = self.peer_addrs.lock().unwrap();
             *addrs
-                .get(&to)
+                .get(&peer)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer address"))?
         };
         let req = msg.to_request();
-        let mut clients = self.clients.lock().unwrap();
         for attempt in 0..2 {
-            use std::collections::hash_map::Entry;
-            let stream = match clients.entry(to) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => {
-                    let stream = TcpStream::connect(addr)?;
-                    stream.set_read_timeout(Some(self.io_timeout))?;
-                    stream.set_write_timeout(Some(self.io_timeout))?;
-                    e.insert(stream)
-                }
-            };
+            if conn.is_none() {
+                let stream = TcpStream::connect_timeout(&addr, self.io_timeout)?;
+                rpc::tune_stream(&stream, Some(self.io_timeout))?;
+                *conn = Some(stream);
+            }
+            let stream = conn.as_mut().expect("connection was just established");
             match rpc::round_trip(stream, &req) {
                 Ok(resp) => return response_to_reply(resp),
                 Err(e) => {
-                    clients.remove(&to);
+                    *conn = None;
                     if attempt == 1 {
                         return Err(e);
                     }
@@ -2780,6 +3084,11 @@ impl ClusterNode {
         // blocks here rather than draining a later prefix and racing us to the
         // store — which would apply committed entries out of order.
         let _apply = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_actions_locked();
+    }
+
+    /// Drain and apply committed entries; the caller must hold `apply_lock`.
+    fn apply_actions_locked(&self) {
         let actions = { self.state.lock().unwrap().drain_apply() };
         if actions.is_empty() {
             return;
@@ -2963,10 +3272,24 @@ impl ReplicaGroup {
         Some(&self.stores[idx])
     }
 
-    /// Committed triples in this bucket (read from a serving replica; 0 if every
-    /// replica is down).
-    pub fn triple_count(&self) -> u64 {
-        self.readable_store().map(|s| s.triple_count()).unwrap_or(0)
+    /// Committed triples in this bucket, read from a serving replica. An error
+    /// (not a misleading `0`) when every replica is down.
+    pub fn triple_count(&self) -> io::Result<u64> {
+        self.readable_store()
+            .map(|s| s.triple_count())
+            .ok_or_else(|| self.unavailable())
+    }
+
+    /// The error a read of this bucket fails with while every replica is down.
+    fn unavailable(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "shard bucket {} is unavailable: all {} replicas are down",
+                self.shard,
+                self.replicas.len()
+            ),
+        )
     }
 
     /// Apply each replica's freshly committed mutations to its store, then run
@@ -3143,8 +3466,10 @@ impl ReplicaGroup {
 /// [`TripleSource`] contract — so the cluster is observationally identical to a
 /// single [`TripleStore`] over the same triples, exactly as [`ShardedStore`] is.
 ///
-/// It implements [`TripleSource`], so the generic [`Evaluator`] runs over a
-/// sharded-and-replicated deployment unchanged. The multi-group analogue of the
+/// Reads go through [`TryTripleSource`]: a bucket with every replica down is an
+/// error, never silently missing data, and [`ShardedRaftCluster::query`] runs
+/// the generic [`Evaluator`] over a sharded-and-replicated deployment
+/// unchanged. The multi-group analogue of the
 /// single-group [`ClusterNode`], it is built on the pure [`RaftState`] + the
 /// synchronous [`ReplicaGroup`] driver, so it is fully deterministic and
 /// in-process (no threads, clocks, or sockets).
@@ -3291,139 +3616,25 @@ impl ShardedRaftCluster {
         }
     }
 
-    /// The per-bucket serving replica stores, skipping any bucket with every
-    /// replica down (a best-effort read, like the remote scatter-gather).
-    fn readable_stores(&self) -> Vec<&TripleStore> {
-        self.groups
-            .iter()
-            .filter_map(|g| g.readable_store())
-            .collect()
-    }
-
     /// Run a read query over the replicated, sharded cluster using the generic
     /// [`Evaluator`] — the per-bucket replication and the scatter-gather are both
-    /// transparent to the engine.
+    /// transparent to the engine. If some bucket has every replica down the
+    /// query fails with [`GStoreError::Io`] rather than silently omitting that
+    /// bucket's triples.
     pub fn query(&self, dict: &Dictionary, sparql_text: &str) -> Result<QueryResult> {
-        let q = sparql::parse(sparql_text)?;
-        Evaluator::new(dict, self).evaluate(&q)
+        query_checked(self, dict, sparql_text)
     }
 }
 
-impl TripleSource for ShardedRaftCluster {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        self.readable_stores().iter().any(|s| s.exists(sub, pred, obj))
-    }
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend_from_slice(s.po_by_s(sub));
+impl TryTripleSource for ShardedRaftCluster {
+    /// One serving replica per bucket (its leader, else any up replica); a
+    /// bucket with every replica down makes the whole read fail.
+    fn scatter(&self) -> io::Result<Scatter<'_>> {
+        let mut shards: Vec<&dyn ShardRead> = Vec::with_capacity(self.groups.len());
+        for g in &self.groups {
+            shards.push(g.readable_store().ok_or_else(|| g.unavailable())?);
         }
-        sort_dedup(out)
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.o_by_sp(sub, pred));
-        }
-        sort_dedup(out)
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.p_by_so(sub, obj));
-        }
-        sort_dedup(out)
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend_from_slice(s.ps_by_o(obj));
-        }
-        sort_dedup(out)
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.s_by_po(pred, obj));
-        }
-        sort_dedup(out)
-    }
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend_from_slice(s.so_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.subs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.objs_by_p(pred));
-        }
-        sort_dedup(out)
-    }
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.subject_keys());
-        }
-        sort_dedup(out)
-    }
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        let mut out = Vec::new();
-        for s in self.readable_stores() {
-            out.extend(s.object_keys());
-        }
-        sort_dedup(out)
-    }
-    fn triple_count(&self) -> u64 {
-        // Each triple lives in exactly one bucket → the per-bucket sum is global.
-        self.readable_stores().iter().map(|s| s.triple_count()).sum()
-    }
-    fn distinct_subjects(&self) -> usize {
-        self.subject_keys().len()
-    }
-    fn distinct_objects(&self) -> usize {
-        self.object_keys().len()
-    }
-    fn num_predicates(&self) -> usize {
-        let mut preds: HashSet<PredId> = HashSet::new();
-        for s in self.readable_stores() {
-            preds.extend(s.predicates());
-        }
-        preds.len()
-    }
-    fn pred_card(&self, pred: PredId) -> usize {
-        self.readable_stores().iter().map(|s| s.pred_card(pred)).sum()
-    }
-    fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        self.subs_by_p(pred).len()
-    }
-    fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        self.objs_by_p(pred).len()
-    }
-    fn iter_all(&self) -> Vec<IdTriple> {
-        // Reproduce a single TripleStore's predicate-major (pred, sub, obj)
-        // order, exactly as ShardedStore does.
-        let mut preds: Vec<PredId> = Vec::new();
-        for s in self.readable_stores() {
-            preds.extend(s.predicates());
-        }
-        let preds = sort_dedup(preds);
-        let mut out = Vec::new();
-        for pred in preds {
-            for (sub, obj) in self.so_by_p(pred) {
-                out.push(IdTriple::new(sub, pred, obj));
-            }
-        }
-        out
+        Ok(Scatter::new(shards))
     }
 }
 
@@ -3691,6 +3902,84 @@ mod tests {
     }
 }
 
+/// Fault-injection fixtures shared by the networked test modules below.
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// A TCP front for a shard node that can be **cut** and **restored** —
+    /// modelling a shard host that goes down and comes back while coordinators
+    /// keep its address. While cut, new connections are accepted and dropped at
+    /// once and established relays are severed at their next frame: exactly what
+    /// a client sees when the node's process dies. The front holds its port for
+    /// the whole test, so the "down" address can never be reused by another
+    /// listener in the meantime.
+    pub(super) struct Link {
+        addr: SocketAddr,
+        up: Arc<AtomicBool>,
+    }
+
+    impl Link {
+        /// Front the shard node listening at `backend` on a fresh ephemeral port.
+        pub(super) fn to(backend: SocketAddr) -> Link {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind link");
+            let addr = listener.local_addr().expect("link addr");
+            let up = Arc::new(AtomicBool::new(true));
+            let flag = Arc::clone(&up);
+            thread::spawn(move || {
+                for client in listener.incoming().flatten() {
+                    if !flag.load(Ordering::SeqCst) {
+                        drop(client); // the host is down: refuse service
+                        continue;
+                    }
+                    let flag = Arc::clone(&flag);
+                    thread::spawn(move || relay(client, backend, &flag));
+                }
+            });
+            Link { addr, up }
+        }
+
+        /// The address coordinators should use for this shard.
+        pub(super) fn addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        /// Take the shard down.
+        pub(super) fn cut(&self) {
+            self.up.store(false, Ordering::SeqCst);
+        }
+
+        /// Bring the shard back.
+        pub(super) fn restore(&self) {
+            self.up.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Relay framed request/response pairs between `client` and the node at
+    /// `backend` until either side closes or the link is cut.
+    fn relay(mut client: TcpStream, backend: SocketAddr, up: &AtomicBool) {
+        let Ok(mut server) = TcpStream::connect(backend) else {
+            return;
+        };
+        let _ = client.set_nodelay(true);
+        let _ = server.set_nodelay(true);
+        while let Ok(req) = rpc::read_message(&mut client) {
+            if !up.load(Ordering::SeqCst) {
+                return; // cut mid-session: sever both sockets
+            }
+            if rpc::write_message(&mut server, &req).is_err() {
+                return;
+            }
+            let Ok(resp) = rpc::read_message(&mut server) else {
+                return;
+            };
+            if !up.load(Ordering::SeqCst) || rpc::write_message(&mut client, &resp).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Integration tests for the **network-distributed** layer: real
 /// [`ShardNode`] servers on ephemeral `127.0.0.1:0` ports in background
 /// threads, driven over genuine TCP loopback by [`RemoteShard`] clients — the
@@ -3776,7 +4065,7 @@ mod net_tests {
         assert_eq!(added, base.triple_count(), "all distinct triples inserted");
         // Each triple lands on exactly one node → per-node counts sum to total.
         assert_eq!(
-            TripleSource::triple_count(&net),
+            net.try_triple_count().unwrap(),
             base.triple_count(),
             "distributed triple_count"
         );
@@ -3846,8 +4135,8 @@ mod net_tests {
         let mut net = NetworkShardedStore::new(shards);
         net.insert_all(triples.iter().copied()).expect("routed insert");
 
-        assert_eq!(TripleSource::triple_count(&net), base.triple_count());
-        assert_eq!(net.iter_all(), base.iter_all());
+        assert_eq!(net.try_triple_count().unwrap(), base.triple_count());
+        assert_eq!(net.try_iter_all().unwrap(), base.iter_all());
 
         let q = "SELECT ?x ?y WHERE { \
                  ?x <http://ex/knows> ?y . \
@@ -3863,16 +4152,133 @@ mod net_tests {
         };
         assert_eq!(rows_sorted(&net_rs), rows_sorted(&base_rs));
     }
+
+    /// Every fallible scatter-gather read of a healthy distributed store is
+    /// byte-for-byte identical to the single-store answer (ordering, dedup and
+    /// global-distinct statistics included).
+    #[test]
+    fn fallible_reads_match_single_store_when_every_shard_answers() {
+        let (_d, triples) = fixture();
+        let base = ShardedStore::from_triples(1, triples.iter().copied());
+        let shards = vec![
+            Shard::Remote(RemoteShard::connect(start_node(Vec::new())).unwrap()),
+            Shard::Local(TripleStore::new()),
+            Shard::Remote(RemoteShard::connect(start_node(Vec::new())).unwrap()),
+        ];
+        let mut net = NetworkShardedStore::new(shards);
+        net.insert_all(triples.iter().copied()).unwrap();
+
+        assert_eq!(net.try_triple_count().unwrap(), base.triple_count());
+        assert_eq!(net.try_distinct_subjects().unwrap(), base.distinct_subjects());
+        assert_eq!(net.try_distinct_objects().unwrap(), base.distinct_objects());
+        assert_eq!(net.try_num_predicates().unwrap(), base.num_predicates());
+        assert_eq!(net.try_subject_keys().unwrap(), base.subject_keys());
+        assert_eq!(net.try_object_keys().unwrap(), base.object_keys());
+        assert_eq!(net.try_iter_all().unwrap(), base.iter_all());
+
+        let mut ids = base.subject_keys();
+        ids.extend(base.object_keys());
+        let ids = sort_dedup(ids);
+        let preds = sort_dedup(base.iter_all().iter().map(|t| t.pred).collect());
+        for &p in &preds {
+            assert_eq!(net.try_so_by_p(p).unwrap(), base.so_by_p(p), "so_by_p({p})");
+            assert_eq!(net.try_subs_by_p(p).unwrap(), base.subs_by_p(p));
+            assert_eq!(net.try_objs_by_p(p).unwrap(), base.objs_by_p(p));
+            assert_eq!(net.try_pred_card(p).unwrap(), base.pred_card(p));
+            assert_eq!(net.try_pred_distinct_subj(p).unwrap(), base.pred_distinct_subj(p));
+            assert_eq!(net.try_pred_distinct_obj(p).unwrap(), base.pred_distinct_obj(p));
+        }
+        for &s in &ids {
+            assert_eq!(net.try_po_by_s(s).unwrap(), base.po_by_s(s), "po_by_s({s})");
+            assert_eq!(net.try_ps_by_o(s).unwrap(), base.ps_by_o(s), "ps_by_o({s})");
+            for &p in &preds {
+                assert_eq!(net.try_o_by_sp(s, p).unwrap(), base.o_by_sp(s, p));
+                assert_eq!(net.try_s_by_po(p, s).unwrap(), base.s_by_po(p, s));
+            }
+            for &o in &ids {
+                assert_eq!(net.try_p_by_so(s, o).unwrap(), base.p_by_so(s, o));
+                for &p in &preds {
+                    assert_eq!(net.try_exists(s, p, o).unwrap(), base.exists(s, p, o));
+                }
+            }
+        }
+    }
+
+    /// Regression: a remote shard that is down used to be merged in as an
+    /// *empty* answer, so a query silently returned a partial result that looked
+    /// complete. It must now fail — naming the shard — and recover once the shard
+    /// is back.
+    #[test]
+    fn query_errors_instead_of_returning_partial_results_when_a_shard_is_down() {
+        use super::test_support::Link;
+        let (d, triples) = fixture();
+        let base = ShardedStore::from_triples(1, triples.iter().copied());
+        let q = "SELECT ?x ?y WHERE { \
+                 ?x <http://ex/knows> ?y . \
+                 ?y <http://ex/type> <http://ex/Person> . \
+                 ?x <http://ex/name> ?n }";
+        let rows = |r: QueryResult| match r {
+            QueryResult::Select(rs) => rows_sorted(&rs),
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let expected = rows(base.query(&d, q).unwrap());
+
+        let links: Vec<Link> = (0..3).map(|_| Link::to(start_node(Vec::new()))).collect();
+        let shards = links
+            .iter()
+            .map(|l| Shard::Remote(RemoteShard::connect(l.addr()).unwrap()))
+            .collect();
+        let mut net = NetworkShardedStore::new(shards);
+        net.insert_all(triples.iter().copied()).unwrap();
+        assert_eq!(rows(net.query(&d, q).unwrap()), expected, "healthy cluster");
+
+        // Take down a shard that holds part of the answer. A best-effort merge
+        // would have answered from the survivors alone — a *different*, wrong
+        // result that this test would previously have received.
+        let victim = (0..net.num_shards())
+            .find(|&i| triples.iter().any(|t| net.shard_index(t.sub) == i))
+            .unwrap();
+        let surviving = ShardedStore::from_triples(
+            1,
+            triples.iter().copied().filter(|t| net.shard_index(t.sub) != victim),
+        );
+        assert_ne!(
+            rows(surviving.query(&d, q).unwrap()),
+            expected,
+            "the down shard must matter to the answer for this test to bite"
+        );
+        links[victim].cut();
+
+        let err = net.query(&d, q).expect_err("a down shard must fail the query");
+        assert!(matches!(err, GStoreError::Io(_)), "got {err:?}");
+        let victim_addr = links[victim].addr().to_string();
+        assert!(
+            err.to_string().contains(&victim_addr),
+            "the error should name the down shard {victim_addr}: {err}"
+        );
+        assert!(net.try_triple_count().is_err());
+        assert!(net.try_iter_all().is_err());
+        assert!(net.try_subject_keys().is_err());
+        assert!(net.try_po_by_s(0).is_err());
+
+        // The failure is not sticky: once the shard is reachable again the
+        // full, correct answer comes back.
+        links[victim].restore();
+        assert_eq!(rows(net.query(&d, q).unwrap()), expected, "after recovery");
+        assert_eq!(net.try_triple_count().unwrap(), base.triple_count());
+    }
 }
 
 /// Tests for the **Raft-like replication layer**. The bulk are *deterministic*:
 /// a [`Sim`] drives `N` in-memory [`RaftState`]s by hand — delivering every
 /// message synchronously and ticking exactly the node we choose — so elections,
 /// replication, failover, catch-up, snapshotting, and split-brain safety are
-/// exercised with **no clocks and no threads** (zero wall-clock flakiness). Two
-/// further tests run real [`ClusterNode`]s over TCP loopback (background threads
-/// on `127.0.0.1:0`, like `tests/dt_service.rs`) and poll for convergence to
-/// prove the transport, election, failover, and recovery work end-to-end.
+/// exercised with **no clocks and no threads** (zero wall-clock flakiness). The
+/// `networked_*` tests (and the quorum / hung-peer regressions next to them) run
+/// real [`ClusterNode`]s over TCP loopback (background threads on
+/// `127.0.0.1:0`, like `tests/dt_service.rs`) to prove the transport,
+/// election, failover, and recovery work end-to-end; they tolerate leadership
+/// changes and slow schedulers by design (see the section comment there).
 #[cfg(test)]
 mod raft_tests {
     use super::*;
@@ -4362,14 +4768,67 @@ mod raft_tests {
         assert_eq!(sim.node(0).commit_index(), 5);
     }
 
-    // ----- Networked end-to-end (real TCP, background threads) ---------------
+    /// Regression (Raft receiver rule): a follower may only commit entries the
+    /// AppendEntries it is processing has *verified* against the leader. Clamping
+    /// `leaderCommit` to the follower's own last index instead would commit a
+    /// stale, never-verified suffix left behind by a deposed leader.
+    #[test]
+    fn follower_commits_only_entries_verified_by_the_append() {
+        let mut sim = Sim::new(3);
+        sim.elect(0);
+        // Leader 0 (term 1) appends two entries that reach node 1 but never
+        // commit (node 2 and the commit broadcast are dropped).
+        sim.nodes[0].propose(LogOp::Insert(t(1, 1, 1))).unwrap();
+        sim.nodes[0].propose(LogOp::Insert(t(2, 2, 2))).unwrap();
+        for o in sim.nodes[0].replicate_now().into_iter().filter(|o| o.to == 1) {
+            let _ = sim.nodes[1].handle(o.msg);
+        }
+        assert_eq!(sim.nodes[1].log_len(), 2, "node 1 holds the unverified suffix");
+        assert_eq!(sim.nodes[1].commit_index(), 0);
 
-    fn fast_cfg() -> RaftConfig {
+        // A newer leader's AppendEntries that only vouches for the log up to
+        // index 0 must not let node 1 commit its unverified entries 1-2, however
+        // far `leader_commit` reaches.
+        let reply = sim.nodes[1].handle(RaftMsg::AppendEntries {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 2,
+            entries: vec![],
+        });
+        assert!(matches!(reply, RaftReply::Append { success: true, .. }));
+        assert_eq!(
+            sim.nodes[1].commit_index(),
+            0,
+            "commit must be capped by the entries this append verified"
+        );
+    }
+
+    // ----- Networked end-to-end (real TCP, background threads) ---------------
+    //
+    // These run real nodes on wall-clock timers, so they are written to be
+    // robust on a loaded CI machine rather than to assume a quiet one:
+    //
+    // * timing is generous (`test_cfg`): heartbeats every 20 ms against a
+    //   250-500 ms election timeout, so a leader is not deposed just because a
+    //   thread was descheduled for a few tens of milliseconds;
+    // * nothing assumes leadership is permanent: `stable_leader` waits until the
+    //   same (leader, term) is observed twice, and every write goes through
+    //   `write_committed` / `client_write_committed`, which retry across leader
+    //   changes until the write is confirmed *committed* (writes are idempotent);
+    // * every failure message carries a per-node status dump.
+
+    /// Wall-clock deadline for any single convergence step.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Timing for the networked tests (see the section comment above).
+    fn test_cfg() -> RaftConfig {
         RaftConfig {
-            election_timeout_min: 4,
-            election_timeout_max: 9,
-            heartbeat_timeout: 1,
-            tick_interval: Duration::from_millis(12),
+            election_timeout_min: 25,
+            election_timeout_max: 50,
+            heartbeat_timeout: 2,
+            tick_interval: Duration::from_millis(10),
         }
     }
 
@@ -4399,6 +4858,28 @@ mod raft_tests {
         nodes
     }
 
+    /// One line per node — liveness, role, term, believed leader, commit index,
+    /// store size — appended to every networked assertion so a CI failure is
+    /// diagnosable from the log alone.
+    fn describe(nodes: &[Arc<ClusterNode>]) -> String {
+        nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "  node {}: alive={} role={:?} term={} leader={:?} commit={} triples={}",
+                    n.id(),
+                    n.is_alive(),
+                    n.role(),
+                    n.current_term(),
+                    n.leader_id(),
+                    n.commit_index(),
+                    n.store_triple_count()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The single alive leader, if exactly one currently claims leadership.
     fn current_leader(nodes: &[Arc<ClusterNode>]) -> Option<usize> {
         let leaders: Vec<usize> = nodes
@@ -4414,10 +4895,81 @@ mod raft_tests {
         }
     }
 
-    /// Poll `cond` until it holds or `deadline` elapses.
-    fn wait_until<F: Fn() -> bool>(deadline: Duration, cond: F) -> bool {
+    /// Wait for a *stable* leader: the same alive leader in the same term on two
+    /// observations a couple of heartbeats apart. Panics with a status dump if
+    /// none emerges by [`DEADLINE`].
+    fn stable_leader(nodes: &[Arc<ClusterNode>]) -> usize {
         let start = Instant::now();
-        while start.elapsed() < deadline {
+        let mut last: Option<(usize, u64)> = None;
+        while start.elapsed() < DEADLINE {
+            let now = current_leader(nodes).map(|l| (l, nodes[l].current_term()));
+            if let Some((l, _)) = now {
+                if now == last {
+                    return l;
+                }
+            }
+            last = now;
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no stable leader within {DEADLINE:?}\n{}", describe(nodes));
+    }
+
+    /// Commit `op` through whichever node currently leads, retrying across
+    /// leadership changes until a leader confirms it committed (and applied it).
+    /// Returns the index of the node that confirmed it.
+    fn write_committed(nodes: &[Arc<ClusterNode>], op: LogOp) -> usize {
+        let start = Instant::now();
+        let mut last_err = None;
+        while start.elapsed() < DEADLINE {
+            let l = stable_leader(nodes);
+            match nodes[l].propose_and_wait(op, Duration::from_secs(2)) {
+                Ok(_) => return l,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!(
+            "write {op:?} not committed within {DEADLINE:?} (last error: {last_err:?})\n{}",
+            describe(nodes)
+        );
+    }
+
+    /// Open a client connection to a node, with a read timeout comfortably
+    /// above the server's commit-wait bound.
+    fn client(addr: SocketAddr) -> TcpStream {
+        let s = TcpStream::connect(addr).expect("connect to cluster node");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    }
+
+    /// Submit `op` as a wire `ClientWrite` to the current leader, retrying on a
+    /// redirect / unconfirmed ack until some node acknowledges it. Returns the
+    /// acknowledging node and the committed index.
+    fn client_write_committed(nodes: &[Arc<ClusterNode>], op: LogOp) -> (usize, u64) {
+        let start = Instant::now();
+        let mut last = None;
+        while start.elapsed() < DEADLINE {
+            let l = stable_leader(nodes);
+            let mut s = client(nodes[l].local_addr().unwrap());
+            match crate::rpc::round_trip(&mut s, &Request::ClientWrite { op }) {
+                Ok(Response::WriteAck {
+                    ok: true, index, ..
+                }) => return (l, index),
+                Ok(resp @ Response::WriteAck { ok: false, .. }) => last = Some(format!("{resp:?}")),
+                Ok(other) => panic!("expected WriteAck, got {other:?}"),
+                Err(e) => last = Some(e.to_string()),
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "ClientWrite {op:?} never acknowledged within {DEADLINE:?} (last: {last:?})\n{}",
+            describe(nodes)
+        );
+    }
+
+    /// Poll `cond` until it holds or [`DEADLINE`] elapses.
+    fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < DEADLINE {
             if cond() {
                 return true;
             }
@@ -4434,65 +4986,61 @@ mod raft_tests {
 
     #[test]
     fn networked_cluster_replicates_then_fails_over_then_recovers() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
+        let nodes = build_cluster(3, test_cfg());
 
-        // 1. A leader is elected over the wire.
-        assert!(
-            wait_until(deadline, || current_leader(&nodes).is_some()),
-            "no leader was elected"
-        );
-        let l = current_leader(&nodes).unwrap();
-
-        // 2. Replicate a few mutations; every replica converges.
+        // 1-2. A leader is elected over the wire; committed writes converge on
+        //      every replica.
         let triples = [t(1, 10, 100), t(2, 10, 200), t(3, 10, 300)];
         for &tr in &triples {
-            nodes[l].propose(LogOp::Insert(tr)).expect("leader accepts write");
+            write_committed(&nodes, LogOp::Insert(tr));
         }
         assert!(
-            wait_until(deadline, || nodes
+            wait_until(|| nodes
                 .iter()
-                .all(|n| n.store_triple_count() == triples.len() as u64)),
-            "replicas did not converge on the initial writes"
+                .all(|n| n.store_triple_count() == triples.len() as u64
+                    && triples.iter().all(|&tr| n.store_contains(tr)))),
+            "replicas did not converge on the initial writes\n{}",
+            describe(&nodes)
         );
-        for n in &nodes {
-            for &tr in &triples {
-                assert!(n.store_contains(tr));
-            }
-        }
 
-        // 3. Kill the leader; a new leader emerges and still accepts writes.
+        // 3. Kill the leader; a new leader emerges and still commits writes.
+        let l = stable_leader(&nodes);
+        let old_term = nodes[l].current_term();
         nodes[l].kill();
-        assert!(
-            wait_until(deadline, || matches!(current_leader(&nodes), Some(nl) if nl != l)),
-            "no new leader after killing the old one"
-        );
-        let l2 = current_leader(&nodes).unwrap();
-        assert_ne!(l2, l);
+        // (Only alive nodes count. The term bump of a failover is asserted
+        // deterministically by `failover_elects_new_leader_and_keeps_accepting_writes`;
+        // here leadership may already have moved just before the kill.)
+        let l2 = stable_leader(&nodes);
+        assert_ne!(l2, l, "a dead node cannot lead\n{}", describe(&nodes));
         let extra = t(4, 10, 400);
-        nodes[l2]
-            .propose(LogOp::Insert(extra))
-            .expect("new leader accepts write");
+        write_committed(&nodes, LogOp::Insert(extra));
         let survivors: Vec<usize> = (0..3).filter(|&i| i != l).collect();
         assert!(
-            wait_until(deadline, || survivors
-                .iter()
-                .all(|&i| nodes[i].store_contains(extra))),
-            "the post-failover write did not reach the survivors"
+            wait_until(|| survivors.iter().all(|&i| nodes[i].store_contains(extra))),
+            "the post-failover write did not reach the survivors\n{}",
+            describe(&nodes)
         );
 
-        // 4. Restart the old leader; it catches up to all four triples and is no
-        //    longer the leader.
+        // 4. Restart the old leader: it never resumes its stale leadership, and
+        //    it catches up to all four triples.
         nodes[l].revive();
-        let all: Vec<IdTriple> = triples.iter().copied().chain(std::iter::once(extra)).collect();
-        assert!(
-            wait_until(deadline, || nodes[l].store_triple_count() == 4
-                && all.iter().all(|&tr| nodes[l].store_contains(tr))),
-            "the revived old leader did not catch up"
-        );
         assert!(
             !nodes[l].is_leader(),
-            "the revived stale leader must step down"
+            "a revived node must not resume its stale leadership"
+        );
+        let all: Vec<IdTriple> = triples.iter().copied().chain(std::iter::once(extra)).collect();
+        assert!(
+            wait_until(|| nodes[l].store_triple_count() == 4
+                && all.iter().all(|&tr| nodes[l].store_contains(tr))),
+            "the revived old leader did not catch up\n{}",
+            describe(&nodes)
+        );
+        // It may legitimately win a *later* election, but never lead in the
+        // term it led before the crash.
+        assert!(
+            !nodes[l].is_leader() || nodes[l].current_term() > old_term,
+            "the revived stale leader must step down\n{}",
+            describe(&nodes)
         );
 
         shutdown_all(&nodes);
@@ -4500,48 +5048,177 @@ mod raft_tests {
 
     #[test]
     fn networked_client_write_rpc_commits_on_leader() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(wait_until(deadline, || current_leader(&nodes).is_some()));
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
-        // A ClientWrite RPC sent to the leader is appended and replicated.
-        let laddr = nodes[l].local_addr().unwrap();
+        // A ClientWrite RPC to the leader is acknowledged only once committed:
+        // the acknowledging leader has already applied it.
         let tr = t(7, 70, 700);
-        let mut s = TcpStream::connect(laddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp = crate::rpc::round_trip(&mut s, &Request::ClientWrite { op: LogOp::Insert(tr) })
-            .expect("client write round-trip");
-        match resp {
-            Response::WriteAck { ok, .. } => assert!(ok, "leader should accept the write"),
-            other => panic!("expected WriteAck, got {other:?}"),
-        }
+        let (l, index) = client_write_committed(&nodes, LogOp::Insert(tr));
+        assert!(index > 0);
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.store_contains(tr))),
-            "client-written triple did not replicate"
+            nodes[l].store_contains(tr),
+            "an acknowledged write is already applied on the leader"
+        );
+        assert!(
+            wait_until(|| nodes.iter().all(|n| n.store_contains(tr))),
+            "client-written triple did not replicate\n{}",
+            describe(&nodes)
         );
 
-        // A ClientWrite to a follower is answered (with a redirect when it is not
-        // the leader).
-        let f = (0..3).find(|&i| i != l).unwrap();
-        let faddr = nodes[f].local_addr().unwrap();
-        let mut s2 = TcpStream::connect(faddr).unwrap();
-        s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp2 = crate::rpc::round_trip(
-            &mut s2,
-            &Request::ClientWrite {
-                op: LogOp::Insert(t(8, 80, 800)),
-            },
-        )
-        .expect("follower client write round-trip");
-        match resp2 {
-            Response::WriteAck { ok, leader_hint, .. } => {
-                if !ok {
-                    assert!(leader_hint >= 0, "a redirect should name a leader");
+        // A ClientWrite to a follower that knows the leader is answered with a
+        // redirect naming a leader. (Leadership can move between choosing the
+        // follower and its answer, so retry until a clean redirect is seen.)
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "never saw a follower redirect\n{}",
+                describe(&nodes)
+            );
+            let l = stable_leader(&nodes);
+            let Some(f) = (0..3).find(|&i| i != l && nodes[i].leader_id() == Some(l as u64)) else {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let mut s = client(nodes[f].local_addr().unwrap());
+            let resp = crate::rpc::round_trip(
+                &mut s,
+                &Request::ClientWrite {
+                    op: LogOp::Insert(t(8, 80, 800)),
+                },
+            )
+            .expect("follower client write round-trip");
+            match resp {
+                Response::WriteAck {
+                    ok: false,
+                    leader_hint,
+                    ..
+                } if leader_hint >= 0 => {
+                    assert!(
+                        (0..3).contains(&leader_hint) && leader_hint != f as i64,
+                        "a redirect must name another node, got {leader_hint}"
+                    );
+                    break;
                 }
+                // The follower became leader in the meantime (and committed), or
+                // the leader was momentarily unknown: try again.
+                Response::WriteAck { .. } => thread::sleep(Duration::from_millis(20)),
+                other => panic!("expected WriteAck, got {other:?}"),
             }
-            other => panic!("expected WriteAck, got {other:?}"),
         }
+
+        shutdown_all(&nodes);
+    }
+
+    /// Regression: a `ClientWrite` used to be acknowledged `ok` as soon as the
+    /// leader *appended* it, so a leader cut off from its quorum told clients
+    /// writes had succeeded that could never commit (and that a later leader
+    /// would discard). An acknowledgement must now mean "committed".
+    #[test]
+    fn client_write_is_not_acknowledged_without_a_quorum() {
+        let nodes = build_cluster(3, test_cfg());
+        let l = stable_leader(&nodes);
+        // Isolate the leader: with both followers down no quorum exists.
+        for i in (0..3).filter(|&i| i != l) {
+            nodes[i].kill();
+        }
+        nodes[l].set_commit_timeout(Duration::from_millis(300));
+
+        let tr = t(9, 90, 900);
+        let mut s = client(nodes[l].local_addr().unwrap());
+        let resp = crate::rpc::round_trip(&mut s, &Request::ClientWrite { op: LogOp::Insert(tr) })
+            .expect("client write round-trip");
+        assert!(
+            matches!(resp, Response::WriteAck { ok: false, .. }),
+            "a write without a quorum must not be acknowledged, got {resp:?}\n{}",
+            describe(&nodes)
+        );
+        assert!(!nodes[l].store_contains(tr), "an uncommitted write is never applied");
+        assert!(
+            matches!(
+                nodes[l].propose_and_wait(LogOp::Insert(t(9, 91, 901)), Duration::from_millis(200)),
+                Err(ProposeError::NotCommitted(_) | ProposeError::NotLeader(_))
+            ),
+            "propose_and_wait must not report an unconfirmed write as committed"
+        );
+
+        // Once the quorum is back, writes commit again.
+        for i in (0..3).filter(|&i| i != l) {
+            nodes[i].revive();
+        }
+        write_committed(&nodes, LogOp::Insert(t(10, 100, 1000)));
+
+        shutdown_all(&nodes);
+    }
+
+    /// Regression (liveness): one *hung* peer — a host that accepts TCP
+    /// connections but never answers, e.g. a stopped process or a partition
+    /// that drops packets — must not stall replication to the healthy majority.
+    /// The transport used to deliver every message sequentially from one
+    /// thread, so each heartbeat round waited out the hung peer's I/O timeouts
+    /// (2 x 300 ms) before the healthy follower heard from the leader again; the
+    /// follower's election timer expired every round and the cluster churned
+    /// through elections while two of three nodes were perfectly healthy.
+    #[test]
+    fn a_hung_peer_does_not_stall_the_healthy_majority() {
+        // Node 2 is a black hole: it accepts connections and never replies.
+        let hole = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hole_addr = hole.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in hole.incoming().flatten() {
+                held.push(s); // keep the socket open, never read or answer it
+            }
+        });
+
+        let ids = [0u64, 1, 2];
+        let nodes: Vec<Arc<ClusterNode>> = [0u64, 1]
+            .iter()
+            .map(|&id| {
+                let peers: Vec<NodeId> = ids.iter().copied().filter(|&p| p != id).collect();
+                ClusterNode::bind(id, peers, TripleStore::new(), "127.0.0.1:0", test_cfg()).unwrap()
+            })
+            .collect();
+        let addr_of = |id: u64| match id {
+            2 => hole_addr,
+            i => nodes[i as usize].local_addr().unwrap(),
+        };
+        for n in &nodes {
+            for &p in ids.iter().filter(|&&p| p != n.id()) {
+                n.set_peer_addr(p, addr_of(p));
+            }
+        }
+        for n in &nodes {
+            let _ = n.start();
+        }
+
+        // The healthy majority elects a leader and keeps it: the term must not
+        // move while heartbeats flow, however long the hung peer blocks.
+        let l = stable_leader(&nodes);
+        let term = nodes[l].current_term();
+        let watch = Instant::now();
+        while watch.elapsed() < Duration::from_millis(1500) {
+            assert_eq!(
+                (current_leader(&nodes), nodes[l].current_term()),
+                (Some(l), term),
+                "leadership churned while only one peer was hung\n{}",
+                describe(&nodes)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // And a write commits on the majority without waiting for the hung
+        // peer's timeouts.
+        let started = Instant::now();
+        nodes[l]
+            .propose_and_wait(LogOp::Insert(t(5, 50, 500)), Duration::from_secs(5))
+            .expect("the healthy majority commits");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(250),
+            "commit waited on the hung peer ({took:?})\n{}",
+            describe(&nodes)
+        );
 
         shutdown_all(&nodes);
     }
@@ -4549,57 +5226,51 @@ mod raft_tests {
     /// Task 3 (per-shard replication, minimal form): a shard backed by a Raft
     /// replication group keeps serving writes and retains its data when one
     /// **replica fails**. A 3-node group replicates the whole keyspace; killing a
-    /// follower still leaves a 2/3 quorum, so the leader commits new writes, and
-    /// the revived replica catches up. (The generalization — one such group *per
-    /// shard* — is documented as remaining in the module scope notes.)
+    /// follower still leaves a 2/3 quorum, so the group keeps a leader and
+    /// commits new writes, and the revived replica catches up. (The
+    /// generalization — one such group *per shard* — is [`ShardedRaftCluster`].)
     #[test]
     fn replicated_shard_survives_a_replica_failure() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(
-            wait_until(deadline, || current_leader(&nodes).is_some()),
-            "no leader elected"
-        );
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
         // A first write replicates to all three replicas of the shard.
         let a = t(1, 2, 3);
-        nodes[l].propose(LogOp::Insert(a)).expect("leader accepts write");
+        write_committed(&nodes, LogOp::Insert(a));
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.store_contains(a))),
-            "initial write did not replicate to every replica"
+            wait_until(|| nodes.iter().all(|n| n.store_contains(a))),
+            "initial write did not replicate to every replica\n{}",
+            describe(&nodes)
         );
 
         // Fail one replica (a follower, not the leader).
+        let l = stable_leader(&nodes);
         let f = (0..3).find(|&i| i != l).unwrap();
         nodes[f].kill();
-        // The leader retains leadership with the remaining 2/3 quorum.
-        assert!(
-            wait_until(deadline, || nodes[l].is_leader()),
-            "leader lost quorum after a single replica failure"
-        );
 
-        // The shard still accepts and commits a new write on the survivors.
-        let b = t(4, 5, 6);
-        nodes[l].propose(LogOp::Insert(b)).expect("survivors still commit");
+        // The remaining 2/3 quorum keeps the shard available: it holds a leader
+        // and commits a new write.
         let survivors: Vec<usize> = (0..3).filter(|&i| i != f).collect();
+        let l2 = stable_leader(&nodes);
+        assert!(survivors.contains(&l2));
+        let b = t(4, 5, 6);
+        write_committed(&nodes, LogOp::Insert(b));
         assert!(
-            wait_until(deadline, || survivors.iter().all(|&i| nodes[i].store_contains(b))),
-            "post-failure write did not reach the surviving replicas"
+            wait_until(|| survivors.iter().all(|&i| nodes[i].store_contains(b))),
+            "post-failure write did not reach the surviving replicas\n{}",
+            describe(&nodes)
         );
 
         // A surviving replica answers a read RPC over the wire (no data lost).
-        let saddr = nodes[survivors[0]].local_addr().unwrap();
-        let mut s = TcpStream::connect(saddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut s = client(nodes[survivors[0]].local_addr().unwrap());
         let resp = crate::rpc::round_trip(&mut s, &Request::TripleCount).unwrap();
         assert!(matches!(resp, Response::Count(n) if n >= 2), "read served by survivor");
 
         // The failed replica revives and catches up to both writes.
         nodes[f].revive();
         assert!(
-            wait_until(deadline, || nodes[f].store_contains(a) && nodes[f].store_contains(b)),
-            "revived replica did not catch up"
+            wait_until(|| nodes[f].store_contains(a) && nodes[f].store_contains(b)),
+            "revived replica did not catch up\n{}",
+            describe(&nodes)
         );
 
         shutdown_all(&nodes);
@@ -4612,39 +5283,24 @@ mod raft_tests {
     #[test]
     fn networked_membership_change_via_client_write_replicates() {
         use std::net::SocketAddr;
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(wait_until(deadline, || current_leader(&nodes).is_some()));
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
-        // Submit an AddNode config-change as a wire ClientWrite to the leader.
+        // Submit an AddNode config-change as a wire ClientWrite; the ack means
+        // it is committed and applied on the acknowledging leader.
         let new_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let laddr = nodes[l].local_addr().unwrap();
-        let mut s = TcpStream::connect(laddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp = crate::rpc::round_trip(
-            &mut s,
-            &Request::ClientWrite {
-                op: LogOp::AddNode { id: 42, addr: new_addr },
-            },
-        )
-        .expect("client config-change round-trip");
-        assert!(
-            matches!(resp, Response::WriteAck { ok: true, .. }),
-            "leader accepts the config-change"
-        );
+        let (l, _) = client_write_committed(&nodes, LogOp::AddNode { id: 42, addr: new_addr });
+        assert!(nodes[l].config().contains(42), "acknowledged ⇒ applied on the leader");
 
         // Every replica converges on the new membership.
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.config().contains(42))),
-            "membership did not replicate to every node"
+            wait_until(|| nodes.iter().all(|n| n.config().contains(42))),
+            "membership did not replicate to every node\n{}",
+            describe(&nodes)
         );
 
         // A follower serves the committed config over the wire.
         let f = (0..3).find(|&i| i != l).unwrap();
-        let faddr = nodes[f].local_addr().unwrap();
-        let mut sf = TcpStream::connect(faddr).unwrap();
-        sf.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut sf = client(nodes[f].local_addr().unwrap());
         let cfg = crate::rpc::round_trip(&mut sf, &Request::GetConfig).expect("GetConfig round-trip");
         match cfg {
             Response::Config {
@@ -4869,7 +5525,7 @@ mod shard_cluster_tests {
         cluster.add_node(1, a1, e1).unwrap();
         cluster.insert_all(triples.iter().copied()).unwrap();
         assert_eq!(
-            TripleSource::triple_count(&cluster),
+            cluster.try_triple_count().unwrap(),
             base.triple_count(),
             "all triples routed, none lost"
         );
@@ -4886,7 +5542,7 @@ mod shard_cluster_tests {
         assert!(endpoint_count(&cluster, 2) > 0, "the joiner received its shards");
 
         // No data was lost or duplicated, and the distributed query is unchanged.
-        assert_eq!(TripleSource::triple_count(&cluster), base.triple_count());
+        assert_eq!(cluster.try_triple_count().unwrap(), base.triple_count());
         assert_eq!(
             select_rows(cluster.query(&d, BGP).unwrap()),
             select_rows(base.query(&d, BGP).unwrap()),
@@ -4905,7 +5561,7 @@ mod shard_cluster_tests {
             cluster.add_node(id, a, e).unwrap();
         }
         cluster.insert_all(triples.iter().copied()).unwrap();
-        assert_eq!(TripleSource::triple_count(&cluster), base.triple_count());
+        assert_eq!(cluster.try_triple_count().unwrap(), base.triple_count());
 
         // Node 1 leaves; its buckets move to survivors.
         cluster.remove_node(1).unwrap();
@@ -4915,7 +5571,7 @@ mod shard_cluster_tests {
         }
         // No data lost and the query is still correct.
         assert_eq!(
-            TripleSource::triple_count(&cluster),
+            cluster.try_triple_count().unwrap(),
             base.triple_count(),
             "no data lost when a node leaves"
         );
@@ -4958,7 +5614,14 @@ mod shard_cluster_tests {
         let holders: Vec<NodeId> = cluster
             .members()
             .into_iter()
-            .filter(|&id| cluster.endpoint(id).unwrap().exists(alice, knows, zoe))
+            .filter(|&id| {
+                cluster
+                    .endpoint(id)
+                    .unwrap()
+                    .reader()
+                    .read_exists(alice, knows, zoe)
+                    .unwrap()
+            })
             .collect();
         assert_eq!(holders, vec![owner], "the write lands on exactly its owner");
 
@@ -4968,6 +5631,46 @@ mod shard_cluster_tests {
             matches!(cluster.query(&d, ask).unwrap(), QueryResult::Ask(true)),
             "post-rebalance write is queryable"
         );
+    }
+
+    /// Regression: a member whose endpoint is down must fail a cluster query
+    /// (with an error naming it) instead of contributing an empty answer.
+    #[test]
+    fn cluster_query_errors_when_a_member_endpoint_is_down() {
+        use super::test_support::Link;
+        let (d, triples) = fixture();
+        let base = ShardedStore::from_triples(1, triples.iter().copied());
+        let expected = select_rows(base.query(&d, BGP).unwrap());
+
+        let mut cluster = ShardCluster::new(8);
+        let mut links = Vec::new();
+        for id in 0..3u64 {
+            let node = Arc::new(ShardNode::bind(TripleStore::new(), "127.0.0.1:0").unwrap());
+            let backend = node.local_addr().unwrap();
+            thread::spawn(move || node.serve_forever());
+            let link = Link::to(backend);
+            let ep = Shard::Remote(RemoteShard::connect(link.addr()).unwrap());
+            cluster.add_node(id, link.addr(), ep).unwrap();
+            links.push(link);
+        }
+        cluster.insert_all(triples.iter().copied()).unwrap();
+        assert_eq!(select_rows(cluster.query(&d, BGP).unwrap()), expected);
+
+        // Down a member that actually holds data.
+        let victim = (0..3u64).find(|&id| endpoint_count(&cluster, id) > 0).unwrap();
+        links[victim as usize].cut();
+        let err = cluster
+            .query(&d, BGP)
+            .expect_err("a down member must fail the query");
+        assert!(
+            err.to_string().contains(&links[victim as usize].addr().to_string()),
+            "error should name the down member: {err}"
+        );
+        assert!(cluster.try_triple_count().is_err());
+
+        links[victim as usize].restore();
+        assert_eq!(select_rows(cluster.query(&d, BGP).unwrap()), expected);
+        assert_eq!(cluster.try_triple_count().unwrap(), base.triple_count());
     }
 }
 
@@ -5079,27 +5782,27 @@ mod replicated_shard_tests {
         assert_eq!(cluster.insert(triples[0]), Some(false));
 
         assert_eq!(
-            TripleSource::triple_count(&cluster),
+            cluster.try_triple_count().unwrap(),
             base.triple_count(),
             "triple_count"
         );
         assert_eq!(
-            cluster.distinct_subjects(),
+            cluster.try_distinct_subjects().unwrap(),
             base.distinct_subjects(),
             "distinct_subjects"
         );
         assert_eq!(
-            cluster.distinct_objects(),
+            cluster.try_distinct_objects().unwrap(),
             base.distinct_objects(),
             "distinct_objects"
         );
         assert_eq!(
-            cluster.num_predicates(),
+            cluster.try_num_predicates().unwrap(),
             base.num_predicates(),
             "num_predicates"
         );
         assert_eq!(
-            TripleSource::iter_all(&cluster),
+            cluster.try_iter_all().unwrap(),
             base.iter_all().collect::<Vec<_>>(),
             "iter_all"
         );
@@ -5109,14 +5812,14 @@ mod replicated_shard_tests {
         ids.extend(base.object_keys());
         ids = sort_dedup(ids);
         for &p in &base.predicates().collect::<Vec<_>>() {
-            assert_eq!(TripleSource::so_by_p(&cluster, p), base.so_by_p(p).to_vec());
-            assert_eq!(cluster.subs_by_p(p), base.subs_by_p(p));
-            assert_eq!(cluster.objs_by_p(p), base.objs_by_p(p));
-            assert_eq!(cluster.pred_card(p), base.pred_card(p));
+            assert_eq!(cluster.try_so_by_p(p).unwrap(), base.so_by_p(p).to_vec());
+            assert_eq!(cluster.try_subs_by_p(p).unwrap(), base.subs_by_p(p));
+            assert_eq!(cluster.try_objs_by_p(p).unwrap(), base.objs_by_p(p));
+            assert_eq!(cluster.try_pred_card(p).unwrap(), base.pred_card(p));
         }
         for &s in &ids {
-            assert_eq!(TripleSource::po_by_s(&cluster, s), base.po_by_s(s).to_vec());
-            assert_eq!(TripleSource::ps_by_o(&cluster, s), base.ps_by_o(s).to_vec());
+            assert_eq!(cluster.try_po_by_s(s).unwrap(), base.po_by_s(s).to_vec());
+            assert_eq!(cluster.try_ps_by_o(s).unwrap(), base.ps_by_o(s).to_vec());
         }
 
         // A multi-pattern BGP evaluated by the same engine yields identical rows.
@@ -5149,8 +5852,8 @@ mod replicated_shard_tests {
 
         // The shard still commits a new write on the survivors, and serves reads.
         assert_eq!(cluster.insert(t(4, 5, 6)), Some(true));
-        assert_eq!(cluster.group(0).triple_count(), 2, "quorum committed the write");
-        assert!(TripleSource::exists(&cluster, 4, 5, 6));
+        assert_eq!(cluster.group(0).triple_count().unwrap(), 2, "quorum committed the write");
+        assert!(cluster.try_exists(4, 5, 6).unwrap());
         assert_eq!(cluster.group(0).leader(), Some(leader), "leader retained");
 
         // A 3rd failure drops below majority: the leader appends but cannot
@@ -5161,7 +5864,7 @@ mod replicated_shard_tests {
         let after = cluster.group(0).state(leader).commit_index();
         assert_eq!(before, after, "no quorum => nothing new commits");
         assert!(
-            !TripleSource::exists(&cluster, 7, 8, 9),
+            !cluster.try_exists(7, 8, 9).unwrap(),
             "an uncommitted write is never applied"
         );
     }
@@ -5381,18 +6084,59 @@ mod replicated_shard_tests {
         }
 
         assert_eq!(
-            TripleSource::triple_count(&cluster),
+            cluster.try_triple_count().unwrap(),
             base.triple_count(),
             "no data lost when a replica per bucket fails"
         );
         assert_eq!(
-            TripleSource::iter_all(&cluster),
+            cluster.try_iter_all().unwrap(),
             base.iter_all().collect::<Vec<_>>(),
         );
         assert_eq!(
             select_rows(cluster.query(&d, BGP).unwrap()),
             base_select(&d, &base, BGP),
         );
+    }
+
+    /// Regression: a bucket with *every* replica down used to be skipped by the
+    /// scatter-gather, so its triples silently vanished from query answers. The
+    /// read must fail instead, and recover as soon as one replica is back.
+    #[test]
+    fn query_errors_when_every_replica_of_a_bucket_is_down() {
+        let (d, triples) = fixture();
+        let base = single(&triples);
+        let expected = base_select(&d, &base, BGP);
+
+        let mut cluster = ShardedRaftCluster::new(4, 3, RaftConfig::default());
+        cluster.bootstrap();
+        cluster.insert_all(triples.iter().copied());
+        assert_eq!(select_rows(cluster.query(&d, BGP).unwrap()), expected);
+
+        // Pick a bucket that holds data, then fail all of its replicas.
+        let g = (0..cluster.num_shards())
+            .find(|&g| cluster.group(g).triple_count().unwrap() > 0)
+            .unwrap();
+        let replicas = cluster.group(g).replicas().to_vec();
+        for &r in &replicas {
+            cluster.set_replica_down(g, r, true);
+        }
+
+        let err = cluster
+            .query(&d, BGP)
+            .expect_err("an unavailable bucket must fail the query");
+        assert!(
+            err.to_string().contains(&format!("shard bucket {g}")),
+            "error should name the unavailable bucket: {err}"
+        );
+        assert!(cluster.try_triple_count().is_err());
+        assert!(cluster.try_iter_all().is_err());
+        assert!(cluster.group(g).triple_count().is_err(), "not a misleading 0");
+
+        // One replica back (a committed-prefix follower read) restores the
+        // complete answer.
+        cluster.set_replica_down(g, replicas[0], false);
+        assert_eq!(select_rows(cluster.query(&d, BGP).unwrap()), expected);
+        assert_eq!(cluster.try_triple_count().unwrap(), base.triple_count());
     }
 
     /// A committed delete replicates across a bucket's replica group.
