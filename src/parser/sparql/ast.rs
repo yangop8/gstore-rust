@@ -406,6 +406,442 @@ pub enum Expr {
         /// Separator for `GROUP_CONCAT`.
         sep: Option<String>,
     },
+    /// An upstream gStore advanced graph function (`builtInCall` alternatives
+    /// such as `shortestPath(?x, <b>, true, {<p>})`). `args` follows the
+    /// grammar alternative's positional shape exactly — one [`GArg`] per
+    /// grammar slot in source order (see [`GFnName::params`]); an optional
+    /// slot that was omitted contributes no entry.
+    ///
+    /// Upstream accepts every one of them as the whole expression of a SELECT
+    /// projection `(f(…) AS ?v)`; only [`GFnName::filter_callable`] ones may
+    /// also appear nested inside an expression (FILTER, HAVING, BIND, …).
+    GraphFn {
+        func: GFnName,
+        args: Vec<GArg>,
+    },
+    /// An upstream `PFN.name({…})` personalised-function call (also accepted
+    /// without the dot, `PFN name({…})`, as the upstream grammar spells it).
+    /// `json` is the `jsonVars` argument exactly as upstream hands it to the
+    /// function: the raw lexemes of its tokens concatenated without the
+    /// whitespace between them, e.g. `{"k":["<a>","<b>"]}`.
+    Pfn {
+        name: String,
+        json: String,
+    },
+    /// A function call through an IRI, `<iri>(args…)` or `pfx:name(args…)`
+    /// (SPARQL `iriOrFunction`). `iri` is fully expanded. Calls into the
+    /// predeclared `rs:` namespace (`urn:gstore-rust:fn:`) name the legacy
+    /// gstore-rust graph built-ins, e.g. `rs:SSSP(<a>, <b>)`.
+    IriCall {
+        iri: String,
+        args: Vec<Expr>,
+    },
+}
+
+/// A `varOrIri` argument of an advanced graph function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VarOrIri {
+    /// A query variable (name without the `?`/`$` sigil).
+    Var(String),
+    /// A fully expanded IRI (prefixes and BASE resolved, no angle brackets).
+    Iri(String),
+}
+
+/// The value of a named advanced-function argument (`alpha=`, `maxIter=`,
+/// `tol=`, `increase=`). The variant follows the grammar slot, not how the
+/// literal was spelled: `maxIter` is a `num_integer` ([`GNum::Int`]); `alpha`,
+/// `tol` and `increase` are `numericLiteral`s ([`GNum::Num`], so `alpha=1`
+/// gives `Num(1.0)`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GNum {
+    Int(i64),
+    Num(f64),
+}
+
+/// One argument of an [`Expr::GraphFn`], in grammar-slot order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GArg {
+    /// `varOrIri`.
+    Node(VarOrIri),
+    /// `booleanLiteral` (the `directed` flag).
+    Bool(bool),
+    /// `integerLiteral` (signed: `k`, `retNum`, `hopCnt`, …) or `num_integer`
+    /// (unsigned: `maximumKplex`'s `k`, `coreTruss`'s two parameters).
+    Int(i64),
+    /// `numericLiteral` (`confidenceDegree`'s six weights), always as `f64`.
+    Num(f64),
+    /// `predSet`: `{}` (no restriction), `{<p>, …}` (allowed predicates) and
+    /// `!<p>` negations (excluded predicates), as expanded IRIs in source
+    /// order. Upstream semantics of the combination are the evaluator's job.
+    PredSet {
+        include: Vec<String>,
+        exclude: Vec<String>,
+    },
+    /// `KEYWORD '=' value`; `key` is the canonical upstream spelling
+    /// (`alpha`, `maxIter`, `tol`, `increase`) whatever case the query used.
+    Named { key: String, value: GNum },
+}
+
+/// One grammar slot of an advanced graph function's argument list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GSlot {
+    /// `varOrIri` → [`GArg::Node`].
+    Node,
+    /// `booleanLiteral` → [`GArg::Bool`].
+    Bool,
+    /// `integerLiteral` (optionally signed) → [`GArg::Int`].
+    Int,
+    /// `num_integer` (unsigned) → [`GArg::Int`].
+    UInt,
+    /// `numericLiteral` → [`GArg::Num`].
+    Num,
+    /// `predSet` → [`GArg::PredSet`].
+    PredSet,
+    /// `KEYWORD '=' numericLiteral` → [`GArg::Named`] with [`GNum::Num`].
+    NamedNum(&'static str),
+    /// `KEYWORD '=' num_integer` → [`GArg::Named`] with [`GNum::Int`].
+    NamedUInt(&'static str),
+}
+
+impl GSlot {
+    /// The grammar's name for the slot, for signatures and error messages.
+    pub fn describe(self) -> String {
+        match self {
+            GSlot::Node => "varOrIri".into(),
+            GSlot::Bool => "booleanLiteral".into(),
+            GSlot::Int => "integerLiteral".into(),
+            GSlot::UInt => "num_integer".into(),
+            GSlot::Num => "numericLiteral".into(),
+            GSlot::PredSet => "predSet".into(),
+            GSlot::NamedNum(k) => format!("{k}=numericLiteral"),
+            GSlot::NamedUInt(k) => format!("{k}=num_integer"),
+        }
+    }
+}
+
+/// A grammar slot plus whether it may be omitted (`( … )?` in the grammar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GParam {
+    pub slot: GSlot,
+    pub optional: bool,
+}
+
+const fn req(slot: GSlot) -> GParam {
+    GParam {
+        slot,
+        optional: false,
+    }
+}
+
+const fn opt(slot: GSlot) -> GParam {
+    GParam {
+        slot,
+        optional: true,
+    }
+}
+
+use GSlot::{Bool as SB, Int as SI, Node as SN, Num as SNum, PredSet as SP, UInt as SU};
+
+const P_UV_DIR_PRED: &[GParam] = &[req(SN), req(SN), req(SB), req(SP)];
+const P_UV_DIR_K_PRED: &[GParam] = &[req(SN), req(SN), req(SB), req(SI), req(SP)];
+const P_UV_DIR_K_PRED_RET: &[GParam] = &[req(SN), req(SN), req(SB), req(SI), req(SP), opt(SI)];
+const P_U_DIR_PRED: &[GParam] = &[req(SN), req(SB), req(SP)];
+const P_U_DIR_K_PRED: &[GParam] = &[req(SN), req(SB), req(SI), req(SP)];
+const P_U_DIR_K_PRED_RET: &[GParam] = &[req(SN), req(SB), req(SI), req(SP), opt(SI)];
+const P_DIR_PRED: &[GParam] = &[req(SB), req(SP)];
+const P_PRED: &[GParam] = &[req(SP)];
+const P_PPR: &[GParam] = &[req(SN), req(SI), req(SP), req(SI)];
+const P_PR: &[GParam] = &[
+    req(SB),
+    req(SP),
+    req(SI),
+    req(GSlot::NamedNum("alpha")),
+    req(GSlot::NamedUInt("maxIter")),
+    req(GSlot::NamedNum("tol")),
+];
+const P_LABELPROP: &[GParam] = &[req(SB), req(SP), req(GSlot::NamedUInt("maxIter"))];
+const P_CLUSTERCOEFF: &[GParam] = &[opt(SN), req(SB), req(SP)];
+const P_MAXIMUMKPLEX: &[GParam] = &[req(SP), opt(SU)];
+const P_CORETRUSS: &[GParam] = &[req(SP), req(SU), req(SU)];
+const P_LOUVAIN: &[GParam] = &[
+    req(SB),
+    req(SP),
+    req(GSlot::NamedUInt("maxIter")),
+    req(GSlot::NamedNum("increase")),
+];
+const P_CONFIDENCEDEGREE: &[GParam] = &[
+    req(SNum),
+    req(SNum),
+    req(SNum),
+    req(SNum),
+    req(SNum),
+    req(SNum),
+];
+const P_JACCARD: &[GParam] = &[req(SN), req(SP), req(SI), req(SI)];
+const P_DEGREECORRELATION: &[GParam] = &[req(SN), req(SI), req(SP)];
+
+/// An upstream gStore 1.4 advanced graph function: every path/analytics
+/// alternative of the `builtInCall` grammar rule (`SPARQL.g4`) except
+/// `K_PFN`, which is [`Expr::Pfn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GFnName {
+    SimpleCyclePath,
+    SimpleCycleBoolean,
+    CyclePath,
+    CycleBoolean,
+    ShortestPath,
+    ShortestPathLen,
+    KHopReachable,
+    KHopEnumerate,
+    KHopReachablePath,
+    Ppr,
+    TriangleCounting,
+    ClosenessCentrality,
+    BfsCount,
+    Pr,
+    Sssp,
+    SsspLen,
+    LabelProp,
+    Wcc,
+    ClusterCoeff,
+    MaximumKplex,
+    CoreTruss,
+    KHopCount,
+    KHopNeighbor,
+    ShortestPathCount,
+    Louvain,
+    ConfidenceDegree,
+    DiameterEstimation,
+    BetweennessCentrality,
+    JaccardSimilarity,
+    DegreeCorrelation,
+    ShortestPaths,
+    KHopAllNeighbors,
+}
+
+impl GFnName {
+    /// Every advanced function, in grammar order.
+    pub const ALL: [GFnName; 32] = [
+        GFnName::SimpleCyclePath,
+        GFnName::SimpleCycleBoolean,
+        GFnName::CyclePath,
+        GFnName::CycleBoolean,
+        GFnName::ShortestPath,
+        GFnName::ShortestPathLen,
+        GFnName::KHopReachable,
+        GFnName::KHopEnumerate,
+        GFnName::KHopReachablePath,
+        GFnName::Ppr,
+        GFnName::TriangleCounting,
+        GFnName::ClosenessCentrality,
+        GFnName::BfsCount,
+        GFnName::Pr,
+        GFnName::Sssp,
+        GFnName::SsspLen,
+        GFnName::LabelProp,
+        GFnName::Wcc,
+        GFnName::ClusterCoeff,
+        GFnName::MaximumKplex,
+        GFnName::CoreTruss,
+        GFnName::KHopCount,
+        GFnName::KHopNeighbor,
+        GFnName::ShortestPathCount,
+        GFnName::Louvain,
+        GFnName::ConfidenceDegree,
+        GFnName::DiameterEstimation,
+        GFnName::BetweennessCentrality,
+        GFnName::JaccardSimilarity,
+        GFnName::DegreeCorrelation,
+        GFnName::ShortestPaths,
+        GFnName::KHopAllNeighbors,
+    ];
+
+    /// The upstream lexer keyword (upper case; matched case-insensitively).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            GFnName::SimpleCyclePath => "SIMPLECYCLEPATH",
+            GFnName::SimpleCycleBoolean => "SIMPLECYCLEBOOLEAN",
+            GFnName::CyclePath => "CYCLEPATH",
+            GFnName::CycleBoolean => "CYCLEBOOLEAN",
+            GFnName::ShortestPath => "SHORTESTPATH",
+            GFnName::ShortestPathLen => "SHORTESTPATHLEN",
+            GFnName::KHopReachable => "KHOPREACHABLE",
+            GFnName::KHopEnumerate => "KHOPENUMERATE",
+            GFnName::KHopReachablePath => "KHOPREACHABLEPATH",
+            GFnName::Ppr => "PPR",
+            GFnName::TriangleCounting => "TRIANGLECOUNTING",
+            GFnName::ClosenessCentrality => "CLOSENESSCENTRALITY",
+            GFnName::BfsCount => "BFSCOUNT",
+            GFnName::Pr => "PR",
+            GFnName::Sssp => "SSSP",
+            GFnName::SsspLen => "SSSPLEN",
+            GFnName::LabelProp => "LABELPROP",
+            GFnName::Wcc => "WCC",
+            GFnName::ClusterCoeff => "CLUSTERCOEFF",
+            GFnName::MaximumKplex => "MAXIMUMKPLEX",
+            GFnName::CoreTruss => "CORETRUSS",
+            GFnName::KHopCount => "KHOPCOUNT",
+            GFnName::KHopNeighbor => "KHOPNEIGHBOR",
+            GFnName::ShortestPathCount => "SHORTESTPATHCOUNT",
+            GFnName::Louvain => "LOUVAIN",
+            GFnName::ConfidenceDegree => "CONFIDENCEDEGREE",
+            GFnName::DiameterEstimation => "DIAMETERESTIMATION",
+            GFnName::BetweennessCentrality => "BETWEENNESSCENTRALITY",
+            GFnName::JaccardSimilarity => "JACCARDSIMILARITY",
+            GFnName::DegreeCorrelation => "DEGREECORRELATION",
+            GFnName::ShortestPaths => "SHORTESTPATHS",
+            GFnName::KHopAllNeighbors => "KHOPALLNEIGHBORS",
+        }
+    }
+
+    /// The function's name as upstream documents it (`SPARQL_QUERY.md`), for
+    /// messages and signatures.
+    pub fn name(self) -> &'static str {
+        match self {
+            GFnName::SimpleCyclePath => "simpleCyclePath",
+            GFnName::SimpleCycleBoolean => "simpleCycleBoolean",
+            GFnName::CyclePath => "cyclePath",
+            GFnName::CycleBoolean => "cycleBoolean",
+            GFnName::ShortestPath => "shortestPath",
+            GFnName::ShortestPathLen => "shortestPathLen",
+            GFnName::KHopReachable => "kHopReachable",
+            GFnName::KHopEnumerate => "kHopEnumerate",
+            GFnName::KHopReachablePath => "kHopReachablePath",
+            GFnName::Ppr => "PPR",
+            GFnName::TriangleCounting => "triangleCounting",
+            GFnName::ClosenessCentrality => "closenessCentrality",
+            GFnName::BfsCount => "bfsCount",
+            GFnName::Pr => "PR",
+            GFnName::Sssp => "SSSP",
+            GFnName::SsspLen => "SSSPLen",
+            GFnName::LabelProp => "labelProp",
+            GFnName::Wcc => "WCC",
+            GFnName::ClusterCoeff => "clusterCoeff",
+            GFnName::MaximumKplex => "maximumKplex",
+            GFnName::CoreTruss => "coreTruss",
+            GFnName::KHopCount => "kHopCount",
+            GFnName::KHopNeighbor => "kHopNeighbor",
+            GFnName::ShortestPathCount => "shortestPathCount",
+            GFnName::Louvain => "louvain",
+            GFnName::ConfidenceDegree => "confidenceDegree",
+            GFnName::DiameterEstimation => "diameterEstimation",
+            GFnName::BetweennessCentrality => "betweennessCentrality",
+            GFnName::JaccardSimilarity => "JaccardSimilarity",
+            GFnName::DegreeCorrelation => "degreeCorrelation",
+            GFnName::ShortestPaths => "shortestPaths",
+            GFnName::KHopAllNeighbors => "kHopAllNeighbors",
+        }
+    }
+
+    /// The function whose keyword is `word` (any case), if any.
+    pub fn from_keyword(word: &str) -> Option<GFnName> {
+        GFnName::ALL
+            .iter()
+            .copied()
+            .find(|f| f.keyword().eq_ignore_ascii_case(word))
+    }
+
+    /// The argument shape of the grammar alternative, slot by slot:
+    ///
+    /// | function | shape |
+    /// |---|---|
+    /// | simpleCyclePath, simpleCycleBoolean, cyclePath, cycleBoolean, shortestPath, shortestPathLen, shortestPathCount, shortestPaths | `(u, v, directed, predSet)` |
+    /// | kHopReachable, kHopReachablePath | `(u, v, directed, k, predSet)` |
+    /// | kHopEnumerate | `(u, v, directed, k, predSet [, retNum])` |
+    /// | PPR | `(u, hopCnt, predSet, retNum)` |
+    /// | triangleCounting, labelProp¹, louvain¹ | `(directed, predSet …)` |
+    /// | closenessCentrality, bfsCount, SSSP, SSSPLen, betweennessCentrality | `(u, directed, predSet)` |
+    /// | PR | `(directed, predSet, retNum, alpha=num, maxIter=int, tol=num)` |
+    /// | WCC, diameterEstimation | `(predSet)` |
+    /// | clusterCoeff | `([u,] directed, predSet)` |
+    /// | maximumKplex | `(predSet [, k])` (`k` unsigned) |
+    /// | coreTruss | `(predSet, int, int)` (unsigned) |
+    /// | kHopCount | `(u, directed, k, predSet)` |
+    /// | kHopNeighbor, kHopAllNeighbors | `(u, directed, k, predSet [, retNum])` |
+    /// | confidenceDegree | six `numericLiteral`s |
+    /// | JaccardSimilarity | `(u, predSet, k, retNum)` |
+    /// | degreeCorrelation | `(u, k, predSet)` |
+    ///
+    /// ¹ `labelProp(directed, predSet, maxIter=int)`,
+    /// `louvain(directed, predSet, maxIter=int, increase=num)`.
+    ///
+    /// The grammar is authoritative where the upstream docs differ (the docs
+    /// omit PR's `retNum` and spell `PR`/`labelProp`/`louvain`'s trailing
+    /// parameters positionally; the grammar requires the `key=` forms).
+    pub fn params(self) -> &'static [GParam] {
+        use GFnName as F;
+        match self {
+            F::SimpleCyclePath
+            | F::SimpleCycleBoolean
+            | F::CyclePath
+            | F::CycleBoolean
+            | F::ShortestPath
+            | F::ShortestPathLen
+            | F::ShortestPathCount
+            | F::ShortestPaths => P_UV_DIR_PRED,
+            F::KHopReachable | F::KHopReachablePath => P_UV_DIR_K_PRED,
+            F::KHopEnumerate => P_UV_DIR_K_PRED_RET,
+            F::Ppr => P_PPR,
+            F::TriangleCounting => P_DIR_PRED,
+            F::ClosenessCentrality
+            | F::BfsCount
+            | F::Sssp
+            | F::SsspLen
+            | F::BetweennessCentrality => P_U_DIR_PRED,
+            F::Pr => P_PR,
+            F::LabelProp => P_LABELPROP,
+            F::Wcc | F::DiameterEstimation => P_PRED,
+            F::ClusterCoeff => P_CLUSTERCOEFF,
+            F::MaximumKplex => P_MAXIMUMKPLEX,
+            F::CoreTruss => P_CORETRUSS,
+            F::KHopCount => P_U_DIR_K_PRED,
+            F::KHopNeighbor | F::KHopAllNeighbors => P_U_DIR_K_PRED_RET,
+            F::Louvain => P_LOUVAIN,
+            F::ConfidenceDegree => P_CONFIDENCEDEGREE,
+            F::JaccardSimilarity => P_JACCARD,
+            F::DegreeCorrelation => P_DEGREECORRELATION,
+        }
+    }
+
+    /// The grammar signature, e.g.
+    /// `kHopEnumerate(varOrIri, varOrIri, booleanLiteral, integerLiteral, predSet [, integerLiteral])`.
+    pub fn signature(self) -> String {
+        let mut s = format!("{}(", self.name());
+        for (i, p) in self.params().iter().enumerate() {
+            let slot = p.slot.describe();
+            match (p.optional, i) {
+                // A leading optional slot carries its own trailing comma.
+                (true, 0) => s.push_str(&format!("[{slot}, ] ")),
+                (true, _) => s.push_str(&format!(" [, {slot}]")),
+                (false, 0) => s.push_str(&slot),
+                (false, _) if self.params()[i - 1].optional && i == 1 => s.push_str(&slot),
+                (false, _) => s.push_str(&format!(", {slot}")),
+            }
+        }
+        s.push(')');
+        s
+    }
+
+    /// Whether upstream also accepts the call nested inside an expression
+    /// (its FILTER/HAVING/BIND comp-tree builder, `QueryParser.cpp`
+    /// `buildCompTree`): only `simpleCycleBoolean`, `cycleBoolean`,
+    /// `shortestPathLen` and `kHopReachable`. All others are accepted only as
+    /// the whole expression of a SELECT projection `(f(…) AS ?v)`.
+    pub fn filter_callable(self) -> bool {
+        matches!(
+            self,
+            GFnName::SimpleCycleBoolean
+                | GFnName::CycleBoolean
+                | GFnName::ShortestPathLen
+                | GFnName::KHopReachable
+        )
+    }
+}
+
+impl std::fmt::Display for GFnName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Aggregate functions (SPARQL 1.1).
