@@ -2217,8 +2217,13 @@ impl RaftState {
         }
 
         let new_match = prev_log_index + entries.len() as u64;
-        if leader_commit > self.commit_index {
-            self.commit_index = leader_commit.min(self.last_log_index());
+        // Raft's receiver rule: commit up to min(leaderCommit, index of the last
+        // entry *this message* verified). Clamping to our own last index instead
+        // would also commit any unverified suffix we still hold beyond the
+        // message (e.g. stale entries from a deposed leader).
+        let verified_commit = leader_commit.min(new_match);
+        if verified_commit > self.commit_index {
+            self.commit_index = verified_commit;
         }
         RaftReply::Append {
             term: self.current_term,
@@ -2300,8 +2305,12 @@ impl RaftState {
                     return Vec::new();
                 }
                 if success {
-                    self.match_index.insert(from, match_index);
-                    self.next_index.insert(from, match_index + 1);
+                    // Within one term a follower's agreed prefix only grows, so
+                    // a late reply to an older AppendEntries must not move
+                    // `match_index` (and with it the commit count) backwards.
+                    let matched = self.match_index.get(&from).copied().unwrap_or(0).max(match_index);
+                    self.match_index.insert(from, matched);
+                    self.next_index.insert(from, matched + 1);
                     let advanced = self.advance_commit();
                     let next = *self.next_index.get(&from).unwrap_or(&0);
                     if next <= self.last_log_index() {
@@ -2472,6 +2481,19 @@ impl RaftState {
         self.snapshot = triples;
     }
 
+    /// The fate of the entry this node appended at `index` during `term`:
+    /// `Some(true)` once it is committed, `Some(false)` once a *different* entry
+    /// is committed at that index (it was overwritten after a leadership
+    /// change), `None` while undecided. An `(index, term)` pair names a unique
+    /// entry (log matching), so comparing terms is exact; an index already folded
+    /// into a snapshot (other than the base itself) is reported undecided.
+    fn entry_outcome(&self, index: u64, term: u64) -> Option<bool> {
+        if index == 0 || self.commit_index < index || index < self.base_index {
+            return None;
+        }
+        Some(self.term_at(index) == term)
+    }
+
     /// Handle revival after a crash: step down from any (now stale) leadership
     /// and reset the election timer.
     ///
@@ -2495,6 +2517,12 @@ impl RaftState {
 pub enum ProposeError {
     /// This node is not the leader; the believed leader (if known) is enclosed.
     NotLeader(Option<NodeId>),
+    /// The leader appended the write but could not confirm it **committed** in
+    /// time (no quorum reachable, or leadership changed underneath it). The
+    /// outcome is unknown — it may still commit under a later leader — so the
+    /// client should retry (every [`LogOp`] is idempotent when re-applied). The
+    /// currently believed leader (if known) is enclosed.
+    NotCommitted(Option<NodeId>),
 }
 
 impl std::fmt::Display for ProposeError {
@@ -2502,6 +2530,14 @@ impl std::fmt::Display for ProposeError {
         match self {
             ProposeError::NotLeader(Some(l)) => write!(f, "not leader; try node {l}"),
             ProposeError::NotLeader(None) => write!(f, "not leader; leader unknown"),
+            ProposeError::NotCommitted(Some(l)) => write!(
+                f,
+                "write not confirmed committed (outcome unknown, retry); leader is node {l}"
+            ),
+            ProposeError::NotCommitted(None) => write!(
+                f,
+                "write not confirmed committed (outcome unknown, retry); leader unknown"
+            ),
         }
     }
 }
@@ -2537,6 +2573,9 @@ pub struct ClusterNode {
     shutdown: Arc<AtomicBool>,
     tick_interval: Duration,
     io_timeout: Duration,
+    /// How long a [`Request::ClientWrite`] waits for its entry to commit before
+    /// answering "not confirmed".
+    commit_timeout: Mutex<Duration>,
 }
 
 impl ClusterNode {
@@ -2546,6 +2585,11 @@ impl ClusterNode {
     /// are the documented generalization), so this value only sizes the agreed
     /// shard→owner map that a [`ShardCluster`] data plane would consume.
     pub const DEFAULT_SHARDS: usize = 16;
+
+    /// Default bound on how long a [`Request::ClientWrite`] waits for its entry
+    /// to commit (see [`ClusterNode::set_commit_timeout`]). Clients should use a
+    /// longer read timeout than this.
+    pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Bind node `id` with cluster peers `peer_ids` (their addresses are set
     /// later via [`ClusterNode::set_peer_addr`]) and a starting `store`.
@@ -2572,7 +2616,19 @@ impl ClusterNode {
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_interval,
             io_timeout: Duration::from_millis(300),
+            commit_timeout: Mutex::new(Self::DEFAULT_COMMIT_TIMEOUT),
         }))
+    }
+
+    /// Bound how long a [`Request::ClientWrite`] served by this node waits for
+    /// its entry to commit before replying `ok: false` (outcome unknown).
+    pub fn set_commit_timeout(&self, timeout: Duration) {
+        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    /// The current [`Request::ClientWrite`] commit-wait bound.
+    pub fn commit_timeout(&self) -> Duration {
+        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Register a peer's resolved address (call once per peer before
@@ -2629,18 +2685,66 @@ impl ClusterNode {
     /// Submit a mutation to this node. Succeeds (with the assigned log index)
     /// only on the leader; otherwise returns [`ProposeError::NotLeader`] with a
     /// redirect hint. On success the entry is replicated immediately.
+    ///
+    /// `Ok` means **appended to the leader's log**, not committed: if the leader
+    /// loses its quorum or its leadership before a majority stores the entry,
+    /// a later leader may discard it. Use [`ClusterNode::propose_and_wait`] when
+    /// the caller needs to know the write is durable cluster-wide.
     pub fn propose(&self, op: LogOp) -> std::result::Result<u64, ProposeError> {
-        let idx = {
+        self.submit(op).map(|(idx, _term)| idx)
+    }
+
+    /// Submit a mutation and wait up to `timeout` until it is **committed** by a
+    /// quorum and applied to this node's store; returns its log index.
+    ///
+    /// Fails with [`ProposeError::NotLeader`] if this node is not the leader, or
+    /// [`ProposeError::NotCommitted`] if commitment is not confirmed in time — the
+    /// leader could not reach a quorum, or a different entry was committed at
+    /// that index after a leadership change. Retrying is safe: every [`LogOp`]
+    /// is idempotent when re-applied (set-semantics triples, membership changes).
+    pub fn propose_and_wait(
+        &self,
+        op: LogOp,
+        timeout: Duration,
+    ) -> std::result::Result<u64, ProposeError> {
+        let (idx, term) = self.submit(op)?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                // Under the apply lock, so "applied" really means "in the store":
+                // a concurrent drain that has already advanced `last_applied`
+                // finishes writing the store before we can get the lock.
+                let _apply = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.apply_actions_locked();
+                let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match st.entry_outcome(idx, term) {
+                    Some(true) if st.last_applied() >= idx => return Ok(idx),
+                    Some(false) => return Err(ProposeError::NotCommitted(st.leader_id())),
+                    _ => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ProposeError::NotCommitted(st.leader_id()));
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Append `op` to the leader's log and push it to the followers at once.
+    /// Returns the entry's `(index, term)`, which identify it uniquely (Raft's
+    /// log-matching property).
+    fn submit(&self, op: LogOp) -> std::result::Result<(u64, u64), ProposeError> {
+        let (idx, term) = {
             let mut st = self.state.lock().unwrap();
             match st.propose(op) {
-                Some(i) => i,
+                Some(i) => (i, st.current_term()),
                 None => return Err(ProposeError::NotLeader(st.leader_id())),
             }
         };
         let outs = { self.state.lock().unwrap().replicate_now() };
         self.dispatch_outgoing(outs);
         self.apply_actions();
-        Ok(idx)
+        Ok((idx, term))
     }
 
     /// Simulate a crash: stop ticking, refuse to serve, and drop cached
@@ -2809,18 +2913,25 @@ impl ClusterNode {
         }
     }
 
+    /// Serve a client write: acknowledge `ok: true` only once the entry is
+    /// **committed** and applied here. (Acknowledging on append alone would tell
+    /// the client a write succeeded that a leadership change could still
+    /// discard.) A non-leader, or a leader that cannot confirm the commit within
+    /// the commit timeout, answers `ok: false` with its best leader hint.
     fn client_write_response(&self, op: LogOp) -> Response {
-        match self.propose(op) {
+        match self.propose_and_wait(op, self.commit_timeout()) {
             Ok(index) => Response::WriteAck {
                 ok: true,
                 leader_hint: self.id as i64,
                 index,
             },
-            Err(ProposeError::NotLeader(hint)) => Response::WriteAck {
-                ok: false,
-                leader_hint: hint.map(|h| h as i64).unwrap_or(-1),
-                index: 0,
-            },
+            Err(ProposeError::NotLeader(hint) | ProposeError::NotCommitted(hint)) => {
+                Response::WriteAck {
+                    ok: false,
+                    leader_hint: hint.map(|h| h as i64).unwrap_or(-1),
+                    index: 0,
+                }
+            }
         }
     }
 
@@ -2899,6 +3010,11 @@ impl ClusterNode {
         // blocks here rather than draining a later prefix and racing us to the
         // store — which would apply committed entries out of order.
         let _apply = self.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_actions_locked();
+    }
+
+    /// Drain and apply committed entries; the caller must hold `apply_lock`.
+    fn apply_actions_locked(&self) {
         let actions = { self.state.lock().unwrap().drain_apply() };
         if actions.is_empty() {
             return;
@@ -4574,14 +4690,67 @@ mod raft_tests {
         assert_eq!(sim.node(0).commit_index(), 5);
     }
 
-    // ----- Networked end-to-end (real TCP, background threads) ---------------
+    /// Regression (Raft receiver rule): a follower may only commit entries the
+    /// AppendEntries it is processing has *verified* against the leader. Clamping
+    /// `leaderCommit` to the follower's own last index instead would commit a
+    /// stale, never-verified suffix left behind by a deposed leader.
+    #[test]
+    fn follower_commits_only_entries_verified_by_the_append() {
+        let mut sim = Sim::new(3);
+        sim.elect(0);
+        // Leader 0 (term 1) appends two entries that reach node 1 but never
+        // commit (node 2 and the commit broadcast are dropped).
+        sim.nodes[0].propose(LogOp::Insert(t(1, 1, 1))).unwrap();
+        sim.nodes[0].propose(LogOp::Insert(t(2, 2, 2))).unwrap();
+        for o in sim.nodes[0].replicate_now().into_iter().filter(|o| o.to == 1) {
+            let _ = sim.nodes[1].handle(o.msg);
+        }
+        assert_eq!(sim.nodes[1].log_len(), 2, "node 1 holds the unverified suffix");
+        assert_eq!(sim.nodes[1].commit_index(), 0);
 
-    fn fast_cfg() -> RaftConfig {
+        // A newer leader's AppendEntries that only vouches for the log up to
+        // index 0 must not let node 1 commit its unverified entries 1-2, however
+        // far `leader_commit` reaches.
+        let reply = sim.nodes[1].handle(RaftMsg::AppendEntries {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 2,
+            entries: vec![],
+        });
+        assert!(matches!(reply, RaftReply::Append { success: true, .. }));
+        assert_eq!(
+            sim.nodes[1].commit_index(),
+            0,
+            "commit must be capped by the entries this append verified"
+        );
+    }
+
+    // ----- Networked end-to-end (real TCP, background threads) ---------------
+    //
+    // These run real nodes on wall-clock timers, so they are written to be
+    // robust on a loaded CI machine rather than to assume a quiet one:
+    //
+    // * timing is generous (`test_cfg`): heartbeats every 20 ms against a
+    //   250-500 ms election timeout, so a leader is not deposed just because a
+    //   thread was descheduled for a few tens of milliseconds;
+    // * nothing assumes leadership is permanent: `stable_leader` waits until the
+    //   same (leader, term) is observed twice, and every write goes through
+    //   `write_committed` / `client_write_committed`, which retry across leader
+    //   changes until the write is confirmed *committed* (writes are idempotent);
+    // * every failure message carries a per-node status dump.
+
+    /// Wall-clock deadline for any single convergence step.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Timing for the networked tests (see the section comment above).
+    fn test_cfg() -> RaftConfig {
         RaftConfig {
-            election_timeout_min: 4,
-            election_timeout_max: 9,
-            heartbeat_timeout: 1,
-            tick_interval: Duration::from_millis(12),
+            election_timeout_min: 25,
+            election_timeout_max: 50,
+            heartbeat_timeout: 2,
+            tick_interval: Duration::from_millis(10),
         }
     }
 
@@ -4611,6 +4780,28 @@ mod raft_tests {
         nodes
     }
 
+    /// One line per node — liveness, role, term, believed leader, commit index,
+    /// store size — appended to every networked assertion so a CI failure is
+    /// diagnosable from the log alone.
+    fn describe(nodes: &[Arc<ClusterNode>]) -> String {
+        nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "  node {}: alive={} role={:?} term={} leader={:?} commit={} triples={}",
+                    n.id(),
+                    n.is_alive(),
+                    n.role(),
+                    n.current_term(),
+                    n.leader_id(),
+                    n.commit_index(),
+                    n.store_triple_count()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The single alive leader, if exactly one currently claims leadership.
     fn current_leader(nodes: &[Arc<ClusterNode>]) -> Option<usize> {
         let leaders: Vec<usize> = nodes
@@ -4626,10 +4817,81 @@ mod raft_tests {
         }
     }
 
-    /// Poll `cond` until it holds or `deadline` elapses.
-    fn wait_until<F: Fn() -> bool>(deadline: Duration, cond: F) -> bool {
+    /// Wait for a *stable* leader: the same alive leader in the same term on two
+    /// observations a couple of heartbeats apart. Panics with a status dump if
+    /// none emerges by [`DEADLINE`].
+    fn stable_leader(nodes: &[Arc<ClusterNode>]) -> usize {
         let start = Instant::now();
-        while start.elapsed() < deadline {
+        let mut last: Option<(usize, u64)> = None;
+        while start.elapsed() < DEADLINE {
+            let now = current_leader(nodes).map(|l| (l, nodes[l].current_term()));
+            if let Some((l, _)) = now {
+                if now == last {
+                    return l;
+                }
+            }
+            last = now;
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no stable leader within {DEADLINE:?}\n{}", describe(nodes));
+    }
+
+    /// Commit `op` through whichever node currently leads, retrying across
+    /// leadership changes until a leader confirms it committed (and applied it).
+    /// Returns the index of the node that confirmed it.
+    fn write_committed(nodes: &[Arc<ClusterNode>], op: LogOp) -> usize {
+        let start = Instant::now();
+        let mut last_err = None;
+        while start.elapsed() < DEADLINE {
+            let l = stable_leader(nodes);
+            match nodes[l].propose_and_wait(op, Duration::from_secs(2)) {
+                Ok(_) => return l,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!(
+            "write {op:?} not committed within {DEADLINE:?} (last error: {last_err:?})\n{}",
+            describe(nodes)
+        );
+    }
+
+    /// Open a client connection to a node, with a read timeout comfortably
+    /// above the server's commit-wait bound.
+    fn client(addr: SocketAddr) -> TcpStream {
+        let s = TcpStream::connect(addr).expect("connect to cluster node");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    }
+
+    /// Submit `op` as a wire `ClientWrite` to the current leader, retrying on a
+    /// redirect / unconfirmed ack until some node acknowledges it. Returns the
+    /// acknowledging node and the committed index.
+    fn client_write_committed(nodes: &[Arc<ClusterNode>], op: LogOp) -> (usize, u64) {
+        let start = Instant::now();
+        let mut last = None;
+        while start.elapsed() < DEADLINE {
+            let l = stable_leader(nodes);
+            let mut s = client(nodes[l].local_addr().unwrap());
+            match crate::rpc::round_trip(&mut s, &Request::ClientWrite { op }) {
+                Ok(Response::WriteAck {
+                    ok: true, index, ..
+                }) => return (l, index),
+                Ok(resp @ Response::WriteAck { ok: false, .. }) => last = Some(format!("{resp:?}")),
+                Ok(other) => panic!("expected WriteAck, got {other:?}"),
+                Err(e) => last = Some(e.to_string()),
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "ClientWrite {op:?} never acknowledged within {DEADLINE:?} (last: {last:?})\n{}",
+            describe(nodes)
+        );
+    }
+
+    /// Poll `cond` until it holds or [`DEADLINE`] elapses.
+    fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < DEADLINE {
             if cond() {
                 return true;
             }
@@ -4646,65 +4908,63 @@ mod raft_tests {
 
     #[test]
     fn networked_cluster_replicates_then_fails_over_then_recovers() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
+        let nodes = build_cluster(3, test_cfg());
 
-        // 1. A leader is elected over the wire.
-        assert!(
-            wait_until(deadline, || current_leader(&nodes).is_some()),
-            "no leader was elected"
-        );
-        let l = current_leader(&nodes).unwrap();
-
-        // 2. Replicate a few mutations; every replica converges.
+        // 1-2. A leader is elected over the wire; committed writes converge on
+        //      every replica.
         let triples = [t(1, 10, 100), t(2, 10, 200), t(3, 10, 300)];
         for &tr in &triples {
-            nodes[l].propose(LogOp::Insert(tr)).expect("leader accepts write");
+            write_committed(&nodes, LogOp::Insert(tr));
         }
         assert!(
-            wait_until(deadline, || nodes
+            wait_until(|| nodes
                 .iter()
-                .all(|n| n.store_triple_count() == triples.len() as u64)),
-            "replicas did not converge on the initial writes"
+                .all(|n| n.store_triple_count() == triples.len() as u64
+                    && triples.iter().all(|&tr| n.store_contains(tr)))),
+            "replicas did not converge on the initial writes\n{}",
+            describe(&nodes)
         );
-        for n in &nodes {
-            for &tr in &triples {
-                assert!(n.store_contains(tr));
-            }
-        }
 
-        // 3. Kill the leader; a new leader emerges and still accepts writes.
+        // 3. Kill the leader; a new leader emerges and still commits writes.
+        let l = stable_leader(&nodes);
+        let old_term = nodes[l].current_term();
         nodes[l].kill();
+        let l2 = stable_leader(&nodes); // only alive nodes can be chosen
+        assert_ne!(l2, l, "a dead node cannot lead\n{}", describe(&nodes));
         assert!(
-            wait_until(deadline, || matches!(current_leader(&nodes), Some(nl) if nl != l)),
-            "no new leader after killing the old one"
+            nodes[l2].current_term() > old_term,
+            "a failover elects in a higher term\n{}",
+            describe(&nodes)
         );
-        let l2 = current_leader(&nodes).unwrap();
-        assert_ne!(l2, l);
         let extra = t(4, 10, 400);
-        nodes[l2]
-            .propose(LogOp::Insert(extra))
-            .expect("new leader accepts write");
+        write_committed(&nodes, LogOp::Insert(extra));
         let survivors: Vec<usize> = (0..3).filter(|&i| i != l).collect();
         assert!(
-            wait_until(deadline, || survivors
-                .iter()
-                .all(|&i| nodes[i].store_contains(extra))),
-            "the post-failover write did not reach the survivors"
+            wait_until(|| survivors.iter().all(|&i| nodes[i].store_contains(extra))),
+            "the post-failover write did not reach the survivors\n{}",
+            describe(&nodes)
         );
 
-        // 4. Restart the old leader; it catches up to all four triples and is no
-        //    longer the leader.
+        // 4. Restart the old leader: it never resumes its stale leadership, and
+        //    it catches up to all four triples.
         nodes[l].revive();
-        let all: Vec<IdTriple> = triples.iter().copied().chain(std::iter::once(extra)).collect();
-        assert!(
-            wait_until(deadline, || nodes[l].store_triple_count() == 4
-                && all.iter().all(|&tr| nodes[l].store_contains(tr))),
-            "the revived old leader did not catch up"
-        );
         assert!(
             !nodes[l].is_leader(),
-            "the revived stale leader must step down"
+            "a revived node must not resume its stale leadership"
+        );
+        let all: Vec<IdTriple> = triples.iter().copied().chain(std::iter::once(extra)).collect();
+        assert!(
+            wait_until(|| nodes[l].store_triple_count() == 4
+                && all.iter().all(|&tr| nodes[l].store_contains(tr))),
+            "the revived old leader did not catch up\n{}",
+            describe(&nodes)
+        );
+        // It may legitimately win a *later* election, but never lead in the
+        // term it led before the crash.
+        assert!(
+            !nodes[l].is_leader() || nodes[l].current_term() > old_term,
+            "the revived stale leader must step down\n{}",
+            describe(&nodes)
         );
 
         shutdown_all(&nodes);
@@ -4712,48 +4972,105 @@ mod raft_tests {
 
     #[test]
     fn networked_client_write_rpc_commits_on_leader() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(wait_until(deadline, || current_leader(&nodes).is_some()));
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
-        // A ClientWrite RPC sent to the leader is appended and replicated.
-        let laddr = nodes[l].local_addr().unwrap();
+        // A ClientWrite RPC to the leader is acknowledged only once committed:
+        // the acknowledging leader has already applied it.
         let tr = t(7, 70, 700);
-        let mut s = TcpStream::connect(laddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp = crate::rpc::round_trip(&mut s, &Request::ClientWrite { op: LogOp::Insert(tr) })
-            .expect("client write round-trip");
-        match resp {
-            Response::WriteAck { ok, .. } => assert!(ok, "leader should accept the write"),
-            other => panic!("expected WriteAck, got {other:?}"),
-        }
+        let (l, index) = client_write_committed(&nodes, LogOp::Insert(tr));
+        assert!(index > 0);
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.store_contains(tr))),
-            "client-written triple did not replicate"
+            nodes[l].store_contains(tr),
+            "an acknowledged write is already applied on the leader"
+        );
+        assert!(
+            wait_until(|| nodes.iter().all(|n| n.store_contains(tr))),
+            "client-written triple did not replicate\n{}",
+            describe(&nodes)
         );
 
-        // A ClientWrite to a follower is answered (with a redirect when it is not
-        // the leader).
-        let f = (0..3).find(|&i| i != l).unwrap();
-        let faddr = nodes[f].local_addr().unwrap();
-        let mut s2 = TcpStream::connect(faddr).unwrap();
-        s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp2 = crate::rpc::round_trip(
-            &mut s2,
-            &Request::ClientWrite {
-                op: LogOp::Insert(t(8, 80, 800)),
-            },
-        )
-        .expect("follower client write round-trip");
-        match resp2 {
-            Response::WriteAck { ok, leader_hint, .. } => {
-                if !ok {
-                    assert!(leader_hint >= 0, "a redirect should name a leader");
+        // A ClientWrite to a follower that knows the leader is answered with a
+        // redirect naming a leader. (Leadership can move between choosing the
+        // follower and its answer, so retry until a clean redirect is seen.)
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "never saw a follower redirect\n{}",
+                describe(&nodes)
+            );
+            let l = stable_leader(&nodes);
+            let Some(f) = (0..3).find(|&i| i != l && nodes[i].leader_id() == Some(l as u64)) else {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let mut s = client(nodes[f].local_addr().unwrap());
+            let resp = crate::rpc::round_trip(
+                &mut s,
+                &Request::ClientWrite {
+                    op: LogOp::Insert(t(8, 80, 800)),
+                },
+            )
+            .expect("follower client write round-trip");
+            match resp {
+                Response::WriteAck {
+                    ok: false,
+                    leader_hint,
+                    ..
+                } if leader_hint >= 0 => {
+                    assert!(
+                        (0..3).contains(&leader_hint) && leader_hint != f as i64,
+                        "a redirect must name another node, got {leader_hint}"
+                    );
+                    break;
                 }
+                // The follower became leader in the meantime (and committed), or
+                // the leader was momentarily unknown: try again.
+                Response::WriteAck { .. } => thread::sleep(Duration::from_millis(20)),
+                other => panic!("expected WriteAck, got {other:?}"),
             }
-            other => panic!("expected WriteAck, got {other:?}"),
         }
+
+        shutdown_all(&nodes);
+    }
+
+    /// Regression: a `ClientWrite` used to be acknowledged `ok` as soon as the
+    /// leader *appended* it, so a leader cut off from its quorum told clients
+    /// writes had succeeded that could never commit (and that a later leader
+    /// would discard). An acknowledgement must now mean "committed".
+    #[test]
+    fn client_write_is_not_acknowledged_without_a_quorum() {
+        let nodes = build_cluster(3, test_cfg());
+        let l = stable_leader(&nodes);
+        // Isolate the leader: with both followers down no quorum exists.
+        for i in (0..3).filter(|&i| i != l) {
+            nodes[i].kill();
+        }
+        nodes[l].set_commit_timeout(Duration::from_millis(300));
+
+        let tr = t(9, 90, 900);
+        let mut s = client(nodes[l].local_addr().unwrap());
+        let resp = crate::rpc::round_trip(&mut s, &Request::ClientWrite { op: LogOp::Insert(tr) })
+            .expect("client write round-trip");
+        assert!(
+            matches!(resp, Response::WriteAck { ok: false, .. }),
+            "a write without a quorum must not be acknowledged, got {resp:?}\n{}",
+            describe(&nodes)
+        );
+        assert!(!nodes[l].store_contains(tr), "an uncommitted write is never applied");
+        assert!(
+            matches!(
+                nodes[l].propose_and_wait(LogOp::Insert(t(9, 91, 901)), Duration::from_millis(200)),
+                Err(ProposeError::NotCommitted(_) | ProposeError::NotLeader(_))
+            ),
+            "propose_and_wait must not report an unconfirmed write as committed"
+        );
+
+        // Once the quorum is back, writes commit again.
+        for i in (0..3).filter(|&i| i != l) {
+            nodes[i].revive();
+        }
+        write_committed(&nodes, LogOp::Insert(t(10, 100, 1000)));
 
         shutdown_all(&nodes);
     }
@@ -4761,57 +5078,51 @@ mod raft_tests {
     /// Task 3 (per-shard replication, minimal form): a shard backed by a Raft
     /// replication group keeps serving writes and retains its data when one
     /// **replica fails**. A 3-node group replicates the whole keyspace; killing a
-    /// follower still leaves a 2/3 quorum, so the leader commits new writes, and
-    /// the revived replica catches up. (The generalization — one such group *per
-    /// shard* — is documented as remaining in the module scope notes.)
+    /// follower still leaves a 2/3 quorum, so the group keeps a leader and
+    /// commits new writes, and the revived replica catches up. (The
+    /// generalization — one such group *per shard* — is [`ShardedRaftCluster`].)
     #[test]
     fn replicated_shard_survives_a_replica_failure() {
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(
-            wait_until(deadline, || current_leader(&nodes).is_some()),
-            "no leader elected"
-        );
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
         // A first write replicates to all three replicas of the shard.
         let a = t(1, 2, 3);
-        nodes[l].propose(LogOp::Insert(a)).expect("leader accepts write");
+        write_committed(&nodes, LogOp::Insert(a));
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.store_contains(a))),
-            "initial write did not replicate to every replica"
+            wait_until(|| nodes.iter().all(|n| n.store_contains(a))),
+            "initial write did not replicate to every replica\n{}",
+            describe(&nodes)
         );
 
         // Fail one replica (a follower, not the leader).
+        let l = stable_leader(&nodes);
         let f = (0..3).find(|&i| i != l).unwrap();
         nodes[f].kill();
-        // The leader retains leadership with the remaining 2/3 quorum.
-        assert!(
-            wait_until(deadline, || nodes[l].is_leader()),
-            "leader lost quorum after a single replica failure"
-        );
 
-        // The shard still accepts and commits a new write on the survivors.
-        let b = t(4, 5, 6);
-        nodes[l].propose(LogOp::Insert(b)).expect("survivors still commit");
+        // The remaining 2/3 quorum keeps the shard available: it holds a leader
+        // and commits a new write.
         let survivors: Vec<usize> = (0..3).filter(|&i| i != f).collect();
+        let l2 = stable_leader(&nodes);
+        assert!(survivors.contains(&l2));
+        let b = t(4, 5, 6);
+        write_committed(&nodes, LogOp::Insert(b));
         assert!(
-            wait_until(deadline, || survivors.iter().all(|&i| nodes[i].store_contains(b))),
-            "post-failure write did not reach the surviving replicas"
+            wait_until(|| survivors.iter().all(|&i| nodes[i].store_contains(b))),
+            "post-failure write did not reach the surviving replicas\n{}",
+            describe(&nodes)
         );
 
         // A surviving replica answers a read RPC over the wire (no data lost).
-        let saddr = nodes[survivors[0]].local_addr().unwrap();
-        let mut s = TcpStream::connect(saddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut s = client(nodes[survivors[0]].local_addr().unwrap());
         let resp = crate::rpc::round_trip(&mut s, &Request::TripleCount).unwrap();
         assert!(matches!(resp, Response::Count(n) if n >= 2), "read served by survivor");
 
         // The failed replica revives and catches up to both writes.
         nodes[f].revive();
         assert!(
-            wait_until(deadline, || nodes[f].store_contains(a) && nodes[f].store_contains(b)),
-            "revived replica did not catch up"
+            wait_until(|| nodes[f].store_contains(a) && nodes[f].store_contains(b)),
+            "revived replica did not catch up\n{}",
+            describe(&nodes)
         );
 
         shutdown_all(&nodes);
@@ -4824,39 +5135,24 @@ mod raft_tests {
     #[test]
     fn networked_membership_change_via_client_write_replicates() {
         use std::net::SocketAddr;
-        let nodes = build_cluster(3, fast_cfg());
-        let deadline = Duration::from_secs(20);
-        assert!(wait_until(deadline, || current_leader(&nodes).is_some()));
-        let l = current_leader(&nodes).unwrap();
+        let nodes = build_cluster(3, test_cfg());
 
-        // Submit an AddNode config-change as a wire ClientWrite to the leader.
+        // Submit an AddNode config-change as a wire ClientWrite; the ack means
+        // it is committed and applied on the acknowledging leader.
         let new_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let laddr = nodes[l].local_addr().unwrap();
-        let mut s = TcpStream::connect(laddr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let resp = crate::rpc::round_trip(
-            &mut s,
-            &Request::ClientWrite {
-                op: LogOp::AddNode { id: 42, addr: new_addr },
-            },
-        )
-        .expect("client config-change round-trip");
-        assert!(
-            matches!(resp, Response::WriteAck { ok: true, .. }),
-            "leader accepts the config-change"
-        );
+        let (l, _) = client_write_committed(&nodes, LogOp::AddNode { id: 42, addr: new_addr });
+        assert!(nodes[l].config().contains(42), "acknowledged ⇒ applied on the leader");
 
         // Every replica converges on the new membership.
         assert!(
-            wait_until(deadline, || nodes.iter().all(|n| n.config().contains(42))),
-            "membership did not replicate to every node"
+            wait_until(|| nodes.iter().all(|n| n.config().contains(42))),
+            "membership did not replicate to every node\n{}",
+            describe(&nodes)
         );
 
         // A follower serves the committed config over the wire.
         let f = (0..3).find(|&i| i != l).unwrap();
-        let faddr = nodes[f].local_addr().unwrap();
-        let mut sf = TcpStream::connect(faddr).unwrap();
-        sf.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut sf = client(nodes[f].local_addr().unwrap());
         let cfg = crate::rpc::round_trip(&mut sf, &Request::GetConfig).expect("GetConfig round-trip");
         match cfg {
             Response::Config {

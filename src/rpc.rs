@@ -479,9 +479,11 @@ pub enum Request {
         last_included_term: u64,
         triples: Vec<IdTriple>,
     },
-    /// A client submits a mutation to the cluster; the leader appends it, a
-    /// follower replies with a redirect hint. The mutation may be a data write
-    /// **or** a membership config-change ([`LogOp::AddNode`]/[`LogOp::RemoveNode`]).
+    /// A client submits a mutation to the cluster; the leader appends it and
+    /// answers once it has committed (bounded by the node's commit timeout), a
+    /// follower replies at once with a redirect hint. The mutation may be a data
+    /// write **or** a membership config-change
+    /// ([`LogOp::AddNode`]/[`LogOp::RemoveNode`]).
     ClientWrite { op: LogOp },
     /// Introspection: ask a node for its raft role / term / commit index.
     ClusterStatus,
@@ -737,9 +739,12 @@ pub enum Response {
     },
     /// Reply to [`Request::InstallSnapshot`].
     SnapshotAck { term: u64 },
-    /// Reply to [`Request::ClientWrite`]: `ok` if appended by the leader;
-    /// `leader_hint` is the known leader id (`-1` if unknown) for a redirect;
-    /// `index` is the assigned log index when `ok`.
+    /// Reply to [`Request::ClientWrite`]: `ok` only once the write is
+    /// **committed** by a quorum and applied on the answering leader; `ok:
+    /// false` means "not the leader" or "not confirmed in time" (outcome
+    /// unknown — retry, writes are idempotent). `leader_hint` is the known
+    /// leader id (`-1` if unknown) for a redirect; `index` is the committed log
+    /// index when `ok`.
     WriteAck {
         ok: bool,
         leader_hint: i64,
