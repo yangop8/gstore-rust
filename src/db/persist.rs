@@ -408,6 +408,17 @@ impl Database {
         self.save(home)
     }
 
+    /// A commit point without a full save: make every mutation applied so far
+    /// durable on a persistent layout (commit the on-disk store's dirty pages
+    /// through its WAL; fsync RocksDB's WAL) and report any persistence failure
+    /// recorded since the previous commit point. Auto-commit SPARQL UPDATEs and
+    /// [`commit`](Self::commit) already do this; call it after mutating through
+    /// the direct API ([`insert_triple`](Self::insert_triple), …). A no-op for an
+    /// in-memory database — persist that with [`save`](Self::save).
+    pub fn sync(&self) -> Result<()> {
+        self.commit_point()
+    }
+
     /// Detach this database from its on-disk storage, returning a purely
     /// in-memory database with the same content (pending write-through is
     /// committed first). Later updates and saves no longer touch the original
@@ -1002,15 +1013,16 @@ impl Database {
             for &t in added {
                 self.persist_mutation(true, None, t);
             }
-            return;
-        }
-        #[cfg(feature = "rocksdb")]
-        if dict_grew {
-            if let Some(rocks) = self.store.as_rocks() {
-                let terms = rocks_layout::terms_of(&self.dict, added);
-                let borrowed: Vec<_> = terms.iter().map(|(s, i, k)| (*s, *i, k.as_str())).collect();
-                if let Err(e) = rocks.put_terms(&borrowed) {
-                    self.note_persist_error(e);
+        } else {
+            #[cfg(feature = "rocksdb")]
+            if dict_grew {
+                if let Some(rocks) = self.store.as_rocks() {
+                    let terms = rocks_layout::terms_of(&self.dict, added);
+                    let borrowed: Vec<_> =
+                        terms.iter().map(|(s, i, k)| (*s, *i, k.as_str())).collect();
+                    if let Err(e) = rocks.put_terms(&borrowed) {
+                        self.note_persist_error(e);
+                    }
                 }
             }
         }
