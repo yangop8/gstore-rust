@@ -367,7 +367,7 @@ impl Pager {
 
         // Clear dirty flags on the pages we just committed.
         let cache = self.cache.get_mut().unwrap();
-        for (_, cp) in cache.map.iter_mut() {
+        for cp in cache.map.values_mut() {
             cp.dirty = false;
         }
         Ok(())

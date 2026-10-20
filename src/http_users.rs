@@ -360,10 +360,7 @@ impl UserStore {
 
     /// Resolve a session token to its username, pruning it if expired.
     pub fn session_user(&mut self, token: &str) -> Option<String> {
-        let expired = match self.sessions.get(token) {
-            Some(s) => s.created.elapsed() > self.ttl,
-            None => return None,
-        };
+        let expired = self.sessions.get(token)?.created.elapsed() > self.ttl;
         if expired {
             self.sessions.remove(token);
             return None;

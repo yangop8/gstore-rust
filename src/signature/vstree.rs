@@ -78,15 +78,11 @@ impl Node {
             } => {
                 nsig.union_with(&sig);
                 let ci = choose_child(children, &sig);
-                match children[ci].insert(id, sig) {
-                    None => return None,
-                    Some(new_child) => {
-                        // Keep the split-off sibling next to its origin.
-                        children.insert(ci + 1, new_child);
-                        if children.len() <= FANOUT {
-                            return None;
-                        }
-                    }
+                let new_child = children[ci].insert(id, sig)?;
+                // Keep the split-off sibling next to its origin.
+                children.insert(ci + 1, new_child);
+                if children.len() <= FANOUT {
+                    return None;
                 }
             }
         }
