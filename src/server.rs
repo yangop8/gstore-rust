@@ -1757,7 +1757,7 @@ impl Request {
 // --- response helpers --------------------------------------------------------
 
 /// Write a buffered response that closes the connection (no extra headers).
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn write_response<W: Write>(
     stream: &mut W,
     status: u16,
@@ -2819,6 +2819,396 @@ mod tests {
         assert!(resp.contains("http://ex/b"), "{resp}");
     }
 
+    // --- connection handling: keep-alive, worker pool, CORS, body cap ---------
+
+    /// Start a server with custom connection settings; returns the serving
+    /// thread too so a test can shut down and join it.
+    fn start_with(
+        opts: HttpOptions,
+    ) -> (Arc<Server>, SocketAddr, thread::JoinHandle<ShutdownReport>) {
+        let db = Database::build_from_str("conn", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_http_options(opts));
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        (server, addr, serving)
+    }
+
+    /// Read exactly one `Content-Length`-framed response from a connection
+    /// that may stay open; returns (head, body).
+    fn read_one<R: BufRead>(r: &mut R) -> (String, String) {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line);
+        }
+        let len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .map(|v| v.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body).unwrap();
+        (head, String::from_utf8(body).unwrap())
+    }
+
+    fn get_status(conn_header: &str) -> String {
+        format!("GET /status HTTP/1.1\r\nHost: x\r\n{conn_header}\r\n")
+    }
+
+    #[test]
+    fn keep_alive_serves_two_requests_on_one_connection() {
+        let (_srv, addr) = start();
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+
+        // HTTP/1.1 without `Connection: close` keeps the connection open.
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut r);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        assert!(head.contains("Keep-Alive: timeout=60, max=99"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+
+        // A second request — with a body — on the same connection.
+        let raw = format!(
+            "POST /sparql HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{SELECT_O}",
+            SELECT_O.len()
+        );
+        w.write_all(raw.as_bytes()).unwrap();
+        let (head, body) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(body.contains("http://ex/b"), "{body}");
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the server closed after `Connection: close`");
+    }
+
+    #[test]
+    fn pipelined_requests_are_answered_in_order() {
+        let (_srv, addr) = start();
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let both = format!(
+            "{}POST /update HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            get_status(""),
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }".len(),
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }"
+        );
+        w.write_all(both.as_bytes()).unwrap();
+        let (_, first) = read_one(&mut r);
+        assert!(first.contains("\"triples\":2"), "{first}");
+        let (head, second) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(second.contains("\"changed\":1"), "{second}");
+    }
+
+    #[test]
+    fn keep_alive_limits_http10_and_opt_out() {
+        let opts = HttpOptions {
+            keep_alive_max: 2,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Keep-Alive: timeout=60, max=1"), "{head}");
+        // The request limit closes the connection after the second response.
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+
+        // HTTP/1.0 closes by default and keeps alive only when asked to.
+        let resp = http(&addr, "GET /status HTTP/1.0\r\n\r\n");
+        assert!(resp.contains("Connection: close"), "{resp}");
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(b"GET /status HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+
+        // A client `Keep-Alive: max=1` hint ends it after one response.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("Keep-Alive: timeout=5, max=1\r\n").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+    }
+
+    #[test]
+    fn keep_alive_can_be_turned_off() {
+        let opts = HttpOptions {
+            keep_alive_timeout: Duration::ZERO,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let resp = http(&addr, &get_status(""));
+        assert!(resp.contains("Connection: close"), "{resp}");
+        assert!(!resp.contains("Keep-Alive"), "{resp}");
+    }
+
+    #[test]
+    fn an_idle_connection_times_out_and_never_delays_shutdown() {
+        let opts = HttpOptions {
+            keep_alive_timeout: Duration::from_millis(300),
+            ..HttpOptions::default()
+        };
+        let (server, addr, serving) = start_with(opts);
+        // Idle timeout: the server closes a quiet kept-alive connection.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        let t0 = Instant::now();
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        assert!(t0.elapsed() < Duration::from_secs(5), "closed after the idle timeout");
+
+        // An idle connection does not hold up a graceful shutdown.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let _ = read_one(&mut r);
+        let t0 = Instant::now();
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(report.drained, "{report:?}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    #[test]
+    fn the_worker_pool_bounds_concurrent_connections() {
+        let opts = HttpOptions {
+            threads: 2,
+            queue_len: 8,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // Two slow clients occupy both workers: they send half a request.
+        let mut slow: Vec<TcpStream> = (0..2)
+            .map(|_| {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n").unwrap();
+                s
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+        // The third (N+1-th) connection is accepted but must wait for a worker.
+        let mut third = TcpStream::connect(addr).unwrap();
+        third.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        third.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        let mut buf = [0u8; 64];
+        let early = third.read(&mut buf);
+        assert!(
+            matches!(&early, Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "with both workers busy the third connection is not served yet: {early:?}"
+        );
+        // Finishing one slow request frees its worker for the third connection.
+        slow[0].write_all(b"Connection: close\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        slow[0].set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        slow[0].read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut resp = String::new();
+        third.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("\"triples\":2"), "{resp}");
+        drop(slow);
+    }
+
+    #[test]
+    fn an_idle_keep_alive_connection_yields_its_worker() {
+        let opts = HttpOptions {
+            threads: 1,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // A kept-alive connection holds the only worker while idle …
+        let a = TcpStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut aw = a.try_clone().unwrap();
+        let mut ar = BufReader::new(a);
+        aw.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut ar);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        // … until another connection needs it: then it closes, far sooner
+        // than its 60 s idle timeout.
+        let t0 = Instant::now();
+        let mut b = TcpStream::connect(addr).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        b.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        let mut resp = String::new();
+        b.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let mut rest = Vec::new();
+        ar.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    #[test]
+    fn options_preflight_and_cors_headers() {
+        let (_srv, addr) = start();
+        let resp = http(
+            &addr,
+            "OPTIONS /file/upload HTTP/1.1\r\nOrigin: http://w\r\nConnection: close\r\n\r\n",
+        );
+        let (head, body) = split_resp(&resp);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
+        assert!(head.contains("Access-Control-Allow-Methods: POST"), "{head}");
+        assert_eq!(body, "ok");
+        let resp = http(
+            &addr,
+            "OPTIONS /file/download/x.nt HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.contains("Access-Control-Allow-Methods: GET"), "{resp}");
+        let resp = http(
+            &addr,
+            "OPTIONS /sparql HTTP/1.1\r\nAccess-Control-Request-Headers: X-Foo, Content-Type\r\n\
+             Connection: close\r\n\r\n",
+        );
+        assert!(resp.contains("Access-Control-Allow-Headers: X-Foo, Content-Type"), "{resp}");
+        // Ordinary responses carry the allow-origin header too.
+        let resp = http(&addr, &get_status("Connection: close\r\n"));
+        assert!(resp.contains("Access-Control-Allow-Origin: *"), "{resp}");
+
+        // With CORS off: no header, and OPTIONS reaches the router (405 here).
+        let opts = HttpOptions {
+            cors: false,
+            ..HttpOptions::default()
+        };
+        let (_srv2, addr2, _serving) = start_with(opts);
+        let resp = http(&addr2, &get_status("Connection: close\r\n"));
+        assert!(!resp.contains("Access-Control"), "{resp}");
+        let resp = http(&addr2, "OPTIONS /sparql HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
+    }
+
+    #[test]
+    fn the_body_cap_answers_413_before_reading() {
+        let opts = HttpOptions {
+            max_body: 16,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"), "{resp}");
+        // An absurd Content-Length is refused the same way.
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        // A malformed one is a plain 400.
+        let resp = http(&addr, "POST /update HTTP/1.1\r\nContent-Length: abc\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        // Within the cap, requests work.
+        let resp = http(&addr, &get_status("Connection: close\r\n"));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    }
+
+    #[test]
+    fn chunked_request_bodies_and_expect_continue() {
+        let (_srv, addr) = start();
+        let update = "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }";
+        let (a, b) = update.split_at(10);
+        let raw = format!(
+            "POST /update HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             {:x}\r\n{a}\r\n{:x};ext=1\r\n{b}\r\n0\r\nX-Trailer: t\r\n\r\n",
+            a.len(),
+            b.len()
+        );
+        let resp = http(&addr, &raw);
+        assert!(resp.contains("\"changed\":1"), "{resp}");
+
+        // `Expect: 100-continue`: the interim response comes before the body.
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(
+            format!(
+                "POST /sparql HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                SELECT_O.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        s.write_all(SELECT_O.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("http://ex/b"), "{resp}");
+    }
+
+    #[test]
+    fn request_parse_reads_raw_bytes() {
+        let raw = b"POST /x?a=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc";
+        let req = Request::parse(&mut &raw[..]).unwrap().unwrap();
+        assert_eq!((req.method.as_str(), req.path.as_str()), ("POST", "/x"));
+        assert_eq!(req.query.as_deref(), Some("a=1"));
+        assert_eq!(req.header("HOST"), Some("h"));
+        assert_eq!(req.body, b"abc");
+        assert!(Request::parse(&mut &b""[..]).unwrap().is_none());
+        let truncated = b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\nab";
+        assert!(Request::parse(&mut &truncated[..]).is_err());
+    }
+
+    #[test]
+    fn merged_params_come_from_query_json_form_or_headers() {
+        let parse = |raw: &str| Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        let json = r#"{"nested":{"username":"no","a":[1,{"b":"}"}]},"username":"r\"oöt","n":42,"t":true,"z":null}"#;
+        let req = parse(&format!(
+            "POST /shutdown?password=q HTTP/1.1\r\npassword: h\r\nencryption: 1\r\n\
+             Content-Length: {}\r\n\r\n{json}",
+            json.len()
+        ));
+        assert_eq!(req.merged_param("username").as_deref(), Some("r\"oöt"));
+        assert_eq!(req.merged_param("password").as_deref(), Some("q"), "query string first");
+        assert_eq!(req.merged_param("n").as_deref(), Some("42"));
+        assert_eq!(req.merged_param("t").as_deref(), Some("true"));
+        assert_eq!(req.merged_param("z"), None);
+        assert_eq!(req.merged_param("encryption").as_deref(), Some("1"), "header fallback");
+        let req = parse("POST /shutdown HTTP/1.1\r\nContent-Length: 15\r\n\r\nusername=a%20b&");
+        assert_eq!(req.merged_param("username").as_deref(), Some("a b"));
+        assert_eq!(json_object_field("{\"a\":", "a"), None);
+        assert_eq!(json_object_field("[1]", "a"), None);
+        assert_eq!(json_object_field("{}", "a"), None);
+        assert_eq!(json_object_field("{\"a\" : \"\\ud83d\\ude00\"}", "a").as_deref(), Some("😀"));
+    }
+
     // --- TLS (feature `tls`) -------------------------------------------------
     //
     // A self-signed EC end-entity cert (CN=localhost, SAN DNS:localhost + IP
@@ -2906,6 +3296,52 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         assert!(text.contains("200 OK"), "TLS response: {text}");
         assert!(text.contains("http://ex/b"), "TLS response: {text}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keep-alive works over TLS too: two requests on one TLS connection.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_keep_alive_serves_two_requests() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("gstore_tls_ka_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        std::fs::write(&key, KEY_PEM).unwrap();
+        let config = load_tls_config(&cert, &key).unwrap();
+        let db = Database::build_from_str("tls_ka", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        thread::spawn(move || s2.serve_forever_tls(config));
+
+        let mut roots = rustls::RootCertStore::empty();
+        let cert_der = rustls_pemfile::certs(&mut std::io::BufReader::new(CERT_PEM.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(cert_der).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client_config), name).unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut tls = BufReader::new(rustls::StreamOwned::new(conn, sock));
+        tls.get_mut().write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut tls);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+        tls.get_mut().write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+        server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
