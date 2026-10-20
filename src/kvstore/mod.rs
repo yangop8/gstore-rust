@@ -6,9 +6,11 @@
 //!
 //! Layout: [`pager::Pager`] gives fixed [`pager::PAGE_SIZE`] pages; [`bptree::BTree`]
 //! builds ordered B+ trees on them; [`store::DiskStore`] composes those into the
-//! six-way triple index (three SPO/POS/OSP orderings) plus the string↔id
-//! dictionary — enough to build, persist, reopen, and query a database entirely
-//! from disk.
+//! six-way triple index (three SPO/POS/OSP orderings), a GSPO quad index for
+//! named graphs, plus the string↔id dictionary — enough to build, persist,
+//! reopen, update, and query a database entirely from disk. The `Database`
+//! facade writes its committed updates through to this store by dictionary key
+//! (see `DiskStore::insert_keys`).
 //!
 //! Space/compaction features layered on top:
 //! * [`disk_dict::DiskDict`] backs an *out-of-core* dictionary: a disk query

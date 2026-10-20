@@ -1406,6 +1406,100 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // ---- key-level writes, named-graph quads, VS-tree staleness ------------
+
+    #[test]
+    fn key_level_writes_persist_with_their_terms() {
+        let path = tmp("keys");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap());
+            assert!(!ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap(), "dup");
+            assert!(ds.delete_keys("<root>", "<contain>", "<node0>", false).unwrap());
+            // Unknown terms and wrong id spaces are simply absent.
+            assert!(!ds.delete_keys("<ghost>", "<contain>", "<node0>", false).unwrap());
+            assert!(!ds.delete_keys("<new>", "<rel>", "\"lit\"@en", false).unwrap());
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.triple_count(), 5);
+        let (dict, mem) = ds.to_memory().unwrap();
+        let s = dict.entity_id("<new>").unwrap();
+        let p = dict.predicate_id("<rel>").unwrap();
+        let o = dict.literal_id("\"lit\"@en").unwrap();
+        assert!(mem.exists(s, p, o));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn named_graph_quads_persist_and_reload() {
+        let path = tmp("quads");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap());
+            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
+            assert!(ds.insert_quad_keys("<g2>", "<root>", "<contain>", "<node0>", false).unwrap());
+            assert!(!ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap(), "dup");
+            assert!(ds.delete_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
+            assert!(!ds.delete_quad_keys("<g9>", "<a>", "<p>", "<b>", false).unwrap());
+            ds.flush().unwrap();
+        }
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.quad_count(), 2);
+        // Quads never touch the default graph.
+        assert_eq!(ds.triple_count(), 5);
+        let (dict, _) = ds.to_memory().unwrap();
+        let named = ds.named_to_memory().unwrap();
+        assert_eq!(named.len(), 2);
+        let g1 = dict.entity_id("<g1>").unwrap();
+        let (a, p, b) = (
+            dict.entity_id("<a>").unwrap(),
+            dict.predicate_id("<p>").unwrap(),
+            dict.entity_id("<b>").unwrap(),
+        );
+        assert!(named[&g1].exists(a, p, b));
+        assert_eq!(named[&g1].triple_count(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vstree_staleness_flag_tracks_default_graph_writes() {
+        let path = tmp("stale_flag");
+        {
+            let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+            assert!(ds.vstree_stale(), "a build's inserts mark it stale");
+            ds.mark_vstree_fresh();
+            ds.flush().unwrap();
+        }
+        {
+            let mut ds = DiskStore::open(&path, 64).unwrap();
+            assert!(!ds.vstree_stale(), "fresh persists");
+            // A named-graph write does not affect the default-graph index …
+            ds.insert_quad_keys("<g>", "<a>", "<p>", "<b>", false).unwrap();
+            assert!(!ds.vstree_stale());
+            // … a default-graph delete does, and the flag is committed with it.
+            ds.delete_keys("<node1>", "<own>", "<point0>", false).unwrap();
+            assert!(ds.vstree_stale());
+            ds.flush().unwrap();
+        }
+        assert!(DiskStore::open(&path, 64).unwrap().vstree_stale());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn build_files_dispatches_on_extension() {
+        let dir = std::env::temp_dir().join("gstore_disk_formats_ut");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl = dir.join("d.ttl");
+        std::fs::write(&ttl, "@prefix ex: <http://ex/> .\nex:a ex:p ex:b , ex:c .\n").unwrap();
+        let nq = dir.join("d.nq");
+        std::fs::write(&nq, "<http://ex/d> <http://ex/p> <http://ex/e> <http://ex/g> .\n").unwrap();
+        let ds = DiskStore::build_files(dir.join("kv"), 64, &[&ttl, &nq]).unwrap();
+        assert_eq!(ds.triple_count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- out-of-core dictionary (lazy str↔id resolution) ------------------
 
     #[test]

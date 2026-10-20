@@ -40,7 +40,10 @@
 //! auto-commit SPARQL UPDATE, `commit()`, `save()`/[`checkpoint`](Database::checkpoint),
 //! and — best effort — when the database is dropped. If a write-through ever
 //! fails, the working set and the store may have diverged, so every later
-//! commit point reports the failure instead of claiming durability.
+//! commit point reports the failure instead of claiming durability. (Each pager
+//! commit is atomic; a transaction whose dirty pages overflow the page cache is
+//! committed in several such batches, so it is durable but not crash-atomic as
+//! a whole — see `DiskStore::insert_ids`.)
 //!
 //! A RocksDB database evaluates directly over RocksDB. New dictionary terms are
 //! written to the `dict` CF before the first triple that uses them, named-graph
@@ -730,7 +733,7 @@ impl Database {
         let mut rocks = RocksStore::open(&rocks_dir)?;
         // Dictionary first: a term without a triple is harmless, the reverse not.
         rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
-        rocks.bulk_load(ids);
+        crate::store::MutableStore::bulk_load(&mut rocks, ids);
         if let Some(e) = rocks.take_error() {
             return Err(GStoreError::Database(e));
         }
@@ -817,11 +820,12 @@ impl Database {
         for extra in [UPDATE_LOG_FILE, REDO_LOG_FILE, BACKUP_OFFSET_FILE] {
             names.push(PathBuf::from(extra));
         }
+        // A destination WAL must never meet a newly copied main file: drop them
+        // all first; the source's own WALs (if any) are copied after their file.
         for paged in [kv, vs] {
-            if !src.join(wal_of(paged)).is_file() {
-                fsutil::remove_file_if_exists(&dst.join(wal_of(paged)))?;
-            }
+            fsutil::remove_file_if_exists(&dst.join(wal_of(paged)))?;
         }
+        fsutil::sync_dir(dst)?;
         for name in &names {
             let (from, to) = (src.join(name), dst.join(name));
             if from.is_file() {
