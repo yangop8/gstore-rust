@@ -1114,6 +1114,21 @@ fn rs_calls_parse_anywhere_an_expression_is_allowed() {
             Some(*name)
         );
     }
+    // Function calls are also GROUP BY / ORDER BY keys without parentheses.
+    let q = sel("PREFIX ex: <http://ex/>
+         SELECT ?x WHERE { ?x <p> ?y }
+         GROUP BY rs:WCC(?x) ?x <http://ex/f>(?x)
+         ORDER BY rs:BFSCOUNT(?x) DESC(?x) ex:g(?x)
+         LIMIT 3");
+    assert_eq!(q.group_by.len(), 3);
+    assert!(matches!(&q.group_by[0], Expr::IriCall { iri, .. } if *iri == rs("WCC")));
+    assert!(matches!(q.group_by[1], Expr::Var(_)));
+    assert!(matches!(&q.group_by[2], Expr::IriCall { iri, .. } if iri == "http://ex/f"));
+    assert_eq!(q.order_by.len(), 3);
+    assert!(matches!(&q.order_by[0].expr, Expr::IriCall { iri, .. } if *iri == rs("BFSCOUNT")));
+    assert!(q.order_by[1].descending);
+    assert!(matches!(&q.order_by[2].expr, Expr::IriCall { iri, .. } if iri == "http://ex/g"));
+    assert_eq!(q.limit, Some(3));
 }
 
 #[test]

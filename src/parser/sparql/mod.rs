@@ -336,6 +336,8 @@ impl<'s> Parser<'s> {
                         self.expect(&Token::RParen, "')'")?;
                         group_by.push(e);
                     }
+                    // GroupCondition ::= FunctionCall, e.g. `GROUP BY rs:WCC(?x)`.
+                    _ if self.at_iri_call() => group_by.push(self.parse_iri_call()?),
                     _ => break,
                 }
             }
@@ -1043,9 +1045,7 @@ impl<'s> Parser<'s> {
                 }
             }
             // `<iri>(args…)` / `pfx:name(args…)`: a function call by IRI.
-            Token::Iri(_) | Token::PName(_, _) if matches!(self.peek_at(1), Token::LParen) => {
-                self.parse_iri_call()
-            }
+            Token::Iri(_) | Token::PName(_, _) if self.at_iri_call() => self.parse_iri_call(),
             Token::Iri(_)
             | Token::PName(_, _)
             | Token::Str { .. }
@@ -1122,6 +1122,12 @@ impl<'s> Parser<'s> {
     }
 
     // ---- IRI function calls ----------------------------------------------
+
+    /// Is the cursor at `<iri>(` / `pfx:name(` — a function call by IRI?
+    fn at_iri_call(&self) -> bool {
+        matches!(self.peek(), Token::Iri(_) | Token::PName(..))
+            && matches!(self.peek_at(1), Token::LParen)
+    }
 
     /// `iri ArgList` (SPARQL `iriOrFunction` with arguments). A call into the
     /// [`RS_NAMESPACE`] must name a legacy built-in ([`RS_FUNCTIONS`]) with an
@@ -1751,12 +1757,16 @@ impl<'s> Parser<'s> {
                 let v = v.clone();
                 self.bump();
                 Expr::Var(v)
+            } else if self.at_iri_call() {
+                // Constraint ::= FunctionCall, e.g. `ORDER BY rs:BFSCOUNT(?x)`.
+                self.parse_iri_call()?
             } else {
                 break;
             };
             conds.push(OrderCondition { expr, descending });
             // Stop when the next token clearly isn't another order key.
             if !matches!(self.peek(), Token::Var(_) | Token::LParen)
+                && !self.at_iri_call()
                 && !matches!(self.keyword().as_deref(), Some("ASC") | Some("DESC"))
             {
                 break;
