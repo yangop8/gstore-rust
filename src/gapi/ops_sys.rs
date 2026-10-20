@@ -87,7 +87,8 @@ mod resources {
         // spaces): state is field 3, utime/stime are fields 14/15.
         let rest = &stat[stat.rfind(')')? + 1..];
         let fields: Vec<&str> = rest.split_whitespace().collect();
-        let proc_time = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+        let proc_time =
+            fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
         let total = std::fs::read_to_string("/proc/stat").ok()?;
         let line = total.lines().find(|l| l.starts_with("cpu "))?;
         let total_time = line
@@ -168,7 +169,11 @@ mod resources {
         if rc != 0 {
             return None;
         }
-        let unit = if buf.f_frsize != 0 { buf.f_frsize } else { buf.f_bsize };
+        let unit = if buf.f_frsize != 0 {
+            buf.f_frsize
+        } else {
+            buf.f_bsize
+        };
         let _ = (buf.f_blocks, buf.f_bfree);
         buf.f_bavail.checked_mul(unit)
     }
@@ -187,7 +192,10 @@ mod resources {
             assert!(super::cpu_times().is_some());
             #[cfg(target_pointer_width = "64")]
             assert!(super::disk_available_mb(&std::env::temp_dir()) > 0);
-            assert_eq!(super::disk_available_mb(std::path::Path::new("/nonexistent/x/y")), 0);
+            assert_eq!(
+                super::disk_available_mb(std::path::Path::new("/nonexistent/x/y")),
+                0
+            );
         }
     }
 }

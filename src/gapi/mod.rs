@@ -27,9 +27,9 @@
 //!
 //! [`serve`] mirrors upstream `checkRequest` (`grpc.cpp` ~188-330):
 //!
-//! 1. parse the parameters ([`params::Params`]: URL query + JSON / form /
+//! 1. the IP access check ([`auth::check_ip`]) — blocked → `1101`;
+//! 2. parse the parameters ([`params::Params`]: URL query + JSON / form /
 //!    multipart body) — malformed → `1003`;
-//! 2. the IP access check ([`auth::check_ip`]) — blocked → `1101`;
 //! 3. look up `operation` in the [`Registry`] — missing or unknown → `1100`;
 //! 4. unless the operation is public (`check`): authenticate the per-request
 //!    `username` / `password` (`encryption=1` = the password's MD5 hex) —
@@ -194,6 +194,10 @@ pub struct OpSpec {
     /// Whether the request must carry valid `username` / `password` (false
     /// only for public operations such as `check`).
     pub auth: bool,
+    /// The privilege name handed to [`auth::check_privilege`] — the
+    /// operation's own name by default, which [`auth::requirement`] maps the
+    /// way upstream does; set it to check an operation as another one.
+    pub privilege: &'static str,
     /// Whether a valid `db_name` is required (validated before the handler
     /// runs, available as [`Ctx::db_name`]).
     pub needs_db: bool,
@@ -209,14 +213,22 @@ impl OpSpec {
             name,
             handler,
             auth: true,
+            privilege: name,
             needs_db: false,
             async_capable: false,
         }
     }
 
-    /// No credentials required.
+    /// No credentials required (and no privilege check).
     pub fn public(mut self) -> OpSpec {
         self.auth = false;
+        self
+    }
+
+    /// Check the caller's privilege as for operation `name` instead of this
+    /// operation's own name.
+    pub fn privilege(mut self, name: &'static str) -> OpSpec {
+        self.privilege = name;
         self
     }
 
@@ -270,7 +282,11 @@ impl Registry {
     /// Register an operation. Panics on a duplicate name (a merge mistake).
     pub fn add(&mut self, spec: OpSpec) {
         let prev = self.ops.insert(spec.name, spec);
-        assert!(prev.is_none(), "gapi operation '{}' registered twice", spec.name);
+        assert!(
+            prev.is_none(),
+            "gapi operation '{}' registered twice",
+            spec.name
+        );
     }
 
     /// Register a path route (checked in registration order).
@@ -315,10 +331,9 @@ pub(crate) fn wants(req: &Request) -> bool {
         "/" => {
             method == "POST"
                 || (method == "GET"
-                    && req
-                        .query
-                        .as_deref()
-                        .is_some_and(|q| params::parse_form(q).iter().any(|(k, _)| k == "operation")))
+                    && req.query.as_deref().is_some_and(|q| {
+                        params::parse_form(q).iter().any(|(k, _)| k == "operation")
+                    }))
         }
         path => registry().path_route(method, path).is_some(),
     }
@@ -349,15 +364,18 @@ pub(crate) fn serve(inner: &ApiInner, req: &Request, peer: Option<SocketAddr>) -
 }
 
 fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
+    if let Err(r) = auth::check_ip(ctx, auth::IpStage::Connect) {
+        return r;
+    }
     let params = match Params::from_request(ctx.req) {
         Ok(p) => p,
         Err(e) => return GResp::error(Status::ParamIsIllegal, e),
     };
-    if let Err(r) = auth::check_ip(ctx, auth::IpStage::Connect) {
-        return r;
-    }
     let reg = registry();
-    if !matches!(ctx.req.path.as_str(), "/api" | "/grpc/api" | "/ghttp/api" | "/") {
+    if !matches!(
+        ctx.req.path.as_str(),
+        "/api" | "/grpc/api" | "/ghttp/api" | "/"
+    ) {
         if let Some(route) = reg.path_route(&ctx.req.method, &ctx.req.path) {
             ctx.op = route.name.to_string();
             return (route.handler)(ctx, &params);
@@ -391,7 +409,9 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
         }
         ctx.db_name = Some(name);
     }
-    if !(ctx.inner_request && ctx.is_root()) && !auth::check_privilege(ctx, &op, db_name.as_deref()) {
+    if !(ctx.inner_request && ctx.is_root())
+        && !auth::check_privilege(ctx, spec.privilege, db_name.as_deref())
+    {
         return GResp::error(
             Status::OperationConditionsAreNotSatisfied,
             format!("You have no {op} privilege"),
@@ -452,18 +472,38 @@ mod tests {
     fn db_names_follow_upstream_rules() {
         assert!(check_db_name("lubm").is_ok());
         assert!(check_db_name("my_db-1").is_ok());
-        for bad in ["", "system", "ab", "x.db", "../etc", "a b c", &"x".repeat(65)] {
+        for bad in [
+            "",
+            "system",
+            "ab",
+            "x.db",
+            "../etc",
+            "a b c",
+            &"x".repeat(65),
+        ] {
             assert!(check_db_name(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(check_db_name("").unwrap_err(), "the value of db_name can not be empty!");
+        assert_eq!(
+            check_db_name("").unwrap_err(),
+            "the value of db_name can not be empty!"
+        );
     }
 
     #[test]
     fn the_registry_holds_the_core_operations() {
         let names = registry().op_names();
         for op in [
-            "check", "login", "testConnect", "getCoreVersion", "stat", "query", "begin", "tquery",
-            "commit", "rollback", "checkpoint",
+            "check",
+            "login",
+            "testConnect",
+            "getCoreVersion",
+            "stat",
+            "query",
+            "begin",
+            "tquery",
+            "commit",
+            "rollback",
+            "checkpoint",
         ] {
             assert!(names.contains(&op), "{op} missing from {names:?}");
         }

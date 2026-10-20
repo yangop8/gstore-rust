@@ -127,7 +127,13 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         append_log(
             &st.root,
             "query.log",
-            &format!("{}\t{}\t{}\t{}", now_millis(), db, ctx.user(), sparql.replace('\n', " ")),
+            &format!(
+                "{}\t{}\t{}\t{}",
+                now_millis(),
+                db,
+                ctx.user(),
+                sparql.replace('\n', " ")
+            ),
         );
         let (task_id, cancel) = ctx.inner.register_task(&mut st, &db, &sparql, ctx.user());
         QueryJob {
@@ -146,7 +152,9 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let thread_id = thread_id();
     let resp = match outcome {
         Err(e) => return query_error(e),
-        Ok(JobOutput::Updated { changed, warning }) => update_response(changed, warning, &query_time, &thread_id),
+        Ok(JobOutput::Updated { changed, warning }) => {
+            update_response(changed, warning, &query_time, &thread_id)
+        }
         Ok(JobOutput::Read(QueryResult::Update { changed })) => {
             update_response(changed, None, &query_time, &thread_id)
         }
@@ -165,7 +173,12 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 
 /// The answer of an applied update (upstream: `isUpdate` responses carry no
 /// result and no `OutputLimit`).
-fn update_response(changed: usize, warning: Option<String>, query_time: &str, thread_id: &str) -> GResp {
+fn update_response(
+    changed: usize,
+    warning: Option<String>,
+    query_time: &str,
+    thread_id: &str,
+) -> GResp {
     let mut r = GResp::json(
         Json::obj()
             .with("StatusCode", 0)
@@ -221,11 +234,17 @@ fn read_response(
         // File outputs are not capped (upstream resets the output limit).
         OutFormat::File => {
             let text = upstream_select_json(rs, None).sorted().to_string();
-            (Json::obj(), Some(write_result_file(ctx, db, thread_id, "json", &text)?))
+            (
+                Json::obj(),
+                Some(write_result_file(ctx, db, thread_id, "json", &text)?),
+            )
         }
         OutFormat::NTripleFile => {
             let text = upstream_tsv(rs);
-            (Json::obj(), Some(write_result_file(ctx, db, thread_id, "txt", &text)?))
+            (
+                Json::obj(),
+                Some(write_result_file(ctx, db, thread_id, "txt", &text)?),
+            )
         }
     };
     body.set("StatusCode", 0);
@@ -268,7 +287,11 @@ fn write_result_file(
             format!("{stem}_{n}.{ext}")
         };
         let path: PathBuf = dir.join(&name);
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut f) => {
                 f.write_all(text.as_bytes()).map_err(fail)?;
                 return Ok(name);
@@ -315,9 +338,10 @@ fn begin(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 
 fn begin_error(db: &str, e: OpError, on_disk: bool) -> GResp {
     match e.kind {
-        OpErrorKind::NotLoaded if on_disk => {
-            GResp::error(Status::OperationConditionsAreNotSatisfied, "Database is not loaded yet.")
-        }
+        OpErrorKind::NotLoaded if on_disk => GResp::error(
+            Status::OperationConditionsAreNotSatisfied,
+            "Database is not loaded yet.",
+        ),
         OpErrorKind::NotLoaded => GResp::error(
             Status::OperationConditionsAreNotSatisfied,
             format!("Database[{db}] does not exist."),
@@ -388,7 +412,13 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     append_log(
         ctx.root_dir(),
         "query.log",
-        &format!("{}\t{}\t{}\t{}", now_millis(), db, ctx.user(), sparql.replace('\n', " ")),
+        &format!(
+            "{}\t{}\t{}\t{}",
+            now_millis(),
+            db,
+            ctx.user(),
+            sparql.replace('\n', " ")
+        ),
     );
     match ApiInner::run_in_txn(&dbh, &db, tid, &sparql) {
         Ok(QueryResult::Update { changed }) => {
@@ -448,9 +478,10 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
 /// A transaction-operation failure as upstream reports it.
 fn txn_error(prefix: &str, e: OpError) -> GResp {
     match e.kind {
-        OpErrorKind::TxnUnknown => {
-            GResp::error(Status::OperationFailed, format!("{prefix}: Wrong transaction id. ({})", e.msg))
-        }
+        OpErrorKind::TxnUnknown => GResp::error(
+            Status::OperationFailed,
+            format!("{prefix}: Wrong transaction id. ({})", e.msg),
+        ),
         OpErrorKind::TxnEnded => GResp::error(
             Status::OperationFailed,
             format!("{prefix}: Transaction not in running state! ({})", e.msg),
@@ -480,8 +511,13 @@ fn checkpoint(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
     match ApiInner::checkpoint_db(&dbh, &db) {
         Ok(()) => GResp::success("Database saved successfully."),
         Err(e) => match e.kind {
-            OpErrorKind::Conflict => GResp::error(Status::OperationConditionsAreNotSatisfied, e.msg),
-            _ => GResp::error(Status::OperationFailed, format!("Checkpoint fail: {}", e.msg)),
+            OpErrorKind::Conflict => {
+                GResp::error(Status::OperationConditionsAreNotSatisfied, e.msg)
+            }
+            _ => GResp::error(
+                Status::OperationFailed,
+                format!("Checkpoint fail: {}", e.msg),
+            ),
         },
     }
 }
@@ -508,7 +544,9 @@ fn query_error(e: OpError) -> GResp {
         OpErrorKind::Conflict | OpErrorKind::NotOwner => {
             GResp::error(Status::OperationConditionsAreNotSatisfied, e.msg)
         }
-        OpErrorKind::Query => GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg)),
+        OpErrorKind::Query => {
+            GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg))
+        }
         _ => GResp::error(Status::OperationFailed, e.msg),
     }
 }
@@ -572,7 +610,10 @@ mod tests {
         assert_eq!(OutFormat::parse(Some("json")), Some(OutFormat::Json));
         assert_eq!(OutFormat::parse(Some("file")), Some(OutFormat::File));
         assert_eq!(OutFormat::parse(Some("n-triple")), Some(OutFormat::NTriple));
-        assert_eq!(OutFormat::parse(Some("n-triple-file")), Some(OutFormat::NTripleFile));
+        assert_eq!(
+            OutFormat::parse(Some("n-triple-file")),
+            Some(OutFormat::NTripleFile)
+        );
         for bad in ["xml", "csv", "JSON", "ntriples"] {
             assert_eq!(OutFormat::parse(Some(bad)), None, "{bad}");
         }

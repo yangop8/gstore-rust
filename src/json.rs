@@ -173,7 +173,10 @@ impl Json {
 
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            Json::Num(n) => n.parse::<u64>().ok().or_else(|| u64::try_from(self.as_i64()?).ok()),
+            Json::Num(n) => n
+                .parse::<u64>()
+                .ok()
+                .or_else(|| u64::try_from(self.as_i64()?).ok()),
             _ => None,
         }
     }
@@ -497,7 +500,9 @@ impl Parser<'_> {
                 Some(b'\\') => {
                     out.push_str(&self.src[run..self.pos]);
                     self.pos += 1;
-                    let c = self.peek().ok_or_else(|| self.err("dangling backslash in string"))?;
+                    let c = self
+                        .peek()
+                        .ok_or_else(|| self.err("dangling backslash in string"))?;
                     self.pos += 1;
                     match c {
                         b'"' => out.push('"'),
@@ -611,7 +616,10 @@ mod tests {
         let v = parse(r#" { "a": [1, -2.5e3, true, false, null], "b": {"c": "d"} } "#).unwrap();
         assert_eq!(v.get("a").unwrap().as_array().unwrap().len(), 5);
         assert_eq!(v.get("a").unwrap().as_array().unwrap()[0].as_i64(), Some(1));
-        assert_eq!(v.get("a").unwrap().as_array().unwrap()[1].as_f64(), Some(-2500.0));
+        assert_eq!(
+            v.get("a").unwrap().as_array().unwrap()[1].as_f64(),
+            Some(-2500.0)
+        );
         assert_eq!(v.get("b").unwrap().get("c").unwrap().as_str(), Some("d"));
         assert_eq!(parse("\u{FEFF}[]").unwrap(), Json::arr());
     }
@@ -621,7 +629,9 @@ mod tests {
         let v = parse("[10, 1.50, 1e2, -0]").unwrap();
         assert_eq!(v.to_string(), "[10,1.50,1e2,-0]");
         assert_eq!(v.as_array().unwrap()[2].as_i64(), Some(100));
-        for bad in ["01", "1.", ".5", "-", "1-2", "1.2.3", "+1", "1e", "0x10", "1e+"] {
+        for bad in [
+            "01", "1.", ".5", "-", "1-2", "1.2.3", "+1", "1e", "0x10", "1e+",
+        ] {
             assert!(parse(bad).is_err(), "{bad} must be rejected");
         }
     }

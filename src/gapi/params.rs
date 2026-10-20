@@ -123,7 +123,11 @@ impl Params {
 
     /// The raw value of `key` (the last one when repeated).
     pub fn raw(&self, key: &str) -> Option<&Json> {
-        self.entries.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.entries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     /// Whether `key` was sent at all (even empty or `null`).
@@ -281,10 +285,10 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Parse a `multipart/form-data` body (RFC 7578): text fields and files.
-fn parse_multipart(
-    content_type: &str,
-    body: &[u8],
-) -> Result<(Vec<(String, String)>, Vec<UploadedFile>), String> {
+/// The text fields and the files of a multipart body.
+type MultipartParts = (Vec<(String, String)>, Vec<UploadedFile>);
+
+fn parse_multipart(content_type: &str, body: &[u8]) -> Result<MultipartParts, String> {
     let boundary = content_type
         .split(';')
         .skip(1)
@@ -357,10 +361,16 @@ fn parse_multipart(
 /// Split one multipart part into its header block (text) and its content.
 fn split_part(part: &[u8]) -> Result<(String, &[u8]), String> {
     if let Some(i) = find(part, b"\r\n\r\n", 0) {
-        return Ok((String::from_utf8_lossy(&part[..i]).into_owned(), &part[i + 4..]));
+        return Ok((
+            String::from_utf8_lossy(&part[..i]).into_owned(),
+            &part[i + 4..],
+        ));
     }
     if let Some(i) = find(part, b"\n\n", 0) {
-        return Ok((String::from_utf8_lossy(&part[..i]).into_owned(), &part[i + 2..]));
+        return Ok((
+            String::from_utf8_lossy(&part[..i]).into_owned(),
+            &part[i + 2..],
+        ));
     }
     Err("a multipart part without a header/body separator".to_string())
 }
@@ -424,20 +434,29 @@ mod tests {
         assert_eq!(p.str("operation").as_deref(), Some("login"));
         assert!(Params::from_parts(None, Some("application/json"), b"{oops").is_err());
         assert!(Params::from_parts(None, Some("application/json"), b"[1]").is_err());
-        assert!(Params::from_parts(None, Some("application/json"), b"").unwrap().keys().next().is_none());
+        assert!(Params::from_parts(None, Some("application/json"), b"")
+            .unwrap()
+            .keys()
+            .next()
+            .is_none());
     }
 
     #[test]
     fn form_body_and_url_query_merge_with_body_winning() {
         let p = Params::from_parts(
-            Some("operation=query&db_name=url&sparql=select%20*%20where%20%7B%3Fs%20%3Fp%20%3Fo%7D"),
+            Some(
+                "operation=query&db_name=url&sparql=select%20*%20where%20%7B%3Fs%20%3Fp%20%3Fo%7D",
+            ),
             Some("application/x-www-form-urlencoded; charset=utf-8"),
             b"db_name=body&format=json&x+y=a+b%2Bc",
         )
         .unwrap();
         assert_eq!(p.str("operation").as_deref(), Some("query"));
         assert_eq!(p.str("db_name").as_deref(), Some("body"));
-        assert_eq!(p.str("sparql").as_deref(), Some("select * where {?s ?p ?o}"));
+        assert_eq!(
+            p.str("sparql").as_deref(),
+            Some("select * where {?s ?p ?o}")
+        );
         assert_eq!(p.str("x y").as_deref(), Some("a b+c"));
         assert_eq!(p.non_empty("format").as_deref(), Some("json"));
     }
@@ -478,7 +497,12 @@ mod tests {
     fn multipart_fields_and_files() {
         let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nroot\r\n\
 --XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.nt\"\r\nContent-Type: application/n-triples\r\n\r\n<a> <b> <c> .\r\n\r\n--XyZ--\r\n";
-        let p = Params::from_parts(Some("operation=x"), Some("multipart/form-data; boundary=XyZ"), body).unwrap();
+        let p = Params::from_parts(
+            Some("operation=x"),
+            Some("multipart/form-data; boundary=XyZ"),
+            body,
+        )
+        .unwrap();
         assert_eq!(p.str("username").as_deref(), Some("root"));
         assert_eq!(p.str("operation").as_deref(), Some("x"));
         assert_eq!(p.str("filename").as_deref(), Some("data.nt"));
@@ -486,13 +510,18 @@ mod tests {
         assert_eq!(f.data, b"<a> <b> <c> .\r\n");
         assert_eq!(f.content_type.as_deref(), Some("application/n-triples"));
         assert!(Params::from_parts(None, Some("multipart/form-data"), body).is_err());
-        assert!(Params::from_parts(None, Some("multipart/form-data; boundary=nope"), body).is_err());
+        assert!(
+            Params::from_parts(None, Some("multipart/form-data; boundary=nope"), body).is_err()
+        );
     }
 
     #[test]
     fn redacts_passwords_for_logging() {
         let p = Params::from_parts(Some("username=u&password=secret"), None, b"").unwrap();
         let j = p.to_redacted_json().to_string();
-        assert!(!j.contains("secret") && j.contains("\"username\":\"u\""), "{j}");
+        assert!(
+            !j.contains("secret") && j.contains("\"username\":\"u\""),
+            "{j}"
+        );
     }
 }

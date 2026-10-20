@@ -58,6 +58,16 @@
 //! transaction ids are `404`; committing or rolling back a finished one is
 //! `409`.
 //!
+//! **Upstream protocol.** The same server also speaks upstream gStore 1.4's
+//! own protocol — `GET|POST /api` (and `POST /`, `GET /?operation=…`) with an
+//! `operation` parameter, per-request `username`/`password`, and a JSON
+//! envelope that is always HTTP 200 — so the upstream SDKs, the Workbench and
+//! the upstream test scripts work unmodified. It is implemented in
+//! [`crate::gapi`] on this module's state (databases, users, transactions,
+//! tasks, logs); the endpoints documented here remain as Rust-only
+//! extensions. Transaction ids are small sequential numbers (the first is
+//! `1`), as upstream's.
+//!
 //! **Panic isolation.** Each request runs under `catch_unwind`: a panicking
 //! handler answers `500` with a JSON error and the locks it poisoned are
 //! recovered, so the server keeps serving.
@@ -160,7 +170,10 @@ pub const CONSOLE_HTML: &str = r##"<!doctype html>
   Every endpoint but <code>/login</code>, <code>GET /</code>, and
   <code>GET /console</code> requires HTTP Basic credentials or an
   <code>Authorization: Bearer &lt;session&gt;</code> token from
-  <code>/login</code>.
+  <code>/login</code>.<br>
+  Upstream gStore protocol (SDKs, Workbench): <code>GET|POST /api</code>
+  with <code>operation=…</code>, <code>username</code> and
+  <code>password</code> parameters.
 </p>
 <script>
 document.getElementById('run').addEventListener('click', function () {

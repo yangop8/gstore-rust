@@ -61,13 +61,26 @@ pub fn note_login_success(_ctx: &Ctx<'_>) {}
 /// is on; the user must still exist.
 pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp> {
     let (Some(username), Some(password)) = (params.str("username"), params.str("password")) else {
-        return Err(GResp::error(Status::ParamIsIllegal, "username or password is empty"));
+        return Err(GResp::error(
+            Status::ParamIsIllegal,
+            "username or password is empty",
+        ));
     };
     if username.is_empty() {
-        return Err(GResp::error(Status::ParamIsIllegal, "username or password is empty"));
+        return Err(GResp::error(
+            Status::ParamIsIllegal,
+            "username or password is empty",
+        ));
     }
-    let wrong = || GResp::error(Status::AuthenticationFailed, "Username or password is wrong.");
-    if ctx.config.trust_inner_localhost && params.bool("inner", false) && ctx.remote_ip == "127.0.0.1"
+    let wrong = || {
+        GResp::error(
+            Status::AuthenticationFailed,
+            "Username or password is wrong.",
+        )
+    };
+    if ctx.config.trust_inner_localhost
+        && params.bool("inner", false)
+        && ctx.remote_ip == "127.0.0.1"
     {
         if !ctx.state().users.exists(&username) {
             return Err(wrong());
@@ -167,13 +180,42 @@ mod tests {
     fn requirements_follow_upstream_check_privilege() {
         assert_eq!(requirement("login"), Requirement::Anyone);
         assert_eq!(requirement("show"), Requirement::Anyone);
-        assert_eq!(requirement("query"), Requirement::Privilege(Privilege::Query));
-        assert_eq!(requirement("monitor"), Requirement::Privilege(Privilege::Query));
-        for op in ["tquery", "begin", "commit", "rollback", "checkpoint", "batchInsert", "update"] {
-            assert_eq!(requirement(op), Requirement::Privilege(Privilege::Update), "{op}");
+        assert_eq!(
+            requirement("query"),
+            Requirement::Privilege(Privilege::Query)
+        );
+        assert_eq!(
+            requirement("monitor"),
+            Requirement::Privilege(Privilege::Query)
+        );
+        for op in [
+            "tquery",
+            "begin",
+            "commit",
+            "rollback",
+            "checkpoint",
+            "batchInsert",
+            "update",
+        ] {
+            assert_eq!(
+                requirement(op),
+                Requirement::Privilege(Privilege::Update),
+                "{op}"
+            );
         }
-        assert_eq!(requirement("export"), Requirement::Privilege(Privilege::Export));
-        for op in ["stat", "build", "drop", "usermanage", "showuser", "ipmanage", "txnlog"] {
+        assert_eq!(
+            requirement("export"),
+            Requirement::Privilege(Privilege::Export)
+        );
+        for op in [
+            "stat",
+            "build",
+            "drop",
+            "usermanage",
+            "showuser",
+            "ipmanage",
+            "txnlog",
+        ] {
             assert_eq!(requirement(op), Requirement::RootOnly, "{op}");
         }
     }

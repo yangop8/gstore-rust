@@ -670,4 +670,78 @@ mod tests {
         let xml = String::from_utf8(buf).unwrap();
         assert!(xml.contains("<boolean>true</boolean>"));
     }
+
+    // --- upstream gStore JSON ---------------------------------------------
+
+    #[test]
+    fn upstream_term_encodings() {
+        let enc = |cell: &str| upstream_binding(cell).to_string();
+        assert_eq!(enc("<http://ex/a>"), r#"{"type":"uri","value":"http://ex/a"}"#);
+        assert_eq!(enc("\"plain\""), r#"{"type":"literal","value":"plain"}"#);
+        assert_eq!(
+            enc("\"chat\"@fr"),
+            r#"{"type":"literal","value":"chat","lang":"fr"}"#
+        );
+        assert_eq!(
+            enc("\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            r#"{"type":"typed-literal","datatype":"http://www.w3.org/2001/XMLSchema#integer","value":"5"}"#
+        );
+        assert_eq!(enc("_:b7"), r#"{"type":"bnode","value":"_:b7"}"#);
+        // Escapes are decoded into the value, then JSON-escaped.
+        assert_eq!(enc("\"a\\\"b\\nc\""), r#"{"type":"literal","value":"a\"b\nc"}"#);
+    }
+
+    #[test]
+    fn upstream_select_shape_drops_empty_rows_and_honours_the_limit() {
+        let mut rs = sample();
+        rs.rows.push(vec![None, None]); // no bound variable: dropped
+        rs.rows.push(vec![Some("<http://ex/c>".to_string()), None]);
+        let j = upstream_select_json(&rs, None);
+        assert_eq!(
+            j.get("head").unwrap().to_string(),
+            r#"{"link":[],"vars":["x","y"]}"#
+        );
+        let b = j.get("results").unwrap().get("bindings").unwrap().as_array().unwrap();
+        assert_eq!(b.len(), 3);
+        assert!(b[1].get("y").is_none(), "unbound cells are omitted");
+        assert_eq!(b[0].get("y").unwrap().get("value").unwrap().as_str(), Some("he said \"hi\", ok"));
+        // The limit counts rows before empty ones are dropped (as upstream).
+        let j = upstream_select_json(&rs, Some(3));
+        assert_eq!(j.get("results").unwrap().get("bindings").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn upstream_ntriple_shapes() {
+        let rs = sample();
+        let j = upstream_ntriple_json(&rs, None);
+        assert_eq!(j.get("head").unwrap().to_string(), r#"["?x","?y"]"#);
+        assert_eq!(
+            j.get("results").unwrap().to_string(),
+            r#"[["<http://ex/a>","\"he said \\\"hi\\\", ok\""],["<http://ex/b>"]]"#
+        );
+        assert_eq!(upstream_ntriple_json(&rs, Some(1)).get("results").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            upstream_tsv(&rs),
+            "?x\t?y\n<http://ex/a>\t\"he said \\\"hi\\\", ok\"\n<http://ex/b>\t\n"
+        );
+        assert_eq!(upstream_tsv(&ResultSet::new(vec!["x".into()])), "[empty result]\n");
+    }
+
+    #[test]
+    fn upstream_ask_and_graph_tables() {
+        let rs = upstream_ask_result(true);
+        assert_eq!(rs.vars, vec!["_askResult"]);
+        assert_eq!(
+            upstream_select_json(&rs, None).sorted().to_string(),
+            r#"{"head":{"link":[],"vars":["_askResult"]},"results":{"bindings":[{"_askResult":{"datatype":"http://www.w3.org/2001/XMLSchema#boolean","type":"typed-literal","value":"true"}}]}}"#
+        );
+        let t = crate::model::Triple::new(
+            Term::iri("http://ex/s"),
+            Term::iri("http://ex/p"),
+            Term::plain_literal("o"),
+        );
+        let rs = triples_as_result_set(&[t]);
+        assert_eq!(rs.vars, vec!["s", "p", "o"]);
+        assert_eq!(rs.rows[0][2].as_deref(), Some("\"o\""));
+    }
 }

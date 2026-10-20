@@ -407,7 +407,10 @@ mod tests {
         assert!(r.is_ok());
         assert!(r.body_json().is_none());
         let (status, ctype, body, headers) = r.into_parts();
-        assert_eq!((status, ctype.as_str(), body.as_slice()), (200, "application/octet-stream", &b"abc"[..]));
+        assert_eq!(
+            (status, ctype.as_str(), body.as_slice()),
+            (200, "application/octet-stream", &b"abc"[..])
+        );
         assert_eq!(headers.len(), 1);
         assert_eq!(GResp::raw(404, "text/plain", vec![]).status_code(), 1005);
     }
