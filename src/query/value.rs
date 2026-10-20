@@ -521,7 +521,9 @@ impl Decimal {
     fn mul(self, other: Decimal) -> Option<Decimal> {
         Some(Decimal {
             mant: self.mant.checked_mul(other.mant)?,
-            scale: self.scale + other.scale,
+            // Checked: zero mantissas never overflow `checked_mul`, so only the
+            // scale bounds a chain like 0.000…1 * 0.000…1 * … .
+            scale: self.scale.checked_add(other.scale)?,
         })
     }
 }
@@ -661,9 +663,14 @@ pub fn parse_datetime_parts(s: &str) -> Option<DateTimeParts> {
 /// timezone is treated as UTC.
 fn parse_xsd_datetime(s: &str) -> Option<f64> {
     let p = parse_datetime_parts(s)?;
-    let days = days_from_civil(p.year, p.month, p.day);
-    let tz = p.tz_offset_secs.unwrap_or(0);
-    let secs = days * 86_400 + p.hour * 3600 + p.minute * 60 + p.second - tz;
+    // The year is any i64 the lexical form spells (xsd:dateTime years are
+    // unbounded), so do the instant arithmetic in i128: `days * 86_400` alone
+    // overflows i64 for |year| ≳ 2.9e11, which a crafted literal such as
+    // "999999999999-01-01T00:00:00Z"^^xsd:dateTime would otherwise hit.
+    let days = days_from_civil(p.year as i128, p.month as i128, p.day as i128);
+    let tz = p.tz_offset_secs.unwrap_or(0) as i128;
+    let secs = days * 86_400 + p.hour as i128 * 3600 + p.minute as i128 * 60 + p.second as i128
+        - tz;
     Some(secs as f64 + p.frac)
 }
 
@@ -740,8 +747,9 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 /// Days from 1970-01-01 to `y-m-d` (proleptic Gregorian; Howard Hinnant's
-/// algorithm). Valid for the full xsd:dateTime year range.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+/// algorithm). Computed in `i128`, so it cannot overflow for any `i64` year the
+/// dateTime parser accepts.
+fn days_from_civil(y: i128, m: i128, d: i128) -> i128 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400; // [0, 399]

@@ -11,8 +11,11 @@
 //! * Register a function by name with [`FunctionRegistry::register`] (or the
 //!   builder methods on [`Evaluator`](crate::query::Evaluator)).
 //! * The expression evaluator consults the registry for any function name it
-//!   does not recognise as a SPARQL built-in, *before* erroring (treating the
-//!   call as unbound). Built-ins always take precedence.
+//!   does not recognise as a SPARQL built-in (i.e. one not listed in
+//!   [`crate::parser::sparql::builtins::BUILTINS`]), *before* erroring
+//!   (treating the call as unbound). Built-ins always take precedence. Only
+//!   built-ins have their argument count checked by the parser; a custom
+//!   function receives whatever arguments the query passes.
 //!
 //! ## Naming and how it is called from SPARQL
 //!

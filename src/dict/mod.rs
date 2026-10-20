@@ -11,6 +11,26 @@
 //!
 //! Keys are [`Term::dict_key`] strings (full N-Triples surface syntax) so an IRI
 //! `<foo>` never collides with a same-named literal `"foo"`.
+//!
+//! ## Id-space bounds
+//!
+//! Every space is bounded exactly like gStore's `allocEntityID` /
+//! `allocLiteralID` / `allocPredicateID`: at most [`LITERAL_FIRST_ID`]
+//! (2,000,000,000) ids each, i.e. entity ids in `[0, LITERAL_FIRST_ID)`,
+//! literal ids in `[LITERAL_FIRST_ID, 2 * LITERAL_FIRST_ID)` and predicate ids in
+//! `[0, LITERAL_FIRST_ID)`. This keeps the entity/literal classification by id
+//! range sound (the 2,000,000,000th entity would otherwise get a literal-range
+//! id) and keeps every id clear of the `u32::MAX` sentinels and of the query
+//! engine's synthetic-id range above `4_200_000_000`. The checked
+//! [`try_intern_entity`](Dictionary::try_intern_entity) /
+//! [`try_intern_literal`](Dictionary::try_intern_literal) /
+//! [`try_intern_predicate`](Dictionary::try_intern_predicate) /
+//! [`try_intern_term`](Dictionary::try_intern_term) return
+//! [`GStoreError::Database`] once a space is exhausted (freed ids are still
+//! reused); the infallible `intern_*` forms panic instead of silently
+//! corrupting the classification. Out-of-core dictionaries that allocate ids
+//! themselves can apply the same bounds with [`checked_entity_id`],
+//! [`checked_literal_id`] and [`checked_predicate_id`].
 
 pub mod prefix;
 
@@ -19,10 +39,64 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{GStoreError, Result};
 use crate::model::id::{
     EntityLiteralId, PredId, INVALID_ENTITY_LITERAL_ID, INVALID_PRED_ID, LITERAL_FIRST_ID,
 };
 use crate::model::Term;
+
+/// Exclusive upper bound of the entity id space: entity ids are
+/// `[0, ENTITY_ID_LIMIT)` (gStore: `limitID_entity < LITERAL_FIRST_ID`).
+pub const ENTITY_ID_LIMIT: EntityLiteralId = LITERAL_FIRST_ID;
+
+/// Exclusive upper bound of the literal *index* space: public literal ids are
+/// `LITERAL_FIRST_ID + index` for `index` in `[0, LITERAL_INDEX_LIMIT)`, i.e.
+/// `[2_000_000_000, 4_000_000_000)` (gStore: `limitID_literal < LITERAL_FIRST_ID`).
+pub const LITERAL_INDEX_LIMIT: u32 = LITERAL_FIRST_ID;
+
+/// Exclusive upper bound of the predicate id space: predicate ids are
+/// `[0, PREDICATE_ID_LIMIT)` (gStore: `limitID_predicate < LITERAL_FIRST_ID`).
+pub const PREDICATE_ID_LIMIT: PredId = LITERAL_FIRST_ID;
+
+/// Validate a newly allocated entity id `next` (the allocator's counter).
+/// `Err` once the entity space `[0, ENTITY_ID_LIMIT)` is exhausted.
+pub fn checked_entity_id(next: u64) -> Result<EntityLiteralId> {
+    if next < u64::from(ENTITY_ID_LIMIT) {
+        Ok(next as EntityLiteralId)
+    } else {
+        Err(GStoreError::Database(format!(
+            "entity id space exhausted: at most {ENTITY_ID_LIMIT} distinct entities \
+             (IRIs / blank nodes) are supported (ids [0, {LITERAL_FIRST_ID}))"
+        )))
+    }
+}
+
+/// Validate a newly allocated literal *index* `next_index` and return its public
+/// id (`LITERAL_FIRST_ID + next_index`). `Err` once the literal space is exhausted.
+pub fn checked_literal_id(next_index: u64) -> Result<EntityLiteralId> {
+    if next_index < u64::from(LITERAL_INDEX_LIMIT) {
+        Ok(LITERAL_FIRST_ID + next_index as u32)
+    } else {
+        Err(GStoreError::Database(format!(
+            "literal id space exhausted: at most {LITERAL_INDEX_LIMIT} distinct literals \
+             are supported (ids [{LITERAL_FIRST_ID}, {}))",
+            u64::from(LITERAL_FIRST_ID) + u64::from(LITERAL_INDEX_LIMIT)
+        )))
+    }
+}
+
+/// Validate a newly allocated predicate id `next`. `Err` once the predicate
+/// space `[0, PREDICATE_ID_LIMIT)` is exhausted.
+pub fn checked_predicate_id(next: u64) -> Result<PredId> {
+    if next < u64::from(PREDICATE_ID_LIMIT) {
+        Ok(next as PredId)
+    } else {
+        Err(GStoreError::Database(format!(
+            "predicate id space exhausted: at most {PREDICATE_ID_LIMIT} distinct \
+             predicates are supported"
+        )))
+    }
+}
 
 /// An *out-of-core* dictionary backend: resolves str↔id against on-disk B+trees
 /// on demand instead of holding every string in RAM. Implemented by the kvstore
@@ -68,30 +142,37 @@ pub trait DiskTermSource: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Interner {
     forward: HashMap<String, u32>,
-    /// `index → Some(string)`; a `None` slot is a reclaimed (freed) hole.
+    /// `index - base → Some(string)`; a `None` slot is a reclaimed (freed) hole.
     backward: Vec<Option<String>>,
     /// Reclaimed indices available for reuse (gStore's `freelist`), LIFO.
     free: Vec<u32>,
+    /// The index stored at `backward[0]`. Always `0` except in a dictionary whose
+    /// counters a test advanced with [`Dictionary::debug_advance_id_counters`]
+    /// to exercise the id-space bounds without allocating billions of strings.
+    /// Not persisted (skipped by serde, so the on-disk format is unchanged).
+    #[serde(skip)]
+    base: u32,
 }
 
 impl Interner {
     /// Intern `s`, returning its dense index. Re-interning is idempotent;
     /// otherwise a freed index is reused before the id space is extended.
-    fn intern(&mut self, s: &str) -> u32 {
+    /// `check` validates (and may reject) a brand-new index against the owning
+    /// space's bound; a reused index is always in range.
+    fn try_intern(&mut self, s: &str, check: impl Fn(u64) -> Result<u32>) -> Result<u32> {
         if let Some(&id) = self.forward.get(s) {
-            return id;
+            return Ok(id);
         }
         let id = if let Some(reused) = self.free.pop() {
-            self.backward[reused as usize] = Some(s.to_owned());
+            self.backward[(reused - self.base) as usize] = Some(s.to_owned());
             reused
         } else {
-            let id = u32::try_from(self.backward.len())
-                .expect("dictionary interner exceeded u32::MAX distinct strings");
+            let id = check(u64::from(self.base) + self.backward.len() as u64)?;
             self.backward.push(Some(s.to_owned()));
             id
         };
         self.forward.insert(s.to_owned(), id);
-        id
+        Ok(id)
     }
 
     /// Look up the dense index for `s`, if interned.
@@ -101,13 +182,14 @@ impl Interner {
 
     /// Resolve a dense index back to its string (`None` for a freed hole).
     fn resolve(&self, idx: u32) -> Option<&str> {
-        self.backward.get(idx as usize).and_then(Option::as_deref)
+        let slot = idx.checked_sub(self.base)? as usize;
+        self.backward.get(slot).and_then(Option::as_deref)
     }
 
     /// Free `s`'s index for reuse, returning it if `s` was interned.
     fn free(&mut self, s: &str) -> Option<u32> {
         let idx = self.forward.remove(s)?;
-        self.backward[idx as usize] = None;
+        self.backward[(idx - self.base) as usize] = None;
         self.free.push(idx);
         Some(idx)
     }
@@ -124,10 +206,11 @@ impl Interner {
 
     /// Live `(index, string)` pairs (skips freed holes).
     fn entries(&self) -> impl Iterator<Item = (u32, &str)> {
+        let base = self.base;
         self.backward
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.as_deref().map(|s| (i as u32, s)))
+            .filter_map(move |(i, s)| s.as_deref().map(|s| (base + i as u32, s)))
     }
 }
 
@@ -178,9 +261,20 @@ impl Dictionary {
     // ---- entity space -----------------------------------------------------
 
     /// Intern an entity (IRI or blank node), returning its entity id in
-    /// `[0, LITERAL_FIRST_ID)`.
+    /// `[0, LITERAL_FIRST_ID)`, or an error once the entity space is exhausted
+    /// (see the module docs). Build and insert paths use this checked form.
+    pub fn try_intern_entity(&mut self, key: &str) -> Result<EntityLiteralId> {
+        self.entities.try_intern(key, checked_entity_id)
+    }
+
+    /// Infallible [`try_intern_entity`](Self::try_intern_entity).
+    ///
+    /// # Panics
+    /// When the entity id space is exhausted — rather than handing out an id in
+    /// the literal range, which would silently corrupt the store.
     pub fn intern_entity(&mut self, key: &str) -> EntityLiteralId {
-        self.entities.intern(key)
+        self.try_intern_entity(key)
+            .unwrap_or_else(|e| panic!("{e} (use try_intern_entity to handle this)"))
     }
 
     pub fn entity_id(&self, key: &str) -> Option<EntityLiteralId> {
@@ -192,28 +286,51 @@ impl Dictionary {
 
     // ---- literal space ----------------------------------------------------
 
-    /// Intern a literal, returning its public id, offset by `LITERAL_FIRST_ID`.
+    /// Intern a literal, returning its public id (its dense index offset by
+    /// `LITERAL_FIRST_ID`), or an error once the literal space is exhausted.
+    pub fn try_intern_literal(&mut self, key: &str) -> Result<EntityLiteralId> {
+        let idx = self.literals.try_intern(key, |next| {
+            checked_literal_id(next).map(|id| id - LITERAL_FIRST_ID)
+        })?;
+        Ok(LITERAL_FIRST_ID + idx)
+    }
+
+    /// Infallible [`try_intern_literal`](Self::try_intern_literal).
+    ///
+    /// # Panics
+    /// When the literal id space is exhausted.
     pub fn intern_literal(&mut self, key: &str) -> EntityLiteralId {
-        self.literals
-            .intern(key)
-            .checked_add(LITERAL_FIRST_ID)
-            .expect("literal id space overflowed EntityLiteralId range")
+        self.try_intern_literal(key)
+            .unwrap_or_else(|e| panic!("{e} (use try_intern_literal to handle this)"))
     }
 
     pub fn literal_id(&self, key: &str) -> Option<EntityLiteralId> {
         if let Some(b) = &self.backing {
             return b.literal_id(key);
         }
-        self.literals.get(key).map(|i| {
-            i.checked_add(LITERAL_FIRST_ID)
-                .expect("literal id space overflowed EntityLiteralId range")
-        })
+        // Checked (not `expect`): a corrupt persisted dictionary with an
+        // out-of-range index reads as "absent" instead of panicking a query.
+        self.literals
+            .get(key)
+            .and_then(|i| i.checked_add(LITERAL_FIRST_ID))
+            .filter(|&id| id != INVALID_ENTITY_LITERAL_ID)
     }
 
     // ---- predicate space --------------------------------------------------
 
+    /// Intern a predicate, returning its id in `[0, PREDICATE_ID_LIMIT)`, or an
+    /// error once the predicate space is exhausted.
+    pub fn try_intern_predicate(&mut self, key: &str) -> Result<PredId> {
+        self.predicates.try_intern(key, checked_predicate_id)
+    }
+
+    /// Infallible [`try_intern_predicate`](Self::try_intern_predicate).
+    ///
+    /// # Panics
+    /// When the predicate id space is exhausted.
     pub fn intern_predicate(&mut self, key: &str) -> PredId {
-        self.predicates.intern(key)
+        self.try_intern_predicate(key)
+            .unwrap_or_else(|e| panic!("{e} (use try_intern_predicate to handle this)"))
     }
 
     pub fn predicate_id(&self, key: &str) -> Option<PredId> {
@@ -227,12 +344,27 @@ impl Dictionary {
 
     /// Intern a term in the appropriate object/subject space: literals go to the
     /// literal space, everything else (IRI / blank node) to the entity space.
+    ///
+    /// # Panics
+    /// When the target id space is exhausted; see
+    /// [`try_intern_term`](Self::try_intern_term).
     pub fn intern_term(&mut self, t: &Term) -> EntityLiteralId {
         let key = t.dict_key();
         if t.is_literal() {
             self.intern_literal(&key)
         } else {
             self.intern_entity(&key)
+        }
+    }
+
+    /// Checked [`intern_term`](Self::intern_term): `Err` when the term's id
+    /// space (entity or literal) is exhausted.
+    pub fn try_intern_term(&mut self, t: &Term) -> Result<EntityLiteralId> {
+        let key = t.dict_key();
+        if t.is_literal() {
+            self.try_intern_literal(&key)
+        } else {
+            self.try_intern_entity(&key)
         }
     }
 
@@ -306,7 +438,11 @@ impl Dictionary {
         }
         let mut v = Vec::with_capacity(self.entities.len() + self.literals.len());
         v.extend(self.entities.entries());
-        v.extend(self.literals.entries().map(|(i, s)| (i + LITERAL_FIRST_ID, s)));
+        v.extend(
+            self.literals
+                .entries()
+                .filter_map(|(i, s)| i.checked_add(LITERAL_FIRST_ID).map(|id| (id, s))),
+        );
         v
     }
 
@@ -361,7 +497,7 @@ impl Dictionary {
     pub fn free_literal(&mut self, key: &str) -> Option<EntityLiteralId> {
         self.literals
             .free(key)
-            .map(|i| i.checked_add(LITERAL_FIRST_ID).expect("literal id overflow"))
+            .and_then(|i| i.checked_add(LITERAL_FIRST_ID))
     }
 
     /// Free a predicate term's id for reuse, if it was interned.
@@ -404,7 +540,7 @@ impl Dictionary {
         let dead_lit: Vec<String> = self
             .literals
             .entries()
-            .filter(|&(i, _)| !referenced_ent_lit.contains(&(i + LITERAL_FIRST_ID)))
+            .filter(|&(i, _)| !referenced_ent_lit.contains(&i.wrapping_add(LITERAL_FIRST_ID)))
             .map(|(_, s)| s.to_owned())
             .collect();
         for key in dead_lit {
@@ -427,6 +563,36 @@ impl Dictionary {
         }
 
         freed
+    }
+
+    /// **Testing aid — not for production use.** Move each id space's
+    /// allocation counter of an *empty* in-memory dictionary to the given next
+    /// id (`next_literal_index` is the literal's dense index, i.e. its public id
+    /// minus `LITERAL_FIRST_ID`), so the id-space bounds can be exercised without
+    /// allocating billions of terms. The skipped ids are simply never used. The
+    /// advanced offsets are not persisted, so such a dictionary must not be
+    /// saved and reloaded.
+    #[doc(hidden)]
+    pub fn debug_advance_id_counters(
+        &mut self,
+        next_entity: EntityLiteralId,
+        next_literal_index: u32,
+        next_predicate: PredId,
+    ) -> Result<()> {
+        let empty = |i: &Interner| i.forward.is_empty() && i.backward.is_empty();
+        if self.backing.is_some()
+            || !empty(&self.entities)
+            || !empty(&self.literals)
+            || !empty(&self.predicates)
+        {
+            return Err(GStoreError::Database(
+                "debug_advance_id_counters needs an empty in-memory dictionary".into(),
+            ));
+        }
+        self.entities.base = next_entity;
+        self.literals.base = next_literal_index;
+        self.predicates.base = next_predicate;
+        Ok(())
     }
 }
 
@@ -584,5 +750,128 @@ mod tests {
             "front-coded dictionary should be <1/2 of raw {raw} bytes, got {}",
             block.len()
         );
+    }
+
+    /// Regression for the unbounded entity space: the 2,000,000,000th entity
+    /// used to receive id `LITERAL_FIRST_ID`, i.e. be classified as a literal.
+    #[test]
+    fn entity_space_is_bounded_below_literal_first_id() {
+        use crate::model::id::{is_entity_id, is_literal_id};
+        let mut d = Dictionary::new();
+        d.debug_advance_id_counters(ENTITY_ID_LIMIT - 2, 0, 0).unwrap();
+        let a = d.try_intern_entity("<a>").unwrap();
+        let b = d.try_intern_entity("<b>").unwrap();
+        assert_eq!((a, b), (LITERAL_FIRST_ID - 2, LITERAL_FIRST_ID - 1));
+        assert!(is_entity_id(b) && !is_literal_id(b));
+        assert_eq!(d.id_to_string(b), Some("<b>"));
+
+        // The next brand-new entity is refused — not given a literal-range id.
+        let err = d.try_intern_entity("<c>").unwrap_err();
+        assert!(err.to_string().contains("entity id space exhausted"), "{err}");
+        assert_eq!(d.entity_id("<c>"), None);
+        assert_eq!(d.entity_num(), 2);
+        // Existing entities still resolve; a term routed to the full space errs.
+        assert_eq!(d.try_intern_entity("<a>").unwrap(), a);
+        assert!(d.try_intern_term(&Term::iri("c")).is_err());
+        // Literals are a separate space and unaffected.
+        assert_eq!(d.try_intern_literal("\"v\"").unwrap(), LITERAL_FIRST_ID);
+
+        // A freed id is reused even when the space is otherwise full.
+        assert_eq!(d.free_entity("<a>"), Some(a));
+        assert_eq!(d.try_intern_entity("<c>").unwrap(), a);
+        assert!(d.try_intern_entity("<d>").is_err());
+    }
+
+    #[test]
+    fn literal_space_is_bounded_to_twice_literal_first_id() {
+        let mut d = Dictionary::new();
+        d.debug_advance_id_counters(0, LITERAL_INDEX_LIMIT - 1, 0).unwrap();
+        let last = d.try_intern_literal("\"last\"").unwrap();
+        assert_eq!(last, 3_999_999_999);
+        assert_eq!(d.literal_id("\"last\""), Some(last));
+        assert_eq!(d.id_to_string(last), Some("\"last\""));
+        assert_eq!(d.entity_literal_entries(), vec![(last, "\"last\"")]);
+        let err = d.try_intern_literal("\"one more\"").unwrap_err();
+        assert!(err.to_string().contains("literal id space exhausted"), "{err}");
+        assert!(d.try_intern_term(&Term::plain_literal("x")).is_err());
+        assert_eq!(d.try_intern_entity("<e>").unwrap(), 0);
+    }
+
+    #[test]
+    fn predicate_space_is_bounded() {
+        let mut d = Dictionary::new();
+        d.debug_advance_id_counters(0, 0, PREDICATE_ID_LIMIT - 1).unwrap();
+        assert_eq!(d.try_intern_predicate("<p>").unwrap(), PREDICATE_ID_LIMIT - 1);
+        assert_eq!(d.predicate_to_string(PREDICATE_ID_LIMIT - 1), Some("<p>"));
+        let err = d.try_intern_predicate("<q>").unwrap_err();
+        assert!(err.to_string().contains("predicate id space exhausted"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "entity id space exhausted")]
+    fn infallible_intern_panics_instead_of_corrupting() {
+        let mut d = Dictionary::new();
+        d.debug_advance_id_counters(ENTITY_ID_LIMIT, 0, 0).unwrap();
+        d.intern_entity("<x>");
+    }
+
+    #[test]
+    fn advancing_counters_requires_an_empty_dictionary() {
+        let mut d = Dictionary::new();
+        d.intern_entity("<a>");
+        assert!(d.debug_advance_id_counters(5, 5, 5).is_err());
+    }
+
+    #[test]
+    fn checked_id_helpers_enforce_the_bounds() {
+        assert_eq!(checked_entity_id(0).unwrap(), 0);
+        assert_eq!(checked_entity_id(1_999_999_999).unwrap(), 1_999_999_999);
+        assert!(checked_entity_id(2_000_000_000).is_err());
+        assert!(checked_entity_id(u64::MAX).is_err());
+        assert_eq!(checked_literal_id(0).unwrap(), LITERAL_FIRST_ID);
+        assert_eq!(checked_literal_id(1_999_999_999).unwrap(), 3_999_999_999);
+        assert!(checked_literal_id(2_000_000_000).is_err());
+        assert!(checked_predicate_id(1_999_999_999).is_ok());
+        assert!(checked_predicate_id(2_000_000_000).is_err());
+    }
+
+    /// The new (serde-skipped) interner offset must not change the persisted
+    /// `dict.bin` encoding: bytes equal those of the pre-change layout.
+    #[test]
+    fn persisted_encoding_is_unchanged() {
+        #[derive(Serialize)]
+        struct OldInterner {
+            forward: HashMap<String, u32>,
+            backward: Vec<Option<String>>,
+            free: Vec<u32>,
+        }
+        #[derive(Serialize)]
+        struct OldDictionary {
+            entities: OldInterner,
+            literals: OldInterner,
+            predicates: OldInterner,
+        }
+        let mut d = Dictionary::new();
+        d.intern_entity("<a>");
+        d.intern_entity("<b>");
+        d.free_entity("<a>");
+        d.intern_literal("\"x\"");
+        d.intern_predicate("<p>");
+        let old = |i: &Interner| OldInterner {
+            forward: i.forward.clone(),
+            backward: i.backward.clone(),
+            free: i.free.clone(),
+        };
+        let mirror = OldDictionary {
+            entities: old(&d.entities),
+            literals: old(&d.literals),
+            predicates: old(&d.predicates),
+        };
+        let new_bytes = bincode::serialize(&d).unwrap();
+        assert_eq!(new_bytes, bincode::serialize(&mirror).unwrap());
+        let back: Dictionary = bincode::deserialize(&new_bytes).unwrap();
+        assert_eq!(back.entity_id("<b>"), Some(1));
+        assert_eq!(back.literal_id("\"x\""), Some(LITERAL_FIRST_ID));
+        assert_eq!(back.predicate_id("<p>"), Some(0));
     }
 }

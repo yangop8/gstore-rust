@@ -193,9 +193,9 @@ fn heuristic_order(
     let first = *nodes
         .iter()
         .max_by(|&&a, &&b| {
+            // `total_cmp`: a NaN score must not panic the planner.
             node_score(graph, a, &placed, store, var_num)
-                .partial_cmp(&node_score(graph, b, &placed, store, var_num))
-                .unwrap()
+                .total_cmp(&node_score(graph, b, &placed, store, var_num))
         })
         .unwrap();
     order.push(first);
@@ -208,8 +208,7 @@ fn heuristic_order(
             .copied()
             .max_by(|&a, &b| {
                 node_score(graph, a, &placed, store, var_num)
-                    .partial_cmp(&node_score(graph, b, &placed, store, var_num))
-                    .unwrap()
+                    .total_cmp(&node_score(graph, b, &placed, store, var_num))
             })
             // disconnected component: take any remaining node
             .or_else(|| nodes.iter().copied().find(|v| !placed.contains(v)));
@@ -260,7 +259,7 @@ fn sampling_order(
                 let new_card = (card * sel).max(1.0);
                 (w, new_card)
             })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            .min_by(|a, b| a.1.total_cmp(&b.1));
         let (next, new_card) = match pick {
             Some(p) => p,
             None => match nodes.iter().copied().find(|v| !placed.contains(v)) {

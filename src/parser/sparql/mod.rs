@@ -12,6 +12,7 @@
 //! (`SERVICE [SILENT] (<iri> | ?var) { … }`).
 
 pub mod ast;
+pub mod builtins;
 pub mod lexer;
 
 use std::collections::HashMap;
@@ -936,6 +937,9 @@ impl Parser {
                     } else {
                         return Err(self.err(format!("unexpected word '{w}' in expression")));
                     };
+                    // A known built-in called with the wrong arity (e.g. `STR()`)
+                    // is a parse error naming the function and its arity.
+                    builtins::check_call(&upper, &args).map_err(|m| self.err(m))?;
                     Ok(Expr::Builtin(upper, args))
                 }
             }

@@ -35,6 +35,11 @@ mod persist;
 
 pub use persist::StorageKind;
 
+#[cfg(test)]
+mod hardening_tests;
+mod load_policy;
+pub use load_policy::{LoadPolicy, LoadSource};
+
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
 const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
@@ -254,6 +259,9 @@ pub struct Database {
     /// The first persistence failure (RocksDB dictionary / named-graph write)
     /// since the last commit point, reported by the next one.
     persist_error: RefCell<Option<String>>,
+    /// Which sources SPARQL `LOAD` may read (see [`LoadPolicy`]). Permissive by
+    /// default; network-facing servers install [`LoadPolicy::restricted`].
+    load_policy: LoadPolicy,
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -325,6 +333,7 @@ impl Database {
             home: None,
             disk: RefCell::new(None),
             persist_error: RefCell::new(None),
+            load_policy: LoadPolicy::default(),
         }
     }
 
@@ -385,6 +394,20 @@ impl Database {
         self.functions.len()
     }
 
+    /// Set which sources SPARQL `LOAD` may read. The default,
+    /// [`LoadPolicy::permissive`], reads any local path (CLI behaviour); a
+    /// server exposing updates to clients should install
+    /// [`LoadPolicy::restricted`] (optionally re-allowing an upload directory
+    /// with [`LoadPolicy::with_allowed_dir`]). Not persisted with the database.
+    pub fn set_load_policy(&mut self, policy: LoadPolicy) {
+        self.load_policy = policy;
+    }
+
+    /// The active `LOAD` policy.
+    pub fn load_policy(&self) -> &LoadPolicy {
+        &self.load_policy
+    }
+
     /// Build a database by importing one or more RDF files. The format of each
     /// file is detected by extension (N-Triples/Turtle/N-Quads/TriG/RDF-XML/
     /// JSON-LD/RDFa; unknown → Turtle) via [`parser::parse_file_by_ext`].
@@ -396,7 +419,7 @@ impl Database {
         let mut id_triples: Vec<IdTriple> = Vec::new();
         for f in files {
             for t in crate::parser::parse_file_by_ext(f)? {
-                id_triples.push(db.encode_triple(&t));
+                id_triples.push(db.encode_triple(&t)?);
             }
         }
         db.store.bulk_load(id_triples);
@@ -425,7 +448,7 @@ impl Database {
         progress(BuildProgress::Dictionary);
         let mut id_triples: Vec<IdTriple> = Vec::with_capacity(triples.len());
         for t in &triples {
-            id_triples.push(db.encode_triple(t));
+            id_triples.push(db.encode_triple(t)?);
         }
         db.store.bulk_load(id_triples);
         progress(BuildProgress::Index);
@@ -547,21 +570,33 @@ impl Database {
 
     // ---- updates ----------------------------------------------------------
 
-    /// Encode a triple to ids, interning any new terms.
-    fn encode_triple(&mut self, t: &Triple) -> IdTriple {
-        let sub = self.dict.intern_entity(&t.subject.dict_key());
-        let pred = self.dict.intern_predicate(&t.predicate.dict_key());
-        let obj = self.dict.intern_term(&t.object);
-        IdTriple::new(sub, pred, obj)
+    /// Encode a triple to ids, interning any new terms. Errs (interning
+    /// nothing further) once a dictionary id space is exhausted.
+    fn encode_triple(&mut self, t: &Triple) -> Result<IdTriple> {
+        let sub = self.dict.try_intern_entity(&t.subject.dict_key())?;
+        let pred = self.dict.try_intern_predicate(&t.predicate.dict_key())?;
+        let obj = self.dict.try_intern_term(&t.object)?;
+        Ok(IdTriple::new(sub, pred, obj))
     }
 
-    /// Insert one triple. Returns `true` if it was newly added. On a persistent
-    /// layout the insert is also written through to disk (see
-    /// [`StorageKind`]); a persistence failure is reported by the next commit
-    /// point (an auto-commit UPDATE, [`commit`](Self::commit), [`save`](Self::save)).
+    /// Insert one triple. Returns `true` if it was newly added; `false` if it
+    /// was already present **or** could not be encoded because a dictionary id
+    /// space is exhausted — use [`try_insert_triple`](Self::try_insert_triple)
+    /// to tell those apart. On a persistent layout the insert is also written
+    /// through to disk (see [`StorageKind`]); a persistence failure is reported
+    /// by the next commit point (an auto-commit UPDATE,
+    /// [`commit`](Self::commit), [`save`](Self::save)).
     pub fn insert_triple(&mut self, t: &Triple) -> bool {
-        let Some((_, id)) = self.intern_for_insert(t, None) else {
-            return false;
+        self.try_insert_triple(t).unwrap_or(false)
+    }
+
+    /// Insert one triple, reporting id-space exhaustion as an error. `Ok(true)`
+    /// if it was newly added, `Ok(false)` if it was already present (or a
+    /// persistence write failed; that failure is reported by the next commit
+    /// point).
+    pub fn try_insert_triple(&mut self, t: &Triple) -> Result<bool> {
+        let Some((_, id)) = self.intern_for_insert(t, None)? else {
+            return Ok(false);
         };
         let changed = self.store.insert(id);
         if changed {
@@ -588,7 +623,7 @@ impl Database {
             self.record_redo(b'I', None, id);
             self.persist_mutation(true, None, id);
         }
-        changed
+        Ok(changed)
     }
 
     /// Fold a just-inserted default-graph triple into the VS-tree incrementally
@@ -732,12 +767,12 @@ impl Database {
 
     /// Insert a triple into a named graph (`None` ⇒ default graph). Returns
     /// `true` if newly added.
-    fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
+    fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> Result<bool> {
         let Some(g) = graph else {
-            return self.insert_triple(t);
+            return self.try_insert_triple(t);
         };
-        let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g)) else {
-            return false;
+        let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
+            return Ok(false);
         };
         let changed = self.named.entry(gid).or_default().insert(id);
         if changed {
@@ -748,7 +783,7 @@ impl Database {
             self.record_redo(b'I', Some(gid), id);
             self.persist_mutation(true, Some(gid), id);
         }
-        changed
+        Ok(changed)
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
@@ -778,12 +813,30 @@ impl Database {
         changed
     }
 
-    /// Apply `INSERT DATA`. Returns the number of triples newly added.
+    /// Apply `INSERT DATA`. Returns the number of triples newly added. A triple
+    /// that cannot be encoded (dictionary id space exhausted) is skipped; see
+    /// [`try_insert_data`](Self::try_insert_data) to surface that as an error.
     pub fn insert_data(&mut self, triples: &[GroundTriple]) -> usize {
         triples
             .iter()
-            .filter(|g| self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
+            .filter(|g| {
+                self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())
+                    .unwrap_or(false)
+            })
             .count()
+    }
+
+    /// Apply `INSERT DATA`, stopping with an error if a dictionary id space is
+    /// exhausted (triples before the failing one stay inserted, as with any
+    /// mid-update failure; wrap in a transaction to make it atomic).
+    pub fn try_insert_data(&mut self, triples: &[GroundTriple]) -> Result<usize> {
+        let mut n = 0;
+        for g in triples {
+            if self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Apply `DELETE DATA`. Returns the number of triples actually removed.
@@ -906,7 +959,7 @@ impl Database {
     /// Apply one UPDATE operation, returning the number of triples it changed.
     fn exec_update_op(&mut self, op: UpdateOp) -> Result<usize> {
         match op {
-            UpdateOp::InsertData(triples) => Ok(self.insert_data(&triples)),
+            UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
             UpdateOp::Modify {
                 delete,
@@ -926,7 +979,7 @@ impl Database {
                     }
                 }
                 for t in &ins {
-                    if self.insert_triple(t) {
+                    if self.try_insert_triple(t)? {
                         changed += 1;
                     }
                 }
@@ -1035,18 +1088,27 @@ impl Database {
     }
 
     /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
-    /// graph. Only local sources are fetched — a `file://` IRI or a bare path;
-    /// remote `http(s)://` sources are not retrieved (no network) and error.
+    /// graph, subject to the [`LoadPolicy`]. Only local sources are fetched — a
+    /// `file:` IRI or a bare path; remote (`http(s)://`, …) sources are never
+    /// retrieved (no network) and error.
     fn load_rdf_source(&mut self, source: &str) -> Result<usize> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            return Err(GStoreError::Query(format!(
-                "LOAD of remote source '{source}' is not supported (no network); \
-                 use a local file path or file:// IRI"
-            )));
+        let path = match self.load_policy.resolve(source)? {
+            LoadSource::Local(path) => path,
+            LoadSource::Remote(_) => {
+                return Err(GStoreError::Query(format!(
+                    "LOAD of remote source '{source}' is not supported (no network); \
+                     use a local file path or file:// IRI"
+                )))
+            }
+        };
+        let triples = turtle::parse_file(&path)?;
+        let mut n = 0;
+        for t in &triples {
+            if self.try_insert_triple(t)? {
+                n += 1;
+            }
         }
-        let path = source.strip_prefix("file://").unwrap_or(source);
-        let triples = turtle::parse_file(path)?;
-        Ok(triples.iter().filter(|t| self.insert_triple(t)).count())
+        Ok(n)
     }
 
     /// Convenience: parse + ensure a SELECT result.
@@ -1429,7 +1491,7 @@ impl Database {
             for t in turtle::parse_str(triple_str)? {
                 match op {
                     'I' => {
-                        self.insert_quad(&t, graph_opt);
+                        self.insert_quad(&t, graph_opt)?;
                     }
                     'D' => {
                         self.delete_quad(&t, graph_opt);
@@ -1580,7 +1642,7 @@ impl Database {
         let mut db = Database::new(name);
         let mut buf: Vec<IdTriple> = Vec::with_capacity(batch.min(1 << 20));
         crate::parser::ntriples::for_each_triple_file(path, |t| {
-            let id = db.encode_triple(&t);
+            let id = db.encode_triple(&t)?;
             buf.push(id);
             if buf.len() >= batch {
                 db.store.bulk_load(buf.drain(..).collect());
@@ -1632,7 +1694,7 @@ impl Database {
         let mut ids: Vec<IdTriple> = Vec::new();
         for chunk in parsed {
             for t in chunk? {
-                ids.push(db.encode_triple(&t));
+                ids.push(db.encode_triple(&t)?);
             }
         }
         db.store.bulk_load(ids);

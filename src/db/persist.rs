@@ -760,6 +760,13 @@ impl Database {
     #[cfg(feature = "rocksdb")]
     fn create_rocksdb(name: String, dir: &Path, triples: Vec<Triple>) -> Result<Database> {
         use crate::backend::rocks::RocksStore;
+        // Encode first: an exhausted id space must fail before anything in
+        // `dir` is replaced.
+        let mut db = Database::new(name);
+        let ids: Vec<IdTriple> = triples
+            .iter()
+            .map(|t| db.encode_triple(t))
+            .collect::<Result<_>>()?;
         fs::create_dir_all(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
@@ -767,8 +774,6 @@ impl Database {
         fsutil::recover_dir_swap(&rocks_dir)?;
         fsutil::remove_dir_if_exists(&rocks_dir)?;
 
-        let mut db = Database::new(name);
-        let ids: Vec<IdTriple> = triples.iter().map(|t| db.encode_triple(t)).collect();
         let mut rocks = RocksStore::open(&rocks_dir)?;
         // Dictionary first: a term without a triple is harmless, the reverse not.
         rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
@@ -998,21 +1003,25 @@ impl Database {
         failure.map_or(Ok(()), Err)
     }
 
-    /// Intern a triple's terms (and its graph IRI) for an insert. For a RocksDB
-    /// database, brand-new dictionary terms are written to the `dict` CF
-    /// *before* the triple; if that fails the insert is abandoned (`None`) and
-    /// the error is reported at the next commit point.
+    /// Intern a triple's terms (and its graph IRI) for an insert. Errs once a
+    /// dictionary id space is exhausted. For a RocksDB database, brand-new
+    /// dictionary terms are written to the `dict` CF *before* the triple; if
+    /// that fails the insert is abandoned (`Ok(None)`) and the error is
+    /// reported at the next commit point.
     pub(super) fn intern_for_insert(
         &mut self,
         t: &Triple,
         graph: Option<&str>,
-    ) -> Option<(Option<u32>, IdTriple)> {
+    ) -> Result<Option<(Option<u32>, IdTriple)>> {
         #[cfg(feature = "rocksdb")]
         if self.store.as_rocks().is_some() {
             return self.intern_persisting_terms(t, graph);
         }
-        let gid = graph.map(|g| self.dict.intern_entity(&Term::iri(g).dict_key()));
-        Some((gid, self.encode_triple(t)))
+        let gid = match graph {
+            Some(g) => Some(self.dict.try_intern_entity(&Term::iri(g).dict_key())?),
+            None => None,
+        };
+        Ok(Some((gid, self.encode_triple(t)?)))
     }
 
     #[cfg(feature = "rocksdb")]
@@ -1020,26 +1029,33 @@ impl Database {
         &mut self,
         t: &Triple,
         graph: Option<&str>,
-    ) -> Option<(Option<u32>, IdTriple)> {
+    ) -> Result<Option<(Option<u32>, IdTriple)>> {
         use crate::backend::rocks::TermSpace;
         use rocks_layout::intern_tracked;
         let mut fresh: Vec<(TermSpace, u32, String)> = Vec::new();
         let dict = &mut self.dict;
-        let gid = graph
-            .map(|g| intern_tracked(dict, TermSpace::Entity, Term::iri(g).dict_key(), &mut fresh));
-        let s = intern_tracked(dict, TermSpace::Entity, t.subject.dict_key(), &mut fresh);
+        let gid = match graph {
+            Some(g) => Some(intern_tracked(
+                dict,
+                TermSpace::Entity,
+                Term::iri(g).dict_key(),
+                &mut fresh,
+            )?),
+            None => None,
+        };
+        let s = intern_tracked(dict, TermSpace::Entity, t.subject.dict_key(), &mut fresh)?;
         let p = intern_tracked(
             dict,
             TermSpace::Predicate,
             t.predicate.dict_key(),
             &mut fresh,
-        );
+        )?;
         let o_space = if t.object.is_literal() {
             TermSpace::Literal
         } else {
             TermSpace::Entity
         };
-        let o = intern_tracked(dict, o_space, t.object.dict_key(), &mut fresh);
+        let o = intern_tracked(dict, o_space, t.object.dict_key(), &mut fresh)?;
         if !fresh.is_empty() {
             let terms: Vec<(TermSpace, u32, &str)> = fresh
                 .iter()
@@ -1048,11 +1064,11 @@ impl Database {
             if let Some(rocks) = self.store.as_rocks() {
                 if let Err(e) = rocks.put_terms(&terms) {
                     self.note_persist_error(e);
-                    return None;
+                    return Ok(None);
                 }
             }
         }
-        Some((gid, IdTriple::new(s, p, o)))
+        Ok(Some((gid, IdTriple::new(s, p, o))))
     }
 
     /// After reasoning inserted `added` straight into the store: write the new
@@ -1197,22 +1213,18 @@ mod rocks_layout {
         space: TermSpace,
         key: String,
         fresh: &mut Vec<(TermSpace, u32, String)>,
-    ) -> u32 {
+    ) -> Result<u32> {
         let known = match space {
             TermSpace::Entity => dict.entity_id(&key),
             TermSpace::Literal => dict.literal_id(&key),
             TermSpace::Predicate => dict.predicate_id(&key),
         };
         if let Some(id) = known {
-            return id;
+            return Ok(id);
         }
-        let id = match space {
-            TermSpace::Entity => dict.intern_entity(&key),
-            TermSpace::Literal => dict.intern_literal(&key),
-            TermSpace::Predicate => dict.intern_predicate(&key),
-        };
+        let id = intern(dict, space, &key)?;
         fresh.push((space, id, key));
-        id
+        Ok(id)
     }
 
     fn space_of(obj: u32) -> TermSpace {
@@ -1293,11 +1305,11 @@ mod rocks_layout {
             }
             while *next < id {
                 let hole = format!("\u{0}gstore-free-slot-{}", *next);
-                intern(&mut dict, space, &hole);
+                intern(&mut dict, space, &hole)?;
                 holes.push((space, hole));
                 *next += 1;
             }
-            let got = intern(&mut dict, space, &key);
+            let got = intern(&mut dict, space, &key)?;
             if got != id {
                 return Err(GStoreError::Database(format!(
                     "corrupt RocksDB dictionary: term {key} stored under two ids"
@@ -1315,11 +1327,13 @@ mod rocks_layout {
         Ok(dict)
     }
 
-    fn intern(dict: &mut Dictionary, space: TermSpace, key: &str) -> u32 {
+    /// Intern `key` in `space`, erring (instead of corrupting ids) once that
+    /// id space is exhausted.
+    fn intern(dict: &mut Dictionary, space: TermSpace, key: &str) -> Result<u32> {
         match space {
-            TermSpace::Entity => dict.intern_entity(key),
-            TermSpace::Literal => dict.intern_literal(key),
-            TermSpace::Predicate => dict.intern_predicate(key),
+            TermSpace::Entity => dict.try_intern_entity(key),
+            TermSpace::Literal => dict.try_intern_literal(key),
+            TermSpace::Predicate => dict.try_intern_predicate(key),
         }
     }
 
