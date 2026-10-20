@@ -895,7 +895,11 @@ pub(crate) fn serve_connection<S: Read + Write>(
 
     let opts = &*env.opts;
     let life = &env.life;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(Timed {
+        inner: stream,
+        ctl,
+        deadline: None,
+    });
     let mut first = Some(first);
     let mut served = 0usize;
     let mut idle = opts.keep_alive_timeout;
@@ -917,12 +921,12 @@ pub(crate) fn serve_connection<S: Read + Write>(
                 g
             }
         };
-        let (req, info) = match read_request(&mut reader, opts.max_body) {
+        let (req, info) = match read_request(&mut reader, opts.max_body, opts.read_timeout) {
             Ok(None) => return, // closed before sending anything
             Ok(Some(r)) => r,
             Err(bad) => {
                 let meta = ConnMeta::new(false, idle, 0, opts.cors);
-                let _ = handle(reader.get_mut(), Err(bad), &meta);
+                let _ = handle(&mut reader.get_mut().inner, Err(bad), &meta);
                 return;
             }
         };
@@ -942,14 +946,39 @@ pub(crate) fn serve_connection<S: Read + Write>(
             && wants_keep_alive(&req, info.http10)
             && !life.stopping();
         let meta = ConnMeta::new(keep, idle, max_requests.saturating_sub(served), opts.cors);
+        let stream = &mut reader.get_mut().inner;
         let kept = if opts.cors && req.method == "OPTIONS" {
-            write_preflight(reader.get_mut(), &req, &meta).is_ok()
+            write_preflight(stream, &req, &meta).is_ok()
         } else {
-            matches!(handle(reader.get_mut(), Ok(req), &meta), Ok(true))
+            matches!(handle(stream, Ok(req), &meta), Ok(true))
         };
         if !(kept && keep) || life.stopping() {
             return;
         }
+    }
+}
+
+/// The connection's transport plus an optional deadline: while one is set,
+/// every read first narrows the socket's read timeout to the time left (and
+/// fails once it has passed), so a request head must arrive *in full* within
+/// [`HttpOptions::read_timeout`] — a client dripping one byte at a time cannot
+/// hold a worker of the bounded pool indefinitely.
+struct Timed<'a, S> {
+    inner: S,
+    ctl: Option<&'a TcpStream>,
+    deadline: Option<Instant>,
+}
+
+impl<S: Read> Read for Timed<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let (Some(deadline), Some(ctl)) = (self.deadline, self.ctl) {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let _ = ctl.set_read_timeout(Some(deadline - now));
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -1064,17 +1093,26 @@ struct Head {
 }
 
 /// Read one request from a connection, answering `Expect: 100-continue`
-/// before the body is read. `Ok(None)` when the client closed the connection
-/// before sending anything.
+/// before the body is read. The request line and headers must arrive within
+/// `read_timeout` in total; the body only must not stall for longer than that
+/// between reads (a large upload may take longer overall). `Ok(None)` when the
+/// client closed the connection before sending anything.
 fn read_request<S: Read + Write>(
-    reader: &mut BufReader<S>,
+    reader: &mut BufReader<Timed<'_, S>>,
     max_body: usize,
+    read_timeout: Duration,
 ) -> Result<Option<(Request, RequestInfo)>, BadRequest> {
-    let Some(head) = read_head(reader, max_body)? else {
+    reader.get_mut().deadline = Some(Instant::now() + read_timeout);
+    let head = read_head(reader, max_body);
+    reader.get_mut().deadline = None;
+    if let Some(ctl) = reader.get_ref().ctl {
+        let _ = ctl.set_read_timeout(Some(read_timeout));
+    }
+    let Some(head) = head? else {
         return Ok(None);
     };
     if head.expect_continue && (head.chunked || head.content_length > 0) {
-        let w = reader.get_mut();
+        let w = &mut reader.get_mut().inner;
         w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
             .and_then(|_| w.flush())
             .map_err(|_| BadRequest::MALFORMED)?;
@@ -1133,10 +1171,8 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
     let mut chunked = false;
     let mut expect_continue = false;
     let mut headers = Vec::new();
-    loop {
-        let Some(h) = read_line_bounded(r)? else {
-            break; // EOF ends the headers
-        };
+    // EOF also ends the headers.
+    while let Some(h) = read_line_bounded(r)? {
         if h.is_empty() {
             break; // end of headers
         }
@@ -3071,6 +3107,40 @@ mod tests {
         let mut rest = Vec::new();
         ar.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    #[test]
+    fn a_dripping_client_cannot_hold_a_worker() {
+        let opts = HttpOptions {
+            threads: 1,
+            read_timeout: Duration::from_millis(500),
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // One byte of request head every 100 ms: each read is well within the
+        // read timeout, but the head as a whole is not.
+        let mut drip = TcpStream::connect(addr).unwrap();
+        let dripper = thread::spawn(move || {
+            for b in b"GET /status HTTP/1.1\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+                if drip.write_all(&[*b]).is_err() {
+                    return true; // the server hung up
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let mut buf = [0u8; 256];
+            drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            matches!(drip.read(&mut buf), Ok(_))
+        });
+        thread::sleep(Duration::from_millis(150));
+        let t0 = Instant::now();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert!(dripper.join().unwrap(), "the dripping connection was dropped");
     }
 
     #[test]
