@@ -27,9 +27,13 @@ pub mod cluster;
 pub mod concurrent;
 pub mod dict;
 pub mod error;
+/// The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).
+pub mod gapi;
 pub mod http_api;
 pub mod http_client;
 pub mod http_users;
+/// A small dependency-free JSON value, parser and serializer.
+pub mod json;
 pub mod kvstore;
 pub mod model;
 pub mod parser;

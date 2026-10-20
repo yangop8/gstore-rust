@@ -58,6 +58,16 @@
 //! transaction ids are `404`; committing or rolling back a finished one is
 //! `409`.
 //!
+//! **Upstream protocol.** The same server also speaks upstream gStore 1.4's
+//! own protocol — `GET|POST /api` (and `POST /`, `GET /?operation=…`) with an
+//! `operation` parameter, per-request `username`/`password`, and a JSON
+//! envelope that is always HTTP 200 — so the upstream SDKs, the Workbench and
+//! the upstream test scripts work unmodified. It is implemented in
+//! [`crate::gapi`] on this module's state (databases, users, transactions,
+//! tasks, logs); the endpoints documented here remain as Rust-only
+//! extensions. Transaction ids are small sequential numbers (the first is
+//! `1`), as upstream's.
+//!
 //! **Panic isolation.** Each request runs under `catch_unwind`: a panicking
 //! handler answers `500` with a JSON error and the locks it poisoned are
 //! recovered, so the server keeps serving.
@@ -89,6 +99,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::db::{Database, LoadPolicy};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
+use crate::gapi::GapiConfig;
 use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
 use crate::query::{Evaluator, QueryResult};
@@ -159,7 +170,10 @@ pub const CONSOLE_HTML: &str = r##"<!doctype html>
   Every endpoint but <code>/login</code>, <code>GET /</code>, and
   <code>GET /console</code> requires HTTP Basic credentials or an
   <code>Authorization: Bearer &lt;session&gt;</code> token from
-  <code>/login</code>.
+  <code>/login</code>.<br>
+  Upstream gStore protocol (SDKs, Workbench): <code>GET|POST /api</code>
+  with <code>operation=…</code>, <code>username</code> and
+  <code>password</code> parameters.
 </p>
 <script>
 document.getElementById('run').addEventListener('click', function () {
@@ -230,6 +244,20 @@ impl Resp {
     /// A `{"StatusCode":code,"StatusMsg":…}` error envelope at HTTP `status`.
     fn fail(status: u16, msg: &str) -> Resp {
         Resp::new(status, JSON, status_json(status as i64, msg))
+    }
+}
+
+impl From<crate::gapi::GResp> for Resp {
+    /// An `/api` response: a JSON envelope is always HTTP 200 (see
+    /// [`crate::gapi::envelope`]).
+    fn from(g: crate::gapi::GResp) -> Resp {
+        let (status, ctype, body, extra) = g.into_parts();
+        Resp {
+            status,
+            ctype,
+            body,
+            extra,
+        }
     }
 }
 
@@ -309,13 +337,13 @@ impl TxnIsolation {
 }
 
 /// One open HTTP transaction (registry entry in [`ApiState::txns`]).
-struct Txn {
+pub(crate) struct Txn {
     /// The database it operates on.
-    db: String,
+    pub(crate) db: String,
     /// The user who began it: only they (or `root`) may `/tquery`, `/commit` or
     /// `/rollback` it.
-    owner: String,
-    isolation: TxnIsolation,
+    pub(crate) owner: String,
+    pub(crate) isolation: TxnIsolation,
 }
 
 /// How many finished transaction ids are remembered so that a repeated
@@ -332,7 +360,7 @@ const ENDED_TXN_MEMORY: usize = 1024;
 /// in-memory footprint until it commits or rolls back. User-defined functions
 /// and the VS-tree are not part of the snapshot (the VS-tree is only a
 /// candidate-pruning accelerator, so results are unchanged).
-struct ReadSnapshot {
+pub(crate) struct ReadSnapshot {
     dict: Dictionary,
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
@@ -383,39 +411,39 @@ impl ReadSnapshot {
 /// The open transaction on a database, kept *inside* the per-db lock so a
 /// request that already holds the lock can tell, race-free, whether a
 /// transaction is open (and must then reject a write or read the snapshot).
-struct OpenTxn {
-    tid: u64,
+pub(crate) struct OpenTxn {
+    pub(crate) tid: u64,
     /// The committed state at `/begin` (see [`ReadSnapshot`]).
-    snapshot: Arc<ReadSnapshot>,
+    pub(crate) snapshot: Arc<ReadSnapshot>,
     /// Whether a `/tquery` update changed data — if so, the commit marks the
     /// database dirty (and saves it under the check_point policy).
-    changed: bool,
+    pub(crate) changed: bool,
 }
 
 /// One loaded database plus its HTTP-layer bookkeeping, behind the per-db
 /// mutex.
-struct DbSlot {
-    db: Database,
+pub(crate) struct DbSlot {
+    pub(crate) db: Database,
     /// Where this database is persisted (`<root>/<name>.db`).
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// The in-memory database has changes not yet saved to [`dir`](Self::dir).
-    dirty: bool,
+    pub(crate) dirty: bool,
     /// The open HTTP transaction on this database, if any.
-    txn: Option<OpenTxn>,
+    pub(crate) txn: Option<OpenTxn>,
     /// Set once the database was unloaded, dropped or replaced while a request
     /// still held this handle: the slot then holds an empty placeholder that
     /// must never be queried, written or saved (it would overwrite `dir`).
-    retired: bool,
+    pub(crate) retired: bool,
 }
 
 /// A shared handle to one loaded database.
-type DbHandle = Arc<Mutex<DbSlot>>;
+pub(crate) type DbHandle = Arc<Mutex<DbSlot>>;
 
 impl DbSlot {
     /// A freshly loaded / built / restored database: clean when it matches
     /// what is on disk at `dir`. The server's `LOAD` policy is installed on it
     /// (clients must not make the server read arbitrary local files).
-    fn handle(mut db: Database, dir: PathBuf, dirty: bool, policy: &LoadPolicy) -> DbHandle {
+    pub(crate) fn handle(mut db: Database, dir: PathBuf, dirty: bool, policy: &LoadPolicy) -> DbHandle {
         db.set_load_policy(policy.clone());
         Arc::new(Mutex::new(DbSlot {
             db,
@@ -430,7 +458,7 @@ impl DbSlot {
     /// drop the database now — closing its store files before anything on disk
     /// replaces them — and leave an empty placeholder that refuses to be saved.
     /// A request that cloned the handle earlier then sees [`retired`](Self::retired).
-    fn retire(&mut self) {
+    pub(crate) fn retire(&mut self) {
         self.retired = true;
         self.dirty = false;
         let name = self.db.name().to_string();
@@ -442,7 +470,7 @@ impl DbSlot {
     /// For an on-disk / RocksDB database opened from `dir` this is a cheap
     /// commit point (its updates are already written through); an in-memory
     /// snapshot is rewritten atomically.
-    fn save(&mut self) -> crate::Result<()> {
+    pub(crate) fn save(&mut self) -> crate::Result<()> {
         if self.retired {
             return Err(GStoreError::Database(format!(
                 "refusing to save: database '{}' is no longer loaded",
@@ -468,7 +496,7 @@ impl DbSlot {
     /// point ([`Database::sync`], a no-op for an in-memory snapshot): its
     /// direct-API writes (`/batch*`, `/upload`) are already written through
     /// and only need committing, so there is no reason to leave them volatile.
-    fn wrote(&mut self, check_point: bool) -> Option<String> {
+    pub(crate) fn wrote(&mut self, check_point: bool) -> Option<String> {
         self.dirty = true;
         if !check_point {
             return self.db.sync().err().map(|e| {
@@ -486,7 +514,7 @@ impl DbSlot {
     /// Run a read on behalf of a *non-transactional* caller: against the
     /// begin-time snapshot while a transaction is open (never its uncommitted
     /// writes), else against the live database.
-    fn read(&mut self, sparql: &str) -> crate::Result<QueryResult> {
+    pub(crate) fn read(&mut self, sparql: &str) -> crate::Result<QueryResult> {
         match &self.txn {
             Some(open) => open.snapshot.query(sparql, None),
             None => self.db.query(sparql),
@@ -494,7 +522,7 @@ impl DbSlot {
     }
 
     /// The committed triple count (the snapshot's while a transaction is open).
-    fn committed_triple_num(&self) -> u64 {
+    pub(crate) fn committed_triple_num(&self) -> u64 {
         match &self.txn {
             Some(open) => open.snapshot.triple_num(),
             None => self.db.triple_num(),
@@ -510,25 +538,106 @@ fn unload_busy(name: &str, tid: u64) -> Resp {
     )
 }
 
-/// The `409` answer to a `/begin` while transaction `open` is open.
-fn txn_already_open(name: &str, open: u64) -> Resp {
-    Resp::fail(
-        409,
-        &format!("a transaction ({open}) is already open on database '{name}'"),
+/// The refusal (REST `409`) of a `/begin` while transaction `open` is open.
+pub(crate) fn txn_already_open_err(name: &str, open: u64) -> OpError {
+    OpError::new(
+        OpErrorKind::Conflict,
+        format!("a transaction ({open}) is already open on database '{name}'"),
     )
 }
 
 /// The `409` answer to a non-transactional write while a transaction is open
 /// on the target database. Writes never silently join someone's transaction.
 fn txn_conflict(name: &str, tid: u64) -> Resp {
-    Resp::fail(
-        409,
-        &format!(
+    txn_conflict_err(name, tid).rest()
+}
+
+/// [`txn_conflict`] as an [`OpError`].
+fn txn_conflict_err(name: &str, tid: u64) -> OpError {
+    OpError::new(
+        OpErrorKind::Conflict,
+        format!(
             "database '{name}' has an open transaction (TID {tid}); non-transactional writes \
              are rejected until it is committed or rolled back (send the statement to /tquery \
              with that tid instead)"
         ),
     )
+}
+
+/// Why a database / transaction operation shared by the REST endpoints and
+/// the upstream `/api` layer ([`crate::gapi`]) was refused or failed. Each
+/// front end renders it its own way: REST as an HTTP status ([`OpError::rest`]),
+/// `/api` as an upstream `StatusCode` (see `crate::gapi::ops_query`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpError {
+    pub(crate) kind: OpErrorKind,
+    pub(crate) msg: String,
+}
+
+/// The class of an [`OpError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpErrorKind {
+    /// The database is not (or no longer) loaded — REST `404`.
+    NotLoaded,
+    /// No such transaction — REST `404`.
+    TxnUnknown,
+    /// The transaction is no longer running — REST `409`.
+    TxnEnded,
+    /// The transaction belongs to another user — REST `403`.
+    NotOwner,
+    /// Refused because of an open transaction or a lifecycle operation in
+    /// progress — REST `409`.
+    Conflict,
+    /// The server is shutting down — REST `503`.
+    ShuttingDown,
+    /// The SPARQL statement failed (syntax, evaluation, cancellation) — REST
+    /// `400` with a `{"error":…}` body.
+    Query,
+    /// An internal failure (I/O, save, begin/commit) — REST `500`.
+    Failed,
+}
+
+impl OpError {
+    pub(crate) fn new(kind: OpErrorKind, msg: impl Into<String>) -> OpError {
+        OpError {
+            kind,
+            msg: msg.into(),
+        }
+    }
+
+    /// The REST endpoints' HTTP status for this error.
+    fn http(&self) -> u16 {
+        match self.kind {
+            OpErrorKind::NotLoaded | OpErrorKind::TxnUnknown => 404,
+            OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
+            OpErrorKind::NotOwner => 403,
+            OpErrorKind::ShuttingDown => 503,
+            OpErrorKind::Query => 400,
+            OpErrorKind::Failed => 500,
+        }
+    }
+
+    /// The REST rendering: `{"StatusCode":<http>,"StatusMsg":…}`, or for a
+    /// failed SPARQL statement the SPARQL endpoints' `{"error":…}` body.
+    fn rest(&self) -> Resp {
+        match self.kind {
+            OpErrorKind::Query => Resp::new(400, SPARQL_JSON, err_json(&self.msg)),
+            _ => Resp::fail(self.http(), &self.msg),
+        }
+    }
+}
+
+/// What a [`QueryJob`] produced.
+#[derive(Debug)]
+pub(crate) enum JobOutput {
+    /// A read (SELECT / ASK / CONSTRUCT / DESCRIBE) result.
+    Read(QueryResult),
+    /// An applied UPDATE: the triples it changed, and a warning when the
+    /// check_point save after it failed (the change stays applied).
+    Updated {
+        changed: usize,
+        warning: Option<String>,
+    },
 }
 
 /// One in-flight query/update task, tracked so `/tasklist` can list it and
@@ -539,14 +648,14 @@ fn txn_conflict(name: &str, tid: u64) -> Resp {
 /// into [`Database::query_cancellable`], which polls it and aborts an in-flight
 /// read with [`GStoreError::Cancelled`](crate::GStoreError::Cancelled). A
 /// concurrent `POST /cancel` sets it while the query is still executing.
-struct TaskEntry {
-    db: String,
+pub(crate) struct TaskEntry {
+    pub(crate) db: String,
     /// A short, log-safe snippet of the query text (newlines flattened,
     /// truncated) — not necessarily the full statement.
-    query: String,
-    user: String,
-    started: Instant,
-    cancel: Arc<AtomicBool>,
+    pub(crate) query: String,
+    pub(crate) user: String,
+    pub(crate) started: Instant,
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 /// Mutable server state guarded by a single mutex. The registries here are all
@@ -563,35 +672,45 @@ struct TaskEntry {
 /// update a registry atomically with the slot) — that cannot deadlock, since
 /// whoever holds this lock never waits for a db lock. So a slow query on one
 /// database can never wedge this lock, `/cancel`, `/tasklist`, other
-/// databases, or a shutdown's cancellation step.
-struct ApiState {
-    root: PathBuf,
-    users: UserStore,
+/// databases, or a shutdown's cancellation step. The upstream-compatible
+/// `/api` layer ([`crate::gapi`]) follows the same rule: its operations run
+/// with no lock held and take this one only briefly.
+pub(crate) struct ApiState {
+    pub(crate) root: PathBuf,
+    pub(crate) users: UserStore,
     /// Loaded, in-memory databases by name. Each is behind its own `Mutex` (and
     /// an `Arc` so a worker can clone the handle and run a query without holding
     /// the outer `ApiState` lock).
-    dbs: HashMap<String, DbHandle>,
+    pub(crate) dbs: HashMap<String, DbHandle>,
     /// Open transactions by id.
-    txns: HashMap<u64, Txn>,
+    pub(crate) txns: HashMap<u64, Txn>,
     /// The single open transaction per database (single-writer), if any.
-    db_txn: HashMap<String, u64>,
+    pub(crate) db_txn: HashMap<String, u64>,
     /// Recently finished transactions (`tid`, outcome), newest last, bounded by
     /// [`ENDED_TXN_MEMORY`].
-    ended_txns: VecDeque<(u64, &'static str)>,
+    pub(crate) ended_txns: VecDeque<(u64, &'static str)>,
+    /// The next transaction id to hand out. Like upstream gStore's
+    /// `Txn_manager` (whose counter starts at 1), ids are small and sequential
+    /// — the upstream test scripts address the first transaction as `tid=1`.
+    /// Ownership checks, not unguessable ids, keep transactions apart.
+    pub(crate) next_tid: u64,
     /// In-flight query/update tasks by id (see [`TaskEntry`]).
-    tasks: HashMap<u64, TaskEntry>,
-    started: Instant,
-    requests: u64,
+    pub(crate) tasks: HashMap<u64, TaskEntry>,
+    pub(crate) started: Instant,
+    pub(crate) requests: u64,
     /// The `LOAD` policy installed on every database this server serves
     /// (default [`LoadPolicy::restricted`]: SPARQL `LOAD` reads nothing).
-    load_policy: LoadPolicy,
+    pub(crate) load_policy: LoadPolicy,
     /// Databases with a lifecycle operation (`/build`, `/load`, `/unload`,
     /// `/drop`, `/restore`, or an `/upload` that opens/creates the database)
     /// in progress. Those run with this lock released (they may wait for the
     /// db lock or do slow I/O), so this reservation keeps a second lifecycle
     /// operation — or a `/begin` — off the same name meanwhile. Released by
     /// [`BusyGuard`].
-    busy: HashSet<String>,
+    pub(crate) busy: HashSet<String>,
+    /// Settings of the upstream-compatible `/api` layer (see
+    /// [`ApiServer::with_gapi_config`]).
+    pub(crate) gapi: GapiConfig,
 }
 
 impl ApiState {
@@ -611,14 +730,14 @@ impl ApiState {
         }
     }
 
-    fn remember_ended(&mut self, tid: u64, outcome: &'static str) {
+    pub(crate) fn remember_ended(&mut self, tid: u64, outcome: &'static str) {
         if self.ended_txns.len() >= ENDED_TXN_MEMORY {
             self.ended_txns.pop_front();
         }
         self.ended_txns.push_back((tid, outcome));
     }
 
-    fn ended_outcome(&self, tid: u64) -> Option<&'static str> {
+    pub(crate) fn ended_outcome(&self, tid: u64) -> Option<&'static str> {
         self.ended_txns
             .iter()
             .rev()
@@ -627,7 +746,7 @@ impl ApiState {
     }
 
     /// The on-disk directory of database `name`.
-    fn db_dir(&self, name: &str) -> PathBuf {
+    pub(crate) fn db_dir(&self, name: &str) -> PathBuf {
         self.root.join(crate::db_dir_for(name))
     }
 }
@@ -647,27 +766,27 @@ pub struct ApiServer {
 
 /// The shared, thread-safe part of an [`ApiServer`]: everything a connection
 /// worker needs. Held behind an `Arc` so a worker only clones a pointer.
-struct ApiInner {
-    state: Mutex<ApiState>,
+pub(crate) struct ApiInner {
+    pub(crate) state: Mutex<ApiState>,
     /// The root directory (also in [`ApiState::root`]); kept here so the access
     /// log can be written even when a panicking handler poisoned the state lock.
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     /// gStore's `check_point` policy: save a database after every successful
     /// write (update, batch, upload, commit). On by default.
-    check_point: bool,
+    pub(crate) check_point: bool,
     /// Upper bound on how long a graceful shutdown waits for in-flight requests.
     grace: Duration,
     /// Set when a graceful shutdown begins. From then on every write is saved
     /// before it is acknowledged (whatever the check_point policy), and no new
     /// transaction may begin — so a write still in flight when the shutdown's
     /// final save runs cannot be acknowledged and then lost.
-    closing: AtomicBool,
+    pub(crate) closing: AtomicBool,
 }
 
 impl ApiInner {
     /// Whether a write must be saved before it is acknowledged: the
     /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
-    fn save_writes(&self) -> bool {
+    pub(crate) fn save_writes(&self) -> bool {
         self.check_point || self.closing.load(Ordering::SeqCst)
     }
 
@@ -677,7 +796,7 @@ impl ApiInner {
     /// its files are closed before the caller replaces or deletes them and a
     /// request still holding the handle can neither use nor save it. Returns
     /// whether it was loaded. Must not be called with the state lock held.
-    fn retire_loaded(&self, name: &str) -> bool {
+    pub(crate) fn retire_loaded(&self, name: &str) -> bool {
         let handle = locked(&self.state).dbs.remove(name);
         match handle {
             Some(h) => {
@@ -690,9 +809,9 @@ impl ApiInner {
 }
 
 /// Releases a [`ApiState::busy`] reservation when dropped (also on a panic).
-struct BusyGuard<'a> {
-    inner: &'a ApiInner,
-    name: String,
+pub(crate) struct BusyGuard<'a> {
+    pub(crate) inner: &'a ApiInner,
+    pub(crate) name: String,
 }
 
 impl Drop for BusyGuard<'_> {
@@ -724,26 +843,26 @@ enum Dispatch {
 
 /// A query handed out of [`ApiInner::dispatch`] to run without the `ApiState`
 /// lock held. It carries its own database handle and cancel flag.
-struct QueryJob {
+pub(crate) struct QueryJob {
     /// The target database (its own lock, independent of `ApiState`).
-    db: DbHandle,
-    name: String,
+    pub(crate) db: DbHandle,
+    pub(crate) name: String,
     /// Shared with the [`TaskEntry`] in [`ApiState::tasks`]; a concurrent
     /// `/cancel` flips it and [`Database::query_cancellable`] observes it.
-    cancel: Arc<AtomicBool>,
+    pub(crate) cancel: Arc<AtomicBool>,
     /// The registry id to unregister once the query finishes.
-    task_id: u64,
-    sparql: String,
+    pub(crate) task_id: u64,
+    pub(crate) sparql: String,
     /// Whether `sparql` is an UPDATE (classified by the parser at dispatch).
-    is_update: bool,
-    fmt: ResultFormat,
+    pub(crate) is_update: bool,
+    pub(crate) fmt: ResultFormat,
 }
 
 /// Unregisters a task when dropped — also when the query panics — so the
 /// `/tasklist` registry never keeps a dead entry.
-struct TaskGuard<'a> {
-    inner: &'a ApiInner,
-    id: u64,
+pub(crate) struct TaskGuard<'a> {
+    pub(crate) inner: &'a ApiInner,
+    pub(crate) id: u64,
 }
 
 impl Drop for TaskGuard<'_> {
@@ -775,11 +894,13 @@ impl ApiServer {
                     txns: HashMap::new(),
                     db_txn: HashMap::new(),
                     ended_txns: VecDeque::new(),
+                    next_tid: 1,
                     tasks: HashMap::new(),
                     started: Instant::now(),
                     requests: 0,
                     load_policy: LoadPolicy::restricted(),
                     busy: HashSet::new(),
+                    gapi: GapiConfig::default(),
                 }),
                 root,
                 check_point: true,
@@ -822,6 +943,35 @@ impl ApiServer {
             inner.grace = grace;
         }
         self
+    }
+
+    /// Replace the settings of the upstream-compatible `/api` layer
+    /// ([`crate::gapi`]): the query output cap (`max_output_size`), the
+    /// version/licence strings it reports, where `format=file` results go, …
+    /// May also be changed later, while serving, with
+    /// [`set_gapi_config`](Self::set_gapi_config).
+    pub fn with_gapi_config(self, config: GapiConfig) -> ApiServer {
+        self.set_gapi_config(config);
+        self
+    }
+
+    /// Cap the rows an `/api` `query` returns (upstream's `max_output_size`,
+    /// default [`crate::gapi::DEFAULT_MAX_OUTPUT_SIZE`]); see
+    /// [`GapiConfig::max_output_size`].
+    pub fn with_max_output_size(self, rows: usize) -> ApiServer {
+        locked(&self.inner.state).gapi.max_output_size = rows;
+        self
+    }
+
+    /// The current `/api` layer settings.
+    pub fn gapi_config(&self) -> GapiConfig {
+        locked(&self.inner.state).gapi.clone()
+    }
+
+    /// Replace the `/api` layer settings while serving (e.g. after a
+    /// configuration reload); requests that already started keep the old ones.
+    pub fn set_gapi_config(&self, config: GapiConfig) {
+        locked(&self.inner.state).gapi = config;
     }
 
     /// Whether the check_point policy (save after every write) is on.
@@ -875,8 +1025,9 @@ impl ApiServer {
             let inner = Arc::clone(&self.inner);
             spawn_worker(move || {
                 let _in_flight = guard;
+                let peer = stream.peer_addr().ok();
                 let mut stream = stream;
-                let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut stream)));
+                let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut stream, peer)));
             });
         });
         self.finish_shutdown(drained)
@@ -892,9 +1043,10 @@ impl ApiServer {
             let config = Arc::clone(&config);
             spawn_worker(move || {
                 let _in_flight = guard;
+                let peer = stream.peer_addr().ok();
                 if let Ok(conn) = rustls::ServerConnection::new(config) {
                     let mut tls = rustls::StreamOwned::new(conn, stream);
-                    let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut tls)));
+                    let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut tls, peer)));
                 }
             });
         });
@@ -966,15 +1118,26 @@ impl ApiInner {
     /// parsing and writing runs under `catch_unwind`: a panicking handler
     /// answers `500` (JSON) and the locks it poisoned are recovered by
     /// [`locked`], so the server keeps serving.
-    fn handle<S: Read + Write>(&self, stream: &mut S) -> std::io::Result<()> {
+    fn handle<S: Read + Write>(&self, stream: &mut S, peer: Option<SocketAddr>) -> std::io::Result<()> {
         let req = match Request::parse(stream) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()),
             Err(_) => return write_response_ext(stream, 400, JSON, &[], &err_json("bad request")),
         };
 
-        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req)))
-            .unwrap_or_else(|_| (Resp::fail(500, PANIC_MSG), "-".to_string()));
+        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req, peer)))
+            .unwrap_or_else(|_| {
+                // The upstream protocol answers every outcome with HTTP 200.
+                let resp = if crate::gapi::wants(&req) {
+                    Resp::from(crate::gapi::GResp::error(
+                        crate::gapi::Status::OperationFailed,
+                        PANIC_MSG,
+                    ))
+                } else {
+                    Resp::fail(500, PANIC_MSG)
+                };
+                (resp, "-".to_string())
+            });
 
         // Access log. Written off-lock (O_APPEND keeps each line atomic); strict
         // request ordering is neither achievable nor needed once connections run
@@ -1003,7 +1166,14 @@ impl ApiInner {
 
     /// Route and execute one request, returning the response and the caller's
     /// display name for the access log.
-    fn respond(&self, req: &Request) -> (Resp, String) {
+    fn respond(&self, req: &Request, peer: Option<SocketAddr>) -> (Resp, String) {
+        // The upstream-compatible `/api` protocol (`/api`, `POST /`,
+        // `GET /?operation=…`, its path routes): per-request credentials and a
+        // JSON envelope, served by `crate::gapi` with no lock held.
+        if crate::gapi::wants(req) {
+            let (resp, user_disp) = crate::gapi::serve(self, req, peer);
+            return (Resp::from(resp), user_disp);
+        }
         // Short critical section: count the request, resolve the caller, route.
         // A query endpoint returns `Dispatch::Query` so the actual (possibly
         // long) execution happens below with the `ApiState` lock released.
@@ -1027,8 +1197,20 @@ impl ApiInner {
         (resp, user_disp)
     }
 
-    /// Run a deferred [`QueryJob`] with only the target database's lock held
-    /// (the `ApiState` lock is free), then unregister the task.
+    /// Run a deferred [`QueryJob`] and render the outcome for the REST
+    /// endpoints (see [`run_query_job`](Self::run_query_job)).
+    fn execute_query_job(&self, job: QueryJob) -> Resp {
+        let fmt = job.fmt;
+        match self.run_query_job(job) {
+            Ok(JobOutput::Read(result)) => render_result(fmt, &result),
+            Ok(JobOutput::Updated { changed, warning }) => update_resp(changed, &warning),
+            Err(e) => e.rest(),
+        }
+    }
+
+    /// Run a [`QueryJob`] with only the target database's lock held (the
+    /// `ApiState` lock is free), then unregister the task. Shared by the REST
+    /// endpoints and the upstream `/api` layer ([`crate::gapi`]).
     ///
     /// The open-transaction check happens here, under the db lock, so it cannot
     /// race a concurrent `/begin`: a write is rejected while a transaction is
@@ -1036,7 +1218,7 @@ impl ApiInner {
     /// (released from the db lock first, so it does not stall the owner's
     /// `/tquery`s). A write that changed data marks the database dirty and is
     /// saved before the lock is released under the check_point policy.
-    fn execute_query_job(&self, job: QueryJob) -> Resp {
+    pub(crate) fn run_query_job(&self, job: QueryJob) -> Result<JobOutput, OpError> {
         // Declared before the db guard so it drops *after* it: the registry is
         // touched (state lock) only once the db lock is released.
         let _task = TaskGuard {
@@ -1049,21 +1231,21 @@ impl ApiInner {
             panic!("test-triggered panic inside a query job");
         }
         if slot.retired {
-            return Resp::fail(
-                404,
-                &format!("database '{}' was unloaded while this request waited", job.name),
-            );
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{}' was unloaded while this request waited", job.name),
+            ));
         }
         if let Some(open) = &slot.txn {
             if job.is_update {
-                return txn_conflict(&job.name, open.tid);
+                return Err(txn_conflict_err(&job.name, open.tid));
             }
             let snapshot = Arc::clone(&open.snapshot);
             drop(slot);
-            return match snapshot.query(&job.sparql, Some(job.cancel)) {
-                Ok(result) => render_result(job.fmt, &result),
-                Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
-            };
+            return snapshot
+                .query(&job.sparql, Some(job.cancel))
+                .map(JobOutput::Read)
+                .map_err(|e| OpError::new(OpErrorKind::Query, e.to_string()));
         }
         let before = slot.db.mutation_count();
         let result = slot.db.query_cancellable(&job.sparql, job.cancel);
@@ -1078,12 +1260,11 @@ impl ApiInner {
                 } else {
                     None
                 };
-                drop(slot);
-                update_resp(changed, &warning)
+                Ok(JobOutput::Updated { changed, warning })
             }
             Ok(result) => {
                 drop(slot);
-                render_result(job.fmt, &result)
+                Ok(JobOutput::Read(result))
             }
             Err(e) => {
                 let msg = if wrote {
@@ -1091,7 +1272,7 @@ impl ApiInner {
                 } else {
                     e.to_string()
                 };
-                Resp::new(400, SPARQL_JSON, err_json(&msg))
+                Err(OpError::new(OpErrorKind::Query, msg))
             }
         }
     }
@@ -1384,7 +1565,7 @@ impl ApiInner {
     /// and cancel flag. The [`TaskGuard`] in
     /// [`execute_query_job`](Self::execute_query_job) unregisters it once the
     /// query completes (success, error, or panic).
-    fn register_task(
+    pub(crate) fn register_task(
         &self,
         st: &mut ApiState,
         db: &str,
@@ -1821,109 +2002,157 @@ impl ApiInner {
                 }
             },
         };
-        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
+        let dbh = match Self::begin_target(st, &name) {
+            Ok(dbh) => dbh,
+            Err(e) => return Dispatch::Done(e.rest()),
         };
-        if let Some(&open) = st.db_txn.get(&name) {
-            return Dispatch::Done(txn_already_open(&name, open));
-        }
-        if st.busy.contains(&name) {
-            return Dispatch::Done(Resp::fail(409, &format!("database '{name}' is busy")));
-        }
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
-            let mut slot = locked(&dbh);
-            if slot.retired {
-                return Resp::fail(404, &format!("database '{name}' is not loaded"));
-            }
-            if let Some(open) = &slot.txn {
-                return txn_already_open(&name, open.tid);
-            }
-            // Checked under the db lock, which the shutdown takes after setting
-            // the flag: no transaction can begin after its rollback pass.
-            if inner.closing.load(Ordering::SeqCst) {
-                return Resp::fail(503, "the server is shutting down");
-            }
-            let snapshot = Arc::new(ReadSnapshot::capture(&slot.db));
-            if let Err(e) = slot.db.begin() {
-                return Resp::fail(500, &format!("begin failed: {e}"));
-            }
-            // Register it while the db lock is held, so the registry and the
-            // slot always agree (a /commit locks the db before the registry).
-            let tid = {
-                let mut st = locked(&inner.state);
-                let conflict = if let Some(&open) = st.db_txn.get(&name) {
-                    Some(txn_already_open(&name, open))
-                } else if st.busy.contains(&name) {
-                    Some(Resp::fail(409, &format!("database '{name}' is busy")))
-                } else {
-                    None
-                };
-                if let Some(r) = conflict {
-                    drop(st);
-                    let _ = slot.db.rollback();
-                    return r;
+            match inner.begin_txn(&dbh, &name, isolation, &user) {
+                Ok(tid) => {
+                    let body = format!(
+                        "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
+                        json_str(&tid.to_string()),
+                        isolation.code(),
+                        json_str(isolation.name()),
+                    );
+                    Resp::new(200, JSON, body.into_bytes())
                 }
-                let mut tid = new_id();
-                while st.txns.contains_key(&tid) || st.ended_outcome(tid).is_some() {
-                    tid = new_id();
-                }
-                st.txns.insert(
-                    tid,
-                    Txn {
-                        db: name.clone(),
-                        owner: user.clone(),
-                        isolation,
-                    },
-                );
-                st.db_txn.insert(name.clone(), tid);
-                tid
-            };
-            slot.txn = Some(OpenTxn {
-                tid,
-                snapshot,
-                changed: false,
-            });
-            drop(slot);
-            append_log(
-                &inner.root,
-                "txn.log",
-                &format!(
-                    "{}\tbegin\t{}\t{}\t{}\t{}",
-                    now_millis(),
-                    name,
-                    tid,
-                    user,
-                    isolation.name()
-                ),
-            );
-            let body = format!(
-                "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
-                json_str(&tid.to_string()),
-                isolation.code(),
-                json_str(isolation.name()),
-            );
-            Resp::new(200, JSON, body.into_bytes())
+                Err(e) => e.rest(),
+            }
         }))
+    }
+
+    /// The pre-checks of a `begin` on `name`, under the state lock: the loaded
+    /// database's handle, or why no transaction can begin on it now.
+    pub(crate) fn begin_target(st: &ApiState, name: &str) -> Result<DbHandle, OpError> {
+        let Some(dbh) = st.dbs.get(name).map(Arc::clone) else {
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' is not loaded"),
+            ));
+        };
+        if let Some(&open) = st.db_txn.get(name) {
+            return Err(txn_already_open_err(name, open));
+        }
+        if st.busy.contains(name) {
+            return Err(OpError::new(
+                OpErrorKind::Conflict,
+                format!("database '{name}' is busy"),
+            ));
+        }
+        Ok(dbh)
+    }
+
+    /// Begin a transaction owned by `user` on loaded database `name` (handle
+    /// `dbh`, from [`begin_target`](Self::begin_target)). Must be called with
+    /// no lock held: it locks the database, snapshots its committed state,
+    /// and registers the transaction while still holding the db lock (so the
+    /// registry and the slot always agree). Returns the new transaction id.
+    pub(crate) fn begin_txn(
+        &self,
+        dbh: &DbHandle,
+        name: &str,
+        isolation: TxnIsolation,
+        user: &str,
+    ) -> Result<u64, OpError> {
+        let mut slot = locked(dbh);
+        if slot.retired {
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' is not loaded"),
+            ));
+        }
+        if let Some(open) = &slot.txn {
+            return Err(txn_already_open_err(name, open.tid));
+        }
+        // Checked under the db lock, which the shutdown takes after setting
+        // the flag: no transaction can begin after its rollback pass.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(OpError::new(OpErrorKind::ShuttingDown, "the server is shutting down"));
+        }
+        let snapshot = Arc::new(ReadSnapshot::capture(&slot.db));
+        if let Err(e) = slot.db.begin() {
+            return Err(OpError::new(OpErrorKind::Failed, format!("begin failed: {e}")));
+        }
+        // Register it while the db lock is held, so the registry and the
+        // slot always agree (a /commit locks the db before the registry).
+        let tid = {
+            let mut st = locked(&self.state);
+            let conflict = if let Some(&open) = st.db_txn.get(name) {
+                Some(txn_already_open_err(name, open))
+            } else if st.busy.contains(name) {
+                Some(OpError::new(
+                    OpErrorKind::Conflict,
+                    format!("database '{name}' is busy"),
+                ))
+            } else {
+                None
+            };
+            if let Some(e) = conflict {
+                drop(st);
+                let _ = slot.db.rollback();
+                return Err(e);
+            }
+            // Sequential, like upstream (see `ApiState::next_tid`); skip any id
+            // still known so a wrapped counter never reuses one.
+            let mut tid = st.next_tid.max(1);
+            while st.txns.contains_key(&tid) || st.ended_outcome(tid).is_some() {
+                tid = tid.checked_add(1).unwrap_or(1);
+            }
+            st.next_tid = tid.checked_add(1).unwrap_or(1);
+            st.txns.insert(
+                tid,
+                Txn {
+                    db: name.to_string(),
+                    owner: user.to_string(),
+                    isolation,
+                },
+            );
+            st.db_txn.insert(name.to_string(), tid);
+            tid
+        };
+        slot.txn = Some(OpenTxn {
+            tid,
+            snapshot,
+            changed: false,
+        });
+        drop(slot);
+        append_log(
+            &self.root,
+            "txn.log",
+            &format!(
+                "{}\tbegin\t{}\t{}\t{}\t{}",
+                now_millis(),
+                name,
+                tid,
+                user,
+                isolation.name()
+            ),
+        );
+        Ok(tid)
     }
 
     /// Look up open transaction `tid` for `user`: unknown ids are `404`, already
     /// finished ones `409`, and someone else's transaction `403` (only the
-    /// owner or `root` may touch it).
-    fn txn_for(&self, st: &ApiState, tid: u64, user: &str) -> Result<String, Resp> {
+    /// owner or `root` may touch it). Returns the transaction's database.
+    pub(crate) fn txn_for(&self, st: &ApiState, tid: u64, user: &str) -> Result<String, OpError> {
         let Some(txn) = st.txns.get(&tid) else {
             return Err(match st.ended_outcome(tid) {
-                Some(outcome) => Resp::fail(
-                    409,
-                    &format!("transaction {tid} is not running (already {outcome})"),
+                Some(outcome) => OpError::new(
+                    OpErrorKind::TxnEnded,
+                    format!("transaction {tid} is not running (already {outcome})"),
                 ),
-                None => Resp::fail(404, &format!("no open transaction {tid}")),
+                None => OpError::new(
+                    OpErrorKind::TxnUnknown,
+                    format!("no open transaction {tid}"),
+                ),
             });
         };
         if txn.owner != user && user != ROOT_USER {
-            return Err(Resp::fail(
-                403,
-                &format!("transaction {tid} belongs to another user"),
+            return Err(OpError::new(
+                OpErrorKind::NotOwner,
+                format!("transaction {tid} belongs to another user"),
             ));
         }
         Ok(txn.db.clone())
@@ -1935,7 +2164,7 @@ impl ApiInner {
         };
         let name = match self.txn_for(st, tid, user) {
             Ok(name) => name,
-            Err(resp) => return Dispatch::Done(resp),
+            Err(e) => return Dispatch::Done(e.rest()),
         };
         let Some(sparql) = req
             .param("sparql")
@@ -1961,32 +2190,42 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        // Runs with the state lock released. The transaction is re-checked
-        // under the db lock, which /commit and /rollback also take before they
-        // end it — so the statement either runs inside transaction `tid` or
-        // is refused, never applied outside it.
         Dispatch::Deferred(Box::new(move |_| {
-            let mut slot = locked(&dbh);
-            if slot.retired || slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
-                return Resp::fail(
-                    409,
-                    &format!("transaction {tid} is not open on database '{name}'"),
-                );
-            }
-            let before = slot.db.mutation_count();
-            let result = slot.db.query(&sparql);
-            // Also a failing UPDATE may have applied part of its operations.
-            if slot.db.mutation_count() != before {
-                if let Some(open) = slot.txn.as_mut() {
-                    open.changed = true;
-                }
-            }
-            drop(slot);
-            match result {
+            match Self::run_in_txn(&dbh, &name, tid, &sparql) {
                 Ok(r) => render_result(fmt, &r),
-                Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
+                Err(e) => e.rest(),
             }
         }))
+    }
+
+    /// Run `sparql` inside open transaction `tid` on database `name` (handle
+    /// `dbh`). Must be called with no lock held. The transaction is re-checked
+    /// under the db lock, which `/commit` and `/rollback` also take before they
+    /// end it — so the statement either runs inside transaction `tid` or is
+    /// refused, never applied outside it.
+    pub(crate) fn run_in_txn(
+        dbh: &DbHandle,
+        name: &str,
+        tid: u64,
+        sparql: &str,
+    ) -> Result<QueryResult, OpError> {
+        let mut slot = locked(dbh);
+        if slot.retired || slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
+            return Err(OpError::new(
+                OpErrorKind::TxnEnded,
+                format!("transaction {tid} is not open on database '{name}'"),
+            ));
+        }
+        let before = slot.db.mutation_count();
+        let result = slot.db.query(sparql);
+        // Also a failing UPDATE may have applied part of its operations.
+        if slot.db.mutation_count() != before {
+            if let Some(open) = slot.txn.as_mut() {
+                open.changed = true;
+            }
+        }
+        drop(slot);
+        result.map_err(|e| OpError::new(OpErrorKind::Query, e.to_string()))
     }
 
     fn handle_commit(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
@@ -2003,66 +2242,84 @@ impl ApiInner {
         };
         let db_name = match self.txn_for(st, tid, user) {
             Ok(name) => name,
-            Err(resp) => return Dispatch::Done(resp),
+            Err(e) => return Dispatch::Done(e.rest()),
         };
         let dbh = st.dbs.get(&db_name).map(Arc::clone);
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let verb = if commit { "commit" } else { "rollback" };
-            let mut slot = dbh.as_ref().map(|h| locked(h));
-            // End it in the registry while the db lock is held (race-free with
-            // /begin, /tquery and a concurrent /commit of the same tid).
-            let txn = {
-                let mut st = locked(&inner.state);
-                if let Err(resp) = inner.txn_for(&st, tid, &user) {
-                    return resp;
-                }
-                let txn = st.txns.remove(&tid).expect("checked by txn_for");
-                st.db_txn.remove(&txn.db);
-                st.remember_ended(tid, if commit { "committed" } else { "rolled back" });
-                txn
-            };
-            let result = match slot.as_mut().filter(|s| !s.retired) {
-                Some(slot) => {
-                    let open = slot.txn.take();
-                    Some(if commit {
-                        // `Database::commit` keeps the writes even when flushing
-                        // its redo log fails, so the data changed either way.
-                        let committed = slot.db.commit();
-                        let warning = if open.is_some_and(|o| o.changed) {
-                            slot.wrote(inner.save_writes())
-                        } else {
-                            None
-                        };
-                        committed.map(|()| warning)
-                    } else {
-                        slot.db.rollback().map(|()| None)
-                    })
-                }
-                None => None,
-            };
-            drop(slot);
-            append_log(
-                &inner.root,
-                "txn.log",
-                &format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    now_millis(),
-                    verb,
-                    txn.db,
-                    tid,
-                    user,
-                    txn.isolation.name()
-                ),
-            );
-            match result {
-                Some(Ok(warning)) => {
-                    Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning)
-                }
-                Some(Err(e)) => Resp::fail(500, &format!("{verb} failed: {e}")),
-                None => Resp::fail(404, &format!("database '{}' is not loaded", txn.db)),
+            match inner.end_txn(dbh.as_ref(), tid, &user, commit) {
+                Ok(warning) => Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning),
+                Err(e) => e.rest(),
             }
         }))
+    }
+
+    /// Commit (or roll back) open transaction `tid` on behalf of `user`;
+    /// `dbh` is the handle of its database (looked up beforehand, `None` when
+    /// it is no longer loaded). Must be called with no lock held. Returns the
+    /// warning of a failed check_point save after a commit that changed data
+    /// (the commit itself stands).
+    pub(crate) fn end_txn(
+        &self,
+        dbh: Option<&DbHandle>,
+        tid: u64,
+        user: &str,
+        commit: bool,
+    ) -> Result<Option<String>, OpError> {
+        let verb = if commit { "commit" } else { "rollback" };
+        let mut slot = dbh.map(|h| locked(h));
+        // End it in the registry while the db lock is held (race-free with
+        // /begin, /tquery and a concurrent /commit of the same tid).
+        let txn = {
+            let mut st = locked(&self.state);
+            self.txn_for(&st, tid, user)?;
+            let txn = st.txns.remove(&tid).expect("checked by txn_for");
+            st.db_txn.remove(&txn.db);
+            st.remember_ended(tid, if commit { "committed" } else { "rolled back" });
+            txn
+        };
+        let result = match slot.as_mut().filter(|s| !s.retired) {
+            Some(slot) => {
+                let open = slot.txn.take();
+                Some(if commit {
+                    // `Database::commit` keeps the writes even when flushing
+                    // its redo log fails, so the data changed either way.
+                    let committed = slot.db.commit();
+                    let warning = if open.is_some_and(|o| o.changed) {
+                        slot.wrote(self.save_writes())
+                    } else {
+                        None
+                    };
+                    committed.map(|()| warning)
+                } else {
+                    slot.db.rollback().map(|()| None)
+                })
+            }
+            None => None,
+        };
+        drop(slot);
+        append_log(
+            &self.root,
+            "txn.log",
+            &format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                now_millis(),
+                verb,
+                txn.db,
+                tid,
+                user,
+                txn.isolation.name()
+            ),
+        );
+        match result {
+            Some(Ok(warning)) => Ok(warning),
+            Some(Err(e)) => Err(OpError::new(OpErrorKind::Failed, format!("{verb} failed: {e}"))),
+            None => Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{}' is not loaded", txn.db),
+            )),
+        }
     }
 
     /// Lock a loaded database for a non-transactional maintenance request: the
@@ -2073,14 +2330,26 @@ impl ApiInner {
         name: &str,
         what: &str,
     ) -> Result<std::sync::MutexGuard<'a, DbSlot>, Resp> {
+        Self::lock_for_op(dbh, name, what).map_err(|e| e.rest())
+    }
+
+    /// [`lock_for`](Self::lock_for) with an [`OpError`].
+    pub(crate) fn lock_for_op<'a>(
+        dbh: &'a DbHandle,
+        name: &str,
+        what: &str,
+    ) -> Result<std::sync::MutexGuard<'a, DbSlot>, OpError> {
         let slot = locked(dbh);
         if slot.retired {
-            return Err(Resp::fail(404, &format!("database '{name}' is not loaded")));
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' is not loaded"),
+            ));
         }
         if let Some(open) = &slot.txn {
-            return Err(Resp::fail(
-                409,
-                &format!(
+            return Err(OpError::new(
+                OpErrorKind::Conflict,
+                format!(
                     "database '{name}' has an open transaction (TID {}); commit or roll back \
                      before {what}",
                     open.tid
@@ -2100,16 +2369,18 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        Dispatch::Deferred(Box::new(move |_| {
-            let mut slot = match Self::lock_for(&dbh, &name, "checkpointing") {
-                Ok(slot) => slot,
-                Err(r) => return r,
-            };
-            match slot.save() {
-                Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
-                Err(e) => Resp::fail(500, &format!("checkpoint failed: {e}")),
-            }
+        Dispatch::Deferred(Box::new(move |_| match Self::checkpoint_db(&dbh, &name) {
+            Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
+            Err(e) => e.rest(),
         }))
+    }
+
+    /// Save loaded database `name` (handle `dbh`) now, whatever the
+    /// check_point policy. Must be called with no lock held.
+    pub(crate) fn checkpoint_db(dbh: &DbHandle, name: &str) -> Result<(), OpError> {
+        let mut slot = Self::lock_for_op(dbh, name, "checkpointing")?;
+        slot.save()
+            .map_err(|e| OpError::new(OpErrorKind::Failed, format!("checkpoint failed: {e}")))
     }
 
     // ---- backup / restore / export ---------------------------------------
@@ -2680,7 +2951,7 @@ fn valid_ground_triple(t: &Triple) -> bool {
 
 /// Whether a SPARQL request is an UPDATE (mutating) statement, skipping any
 /// leading `PREFIX`/`BASE` declarations.
-fn is_update_sparql(s: &str) -> bool {
+pub(crate) fn is_update_sparql(s: &str) -> bool {
     // Classify by the *parser*, not a whitespace token scan. A leading
     // `# comment` line (the lexer skips comments) or unusual whitespace must not
     // be able to hide an UPDATE keyword from this check — otherwise a query-only
@@ -2752,7 +3023,7 @@ fn wants_inline(req: &Request) -> bool {
 
 /// Validate a database name: non-empty, ≤ 64 chars, `[A-Za-z0-9_-]` only (so it
 /// is a safe single path component).
-fn valid_db_name(name: &str) -> bool {
+pub(crate) fn valid_db_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -2761,7 +3032,7 @@ fn valid_db_name(name: &str) -> bool {
 }
 
 /// Append one line (with a trailing newline) to `root/file`, best effort.
-fn append_log(root: &Path, file: &str, line: &str) {
+pub(crate) fn append_log(root: &Path, file: &str, line: &str) {
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2772,7 +3043,7 @@ fn append_log(root: &Path, file: &str, line: &str) {
 }
 
 /// Milliseconds since the Unix epoch (for log timestamps).
-fn now_millis() -> u128 {
+pub(crate) fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())

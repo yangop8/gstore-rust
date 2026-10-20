@@ -441,7 +441,9 @@ fn users_db_stores_versioned_pbkdf2_hashes() {
     for line in text.lines() {
         let cred = line.split('\t').nth(1).unwrap();
         let parts: Vec<&str> = cred.split('$').collect();
-        assert_eq!(parts[0], "pbkdf2-sha256", "{line}");
+        // PBKDF2 over the password's MD5 hex digest, so `encryption=1` (MD5)
+        // clients of the upstream `/api` protocol verify against the same hash.
+        assert_eq!(parts[0], "pbkdf2-sha256-md5", "{line}");
         let iterations = parts[1].parse::<u32>().unwrap();
         assert_eq!(iterations, PBKDF2_ITERATIONS);
         assert!(iterations >= 10_000, "work factor floor");
