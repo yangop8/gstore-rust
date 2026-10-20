@@ -23,9 +23,11 @@
 //! [`ApiServer::with_check_point`]) every successful write — `/update`, an
 //! update via `/sparql`, `/batchInsert`, `/batchRemove`, `/upload`, a `/commit`
 //! that changed data — is saved to `<root>/<name>.db` before it is
-//! acknowledged. With the policy off, changes stay in memory until
-//! `/checkpoint` (which always forces a save), `/unload` (which saves a dirty
-//! database before dropping it) or a graceful shutdown.
+//! acknowledged. An UPDATE that fails part-way counts as a write too: its
+//! operations before the failing one stay applied (the error says so), so they
+//! are saved like any other change. With the policy off, changes stay in
+//! memory until `/checkpoint` (which always forces a save), `/unload` (which
+//! saves a dirty database before dropping it) or a graceful shutdown.
 //!
 //! **Graceful shutdown.** [`ApiServer::shutdown`] (or a
 //! [`ShutdownHandle`] — e.g. wired to `SIGINT`/`SIGTERM` with
@@ -33,7 +35,14 @@
 //! requests finish (bounded; queries still running after the grace period are
 //! cancelled), rolls back open transactions, saves every dirty database, and
 //! makes [`serve_forever`](ApiServer::serve_forever) return a
-//! [`ShutdownReport`].
+//! [`ShutdownReport`]. Once it has begun, every write is saved before it is
+//! acknowledged, and a request that reaches a database only after its final
+//! save is refused — so no acknowledged write is lost.
+//!
+//! **Locking.** Every database has its own lock, and no request ever waits for
+//! one while holding the server-wide state lock (see `ApiState`): a long
+//! query blocks only requests for *its* database, never `/cancel`,
+//! `/tasklist` or other databases.
 //!
 //! **Transactions.** At most one transaction is open per database, owned by
 //! the user who began it: only that user (or `root`) may `/tquery`, `/commit`
@@ -67,7 +76,7 @@
 //! As with [`crate::server`], real TLS is out of scope — terminate HTTPS in a
 //! reverse proxy and do not send credentials over plain `http://` in production.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -493,6 +502,22 @@ impl DbSlot {
     }
 }
 
+/// The `409` answer to an `/unload` while transaction `tid` is open.
+fn unload_busy(name: &str, tid: u64) -> Resp {
+    Resp::fail(
+        409,
+        &format!("database '{name}' is busy in transaction {tid}; commit or roll back first"),
+    )
+}
+
+/// The `409` answer to a `/begin` while transaction `open` is open.
+fn txn_already_open(name: &str, open: u64) -> Resp {
+    Resp::fail(
+        409,
+        &format!("a transaction ({open}) is already open on database '{name}'"),
+    )
+}
+
 /// The `409` answer to a non-transactional write while a transaction is open
 /// on the target database. Writes never silently join someone's transaction.
 fn txn_conflict(name: &str, tid: u64) -> Resp {
@@ -530,7 +555,15 @@ struct TaskEntry {
 /// that db's lock and leaves this one free — which is what lets a concurrent
 /// `POST /cancel` reach the task registry while a query runs.
 ///
-/// Lock order: this lock first, then a db lock — never the reverse.
+/// **Locking rule: never wait for a db lock while holding this lock.** A
+/// request that needs a database clones its handle here, releases this lock,
+/// and only then locks the database ([`Dispatch::Query`] /
+/// [`Dispatch::Deferred`]), re-checking under the db lock that the slot is
+/// still served. Holding a db lock, a thread may take this lock briefly (to
+/// update a registry atomically with the slot) — that cannot deadlock, since
+/// whoever holds this lock never waits for a db lock. So a slow query on one
+/// database can never wedge this lock, `/cancel`, `/tasklist`, other
+/// databases, or a shutdown's cancellation step.
 struct ApiState {
     root: PathBuf,
     users: UserStore,
@@ -552,20 +585,29 @@ struct ApiState {
     /// The `LOAD` policy installed on every database this server serves
     /// (default [`LoadPolicy::restricted`]: SPARQL `LOAD` reads nothing).
     load_policy: LoadPolicy,
+    /// Databases with a lifecycle operation (`/build`, `/load`, `/unload`,
+    /// `/drop`, `/restore`, or an `/upload` that opens/creates the database)
+    /// in progress. Those run with this lock released (they may wait for the
+    /// db lock or do slow I/O), so this reservation keeps a second lifecycle
+    /// operation — or a `/begin` — off the same name meanwhile. Released by
+    /// [`BusyGuard`].
+    busy: HashSet<String>,
 }
 
 impl ApiState {
-    /// Unload database `name`, if loaded, *without* saving: its slot is retired
-    /// (see [`DbSlot::retire`]) so its files are closed before the caller
-    /// replaces or deletes them, and a request still holding the handle can
-    /// neither use nor save it. Returns whether it was loaded.
-    fn evict(&mut self, name: &str) -> bool {
-        match self.dbs.remove(name) {
-            Some(h) => {
-                locked(&h).retire();
-                true
-            }
-            None => false,
+    /// Reserve `name` for a lifecycle operation, or the `409` refusal when
+    /// another one is in progress.
+    fn claim(&mut self, name: &str) -> Result<(), Resp> {
+        if self.busy.insert(name.to_string()) {
+            Ok(())
+        } else {
+            Err(Resp::fail(
+                409,
+                &format!(
+                    "database '{name}' is busy: another build/load/unload/drop/restore of it is \
+                     in progress"
+                ),
+            ))
         }
     }
 
@@ -615,20 +657,69 @@ struct ApiInner {
     check_point: bool,
     /// Upper bound on how long a graceful shutdown waits for in-flight requests.
     grace: Duration,
+    /// Set when a graceful shutdown begins. From then on every write is saved
+    /// before it is acknowledged (whatever the check_point policy), and no new
+    /// transaction may begin — so a write still in flight when the shutdown's
+    /// final save runs cannot be acknowledged and then lost.
+    closing: AtomicBool,
 }
 
-/// The outcome of routing a request: either a fully-built response, or a query
+impl ApiInner {
+    /// Whether a write must be saved before it is acknowledged: the
+    /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
+    fn save_writes(&self) -> bool {
+        self.check_point || self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Stop serving `name` (if loaded) *without* saving: take its handle out
+    /// of the registry, then — with the state lock released — wait for any
+    /// request still using it and retire the slot (see [`DbSlot::retire`]), so
+    /// its files are closed before the caller replaces or deletes them and a
+    /// request still holding the handle can neither use nor save it. Returns
+    /// whether it was loaded. Must not be called with the state lock held.
+    fn retire_loaded(&self, name: &str) -> bool {
+        let handle = locked(&self.state).dbs.remove(name);
+        match handle {
+            Some(h) => {
+                locked(&h).retire();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Releases a [`ApiState::busy`] reservation when dropped (also on a panic).
+struct BusyGuard<'a> {
+    inner: &'a ApiInner,
+    name: String,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        locked(&self.inner.state).busy.remove(&self.name);
+    }
+}
+
+/// A privilege-gated endpoint that touches a database: it validates the request
+/// under the state lock and returns the db work as a [`Dispatch::Deferred`].
+type Handler = fn(&ApiInner, &mut ApiState, &Request, &str) -> Dispatch;
+
+/// The outcome of routing a request: either a fully-built response, or work
 /// deferred to run *after* the [`ApiState`] lock is released — so a concurrent
-/// `POST /cancel` can reach the task registry while the query executes.
+/// `POST /cancel` can reach the task registry while it executes.
 enum Dispatch {
     Done(Resp),
     Query(QueryJob),
-    /// A response whose (possibly db-lock-contended) work runs with the
-    /// `ApiState` lock released — the closure captures cloned [`DbHandle`]s and
-    /// does the locking itself. Used by the read-only monitoring endpoints so a
-    /// slow query holding one db's lock cannot wedge the state lock and make
-    /// `POST /cancel` undeliverable.
-    Deferred(Box<dyn FnOnce() -> Resp + Send>),
+    /// A response whose (possibly db-lock-contended or slow) work runs with
+    /// the `ApiState` lock released — the closure captures cloned
+    /// [`DbHandle`]s and does the locking itself (see the locking rule on
+    /// [`ApiState`]); it gets the server to take the state lock briefly when
+    /// it must update a registry. Every endpoint that touches a database other
+    /// than through a [`QueryJob`] works this way, so a slow query holding one
+    /// db's lock cannot wedge the state lock and make `POST /cancel`
+    /// undeliverable.
+    Deferred(Box<dyn FnOnce(&ApiInner) -> Resp + Send>),
 }
 
 /// A query handed out of [`ApiInner::dispatch`] to run without the `ApiState`
@@ -688,10 +779,12 @@ impl ApiServer {
                     started: Instant::now(),
                     requests: 0,
                     load_policy: LoadPolicy::restricted(),
+                    busy: HashSet::new(),
                 }),
                 root,
                 check_point: true,
                 grace: DEFAULT_SHUTDOWN_GRACE,
+                closing: AtomicBool::new(false),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -810,11 +903,16 @@ impl ApiServer {
 
     /// The tail of a graceful shutdown, after the listener closed and in-flight
     /// requests had their grace period: cancel queries that are still running,
-    /// roll back open transactions (uncommitted work is never persisted), and
-    /// save every database with unsaved changes.
+    /// roll back open transactions (uncommitted work is never persisted), save
+    /// every database with unsaved changes, and retire every slot so a request
+    /// that is still queued on one can no longer apply a write nobody would
+    /// save. From the start, every write still in flight saves itself before it
+    /// is acknowledged (see [`ApiInner::closing`]).
     fn finish_shutdown(&self, mut drained: bool) -> ShutdownReport {
+        let inner = &self.inner;
+        inner.closing.store(true, Ordering::SeqCst);
         if !drained {
-            for t in locked(&self.inner.state).tasks.values() {
+            for t in locked(&inner.state).tasks.values() {
                 t.cancel.store(true, Ordering::Relaxed);
             }
             drained = self.life.wait_idle(Duration::from_secs(2));
@@ -823,32 +921,32 @@ impl ApiServer {
             drained,
             ..ShutdownReport::default()
         };
-        let mut st = locked(&self.inner.state);
-        let mut tids: Vec<u64> = st.txns.keys().copied().collect();
-        tids.sort_unstable();
-        for tid in tids {
-            let Some(txn) = st.txns.remove(&tid) else {
-                continue;
-            };
-            st.db_txn.remove(&txn.db);
-            if let Some(h) = st.dbs.get(&txn.db) {
-                let mut slot = locked(h);
-                let _ = slot.db.rollback();
-                slot.txn = None;
-            }
-            st.remember_ended(tid, "rolled back");
-            append_log(
-                &st.root,
-                "txn.log",
-                &format!("{}\trollback\t{}\t{}\t(shutdown)", now_millis(), txn.db, tid),
-            );
-            report.rolled_back += 1;
-        }
-        let mut names: Vec<String> = st.dbs.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            let h = Arc::clone(&st.dbs[&name]);
+        // Clone the handles, then lock each database with the state lock
+        // released (see the locking rule on `ApiState`).
+        let mut handles: Vec<(String, DbHandle)> = locked(&inner.state)
+            .dbs
+            .iter()
+            .map(|(n, h)| (n.clone(), Arc::clone(h)))
+            .collect();
+        handles.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, h) in handles {
             let mut slot = locked(&h);
+            if slot.retired {
+                continue;
+            }
+            if let Some(open) = slot.txn.take() {
+                let _ = slot.db.rollback();
+                let mut st = locked(&inner.state);
+                st.txns.remove(&open.tid);
+                st.db_txn.remove(&name);
+                st.remember_ended(open.tid, "rolled back");
+                append_log(
+                    &st.root,
+                    "txn.log",
+                    &format!("{}\trollback\t{}\t{}\t(shutdown)", now_millis(), name, open.tid),
+                );
+                report.rolled_back += 1;
+            }
             if slot.dirty {
                 let dir = slot.dir.clone();
                 match slot.save() {
@@ -856,6 +954,7 @@ impl ApiServer {
                     Err(e) => report.failed.push((dir, e.to_string())),
                 }
             }
+            slot.retire();
         }
         report
     }
@@ -923,7 +1022,7 @@ impl ApiInner {
         let resp = match dispatch {
             Dispatch::Done(r) => r,
             Dispatch::Query(job) => self.execute_query_job(job),
-            Dispatch::Deferred(f) => f(),
+            Dispatch::Deferred(f) => f(self),
         };
         (resp, user_disp)
     }
@@ -966,11 +1065,16 @@ impl ApiInner {
                 Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
             };
         }
+        let before = slot.db.mutation_count();
         let result = slot.db.query_cancellable(&job.sparql, job.cancel);
+        // Whether data changed — also by an UPDATE that failed part-way: the
+        // operations before the failing one stay applied, so the database is
+        // dirty and (under check_point) saved like after any other write.
+        let wrote = slot.db.mutation_count() != before;
         match result {
             Ok(QueryResult::Update { changed }) => {
-                let warning = if changed > 0 {
-                    slot.wrote(self.check_point)
+                let warning = if wrote {
+                    slot.wrote(self.save_writes())
                 } else {
                     None
                 };
@@ -981,7 +1085,14 @@ impl ApiInner {
                 drop(slot);
                 render_result(job.fmt, &result)
             }
-            Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
+            Err(e) => {
+                let msg = if wrote {
+                    partial_update_msg(&e, slot.wrote(self.save_writes()))
+                } else {
+                    e.to_string()
+                };
+                Resp::new(400, SPARQL_JSON, err_json(&msg))
+            }
         }
     }
 
@@ -1079,49 +1190,42 @@ impl ApiInner {
             _ => {}
         }
 
+        // Endpoints that touch a database run their db work deferred (with the
+        // state lock released, see the locking rule on `ApiState`).
+        let deferred = match (method, path) {
+            ("POST", "/build") => Some((Privilege::Load, Self::handle_build as Handler)),
+            ("POST", "/load") => Some((Privilege::Load, Self::handle_load as Handler)),
+            ("POST", "/upload") => Some((Privilege::Load, Self::handle_upload as Handler)),
+            ("POST", "/unload") => Some((Privilege::Unload, Self::handle_unload as Handler)),
+            ("POST", "/drop") => Some((Privilege::Unload, Self::handle_drop as Handler)),
+            ("POST", "/begin") => Some((Privilege::Update, Self::handle_begin as Handler)),
+            ("POST", "/commit") => Some((Privilege::Update, Self::handle_commit as Handler)),
+            ("POST", "/rollback") => Some((Privilege::Update, Self::handle_rollback as Handler)),
+            ("POST", "/checkpoint") => {
+                Some((Privilege::Update, Self::handle_checkpoint as Handler))
+            }
+            ("POST", "/backup") => Some((Privilege::Backup, Self::handle_backup as Handler)),
+            ("POST", "/restore") => Some((Privilege::Restore, Self::handle_restore as Handler)),
+            ("GET" | "POST", "/export") => {
+                Some((Privilege::Export, Self::handle_export as Handler))
+            }
+            ("POST", "/batchInsert") => {
+                Some((Privilege::Update, Self::handle_batch_insert as Handler))
+            }
+            ("POST", "/batchRemove") => {
+                Some((Privilege::Update, Self::handle_batch_remove as Handler))
+            }
+            _ => None,
+        };
+        if let Some((need, handler)) = deferred {
+            return if st.users.has_priv(&user, need) {
+                handler(self, st, req, &user)
+            } else {
+                Dispatch::Done(self.forbidden())
+            };
+        }
+
         let resp = match (method, path) {
-            ("POST", "/build") => self.guarded(st, &user, Privilege::Load, |s, st| {
-                s.handle_build(st, req)
-            }),
-            ("POST", "/load") => self.guarded(st, &user, Privilege::Load, |s, st| {
-                s.handle_load(st, req)
-            }),
-            ("POST", "/upload") => self.guarded(st, &user, Privilege::Load, |s, st| {
-                s.handle_upload(st, req)
-            }),
-            ("POST", "/unload") => self.guarded(st, &user, Privilege::Unload, |s, st| {
-                s.handle_unload(st, req)
-            }),
-            ("POST", "/drop") => self.guarded(st, &user, Privilege::Unload, |s, st| {
-                s.handle_drop(st, req)
-            }),
-            ("POST", "/begin") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_begin(st, req, &user)
-            }),
-            ("POST", "/commit") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_txn_end(st, req, &user, true)
-            }),
-            ("POST", "/rollback") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_txn_end(st, req, &user, false)
-            }),
-            ("POST", "/checkpoint") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_checkpoint(st, req)
-            }),
-            ("POST", "/backup") => self.guarded(st, &user, Privilege::Backup, |s, st| {
-                s.handle_backup(st, req)
-            }),
-            ("POST", "/restore") => self.guarded(st, &user, Privilege::Restore, |s, st| {
-                s.handle_restore(st, req)
-            }),
-            ("GET" | "POST", "/export") => self.guarded(st, &user, Privilege::Export, |s, st| {
-                s.handle_export(st, req)
-            }),
-            ("POST", "/batchInsert") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_batch(st, req, &user, true)
-            }),
-            ("POST", "/batchRemove") => self.guarded(st, &user, Privilege::Update, |s, st| {
-                s.handle_batch(st, req, &user, false)
-            }),
             ("POST", "/user/create") => self.guarded(st, &user, Privilege::Admin, |s, st| {
                 s.handle_user_create(st, req)
             }),
@@ -1353,58 +1457,87 @@ impl ApiInner {
 
     // ---- database lifecycle ----------------------------------------------
 
-    fn handle_build(&self, st: &mut ApiState, req: &Request) -> Resp {
+    /// `POST /build?db_name=…` (RDF in the body, or a server-local
+    /// `db_path`). The parse and save run with the state lock released; the
+    /// name is reserved meanwhile ([`ApiState::busy`]).
+    fn handle_build(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         if st.db_txn.contains_key(&name) {
-            return Resp::fail(409, "database is busy in a transaction");
+            return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
+        }
+        if let Err(r) = st.claim(&name) {
+            return Dispatch::Done(r);
         }
         // Build from a server-local file path, or from the request body (RDF).
-        let built = if let Some(path) = req.param("db_path").or_else(|| req.param("path")) {
-            Database::build_from_files(name.clone(), &[path])
-        } else {
-            Database::build_from_str(name.clone(), &req.body_str())
-        };
-        let db = match built {
-            Ok(db) => db,
-            Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
-        };
+        let path = req.param("db_path").or_else(|| req.param("path"));
+        let body = if path.is_none() { req.body_str() } else { String::new() };
         let dir = st.db_dir(&name);
-        // A rebuilt database replaces the loaded one: close its files first.
-        st.evict(&name);
-        if let Err(e) = db.save(&dir) {
-            return Resp::fail(500, &format!("save failed: {e}"));
-        }
-        let triples = db.triple_num();
-        let slot = DbSlot::handle(db, dir, false, &st.load_policy);
-        st.dbs.insert(name.clone(), slot);
-        Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+        Dispatch::Deferred(Box::new(move |inner| {
+            let _busy = BusyGuard {
+                inner,
+                name: name.clone(),
+            };
+            let built = match path {
+                Some(path) => Database::build_from_files(name.clone(), &[path]),
+                None => Database::build_from_str(name.clone(), &body),
+            };
+            let db = match built {
+                Ok(db) => db,
+                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+            };
+            // A rebuilt database replaces the loaded one: retire it (closing
+            // its files) before its directory is rewritten.
+            inner.retire_loaded(&name);
+            if let Err(e) = db.save(&dir) {
+                return Resp::fail(500, &format!("save failed: {e}"));
+            }
+            let triples = db.triple_num();
+            let mut st = locked(&inner.state);
+            let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+            st.dbs.insert(name.clone(), slot);
+            Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+        }))
     }
 
-    fn handle_load(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_load(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         // Re-loading an already-loaded database would silently discard its
         // unsaved in-memory changes; it is a no-op instead (as in gStore).
         if st.dbs.contains_key(&name) {
-            return Resp::ok(&format!("database '{name}' already loaded"));
+            return Dispatch::Done(Resp::ok(&format!("database '{name}' already loaded")));
+        }
+        if let Err(r) = st.claim(&name) {
+            return Dispatch::Done(r);
         }
         let dir = st.db_dir(&name);
-        if !dir.is_dir() {
-            return Resp::fail(404, &format!("database '{name}' not found on disk"));
-        }
-        // Any layout (snapshot, on-disk `kvstore.kv`, RocksDB): an on-disk /
-        // RocksDB database keeps writing its updates through to `dir`.
-        match Database::open(&dir) {
-            Ok(db) => {
-                let slot = DbSlot::handle(db, dir, false, &st.load_policy);
-                st.dbs.insert(name.clone(), slot);
-                Resp::ok(&format!("database '{name}' loaded"))
+        // Opening can be slow (an on-disk database is materialized), so it
+        // runs with the state lock released.
+        Dispatch::Deferred(Box::new(move |inner| {
+            let _busy = BusyGuard {
+                inner,
+                name: name.clone(),
+            };
+            // Finish an interrupted restore that left the directory mid-swap.
+            let _ = Database::recover_restore(&dir);
+            if !dir.is_dir() {
+                return Resp::fail(404, &format!("database '{name}' not found on disk"));
             }
-            Err(e) => Resp::fail(500, &format!("load failed: {e}")),
-        }
+            // Any layout (snapshot, on-disk `kvstore.kv`, RocksDB): an on-disk /
+            // RocksDB database keeps writing its updates through to `dir`.
+            match Database::open(&dir) {
+                Ok(db) => {
+                    let mut st = locked(&inner.state);
+                    let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                    st.dbs.insert(name.clone(), slot);
+                    Resp::ok(&format!("database '{name}' loaded"))
+                }
+                Err(e) => Resp::fail(500, &format!("load failed: {e}")),
+            }
+        }))
     }
 
     /// `POST /upload?db_name=<name>[&format=turtle|ntriples|nquads|rdfxml|trig]`
@@ -1417,44 +1550,64 @@ impl ApiInner {
     /// or — if neither exists yet — a fresh empty database is created (mirrors
     /// gStore's `LoadFile`, which may target a not-yet-built db). The result is
     /// saved under the check_point policy.
-    fn handle_upload(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_upload(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         if let Some(&tid) = st.db_txn.get(&name) {
-            return txn_conflict(&name, tid);
+            return Dispatch::Done(txn_conflict(&name, tid));
+        }
+        let loaded = st.dbs.get(&name).map(Arc::clone);
+        if loaded.is_none() {
+            // Opening / creating it is a lifecycle operation on the name.
+            if let Err(r) = st.claim(&name) {
+                return Dispatch::Done(r);
+            }
         }
         let format = upload_format(req);
         let content = req.body_str();
-        let triples = match parse_rdf(&format, &content) {
-            Ok(ts) => ts,
-            Err(e) => return Resp::fail(400, &format!("upload parse failed ({format}): {e}")),
-        };
-        let parsed = triples.len();
-
-        if !st.dbs.contains_key(&name) {
-            let dir = st.db_dir(&name);
-            let (opened, fresh) = if dir.is_dir() {
-                (Database::open(&dir), false)
-            } else {
-                (Database::build_from_str(name.clone(), ""), true)
+        let dir = st.db_dir(&name);
+        let policy = st.load_policy.clone();
+        Dispatch::Deferred(Box::new(move |inner| {
+            let busy = loaded.is_none().then(|| BusyGuard {
+                inner,
+                name: name.clone(),
+            });
+            let triples = match parse_rdf(&format, &content) {
+                Ok(ts) => ts,
+                Err(e) => return Resp::fail(400, &format!("upload parse failed ({format}): {e}")),
             };
-            match opened {
-                // A fresh database exists only in memory so far: dirty, so that
-                // it is persisted even if nothing ends up being inserted.
-                Ok(db) => {
-                    let slot = DbSlot::handle(db, dir, fresh, &st.load_policy);
-                    st.dbs.insert(name.clone(), slot);
+            let parsed = triples.len();
+            let dbh = match loaded {
+                Some(h) => h,
+                None => {
+                    let (opened, fresh) = if dir.is_dir() {
+                        (Database::open(&dir), false)
+                    } else {
+                        (Database::build_from_str(name.clone(), ""), true)
+                    };
+                    match opened {
+                        // A fresh database exists only in memory so far: dirty,
+                        // so it is persisted even if nothing ends up inserted.
+                        Ok(db) => {
+                            let h = DbSlot::handle(db, dir, fresh, &policy);
+                            locked(&inner.state).dbs.insert(name.clone(), Arc::clone(&h));
+                            h
+                        }
+                        Err(e) => {
+                            return Resp::fail(500, &format!("upload failed to open database: {e}"))
+                        }
+                    }
                 }
-                Err(e) => return Resp::fail(500, &format!("upload failed to open database: {e}")),
+            };
+            drop(busy);
+            let mut slot = locked(&dbh);
+            if slot.retired {
+                return Resp::fail(404, &format!("database '{name}' was unloaded meanwhile"));
             }
-        }
-        let (inserted, warning) = {
-            let dbh = st
-                .dbs
-                .get(&name)
-                .expect("just inserted or already loaded above");
-            let mut slot = locked(dbh);
+            if let Some(open) = &slot.txn {
+                return txn_conflict(&name, open.tid);
+            }
             let mut inserted = 0usize;
             let mut failure = None;
             for t in &triples {
@@ -1468,48 +1621,58 @@ impl ApiInner {
                 }
             }
             let warning = if inserted > 0 || slot.dirty {
-                slot.wrote(self.check_point)
+                slot.wrote(inner.save_writes())
             } else {
                 None
             };
+            drop(slot);
             if let Some(e) = failure {
                 return Resp::fail(
                     500,
                     &format!("upload stopped after inserting {inserted} triple(s): {e}"),
                 );
             }
-            (inserted, warning)
-        };
-        // (Lifecycle endpoints like /build and /load don't append to
-        // query.log either; the access log — written unconditionally in
-        // `handle` — already records that this request happened.)
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"upload complete\",\"db_name\":{},\"format\":{},\"triples_parsed\":{parsed},\"triples_inserted\":{inserted}{}}}",
-            json_str(&name),
-            json_str(&format),
-            warn_field(&warning),
-        );
-        Resp::new(200, JSON, body.into_bytes())
+            // (Lifecycle endpoints like /build and /load don't append to
+            // query.log either; the access log — written unconditionally in
+            // `handle` — already records that this request happened.)
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"upload complete\",\"db_name\":{},\"format\":{},\"triples_parsed\":{parsed},\"triples_inserted\":{inserted}{}}}",
+                json_str(&name),
+                json_str(&format),
+                warn_field(&warning),
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     /// `POST /unload?db_name=…` — save the database if it has unsaved changes,
     /// then drop it from memory. If the save fails it stays loaded (nothing is
     /// lost) and the error is returned.
-    fn handle_unload(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_unload(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         if let Some(&tid) = st.db_txn.get(&name) {
-            return Resp::fail(
-                409,
-                &format!("database '{name}' is busy in transaction {tid}; commit or roll back first"),
-            );
+            return Dispatch::Done(unload_busy(&name, tid));
         }
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let saved = {
+        if let Err(r) = st.claim(&name) {
+            return Dispatch::Done(r);
+        }
+        Dispatch::Deferred(Box::new(move |inner| {
+            let _busy = BusyGuard {
+                inner,
+                name: name.clone(),
+            };
             let mut slot = locked(&dbh);
+            if slot.retired {
+                return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            }
+            if let Some(open) = &slot.txn {
+                return unload_busy(&name, open.tid);
+            }
             let saved = if slot.dirty {
                 if let Err(e) = slot.save() {
                     return Resp::fail(
@@ -1532,36 +1695,50 @@ impl ApiInner {
             // Requests that queued on this handle must not write to (or save)
             // a database that is no longer served.
             slot.retire();
-            saved
-        };
-        st.dbs.remove(&name);
-        if saved {
-            Resp::ok(&format!("database '{name}' saved and unloaded"))
-        } else {
-            Resp::ok(&format!("database '{name}' unloaded"))
-        }
+            {
+                let mut st = locked(&inner.state);
+                if st.dbs.get(&name).is_some_and(|h| Arc::ptr_eq(h, &dbh)) {
+                    st.dbs.remove(&name);
+                }
+            }
+            drop(slot);
+            if saved {
+                Resp::ok(&format!("database '{name}' saved and unloaded"))
+            } else {
+                Resp::ok(&format!("database '{name}' unloaded"))
+            }
+        }))
     }
 
-    fn handle_drop(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_drop(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         if st.db_txn.contains_key(&name) {
-            return Resp::fail(409, "database is busy in a transaction");
+            return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
         }
-        // Retire (closing its store files) before the directory is deleted.
-        let was_loaded = st.evict(&name);
+        if let Err(r) = st.claim(&name) {
+            return Dispatch::Done(r);
+        }
         let dir = st.db_dir(&name);
-        let existed_on_disk = dir.is_dir();
-        if existed_on_disk {
-            if let Err(e) = fs::remove_dir_all(&dir) {
-                return Resp::fail(500, &format!("drop failed: {e}"));
+        Dispatch::Deferred(Box::new(move |inner| {
+            let _busy = BusyGuard {
+                inner,
+                name: name.clone(),
+            };
+            // Retire (closing its store files) before the directory is deleted.
+            let was_loaded = inner.retire_loaded(&name);
+            let existed_on_disk = dir.is_dir();
+            if existed_on_disk {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    return Resp::fail(500, &format!("drop failed: {e}"));
+                }
             }
-        }
-        if !was_loaded && !existed_on_disk {
-            return Resp::fail(404, &format!("database '{name}' does not exist"));
-        }
-        Resp::ok(&format!("database '{name}' dropped"))
+            if !was_loaded && !existed_on_disk {
+                return Resp::fail(404, &format!("database '{name}' does not exist"));
+            }
+            Resp::ok(&format!("database '{name}' dropped"))
+        }))
     }
 
     fn handle_show(&self, st: &ApiState) -> Dispatch {
@@ -1571,7 +1748,7 @@ impl ApiInner {
         let root = st.root.clone();
         let loaded: HashMap<String, DbHandle> =
             st.dbs.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
-        Dispatch::Deferred(Box::new(move || {
+        Dispatch::Deferred(Box::new(move |_| {
             let mut names: Vec<String> = Vec::new();
             // On-disk databases (directories ending in the .db suffix).
             if let Ok(rd) = fs::read_dir(&root) {
@@ -1625,78 +1802,109 @@ impl ApiInner {
     /// the caller. The committed state is snapshotted for everyone else's
     /// reads (see [`ReadSnapshot`]), and until the transaction ends every
     /// non-transactional write to the database is rejected with `409`.
-    fn handle_begin(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    fn handle_begin(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
         let isolation = match req.param("isolevel").filter(|s| !s.trim().is_empty()) {
             None => TxnIsolation::Serializable,
             Some(v) => match TxnIsolation::parse(&v) {
                 Some(level) => level,
                 None => {
-                    return Resp::fail(
+                    return Dispatch::Done(Resp::fail(
                         400,
                         &format!(
                             "invalid isolevel '{v}': the isolation level's value can only be \
                              1 (SERIALIZABLE), 2 (SNAPSHOT) or 3 (READ_COMMITTED)"
                         ),
-                    )
+                    ))
                 }
             },
         };
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
         if let Some(&open) = st.db_txn.get(&name) {
-            return Resp::fail(
-                409,
-                &format!("a transaction ({open}) is already open on database '{name}'"),
-            );
+            return Dispatch::Done(txn_already_open(&name, open));
         }
-        let mut tid = new_id();
-        while st.txns.contains_key(&tid) || st.ended_outcome(tid).is_some() {
-            tid = new_id();
+        if st.busy.contains(&name) {
+            return Dispatch::Done(Resp::fail(409, &format!("database '{name}' is busy")));
         }
-        {
+        let user = user.to_string();
+        Dispatch::Deferred(Box::new(move |inner| {
             let mut slot = locked(&dbh);
+            if slot.retired {
+                return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            }
+            if let Some(open) = &slot.txn {
+                return txn_already_open(&name, open.tid);
+            }
+            // Checked under the db lock, which the shutdown takes after setting
+            // the flag: no transaction can begin after its rollback pass.
+            if inner.closing.load(Ordering::SeqCst) {
+                return Resp::fail(503, "the server is shutting down");
+            }
             let snapshot = Arc::new(ReadSnapshot::capture(&slot.db));
             if let Err(e) = slot.db.begin() {
                 return Resp::fail(500, &format!("begin failed: {e}"));
             }
+            // Register it while the db lock is held, so the registry and the
+            // slot always agree (a /commit locks the db before the registry).
+            let tid = {
+                let mut st = locked(&inner.state);
+                let conflict = if let Some(&open) = st.db_txn.get(&name) {
+                    Some(txn_already_open(&name, open))
+                } else if st.busy.contains(&name) {
+                    Some(Resp::fail(409, &format!("database '{name}' is busy")))
+                } else {
+                    None
+                };
+                if let Some(r) = conflict {
+                    drop(st);
+                    let _ = slot.db.rollback();
+                    return r;
+                }
+                let mut tid = new_id();
+                while st.txns.contains_key(&tid) || st.ended_outcome(tid).is_some() {
+                    tid = new_id();
+                }
+                st.txns.insert(
+                    tid,
+                    Txn {
+                        db: name.clone(),
+                        owner: user.clone(),
+                        isolation,
+                    },
+                );
+                st.db_txn.insert(name.clone(), tid);
+                tid
+            };
             slot.txn = Some(OpenTxn {
                 tid,
                 snapshot,
                 changed: false,
             });
-        }
-        st.txns.insert(
-            tid,
-            Txn {
-                db: name.clone(),
-                owner: user.to_string(),
-                isolation,
-            },
-        );
-        st.db_txn.insert(name.clone(), tid);
-        append_log(
-            &st.root,
-            "txn.log",
-            &format!(
-                "{}\tbegin\t{}\t{}\t{}\t{}",
-                now_millis(),
-                name,
-                tid,
-                user,
-                isolation.name()
-            ),
-        );
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
-            json_str(&tid.to_string()),
-            isolation.code(),
-            json_str(isolation.name()),
-        );
-        Resp::new(200, JSON, body.into_bytes())
+            drop(slot);
+            append_log(
+                &inner.root,
+                "txn.log",
+                &format!(
+                    "{}\tbegin\t{}\t{}\t{}\t{}",
+                    now_millis(),
+                    name,
+                    tid,
+                    user,
+                    isolation.name()
+                ),
+            );
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
+                json_str(&tid.to_string()),
+                isolation.code(),
+                json_str(isolation.name()),
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     /// Look up open transaction `tid` for `user`: unknown ids are `404`, already
@@ -1744,15 +1952,6 @@ impl ApiInner {
         if !st.users.has_priv(user, need) {
             return Dispatch::Done(self.forbidden());
         }
-        // Execute the transactional statement SYNCHRONOUSLY, still holding the
-        // ApiState lock, so a concurrent /commit or /rollback cannot slip between
-        // the transaction lookup above and this execution — a TOCTOU that would
-        // otherwise apply the statement non-transactionally (after a rollback that
-        // already returned OK) or record it in a different transaction's undo log.
-        // Unlike a read query it is NOT deferred: transactional statements are
-        // bounded writes, so the brief lock hold is an acceptable trade for
-        // atomicity. (A deferred query still cannot be cancelled mid-flight here,
-        // but a bounded write does not need /cancel the way a long SELECT does.)
         append_log(
             &st.root,
             "query.log",
@@ -1762,176 +1961,276 @@ impl ApiInner {
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let mut slot = locked(&dbh);
-        if slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
-            return Dispatch::Done(Resp::fail(
-                409,
-                &format!("transaction {tid} is not open on database '{name}'"),
-            ));
-        }
-        let result = slot.db.query(&sparql);
-        if let Ok(QueryResult::Update { changed }) = &result {
-            if *changed > 0 {
+        // Runs with the state lock released. The transaction is re-checked
+        // under the db lock, which /commit and /rollback also take before they
+        // end it — so the statement either runs inside transaction `tid` or
+        // is refused, never applied outside it.
+        Dispatch::Deferred(Box::new(move |_| {
+            let mut slot = locked(&dbh);
+            if slot.retired || slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
+                return Resp::fail(
+                    409,
+                    &format!("transaction {tid} is not open on database '{name}'"),
+                );
+            }
+            let before = slot.db.mutation_count();
+            let result = slot.db.query(&sparql);
+            // Also a failing UPDATE may have applied part of its operations.
+            if slot.db.mutation_count() != before {
                 if let Some(open) = slot.txn.as_mut() {
                     open.changed = true;
                 }
             }
-        }
-        drop(slot);
-        Dispatch::Done(match result {
-            Ok(r) => render_result(fmt, &r),
-            Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
-        })
+            drop(slot);
+            match result {
+                Ok(r) => render_result(fmt, &r),
+                Err(e) => Resp::new(400, SPARQL_JSON, err_json(&e.to_string())),
+            }
+        }))
     }
 
-    fn handle_txn_end(&self, st: &mut ApiState, req: &Request, user: &str, commit: bool) -> Resp {
+    fn handle_commit(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
+        self.handle_txn_end(st, req, user, true)
+    }
+
+    fn handle_rollback(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
+        self.handle_txn_end(st, req, user, false)
+    }
+
+    fn handle_txn_end(&self, st: &mut ApiState, req: &Request, user: &str, commit: bool) -> Dispatch {
         let Some(tid) = self.txn_id(req) else {
-            return Resp::fail(400, "missing or malformed tid/txn parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
-        if let Err(resp) = self.txn_for(st, tid, user) {
-            return resp;
-        }
-        let txn = st.txns.remove(&tid).expect("checked by txn_for");
-        st.db_txn.remove(&txn.db);
-        let verb = if commit { "commit" } else { "rollback" };
-        st.remember_ended(tid, if commit { "committed" } else { "rolled back" });
-        let result = st.dbs.get(&txn.db).map(|dbh| {
-            let mut slot = locked(dbh);
-            let open = slot.txn.take();
-            if commit {
-                // `Database::commit` keeps the writes even when flushing its
-                // redo log fails, so the data changed either way.
-                let committed = slot.db.commit();
-                let warning = if open.is_some_and(|o| o.changed) {
-                    slot.wrote(self.check_point)
-                } else {
-                    None
-                };
-                committed.map(|()| warning)
-            } else {
-                slot.db.rollback().map(|()| None)
+        let db_name = match self.txn_for(st, tid, user) {
+            Ok(name) => name,
+            Err(resp) => return Dispatch::Done(resp),
+        };
+        let dbh = st.dbs.get(&db_name).map(Arc::clone);
+        let user = user.to_string();
+        Dispatch::Deferred(Box::new(move |inner| {
+            let verb = if commit { "commit" } else { "rollback" };
+            let mut slot = dbh.as_ref().map(|h| locked(h));
+            // End it in the registry while the db lock is held (race-free with
+            // /begin, /tquery and a concurrent /commit of the same tid).
+            let txn = {
+                let mut st = locked(&inner.state);
+                if let Err(resp) = inner.txn_for(&st, tid, &user) {
+                    return resp;
+                }
+                let txn = st.txns.remove(&tid).expect("checked by txn_for");
+                st.db_txn.remove(&txn.db);
+                st.remember_ended(tid, if commit { "committed" } else { "rolled back" });
+                txn
+            };
+            let result = match slot.as_mut().filter(|s| !s.retired) {
+                Some(slot) => {
+                    let open = slot.txn.take();
+                    Some(if commit {
+                        // `Database::commit` keeps the writes even when flushing
+                        // its redo log fails, so the data changed either way.
+                        let committed = slot.db.commit();
+                        let warning = if open.is_some_and(|o| o.changed) {
+                            slot.wrote(inner.save_writes())
+                        } else {
+                            None
+                        };
+                        committed.map(|()| warning)
+                    } else {
+                        slot.db.rollback().map(|()| None)
+                    })
+                }
+                None => None,
+            };
+            drop(slot);
+            append_log(
+                &inner.root,
+                "txn.log",
+                &format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    now_millis(),
+                    verb,
+                    txn.db,
+                    tid,
+                    user,
+                    txn.isolation.name()
+                ),
+            );
+            match result {
+                Some(Ok(warning)) => {
+                    Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning)
+                }
+                Some(Err(e)) => Resp::fail(500, &format!("{verb} failed: {e}")),
+                None => Resp::fail(404, &format!("database '{}' is not loaded", txn.db)),
             }
-        });
-        append_log(
-            &st.root,
-            "txn.log",
-            &format!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                now_millis(),
-                verb,
-                txn.db,
-                tid,
-                user,
-                txn.isolation.name()
-            ),
-        );
-        match result {
-            Some(Ok(warning)) => Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning),
-            Some(Err(e)) => Resp::fail(500, &format!("{verb} failed: {e}")),
-            None => Resp::fail(404, &format!("database '{}' is not loaded", txn.db)),
+        }))
+    }
+
+    /// Lock a loaded database for a non-transactional maintenance request: the
+    /// slot's guard, or the response refusing it (`404` once it is no longer
+    /// served; `409` naming `what` while a transaction is open).
+    fn lock_for<'a>(
+        dbh: &'a DbHandle,
+        name: &str,
+        what: &str,
+    ) -> Result<std::sync::MutexGuard<'a, DbSlot>, Resp> {
+        let slot = locked(dbh);
+        if slot.retired {
+            return Err(Resp::fail(404, &format!("database '{name}' is not loaded")));
         }
+        if let Some(open) = &slot.txn {
+            return Err(Resp::fail(
+                409,
+                &format!(
+                    "database '{name}' has an open transaction (TID {}); commit or roll back \
+                     before {what}",
+                    open.tid
+                ),
+            ));
+        }
+        Ok(slot)
     }
 
     /// `POST /checkpoint?db_name=…` — force a save now (whatever the
     /// check_point policy). Refused while a transaction is open, since the live
     /// database then holds uncommitted writes.
-    fn handle_checkpoint(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_checkpoint(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
-        let Some(dbh) = st.dbs.get(&name) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let mut slot = locked(dbh);
-        if let Some(open) = &slot.txn {
-            return Resp::fail(
-                409,
-                &format!(
-                    "database '{name}' has an open transaction (TID {}); commit or roll back \
-                     before checkpointing",
-                    open.tid
-                ),
-            );
-        }
-        match slot.save() {
-            Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
-            Err(e) => Resp::fail(500, &format!("checkpoint failed: {e}")),
-        }
+        Dispatch::Deferred(Box::new(move |_| {
+            let mut slot = match Self::lock_for(&dbh, &name, "checkpointing") {
+                Ok(slot) => slot,
+                Err(r) => return r,
+            };
+            match slot.save() {
+                Ok(()) => Resp::ok(&format!("database '{name}' checkpointed")),
+                Err(e) => Resp::fail(500, &format!("checkpoint failed: {e}")),
+            }
+        }))
     }
 
     // ---- backup / restore / export ---------------------------------------
 
-    fn handle_backup(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_backup(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
         let path = req
             .param("path")
             .or_else(|| req.param("backup_path"))
             .map(PathBuf::from)
             .unwrap_or_else(|| st.root.join(format!("{name}.backup")));
-        let Some(dbh) = st.dbs.get(&name) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let slot = locked(dbh);
-        // A backup of the live database would capture uncommitted writes.
-        if let Some(open) = &slot.txn {
-            return Resp::fail(
-                409,
-                &format!(
-                    "database '{name}' has an open transaction (TID {}); commit or roll back \
-                     before backing up",
-                    open.tid
-                ),
-            );
-        }
-        match slot.db.backup(&path) {
-            Ok(()) => {
-                let body = format!(
-                    "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
-                    json_str(&path.to_string_lossy())
-                );
-                Resp::new(200, JSON, body.into_bytes())
+        Dispatch::Deferred(Box::new(move |_| {
+            // A backup of the live database would capture uncommitted writes.
+            let slot = match Self::lock_for(&dbh, &name, "backing up") {
+                Ok(slot) => slot,
+                Err(r) => return r,
+            };
+            match slot.db.backup(&path) {
+                Ok(()) => {
+                    let body = format!(
+                        "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
+                        json_str(&path.to_string_lossy())
+                    );
+                    Resp::new(200, JSON, body.into_bytes())
+                }
+                Err(e) => Resp::fail(500, &format!("backup failed: {e}")),
             }
-            Err(e) => Resp::fail(500, &format!("backup failed: {e}")),
-        }
+        }))
     }
 
-    fn handle_restore(&self, st: &mut ApiState, req: &Request) -> Resp {
+    /// `POST /restore?db_name=…&path=<backup>` — replace the database with a
+    /// backup (any layout). The backup is copied next to the database's
+    /// directory and validated *before* the loaded database is touched, so a
+    /// corrupt backup changes nothing; only then is the loaded database retired
+    /// (its unsaved changes saved first, so a failed swap loses nothing) and
+    /// the copy swapped in.
+    fn handle_restore(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
-            return Resp::fail(400, "missing or invalid db_name");
+            return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         let Some(path) = req.param("path").or_else(|| req.param("backup_path")) else {
-            return Resp::fail(400, "missing backup path");
+            return Dispatch::Done(Resp::fail(400, "missing backup path"));
         };
         if st.db_txn.contains_key(&name) {
-            return Resp::fail(409, "database is busy in a transaction");
+            return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
         }
-        // Validate before touching the live database: the backup must hold one.
         if Database::storage_kind(&path).is_none() {
-            return Resp::fail(
+            return Dispatch::Done(Resp::fail(
                 500,
                 &format!("restore failed: '{path}' does not contain a database backup"),
-            );
+            ));
+        }
+        if let Err(r) = st.claim(&name) {
+            return Dispatch::Done(r);
         }
         let dir = st.db_dir(&name);
-        // The restored copy replaces the loaded database (whose unsaved changes
-        // a restore discards): close its files before they are replaced.
-        st.evict(&name);
-        // Copy the backup (any layout) into the database's own directory and
-        // open it there — never open the backup in place, or later writes
-        // would land in the backup.
-        if let Err(e) = Database::restore_into(&path, &dir) {
-            return Resp::fail(500, &format!("restore failed: {e}"));
-        }
-        match Database::open(&dir) {
-            Ok(db) => {
-                let slot = DbSlot::handle(db, dir, false, &st.load_policy);
-                st.dbs.insert(name.clone(), slot);
-                Resp::ok(&format!("database '{name}' restored"))
+        Dispatch::Deferred(Box::new(move |inner| {
+            let _busy = BusyGuard {
+                inner,
+                name: name.clone(),
+            };
+            // Copy the backup beside the database's own directory and validate
+            // the copy — never open the backup in place, or later writes would
+            // land in the backup. The loaded database is untouched so far.
+            let staged = match Database::stage_restore(Path::new(&path), &dir) {
+                Ok(staged) => staged,
+                Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
+            };
+            let loaded = locked(&inner.state).dbs.get(&name).map(Arc::clone);
+            if let Some(h) = &loaded {
+                let mut slot = locked(h);
+                if !slot.retired && slot.dirty {
+                    if let Err(e) = slot.save() {
+                        drop(slot);
+                        Database::discard_staged_restore(&staged);
+                        return Resp::fail(
+                            500,
+                            &format!(
+                                "restore aborted: saving the unsaved changes of '{name}' failed \
+                                 ({e}); it stays loaded"
+                            ),
+                        );
+                    }
+                }
+                // Close its files before the directory is swapped out.
+                slot.retire();
+                let mut st = locked(&inner.state);
+                if st.dbs.get(&name).is_some_and(|cur| Arc::ptr_eq(cur, h)) {
+                    st.dbs.remove(&name);
+                }
             }
-            Err(e) => Resp::fail(500, &format!("restore failed to open the restored copy: {e}")),
-        }
+            let installed = Database::install_restore(&staged, &dir);
+            // Serve whatever the directory now holds: the restored copy, or —
+            // if the swap failed — the previous database (saved above).
+            let reopened = Database::open(&dir);
+            match (installed, reopened) {
+                (Ok(()), Ok(db)) => {
+                    let mut st = locked(&inner.state);
+                    let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                    st.dbs.insert(name.clone(), slot);
+                    Resp::ok(&format!("database '{name}' restored"))
+                }
+                (Ok(()), Err(e)) => {
+                    Resp::fail(500, &format!("restore failed to open the restored copy: {e}"))
+                }
+                (Err(e), reopened) => {
+                    Database::discard_staged_restore(&staged);
+                    if let (Ok(db), true) = (reopened, loaded.is_some()) {
+                        let mut st = locked(&inner.state);
+                        let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                        st.dbs.insert(name.clone(), slot);
+                    }
+                    Resp::fail(500, &format!("restore failed: {e}"))
+                }
+            }
+        }))
     }
 
     /// `GET /export?db_name=<name>[&download=0]` — the whole database as
@@ -1939,30 +2238,47 @@ impl ApiInner {
     /// file download (`Content-Disposition: attachment`) by default; pass
     /// `download=0`/`false`/`no`/`off` for an inline (browser-rendered)
     /// response instead.
-    fn handle_export(&self, st: &mut ApiState, req: &Request) -> Resp {
+    fn handle_export(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
-        let Some(dbh) = st.dbs.get(&name) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let exported = locked(dbh).read("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
-        match exported {
-            Ok(QueryResult::Construct(ts)) => {
-                let mut resp = Resp::new(200, "application/n-triples", ntriples_body(&ts));
-                let disposition = if wants_inline(req) { "inline" } else { "attachment" };
-                resp.extra.push((
-                    "Content-Disposition".to_string(),
-                    format!("{disposition}; filename=\"{name}.nt\""),
-                ));
-                resp
+        let inline = wants_inline(req);
+        Dispatch::Deferred(Box::new(move |_| {
+            let exported = {
+                let mut slot = locked(&dbh);
+                if slot.retired {
+                    return Resp::fail(404, &format!("database '{name}' is not loaded"));
+                }
+                slot.read("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
+            };
+            match exported {
+                Ok(QueryResult::Construct(ts)) => {
+                    let mut resp = Resp::new(200, "application/n-triples", ntriples_body(&ts));
+                    let disposition = if inline { "inline" } else { "attachment" };
+                    resp.extra.push((
+                        "Content-Disposition".to_string(),
+                        format!("{disposition}; filename=\"{name}.nt\""),
+                    ));
+                    resp
+                }
+                Ok(_) => Resp::fail(500, "export produced an unexpected result"),
+                Err(e) => Resp::fail(500, &format!("export failed: {e}")),
             }
-            Ok(_) => Resp::fail(500, "export produced an unexpected result"),
-            Err(e) => Resp::fail(500, &format!("export failed: {e}")),
-        }
+        }))
     }
 
     // ---- batch ------------------------------------------------------------
+
+    fn handle_batch_insert(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
+        self.handle_batch(st, req, user, true)
+    }
+
+    fn handle_batch_remove(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
+        self.handle_batch(st, req, user, false)
+    }
 
     /// `POST /batchInsert` / `POST /batchRemove` — the triples (a `triples=`
     /// parameter or the raw body) are *parsed as RDF* (N-Triples by default;
@@ -1974,19 +2290,21 @@ impl ApiInner {
     /// nothing is applied. Reports `parsed`, `applied` (= `changed`) and
     /// `failed` (parsed but not applied: duplicates on insert, absent triples on
     /// remove, or a literal/blank in a position RDF does not allow).
-    fn handle_batch(&self, st: &mut ApiState, req: &Request, user: &str, insert: bool) -> Resp {
+    fn handle_batch(&self, st: &mut ApiState, req: &Request, user: &str, insert: bool) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
-            return Resp::fail(400, "missing or ambiguous db parameter");
+            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
         let payload = req.param("triples").unwrap_or_else(|| req.body_str());
         if payload.trim().is_empty() {
-            return Resp::fail(400, "no triples supplied");
+            return Dispatch::Done(Resp::fail(400, "no triples supplied"));
         }
         let op = if insert { "batchInsert" } else { "batchRemove" };
         let (format, triples) = match parse_batch_payload(req.param("format").as_deref(), &payload)
         {
             Ok(parsed) => parsed,
-            Err(e) => return Resp::fail(400, &format!("{op} payload is not valid RDF {e}")),
+            Err(e) => {
+                return Dispatch::Done(Resp::fail(400, &format!("{op} payload is not valid RDF {e}")))
+            }
         };
         append_log(
             &st.root,
@@ -1999,51 +2317,56 @@ impl ApiInner {
                 triples.len()
             ),
         );
-        let Some(dbh) = st.dbs.get(&name) else {
-            return Resp::fail(404, &format!("database '{name}' is not loaded"));
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let mut slot = locked(dbh);
-        if let Some(open) = &slot.txn {
-            return txn_conflict(&name, open.tid);
-        }
-        let parsed = triples.len();
-        let mut applied = 0usize;
-        let mut failure = None;
-        for t in triples.iter().filter(|t| valid_ground_triple(t)) {
-            let changed = if insert {
-                slot.db.try_insert_triple(t)
-            } else {
-                Ok(slot.db.remove_triple(t))
-            };
-            match changed {
-                Ok(true) => applied += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    failure = Some(e);
-                    break;
+        Dispatch::Deferred(Box::new(move |inner| {
+            let mut slot = locked(&dbh);
+            if slot.retired {
+                return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            }
+            if let Some(open) = &slot.txn {
+                return txn_conflict(&name, open.tid);
+            }
+            let parsed = triples.len();
+            let mut applied = 0usize;
+            let mut failure = None;
+            for t in triples.iter().filter(|t| valid_ground_triple(t)) {
+                let changed = if insert {
+                    slot.db.try_insert_triple(t)
+                } else {
+                    Ok(slot.db.remove_triple(t))
+                };
+                match changed {
+                    Ok(true) => applied += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
                 }
             }
-        }
-        let warning = if applied > 0 {
-            slot.wrote(self.check_point)
-        } else {
-            None
-        };
-        drop(slot);
-        if let Some(e) = failure {
-            return Resp::fail(
-                500,
-                &format!("{op} stopped after applying {applied} triple(s): {e}"),
+            let warning = if applied > 0 {
+                slot.wrote(inner.save_writes())
+            } else {
+                None
+            };
+            drop(slot);
+            if let Some(e) = failure {
+                return Resp::fail(
+                    500,
+                    &format!("{op} stopped after applying {applied} triple(s): {e}"),
+                );
+            }
+            let failed = parsed - applied;
+            let verb = if insert { "inserted" } else { "removed" };
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"batch {verb}\",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}{}}}",
+                json_str(format),
+                warn_field(&warning),
             );
-        }
-        let failed = parsed - applied;
-        let verb = if insert { "inserted" } else { "removed" };
-        let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"batch {verb}\",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}{}}}",
-            json_str(format),
-            warn_field(&warning),
-        );
-        Resp::new(200, JSON, body.into_bytes())
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     // ---- monitoring -------------------------------------------------------
@@ -2058,7 +2381,7 @@ impl ApiInner {
         let nreq = st.requests;
         let uptime = st.started.elapsed().as_secs();
         let check_point = self.check_point;
-        Dispatch::Deferred(Box::new(move || {
+        Dispatch::Deferred(Box::new(move |_| {
             let mut total_triples: u64 = 0;
             let mut dirty_dbs = 0usize;
             for d in &dbs {
@@ -2084,7 +2407,7 @@ impl ApiInner {
         let nreq = st.requests;
         let nusers = st.users.count();
         let ntxns = st.txns.len();
-        Dispatch::Deferred(Box::new(move || {
+        Dispatch::Deferred(Box::new(move |_| {
             let mut dbs = Vec::new();
             for (_n, d) in &entries {
                 let slot = locked(d);
@@ -2263,6 +2586,16 @@ fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
         }
         QueryResult::Construct(ts) => Resp::new(200, "application/n-triples", ntriples_body(ts)),
         QueryResult::Update { changed } => update_resp(*changed, &None),
+    }
+}
+
+/// The error message of an UPDATE that failed after applying part of its
+/// operations (which stay applied — and were saved, unless `warning` says the
+/// save failed).
+fn partial_update_msg(e: &GStoreError, warning: Option<String>) -> String {
+    match warning {
+        Some(w) => format!("{e} (operations before the failing one were applied; {w})"),
+        None => format!("{e} (operations before the failing one were applied)"),
     }
 }
 
@@ -2786,6 +3119,203 @@ mod tests {
     }
 
     /// Extract the first `"id":<n>` from a `/tasklist` JSON body.
+    /// Like `raw_request`, but gives up after `timeout` (`None`) instead of
+    /// waiting forever for a wedged server.
+    fn request_within(
+        addr: &SocketAddr,
+        method: &str,
+        target: &str,
+        auth: Option<&str>,
+        body: &str,
+        timeout: std::time::Duration,
+    ) -> Option<(u16, String)> {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(timeout)).unwrap();
+        let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
+        if let Some(a) = auth {
+            raw.push_str(&format!("Authorization: {a}\r\n"));
+        }
+        raw.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        s.write_all(raw.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).ok()?;
+        Some(split_status_body(&resp))
+    }
+
+    /// The `"TID"` of a `/begin` response.
+    fn tid_of(begin_body: &str) -> String {
+        let i = begin_body.find("\"TID\":\"").expect("TID") + "\"TID\":\"".len();
+        begin_body[i..].chars().take_while(|c| c.is_ascii_digit()).collect()
+    }
+
+    /// No endpoint may wait for a database's lock while holding the server's
+    /// state lock: while a (simulated) long query holds database `w`'s lock,
+    /// a request to any endpoint touching `w` waits — but `/tasklist` (which
+    /// needs the state lock, as do `/cancel`, other databases and a
+    /// shutdown's cancellation step) still answers at once.
+    #[test]
+    fn a_busy_database_never_wedges_the_state_lock() {
+        let (srv, addr) = start("wedge");
+        let root = basic("root", "root");
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=w", Some(&root), data));
+        assert_eq!(s, 200, "build: {b}");
+        let backup = srv.root_dir().join("w.bak");
+        let backup = backup.display().to_string();
+
+        // Run `target` while the db lock is held; `/tasklist` must stay live.
+        let probe = |method: &'static str, target: String, body: &'static str| -> (u16, String) {
+            let handle = locked(&srv.inner.state)
+                .dbs
+                .get("w")
+                .cloned()
+                .expect("w is loaded");
+            let guard = locked(&handle);
+            let auth = root.clone();
+            let t = target.clone();
+            let req = std::thread::spawn(move || {
+                split_status_body(&raw_request(&addr, method, &t, Some(&auth), body))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let started = std::time::Instant::now();
+            let tasklist = request_within(
+                &addr,
+                "GET",
+                "/tasklist",
+                Some(&root),
+                "",
+                std::time::Duration::from_secs(3),
+            );
+            let waited = started.elapsed();
+            drop(guard);
+            let resp = req.join().unwrap();
+            assert!(
+                matches!(tasklist, Some((200, _))),
+                "/tasklist wedged ({waited:?}) behind {method} {target}"
+            );
+            resp
+        };
+
+        let w = "?db_name=w";
+        let nt = "<http://ex/n> <http://ex/p> <http://ex/m> .";
+        assert_eq!(probe("POST", format!("/batchInsert{w}"), nt).0, 200);
+        assert_eq!(probe("POST", format!("/batchRemove{w}"), nt).0, 200);
+        assert_eq!(probe("POST", format!("/upload{w}&format=ntriples"), nt).0, 200);
+        assert_eq!(probe("POST", format!("/checkpoint{w}"), "").0, 200);
+        assert_eq!(probe("POST", format!("/backup{w}&path={backup}"), "").0, 200);
+        assert_eq!(probe("GET", format!("/export{w}"), "").0, 200);
+        let (s, b) = probe("POST", format!("/begin{w}"), "");
+        assert_eq!(s, 200, "{b}");
+        let tid = tid_of(&b);
+        let sel = "SELECT * WHERE { ?s ?p ?o }";
+        assert_eq!(probe("POST", format!("/tquery?tid={tid}"), sel).0, 200);
+        assert_eq!(probe("POST", format!("/commit?tid={tid}"), "").0, 200);
+        let (_, b) = split_status_body(&raw_request(&addr, "POST", &format!("/begin{w}"), Some(&root), ""));
+        let tid = tid_of(&b);
+        assert_eq!(probe("POST", format!("/rollback?tid={tid}"), "").0, 200);
+        assert_eq!(probe("POST", format!("/build{w}"), data).0, 200);
+        assert_eq!(probe("POST", format!("/restore{w}&path={backup}"), "").0, 200);
+        assert_eq!(probe("POST", format!("/unload{w}"), "").0, 200);
+        let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/load{w}"), Some(&root), ""));
+        assert_eq!(s, 200, "load: {b}");
+        assert_eq!(probe("POST", format!("/drop{w}"), "").0, 200);
+        srv.shutdown();
+    }
+
+    /// A write whose request is still being read when a graceful shutdown
+    /// finishes (check_point off) must not be acknowledged unless it was also
+    /// saved: the shutdown retires every slot after its final save, so such a
+    /// late write is refused instead of applied and silently lost.
+    #[test]
+    fn a_write_arriving_after_the_shutdown_save_is_never_acked_and_lost() {
+        let root_dir = tmp_root("late_write");
+        let server = Arc::new(
+            ApiServer::bind(&root_dir, "root", "127.0.0.1:0")
+                .unwrap()
+                .with_check_point(false)
+                .with_shutdown_grace(std::time::Duration::from_millis(50)),
+        );
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = std::thread::spawn(move || s2.serve_forever());
+        let root = basic("root", "root");
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=s", Some(&root), data));
+        assert_eq!(s, 200, "build: {b}");
+
+        // A client that has sent its headers but not yet its body.
+        let update = "INSERT DATA { <http://ex/late> <http://ex/p> <http://ex/x> }";
+        let mut late = TcpStream::connect(addr).unwrap();
+        late.write_all(
+            format!(
+                "POST /update?db_name=s HTTP/1.1\r\nHost: x\r\nAuthorization: {root}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                update.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(report.saved.is_empty(), "nothing was dirty: {report:?}");
+
+        // The shutdown is over; now the body arrives.
+        late.write_all(update.as_bytes()).unwrap();
+        let mut resp = String::new();
+        late.read_to_string(&mut resp).unwrap();
+        let (status, body) = split_status_body(&resp);
+        let mut db = Database::open(root_dir.join("s.db")).unwrap();
+        let durable = db
+            .query("ASK { <http://ex/late> <http://ex/p> <http://ex/x> }")
+            .unwrap()
+            == QueryResult::Ask(true);
+        assert!(status != 200 || durable, "acknowledged ({body}) but not saved");
+        assert_ne!(status, 200, "a write after the final save is refused: {body}");
+        let _ = fs::remove_dir_all(&root_dir);
+    }
+
+    /// An UPDATE that fails part-way leaves its earlier operations applied;
+    /// the database is then dirty like after any write — saved under
+    /// check_point — so what readers see is what a restart finds. Same for a
+    /// failing `/tquery` statement followed by `/commit`.
+    #[test]
+    fn a_partially_applied_update_is_saved() {
+        let (srv, addr) = start("partial_update");
+        let root = basic("root", "root");
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        for db in ["x", "y"] {
+            let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/build?db_name={db}"), Some(&root), data));
+            assert_eq!(s, 200, "build: {b}");
+        }
+        // LOAD is refused by the server's restricted policy: the update fails
+        // after its INSERT DATA was applied.
+        let failing = |s: &str| {
+            format!("INSERT DATA {{ <http://ex/{s}> <http://ex/p> <http://ex/d> }} ; LOAD <file:///nonexistent/x.ttl>")
+        };
+        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/update?db_name=x", Some(&root), &failing("c")));
+        assert_eq!(s, 400, "{b}");
+        assert!(b.contains("were applied"), "the client is told: {b}");
+        let on_disk = |db: &str, s: &str| {
+            let mut d = Database::open(srv.root_dir().join(format!("{db}.db"))).unwrap();
+            d.query(&format!("ASK {{ <http://ex/{s}> <http://ex/p> <http://ex/d> }}")).unwrap()
+                == QueryResult::Ask(true)
+        };
+        assert!(on_disk("x", "c"), "the applied part was saved (check_point)");
+
+        let (_, b) = split_status_body(&raw_request(&addr, "POST", "/begin?db_name=y", Some(&root), ""));
+        let tid = tid_of(&b);
+        let (s, _) = split_status_body(&raw_request(&addr, "POST", &format!("/tquery?tid={tid}"), Some(&root), &failing("t")));
+        assert_eq!(s, 400);
+        let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/commit?tid={tid}"), Some(&root), ""));
+        assert_eq!(s, 200, "{b}");
+        assert!(on_disk("y", "t"), "the committed part was saved");
+        srv.shutdown();
+    }
+
     fn first_task_id(tasklist_json: &str) -> Option<u64> {
         let i = tasklist_json.find("\"id\":")? + "\"id\":".len();
         tasklist_json[i..]

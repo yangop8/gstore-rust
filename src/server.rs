@@ -190,6 +190,11 @@ struct ServerInner {
     dir: Option<PathBuf>,
     /// gStore's `check_point` policy: save after every successful update.
     check_point: bool,
+    /// Set when a graceful shutdown begins: from then on every update saves
+    /// itself before it is acknowledged, whatever the check_point policy — so
+    /// an update still in flight when the shutdown's final save runs (or that
+    /// only gets the lock afterwards) is never acknowledged and then lost.
+    closing: AtomicBool,
 }
 
 impl Server {
@@ -208,6 +213,7 @@ impl Server {
                 auth: None,
                 dir: None,
                 check_point: true,
+                closing: AtomicBool::new(false),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -345,17 +351,28 @@ impl Server {
 
     /// The tail of a graceful shutdown: save unsaved changes (if a directory is
     /// attached) and report what happened.
+    ///
+    /// The `closing` flag is raised first. An update that applies its change
+    /// after that saves it itself (see [`ServerInner::execute`]); one that
+    /// applied it before has set `dirty` first. Both are sequentially
+    /// consistent, so at least one side sees the other: either this save or
+    /// the update's own covers every change — while a shutdown with nothing
+    /// unsaved still never waits for the database lock.
     fn finish_shutdown(&self, drained: bool) -> ShutdownReport {
         let mut report = ShutdownReport {
             drained,
             ..ShutdownReport::default()
         };
+        self.inner.closing.store(true, Ordering::SeqCst);
         if self.inner.dirty.load(Ordering::SeqCst) {
             let db = locked(&self.inner.db);
-            match self.inner.save_locked(&db) {
-                Ok(Some(dir)) => report.saved.push(dir),
-                Ok(None) => {}
-                Err((dir, e)) => report.failed.push((dir, e)),
+            // Re-checked under the lock: the update may have saved itself.
+            if self.inner.dirty.load(Ordering::SeqCst) {
+                match self.inner.save_locked(&db) {
+                    Ok(Some(dir)) => report.saved.push(dir),
+                    Ok(None) => {}
+                    Err((dir, e)) => report.failed.push((dir, e)),
+                }
             }
         }
         report
@@ -773,25 +790,34 @@ impl ServerInner {
     }
 
     /// Run `sparql` under the database lock. An UPDATE that changed data marks
-    /// the database dirty and — under the check_point policy — saves it before
-    /// the lock is released, so the on-disk copy never lags an acknowledged
-    /// write. A failed save does not undo the (applied) update: it is reported
-    /// as a warning and the database stays dirty, to be retried on shutdown.
+    /// the database dirty and — under the check_point policy, or once a
+    /// shutdown has begun — saves it before the lock is released, so the
+    /// on-disk copy never lags an acknowledged write. That includes an UPDATE
+    /// that failed part-way: its operations before the failing one stay
+    /// applied (and visible), so they are saved too. A failed save does not
+    /// undo the (applied) update: it is reported as a warning and the database
+    /// stays dirty, to be retried on shutdown.
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let mut db = locked(&self.db);
-        let result = db.query(sparql);
+        let before = db.mutation_count();
+        let mut result = db.query(sparql);
         let mut warning = None;
-        if let Ok(QueryResult::Update { changed }) = &result {
-            if *changed > 0 {
-                self.dirty.store(true, Ordering::SeqCst);
-                if self.check_point {
-                    if let Err((dir, e)) = self.save_locked(&db) {
-                        warning = Some(format!(
-                            "update applied in memory but saving to '{}' failed: {e}",
-                            dir.display()
-                        ));
-                    }
+        if db.mutation_count() != before {
+            self.dirty.store(true, Ordering::SeqCst);
+            if self.check_point || self.closing.load(Ordering::SeqCst) {
+                if let Err((dir, e)) = self.save_locked(&db) {
+                    warning = Some(format!(
+                        "update applied in memory but saving to '{}' failed: {e}",
+                        dir.display()
+                    ));
                 }
+            }
+            if let Err(e) = &result {
+                let note = match &warning {
+                    Some(w) => format!("operations before the failing one were applied; {w}"),
+                    None => "operations before the failing one were applied".to_string(),
+                };
+                result = Err(crate::GStoreError::Query(format!("{e} ({note})")));
             }
         }
         (result, warning)
@@ -1441,6 +1467,90 @@ mod tests {
             body.len()
         );
         http(addr, &raw)
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn ask(dir: &std::path::Path, q: &str) -> bool {
+        Database::open(dir).unwrap().query(q).unwrap() == QueryResult::Ask(true)
+    }
+
+    /// An UPDATE that fails part-way leaves its earlier operations applied, so
+    /// the database is dirty and saved under check_point like after any write.
+    #[test]
+    fn a_partially_applied_update_is_saved() {
+        let dir = tmp_dir("partial");
+        let db = Database::build_from_str("srv", DATA).unwrap();
+        db.save(&dir).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir(&dir));
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        let resp = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> } ; LOAD <file:///nonexistent/x.ttl>",
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("were applied"), "the client is told: {resp}");
+        assert!(
+            ask(&dir, "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }"),
+            "the applied part was saved"
+        );
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With check_point off, an update still in flight when the graceful
+    /// shutdown's final save ran (here: its body arrives only afterwards) is
+    /// saved before it is acknowledged — never acknowledged and then lost.
+    #[test]
+    fn an_update_finishing_after_shutdown_is_saved_before_it_is_acked() {
+        let dir = tmp_dir("late_update");
+        let db = Database::build_from_str("srv", DATA).unwrap();
+        db.save(&dir).unwrap();
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_db_dir(&dir)
+                .with_check_point(false)
+                .with_shutdown_grace(Duration::from_millis(50)),
+        );
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+
+        let update = "INSERT DATA { <http://ex/late> <http://ex/p> <http://ex/x> }";
+        let mut late = TcpStream::connect(addr).unwrap();
+        late.write_all(
+            format!(
+                "POST /update HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                update.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(!report.drained && report.saved.is_empty(), "{report:?}");
+
+        late.write_all(update.as_bytes()).unwrap();
+        let mut resp = String::new();
+        late.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            ask(&dir, "ASK { <http://ex/late> <http://ex/p> <http://ex/x> }"),
+            "an acknowledged update is durable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

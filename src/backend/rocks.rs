@@ -56,6 +56,25 @@
 //! state RocksDB recovers after a crash is always self-consistent and nothing
 //! depends on a separately-saved `dict.bin`.
 //!
+//! ## Transactions: the undo journal
+//!
+//! A `Database` transaction writes straight through to RocksDB (queries inside
+//! it read their own writes), so to keep it crash-atomic every mutation made
+//! while one is open ([`begin_journal`](RocksStore::begin_journal)) carries, *in
+//! the same atomic write batch*, an undo record in the `meta` CF: the inverse
+//! operation, keyed by a sequence number. Commit deletes the whole journal in
+//! one batch; rollback replays it newest-first and then deletes it. If the
+//! process dies with a journal present (an uncommitted transaction, or a
+//! rollback cut short), [`RocksStore::open`] replays and deletes it before
+//! anything else — so after a crash no uncommitted write survives. Replaying is
+//! idempotent (each record sets one key present or absent), so a replay cut
+//! short is simply repeated. Dictionary terms written during the transaction
+//! are not journaled: a term without a triple is harmless.
+//!
+//! If the journal cannot be deleted or replayed (a write error), the store
+//! refuses further triple and quad writes until a retry succeeds — a stale
+//! journal replayed later would otherwise undo newer writes.
+//!
 //! ## Write errors
 //!
 //! [`MutableStore`] returns a plain `bool`, so a failed RocksDB write cannot be
@@ -83,6 +102,30 @@ const CF_STATS: &str = "stats";
 const CF_DICT: &str = "dict";
 const CF_GSPO: &str = "gspo";
 const CF_META: &str = "meta";
+
+/// `meta` CF key prefix of the open transaction's undo journal; each record is
+/// `JOURNAL_PREFIX ‖ be64(seq)` (see the module docs). The leading NUL keeps it
+/// apart from the UTF-8 names (`name`, `layout`) stored in the same CF.
+const JOURNAL_PREFIX: &[u8] = b"\x00txn-undo\x00";
+/// The exclusive upper bound of the journal key range.
+const JOURNAL_END: &[u8] = b"\x00txn-undo\x01";
+/// Journal record op: undo by re-inserting / by removing.
+const UNDO_INSERT: u8 = b'+';
+const UNDO_REMOVE: u8 = b'-';
+
+/// The state of the undo journal (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Journal {
+    /// No transaction: mutations are not journaled.
+    Off,
+    /// A transaction is open; the next record gets this sequence number.
+    Recording(u64),
+    /// The journal of an ended transaction is still on disk because deleting
+    /// (`replay == false`: it committed) or replaying (`replay == true`: it
+    /// rolled back) it failed. Triple/quad writes are refused until a retry
+    /// ([`RocksStore::heal_journal`]) succeeds.
+    Stale { replay: bool, why: String },
+}
 
 /// Which id space a dictionary term belongs to (the `dict` CF key tag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,6 +185,33 @@ pub struct RocksStore {
     distinct_objects: u64,
     /// The first write failure not yet collected by [`take_error`](Self::take_error).
     error: std::sync::Mutex<Option<String>>,
+    /// The transaction undo journal (see the module docs).
+    journal: std::sync::Mutex<Journal>,
+    /// Test-only failpoints (see [`RocksStore::inject_failures`]).
+    #[cfg(test)]
+    failpoints: Failpoints,
+}
+
+/// Test-only write-failure injection, standing in for e.g. `ENOSPC`.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Failpoints {
+    /// Writes to the `dict` and `gspo` column families fail.
+    pub(crate) side_writes: std::sync::atomic::AtomicBool,
+    /// Deleting the undo journal fails.
+    pub(crate) journal_clear: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl Failpoints {
+    fn hit(flag: &std::sync::atomic::AtomicBool, what: &str) -> Result<()> {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(GStoreError::Database(format!(
+                "rocksdb write ({what}): injected failure (No space left on device)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for RocksStore {
@@ -180,11 +250,18 @@ impl RocksStore {
             distinct_subjects: 0,
             distinct_objects: 0,
             error: std::sync::Mutex::new(None),
+            journal: std::sync::Mutex::new(Journal::Off),
+            #[cfg(test)]
+            failpoints: Failpoints::default(),
         };
         store.triple_count = store.get_u64(K_TRIPLES);
         store.num_predicates = store.get_u64(K_PREDS);
         store.distinct_subjects = store.get_u64(K_SUBJECTS);
         store.distinct_objects = store.get_u64(K_OBJECTS);
+        // A journal left behind is an uncommitted transaction (or a rollback
+        // cut short) of a process that died: undo it before anything reads.
+        store.replay_journal()?;
+        store.sync_wal()?;
         Ok(store)
     }
 
@@ -235,6 +312,10 @@ impl RocksStore {
     }
 
     fn record_error(&self, what: &str, e: rocksdb::Error) {
+        self.record_error_msg(what, e.as_ref());
+    }
+
+    fn record_error_msg(&self, what: &str, e: &str) {
         let mut slot = self
             .error
             .lock()
@@ -242,6 +323,208 @@ impl RocksStore {
         if slot.is_none() {
             *slot = Some(format!("rocksdb write ({what}): {e}"));
         }
+    }
+
+    /// Test-only: the write-failure injection switches of this store.
+    #[cfg(test)]
+    pub(crate) fn inject_failures(&self) -> &Failpoints {
+        &self.failpoints
+    }
+
+    // ---- transaction undo journal (meta CF) -----------------------------
+
+    fn journal_state(&self) -> std::sync::MutexGuard<'_, Journal> {
+        self.journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start journaling mutations for a transaction (see the module docs).
+    /// Fails if one is already being journaled, or if the journal of an earlier
+    /// transaction is still stale and cannot be cleaned up now.
+    pub fn begin_journal(&mut self) -> Result<()> {
+        self.heal_journal()?;
+        let mut j = self.journal_state();
+        if *j != Journal::Off {
+            return Err(GStoreError::Database(
+                "rocksdb: a transaction is already being journaled".into(),
+            ));
+        }
+        *j = Journal::Recording(0);
+        Ok(())
+    }
+
+    /// Whether a transaction's mutations are currently being journaled.
+    pub fn journaling(&self) -> bool {
+        matches!(*self.journal_state(), Journal::Recording(_))
+    }
+
+    /// Commit the journaled transaction: delete its undo journal in one atomic
+    /// batch. On failure the journal stays stale (writes are refused) until a
+    /// later [`heal_journal`](Self::heal_journal) deletes it.
+    pub fn commit_journal(&mut self) -> Result<()> {
+        if !self.journaling() {
+            return Ok(());
+        }
+        *self.journal_state() = Journal::Stale {
+            replay: false,
+            why: String::new(),
+        };
+        self.heal_journal()
+    }
+
+    /// Roll back the journaled transaction: replay its undo journal newest
+    /// first (restoring every triple and quad it changed), then delete it. On
+    /// failure the journal stays stale (writes are refused) until a later
+    /// [`heal_journal`](Self::heal_journal) finishes the rollback; a crash
+    /// finishes it on the next [`open`](Self::open).
+    pub fn rollback_journal(&mut self) -> Result<()> {
+        if !self.journaling() {
+            return Ok(());
+        }
+        *self.journal_state() = Journal::Stale {
+            replay: true,
+            why: String::new(),
+        };
+        self.heal_journal()
+    }
+
+    /// Retry the cleanup of a stale journal — one whose deletion (after a
+    /// commit) or replay (after a rollback) failed; a no-op otherwise. Errs,
+    /// keeping it stale, if the retry fails too.
+    pub fn heal_journal(&mut self) -> Result<()> {
+        let replay = match &*self.journal_state() {
+            Journal::Stale { replay, .. } => *replay,
+            _ => return Ok(()),
+        };
+        let res = if replay {
+            self.replay_journal()
+        } else {
+            self.clear_journal()
+        };
+        let mut j = self.journal_state();
+        match res {
+            Ok(()) => {
+                *j = Journal::Off;
+                Ok(())
+            }
+            Err(e) => {
+                let why = e.to_string();
+                *j = Journal::Stale {
+                    replay,
+                    why: why.clone(),
+                };
+                Err(GStoreError::Database(format!(
+                    "rocksdb: a transaction's undo journal could not be {}: {why}",
+                    if replay { "replayed" } else { "cleared" }
+                )))
+            }
+        }
+    }
+
+    /// The reason triple/quad writes are refused, if they are (a stale journal).
+    pub fn journal_error(&self) -> Option<String> {
+        match &*self.journal_state() {
+            Journal::Stale { replay, why } => Some(format!(
+                "a transaction's undo journal could not be {} ({why}); writes are refused \
+                 until that succeeds",
+                if *replay { "replayed" } else { "cleared" }
+            )),
+            _ => None,
+        }
+    }
+
+    /// Append the undo record of a mutation to `wb` when a transaction is being
+    /// journaled. `undo` is the op that reverses it.
+    fn journal_into(&self, wb: &mut WriteBatch, undo: u8, graph: Option<u32>, t: IdTriple) {
+        let mut j = self.journal_state();
+        let Journal::Recording(seq) = &mut *j else {
+            return;
+        };
+        let mut key = JOURNAL_PREFIX.to_vec();
+        key.extend_from_slice(&seq.to_be_bytes());
+        *seq += 1;
+        let mut val = Vec::with_capacity(18);
+        val.push(undo);
+        match graph {
+            Some(g) => {
+                val.push(1);
+                val.extend_from_slice(&be(g));
+            }
+            None => {
+                val.push(0);
+                val.extend_from_slice(&[0; 4]);
+            }
+        }
+        val.extend_from_slice(&key3(t.sub, t.pred, t.obj));
+        wb.put_cf(self.cf(CF_META), key, val);
+    }
+
+    /// Every journal record `(undo op, graph, triple)`, oldest first.
+    fn journal_records(&self) -> Result<Vec<(u8, Option<u32>, IdTriple)>> {
+        let mut out = Vec::new();
+        let mode = IteratorMode::From(JOURNAL_PREFIX, Direction::Forward);
+        for item in self.db.iterator_cf(self.cf(CF_META), mode) {
+            let (k, v) = item
+                .map_err(|e| GStoreError::Database(format!("rocksdb read (journal): {e}")))?;
+            if !k.starts_with(JOURNAL_PREFIX) {
+                break;
+            }
+            if v.len() != 18 || !matches!(v[0], UNDO_INSERT | UNDO_REMOVE) {
+                return Err(GStoreError::Database("corrupt rocksdb undo journal record".into()));
+            }
+            let graph = (v[1] == 1).then(|| de(&v[2..6]));
+            out.push((v[0], graph, IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18]))));
+        }
+        Ok(out)
+    }
+
+    /// Undo every journaled mutation (newest first), then delete the journal.
+    /// Idempotent: a replay cut short is completed by running it again.
+    fn replay_journal(&mut self) -> Result<()> {
+        let records = self.journal_records()?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        for (op, graph, t) in records.into_iter().rev() {
+            let insert = op == UNDO_INSERT;
+            match graph {
+                None => {
+                    let res = if insert {
+                        self.write_insert(t)
+                    } else {
+                        self.write_remove(t)
+                    };
+                    res.map_err(|e| {
+                        GStoreError::Database(format!("rocksdb write (journal replay): {e}"))
+                    })?;
+                }
+                Some(g) => {
+                    self.quad_write(g, t, insert)?;
+                }
+            }
+        }
+        self.clear_journal()
+    }
+
+    /// Delete the whole journal in one atomic batch.
+    fn clear_journal(&self) -> Result<()> {
+        #[cfg(test)]
+        Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
+        let mut wb = WriteBatch::default();
+        wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
+        self.db
+            .write(wb)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (journal): {e}")))
+    }
+
+    /// Refuse a triple/quad write while the journal is stale (see the module
+    /// docs), trying to clean it up first.
+    fn writable(&mut self) -> std::result::Result<(), String> {
+        if self.journal_error().is_none() {
+            return Ok(());
+        }
+        self.heal_journal().map_err(|e| e.to_string())
     }
 
     // ---- dictionary (dict CF) ---------------------------------------------
@@ -252,6 +535,8 @@ impl RocksStore {
         if terms.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        Failpoints::hit(&self.failpoints.side_writes, "dictionary")?;
         let cf = self.cf(CF_DICT);
         let mut wb = WriteBatch::default();
         for (space, id, key) in terms {
@@ -300,25 +585,26 @@ impl RocksStore {
     // ---- named graphs (gspo CF) --------------------------------------------
 
     /// Insert a quad (graph-IRI entity id + triple). Returns `true` if new.
+    /// Journaled inside a transaction; refused while the journal is stale.
     pub fn insert_quad(&self, g: u32, t: IdTriple) -> Result<bool> {
-        let cf = self.cf(CF_GSPO);
-        let key = key4(g, t.sub, t.pred, t.obj);
-        let present = self
-            .db
-            .get_cf(cf, key)
-            .map_err(|e| GStoreError::Database(format!("rocksdb read (quad): {e}")))?
-            .is_some();
-        if present {
-            return Ok(false);
+        if let Some(e) = self.journal_error() {
+            return Err(GStoreError::Database(format!("rocksdb write (quad): {e}")));
         }
-        self.db
-            .put_cf(cf, key, b"")
-            .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
-        Ok(true)
+        self.quad_write(g, t, true)
     }
 
-    /// Remove a quad. Returns `true` if it existed.
+    /// Remove a quad. Returns `true` if it existed. Journaled inside a
+    /// transaction; refused while the journal is stale.
     pub fn remove_quad(&self, g: u32, t: IdTriple) -> Result<bool> {
+        if let Some(e) = self.journal_error() {
+            return Err(GStoreError::Database(format!("rocksdb write (quad): {e}")));
+        }
+        self.quad_write(g, t, false)
+    }
+
+    /// Set quad `(g, t)` present (`insert`) or absent, journaling the change.
+    /// Returns whether it changed.
+    fn quad_write(&self, g: u32, t: IdTriple, insert: bool) -> Result<bool> {
         let cf = self.cf(CF_GSPO);
         let key = key4(g, t.sub, t.pred, t.obj);
         let present = self
@@ -326,11 +612,21 @@ impl RocksStore {
             .get_cf(cf, key)
             .map_err(|e| GStoreError::Database(format!("rocksdb read (quad): {e}")))?
             .is_some();
-        if !present {
+        if present == insert {
             return Ok(false);
         }
+        #[cfg(test)]
+        Failpoints::hit(&self.failpoints.side_writes, "quad")?;
+        let mut wb = WriteBatch::default();
+        if insert {
+            wb.put_cf(cf, key, b"");
+            self.journal_into(&mut wb, UNDO_REMOVE, Some(g), t);
+        } else {
+            wb.delete_cf(cf, key);
+            self.journal_into(&mut wb, UNDO_INSERT, Some(g), t);
+        }
         self.db
-            .delete_cf(cf, key)
+            .write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
         Ok(true)
     }
@@ -464,8 +760,37 @@ impl RocksStore {
     }
 
     fn insert_ids(&mut self, t: IdTriple) -> bool {
-        if self.contains_ids(t) {
+        if let Err(e) = self.writable() {
+            self.record_error_msg("insert", &e);
             return false;
+        }
+        match self.write_insert(t) {
+            Ok(changed) => changed,
+            Err(e) => {
+                self.record_error("insert", e);
+                false
+            }
+        }
+    }
+
+    fn remove_ids(&mut self, t: IdTriple) -> bool {
+        if let Err(e) = self.writable() {
+            self.record_error_msg("remove", &e);
+            return false;
+        }
+        match self.write_remove(t) {
+            Ok(changed) => changed,
+            Err(e) => {
+                self.record_error("remove", e);
+                false
+            }
+        }
+    }
+
+    /// Insert `t` (journaled inside a transaction). `Ok(false)` if present.
+    fn write_insert(&mut self, t: IdTriple) -> std::result::Result<bool, rocksdb::Error> {
+        if self.contains_ids(t) {
+            return Ok(false);
         }
         let IdTriple { sub, pred, obj } = t;
         let mut wb = WriteBatch::default();
@@ -502,21 +827,20 @@ impl RocksStore {
         if self.step(&mut wb, &tag2(T_PO, pred, obj), true).0 == 0 {
             self.step(&mut wb, &tag1(T_POBJ, pred), true);
         }
+        self.journal_into(&mut wb, UNDO_REMOVE, None, t);
 
-        if let Err(e) = self.db.write(wb) {
-            self.record_error("insert", e);
-            return false;
-        }
+        self.db.write(wb)?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
         self.distinct_objects = objects;
-        true
+        Ok(true)
     }
 
-    fn remove_ids(&mut self, t: IdTriple) -> bool {
+    /// Remove `t` (journaled inside a transaction). `Ok(false)` if absent.
+    fn write_remove(&mut self, t: IdTriple) -> std::result::Result<bool, rocksdb::Error> {
         if !self.contains_ids(t) {
-            return false;
+            return Ok(false);
         }
         let IdTriple { sub, pred, obj } = t;
         let mut wb = WriteBatch::default();
@@ -548,16 +872,14 @@ impl RocksStore {
         if self.step(&mut wb, &tag2(T_PO, pred, obj), false).1 == 0 {
             self.step(&mut wb, &tag1(T_POBJ, pred), false);
         }
+        self.journal_into(&mut wb, UNDO_INSERT, None, t);
 
-        if let Err(e) = self.db.write(wb) {
-            self.record_error("remove", e);
-            return false;
-        }
+        self.db.write(wb)?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
         self.distinct_objects = objects;
-        true
+        Ok(true)
     }
 }
 

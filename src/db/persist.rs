@@ -46,10 +46,24 @@
 //! a whole — see `DiskStore::insert_ids`.)
 //!
 //! A RocksDB database evaluates directly over RocksDB. New dictionary terms are
-//! written to the `dict` CF before the first triple that uses them, named-graph
-//! quads go to the `gspo` CF, and the RocksDB WAL is fsynced at each commit
+//! written to the `dict` CF before the first triple that uses them (also those
+//! a reasoner interns), named-graph quads go to the `gspo` CF *before* the
+//! in-memory named graph changes, and the RocksDB WAL is fsynced at each commit
 //! point. Write errors never panic: they are recorded and returned by the next
-//! commit point.
+//! commit point, and a write that failed is not applied in memory either (a
+//! failed term write forgets the freshly interned terms again), so a retry
+//! persists it. Inside a transaction every RocksDB write carries an undo record
+//! in the same atomic batch (see [`crate::backend::rocks`]): `commit()` deletes
+//! the journal, `rollback()` replays it, and an open after a crash replays it —
+//! so no uncommitted write survives a crash.
+//!
+//! ## Directory replacement
+//!
+//! A `rocksdb/` directory that a save or restore replaces is renamed out of the
+//! way before it is deleted, so a crash mid-deletion never leaves a partial
+//! store that layout detection would prefer over the newly committed layout.
+//! [`Database::restore_into`] stages and validates the copy beside the target
+//! and swaps it in as a whole directory.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -68,7 +82,7 @@ use crate::kvstore::DiskStore;
 use crate::model::id::is_literal_id;
 use crate::model::{IdTriple, Term, Triple};
 use crate::signature::VsTree;
-use crate::store::{Backend, TripleSource, TripleStore};
+use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
 /// The members of a bincode snapshot, in the order they are staged (`meta.bin`
 /// last: it is the file layout detection keys on).
@@ -96,7 +110,8 @@ const LEGACY_SUFFIX: &str = ".legacy";
 /// updates applied so far durable; a persistence failure is reported by the
 /// next commit point. An on-disk database still evaluates queries over an
 /// in-memory working set loaded at open; inside a transaction its writes reach
-/// the store only at `commit`.
+/// the store only at `commit`. A RocksDB transaction writes through but is
+/// journaled, so a crash before `commit` undoes it on the next open.
 ///
 /// **Legacy shadow snapshots.** Builds before this layout handling `save()`d an
 /// updated on-disk database as a bincode snapshot next to the untouched
@@ -307,10 +322,10 @@ fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
         }
     }
     if keep != StorageKind::RocksDb {
-        let rocks = dir.join(ROCKS_SUBDIR);
-        fsutil::remove_dir_if_exists(&rocks)?;
-        fsutil::recover_dir_swap(&rocks)?;
-        fsutil::remove_dir_if_exists(&rocks)?;
+        // Crash-safe: `rocksdb/` takes precedence in layout detection, so it is
+        // renamed out of the way (durably) before it is deleted — a half-deleted
+        // store must never shadow the layout that was just committed.
+        fsutil::discard_dir(&dir.join(ROCKS_SUBDIR))?;
     }
     fsutil::sync_dir(dir)
 }
@@ -371,6 +386,7 @@ impl Database {
     /// layouts every committed update is written back there.
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Database> {
         let dir = dir.as_ref();
+        Database::recover_restore(dir)?;
         if !dir.is_dir() {
             return Err(GStoreError::Database(format!(
                 "database directory '{}' does not exist",
@@ -771,8 +787,7 @@ impl Database {
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
-        fsutil::recover_dir_swap(&rocks_dir)?;
-        fsutil::remove_dir_if_exists(&rocks_dir)?;
+        fsutil::discard_dir(&rocks_dir)?;
 
         let mut rocks = RocksStore::open(&rocks_dir)?;
         // Dictionary first: a term without a triple is harmless, the reverse not.
@@ -882,31 +897,87 @@ impl Database {
         if rocks_src.is_dir() {
             fsutil::replace_dir_with_copy(&rocks_src, &rocks_dst)?;
         } else {
-            fsutil::recover_dir_swap(&rocks_dst)?;
-            fsutil::remove_dir_if_exists(&rocks_dst)?;
+            fsutil::discard_dir(&rocks_dst)?;
         }
         fsutil::sync_dir(dst)
     }
 
     /// Restore the database held in `backup` (any layout) into directory
-    /// `target`, replacing whatever database `target` held. A snapshot backup
-    /// is loaded (validating it) and saved; an on-disk or RocksDB backup is
-    /// copied file by file (see [`backup_dir`](Self::backup_dir)) — which also
-    /// works without the `rocksdb` feature. Open the result with
-    /// [`open`](Self::open).
+    /// `target`, replacing whatever database `target` held. Crash-safe and
+    /// validated: the backup is first copied into a staging directory beside
+    /// `target` (a snapshot backup is loaded — which validates it — and saved
+    /// there; an on-disk or RocksDB backup is copied file by file, see
+    /// [`backup_dir`](Self::backup_dir)), the staged copy is opened to check it
+    /// is a readable database, and only then is it swapped in for `target` as a
+    /// whole directory (an interrupted swap is completed by the next
+    /// [`open`](Self::open)). A corrupt or truncated backup therefore leaves
+    /// `target` untouched. `target` is replaced as a whole, so it must be a
+    /// directory dedicated to the database (as `<name>.db` is). Open the result
+    /// with [`open`](Self::open).
+    ///
+    /// Without the `rocksdb` feature a RocksDB backup can be restored but not
+    /// opened, so it is only checked for a RocksDB `CURRENT` file.
     pub fn restore_into<P: AsRef<Path>, Q: AsRef<Path>>(backup: P, target: Q) -> Result<()> {
-        let (backup, target) = (backup.as_ref(), target.as_ref());
-        match Database::storage_kind(backup) {
-            Some(StorageKind::Snapshot) => Database::load_snapshot(backup)?.save(target),
-            Some(kind) => {
-                Database::backup_dir(backup, target)?;
-                remove_other_layouts(target, kind)
-            }
-            None => Err(GStoreError::Database(format!(
+        let target = target.as_ref();
+        let staged = Database::stage_restore(backup.as_ref(), target)?;
+        Database::install_restore(&staged, target)
+    }
+
+    /// The first half of [`restore_into`](Self::restore_into): copy `backup`
+    /// into the staging directory of `target` and validate the copy, without
+    /// touching `target` itself. Returns the staged directory, to be passed to
+    /// [`install_restore`](Self::install_restore) (or
+    /// [`discard_staged_restore`](Self::discard_staged_restore)).
+    pub(crate) fn stage_restore(backup: &Path, target: &Path) -> Result<PathBuf> {
+        let Some(kind) = Database::storage_kind(backup) else {
+            return Err(GStoreError::Database(format!(
                 "'{}' does not contain a database backup",
                 backup.display()
-            ))),
+            )));
+        };
+        // Finish (or clean up after) an interrupted earlier restore of `target`.
+        Database::recover_restore(target)?;
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
         }
+        let staged = fsutil::RESTORE_SWAP.staging(target);
+        fsutil::remove_dir_if_exists(&staged)?;
+        let built = (|| -> Result<()> {
+            match kind {
+                // Loading validates the snapshot (meta vs. contents).
+                StorageKind::Snapshot => Database::load_snapshot(backup)?.save(&staged),
+                _ => {
+                    Database::backup_dir(backup, &staged)?;
+                    remove_other_layouts(&staged, kind)?;
+                    validate_restored_copy(&staged, kind)
+                }
+            }
+        })();
+        if let Err(e) = built {
+            let _ = fsutil::remove_dir_if_exists(&staged);
+            return Err(e);
+        }
+        Ok(staged)
+    }
+
+    /// The second half of [`restore_into`](Self::restore_into): swap the staged
+    /// copy in for `target` (crash-safe; see [`recover_restore`](Self::recover_restore)).
+    /// No process may have a database open in `target` while this runs.
+    pub(crate) fn install_restore(staged: &Path, target: &Path) -> Result<()> {
+        fsutil::install_staged_dir_as(staged, target, &fsutil::RESTORE_SWAP)
+    }
+
+    /// Drop a staged restore that will not be installed.
+    pub(crate) fn discard_staged_restore(staged: &Path) {
+        let _ = fsutil::remove_dir_if_exists(staged);
+    }
+
+    /// Complete an interrupted [`restore_into`](Self::restore_into) of directory
+    /// `dir` (the staged copy had fully replaced nothing yet, or was half way
+    /// through the swap), or remove its leftovers. Run by [`open`](Self::open);
+    /// only the restore's own `<dir>.restore-*` siblings are ever touched.
+    pub(crate) fn recover_restore(dir: &Path) -> Result<()> {
+        fsutil::recover_dir_swap_as(dir, &fsutil::RESTORE_SWAP)
     }
 
     // ---- write-through hooks (called by the mutation paths) ----------------
@@ -920,11 +991,12 @@ impl Database {
         }
     }
 
-    /// Persist one *applied* mutation of the default graph (`graph == None`) or
-    /// of a named graph through the database's persistent layout. On-disk:
-    /// written through (or queued inside a transaction). RocksDB: named-graph
-    /// quads are written to the `gspo` CF (default-graph triples already went to
-    /// RocksDB through the [`Backend`]). In-memory: nothing to do.
+    /// Write one *applied* mutation of the default graph (`graph == None`) or
+    /// of a named graph through to an on-disk store (queued inside a
+    /// transaction). The other layouts persist elsewhere: RocksDB default-graph
+    /// triples go to RocksDB through the [`Backend`], and named-graph quads
+    /// through [`persist_named_quad`](Self::persist_named_quad) *before* the
+    /// in-memory graph is changed. In-memory: nothing to do.
     pub(super) fn persist_mutation(&mut self, insert: bool, graph: Option<u32>, id: IdTriple) {
         let in_txn = self.txn.is_some();
         if let Some(sink) = self.disk.get_mut() {
@@ -932,18 +1004,23 @@ impl Database {
                 Some(op) => sink.record(op, in_txn),
                 None => sink.fail("a mutated triple references an id missing from the dictionary"),
             }
-            return;
-        }
-        if let Some(g) = graph {
-            self.persist_named_quad(insert, g, id);
         }
     }
 
-    /// Mirror a named-graph change to RocksDB's `gspo` CF (no-op otherwise).
+    /// Mirror a named-graph change to RocksDB's `gspo` CF (journaled inside a
+    /// transaction). Returns `false` — the error noted for the next commit
+    /// point — when the write failed; the caller must then leave the in-memory
+    /// graph unchanged, so memory never holds a change RocksDB lacks (a retry
+    /// then writes it again). Always `true` for the other layouts.
     #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
-    pub(super) fn persist_named_quad(&mut self, insert: bool, graph: u32, id: IdTriple) {
+    pub(super) fn persist_named_quad(&mut self, insert: bool, graph: u32, id: IdTriple) -> bool {
         #[cfg(feature = "rocksdb")]
-        if let Some(rocks) = self.store.as_rocks() {
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            // A stale undo journal blocks writes until it is cleaned up.
+            if let Err(e) = rocks.heal_journal() {
+                self.note_persist_error(e);
+                return false;
+            }
             let res = if insert {
                 rocks.insert_quad(graph, id)
             } else {
@@ -951,8 +1028,48 @@ impl Database {
             };
             if let Err(e) = res {
                 self.note_persist_error(e);
+                return false;
             }
         }
+        true
+    }
+
+    // ---- RocksDB transaction journal ---------------------------------------
+
+    /// Start journaling a transaction's RocksDB writes (no-op otherwise).
+    pub(super) fn rocks_begin_journal(&mut self) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            return rocks.begin_journal();
+        }
+        Ok(())
+    }
+
+    /// Whether this is a RocksDB database journaling an open transaction.
+    pub(super) fn rocks_journaling(&self) -> bool {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks() {
+            return rocks.journaling();
+        }
+        false
+    }
+
+    /// Commit the journaled transaction (delete its undo journal).
+    pub(super) fn rocks_commit_journal(&mut self) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            return rocks.commit_journal();
+        }
+        Ok(())
+    }
+
+    /// Roll back the journaled transaction (replay its undo journal).
+    pub(super) fn rocks_rollback_journal(&mut self) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            return rocks.rollback_journal();
+        }
+        Ok(())
     }
 
     /// Apply the queued write-through of a committing transaction.
@@ -988,6 +1105,11 @@ impl Database {
         if let Some(rocks) = self.store.as_rocks() {
             if let Err(e) = rocks.sync_wal() {
                 failure.get_or_insert(e);
+            }
+            // Not `take`n: a stale journal keeps failing commit points until
+            // it is cleaned up.
+            if let Some(e) = rocks.journal_error() {
+                failure.get_or_insert(GStoreError::Database(format!("rocksdb: {e}")));
             }
         }
         let recorded = self
@@ -1056,43 +1178,124 @@ impl Database {
             TermSpace::Entity
         };
         let o = intern_tracked(dict, o_space, t.object.dict_key(), &mut fresh)?;
-        if !fresh.is_empty() {
+        // Known terms whose earlier write failed are written again now.
+        let mut retried: Vec<(TermSpace, u32, String)> = Vec::new();
+        if !self.unpersisted_terms.is_empty() {
+            let used = [
+                gid.map(|g| (TermSpace::Entity, g)),
+                Some((TermSpace::Entity, s)),
+                Some((TermSpace::Predicate, p)),
+                Some((o_space, o)),
+            ];
+            for (space, id) in used.into_iter().flatten() {
+                let pending = self.unpersisted_terms.contains(&(space, id))
+                    && !fresh.iter().chain(&retried).any(|(sp, i, _)| (*sp, *i) == (space, id));
+                let key = match space {
+                    TermSpace::Predicate => self.dict.predicate_to_string(id),
+                    _ => self.dict.id_to_string(id),
+                };
+                if let (true, Some(key)) = (pending, key) {
+                    retried.push((space, id, key.to_owned()));
+                }
+            }
+        }
+        if !fresh.is_empty() || !retried.is_empty() {
             let terms: Vec<(TermSpace, u32, &str)> = fresh
                 .iter()
+                .chain(&retried)
                 .map(|(sp, id, k)| (*sp, *id, k.as_str()))
                 .collect();
             if let Some(rocks) = self.store.as_rocks() {
                 if let Err(e) = rocks.put_terms(&terms) {
+                    // Forget the terms again, so that a retry interns them
+                    // afresh and persists them: a known-but-unpersisted term
+                    // would let a later triple reference an id RocksDB has no
+                    // dictionary entry for.
+                    for (space, _, key) in &fresh {
+                        match space {
+                            TermSpace::Entity => self.dict.free_entity(key),
+                            TermSpace::Literal => self.dict.free_literal(key),
+                            TermSpace::Predicate => self.dict.free_predicate(key),
+                        };
+                    }
                     self.note_persist_error(e);
                     return Ok(None);
                 }
+            }
+            for (space, id, _) in &retried {
+                self.unpersisted_terms.remove(&(*space, *id));
             }
         }
         Ok(Some((gid, IdTriple::new(s, p, o))))
     }
 
-    /// After reasoning inserted `added` straight into the store: write the new
-    /// triples through (on-disk) and, if the dictionary grew, persist the terms
-    /// they use (RocksDB; idempotent overwrites).
-    #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
-    pub(super) fn persist_inferred(&mut self, added: &[IdTriple], dict_grew: bool) {
+    /// After reasoning inserted `added` into the default graph: write the new
+    /// triples through to an on-disk store (RocksDB already persisted them,
+    /// terms first, see [`infer`](Self::infer)).
+    pub(super) fn persist_inferred(&mut self, added: &[IdTriple]) {
         if self.is_disk_backed() {
             for &t in added {
                 self.persist_mutation(true, None, t);
             }
-        } else {
-            #[cfg(feature = "rocksdb")]
-            if dict_grew {
-                if let Some(rocks) = self.store.as_rocks() {
-                    let terms = rocks_layout::terms_of(&self.dict, added);
-                    let borrowed: Vec<_> =
-                        terms.iter().map(|(s, i, k)| (*s, *i, k.as_str())).collect();
-                    if let Err(e) = rocks.put_terms(&borrowed) {
-                        self.note_persist_error(e);
-                    }
-                }
-            }
         }
+    }
+
+    /// Run a reasoner over the dictionary and default graph. `run` gets the
+    /// insert function to use for every inferred triple: a plain store insert,
+    /// except on RocksDB, where the dictionary terms the triple uses (which the
+    /// reasoner may just have interned, e.g. `rdf:type` or a rule-head
+    /// constant) are written to the `dict` CF *before* the triple — the
+    /// invariant every insert keeps, so a crash never leaves a persisted triple
+    /// whose terms are missing. A triple whose terms cannot be persisted is not
+    /// inserted (the error is reported at the next commit point).
+    pub(super) fn infer<R>(&mut self, run: R) -> Vec<IdTriple>
+    where
+        R: FnOnce(
+            &mut Dictionary,
+            &mut Backend,
+            &mut dyn FnMut(&Dictionary, &mut Backend, IdTriple) -> bool,
+        ) -> Vec<IdTriple>,
+    {
+        #[cfg(feature = "rocksdb")]
+        if self.store.as_rocks().is_some() {
+            use crate::backend::rocks::TermSpace;
+            // Terms already written during this run (re-writing one is a
+            // harmless overwrite; this just avoids doing it per triple).
+            let mut written: HashSet<(TermSpace, u32)> = HashSet::new();
+            // Terms whose write failed: the reasoner may have interned them,
+            // so the next insert that uses one must write it first.
+            let mut unwritten: HashSet<(TermSpace, u32)> = HashSet::new();
+            let mut failure: Option<String> = None;
+            let added = run(&mut self.dict, &mut self.store, &mut |dict, store, t| {
+                let terms: Vec<(TermSpace, u32, String)> = rocks_layout::terms_of(dict, &[t])
+                    .into_iter()
+                    .filter(|(space, id, _)| !written.contains(&(*space, *id)))
+                    .collect();
+                if !terms.is_empty() {
+                    let borrowed: Vec<(TermSpace, u32, &str)> =
+                        terms.iter().map(|(s, i, k)| (*s, *i, k.as_str())).collect();
+                    let res = match store.as_rocks() {
+                        Some(rocks) => rocks.put_terms(&borrowed),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = res {
+                        failure.get_or_insert_with(|| e.to_string());
+                        unwritten.extend(terms.iter().map(|(s, i, _)| (*s, *i)));
+                        return false;
+                    }
+                    written.extend(terms.iter().map(|(s, i, _)| (*s, *i)));
+                }
+                store.insert(t)
+            });
+            self.unpersisted_terms.retain(|k| !written.contains(k));
+            self.unpersisted_terms
+                .extend(unwritten.into_iter().filter(|k| !written.contains(k)));
+            if let Some(e) = failure {
+                self.note_persist_error(e);
+            }
+            return added;
+        }
+        run(&mut self.dict, &mut self.store, &mut |_, store, t| store.insert(t))
     }
 
     /// After id reclamation: rewrite RocksDB's stored dictionary so freed ids
@@ -1101,11 +1304,33 @@ impl Database {
     pub(super) fn persist_dictionary_rewrite(&mut self) {
         #[cfg(feature = "rocksdb")]
         if let Some(rocks) = self.store.as_rocks() {
-            if let Err(e) = rocks.replace_dictionary(rocks_layout::dict_entries(&self.dict)) {
-                self.note_persist_error(e);
+            match rocks.replace_dictionary(rocks_layout::dict_entries(&self.dict)) {
+                // Every live term is stored now.
+                Ok(()) => self.unpersisted_terms.clear(),
+                Err(e) => self.note_persist_error(e),
             }
         }
     }
+}
+
+/// Check that a restored on-disk / RocksDB copy in `dir` opens as a database.
+/// Without the `rocksdb` feature a RocksDB copy cannot be opened, so it is only
+/// checked for the `CURRENT` file every RocksDB directory has.
+fn validate_restored_copy(dir: &Path, kind: StorageKind) -> Result<()> {
+    if kind == StorageKind::RocksDb && !cfg!(feature = "rocksdb") {
+        let current = dir.join(ROCKS_SUBDIR).join("CURRENT");
+        return if current.is_file() {
+            Ok(())
+        } else {
+            Err(GStoreError::Database(format!(
+                "the RocksDB backup has no '{}'",
+                current.display()
+            )))
+        };
+    }
+    Database::open(dir).map(drop).map_err(|e| {
+        GStoreError::Database(format!("the backup is not a readable database: {e}"))
+    })
 }
 
 /// Reconcile a legacy shadow snapshot found next to `kvstore.kv` (see the

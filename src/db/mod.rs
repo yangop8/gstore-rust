@@ -30,13 +30,15 @@ use crate::query::{Evaluator, FunctionRegistry, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
-mod fsutil;
+pub(crate) mod fsutil;
 mod persist;
 
 pub use persist::StorageKind;
 
 #[cfg(test)]
 mod hardening_tests;
+#[cfg(test)]
+mod review_tests;
 mod load_policy;
 pub use load_policy::{LoadPolicy, LoadSource};
 
@@ -262,6 +264,15 @@ pub struct Database {
     /// Which sources SPARQL `LOAD` may read (see [`LoadPolicy`]). Permissive by
     /// default; network-facing servers install [`LoadPolicy::restricted`].
     load_policy: LoadPolicy,
+    /// Advances on every applied data mutation (see
+    /// [`mutation_count`](Self::mutation_count)).
+    mutations: u64,
+    /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
+    /// failed (e.g. interned by a reasoner run whose term write failed). The
+    /// next insert that uses one writes it first, so no persisted triple ever
+    /// references an id RocksDB has no dictionary entry for.
+    #[cfg(feature = "rocksdb")]
+    unpersisted_terms: HashSet<(crate::backend::rocks::TermSpace, u32)>,
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -334,7 +345,28 @@ impl Database {
             disk: RefCell::new(None),
             persist_error: RefCell::new(None),
             load_policy: LoadPolicy::default(),
+            mutations: 0,
+            #[cfg(feature = "rocksdb")]
+            unpersisted_terms: HashSet::new(),
         }
+    }
+
+    /// A counter that advances whenever this database's data changes — every
+    /// applied insert, delete, clear, inference and rollback; reads never move
+    /// it. Comparing it before and after a request tells whether the request
+    /// changed anything, *including* an UPDATE that failed part-way: its
+    /// operations before the failing one stay applied (see
+    /// [`query`](Self::query)), so a caller tracking unsaved changes must
+    /// treat the database as modified.
+    pub fn mutation_count(&self) -> u64 {
+        self.mutations
+    }
+
+    /// Record an applied data mutation: invalidate cached query results and
+    /// advance [`mutation_count`](Self::mutation_count).
+    fn touched(&mut self) {
+        self.query_cache.get_mut().clear();
+        self.mutations += 1;
     }
 
     /// Rebuild the VS-tree from the current store and mark the index valid.
@@ -616,7 +648,7 @@ impl Database {
                     self.vstree_index_insert(id);
                 }
             }
-            self.query_cache.get_mut().clear();
+            self.touched();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Del(None, id)); // rollback removes what we added
             }
@@ -678,7 +710,7 @@ impl Database {
             // handling those would need entry removal + rebalancing the bulk-built
             // tree, so we keep the simple, always-correct rebuild for deletes.
             self.index_valid = false;
-            self.query_cache.get_mut().clear();
+            self.touched();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
             }
@@ -695,12 +727,17 @@ impl Database {
     /// makes them permanent. Returns an error if a transaction is already active
     /// (nesting is not supported). Provides atomicity + rollback; full MVCC
     /// (version chains, locking, GC) is a separate concern (see REFACTOR_BACKLOG).
+    ///
+    /// On a RocksDB database the transaction's writes are journaled so that it
+    /// stays atomic across a crash: uncommitted writes are undone on the next
+    /// open (see [`crate::backend::rocks`]).
     pub fn begin(&mut self) -> Result<()> {
         if self.txn.is_some() {
             return Err(GStoreError::Database(
                 "a transaction is already active".into(),
             ));
         }
+        self.rocks_begin_journal()?;
         self.txn = Some(Vec::new());
         Ok(())
     }
@@ -716,8 +753,11 @@ impl Database {
             return Err(GStoreError::Database("no active transaction".into()));
         }
         self.disk_commit_pending();
-        self.flush_redo()?;
-        self.commit_point()
+        let redo = self.flush_redo();
+        // RocksDB: deleting the undo journal is what commits the transaction.
+        let journal = self.rocks_commit_journal();
+        let point = self.commit_point();
+        redo.and(journal).and(point)
     }
 
     /// Roll back the active transaction, undoing every triple mutation made
@@ -731,29 +771,38 @@ impl Database {
         // on-disk store (which never saw them).
         self.redo_pending.clear();
         self.disk_discard_pending();
+        // A RocksDB store is rolled back by replaying its undo journal (which
+        // also covers the named-graph quads in RocksDB); only the in-memory
+        // named-graph map is undone here.
+        let journaled = self.rocks_journaling();
         for op in log.into_iter().rev() {
             match op {
                 UndoOp::Add(None, id) => {
-                    self.store.insert(id);
+                    if !journaled {
+                        self.store.insert(id);
+                    }
                 }
                 UndoOp::Del(None, id) => {
-                    self.store.remove(id);
+                    if !journaled {
+                        self.store.remove(id);
+                    }
                 }
                 UndoOp::Add(Some(gid), id) => {
-                    if self.named.entry(gid).or_default().insert(id) {
+                    if self.named.entry(gid).or_default().insert(id) && !journaled {
                         self.persist_named_quad(true, gid, id);
                     }
                 }
                 UndoOp::Del(Some(gid), id) => {
-                    if self.named.get_mut(&gid).is_some_and(|s| s.remove(id)) {
+                    if self.named.get_mut(&gid).is_some_and(|s| s.remove(id)) && !journaled {
                         self.persist_named_quad(false, gid, id);
                     }
                 }
             }
         }
+        let replayed = self.rocks_rollback_journal();
         self.index_valid = false;
-        self.query_cache.get_mut().clear();
-        Ok(())
+        self.touched();
+        replayed
     }
 
     /// Whether a transaction is currently active.
@@ -774,16 +823,24 @@ impl Database {
         let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
             return Ok(false);
         };
-        let changed = self.named.entry(gid).or_default().insert(id);
-        if changed {
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Del(Some(gid), id));
-            }
-            self.record_redo(b'I', Some(gid), id);
-            self.persist_mutation(true, Some(gid), id);
+        let present = self
+            .named
+            .get(&gid)
+            .is_some_and(|s| s.exists(id.sub, id.pred, id.obj));
+        // RocksDB first: if the quad cannot be persisted it is not applied at
+        // all (so a retry writes it again), and the error is reported at the
+        // next commit point.
+        if present || !self.persist_named_quad(true, gid, id) {
+            return Ok(false);
         }
-        Ok(changed)
+        self.named.entry(gid).or_default().insert(id);
+        self.touched();
+        if let Some(log) = self.txn.as_mut() {
+            log.push(UndoOp::Del(Some(gid), id));
+        }
+        self.record_redo(b'I', Some(gid), id);
+        self.persist_mutation(true, Some(gid), id);
+        Ok(true)
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
@@ -801,16 +858,24 @@ impl Database {
             return false;
         };
         let id = IdTriple::new(sub, pred, obj);
-        let changed = self.named.get_mut(&gid).is_some_and(|s| s.remove(id));
-        if changed {
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Add(Some(gid), id));
-            }
-            self.record_redo(b'D', Some(gid), id);
-            self.persist_mutation(false, Some(gid), id);
+        let present = self
+            .named
+            .get(&gid)
+            .is_some_and(|s| s.exists(id.sub, id.pred, id.obj));
+        // RocksDB first (see `insert_quad`).
+        if !present || !self.persist_named_quad(false, gid, id) {
+            return false;
         }
-        changed
+        if let Some(s) = self.named.get_mut(&gid) {
+            s.remove(id);
+        }
+        self.touched();
+        if let Some(log) = self.txn.as_mut() {
+            log.push(UndoOp::Add(Some(gid), id));
+        }
+        self.record_redo(b'D', Some(gid), id);
+        self.persist_mutation(false, Some(gid), id);
+        true
     }
 
     /// Apply `INSERT DATA`. Returns the number of triples newly added. A triple
@@ -852,27 +917,29 @@ impl Database {
     /// typing. Returns the number of inferred triples added; the VS-tree is
     /// invalidated (and rebuilt lazily on save / next consistent query).
     pub fn materialize_rdfs(&mut self) -> usize {
-        let terms_before = self.dict_term_count();
-        let added = crate::reason::materialize(&mut self.dict, &mut self.store);
+        let added = self.infer(|dict, store, insert| {
+            crate::reason::materialize_with(dict, store, insert)
+        });
+        self.record_inferred(added)
+    }
+
+    /// Book-keeping after reasoning inserted `added` into the default graph:
+    /// invalidate the index and cache, log them for rollback, and write them
+    /// through (on-disk). Returns how many there were.
+    fn record_inferred(&mut self, added: Vec<IdTriple>) -> usize {
         let n = added.len();
         if n > 0 {
             self.index_valid = false;
-            self.query_cache.get_mut().clear();
+            self.touched();
             // Record inferred triples so reasoning inside a transaction rolls back.
             if let Some(log) = self.txn.as_mut() {
                 for t in &added {
                     log.push(UndoOp::Del(None, *t));
                 }
             }
-            let grew = self.dict_term_count() != terms_before;
-            self.persist_inferred(&added, grew);
+            self.persist_inferred(&added);
         }
         n
-    }
-
-    /// Total number of live dictionary terms (all three id spaces).
-    fn dict_term_count(&self) -> usize {
-        self.dict.entity_num() + self.dict.literal_num() + self.dict.predicate_num()
     }
 
     // ---- query ------------------------------------------------------------
@@ -936,9 +1003,13 @@ impl Database {
                 Ok(result)
             }
             Query::Update(ops) => {
+                let before = self.mutations;
                 let mut changed = 0;
                 for op in ops {
-                    changed += self.exec_update_op(op)?;
+                    match self.exec_update_op(op) {
+                        Ok(n) => changed += n,
+                        Err(e) => return Err(self.failed_update(e, before)),
+                    }
                 }
                 // Append the applied statement to the update log, if enabled.
                 if let Some(path) = self.update_log.clone() {
@@ -951,6 +1022,26 @@ impl Database {
                 }
                 Ok(QueryResult::Update { changed })
             }
+        }
+    }
+
+    /// An UPDATE failed with `e` after its earlier operations (or part of the
+    /// failing one) may already have been applied — they stay applied, as
+    /// documented on [`try_insert_data`](Self::try_insert_data). Outside a
+    /// transaction the applied part is still made durable (this is the
+    /// request's commit point), so the persistent store never lags what
+    /// readers see; `before` is the [`mutation_count`](Self::mutation_count)
+    /// the update started at.
+    fn failed_update(&mut self, e: GStoreError, before: u64) -> GStoreError {
+        if self.txn.is_some() || self.mutations == before {
+            return e;
+        }
+        match self.commit_point() {
+            Ok(()) => e,
+            Err(pe) => GStoreError::Database(format!(
+                "{e}; in addition, the part of the update applied before the failure could not \
+                 be persisted: {pe}"
+            )),
         }
     }
 
@@ -1035,7 +1126,7 @@ impl Database {
                 }
             }
             self.index_valid = false;
-            self.query_cache.get_mut().clear();
+            self.touched();
         }
         n
     }
@@ -1055,11 +1146,9 @@ impl Database {
                 }
             }
             if let Some(removed) = self.named.remove(&gid) {
-                for t in removed.iter_all() {
-                    self.persist_mutation(false, Some(gid), t);
-                }
+                self.persist_cleared_graph(gid, removed);
             }
-            self.query_cache.get_mut().clear();
+            self.touched();
         }
         n
     }
@@ -1076,13 +1165,29 @@ impl Database {
                 }
             }
             for (gid, removed) in std::mem::take(&mut self.named) {
-                for t in removed.iter_all() {
-                    self.persist_mutation(false, Some(gid), t);
-                }
+                self.persist_cleared_graph(gid, removed);
             }
-            self.query_cache.get_mut().clear();
+            self.touched();
         }
         total
+    }
+
+    /// Persist the removal of named graph `gid` (already taken out of
+    /// [`named`](Self::named)) whose quads were `removed`. A quad RocksDB could
+    /// not delete is put back into the in-memory graph, so memory never claims
+    /// a deletion the store did not make (the error is reported at the next
+    /// commit point).
+    fn persist_cleared_graph(&mut self, gid: u32, removed: TripleStore) {
+        let mut kept = TripleStore::new();
+        for t in removed.iter_all() {
+            self.persist_mutation(false, Some(gid), t);
+            if !self.persist_named_quad(false, gid, t) {
+                kept.insert(t);
+            }
+        }
+        if kept.triple_count() > 0 {
+            self.named.insert(gid, kept);
+        }
     }
 
     /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
@@ -1585,21 +1690,10 @@ impl Database {
     /// inferred triples are recorded for transaction rollback like
     /// [`materialize_rdfs`](Self::materialize_rdfs).
     pub fn run_rules(&mut self) -> usize {
-        let terms_before = self.dict_term_count();
-        let added = self.rules.apply(&mut self.dict, &mut self.store);
-        let n = added.len();
-        if n > 0 {
-            self.index_valid = false;
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                for t in &added {
-                    log.push(UndoOp::Del(None, *t));
-                }
-            }
-            let grew = self.dict_term_count() != terms_before;
-            self.persist_inferred(&added, grew);
-        }
-        n
+        let mut rules = std::mem::take(&mut self.rules);
+        let added = self.infer(|dict, store, insert| rules.apply_with(dict, store, insert));
+        self.rules = rules;
+        self.record_inferred(added)
     }
 
     // ---- query-cache capacity --------------------------------------------

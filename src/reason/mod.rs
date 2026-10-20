@@ -40,6 +40,18 @@ pub fn materialize<S: TripleSource + MutableStore>(
     dict: &mut Dictionary,
     store: &mut S,
 ) -> Vec<IdTriple> {
+    materialize_with(dict, store, |_, store: &mut S, t| store.insert(t))
+}
+
+/// [`materialize`], inserting every inferred triple through `insert` (given the
+/// dictionary as it is at that moment) instead of a plain `store.insert` —
+/// e.g. to persist the terms a triple uses before the triple itself. `insert`
+/// returns whether the triple was newly added.
+pub fn materialize_with<S, F>(dict: &mut Dictionary, store: &mut S, mut insert: F) -> Vec<IdTriple>
+where
+    S: TripleSource + MutableStore,
+    F: FnMut(&Dictionary, &mut S, IdTriple) -> bool,
+{
     let key = |iri: &str| Term::iri(iri).dict_key();
     let sco_p = dict.predicate_id(&key(RDFS_SUBCLASS));
     let spo_p = dict.predicate_id(&key(RDFS_SUBPROP));
@@ -88,7 +100,7 @@ pub fn materialize<S: TripleSource + MutableStore>(
         gather(dict, store, type_p, sco_p, spo_p, dom_p, rng_p, &mut new);
         let mut added = 0usize;
         for t in new {
-            if store.insert(t) {
+            if insert(dict, store, t) {
                 added_all.push(t);
                 added += 1;
             }
@@ -492,6 +504,23 @@ impl RuleSet {
         dict: &mut Dictionary,
         store: &mut S,
     ) -> Vec<IdTriple> {
+        self.apply_with(dict, store, |_, store: &mut S, t| store.insert(t))
+    }
+
+    /// [`apply`](Self::apply), inserting every inferred triple through `insert`
+    /// (given the dictionary after the triple's terms were interned) instead of
+    /// a plain `store.insert` — e.g. to persist those terms before the triple.
+    /// `insert` returns whether the triple was newly added.
+    pub fn apply_with<S, F>(
+        &mut self,
+        dict: &mut Dictionary,
+        store: &mut S,
+        mut insert: F,
+    ) -> Vec<IdTriple>
+    where
+        S: TripleSource + MutableStore,
+        F: FnMut(&Dictionary, &mut S, IdTriple) -> bool,
+    {
         for r in &mut self.rules {
             r.effect_count = 0;
         }
@@ -517,7 +546,7 @@ impl RuleSet {
                         continue;
                     };
                     let id = IdTriple::new(s, p, o);
-                    if store.insert(id) {
+                    if insert(dict, store, id) {
                         added_all.push(id);
                         self.rules[i].effect_count += 1;
                         round_added += 1;

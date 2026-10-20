@@ -36,6 +36,15 @@
 //! restart — a missing `root` is re-seeded with the configured initial root
 //! password.
 //!
+//! ## Crash safety
+//!
+//! `users.db` is rewritten atomically (temp file, `fsync`, rename, directory
+//! `fsync`), so a crash or a full disk mid-save leaves the previous file
+//! intact. A file with a line that does not parse (e.g. torn by an older build
+//! that rewrote it in place) is refused rather than loaded partially: skipping
+//! the damaged lines would silently drop those users — and could re-seed `root`
+//! with the command-line initial password. Fix or delete the reported line.
+//!
 //! Privilege model (matching gStore's numeric privileges 1..7 plus an `admin`
 //! super-privilege):
 //!
@@ -385,30 +394,39 @@ impl UserStore {
 
     fn read_file(&mut self) -> io::Result<()> {
         let text = fs::read_to_string(&self.path)?;
-        for line in text.lines() {
+        for (n, line) in text.lines().enumerate() {
             let line = line.trim_end();
             if line.is_empty() {
                 continue;
             }
+            let malformed = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "user store '{}': line {} is malformed (damaged file?); refusing to \
+                         load it, since skipping it would silently drop that user — fix or \
+                         delete the line",
+                        self.path.display(),
+                        n + 1
+                    ),
+                )
+            };
             let mut cols = line.split('\t');
             let (Some(name), Some(cred)) = (cols.next(), cols.next()) else {
-                continue;
+                return Err(malformed());
             };
             // Current format: `name<TAB>pbkdf2-sha256$…<TAB>privileges`.
             // Legacy format:  `name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`.
             let password = if cred.starts_with(PASSWORD_SCHEME) {
-                match PasswordHash::parse_pbkdf2(cred) {
-                    Some(h) => h,
-                    None => continue,
-                }
+                PasswordHash::parse_pbkdf2(cred).ok_or_else(malformed)?
             } else {
                 let Some(hash) = cols.next() else {
-                    continue;
+                    return Err(malformed());
                 };
                 let (Ok(salt), Ok(hash)) =
                     (u64::from_str_radix(cred, 16), u64::from_str_radix(hash, 16))
                 else {
-                    continue;
+                    return Err(malformed());
                 };
                 PasswordHash::Legacy { salt, hash }
             };
@@ -428,7 +446,8 @@ impl UserStore {
         Ok(())
     }
 
-    /// Persist the user table to disk (sorted by name for stable output).
+    /// Persist the user table to disk (sorted by name for stable output),
+    /// atomically: a crash or I/O error mid-save leaves the previous file.
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -443,7 +462,10 @@ impl UserStore {
             let cred = u.password.encode();
             out.push_str(&format!("{}\t{cred}\t{}\n", u.name, u.privilege_str()));
         }
-        fs::write(&self.path, out)
+        crate::db::fsutil::atomic_write(&self.path, out.as_bytes()).map_err(|e| match e {
+            crate::error::GStoreError::Io(io) => io,
+            other => io::Error::other(other.to_string()),
+        })
     }
 
     // ---- user management --------------------------------------------------
@@ -1001,6 +1023,52 @@ mod tests {
         assert_eq!(store.session_user(&token).as_deref(), Some("bob"));
         assert!(store.logout(&token));
         assert!(store.session_user(&token).is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A save replaces `users.db` (temp file + rename) instead of truncating and
+    /// rewriting it in place, so a crash or a full disk mid-save can never
+    /// leave a torn file. Observable through a hard link to the old file: an
+    /// in-place rewrite would change what the link sees too.
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_the_file_instead_of_rewriting_it_in_place() {
+        let path = tmp("atomic");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        let before = fs::read(&path).unwrap();
+        let link = PathBuf::from(format!("{}.link", path.display()));
+        let _ = fs::remove_file(&link);
+        fs::hard_link(&path, &link).unwrap();
+        store
+            .add("carol", "pw", BTreeSet::from([Privilege::Query]))
+            .unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("carol"));
+        assert_eq!(fs::read(&link).unwrap(), before, "the old inode is untouched");
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&link);
+    }
+
+    /// A torn `users.db` (cut mid-line, as an interrupted in-place rewrite
+    /// leaves it) is refused instead of loaded partially — loading it would
+    /// silently drop the users after the cut and, with `root`'s line gone,
+    /// re-seed `root` with the command-line password.
+    #[test]
+    fn a_torn_user_file_is_refused_rather_than_partially_loaded() {
+        let path = tmp("torn");
+        let mut store = UserStore::open(&path, "operator-root-pw").unwrap();
+        for u in ["alice", "bob"] {
+            store.add(u, "pw", BTreeSet::from([Privilege::Query])).unwrap();
+        }
+        let full = fs::read_to_string(&path).unwrap();
+        // Cut in the middle of the last line (`root`, which sorts last).
+        let cut = full.trim_end().len() - 10;
+        fs::write(&path, &full[..cut]).unwrap();
+        let err = UserStore::open(&path, "123456").err().expect("must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("line 3"), "{err}");
+        // Nothing was rewritten: the damaged file is left for the operator.
+        assert_eq!(fs::read_to_string(&path).unwrap(), &full[..cut]);
         let _ = fs::remove_file(&path);
     }
 }

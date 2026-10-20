@@ -307,12 +307,60 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     sync_dir(dst)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only failpoint: [`discard_dir`] stops (as if the process died)
+    /// after renaming the directory away, before deleting it.
+    pub(crate) static CRASH_BEFORE_DISCARD_DELETE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The sibling names a directory swap uses for `target`: where the replacement
+/// is staged, where a complete replacement waits to be swapped in, and where
+/// the replaced directory goes before it is deleted.
+pub(crate) struct DirSwap {
+    tmp: &'static str,
+    new: &'static str,
+    old: &'static str,
+}
+
+/// The swap names of a store directory inside a database directory
+/// (`rocksdb/` → `rocksdb.tmp` / `rocksdb.new` / `rocksdb.old`).
+const STORE_SWAP: DirSwap = DirSwap {
+    tmp: TMP_SUFFIX,
+    new: NEW_SUFFIX,
+    old: OLD_SUFFIX,
+};
+
+/// The swap names of a whole database directory being replaced by a restore
+/// (`x.db` → `x.db.restore-tmp` / `-new` / `-old`). Distinctive on purpose: the
+/// recovery run before every open deletes leftovers under these names, so they
+/// must never collide with a user's own directories (e.g. a manual `x.db.old`).
+pub(crate) const RESTORE_SWAP: DirSwap = DirSwap {
+    tmp: ".restore-tmp",
+    new: ".restore-new",
+    old: ".restore-old",
+};
+
+impl DirSwap {
+    /// Where the replacement of `target` is staged.
+    pub(crate) fn staging(&self, target: &Path) -> PathBuf {
+        with_suffix(target, self.tmp)
+    }
+}
+
 /// Install a fully-populated staging directory `staged` as `target`, replacing
 /// any existing `target`: `staged` → `target.new` → (`target` → `target.old`)
 /// → `target`. Interrupted swaps are completed by [`recover_dir_swap`].
 pub(crate) fn install_staged_dir(staged: &Path, target: &Path) -> Result<()> {
-    let new = with_suffix(target, NEW_SUFFIX);
-    let old = with_suffix(target, OLD_SUFFIX);
+    install_staged_dir_as(staged, target, &STORE_SWAP)
+}
+
+/// [`install_staged_dir`] with the sibling names of `swap`; interrupted swaps
+/// are completed by [`recover_dir_swap_as`] with the same names.
+pub(crate) fn install_staged_dir_as(staged: &Path, target: &Path, swap: &DirSwap) -> Result<()> {
+    let new = with_suffix(target, swap.new);
+    let old = with_suffix(target, swap.old);
     remove_dir_if_exists(&new)?;
     fs::rename(staged, &new)?;
     sync_dir(parent_of(target))?;
@@ -324,6 +372,33 @@ pub(crate) fn install_staged_dir(staged: &Path, target: &Path) -> Result<()> {
     sync_dir(parent_of(target))?;
     remove_dir_if_exists(&old)?;
     Ok(())
+}
+
+/// Remove directory `target` — and a staged `target.new` waiting to be swapped
+/// in — such that a crash part-way never leaves a *partially deleted* directory
+/// under a name that layout detection or [`recover_dir_swap`] acts on: each is
+/// first renamed to `target.old` (ignored by detection, cleaned up by
+/// `recover_dir_swap`), the rename is made durable, and only then is the tree
+/// deleted. (`fs::remove_dir_all` unlinks one file at a time, so a crash in the
+/// middle of it would leave e.g. a RocksDB directory missing its `CURRENT` file
+/// — which a later open would mistake for a fresh, empty store.)
+pub(crate) fn discard_dir(target: &Path) -> Result<()> {
+    let old = with_suffix(target, OLD_SUFFIX);
+    for victim in [with_suffix(target, NEW_SUFFIX), target.to_path_buf()] {
+        if victim.is_dir() {
+            remove_dir_if_exists(&old)?;
+            fs::rename(&victim, &old)?;
+            sync_dir(parent_of(target))?;
+        }
+    }
+    #[cfg(test)]
+    if CRASH_BEFORE_DISCARD_DELETE.with(|c| c.get()) {
+        return Err(GStoreError::Database(
+            "simulated crash while deleting a discarded directory".into(),
+        ));
+    }
+    remove_dir_if_exists(&old)?;
+    remove_dir_if_exists(&tmp_path(target))
 }
 
 /// Replace directory `dst` by a recursive copy of `src` (staged, then swapped
@@ -339,14 +414,19 @@ pub(crate) fn replace_dir_with_copy(src: &Path, dst: &Path) -> Result<()> {
 /// complete `target.new` is moved into place when `target` is missing; stale
 /// `target.tmp` / `target.old` leftovers are removed.
 pub(crate) fn recover_dir_swap(target: &Path) -> Result<()> {
-    let new = with_suffix(target, NEW_SUFFIX);
+    recover_dir_swap_as(target, &STORE_SWAP)
+}
+
+/// [`recover_dir_swap`] for a swap made with the sibling names of `swap`.
+pub(crate) fn recover_dir_swap_as(target: &Path, swap: &DirSwap) -> Result<()> {
+    let new = with_suffix(target, swap.new);
     if !target.exists() && new.is_dir() {
         fs::rename(&new, target)?;
         sync_dir(parent_of(target))?;
     }
     remove_dir_if_exists(&new)?;
-    remove_dir_if_exists(&with_suffix(target, OLD_SUFFIX))?;
-    remove_dir_if_exists(&tmp_path(target))?;
+    remove_dir_if_exists(&with_suffix(target, swap.old))?;
+    remove_dir_if_exists(&with_suffix(target, swap.tmp))?;
     Ok(())
 }
 
@@ -482,6 +562,54 @@ mod tests {
         recover_dir_swap(&target).unwrap();
         assert_eq!(fs::read(target.join("f")).unwrap(), b"new");
         assert!(!with_suffix(&target, OLD_SUFFIX).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_dir_removes_target_and_staged_copy_via_ignored_name() {
+        let dir = tmp_dir("discard");
+        let target = dir.join("rocksdb");
+        fs::create_dir_all(target.join("sub")).unwrap();
+        fs::write(target.join("CURRENT"), b"x").unwrap();
+        fs::create_dir_all(with_suffix(&target, NEW_SUFFIX)).unwrap();
+        // A leftover of an earlier interrupted discard is ignored by detection.
+        fs::create_dir_all(with_suffix(&target, OLD_SUFFIX)).unwrap();
+        discard_dir(&target).unwrap();
+        for p in [
+            target.clone(),
+            with_suffix(&target, NEW_SUFFIX),
+            with_suffix(&target, OLD_SUFFIX),
+            tmp_path(&target),
+        ] {
+            assert!(!p.exists(), "{} must be gone", p.display());
+        }
+        // A crash right after the rename leaves only `.old`, which layout
+        // detection ignores and recovery deletes.
+        fs::create_dir_all(with_suffix(&target, OLD_SUFFIX)).unwrap();
+        assert!(!dir_or_staged_exists(&target));
+        recover_dir_swap(&target).unwrap();
+        assert!(!with_suffix(&target, OLD_SUFFIX).exists());
+        discard_dir(&target).unwrap(); // nothing there: a no-op
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_swap_names_are_distinct_from_store_swap_names() {
+        let dir = tmp_dir("restore_swap");
+        let target = dir.join("x.db");
+        // A user's own `x.db.old` / `x.db.new` / `x.db.tmp` are never touched.
+        for s in [OLD_SUFFIX, NEW_SUFFIX, TMP_SUFFIX] {
+            fs::create_dir_all(with_suffix(&target, s)).unwrap();
+        }
+        let staged = RESTORE_SWAP.staging(&target);
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("f"), b"restored").unwrap();
+        install_staged_dir_as(&staged, &target, &RESTORE_SWAP).unwrap();
+        recover_dir_swap_as(&target, &RESTORE_SWAP).unwrap();
+        assert_eq!(fs::read(target.join("f")).unwrap(), b"restored");
+        for s in [OLD_SUFFIX, NEW_SUFFIX, TMP_SUFFIX] {
+            assert!(with_suffix(&target, s).is_dir(), "{s} sibling must survive");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
