@@ -1,6 +1,10 @@
 //! A minimal, dependency-free binary RPC wire codec for the distributed shard
 //! layer ([`crate::cluster`]).
 //!
+//! **Experimental**, like the cluster it serves: the wire format carries no
+//! version or authentication, is not used by `gserver` / the HTTP API, and may
+//! change incompatibly between releases. Only expose it on trusted networks.
+//!
 //! ## What this is
 //!
 //! A compact **length-prefixed** request/response protocol over any

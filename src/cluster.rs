@@ -50,7 +50,7 @@
 //! a **real network transport** so shards can live in separate processes/hosts:
 //!
 //! * [`ShardNode`] — a server that owns one local [`TripleStore`] shard and
-//!   answers per-shard RPCs over TCP (the [`crate::bin::gnode`] binary is a thin
+//!   answers per-shard RPCs over TCP (the `gnode` binary is a thin
 //!   wrapper around it; see `src/bin/gnode.rs`).
 //! * [`RemoteShard`] — a TCP client to a [`ShardNode`], speaking the
 //!   length-prefixed binary protocol in [`crate::rpc`].
@@ -92,8 +92,8 @@
 //! * [`ClusterConfig`] — the replicated configuration object (member set + the
 //!   shard→owner assignment, tagged with an `epoch`). Membership changes are
 //!   replicated as Raft **config-change** log entries
-//!   ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
-//!   [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)): committed by quorum and
+//!   ([`LogOp::AddNode`] /
+//!   [`LogOp::RemoveNode`]): committed by quorum and
 //!   applied on every [`ClusterNode`] replica, which therefore converge on an
 //!   identical config (served over [`Request::GetConfig`]).
 //! * [`ShardCluster`] — the data-plane coordinator. It maps shards to owners by
@@ -1286,8 +1286,8 @@ impl TryTripleSource for NetworkShardedStore {
 /// address) plus the shard→owner assignment, tagged with a monotonic `epoch`.
 ///
 /// A change is a single config-change committed through the Raft log
-/// ([`LogOp::AddNode`](crate::rpc::LogOp::AddNode) /
-/// [`LogOp::RemoveNode`](crate::rpc::LogOp::RemoveNode)); applying the committed
+/// ([`LogOp::AddNode`] /
+/// [`LogOp::RemoveNode`]); applying the committed
 /// op with [`ClusterConfig::apply`] is deterministic, so every replica that has
 /// seen the same committed prefix holds a byte-identical config. The shard→owner
 /// map is recomputed by rendezvous hashing over the (sorted) member set.
@@ -1599,11 +1599,14 @@ impl TryTripleSource for ShardCluster {
 // explicit logical `tick`s and message handlers, with no clocks or sockets, so
 // it is exhaustively and *deterministically* testable — and a **transport**
 // ([`ClusterNode`]) that wraps it with the same `std`-only length-prefixed RPC
-// ([`crate::rpc`]) used by the sharding layer, a background tick driver, and a
-// kill/revive switch for fault-injection tests. This mirrors gStore's C++
-// `Cluster` (ClusterManager term/quorum/election, ClusterEntityLeader heartbeat/
-// append/failover, ClusterEntityFollower, ClusterLog) within this crate's
-// zero-extra-dependency stance.
+// ([`crate::rpc`]) used by the sharding layer, a background tick driver, one
+// sender thread per peer (so a slow peer only delays itself), and a
+// kill/revive switch for fault-injection tests. Its vocabulary is loosely
+// modelled on upstream gStore's `src/Cluster` sources (ClusterManager
+// term/quorum/election, ClusterEntityLeader heartbeat/append/failover,
+// ClusterEntityFollower, ClusterLog) — which upstream 1.4 does not compile into
+// its release — within this crate's zero-extra-dependency stance. Experimental:
+// see the module docs.
 // ===========================================================================
 
 use std::collections::{HashMap, VecDeque};
@@ -4266,10 +4269,12 @@ mod net_tests {
 /// a [`Sim`] drives `N` in-memory [`RaftState`]s by hand — delivering every
 /// message synchronously and ticking exactly the node we choose — so elections,
 /// replication, failover, catch-up, snapshotting, and split-brain safety are
-/// exercised with **no clocks and no threads** (zero wall-clock flakiness). Two
-/// further tests run real [`ClusterNode`]s over TCP loopback (background threads
-/// on `127.0.0.1:0`, like `tests/dt_service.rs`) and poll for convergence to
-/// prove the transport, election, failover, and recovery work end-to-end.
+/// exercised with **no clocks and no threads** (zero wall-clock flakiness). The
+/// `networked_*` tests (and the quorum / hung-peer regressions next to them) run
+/// real [`ClusterNode`]s over TCP loopback (background threads on
+/// `127.0.0.1:0`, like `tests/dt_service.rs`) to prove the transport,
+/// election, failover, and recovery work end-to-end; they tolerate leadership
+/// changes and slow schedulers by design (see the section comment there).
 #[cfg(test)]
 mod raft_tests {
     use super::*;

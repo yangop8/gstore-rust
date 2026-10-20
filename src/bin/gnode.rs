@@ -3,6 +3,12 @@
 //! TCP for a [`NetworkShardedStore`](gstore::cluster::NetworkShardedStore)
 //! coordinator (see [`gstore::cluster::ShardNode`] / [`gstore::rpc`]).
 //!
+//! **Experimental.** `gnode` exercises the experimental [`gstore::cluster`]
+//! layer: nothing it holds is persisted (a restarted node starts empty), the
+//! RPC protocol is unauthenticated and may change between releases, and it is
+//! not connected to `gserver` or the HTTP API. It has no counterpart in
+//! upstream gStore 1.4. Do not use it for data you need to keep.
+//!
 //! Usage:
 //!
 //! - `gnode [bind_addr] [data_file]` — run a single **shard** node (the default).
@@ -43,7 +49,7 @@ fn main() -> ExitCode {
     for arg in &args[1..] {
         if arg == "-h" || arg == "--help" {
             eprintln!(
-                "usage:\n  gnode [bind_addr] [data_file]\n  gnode cluster <id> <bind_addr> [peer_id@addr ...]"
+                "usage (experimental, in-memory only):\n  gnode [bind_addr] [data_file]\n  gnode cluster <id> <bind_addr> [peer_id@addr ...]"
             );
             return ExitCode::SUCCESS;
         }
