@@ -2544,12 +2544,31 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// The outbound replication channel to one peer: a single-slot mailbox holding
+/// the **newest** Raft message for that peer, drained by that peer's dedicated
+/// sender thread.
+///
+/// One slot (overwrite, not a queue) is enough because every message the state
+/// machine emits for a peer is built from its *current* view of that peer
+/// (`next_index`, commit index, term), so a newer message supersedes an older,
+/// unsent one; and it keeps a slow peer from accumulating an unbounded backlog.
+#[derive(Debug, Default)]
+struct PeerLink {
+    pending: Mutex<Option<RaftMsg>>,
+    ready: std::sync::Condvar,
+}
+
 /// A cluster node: a [`RaftState`] plus a replicated [`TripleStore`], wrapped in
 /// the same `std`-only length-prefixed RPC transport ([`crate::rpc`]) as the
 /// sharding layer. It runs a TCP server (answering Raft RPCs, client writes,
-/// status, and read-only shard queries against the replicated store) and a
-/// background **driver** that ticks the state machine and delivers the messages
-/// it emits. A kill/revive switch simulates node failure for tests.
+/// status, and read-only shard queries against the replicated store), a
+/// background **driver** that ticks the state machine, and one **sender**
+/// thread per peer that delivers the messages addressed to it. A kill/revive
+/// switch simulates node failure for tests.
+///
+/// Delivery is per peer and asynchronous: a slow, hung or unreachable peer only
+/// delays its own sender, never heartbeats or commits to the rest of the
+/// cluster — so a quorum keeps a stable leader while a minority is unresponsive.
 #[derive(Debug)]
 pub struct ClusterNode {
     id: NodeId,
@@ -2566,8 +2585,9 @@ pub struct ClusterNode {
     /// id → address of every peer (filled in after binding, since ephemeral
     /// ports are only known post-bind).
     peer_addrs: Mutex<HashMap<NodeId, SocketAddr>>,
-    /// Cached outbound connections, one per peer.
-    clients: Mutex<HashMap<NodeId, TcpStream>>,
+    /// One outbound mailbox per peer (fixed at bind time), each drained by its
+    /// own sender thread that also owns the connection to that peer.
+    links: HashMap<NodeId, Arc<PeerLink>>,
     listener: TcpListener,
     alive: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -2602,6 +2622,11 @@ impl ClusterNode {
     ) -> io::Result<Arc<ClusterNode>> {
         let listener = TcpListener::bind(addr)?;
         let tick_interval = cfg.tick_interval;
+        let links = peer_ids
+            .iter()
+            .filter(|&&p| p != id)
+            .map(|&p| (p, Arc::new(PeerLink::default())))
+            .collect();
         let state = RaftState::new(id, peer_ids, &cfg);
         Ok(Arc::new(ClusterNode {
             id,
@@ -2610,7 +2635,7 @@ impl ClusterNode {
             apply_lock: Mutex::new(()),
             config: Arc::new(Mutex::new(ClusterConfig::new(Self::DEFAULT_SHARDS))),
             peer_addrs: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
+            links,
             listener,
             alive: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -2742,17 +2767,21 @@ impl ClusterNode {
             }
         };
         let outs = { self.state.lock().unwrap().replicate_now() };
-        self.dispatch_outgoing(outs);
+        self.route(outs);
         self.apply_actions();
         Ok((idx, term))
     }
 
-    /// Simulate a crash: stop ticking, refuse to serve, and drop cached
-    /// connections. In-memory state is retained (a later [`ClusterNode::revive`]
-    /// models a restart that reloaded persistent state).
+    /// Simulate a crash: stop ticking, sending and serving; each peer sender
+    /// drops its connection and any unsent message. In-memory state is retained
+    /// (a later [`ClusterNode::revive`] models a restart that reloaded
+    /// persistent state).
     pub fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        self.clients.lock().unwrap().clear();
+        for link in self.links.values() {
+            link.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            link.ready.notify_one();
+        }
     }
     /// Bring a killed node back: resume ticking/serving and reset its election
     /// timer.
@@ -2769,14 +2798,20 @@ impl ClusterNode {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Spawn the server and driver threads. Returns their join handles (callers
-    /// may ignore them; threads exit on [`ClusterNode::shutdown`]).
+    /// Spawn the server, driver and per-peer sender threads. Returns their join
+    /// handles (callers may ignore them; threads exit on
+    /// [`ClusterNode::shutdown`]).
     pub fn start(self: &Arc<Self>) -> Vec<thread::JoinHandle<()>> {
         let server = Arc::clone(self);
-        let h1 = thread::spawn(move || server.run_server());
+        let mut handles = vec![thread::spawn(move || server.run_server())];
         let driver = Arc::clone(self);
-        let h2 = thread::spawn(move || driver.run_driver());
-        vec![h1, h2]
+        handles.push(thread::spawn(move || driver.run_driver()));
+        for (&peer, link) in &self.links {
+            let me = Arc::clone(self);
+            let link = Arc::clone(link);
+            handles.push(thread::spawn(move || me.run_peer_sender(peer, &link)));
+        }
+        handles
     }
 
     fn run_server(self: Arc<Self>) {
@@ -2945,57 +2980,91 @@ impl ClusterNode {
                 continue;
             }
             let outs = { self.state.lock().unwrap().tick() };
-            self.dispatch_outgoing(outs);
+            self.route(outs);
             self.apply_actions();
         }
     }
 
-    /// Deliver outgoing messages, feeding each reply back into the state machine
-    /// (which may produce further messages — catch-up, commit propagation —
-    /// processed in the same drain). Iterative with a hard guard so a flapping
-    /// peer can never spin forever.
-    fn dispatch_outgoing(&self, initial: Vec<Outgoing>) {
-        let mut queue: VecDeque<Outgoing> = initial.into_iter().collect();
-        let mut guard = 0usize;
-        while let Some(o) = queue.pop_front() {
-            guard += 1;
-            if guard > 100_000 || !self.alive.load(Ordering::SeqCst) {
-                return;
-            }
-            match self.send_msg(o.to, &o.msg) {
-                Ok(reply) => {
-                    let more = self.state.lock().unwrap().handle_reply(o.to, reply);
-                    self.apply_actions();
-                    queue.extend(more);
-                }
-                Err(_) => { /* peer unreachable; best-effort, retried next tick */ }
+    /// Hand each outgoing message to its peer's mailbox (replacing any older,
+    /// still-unsent message for that peer) and wake the peer's sender. Never
+    /// blocks on the network, so the tick driver and client writes are never held
+    /// up by a slow peer.
+    fn route(&self, outs: Vec<Outgoing>) {
+        for o in outs {
+            if let Some(link) = self.links.get(&o.to) {
+                *link.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(o.msg);
+                link.ready.notify_one();
             }
         }
     }
 
-    fn send_msg(&self, to: NodeId, msg: &RaftMsg) -> io::Result<RaftReply> {
+    /// The sender thread for one peer: deliver the newest message in its mailbox
+    /// over this thread's own connection, feed the reply back into the state
+    /// machine, and route whatever that produces (catch-up for this peer, a
+    /// commit broadcast, a fresh leader's heartbeats). Blocking I/O here only
+    /// ever delays traffic to *this* peer.
+    fn run_peer_sender(self: Arc<Self>, peer: NodeId, link: &PeerLink) {
+        let mut conn: Option<TcpStream> = None;
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let msg = {
+                let mut slot = link.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_none() {
+                    slot = link
+                        .ready
+                        .wait_timeout(slot, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                slot.take()
+            };
+            if !self.alive.load(Ordering::SeqCst) {
+                conn = None; // a crashed node holds no connections and sends nothing
+                continue;
+            }
+            let Some(msg) = msg else { continue };
+            let Ok(reply) = self.send_to(&mut conn, peer, &msg) else {
+                continue; // unreachable: dropped; the next heartbeat retries
+            };
+            if !self.alive.load(Ordering::SeqCst) {
+                continue; // crashed while waiting for the reply
+            }
+            let more = self.state.lock().unwrap().handle_reply(peer, reply);
+            self.apply_actions();
+            self.route(more);
+        }
+    }
+
+    /// One request/reply exchange with `peer` over the sender's connection
+    /// `conn`, (re)connecting as needed and retrying once on a fresh connection
+    /// if the cached one turns out to be broken (e.g. closed by the peer while
+    /// idle).
+    fn send_to(
+        &self,
+        conn: &mut Option<TcpStream>,
+        peer: NodeId,
+        msg: &RaftMsg,
+    ) -> io::Result<RaftReply> {
         let addr = {
             let addrs = self.peer_addrs.lock().unwrap();
             *addrs
-                .get(&to)
+                .get(&peer)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer address"))?
         };
         let req = msg.to_request();
-        let mut clients = self.clients.lock().unwrap();
         for attempt in 0..2 {
-            use std::collections::hash_map::Entry;
-            let stream = match clients.entry(to) {
-                Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => {
-                    let stream = TcpStream::connect_timeout(&addr, self.io_timeout)?;
-                    rpc::tune_stream(&stream, Some(self.io_timeout))?;
-                    e.insert(stream)
-                }
-            };
+            if conn.is_none() {
+                let stream = TcpStream::connect_timeout(&addr, self.io_timeout)?;
+                rpc::tune_stream(&stream, Some(self.io_timeout))?;
+                *conn = Some(stream);
+            }
+            let stream = conn.as_mut().expect("connection was just established");
             match rpc::round_trip(stream, &req) {
                 Ok(resp) => return response_to_reply(resp),
                 Err(e) => {
-                    clients.remove(&to);
+                    *conn = None;
                     if attempt == 1 {
                         return Err(e);
                     }
@@ -5071,6 +5140,78 @@ mod raft_tests {
             nodes[i].revive();
         }
         write_committed(&nodes, LogOp::Insert(t(10, 100, 1000)));
+
+        shutdown_all(&nodes);
+    }
+
+    /// Regression (liveness): one *hung* peer — a host that accepts TCP
+    /// connections but never answers, e.g. a stopped process or a partition
+    /// that drops packets — must not stall replication to the healthy majority.
+    /// The transport used to deliver every message sequentially from one
+    /// thread, so each heartbeat round waited out the hung peer's I/O timeouts
+    /// (2 x 300 ms) before the healthy follower heard from the leader again; the
+    /// follower's election timer expired every round and the cluster churned
+    /// through elections while two of three nodes were perfectly healthy.
+    #[test]
+    fn a_hung_peer_does_not_stall_the_healthy_majority() {
+        // Node 2 is a black hole: it accepts connections and never replies.
+        let hole = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hole_addr = hole.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in hole.incoming().flatten() {
+                held.push(s); // keep the socket open, never read or answer it
+            }
+        });
+
+        let ids = [0u64, 1, 2];
+        let nodes: Vec<Arc<ClusterNode>> = [0u64, 1]
+            .iter()
+            .map(|&id| {
+                let peers: Vec<NodeId> = ids.iter().copied().filter(|&p| p != id).collect();
+                ClusterNode::bind(id, peers, TripleStore::new(), "127.0.0.1:0", test_cfg()).unwrap()
+            })
+            .collect();
+        let addr_of = |id: u64| match id {
+            2 => hole_addr,
+            i => nodes[i as usize].local_addr().unwrap(),
+        };
+        for n in &nodes {
+            for &p in ids.iter().filter(|&&p| p != n.id()) {
+                n.set_peer_addr(p, addr_of(p));
+            }
+        }
+        for n in &nodes {
+            let _ = n.start();
+        }
+
+        // The healthy majority elects a leader and keeps it: the term must not
+        // move while heartbeats flow, however long the hung peer blocks.
+        let l = stable_leader(&nodes);
+        let term = nodes[l].current_term();
+        let watch = Instant::now();
+        while watch.elapsed() < Duration::from_millis(1500) {
+            assert_eq!(
+                (current_leader(&nodes), nodes[l].current_term()),
+                (Some(l), term),
+                "leadership churned while only one peer was hung\n{}",
+                describe(&nodes)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // And a write commits on the majority without waiting for the hung
+        // peer's timeouts.
+        let started = Instant::now();
+        nodes[l]
+            .propose_and_wait(LogOp::Insert(t(5, 50, 500)), Duration::from_secs(5))
+            .expect("the healthy majority commits");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(250),
+            "commit waited on the hung peer ({took:?})\n{}",
+            describe(&nodes)
+        );
 
         shutdown_all(&nodes);
     }
