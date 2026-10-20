@@ -127,6 +127,17 @@ impl LogEntry {
 
 /// Write one length-prefixed message: a 4-byte big-endian length followed by
 /// `payload`, then flush. Errors if `payload` exceeds [`MAX_FRAME`].
+///
+/// The prefix and payload are coalesced into **one** buffer and written with a
+/// single `write_all`. Issuing them as two small writes on a `TcpStream` is the
+/// classic write-write-read pattern that trips Nagle's algorithm against the
+/// peer's delayed ACK: the payload segment is held back until the prefix is
+/// ACKed, which the receiver delays by ~40 ms, so *every* request and every
+/// reply paid ~40 ms of dead time (~90 ms per round trip on loopback). That
+/// latency exceeded the Raft election timeout, so a networked cluster churned
+/// through elections and could not hold a leader long enough to commit. Callers
+/// that own their sockets should additionally set `TCP_NODELAY`
+/// (see [`tune_stream`]).
 pub fn write_message<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(
@@ -135,9 +146,26 @@ pub fn write_message<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
         ));
     }
     let len = payload.len() as u32;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(payload)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    w.write_all(&frame)?;
     w.flush()
+}
+
+/// Configure a freshly connected / accepted RPC socket for request/response
+/// traffic: disable Nagle's algorithm (`TCP_NODELAY`) so a small frame is sent
+/// at once instead of waiting on the peer's delayed ACK, and apply `timeout` (if
+/// any) to both reads and writes so a hung peer surfaces as an error rather than
+/// blocking the caller forever.
+pub fn tune_stream(
+    stream: &std::net::TcpStream,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    Ok(())
 }
 
 /// Read one length-prefixed message: a 4-byte big-endian length, then exactly
@@ -985,6 +1013,72 @@ mod tests {
         assert_eq!(
             read_message(&mut cur).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    /// Regression: a frame must leave in a **single** write. Writing the length
+    /// prefix and the payload separately is the write-write-read pattern that
+    /// stalls on Nagle + delayed ACK (~40 ms per message), which made every RPC
+    /// round trip ~90 ms and starved the Raft heartbeats past the election
+    /// timeout (the root cause of the flaky networked cluster tests).
+    #[test]
+    fn write_message_emits_exactly_one_write_per_frame() {
+        struct CountingWriter {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for payload in [&b""[..], b"x", &[7u8; 4096][..]] {
+            let mut w = CountingWriter {
+                writes: 0,
+                bytes: Vec::new(),
+            };
+            write_message(&mut w, payload).unwrap();
+            assert_eq!(w.writes, 1, "frame of {} bytes split across writes", payload.len());
+            assert_eq!(read_message(&mut Cursor::new(w.bytes)).unwrap(), payload);
+        }
+    }
+
+    /// End to end over real loopback TCP: request/response round trips are not
+    /// throttled by Nagle/delayed-ACK. Before the single-write framing fix, 40
+    /// round trips took ~3.5 s (~88 ms each); now they take a few milliseconds.
+    /// The bound is ~1000x the healthy figure, so it only trips on the bug.
+    #[test]
+    fn loopback_round_trips_are_not_throttled_by_delayed_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            while let Ok(bytes) = read_message(&mut stream) {
+                let _ = Request::decode(&bytes).unwrap();
+                write_message(&mut stream, &Response::Count(1).encode()).unwrap();
+            }
+        });
+        // Deliberately *not* tuned (no TCP_NODELAY): the framing alone must
+        // avoid the stall.
+        let mut client = TcpStream::connect(addr).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..40 {
+            assert_eq!(
+                round_trip(&mut client, &Request::TripleCount).unwrap(),
+                Response::Count(1)
+            );
+        }
+        let took = start.elapsed();
+        drop(client);
+        server.join().unwrap();
+        assert!(
+            took < std::time::Duration::from_millis(1500),
+            "40 loopback round trips took {took:?}; frames are being delayed"
         );
     }
 
