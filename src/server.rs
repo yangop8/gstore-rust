@@ -3129,7 +3129,12 @@ mod tests {
             }
             let mut buf = [0u8; 256];
             drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            matches!(drip.read(&mut buf), Ok(_))
+            // A response, EOF or a reset all mean the server let go; only a
+            // timeout would mean it still holds the connection.
+            !matches!(
+                drip.read(&mut buf),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            )
         });
         thread::sleep(Duration::from_millis(150));
         let t0 = Instant::now();
