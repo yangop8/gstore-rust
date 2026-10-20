@@ -51,7 +51,7 @@
 //! Positional arguments follow the grammar alternative of each function
 //! (`SPARQL.g4:197-229`, summarised by [`GFnKind::signature`]) and are mapped
 //! to [`GArgs`] fields as upstream's `QueryParser` maps them into `PathArgs`
-//! (QueryParser.cpp:470-580):
+//! (QueryParser.cpp:476-586):
 //!
 //! | function (signature)                                        | srcs | dsts | directed | k | ret_num | named / nums |
 //! |-------------------------------------------------------------|------|------|----------|---|---------|--------------|
@@ -105,13 +105,23 @@
 //! * A variable bound to a **literal** has no CSR node; pass its dictionary id
 //!   as an isolated node (upstream prints the literal's string the same way).
 //!
-//! [`GArgs::where_empty`] tells whether the WHERE clause produced no
-//! solutions. Upstream then evaluates through a separate code path
-//! (GE:1508-2033) whose only output difference is `kHopNeighbor`'s key
-//! (`"dst"` there, `"neighbor"` otherwise). In that path a *variable* argument
-//! is looked up as if it were an IRI and becomes a missing node — the engine
-//! should pass `srcs = [GNode::MISSING]` to reproduce it, or an empty list to
-//! emit `{"paths":[]}` (the engine package decides; document the choice).
+//! # Result row shape (for the engine)
+//!
+//! Upstream projects a graph function as an aggregate: its value is computed
+//! once over all the solutions (of a GROUP BY group). When it is the only
+//! projection the query yields exactly **one** row (GE:2041-2050 reserves one
+//! row); next to other projections upstream keeps one row per solution and
+//! writes the function value into the **last** row only (`result.back()`,
+//! GE:3108). [`GArgs::where_empty`] tells
+//! whether the WHERE clause produced no solutions: when the function is
+//! then the *only* projected expression, upstream evaluates it through a
+//! separate code path (GE:1508-2033) whose only output difference is
+//! `kHopNeighbor`'s key (`"dst"` there, `"neighbor"` otherwise); with
+//! several projections and no solutions upstream returns no row at all. In
+//! that constant path a *variable* argument is looked up as if it were an
+//! IRI and becomes a missing node — the engine should pass
+//! `srcs = [GNode::MISSING]` to reproduce it, or an empty list to emit
+//! `{"paths":[]}` (the engine package decides; document the choice).
 //!
 //! # FILTER-position forms
 //!
@@ -513,7 +523,9 @@ pub struct GArgs {
     pub k: Option<i64>,
     /// The second integer argument (`retNum`; `PR`'s third argument).
     pub ret_num: Option<i64>,
-    /// The resolved `predSet`.
+    /// The resolved `predSet` ([`PredFilter::resolve`]; [`PredFilter::all`]
+    /// for `confidenceDegree`). The default is the *empty* list (no edge may
+    /// be traversed), so always set it.
     pub preds: PredFilter,
     /// `alpha=` (PR).
     pub alpha: Option<f64>,

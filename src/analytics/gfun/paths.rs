@@ -345,7 +345,7 @@ pub fn k_hop_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// **Upstream:** GE:1932-1953 / GE:3002-3027; kHopNeighbor.cpp:14-76.
 ///
 /// **Per source:** `{"src":"‹u›","depth":K, "dst":["‹a›","‹b›",…]}` when
-/// [`GArgs::where_empty`] (constant branch, GE:1946), otherwise the key is
+/// [`GArgs::where_empty`] (constant branch, GE:1942), otherwise the key is
 /// `"neighbor"` (GE:3016): `{"src":"‹u›","depth":K, "neighbor":[…]}`.
 /// `K` = `k` as written; `retNum` = `a.ret_num`, `None` or negative → 100.
 ///

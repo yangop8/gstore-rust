@@ -136,7 +136,7 @@ pub fn nlohmann_f64(x: f64) -> String {
 
 /// Upstream parses `alpha=`, `tol=`, `increase=` and `maxIter=` with C
 /// `stof` (single precision) before storing them in a `double`
-/// (QueryParser.cpp:555-566). Apply this to reproduce that rounding:
+/// (QueryParser.cpp:541-556). Apply this to reproduce that rounding:
 /// `f32_round(0.85) == 0.8500000238418579`.
 pub fn f32_round(x: f64) -> f64 {
     f64::from(x as f32)
