@@ -4081,14 +4081,26 @@ mod builtin_tests {
 
     #[test]
     fn sssplen_aliases_shortestpathlen() {
-        assert_eq!(lit(&scalar("rs:SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
-        assert_eq!(lit(&scalar("rs:SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
+        assert_eq!(
+            lit(&scalar("rs:SSSPLEN(<http://ex/a>, <http://ex/d>)")),
+            "3"
+        );
+        assert_eq!(
+            lit(&scalar("rs:SSSPLEN(<http://ex/d>, <http://ex/a>)")),
+            "-1"
+        );
     }
 
     #[test]
     fn shortestpaths_counts_distinct_paths() {
-        assert_eq!(lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
-        assert_eq!(lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
+        assert_eq!(
+            lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")),
+            "1"
+        );
+        assert_eq!(
+            lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")),
+            "1"
+        );
     }
 
     #[test]
@@ -4101,7 +4113,10 @@ mod builtin_tests {
             lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/a>, 2)")),
             "<http://ex/c>"
         );
-        assert_eq!(lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
+        assert_eq!(
+            lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/b>, 1)")),
+            "<http://ex/c>"
+        );
     }
 
     #[test]
@@ -4131,7 +4146,10 @@ mod builtin_tests {
     #[test]
     fn community_builtins_group_the_graph() {
         // The whole graph is one connected blob ⇒ same label-prop community.
-        assert_eq!(lit(&scalar("rs:LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(
+            lit(&scalar("rs:LABELPROP(<http://ex/a>, <http://ex/d>)")),
+            "true"
+        );
         // Louvain returns a community size (≥ 1) for a known node.
         let sz: usize = lit(&scalar("rs:LOUVAIN(<http://ex/a>)")).parse().unwrap();
         assert!(sz >= 1);
@@ -4149,12 +4167,18 @@ mod builtin_tests {
     #[test]
     fn centrality_builtins_rank_intermediate_nodes() {
         // A source node is never an intermediary ⇒ betweenness 0.
-        let bc_a: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
-        let bc_b: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
+        let bc_a: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/a>)"))
+            .parse()
+            .unwrap();
+        let bc_b: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/b>)"))
+            .parse()
+            .unwrap();
         assert_eq!(bc_a, 0.0);
         assert!(bc_b > 0.0);
         // a reaches five nodes ⇒ positive closeness.
-        let cc_a: f64 = lit(&scalar("rs:CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let cc_a: f64 = lit(&scalar("rs:CLOSENESSCENTRALITY(<http://ex/a>)"))
+            .parse()
+            .unwrap();
         assert!(cc_a > 0.0);
     }
 
@@ -4163,12 +4187,19 @@ mod builtin_tests {
         // JACCARDSIMILARITY is a dedicated graph function (literal-as-node is fine):
         // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
         assert_eq!(
-            lit(&scalar(r#"rs:JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
+            lit(&scalar(
+                r#"rs:JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#
+            )),
             "0.5"
         );
         // Node-mode SIMILARITY requires BOTH args to be IRIs naming graph nodes;
-        // a node vs itself has an identical neighbour set ⇒ 1.0.
-        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        // a node vs itself has an identical neighbour set ⇒ 1.0. (Node mode
+        // is the legacy gstore-rust SIMILARITY, rs:SIMILARITY; upstream's bare
+        // SIMILARITY is string similarity.)
+        assert_eq!(
+            lit(&scalar("rs:SIMILARITY(<http://ex/a>, <http://ex/a>)")),
+            "1.0"
+        );
         // Regression (#3): two STORED LITERALS must use STRING similarity, not
         // node cosine. Both are objects of <a>, so node mode would wrongly report
         // a cosine of 1.0; string (Jaro) similarity of these very different
@@ -4193,8 +4224,12 @@ mod builtin_tests {
 
     #[test]
     fn ppr_prefers_the_source() {
-        let self_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
-        let far_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
+        let self_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/a>)"))
+            .parse()
+            .unwrap();
+        let far_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/d>)"))
+            .parse()
+            .unwrap();
         assert!(self_score > far_score);
         assert!(far_score >= 0.0);
     }

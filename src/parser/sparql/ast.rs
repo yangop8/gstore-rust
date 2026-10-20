@@ -415,18 +415,27 @@ pub enum Expr {
     /// Upstream accepts every one of them as the whole expression of a SELECT
     /// projection `(f(…) AS ?v)`; only [`GFnName::filter_callable`] ones may
     /// also appear nested inside an expression (FILTER, HAVING, BIND, …).
-    GraphFn { func: GFnName, args: Vec<GArg> },
+    GraphFn {
+        func: GFnName,
+        args: Vec<GArg>,
+    },
     /// An upstream `PFN.name({…})` personalised-function call (also accepted
     /// without the dot, `PFN name({…})`, as the upstream grammar spells it).
     /// `json` is the `jsonVars` argument exactly as upstream hands it to the
     /// function: the raw lexemes of its tokens concatenated without the
     /// whitespace between them, e.g. `{"k":["<a>","<b>"]}`.
-    Pfn { name: String, json: String },
+    Pfn {
+        name: String,
+        json: String,
+    },
     /// A function call through an IRI, `<iri>(args…)` or `pfx:name(args…)`
     /// (SPARQL `iriOrFunction`). `iri` is fully expanded. Calls into the
     /// predeclared `rs:` namespace (`urn:gstore-rust:fn:`) name the legacy
     /// gstore-rust graph built-ins, e.g. `rs:SSSP(<a>, <b>)`.
-    IriCall { iri: String, args: Vec<Expr> },
+    IriCall {
+        iri: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// A `varOrIri` argument of an advanced graph function.

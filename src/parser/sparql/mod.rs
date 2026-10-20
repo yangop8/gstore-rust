@@ -1166,8 +1166,8 @@ impl<'s> Parser<'s> {
     fn parse_projection_expr(&mut self) -> Result<Expr> {
         let call = match self.peek() {
             Token::Word(w) => {
-                if let Some(func) = GFnName::from_keyword(w)
-                    .filter(|_| matches!(self.peek_at(1), Token::LParen))
+                if let Some(func) =
+                    GFnName::from_keyword(w).filter(|_| matches!(self.peek_at(1), Token::LParen))
                 {
                     let e = self.parse_graph_fn(func, true)?;
                     Some((e, func.name().to_string()))
@@ -1268,7 +1268,10 @@ impl<'s> Parser<'s> {
     fn parse_gfn_args(&mut self, func: GFnName) -> std::result::Result<Vec<GArg>, String> {
         let ctx = |m: String| format!("{} expects {}: {m}", func.name(), func.signature());
         if !matches!(self.peek(), Token::LParen) {
-            return Err(ctx(format!("expected '(', found {}", describe_token(self.peek()))));
+            return Err(ctx(format!(
+                "expected '(', found {}",
+                describe_token(self.peek())
+            )));
         }
         self.bump();
         let mut args = Vec::new();
@@ -1305,7 +1308,10 @@ impl<'s> Parser<'s> {
                 }
             }
             if matches!(self.peek(), Token::RParen) {
-                return Err(ctx(format!("missing argument {argno} ({})", p.slot.describe())));
+                return Err(ctx(format!(
+                    "missing argument {argno} ({})",
+                    p.slot.describe()
+                )));
             }
             args.push(self.parse_gfn_slot(p.slot, argno).map_err(&ctx)?);
         }
@@ -1330,12 +1336,19 @@ impl<'s> Parser<'s> {
     /// needed for a leading optional slot: `clusterCoeff`'s `varOrIri`.)
     fn starts_gfn_slot(&self, slot: GSlot) -> bool {
         match slot {
-            GSlot::Node => matches!(self.peek(), Token::Var(_) | Token::Iri(_) | Token::PName(..)),
+            GSlot::Node => matches!(
+                self.peek(),
+                Token::Var(_) | Token::Iri(_) | Token::PName(..)
+            ),
             GSlot::Bool => matches!(self.peek(), Token::Word(w)
                 if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false")),
             GSlot::Int | GSlot::UInt | GSlot::Num => matches!(
                 self.peek(),
-                Token::Integer(_) | Token::Decimal(_) | Token::Double(_) | Token::Plus | Token::Minus
+                Token::Integer(_)
+                    | Token::Decimal(_)
+                    | Token::Double(_)
+                    | Token::Plus
+                    | Token::Minus
             ),
             GSlot::PredSet => matches!(self.peek(), Token::LBrace),
             GSlot::NamedNum(k) | GSlot::NamedUInt(k) => {
@@ -1354,7 +1367,9 @@ impl<'s> Parser<'s> {
                     Ok(GArg::Node(VarOrIri::Var(v)))
                 }
                 tok @ (Token::Iri(_) | Token::PName(..)) => {
-                    let iri = self.token_iri(&tok).map_err(|e| format!("argument {argno}: {e}"))?;
+                    let iri = self
+                        .token_iri(&tok)
+                        .map_err(|e| format!("argument {argno}: {e}"))?;
                     self.bump();
                     Ok(GArg::Node(VarOrIri::Iri(iri)))
                 }
