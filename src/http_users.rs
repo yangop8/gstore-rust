@@ -322,11 +322,19 @@ impl UserStore {
     /// given password the first time). The file is (re)written so a freshly
     /// seeded `root` is persisted.
     pub fn open(path: impl AsRef<Path>, root_password: &str) -> io::Result<UserStore> {
-        let path = path.as_ref().to_path_buf();
+        let mut store = UserStore::load(path)?;
+        if store.seed_root(root_password) {
+            store.save()?;
+        }
+        Ok(store)
+    }
+
+    /// Read the user file at `path` (empty store if absent) without seeding.
+    fn load(path: impl AsRef<Path>) -> io::Result<UserStore> {
         let mut key = [0u8; 32];
         random_bytes(&mut key);
         let mut store = UserStore {
-            path,
+            path: path.as_ref().to_path_buf(),
             users: HashMap::new(),
             sessions: HashMap::new(),
             ttl: Duration::from_secs(24 * 3600),
@@ -336,18 +344,24 @@ impl UserStore {
         if store.path.is_file() {
             store.read_file()?;
         }
-        if !store.users.contains_key(ROOT_USER) {
-            store.users.insert(
-                ROOT_USER.to_string(),
-                User {
-                    name: ROOT_USER.to_string(),
-                    password: PasswordHash::new(root_password),
-                    privileges: BTreeSet::from([Privilege::Admin]),
-                },
-            );
-            store.save()?;
-        }
         Ok(store)
+    }
+
+    /// Create the built-in `root` with `password` if it is missing; returns
+    /// whether it was created.
+    fn seed_root(&mut self, password: &str) -> bool {
+        if self.users.contains_key(ROOT_USER) {
+            return false;
+        }
+        self.users.insert(
+            ROOT_USER.to_string(),
+            User {
+                name: ROOT_USER.to_string(),
+                password: PasswordHash::new(password),
+                privileges: BTreeSet::from([Privilege::Admin]),
+            },
+        );
+        true
     }
 
     /// Offline password reset: set `name`'s password in the user file at `path`
@@ -360,7 +374,10 @@ impl UserStore {
         name: &str,
         new_password: &str,
     ) -> io::Result<()> {
-        let mut store = UserStore::open(path, new_password)?;
+        let mut store = UserStore::load(path)?;
+        if name == ROOT_USER && store.seed_root(new_password) {
+            return store.save();
+        }
         store
             .set_password(name, new_password)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
@@ -876,6 +893,15 @@ mod tests {
         assert!(UserStore::open(&fresh, "other").unwrap().verify(ROOT_USER, "pw2"));
         // Unknown users are an error, not silently created.
         assert!(UserStore::reset_password_offline(&fresh, "nobody", "x").is_err());
+        // Resetting a non-root user never seeds a root with that password.
+        let no_root = tmp("reset_no_root");
+        fs::write(&no_root, format!("erin\t{}\tquery\n", hash_password("old"))).unwrap();
+        UserStore::reset_password_offline(&no_root, "erin", "new").unwrap();
+        let text = fs::read_to_string(&no_root).unwrap();
+        assert!(!text.contains("root\t"), "{text}");
+        let store = UserStore::open(&no_root, "seeded-root").unwrap();
+        assert!(store.verify("erin", "new") && !store.verify("erin", "old"));
+        let _ = fs::remove_file(&no_root);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&fresh);
     }
