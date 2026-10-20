@@ -43,11 +43,18 @@ impl ResultSet {
     }
 
     /// Render the table as gStore-style aligned text (header + rows).
+    ///
+    /// The fields are public, so a hand-built table may be ragged; a row with
+    /// more cells than `vars` simply widens the layout (extra columns get no
+    /// header) instead of indexing past `widths`.
     pub fn to_table_string(&self) -> String {
         let mut widths: Vec<usize> = self.vars.iter().map(|v| v.len() + 1).collect();
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 let w = cell.as_deref().unwrap_or("").len();
+                if i >= widths.len() {
+                    widths.resize(i + 1, 0);
+                }
                 if w > widths[i] {
                     widths[i] = w;
                 }
@@ -91,5 +98,14 @@ mod tests {
         assert!(s.contains("?y"));
         assert!(s.contains("<a>"));
         assert_eq!(rs.row_count(), 2);
+    }
+
+    #[test]
+    fn ragged_rows_do_not_panic() {
+        let mut rs = ResultSet::new(vec!["x".into()]);
+        rs.rows.push(vec![Some("<a>".into()), Some("<extra>".into())]);
+        rs.rows.push(vec![]);
+        let s = rs.to_table_string();
+        assert!(s.contains("<extra>"));
     }
 }

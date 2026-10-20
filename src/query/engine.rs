@@ -26,6 +26,7 @@ use crate::model::id::PredId;
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
+use crate::parser::sparql::builtins;
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
@@ -147,7 +148,17 @@ impl Extras {
         if let Some(&id) = self.index.get(t) {
             return id;
         }
-        let id = SYNTH_BASE + self.terms.len() as u32;
+        // The synthetic range is `[SYNTH_BASE, u32::MAX)`. Once it is full (~95M
+        // distinct computed terms in one query) further terms get the
+        // unresolvable sentinel `u32::MAX` — they read back as unbound — rather
+        // than overflowing the id arithmetic.
+        let Some(id) = u32::try_from(self.terms.len())
+            .ok()
+            .and_then(|n| SYNTH_BASE.checked_add(n))
+            .filter(|&id| id != u32::MAX)
+        else {
+            return u32::MAX;
+        };
         self.terms.push(t.clone());
         self.index.insert(t.clone(), id);
         id
@@ -2006,6 +2017,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     fn eval_builtin(&self, name: &str, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
+        // Names outside the built-in table are user-defined functions.
+        let Some(spec) = builtins::lookup(name) else {
+            return self.eval_custom_function(name, args, b, l);
+        };
+        // The parser rejects wrong-arity built-in calls; an AST built some other
+        // way gets an evaluation error (solution dropped), never an index panic.
+        if !spec.arity.accepts(args.len()) {
+            return None;
+        }
         // BOUND inspects binding state directly (its arg may be unbound).
         if name == "BOUND" {
             if let [Expr::Var(v)] = args {
@@ -2016,16 +2036,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
         match name {
             "STR" => Some(Value::Str {
-                value: self.eval_value(&args[0], b, l)?.lexical(),
+                value: self.eval_value(args.first()?, b, l)?.lexical(),
                 lang: None,
             }),
             "STRLEN" => {
-                let v = self.eval_value(&args[0], b, l)?;
+                let v = self.eval_value(args.first()?, b, l)?;
                 Some(Value::Int(v.lexical().chars().count() as i64))
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
-            "ABS" => match self.eval_value(&args[0], b, l)? {
+            "ABS" => match self.eval_value(args.first()?, b, l)? {
                 // `i64::abs(i64::MIN)` overflows (panics in debug, wraps to a
                 // negative value in release); widen to `BigInt` like `negate`.
                 Value::Int(i) => Some(
@@ -2039,17 +2059,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "CEIL" => self.num1(args, b, l, f64::ceil, |i| i),
             "FLOOR" => self.num1(args, b, l, f64::floor, |i| i),
             "ROUND" => self.num1(args, b, l, f64::round, |i| i),
-            "ISNUMERIC" => Some(Value::Bool(self.eval_value(&args[0], b, l)?.is_numeric())),
+            "ISNUMERIC" => Some(Value::Bool(self.eval_value(args.first()?, b, l)?.is_numeric())),
             "ISIRI" | "ISURI" => Some(Value::Bool(matches!(
-                self.eval_value(&args[0], b, l)?,
+                self.eval_value(args.first()?, b, l)?,
                 Value::Iri(_)
             ))),
             "ISBLANK" => Some(Value::Bool(matches!(
-                self.eval_value(&args[0], b, l)?,
+                self.eval_value(args.first()?, b, l)?,
                 Value::Blank(_)
             ))),
             "ISLITERAL" => Some(Value::Bool(matches!(
-                self.eval_value(&args[0], b, l)?,
+                self.eval_value(args.first()?, b, l)?,
                 Value::Int(_)
                     | Value::BigInt(_)
                     | Value::Decimal(_)
@@ -2059,7 +2079,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     | Value::Typed { .. }
             ))),
             "LANG" => {
-                let v = self.eval_value(&args[0], b, l)?;
+                let v = self.eval_value(args.first()?, b, l)?;
                 let lang = match v {
                     Value::Str { lang, .. } => lang.unwrap_or_default(),
                     _ => String::new(),
@@ -2070,7 +2090,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 })
             }
             "DATATYPE" => {
-                let v = self.eval_value(&args[0], b, l)?;
+                let v = self.eval_value(args.first()?, b, l)?;
                 Some(Value::Iri(datatype_iri(&v)?))
             }
             "CONTAINS" => self.str2_bool(args, b, l, |a, c| a.contains(&c)),
@@ -2097,14 +2117,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 })
             }
             "SAMETERM" => {
-                let a = self.eval_value(&args[0], b, l)?;
-                let c = self.eval_value(&args[1], b, l)?;
+                let a = self.eval_value(args.first()?, b, l)?;
+                let c = self.eval_value(args.get(1)?, b, l)?;
                 Some(Value::Bool(a == c))
             }
             "COALESCE" => args.iter().find_map(|a| self.eval_value(a, b, l)),
             "REGEX" => {
-                let text = self.eval_value(&args[0], b, l)?.lexical();
-                let pat = self.eval_value(&args[1], b, l)?.lexical();
+                let text = self.eval_value(args.first()?, b, l)?.lexical();
+                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
                 let flags = match args.get(2) {
                     Some(a) => self.eval_value(a, b, l)?.lexical(),
                     None => String::new(),
@@ -2127,8 +2147,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let start = self.eval_value(args.get(1)?, b, l)?.as_f64()?.round() as i64;
                 // XPath fn:substring semantics: keep 1-based positions `p` with
                 // start <= p < start+length (length defaults to the rest).
+                // `as i64` saturates (NaN ⇒ 0), and the sum saturates too, so
+                // huge positions such as SUBSTR(?s, 9e18, 9e18) cannot overflow.
                 let end = match args.get(2) {
-                    Some(e) => start + self.eval_value(e, b, l)?.as_f64()?.round() as i64,
+                    Some(e) => {
+                        start.saturating_add(self.eval_value(e, b, l)?.as_f64()?.round() as i64)
+                    }
                     None => total + 1,
                 };
                 let from = (start.max(1) - 1).min(total) as usize;
@@ -2272,13 +2296,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 lang: None,
             }),
             "IF" => {
-                if args.len() != 3 {
-                    return None;
-                }
-                if self.eval_ebv(&args[0], b, l)? {
-                    self.eval_value(&args[1], b, l)
+                if self.eval_ebv(args.first()?, b, l)? {
+                    self.eval_value(args.get(1)?, b, l)
                 } else {
-                    self.eval_value(&args[2], b, l)
+                    self.eval_value(args.get(2)?, b, l)
                 }
             }
 
@@ -2495,19 +2516,30 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // DIAMETERESTIMATION(): double-sweep BFS diameter estimate.
             "DIAMETERESTIMATION" => Some(Value::Int(self.diameter_cached() as i64)),
 
-            // User-defined function fallback (gStore `pfnQuery`): a name that is
-            // not a SPARQL built-in is looked up in the registry before erroring.
-            // Arguments are evaluated to values first; if any errors/unbound the
-            // call yields `None`, like a built-in with a bad argument.
-            _ => {
-                let f = self.functions.get(name)?;
-                let mut argv = Vec::with_capacity(args.len());
-                for a in args {
-                    argv.push(self.eval_value(a, b, l)?);
-                }
-                f(&argv)
-            }
+            // Every name in `builtins::BUILTINS` has an arm above (pinned by
+            // the `every_table_builtin_has_an_engine_arm` test); this arm only
+            // guards against the table and the dispatcher drifting apart.
+            _ => None,
         }
+    }
+
+    /// User-defined function fallback (gStore `pfnQuery`): a name that is not a
+    /// SPARQL built-in is looked up in the registry before erroring. Arguments
+    /// are evaluated to values first; if any errors/unbound the call yields
+    /// `None`, like a built-in with a bad argument.
+    fn eval_custom_function(
+        &self,
+        name: &str,
+        args: &[Expr],
+        b: &Binding,
+        l: &VarLayout,
+    ) -> Option<Value> {
+        let f = self.functions.get(name)?;
+        let mut argv = Vec::with_capacity(args.len());
+        for a in args {
+            argv.push(self.eval_value(a, b, l)?);
+        }
+        f(&argv)
     }
 
     /// Resolve a graph built-in node argument to its dictionary entity id.
@@ -2664,7 +2696,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let v = self.eval_value(&args[0], b, l)?;
+        let v = self.eval_value(args.first()?, b, l)?;
         Some(Value::Str {
             value: f(&v.lexical()),
             lang: None,
@@ -2678,8 +2710,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(String, String) -> String,
     ) -> Option<Value> {
-        let a = self.eval_value(&args[0], b, l)?.lexical();
-        let c = self.eval_value(&args[1], b, l)?.lexical();
+        let a = self.eval_value(args.first()?, b, l)?.lexical();
+        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
         Some(Value::Str {
             value: f(a, c),
             lang: None,
@@ -2693,8 +2725,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(String, String) -> bool,
     ) -> Option<Value> {
-        let a = self.eval_value(&args[0], b, l)?.lexical();
-        let c = self.eval_value(&args[1], b, l)?.lexical();
+        let a = self.eval_value(args.first()?, b, l)?.lexical();
+        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
         Some(Value::Bool(f(a, c)))
     }
 
@@ -2706,7 +2738,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         ff: impl Fn(f64) -> f64,
         fi: impl Fn(i64) -> i64,
     ) -> Option<Value> {
-        match self.eval_value(&args[0], b, l)? {
+        match self.eval_value(args.first()?, b, l)? {
             Value::Int(i) => Some(Value::Int(fi(i))),
             Value::Double(d) => Some(Value::Double(ff(d))),
             // BigInt / Decimal have no i64/f64-native fast path here; evaluate in
@@ -2724,11 +2756,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         order_by: &[OrderCondition],
         layout: &VarLayout,
     ) {
-        solutions.sort_by(|a, b| {
-            for cond in order_by {
-                let va = self.eval_value(&cond.expr, a, layout);
-                let vb = self.eval_value(&cond.expr, b, layout);
-                let ord = order_key(&va).cmp(&order_key(&vb));
+        // Evaluate every sort key exactly once per solution, then sort on the
+        // cached keys. Re-evaluating inside the comparator would be O(n log n)
+        // evaluations and, for a non-deterministic key such as `ORDER BY
+        // RAND()`, an inconsistent comparator — which `slice::sort_by` is
+        // allowed to (and since Rust 1.81 may) answer with a panic.
+        let keys: Vec<Vec<_>> = solutions
+            .iter()
+            .map(|s| {
+                order_by
+                    .iter()
+                    .map(|cond| order_key(&self.eval_value(&cond.expr, s, layout)))
+                    .collect()
+            })
+            .collect();
+        let mut perm: Vec<usize> = (0..solutions.len()).collect();
+        perm.sort_by(|&a, &b| {
+            for (k, cond) in order_by.iter().enumerate() {
+                let ord = keys[a][k].cmp(&keys[b][k]);
                 let ord = if cond.descending { ord.reverse() } else { ord };
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
@@ -2736,6 +2781,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             std::cmp::Ordering::Equal
         });
+        let sorted: Vec<Binding> = perm.iter().map(|&i| std::mem::take(&mut solutions[i])).collect();
+        for (slot, b) in solutions.iter_mut().zip(sorted) {
+            *slot = b;
+        }
     }
 }
 
@@ -3252,17 +3301,20 @@ fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<us
             collect_substr_constraints(b, layout, out);
         }
         Expr::Builtin(name, args) => {
-            let needle = match name.as_str() {
-                "CONTAINS" | "STRSTARTS" | "STRENDS" if args.len() == 2 => const_string(&args[1]),
+            // Only the exact two-argument shapes qualify; matching on the slice
+            // pattern (rather than indexing `args[0]`) keeps a zero-argument
+            // call such as `FILTER(STR())` from panicking here.
+            let (target, needle) = match (name.as_str(), args.as_slice()) {
+                ("CONTAINS" | "STRSTARTS" | "STRENDS", [target, pat]) => (target, const_string(pat)),
                 // A metacharacter-free regex pattern is just a literal substring.
                 // Only the plain two-arg form: a flags arg (e.g. "i") could break
                 // byte-substring soundness.
-                "REGEX" if args.len() == 2 => {
-                    const_string(&args[1]).filter(|p| is_plain_literal_regex(p))
+                ("REGEX", [target, pat]) => {
+                    (target, const_string(pat).filter(|p| is_plain_literal_regex(p)))
                 }
-                _ => None,
+                _ => return,
             };
-            if let (Some(vi), Some(n)) = (substr_target_var(&args[0], layout), needle) {
+            if let (Some(vi), Some(n)) = (substr_target_var(target, layout), needle) {
                 if n.len() >= 3 {
                     out.entry(vi).or_default().push(n);
                 }
@@ -3279,9 +3331,10 @@ fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<us
 fn substr_target_var(e: &Expr, layout: &VarLayout) -> Option<usize> {
     match e {
         Expr::Var(v) => layout.index.get(v).copied(),
-        Expr::Builtin(name, args) if name == "STR" && args.len() == 1 => {
-            substr_target_var(&args[0], layout)
-        }
+        Expr::Builtin(name, args) if name == "STR" => match args.as_slice() {
+            [inner] => substr_target_var(inner, layout),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3484,6 +3537,137 @@ mod builtin_tests {
             collect_substr_constraints(&e, &layout, &mut out3);
         }
         assert!(out3.is_empty(), "unsound/unhelpful filters extract nothing: {out3:?}");
+    }
+
+    /// Regression: `FILTER(STR())` reached `collect_substr_constraints`, which
+    /// indexed `args[0]` of every built-in call and panicked on an empty list.
+    #[test]
+    fn substring_constraints_tolerate_zero_arg_calls() {
+        let layout = VarLayout::from_vars(vec!["v".into()], vec![false]);
+        let mut out = HashMap::new();
+        for name in ["STR", "CONTAINS", "STRSTARTS", "STRENDS", "REGEX", "LCASE"] {
+            collect_substr_constraints(&Expr::Builtin(name.into(), vec![]), &layout, &mut out);
+            let nested = Expr::Builtin(
+                "CONTAINS".into(),
+                vec![Expr::Builtin("STR".into(), vec![]), Expr::Const(Term::plain_literal("abc"))],
+            );
+            collect_substr_constraints(&nested, &layout, &mut out);
+        }
+        assert!(out.is_empty());
+    }
+
+    /// The engine's built-in dispatcher and the shared arity table
+    /// (`parser::sparql::builtins::BUILTINS`) must name exactly the same
+    /// functions: a table entry without an engine arm would silently evaluate to
+    /// an error, and an arm missing from the table would be unreachable (its
+    /// name would be routed to the user-function registry instead).
+    #[test]
+    fn every_table_builtin_has_an_engine_arm() {
+        let src = include_str!("engine.rs");
+        let start = src.find("fn eval_builtin(").expect("eval_builtin present");
+        let end = src[start..]
+            .find("fn eval_custom_function(")
+            .map(|i| start + i)
+            .expect("eval_custom_function follows eval_builtin");
+        let body = &src[start..end];
+        let re = Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#)
+            .unwrap();
+        let handled: HashSet<&str> = re
+            .captures_iter(body)
+            .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))
+            .collect();
+        let table: HashSet<&str> = builtins::BUILTINS.iter().map(|b| b.name).collect();
+        let missing_arm: Vec<_> = table.difference(&handled).collect();
+        let missing_entry: Vec<_> = handled.difference(&table).collect();
+        assert!(missing_arm.is_empty(), "table names without an engine arm: {missing_arm:?}");
+        assert!(missing_entry.is_empty(), "engine arms missing from the table: {missing_entry:?}");
+    }
+
+    /// Every built-in evaluated with 0–4 arguments, as an AST the parser would
+    /// have rejected, yields a value or an evaluation error — never a panic.
+    #[test]
+    fn builtins_with_any_arity_never_panic_in_the_evaluator() {
+        let (d, s) = fixture(true);
+        let ev = Evaluator::new(&d, &s);
+        let layout = VarLayout::from_vars(vec!["n".into()], vec![false]);
+        let name_id = d.term_id(&Term::plain_literal("Hello World")).unwrap();
+        let binding: Binding = vec![Some(name_id)];
+        let arg_pool = [
+            Expr::Var("n".into()),
+            Expr::Const(Term::iri("http://ex/a")),
+            Expr::Const(Term::typed_literal("2", xsd::INTEGER)),
+            Expr::Var("unbound_var".into()),
+        ];
+        for spec in builtins::BUILTINS {
+            for n in 0..=4 {
+                let args: Vec<Expr> = arg_pool.iter().cycle().take(n).cloned().collect();
+                let e = Expr::Builtin(spec.name.to_string(), args);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ev.eval_value(&e, &binding, &layout)
+                }));
+                let v = r.unwrap_or_else(|_| panic!("{}({n} args) panicked", spec.name));
+                if !spec.arity.accepts(n) {
+                    assert!(v.is_none(), "{}({n} args) must be an evaluation error", spec.name);
+                }
+            }
+        }
+    }
+
+    /// `ORDER BY RAND()` used to re-evaluate the key inside the comparator,
+    /// handing `sort_by` an inconsistent order (which it may answer with a
+    /// panic). Keys are now computed once per row.
+    #[test]
+    fn order_by_rand_is_stable_and_panic_free() {
+        let mut d = Dictionary::new();
+        let p = d.intern_predicate(&Term::iri("http://ex/p").dict_key());
+        let o = d.intern_term(&Term::iri("http://ex/o"));
+        let mut triples = Vec::new();
+        for i in 0..400 {
+            let s = d.intern_term(&Term::iri(format!("http://ex/s{i}")));
+            triples.push(IdTriple::new(s, p, o));
+        }
+        let mut s = TripleStore::new();
+        s.bulk_load(triples);
+        for q in [
+            "SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY (RAND())",
+            "SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY DESC(RAND()) ?s",
+            "SELECT ?s (RAND() AS ?r) WHERE { ?s <http://ex/p> ?o } ORDER BY ?r",
+        ] {
+            let parsed = parse(q).unwrap();
+            for _ in 0..5 {
+                match Evaluator::new(&d, &s).evaluate(&parsed).unwrap() {
+                    QueryResult::Select(rs) => assert_eq!(rs.row_count(), 400, "{q}"),
+                    other => panic!("expected SELECT, got {other:?}"),
+                }
+            }
+        }
+        // A deterministic key still sorts correctly through the cached keys.
+        let parsed = parse("SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY DESC(?s) LIMIT 2")
+            .unwrap();
+        let QueryResult::Select(rs) = Evaluator::new(&d, &s).evaluate(&parsed).unwrap() else {
+            panic!("expected SELECT")
+        };
+        assert_eq!(
+            rs.rows,
+            vec![vec![Some("<http://ex/s99>".into())], vec![Some("<http://ex/s98>".into())]]
+        );
+    }
+
+    #[test]
+    fn substr_with_huge_positions_does_not_overflow() {
+        assert_eq!(scalar(r#"SUBSTR("abc", 9e18, 9e18)"#), r#""""#);
+        assert_eq!(scalar(r#"SUBSTR("abc", -9e18, 9e18)"#), r#""""#);
+        assert_eq!(scalar(r#"SUBSTR("abc", 2, 9e18)"#), r#""bc""#);
+        assert_eq!(scalar(r#"SUBSTR("abc", 1e300, 1e300)"#), r#""""#);
+    }
+
+    #[test]
+    fn datetime_with_huge_year_compares_without_overflow() {
+        let huge = "\"999999999999999999-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+        let neg = "\"-9223372036854775807-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+        assert!(scalar(&format!("({huge} > {DTL})")).contains("true"));
+        assert!(scalar(&format!("({neg} < {DTL})")).contains("true"));
+        assert!(scalar(&format!("YEAR({huge})")).contains("999999999999999999"));
     }
 
     const DT: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
