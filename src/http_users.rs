@@ -9,10 +9,11 @@
 //! ## Password hashing
 //!
 //! Passwords are stored as a **versioned PBKDF2-HMAC-SHA256** hash
-//! (RFC 8018, built on the crate's own SHA-256 in [`crate::query::hash`]):
+//! (RFC 8018, built on the crate's own SHA-256 in [`crate::query::hash`]) of
+//! the password's **lowercase hex MD5 digest**:
 //!
 //! ```text
-//! pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+//! pbkdf2-sha256-md5$<iterations>$<salt_hex>$<hash_hex>    key = PBKDF2(md5hex(password))
 //! ```
 //!
 //! with [`PBKDF2_ITERATIONS`] iterations, a 16-byte salt from the OS random
@@ -21,17 +22,38 @@
 //! parameters are recorded in the entry and fixed by their specifications, a
 //! stored hash stays verifiable across Rust toolchain upgrades.
 //!
-//! **Legacy entries.** Earlier versions hashed with
-//! `std::collections::hash_map::DefaultHasher`, whose algorithm the standard
-//! library explicitly does not promise to keep stable across releases. Such
-//! entries (`name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`) are still read and
-//! verified with the old function, and are transparently re-hashed into the
-//! PBKDF2 format on the first successful [`UserStore::login`] /
-//! [`UserStore::verify_and_upgrade`] (entries with fewer than the current
-//! iteration count are upgraded the same way). A legacy entry may, however,
-//! *fail* to verify if the binary was built with a toolchain whose
-//! `DefaultHasher` differs from the one that wrote it. To recover, reset the
-//! password offline with [`UserStore::reset_password_offline`] (for example
+//! Feeding `md5hex(password)` (rather than the password) to PBKDF2 is what lets
+//! ONE stored slow hash serve both kinds of upstream gStore clients
+//! ([`PasswordForm`]): a client sending the plaintext password (the server
+//! computes its MD5, then PBKDF2), and an `encryption=1` client, which sends
+//! the MD5 hex digest of the password instead of the password (PBKDF2 of the
+//! received digest). MD5 is only a fixed, public pre-transform here; the slow,
+//! salted PBKDF2 is what protects the stored entry.
+//!
+//! **Older entries.** Two earlier formats are still read and verified:
+//!
+//! * `pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>`
+//!   ([`PASSWORD_SCHEME_RAW`], the previous version): PBKDF2 of the raw
+//!   password;
+//! * the pre-versioning `name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`
+//!   entries, hashed with `std::collections::hash_map::DefaultHasher`, whose
+//!   algorithm the standard library explicitly does not promise to keep stable
+//!   across releases.
+//!
+//! Both are transparently re-hashed into the current format on the next
+//! successful **plaintext** verification ([`UserStore::login`],
+//! [`UserStore::verify_and_upgrade`], or [`UserStore::authenticate`] with
+//! [`PasswordForm::Plain`]); entries with fewer than the current iteration
+//! count are upgraded the same way. **Until that migration has happened, an
+//! older entry cannot be verified for an `encryption=1` client** (it stores
+//! nothing derivable from the MD5 digest): such a check yields
+//! [`CredentialCheck::NeedsPlaintextLogin`], which the `/api` layer answers
+//! with `1001` and a message asking the user to log in once without
+//! encryption.
+//!
+//! A legacy entry may *fail* to verify if the binary was built with a toolchain
+//! whose `DefaultHasher` differs from the one that wrote it. To recover, reset
+//! the password offline with [`UserStore::reset_password_offline`] (for example
 //! `root`'s), or stop the server, delete that user's line from `users.db` and
 //! restart — a missing `root` is re-seeded with the configured initial root
 //! password.
@@ -72,14 +94,21 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::query::hash::{
-    constant_time_eq, hex_decode, hex_encode, pbkdf2_hmac_sha256, HmacSha256,
+    constant_time_eq, hex_decode, hex_encode, md5_hex, pbkdf2_hmac_sha256, HmacSha256,
 };
 
 /// The built-in super-user. Always present, always fully privileged.
 pub const ROOT_USER: &str = "root";
 
-/// Scheme tag of the current password-hash format (`pbkdf2-sha256$…`).
-pub const PASSWORD_SCHEME: &str = "pbkdf2-sha256";
+/// Scheme tag of the current password-hash format (`pbkdf2-sha256-md5$…`:
+/// PBKDF2-HMAC-SHA256 of the password's lowercase MD5 hex digest; see the
+/// module docs).
+pub const PASSWORD_SCHEME: &str = "pbkdf2-sha256-md5";
+
+/// Scheme tag of the previous format (`pbkdf2-sha256$…`: PBKDF2-HMAC-SHA256 of
+/// the raw password). Still read and verified; re-hashed into
+/// [`PASSWORD_SCHEME`] on the next plaintext login.
+pub const PASSWORD_SCHEME_RAW: &str = "pbkdf2-sha256";
 
 /// PBKDF2-HMAC-SHA256 iteration count for newly hashed passwords. Stored with
 /// each hash, so raising it later keeps old entries verifiable (and they are
@@ -154,11 +183,63 @@ impl Privilege {
     }
 }
 
+/// How a client presented its password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PasswordForm {
+    /// The plaintext password.
+    Plain,
+    /// The lowercase hex MD5 digest of the password (upstream gStore's
+    /// `encryption=1`). Upper-case hex digits are accepted too.
+    Md5Hex,
+}
+
+impl PasswordForm {
+    fn tag(self) -> u8 {
+        match self {
+            PasswordForm::Plain => 0,
+            PasswordForm::Md5Hex => 1,
+        }
+    }
+}
+
+/// The outcome of checking a client's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialCheck {
+    /// The credentials are correct.
+    Valid,
+    /// Unknown user or wrong password.
+    Invalid,
+    /// The user's stored entry predates the MD5-compatible format, so a
+    /// [`PasswordForm::Md5Hex`] client cannot be verified against it yet: the
+    /// user must log in once with the plaintext password, which migrates it.
+    NeedsPlaintextLogin,
+}
+
+/// What a stored PBKDF2 entry was computed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prehash {
+    /// `pbkdf2-sha256`: the raw password (previous format).
+    Raw,
+    /// `pbkdf2-sha256-md5`: the password's lowercase MD5 hex digest (current).
+    Md5Hex,
+}
+
+impl Prehash {
+    fn scheme(self) -> &'static str {
+        match self {
+            Prehash::Raw => PASSWORD_SCHEME_RAW,
+            Prehash::Md5Hex => PASSWORD_SCHEME,
+        }
+    }
+}
+
 /// A stored password verifier (never the password itself).
 #[derive(Clone, PartialEq, Eq)]
 enum PasswordHash {
-    /// The current format: `pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>`.
+    /// `<scheme>$<iterations>$<salt_hex>$<hash_hex>`; the scheme records what
+    /// was fed to PBKDF2 (see [`Prehash`]).
     Pbkdf2Sha256 {
+        input: Prehash,
         iterations: u32,
         salt: Vec<u8>,
         hash: [u8; HASH_LEN],
@@ -172,72 +253,116 @@ impl std::fmt::Debug for PasswordHash {
     // Redacted: salts and digests stay out of logs and `{:?}` dumps.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PasswordHash::Pbkdf2Sha256 { iterations, .. } => {
-                write!(f, "{PASSWORD_SCHEME}(iterations={iterations}, ..)")
-            }
+            PasswordHash::Pbkdf2Sha256 {
+                input, iterations, ..
+            } => write!(f, "{}(iterations={iterations}, ..)", input.scheme()),
             PasswordHash::Legacy { .. } => write!(f, "legacy(..)"),
         }
     }
 }
 
+/// Normalize a client-supplied MD5 hex digest: exactly 32 hex digits, which
+/// are lowercased. `None` for anything else.
+fn normalize_md5_hex(digest: &str) -> Option<String> {
+    let d = digest.trim();
+    (d.len() == 32 && d.bytes().all(|b| b.is_ascii_hexdigit())).then(|| d.to_ascii_lowercase())
+}
+
 impl PasswordHash {
-    /// Hash `password` under a fresh random salt with the current parameters.
+    /// Hash the plaintext `password` in the current format under a fresh salt.
     fn new(password: &str) -> PasswordHash {
-        let mut salt = vec![0u8; SALT_LEN];
-        random_bytes(&mut salt);
-        PasswordHash::pbkdf2(password, salt, PBKDF2_ITERATIONS)
+        PasswordHash::from_md5_hex(&md5_hex(password))
     }
 
-    fn pbkdf2(password: &str, salt: Vec<u8>, iterations: u32) -> PasswordHash {
+    /// Hash a normalized (lowercase) MD5 hex digest in the current format
+    /// under a fresh salt.
+    fn from_md5_hex(digest: &str) -> PasswordHash {
+        let mut salt = vec![0u8; SALT_LEN];
+        random_bytes(&mut salt);
+        PasswordHash::pbkdf2(Prehash::Md5Hex, digest, salt, PBKDF2_ITERATIONS)
+    }
+
+    fn pbkdf2(input: Prehash, secret: &str, salt: Vec<u8>, iterations: u32) -> PasswordHash {
         let mut hash = [0u8; HASH_LEN];
-        pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, &mut hash);
+        pbkdf2_hmac_sha256(secret.as_bytes(), &salt, iterations, &mut hash);
         PasswordHash::Pbkdf2Sha256 {
+            input,
             iterations,
             salt,
             hash,
         }
     }
 
-    /// Whether `password` matches, comparing digests in constant time.
-    fn verify(&self, password: &str) -> bool {
+    /// Whether `secret`, presented in `form`, matches (digests compared in
+    /// constant time). `None` when this entry cannot be checked in that form:
+    /// an older entry against an MD5 digest.
+    fn verify_as(&self, secret: &str, form: PasswordForm) -> Option<bool> {
         match self {
             PasswordHash::Pbkdf2Sha256 {
+                input,
                 iterations,
                 salt,
                 hash,
             } => {
+                let fed = match (input, form) {
+                    (Prehash::Raw, PasswordForm::Plain) => secret.to_string(),
+                    (Prehash::Raw, PasswordForm::Md5Hex) => return None,
+                    (Prehash::Md5Hex, PasswordForm::Plain) => md5_hex(secret),
+                    (Prehash::Md5Hex, PasswordForm::Md5Hex) => match normalize_md5_hex(secret) {
+                        Some(d) => d,
+                        None => return Some(false),
+                    },
+                };
                 let mut got = [0u8; HASH_LEN];
-                pbkdf2_hmac_sha256(password.as_bytes(), salt, *iterations, &mut got);
-                constant_time_eq(&got, hash)
+                pbkdf2_hmac_sha256(fed.as_bytes(), salt, *iterations, &mut got);
+                Some(constant_time_eq(&got, hash))
             }
-            PasswordHash::Legacy { salt, hash } => {
-                let got = legacy_hash_password(password, *salt);
-                std::hint::black_box(got ^ *hash) == 0
-            }
+            PasswordHash::Legacy { salt, hash } => match form {
+                PasswordForm::Plain => {
+                    let got = legacy_hash_password(secret, *salt);
+                    Some(std::hint::black_box(got ^ *hash) == 0)
+                }
+                PasswordForm::Md5Hex => None,
+            },
         }
     }
 
-    /// Whether a verified entry should be re-hashed with current parameters.
+    /// Whether the plaintext `password` matches.
+    fn verify(&self, password: &str) -> bool {
+        self.verify_as(password, PasswordForm::Plain) == Some(true)
+    }
+
+    /// Whether a verified entry should be re-hashed into the current format
+    /// with current parameters.
     fn needs_upgrade(&self) -> bool {
         match self {
             PasswordHash::Pbkdf2Sha256 {
-                iterations, salt, ..
-            } => *iterations < PBKDF2_ITERATIONS || salt.len() < SALT_LEN,
+                input,
+                iterations,
+                salt,
+                ..
+            } => {
+                *input != Prehash::Md5Hex
+                    || *iterations < PBKDF2_ITERATIONS
+                    || salt.len() < SALT_LEN
+            }
             PasswordHash::Legacy { .. } => true,
         }
     }
 
-    /// The persisted credential column(s): `pbkdf2-sha256$<iter>$<salt>$<hash>`
-    /// for a current entry; for a not-yet-migrated legacy entry, its original
-    /// two tab-separated hex columns so the file stays readable as before.
+    /// The persisted credential column(s): `<scheme>$<iter>$<salt>$<hash>` for
+    /// a PBKDF2 entry; for a not-yet-migrated legacy entry, its original two
+    /// tab-separated hex columns so the file stays readable as before.
     fn encode(&self) -> String {
         match self {
             PasswordHash::Pbkdf2Sha256 {
+                input,
                 iterations,
                 salt,
                 hash,
             } => format!(
-                "{PASSWORD_SCHEME}${iterations}${}${}",
+                "{}${iterations}${}${}",
+                input.scheme(),
                 hex_encode(salt),
                 hex_encode(hash)
             ),
@@ -245,12 +370,15 @@ impl PasswordHash {
         }
     }
 
-    /// Parse a `pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>` string.
+    /// Parse a `<scheme>$<iter>$<salt_hex>$<hash_hex>` string (either PBKDF2
+    /// scheme).
     fn parse_pbkdf2(s: &str) -> Option<PasswordHash> {
         let mut parts = s.split('$');
-        if parts.next()? != PASSWORD_SCHEME {
-            return None;
-        }
+        let input = match parts.next()? {
+            PASSWORD_SCHEME => Prehash::Md5Hex,
+            PASSWORD_SCHEME_RAW => Prehash::Raw,
+            _ => return None,
+        };
         let iterations: u32 = parts.next()?.parse().ok().filter(|&n| n > 0)?;
         let salt = hex_decode(parts.next()?)?;
         let hash: [u8; HASH_LEN] = hex_decode(parts.next()?)?.try_into().ok()?;
@@ -258,6 +386,7 @@ impl PasswordHash {
             return None;
         }
         Some(PasswordHash::Pbkdf2Sha256 {
+            input,
             iterations,
             salt,
             hash,
@@ -266,15 +395,27 @@ impl PasswordHash {
 }
 
 /// Hash `password` in the current versioned format
-/// (`pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>`, random salt).
+/// (`pbkdf2-sha256-md5$<iterations>$<salt_hex>$<hash_hex>`, random salt).
 pub fn hash_password(password: &str) -> String {
     PasswordHash::new(password).encode()
 }
 
-/// Verify `password` against a hash produced by [`hash_password`]. Malformed
+/// Verify the plaintext `password` against a hash produced by
+/// [`hash_password`] (or in the previous `pbkdf2-sha256$…` format). Malformed
 /// or unknown-scheme input never verifies.
 pub fn verify_password(stored: &str, password: &str) -> bool {
     PasswordHash::parse_pbkdf2(stored).is_some_and(|h| h.verify(password))
+}
+
+/// Verify a client-supplied MD5 hex digest of the password (upstream gStore's
+/// `encryption=1`) against a stored hash: `Some(matches)` for an entry in the
+/// current format, `None` for one in the previous `pbkdf2-sha256$…` format
+/// (which cannot be checked from a digest). Malformed input is `Some(false)`.
+pub fn verify_password_md5(stored: &str, md5_hex_digest: &str) -> Option<bool> {
+    match PasswordHash::parse_pbkdf2(stored) {
+        Some(h) => h.verify_as(md5_hex_digest, PasswordForm::Md5Hex),
+        None => Some(false),
+    }
 }
 
 /// One stored user: name, password verifier, and granted privileges.
@@ -316,12 +457,13 @@ pub struct UserStore {
     sessions: HashMap<String, Session>,
     ttl: Duration,
     /// Fast path for repeated verification of the same credentials (HTTP Basic
-    /// auth re-sends them on every request): user → HMAC-SHA256 of the last
-    /// password that verified, under the per-process random `verified_key`. A
-    /// hit skips the deliberately slow PBKDF2; a miss falls back to it.
-    /// Invalidated whenever a user's password changes or the user is dropped.
-    /// Memory only — never persisted.
-    verified: Mutex<HashMap<String, [u8; 32]>>,
+    /// auth and the `/api` protocol re-send them on every request): (user,
+    /// [`PasswordForm`] tag) → HMAC-SHA256 of the last secret that verified in
+    /// that form, under the per-process random `verified_key`. A hit skips the
+    /// deliberately slow PBKDF2; a miss falls back to it. Invalidated whenever
+    /// a user's password changes or the user is dropped. Memory only — never
+    /// persisted.
+    verified: Mutex<HashMap<(String, u8), [u8; 32]>>,
     verified_key: HmacSha256,
 }
 
@@ -415,9 +557,9 @@ impl UserStore {
             let (Some(name), Some(cred)) = (cols.next(), cols.next()) else {
                 return Err(malformed());
             };
-            // Current format: `name<TAB>pbkdf2-sha256$…<TAB>privileges`.
+            // PBKDF2 formats: `name<TAB>pbkdf2-sha256[-md5]$…<TAB>privileges`.
             // Legacy format:  `name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`.
-            let password = if cred.starts_with(PASSWORD_SCHEME) {
+            let password = if cred.starts_with(PASSWORD_SCHEME_RAW) {
                 PasswordHash::parse_pbkdf2(cred).ok_or_else(malformed)?
             } else {
                 let Some(hash) = cols.next() else {
@@ -580,60 +722,107 @@ impl UserStore {
     /// Verify a username/password pair. Digests are compared in constant time,
     /// and an unknown user costs the same PBKDF2 work as a wrong password (no
     /// user-enumeration timing signal). Does not modify the store — use
-    /// [`verify_and_upgrade`](Self::verify_and_upgrade) to also migrate a
-    /// legacy entry.
+    /// [`verify_and_upgrade`](Self::verify_and_upgrade) to also migrate an
+    /// older entry.
     pub fn verify(&self, name: &str, password: &str) -> bool {
+        self.check_credentials(name, password, PasswordForm::Plain) == CredentialCheck::Valid
+    }
+
+    /// Check credentials presented in `form` (the plaintext password, or its
+    /// MD5 hex digest for upstream's `encryption=1`) without modifying the
+    /// store. [`CredentialCheck::NeedsPlaintextLogin`] means `form` is
+    /// [`PasswordForm::Md5Hex`] but the user's entry is in an older format
+    /// that only a plaintext login can verify (and migrate).
+    pub fn check_credentials(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
         let Some(u) = self.users.get(name) else {
             // Burn the same work as a real check against a fixed dummy entry.
             let dummy = PasswordHash::Pbkdf2Sha256 {
+                input: Prehash::Md5Hex,
                 iterations: PBKDF2_ITERATIONS,
                 salt: vec![0u8; SALT_LEN],
                 hash: [0u8; HASH_LEN],
             };
-            let _ = std::hint::black_box(dummy.verify(password));
-            return false;
+            let _ = std::hint::black_box(dummy.verify_as(secret, form));
+            return CredentialCheck::Invalid;
         };
-        let tag = self.verified_key.mac(&[name.as_bytes(), &[0], password.as_bytes()]);
+        // The cache is keyed by the normalized secret, so `ABC…` and `abc…`
+        // digests share an entry.
+        let normalized;
+        let secret = match form {
+            PasswordForm::Plain => secret,
+            PasswordForm::Md5Hex => match normalize_md5_hex(secret) {
+                Some(d) => {
+                    normalized = d;
+                    &normalized
+                }
+                None => secret,
+            },
+        };
+        let key = (name.to_string(), form.tag());
+        let tag = self
+            .verified_key
+            .mac(&[name.as_bytes(), &[0, form.tag()], secret.as_bytes()]);
         let cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.get(name).is_some_and(|t| constant_time_eq(t, &tag)) {
-            return true;
+        if cache.get(&key).is_some_and(|t| constant_time_eq(t, &tag)) {
+            return CredentialCheck::Valid;
         }
         drop(cache);
-        let ok = u.password.verify(password);
-        if ok {
-            self.verified
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(name.to_string(), tag);
+        match u.password.verify_as(secret, form) {
+            Some(true) => {
+                self.verified
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, tag);
+                CredentialCheck::Valid
+            }
+            Some(false) => CredentialCheck::Invalid,
+            None => CredentialCheck::NeedsPlaintextLogin,
         }
-        ok
     }
 
-    /// [`verify`](Self::verify), and on success transparently re-hash an entry
-    /// stored in the legacy format (or with fewer than [`PBKDF2_ITERATIONS`]
-    /// iterations) into the current format, persisting the store. A failure to
-    /// persist the upgrade does not fail the verification.
-    pub fn verify_and_upgrade(&mut self, name: &str, password: &str) -> bool {
-        if !self.verify(name, password) {
-            return false;
+    /// [`check_credentials`](Self::check_credentials), and on success
+    /// transparently re-hash an entry that is not in the current format (or
+    /// has fewer than [`PBKDF2_ITERATIONS`] iterations), persisting the store.
+    /// A plaintext login can migrate any entry; an MD5-digest login can only
+    /// refresh the parameters of an entry already in the current format. A
+    /// failure to persist the upgrade does not fail the verification.
+    pub fn authenticate(&mut self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
+        let outcome = self.check_credentials(name, secret, form);
+        if outcome != CredentialCheck::Valid {
+            return outcome;
         }
         if let Some(u) = self.users.get_mut(name) {
             if u.password.needs_upgrade() {
-                u.password = PasswordHash::new(password);
-                let _ = self.save();
+                let rehashed = match form {
+                    PasswordForm::Plain => Some(PasswordHash::new(secret)),
+                    // Valid ⇒ the entry is already MD5-based and `secret` is a
+                    // well-formed digest.
+                    PasswordForm::Md5Hex => normalize_md5_hex(secret).map(|d| PasswordHash::from_md5_hex(&d)),
+                };
+                if let Some(h) = rehashed {
+                    u.password = h;
+                    let _ = self.save();
+                }
             }
         }
-        true
+        CredentialCheck::Valid
     }
 
-    /// Drop `name`'s cached verified-credential tag.
+    /// [`verify`](Self::verify), and on success transparently re-hash an entry
+    /// stored in an older format (or with fewer than [`PBKDF2_ITERATIONS`]
+    /// iterations) into the current format, persisting the store. A failure to
+    /// persist the upgrade does not fail the verification.
+    pub fn verify_and_upgrade(&mut self, name: &str, password: &str) -> bool {
+        self.authenticate(name, password, PasswordForm::Plain) == CredentialCheck::Valid
+    }
+
+    /// Drop `name`'s cached verified-credential tags (every form).
     fn forget_verified(&self, name: &str) {
         self.verified
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
+            .retain(|(n, _), _| n != name);
     }
-
     /// Verify credentials and, on success, issue an opaque session token. A
     /// legacy-format password entry is upgraded to the current format here.
     pub fn login(&mut self, name: &str, password: &str) -> Option<String> {
@@ -788,7 +977,8 @@ mod tests {
         let h = hash_password("pw");
         let parts: Vec<&str> = h.split('$').collect();
         assert_eq!(parts.len(), 4, "{h}");
-        assert_eq!(parts[0], "pbkdf2-sha256");
+        assert_eq!(parts[0], "pbkdf2-sha256-md5");
+        assert_eq!(parts[0], PASSWORD_SCHEME);
         assert_eq!(parts[1], PBKDF2_ITERATIONS.to_string());
         assert_eq!(parts[2].len(), SALT_LEN * 2, "16-byte salt, hex");
         assert_eq!(parts[3].len(), HASH_LEN * 2, "32-byte key, hex");
@@ -847,7 +1037,7 @@ mod tests {
         let file = fs::read_to_string(&path).unwrap();
         let stored_hash = file.split('\t').nth(1).unwrap().rsplit('$').next().unwrap();
         assert!(!dbg.contains(stored_hash), "{dbg}");
-        assert!(dbg.contains("pbkdf2-sha256(iterations="), "{dbg}");
+        assert!(dbg.contains("pbkdf2-sha256-md5(iterations="), "{dbg}");
         let _ = fs::remove_file(&path);
     }
 
@@ -879,7 +1069,7 @@ mod tests {
         assert!(store.login("alice", "alicepw").is_some());
         let text = fs::read_to_string(&path).unwrap();
         let alice = text.lines().find(|l| l.starts_with("alice\t")).unwrap();
-        assert!(alice.starts_with("alice\tpbkdf2-sha256$"), "{alice}");
+        assert!(alice.starts_with("alice\tpbkdf2-sha256-md5$"), "{alice}");
         assert!(alice.ends_with("\tquery,update"), "{alice}");
         let root = text.lines().find(|l| l.starts_with("root\t")).unwrap();
         assert!(root.starts_with(&format!("root\t{root_salt:016x}\t")), "{root}");
@@ -890,7 +1080,110 @@ mod tests {
         assert!(!store.verify("alice", "wrong"));
         assert!(store.verify_and_upgrade(ROOT_USER, "rootpw"));
         let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.lines().any(|l| !l.contains("pbkdf2-sha256$")), "{text}");
+        assert!(!text.lines().any(|l| !l.contains("pbkdf2-sha256-md5$")), "{text}");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The current entry is PBKDF2 over the lowercase MD5 hex of the password,
+    /// pinned by a vector computed independently (Python `hashlib`:
+    /// `pbkdf2_hmac("sha256", md5(b"password").hexdigest().encode(), b"salt",
+    /// 4096, 32)`), and verifies both from the plaintext and from the digest.
+    #[test]
+    fn md5_scheme_verifies_plaintext_and_digest_clients() {
+        let stored = format!(
+            "pbkdf2-sha256-md5$4096${}${}",
+            hex_encode(b"salt"),
+            "09f557c40ab742331833f9598ca7f7926223f8367dbc77a5866ec166283d19b7"
+        );
+        assert!(verify_password(&stored, "password"));
+        assert!(!verify_password(&stored, "Password"));
+        let digest = "5f4dcc3b5aa765d61d8327deb882cf99";
+        assert_eq!(md5_hex("password"), digest);
+        assert_eq!(verify_password_md5(&stored, digest), Some(true));
+        assert_eq!(verify_password_md5(&stored, &digest.to_ascii_uppercase()), Some(true));
+        assert_eq!(verify_password_md5(&stored, &md5_hex("nope")), Some(false));
+        // The plaintext itself (or a malformed digest) is not a valid digest.
+        assert_eq!(verify_password_md5(&stored, "password"), Some(false));
+        assert_eq!(verify_password_md5(&stored, &digest[..31]), Some(false));
+        // The previous (raw) format cannot be verified from a digest.
+        let raw = format!(
+            "pbkdf2-sha256$4096${}${}",
+            hex_encode(b"salt"),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+        assert_eq!(verify_password_md5(&raw, digest), None);
+        assert!(verify_password(&raw, "password"));
+        assert_eq!(verify_password_md5("garbage", digest), Some(false));
+    }
+
+    /// An entry in the previous `pbkdf2-sha256$` (raw) format and a legacy
+    /// entry both refuse MD5-digest clients until a plaintext login migrated
+    /// them; afterwards one stored hash serves both kinds of clients.
+    #[test]
+    fn older_entries_need_one_plaintext_login_before_md5_clients_work() {
+        let path = tmp("md5_migrate");
+        let mut raw_hash = [0u8; HASH_LEN];
+        pbkdf2_hmac_sha256(b"bobpw", b"0123456789abcdef", PBKDF2_ITERATIONS, &mut raw_hash);
+        let raw = format!(
+            "pbkdf2-sha256${PBKDF2_ITERATIONS}${}${}",
+            hex_encode(b"0123456789abcdef"),
+            hex_encode(&raw_hash)
+        );
+        let salt = 0x0123_4567_89ab_cdefu64;
+        fs::write(
+            &path,
+            format!(
+                "bob\t{raw}\tquery\ncarl\t{salt:016x}\t{:016x}\tquery\nroot\t{}\tadmin\n",
+                legacy_hash_password("carlpw", salt),
+                hash_password("rootpw"),
+            ),
+        )
+        .unwrap();
+        let mut store = UserStore::open(&path, "ignored").unwrap();
+        let md5 = PasswordForm::Md5Hex;
+        let plain = PasswordForm::Plain;
+        for (user, pw) in [("bob", "bobpw"), ("carl", "carlpw")] {
+            assert_eq!(
+                store.authenticate(user, &md5_hex(pw), md5),
+                CredentialCheck::NeedsPlaintextLogin,
+                "{user}"
+            );
+            assert_eq!(store.authenticate(user, "wrong", plain), CredentialCheck::Invalid);
+            assert_eq!(store.authenticate(user, pw, plain), CredentialCheck::Valid);
+            assert_eq!(store.authenticate(user, &md5_hex(pw), md5), CredentialCheck::Valid, "{user}");
+            assert_eq!(
+                store.authenticate(user, &md5_hex("wrong"), md5),
+                CredentialCheck::Invalid
+            );
+        }
+        // root was created in the current format: digest clients work at once.
+        assert_eq!(store.check_credentials(ROOT_USER, &md5_hex("rootpw"), md5), CredentialCheck::Valid);
+        assert_eq!(store.check_credentials("nobody", &md5_hex("x"), md5), CredentialCheck::Invalid);
+        // Migrated entries survive a reload, in the current format only.
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.lines().all(|l| l.split('\t').nth(1).unwrap().starts_with("pbkdf2-sha256-md5$")), "{text}");
+        let store = UserStore::open(&path, "ignored").unwrap();
+        assert!(store.verify("bob", "bobpw"));
+        assert_eq!(store.check_credentials("carl", &md5_hex("carlpw"), md5), CredentialCheck::Valid);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The verified-credential cache keeps the two forms apart and is dropped
+    /// for both on a password change.
+    #[test]
+    fn verified_cache_is_per_form_and_invalidated_for_both() {
+        let path = tmp("cache_forms");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("dana", "old", BTreeSet::new()).unwrap();
+        let md5 = PasswordForm::Md5Hex;
+        assert_eq!(store.check_credentials("dana", &md5_hex("old"), md5), CredentialCheck::Valid);
+        assert!(store.verify("dana", "old"));
+        // A plaintext password that happens to be the digest is not the digest.
+        assert!(!store.verify("dana", &md5_hex("old")));
+        store.set_password("dana", "new").unwrap();
+        assert_eq!(store.check_credentials("dana", &md5_hex("old"), md5), CredentialCheck::Invalid);
+        assert!(!store.verify("dana", "old"));
+        assert_eq!(store.check_credentials("dana", &md5_hex("new"), md5), CredentialCheck::Valid);
         let _ = fs::remove_file(&path);
     }
 

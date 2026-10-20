@@ -2,8 +2,8 @@
 //!
 //! JSON-LD (<https://www.w3.org/TR/json-ld11/>) serializes an RDF graph as JSON.
 //! To stay dependency-free (the whole crate hand-writes its parsers), this module
-//! ships a tiny internal JSON reader — no `serde`, no `serde_json` — and a
-//! pragmatic expansion-to-triples pass.
+//! uses the crate's own JSON reader ([`crate::json`]) — no `serde`, no
+//! `serde_json` — and a pragmatic expansion-to-triples pass.
 //!
 //! # Supported subset
 //!
@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{GStoreError, Result};
+use crate::json::Json;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 
@@ -50,7 +51,10 @@ const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 /// Parse a JSON-LD document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
-    let json = JsonReader::new(content).parse()?;
+    let json = crate::json::parse(content).map_err(|e| GStoreError::RdfParse {
+        line: e.line,
+        msg: e.msg,
+    })?;
     let mut proc = Processor::default();
     proc.process_top(&json, &Context::default())?;
     Ok(proc.triples)
@@ -62,265 +66,7 @@ pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
     parse_str(&content)
 }
 
-// ---- minimal JSON reader --------------------------------------------------
-
-/// A parsed JSON value. Object entries keep document order; numbers keep their
-/// original lexical form so integer/double classification is exact.
-#[derive(Debug, Clone)]
-enum Json {
-    Null,
-    Bool(bool),
-    Num(String),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-struct JsonReader {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-/// Maximum JSON nesting depth accepted (guards the recursive reader/processor/
-/// drop against stack overflow on adversarial input; see `parse_value`).
-const MAX_JSON_DEPTH: usize = 256;
-
-impl JsonReader {
-    fn new(s: &str) -> JsonReader {
-        JsonReader {
-            chars: s.chars().collect(),
-            pos: 0,
-        }
-    }
-
-    fn err(&self, msg: impl Into<String>) -> GStoreError {
-        let line = self.chars[..self.pos.min(self.chars.len())]
-            .iter()
-            .filter(|&&c| c == '\n')
-            .count()
-            + 1;
-        GStoreError::RdfParse {
-            line,
-            msg: msg.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
-            self.pos += 1;
-        }
-    }
-
-    fn parse(&mut self) -> Result<Json> {
-        self.skip_ws();
-        let v = self.parse_value(0)?;
-        self.skip_ws();
-        if self.peek().is_some() {
-            return Err(self.err("trailing content after JSON value"));
-        }
-        Ok(v)
-    }
-
-    fn parse_value(&mut self, depth: usize) -> Result<Json> {
-        // Bound nesting so a pathological input (e.g. a megabyte of `[`) cannot
-        // overflow the stack — the parser, the downstream node processor, and the
-        // recursive `Json` drop all descend at most this far.
-        if depth > MAX_JSON_DEPTH {
-            return Err(self.err("JSON nesting too deep"));
-        }
-        self.skip_ws();
-        match self.peek() {
-            Some('{') => self.parse_object(depth),
-            Some('[') => self.parse_array(depth),
-            Some('"') => Ok(Json::Str(self.parse_string()?)),
-            Some('t') | Some('f') => self.parse_bool(),
-            Some('n') => self.parse_null(),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
-            _ => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    fn parse_object(&mut self, depth: usize) -> Result<Json> {
-        self.bump(); // '{'
-        let mut pairs = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some('}') {
-            self.bump();
-            return Ok(Json::Obj(pairs));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some('"') {
-                return Err(self.err("expected a string key in object"));
-            }
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.bump() != Some(':') {
-                return Err(self.err("expected ':' after object key"));
-            }
-            let value = self.parse_value(depth + 1)?;
-            pairs.push((key, value));
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some('}') => break,
-                _ => return Err(self.err("expected ',' or '}' in object")),
-            }
-        }
-        Ok(Json::Obj(pairs))
-    }
-
-    fn parse_array(&mut self, depth: usize) -> Result<Json> {
-        self.bump(); // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.bump();
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            let value = self.parse_value(depth + 1)?;
-            items.push(value);
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some(']') => break,
-                _ => return Err(self.err("expected ',' or ']' in array")),
-            }
-        }
-        Ok(Json::Arr(items))
-    }
-
-    fn parse_string(&mut self) -> Result<String> {
-        self.bump(); // opening '"'
-        let mut s = String::new();
-        loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated string")),
-                Some('"') => return Ok(s),
-                Some('\\') => match self.bump() {
-                    Some('"') => s.push('"'),
-                    Some('\\') => s.push('\\'),
-                    Some('/') => s.push('/'),
-                    Some('b') => s.push('\u{0008}'),
-                    Some('f') => s.push('\u{000C}'),
-                    Some('n') => s.push('\n'),
-                    Some('r') => s.push('\r'),
-                    Some('t') => s.push('\t'),
-                    Some('u') => {
-                        let cp = self.read_hex4()?;
-                        // Combine a UTF-16 surrogate pair if present.
-                        if (0xD800..=0xDBFF).contains(&cp) {
-                            if self.peek() == Some('\\') {
-                                self.bump();
-                                if self.bump() != Some('u') {
-                                    return Err(self.err("expected low surrogate escape"));
-                                }
-                                let lo = self.read_hex4()?;
-                                if !(0xDC00..=0xDFFF).contains(&lo) {
-                                    return Err(self.err("invalid low surrogate"));
-                                }
-                                let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                s.push(
-                                    char::from_u32(c)
-                                        .ok_or_else(|| self.err("invalid surrogate pair"))?,
-                                );
-                            } else {
-                                return Err(self.err("unpaired high surrogate"));
-                            }
-                        } else {
-                            s.push(
-                                char::from_u32(cp)
-                                    .ok_or_else(|| self.err("invalid \\u code point"))?,
-                            );
-                        }
-                    }
-                    Some(c) => return Err(self.err(format!("invalid escape '\\{c}'"))),
-                    None => return Err(self.err("dangling backslash in string")),
-                },
-                Some(c) => s.push(c),
-            }
-        }
-    }
-
-    fn read_hex4(&mut self) -> Result<u32> {
-        let mut code = 0u32;
-        for _ in 0..4 {
-            let c = self.bump().ok_or_else(|| self.err("truncated \\u escape"))?;
-            let d = c
-                .to_digit(16)
-                .ok_or_else(|| self.err(format!("bad hex digit '{c}'")))?;
-            code = code * 16 + d;
-        }
-        Ok(code)
-    }
-
-    fn parse_number(&mut self) -> Result<Json> {
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E') {
-                s.push(c);
-                self.bump();
-            } else {
-                break;
-            }
-        }
-        if s.is_empty() {
-            return Err(self.err("invalid number"));
-        }
-        // Validate the collected run against a basic JSON number shape: it must
-        // parse as f64 and must not carry a leading '+' (JSON forbids it, though
-        // Rust's float parser accepts it). This rejects garbage like `1-2`, `-`,
-        // and `1.2.3` instead of storing it as an xsd:integer/double literal.
-        if s.starts_with('+') || s.parse::<f64>().is_err() {
-            return Err(self.err(format!("invalid number literal {s:?}")));
-        }
-        Ok(Json::Num(s))
-    }
-
-    fn parse_bool(&mut self) -> Result<Json> {
-        if self.match_word("true") {
-            Ok(Json::Bool(true))
-        } else if self.match_word("false") {
-            Ok(Json::Bool(false))
-        } else {
-            Err(self.err("invalid literal"))
-        }
-    }
-
-    fn parse_null(&mut self) -> Result<Json> {
-        if self.match_word("null") {
-            Ok(Json::Null)
-        } else {
-            Err(self.err("invalid literal"))
-        }
-    }
-
-    fn match_word(&mut self, word: &str) -> bool {
-        if word
-            .chars()
-            .enumerate()
-            .all(|(i, c)| self.chars.get(self.pos + i).copied() == Some(c))
-        {
-            self.pos += word.chars().count();
-            true
-        } else {
-            false
-        }
-    }
-}
+// The JSON reader is the crate-wide one in `crate::json`.
 
 // ---- active context -------------------------------------------------------
 

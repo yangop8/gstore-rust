@@ -17,6 +17,7 @@
 
 use std::io::{self, Write};
 
+use crate::json::Json;
 use crate::model::Term;
 use crate::parser::ntriples::parse_term;
 use crate::query::ResultSet;
@@ -393,6 +394,153 @@ fn tsv_value(cell: &str) -> String {
         Ok(t) => t.to_string(),
         Err(_) => Term::plain_literal(cell).to_string(),
     }
+}
+
+// --- upstream gStore's JSON shapes --------------------------------------------
+//
+// The upstream `/api` protocol ([`crate::gapi`]) does not use SPARQL 1.1
+// Results JSON but gStore's own variant (`ResultSet::to_JSON`,
+// `src/Query/ResultSet.cpp` ~388-600):
+//
+// ```json
+// {"head":{"link":[],"vars":["x"]},
+//  "results":{"bindings":[{"x":{"type":"typed-literal","datatype":"…#integer","value":"5"}}]}}
+// ```
+//
+// * an IRI is `{"type":"uri","value":…}` (angle brackets stripped);
+// * a plain literal is `{"type":"literal","value":…}`, a language-tagged one
+//   adds `"lang"` (not SPARQL's `"xml:lang"`);
+// * a datatyped literal is `{"type":"typed-literal","datatype":…,"value":…}`;
+// * a blank node is `{"type":"bnode","value":"_:label"}` — the value keeps
+//   upstream's `_:` form; upstream itself labels these `"error"` (blank nodes
+//   fall through its type dispatch), which is a bug this rewrite does not copy;
+// * an unbound variable is omitted from its row, and a row with no bound
+//   variable at all is dropped (as upstream does).
+//
+// ASK is answered as a one-row table over the variable `_askResult` holding
+// `"true"`/`"false"^^xsd:boolean` (`GeneralEvaluation.cpp` ~3270-3290).
+
+/// `xsd:boolean`, the datatype of upstream's `_askResult`.
+const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+
+/// One result cell (an N-Triples surface term) in upstream gStore's JSON
+/// encoding (see the section comment above).
+pub fn upstream_binding(cell: &str) -> Json {
+    let (kind, value, datatype, lang) = match parse_term(cell) {
+        Ok(Term::Iri(s)) => ("uri", s, None, None),
+        Ok(Term::Blank(l)) => ("bnode", format!("_:{l}"), None, None),
+        Ok(Term::Literal {
+            value,
+            datatype,
+            lang,
+        }) => match (datatype, lang) {
+            (_, Some(l)) => ("literal", value, None, Some(l)),
+            (Some(dt), None) => ("typed-literal", value, Some(dt), None),
+            (None, None) => ("literal", value, None, None),
+        },
+        Err(_) => ("literal", cell.to_string(), None, None),
+    };
+    let mut b = Json::obj().with("type", kind);
+    if let Some(dt) = datatype {
+        b.set("datatype", dt);
+    }
+    b.set("value", value);
+    if let Some(l) = lang {
+        b.set("lang", l);
+    }
+    b
+}
+
+/// A SELECT table in upstream gStore's JSON shape (`head.link`, `head.vars`,
+/// `results.bindings`), emitting at most `limit` rows (all when `None`).
+pub fn upstream_select_json(rs: &ResultSet, limit: Option<usize>) -> Json {
+    let vars: Vec<Json> = rs.vars.iter().map(|v| Json::from(v.as_str())).collect();
+    let mut bindings = Vec::new();
+    for row in rs.rows.iter().take(limit.unwrap_or(usize::MAX)) {
+        let mut b = Json::obj();
+        for (ci, cell) in row.iter().enumerate() {
+            if let (Some(val), Some(var)) = (cell, rs.vars.get(ci)) {
+                b.set(var.as_str(), upstream_binding(val));
+            }
+        }
+        if b.as_object().is_some_and(|e| !e.is_empty()) {
+            bindings.push(b);
+        }
+    }
+    Json::obj()
+        .with(
+            "head",
+            Json::obj().with("link", Json::arr()).with("vars", Json::Arr(vars)),
+        )
+        .with("results", Json::obj().with("bindings", Json::Arr(bindings)))
+}
+
+/// A SELECT table in upstream's `format=n-triple` shape
+/// (`ResultSet::to_NT_TRIPLE_JSON`): `head` is the list of `?`-prefixed
+/// variable names and `results` a list of rows, each the list of its bound
+/// cells as N-Triples terms (upstream skips unbound cells within a row; so
+/// does this). At most `limit` rows.
+pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
+    let head: Vec<Json> = rs.vars.iter().map(|v| Json::from(format!("?{v}"))).collect();
+    let mut rows = Vec::new();
+    for row in rs.rows.iter().take(limit.unwrap_or(usize::MAX)) {
+        let cells: Vec<Json> = row
+            .iter()
+            .flatten()
+            .filter(|c| !c.is_empty())
+            .map(|c| Json::from(c.as_str()))
+            .collect();
+        if !cells.is_empty() {
+            rows.push(Json::Arr(cells));
+        }
+    }
+    Json::obj()
+        .with("head", Json::Arr(head))
+        .with("results", Json::Arr(rows))
+}
+
+/// The text of upstream's `format=n-triple-file` output (`ResultSet::output`):
+/// a tab-separated header of `?`-prefixed variables, then one line per row
+/// of tab-separated N-Triples terms (empty for an unbound cell), or
+/// `[empty result]` when there are no rows.
+pub fn upstream_tsv(rs: &ResultSet) -> String {
+    if rs.rows.is_empty() {
+        return "[empty result]\n".to_string();
+    }
+    let mut out = rs
+        .vars
+        .iter()
+        .map(|v| format!("?{v}"))
+        .collect::<Vec<_>>()
+        .join("\t");
+    out.push('\n');
+    for row in &rs.rows {
+        let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
+        out.push_str(&cells.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+/// An ASK answer as upstream's one-row `_askResult` table.
+pub fn upstream_ask_result(value: bool) -> ResultSet {
+    let mut rs = ResultSet::new(vec!["_askResult".to_string()]);
+    rs.rows.push(vec![Some(format!("\"{value}\"^^<{XSD_BOOLEAN}>"))]);
+    rs
+}
+
+/// CONSTRUCT / DESCRIBE triples as a `s`, `p`, `o` table (a Rust extension:
+/// upstream has no graph-returning query forms).
+pub fn triples_as_result_set(triples: &[crate::model::Triple]) -> ResultSet {
+    let mut rs = ResultSet::new(vec!["s".to_string(), "p".to_string(), "o".to_string()]);
+    for t in triples {
+        rs.rows.push(vec![
+            Some(t.subject.to_string()),
+            Some(t.predicate.to_string()),
+            Some(t.object.to_string()),
+        ]);
+    }
+    rs
 }
 
 #[cfg(test)]
