@@ -12,7 +12,8 @@
 //! Layout: [`paths`] (path / reachability / BFS family), [`metrics`]
 //! (centrality, community, similarity, …), [`fmt`] (upstream-exact number and
 //! JSON formatting, `pathVec2JSON`), [`cxx`] (libstdc++/glibc behaviour that
-//! leaks into output order), [`traverse`] (BFS building blocks).
+//! leaks into output order), [`traverse`] (BFS building blocks),
+//! [`from_ast`] (the parser's `Expr::GraphFn` → [`GCall`] → [`GArgs`] mapping).
 //!
 //! # Output contract (all functions)
 //!
@@ -135,6 +136,7 @@
 
 pub mod cxx;
 pub mod fmt;
+pub mod from_ast;
 pub mod metrics;
 pub mod paths;
 pub mod traverse;
@@ -143,6 +145,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::analytics::csr::{CsrGraph, Direction, EdgeDir, Node, PredFilter};
+pub use from_ast::{iri_entity, iri_node, GCall, PredSetArg};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId, INVALID_ENTITY_LITERAL_ID};

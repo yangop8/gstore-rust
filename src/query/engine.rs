@@ -497,13 +497,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// remove and add: evaluate the WHERE pattern, then instantiate each
     /// template against every solution (skipping template triples with an
     /// unbound variable), de-duplicated. The caller (Database) applies deletes
-    /// before inserts. Read-only — does not mutate the store.
+    /// before inserts. Read-only — does not mutate the store. Fails, like
+    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced graph
+    /// function or `PFN` that the engine cannot evaluate yet.
     pub fn eval_update_modify(
         &self,
         delete: &[TriplePattern],
         insert: &[TriplePattern],
         pattern: &GraphPattern,
-    ) -> (Vec<Triple>, Vec<Triple>) {
+    ) -> Result<(Vec<Triple>, Vec<Triple>)> {
+        if let Some(msg) = unwired_in_pattern(pattern) {
+            return Err(GStoreError::Query(msg));
+        }
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
         let mut dels = Vec::new();
@@ -526,7 +531,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
         }
-        (dels, ins)
+        Ok((dels, ins))
     }
 
     /// Fill a template triple from a solution; `None` if any position is unbound.

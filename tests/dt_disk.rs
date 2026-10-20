@@ -14,8 +14,11 @@ fn small_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/small/small.nt")
 }
 
+/// A scratch path unique to this test process, so concurrent runs of the
+/// suite (e.g. from two checkouts sharing `/tmp`) never clobber each other's
+/// on-disk databases.
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("gstore_dt_disk_{tag}.db"));
+    let d = std::env::temp_dir().join(format!("gstore_dt_disk_{tag}_{}.db", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -47,7 +50,7 @@ fn disk_build_reopen_query_small() {
 fn disk_streaming_query_off_disk() {
     // DiskStore::query streams matches straight from the on-disk indexes — only
     // the dictionary is loaded into memory, the triples stay on disk.
-    let path = std::env::temp_dir().join("gstore_dt_stream.kv");
+    let path = std::env::temp_dir().join(format!("gstore_dt_stream_{}.kv", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     let ds = DiskStore::build_files(&path, 256, &[small_nt()]).unwrap();

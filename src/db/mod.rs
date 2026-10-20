@@ -1093,7 +1093,7 @@ impl Database {
                 // data, then apply deletes before inserts (SPARQL semantics).
                 let (dels, ins) = {
                     let eval = Evaluator::new(&self.dict, &self.store);
-                    eval.eval_update_modify(&delete, &insert, &pattern)
+                    eval.eval_update_modify(&delete, &insert, &pattern)?
                 };
                 let mut changed = 0;
                 for t in &dels {

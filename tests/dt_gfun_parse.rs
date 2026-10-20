@@ -1234,6 +1234,53 @@ fn advanced_functions_and_pfn_are_a_clean_not_wired_yet_error() {
 }
 
 #[test]
+fn advanced_functions_in_an_update_where_are_a_clean_error() {
+    let mut db = Database::build_from_str("gfun_parse_update", DATA).unwrap();
+    let before = db.triple_num();
+    for (q, want) in [
+        (
+            "DELETE { ?x <http://ex/p> ?y } WHERE { ?x <http://ex/p> ?y \
+             FILTER(shortestPathLen(?x, ?y, true, {}) = 1) }",
+            "not wired yet: shortestPathLen",
+        ),
+        (
+            "INSERT { ?x <http://ex/q> ?y } WHERE { ?x <http://ex/p> ?y \
+             OPTIONAL { ?y <http://ex/p> ?z FILTER(kHopReachable(?x, ?z, true, 2, {})) } }",
+            "not wired yet: kHopReachable",
+        ),
+    ] {
+        let e = match db.query(q) {
+            Err(e) => e.to_string(),
+            Ok(r) => panic!("`{q}` should fail, got {r:?}"),
+        };
+        assert_contains(&e, &[want]);
+    }
+    assert_eq!(db.triple_num(), before);
+}
+
+#[test]
+fn iri_calls_reach_functions_registered_under_their_iri() {
+    let mut db = Database::build_from_str("gfun_parse_iri_fn", DATA).unwrap();
+    db.register_function("http://ex/fn/double", |args| {
+        Some(gstore::Value::Int(args.first()?.as_f64()? as i64 * 2))
+    });
+    for q in [
+        "SELECT (<http://ex/fn/double>(21) AS ?v) WHERE {}",
+        "PREFIX f: <http://ex/fn/> SELECT (f:double(21) AS ?v) WHERE {}",
+        "PREFIX f: <http://ex/fn/> SELECT (f:DOUBLE(21) AS ?v) WHERE {}",
+    ] {
+        let rs = db.select(q).unwrap();
+        let cell = rs.rows[0][0].clone().unwrap_or_default();
+        assert!(cell.starts_with("\"42\""), "{q}: {cell}");
+    }
+    // Unregistered IRI: evaluates to unbound.
+    let rs = db
+        .select("SELECT (<http://ex/fn/none>(1) AS ?v) WHERE {}")
+        .unwrap();
+    assert_eq!(rs.rows, vec![vec![None]]);
+}
+
+#[test]
 fn rs_calls_evaluate_with_the_legacy_implementations() {
     let mut db = Database::build_from_str("gfun_parse_rs", DATA).unwrap();
     let rs = db
