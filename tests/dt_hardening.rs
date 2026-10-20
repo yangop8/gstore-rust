@@ -3,6 +3,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use gstore::db::LoadPolicy;
 use gstore::dict::Dictionary;
 use gstore::parser::sparql::ast::{
     Expr, GraphPattern, PatternTerm, Projection, Query, SelectItem, SelectQuery, TriplePattern,
@@ -206,4 +207,214 @@ fn crafted_queries_found_by_the_audit_do_not_panic() {
         let r = catch_unwind(AssertUnwindSafe(|| db.query(q)));
         assert!(r.is_ok(), "panicked: {q}");
     }
+}
+
+// ---- 2. dictionary id-space bounds ----------------------------------------
+
+/// The 2,000,000,000th entity must be refused, not handed a literal-range id
+/// (`LITERAL_FIRST_ID`), which would flip its entity/literal classification.
+#[test]
+fn dictionary_refuses_entities_beyond_literal_first_id() {
+    use gstore::dict::ENTITY_ID_LIMIT;
+    use gstore::model::id::{is_entity_id, LITERAL_FIRST_ID};
+    let mut d = Dictionary::new();
+    d.debug_advance_id_counters(ENTITY_ID_LIMIT - 1, 0, 0)
+        .unwrap();
+    let last = d.try_intern_term(&Term::iri("http://ex/last")).unwrap();
+    assert_eq!(last, LITERAL_FIRST_ID - 1);
+    assert!(is_entity_id(last));
+    let err = d
+        .try_intern_term(&Term::iri("http://ex/one-too-many"))
+        .unwrap_err();
+    assert!(matches!(err, GStoreError::Database(_)), "{err:?}");
+    assert!(err.to_string().contains("entity id space exhausted"));
+    // Literals live in their own bounded space and still intern.
+    let lit = d.try_intern_term(&Term::plain_literal("ok")).unwrap();
+    assert_eq!(lit, LITERAL_FIRST_ID);
+}
+
+// ---- 3. LOAD policy --------------------------------------------------------
+
+/// A scratch directory tree, removed on drop:
+/// `root/allowed/{inside.nt, sub/deep.nt}` and `root/outside/secret.nt`.
+struct Sandbox {
+    root: std::path::PathBuf,
+}
+
+impl Sandbox {
+    fn new(tag: &str) -> Sandbox {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "gstore_load_policy_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("allowed/sub")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let write = |rel: &str, name: &str| {
+            let line = format!("<http://ex/{name}> <http://ex/p> \"{name}\" .\n");
+            std::fs::write(root.join(rel), line).unwrap();
+        };
+        write("allowed/inside.nt", "in");
+        write("allowed/sub/deep.nt", "deep");
+        write("outside/secret.nt", "secret");
+        Sandbox { root }
+    }
+
+    fn path(&self, rel: &str) -> String {
+        self.root.join(rel).display().to_string()
+    }
+
+    fn allowed(&self) -> std::path::PathBuf {
+        self.root.join("allowed")
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn load(db: &mut Database, source: &str) -> gstore::Result<QueryResult> {
+    db.query(&format!("LOAD <{source}>"))
+}
+
+fn assert_denied(r: gstore::Result<QueryResult>, what: &str) {
+    match r {
+        Err(GStoreError::Query(msg)) => {
+            assert!(
+                msg.contains("load policy"),
+                "{what}: unexpected message {msg:?}"
+            )
+        }
+        other => panic!("{what}: expected a policy denial, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_policy_keeps_loading_any_local_file() {
+    let sb = Sandbox::new("default");
+    let mut db = Database::new("d");
+    assert_eq!(db.load_policy(), &LoadPolicy::permissive());
+    let r = load(&mut db, &format!("file://{}", sb.path("outside/secret.nt"))).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+    // A bare path works too (historical behaviour).
+    let r = load(&mut db, &sb.path("allowed/inside.nt")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+    // Remote sources are still unsupported (no network), with the old message.
+    let err = load(&mut db, "http://example.org/x.ttl").unwrap_err();
+    assert!(
+        err.to_string().contains("not supported (no network)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn restricted_policy_denies_local_and_remote_loads() {
+    let sb = Sandbox::new("restricted");
+    let mut db = Database::new("r");
+    db.set_load_policy(LoadPolicy::restricted());
+    let inside = sb.path("allowed/inside.nt");
+    assert_denied(load(&mut db, &format!("file://{inside}")), "file IRI");
+    assert_denied(load(&mut db, &inside), "bare path");
+    assert_denied(load(&mut db, "file:///etc/passwd"), "/etc/passwd");
+    assert_denied(load(&mut db, "http://example.org/x.ttl"), "remote");
+    assert_eq!(db.triple_num(), 0);
+    // SILENT turns the denial into a no-op, per SPARQL semantics.
+    let r = db.query(&format!("LOAD SILENT <{inside}>")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 0 });
+}
+
+#[test]
+fn allowed_dir_policy_loads_inside_and_refuses_escapes() {
+    let sb = Sandbox::new("dirs");
+    let mut db = Database::new("a");
+    db.set_load_policy(LoadPolicy::restricted().with_allowed_dir(sb.allowed()));
+
+    // Inside the allowed directory (and its subdirectories): allowed.
+    let r = load(&mut db, &format!("file://{}", sb.path("allowed/inside.nt"))).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+    let r = load(&mut db, &sb.path("allowed/sub/deep.nt")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+    // `..` that stays inside is fine once canonicalized.
+    let r = load(&mut db, &sb.path("allowed/sub/../inside.nt")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 0 }, "already loaded");
+
+    // Outside, `../` escapes, directories, missing files: all refused alike.
+    assert_denied(load(&mut db, &sb.path("outside/secret.nt")), "outside");
+    let escape = sb.path("allowed/../outside/secret.nt");
+    assert_denied(load(&mut db, &escape), "dot-dot escape");
+    let deep_escape = sb.path("allowed/sub/../../outside/secret.nt");
+    assert_denied(
+        load(&mut db, &format!("file://{deep_escape}")),
+        "dot-dot via file IRI",
+    );
+    assert_denied(load(&mut db, &sb.path("allowed/sub")), "a directory");
+    assert_denied(
+        load(&mut db, &sb.path("allowed/missing.nt")),
+        "missing file",
+    );
+    assert_denied(load(&mut db, "/etc/passwd"), "/etc/passwd");
+    assert_denied(load(&mut db, "http://example.org/x.ttl"), "remote");
+
+    // Missing-vs-outside is indistinguishable to the client (no existence oracle).
+    let a = load(&mut db, &sb.path("outside/secret.nt"))
+        .unwrap_err()
+        .to_string();
+    let b = load(&mut db, &sb.path("outside/nope.nt"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(a.replace("secret", "X"), b.replace("nope", "X"));
+
+    let rs = db
+        .select("SELECT ?s WHERE { ?s <http://ex/p> ?o }")
+        .unwrap();
+    assert_eq!(rs.row_count(), 2, "only the two allowed files were loaded");
+}
+
+#[cfg(unix)]
+#[test]
+fn allowed_dir_policy_refuses_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("symlink");
+    // A symlinked file and a symlinked directory inside `allowed/` pointing out.
+    symlink(
+        sb.root.join("outside/secret.nt"),
+        sb.root.join("allowed/link.nt"),
+    )
+    .unwrap();
+    symlink(sb.root.join("outside"), sb.root.join("allowed/outdir")).unwrap();
+    // A symlink that stays inside is fine.
+    symlink(
+        sb.root.join("allowed/inside.nt"),
+        sb.root.join("allowed/alias.nt"),
+    )
+    .unwrap();
+
+    let mut db = Database::new("s");
+    db.set_load_policy(LoadPolicy::restricted().with_allowed_dir(sb.allowed()));
+    assert_denied(
+        load(&mut db, &sb.path("allowed/link.nt")),
+        "file symlink escape",
+    );
+    assert_denied(
+        load(&mut db, &sb.path("allowed/outdir/secret.nt")),
+        "dir symlink escape",
+    );
+    let r = load(&mut db, &sb.path("allowed/alias.nt")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+
+    // An allowed directory given *through* a symlink is canonicalized too.
+    symlink(sb.allowed(), sb.root.join("allowed_alias")).unwrap();
+    let mut db2 = Database::new("s2");
+    db2.set_load_policy(LoadPolicy::restricted().with_allowed_dir(sb.root.join("allowed_alias")));
+    let r = load(&mut db2, &sb.path("allowed/inside.nt")).unwrap();
+    assert_eq!(r, QueryResult::Update { changed: 1 });
+    assert_denied(
+        load(&mut db2, &sb.path("outside/secret.nt")),
+        "outside via alias policy",
+    );
 }
