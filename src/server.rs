@@ -21,6 +21,18 @@
 //!
 //! Beyond the base protocol this endpoint adds:
 //!
+//! * **Durability** — a server that knows its database directory
+//!   ([`Server::with_db_dir`]) saves after every successful update (gStore's
+//!   `check_point` policy, on by default; [`Server::with_check_point`] turns it
+//!   off) and saves any remaining change on graceful shutdown.
+//! * **Graceful shutdown** — [`Server::shutdown`] / a [`ShutdownHandle`] (and,
+//!   on unix, `SIGINT`/`SIGTERM` via [`shutdown_on_signals`]) stops accepting,
+//!   lets in-flight requests finish (bounded by a grace period), saves, and makes
+//!   `serve_forever` return a [`ShutdownReport`]. The same machinery drives
+//!   [`ApiServer`](crate::http_api::ApiServer).
+//! * **Panic isolation** — each request is routed under `catch_unwind`: a
+//!   panicking handler answers `500` with a JSON error, and the poisoned
+//!   database lock is recovered so later requests keep working.
 //! * **HTTP Basic auth** — optional, via [`Server::with_basic_auth`]. When
 //!   configured, every request must carry a valid `Authorization: Basic` header
 //!   or it is answered `401` with `WWW-Authenticate: Basic`. With no credentials
@@ -47,10 +59,13 @@
 //! clustering/sharding.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::Database;
 use crate::query::{QueryResult, ResultSet};
@@ -135,10 +150,24 @@ document.getElementById('run').addEventListener('click', function () {
 "##;
 
 /// An HTTP SPARQL server wrapping a [`Database`].
+///
+/// **Durability.** When the server knows its database directory (see
+/// [`with_db_dir`](Self::with_db_dir)), every successful UPDATE that changed
+/// data is saved back to that directory straight away (the gStore
+/// `check_point` policy, on by default — turn it off with
+/// [`with_check_point(false)`](Self::with_check_point)), and any still-unsaved
+/// change is saved during a graceful [`shutdown`](Self::shutdown). A server
+/// built with plain [`bind`](Self::bind) has no directory and stays purely
+/// in-memory, exactly as before.
 pub struct Server {
     /// The shared, thread-safe part handed to each connection's worker thread.
     inner: Arc<ServerInner>,
-    listener: TcpListener,
+    /// The listening socket; taken (closed) once the server has shut down.
+    listener: Mutex<Option<TcpListener>>,
+    addr: SocketAddr,
+    life: Arc<Lifecycle>,
+    /// Upper bound on how long a graceful shutdown waits for in-flight requests.
+    grace: Duration,
 }
 
 /// The part of a [`Server`] shared across connection worker threads (behind an
@@ -147,22 +176,72 @@ pub struct Server {
 /// needs to clone this `Arc`.
 struct ServerInner {
     db: Mutex<Database>,
+    /// Set (under the `db` lock) when the in-memory database has changes that
+    /// are not yet saved to [`dir`](Self::dir); cleared by a successful save.
+    dirty: AtomicBool,
     /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
     auth: Option<(String, String)>,
+    /// The directory the database was loaded from / is persisted to. `None` ⇒
+    /// in-memory only (nothing is ever saved).
+    dir: Option<PathBuf>,
+    /// gStore's `check_point` policy: save after every successful update.
+    check_point: bool,
 }
 
 impl Server {
     /// Bind to `addr` (e.g. `"127.0.0.1:7000"` or `"127.0.0.1:0"` for an
-    /// ephemeral port), taking ownership of `db`.
+    /// ephemeral port), taking ownership of `db`. The server is in-memory only
+    /// until a directory is attached with [`with_db_dir`](Self::with_db_dir).
     pub fn bind<A: ToSocketAddrs>(db: Database, addr: A) -> std::io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
+        let addr = listener.local_addr()?;
         Ok(Server {
             inner: Arc::new(ServerInner {
                 db: Mutex::new(db),
+                dirty: AtomicBool::new(false),
                 auth: None,
+                dir: None,
+                check_point: true,
             }),
-            listener,
+            listener: Mutex::new(Some(listener)),
+            addr,
+            life: Lifecycle::new(addr),
+            grace: DEFAULT_SHUTDOWN_GRACE,
         })
+    }
+
+    /// Persist the database to `dir` (normally the directory it was loaded
+    /// from): saved after each successful update while the `check_point` policy
+    /// is on (the default), and on graceful shutdown in any case.
+    ///
+    /// ```no_run
+    /// # use gstore::{Database, server::Server};
+    /// let db = Database::load("lubm.db").unwrap();
+    /// let server = Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir("lubm.db");
+    /// ```
+    pub fn with_db_dir(mut self, dir: impl Into<PathBuf>) -> Server {
+        // Builders run right after `bind`, before the inner `Arc` is shared with
+        // any worker thread, so `get_mut` succeeds (see `with_basic_auth`).
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.dir = Some(dir.into());
+        }
+        self
+    }
+
+    /// Turn gStore's `check_point` policy on (the default) or off. When off,
+    /// updates stay in memory and are saved only on graceful shutdown.
+    pub fn with_check_point(mut self, on: bool) -> Server {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.check_point = on;
+        }
+        self
+    }
+
+    /// Bound the time a graceful shutdown waits for in-flight requests to
+    /// finish before saving and returning (default [`DEFAULT_SHUTDOWN_GRACE`]).
+    pub fn with_shutdown_grace(mut self, grace: Duration) -> Server {
+        self.grace = grace;
+        self
     }
 
     /// Require HTTP Basic auth with these credentials on every request.
@@ -185,37 +264,319 @@ impl Server {
 
     /// The actual bound address (useful after binding to port 0).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        Ok(self.addr)
     }
 
-    /// Accept connections forever, handling each on its own worker thread so a
-    /// slow query on one connection does not block the others (the [`Database`]
-    /// itself is still serialized behind its `Mutex`).
-    pub fn serve_forever(&self) {
-        for stream in self.listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+    /// The directory the database is persisted to, if any.
+    pub fn db_dir(&self) -> Option<&Path> {
+        self.inner.dir.as_deref()
+    }
+
+    /// Whether the check_point policy (save after every update) is on.
+    pub fn check_point(&self) -> bool {
+        self.inner.check_point
+    }
+
+    /// A cloneable handle that can stop this server from any thread (or from a
+    /// signal watcher, see [`shutdown_on_signals`]).
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle::new(Arc::clone(&self.life))
+    }
+
+    /// Request a graceful shutdown: stop accepting connections, let in-flight
+    /// requests finish (bounded by the grace period), save the database if it
+    /// has unsaved changes, and return from [`serve_forever`](Self::serve_forever).
+    /// Returns immediately; join the serving thread to wait for completion.
+    pub fn shutdown(&self) {
+        self.life.request_stop();
+    }
+
+    /// Accept connections until [`shutdown`](Self::shutdown), handling each on
+    /// its own worker thread so a slow query on one connection does not block
+    /// the others (the [`Database`] itself is still serialized behind its
+    /// `Mutex`). On shutdown the listener is closed, in-flight requests are given
+    /// up to the grace period to finish, unsaved changes are saved, and a
+    /// [`ShutdownReport`] is returned.
+    pub fn serve_forever(&self) -> ShutdownReport {
+        let drained = run_accept_loop(&self.listener, &self.life, self.grace, |stream, guard| {
             let inner = Arc::clone(&self.inner);
             spawn_worker(move || {
-                let _ = inner.handle(stream);
+                let _in_flight = guard;
+                let mut stream = stream;
+                let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut stream)));
             });
-        }
+        });
+        self.finish_shutdown(drained)
     }
 
     /// Like [`serve_forever`](Self::serve_forever) but terminates TLS
     /// in-process, wrapping every accepted connection in a `rustls` stream built
     /// from `config` (see [`load_tls_config`]). Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
-        for stream in self.listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
+        let drained = run_accept_loop(&self.listener, &self.life, self.grace, |stream, guard| {
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
             spawn_worker(move || {
+                let _in_flight = guard;
                 if let Ok(conn) = rustls::ServerConnection::new(config) {
-                    let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
+                    let mut tls = rustls::StreamOwned::new(conn, stream);
+                    let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut tls)));
                 }
             });
+        });
+        self.finish_shutdown(drained)
+    }
+
+    /// The tail of a graceful shutdown: save unsaved changes (if a directory is
+    /// attached) and report what happened.
+    fn finish_shutdown(&self, drained: bool) -> ShutdownReport {
+        let mut report = ShutdownReport {
+            drained,
+            ..ShutdownReport::default()
+        };
+        if self.inner.dirty.load(Ordering::SeqCst) {
+            let db = locked(&self.inner.db);
+            match self.inner.save_locked(&db) {
+                Ok(Some(dir)) => report.saved.push(dir),
+                Ok(None) => {}
+                Err((dir, e)) => report.failed.push((dir, e)),
+            }
         }
+        report
+    }
+}
+
+/// The default upper bound on how long a graceful shutdown waits for in-flight
+/// requests before it saves and returns anyway.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// What a graceful shutdown did; returned by `serve_forever` on both
+/// [`Server`] and [`ApiServer`](crate::http_api::ApiServer).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// `true` when every in-flight request finished within the grace period.
+    pub drained: bool,
+    /// Database directories saved during shutdown (only databases with unsaved
+    /// changes are written).
+    pub saved: Vec<PathBuf>,
+    /// Saves that failed, as `(directory, error message)`.
+    pub failed: Vec<(PathBuf, String)>,
+    /// Open HTTP transactions rolled back because the server stopped
+    /// ([`ApiServer`](crate::http_api::ApiServer) only).
+    pub rolled_back: usize,
+}
+
+/// A cloneable, thread-safe handle that gracefully stops a running [`Server`]
+/// or [`ApiServer`](crate::http_api::ApiServer) — from a test, another thread,
+/// or a signal watcher ([`shutdown_on_signals`]).
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    life: Arc<Lifecycle>,
+}
+
+impl ShutdownHandle {
+    pub(crate) fn new(life: Arc<Lifecycle>) -> ShutdownHandle {
+        ShutdownHandle { life }
+    }
+
+    /// Request a graceful shutdown (idempotent, non-blocking).
+    pub fn shutdown(&self) {
+        self.life.request_stop();
+    }
+
+    /// Whether a shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        self.life.stopping()
+    }
+}
+
+impl std::fmt::Debug for ShutdownHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownHandle")
+            .field("addr", &self.life.wake)
+            .field("shutdown", &self.is_shutdown())
+            .finish()
+    }
+}
+
+/// Stop/in-flight bookkeeping shared by a server's accept loop, its workers,
+/// and every [`ShutdownHandle`].
+pub(crate) struct Lifecycle {
+    stop: AtomicBool,
+    in_flight: AtomicUsize,
+    /// A connectable form of the bound address, used to wake a blocked
+    /// `accept()` when a shutdown is requested.
+    wake: SocketAddr,
+}
+
+impl Lifecycle {
+    pub(crate) fn new(bound: SocketAddr) -> Arc<Lifecycle> {
+        // An unspecified bind address (0.0.0.0 / ::) is not connectable on every
+        // platform; wake through the loopback address of the same family.
+        let ip = match bound.ip() {
+            IpAddr::V4(v) if v.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v) if v.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        Arc::new(Lifecycle {
+            stop: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            wake: SocketAddr::new(ip, bound.port()),
+        })
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Flag the shutdown and wake the accept loop with a throwaway
+    /// self-connection (the loop re-checks the flag after every `accept`).
+    pub(crate) fn request_stop(&self) {
+        if !self.stop.swap(true, Ordering::SeqCst) {
+            let _ = TcpStream::connect_timeout(&self.wake, Duration::from_secs(1));
+        }
+    }
+
+    /// Count one in-flight connection until the returned guard drops.
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Wait until no connection is in flight, at most `grace`. Returns whether
+    /// the server drained.
+    pub(crate) fn wait_idle(&self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Marks one connection as in flight; dropping it (normally, on a panic, or
+/// when a worker thread could not be spawned) releases the count.
+pub(crate) struct InFlightGuard(Arc<Lifecycle>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The shared accept loop: hand every accepted connection (with its read
+/// timeout set and an [`InFlightGuard`]) to `on_conn` until a shutdown is
+/// requested, then close the listener and wait — at most `grace` — for the
+/// in-flight connections to finish. Returns whether they all did.
+pub(crate) fn run_accept_loop(
+    listener: &Mutex<Option<TcpListener>>,
+    life: &Arc<Lifecycle>,
+    grace: Duration,
+    mut on_conn: impl FnMut(TcpStream, InFlightGuard),
+) -> bool {
+    // Accept on a clone of the socket so the `Mutex` is not held while blocked.
+    let sock = locked(listener).as_ref().and_then(|l| l.try_clone().ok());
+    if let Some(sock) = sock {
+        while !life.stopping() {
+            match sock.accept() {
+                Ok((stream, _)) => {
+                    if life.stopping() {
+                        break; // the wake-up self-connection (or a late client)
+                    }
+                    let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+                    on_conn(stream, life.enter());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // E.g. EMFILE under a connection flood: back off instead of
+                // spinning on the failing accept.
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+    // Close both descriptors so new connections are refused from now on.
+    locked(listener).take();
+    life.wait_idle(grace)
+}
+
+/// Arrange for `SIGINT`/`SIGTERM` to trigger `handle.shutdown()` (unix only;
+/// returns `false` — and does nothing — elsewhere or if the handlers could not
+/// be installed). A tiny watcher thread polls the flag the async-signal-safe
+/// handler sets. After the first signal the default disposition is restored,
+/// so a second Ctrl-C terminates the process immediately.
+pub fn shutdown_on_signals(handle: ShutdownHandle) -> bool {
+    #[cfg(unix)]
+    {
+        if !signals::install() {
+            return false;
+        }
+        thread::Builder::new()
+            .name("gstore-signals".into())
+            .spawn(move || loop {
+                if signals::received() {
+                    signals::restore_default();
+                    handle.shutdown();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            })
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = handle;
+        false
+    }
+}
+
+/// Minimal `signal(2)` binding (no extra crates): the handler only stores to an
+/// `AtomicBool`, which is async-signal-safe.
+#[cfg(unix)]
+mod signals {
+    use std::os::raw::c_int;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RECEIVED: AtomicBool = AtomicBool::new(false);
+
+    const SIGINT: c_int = 2;
+    const SIGTERM: c_int = 15;
+    /// `SIG_DFL` / `SIG_ERR` as the pointer-sized `sighandler_t` values.
+    const SIG_DFL: usize = 0;
+    const SIG_ERR: usize = usize::MAX;
+
+    extern "C" {
+        /// `sighandler_t signal(int signum, sighandler_t handler)` from libc;
+        /// `sighandler_t` is passed as a pointer-sized integer so that
+        /// `SIG_DFL` can be expressed.
+        fn signal(signum: c_int, handler: usize) -> usize;
+    }
+
+    extern "C" fn on_signal(_signum: c_int) {
+        RECEIVED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn install() -> bool {
+        let handler = on_signal as extern "C" fn(c_int) as usize;
+        // SAFETY: `signal` is the C library's; `on_signal` has the C handler
+        // signature and only performs a lock-free atomic store.
+        unsafe { signal(SIGINT, handler) != SIG_ERR && signal(SIGTERM, handler) != SIG_ERR }
+    }
+
+    pub(super) fn restore_default() {
+        // SAFETY: restoring the default disposition is always valid.
+        unsafe {
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTERM, SIG_DFL);
+        }
+    }
+
+    pub(super) fn received() -> bool {
+        RECEIVED.load(Ordering::SeqCst)
     }
 }
 
@@ -241,21 +602,61 @@ pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The message returned (as HTTP 500) when a request handler panics; the panic
+/// itself is caught per request so the worker, the locks and the server survive.
+pub(crate) const PANIC_MSG: &str = "internal server error: the request handler panicked";
+
+/// A response computed by [`ServerInner::route`], written after the (panic-
+/// isolated) routing step.
+enum Reply {
+    /// A buffered body. `compress` allows gzip/deflate (feature `gzip`).
+    Buffered {
+        status: u16,
+        ctype: String,
+        body: Vec<u8>,
+        compress: bool,
+    },
+    /// A SELECT streamed with `Transfer-Encoding: chunked`.
+    Stream(ResultFormat, ResultSet),
+}
+
+impl Reply {
+    fn buffered(status: u16, ctype: &str, body: Vec<u8>) -> Reply {
+        Reply::Buffered {
+            status,
+            ctype: ctype.to_string(),
+            body,
+            compress: true,
+        }
+    }
+
+    fn plain(status: u16, ctype: &str, body: &[u8]) -> Reply {
+        Reply::Buffered {
+            status,
+            ctype: ctype.to_string(),
+            body: body.to_vec(),
+            compress: false,
+        }
+    }
+}
+
 impl ServerInner {
     /// Handle one connection (one request). Generic over the transport so the
     /// same code path serves plain [`TcpStream`]s and `rustls` TLS streams.
-    fn handle<S: Read + Write>(&self, mut stream: S) -> std::io::Result<()> {
-        let req = match Request::parse(&mut stream) {
+    /// Routing runs under `catch_unwind`: a panicking handler answers `500`
+    /// and leaves the server (and its recovered locks) serving.
+    fn handle<S: Read + Write>(&self, stream: &mut S) -> std::io::Result<()> {
+        let req = match Request::parse(stream) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(()), // connection closed with no request
-            Err(_) => return write_response(&mut stream, 400, "text/plain", b"bad request"),
+            Err(_) => return write_response(stream, 400, "text/plain", b"bad request"),
         };
         // Auth gate: when credentials are configured every request must present
         // a matching `Authorization: Basic` header.
         if let Some((user, pass)) = &self.auth {
             if !req.authorized(user, pass) {
                 return write_response_ext(
-                    &mut stream,
+                    stream,
                     401,
                     "text/plain",
                     &[("WWW-Authenticate", "Basic realm=\"gStore\"")],
@@ -263,29 +664,45 @@ impl ServerInner {
                 );
             }
         }
+        let reply = catch_unwind(AssertUnwindSafe(|| self.route(&req)))
+            .unwrap_or_else(|_| Reply::plain(500, "application/json", &err_json(PANIC_MSG)));
         // The client's `Accept-Encoding` (used to optionally compress buffered
         // bodies under the `gzip` feature; ignored without it).
         let enc = req.header("accept-encoding");
+        match reply {
+            Reply::Buffered {
+                status,
+                ctype,
+                body,
+                compress: true,
+            } => write_response_maybe_gzip(stream, status, &ctype, &[], &body, enc),
+            Reply::Buffered {
+                status, ctype, body, ..
+            } => write_response(stream, status, &ctype, &body),
+            Reply::Stream(fmt, rs) => stream_select(stream, fmt, &rs),
+        }
+    }
+
+    /// Route a parsed, authorized request to its handler.
+    fn route(&self, req: &Request) -> Reply {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET" | "POST", "/sparql") => self.handle_sparql(&mut stream, &req),
-            ("POST", "/update") => {
-                let (s, c, b) = self.run_update(&req.body_string());
-                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
-            }
-            ("GET", "/status") => {
-                let (s, c, b) = self.status_json();
-                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
-            }
-            ("GET", "/" | "/console") => write_response_maybe_gzip(
-                &mut stream,
+            ("GET" | "POST", "/sparql") => self.handle_sparql(req),
+            ("POST", "/update") => self.run_update(&req.body_string()),
+            ("GET", "/status") => self.status_json(),
+            ("GET", "/" | "/console") => Reply::buffered(
                 200,
                 "text/html; charset=utf-8",
-                &[],
-                CONSOLE_HTML.as_bytes(),
-                enc,
+                CONSOLE_HTML.as_bytes().to_vec(),
             ),
-            ("GET" | "POST", _) => write_response(&mut stream, 404, "text/plain", b"not found"),
-            _ => write_response(&mut stream, 405, "text/plain", b"method not allowed"),
+            // Test-only trigger for the panic-isolation tests: panics while
+            // holding the database lock (poisoning it).
+            #[cfg(test)]
+            ("GET", "/__test/panic") => {
+                let _db = locked(&self.db);
+                panic!("test-triggered handler panic");
+            }
+            ("GET" | "POST", _) => Reply::plain(404, "text/plain", b"not found"),
+            _ => Reply::plain(405, "text/plain", b"method not allowed"),
         }
     }
 
@@ -293,78 +710,102 @@ impl ServerInner {
     /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
     /// The [`Database`] lock is released before any serialization or network
     /// write, so it is held only for the query itself.
-    fn handle_sparql<S: Read + Write>(
-        &self,
-        stream: &mut S,
-        req: &Request,
-    ) -> std::io::Result<()> {
+    fn handle_sparql(&self, req: &Request) -> Reply {
         let q = match req.query_string() {
             Some(q) => q,
-            None => return write_response(stream, 400, SPARQL_JSON, &err_json("missing query")),
+            None => return Reply::plain(400, SPARQL_JSON, &err_json("missing query")),
         };
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
-        let enc = req.header("accept-encoding");
-        let result = {
-            let mut db = locked(&self.db);
-            db.query(&q)
-        };
+        let (result, warning) = self.execute(&q);
         match result {
             Ok(QueryResult::Select(rs)) => {
                 if req.wants_stream() {
-                    stream_select(stream, fmt, &rs)
+                    Reply::Stream(fmt, rs)
                 } else {
                     let mut buf = Vec::new();
                     let _ = sparql_results::write_select(fmt, &rs, &mut buf);
-                    write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
+                    Reply::buffered(200, fmt.content_type(), buf)
                 }
             }
             Ok(QueryResult::Ask(b)) => {
                 let mut buf = Vec::new();
                 let _ = sparql_results::write_ask(fmt, b, &mut buf);
-                write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
+                Reply::buffered(200, fmt.content_type(), buf)
             }
-            Ok(QueryResult::Construct(ts)) => write_response_maybe_gzip(
-                stream,
-                200,
-                "application/n-triples",
-                &[],
-                &ntriples_body(&ts),
-                enc,
-            ),
-            Ok(QueryResult::Update { changed }) => write_response_maybe_gzip(
-                stream,
-                200,
-                "application/json",
-                &[],
-                format!("{{\"changed\":{changed}}}").as_bytes(),
-                enc,
-            ),
-            Err(e) => write_response(stream, 400, SPARQL_JSON, &err_json(&e.to_string())),
+            Ok(QueryResult::Construct(ts)) => {
+                Reply::buffered(200, "application/n-triples", ntriples_body(&ts))
+            }
+            Ok(QueryResult::Update { changed }) => {
+                Reply::buffered(200, "application/json", changed_json(changed, warning))
+            }
+            Err(e) => Reply::plain(400, SPARQL_JSON, &err_json(&e.to_string())),
         }
     }
 
-    fn run_update(&self, u: &str) -> (u16, String, Vec<u8>) {
-        let mut db = locked(&self.db);
-        match db.query(u) {
-            Ok(QueryResult::Update { changed }) => (
-                200,
-                "application/json".into(),
-                format!("{{\"changed\":{changed}}}").into_bytes(),
-            ),
-            Ok(_) => (
+    fn run_update(&self, u: &str) -> Reply {
+        let (result, warning) = self.execute(u);
+        match result {
+            Ok(QueryResult::Update { changed }) => {
+                Reply::buffered(200, "application/json", changed_json(changed, warning))
+            }
+            Ok(_) => Reply::buffered(
                 400,
-                "application/json".into(),
+                "application/json",
                 err_json("/update expects a SPARQL UPDATE request"),
             ),
-            Err(e) => (400, "application/json".into(), err_json(&e.to_string())),
+            Err(e) => Reply::buffered(400, "application/json", err_json(&e.to_string())),
         }
     }
 
-    fn status_json(&self) -> (u16, String, Vec<u8>) {
+    /// Run `sparql` under the database lock. An UPDATE that changed data marks
+    /// the database dirty and — under the check_point policy — saves it before
+    /// the lock is released, so the on-disk copy never lags an acknowledged
+    /// write. A failed save does not undo the (applied) update: it is reported
+    /// as a warning and the database stays dirty, to be retried on shutdown.
+    fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
+        let mut db = locked(&self.db);
+        let result = db.query(sparql);
+        let mut warning = None;
+        if let Ok(QueryResult::Update { changed }) = &result {
+            if *changed > 0 {
+                self.dirty.store(true, Ordering::SeqCst);
+                if self.check_point {
+                    if let Err((dir, e)) = self.save_locked(&db) {
+                        warning = Some(format!(
+                            "update applied in memory but saving to '{}' failed: {e}",
+                            dir.display()
+                        ));
+                    }
+                }
+            }
+        }
+        (result, warning)
+    }
+
+    /// Save `db` (whose lock the caller holds) to the attached directory and
+    /// clear the dirty flag. `Ok(None)` when no directory is attached.
+    fn save_locked(&self, db: &Database) -> Result<Option<PathBuf>, (PathBuf, String)> {
+        let Some(dir) = &self.dir else {
+            return Ok(None);
+        };
+        match db.save(dir) {
+            Ok(()) => {
+                self.dirty.store(false, Ordering::SeqCst);
+                Ok(Some(dir.clone()))
+            }
+            Err(e) => Err((dir.clone(), e.to_string())),
+        }
+    }
+
+    fn status_json(&self) -> Reply {
         let db = locked(&self.db);
         let s = db.stats();
+        let dir = match &self.dir {
+            Some(d) => json_str(&d.to_string_lossy()),
+            None => "null".to_string(),
+        };
         let body = format!(
-            "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
+            "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{},\"db_dir\":{dir},\"check_point\":{},\"dirty\":{}}}",
             json_str(&s.name),
             s.triple_num,
             s.entity_num,
@@ -372,8 +813,18 @@ impl ServerInner {
             s.predicate_num,
             s.index_valid,
             s.in_transaction,
+            self.check_point,
+            self.dirty.load(Ordering::SeqCst),
         );
-        (200, "application/json".into(), body.into_bytes())
+        Reply::buffered(200, "application/json", body.into_bytes())
+    }
+}
+
+/// `{"changed":N}` plus an optional `"warning"` (e.g. a failed check_point save).
+fn changed_json(changed: usize, warning: Option<String>) -> Vec<u8> {
+    match warning {
+        Some(w) => format!("{{\"changed\":{changed},\"warning\":{}}}", json_str(&w)).into_bytes(),
+        None => format!("{{\"changed\":{changed}}}").into_bytes(),
     }
 }
 
@@ -975,6 +1426,53 @@ mod tests {
             body.len()
         );
         http(addr, &raw)
+    }
+
+    #[test]
+    fn handler_panic_returns_500_and_the_server_keeps_serving() {
+        let (_srv, addr) = start();
+        // The test-only route panics while holding the database lock.
+        let resp = http(&addr, "GET /__test/panic HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(resp.contains("500 Internal Server Error"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        assert!(resp.contains("\"error\"") && resp.contains("panicked"), "{resp}");
+        // The poisoned database lock is recovered: reads and writes still work.
+        let ok = post(&addr, "/sparql", SELECT_O);
+        assert!(ok.contains("200 OK") && ok.contains("http://ex/b"), "{ok}");
+        let upd = post(&addr, "/update", "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }");
+        assert!(upd.contains("\"changed\":1"), "{upd}");
+        let status = http(&addr, "GET /status HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(status.contains("\"triples\":3"), "{status}");
+    }
+
+    #[test]
+    fn shutdown_returns_from_serve_forever_and_closes_the_listener() {
+        let db = Database::build_from_str("sd", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        assert!(post(&addr, "/sparql", SELECT_O).contains("200 OK"));
+        let handle = server.shutdown_handle();
+        assert!(!handle.is_shutdown());
+        handle.shutdown();
+        handle.shutdown(); // idempotent
+        assert!(handle.is_shutdown());
+        let report = serving.join().unwrap();
+        assert!(report.drained);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        // serve_forever after a shutdown returns immediately.
+        assert_eq!(server.serve_forever(), ShutdownReport { drained: true, ..Default::default() });
+    }
+
+    #[test]
+    fn wake_address_maps_unspecified_to_loopback() {
+        let v4: SocketAddr = "0.0.0.0:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v4).wake, "127.0.0.1:7000".parse().unwrap());
+        let v6: SocketAddr = "[::]:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v6).wake, "[::1]:7000".parse().unwrap());
+        let specific: SocketAddr = "10.1.2.3:80".parse().unwrap();
+        assert_eq!(Lifecycle::new(specific).wake, specific);
     }
 
     #[test]
