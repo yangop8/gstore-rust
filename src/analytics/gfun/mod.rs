@@ -543,6 +543,26 @@ pub struct GArgs {
 }
 
 impl GArgs {
+    /// Upstream's hop limit `k < 0 ? 999 : k` (kHopReachable, kHopEnumerate,
+    /// kHopReachablePath, kHopAllNeighbors, JaccardSimilarity,
+    /// degreeCorrelation); a missing `k` counts as negative.
+    pub fn hop_limit(&self) -> i64 {
+        match self.k {
+            Some(k) if k >= 0 => k,
+            _ => 999,
+        }
+    }
+
+    /// `ret_num`, or `default` when absent or negative (upstream's
+    /// `retNum < 0 ? default : retNum`: 100 for kHopNeighbor /
+    /// kHopAllNeighbors, 10 for JaccardSimilarity).
+    pub fn ret_num_or(&self, default: i64) -> i64 {
+        match self.ret_num {
+            Some(r) if r >= 0 => r,
+            _ => default,
+        }
+    }
+
     /// `srcs` without repeated entities, in order.
     pub fn distinct_srcs(&self) -> Vec<GNode> {
         let mut seen = HashSet::new();
@@ -779,6 +799,21 @@ mod tests {
         assert_eq!(s, vec![1, 2]);
         assert_eq!(GNode::MISSING.upstream_id(), -1);
         assert!(GNode::MISSING.is_missing());
+    }
+
+    #[test]
+    fn upstream_defaults_for_k_and_ret_num() {
+        let mut a = GArgs::default();
+        assert_eq!((a.hop_limit(), a.ret_num_or(100)), (999, 100));
+        a.k = Some(-1);
+        a.ret_num = Some(-5);
+        assert_eq!((a.hop_limit(), a.ret_num_or(10)), (999, 10));
+        a.k = Some(0);
+        a.ret_num = Some(0);
+        assert_eq!((a.hop_limit(), a.ret_num_or(10)), (0, 0));
+        a.k = Some(3);
+        a.ret_num = Some(7);
+        assert_eq!((a.hop_limit(), a.ret_num_or(10)), (3, 7));
     }
 
     #[test]

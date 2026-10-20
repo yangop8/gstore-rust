@@ -23,6 +23,8 @@
 //!   same queue discipline, same `std::set` / `std::map` (ascending) and
 //!   `unordered_map` ([`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder))
 //!   iteration orders): they decide which of several equal paths is printed.
+//! * `k' = if k < 0 { 999 } else { k }` is [`GArgs::hop_limit`]; upstream's
+//!   `retNum < 0 ? default : retNum` is [`GArgs::ret_num_or`].
 //! * Upstream vertex ids are entity ids; CSR algorithms here run on
 //!   [`Node`](super::Node)s (same order). "Isolated" / "missing" vertices: see
 //!   the module docs; each spec states the special cases.
