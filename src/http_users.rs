@@ -2,10 +2,39 @@
 //! HTTP endpoint — the analogue of gStore's `ApiUserOperation` /
 //! `system.nt` user database.
 //!
-//! It is dependency-free (std only): passwords are stored as a **salted,
-//! iterated hash** (never plaintext), sessions are opaque random tokens, and the
-//! whole store is persisted to a small tab-separated file so users survive a
-//! restart.
+//! It is dependency-free (std only): passwords are never stored in plaintext,
+//! sessions are opaque random tokens, and the whole store is persisted to a
+//! small tab-separated file (`users.db`) so users survive a restart.
+//!
+//! ## Password hashing
+//!
+//! Passwords are stored as a **versioned PBKDF2-HMAC-SHA256** hash
+//! (RFC 8018, built on the crate's own SHA-256 in [`crate::query::hash`]):
+//!
+//! ```text
+//! pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+//! ```
+//!
+//! with [`PBKDF2_ITERATIONS`] iterations, a 16-byte salt from the OS random
+//! source (`/dev/urandom`; see [`random_bytes`] for the fallback), and a 32-byte
+//! derived key compared in constant time. Because the algorithm and its
+//! parameters are recorded in the entry and fixed by their specifications, a
+//! stored hash stays verifiable across Rust toolchain upgrades.
+//!
+//! **Legacy entries.** Earlier versions hashed with
+//! `std::collections::hash_map::DefaultHasher`, whose algorithm the standard
+//! library explicitly does not promise to keep stable across releases. Such
+//! entries (`name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`) are still read and
+//! verified with the old function, and are transparently re-hashed into the
+//! PBKDF2 format on the first successful [`UserStore::login`] /
+//! [`UserStore::verify_and_upgrade`] (entries with fewer than the current
+//! iteration count are upgraded the same way). A legacy entry may, however,
+//! *fail* to verify if the binary was built with a toolchain whose
+//! `DefaultHasher` differs from the one that wrote it. To recover, reset the
+//! password offline with [`UserStore::reset_password_offline`] (for example
+//! `root`'s), or stop the server, delete that user's line from `users.db` and
+//! restart — a missing `root` is re-seeded with the configured initial root
+//! password.
 //!
 //! Privilege model (matching gStore's numeric privileges 1..7 plus an `admin`
 //! super-privilege):
@@ -30,10 +59,32 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::query::hash::{
+    constant_time_eq, hex_decode, hex_encode, pbkdf2_hmac_sha256, HmacSha256,
+};
 
 /// The built-in super-user. Always present, always fully privileged.
 pub const ROOT_USER: &str = "root";
+
+/// Scheme tag of the current password-hash format (`pbkdf2-sha256$…`).
+pub const PASSWORD_SCHEME: &str = "pbkdf2-sha256";
+
+/// PBKDF2-HMAC-SHA256 iteration count for newly hashed passwords. Stored with
+/// each hash, so raising it later keeps old entries verifiable (and they are
+/// upgraded on their next successful login).
+pub const PBKDF2_ITERATIONS: u32 = 100_000;
+
+// The work factor must never drop below the 10,000-iteration floor.
+const _: () = assert!(PBKDF2_ITERATIONS >= 10_000);
+
+/// Salt length in bytes for new password hashes.
+const SALT_LEN: usize = 16;
+
+/// Derived-key (stored hash) length in bytes.
+const HASH_LEN: usize = 32;
 
 /// A single access privilege. `Admin` implies every other privilege.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,12 +145,134 @@ impl Privilege {
     }
 }
 
-/// One stored user: name, salted password hash, and granted privileges.
+/// A stored password verifier (never the password itself).
+#[derive(Clone, PartialEq, Eq)]
+enum PasswordHash {
+    /// The current format: `pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>`.
+    Pbkdf2Sha256 {
+        iterations: u32,
+        salt: Vec<u8>,
+        hash: [u8; HASH_LEN],
+    },
+    /// The pre-versioning format: a 64-bit salt and a `DefaultHasher`-iterated
+    /// 64-bit digest. Read and verified for migration only, never created.
+    Legacy { salt: u64, hash: u64 },
+}
+
+impl std::fmt::Debug for PasswordHash {
+    // Redacted: salts and digests stay out of logs and `{:?}` dumps.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasswordHash::Pbkdf2Sha256 { iterations, .. } => {
+                write!(f, "{PASSWORD_SCHEME}(iterations={iterations}, ..)")
+            }
+            PasswordHash::Legacy { .. } => write!(f, "legacy(..)"),
+        }
+    }
+}
+
+impl PasswordHash {
+    /// Hash `password` under a fresh random salt with the current parameters.
+    fn new(password: &str) -> PasswordHash {
+        let mut salt = vec![0u8; SALT_LEN];
+        random_bytes(&mut salt);
+        PasswordHash::pbkdf2(password, salt, PBKDF2_ITERATIONS)
+    }
+
+    fn pbkdf2(password: &str, salt: Vec<u8>, iterations: u32) -> PasswordHash {
+        let mut hash = [0u8; HASH_LEN];
+        pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, &mut hash);
+        PasswordHash::Pbkdf2Sha256 {
+            iterations,
+            salt,
+            hash,
+        }
+    }
+
+    /// Whether `password` matches, comparing digests in constant time.
+    fn verify(&self, password: &str) -> bool {
+        match self {
+            PasswordHash::Pbkdf2Sha256 {
+                iterations,
+                salt,
+                hash,
+            } => {
+                let mut got = [0u8; HASH_LEN];
+                pbkdf2_hmac_sha256(password.as_bytes(), salt, *iterations, &mut got);
+                constant_time_eq(&got, hash)
+            }
+            PasswordHash::Legacy { salt, hash } => {
+                let got = legacy_hash_password(password, *salt);
+                std::hint::black_box(got ^ *hash) == 0
+            }
+        }
+    }
+
+    /// Whether a verified entry should be re-hashed with current parameters.
+    fn needs_upgrade(&self) -> bool {
+        match self {
+            PasswordHash::Pbkdf2Sha256 {
+                iterations, salt, ..
+            } => *iterations < PBKDF2_ITERATIONS || salt.len() < SALT_LEN,
+            PasswordHash::Legacy { .. } => true,
+        }
+    }
+
+    /// The persisted credential column(s): `pbkdf2-sha256$<iter>$<salt>$<hash>`
+    /// for a current entry; for a not-yet-migrated legacy entry, its original
+    /// two tab-separated hex columns so the file stays readable as before.
+    fn encode(&self) -> String {
+        match self {
+            PasswordHash::Pbkdf2Sha256 {
+                iterations,
+                salt,
+                hash,
+            } => format!(
+                "{PASSWORD_SCHEME}${iterations}${}${}",
+                hex_encode(salt),
+                hex_encode(hash)
+            ),
+            PasswordHash::Legacy { salt, hash } => format!("{salt:016x}\t{hash:016x}"),
+        }
+    }
+
+    /// Parse a `pbkdf2-sha256$<iter>$<salt_hex>$<hash_hex>` string.
+    fn parse_pbkdf2(s: &str) -> Option<PasswordHash> {
+        let mut parts = s.split('$');
+        if parts.next()? != PASSWORD_SCHEME {
+            return None;
+        }
+        let iterations: u32 = parts.next()?.parse().ok().filter(|&n| n > 0)?;
+        let salt = hex_decode(parts.next()?)?;
+        let hash: [u8; HASH_LEN] = hex_decode(parts.next()?)?.try_into().ok()?;
+        if parts.next().is_some() || salt.is_empty() {
+            return None;
+        }
+        Some(PasswordHash::Pbkdf2Sha256 {
+            iterations,
+            salt,
+            hash,
+        })
+    }
+}
+
+/// Hash `password` in the current versioned format
+/// (`pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>`, random salt).
+pub fn hash_password(password: &str) -> String {
+    PasswordHash::new(password).encode()
+}
+
+/// Verify `password` against a hash produced by [`hash_password`]. Malformed
+/// or unknown-scheme input never verifies.
+pub fn verify_password(stored: &str, password: &str) -> bool {
+    PasswordHash::parse_pbkdf2(stored).is_some_and(|h| h.verify(password))
+}
+
+/// One stored user: name, password verifier, and granted privileges.
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,
-    salt: u64,
-    hash: u64,
+    password: PasswordHash,
     pub privileges: BTreeSet<Privilege>,
 }
 
@@ -133,6 +306,14 @@ pub struct UserStore {
     users: HashMap<String, User>,
     sessions: HashMap<String, Session>,
     ttl: Duration,
+    /// Fast path for repeated verification of the same credentials (HTTP Basic
+    /// auth re-sends them on every request): user → HMAC-SHA256 of the last
+    /// password that verified, under the per-process random `verified_key`. A
+    /// hit skips the deliberately slow PBKDF2; a miss falls back to it.
+    /// Invalidated whenever a user's password changes or the user is dropped.
+    /// Memory only — never persisted.
+    verified: Mutex<HashMap<String, [u8; 32]>>,
+    verified_key: HmacSha256,
 }
 
 impl UserStore {
@@ -142,29 +323,47 @@ impl UserStore {
     /// seeded `root` is persisted.
     pub fn open(path: impl AsRef<Path>, root_password: &str) -> io::Result<UserStore> {
         let path = path.as_ref().to_path_buf();
+        let mut key = [0u8; 32];
+        random_bytes(&mut key);
         let mut store = UserStore {
             path,
             users: HashMap::new(),
             sessions: HashMap::new(),
             ttl: Duration::from_secs(24 * 3600),
+            verified: Mutex::new(HashMap::new()),
+            verified_key: HmacSha256::new(&key),
         };
         if store.path.is_file() {
             store.read_file()?;
         }
         if !store.users.contains_key(ROOT_USER) {
-            let (salt, hash) = make_hash(root_password);
             store.users.insert(
                 ROOT_USER.to_string(),
                 User {
                     name: ROOT_USER.to_string(),
-                    salt,
-                    hash,
+                    password: PasswordHash::new(root_password),
                     privileges: BTreeSet::from([Privilege::Admin]),
                 },
             );
             store.save()?;
         }
         Ok(store)
+    }
+
+    /// Offline password reset: set `name`'s password in the user file at `path`
+    /// without knowing the old one (the recovery path for a forgotten password
+    /// or a legacy entry that no longer verifies, see the module docs). A
+    /// missing `root` is created with `new_password`. Run it while no server is
+    /// using `path` (the server would overwrite the file from its own copy).
+    pub fn reset_password_offline(
+        path: impl AsRef<Path>,
+        name: &str,
+        new_password: &str,
+    ) -> io::Result<()> {
+        let mut store = UserStore::open(path, new_password)?;
+        store
+            .set_password(name, new_password)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
     }
 
     fn read_file(&mut self) -> io::Result<()> {
@@ -175,27 +374,36 @@ impl UserStore {
                 continue;
             }
             let mut cols = line.split('\t');
-            let (Some(name), Some(salt), Some(hash)) =
-                (cols.next(), cols.next(), cols.next())
-            else {
+            let (Some(name), Some(cred)) = (cols.next(), cols.next()) else {
                 continue;
+            };
+            // Current format: `name<TAB>pbkdf2-sha256$…<TAB>privileges`.
+            // Legacy format:  `name<TAB>salt16hex<TAB>hash16hex<TAB>privileges`.
+            let password = if cred.starts_with(PASSWORD_SCHEME) {
+                match PasswordHash::parse_pbkdf2(cred) {
+                    Some(h) => h,
+                    None => continue,
+                }
+            } else {
+                let Some(hash) = cols.next() else {
+                    continue;
+                };
+                let (Ok(salt), Ok(hash)) =
+                    (u64::from_str_radix(cred, 16), u64::from_str_radix(hash, 16))
+                else {
+                    continue;
+                };
+                PasswordHash::Legacy { salt, hash }
             };
             let privileges = cols
                 .next()
                 .and_then(Privilege::parse_list)
                 .unwrap_or_default();
-            let (Ok(salt), Ok(hash)) = (
-                u64::from_str_radix(salt, 16),
-                u64::from_str_radix(hash, 16),
-            ) else {
-                continue;
-            };
             self.users.insert(
                 name.to_string(),
                 User {
                     name: name.to_string(),
-                    salt,
-                    hash,
+                    password,
                     privileges,
                 },
             );
@@ -213,13 +421,10 @@ impl UserStore {
         let mut out = String::new();
         for name in names {
             let u = &self.users[name];
-            out.push_str(&format!(
-                "{}\t{:016x}\t{:016x}\t{}\n",
-                u.name,
-                u.salt,
-                u.hash,
-                u.privilege_str()
-            ));
+            // A legacy entry not yet migrated (its user has not logged in since
+            // the upgrade) keeps its two-column form, so it stays readable.
+            let cred = u.password.encode();
+            out.push_str(&format!("{}\t{cred}\t{}\n", u.name, u.privilege_str()));
         }
         fs::write(&self.path, out)
     }
@@ -260,13 +465,12 @@ impl UserStore {
         if self.users.contains_key(name) {
             return Err(format!("user '{name}' already exists"));
         }
-        let (salt, hash) = make_hash(password);
+        self.forget_verified(name);
         self.users.insert(
             name.to_string(),
             User {
                 name: name.to_string(),
-                salt,
-                hash,
+                password: PasswordHash::new(password),
                 privileges,
             },
         );
@@ -281,6 +485,7 @@ impl UserStore {
         if self.users.remove(name).is_none() {
             return Err(format!("user '{name}' does not exist"));
         }
+        self.forget_verified(name);
         // Invalidate any live sessions for the dropped user.
         self.sessions.retain(|_, s| s.user != name);
         self.save().map_err(|e| e.to_string())
@@ -295,9 +500,8 @@ impl UserStore {
             .users
             .get_mut(name)
             .ok_or_else(|| format!("user '{name}' does not exist"))?;
-        let (salt, hash) = make_hash(password);
-        user.salt = salt;
-        user.hash = hash;
+        user.password = PasswordHash::new(password);
+        self.forget_verified(name);
         self.save().map_err(|e| e.to_string())
     }
 
@@ -334,17 +538,67 @@ impl UserStore {
 
     // ---- authentication ---------------------------------------------------
 
-    /// Verify a username/password pair (constant-ish time on the hash compare).
+    /// Verify a username/password pair. Digests are compared in constant time,
+    /// and an unknown user costs the same PBKDF2 work as a wrong password (no
+    /// user-enumeration timing signal). Does not modify the store — use
+    /// [`verify_and_upgrade`](Self::verify_and_upgrade) to also migrate a
+    /// legacy entry.
     pub fn verify(&self, name: &str, password: &str) -> bool {
-        match self.users.get(name) {
-            Some(u) => verify_hash(password, u.salt, u.hash),
-            None => false,
+        let Some(u) = self.users.get(name) else {
+            // Burn the same work as a real check against a fixed dummy entry.
+            let dummy = PasswordHash::Pbkdf2Sha256 {
+                iterations: PBKDF2_ITERATIONS,
+                salt: vec![0u8; SALT_LEN],
+                hash: [0u8; HASH_LEN],
+            };
+            let _ = std::hint::black_box(dummy.verify(password));
+            return false;
+        };
+        let tag = self.verified_key.mac(&[name.as_bytes(), &[0], password.as_bytes()]);
+        let cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.get(name).is_some_and(|t| constant_time_eq(t, &tag)) {
+            return true;
         }
+        drop(cache);
+        let ok = u.password.verify(password);
+        if ok {
+            self.verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.to_string(), tag);
+        }
+        ok
     }
 
-    /// Verify credentials and, on success, issue an opaque session token.
-    pub fn login(&mut self, name: &str, password: &str) -> Option<String> {
+    /// [`verify`](Self::verify), and on success transparently re-hash an entry
+    /// stored in the legacy format (or with fewer than [`PBKDF2_ITERATIONS`]
+    /// iterations) into the current format, persisting the store. A failure to
+    /// persist the upgrade does not fail the verification.
+    pub fn verify_and_upgrade(&mut self, name: &str, password: &str) -> bool {
         if !self.verify(name, password) {
+            return false;
+        }
+        if let Some(u) = self.users.get_mut(name) {
+            if u.password.needs_upgrade() {
+                u.password = PasswordHash::new(password);
+                let _ = self.save();
+            }
+        }
+        true
+    }
+
+    /// Drop `name`'s cached verified-credential tag.
+    fn forget_verified(&self, name: &str) {
+        self.verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    /// Verify credentials and, on success, issue an opaque session token. A
+    /// legacy-format password entry is upgraded to the current format here.
+    pub fn login(&mut self, name: &str, password: &str) -> Option<String> {
+        if !self.verify_and_upgrade(name, password) {
             return None;
         }
         let token = new_token();
@@ -388,22 +642,12 @@ impl UserStore {
 
 // --- password hashing & token generation -------------------------------------
 
-/// Derive `(salt, hash)` for a fresh password using a random salt.
-fn make_hash(password: &str) -> (u64, u64) {
-    let salt = random_u64();
-    (salt, hash_password(password, salt))
-}
-
-/// Recompute the salted hash and compare without short-circuiting.
-fn verify_hash(password: &str, salt: u64, expected: u64) -> bool {
-    let got = hash_password(password, salt);
-    // Constant-time-ish compare of two u64s.
-    got ^ expected == 0
-}
-
-/// A salted, iterated hash. Not bcrypt-grade, but std-only and never stores the
-/// plaintext; the iteration count slows brute-force guessing.
-fn hash_password(password: &str, salt: u64) -> u64 {
+/// The **legacy** (pre-versioning) password hash, kept only to verify and
+/// migrate old `users.db` entries. Its output depends on `DefaultHasher`, whose
+/// algorithm `std` does not guarantee across Rust releases, so an entry written
+/// by a differently-built binary may not verify (see the module docs for the
+/// reset path). Never used for new hashes.
+fn legacy_hash_password(password: &str, salt: u64) -> u64 {
     let mut acc = salt ^ 0x9E37_79B9_7F4A_7C15;
     for i in 0..8192u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -416,24 +660,52 @@ fn hash_password(password: &str, salt: u64) -> u64 {
     acc
 }
 
-/// A 128-bit opaque session token rendered as hex.
+/// A 128-bit opaque session token rendered as hex (32 characters).
 fn new_token() -> String {
-    format!("{:016x}{:016x}", random_u64(), random_u64())
+    let mut t = [0u8; 16];
+    random_bytes(&mut t);
+    hex_encode(&t)
 }
 
-/// A best-effort random `u64` from OS-seeded `RandomState` mixed with the
-/// current time and a process-wide counter (std-only; not a CSPRNG, sufficient
-/// for session tokens and salts in this scope).
-fn random_u64() -> u64 {
+/// Fill `buf` from the operating system's CSPRNG (`/dev/urandom`). Returns
+/// `false` when it is unavailable (non-Unix target, restricted sandbox).
+fn os_random_bytes(buf: &mut [u8]) -> bool {
+    use std::io::Read;
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .is_ok()
+}
+
+/// Fill `buf` with random bytes for salts, session tokens and keys.
+///
+/// Reads `/dev/urandom`. **Fallback** (only when that fails): SHA-256 over
+/// `std`'s per-process `RandomState` SipHash keys — which `std` seeds from the
+/// OS random source on every supported platform — mixed with the wall clock,
+/// the process id and a process-wide counter. That is unpredictable in
+/// practice but is not a vetted CSPRNG; deployments should make sure
+/// `/dev/urandom` is readable.
+pub fn random_bytes(buf: &mut [u8]) {
+    if os_random_bytes(buf) {
+        return;
+    }
     static CTR: AtomicU64 = AtomicU64::new(0);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos.hash(&mut h);
-    CTR.fetch_add(1, Ordering::Relaxed).hash(&mut h);
-    h.finish()
+    for (i, chunk) in buf.chunks_mut(32).enumerate() {
+        let mut ctx = crate::query::hash::Sha256::new();
+        for _ in 0..4 {
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let h = std::collections::hash_map::RandomState::new().hash_one(n);
+            ctx.update(&h.to_le_bytes());
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        ctx.update(&nanos.to_le_bytes());
+        ctx.update(&std::process::id().to_le_bytes());
+        ctx.update(&(i as u64).to_le_bytes());
+        let block = ctx.finalize();
+        chunk.copy_from_slice(&block[..chunk.len()]);
+    }
 }
 
 /// Validate a username: non-empty, ≤ 64 chars, ASCII alphanumeric plus `_`/`-`,
@@ -457,18 +729,175 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("gstore_users_{}_{}.db", name, random_u64()));
+        p.push(format!("gstore_users_{}_{}.db", name, new_token()));
         p
     }
 
     #[test]
     fn hash_is_salted_and_verifies() {
-        let (s1, h1) = make_hash("secret");
-        let (s2, h2) = make_hash("secret");
-        assert_ne!(s1, s2, "salts differ");
-        assert_ne!(h1, h2, "same password hashes to different digests");
-        assert!(verify_hash("secret", s1, h1));
-        assert!(!verify_hash("wrong", s1, h1));
+        let h1 = hash_password("secret");
+        let h2 = hash_password("secret");
+        assert_ne!(h1, h2, "same password hashes to different strings (salted)");
+        assert!(verify_password(&h1, "secret"));
+        assert!(verify_password(&h2, "secret"));
+        assert!(!verify_password(&h1, "wrong"));
+        assert!(!verify_password(&h1, ""));
+    }
+
+    #[test]
+    fn hash_format_is_versioned_pbkdf2_sha256() {
+        let h = hash_password("pw");
+        let parts: Vec<&str> = h.split('$').collect();
+        assert_eq!(parts.len(), 4, "{h}");
+        assert_eq!(parts[0], "pbkdf2-sha256");
+        assert_eq!(parts[1], PBKDF2_ITERATIONS.to_string());
+        assert_eq!(parts[2].len(), SALT_LEN * 2, "16-byte salt, hex");
+        assert_eq!(parts[3].len(), HASH_LEN * 2, "32-byte key, hex");
+        assert!(parts[2..].iter().all(|p| p.bytes().all(|b| b.is_ascii_hexdigit())));
+    }
+
+    /// The stored form is plain PBKDF2-HMAC-SHA256, so it is pinned by the
+    /// published test vector — independent of the Rust toolchain.
+    #[test]
+    fn stored_hash_is_stable_against_a_published_vector() {
+        let stored = format!(
+            "pbkdf2-sha256$4096${}${}",
+            hex_encode(b"salt"),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+        assert!(verify_password(&stored, "password"));
+        assert!(!verify_password(&stored, "Password"));
+    }
+
+    #[test]
+    fn malformed_hashes_never_verify() {
+        for bad in [
+            "",
+            "pbkdf2-sha256",
+            "pbkdf2-sha256$0$73616c74$00",
+            "pbkdf2-sha256$x$73616c74$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            "pbkdf2-sha256$4096$$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            "pbkdf2-sha256$4096$73616c74$c5e4",
+            "pbkdf2-sha256$4096$zz$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            "md5$4096$73616c74$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+            "pbkdf2-sha256$4096$73616c74$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a$x",
+        ] {
+            assert!(!verify_password(bad, "password"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn salts_and_tokens_come_from_the_os_rng() {
+        let mut a = [0u8; 16];
+        #[cfg(target_os = "linux")]
+        assert!(os_random_bytes(&mut a), "/dev/urandom must be readable on Linux");
+        random_bytes(&mut a);
+        let mut b = [0u8; 16];
+        random_bytes(&mut b);
+        assert_ne!(a, b);
+        let t = new_token();
+        assert_eq!(t.len(), 32);
+        assert_ne!(t, new_token());
+    }
+
+    #[test]
+    fn debug_output_redacts_hash_material() {
+        let path = tmp("debug");
+        let store = UserStore::open(&path, "rootpw").unwrap();
+        let dbg = format!("{:?}", store.get(ROOT_USER).unwrap());
+        let file = fs::read_to_string(&path).unwrap();
+        let stored_hash = file.split('\t').nth(1).unwrap().rsplit('$').next().unwrap();
+        assert!(!dbg.contains(stored_hash), "{dbg}");
+        assert!(dbg.contains("pbkdf2-sha256(iterations="), "{dbg}");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pre-versioning `users.db` (DefaultHasher digests) still loads; the
+    /// entry verifies with the legacy function, is re-hashed into the PBKDF2
+    /// format on login, and survives a reload.
+    #[test]
+    fn legacy_entries_verify_and_migrate_on_login() {
+        let path = tmp("legacy");
+        let salt = 0x0123_4567_89ab_cdefu64;
+        let root_salt = 0x1111_2222_3333_4444u64;
+        let legacy = format!(
+            "alice\t{salt:016x}\t{:016x}\tquery,update\nroot\t{root_salt:016x}\t{:016x}\tadmin\n",
+            legacy_hash_password("alicepw", salt),
+            legacy_hash_password("rootpw", root_salt),
+        );
+        fs::write(&path, &legacy).unwrap();
+
+        let mut store = UserStore::open(&path, "ignored-root-seed").unwrap();
+        assert!(store.has_priv("alice", Privilege::Update));
+        assert!(store.verify("alice", "alicepw"), "legacy hash verifies");
+        assert!(!store.verify("alice", "wrong"));
+        // `verify` alone does not rewrite the file: legacy lines are preserved.
+        store.save().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&format!("alice\t{salt:016x}\t")), "{text}");
+
+        // Login upgrades alice (only alice) to the versioned format.
+        assert!(store.login("alice", "alicepw").is_some());
+        let text = fs::read_to_string(&path).unwrap();
+        let alice = text.lines().find(|l| l.starts_with("alice\t")).unwrap();
+        assert!(alice.starts_with("alice\tpbkdf2-sha256$"), "{alice}");
+        assert!(alice.ends_with("\tquery,update"), "{alice}");
+        let root = text.lines().find(|l| l.starts_with("root\t")).unwrap();
+        assert!(root.starts_with(&format!("root\t{root_salt:016x}\t")), "{root}");
+
+        // After a reload the migrated entry still verifies; root still legacy.
+        let mut store = UserStore::open(&path, "ignored").unwrap();
+        assert!(store.verify("alice", "alicepw"));
+        assert!(!store.verify("alice", "wrong"));
+        assert!(store.verify_and_upgrade(ROOT_USER, "rootpw"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.lines().any(|l| !l.contains("pbkdf2-sha256$")), "{text}");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Recovery for an entry that no longer verifies (e.g. a legacy hash after a
+    /// toolchain change): reset it offline, without the old password.
+    #[test]
+    fn root_password_can_be_reset_offline() {
+        let path = tmp("reset");
+        // A legacy root line whose digest cannot verify any password we try.
+        fs::write(&path, "root\t00000000000000ff\tdeadbeefdeadbeef\tadmin\n").unwrap();
+        let store = UserStore::open(&path, "seed").unwrap();
+        assert!(!store.verify(ROOT_USER, "seed"));
+        drop(store);
+
+        UserStore::reset_password_offline(&path, ROOT_USER, "new-root-pw").unwrap();
+        let store = UserStore::open(&path, "seed").unwrap();
+        assert!(store.verify(ROOT_USER, "new-root-pw"));
+        assert!(store.has_priv(ROOT_USER, Privilege::Admin));
+        // Missing file: root is created with the new password.
+        let fresh = tmp("reset_fresh");
+        UserStore::reset_password_offline(&fresh, ROOT_USER, "pw2").unwrap();
+        assert!(UserStore::open(&fresh, "other").unwrap().verify(ROOT_USER, "pw2"));
+        // Unknown users are an error, not silently created.
+        assert!(UserStore::reset_password_offline(&fresh, "nobody", "x").is_err());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&fresh);
+    }
+
+    #[test]
+    fn verified_credentials_cache_is_invalidated_on_password_change() {
+        let path = tmp("cache");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("carol", "old", BTreeSet::new()).unwrap();
+        assert!(store.verify("carol", "old"));
+        assert!(store.verify("carol", "old"), "cached fast path");
+        store.set_password("carol", "new").unwrap();
+        assert!(!store.verify("carol", "old"), "stale cache entry must not verify");
+        assert!(store.verify("carol", "new"));
+        store.drop_user("carol").unwrap();
+        assert!(!store.verify("carol", "new"));
+        // Re-creating the user with a different password does not resurrect it.
+        store.add("carol", "third", BTreeSet::new()).unwrap();
+        assert!(!store.verify("carol", "new"));
+        assert!(store.verify("carol", "third"));
+        assert!(!store.verify("nobody", "x"));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

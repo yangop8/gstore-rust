@@ -418,3 +418,50 @@ fn allowed_dir_policy_refuses_symlink_escapes() {
         "outside via alias policy",
     );
 }
+
+// ---- 4. stable password hashing --------------------------------------------
+
+/// The persisted `users.db` entry is the versioned PBKDF2-HMAC-SHA256 format,
+/// and it verifies again after a reload (no dependence on `DefaultHasher`).
+#[test]
+fn users_db_stores_versioned_pbkdf2_hashes() {
+    use gstore::http_users::{
+        hash_password, verify_password, UserStore, PBKDF2_ITERATIONS, ROOT_USER,
+    };
+    let path =
+        std::env::temp_dir().join(format!("gstore_hardening_users_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut store = UserStore::open(&path, "r00t").unwrap();
+        store
+            .add("dave", "s3cret", std::collections::BTreeSet::new())
+            .unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    for line in text.lines() {
+        let cred = line.split('\t').nth(1).unwrap();
+        let parts: Vec<&str> = cred.split('$').collect();
+        assert_eq!(parts[0], "pbkdf2-sha256", "{line}");
+        let iterations = parts[1].parse::<u32>().unwrap();
+        assert_eq!(iterations, PBKDF2_ITERATIONS);
+        assert!(iterations >= 10_000, "work factor floor");
+        assert_eq!(parts[2].len(), 32, "16-byte salt");
+        assert_eq!(parts[3].len(), 64, "32-byte digest");
+        assert!(!line.contains("s3cret") && !line.contains("r00t"));
+    }
+    let mut store = UserStore::open(&path, "ignored").unwrap();
+    assert!(store.verify(ROOT_USER, "r00t"));
+    assert!(store.verify("dave", "s3cret"));
+    assert!(!store.verify("dave", "S3cret"));
+    assert!(store.login("dave", "s3cret").is_some());
+    assert!(store.login("dave", "nope").is_none());
+
+    // The same scheme is available standalone, and is pinned by a published
+    // PBKDF2-HMAC-SHA256 vector (P="password", S="salt", c=4096).
+    assert!(verify_password(&hash_password("x"), "x"));
+    assert!(verify_password(
+        "pbkdf2-sha256$4096$73616c74$c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+        "password"
+    ));
+    let _ = std::fs::remove_file(&path);
+}
