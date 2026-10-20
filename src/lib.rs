@@ -25,6 +25,7 @@ pub mod analytics;
 pub mod backend;
 pub mod cluster;
 pub mod concurrent;
+pub mod config;
 pub mod dict;
 pub mod error;
 /// The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).
