@@ -4,12 +4,12 @@
 //! # Upstream model
 //!
 //! Mirrors gStore 1.4's `CSR` (`src/Database/CSR.{h,cpp}`) as built by
-//! `GeneralEvaluation::loadCSR` (`src/Query/GeneralEvaluation.cpp:137-232`)
+//! `GeneralEvaluation::loadCSR` (`src/Query/GeneralEvaluation.cpp:137-258`)
 //! and read through `CSRQueryHandler` (`src/Query/Algorithm/CSRQueryHandler.cpp`):
 //!
 //! * **Entities only.** A triple `(s, p, o)` becomes an edge `s -p-> o` only when
 //!   `o` is an entity (IRI / blank node); triples with a literal object are
-//!   skipped (GE:166-170 drops objects `>= LITERAL_FIRST_ID`; GE:205-206 skips
+//!   skipped (GE:173-177 drops objects `>= LITERAL_FIRST_ID`; GE:210-211 skips
 //!   literal objects for the in-direction).
 //! * **Per predicate, both directions.** Upstream keeps `csr[0]` (out: subject →
 //!   objects) and `csr[1]` (in: object → subjects) *per predicate*. Here every
@@ -22,9 +22,9 @@
 //!   pair appears once in each predicate's list). Within one predicate a triple
 //!   is a set element, so there are no duplicates.
 //! * **Vertex set / counts.** [`CsrGraph::num_nodes`] is upstream `csr[1].n`
-//!   (distinct vertices appearing in any adjacency list, GE:233-239) and
+//!   (distinct vertices appearing in any adjacency list, GE:238-245) and
 //!   [`CsrGraph::num_edges`] is `csr[1].m` (sum of per-predicate edge counts,
-//!   GE:241-244).
+//!   GE:247-250).
 //!
 //! # Node ids
 //!
@@ -393,9 +393,22 @@ impl CsrGraph {
         entities.dedup();
         entities.shrink_to_fit();
         let n = entities.len();
+        // Entity → node lookup for the build: a direct table when the ids are
+        // reasonably dense (the usual case: ids are allocated sequentially),
+        // a binary search otherwise. Every endpoint is in `entities`.
+        let max_id = entities.last().copied().unwrap_or(0) as usize;
+        let dense: Option<Vec<Node>> = (max_id < 4 * n + 1024).then(|| {
+            let mut table = vec![Node::MAX; max_id + 1];
+            for (i, &e) in entities.iter().enumerate() {
+                table[e as usize] = i as Node;
+            }
+            table
+        });
         let node = |e: EntityLiteralId| -> Node {
-            // Every endpoint is in `entities` by construction.
-            entities.binary_search(&e).map_or(0, |i| i as Node)
+            match &dense {
+                Some(table) => table[e as usize],
+                None => entities.binary_search(&e).map_or(0, |i| i as Node),
+            }
         };
 
         // Out-adjacency: sorted by (sub, pred, obj); node order is monotone in
@@ -826,6 +839,28 @@ mod tests {
         );
         assert_eq!(g.node_of(9), Some(2));
         assert_eq!(g.entity_of(1), 5);
+    }
+
+    #[test]
+    fn sparse_and_dense_entity_ids_build_the_same_shape() {
+        // Sparse ids (binary-search lookup during the build) …
+        let sparse = CsrGraph::from_id_triples(vec![
+            t(1_000_000, 0, 7),
+            t(7, 0, 1_999_999_999),
+            t(1_000_000, 1, 1_999_999_999),
+        ])
+        .unwrap();
+        // … and the same graph with dense ids (table lookup).
+        let dense = CsrGraph::from_id_triples(vec![t(1, 0, 0), t(0, 0, 2), t(1, 1, 2)]).unwrap();
+        assert_eq!(sparse.entities(), &[7, 1_000_000, 1_999_999_999]);
+        for g in [&sparse, &dense] {
+            assert_eq!(g.num_nodes(), 3);
+            assert_eq!(g.out_nbrs(1, 0), &[0]);
+            assert_eq!(g.out_nbrs(1, 1), &[2]);
+            assert_eq!(g.out_nbrs(0, 0), &[2]);
+            assert_eq!(g.in_nbrs(2, 0), &[0]);
+            assert_eq!(g.in_nbrs(2, 1), &[1]);
+        }
     }
 
     #[test]

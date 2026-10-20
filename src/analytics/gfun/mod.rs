@@ -39,9 +39,10 @@
 //!   members) are **entity ids** (not CSR node indices), printed as C `int`.
 //! * **Separators — the one deliberate deviation.** Some upstream builders
 //!   append consecutive entries without a `,` (e.g. the variable-argument
-//!   branch of `kHopReachable`, GE:2759-2769; `betweennessCentrality` /
-//!   `JaccardSimilarity` / `degreeCorrelation` / `kHopAllNeighbors` wrappers,
-//!   GE:4099-4177), which only shows when more than one source binding is
+//!   branch of `kHopReachable`, GE:2759-2769; per-source `clusterCoeff`,
+//!   GE:2984-2987; the `betweennessCentrality` / `JaccardSimilarity` /
+//!   `degreeCorrelation` / `kHopAllNeighbors` wrappers, GE:4099-4177), which
+//!   only shows when more than one source binding is
 //!   evaluated and yields invalid JSON. Ports emit `,` between consecutive
 //!   entries there. Everything else (including the unquoted IRIs above,
 //!   which the upstream docs show) is reproduced as is.
