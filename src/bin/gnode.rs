@@ -4,8 +4,9 @@
 //! coordinator (see [`gstore::cluster::ShardNode`] / [`gstore::rpc`]).
 //!
 //! **Experimental.** `gnode` exercises the experimental [`gstore::cluster`]
-//! layer: nothing it holds is persisted (a restarted node starts empty), the
-//! RPC protocol is unauthenticated and may change between releases, and it is
+//! layer: nothing written to it is persisted (a restarted node starts from its
+//! optional `data_file` only, a cluster replica from nothing), the RPC
+//! protocol is unauthenticated and may change between releases, and it is
 //! not connected to `gserver` or the HTTP API. It has no counterpart in
 //! upstream gStore 1.4. Do not use it for data you need to keep.
 //!
