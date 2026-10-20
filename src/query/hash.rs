@@ -7,8 +7,18 @@
 //! the UTF-8 bytes of a string and returns the lowercase hex digest, which is
 //! exactly the lexical form SPARQL requires.
 //!
+//! SHA-256 is also exposed as an incremental [`Sha256`] context, on which the
+//! module builds [`HmacSha256`] / [`hmac_sha256`] (RFC 2104) and
+//! [`pbkdf2_hmac_sha256`] (RFC 8018). Those back the stable, versioned password
+//! hashes in [`crate::http_users`] — unlike `std`'s `DefaultHasher`, whose
+//! algorithm may change between Rust releases, these outputs are fixed by
+//! their specifications forever. [`constant_time_eq`] is the matching
+//! timing-independent comparison.
+//!
 //! Correctness is pinned by `#[cfg(test)]` vectors against the published digests
-//! of the empty string and `"abc"`.
+//! of the empty string and `"abc"`, the RFC 4231 HMAC-SHA256 test cases, and
+//! published PBKDF2-HMAC-SHA256 vectors (RFC 7914 §11 and the RFC 6070-style
+//! set).
 
 /// Render bytes as a lowercase hex string.
 fn to_hex(bytes: &[u8]) -> String {
@@ -179,70 +189,254 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// The SHA-256 initial hash value H(0).
+const SHA256_IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// The SHA-256 compression function: fold one 64-byte block into `h`.
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (i, word) in w.iter_mut().take(16).enumerate() {
+        *word = u32::from_be_bytes([
+            block[i * 4],
+            block[i * 4 + 1],
+            block[i * 4 + 2],
+            block[i * 4 + 3],
+        ]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let mut v = *h;
+    for i in 0..64 {
+        let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+        let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+        let t1 = v[7]
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+        let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+        let t2 = s0.wrapping_add(maj);
+        v[7] = v[6];
+        v[6] = v[5];
+        v[5] = v[4];
+        v[4] = v[3].wrapping_add(t1);
+        v[3] = v[2];
+        v[2] = v[1];
+        v[1] = v[0];
+        v[0] = t1.wrapping_add(t2);
+    }
+    for (hi, vi) in h.iter_mut().zip(v.iter()) {
+        *hi = hi.wrapping_add(*vi);
+    }
+}
+
+/// An incremental (streaming) SHA-256 context: [`update`](Self::update) with
+/// any number of byte slices, then [`finalize`](Self::finalize). Cloning a
+/// context snapshots its state, which HMAC uses to precompute the keyed
+/// inner/outer prefixes once instead of re-hashing the padded key per message.
+#[derive(Clone)]
+pub struct Sha256 {
+    h: [u32; 8],
+    /// Pending bytes of the not-yet-full current block.
+    buf: [u8; 64],
+    buf_len: usize,
+    /// Total message length in bytes so far (for the final length padding).
+    total_len: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Sha256::new()
+    }
+}
+
+impl Sha256 {
+    /// A fresh context (the hash of the empty message so far).
+    pub fn new() -> Sha256 {
+        Sha256 {
+            h: SHA256_IV,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Absorb `data` into the running hash.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 64 {
+                return;
+            }
+            let block = self.buf;
+            sha256_compress(&mut self.h, &block);
+            self.buf_len = 0;
+        }
+        let mut blocks = data.chunks_exact(64);
+        for block in &mut blocks {
+            let block: &[u8; 64] = block.try_into().expect("chunks_exact yields 64-byte blocks");
+            sha256_compress(&mut self.h, block);
+        }
+        let rest = blocks.remainder();
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    /// Apply the FIPS 180-4 padding and return the 32-byte digest.
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        // 0x80, then zeros up to 56 mod 64, then the 64-bit big-endian length.
+        let pad_zeros = (119 - self.buf_len) % 64;
+        let mut tail = [0u8; 72];
+        tail[0] = 0x80;
+        tail[1 + pad_zeros..1 + pad_zeros + 8].copy_from_slice(&bit_len.to_be_bytes());
+        let tail_len = 1 + pad_zeros + 8;
+        // `update` would also count the padding into `total_len`; that no longer
+        // matters because the length field is already captured above.
+        self.update(&tail[..tail_len]);
+        debug_assert_eq!(self.buf_len, 0);
+        let mut out = [0u8; 32];
+        for (i, word) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// SHA-256 digest (32 bytes).
 pub fn sha256(input: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+    let mut ctx = Sha256::new();
+    ctx.update(input);
+    ctx.finalize()
+}
 
-    let mut msg = input.to_vec();
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
+// ---------------------------------------------------------------------------
+// HMAC-SHA256 (RFC 2104 / RFC 4231) and PBKDF2-HMAC-SHA256 (RFC 8018)
+// ---------------------------------------------------------------------------
 
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
+/// SHA-256's block size in bytes (the HMAC key-padding width).
+const SHA256_BLOCK: usize = 64;
+
+/// A keyed HMAC-SHA256 instance with the inner (`K ⊕ ipad`) and outer
+/// (`K ⊕ opad`) prefixes already absorbed, so each MAC costs only the message
+/// blocks plus one outer block — what makes PBKDF2's many iterations cheap.
+#[derive(Clone)]
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    /// Key an HMAC. Keys longer than the block size are hashed first (RFC 2104).
+    pub fn new(key: &[u8]) -> HmacSha256 {
+        let mut k = [0u8; SHA256_BLOCK];
+        if key.len() > SHA256_BLOCK {
+            k[..32].copy_from_slice(&sha256(key));
+        } else {
+            k[..key.len()].copy_from_slice(key);
         }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
+        let mut ipad = [0x36u8; SHA256_BLOCK];
+        let mut opad = [0x5cu8; SHA256_BLOCK];
+        for i in 0..SHA256_BLOCK {
+            ipad[i] ^= k[i];
+            opad[i] ^= k[i];
         }
-        let mut v = h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7]
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(SHA256_K[i])
-                .wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v[7] = v[6];
-            v[6] = v[5];
-            v[5] = v[4];
-            v[4] = v[3].wrapping_add(t1);
-            v[3] = v[2];
-            v[2] = v[1];
-            v[1] = v[0];
-            v[0] = t1.wrapping_add(t2);
-        }
-        for (hi, vi) in h.iter_mut().zip(v.iter()) {
-            *hi = hi.wrapping_add(*vi);
-        }
+        let mut inner = Sha256::new();
+        inner.update(&ipad);
+        let mut outer = Sha256::new();
+        outer.update(&opad);
+        HmacSha256 { inner, outer }
     }
 
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    /// The MAC of the concatenation of `parts` under this key.
+    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut inner = self.inner.clone();
+        for p in parts {
+            inner.update(p);
+        }
+        let ih = inner.finalize();
+        let mut outer = self.outer.clone();
+        outer.update(&ih);
+        outer.finalize()
     }
-    out
+}
+
+/// HMAC-SHA256 of `msg` under `key` (RFC 2104 with SHA-256, RFC 4231 vectors).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    HmacSha256::new(key).mac(&[msg])
+}
+
+/// PBKDF2 (RFC 8018 §5.2) with HMAC-SHA256 as the PRF: derive `out.len()` bytes
+/// from `password` and `salt` using `iterations` rounds (`0` is treated as 1).
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    let prf = HmacSha256::new(password);
+    let iterations = iterations.max(1);
+    for (block_idx, chunk) in out.chunks_mut(32).enumerate() {
+        // INT(i): the 1-based block index, big-endian. `out` would need to be
+        // > 128 GiB for this to overflow u32.
+        let i = u32::try_from(block_idx + 1).unwrap_or(u32::MAX).to_be_bytes();
+        let mut u = prf.mac(&[salt, &i]);
+        let mut t = u;
+        for _ in 1..iterations {
+            u = prf.mac(&[&u]);
+            for (tb, ub) in t.iter_mut().zip(u.iter()) {
+                *tb ^= ub;
+            }
+        }
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+}
+
+/// Compare two byte strings in time independent of where they first differ
+/// (lengths are not secret). Use for MAC / password-hash verification.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    // `black_box` discourages the optimizer from short-circuiting the fold.
+    std::hint::black_box(diff) == 0
+}
+
+/// Lowercase hex rendering of `bytes` (public for password-hash encoding).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    to_hex(bytes)
+}
+
+/// Decode a hex string (either case) into bytes; `None` on odd length or a
+/// non-hex digit.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    b.chunks_exact(2)
+        .map(|p| Some((nib(p[0])? << 4) | nib(p[1])?))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +641,145 @@ mod tests {
             sha512_hex("abc"),
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
         );
+    }
+
+    #[test]
+    fn streaming_sha256_matches_one_shot_at_every_split() {
+        // Exercise every buffer boundary: lengths around the 55/56/64-byte
+        // padding edges, fed in uneven pieces.
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+        for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 119, 120, 128, 300] {
+            let msg = &data[..len];
+            let want = sha256(msg);
+            for split in [0usize, 1, 13, 63, 64, 65] {
+                let split = split.min(len);
+                let mut ctx = Sha256::new();
+                ctx.update(&msg[..split]);
+                ctx.update(&msg[split..]);
+                assert_eq!(ctx.finalize(), want, "len={len} split={split}");
+            }
+        }
+        // 1,000,000 × 'a' (FIPS 180-2 appendix B.3), fed in 1000-byte chunks.
+        let mut ctx = Sha256::new();
+        let chunk = [b'a'; 1000];
+        for _ in 0..1000 {
+            ctx.update(&chunk);
+        }
+        assert_eq!(
+            to_hex(&ctx.finalize()),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    /// RFC 4231 §4.2–4.8: all seven HMAC-SHA256 test cases.
+    #[test]
+    fn hmac_sha256_rfc4231_vectors() {
+        let tc = |key: &[u8], data: &[u8]| to_hex(&hmac_sha256(key, data));
+        assert_eq!(
+            tc(&[0x0b; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            tc(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            tc(&[0xaa; 20], &[0xdd; 50]),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        );
+        let key4: Vec<u8> = (1..=25).collect();
+        assert_eq!(
+            tc(&key4, &[0xcd; 50]),
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
+        );
+        // Test case 5 is truncated to 128 bits.
+        assert_eq!(
+            &tc(&[0x0c; 20], b"Test With Truncation")[..32],
+            "a3b6167473100ee06e0c796c2955552b"
+        );
+        // Test cases 6–7: a key longer than the block size is hashed first.
+        assert_eq!(
+            tc(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert_eq!(
+            tc(
+                &[0xaa; 131],
+                b"This is a test using a larger than block-size key and a larger than \
+                  block-size data. The key needs to be hashed before being used by the \
+                  HMAC algorithm."
+            ),
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
+        );
+    }
+
+    #[test]
+    fn hmac_multi_part_equals_concatenation() {
+        let mac = HmacSha256::new(b"k");
+        assert_eq!(mac.mac(&[b"ab", b"", b"cd"]), hmac_sha256(b"k", b"abcd"));
+    }
+
+    fn pbkdf2_hex(p: &[u8], s: &[u8], c: u32, len: usize) -> String {
+        let mut out = vec![0u8; len];
+        pbkdf2_hmac_sha256(p, s, c, &mut out);
+        to_hex(&out)
+    }
+
+    /// Published PBKDF2-HMAC-SHA256 vectors: the RFC 6070 inputs re-derived
+    /// with SHA-256 (as widely published), plus RFC 7914 §11.
+    #[test]
+    fn pbkdf2_hmac_sha256_known_vectors() {
+        assert_eq!(
+            pbkdf2_hex(b"password", b"salt", 1, 32),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+        assert_eq!(
+            pbkdf2_hex(b"password", b"salt", 2, 32),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
+        assert_eq!(
+            pbkdf2_hex(b"password", b"salt", 4096, 32),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+        // Multi-block output (40 bytes ⇒ two PRF blocks, second truncated).
+        assert_eq!(
+            pbkdf2_hex(
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096,
+                40
+            ),
+            "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9"
+        );
+        // Embedded NULs.
+        assert_eq!(
+            pbkdf2_hex(b"pass\0word", b"sa\0lt", 4096, 16),
+            "89b69d0516f829893c696226650a8687"
+        );
+        // RFC 7914 §11 (the PBKDF2-HMAC-SHA256 vectors used by scrypt).
+        assert_eq!(
+            pbkdf2_hex(b"passwd", b"salt", 1, 64),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+             49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+        assert_eq!(
+            pbkdf2_hex(b"Password", b"NaCl", 80000, 64),
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56\
+             a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_and_hex_roundtrip() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+        let bytes = [0x00u8, 0x7f, 0x80, 0xff, 0x12];
+        assert_eq!(hex_decode(&hex_encode(&bytes)).unwrap(), bytes);
+        assert_eq!(hex_decode("ABcd").unwrap(), vec![0xab, 0xcd]);
+        assert!(hex_decode("abc").is_none());
+        assert!(hex_decode("zz").is_none());
     }
 
     #[test]
