@@ -1,14 +1,18 @@
-//! `gbuild` — build a database from RDF (N-Triples) files.
+//! `gbuild` — build a database from RDF files.
 //!
 //! Mirrors gStore's `gbuild`:
 //!
 //! ```text
-//! gbuild [--disk | --rocksdb] <db_name> <data.nt> [more.nt ...]
+//! gbuild [--disk | --rocksdb] <db_name> <data.nt> [more.ttl ...]
 //! ```
 //!
 //! Produces a `<db_name>.db` directory holding the dictionary and indexes.
 //! `--disk` selects the on-disk B+ tree KVstore; `--rocksdb` (requires building
-//! with `--features rocksdb`) selects the persistent RocksDB backend.
+//! with `--features rocksdb`) selects the persistent RocksDB backend. With every
+//! backend the format of each input file is chosen by its extension (`.nt`,
+//! `.ttl`, `.nq`, `.trig`, `.rdf`/`.xml`/`.owl`, `.jsonld`/`.json`,
+//! `.html`/`.xhtml`; anything else is parsed as Turtle). Building replaces any
+//! database previously stored in the directory, whatever its backend.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -46,7 +50,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         // Reopen to report stats.
-        match Database::load_disk(&dir) {
+        match Database::open(&dir) {
             Ok(db) => print_stats(name, &dir, &db, started, "on-disk B+ tree"),
             Err(e) => {
                 eprintln!("built, but failed to reopen: {e}");
@@ -70,28 +74,16 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Build a RocksDB-backed database. `build_rocksdb_from_str` takes RDF text, so we
-/// concatenate the input files first. Gated on the `rocksdb` feature.
+/// Build a RocksDB-backed database (each file parsed by its extension). Gated on
+/// the `rocksdb` feature.
 #[cfg(feature = "rocksdb")]
 fn build_rocksdb(name: &str, dir: &str, files: &[String], started: Instant) -> ExitCode {
-    let mut content = String::new();
-    for f in files {
-        match std::fs::read_to_string(f) {
-            Ok(s) => {
-                content.push_str(&s);
-                content.push('\n');
-            }
-            Err(e) => {
-                eprintln!("cannot read {f}: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    if let Err(e) = Database::build_rocksdb_from_str(name.to_string(), dir, &content) {
+    // Close the freshly built store before reopening it (RocksDB takes a lock).
+    if let Err(e) = Database::build_rocksdb_from_files(name.to_string(), dir, files) {
         eprintln!("rocksdb build failed: {e}");
         return ExitCode::FAILURE;
     }
-    match Database::open_rocksdb(dir) {
+    match Database::open(dir) {
         Ok(db) => print_stats(name, dir, &db, started, "RocksDB"),
         Err(e) => {
             eprintln!("built, but failed to reopen: {e}");

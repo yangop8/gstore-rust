@@ -8,7 +8,8 @@
 //! ```
 //!
 //! SELECT prints an aligned table; ASK prints true/false; INSERT/DELETE DATA
-//! applies the update and re-saves the database.
+//! applies the update and re-saves the database. Every database layout
+//! (snapshot, on-disk, RocksDB) is opened via [`Database::open`].
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -40,13 +41,8 @@ fn main() -> ExitCode {
     };
 
     let dir = db_dir_for(name);
-    // Auto-detect the backend: an on-disk KVstore directory vs a bincode snapshot.
-    let loaded = if Database::is_disk(&dir) {
-        Database::load_disk(&dir)
-    } else {
-        Database::load(&dir)
-    };
-    let mut db = match loaded {
+    // Auto-detect the layout: snapshot, on-disk KVstore, or RocksDB.
+    let mut db = match Database::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");

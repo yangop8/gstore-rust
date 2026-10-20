@@ -6,8 +6,10 @@
 //! grestore <backup_dir> <db_name>
 //! ```
 //!
-//! Reads the snapshot in `<backup_dir>` and writes it to the target database
-//! directory (`<db_name>.db`). On-disk (KVstore) backups are copied verbatim.
+//! Restores the backup in `<backup_dir>` — any layout — into the target
+//! database directory (`<db_name>.db`), replacing what it held, via
+//! [`Database::restore_into`]: a snapshot backup is validated and re-saved;
+//! on-disk (KVstore) and RocksDB backups are copied verbatim.
 
 use std::process::ExitCode;
 
@@ -27,20 +29,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let result = if Database::is_disk(backup) {
-        // On-disk backup: copy the files into the target directory.
-        Database::backup_dir(backup, &dir)
-    } else {
-        match Database::restore(backup) {
-            Ok(db) => db.save(&dir),
-            Err(e) => {
-                eprintln!("cannot restore from '{backup}': {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-    if let Err(e) = result {
-        eprintln!("restore into '{dir}' failed: {e}");
+    if let Err(e) = Database::restore_into(backup, &dir) {
+        eprintln!("restore of '{backup}' into '{dir}' failed: {e}");
         return ExitCode::FAILURE;
     }
     println!("Restored '{backup}' into '{dir}'");

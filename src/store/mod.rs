@@ -105,6 +105,9 @@ impl<T: TripleSource + MutableStore> StorageBackend for T {}
 ///
 /// The default is `Memory` — every existing constructor wraps a fresh
 /// [`TripleStore`], so behaviour with the `rocksdb` feature *off* is identical.
+/// An on-disk (`kvstore.kv`) database also evaluates over a `Memory` working
+/// set: the `Database` facade writes every committed mutation through to its
+/// [`DiskStore`](crate::kvstore::DiskStore), which stays the source of truth.
 #[derive(Debug)]
 pub enum Backend {
     /// In-memory triple store (the default; three sorted adjacency maps).
@@ -135,6 +138,35 @@ impl Backend {
             Backend::Memory(s) => Some(s),
             #[cfg(feature = "rocksdb")]
             Backend::Rocks(_) => None,
+        }
+    }
+
+    /// The RocksDB store, if this is the `Rocks` variant.
+    #[cfg(feature = "rocksdb")]
+    pub fn as_rocks(&self) -> Option<&crate::backend::rocks::RocksStore> {
+        match self {
+            Backend::Rocks(r) => Some(r),
+            Backend::Memory(_) => None,
+        }
+    }
+
+    /// Mutable access to the RocksDB store, if this is the `Rocks` variant.
+    #[cfg(feature = "rocksdb")]
+    pub fn as_rocks_mut(&mut self) -> Option<&mut crate::backend::rocks::RocksStore> {
+        match self {
+            Backend::Rocks(r) => Some(r),
+            Backend::Memory(_) => None,
+        }
+    }
+
+    /// Collect (and clear) a write error a persistent variant recorded because
+    /// [`MutableStore`]'s `bool` results cannot carry one. Always `None` for the
+    /// in-memory store, whose writes cannot fail.
+    pub fn take_write_error(&self) -> Option<String> {
+        match self {
+            Backend::Memory(_) => None,
+            #[cfg(feature = "rocksdb")]
+            Backend::Rocks(r) => r.take_error(),
         }
     }
 

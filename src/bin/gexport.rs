@@ -24,12 +24,7 @@ fn main() -> ExitCode {
     let dir = db_dir_for(&args[1]);
     let out = &args[2];
 
-    let db = if Database::is_disk(&dir) {
-        Database::load_disk(&dir)
-    } else {
-        Database::load(&dir)
-    };
-    let db = match db {
+    let db = match Database::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
