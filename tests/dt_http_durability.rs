@@ -125,7 +125,12 @@ fn on_disk_has_new_triple(dir: &Path) -> bool {
 fn start_single(
     tag: &str,
     check_point: bool,
-) -> (Arc<Server>, SocketAddr, PathBuf, thread::JoinHandle<ShutdownReport>) {
+) -> (
+    Arc<Server>,
+    SocketAddr,
+    PathBuf,
+    thread::JoinHandle<ShutdownReport>,
+) {
     let dir = tmp_dir(tag);
     Database::build_from_str("single", DATA)
         .unwrap()
@@ -158,7 +163,9 @@ fn single_server_update_survives_shutdown_and_reload() {
     assert!(status.contains("\"dirty\":true"), "{status}");
 
     server.shutdown();
-    let report = serving.join().expect("serve_forever returns after shutdown");
+    let report = serving
+        .join()
+        .expect("serve_forever returns after shutdown");
     assert!(report.drained, "{report:?}");
     assert_eq!(report.saved, vec![dir.clone()], "{report:?}");
     assert!(report.failed.is_empty(), "{report:?}");
@@ -167,7 +174,12 @@ fn single_server_update_survives_shutdown_and_reload() {
         "the update must be on disk after a graceful shutdown"
     );
     // The original data is intact too.
-    assert!(on_disk_has(&dir, "http://ex/a", "http://ex/p", "http://ex/b"));
+    assert!(on_disk_has(
+        &dir,
+        "http://ex/a",
+        "http://ex/p",
+        "http://ex/b"
+    ));
     // The listener is closed: new connections are refused.
     assert!(
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err(),
@@ -194,7 +206,12 @@ fn single_server_check_point_saves_every_update() {
         "DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }",
     );
     assert_eq!(s, 200);
-    assert!(!on_disk_has(&dir, "http://ex/a", "http://ex/p", "http://ex/b"));
+    assert!(!on_disk_has(
+        &dir,
+        "http://ex/a",
+        "http://ex/p",
+        "http://ex/b"
+    ));
     let (_, status) = request(&addr, "GET", "/status", None, "");
     assert!(status.contains("\"dirty\":false"), "{status}");
     server.shutdown();
@@ -205,7 +222,11 @@ fn single_server_check_point_saves_every_update() {
 #[test]
 fn single_server_without_a_directory_stays_in_memory() {
     let server = Arc::new(
-        Server::bind(Database::build_from_str("mem", DATA).unwrap(), "127.0.0.1:0").unwrap(),
+        Server::bind(
+            Database::build_from_str("mem", DATA).unwrap(),
+            "127.0.0.1:0",
+        )
+        .unwrap(),
     );
     assert!(server.db_dir().is_none());
     let addr = server.local_addr().unwrap();
@@ -214,7 +235,10 @@ fn single_server_without_a_directory_stays_in_memory() {
     assert_eq!(request(&addr, "POST", "/update", None, NEW_TRIPLE).0, 200);
     server.shutdown_handle().shutdown();
     let report = serving.join().unwrap();
-    assert!(report.saved.is_empty() && report.failed.is_empty(), "{report:?}");
+    assert!(
+        report.saved.is_empty() && report.failed.is_empty(),
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -230,7 +254,7 @@ fn single_server_shutdown_lets_an_in_flight_request_finish() {
     )
     .unwrap();
     s.flush().unwrap();
-    thread::sleep(Duration::from_millis(200)); // let the accept loop hand it off
+    thread::sleep(Duration::from_millis(500)); // let the accept loop hand it off
     server.shutdown();
     thread::sleep(Duration::from_millis(200));
     assert!(
@@ -264,11 +288,14 @@ fn single_server_shutdown_wait_is_bounded() {
     let serving = thread::spawn(move || s2.serve_forever());
     // A client that connects and never sends a request pins a worker.
     let _idle = TcpStream::connect(addr).unwrap();
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(500));
     let t0 = Instant::now();
     server.shutdown();
     let report = serving.join().unwrap();
-    assert!(!report.drained, "the idle connection is still open: {report:?}");
+    assert!(
+        !report.drained,
+        "the idle connection is still open: {report:?}"
+    );
     assert!(
         t0.elapsed() < Duration::from_secs(5),
         "shutdown must not wait longer than (about) the grace period"
@@ -304,7 +331,13 @@ impl Api {
     }
 
     fn root(&self, method: &str, target: &str, body: &str) -> (u16, String) {
-        request(&self.addr, method, target, Some(&basic("root", "root")), body)
+        request(
+            &self.addr,
+            method,
+            target,
+            Some(&basic("root", "root")),
+            body,
+        )
     }
 
     fn as_user(&self, user: &str, method: &str, target: &str, body: &str) -> (u16, String) {
@@ -386,12 +419,22 @@ fn api_check_point_off_saves_only_on_checkpoint() {
     let batch = "<http://ex/x> <http://ex/p> <http://ex/y> .\n";
     assert_eq!(api.root("POST", "/batchInsert?db_name=k", batch).0, 200);
     assert!(!on_disk_has_new_triple(&api.db_dir("k")));
-    assert!(!on_disk_has(&api.db_dir("k"), "http://ex/x", "http://ex/p", "http://ex/y"));
+    assert!(!on_disk_has(
+        &api.db_dir("k"),
+        "http://ex/x",
+        "http://ex/p",
+        "http://ex/y"
+    ));
 
     let (s, body) = api.root("POST", "/checkpoint?db_name=k", "");
     assert_eq!(s, 200, "checkpoint: {body}");
     assert!(on_disk_has_new_triple(&api.db_dir("k")));
-    assert!(on_disk_has(&api.db_dir("k"), "http://ex/x", "http://ex/p", "http://ex/y"));
+    assert!(on_disk_has(
+        &api.db_dir("k"),
+        "http://ex/x",
+        "http://ex/p",
+        "http://ex/y"
+    ));
 }
 
 #[test]
@@ -410,7 +453,10 @@ fn api_check_point_on_saves_every_write() {
         "<http://ex/b1> <http://ex/p> <http://ex/o1> .\n",
     );
     assert_eq!(s, 200, "{body}");
-    assert!(on_disk_has(&dir, "http://ex/b1", "http://ex/p", "http://ex/o1"), "batch is saved");
+    assert!(
+        on_disk_has(&dir, "http://ex/b1", "http://ex/p", "http://ex/o1"),
+        "batch is saved"
+    );
 
     let (s, body) = api.root(
         "POST",
@@ -418,7 +464,10 @@ fn api_check_point_on_saves_every_write() {
         "<http://ex/u1> <http://ex/p> <http://ex/o2> .\n",
     );
     assert_eq!(s, 200, "{body}");
-    assert!(on_disk_has(&dir, "http://ex/u1", "http://ex/p", "http://ex/o2"), "upload is saved");
+    assert!(
+        on_disk_has(&dir, "http://ex/u1", "http://ex/p", "http://ex/o2"),
+        "upload is saved"
+    );
 
     let tid = api.begin("root", "w");
     let (s, _) = api.root(
@@ -432,7 +481,10 @@ fn api_check_point_on_saves_every_write() {
         "an uncommitted transactional write is never saved"
     );
     assert_eq!(api.root("POST", &format!("/commit?tid={tid}"), "").0, 200);
-    assert!(on_disk_has(&dir, "http://ex/t1", "http://ex/p", "http://ex/o3"), "commit is saved");
+    assert!(
+        on_disk_has(&dir, "http://ex/t1", "http://ex/p", "http://ex/o3"),
+        "commit is saved"
+    );
 }
 
 #[test]
@@ -452,9 +504,16 @@ fn api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions() {
     let report = api.shutdown();
     assert!(report.drained, "{report:?}");
     assert_eq!(report.rolled_back, 1, "{report:?}");
-    assert_eq!(report.saved, vec![api.db_dir("s")], "only the dirty db is saved: {report:?}");
+    assert_eq!(
+        report.saved,
+        vec![api.db_dir("s")],
+        "only the dirty db is saved: {report:?}"
+    );
     let dir = api.db_dir("s");
-    assert!(on_disk_has_new_triple(&dir), "the committed update is saved on shutdown");
+    assert!(
+        on_disk_has_new_triple(&dir),
+        "the committed update is saved on shutdown"
+    );
     assert!(
         !on_disk_has(&dir, "http://ex/uncommitted", "http://ex/p", "http://ex/o"),
         "an open transaction is rolled back, never persisted"
@@ -473,11 +532,18 @@ fn api_transaction_is_owned_by_its_user() {
 
     for path in ["/tquery", "/commit", "/rollback"] {
         let (s, body) = api.as_user("bob", "POST", &format!("{path}?tid={tid}"), insert);
-        assert_eq!(s, 403, "bob must not touch alice's transaction via {path}: {body}");
+        assert_eq!(
+            s, 403,
+            "bob must not touch alice's transaction via {path}: {body}"
+        );
         assert!(body.contains("another user"), "{body}");
     }
     // The owner may use it; root may end it.
-    assert_eq!(api.as_user("alice", "POST", &format!("/tquery?tid={tid}"), insert).0, 200);
+    assert_eq!(
+        api.as_user("alice", "POST", &format!("/tquery?tid={tid}"), insert)
+            .0,
+        200
+    );
     let (s, body) = api.root("POST", &format!("/commit?tid={tid}"), "");
     assert_eq!(s, 200, "root may commit any transaction: {body}");
     let (_, body) = api.as_user(
@@ -500,7 +566,10 @@ fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open() {
         ("/update?db_name=r", NEW_TRIPLE),
         ("/sparql?db_name=r", NEW_TRIPLE),
         ("/batchInsert?db_name=r", batch),
-        ("/batchRemove?db_name=r", "<http://ex/a> <http://ex/p> <http://ex/b> .\n"),
+        (
+            "/batchRemove?db_name=r",
+            "<http://ex/a> <http://ex/p> <http://ex/b> .\n",
+        ),
         ("/upload?db_name=r&format=ntriples", batch),
         ("/checkpoint?db_name=r", ""),
     ];
@@ -517,8 +586,14 @@ fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open() {
         "/sparql?db_name=r",
         "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
     );
-    assert!(!body.contains("http://ex/c") && !body.contains("http://ex/x"), "{body}");
-    assert!(body.contains("http://ex/b"), "the original data is intact: {body}");
+    assert!(
+        !body.contains("http://ex/c") && !body.contains("http://ex/x"),
+        "{body}"
+    );
+    assert!(
+        body.contains("http://ex/b"),
+        "the original data is intact: {body}"
+    );
     // Once the transaction is over, writes are accepted again.
     assert_eq!(api.root("POST", "/update?db_name=r", NEW_TRIPLE).0, 200);
 }
@@ -553,19 +628,32 @@ fn api_other_clients_never_read_uncommitted_data() {
     assert!(body.contains("true"), "dirty read of a delete: {body}");
     let (s, body) = api.as_user("bob", "GET", "/export?db_name=d", "");
     assert_eq!(s, 200);
-    assert!(!body.contains("http://ex/dirty") && body.contains("http://ex/b"), "{body}");
+    assert!(
+        !body.contains("http://ex/dirty") && body.contains("http://ex/b"),
+        "{body}"
+    );
     // The live store holds 3 triples (2 + 2 inserted - 1 deleted), but only
     // the committed 2 are reported while the transaction is open.
     let (_, body) = api.root("GET", "/show", "");
-    assert!(body.contains("\"triples\":2"), "committed count while txn open: {body}");
+    assert!(
+        body.contains("\"triples\":2"),
+        "committed count while txn open: {body}"
+    );
     let (_, body) = api.root("GET", "/status", "");
     assert!(body.contains("\"total_triples\":2"), "{body}");
 
-    assert_eq!(api.as_user("alice", "POST", &format!("/commit?tid={tid}"), "").0, 200);
+    assert_eq!(
+        api.as_user("alice", "POST", &format!("/commit?tid={tid}"), "")
+            .0,
+        200
+    );
     let (_, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_new);
     assert!(body.contains("true"), "visible once committed: {body}");
     let (_, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_old);
-    assert!(body.contains("false"), "the delete is visible once committed: {body}");
+    assert!(
+        body.contains("false"),
+        "the delete is visible once committed: {body}"
+    );
     let (_, body) = api.root("GET", "/show", "");
     assert!(body.contains("\"triples\":3"), "{body}");
 }
@@ -582,10 +670,21 @@ fn api_rolled_back_writes_are_never_visible() {
     );
     assert_eq!(s, 200);
     let ask = "ASK { <http://ex/rb> <http://ex/p> <http://ex/o> }";
-    assert!(api.root("POST", "/sparql?db_name=b", ask).1.contains("false"));
+    assert!(api
+        .root("POST", "/sparql?db_name=b", ask)
+        .1
+        .contains("false"));
     assert_eq!(api.root("POST", &format!("/rollback?tid={tid}"), "").0, 200);
-    assert!(api.root("POST", "/sparql?db_name=b", ask).1.contains("false"));
-    assert!(!on_disk_has(&api.db_dir("b"), "http://ex/rb", "http://ex/p", "http://ex/o"));
+    assert!(api
+        .root("POST", "/sparql?db_name=b", ask)
+        .1
+        .contains("false"));
+    assert!(!on_disk_has(
+        &api.db_dir("b"),
+        "http://ex/rb",
+        "http://ex/p",
+        "http://ex/o"
+    ));
 }
 
 #[test]
@@ -595,11 +694,18 @@ fn api_isolevel_is_validated_and_reported() {
     // Default: SERIALIZABLE (1), upstream's Txn_manager::Begin default.
     let (s, body) = api.root("POST", "/begin?db_name=i", "");
     assert_eq!(s, 200, "{body}");
-    assert!(body.contains("\"isolevel\":1") && body.contains("SERIALIZABLE"), "{body}");
+    assert!(
+        body.contains("\"isolevel\":1") && body.contains("SERIALIZABLE"),
+        "{body}"
+    );
     let tid = json_field(&body, "TID").unwrap().to_string();
     assert_eq!(api.root("POST", &format!("/rollback?tid={tid}"), "").0, 200);
 
-    for (level, code, name) in [("2", 2, "SNAPSHOT"), ("3", 3, "READ_COMMITTED"), ("serializable", 1, "SERIALIZABLE")] {
+    for (level, code, name) in [
+        ("2", 2, "SNAPSHOT"),
+        ("3", 3, "READ_COMMITTED"),
+        ("serializable", 1, "SERIALIZABLE"),
+    ] {
         let (s, body) = api.root("POST", &format!("/begin?db_name=i&isolevel={level}"), "");
         assert_eq!(s, 200, "{body}");
         assert!(body.contains(&format!("\"isolevel\":{code}")), "{body}");
@@ -624,7 +730,10 @@ fn api_unknown_and_finished_transactions_are_clean_errors() {
     let (s, body) = api.root("POST", "/commit?tid=123456789", "");
     assert_eq!(s, 404, "{body}");
     assert_eq!(api.root("POST", "/rollback?tid=abc", "").0, 400);
-    assert_eq!(api.root("POST", "/tquery?tid=987", "ASK { ?s ?p ?o }").0, 404);
+    assert_eq!(
+        api.root("POST", "/tquery?tid=987", "ASK { ?s ?p ?o }").0,
+        404
+    );
 
     let tid = api.begin("root", "t");
     assert_eq!(api.root("POST", &format!("/commit?tid={tid}"), "").0, 200);
@@ -665,11 +774,19 @@ fn api_batch_injection_payload_is_a_parse_error_and_data_is_intact() {
         "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
     );
     assert_eq!(s, 200);
-    assert!(body.contains("http://ex/b") && body.contains("Alice"), "data intact: {body}");
+    assert!(
+        body.contains("http://ex/b") && body.contains("Alice"),
+        "data intact: {body}"
+    );
     assert!(!body.contains("\"x\""), "nothing inserted: {body}");
     let (_, show) = api.root("GET", "/show", "");
     assert!(show.contains("\"triples\":2"), "{show}");
-    assert!(on_disk_has(&api.db_dir("j"), "http://ex/a", "http://ex/p", "http://ex/b"));
+    assert!(on_disk_has(
+        &api.db_dir("j"),
+        "http://ex/a",
+        "http://ex/p",
+        "http://ex/b"
+    ));
 }
 
 #[test]
@@ -681,14 +798,23 @@ fn api_batch_reports_counts_and_accepts_turtle() {
               <http://ex/a> <http://ex/p> <http://ex/b> .\n";
     let (s, body) = api.root("POST", "/batchInsert?db_name=c", nt);
     assert_eq!(s, 200, "{body}");
-    for want in ["\"format\":\"ntriples\"", "\"parsed\":2", "\"applied\":1", "\"failed\":1", "\"changed\":1"] {
+    for want in [
+        "\"format\":\"ntriples\"",
+        "\"parsed\":2",
+        "\"applied\":1",
+        "\"failed\":1",
+        "\"changed\":1",
+    ] {
         assert!(body.contains(want), "{want} in {body}");
     }
     // Turtle, detected from @prefix.
     let ttl = "@prefix : <http://ex/> .\n:t1 :p :o1 , :o2 .\n";
     let (s, body) = api.root("POST", "/batchInsert?db_name=c", ttl);
     assert_eq!(s, 200, "{body}");
-    assert!(body.contains("\"format\":\"turtle\"") && body.contains("\"applied\":2"), "{body}");
+    assert!(
+        body.contains("\"format\":\"turtle\"") && body.contains("\"applied\":2"),
+        "{body}"
+    );
     // Turtle via format=ttl, without prefixes.
     let (s, body) = api.root(
         "POST",
@@ -705,9 +831,22 @@ fn api_batch_reports_counts_and_accepts_turtle() {
               <http://ex/nope> <http://ex/p> <http://ex/o1> .\n";
     let (s, body) = api.root("POST", "/batchRemove?db_name=c", rm);
     assert_eq!(s, 200, "{body}");
-    assert!(body.contains("\"applied\":1") && body.contains("\"failed\":1"), "{body}");
-    assert!(!on_disk_has(&api.db_dir("c"), "http://ex/n1", "http://ex/p", "http://ex/o1"));
-    assert!(on_disk_has(&api.db_dir("c"), "http://ex/t1", "http://ex/p", "http://ex/o2"));
+    assert!(
+        body.contains("\"applied\":1") && body.contains("\"failed\":1"),
+        "{body}"
+    );
+    assert!(!on_disk_has(
+        &api.db_dir("c"),
+        "http://ex/n1",
+        "http://ex/p",
+        "http://ex/o1"
+    ));
+    assert!(on_disk_has(
+        &api.db_dir("c"),
+        "http://ex/t1",
+        "http://ex/p",
+        "http://ex/o2"
+    ));
 }
 
 #[test]
@@ -723,7 +862,10 @@ fn api_load_of_a_loaded_database_keeps_unsaved_changes() {
         "/sparql?db_name=l",
         "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }",
     );
-    assert!(body.contains("true"), "the unsaved update survives /load: {body}");
+    assert!(
+        body.contains("true"),
+        "the unsaved update survives /load: {body}"
+    );
 }
 
 // ---- the real gserver binary, stopped with SIGTERM ------------------------
@@ -734,7 +876,11 @@ fn api_load_of_a_loaded_database_keeps_unsaved_changes() {
 #[cfg(unix)]
 fn spawn_gserver(
     args: &[&str],
-) -> (std::process::Child, SocketAddr, thread::JoinHandle<Vec<String>>) {
+) -> (
+    std::process::Child,
+    SocketAddr,
+    thread::JoinHandle<Vec<String>>,
+) {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     let mut child = Command::new(env!("CARGO_BIN_EXE_gserver"))
@@ -788,16 +934,24 @@ fn terminate(child: &mut std::process::Child) {
 #[test]
 fn gserver_sigterm_saves_single_database() {
     let dir = tmp_dir("gserver_single");
-    Database::build_from_str("gs", DATA).unwrap().save(&dir).unwrap();
+    Database::build_from_str("gs", DATA)
+        .unwrap()
+        .save(&dir)
+        .unwrap();
     let dir_s = dir.to_string_lossy().into_owned();
-    let (mut child, addr, reader) =
-        spawn_gserver(&[&dir_s, "--port", "0", "--no-checkpoint"]);
+    let (mut child, addr, reader) = spawn_gserver(&[&dir_s, "--port", "0", "--no-checkpoint"]);
     let (s, body) = request(&addr, "POST", "/update", None, NEW_TRIPLE);
     assert_eq!(s, 200, "{body}");
-    assert!(!on_disk_has_new_triple(&dir), "--no-checkpoint: not saved yet");
+    assert!(
+        !on_disk_has_new_triple(&dir),
+        "--no-checkpoint: not saved yet"
+    );
     terminate(&mut child);
     let out = reader.join().unwrap().join("\n");
-    assert!(on_disk_has_new_triple(&dir), "SIGTERM must save the update; output:\n{out}");
+    assert!(
+        on_disk_has_new_triple(&dir),
+        "SIGTERM must save the update; output:\n{out}"
+    );
     assert!(out.contains("saved database to"), "{out}");
     assert!(out.contains(&dir_s), "{out}");
 }
@@ -822,9 +976,15 @@ fn gserver_sigterm_saves_api_databases() {
     let (s, body) = request(&addr, "POST", "/update?db_name=g", Some(&auth), NEW_TRIPLE);
     assert_eq!(s, 200, "{body}");
     let dir = root.join("g.db");
-    assert!(!on_disk_has_new_triple(&dir), "--no-checkpoint: not saved yet");
+    assert!(
+        !on_disk_has_new_triple(&dir),
+        "--no-checkpoint: not saved yet"
+    );
     terminate(&mut child);
     let out = reader.join().unwrap().join("\n");
-    assert!(on_disk_has_new_triple(&dir), "SIGTERM must save the update; output:\n{out}");
+    assert!(
+        on_disk_has_new_triple(&dir),
+        "SIGTERM must save the update; output:\n{out}"
+    );
     assert!(out.contains("saved database to"), "{out}");
 }

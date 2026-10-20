@@ -1693,13 +1693,15 @@ impl ApiInner {
             let mut slot = locked(dbh);
             let open = slot.txn.take();
             if commit {
-                slot.db.commit().map(|()| {
-                    if open.is_some_and(|o| o.changed) {
-                        slot.wrote(self.check_point)
-                    } else {
-                        None
-                    }
-                })
+                // `Database::commit` keeps the writes even when flushing its
+                // redo log fails, so the data changed either way.
+                let committed = slot.db.commit();
+                let warning = if open.is_some_and(|o| o.changed) {
+                    slot.wrote(self.check_point)
+                } else {
+                    None
+                };
+                committed.map(|()| warning)
             } else {
                 slot.db.rollback().map(|()| None)
             }
