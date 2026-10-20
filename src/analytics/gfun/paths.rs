@@ -308,8 +308,12 @@ pub fn k_hop_reachable_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 ///
 /// **Example** (SPARQL_QUERY.md): `kHopEnumerate(<Alice>, ?x, true, 3, {<like>, <focus>})`
 /// with `?x = <Carol>` → two paths `Alice -like-> Bob -like-> Eve -like-> Carol`
-/// then `Alice -focus-> Bob -like-> Eve -like-> Carol`, each with
-/// `"nodes":[{"nodeIndex":3,…<Carol>},{"nodeIndex":2,…<Eve>},{"nodeIndex":0,…<Alice>},{"nodeIndex":1,…<Bob>}]`.
+/// then `Alice -focus-> Bob -like-> Eve -like-> Carol` (predicates in the
+/// written order). The docs list each path's `nodes` as `3,2,0,1`; the
+/// `pathVec2JSON` map order for the insertion sequence `0,1,2,3` is
+/// `3,2,1,0` under libstdc++ (see
+/// [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder)), which also matches
+/// the docs' other examples — treat the docs' order here as stale.
 pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let _ = (ctx, a);
     Err(not_implemented(GFnKind::KHopEnumerate))

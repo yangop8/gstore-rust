@@ -346,7 +346,7 @@ impl GPath {
 /// * `nodes` lists each distinct path vertex once, in the iteration order of
 ///   upstream's `unordered_map<int, string> nodeIRI` filled in path order —
 ///   reproduced with [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder)
-///   (e.g. path `4→3→1→0` lists `0,1,3,4`; path `0→1→2→3` lists `3,2,0,1`).
+///   (e.g. path `4→3→1→0` lists `0,1,3,4`; path `0→1→2→3` lists `3,2,1,0`).
 /// * The unused `weight` parameter of the upstream builder is not supported
 ///   (no caller passes it; upstream would also forget a comma before it).
 pub fn push_path_json(
@@ -365,7 +365,10 @@ pub fn push_path_json(
         if i > 0 {
             out.push(',');
         }
-        let (a, b) = (path.nodes[i], path.nodes.get(i + 1).copied().unwrap_or(path.nodes[i]));
+        let (a, b) = (
+            path.nodes[i],
+            path.nodes.get(i + 1).copied().unwrap_or(path.nodes[i]),
+        );
         let (from, to) = if e.reversed { (b, a) } else { (a, b) };
         out.push_str(&format!(
             "{{\"fromNode\":{},\"toNode\":{},\"predIRI\":",
@@ -487,7 +490,9 @@ mod tests {
         for (d, w) in DS.iter().zip(want) {
             assert_eq!(cxx_to_string(*d), w, "{d}");
         }
-        assert!(cxx_to_string(1e300).starts_with("1000000000000000052504760255204420248704468581108"));
+        assert!(
+            cxx_to_string(1e300).starts_with("1000000000000000052504760255204420248704468581108")
+        );
         assert!(cxx_to_string(1e300).ends_with("540160.000000"));
         assert_eq!(cxx_to_string(0.0429273), "0.042927");
         assert_eq!(cxx_to_string(-f64::NAN), "-nan");

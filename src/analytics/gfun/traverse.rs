@@ -180,10 +180,18 @@ where
 /// indexed by node. Distances do not depend on the [`NbrOrder`].
 pub fn bfs_levels(g: &CsrGraph, src: Node, filter: &PredFilter, dir: Direction) -> Vec<u32> {
     let mut dist = vec![UNREACHED; g.num_nodes()];
-    let _ = bfs(g, src, filter, dir, NbrOrder::PerPredOutThenIn, None, |n, d| {
-        dist[n as usize] = d;
-        ControlFlow::<()>::Continue(())
-    });
+    let _ = bfs(
+        g,
+        src,
+        filter,
+        dir,
+        NbrOrder::PerPredOutThenIn,
+        None,
+        |n, d| {
+            dist[n as usize] = d;
+            ControlFlow::<()>::Continue(())
+        },
+    );
     dist
 }
 
@@ -223,9 +231,14 @@ mod tests {
     fn order_of(order: NbrOrder) -> Vec<(Node, PredId, EdgeDir)> {
         let g = g();
         let mut v = Vec::new();
-        for_each_nbr(&g, 0, &PredFilter::from_ids([0, 1]), Direction::Both, order, |n, p, d| {
-            v.push((n, p, d))
-        });
+        for_each_nbr(
+            &g,
+            0,
+            &PredFilter::from_ids([0, 1]),
+            Direction::Both,
+            order,
+            |n, p, d| v.push((n, p, d)),
+        );
         v
     }
 
@@ -255,14 +268,22 @@ mod tests {
         let o = bfs_order(&g, 5, &f, Direction::Both, NbrOrder::PerPredOutThenIn);
         assert_eq!(o, vec![(5, 0), (1, 1), (0, 2), (2, 3), (3, 3), (4, 3)]);
         let mut seen = 0;
-        let r = bfs(&g, 0, &f, Direction::Both, NbrOrder::AllInThenAllOut, Some(1), |n, _| {
-            seen += 1;
-            if n == 4 {
-                ControlFlow::Break(n)
-            } else {
-                ControlFlow::Continue(())
-            }
-        });
+        let r = bfs(
+            &g,
+            0,
+            &f,
+            Direction::Both,
+            NbrOrder::AllInThenAllOut,
+            Some(1),
+            |n, _| {
+                seen += 1;
+                if n == 4 {
+                    ControlFlow::Break(n)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
         assert_eq!(r, ControlFlow::Break(4));
         assert_eq!(seen, 3); // 0, then in-neighbours 2 and 4
         assert!(bfs_order(&g, 99, &f, Direction::Out, NbrOrder::PerPredOutThenIn).is_empty());

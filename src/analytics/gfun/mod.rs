@@ -722,7 +722,10 @@ mod tests {
     #[test]
     fn signatures_follow_the_grammar() {
         assert_eq!(GFnKind::ShortestPath.signature().len(), 4);
-        assert_eq!(GFnKind::KHopEnumerate.signature().last(), Some(&ArgSlot::OptInt));
+        assert_eq!(
+            GFnKind::KHopEnumerate.signature().last(),
+            Some(&ArgSlot::OptInt)
+        );
         assert_eq!(GFnKind::ClusterCoeff.signature()[0], ArgSlot::OptNode);
         assert_eq!(GFnKind::ConfidenceDegree.signature().len(), 6);
         assert!(GFnKind::Pr
@@ -754,7 +757,11 @@ mod tests {
             dsts: vec![n(5), n(6)],
             ..GArgs::default()
         };
-        let p: Vec<(u32, u32)> = a.pairs().iter().map(|(u, v)| (u.entity, v.entity)).collect();
+        let p: Vec<(u32, u32)> = a
+            .pairs()
+            .iter()
+            .map(|(u, v)| (u.entity, v.entity))
+            .collect();
         assert_eq!(p, vec![(1, 5), (1, 6), (2, 5), (2, 6)]);
         let s: Vec<u32> = a.distinct_srcs().iter().map(|u| u.entity).collect();
         assert_eq!(s, vec![1, 2]);

@@ -465,7 +465,11 @@ impl CsrGraph {
     /// `getSetEdgeNum(pred_set)`; a predicate listed twice is counted once
     /// because filters are de-duplicated).
     pub fn num_edges_with(&self, filter: &PredFilter) -> u64 {
-        filter.preds().iter().map(|&p| self.pred_edge_count(p)).sum()
+        filter
+            .preds()
+            .iter()
+            .map(|&p| self.pred_edge_count(p))
+            .sum()
     }
 
     /// Number of edges labelled `p` (0 for a predicate without entity edges).
@@ -693,9 +697,17 @@ impl CsrGraph {
 
     fn dir_degree(&self, adj: &Adjacency, node: Node, filter: &PredFilter) -> usize {
         if filter.is_ascending() {
-            adj.edges(node).0.iter().filter(|&&p| filter.contains(p)).count()
+            adj.edges(node)
+                .0
+                .iter()
+                .filter(|&&p| filter.contains(p))
+                .count()
         } else {
-            filter.preds().iter().map(|&p| adj.slice(node, p).len()).sum()
+            filter
+                .preds()
+                .iter()
+                .map(|&p| adj.slice(node, p).len())
+                .sum()
         }
     }
 
@@ -807,7 +819,11 @@ mod tests {
         assert_eq!(g.entities(), &[2, 5, 9]);
         assert_eq!(g.num_nodes(), 3);
         assert_eq!(g.num_edges(), 2);
-        assert_eq!(g.node_of(7), None, "subject with only literal objects is not a vertex");
+        assert_eq!(
+            g.node_of(7),
+            None,
+            "subject with only literal objects is not a vertex"
+        );
         assert_eq!(g.node_of(9), Some(2));
         assert_eq!(g.entity_of(1), 5);
     }
@@ -822,18 +838,22 @@ mod tests {
         assert_eq!(ent(g.out_nbrs(n0, 0)), vec![2]);
         assert!(g.out_nbrs(n0, 7).is_empty());
         let mut seen = Vec::new();
-        g.for_each_out(n0, &PredFilter::from_ids([1, 0]), |n, p| seen.push((p, g.entity_of(n))));
+        g.for_each_out(n0, &PredFilter::from_ids([1, 0]), |n, p| {
+            seen.push((p, g.entity_of(n)))
+        });
         assert_eq!(seen, vec![(1, 1), (1, 3), (0, 2)]);
         seen.clear();
-        g.for_each_out(n0, &PredFilter::from_ids([0, 1]), |n, p| seen.push((p, g.entity_of(n))));
+        g.for_each_out(n0, &PredFilter::from_ids([0, 1]), |n, p| {
+            seen.push((p, g.entity_of(n)))
+        });
         assert_eq!(seen, vec![(0, 2), (1, 1), (1, 3)]);
     }
 
     #[test]
     fn both_interleaves_per_predicate_in_both_scan_modes() {
         // a=0, b=1, c=2: a -p0-> b, c -p0-> a, a -p1-> c, b -p1-> a
-        let g =
-            CsrGraph::from_id_triples(vec![t(0, 0, 1), t(2, 0, 0), t(0, 1, 2), t(1, 1, 0)]).unwrap();
+        let g = CsrGraph::from_id_triples(vec![t(0, 0, 1), t(2, 0, 0), t(0, 1, 2), t(1, 1, 0)])
+            .unwrap();
         let a = g.node_of(0).unwrap();
         let collect = |f: &PredFilter| {
             let mut v = Vec::new();

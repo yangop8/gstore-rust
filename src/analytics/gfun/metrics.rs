@@ -433,7 +433,9 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
         return jaro_f32(t, s);
     }
     if s.windows(t.len()).any(|w| w == t) {
-        return (t_len as f32 / s_len as f32 + t_len as f32 / t_len as f32 + 1.0) / 3.0;
+        // Upstream: `((float)t_len/(float)s_len + (float)t_len/(float)t_len + 1)/3`;
+        // `x / x` is exactly 1.0 in IEEE arithmetic for the non-zero `t_len`.
+        return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
     }
     let match_dt = t_len / 2 - 1;
     let mut sv = vec![-1i64; s.len()];
@@ -470,6 +472,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::excessive_precision)] // goldens as C printed them (%.9g)
     fn jaro_matches_upstream_float_results() {
         // Values printed (%.9g) by the upstream function compiled with g++ 13.
         let cases: &[(&str, &str, f32)] = &[
