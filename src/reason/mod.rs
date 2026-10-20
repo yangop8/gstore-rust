@@ -53,8 +53,10 @@ pub fn materialize<S: TripleSource + MutableStore>(
     // Subclass/domain/range rules assert `rdf:type` triples, so the type
     // predicate must exist (intern it if the data never used it directly).
     let needs_type = sco_p.is_some() || dom_p.is_some() || rng_p.is_some();
+    // (An exhausted predicate id space leaves `rdf:type` unresolved: the
+    // type-asserting rules then simply infer nothing, rather than panicking.)
     let type_p = if needs_type {
-        Some(dict.intern_predicate(&key(RDF_TYPE)))
+        dict.try_intern_predicate(&key(RDF_TYPE)).ok()
     } else {
         dict.predicate_id(&key(RDF_TYPE))
     };
@@ -74,7 +76,9 @@ pub fn materialize<S: TripleSource + MutableStore>(
             .filter_map(|&e| dict.id_to_string(e).map(str::to_owned))
             .collect();
         for k in keys {
-            dict.intern_predicate(&k);
+            // Best effort: a property that cannot get a predicate id (id space
+            // exhausted) is just never resolved as a subproperty target.
+            let _ = dict.try_intern_predicate(&k);
         }
     }
 
@@ -503,11 +507,16 @@ impl RuleSet {
                 let derived = self.rules[i].derive(dict, store);
                 // Write phase: intern + insert; count only genuinely-new triples.
                 for t in derived {
-                    let id = IdTriple::new(
-                        dict.intern_entity(&t.subject.dict_key()),
-                        dict.intern_predicate(&t.predicate.dict_key()),
-                        dict.intern_term(&t.object),
-                    );
+                    // A head triple whose terms cannot be interned (a
+                    // dictionary id space is exhausted) is not materialized.
+                    let (Ok(s), Ok(p), Ok(o)) = (
+                        dict.try_intern_entity(&t.subject.dict_key()),
+                        dict.try_intern_predicate(&t.predicate.dict_key()),
+                        dict.try_intern_term(&t.object),
+                    ) else {
+                        continue;
+                    };
+                    let id = IdTriple::new(s, p, o);
                     if store.insert(id) {
                         added_all.push(id);
                         self.rules[i].effect_count += 1;

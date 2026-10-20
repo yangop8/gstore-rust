@@ -46,7 +46,22 @@ fn main() -> ExitCode {
         }
     };
 
-    let added = triples.iter().filter(|t| db.insert_triple(t)).count();
+    let mut added = 0usize;
+    for t in &triples {
+        match db.try_insert_triple(t) {
+            Ok(true) => added += 1,
+            Ok(false) => {}
+            Err(e) => {
+                // Persist what was inserted so far, then report the failure.
+                let saved = match db.save(&dir) {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (saving failed: {e})"),
+                };
+                eprintln!("inserted {added} triple(s), then failed: {e}{saved}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     if let Err(e) = db.save(&dir) {
         eprintln!("inserted {added} triple(s) but saving failed: {e}");

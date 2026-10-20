@@ -147,10 +147,21 @@ pub(crate) fn write_bincode_atomic<T: Serialize>(path: &Path, value: &T) -> Resu
 }
 
 /// Read a bincode-encoded value from `path`.
+///
+/// Same encoding as `bincode::serialize` (fixed-width ints, trailing bytes
+/// allowed), but the decoder may read at most the file's length: a corrupt
+/// length prefix then fails cleanly instead of asking the allocator for
+/// exabytes (which aborts the process).
 pub(crate) fn read_bincode<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T> {
+    use bincode::Options;
     let file = File::open(path)?;
+    let limit = file.metadata()?.len();
     let reader = io::BufReader::new(file);
-    Ok(bincode::deserialize_from(reader)?)
+    Ok(bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize_from(reader)?)
 }
 
 /// Atomically replace `dst` with a copy of the file `src`.
@@ -471,6 +482,27 @@ mod tests {
         recover_dir_swap(&target).unwrap();
         assert_eq!(fs::read(target.join("f")).unwrap(), b"new");
         assert!(!with_suffix(&target, OLD_SUFFIX).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_bincode_matches_serialize_and_rejects_huge_length_prefixes() {
+        let dir = tmp_dir("bincode_limit");
+        let ok = dir.join("ok.bin");
+        let value = (7u32, String::from("seven"), vec![1u64, 2, 3]);
+        fs::write(&ok, bincode::serialize(&value).unwrap()).unwrap();
+        let back: (u32, String, Vec<u64>) = read_bincode(&ok).unwrap();
+        assert_eq!(back, value);
+
+        // A string whose u64 length prefix claims ~7 EB: must be an error, not
+        // an allocation failure that aborts the process.
+        let bad = dir.join("bad.bin");
+        let mut bytes = u64::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"short");
+        fs::write(&bad, &bytes).unwrap();
+        assert!(read_bincode::<String>(&bad).is_err());
+        fs::write(&bad, b"definitely not bincode").unwrap();
+        assert!(read_bincode::<(String, u64)>(&bad).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

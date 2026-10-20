@@ -67,7 +67,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::db::Database;
+use crate::db::{Database, LoadPolicy};
 use crate::query::{QueryResult, ResultSet};
 use crate::sparql_results::{self, json_str, ResultFormat};
 
@@ -159,6 +159,10 @@ document.getElementById('run').addEventListener('click', function () {
 /// change is saved during a graceful [`shutdown`](Self::shutdown). A server
 /// built with plain [`bind`](Self::bind) has no directory and stays purely
 /// in-memory, exactly as before.
+///
+/// **`LOAD`.** The served database gets [`LoadPolicy::restricted`]: a client's
+/// SPARQL `LOAD` cannot make the server read local files (or anything else).
+/// Re-allow a directory with [`with_load_policy`](Self::with_load_policy).
 pub struct Server {
     /// The shared, thread-safe part handed to each connection's worker thread.
     inner: Arc<ServerInner>,
@@ -192,7 +196,9 @@ impl Server {
     /// Bind to `addr` (e.g. `"127.0.0.1:7000"` or `"127.0.0.1:0"` for an
     /// ephemeral port), taking ownership of `db`. The server is in-memory only
     /// until a directory is attached with [`with_db_dir`](Self::with_db_dir).
-    pub fn bind<A: ToSocketAddrs>(db: Database, addr: A) -> std::io::Result<Server> {
+    /// The database's `LOAD` policy is set to [`LoadPolicy::restricted`].
+    pub fn bind<A: ToSocketAddrs>(mut db: Database, addr: A) -> std::io::Result<Server> {
+        db.set_load_policy(LoadPolicy::restricted());
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         Ok(Server {
@@ -228,8 +234,17 @@ impl Server {
         self
     }
 
+    /// Replace the SPARQL `LOAD` policy of the served database (the default is
+    /// [`LoadPolicy::restricted`]), e.g. to let `LOAD` read one directory with
+    /// `LoadPolicy::restricted().with_allowed_dir(dir)`.
+    pub fn with_load_policy(self, policy: LoadPolicy) -> Server {
+        locked(&self.inner.db).set_load_policy(policy);
+        self
+    }
+
     /// Turn gStore's `check_point` policy on (the default) or off. When off,
-    /// updates stay in memory and are saved only on graceful shutdown.
+    /// updates stay in memory and are saved only on graceful shutdown (an
+    /// on-disk / RocksDB database still commits each update it writes through).
     pub fn with_check_point(mut self, on: bool) -> Server {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = on;

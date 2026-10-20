@@ -887,12 +887,10 @@ impl Database {
     /// pattern/phase boundary with [`GStoreError::Cancelled`]. Updates ignore the
     /// flag. Mirrors gStore's task cancellation.
     ///
-    /// Note: the bundled single-threaded HTTP server (`src/http_api.rs`,
-    /// `src/server.rs`) processes requests sequentially and holds its state lock
-    /// for the whole request, so it cannot deliver a `/cancel` while a query it is
-    /// running occupies that single thread — cancellation is effective for library
-    /// embedders that run queries on their own threads (and for a future
-    /// multi-threaded front-end). See the note at the `/cancel` handler.
+    /// The multi-database [`ApiServer`](crate::http_api::ApiServer) runs each
+    /// connection on its own worker thread and executes queries without its
+    /// state lock held, so `POST /cancel` (and a graceful shutdown past its grace
+    /// period) reaches a running query through this flag.
     pub fn query_cancellable(
         &mut self,
         sparql: &str,

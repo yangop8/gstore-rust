@@ -123,3 +123,37 @@ fn load_reports_exhaustion() {
     assert!(exhausted(&err), "{err}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn concurrent_txn_commit_is_all_or_nothing_on_exhaustion() {
+    use crate::concurrent::ConcurrentDb;
+    let mut db = Database::new("cc");
+    db.dict
+        .debug_advance_id_counters(ENTITY_ID_LIMIT - 1, 0, 0)
+        .unwrap();
+    let cdb = ConcurrentDb::new(db);
+    let t = |s: &str, o: &str| Triple::new(Term::iri(s), Term::iri("http://ex/p"), Term::iri(o));
+
+    // <x> takes the last entity id, so <y> cannot be encoded: the whole
+    // transaction must fail and the first triple must not stay applied.
+    let v0 = cdb.version();
+    let mut txn = cdb.begin();
+    txn.insert(t("http://ex/x", "http://ex/x"));
+    txn.insert(t("http://ex/x", "http://ex/y"));
+    let err = txn.commit().unwrap_err();
+    assert!(exhausted(&err), "{err}");
+    assert_eq!(cdb.version(), v0, "nothing was published");
+    cdb.write(|db| {
+        assert_eq!(db.triple_num(), 0, "the first insert was rolled back");
+        assert!(!db.in_transaction());
+    });
+    let rs = cdb.query("SELECT ?s WHERE { ?s ?p ?o }").unwrap();
+    assert!(matches!(rs, QueryResult::Select(ref r) if r.rows.is_empty()));
+
+    // A transaction that fits still commits.
+    let mut txn = cdb.begin();
+    txn.insert(t("http://ex/x", "http://ex/x"));
+    assert!(txn.commit().is_ok());
+    assert!(cdb.snapshot().contains(&t("http://ex/x", "http://ex/x")));
+    cdb.sync().unwrap();
+}

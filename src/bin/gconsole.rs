@@ -156,21 +156,22 @@ fn import_file(db: &mut Database, path: &str) {
     use gstore::Triple;
     let mut count = 0usize;
     let res = gstore_import(path, |t| {
-        if db.insert_triple(&t) {
+        if db.try_insert_triple(&t)? {
             count += 1;
         }
+        Ok(())
     });
     match res {
         Ok(()) => println!("imported {count} new triple(s) from {path}"),
-        Err(e) => eprintln!("import failed: {e}"),
+        Err(e) => eprintln!("import failed after {count} new triple(s): {e}"),
     }
 
     // Local import helper kept here to avoid widening the library's public API.
-    fn gstore_import<F: FnMut(Triple)>(path: &str, mut f: F) -> gstore::Result<()> {
-        gstore::parser::ntriples::for_each_triple_file(path, |t| {
-            f(t);
-            Ok(())
-        })
+    fn gstore_import<F: FnMut(Triple) -> gstore::Result<()>>(
+        path: &str,
+        f: F,
+    ) -> gstore::Result<()> {
+        gstore::parser::ntriples::for_each_triple_file(path, f)
     }
 }
 

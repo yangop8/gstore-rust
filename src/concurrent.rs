@@ -380,12 +380,18 @@ impl VersionedStore {
             let t = &chain.triple;
             match rec.op {
                 ChainOp::Insert => {
-                    let id = IdTriple::new(
-                        dict.intern_entity(&t.subject.dict_key()),
-                        dict.intern_predicate(&t.predicate.dict_key()),
-                        dict.intern_term(&t.object),
-                    );
-                    store.insert(id);
+                    // The writer database interned these terms when the
+                    // version was committed, so this cannot exhaust an id space
+                    // the writer did not; if it somehow does, skip the triple
+                    // rather than panic.
+                    let (Ok(s), Ok(p), Ok(o)) = (
+                        dict.try_intern_entity(&t.subject.dict_key()),
+                        dict.try_intern_predicate(&t.predicate.dict_key()),
+                        dict.try_intern_term(&t.object),
+                    ) else {
+                        continue;
+                    };
+                    store.insert(IdTriple::new(s, p, o));
                 }
                 ChainOp::Tombstone => {
                     if let (Some(s), Some(p), Some(o)) = (
@@ -505,6 +511,11 @@ impl ConcurrentDb {
     /// Run a closure that mutates the database under the writer lock, then
     /// publish a new snapshot. Lets callers batch several mutations into one
     /// atomically-published version.
+    ///
+    /// Direct-API mutations ([`Database::insert_triple`], …) of an on-disk /
+    /// RocksDB database become durable at the next commit point: call
+    /// [`Database::sync`] inside the closure (or [`sync`](Self::sync) after it)
+    /// to make them durable now and to see any persistence failure.
     pub fn write<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&mut Database) -> T,
@@ -515,6 +526,14 @@ impl ConcurrentDb {
         let v = self.publish(&db);
         occ.last_legacy_version = v;
         out
+    }
+
+    /// A commit point on the authoritative database (see [`Database::sync`]):
+    /// makes every mutation applied so far durable on a persistent layout and
+    /// reports any persistence failure since the previous commit point. A no-op
+    /// for an in-memory database.
+    pub fn sync(&self) -> Result<()> {
+        self.writer.lock().unwrap().sync()
     }
 
     /// Publish a fresh snapshot from the writer database (bumping the version),
@@ -795,17 +814,19 @@ impl Txn<'_> {
             )));
         }
 
-        // No conflict: apply the buffered writes to the authoritative database.
-        for op in &self.ops {
-            match op {
-                TxnOp::Insert(t) => {
-                    db.insert_triple(t);
-                }
-                TxnOp::Delete(t) => {
-                    db.remove_triple(t);
-                }
+        // No conflict: apply the buffered writes to the authoritative database,
+        // all or nothing (an insert can fail once a dictionary id space is
+        // exhausted; the ops applied before it are then undone).
+        let persist_failure = match apply_txn_ops(&mut db, &self.ops) {
+            Ok(failure) => failure,
+            Err(e) => {
+                occ.deregister(self.start_version);
+                occ.gc();
+                self.db.gc_versions(occ.gc_floor());
+                self.registered = false;
+                return Err(e);
             }
-        }
+        };
         let new_version = self.db.publish(&db);
 
         // Append this commit's per-key version records to the shared chains: one
@@ -837,13 +858,49 @@ impl Txn<'_> {
         occ.gc();
         self.db.gc_versions(occ.gc_floor());
         self.registered = false;
-        Ok(new_version)
+        // The writes are committed and published either way; a persistence
+        // failure at the commit point is reported like an auto-commit UPDATE's.
+        match persist_failure {
+            Some(e) => Err(e),
+            None => Ok(new_version),
+        }
     }
 
     /// Abort explicitly, discarding all buffered writes. (Dropping a txn without
     /// committing has the same effect.)
     pub fn abort(self) {
         // `Drop` performs the deregistration + GC.
+    }
+}
+
+/// Apply a validated transaction's buffered writes to the authoritative `db`,
+/// all or nothing: inside a [`Database`] transaction (unless the caller already
+/// opened one through [`ConcurrentDb::write`]), so an insert that cannot be
+/// encoded — a dictionary id space is exhausted — undoes the ops applied before
+/// it and is returned as `Err`. Committing that transaction is a commit point
+/// (durable on an on-disk / RocksDB layout); a persistence failure there leaves
+/// the writes applied and is returned as `Ok(Some(error))`.
+fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>> {
+    let own_txn = !db.in_transaction();
+    if own_txn {
+        db.begin()?;
+    }
+    let applied = ops.iter().try_for_each(|op| match op {
+        TxnOp::Insert(t) => db.try_insert_triple(t).map(drop),
+        TxnOp::Delete(t) => {
+            db.remove_triple(t);
+            Ok(())
+        }
+    });
+    match applied {
+        Ok(()) if own_txn => Ok(db.commit().err()),
+        Ok(()) => Ok(None),
+        Err(e) => {
+            if own_txn {
+                db.rollback()?;
+            }
+            Err(e)
+        }
     }
 }
 

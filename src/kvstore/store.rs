@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::dict::{Dictionary, DiskTermSource};
-use crate::error::{GStoreError, Result};
+use crate::error::Result;
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::{sparql, turtle};
@@ -242,7 +242,9 @@ impl DiskStore {
         if let Some(v) = self.entity2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
-        let id = self.entity_count;
+        // Bounded like the in-memory dictionary: an entity id must never spill
+        // into the literal range [LITERAL_FIRST_ID, ..).
+        let id = crate::dict::checked_entity_id(u64::from(self.entity_count))?;
         self.entity2id.insert(pager, key.as_bytes(), &be32(id))?;
         // id2entity is integer-keyed by the dense entity id.
         self.id2entity.insert(pager, id, key.as_bytes())?;
@@ -259,9 +261,7 @@ impl DiskStore {
         if let Some(v) = self.literal2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
-        let id = LITERAL_FIRST_ID
-            .checked_add(self.literal_count)
-            .ok_or_else(|| GStoreError::Database("literal id space exhausted".to_string()))?;
+        let id = crate::dict::checked_literal_id(u64::from(self.literal_count))?;
         self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
         // id2literal is integer-keyed by the *local* literal index (id minus the
         // LITERAL_FIRST_ID offset) so the dense array stays compact from 0.
@@ -277,7 +277,7 @@ impl DiskStore {
         if let Some(v) = self.predicate2id.get(pager, key.as_bytes())? {
             return Ok(de32(&v));
         }
-        let id = self.pred_count;
+        let id = crate::dict::checked_predicate_id(u64::from(self.pred_count))?;
         self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
         // id2predicate is integer-keyed by the dense predicate id.
         self.id2predicate.insert(pager, id, key.as_bytes())?;
@@ -984,20 +984,18 @@ impl DiskStore {
         let mut dict = Dictionary::new();
         for id in 0..self.entity_count {
             if let Some(s) = self.id_to_string(id)? {
-                dict.intern_entity(&s);
+                dict.try_intern_entity(&s)?;
             }
         }
         for i in 0..self.literal_count {
-            let lit_id = LITERAL_FIRST_ID
-                .checked_add(i)
-                .ok_or_else(|| GStoreError::Database("literal id space exhausted".to_string()))?;
+            let lit_id = crate::dict::checked_literal_id(u64::from(i))?;
             if let Some(s) = self.id_to_string(lit_id)? {
-                dict.intern_literal(&s);
+                dict.try_intern_literal(&s)?;
             }
         }
         for id in 0..self.pred_count {
             if let Some(s) = self.predicate_to_string(id)? {
-                dict.intern_predicate(&s);
+                dict.try_intern_predicate(&s)?;
             }
         }
         Ok(dict)
@@ -2139,5 +2137,29 @@ mod tests {
             h.join().unwrap();
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn id_spaces_are_bounded_like_the_dictionary() {
+        use crate::dict::{ENTITY_ID_LIMIT, LITERAL_INDEX_LIMIT, PREDICATE_ID_LIMIT};
+        let path = tmp("id_bounds");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        // Pretend each space is full: a *new* term must be refused (before
+        // anything is written), while already-interned terms still resolve.
+        ds.entity_count = ENTITY_ID_LIMIT;
+        ds.literal_count = LITERAL_INDEX_LIMIT;
+        ds.pred_count = PREDICATE_ID_LIMIT;
+        let e = ds.intern_entity("<brand-new>").unwrap_err().to_string();
+        assert!(e.contains("entity id space exhausted"), "{e}");
+        let e = ds.intern_literal("\"brand-new\"").unwrap_err().to_string();
+        assert!(e.contains("literal id space exhausted"), "{e}");
+        let e = ds.intern_predicate("<brand-new>").unwrap_err().to_string();
+        assert!(e.contains("predicate id space exhausted"), "{e}");
+        assert!(ds.insert_keys("<root>", "<rel>", "<x>", false).is_err());
+        assert_eq!(ds.intern_entity("<root>").unwrap(), 0);
+        assert!(ds.intern_predicate("<contain>").is_ok());
+        drop(ds);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("kv.wal")).ok();
     }
 }

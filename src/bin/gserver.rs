@@ -1,16 +1,20 @@
 //! `gserver` — serve a gStore database over HTTP.
 //!
-//! Usage: `gserver [db_dir] [--api] [--rocksdb] [--no-checkpoint] [--password PW] [--port N] [--addr HOST]`
+//! Usage: `gserver [db_dir] [--api] [--rocksdb] [--no-checkpoint] [--load-dir DIR]… [--password PW] [--port N] [--addr HOST]`
 //!
 //! Two modes:
 //!
 //! - default (single database): serve one database over the SPARQL-protocol
 //!   subset — `GET/POST /sparql`, `POST /update`, `GET /status`, and a web
-//!   console at `GET /`. `db_dir` loads that database (`--rocksdb` opens it as a
-//!   RocksDB-backed database; needs `--features rocksdb`) and updates are
-//!   persisted back to it. A `db_dir` that does not exist yet starts empty and
-//!   is created on the first save; one that exists but cannot be loaded is
-//!   served as an empty in-memory database and is never overwritten.
+//!   console at `GET /`. `db_dir` is opened whatever its layout (bincode
+//!   snapshot, on-disk `kvstore.kv` from `gbuild --disk`, or RocksDB — the last
+//!   needs `--features rocksdb`) and updates are persisted back to it: an
+//!   on-disk / RocksDB database writes each update through, a snapshot is
+//!   re-saved atomically. `--rocksdb` is accepted for compatibility and insists
+//!   the directory holds a RocksDB database. A `db_dir` that does not exist yet
+//!   (or is an empty directory) starts empty and is created on the first save;
+//!   one that holds a database that cannot be opened is an error — gserver
+//!   exits rather than serve (and later save) an empty database in its place.
 //! - `--api` (full multi-database API): serve [`gstore::http_api::ApiServer`]
 //!   rooted at `db_dir` (default `.`): users/RBAC (default user `root`, password
 //!   from `--password`, default `123456`, mirroring gStore), `/login`, `/build`,
@@ -23,7 +27,10 @@
 //! - `--no-checkpoint`: turn off gStore's `check_point` policy. By default every
 //!   write that changes data is saved to disk before it is acknowledged; with
 //!   this flag changes stay in memory and are saved on graceful shutdown (and,
-//!   in `--api` mode, on `/checkpoint` and `/unload`).
+//!   in `--api` mode, on `/checkpoint` and `/unload`). On-disk / RocksDB
+//!   databases still commit each write they apply.
+//! - `--load-dir DIR` (repeatable): let SPARQL `LOAD` read files inside `DIR`.
+//!   By default a client's `LOAD` cannot make the server read any file.
 //!
 //! `SIGINT` (Ctrl-C) and `SIGTERM` trigger a graceful shutdown: stop accepting,
 //! let in-flight requests finish, save unsaved changes, exit. A second Ctrl-C
@@ -33,7 +40,7 @@ use std::path::Path;
 
 use gstore::http_api::ApiServer;
 use gstore::server::{shutdown_on_signals, Server, ShutdownReport};
-use gstore::Database;
+use gstore::{Database, LoadPolicy, StorageKind};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -43,6 +50,7 @@ fn main() {
     let mut rocksdb = false;
     let mut api = false;
     let mut check_point = true;
+    let mut load_dirs: Vec<String> = Vec::new();
     let mut password = String::from("123456"); // gStore's default root password
     // TLS cert/key paths (feature `tls`). Declared unconditionally so both code
     // paths type-check; only ever set by the cfg-gated `--tls-*` arms below.
@@ -73,6 +81,16 @@ fn main() {
             "--rocksdb" => rocksdb = true,
             "--api" => api = true,
             "--no-checkpoint" => check_point = false,
+            "--load-dir" => {
+                i += 1;
+                match args.get(i) {
+                    Some(d) => load_dirs.push(d.clone()),
+                    None => {
+                        eprintln!("error: --load-dir needs a directory");
+                        std::process::exit(2);
+                    }
+                }
+            }
             #[cfg(feature = "tls")]
             "--tls-cert" => {
                 i += 1;
@@ -97,7 +115,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: gserver [db_dir] [--api] [--rocksdb] [--no-checkpoint] [--password PW] [--port N] [--addr HOST]"
+                    "usage: gserver [db_dir] [--api] [--rocksdb] [--no-checkpoint] [--load-dir DIR]... [--password PW] [--port N] [--addr HOST]"
                 );
                 #[cfg(feature = "tls")]
                 eprintln!("       [--tls-cert FILE --tls-key FILE]  (serve HTTPS)");
@@ -116,6 +134,8 @@ fn main() {
         std::process::exit(2);
     }
 
+    let load_policy = load_policy_for(&load_dirs);
+
     if api {
         if rocksdb {
             eprintln!("gserver: --rocksdb is ignored in --api mode (the API manages its own databases)");
@@ -126,6 +146,7 @@ fn main() {
             &host,
             port,
             check_point,
+            load_policy,
             tls_cert.as_deref(),
             tls_key.as_deref(),
         );
@@ -135,28 +156,12 @@ fn main() {
     // The database, and the directory its updates are persisted to (`None` ⇒
     // in-memory only).
     let (db, persist_dir) = match &db_dir {
-        Some(dir) if rocksdb => (open_rocksdb_or_exit(dir), Some(dir.clone())),
-        Some(dir) => match Database::load(dir) {
-            Ok(db) => (db, Some(dir.clone())),
-            Err(_) if !Path::new(dir).exists() => {
-                eprintln!(
-                    "'{dir}' does not exist yet; serving a fresh empty database that will be saved there"
-                );
-                (Database::new(db_name_for(dir)), Some(dir.clone()))
-            }
-            Err(e) => {
-                eprintln!(
-                    "could not load '{dir}' ({e}); serving a fresh empty IN-MEMORY database \
-                     (changes are not saved, so '{dir}' is never overwritten)"
-                );
-                (Database::new("gserver"), None)
-            }
-        },
+        Some(dir) => (open_or_exit(dir, rocksdb), Some(dir.clone())),
         None => (Database::new("gserver"), None),
     };
 
     let mut server = match Server::bind(db, (host.as_str(), port)) {
-        Ok(s) => s.with_check_point(check_point),
+        Ok(s) => s.with_check_point(check_point).with_load_policy(load_policy),
         Err(e) => {
             eprintln!("failed to bind {host}:{port}: {e}");
             std::process::exit(1);
@@ -205,12 +210,14 @@ fn main() {
 
 /// Serve the full multi-database API ([`ApiServer`]) rooted at `db_dir`
 /// (default the current directory), with users/RBAC and the web console.
+#[allow(clippy::too_many_arguments)]
 fn run_api(
     db_dir: Option<String>,
     password: &str,
     host: &str,
     port: u16,
     check_point: bool,
+    load_policy: LoadPolicy,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
 ) {
@@ -222,7 +229,7 @@ fn run_api(
         );
     }
     let server = match ApiServer::bind(&root, password, (host, port)) {
-        Ok(s) => s.with_check_point(check_point),
+        Ok(s) => s.with_check_point(check_point).with_load_policy(load_policy),
         Err(e) => {
             eprintln!("failed to start API server at {host}:{port}: {e}");
             std::process::exit(1);
@@ -310,17 +317,49 @@ fn print_report(report: &ShutdownReport) {
     }
 }
 
-/// Open a RocksDB-backed database (feature `rocksdb`), or exit with a message.
-#[cfg(feature = "rocksdb")]
-fn open_rocksdb_or_exit(dir: &str) -> Database {
-    Database::open_rocksdb(dir).unwrap_or_else(|e| {
-        eprintln!("could not open RocksDB database '{dir}': {e}");
-        std::process::exit(1);
-    })
+/// The `LOAD` policy for the served databases: nothing may be loaded, except
+/// files inside the `--load-dir` directories.
+fn load_policy_for(dirs: &[String]) -> LoadPolicy {
+    let mut policy = LoadPolicy::restricted();
+    for d in dirs {
+        if !Path::new(d).is_dir() {
+            eprintln!("error: --load-dir '{d}' is not a directory");
+            std::process::exit(2);
+        }
+        policy = policy.with_allowed_dir(d);
+        println!("gserver: SPARQL LOAD may read files under '{d}'");
+    }
+    policy
 }
 
-#[cfg(not(feature = "rocksdb"))]
-fn open_rocksdb_or_exit(_dir: &str) -> Database {
-    eprintln!("gserver: --rocksdb requires building with `--features rocksdb`");
-    std::process::exit(1);
+/// Open the single database at `dir`, whatever its layout. A directory that does
+/// not exist yet (or is empty) gives a fresh database that is saved there on the
+/// first update. Anything else that cannot be opened is fatal: serving an empty
+/// stand-in could later be saved over the real database.
+fn open_or_exit(dir: &str, expect_rocksdb: bool) -> Database {
+    let path = Path::new(dir);
+    let is_empty_dir = path.is_dir()
+        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
+    if !path.exists() || is_empty_dir {
+        if expect_rocksdb {
+            eprintln!("gserver: --rocksdb given but '{dir}' holds no database");
+            std::process::exit(1);
+        }
+        eprintln!("'{dir}' holds no database yet; serving a fresh empty database that will be saved there");
+        return Database::new(db_name_for(dir));
+    }
+    if expect_rocksdb && Database::storage_kind(path) != Some(StorageKind::RocksDb) {
+        eprintln!("gserver: --rocksdb given but '{dir}' is not a RocksDB-backed database");
+        std::process::exit(1);
+    }
+    match Database::open(path) {
+        Ok(db) => {
+            println!("gserver: opened '{dir}' ({} layout)", db.storage());
+            db
+        }
+        Err(e) => {
+            eprintln!("gserver: could not open database '{dir}': {e}");
+            std::process::exit(1);
+        }
+    }
 }

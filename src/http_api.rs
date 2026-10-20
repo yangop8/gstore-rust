@@ -77,7 +77,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::db::Database;
+use crate::db::{Database, LoadPolicy};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::http_users::{Privilege, UserStore, ROOT_USER};
@@ -393,6 +393,10 @@ struct DbSlot {
     dirty: bool,
     /// The open HTTP transaction on this database, if any.
     txn: Option<OpenTxn>,
+    /// Set once the database was unloaded, dropped or replaced while a request
+    /// still held this handle: the slot then holds an empty placeholder that
+    /// must never be queried, written or saved (it would overwrite `dir`).
+    retired: bool,
 }
 
 /// A shared handle to one loaded database.
@@ -400,19 +404,42 @@ type DbHandle = Arc<Mutex<DbSlot>>;
 
 impl DbSlot {
     /// A freshly loaded / built / restored database: clean when it matches
-    /// what is on disk at `dir`.
-    fn handle(db: Database, dir: PathBuf, dirty: bool) -> DbHandle {
+    /// what is on disk at `dir`. The server's `LOAD` policy is installed on it
+    /// (clients must not make the server read arbitrary local files).
+    fn handle(mut db: Database, dir: PathBuf, dirty: bool, policy: &LoadPolicy) -> DbHandle {
+        db.set_load_policy(policy.clone());
         Arc::new(Mutex::new(DbSlot {
             db,
             dir,
             dirty,
             txn: None,
+            retired: false,
         }))
+    }
+
+    /// Retire this slot (its database is being unloaded, dropped or replaced):
+    /// drop the database now — closing its store files before anything on disk
+    /// replaces them — and leave an empty placeholder that refuses to be saved.
+    /// A request that cloned the handle earlier then sees [`retired`](Self::retired).
+    fn retire(&mut self) {
+        self.retired = true;
+        self.dirty = false;
+        let name = self.db.name().to_string();
+        self.db = Database::new(name);
     }
 
     /// Save to [`dir`](Self::dir) and clear the dirty flag. Refused while a
     /// transaction is open — the live database then holds uncommitted writes.
+    /// For an on-disk / RocksDB database opened from `dir` this is a cheap
+    /// commit point (its updates are already written through); an in-memory
+    /// snapshot is rewritten atomically.
     fn save(&mut self) -> crate::Result<()> {
+        if self.retired {
+            return Err(GStoreError::Database(format!(
+                "refusing to save: database '{}' is no longer loaded",
+                self.db.name()
+            )));
+        }
         if self.txn.is_some() {
             return Err(GStoreError::Database(
                 "refusing to save: a transaction is open (its writes are uncommitted)".into(),
@@ -427,10 +454,17 @@ impl DbSlot {
     /// check_point policy, save now. Returns a warning when that save failed
     /// (the write itself stays applied in memory and is retried on unload /
     /// shutdown / `/checkpoint`).
+    ///
+    /// With check_point off an on-disk / RocksDB database still gets a commit
+    /// point ([`Database::sync`], a no-op for an in-memory snapshot): its
+    /// direct-API writes (`/batch*`, `/upload`) are already written through
+    /// and only need committing, so there is no reason to leave them volatile.
     fn wrote(&mut self, check_point: bool) -> Option<String> {
         self.dirty = true;
         if !check_point {
-            return None;
+            return self.db.sync().err().map(|e| {
+                format!("change applied in memory but could not be made durable: {e}")
+            });
         }
         self.save().err().map(|e| {
             format!(
@@ -515,9 +549,26 @@ struct ApiState {
     tasks: HashMap<u64, TaskEntry>,
     started: Instant,
     requests: u64,
+    /// The `LOAD` policy installed on every database this server serves
+    /// (default [`LoadPolicy::restricted`]: SPARQL `LOAD` reads nothing).
+    load_policy: LoadPolicy,
 }
 
 impl ApiState {
+    /// Unload database `name`, if loaded, *without* saving: its slot is retired
+    /// (see [`DbSlot::retire`]) so its files are closed before the caller
+    /// replaces or deletes them, and a request still holding the handle can
+    /// neither use nor save it. Returns whether it was loaded.
+    fn evict(&mut self, name: &str) -> bool {
+        match self.dbs.remove(name) {
+            Some(h) => {
+                locked(&h).retire();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn remember_ended(&mut self, tid: u64, outcome: &'static str) {
         if self.ended_txns.len() >= ENDED_TXN_MEMORY {
             self.ended_txns.pop_front();
@@ -636,6 +687,7 @@ impl ApiServer {
                     tasks: HashMap::new(),
                     started: Instant::now(),
                     requests: 0,
+                    load_policy: LoadPolicy::restricted(),
                 }),
                 root,
                 check_point: true,
@@ -657,6 +709,15 @@ impl ApiServer {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = on;
         }
+        self
+    }
+
+    /// The SPARQL `LOAD` policy for every database this server serves. The
+    /// default, [`LoadPolicy::restricted`], lets `LOAD` read nothing — clients
+    /// must not be able to make the server read arbitrary local files;
+    /// re-allow a directory with [`LoadPolicy::with_allowed_dir`].
+    pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
+        locked(&self.inner.state).load_policy = policy;
         self
     }
 
@@ -888,6 +949,12 @@ impl ApiInner {
         if job.sparql.contains("__gstore_test_panic__") {
             panic!("test-triggered panic inside a query job");
         }
+        if slot.retired {
+            return Resp::fail(
+                404,
+                &format!("database '{}' was unloaded while this request waited", job.name),
+            );
+        }
         if let Some(open) = &slot.txn {
             if job.is_update {
                 return txn_conflict(&job.name, open.tid);
@@ -921,7 +988,9 @@ impl ApiInner {
     /// Resolve the caller's identity from Basic auth or a session token.
     fn resolve_user(&self, st: &mut ApiState, req: &Request) -> Option<String> {
         if let Some((u, p)) = parse_basic_auth(req) {
-            if st.users.verify(&u, &p) {
+            // Also migrates a legacy password hash on first successful use,
+            // so Basic-auth-only clients get upgraded like `/login` users.
+            if st.users.verify_and_upgrade(&u, &p) {
                 return Some(u);
             }
         }
@@ -1302,11 +1371,14 @@ impl ApiInner {
             Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
         };
         let dir = st.db_dir(&name);
+        // A rebuilt database replaces the loaded one: close its files first.
+        st.evict(&name);
         if let Err(e) = db.save(&dir) {
             return Resp::fail(500, &format!("save failed: {e}"));
         }
         let triples = db.triple_num();
-        st.dbs.insert(name.clone(), DbSlot::handle(db, dir, false));
+        let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+        st.dbs.insert(name.clone(), slot);
         Resp::ok(&format!("database '{name}' built ({triples} triples)"))
     }
 
@@ -1323,9 +1395,12 @@ impl ApiInner {
         if !dir.is_dir() {
             return Resp::fail(404, &format!("database '{name}' not found on disk"));
         }
-        match Database::load(&dir) {
+        // Any layout (snapshot, on-disk `kvstore.kv`, RocksDB): an on-disk /
+        // RocksDB database keeps writing its updates through to `dir`.
+        match Database::open(&dir) {
             Ok(db) => {
-                st.dbs.insert(name.clone(), DbSlot::handle(db, dir, false));
+                let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                st.dbs.insert(name.clone(), slot);
                 Resp::ok(&format!("database '{name}' loaded"))
             }
             Err(e) => Resp::fail(500, &format!("load failed: {e}")),
@@ -1360,7 +1435,7 @@ impl ApiInner {
         if !st.dbs.contains_key(&name) {
             let dir = st.db_dir(&name);
             let (opened, fresh) = if dir.is_dir() {
-                (Database::load(&dir), false)
+                (Database::open(&dir), false)
             } else {
                 (Database::build_from_str(name.clone(), ""), true)
             };
@@ -1368,7 +1443,8 @@ impl ApiInner {
                 // A fresh database exists only in memory so far: dirty, so that
                 // it is persisted even if nothing ends up being inserted.
                 Ok(db) => {
-                    st.dbs.insert(name.clone(), DbSlot::handle(db, dir, fresh));
+                    let slot = DbSlot::handle(db, dir, fresh, &st.load_policy);
+                    st.dbs.insert(name.clone(), slot);
                 }
                 Err(e) => return Resp::fail(500, &format!("upload failed to open database: {e}")),
             }
@@ -1379,12 +1455,29 @@ impl ApiInner {
                 .get(&name)
                 .expect("just inserted or already loaded above");
             let mut slot = locked(dbh);
-            let inserted = triples.iter().filter(|t| slot.db.insert_triple(t)).count();
+            let mut inserted = 0usize;
+            let mut failure = None;
+            for t in &triples {
+                match slot.db.try_insert_triple(t) {
+                    Ok(true) => inserted += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
             let warning = if inserted > 0 || slot.dirty {
                 slot.wrote(self.check_point)
             } else {
                 None
             };
+            if let Some(e) = failure {
+                return Resp::fail(
+                    500,
+                    &format!("upload stopped after inserting {inserted} triple(s): {e}"),
+                );
+            }
             (inserted, warning)
         };
         // (Lifecycle endpoints like /build and /load don't append to
@@ -1417,7 +1510,7 @@ impl ApiInner {
         };
         let saved = {
             let mut slot = locked(&dbh);
-            if slot.dirty {
+            let saved = if slot.dirty {
                 if let Err(e) = slot.save() {
                     return Resp::fail(
                         500,
@@ -1426,8 +1519,20 @@ impl ApiInner {
                 }
                 true
             } else {
+                // Nothing unsaved in memory; still a commit point for an
+                // on-disk / RocksDB database (its write-through is committed).
+                if let Err(e) = slot.db.sync() {
+                    return Resp::fail(
+                        500,
+                        &format!("unload aborted: committing '{name}' failed ({e}); it stays loaded"),
+                    );
+                }
                 false
-            }
+            };
+            // Requests that queued on this handle must not write to (or save)
+            // a database that is no longer served.
+            slot.retire();
+            saved
         };
         st.dbs.remove(&name);
         if saved {
@@ -1444,7 +1549,8 @@ impl ApiInner {
         if st.db_txn.contains_key(&name) {
             return Resp::fail(409, "database is busy in a transaction");
         }
-        let was_loaded = st.dbs.remove(&name).is_some();
+        // Retire (closing its store files) before the directory is deleted.
+        let was_loaded = st.evict(&name);
         let dir = st.db_dir(&name);
         let existed_on_disk = dir.is_dir();
         if existed_on_disk {
@@ -1801,16 +1907,30 @@ impl ApiInner {
         if st.db_txn.contains_key(&name) {
             return Resp::fail(409, "database is busy in a transaction");
         }
-        match Database::restore(&path) {
+        // Validate before touching the live database: the backup must hold one.
+        if Database::storage_kind(&path).is_none() {
+            return Resp::fail(
+                500,
+                &format!("restore failed: '{path}' does not contain a database backup"),
+            );
+        }
+        let dir = st.db_dir(&name);
+        // The restored copy replaces the loaded database (whose unsaved changes
+        // a restore discards): close its files before they are replaced.
+        st.evict(&name);
+        // Copy the backup (any layout) into the database's own directory and
+        // open it there — never open the backup in place, or later writes
+        // would land in the backup.
+        if let Err(e) = Database::restore_into(&path, &dir) {
+            return Resp::fail(500, &format!("restore failed: {e}"));
+        }
+        match Database::open(&dir) {
             Ok(db) => {
-                let dir = st.db_dir(&name);
-                if let Err(e) = db.save(&dir) {
-                    return Resp::fail(500, &format!("restore persist failed: {e}"));
-                }
-                st.dbs.insert(name.clone(), DbSlot::handle(db, dir, false));
+                let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                st.dbs.insert(name.clone(), slot);
                 Resp::ok(&format!("database '{name}' restored"))
             }
-            Err(e) => Resp::fail(500, &format!("restore failed: {e}")),
+            Err(e) => Resp::fail(500, &format!("restore failed to open the restored copy: {e}")),
         }
     }
 
@@ -1887,23 +2007,35 @@ impl ApiInner {
             return txn_conflict(&name, open.tid);
         }
         let parsed = triples.len();
-        let applied = triples
-            .iter()
-            .filter(|t| {
-                valid_ground_triple(t)
-                    && if insert {
-                        slot.db.insert_triple(t)
-                    } else {
-                        slot.db.remove_triple(t)
-                    }
-            })
-            .count();
+        let mut applied = 0usize;
+        let mut failure = None;
+        for t in triples.iter().filter(|t| valid_ground_triple(t)) {
+            let changed = if insert {
+                slot.db.try_insert_triple(t)
+            } else {
+                Ok(slot.db.remove_triple(t))
+            };
+            match changed {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
         let warning = if applied > 0 {
             slot.wrote(self.check_point)
         } else {
             None
         };
         drop(slot);
+        if let Some(e) = failure {
+            return Resp::fail(
+                500,
+                &format!("{op} stopped after applying {applied} triple(s): {e}"),
+            );
+        }
         let failed = parsed - applied;
         let verb = if insert { "inserted" } else { "removed" };
         let body = format!(
