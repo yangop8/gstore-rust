@@ -227,6 +227,49 @@ fn restart_route_requests_a_restart() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn an_api_server_built_from_conf_ini_uses_its_settings() {
+    let root = tmp_dir("bind_with_config");
+    let cfg = gstore::config::GStoreConfig::from_ini_str(&format!(
+        "[server]\nport=0\nthread_num=2\nkeep_alive_timeout=0\nmax_output_size=7\ncors=off\n\
+         [system]\ndb_home={}\nroot_password=cfgpw\nsystem_username=sys\ncheck_point=off\n\
+         [upload]\nupload_max_body_size=64\n",
+        root.display()
+    ));
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+    let server = Arc::new(ApiServer::bind_with_config(cfg).unwrap());
+    assert_eq!(server.root_dir(), root.as_path());
+    assert_eq!(server.http_options().threads, 2);
+    assert_eq!(server.http_options().max_body, 64);
+    assert!(!server.check_point());
+    assert_eq!(server.config().max_output_size, 7);
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+
+    // root_password seeds the user store.
+    let (s, body) = request(&addr, "POST", "/login", "username=root&password=cfgpw");
+    assert_eq!(s, 200, "{body}");
+    // keep_alive_timeout=0 ⇒ every response closes; cors=off ⇒ no CORS header.
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp).unwrap();
+    assert!(resp.contains("Connection: close"), "{resp}");
+    assert!(!resp.contains("Access-Control-Allow-Origin"), "{resp}");
+    // upload_max_body_size caps request bodies.
+    let (s, _) = request(&addr, "POST", "/login", &"x".repeat(100));
+    assert_eq!(s, 413);
+    // system_username names the user that may stop the server.
+    let pw = server.system_password().to_string();
+    let (_, body) = request(&addr, "GET", &format!("/shutdown?username=system&password={pw}"), "");
+    assert_eq!(status_code(&body), 1001, "only `sys` is the system user here: {body}");
+    let (_, body) = request(&addr, "GET", &format!("/shutdown?username=sys&password={pw}"), "");
+    assert_eq!(status_code(&body), 0, "{body}");
+    join_within(serving, Duration::from_secs(20));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---- the gserver binary ------------------------------------------------------
 
 #[cfg(unix)]

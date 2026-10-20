@@ -840,8 +840,12 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                      pass --password (or set root_password) before exposing this server"
                 );
             }
-            let server = match ApiServer::bind(root, &cfg.root_password, addr) {
-                Ok(s) => s.with_config(cfg.clone()).with_load_policy(load_policy),
+            // The served root becomes the configuration's db_home, so request
+            // handlers reading the config see where the databases really are.
+            let mut served = cfg.clone();
+            served.db_home = root.clone();
+            let server = match ApiServer::bind_with_config(served) {
+                Ok(s) => s.with_load_policy(load_policy),
                 Err(e) => {
                     eprintln!("failed to start API server at {}:{}: {e}", cfg.listen_addr, cfg.port);
                     return 1;
