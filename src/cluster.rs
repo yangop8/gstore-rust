@@ -2712,7 +2712,9 @@ impl ClusterNode {
 
     /// Submit a mutation to this node. Succeeds (with the assigned log index)
     /// only on the leader; otherwise returns [`ProposeError::NotLeader`] with a
-    /// redirect hint. On success the entry is replicated immediately.
+    /// redirect hint. On success the entry is handed to every peer's sender at
+    /// once (replication proceeds asynchronously; this call never blocks on the
+    /// network).
     ///
     /// `Ok` means **appended to the leader's log**, not committed: if the leader
     /// loses its quorum or its leadership before a majority stores the entry,
@@ -3464,8 +3466,10 @@ impl ReplicaGroup {
 /// [`TripleSource`] contract — so the cluster is observationally identical to a
 /// single [`TripleStore`] over the same triples, exactly as [`ShardedStore`] is.
 ///
-/// It implements [`TripleSource`], so the generic [`Evaluator`] runs over a
-/// sharded-and-replicated deployment unchanged. The multi-group analogue of the
+/// Reads go through [`TryTripleSource`]: a bucket with every replica down is an
+/// error, never silently missing data, and [`ShardedRaftCluster::query`] runs
+/// the generic [`Evaluator`] over a sharded-and-replicated deployment
+/// unchanged. The multi-group analogue of the
 /// single-group [`ClusterNode`], it is built on the pure [`RaftState`] + the
 /// synchronous [`ReplicaGroup`] driver, so it is fully deterministic and
 /// in-process (no threads, clocks, or sockets).
