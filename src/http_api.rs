@@ -263,12 +263,15 @@ impl TxnIsolation {
     /// level name (`serializable`, `snapshot`, `read_committed`; case- and
     /// separator-insensitive). `None` for anything else.
     pub fn parse(s: &str) -> Option<TxnIsolation> {
-        let norm: String = s
-            .trim()
-            .chars()
-            .filter(|c| !matches!(c, '_' | '-' | ' '))
-            .collect::<String>()
-            .to_ascii_lowercase();
+        let s = s.trim();
+        let norm: String = if s.chars().all(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-' | ' ')) {
+            s.chars()
+                .filter(|c| !matches!(c, '_' | '-' | ' '))
+                .collect::<String>()
+                .to_ascii_lowercase()
+        } else {
+            s.to_string()
+        };
         match norm.as_str() {
             "1" | "serializable" => Some(TxnIsolation::Serializable),
             "2" | "snapshot" | "si" => Some(TxnIsolation::Snapshot),
@@ -2768,5 +2771,110 @@ mod tests {
             qbody.to_lowercase().contains("cancel"),
             "expected a cancellation error, got: {qbody}"
         );
+    }
+
+    #[test]
+    fn handler_panic_returns_500_and_the_server_keeps_serving() {
+        let (server, addr) = start("panic");
+        let root = basic("root", "root");
+        let req = |method: &str, target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, method, target, Some(&root), body))
+        };
+        assert_eq!(req("POST", "/build?db_name=p", "<http://ex/a> <http://ex/p> <http://ex/b> .").0, 200);
+
+        // Panics while holding BOTH the state lock and db `p`'s lock.
+        let (status, body) = req("GET", "/__test/panic?db_name=p", "");
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("\"StatusCode\":500") && body.contains("panicked"), "{body}");
+        assert!(server.inner.state.is_poisoned(), "the test route poisoned the state lock");
+
+        // Both poisoned locks are recovered: the server keeps answering.
+        let (status, body) = req("POST", "/sparql?db_name=p", "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("http://ex/b"), "{body}");
+        assert_eq!(req("POST", "/update?db_name=p", "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }").0, 200);
+        assert_eq!(req("GET", "/status", "").0, 200);
+        assert_eq!(req("GET", "/show", "").0, 200);
+        // The access log still records requests (written outside the state lock).
+        let (_, log) = req("GET", "/accesslog", "");
+        assert!(log.contains("/__test/panic\t-\t500"), "{log}");
+    }
+
+    #[test]
+    fn query_job_panic_unregisters_its_task() {
+        let (_srv, addr) = start("panic_job");
+        let root = basic("root", "root");
+        let req = |method: &str, target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, method, target, Some(&root), body))
+        };
+        assert_eq!(req("POST", "/build?db_name=q", "").0, 200);
+        // The test hook panics inside the deferred query job, holding the db lock.
+        let (status, body) = req(
+            "POST",
+            "/sparql?db_name=q",
+            "SELECT * WHERE { ?s ?p ?o } # __gstore_test_panic__",
+        );
+        assert_eq!(status, 500, "{body}");
+        let (_, tasks) = req("GET", "/tasklist", "");
+        assert!(tasks.contains("\"tasks\":[]"), "the panicked task is unregistered: {tasks}");
+        let (status, _) = req("POST", "/sparql?db_name=q", "SELECT * WHERE { ?s ?p ?o }");
+        assert_eq!(status, 200, "the poisoned db lock is recovered");
+    }
+
+    #[test]
+    fn isolevel_parsing_maps_upstream_levels() {
+        assert_eq!(TxnIsolation::parse("1"), Some(TxnIsolation::Serializable));
+        assert_eq!(TxnIsolation::parse(" 2 "), Some(TxnIsolation::Snapshot));
+        assert_eq!(TxnIsolation::parse("3"), Some(TxnIsolation::ReadCommitted));
+        assert_eq!(TxnIsolation::parse("read_committed"), Some(TxnIsolation::ReadCommitted));
+        assert_eq!(TxnIsolation::parse("Read-Committed"), Some(TxnIsolation::ReadCommitted));
+        assert_eq!(TxnIsolation::parse("SNAPSHOT"), Some(TxnIsolation::Snapshot));
+        assert_eq!(TxnIsolation::parse("serializable"), Some(TxnIsolation::Serializable));
+        for bad in ["0", "4", "-1", "", "abc", "12"] {
+            assert_eq!(TxnIsolation::parse(bad), None, "{bad:?}");
+        }
+        for level in [TxnIsolation::Serializable, TxnIsolation::Snapshot, TxnIsolation::ReadCommitted] {
+            assert_eq!(TxnIsolation::parse(&level.code().to_string()), Some(level));
+            assert_eq!(TxnIsolation::parse(level.name()), Some(level));
+        }
+    }
+
+    #[test]
+    fn batch_payload_is_parsed_as_rdf_never_as_sparql() {
+        // The original injection payload is a parse error in every mode.
+        let inject = "<a> <b> <c> } ; DROP ALL ; INSERT DATA { <x> <y> <z>";
+        for fmt in [None, Some("nt"), Some("ttl"), Some("json")] {
+            assert!(parse_batch_payload(fmt, inject).is_err(), "{fmt:?}");
+        }
+        // N-Triples by default, one statement per line.
+        let (f, ts) = parse_batch_payload(None, "<http://a> <http://b> <http://c> .\n<http://a> <http://b> \"x\" .\n").unwrap();
+        assert_eq!((f, ts.len()), ("ntriples", 2));
+        // Several statements on one line fall back to Turtle (a superset).
+        let (f, ts) = parse_batch_payload(None, "<http://a> <http://b> <http://c> . <http://d> <http://b> <http://c> .").unwrap();
+        assert_eq!((f, ts.len()), ("turtle", 2));
+        // @prefix / PREFIX select Turtle.
+        let (f, ts) = parse_batch_payload(None, "@prefix : <http://ex/> .\n:a :p :b , :c .").unwrap();
+        assert_eq!((f, ts.len()), ("turtle", 2));
+        let (f, _) = parse_batch_payload(None, "PREFIX : <http://ex/>\n:a :p :b .").unwrap();
+        assert_eq!(f, "turtle");
+        // An explicit format wins; bare `json` (a response format) is ignored.
+        let (f, _) = parse_batch_payload(Some("TTL"), "<http://a> <http://b> <http://c> .").unwrap();
+        assert_eq!(f, "turtle");
+        let (f, _) = parse_batch_payload(Some("json"), "<http://a> <http://b> <http://c> .").unwrap();
+        assert_eq!(f, "ntriples");
+        assert!(parse_batch_payload(Some("nt"), "@prefix : <http://ex/> .\n:a :p :b .").is_err());
+        assert!(parse_batch_payload(Some("csv"), "a,b,c").unwrap_err().contains("unknown format"));
+        // A SPARQL update is not RDF.
+        assert!(parse_batch_payload(None, "INSERT DATA { <http://a> <http://b> <http://c> }").is_err());
+        assert!(parse_batch_payload(None, "DROP ALL").is_err());
+    }
+
+    #[test]
+    fn invalid_ground_triples_are_not_applied() {
+        let t = |s: Term, p: Term| Triple::new(s, p, Term::iri("http://o"));
+        assert!(valid_ground_triple(&t(Term::iri("http://s"), Term::iri("http://p"))));
+        assert!(valid_ground_triple(&t(Term::Blank("b".into()), Term::iri("http://p"))));
+        assert!(!valid_ground_triple(&t(Term::plain_literal("lit"), Term::iri("http://p"))));
+        assert!(!valid_ground_triple(&t(Term::iri("http://s"), Term::Blank("b".into()))));
     }
 }

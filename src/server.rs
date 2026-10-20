@@ -1429,6 +1429,53 @@ mod tests {
     }
 
     #[test]
+    fn handler_panic_returns_500_and_the_server_keeps_serving() {
+        let (_srv, addr) = start();
+        // The test-only route panics while holding the database lock.
+        let resp = http(&addr, "GET /__test/panic HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(resp.contains("500 Internal Server Error"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        assert!(resp.contains("\"error\"") && resp.contains("panicked"), "{resp}");
+        // The poisoned database lock is recovered: reads and writes still work.
+        let ok = post(&addr, "/sparql", SELECT_O);
+        assert!(ok.contains("200 OK") && ok.contains("http://ex/b"), "{ok}");
+        let upd = post(&addr, "/update", "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }");
+        assert!(upd.contains("\"changed\":1"), "{upd}");
+        let status = http(&addr, "GET /status HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(status.contains("\"triples\":3"), "{status}");
+    }
+
+    #[test]
+    fn shutdown_returns_from_serve_forever_and_closes_the_listener() {
+        let db = Database::build_from_str("sd", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        assert!(post(&addr, "/sparql", SELECT_O).contains("200 OK"));
+        let handle = server.shutdown_handle();
+        assert!(!handle.is_shutdown());
+        handle.shutdown();
+        handle.shutdown(); // idempotent
+        assert!(handle.is_shutdown());
+        let report = serving.join().unwrap();
+        assert!(report.drained);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        // serve_forever after a shutdown returns immediately.
+        assert_eq!(server.serve_forever(), ShutdownReport { drained: true, ..Default::default() });
+    }
+
+    #[test]
+    fn wake_address_maps_unspecified_to_loopback() {
+        let v4: SocketAddr = "0.0.0.0:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v4).wake, "127.0.0.1:7000".parse().unwrap());
+        let v6: SocketAddr = "[::]:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v6).wake, "[::1]:7000".parse().unwrap());
+        let specific: SocketAddr = "10.1.2.3:80".parse().unwrap();
+        assert_eq!(Lifecycle::new(specific).wake, specific);
+    }
+
+    #[test]
     fn select_returns_sparql_json() {
         let (_srv, addr) = start();
         let resp = post(&addr, "/sparql", "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }");
