@@ -84,21 +84,49 @@ fn disk_api_insert_delete_survive_reopen() {
         assert_eq!(db.triple_num(), 4);
     }
     // No shadow snapshot is written next to the store.
-    assert!(!dir.join("store.bin").exists(), "save() must not write store.bin");
+    assert!(
+        !dir.join("store.bin").exists(),
+        "save() must not write store.bin"
+    );
     assert!(!dir.join("dict.bin").exists());
 
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.triple_num(), 4);
-    assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/x> <http://ex/q> ?o }"), ["<http://ex/y>"]);
     assert_eq!(
-        col0(&mut db, "SELECT ?l WHERE { <http://ex/x> <http://ex/label> ?l }"),
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { <http://ex/x> <http://ex/q> ?o }"
+        ),
+        ["<http://ex/y>"]
+    );
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?l WHERE { <http://ex/x> <http://ex/label> ?l }"
+        ),
         ["\"fresh literal\""]
     );
-    assert!(col0(&mut db, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }").is_empty());
+    assert!(col0(
+        &mut db,
+        "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"
+    )
+    .is_empty());
     // The VS-tree-filtered path (constant object) sees post-build data too: the
     // stale out-of-core index must have been rebuilt, not trusted.
-    assert_eq!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/q> <http://ex/y> }"), ["<http://ex/x>"]);
-    assert_eq!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/c> }"), ["<http://ex/b>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { ?s <http://ex/q> <http://ex/y> }"
+        ),
+        ["<http://ex/x>"]
+    );
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/c> }"
+        ),
+        ["<http://ex/b>"]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -110,8 +138,10 @@ fn disk_sparql_update_is_durable_without_save() {
     disk_db(&dir);
     {
         let mut db = Database::open(&dir).unwrap();
-        db.query("INSERT DATA { <http://ex/n1> <http://ex/p> <http://ex/n2> }").unwrap();
-        db.query("DELETE DATA { <http://ex/b> <http://ex/p> <http://ex/c> }").unwrap();
+        db.query("INSERT DATA { <http://ex/n1> <http://ex/p> <http://ex/n2> }")
+            .unwrap();
+        db.query("DELETE DATA { <http://ex/b> <http://ex/p> <http://ex/c> }")
+            .unwrap();
         db.query("DELETE { ?s <http://ex/name> ?n } INSERT { ?s <http://ex/name> \"Alicia\" } WHERE { ?s <http://ex/name> ?n }")
             .unwrap();
         // Dropped without save().
@@ -121,7 +151,10 @@ fn disk_sparql_update_is_durable_without_save() {
         col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }"),
         ["<http://ex/a>", "<http://ex/n1>"]
     );
-    assert_eq!(col0(&mut db, "SELECT ?n WHERE { ?s <http://ex/name> ?n }"), ["\"Alicia\""]);
+    assert_eq!(
+        col0(&mut db, "SELECT ?n WHERE { ?s <http://ex/name> ?n }"),
+        ["\"Alicia\""]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -132,7 +165,8 @@ fn disk_commit_points_survive_a_crash() {
     let dir = tmp("disk_crash");
     disk_db(&dir);
     let mut db = Database::open(&dir).unwrap();
-    db.query("INSERT DATA { <http://ex/by_update> <http://ex/p> <http://ex/x> }").unwrap();
+    db.query("INSERT DATA { <http://ex/by_update> <http://ex/p> <http://ex/x> }")
+        .unwrap();
     db.insert_triple(&triple("by_api_synced", "p", "x"));
     db.sync().unwrap();
     db.begin().unwrap();
@@ -141,7 +175,10 @@ fn disk_commit_points_survive_a_crash() {
 
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(
-        col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"),
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"
+        ),
         ["<http://ex/by_api_synced>", "<http://ex/by_update>"]
     );
     let _ = fs::remove_dir_all(&dir);
@@ -166,11 +203,17 @@ fn disk_named_graphs_survive_reopen() {
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(db.named_graphs().len(), 2);
         assert_eq!(
-            col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s ?p ?o } }"),
+            col0(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s ?p ?o } }"
+            ),
             ["<http://ex/s1>"]
         );
         assert_eq!(
-            col0(&mut db, "SELECT ?g WHERE { GRAPH ?g { <http://ex/s3> ?p ?o } }"),
+            col0(
+                &mut db,
+                "SELECT ?g WHERE { GRAPH ?g { <http://ex/s3> ?p ?o } }"
+            ),
             ["<http://ex/g2>"]
         );
         // The default graph is untouched by the quad updates.
@@ -179,7 +222,11 @@ fn disk_named_graphs_survive_reopen() {
     }
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.named_graphs().len(), 1, "DROP GRAPH persisted");
-    assert!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s ?p ?o } }").is_empty());
+    assert!(col0(
+        &mut db,
+        "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s ?p ?o } }"
+    )
+    .is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -191,13 +238,16 @@ fn disk_transactions_persist_only_committed_work() {
         let mut db = Database::open(&dir).unwrap();
         db.begin().unwrap();
         db.insert_triple(&triple("ghost", "p", "x"));
-        db.query("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }").unwrap();
+        db.query("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }")
+            .unwrap();
         db.rollback().unwrap();
 
         db.begin().unwrap();
         db.insert_triple(&triple("kept", "p", "x"));
-        db.query("INSERT DATA { GRAPH <http://ex/g> { <http://ex/kept> <http://ex/p> <http://ex/x> } }")
-            .unwrap();
+        db.query(
+            "INSERT DATA { GRAPH <http://ex/g> { <http://ex/kept> <http://ex/p> <http://ex/x> } }",
+        )
+        .unwrap();
         db.commit().unwrap();
 
         // An open, uncommitted transaction at drop time is discarded.
@@ -210,7 +260,10 @@ fn disk_transactions_persist_only_committed_work() {
         ["<http://ex/a>", "<http://ex/b>", "<http://ex/kept>"]
     );
     assert_eq!(
-        col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+        ),
         ["<http://ex/kept>"]
     );
     let _ = fs::remove_dir_all(&dir);
@@ -241,7 +294,10 @@ fn disk_clear_and_reasoning_are_written_through() {
         ["<http://ex/Animal>", "<http://ex/Cat>"],
         "inferred triples persisted"
     );
-    assert!(col0(&mut db, "SELECT ?o WHERE { <http://ex/a> ?p ?o }").is_empty(), "CLEAR persisted");
+    assert!(
+        col0(&mut db, "SELECT ?o WHERE { <http://ex/a> ?p ?o }").is_empty(),
+        "CLEAR persisted"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -264,28 +320,53 @@ fn disk_cli_gadd_gsub_gquery_roundtrip() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let name_s = name.to_str().unwrap();
-    run(env!("CARGO_BIN_EXE_gbuild"), &["--disk", name_s, base_nt.to_str().unwrap()]);
-    let added = run(env!("CARGO_BIN_EXE_gadd"), &[name_s, add_nt.to_str().unwrap()]);
+    run(
+        env!("CARGO_BIN_EXE_gbuild"),
+        &["--disk", name_s, base_nt.to_str().unwrap()],
+    );
+    let added = run(
+        env!("CARGO_BIN_EXE_gadd"),
+        &[name_s, add_nt.to_str().unwrap()],
+    );
     assert!(added.contains("2 now total"), "gadd: {added}");
 
     let q = "SELECT ?s WHERE { ?s <http://ex/p> ?o }";
     let out = run(env!("CARGO_BIN_EXE_gquery"), &[name_s, "-e", q]);
-    assert!(out.contains("<http://ex/s1>") && out.contains("<http://ex/s2>"), "gquery after gadd:\n{out}");
+    assert!(
+        out.contains("<http://ex/s1>") && out.contains("<http://ex/s2>"),
+        "gquery after gadd:\n{out}"
+    );
 
-    run(env!("CARGO_BIN_EXE_gsub"), &[name_s, base_nt.to_str().unwrap()]);
+    run(
+        env!("CARGO_BIN_EXE_gsub"),
+        &[name_s, base_nt.to_str().unwrap()],
+    );
     let out = run(env!("CARGO_BIN_EXE_gquery"), &[name_s, "-e", q]);
-    assert!(!out.contains("<http://ex/s1>") && out.contains("<http://ex/s2>"), "gquery after gsub:\n{out}");
+    assert!(
+        !out.contains("<http://ex/s1>") && out.contains("<http://ex/s2>"),
+        "gquery after gsub:\n{out}"
+    );
 
     run(
         env!("CARGO_BIN_EXE_gquery"),
-        &[name_s, "-e", "INSERT DATA { <http://ex/s3> <http://ex/p> <http://ex/o> }"],
+        &[
+            name_s,
+            "-e",
+            "INSERT DATA { <http://ex/s3> <http://ex/p> <http://ex/o> }",
+        ],
     );
     let out = run(env!("CARGO_BIN_EXE_gquery"), &[name_s, "-e", q]);
-    assert!(out.contains("<http://ex/s3>"), "gquery UPDATE persisted:\n{out}");
+    assert!(
+        out.contains("<http://ex/s3>"),
+        "gquery UPDATE persisted:\n{out}"
+    );
 
     // The tool reports the real backend and the database stayed on disk.
     let shown = run(env!("CARGO_BIN_EXE_gshow"), &[name_s]);
-    assert!(shown.contains("on-disk") && shown.contains("triples   : 2"), "gshow:\n{shown}");
+    assert!(
+        shown.contains("on-disk") && shown.contains("triples   : 2"),
+        "gshow:\n{shown}"
+    );
     assert!(Database::is_disk(base.join("t.db")));
     assert!(!base.join("t.db/store.bin").exists());
     let _ = fs::remove_dir_all(&base);
@@ -301,11 +382,19 @@ fn gbuild_disk_dispatches_on_file_extension() {
         "@prefix ex: <http://ex/> .\nex:a ex:knows ex:b , ex:c ;\n     ex:name \"A\" .\n",
     );
     let nq = base.join("more.nq");
-    write(&nq, "<http://ex/d> <http://ex/knows> <http://ex/e> <http://ex/g> .\n");
+    write(
+        &nq,
+        "<http://ex/d> <http://ex/knows> <http://ex/e> <http://ex/g> .\n",
+    );
     let name = base.join("fmt");
 
     let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
-        .args(["--disk", name.to_str().unwrap(), ttl.to_str().unwrap(), nq.to_str().unwrap()])
+        .args([
+            "--disk",
+            name.to_str().unwrap(),
+            ttl.to_str().unwrap(),
+            nq.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "gbuild --disk failed: {out:?}");
@@ -331,14 +420,26 @@ fn legacy_shadow_snapshot_is_reconciled_into_kvstore() {
         let mut mem = Database::open(&dir).unwrap().into_memory().unwrap();
         mem.insert_triple(&triple("added", "p", "x"));
         mem.remove_triple(&triple("a", "p", "b"));
-        mem.query("INSERT DATA { GRAPH <http://ex/g> { <http://ex/q> <http://ex/p> <http://ex/r> } }")
-            .unwrap();
+        mem.query(
+            "INSERT DATA { GRAPH <http://ex/g> { <http://ex/q> <http://ex/p> <http://ex/r> } }",
+        )
+        .unwrap();
         mem.save(&snap_dir).unwrap();
     }
-    for f in ["dict.bin", "store.bin", "named.bin", "meta.bin", "vstree.bin"] {
+    for f in [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "meta.bin",
+        "vstree.bin",
+    ] {
         fs::copy(snap_dir.join(f), dir.join(f)).unwrap();
     }
-    assert_eq!(Database::storage_kind(&dir), Some(StorageKind::Disk), "kvstore.kv takes precedence");
+    assert_eq!(
+        Database::storage_kind(&dir),
+        Some(StorageKind::Disk),
+        "kvstore.kv takes precedence"
+    );
 
     for round in 0..2 {
         let mut db = Database::open(&dir).unwrap();
@@ -348,10 +449,19 @@ fn legacy_shadow_snapshot_is_reconciled_into_kvstore() {
             ["<http://ex/added>", "<http://ex/b>"],
             "round {round}"
         );
-        assert_eq!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"), ["<http://ex/q>"]);
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+            ),
+            ["<http://ex/q>"]
+        );
     }
     assert!(!dir.join("store.bin").exists());
-    assert!(dir.join("store.bin.legacy").is_file(), "shadow kept for manual recovery");
+    assert!(
+        dir.join("store.bin.legacy").is_file(),
+        "shadow kept for manual recovery"
+    );
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&snap_dir);
 }
@@ -360,11 +470,18 @@ fn legacy_shadow_snapshot_is_reconciled_into_kvstore() {
 fn older_shadow_snapshot_is_ignored() {
     let dir = tmp("legacy_old_shadow");
     let snap_dir = tmp("legacy_old_shadow_snap");
-    let mut mem = Database::build_from_str("old", "<http://ex/stale> <http://ex/p> <http://ex/x> .").unwrap();
+    let mut mem =
+        Database::build_from_str("old", "<http://ex/stale> <http://ex/p> <http://ex/x> .").unwrap();
     mem.insert_triple(&triple("stale2", "p", "x"));
     mem.save(&snap_dir).unwrap();
     fs::create_dir_all(&dir).unwrap();
-    for f in ["dict.bin", "store.bin", "named.bin", "meta.bin", "vstree.bin"] {
+    for f in [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "meta.bin",
+        "vstree.bin",
+    ] {
         fs::copy(snap_dir.join(f), dir.join(f)).unwrap();
     }
     // A disk build written *after* the shadow — the shadow is older.
@@ -379,7 +496,11 @@ fn older_shadow_snapshot_is_ignored() {
     }
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.triple_num(), 3, "older shadow content is not applied");
-    assert!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }").is_empty());
+    assert!(col0(
+        &mut db,
+        "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"
+    )
+    .is_empty());
     assert!(dir.join("store.bin.legacy").is_file());
     let _ = fs::remove_file(&nt);
     let _ = fs::remove_dir_all(&dir);
@@ -392,7 +513,10 @@ fn older_shadow_snapshot_is_ignored() {
 fn open_detects_every_layout() {
     // Snapshot.
     let snap = tmp("detect_snap");
-    Database::build_from_str("snap", BASE_NT).unwrap().save(&snap).unwrap();
+    Database::build_from_str("snap", BASE_NT)
+        .unwrap()
+        .save(&snap)
+        .unwrap();
     assert_eq!(Database::storage_kind(&snap), Some(StorageKind::Snapshot));
     let db = Database::open(&snap).unwrap();
     assert_eq!((db.storage(), db.triple_num()), (StorageKind::Snapshot, 3));
@@ -408,7 +532,10 @@ fn open_detects_every_layout() {
 
     // Missing and empty directories give clear errors.
     let missing = tmp("detect_missing");
-    assert!(Database::open(&missing).unwrap_err().to_string().contains("does not exist"));
+    assert!(Database::open(&missing)
+        .unwrap_err()
+        .to_string()
+        .contains("does not exist"));
     fs::create_dir_all(&missing).unwrap();
     assert_eq!(Database::storage_kind(&missing), None);
     assert!(Database::open(&missing)
@@ -424,7 +551,10 @@ fn open_detects_every_layout() {
     #[cfg(not(feature = "rocksdb"))]
     {
         let err = Database::open(&rocks).unwrap_err().to_string();
-        assert!(err.contains("RocksDB") && err.contains("--features rocksdb"), "{err}");
+        assert!(
+            err.contains("RocksDB") && err.contains("--features rocksdb"),
+            "{err}"
+        );
     }
 
     for d in [&snap, &disk, &missing, &rocks] {
@@ -444,7 +574,13 @@ fn saving_another_layout_replaces_the_old_one() {
     assert!(!dir.join("kvstore.kv").exists());
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.triple_num(), 4);
-    assert_eq!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"), ["<http://ex/m>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"
+        ),
+        ["<http://ex/m>"]
+    );
 
     // A disk build over it replaces the snapshot.
     disk_db(&dir);
@@ -468,33 +604,55 @@ fn failed_save_leaves_previous_snapshot_intact() {
     fs::create_dir_all(&blocker).unwrap();
     db.insert_triple(&triple("new", "p", "x"));
     assert!(db.save(&dir).is_err(), "the blocked save must fail");
-    assert!(!dir.join("dict.bin.tmp").exists(), "aborted save cleans its temp files");
+    assert!(
+        !dir.join("dict.bin.tmp").exists(),
+        "aborted save cleans its temp files"
+    );
 
     // The previous, complete snapshot still loads.
     let mut old = Database::open(&dir).unwrap();
     assert_eq!(old.triple_num(), 3);
-    assert!(col0(&mut old, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }").is_empty());
+    assert!(col0(
+        &mut old,
+        "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"
+    )
+    .is_empty());
 
     // Once the obstacle is gone the save goes through.
     fs::remove_dir(&blocker).unwrap();
     db.save(&dir).unwrap();
     let mut new = Database::open(&dir).unwrap();
     assert_eq!(new.triple_num(), 4);
-    assert_eq!(col0(&mut new, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"), ["<http://ex/new>"]);
+    assert_eq!(
+        col0(
+            &mut new,
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/x> }"
+        ),
+        ["<http://ex/new>"]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn interrupted_snapshot_commit_is_rolled_forward_on_open() {
     let dir = tmp("atomic_rollfwd");
-    Database::build_from_str("v1", BASE_NT).unwrap().save(&dir).unwrap();
+    Database::build_from_str("v1", BASE_NT)
+        .unwrap()
+        .save(&dir)
+        .unwrap();
     // Stage a complete v2 set by hand and leave a commit record, as a crash
     // right after the record was written would.
     let v2_dir = tmp("atomic_rollfwd_v2");
     let mut v2 = Database::build_from_str("v2", BASE_NT).unwrap();
     v2.insert_triple(&triple("v2", "p", "x"));
     v2.save(&v2_dir).unwrap();
-    let names = ["dict.bin", "store.bin", "named.bin", "vstree.bin", "meta.bin"];
+    let names = [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "vstree.bin",
+        "meta.bin",
+    ];
     for f in names {
         fs::copy(v2_dir.join(f), dir.join(format!("{f}.tmp"))).unwrap();
     }
@@ -503,7 +661,11 @@ fn interrupted_snapshot_commit_is_rolled_forward_on_open() {
     fs::rename(dir.join("dict.bin.tmp"), dir.join("dict.bin")).unwrap();
 
     let db = Database::open(&dir).unwrap();
-    assert_eq!((db.name(), db.triple_num()), ("v2", 4), "the committed set wins");
+    assert_eq!(
+        (db.name(), db.triple_num()),
+        ("v2", 4),
+        "the committed set wins"
+    );
     assert!(!dir.join("SNAPSHOT.commit").exists());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&v2_dir);
@@ -520,7 +682,8 @@ fn backup_dir_copies_wals_logs_and_rocksdb_dir() {
         let mut db = Database::open(&src).unwrap();
         db.enable_redo_log_in(&src).unwrap();
         db.enable_update_log_in(&src).unwrap();
-        db.query("INSERT DATA { <http://ex/u> <http://ex/p> <http://ex/v> }").unwrap();
+        db.query("INSERT DATA { <http://ex/u> <http://ex/p> <http://ex/v> }")
+            .unwrap();
     }
     // A pending (here: torn, hence ignored on open) write-ahead log and a
     // RocksDB store directory must be carried along by a file-level copy.
@@ -531,7 +694,15 @@ fn backup_dir_copies_wals_logs_and_rocksdb_dir() {
     write(&dst.join("store.bin"), "stale");
 
     Database::backup_dir(&src, &dst).unwrap();
-    for f in ["kvstore.kv", "vstree.kv", "vstree.kv.wal", "redo.log", "update.log", "rocksdb/CURRENT", "rocksdb/sub/000001.sst"] {
+    for f in [
+        "kvstore.kv",
+        "vstree.kv",
+        "vstree.kv.wal",
+        "redo.log",
+        "update.log",
+        "rocksdb/CURRENT",
+        "rocksdb/sub/000001.sst",
+    ] {
         assert!(dst.join(f).is_file(), "{f} copied");
     }
     assert!(!dst.join("store.bin").exists(), "dst mirrors src");
@@ -539,7 +710,13 @@ fn backup_dir_copies_wals_logs_and_rocksdb_dir() {
     // Without the fake rocksdb dir the copy opens as the same disk database.
     fs::remove_dir_all(dst.join("rocksdb")).unwrap();
     let mut db = Database::open(&dst).unwrap();
-    assert_eq!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/v> }"), ["<http://ex/u>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/v> }"
+        ),
+        ["<http://ex/u>"]
+    );
     let _ = fs::remove_dir_all(&src);
     let _ = fs::remove_dir_all(&dst);
 }
@@ -563,14 +740,23 @@ fn disk_backup_and_restore_into_roundtrip() {
     let mut db = Database::open(&target).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);
     assert_eq!(db.triple_num(), 4);
-    assert_eq!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"), ["<http://ex/n>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+        ),
+        ["<http://ex/n>"]
+    );
     assert!(col0(&mut db, "SELECT ?s WHERE { ?s ?p <http://ex/x> }").is_empty());
     // The restored copy is independent of the original.
     db.insert_triple(&triple("only_target", "p", "x"));
     db.save(&target).unwrap();
-    assert!(col0(&mut Database::open(&dir).unwrap(), "SELECT ?s WHERE { ?s ?p <http://ex/x> }")
-        .iter()
-        .all(|s| s != "<http://ex/only_target>"));
+    assert!(col0(
+        &mut Database::open(&dir).unwrap(),
+        "SELECT ?s WHERE { ?s ?p <http://ex/x> }"
+    )
+    .iter()
+    .all(|s| s != "<http://ex/only_target>"));
     for d in [&dir, &bak, &target] {
         let _ = fs::remove_dir_all(d);
     }
@@ -588,14 +774,36 @@ fn cli_backup_restore_of_a_disk_database() {
         let out = Command::new(bin).args(args).output().unwrap();
         assert!(out.status.success(), "{bin} {args:?}: {out:?}");
     };
-    ok(env!("CARGO_BIN_EXE_gbuild"), &["--disk", name.to_str().unwrap(), nt.to_str().unwrap()]);
-    ok(env!("CARGO_BIN_EXE_gquery"), &[name.to_str().unwrap(), "-e", "INSERT DATA { <http://ex/z> <http://ex/p> <http://ex/zz> }"]);
-    ok(env!("CARGO_BIN_EXE_gbackup"), &[name.to_str().unwrap(), bak.to_str().unwrap()]);
+    ok(
+        env!("CARGO_BIN_EXE_gbuild"),
+        &["--disk", name.to_str().unwrap(), nt.to_str().unwrap()],
+    );
+    ok(
+        env!("CARGO_BIN_EXE_gquery"),
+        &[
+            name.to_str().unwrap(),
+            "-e",
+            "INSERT DATA { <http://ex/z> <http://ex/p> <http://ex/zz> }",
+        ],
+    );
+    ok(
+        env!("CARGO_BIN_EXE_gbackup"),
+        &[name.to_str().unwrap(), bak.to_str().unwrap()],
+    );
     let restored = base.join("restored");
-    ok(env!("CARGO_BIN_EXE_grestore"), &[bak.to_str().unwrap(), restored.to_str().unwrap()]);
+    ok(
+        env!("CARGO_BIN_EXE_grestore"),
+        &[bak.to_str().unwrap(), restored.to_str().unwrap()],
+    );
     let mut db = Database::open(base.join("restored.db")).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);
-    assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/z> <http://ex/p> ?o }"), ["<http://ex/zz>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { <http://ex/z> <http://ex/p> ?o }"
+        ),
+        ["<http://ex/zz>"]
+    );
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -606,14 +814,24 @@ fn concurrent_db_over_a_disk_database() {
     disk_db(&dir);
     {
         let cdb = gstore::ConcurrentDb::new(Database::open(&dir).unwrap());
-        cdb.update("INSERT DATA { <http://ex/c1> <http://ex/p> <http://ex/c2> }").unwrap();
-        match cdb.query("ASK { <http://ex/c1> <http://ex/p> <http://ex/c2> }").unwrap() {
+        cdb.update("INSERT DATA { <http://ex/c1> <http://ex/p> <http://ex/c2> }")
+            .unwrap();
+        match cdb
+            .query("ASK { <http://ex/c1> <http://ex/p> <http://ex/c2> }")
+            .unwrap()
+        {
             gstore::QueryResult::Ask(b) => assert!(b),
             other => panic!("{other:?}"),
         }
     }
     let mut db = Database::open(&dir).unwrap();
-    assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/c1> <http://ex/p> ?o }"), ["<http://ex/c2>"]);
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { <http://ex/c1> <http://ex/p> ?o }"
+        ),
+        ["<http://ex/c2>"]
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -633,18 +851,27 @@ mod rocks {
         {
             let mut db = rocks_db(&dir);
             assert_eq!(db.storage(), StorageKind::RocksDb);
-            db.query("INSERT DATA { <http://ex/new> <http://ex/newp> \"brand new\" }").unwrap();
-            db.query("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }").unwrap();
+            db.query("INSERT DATA { <http://ex/new> <http://ex/newp> \"brand new\" }")
+                .unwrap();
+            db.query("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }")
+                .unwrap();
             db.save(&dir).unwrap();
         }
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(db.name(), "rk");
         assert_eq!(db.triple_num(), 3);
         assert_eq!(
-            col0(&mut db, "SELECT ?o WHERE { <http://ex/new> <http://ex/newp> ?o }"),
+            col0(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/new> <http://ex/newp> ?o }"
+            ),
             ["\"brand new\""]
         );
-        assert!(col0(&mut db, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }").is_empty());
+        assert!(col0(
+            &mut db,
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"
+        )
+        .is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -656,14 +883,28 @@ mod rocks {
         {
             let mut db = rocks_db(&dir);
             db.insert_triple(&triple("t1", "tp", "t2"));
-            db.query("INSERT DATA { GRAPH <http://ex/g> { <http://ex/t3> <http://ex/tp> \"lit\" } }")
-                .unwrap();
+            db.query(
+                "INSERT DATA { GRAPH <http://ex/g> { <http://ex/t3> <http://ex/tp> \"lit\" } }",
+            )
+            .unwrap();
             db.remove_triple(&triple("b", "p", "c"));
         }
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(db.triple_num(), 3);
-        assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/t1> <http://ex/tp> ?o }"), ["<http://ex/t2>"]);
-        assert_eq!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"), ["<http://ex/t3>"]);
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/t1> <http://ex/tp> ?o }"
+            ),
+            ["<http://ex/t2>"]
+        );
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+            ),
+            ["<http://ex/t3>"]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -683,8 +924,20 @@ mod rocks {
         Database::restore_into(&bak, &target).unwrap();
         let mut db = Database::open(&target).unwrap();
         assert_eq!(db.triple_num(), 4, "the backup carries the triples");
-        assert_eq!(col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/v> }"), ["<http://ex/bk>"]);
-        assert_eq!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"), ["<http://ex/bk>"]);
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/v> }"
+            ),
+            ["<http://ex/bk>"]
+        );
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+            ),
+            ["<http://ex/bk>"]
+        );
         drop(db);
 
         // The file-level copy of a closed store round-trips as well.
@@ -701,12 +954,19 @@ mod rocks {
     fn rocks_concurrent_snapshot_does_not_panic() {
         let dir = tmp("rocks_concurrent");
         let cdb = gstore::ConcurrentDb::new(rocks_db(&dir));
-        match cdb.query("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }").unwrap() {
+        match cdb
+            .query("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }")
+            .unwrap()
+        {
             gstore::QueryResult::Select(rs) => assert_eq!(rs.row_count(), 1),
             other => panic!("{other:?}"),
         }
-        cdb.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/z> }").unwrap();
-        match cdb.query("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }").unwrap() {
+        cdb.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/z> }")
+            .unwrap();
+        match cdb
+            .query("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }")
+            .unwrap()
+        {
             gstore::QueryResult::Select(rs) => assert_eq!(rs.row_count(), 2),
             other => panic!("{other:?}"),
         }
@@ -730,10 +990,22 @@ mod rocks {
             col0(&mut db, "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }"),
             ["<http://ex/a>", "<http://ex/reuse>"]
         );
-        assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/reuse> <http://ex/p> ?o }"), ["<http://ex/fresh>"]);
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/reuse> <http://ex/p> ?o }"
+            ),
+            ["<http://ex/fresh>"]
+        );
         // And another new term after reopen does not collide.
         db.insert_triple(&triple("again", "p", "other"));
-        assert_eq!(col0(&mut db, "SELECT ?o WHERE { <http://ex/again> <http://ex/p> ?o }"), ["<http://ex/other>"]);
+        assert_eq!(
+            col0(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/again> <http://ex/p> ?o }"
+            ),
+            ["<http://ex/other>"]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -758,7 +1030,10 @@ mod rocks {
         for _ in 0..2 {
             let mut db = Database::open(&dir).unwrap();
             assert_eq!(db.name(), "legacy");
-            assert_eq!(col0(&mut db, "SELECT ?n WHERE { ?s <http://ex/name> ?n }"), ["\"Alice\""]);
+            assert_eq!(
+                col0(&mut db, "SELECT ?n WHERE { ?s <http://ex/name> ?n }"),
+                ["\"Alice\""]
+            );
         }
         assert!(dir.join("dict.bin.legacy").is_file());
 
@@ -786,7 +1061,10 @@ mod rocks {
         let base = tmp("rocks_cli");
         fs::create_dir_all(&base).unwrap();
         let ttl = base.join("d.ttl");
-        write(&ttl, "@prefix ex: <http://ex/> .\nex:m ex:dir ex:n , ex:o .\n");
+        write(
+            &ttl,
+            "@prefix ex: <http://ex/> .\nex:m ex:dir ex:n , ex:o .\n",
+        );
         let add = base.join("add.nt");
         write(&add, "<http://ex/q> <http://ex/dir> <http://ex/n> .\n");
         let name = base.join("r");
@@ -795,12 +1073,31 @@ mod rocks {
             assert!(out.status.success(), "{bin} {args:?}: {out:?}");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        ok(env!("CARGO_BIN_EXE_gbuild"), &["--rocksdb", name.to_str().unwrap(), ttl.to_str().unwrap()]);
-        ok(env!("CARGO_BIN_EXE_gadd"), &[name.to_str().unwrap(), add.to_str().unwrap()]);
-        let out = ok(env!("CARGO_BIN_EXE_gquery"), &[name.to_str().unwrap(), "-e", "SELECT ?s ?o WHERE { ?s <http://ex/dir> ?o }"]);
-        assert!(out.contains("<http://ex/q>") && out.contains("<http://ex/o>"), "{out}");
+        ok(
+            env!("CARGO_BIN_EXE_gbuild"),
+            &["--rocksdb", name.to_str().unwrap(), ttl.to_str().unwrap()],
+        );
+        ok(
+            env!("CARGO_BIN_EXE_gadd"),
+            &[name.to_str().unwrap(), add.to_str().unwrap()],
+        );
+        let out = ok(
+            env!("CARGO_BIN_EXE_gquery"),
+            &[
+                name.to_str().unwrap(),
+                "-e",
+                "SELECT ?s ?o WHERE { ?s <http://ex/dir> ?o }",
+            ],
+        );
+        assert!(
+            out.contains("<http://ex/q>") && out.contains("<http://ex/o>"),
+            "{out}"
+        );
         let shown = ok(env!("CARGO_BIN_EXE_gshow"), &[name.to_str().unwrap()]);
-        assert!(shown.contains("RocksDB") && shown.contains("triples   : 3"), "{shown}");
+        assert!(
+            shown.contains("RocksDB") && shown.contains("triples   : 3"),
+            "{shown}"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

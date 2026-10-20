@@ -1698,7 +1698,10 @@ fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
 
 /// Write a full-backup checkpoint marker: `GSTORE-BACKUP 1\noffset <N>\n`.
 fn write_backup_offset(path: &Path, offset: u64) -> Result<()> {
-    fsutil::atomic_write(path, format!("GSTORE-BACKUP 1\noffset {offset}\n").as_bytes())
+    fsutil::atomic_write(
+        path,
+        format!("GSTORE-BACKUP 1\noffset {offset}\n").as_bytes(),
+    )
 }
 
 /// Read a full-backup checkpoint marker's `offset`.

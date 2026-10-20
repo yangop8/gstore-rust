@@ -27,9 +27,8 @@ use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::{sparql, turtle};
-use crate::store::MutableStore;
 use crate::query::{Evaluator, QueryResult};
-use crate::store::{TripleSource, TripleStore};
+use crate::store::{MutableStore, TripleSource, TripleStore};
 
 use super::bptree::{be32, de32, BTree};
 use super::disk_dict::DiskDict;

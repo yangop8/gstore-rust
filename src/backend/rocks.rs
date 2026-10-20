@@ -235,7 +235,10 @@ impl RocksStore {
     }
 
     fn record_error(&self, what: &str, e: rocksdb::Error) {
-        let mut slot = self.error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.is_none() {
             *slot = Some(format!("rocksdb write ({what}): {e}"));
         }

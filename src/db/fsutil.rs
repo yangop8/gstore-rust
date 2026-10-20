@@ -413,8 +413,14 @@ mod tests {
 
         // Simulate a crash after the commit record was written and one member
         // was renamed, but before the other was.
-        write_tmp(&dir.join("a.bin"), |w| Ok(bincode::serialize_into(w, &2u32)?)).unwrap();
-        write_tmp(&dir.join("b.bin"), |w| Ok(bincode::serialize_into(w, &2u32)?)).unwrap();
+        write_tmp(&dir.join("a.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
+        write_tmp(&dir.join("b.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
         atomic_write(&dir.join(SNAPSHOT_COMMIT_FILE), b"a.bin\nb.bin").unwrap();
         fs::rename(tmp_path(&dir.join("a.bin")), dir.join("a.bin")).unwrap();
 
@@ -432,7 +438,10 @@ mod tests {
         let members: &[&str] = &["a.bin"];
         write_bincode_atomic(&dir.join("a.bin"), &1u32).unwrap();
         // A temp file without a commit record: the prepare never finished.
-        write_tmp(&dir.join("a.bin"), |w| Ok(bincode::serialize_into(w, &2u32)?)).unwrap();
+        write_tmp(&dir.join("a.bin"), |w| {
+            Ok(bincode::serialize_into(w, &2u32)?)
+        })
+        .unwrap();
         recover_snapshot(&dir, members).unwrap();
         let a: u32 = bincode::deserialize(&fs::read(dir.join("a.bin")).unwrap()).unwrap();
         assert_eq!(a, 1);

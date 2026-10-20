@@ -77,8 +77,33 @@ const SNAPSHOT_FILES: &[&str] = &[DICT_FILE, STORE_FILE, NAMED_FILE, VSTREE_FILE
 /// Suffix legacy shadow-snapshot files are renamed to (see the module docs).
 const LEGACY_SUFFIX: &str = ".legacy";
 
-/// Which persistent layout a database directory holds (see the module docs for
-/// what each contains and the detection precedence).
+/// Which persistent layout a database directory holds.
+///
+/// | kind | marker in the directory | what is stored where |
+/// |------|-------------------------|----------------------|
+/// | [`RocksDb`](Self::RocksDb) | `rocksdb/` | everything (triples, statistics, dictionary, named graphs, name) in one RocksDB instance |
+/// | [`Disk`](Self::Disk) | `kvstore.kv` | triples, dictionary and named graphs in the WAL-protected B+ tree file; `vstree.kv` is the out-of-core VS-tree |
+/// | [`Snapshot`](Self::Snapshot) | `meta.bin` | bincode snapshot: `dict.bin`, `store.bin`, `named.bin`, `vstree.bin`, `meta.bin` |
+///
+/// [`Database::open`] detects the layout with exactly this precedence
+/// (`rocksdb/` over `kvstore.kv` over a snapshot). Saving a database into a
+/// directory leaves only the saved layout there.
+///
+/// **Commit points.** On-disk and RocksDB databases persist every committed
+/// update to their own directory: each auto-commit SPARQL UPDATE,
+/// [`Database::commit`], [`Database::sync`], [`Database::save`] /
+/// [`Database::checkpoint`], and (best effort) dropping the database make the
+/// updates applied so far durable; a persistence failure is reported by the
+/// next commit point. An on-disk database still evaluates queries over an
+/// in-memory working set loaded at open; inside a transaction its writes reach
+/// the store only at `commit`.
+///
+/// **Legacy shadow snapshots.** Builds before this layout handling `save()`d an
+/// updated on-disk database as a bincode snapshot next to the untouched
+/// `kvstore.kv`. `kvstore.kv` stays authoritative; a shadow `store.bin` at least
+/// as new as it is reconciled into it on open (it holds the updates that build
+/// reported as applied), an older one is ignored, and either way the shadow
+/// files are renamed to `*.legacy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
     /// A bincode snapshot (`meta.bin`, `dict.bin`, `store.bin`, …), loaded fully
@@ -121,7 +146,12 @@ pub(super) struct DiskOp {
 
 impl DiskOp {
     /// Resolve an id-level mutation against the working-set dictionary.
-    fn resolve(dict: &Dictionary, insert: bool, graph: Option<u32>, id: IdTriple) -> Option<DiskOp> {
+    fn resolve(
+        dict: &Dictionary,
+        insert: bool,
+        graph: Option<u32>,
+        id: IdTriple,
+    ) -> Option<DiskOp> {
         let graph = match graph {
             Some(g) => Some(dict.id_to_string(g)?.to_owned()),
             None => None,
@@ -288,7 +318,10 @@ fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
 /// Build the out-of-core VS-tree file at `path` from `entries`, atomically:
 /// built under a temp name, then renamed over `path` (after removing any stale
 /// WAL that would otherwise replay into the new file), then reopened.
-fn write_vstree_kv(path: &Path, entries: Vec<(u32, crate::signature::Signature)>) -> Result<VsTree> {
+fn write_vstree_kv(
+    path: &Path,
+    entries: Vec<(u32, crate::signature::Signature)>,
+) -> Result<VsTree> {
     let tmp = fsutil::tmp_path(path);
     fsutil::remove_file_if_exists(&wal_of(&tmp))?;
     fsutil::remove_file_if_exists(&tmp)?;
@@ -315,7 +348,7 @@ impl Database {
 
     /// Which persistent layout directory `dir` holds, if any (precedence:
     /// RocksDB, then on-disk KVstore, then bincode snapshot — see the
-    /// [module docs](self)). Works with or without the `rocksdb` feature.
+    /// [`StorageKind`]). Works with or without the `rocksdb` feature.
     pub fn storage_kind<P: AsRef<Path>>(dir: P) -> Option<StorageKind> {
         let dir = dir.as_ref();
         if fsutil::dir_or_staged_exists(&dir.join(ROCKS_SUBDIR)) {
@@ -449,7 +482,8 @@ impl Database {
     /// Save the database into directory `dir` (created if necessary).
     ///
     /// * In-memory database: writes the bincode snapshot as one crash-atomic set
-    ///   (see [`fsutil`](super::fsutil)) and removes any other layout's files
+    ///   (temp files + a commit record, renamed into place) and removes any
+    ///   other layout's files
     ///   from `dir`.
     /// * On-disk database: at its home directory, commits the write-through to
     ///   `kvstore.kv` — no shadow `store.bin` is written. Into another
@@ -463,7 +497,10 @@ impl Database {
     pub fn save<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        let at_home = self.home.as_deref().is_some_and(|h| fsutil::same_dir(h, dir));
+        let at_home = self
+            .home
+            .as_deref()
+            .is_some_and(|h| fsutil::same_dir(h, dir));
         if self.disk.borrow().is_some() {
             self.commit_point()?;
             return if at_home {
@@ -523,7 +560,9 @@ impl Database {
     /// Copy a (just committed) on-disk database's store files into `dir`.
     fn copy_disk_files_to(&self, dir: &Path) -> Result<()> {
         let Some(home) = self.home.as_deref() else {
-            return Err(GStoreError::Database("on-disk database has no home directory".into()));
+            return Err(GStoreError::Database(
+                "on-disk database has no home directory".into(),
+            ));
         };
         let stale = self
             .disk
@@ -587,8 +626,8 @@ impl Database {
             )));
         }
         // The VS-tree is rebuilt from the store if absent or unreadable.
-        let vstree = fsutil::read_bincode(&dir.join(VSTREE_FILE))
-            .unwrap_or_else(|_| build_vstree(&store));
+        let vstree =
+            fsutil::read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
         let mut db = Database::new(meta.name);
         db.dict = dict;
         db.store = Backend::Memory(store);
@@ -635,7 +674,7 @@ impl Database {
     /// truth; their content (dictionary, default graph, named graphs) is
     /// materialized as the in-memory working set queries evaluate over, and
     /// every later committed mutation is written through to the store (see the
-    /// [module docs](self)). The out-of-core VS-tree (`vstree.kv`) is opened —
+    /// [`StorageKind`] docs). The out-of-core VS-tree (`vstree.kv`) is opened —
     /// or rebuilt first if an update made it stale.
     pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
         let dir = dir.as_ref();
@@ -986,9 +1025,15 @@ impl Database {
         use rocks_layout::intern_tracked;
         let mut fresh: Vec<(TermSpace, u32, String)> = Vec::new();
         let dict = &mut self.dict;
-        let gid = graph.map(|g| intern_tracked(dict, TermSpace::Entity, Term::iri(g).dict_key(), &mut fresh));
+        let gid = graph
+            .map(|g| intern_tracked(dict, TermSpace::Entity, Term::iri(g).dict_key(), &mut fresh));
         let s = intern_tracked(dict, TermSpace::Entity, t.subject.dict_key(), &mut fresh);
-        let p = intern_tracked(dict, TermSpace::Predicate, t.predicate.dict_key(), &mut fresh);
+        let p = intern_tracked(
+            dict,
+            TermSpace::Predicate,
+            t.predicate.dict_key(),
+            &mut fresh,
+        );
         let o_space = if t.object.is_literal() {
             TermSpace::Literal
         } else {
@@ -996,8 +1041,10 @@ impl Database {
         };
         let o = intern_tracked(dict, o_space, t.object.dict_key(), &mut fresh);
         if !fresh.is_empty() {
-            let terms: Vec<(TermSpace, u32, &str)> =
-                fresh.iter().map(|(sp, id, k)| (*sp, *id, k.as_str())).collect();
+            let terms: Vec<(TermSpace, u32, &str)> = fresh
+                .iter()
+                .map(|(sp, id, k)| (*sp, *id, k.as_str()))
+                .collect();
             if let Some(rocks) = self.store.as_rocks() {
                 if let Err(e) = rocks.put_terms(&terms) {
                     self.note_persist_error(e);
@@ -1225,7 +1272,9 @@ mod rocks_layout {
     /// Rebuild the in-memory dictionary from the `dict` CF, keeping every id
     /// exactly as stored. Gaps (ids freed by reclamation, or interned but never
     /// used by a persisted triple) become free-list holes, as they were.
-    pub(super) fn dictionary_from_terms(terms: Vec<(TermSpace, u32, String)>) -> Result<Dictionary> {
+    pub(super) fn dictionary_from_terms(
+        terms: Vec<(TermSpace, u32, String)>,
+    ) -> Result<Dictionary> {
         let mut dict = Dictionary::new();
         let mut holes: Vec<(TermSpace, String)> = Vec::new();
         let mut next_entity = 0u32;
