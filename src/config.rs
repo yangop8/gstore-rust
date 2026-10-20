@@ -861,8 +861,10 @@ upload_allow_compress_packages = "zip"
              k1 = second\n\
              garbage line\n\
              [b]\n\
-             k1=\n",
+             k1=\n\
+             k2 = #not-a-comment\n",
         );
+        assert_eq!(ini.get("b", "k2"), Some("#not-a-comment"), "a value may start with #");
         assert_eq!(ini.get("", "top"), Some("ignored"));
         assert_eq!(ini.get("a", "k1"), Some("v1"), "first occurrence wins");
         assert_eq!(ini.get("a", "k2"), Some("quoted value"));

@@ -17,6 +17,11 @@
 //!   directly — no SPARQL text is ever built from user input.
 //! * **Logging & monitoring** — query / access / transaction logs and a live
 //!   `/monitor` (and `/status`) JSON snapshot.
+//! * **Server lifecycle** — upstream's `/shutdown` and `/restart` path routes
+//!   (root, or the `system` user with the per-run password `gserver` writes to
+//!   its pid file); see `ApiInner::handle_stop_route`. Connection handling
+//!   (worker pool, keep-alive, CORS, body cap) and `conf.ini` settings come from
+//!   [`ApiServer::with_config`] / [`ApiServer::with_http_options`].
 //!
 //! **Durability.** Each loaded database tracks whether it has unsaved changes.
 //! Under gStore's `check_point` policy (on by default,
