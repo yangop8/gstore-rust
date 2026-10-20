@@ -6,6 +6,8 @@
 //! (read up to a closing `>` with no whitespace/illegal chars); on failure we
 //! fall back to the comparison operator.
 
+use std::ops::Range;
+
 use crate::error::{GStoreError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,11 +71,27 @@ pub enum Token {
 
 /// Tokenize an entire SPARQL string.
 pub fn tokenize(input: &str) -> Result<Vec<Token>> {
-    Lexer {
-        chars: input.chars().collect(),
-        pos: 0,
-    }
-    .run()
+    tokenize_with_spans(input).map(|(tokens, _)| tokens)
+}
+
+/// Tokenize an entire SPARQL string, also returning each token's source span
+/// as a byte range into `input` (`spans[i]` belongs to `tokens[i]`; the
+/// trailing [`Token::Eof`] gets the empty span at `input.len()`).
+///
+/// The parser needs the raw lexemes where a construct is passed through
+/// verbatim rather than interpreted, e.g. the `jsonVars` argument text of an
+/// upstream `PFN.name({…})` call.
+pub fn tokenize_with_spans(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>)> {
+    let chars: Vec<char> = input.chars().collect();
+    // byte_at[i] = byte offset of chars[i]; byte_at[chars.len()] = input.len().
+    let mut byte_at: Vec<usize> = input.char_indices().map(|(b, _)| b).collect();
+    byte_at.push(input.len());
+    let (tokens, char_spans) = Lexer { chars, pos: 0 }.run()?;
+    let spans = char_spans
+        .into_iter()
+        .map(|(a, b)| byte_at[a]..byte_at[b])
+        .collect();
+    Ok((tokens, spans))
 }
 
 struct Lexer {
@@ -100,13 +118,18 @@ impl Lexer {
         c
     }
 
-    fn run(mut self) -> Result<Vec<Token>> {
+    /// Lex the whole input into tokens plus their `[start, end)` char spans.
+    #[allow(clippy::type_complexity)]
+    fn run(mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
         let mut out = Vec::new();
+        let mut spans = Vec::new();
         loop {
             self.skip_ws_and_comments();
+            let start = self.pos;
             let Some(c) = self.peek() else {
                 out.push(Token::Eof);
-                return Ok(out);
+                spans.push((start, start));
+                return Ok((out, spans));
             };
             let tok = match c {
                 '{' => self.single(Token::LBrace),
@@ -176,6 +199,7 @@ impl Lexer {
                 other => return Err(self.err(format!("unexpected character '{other}'"))),
             };
             out.push(tok);
+            spans.push((start, self.pos));
         }
     }
 
@@ -573,6 +597,27 @@ mod tests {
         assert_eq!(t[0], Token::Word("SELECT".into()));
         assert_eq!(t[1], Token::Word("DISTINCT".into()));
         assert_eq!(t[2], Token::Word("WHERE".into()));
+    }
+
+    #[test]
+    fn spans_cover_raw_lexemes() {
+        let src = "{ \"k\\n\" : [\"<é>\"] } # c\n?x";
+        let (toks, spans) = tokenize_with_spans(src).unwrap();
+        assert_eq!(toks.len(), spans.len());
+        let raw: Vec<&str> = spans.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(
+            raw,
+            vec!["{", "\"k\\n\"", ":", "[", "\"<é>\"", "]", "}", "?x", ""]
+        );
+        assert_eq!(
+            toks[1],
+            Token::Str {
+                value: "k\n".into(),
+                lang: None,
+                datatype: None
+            }
+        );
+        assert_eq!(*toks.last().unwrap(), Token::Eof);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::model::id::PredId;
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
-use crate::parser::sparql::builtins;
+use crate::parser::sparql::{builtins, rs_function_name};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
@@ -358,6 +358,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         self.check_cancel()?;
+        if let Some(msg) = unwired_call(query) {
+            return Err(GStoreError::Query(msg));
+        }
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
@@ -815,7 +818,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .ebv()?,
             )),
             // Builtins over aggregate context are not supported.
-            Expr::Builtin(_, _) => None,
+            Expr::Builtin(_, _) | Expr::IriCall { .. } => None,
+            // Advanced functions / PFN are rejected before evaluation starts
+            // (see `unwired_call`).
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
             // EXISTS in HAVING: test against the group's representative solution.
             Expr::Exists(neg, pat) => {
                 let rep = *sols.first()?;
@@ -1831,6 +1837,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
+            // `rs:NAME(…)` is the legacy gstore-rust built-in NAME; any other
+            // IRI is looked up among the user-defined functions.
+            Expr::IriCall { iri, args } => match rs_function_name(iri) {
+                Some(name) => self.eval_builtin(name, args, b, l),
+                None => self.eval_custom_function(iri, args, b, l),
+            },
+            // Advanced functions / PFN are rejected before evaluation starts
+            // (see `unwired_call`).
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
             Expr::Exists(neg, pat) => Some(Value::Bool(self.eval_exists(*neg, pat, b, l))),
             // Aggregates only have meaning in group context (handled elsewhere).
             Expr::Aggregate { .. } => None,
@@ -1986,6 +2001,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 n.clone(),
                 args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
             ),
+            Expr::IriCall { iri, args } => Expr::IriCall {
+                iri: iri.clone(),
+                args: args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
+            },
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => e.clone(),
             Expr::Exists(neg, pat) => {
                 Expr::Exists(*neg, Box::new(self.subst_pattern(pat, b, layout)))
             }
@@ -3055,8 +3075,84 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             expr_has_aggregate(a) || expr_has_aggregate(b)
         }
         Expr::Not(a) | Expr::Unary(_, a) => expr_has_aggregate(a),
-        Expr::Builtin(_, args) => args.iter().any(expr_has_aggregate),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().any(expr_has_aggregate),
         _ => false,
+    }
+}
+
+/// Upstream advanced graph functions ([`Expr::GraphFn`]) and `PFN` calls
+/// parse, but evaluating them is not wired into the engine yet: report the
+/// first one in `q` so the query fails cleanly instead of yielding unbound
+/// values.
+fn unwired_call(q: &Query) -> Option<String> {
+    match q {
+        Query::Select(s) => unwired_in_select(s),
+        Query::Ask(a) => unwired_in_pattern(&a.pattern),
+        Query::Construct(c) => unwired_in_pattern(&c.pattern)
+            .or_else(|| c.order_by.iter().find_map(|o| unwired_in_expr(&o.expr))),
+        Query::Describe(d) => d.pattern.as_ref().and_then(unwired_in_pattern),
+        Query::Update(_) => None,
+    }
+}
+
+fn unwired_in_select(s: &SelectQuery) -> Option<String> {
+    let items: &[SelectItem] = match &s.projection {
+        Projection::Items(items) => items,
+        Projection::All => &[],
+    };
+    items
+        .iter()
+        .find_map(|it| match it {
+            SelectItem::Expr(e, _) => unwired_in_expr(e),
+            SelectItem::Var(_) => None,
+        })
+        .or_else(|| unwired_in_pattern(&s.pattern))
+        .or_else(|| s.group_by.iter().chain(&s.having).find_map(unwired_in_expr))
+        .or_else(|| s.order_by.iter().find_map(|o| unwired_in_expr(&o.expr)))
+}
+
+fn unwired_in_pattern(gp: &GraphPattern) -> Option<String> {
+    match gp {
+        GraphPattern::Empty
+        | GraphPattern::Bgp(_)
+        | GraphPattern::Path(_)
+        | GraphPattern::Values(_, _) => None,
+        GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
+            unwired_in_pattern(a).or_else(|| unwired_in_pattern(b))
+        }
+        GraphPattern::LeftJoin(a, b, fs) => unwired_in_pattern(a)
+            .or_else(|| unwired_in_pattern(b))
+            .or_else(|| fs.iter().find_map(unwired_in_expr)),
+        GraphPattern::Filter(fs, inner) => fs
+            .iter()
+            .find_map(unwired_in_expr)
+            .or_else(|| unwired_in_pattern(inner)),
+        GraphPattern::Extend(inner, _, e) => {
+            unwired_in_pattern(inner).or_else(|| unwired_in_expr(e))
+        }
+        GraphPattern::SubSelect(sq) => unwired_in_select(sq),
+        GraphPattern::Graph(_, inner) => unwired_in_pattern(inner),
+        GraphPattern::Service { pattern, .. } => unwired_in_pattern(pattern),
+    }
+}
+
+fn unwired_in_expr(e: &Expr) -> Option<String> {
+    match e {
+        Expr::GraphFn { func, .. } => Some(format!(
+            "advanced function evaluation not wired yet: {}(…)",
+            func.name()
+        )),
+        Expr::Pfn { name, .. } => Some(format!("PFN not supported yet: PFN.{name}(…)")),
+        Expr::Var(_) | Expr::Const(_) => None,
+        Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+            unwired_in_expr(a).or_else(|| unwired_in_expr(b))
+        }
+        Expr::Not(a) | Expr::Unary(_, a) => unwired_in_expr(a),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
+            args.iter().find_map(unwired_in_expr)
+        }
+        Expr::Exists(_, p) => unwired_in_pattern(p),
+        Expr::Aggregate { arg, .. } => arg.as_deref().and_then(unwired_in_expr),
     }
 }
 
@@ -3933,24 +4029,24 @@ mod builtin_tests {
 
     #[test]
     fn cycleboolean_detects_directed_cycle() {
-        assert_eq!(lit(&scalar_on(false, "CYCLEBOOLEAN()")), "false");
-        assert_eq!(lit(&scalar_on(true, "CYCLEBOOLEAN()")), "true");
-        assert_eq!(lit(&scalar_on(true, "SIMPLECYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(false, "rs:CYCLEBOOLEAN()")), "false");
+        assert_eq!(lit(&scalar_on(true, "rs:CYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(true, "rs:SIMPLECYCLEBOOLEAN()")), "true");
     }
 
     #[test]
     fn shortestpathlen_counts_edges() {
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
             "3"
         );
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
             "0"
         );
         // d→a is unreachable in the acyclic graph ⇒ -1 sentinel.
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
             "-1"
         );
     }
@@ -3958,15 +4054,15 @@ mod builtin_tests {
     #[test]
     fn khopreachable_respects_budget() {
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
             "true"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
             "false"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
             "true"
         );
     }
@@ -3976,44 +4072,44 @@ mod builtin_tests {
     #[test]
     fn sssp_serializes_the_path() {
         assert_eq!(
-            lit(&scalar("SSSP(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:SSSP(<http://ex/a>, <http://ex/d>)")),
             "<http://ex/a> <http://ex/b> <http://ex/c> <http://ex/d>"
         );
         // Unreachable ⇒ empty (but bound) string.
-        assert_eq!(lit(&scalar("SSSP(<http://ex/d>, <http://ex/a>)")), "");
+        assert_eq!(lit(&scalar("rs:SSSP(<http://ex/d>, <http://ex/a>)")), "");
     }
 
     #[test]
     fn sssplen_aliases_shortestpathlen() {
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
+        assert_eq!(lit(&scalar("rs:SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
+        assert_eq!(lit(&scalar("rs:SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
     }
 
     #[test]
     fn shortestpaths_counts_distinct_paths() {
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
+        assert_eq!(lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
+        assert_eq!(lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
     }
 
     #[test]
     fn khop_count_and_neighbor_and_all() {
         // a's out-edges: b, "Hello World", <dt> ⇒ 3 nodes at exactly 1 hop.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:KHOPCOUNT(<http://ex/a>, 1)")), "3");
         // Exactly 2 hops from a is just {c}.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 2)")), "1");
+        assert_eq!(lit(&scalar("rs:KHOPCOUNT(<http://ex/a>, 2)")), "1");
         assert_eq!(
-            lit(&scalar("KHOPNEIGHBOR(<http://ex/a>, 2)")),
+            lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/a>, 2)")),
             "<http://ex/c>"
         );
-        assert_eq!(lit(&scalar("KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
+        assert_eq!(lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
     }
 
     #[test]
     fn bfscount_counts_reachable() {
         // All reachable from a (excl. a): b, c, d, "Hello World", <dt> ⇒ 5.
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>)")), "5");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 1)")), "3");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 2)")), "4");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>)")), "5");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>, 2)")), "4");
     }
 
     #[test]
@@ -4028,23 +4124,23 @@ mod builtin_tests {
     #[test]
     fn wcc_membership_and_size() {
         // Every node hangs off a ⇒ one weakly-connected component of 6 nodes.
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>, <http://ex/d>)")), "true");
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>)")), "6");
+        assert_eq!(lit(&scalar("rs:WCC(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("rs:WCC(<http://ex/a>)")), "6");
     }
 
     #[test]
     fn community_builtins_group_the_graph() {
         // The whole graph is one connected blob ⇒ same label-prop community.
-        assert_eq!(lit(&scalar("LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("rs:LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
         // Louvain returns a community size (≥ 1) for a known node.
-        let sz: usize = lit(&scalar("LOUVAIN(<http://ex/a>)")).parse().unwrap();
+        let sz: usize = lit(&scalar("rs:LOUVAIN(<http://ex/a>)")).parse().unwrap();
         assert!(sz >= 1);
     }
 
     #[test]
     fn triangle_and_clustering_are_zero_on_a_tree() {
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING()")), "0");
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING(<http://ex/a>)")), "0");
+        assert_eq!(lit(&scalar("rs:TRIANGLECOUNTING()")), "0");
+        assert_eq!(lit(&scalar("rs:TRIANGLECOUNTING(<http://ex/a>)")), "0");
         // Acyclic fan/path ⇒ no closed triples ⇒ transitivity 0.0.
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF()")), "0.0");
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF(<http://ex/a>)")), "0.0");
@@ -4053,12 +4149,12 @@ mod builtin_tests {
     #[test]
     fn centrality_builtins_rank_intermediate_nodes() {
         // A source node is never an intermediary ⇒ betweenness 0.
-        let bc_a: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
-        let bc_b: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
+        let bc_a: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let bc_b: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
         assert_eq!(bc_a, 0.0);
         assert!(bc_b > 0.0);
         // a reaches five nodes ⇒ positive closeness.
-        let cc_a: f64 = lit(&scalar("CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let cc_a: f64 = lit(&scalar("rs:CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
         assert!(cc_a > 0.0);
     }
 
@@ -4067,7 +4163,7 @@ mod builtin_tests {
         // JACCARDSIMILARITY is a dedicated graph function (literal-as-node is fine):
         // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
         assert_eq!(
-            lit(&scalar(r#"JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
+            lit(&scalar(r#"rs:JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
             "0.5"
         );
         // Node-mode SIMILARITY requires BOTH args to be IRIs naming graph nodes;
@@ -4089,16 +4185,16 @@ mod builtin_tests {
 
     #[test]
     fn degree_correlation_and_diameter() {
-        let r: f64 = lit(&scalar("DEGREECORRELATION()")).parse().unwrap();
+        let r: f64 = lit(&scalar("rs:DEGREECORRELATION()")).parse().unwrap();
         assert!(r.is_finite() && (-1.0..=1.0).contains(&r));
         // Undirected longest shortest path: leaf → a → b → c → d = 4.
-        assert_eq!(lit(&scalar("DIAMETERESTIMATION()")), "4");
+        assert_eq!(lit(&scalar("rs:DIAMETERESTIMATION()")), "4");
     }
 
     #[test]
     fn ppr_prefers_the_source() {
-        let self_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
-        let far_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
+        let self_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
+        let far_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
         assert!(self_score > far_score);
         assert!(far_score >= 0.0);
     }
@@ -4107,7 +4203,7 @@ mod builtin_tests {
     fn graph_builtin_inside_filter() {
         // Keep only rows where a can reach d within 3 hops (it can).
         assert_eq!(
-            count("<http://ex/a> <http://ex/name> ?n FILTER(SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
+            count("<http://ex/a> <http://ex/name> ?n FILTER(rs:SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
             1
         );
     }
