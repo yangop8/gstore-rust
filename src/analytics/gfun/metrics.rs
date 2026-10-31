@@ -35,14 +35,17 @@
 //! [`pr`]). Every long loop polls the cancellation flag
 //! ([`GFunCtx::check_cancel`]).
 
+mod grisu;
 mod kplex;
 mod ppr;
+
+pub use grisu::nlohmann_dump_f64;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::cxx::{cxx_sort_by, CxxUnorderedOrder, GlibcRand};
 use super::fmt::{
-    cxx_g, cxx_g_f32, cxx_int_id, cxx_to_string, f32_round, nlohmann_f64, paths_json,
+    cxx_g, cxx_g_f32, cxx_int_id, cxx_to_string, f32_round, paths_json,
     push_json_quoted, push_vert_list_json, JsonList,
 };
 use super::traverse::{for_each_nbr, NbrOrder, NodeMarks};
@@ -171,18 +174,24 @@ fn nbr_set(g: &CsrGraph, v: Node, f: &PredFilter) -> Vec<Node> {
 pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let ret_num = to_int(a.ret_num.unwrap_or(-1));
     let k = to_int(a.k.unwrap_or(-1));
+    if ret_num < 0 {
+        // Upstream: `topkV2ppr.resize(retNum)` throws `std::length_error`.
+        return Err(GStoreError::Query(format!(
+            "PPR: retNum must not be negative (got {ret_num})"
+        )));
+    }
     let mut out = JsonList::new();
-    let mut fwd = None;
+    let mut session = None;
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         if src.is_missing() {
             continue;
         }
-        let top = if ret_num <= 0 {
+        let top = if ret_num == 0 {
             Vec::new()
         } else {
-            let fwd = fwd.get_or_insert_with(|| ppr::FilteredOut::new(ctx.csr, &a.preds));
-            ppr::ssppr(ctx, fwd, &src, ret_num as usize, k)?
+            let session = session.get_or_insert_with(|| ppr::Session::new(ctx.csr, &a.preds));
+            ppr::ssppr(ctx, session, &src, &a.preds, ret_num as usize, k)?
         };
         let e = out.item();
         e.push_str("{\"src\":");
@@ -924,8 +933,8 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let max_labels = max_labels.unwrap_or_else(|| (0..n as u32).collect());
     let mut lbl2id: BTreeMap<u32, usize> = coms.iter().enumerate().map(|(i, &c)| (c, i)).collect();
     let mut res: Vec<Vec<EntityLiteralId>> = vec![Vec::new(); coms.len()];
-    for vid in 0..n {
-        let idx = *lbl2id.entry(max_labels[vid]).or_insert(0);
+    for (vid, &label) in max_labels.iter().enumerate() {
+        let idx = *lbl2id.entry(label).or_insert(0);
         if let Some(r) = res.get_mut(idx) {
             r.push(g.entity_of(vid as Node));
         }
@@ -1606,7 +1615,9 @@ pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// `[[‹v›, x], …]` for every vertex in node order, e.g.
 /// `[["<Alice>",0.5],["<Bob>",1.0]]` — strings escaped like nlohmann
 /// ([`push_json_quoted`](super::fmt::push_json_quoted)), numbers via
-/// [`nlohmann_f64`](super::fmt::nlohmann_f64). **Spec fix:** an empty graph
+/// [`nlohmann_dump_f64`] (an exact Grisu2 port: nlohmann's digits are not
+/// always the shortest round-trip form, e.g. `0.27559055118110237`, so
+/// [`fmt::nlohmann_f64`](super::fmt::nlohmann_f64) is not used). **Spec fix:** an empty graph
 /// dumps the never-assigned `nlohmann::json` value: `null`.
 ///
 /// **x:** undirected BFS from `v` (per predicate: out, then in); `cnt` =
@@ -1648,7 +1659,7 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         s.push('[');
         push_json_quoted(&mut s, node_name(ctx, v));
         s.push(',');
-        s.push_str(&nlohmann_f64(res));
+        s.push_str(&nlohmann_dump_f64(res));
         s.push(']');
     }
     s.push(']');
