@@ -14,15 +14,30 @@
 //! * `rdf:parseType="Resource"` (anonymous blank node) and `="Literal"`
 //! * `rdf:li` membership properties (lowered to `rdf:_1`, `rdf:_2`, …) and the
 //!   `rdf:Seq`/`rdf:Bag`/`rdf:Alt` container classes
+//! * `rdf:parseType="Collection"` (the node elements become an
+//!   `rdf:first`/`rdf:rest` list ending in `rdf:nil`)
+//! * internal DTD entities: `<!DOCTYPE rdf:RDF [ <!ENTITY xsd "http://…#"> ]>`
+//!   and `&xsd;` references in attribute values and text (the OWL idiom
+//!   `rdf:resource="&xsd;string"`). A replacement text may use entities
+//!   declared before it; it is inserted as text (not re-parsed as markup).
+//!   External entities (`SYSTEM` / `PUBLIC`) are never fetched — a reference
+//!   to one is an error — and expansion is bounded
+//!   ([`MAX_ENTITY_VALUE`] per entity, [`MAX_ENTITY_EXPANSION`] per
+//!   document), so an "entity bomb" (billion laughs) is refused, not expanded.
 //!
 //! It is deliberately lenient and does not validate; constructs outside the
 //! supported subset are either ignored or surfaced as a parse error.
+//!
+//! The document is parsed whole; the bulk loaders refuse one larger than
+//! [`ImportOptions::max_document_bytes`](crate::parser::import::ImportOptions)
+//! (256 MiB by default).
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::stream::BlankLabeler;
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -33,11 +48,28 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// RDF/XML nests a handful of levels; this matches the Turtle parser's limit.
 const MAX_NESTING_DEPTH: usize = 256;
 
+/// Longest replacement text one DTD entity may expand to (characters).
+pub const MAX_ENTITY_VALUE: usize = 64 * 1024;
+
+/// Most characters entity references may add to one document in total.
+pub const MAX_ENTITY_EXPANSION: usize = 4 << 20;
+
 /// Parse an RDF/XML document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
+    parse_str_with(content, &mut BlankLabeler::keep())
+}
+
+/// Parse an RDF/XML document, naming blank nodes (`rdf:nodeID` values and
+/// anonymous nodes) with `labels`.
+pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Triple>> {
     let root = XmlParser::new(content).parse_document()?;
-    let mut ex = Extractor::default();
-    ex.run(&root)?;
+    let mut ex = Extractor {
+        triples: Vec::new(),
+        labels: std::mem::take(labels),
+    };
+    let ran = ex.run(&root);
+    *labels = ex.labels;
+    ran?;
     Ok(ex.triples)
 }
 
@@ -94,6 +126,11 @@ struct XmlParser {
     pos: usize,
     /// Elements currently open, bounded by [`MAX_NESTING_DEPTH`].
     depth: usize,
+    /// Internal DTD entities: name → replacement text (`None` = an external
+    /// entity, which is never fetched).
+    entities: HashMap<String, Option<String>>,
+    /// Characters entity references have added so far.
+    expanded: usize,
 }
 
 impl XmlParser {
@@ -102,6 +139,8 @@ impl XmlParser {
             chars: s.chars().collect(),
             pos: 0,
             depth: 0,
+            entities: HashMap::new(),
+            expanded: 0,
         }
     }
 
@@ -177,22 +216,210 @@ impl XmlParser {
         Ok(())
     }
 
+    /// `<!DOCTYPE name ExternalID? [ internal subset ]? >`: the internal
+    /// subset's `<!ENTITY …>` declarations are recorded, every other
+    /// declaration is skipped.
     fn skip_doctype(&mut self) -> Result<()> {
         self.pos += 9; // "<!DOCTYPE"
-        let mut depth = 0i32;
-        while let Some(c) = self.peek() {
-            match c {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                '>' if depth <= 0 => {
+        loop {
+            match self.peek() {
+                None => return Err(self.err("unterminated DOCTYPE")),
+                Some('>') => {
                     self.bump();
                     return Ok(());
                 }
-                _ => {}
+                Some('[') => {
+                    self.bump();
+                    break;
+                }
+                Some(q @ ('"' | '\'')) => self.skip_quoted(q)?,
+                Some(_) => {
+                    self.bump();
+                }
             }
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(']') {
+                self.bump();
+                self.skip_ws();
+                if self.bump() != Some('>') {
+                    return Err(self.err("expected '>' to close the DOCTYPE"));
+                }
+                return Ok(());
+            } else if self.starts_with("<!--") {
+                self.skip_comment()?;
+            } else if self.starts_with("<?") {
+                while !self.starts_with("?>") {
+                    if self.bump().is_none() {
+                        return Err(self.err("unterminated processing instruction"));
+                    }
+                }
+                self.pos += 2;
+            } else if self.starts_with("<!ENTITY") {
+                self.parse_entity_decl()?;
+            } else if self.starts_with("<!") {
+                self.skip_decl()?;
+            } else if self.peek() == Some('%') {
+                // A parameter-entity reference: not expanded (ignored).
+                while let Some(c) = self.bump() {
+                    if c == ';' {
+                        break;
+                    }
+                }
+            } else if self.peek().is_none() {
+                return Err(self.err("unterminated DOCTYPE"));
+            } else {
+                return Err(self.err("unexpected character in the DTD internal subset"));
+            }
+        }
+    }
+
+    /// Skip a quoted string starting at `q`.
+    fn skip_quoted(&mut self, q: char) -> Result<()> {
+        self.bump();
+        loop {
+            match self.bump() {
+                Some(c) if c == q => return Ok(()),
+                Some(_) => {}
+                None => return Err(self.err("unterminated quoted string in the DTD")),
+            }
+        }
+    }
+
+    /// Skip a markup declaration up to its closing `>` (quotes respected).
+    fn skip_decl(&mut self) -> Result<()> {
+        loop {
+            match self.peek() {
+                None => return Err(self.err("unterminated declaration in the DTD")),
+                Some('>') => {
+                    self.bump();
+                    return Ok(());
+                }
+                Some(q @ ('"' | '\'')) => self.skip_quoted(q)?,
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// `<!ENTITY name "value">` (recorded, its references expanded now),
+    /// `<!ENTITY name SYSTEM "uri">` (recorded as external, never fetched) or
+    /// `<!ENTITY % name …>` (a parameter entity: ignored).
+    fn parse_entity_decl(&mut self) -> Result<()> {
+        self.pos += 8; // "<!ENTITY"
+        self.skip_ws();
+        let parameter = self.peek() == Some('%');
+        if parameter {
+            self.bump();
+            self.skip_ws();
+        }
+        let mut name = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_whitespace() || c == '>' || c == '"' || c == '\'' {
+                break;
+            }
+            name.push(c);
             self.bump();
         }
-        Err(self.err("unterminated DOCTYPE"))
+        if name.is_empty() {
+            return Err(self.err("<!ENTITY> without a name"));
+        }
+        self.skip_ws();
+        let value = match self.peek() {
+            Some(q @ ('"' | '\'')) => {
+                self.bump();
+                let mut raw = String::new();
+                loop {
+                    match self.bump() {
+                        Some(c) if c == q => break,
+                        Some(c) => raw.push(c),
+                        None => return Err(self.err("unterminated entity value")),
+                    }
+                }
+                Some(self.expand_entity_value(&name, &raw)?)
+            }
+            _ => None,
+        };
+        self.skip_decl()?;
+        // The first declaration of a name is binding (XML 1.0 §4.2).
+        if !parameter && !self.entities.contains_key(&name) {
+            self.entities.insert(name, value);
+        }
+        Ok(())
+    }
+
+    /// Expand the character and entity references of an entity's literal
+    /// value, bounded by [`MAX_ENTITY_VALUE`].
+    fn expand_entity_value(&self, name: &str, raw: &str) -> Result<String> {
+        let mut out = String::new();
+        let mut rest = raw;
+        while let Some(i) = rest.find('&') {
+            out.push_str(&rest[..i]);
+            let after = &rest[i + 1..];
+            let end = after
+                .find(';')
+                .ok_or_else(|| self.err(format!("unterminated reference in entity '{name}'")))?;
+            let reference = &after[..end];
+            match self.decode_reference(reference)? {
+                Some(c) => out.push(c),
+                None => match self.entities.get(reference) {
+                    Some(Some(text)) => out.push_str(text),
+                    Some(None) => {
+                        return Err(self.err(format!(
+                            "external entity '&{reference};' is not supported"
+                        )))
+                    }
+                    None => {
+                        return Err(self.err(format!(
+                            "entity '{name}' refers to undeclared entity '&{reference};'"
+                        )))
+                    }
+                },
+            }
+            if out.len() > MAX_ENTITY_VALUE {
+                break;
+            }
+            rest = &after[end + 1..];
+        }
+        if out.len() <= MAX_ENTITY_VALUE {
+            out.push_str(rest);
+        }
+        if out.len() > MAX_ENTITY_VALUE {
+            return Err(self.err(format!(
+                "entity '{name}' expands beyond {MAX_ENTITY_VALUE} characters (entity expansion limit)"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// A predefined entity or character reference (`lt`, `#x41`, …) as a
+    /// character; `None` for any other name.
+    fn decode_reference(&self, name: &str) -> Result<Option<char>> {
+        Ok(Some(match name {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                    let code = u32::from_str_radix(hex, 16)
+                        .map_err(|_| self.err(format!("bad character reference '&{name};'")))?;
+                    char::from_u32(code)
+                        .ok_or_else(|| self.err(format!("invalid code point in '&{name};'")))?
+                } else if let Some(dec) = name.strip_prefix('#') {
+                    let code = dec
+                        .parse::<u32>()
+                        .map_err(|_| self.err(format!("bad character reference '&{name};'")))?;
+                    char::from_u32(code)
+                        .ok_or_else(|| self.err(format!("invalid code point in '&{name};'")))?
+                } else {
+                    return Ok(None);
+                }
+            }
+        }))
     }
 
     fn parse_document(&mut self) -> Result<XmlElement> {
@@ -288,7 +515,7 @@ impl XmlParser {
                     }
                 }
                 Some('&') => {
-                    text.push(self.read_entity()?);
+                    self.read_entity(&mut text)?;
                 }
                 Some(c) => {
                     text.push(c);
@@ -335,7 +562,7 @@ impl XmlParser {
             loop {
                 match self.peek() {
                     None => return Err(self.err("unterminated attribute value")),
-                    Some('&') => value.push(self.read_entity()?),
+                    Some('&') => self.read_entity(&mut value)?,
                     Some(c) if c == quote => {
                         self.bump();
                         break;
@@ -351,55 +578,59 @@ impl XmlParser {
         Ok(attrs)
     }
 
-    /// Decode one XML entity reference starting at `&`.
-    fn read_entity(&mut self) -> Result<char> {
+    /// Decode one XML entity reference starting at `&` into `out`: a
+    /// predefined entity, a character reference, or a DTD entity (counted
+    /// against [`MAX_ENTITY_EXPANSION`]).
+    fn read_entity(&mut self, out: &mut String) -> Result<()> {
         debug_assert_eq!(self.peek(), Some('&'));
         self.bump();
         let mut name = String::new();
-        while let Some(c) = self.peek() {
-            if c == ';' {
-                self.bump();
-                break;
-            }
-            name.push(c);
-            self.bump();
-            if name.len() > 32 {
-                return Err(self.err("unterminated entity reference"));
+        loop {
+            match self.peek() {
+                Some(';') => {
+                    self.bump();
+                    break;
+                }
+                Some(c) => {
+                    name.push(c);
+                    self.bump();
+                    if name.len() > 256 {
+                        return Err(self.err("unterminated entity reference"));
+                    }
+                }
+                None => return Err(self.err("unterminated entity reference")),
             }
         }
-        let ch = match name.as_str() {
-            "lt" => '<',
-            "gt" => '>',
-            "amp" => '&',
-            "quot" => '"',
-            "apos" => '\'',
-            _ => {
-                if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
-                    let code = u32::from_str_radix(hex, 16)
-                        .map_err(|_| self.err(format!("bad character reference '&{name};'")))?;
-                    char::from_u32(code)
-                        .ok_or_else(|| self.err(format!("invalid code point in '&{name};'")))?
-                } else if let Some(dec) = name.strip_prefix('#') {
-                    let code = dec
-                        .parse::<u32>()
-                        .map_err(|_| self.err(format!("bad character reference '&{name};'")))?;
-                    char::from_u32(code)
-                        .ok_or_else(|| self.err(format!("invalid code point in '&{name};'")))?
-                } else {
-                    return Err(self.err(format!("unknown entity '&{name};'")));
+        if let Some(c) = self.decode_reference(&name)? {
+            out.push(c);
+            return Ok(());
+        }
+        match self.entities.get(&name) {
+            Some(Some(text)) => {
+                self.expanded += text.len();
+                if self.expanded > MAX_ENTITY_EXPANSION {
+                    return Err(self.err(format!(
+                        "entity references expand beyond {MAX_ENTITY_EXPANSION} characters \
+                         (entity expansion limit)"
+                    )));
                 }
+                out.push_str(text);
+                Ok(())
             }
-        };
-        Ok(ch)
+            Some(None) => Err(self.err(format!(
+                "external entity '&{name};' is not supported"
+            ))),
+            None => Err(self.err(format!("unknown entity '&{name};'"))),
+        }
     }
 }
 
 // ---- triple extraction ----------------------------------------------------
 
-#[derive(Default)]
 struct Extractor {
     triples: Vec<Triple>,
-    bnode: usize,
+    /// Names `rdf:nodeID` values and anonymous nodes.
+    labels: BlankLabeler,
 }
 
 /// The inherited XML context threaded through the walk.
@@ -424,9 +655,12 @@ impl Ctx {
 
 impl Extractor {
     fn fresh_blank(&mut self) -> Term {
-        let t = Term::Blank(format!("rx{}", self.bnode));
-        self.bnode += 1;
-        t
+        Term::Blank(self.labels.fresh())
+    }
+
+    /// The node an `rdf:nodeID` names.
+    fn node_id(&self, nid: &str) -> Term {
+        Term::Blank(self.labels.explicit(nid))
     }
 
     /// Walk the document root: either `rdf:RDF` (iterate its node children) or a
@@ -472,7 +706,7 @@ impl Extractor {
         } else if let Some(id) = attr_value(el, RDF_NS, "ID", &ctx.ns)? {
             Term::Iri(resolve(&ctx.base, &format!("#{id}")))
         } else if let Some(nid) = attr_value(el, RDF_NS, "nodeID", &ctx.ns)? {
-            Term::Blank(nid)
+            self.node_id(&nid)
         } else {
             self.fresh_blank()
         };
@@ -543,7 +777,8 @@ impl Extractor {
         }
         // rdf:nodeID ⇒ blank-node object.
         if let Some(nid) = attr_value(pe, RDF_NS, "nodeID", &ctx.ns)? {
-            self.push(subject.clone(), predicate, Term::Blank(nid));
+            let obj = self.node_id(&nid);
+            self.push(subject.clone(), predicate, obj);
             return Ok(());
         }
 
@@ -587,7 +822,36 @@ impl Extractor {
                     );
                     return Ok(());
                 }
-                _ => { /* Collection / other: fall through to generic handling. */ }
+                "Collection" => {
+                    // The node elements, in order, become an RDF list.
+                    let mut items = Vec::new();
+                    for child in pe.elements() {
+                        items.push(self.node(child, &ctx)?);
+                    }
+                    let nil = Term::Iri(format!("{RDF_NS}nil"));
+                    if items.is_empty() {
+                        self.push(subject.clone(), predicate, nil);
+                        return Ok(());
+                    }
+                    let first = Term::Iri(format!("{RDF_NS}first"));
+                    let rest = Term::Iri(format!("{RDF_NS}rest"));
+                    let head = self.fresh_blank();
+                    self.push(subject.clone(), predicate, head.clone());
+                    let n = items.len();
+                    let mut cell = head;
+                    for (i, item) in items.into_iter().enumerate() {
+                        self.push(cell.clone(), first.clone(), item);
+                        let next = if i + 1 < n {
+                            self.fresh_blank()
+                        } else {
+                            nil.clone()
+                        };
+                        self.push(cell, rest.clone(), next.clone());
+                        cell = next;
+                    }
+                    return Ok(());
+                }
+                _ => { /* other: fall through to generic handling. */ }
             }
         }
 

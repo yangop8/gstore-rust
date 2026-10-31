@@ -24,6 +24,9 @@ use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::stream::{
+    BlankLabeler, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
+};
 
 /// One N-Quads statement: a triple plus the graph it belongs to (`None` ⇒ the
 /// default graph). Reused by the [`crate::parser::trig`] reader.
@@ -55,36 +58,120 @@ impl Quad {
             self.object.clone(),
         )
     }
+
+    /// The triple part, consuming the quad.
+    pub fn into_triple(self) -> Triple {
+        Triple::new(self.subject, self.predicate, self.object)
+    }
 }
 
 /// Parse the entire content of an N-Quads document into quads.
 pub fn parse_str(content: &str) -> Result<Vec<Quad>> {
-    let mut out = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        if let Some(q) = parse_line(line, i + 1)? {
-            out.push(q);
-        }
-    }
-    Ok(out)
+    let mut sink = CollectQuads::default();
+    parse_reader(content.as_bytes(), &BlankLabeler::keep(), &mut sink)?;
+    Ok(sink.quads)
 }
 
-/// Read an entire `.nq` file into a vector of quads.
+/// Read an entire `.nq` file into a vector of quads (streamed line by line).
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Quad>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        if let Some(q) = parse_line(&line, i + 1)? {
-            out.push(q);
-        }
-    }
-    Ok(out)
+    let mut sink = CollectQuads::default();
+    parse_reader(
+        BufReader::with_capacity(DEFAULT_WINDOW, file),
+        &BlankLabeler::keep(),
+        &mut sink,
+    )?;
+    Ok(sink.quads)
 }
 
 /// Convenience: parse a document and drop the graph labels, yielding triples.
 pub fn parse_str_triples(content: &str) -> Result<Vec<Triple>> {
     Ok(parse_str(content)?.iter().map(Quad::to_triple).collect())
+}
+
+/// Stream an N-Quads document from `reader` into `sink`, one line (one
+/// statement) at a time: memory holds the reader's buffer plus the current
+/// line. Blank-node labels go through `labels` (verbatim in keep mode).
+pub fn parse_reader<R: BufRead>(
+    reader: R,
+    labels: &BlankLabeler,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    stream_lines(reader, labels, true, sink)
+}
+
+/// The line-at-a-time driver behind the N-Triples (`allow_graph == false`)
+/// and N-Quads readers. A line that does not parse (or is not UTF-8) is
+/// reported to `sink` as one failed statement; I/O errors end the parse.
+pub(crate) fn stream_lines<R: BufRead>(
+    mut reader: R,
+    labels: &BlankLabeler,
+    allow_graph: bool,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out: Vec<Quad> = Vec::with_capacity(1);
+    let mut line_no = 0usize;
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            return Ok(());
+        }
+        line_no += 1;
+        let parsed = match std::str::from_utf8(&buf) {
+            Ok(line) if allow_graph => parse_line(line, line_no),
+            Ok(line) => crate::parser::ntriples::parse_line(line, line_no)
+                .map(|t| t.map(|t| Quad::new(t.subject, t.predicate, t.object, None))),
+            Err(_) => Err(GStoreError::RdfParse {
+                line: line_no,
+                msg: "invalid UTF-8".into(),
+            }),
+        };
+        match parsed {
+            Ok(Some(mut q)) => {
+                relabel_quad(&mut q, labels);
+                out.push(q);
+                sink.statement(&mut out)?;
+                out.clear();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let text = String::from_utf8_lossy(&buf);
+                sink.error(SyntaxError::from_error(&e).with_context(snippet(text.trim())))?;
+            }
+        }
+        // One huge line must not pin its buffer for the rest of the file.
+        if buf.capacity() > 4 * DEFAULT_WINDOW {
+            buf = Vec::new();
+        }
+    }
+}
+
+/// At most 200 characters of `s` (an error log context).
+pub(crate) fn snippet(s: &str) -> String {
+    match s.char_indices().nth(200) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// Rename the blank nodes of a quad read by a non-minting reader.
+fn relabel_quad(q: &mut Quad, labels: &BlankLabeler) {
+    if labels.is_keep() {
+        return;
+    }
+    for t in [&mut q.subject, &mut q.predicate, &mut q.object] {
+        relabel(t, labels);
+    }
+    if let Some(g) = q.graph.as_mut() {
+        relabel(g, labels);
+    }
+}
+
+fn relabel(t: &mut Term, labels: &BlankLabeler) {
+    if let Term::Blank(l) = t {
+        *l = labels.explicit_verbatim(l);
+    }
 }
 
 /// Parse one line. Returns `Ok(None)` for blank lines and comments.

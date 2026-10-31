@@ -19,6 +19,8 @@ use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::nquads::Quad;
+use crate::parser::stream::{BlankLabeler, StatementSink, SyntaxError, DEFAULT_WINDOW};
 
 /// Parse the entire content of an N-Triples document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
@@ -30,22 +32,48 @@ pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
     Ok(out)
 }
 
+/// Stream an N-Triples document from `reader` into `sink`, one line (one
+/// statement) at a time — memory holds the reader's buffer and the current
+/// line, never the document. Blank-node labels go through `labels`
+/// (verbatim in keep mode). A statement with a fourth (graph) term is an
+/// error here; use [`crate::parser::nquads::parse_reader`] for N-Quads.
+pub fn parse_reader<R: BufRead>(
+    reader: R,
+    labels: &BlankLabeler,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    crate::parser::nquads::stream_lines(reader, labels, false, sink)
+}
+
+/// Adapts a per-triple closure to a strict [`StatementSink`].
+struct TripleFn<F>(F);
+
+impl<F: FnMut(Triple) -> Result<()>> StatementSink for TripleFn<F> {
+    fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
+        for q in quads.drain(..) {
+            (self.0)(q.into_triple())?;
+        }
+        Ok(())
+    }
+
+    fn error(&mut self, err: SyntaxError) -> Result<()> {
+        Err(err.to_error())
+    }
+}
+
 /// Stream triples from a file on disk, invoking `f` per triple. Reads line by
 /// line so multi-gigabyte `.nt` files don't need to be slurped into memory.
-pub fn for_each_triple_file<P, F>(path: P, mut f: F) -> Result<()>
+pub fn for_each_triple_file<P, F>(path: P, f: F) -> Result<()>
 where
     P: AsRef<Path>,
     F: FnMut(Triple) -> Result<()>,
 {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        if let Some(t) = parse_line(&line, i + 1)? {
-            f(t)?;
-        }
-    }
-    Ok(())
+    parse_reader(
+        BufReader::with_capacity(DEFAULT_WINDOW, file),
+        &BlankLabeler::keep(),
+        &mut TripleFn(f),
+    )
 }
 
 /// Convenience: read an entire `.nt` file into a vector of triples.
@@ -60,16 +88,11 @@ pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
 
 /// Stream triples from an in-memory document, invoking `f` per triple. Avoids
 /// materializing intermediate vectors for large inputs.
-pub fn for_each_triple_str<F>(content: &str, mut f: F) -> Result<()>
+pub fn for_each_triple_str<F>(content: &str, f: F) -> Result<()>
 where
     F: FnMut(Triple) -> Result<()>,
 {
-    for (i, line) in content.lines().enumerate() {
-        if let Some(t) = parse_line(line, i + 1)? {
-            f(t)?;
-        }
-    }
-    Ok(())
+    parse_reader(content.as_bytes(), &BlankLabeler::keep(), &mut TripleFn(f))
 }
 
 /// Parse a single RDF term from its N-Triples surface form (the inverse of

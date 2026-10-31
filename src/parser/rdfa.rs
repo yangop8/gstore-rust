@@ -40,19 +40,48 @@ use std::path::Path;
 use crate::error::Result;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
+use crate::parser::stream::BlankLabeler;
 
 /// Parse an (X)HTML document containing RDFa into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
+    parse_str_with(content, &mut BlankLabeler::keep())
+}
+
+/// Parse an (X)HTML document containing RDFa, naming blank nodes (author
+/// `_:` CURIEs and minted nodes) with `labels`. The document is parsed whole;
+/// the bulk loaders refuse one larger than
+/// [`ImportOptions::max_document_bytes`](crate::parser::import::ImportOptions).
+pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Triple>> {
     let tokens = Lexer::new(content).tokenize();
     let root = build_tree(tokens);
-    let mut ex = Extractor::default();
+    let mut ex = Extractor {
+        triples: Vec::new(),
+        labels: std::mem::take(labels),
+    };
     let base = find_base(&root).unwrap_or_default();
     let ctx = EvalContext::root(base);
     for child in root.element_children() {
         ex.process(child, &ctx, true);
     }
-    Ok(ex.triples)
+    // Author labels go through the labeler now; minted ones carry a marker
+    // no `_:` CURIE can contain, so the two never meet.
+    let mut triples = std::mem::take(&mut ex.triples);
+    for t in &mut triples {
+        for term in [&mut t.subject, &mut t.object] {
+            if let Term::Blank(l) = term {
+                *l = match l.strip_prefix(MINTED) {
+                    Some(m) => m.to_string(),
+                    None => ex.labels.explicit(l),
+                };
+            }
+        }
+    }
+    *labels = ex.labels;
+    Ok(triples)
 }
+
+/// Marks a minted blank label until [`parse_str_with`] finishes.
+const MINTED: char = '\u{0}';
 
 /// Parse an (X)HTML file containing RDFa into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
@@ -515,21 +544,18 @@ impl EvalContext {
     }
 }
 
-#[derive(Default)]
 struct Extractor {
     triples: Vec<Triple>,
-    bnode: usize,
+    labels: BlankLabeler,
 }
 
 impl Extractor {
     /// Mint a fresh, document-unique blank node for a `@typeof`/`@rel` chain.
-    /// The `~` cannot appear in a parsed `_:` CURIE reference (an NCName), so a
-    /// minted label can never collide with an author-written `_:` blank node —
-    /// mirrors the Turtle (`g~`) and JSON-LD (`jld~`) parsers.
+    /// Its label comes from the [`BlankLabeler`] (round-trippable, never equal
+    /// to an author-written `_:` label); it carries the [`MINTED`] marker
+    /// until the parse finishes.
     fn fresh_blank(&mut self) -> Term {
-        let t = Term::Blank(format!("rdfa~{}", self.bnode));
-        self.bnode += 1;
-        t
+        Term::Blank(format!("{MINTED}{}", self.labels.fresh()))
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
@@ -1143,8 +1169,10 @@ mod tests {
     #[test]
     fn minted_blank_never_collides_with_author_blank() {
         // #1 (LOW): an author-written `_:rdfa0` must stay distinct from a blank the
-        // parser mints. The minted label carries a `~` (not a valid `_:` CURIE
-        // char), so the two can never be unified into one node.
+        // parser mints. Minted labels come from the BlankLabeler (`genid-<n>`;
+        // an author label starting `genid-` is escaped), so the two can never be
+        // unified into one node — and, unlike the earlier `rdfa~<n>`, the minted
+        // label round-trips through `ntriples::parse_term`.
         let doc = r#"
         <div>
           <span about="_:rdfa0" property="http://ex/p">authored</span>
@@ -1158,7 +1186,12 @@ mod tests {
         let Term::Blank(minted) = &types[0].subject else {
             panic!("bare @typeof must mint a blank subject");
         };
-        assert!(minted.starts_with("rdfa~"), "minted label must use the ~ separator: {minted}");
+        assert!(minted.starts_with("genid-"), "minted label: {minted}");
+        assert_eq!(
+            crate::parser::ntriples::parse_term(&format!("_:{minted}")).unwrap(),
+            types[0].subject,
+            "minted label must round-trip"
+        );
         assert_ne!(&types[0].subject, &authored[0].subject, "minted must not equal author blank");
     }
 
