@@ -500,9 +500,10 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// arithmetic.
 ///
 /// **Example** (SPARQL_QUERY.md): `betweennessCentrality(<Eve>, true, {…})`
-/// → `{"paths":[{"src":"<Eve>", "result":6.5}]}` (the doc example uses
-/// predicates absent from the sample data; with the real predicates of the
-/// sample graph the value differs).
+/// → `{"paths":[{"src":"<Eve>", "result":6.5}]}` (the doc example writes
+/// `<likes>`, `<follows>`, `<dislikes>`, which the sample data does not use
+/// and which resolve to nothing, giving 0; over the data's own predicates,
+/// `{}`, the value is the doc's 6.5).
 pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut out = JsonList::new();
     for src in a.distinct_srcs() {
@@ -1626,6 +1627,10 @@ fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f6
 /// (ascending), a BFS along **out-edges only** (always directed); `D` = the
 /// largest distance seen; 0 for an edgeless graph. (`O(n · (n + m))`, as
 /// upstream.)
+///
+/// **Example** (SPARQL_QUERY.md): `{"paths":[4]}` for the sample graph over
+/// its own predicates (the doc's `<likes>`, `<follows>`, `<dislikes>` do
+/// not occur in the sample data and would give 0).
 pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let g = ctx.csr;
     let f = &a.preds;
