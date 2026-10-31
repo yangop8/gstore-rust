@@ -35,6 +35,10 @@ rustls-pemfile = { version = "2", optional = true }
 # default: the default console reads plain lines. No default features: the
 # console keeps its own history file and needs no home-dir/file-lock helpers.
 rustyline = { version = "19", optional = true, default-features = false }
+# Optional zip packages (see the `zip` feature). OFF by default. No default
+# features: only the `deflate` method (pure Rust), no encryption / bzip2 /
+# lzma / zstd / time.
+zip = { version = "9", optional = true, default-features = false, features = ["deflate"] }
 
 [features]
 # Persistent RocksDB storage backend (see `src/backend/rocks.rs`).
@@ -48,6 +52,11 @@ tls = ["dep:rustls", "dep:rustls-pemfile"]
 # `gconsole` line editing: arrow keys / Emacs keys, history recall and tab
 # completion of command and database names (see `src/console/mod.rs`).
 readline = ["dep:rustyline"]
+# Zip packages in the `/api` layer and the CLI: `build` / `batchInsert` /
+# `batchRemove` from a `.zip` of RDF files, `backup compress=true` /
+# `restore` of a zipped backup, `export compress=true`, and `gexport --zip`
+# / `gbackup --zip` / `grestore x.zip` (see `src/zipio.rs`).
+zip = ["dep:zip"]
 
 [dev-dependencies]
 
