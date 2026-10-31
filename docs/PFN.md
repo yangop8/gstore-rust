@@ -501,6 +501,16 @@ usable as is: its bodies are C++).
   them safe file names.
 * **`funquery` paging** (`pageNo` / `pageSize`) is an extension; upstream
   always returns the whole list.
+* **`pfn_base_path`**: without the key the functions live under the
+  server's database directory (`<db_home>/pfn`), like the backups do here;
+  upstream defaults to `./pfn/` relative to its working directory. The key
+  is read at startup (as upstream reads it once); `refreshconf` re-applies
+  the `[pfn]` limits only.
+* **Where PFN runs**: the `/api` and REST endpoints of `gserver` (and an
+  embedded `Database` / `ConcurrentDb` with a caller installed). A function
+  called from the `WHERE` clause of an UPDATE (inside a sub-SELECT) uses the
+  database's installed caller only, which a server does not set — upstream
+  does not evaluate PFN in updates at all.
 * **Upstream's extra `funInfo` fields** `funArgs` and `funReturn` (listed in
   its docs, dropped by its code) are not stored, as upstream.
 * A PFN value is a plain literal everywhere but the `/api` `query`
