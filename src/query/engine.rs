@@ -1843,8 +1843,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
             // `rs:NAME(…)` is the legacy gstore-rust built-in NAME; any other
-            // IRI is looked up among the user-defined functions.
+            // IRI is looked up among the user-defined functions. The bare
+            // `SIMILARITY` is upstream's string similarity, so the legacy
+            // node/string SIMILARITY is only reachable as `rs:SIMILARITY`.
             Expr::IriCall { iri, args } => match rs_function_name(iri) {
+                Some("SIMILARITY") => self.eval_legacy_similarity(args, b, l),
                 Some(name) => self.eval_builtin(name, args, b, l),
                 None => self.eval_custom_function(iri, args, b, l),
             },
@@ -1855,6 +1858,29 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // Aggregates only have meaning in group context (handled elsewhere).
             Expr::Aggregate { .. } => None,
         }
+    }
+
+    /// `rs:SIMILARITY(a, b)`, the legacy gstore-rust SIMILARITY. Polymorphic,
+    /// but dispatched on IRI-ness (NOT mere dictionary membership): node
+    /// similarity (neighbour-set cosine overlap) only when BOTH arguments are
+    /// IRIs naming graph nodes; otherwise Jaro string similarity of the
+    /// lexical forms. This keeps string similarity working for literals — a
+    /// stored literal must never be silently reinterpreted as a graph node
+    /// (which would make SIMILARITY on data-bound strings data-dependent and
+    /// non-compositional).
+    fn eval_legacy_similarity(&self, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
+        let av = self.eval_value(args.first()?, b, l)?;
+        let cv = self.eval_value(args.get(1)?, b, l)?;
+        if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
+            if let (Some(a), Some(c)) =
+                (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
+            {
+                if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
+                    return Some(Value::Double(sim));
+                }
+            }
+        }
+        Some(Value::Double(jaro_similarity(&av.lexical(), &cv.lexical())))
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
@@ -2242,25 +2268,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(lang_matches(&tag, &range)))
             }
             "SIMILARITY" => {
-                // Polymorphic, but dispatched on IRI-ness (NOT mere dictionary
-                // membership): node similarity (neighbour-set cosine overlap) only
-                // when BOTH arguments are IRIs naming graph nodes; otherwise the
-                // original Jaro string similarity. This keeps string similarity
-                // working for literals — a stored literal must never be silently
-                // reinterpreted as a graph node (which would make SIMILARITY on
-                // data-bound strings data-dependent and non-compositional).
+                // Upstream gStore's SIMILARITY (TempResult.cpp:1278-1288):
+                // `doSimilarity(x.term_value, y.term_value)`, its Jaro variant,
+                // over the arguments' *term strings* — `<iri>`, `"lit"`,
+                // `"lit"@en`, `"1"^^<…#integer>` (the dictionary key form that
+                // upstream's `getStringByID` / constant `getText()` yield), so
+                // the quotes and brackets take part in the comparison. The
+                // legacy gstore-rust node/string similarity is `rs:SIMILARITY`.
                 let av = self.eval_value(args.first()?, b, l)?;
                 let cv = self.eval_value(args.get(1)?, b, l)?;
-                if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
-                    if let (Some(a), Some(c)) =
-                        (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
-                    {
-                        if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
-                            return Some(Value::Double(sim));
-                        }
-                    }
-                }
-                Some(Value::Double(jaro_similarity(&av.lexical(), &cv.lexical())))
+                Some(Value::Double(crate::analytics::gfun::metrics::jaro_similarity(
+                    &value_to_term(&av).dict_key(),
+                    &value_to_term(&cv).dict_key(),
+                )))
             }
 
             // ---- numeric -------------------------------------------------
@@ -2974,9 +2994,11 @@ fn gen_uuid() -> String {
     )
 }
 
-/// Jaro string similarity in `[0, 1]`, backing the gStore `SIMILARITY` built-in
-/// (ported from `TempResult::doSimilarity`, including its equal/empty/substring
-/// short-cuts so results track the C++ engine).
+/// Jaro string similarity in `[0, 1]` over Unicode scalar values, with
+/// `TempResult::doSimilarity`'s equal/empty/substring short-cuts but textbook
+/// transposition counting, in `f64`: the string mode of the legacy
+/// `rs:SIMILARITY`. The bare `SIMILARITY` uses the exact upstream port,
+/// [`crate::analytics::gfun::metrics::jaro_similarity`].
 fn jaro_similarity(s: &str, t: &str) -> f64 {
     if s == t {
         return 1.0;
@@ -3909,11 +3931,38 @@ mod builtin_tests {
 
     #[test]
     fn similarity_jaro() {
+        // Bare SIMILARITY is upstream's `doSimilarity` over the *term
+        // strings*, so quotes and brackets take part in the comparison.
+        let sim = |e: &str| -> f64 { lit(&scalar(e)).parse().unwrap() };
+        let upstream = crate::analytics::gfun::metrics::jaro_similarity;
         assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
-        assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "xyz")"#)), "0.0");
-        // "abc" is a substring of "abcdef": (3/6 + 2)/3 = 0.8333…
-        let sub: f64 = lit(&scalar(r#"SIMILARITY("abcdef", "abc")"#)).parse().unwrap();
-        assert!((sub - 0.833_333).abs() < 1e-4, "got {sub}");
+        // `"abc"` vs `"xyz"`: only the two quotes match: (2/5 + 2/5 + 2/2)/3.
+        let v = sim(r#"SIMILARITY("abc", "xyz")"#);
+        assert!((v - 0.6).abs() < 1e-6, "got {v}");
+        // `"abc"` is no substring of `"abcdef"` (the closing quote differs):
+        // four matches, no transposition: (4/8 + 4/5 + 4/4)/3.
+        let v = sim(r#"SIMILARITY("abcdef", "abc")"#);
+        assert!((v - 2.3 / 3.0).abs() < 1e-6, "got {v}");
+        // Exactly the upstream port (f32 arithmetic, byte-wise), on term strings.
+        assert_eq!(
+            sim(r#"SIMILARITY("MARTHA", "MARHTA")"#),
+            upstream("\"MARTHA\"", "\"MARHTA\"")
+        );
+        assert_eq!(
+            sim("SIMILARITY(<http://ex/a>, <http://ex/c>)"),
+            upstream("<http://ex/a>", "<http://ex/c>")
+        );
+        assert_eq!(
+            sim(r#"SIMILARITY(?n, "Hello")"#),
+            upstream("\"Hello World\"", "\"Hello\"")
+        );
+        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        // The legacy gstore-rust SIMILARITY (lexical forms, textbook Jaro)
+        // stays reachable as rs:SIMILARITY: "abc" is a substring of "abcdef"
+        // there, (3/6 + 2)/3.
+        let v = sim(r#"rs:SIMILARITY("abcdef", "abc")"#);
+        assert!((v - 2.5 / 3.0).abs() < 1e-9, "got {v}");
+        assert_eq!(lit(&scalar(r#"rs:SIMILARITY("abc", "xyz")"#)), "0.0");
     }
 
     // ---- numeric ----------------------------------------------------------

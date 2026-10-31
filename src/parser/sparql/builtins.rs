@@ -91,6 +91,12 @@ const fn n(k: usize) -> Arity {
 /// Standard SPARQL 1.1 functions (§17.4) plus the gStore extensions (graph
 /// analytics, `SIMILARITY`, `SIMPLECYCLEBOOLEAN`, …). Aggregates (`COUNT`,
 /// `SUM`, …) are parsed separately and are not listed.
+///
+/// The legacy gstore-rust graph built-ins whose bare names now denote an
+/// upstream advanced function (`SSSP`, `PPR`, `WCC`, …, see
+/// [`super::RS_FUNCTIONS`]) stay listed here: their entries are the argument
+/// counts that `rs:NAME(…)` calls are checked against, and the query engine
+/// still evaluates them by these names.
 pub const BUILTINS: &[Builtin] = &[
     b("ABS", n(1)),
     b("BETWEENNESSCENTRALITY", n(1)),

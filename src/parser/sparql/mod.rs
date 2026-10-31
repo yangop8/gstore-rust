@@ -53,7 +53,9 @@ pub const RS_NAMESPACE: &str = "urn:gstore-rust:fn:";
 /// case; the local name is matched case-insensitively). Each keeps the
 /// argument count it has in [`builtins::BUILTINS`]. `CLUSTERINGCOEFF`,
 /// `KHOPENUMERATEPATH` and `SIMILARITY` do not collide with an upstream
-/// advanced function, so their bare names also keep working.
+/// advanced function, so their bare names also parse; the bare `SIMILARITY`
+/// is upstream's Jaro string similarity, though, and the legacy node/string
+/// `SIMILARITY` only runs as `rs:SIMILARITY` (see the query engine).
 pub const RS_FUNCTIONS: &[&str] = &[
     "BETWEENNESSCENTRALITY",
     "BFSCOUNT",

@@ -1450,7 +1450,7 @@ impl GraphView {
     /// `|N(a) ∩ N(b)| / sqrt(|N(a)|·|N(b)|)`. Chosen over SimRank for O(deg)
     /// cost and determinism. `None` if either node is absent; `Some(0.0)` when
     /// either neighbourhood is empty. Backs the node-similarity path of the
-    /// `SIMILARITY` built-in.
+    /// legacy `rs:SIMILARITY` built-in.
     pub fn neighbor_cosine_similarity(
         &self,
         a: EntityLiteralId,
