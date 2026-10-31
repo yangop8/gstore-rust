@@ -249,7 +249,9 @@ impl OpSpec {
 
 /// A route on its own HTTP path (upstream's `/shutdown`, `/restart`,
 /// `/file/upload`, `/file/download/*`). Its handler does its own
-/// authentication (with [`auth::authenticate`]) as upstream's differ.
+/// authentication, as upstream's differ — through [`auth::authenticate`], or
+/// [`auth::verify`] for credentials gathered another way (the lifecycle
+/// routes also read headers and accept the `system` user).
 #[derive(Clone, Copy)]
 pub struct PathRoute {
     /// A name for logs and [`Ctx::op`].
