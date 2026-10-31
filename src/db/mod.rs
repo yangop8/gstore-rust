@@ -462,11 +462,7 @@ impl Database {
         name: impl Into<String>,
         files: &[P],
     ) -> Result<Database> {
-        let inputs: Vec<String> = files
-            .iter()
-            .map(|f| f.as_ref().to_string_lossy().into_owned())
-            .collect();
-        let sources = import::expand_sources(&inputs, &LoadPolicy::permissive())?;
+        let sources = import::sources_from_paths(files)?;
         let (db, _) =
             Database::build_from_sources(name, &sources, &import::ImportOptions::strict(), &mut ())?;
         Ok(db)

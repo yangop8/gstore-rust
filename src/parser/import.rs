@@ -410,6 +410,27 @@ pub fn expand_sources<S: AsRef<str>>(inputs: &[S], policy: &LoadPolicy) -> Resul
     Ok(out)
 }
 
+/// [`expand_sources`] for trusted paths (the library's and CLI tools' own
+/// file lists): directories expand, `http(s)://` strings become URLs, and
+/// every other path is a file, taken as is.
+pub fn sources_from_paths<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<Source>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let p = p.as_ref();
+        match p.to_str() {
+            Some(s) if is_url(s) => out.push(Source::Url(s.trim().to_string())),
+            _ if p.is_dir() => {
+                let mut files = Vec::new();
+                walk_rdf_files(p, &mut files)?;
+                files.sort();
+                out.extend(files.into_iter().map(Source::File));
+            }
+            _ => out.push(Source::File(p.to_path_buf())),
+        }
+    }
+    Ok(out)
+}
+
 /// Every RDF file below `dir` (see [`expand_sources`]).
 pub fn walk_rdf_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir)? {

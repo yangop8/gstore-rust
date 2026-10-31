@@ -81,6 +81,7 @@ use crate::error::{GStoreError, Result};
 use crate::kvstore::DiskStore;
 use crate::model::id::is_literal_id;
 use crate::model::{IdTriple, Term, Triple};
+use crate::parser::import;
 use crate::signature::VsTree;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
@@ -724,12 +725,27 @@ impl Database {
     // ---- on-disk B+ tree KVstore ---------------------------------------------
 
     /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
-    /// files, detecting each file's format by extension (as
-    /// [`build_from_files`](Self::build_from_files) does). The triples and
+    /// files (and directories / URLs), detecting each file's format by
+    /// extension (as [`build_from_files`](Self::build_from_files) does). The
+    /// input streams in; the triples, named-graph quads (N-Quads / TriG) and
     /// dictionary are written to `kvstore.kv` through the page cache; the
     /// out-of-core VS-tree is written to `vstree.kv`. Other layouts' files in
-    /// `dir` are removed (a fresh build).
+    /// `dir` are removed (a fresh build). Strict.
     pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
+        let sources = import::sources_from_paths(files)?;
+        Database::build_disk_from_sources(dir, &sources, &import::ImportOptions::strict(), &mut ())
+            .map(|_| ())
+    }
+
+    /// [`build_disk`](Self::build_disk) from `sources` with explicit
+    /// [`import::ImportOptions`] (e.g. tolerant, logging skipped statements
+    /// to `log`); returns the import counts.
+    pub fn build_disk_from_sources<P: AsRef<Path>>(
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         remove_other_layouts(dir, StorageKind::Disk)?;
@@ -737,7 +753,9 @@ impl Database {
         // leftover WAL from a crashed earlier build can't replay into the new file.
         let kv = dir.join(KV_FILE);
         super::remove_file_and_wal(&kv);
-        let mut ds = DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
+        let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+        let report = ds.import_sources(sources, opts, log)?;
+        ds.flush()?;
         // Build the out-of-core VS-tree alongside the store, so a later
         // `load_disk` filters through it on disk instead of materializing it.
         let vskv = dir.join(VSTREE_KV_FILE);
@@ -745,7 +763,7 @@ impl Database {
         drop(write_vstree_kv(&vskv, vstree_entries(&ds))?);
         ds.mark_vstree_fresh();
         ds.flush()?;
-        Ok(())
+        Ok(report)
     }
 
     /// Whether directory `dir` holds an on-disk KVstore database.
@@ -821,35 +839,79 @@ impl Database {
         dir: P,
         content: &str,
     ) -> Result<Database> {
-        let triples = crate::parser::turtle::parse_str(content)?;
-        Database::create_rocksdb(name.into(), dir.as_ref(), triples)
+        let opts = import::ImportOptions {
+            blank_nodes: import::BlankNodes::Keep,
+            ..import::ImportOptions::strict()
+        };
+        let mut db = Database::new(name);
+        let mut acc = super::BuildAccumulator::default();
+        import::import_reader(
+            content.as_bytes(),
+            import::RdfFormat::Turtle,
+            "<string>",
+            &opts,
+            &mut (),
+            &mut |batch: &mut Vec<crate::parser::nquads::Quad>| acc.add(&mut db, batch),
+        )?;
+        Database::create_rocksdb(db, acc, dir.as_ref())
     }
 
-    /// Build a RocksDB-backed database in `dir` from RDF files, detecting each
-    /// file's format by extension (see [`build_from_files`](Self::build_from_files)).
+    /// Build a RocksDB-backed database in `dir` from RDF files (and
+    /// directories / URLs), detecting each file's format by extension (see
+    /// [`build_from_files`](Self::build_from_files)). The input streams in;
+    /// N-Quads / TriG statements keep their named graph (the `gspo` CF).
     #[cfg(feature = "rocksdb")]
     pub fn build_rocksdb_from_files<P: AsRef<Path>, Q: AsRef<Path>>(
         name: impl Into<String>,
         dir: P,
         files: &[Q],
     ) -> Result<Database> {
-        let mut triples = Vec::new();
-        for f in files {
-            triples.extend(crate::parser::parse_file_by_ext(f)?);
-        }
-        Database::create_rocksdb(name.into(), dir.as_ref(), triples)
+        let sources = import::sources_from_paths(files)?;
+        let (db, _) = Database::build_rocksdb_from_sources(
+            name,
+            dir,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )?;
+        Ok(db)
     }
 
+    /// [`build_rocksdb_from_files`](Self::build_rocksdb_from_files) from
+    /// `sources` with explicit [`import::ImportOptions`]; returns the import
+    /// counts too.
     #[cfg(feature = "rocksdb")]
-    fn create_rocksdb(name: String, dir: &Path, triples: Vec<Triple>) -> Result<Database> {
-        use crate::backend::rocks::RocksStore;
-        // Encode first: an exhausted id space must fail before anything in
-        // `dir` is replaced.
+    pub fn build_rocksdb_from_sources<P: AsRef<Path>>(
+        name: impl Into<String>,
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<(Database, import::ImportReport)> {
         let mut db = Database::new(name);
-        let ids: Vec<IdTriple> = triples
-            .iter()
-            .map(|t| db.encode_triple(t))
-            .collect::<Result<_>>()?;
+        let mut acc = super::BuildAccumulator::default();
+        let report = import::import_sources(
+            sources,
+            "build",
+            opts,
+            log,
+            &mut |batch: &mut Vec<crate::parser::nquads::Quad>| acc.add(&mut db, batch),
+        )?;
+        Ok((Database::create_rocksdb(db, acc, dir.as_ref())?, report))
+    }
+
+    /// Write an encoded build (`db`'s dictionary, `acc`'s ids) into a fresh
+    /// RocksDB store in `dir`.
+    #[cfg(feature = "rocksdb")]
+    fn create_rocksdb(
+        mut db: Database,
+        acc: super::BuildAccumulator,
+        dir: &Path,
+    ) -> Result<Database> {
+        use crate::backend::rocks::RocksStore;
+        // Everything is encoded already: an exhausted id space has failed
+        // before anything in `dir` is replaced.
+        let super::BuildAccumulator { default: ids, named } = acc;
         fs::create_dir_all(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
@@ -862,6 +924,15 @@ impl Database {
         crate::store::MutableStore::bulk_load(&mut rocks, ids);
         if let Some(e) = rocks.take_error() {
             return Err(GStoreError::Database(e));
+        }
+        // Named graphs: the `gspo` CF and the in-memory map.
+        for (gid, quads) in named {
+            for &id in &quads {
+                rocks.insert_quad(gid, id)?;
+            }
+            let mut graph = TripleStore::new();
+            graph.bulk_load(quads);
+            db.named.insert(gid, graph);
         }
         rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
         rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
