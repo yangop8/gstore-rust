@@ -106,9 +106,9 @@ use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
 use crate::query::{Evaluator, QueryResult};
 use crate::server::{
-    ct_eq, err_json, locked, merge_headers, ntriples_body, parse_basic_auth, serve_pooled,
-    write_response_maybe_gzip, ConnHeaders, HttpOptions, Lifecycle, Request, ShutdownHandle,
-    ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
+    ct_eq, err_json, form_get, locked, merge_headers, ntriples_body, parse_basic_auth,
+    serve_pooled, write_response_maybe_gzip, ConnHeaders, HttpOptions, Lifecycle, Request,
+    ShutdownHandle, ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::{TripleSource, TripleStore};
@@ -266,45 +266,14 @@ fn lifecycle_param(req: &Request, key: &str) -> Option<String> {
     if let Some(v) = req.header(key) {
         return Some(v.to_string());
     }
-    if let Some(v) = req.query.as_deref().and_then(|q| form_value(q, key)) {
+    if let Some(v) = req.query.as_deref().and_then(|q| form_get(q, key)) {
         return Some(v);
     }
     let body = req.body.trim_ascii_start();
     if body.first() == Some(&b'{') {
         return json_member(body, key);
     }
-    form_value(&String::from_utf8_lossy(body), key)
-}
-
-/// `key` in an `application/x-www-form-urlencoded` string.
-fn form_value(qs: &str, key: &str) -> Option<String> {
-    qs.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (url_unescape(k) == key).then(|| url_unescape(v))
-    })
-}
-
-fn url_unescape(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    Err(_) => out.push(b'%'),
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    form_get(&String::from_utf8_lossy(body), key)
 }
 
 /// The top-level member `key` of a JSON object, as a string (a string member
@@ -3955,5 +3924,28 @@ mod tests {
         assert!(valid_ground_triple(&t(Term::Blank("b".into()), Term::iri("http://p"))));
         assert!(!valid_ground_triple(&t(Term::plain_literal("lit"), Term::iri("http://p"))));
         assert!(!valid_ground_triple(&t(Term::iri("http://s"), Term::Blank("b".into()))));
+    }
+
+    #[test]
+    fn lifecycle_credentials_are_read_from_json_bodies() {
+        // JSON \u escapes (a BMP char and a surrogate pair), built from parts.
+        let esc = |hex: &str| format!("\\{}{hex}", 'u');
+        let text = format!(
+            r#" {{ "nested": {{"username": "x", "a": [1, {{"b": "]"}}]}}, "n": -1.5e3,
+            "username" : "r\"o\\ot{}{}{}", "password": 123, "z": null }} "#,
+            esc("00e9"),
+            esc("d83d"),
+            esc("de00")
+        );
+        let body = text.as_bytes();
+        assert_eq!(json_member(body, "username").as_deref(), Some("r\"o\\ot\u{e9}\u{1f600}"));
+        assert_eq!(json_member(body, "password").as_deref(), Some("123"));
+        assert_eq!(json_member(body, "n").as_deref(), Some("-1.5e3"));
+        assert_eq!(json_member(body, "z"), None);
+        assert_eq!(json_member(body, "nested"), None);
+        assert_eq!(json_member(body, "missing"), None);
+        assert_eq!(json_member(b"{\"username\":\"unterminated", "username"), None);
+        assert_eq!(json_member(b"[\"username\"]", "username"), None);
+        assert_eq!(json_member(b"{}", "username"), None);
     }
 }

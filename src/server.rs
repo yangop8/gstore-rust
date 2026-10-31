@@ -2162,7 +2162,7 @@ fn read_limited_line<B: BufRead>(reader: &mut B, buf: &mut String) -> io::Result
 // --- URL form decoding -------------------------------------------------------
 
 /// Look up `key` in an `application/x-www-form-urlencoded` string.
-fn form_get(qs: &str, key: &str) -> Option<String> {
+pub(crate) fn form_get(qs: &str, key: &str) -> Option<String> {
     for pair in qs.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if url_decode(k) == key {
