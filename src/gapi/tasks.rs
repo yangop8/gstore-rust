@@ -57,6 +57,21 @@
 //! `<export dir>/<opt_id>.json` (upstream's location) instead of being held
 //! in memory; the file is removed when the task is dropped from retention.
 //!
+//! # Callbacks
+//!
+//! With a `callback` parameter, the finished operation's envelope — what the
+//! synchronous request would have answered, plus its `opt_id` — is POSTed
+//! there as `application/json` (upstream `HttpUtil::Post`; upstream's
+//! payloads carry the `opt_id` for most operations, here all do). Delivery
+//! happens on the runner thread after the task already reads as finished,
+//! bounded by [`TaskConfig::callback_timeout`], one attempt by default as
+//! upstream ([`TaskConfig::callback_retries`]); its outcome is recorded
+//! ([`TaskInfo::callback_status`]) and never changes the task's state. The
+//! URL must be `http://…` (`https://…` with the `tls` feature) and is checked
+//! before the operation is accepted. As upstream, the server POSTs wherever
+//! the (authenticated, privileged) caller says — deploy it where its
+//! outbound connections are restricted if that matters.
+//!
 //! # Shutdown
 //!
 //! [`TaskManager::close`] refuses new asynchronous operations,
@@ -467,10 +482,12 @@ impl Inner {
                     start_ms: now_ms(),
                     end_ms: 0,
                     elapsed: Duration::ZERO,
-                    status_msg: if is_async {
-                        RUNNING_MSG.to_string()
-                    } else {
-                        String::new()
+                    // Upstream logs a submitted query as "Operation
+                    // Success.", every other operation as "Operation success".
+                    status_msg: match (is_async, spec.operation.as_str()) {
+                        (false, _) => String::new(),
+                        (true, "query") => ACCEPTED_MSG.to_string(),
+                        (true, _) => RUNNING_MSG.to_string(),
                     },
                     status_code: None,
                     success_num: 0,

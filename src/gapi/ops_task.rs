@@ -184,7 +184,7 @@ fn task_list(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     };
     let page_no = if page_no <= 0 { 1 } else { page_no as u64 };
     let page_size = if page_size <= 0 { 10 } else { page_size as u64 };
-    let every = !matches!(status, 0 | 1 | -1);
+    let every = !(-1..=1).contains(&status);
     let all = sees_all(ctx);
     let tasks: Vec<TaskInfo> = ctx
         .inner

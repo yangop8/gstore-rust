@@ -209,7 +209,7 @@ pub struct OpSpec {
     pub needs_db: bool,
     /// Whether the operation honours `async=true` (upstream's `jsonBoolParam`:
     /// `true` / `"true"` / `"1"`). The dispatcher then runs the handler on
-    /// the task manager's runner threads ([`tasks::run_async`]) and answers
+    /// the task manager's runner threads (`tasks::run_async`) and answers
     /// with an `opt_id` at once; the handler itself is written synchronously
     /// (it sees `async=false`) and may reach its task through
     /// [`tasks::current`] (cancellation flag, progress).

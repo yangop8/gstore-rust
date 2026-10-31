@@ -65,6 +65,15 @@
 //! `/tasklist` lists and `/cancel` (or a shutdown past its grace period) can
 //! cancel.
 //!
+//! **Tasks.** One task manager ([`crate::gapi::tasks::TaskManager`], see
+//! [`ApiServer::task_manager`]) tracks the running SPARQL statements and the
+//! upstream protocol's asynchronous operations (`async=true`) under
+//! upstream-style `opt_id`s: `/tasklist` and `/cancel` here, and
+//! `operationTaskList` / `operationTaskCancel` / `checkOperationState` in
+//! [`crate::gapi`], see and cancel the same tasks. A graceful shutdown also
+//! cancels the asynchronous operations still running and waits for them
+//! (bounded, [`TaskConfig::shutdown_wait`]).
+//!
 //! **Transactions.** At most one transaction is open per database, owned by
 //! the user who began it: only that user (or `root`) may `/tquery`, `/commit`
 //! or `/rollback` it. While it is open, every non-transactional write to that
