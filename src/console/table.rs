@@ -239,7 +239,10 @@ mod tests {
             binding_term(&b(r#"{"type":"uri","value":"http://e/a"}"#)),
             "<http://e/a>"
         );
-        assert_eq!(binding_term(&b(r#"{"type":"bnode","value":"_:b1"}"#)), "_:b1");
+        assert_eq!(
+            binding_term(&b(r#"{"type":"bnode","value":"_:b1"}"#)),
+            "_:b1"
+        );
         assert_eq!(binding_term(&b(r#"{"type":"bnode","value":"b1"}"#)), "_:b1");
         assert_eq!(
             binding_term(&b(r#"{"type":"literal","value":"a \"q\"\nb","lang":"en"}"#)),
@@ -251,7 +254,10 @@ mod tests {
             )),
             "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"
         );
-        assert_eq!(binding_term(&b(r#"{"type":"literal","value":"x"}"#)), "\"x\"");
+        assert_eq!(
+            binding_term(&b(r#"{"type":"literal","value":"x"}"#)),
+            "\"x\""
+        );
         assert_eq!(
             pretty_json(&b(r#"{"paths":[{"src":"<a>","len":2}],"e":[],"o":{}}"#)),
             "{\n    \"paths\": [\n        {\n            \"src\": \"<a>\",\n            \"len\": 2\n        }\n    ],\n    \"e\": [],\n    \"o\": {}\n}"

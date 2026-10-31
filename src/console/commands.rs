@@ -96,7 +96,12 @@ pub struct Command {
     handler: Option<Handler>,
 }
 
-const fn cmd(name: &'static str, handler: Handler, doc: &'static str, usage: &'static str) -> Command {
+const fn cmd(
+    name: &'static str,
+    handler: Handler,
+    doc: &'static str,
+    usage: &'static str,
+) -> Command {
     Command {
         name,
         doc,
@@ -107,6 +112,7 @@ const fn cmd(name: &'static str, handler: Handler, doc: &'static str, usage: &'s
 
 /// The commands, in upstream's order (plus `exit` and `history`); the last
 /// entry stands for SPARQL typed at the prompt.
+#[rustfmt::skip]
 pub static COMMANDS: &[Command] = &[
     cmd("quit", h_quit, "Quit this console.", "quit;"),
     cmd("exit", h_quit, "Synonym for \"quit\".", "exit;"),
@@ -175,6 +181,41 @@ pub fn command_names() -> Vec<&'static str> {
         .filter(|c| c.handler.is_some())
         .map(|c| c.name)
         .collect()
+}
+
+/// Tab completion (the `readline` feature) of the word before byte `pos` of
+/// `line`: the first word of a statement completes to command names, a
+/// later word to `db_names`. Returns where the word starts and the
+/// candidates.
+pub fn completions(line: &str, pos: usize, db_names: &[String]) -> (usize, Vec<String>) {
+    let before = line.get(..pos).unwrap_or(line);
+    let start = before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace() || *c == ';')
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let word = &before[start..];
+    let first = before[..start]
+        .rsplit(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
+    let candidates = if first {
+        let lower = word.to_ascii_lowercase();
+        command_names()
+            .into_iter()
+            .filter(|n| n.starts_with(&lower))
+            .map(str::to_string)
+            .collect()
+    } else {
+        db_names
+            .iter()
+            .filter(|n| n.starts_with(word))
+            .cloned()
+            .collect()
+    };
+    (start, candidates)
 }
 
 /// Upstream's version lines (`PRINT_VERSION`), plus this implementation's.
@@ -304,10 +345,7 @@ impl Resp {
             .get("StatusCode")
             .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
             .unwrap_or(-1);
-        let msg = json
-            .get("StatusMsg")
-            .map(text_of)
-            .unwrap_or_default();
+        let msg = json.get("StatusMsg").map(text_of).unwrap_or_default();
         Resp { code, msg, json }
     }
 
@@ -770,7 +808,10 @@ pub fn result_table(j: &Json) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     }
     let names: Vec<&str> = vars.iter().map(|v| v.trim_start_matches('?')).collect();
     let results = j.get("results");
-    let rows: Vec<Vec<String>> = match results.and_then(|r| r.get("bindings")).and_then(Json::as_array) {
+    let rows: Vec<Vec<String>> = match results
+        .and_then(|r| r.get("bindings"))
+        .and_then(Json::as_array)
+    {
         Some(bindings) => bindings
             .iter()
             .map(|b| {
@@ -784,7 +825,13 @@ pub fn result_table(j: &Json) -> Option<(Vec<String>, Vec<Vec<String>>)> {
             .and_then(Json::as_array)
             .unwrap_or_default()
             .iter()
-            .map(|row| row.as_array().unwrap_or_default().iter().map(text_of).collect())
+            .map(|row| {
+                row.as_array()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(text_of)
+                    .collect()
+            })
             .collect(),
     };
     let header = names.iter().map(|v| format!("?{v}")).collect();
@@ -835,7 +882,11 @@ fn h_init(c: &mut Console, args: &[String]) -> CmdResult {
                 .collect()
         })
         .collect();
-    let _ = write!(c.out, "{}", table::render(&["db_name", "status", "msg"], &rows));
+    let _ = write!(
+        c.out,
+        "{}",
+        table::render(&["db_name", "status", "msg"], &rows)
+    );
     for row in &rows {
         if row[1] == "0" {
             c.remember_db(&row[0]);
@@ -957,7 +1008,10 @@ fn h_use(c: &mut Console, args: &[String]) -> CmdResult {
     }
     let r = c.request(
         "load",
-        vec![("db_name", Json::from(db.as_str())), ("csr", Json::from("0"))],
+        vec![
+            ("db_name", Json::from(db.as_str())),
+            ("csr", Json::from("0")),
+        ],
     )?;
     if !r.ok() {
         c.privilege_hint(&r, &db);
@@ -1150,7 +1204,11 @@ fn h_unload(c: &mut Console, _args: &[String]) -> CmdResult {
 fn batch(c: &mut Console, args: &[String], insert: bool) -> CmdResult {
     let db = c.need_db()?;
     c.not_sysdb()?;
-    c.argc(args, &[1], if insert { "batchinsert" } else { "batchremove" })?;
+    c.argc(
+        args,
+        &[1],
+        if insert { "batchinsert" } else { "batchremove" },
+    )?;
     let file = &args[0];
     let remote = is_remote(file);
     let file = if remote {
@@ -1178,9 +1236,15 @@ fn batch(c: &mut Console, args: &[String], insert: bool) -> CmdResult {
     }
     let (ok, failed) = (r.num("success_num"), r.num("failed_num"));
     if insert {
-        say!(c, "After inserted triples num {ok},failed num {failed},used {ms} ms");
+        say!(
+            c,
+            "After inserted triples num {ok},failed num {failed},used {ms} ms"
+        );
     } else {
-        say!(c, "After removed triples num {ok},failed num {failed},used {ms} ms");
+        say!(
+            c,
+            "After removed triples num {ok},failed num {failed},used {ms} ms"
+        );
     }
     Ok(())
 }
@@ -1290,7 +1354,14 @@ fn reason_rule_op(
 }
 
 fn h_compilereason(c: &mut Console, args: &[String]) -> CmdResult {
-    reason_rule_op(c, args, "compilereason", "3", "compile", &["insert_sparql", "delete_sparql"])
+    reason_rule_op(
+        c,
+        args,
+        "compilereason",
+        "3",
+        "compile",
+        &["insert_sparql", "delete_sparql"],
+    )
 }
 
 fn h_executereason(c: &mut Console, args: &[String]) -> CmdResult {
@@ -1317,7 +1388,11 @@ fn h_showreason(c: &mut Console, args: &[String]) -> CmdResult {
     if !r.ok() {
         bail!(c, "show reason {rule} failed: {}", r.msg);
     }
-    let info = r.json.get("ruleinfo").map(json_value).unwrap_or_else(Json::obj);
+    let info = r
+        .json
+        .get("ruleinfo")
+        .map(json_value)
+        .unwrap_or_else(Json::obj);
     let field = |k: &str| info.get(k).map(text_of).unwrap_or_default();
     let (name, desc) = (field("rulename"), field("description"));
     let conditions: Vec<Json> = info
@@ -1338,10 +1413,19 @@ fn h_showreason(c: &mut Console, args: &[String]) -> CmdResult {
             .iter()
             .map(|f| format!("{};", text_of(f)))
             .collect();
-        for p in cond.get("patterns").and_then(Json::as_array).unwrap_or_default() {
+        for p in cond
+            .get("patterns")
+            .and_then(Json::as_array)
+            .unwrap_or_default()
+        {
             let p = json_value(p);
             let part = |k: &str| p.get(k).map(text_of).unwrap_or_default();
-            let pattern = format!("<{},{},{}>", part("subject"), part("predicate"), part("object"));
+            let pattern = format!(
+                "<{},{},{}>",
+                part("subject"),
+                part("predicate"),
+                part("object")
+            );
             rows.push(vec![name.clone(), desc.clone(), pattern, filters.clone()]);
         }
     }
@@ -1380,8 +1464,7 @@ fn show_users(c: &mut Console) -> Result<Vec<Json>, Fail> {
     if !r.ok() {
         bail!(c, "Users Query failed: {}", r.msg);
     }
-    Ok(r
-        .json
+    Ok(r.json
         .get("ResponseBody")
         .and_then(Json::as_array)
         .unwrap_or_default()
@@ -1464,14 +1547,21 @@ fn h_pusr(c: &mut Console, args: &[String]) -> CmdResult {
             .cloned()
             .unwrap_or_else(|| "no priv".to_string()),
     };
-    let _ = write!(c.out, "{}", table::render(&headers, &[vec![target, db, privs]]));
+    let _ = write!(
+        c.out,
+        "{}",
+        table::render(&headers, &[vec![target, db, privs]])
+    );
     Ok(())
 }
 
 fn h_showusrs(c: &mut Console, args: &[String]) -> CmdResult {
     c.argc(args, &[0], "showusrs")?;
     if !c.is_root() {
-        bail!(c, "Permission denied. Only root is allowed to view all usrs.");
+        bail!(
+            c,
+            "Permission denied. Only root is allowed to view all usrs."
+        );
     }
     let users = show_users(c)?;
     let mut rows = vec![vec![
@@ -1549,7 +1639,10 @@ fn h_setpswd(c: &mut Console, args: &[String]) -> CmdResult {
         bail!(c, "Too much not match. Password set failed.");
     };
     let r = if args.is_empty() {
-        c.request("userpassword", vec![("op_password", Json::from(new.as_str()))])?
+        c.request(
+            "userpassword",
+            vec![("op_password", Json::from(new.as_str()))],
+        )?
     } else {
         c.request(
             "usermanage",
@@ -1761,7 +1854,14 @@ fn h_delusr(c: &mut Console, args: &[String]) -> CmdResult {
 /// Upstream's `PFNInfo` as JSON: its six string fields, from `src`.
 fn fun_info(src: &Json) -> Json {
     let mut info = Json::obj();
-    for k in ["funName", "funDesc", "funBody", "funSubs", "funStatus", "lastTime"] {
+    for k in [
+        "funName",
+        "funDesc",
+        "funBody",
+        "funSubs",
+        "funStatus",
+        "lastTime",
+    ] {
         info.set(k, src.get(k).map(text_of).unwrap_or_default());
     }
     info
@@ -1812,10 +1912,22 @@ fn fun_cudb(c: &mut Console, args: &[String], name: &str, kind: &str) -> CmdResu
         fun_info(&Json::obj().with("funName", args[0].as_str()))
     };
     let (ok, failed) = match kind {
-        "1" => ("create custom function successfully!", "failed to create custom function"),
-        "2" => ("update custom function successfully!", "failed to update custom function"),
-        "3" => ("delete custom function successfully!", "failed to delete custom function"),
-        _ => ("custom function build successfully!", "failed to build custom function"),
+        "1" => (
+            "create custom function successfully!",
+            "failed to create custom function",
+        ),
+        "2" => (
+            "update custom function successfully!",
+            "failed to update custom function",
+        ),
+        "3" => (
+            "delete custom function successfully!",
+            "failed to delete custom function",
+        ),
+        _ => (
+            "custom function build successfully!",
+            "failed to build custom function",
+        ),
     };
     let r = c.request(
         "funcudb",
@@ -1855,7 +1967,13 @@ fn help_usage(c: &mut Console) {
     );
     let rows: Vec<Vec<String>> = COMMANDS
         .iter()
-        .map(|cmd| vec![cmd.name.to_string(), cmd.doc.to_string(), cmd.usage.to_string()])
+        .map(|cmd| {
+            vec![
+                cmd.name.to_string(),
+                cmd.doc.to_string(),
+                cmd.usage.to_string(),
+            ]
+        })
         .collect();
     let _ = write!(
         c.out,
@@ -1872,7 +1990,10 @@ fn h_help(c: &mut Console, args: &[String]) -> CmdResult {
             "{PRODUCT_NAME} Console , an interactive shell based utility to communicate with {PRODUCT_NAME} repositories."
         );
         say!(c);
-        say!(c, "For information about {PRODUCT_NAME} products and services, visit:");
+        say!(
+            c,
+            "For information about {PRODUCT_NAME} products and services, visit:"
+        );
         say!(c, "   {PRODUCT_WEBSITE}");
         say!(
             c,
@@ -1882,7 +2003,10 @@ fn h_help(c: &mut Console, args: &[String]) -> CmdResult {
         say!(c);
         say!(c, "Commands end with ;. Cross line input is allowed.");
         say!(c, "Comment start with #.");
-        say!(c, "CTRL+C to quit current command. CTRL+D to exit this console.");
+        say!(
+            c,
+            "CTRL+C to quit current command. CTRL+D to exit this console."
+        );
         say!(c, "List of all console commands:");
         let mut rows: Vec<Vec<String>> = COMMANDS
             .iter()
@@ -1910,10 +2034,16 @@ fn h_help(c: &mut Console, args: &[String]) -> CmdResult {
                 ("CTRL-d", "delete a character"),
                 ("CTRL-f", "move cursor forward (right arrow)"),
                 ("CTRL-b", "move cursor backward (left arrow)"),
-                ("CTRL-p", "previous line, previous command in history (up arrow)"),
+                (
+                    "CTRL-p",
+                    "previous line, previous command in history (up arrow)",
+                ),
                 ("CTRL-n", "next line, next command in history (down arrow)"),
                 ("CTRL-k", "kill the line after the cursor, add to clipboard"),
-                ("CTRL-u", "kill the line before the cursor, add to clipboard"),
+                (
+                    "CTRL-u",
+                    "kill the line before the cursor, add to clipboard",
+                ),
                 ("CTRL-y", "paste from the clipboard"),
                 ("ALT-b", "move cursor back one word"),
                 ("ALT-f", "move cursor forward one word"),
@@ -1944,7 +2074,10 @@ fn h_help(c: &mut Console, args: &[String]) -> CmdResult {
                     c,
                     "{other}: Not a supported console command. \nList of gconsole command:"
                 );
-                let names: String = COMMANDS.iter().map(|cmd| format!("{} ", cmd.name)).collect();
+                let names: String = COMMANDS
+                    .iter()
+                    .map(|cmd| format!("{} ", cmd.name))
+                    .collect();
                 say!(c, "{names}");
             }
         },
@@ -2008,17 +2141,80 @@ mod tests {
         assert_eq!(COMMANDS.last().unwrap().name, "raw_sparql");
         assert!(find_command("raw_sparql").is_none());
         for name in [
-            "quit", "refreshconf", "init", "sparql", "create", "use", "drop", "show", "showdbs",
-            "backup", "restore", "export", "pdb", "unload", "batchinsert", "batchremove",
-            "addreason", "listreason", "compilereason", "executereason", "disablereason",
-            "showreason", "deletereason", "flushpriv", "pusr", "setpswd", "setpriv", "clearpriv",
-            "addusr", "delusr", "showusrs", "showpfn", "addpfn", "mdfpfn", "delpfn", "buildpfn",
-            "help", "?", "usage", "version", "pwd", "clear",
+            "quit",
+            "refreshconf",
+            "init",
+            "sparql",
+            "create",
+            "use",
+            "drop",
+            "show",
+            "showdbs",
+            "backup",
+            "restore",
+            "export",
+            "pdb",
+            "unload",
+            "batchinsert",
+            "batchremove",
+            "addreason",
+            "listreason",
+            "compilereason",
+            "executereason",
+            "disablereason",
+            "showreason",
+            "deletereason",
+            "flushpriv",
+            "pusr",
+            "setpswd",
+            "setpriv",
+            "clearpriv",
+            "addusr",
+            "delusr",
+            "showusrs",
+            "showpfn",
+            "addpfn",
+            "mdfpfn",
+            "delpfn",
+            "buildpfn",
+            "help",
+            "?",
+            "usage",
+            "version",
+            "pwd",
+            "clear",
         ] {
             assert!(find_command(name).is_some(), "{name}");
         }
         assert_eq!(find_command("SHOWDBS").unwrap().name, "showdbs");
         assert!(find_command("select").is_none());
+    }
+
+    #[test]
+    fn completion_of_commands_and_databases() {
+        let dbs = vec![
+            "lubm".to_string(),
+            "small".to_string(),
+            "smaller".to_string(),
+        ];
+        let (start, c) = completions("sho", 3, &dbs);
+        assert_eq!(start, 0);
+        assert_eq!(c, ["show", "showdbs", "showreason", "showusrs", "showpfn"]);
+        assert_eq!(completions("SHOWD", 5, &dbs).1, ["showdbs"]);
+        assert_eq!(
+            completions("use sm", 6, &dbs),
+            (4, vec!["small".to_string(), "smaller".to_string()])
+        );
+        // After a `;`, a new statement: commands again.
+        assert_eq!(
+            completions("pdb; us", 7, &dbs),
+            (5, vec!["use".to_string(), "usage".to_string()])
+        );
+        assert_eq!(
+            completions("drop\u{3000}lu", 9, &dbs),
+            (7, vec!["lubm".to_string()])
+        );
+        assert!(completions("use x", 5, &dbs).1.is_empty());
     }
 
     #[test]

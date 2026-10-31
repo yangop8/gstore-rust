@@ -21,8 +21,19 @@
 /// The SPARQL keywords that start a query or update typed directly at the
 /// prompt (upstream: `select`, `insert`, `delete`, `prefix`, `base`).
 const SPARQL_KEYWORDS: &[&str] = &[
-    "select", "ask", "construct", "describe", "insert", "delete", "prefix", "base", "load", "with",
-    "add", "move", "copy",
+    "select",
+    "ask",
+    "construct",
+    "describe",
+    "insert",
+    "delete",
+    "prefix",
+    "base",
+    "load",
+    "with",
+    "add",
+    "move",
+    "copy",
 ];
 
 /// What the scan of the buffered input found.
@@ -42,7 +53,9 @@ pub enum Next {
 pub fn next_statement(buf: &str, at_eof: bool) -> Next {
     let start = skip_blank(buf);
     if start >= buf.len() {
-        return Next::Blank { consumed: buf.len() };
+        return Next::Blank {
+            consumed: buf.len(),
+        };
     }
     let body = &buf[start..];
     let end = if is_sparql(body) {
@@ -577,14 +590,23 @@ mod tests {
     fn arguments_and_comments() {
         assert_eq!(
             parse_command("CREATE lubm data/lubm.nt").unwrap(),
-            ("create".to_string(), vec!["lubm".into(), "data/lubm.nt".into()])
+            (
+                "create".to_string(),
+                vec!["lubm".into(), "data/lubm.nt".into()]
+            )
         );
         assert_eq!(
             parse_command("create \"my db\"  \"a b.nt\"").unwrap().1,
             vec!["my db".to_string(), "a b.nt".to_string()]
         );
-        assert_eq!(parse_command("create \"my db").unwrap_err(), InvalidArguments);
-        assert_eq!(parse_command("create \"my\"db").unwrap_err(), InvalidArguments);
+        assert_eq!(
+            parse_command("create \"my db").unwrap_err(),
+            InvalidArguments
+        );
+        assert_eq!(
+            parse_command("create \"my\"db").unwrap_err(),
+            InvalidArguments
+        );
         assert_eq!(
             parse_command("show lubm # the lubm db\n").unwrap().1,
             vec!["lubm".to_string()]

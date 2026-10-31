@@ -344,7 +344,10 @@ fn output_redirection() {
     );
     let out = &r.out;
     assert!(out.contains("Redirect output to file: out.txt\n"), "{r:?}");
-    assert!(!out.contains("<node0>"), "the table went to the file: {r:?}");
+    assert!(
+        !out.contains("<node0>"),
+        "the table went to the file: {r:?}"
+    );
     let file = fs::read_to_string(cwd.join("out.txt")).unwrap();
     assert!(file.starts_with("-----------\n|   ?o    |\n"), "{file}");
     assert!(file.contains("| <node4> |"), "{file}");
@@ -381,7 +384,8 @@ fn exec_mode_and_exit_codes() {
     let r = run(cmd, "");
     assert_eq!(r.code, 0, "{r:?}");
     assert!(
-        r.out.starts_with("Current database switch to small successfully.\n\n"),
+        r.out
+            .starts_with("Current database switch to small successfully.\n\n"),
         "no banner, no prompt: {r:?}"
     );
     assert!(r.out.contains("| \"Bookug Lobert\" |"), "{r:?}");
@@ -426,7 +430,10 @@ fn wrong_password_and_unreachable_server() {
     cmd.args(["-u", "root", "-p", "wrong", "-e", "showdbs;"]);
     let r = run(cmd, "");
     assert_eq!(r.code, 1, "{r:?}");
-    assert_eq!(r.out, "login failed: Username or password is wrong.\n", "{r:?}");
+    assert_eq!(
+        r.out, "login failed: Username or password is wrong.\n",
+        "{r:?}"
+    );
     // Scripted credentials are not retried: the next line is not a user.
     let r = run(
         gconsole(&srv.addr, &cwd),
@@ -451,8 +458,7 @@ fn wrong_password_and_unreachable_server() {
     let r = run(cmd, "showdbs;\n");
     assert_eq!(r.code, 1, "{r:?}");
     assert_eq!(
-        r.out,
-        "Could not connect to server. Please check server status\n",
+        r.out, "Could not connect to server. Please check server status\n",
         "{r:?}"
     );
     assert!(r.err.contains(&format!("{}", free.port())), "{r:?}");
@@ -616,14 +622,17 @@ fn help_version_and_unknown_commands() {
     let r = run(cmd, "");
     assert_eq!(r.code, 0);
     assert!(
-        r.out.contains("Usage: bin/gconsole [OPTIONS]\n  -?, --help          Display this help and exit.\n"),
+        r.out.contains(
+            "Usage: bin/gconsole [OPTIONS]\n  -?, --help          Display this help and exit.\n"
+        ),
         "{r:?}"
     );
     let mut cmd = gconsole(&srv.addr, &cwd);
     cmd.arg("-v");
     let r = run(cmd, "");
     assert!(
-        r.out.starts_with("gStore version: 1.4 Source distribution\n"),
+        r.out
+            .starts_with("gStore version: 1.4 Source distribution\n"),
         "{r:?}"
     );
 }
@@ -634,7 +643,11 @@ fn reasoning_and_function_commands_show_the_servers_answer() {
     ok(&srv.build("small", &data("small/small.nt")));
     let cwd = scratch("gc_reason_cwd");
     let _cwd = DirGuard(cwd.clone());
-    fs::write(cwd.join("rule.json"), r#"{"rulename":"r1","description":"d"}"#).unwrap();
+    fs::write(
+        cwd.join("rule.json"),
+        r#"{"rulename":"r1","description":"d"}"#,
+    )
+    .unwrap();
     fs::write(cwd.join("bad.json"), "{not json").unwrap();
     fs::write(cwd.join("fun.json"), r#"{"funName":"f1","funBody":"{}"}"#).unwrap();
     let r = script(
@@ -736,7 +749,10 @@ fn interactive_prompts_banner_and_history() {
     cmd.args(["-u", "root", "-p", PASSWORD, "-i"])
         .env("GSTORE_HISTFILE", &hist);
     let r = run(cmd, "history 2;\n");
-    assert!(r.out.contains("    4  unload;\n    5  history 2;\n"), "{r:?}");
+    assert!(
+        r.out.contains("    4  unload;\n    5  history 2;\n"),
+        "{r:?}"
+    );
     // Scripts leave no history.
     let mut cmd = gconsole(&srv.addr, &cwd);
     cmd.args(["-u", "root", "-p", PASSWORD])
@@ -881,7 +897,9 @@ fn reply(stream: &mut TcpStream, body: &Json) {
 }
 
 fn success() -> Json {
-    Json::obj().with("StatusCode", 0).with("StatusMsg", "success")
+    Json::obj()
+        .with("StatusCode", 0)
+        .with("StatusMsg", "success")
 }
 
 #[test]
@@ -928,7 +946,9 @@ fn requests_carry_upstreams_operations_and_parameters() {
             ("query", _) => success()
                 .with(
                     "head",
-                    Json::obj().with("link", Json::arr()).with("vars", Json::Arr(vec![Json::from("r")])),
+                    Json::obj()
+                        .with("link", Json::arr())
+                        .with("vars", Json::Arr(vec![Json::from("r")])),
                 )
                 .with(
                     "results",
@@ -1025,20 +1045,32 @@ fn requests_carry_upstreams_operations_and_parameters() {
         r#"["http://example.org/x.nt"]"#
     );
     let load = &fake.ops("load")[0];
-    assert_eq!((field(load, "db_name"), field(load, "csr")), ("db1".into(), "0".into()));
+    assert_eq!(
+        (field(load, "db_name"), field(load, "csr")),
+        ("db1".into(), "0".into())
+    );
     let query = &fake.ops("query")[0];
     assert_eq!(field(query, "sparql"), "select ?r where { ?r ?p ?o }");
     assert_eq!(field(query, "db_name"), "db1");
     let insert = &fake.ops("batchInsert")[0];
-    assert_eq!(insert.get("file").unwrap().to_string(), format!(r#"["{}"]"#, abs("d.nt")));
+    assert_eq!(
+        insert.get("file").unwrap().to_string(),
+        format!(r#"["{}"]"#, abs("d.nt"))
+    );
     assert_eq!(fake.ops("batchRemove").len(), 1);
     assert_eq!(field(&fake.ops("backup")[0], "backup_path"), "bk");
     assert_eq!(field(&fake.ops("export")[0], "db_path"), "export/");
     let restore = &fake.ops("restore")[0];
     assert_eq!(field(restore, "db_name"), "db2");
-    assert_eq!(field(restore, "backup_path"), "./backups/db1.db_20240101000000");
+    assert_eq!(
+        field(restore, "backup_path"),
+        "./backups/db1.db_20240101000000"
+    );
     let drop = &fake.ops("drop")[0];
-    assert_eq!((field(drop, "db_name"), field(drop, "is_backup")), ("db2".into(), "false".into()));
+    assert_eq!(
+        (field(drop, "db_name"), field(drop, "is_backup")),
+        ("db2".into(), "false".into())
+    );
     assert_eq!(field(&fake.ops("init")[0], "db_names"), "a1x,b2y");
     assert_eq!(fake.ops("refreshconf").len(), 1);
     let reasons = fake.ops("reasonManage");
@@ -1110,8 +1142,8 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     // `query` is never answered; its task is listed as opt_id 42.
     let last_query: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let lq = Arc::clone(&last_query);
-    let respond: Arc<Responder> = Arc::new(move |req: &Json| {
-        match field(req, "operation").as_str() {
+    let respond: Arc<Responder> =
+        Arc::new(move |req: &Json| match field(req, "operation").as_str() {
             "query" => {
                 *lq.lock().unwrap() = field(req, "sparql");
                 None
@@ -1133,8 +1165,7 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
                     .with("StatusMsg", "query cancel successfully"),
             ),
             _ => Some(success()),
-        }
-    });
+        });
     let fake = Fake::start(respond);
     let cwd = scratch("gc_ctrl_c");
     let _cwd = DirGuard(cwd.clone());
@@ -1161,13 +1192,19 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     wait_for("the query", || !fake.ops("query").is_empty());
     thread::sleep(Duration::from_millis(200));
     sigint(&child);
-    wait_for("the cancellation", || !fake.ops("operationTaskCancel").is_empty());
+    wait_for("the cancellation", || {
+        !fake.ops("operationTaskCancel").is_empty()
+    });
     // The console is still there.
     stdin.write_all(b"pdb;\n").unwrap();
     drop(stdin);
     let code = wait(&mut child);
     let (out, err) = (out.join().unwrap(), err.join().unwrap());
-    let queries: Vec<String> = fake.ops("query").iter().map(|q| field(q, "sparql")).collect();
+    let queries: Vec<String> = fake
+        .ops("query")
+        .iter()
+        .map(|q| field(q, "sparql"))
+        .collect();
     assert_eq!(
         queries,
         ["select ?x where { ?x ?p ?o }"],
@@ -1179,9 +1216,14 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
         .map(|c| field(c, "opt_id"))
         .collect();
     assert_eq!(cancels, ["42"], "only this user's task");
-    wait_for("the dropped connection", || !fake.dropped.lock().unwrap().is_empty());
+    wait_for("the dropped connection", || {
+        !fake.dropped.lock().unwrap().is_empty()
+    });
     assert!(out.contains("Query cancelled.\n"), "{out}\n{err}");
-    assert!(out.ends_with("slow\n\n"), "pdb ran after the cancel: {out}\n{err}");
+    assert!(
+        out.ends_with("slow\n\n"),
+        "pdb ran after the cancel: {out}\n{err}"
+    );
     // A cancelled command counts as a failure of the script.
     assert_eq!(code, 1, "{out}\n{err}");
 }
@@ -1285,7 +1327,9 @@ fn gconsole_finds_gserver_through_conf_ini() {
             .spawn()
             .unwrap(),
     );
-    wait_for("gserver", || TcpStream::connect(("127.0.0.1", port)).is_ok());
+    wait_for("gserver", || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
     // No --port: gconsole reads it from ./conf/conf.ini, like upstream.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
     cmd.current_dir(&dir)
@@ -1304,7 +1348,8 @@ fn gconsole_finds_gserver_through_conf_ini() {
         "{r:?}"
     );
     assert!(
-        r.out.contains("\"25\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+        r.out
+            .contains("\"25\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
         "{r:?}"
     );
     assert!(dir.join("dbhome/small.db").is_dir());

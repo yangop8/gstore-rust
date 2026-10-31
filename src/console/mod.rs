@@ -110,10 +110,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "--host" | "-H" => o.host = Some(value(flag)?),
             "--port" | "-P" => {
                 let v = value(flag)?;
-                o.port = Some(
-                    v.parse()
-                        .map_err(|_| format!("invalid port '{v}'"))?,
-                );
+                o.port = Some(v.parse().map_err(|_| format!("invalid port '{v}'"))?);
             }
             "-c" | "--config" => o.config = Some(PathBuf::from(value(flag)?)),
             "-e" | "--exec" => o.exec = Some(value(flag)?),
@@ -240,7 +237,10 @@ pub fn main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let host = opts.host.clone().unwrap_or_else(|| DEFAULT_HOST.to_string());
+    let host = opts
+        .host
+        .clone()
+        .unwrap_or_else(|| DEFAULT_HOST.to_string());
     run_client(&opts, ApiClient::new(&host, port))
 }
 
@@ -483,31 +483,7 @@ mod editor {
             pos: usize,
             _ctx: &Context<'_>,
         ) -> rustyline::Result<(usize, Vec<Pair>)> {
-            let before = &line[..pos];
-            let start = before
-                .rfind(|c: char| c.is_whitespace() || c == ';')
-                .map_or(0, |i| i + 1);
-            let word = &before[start..];
-            let first = before[..start]
-                .rsplit(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .is_empty();
-            let candidates: Vec<String> = if first {
-                commands::command_names()
-                    .into_iter()
-                    .filter(|n| n.starts_with(&word.to_ascii_lowercase()))
-                    .map(str::to_string)
-                    .collect()
-            } else {
-                self.db_names
-                    .borrow()
-                    .iter()
-                    .filter(|n| n.starts_with(word))
-                    .cloned()
-                    .collect()
-            };
+            let (start, candidates) = commands::completions(line, pos, &self.db_names.borrow());
             Ok((
                 start,
                 candidates
@@ -572,7 +548,9 @@ mod tests {
     #[test]
     fn command_lines() {
         assert_eq!(
-            parse_args(&args(&["-u", "root", "-p", "123456", "--port", "9001", "-e", "showdbs;"])),
+            parse_args(&args(&[
+                "-u", "root", "-p", "123456", "--port", "9001", "-e", "showdbs;"
+            ])),
             Ok(Invocation::Run(Options {
                 user: Some("root".into()),
                 password: Some("123456".into()),
