@@ -87,6 +87,17 @@
 //! statistics) and runs DP-B only when they outnumber the values it reads
 //! at least twice; [`DpbMode::Always`] skips the estimate.
 //!
+//! Upstream's entry point (`Optimizer::ChooseStrategy` / `ExecutionTopK`)
+//! takes DP-B for a LIMIT with exactly one `ORDER BY` expression that is not
+//! a bare variable; here a bare variable is a linear key too, and later keys
+//! are allowed. Two upstream behaviours are deliberately not copied: ties
+//! come out in DP-B's internal order there (here in the full path's order),
+//! and `FQIterator::TryGetNext` leaves a scored node's own score out of its
+//! list's first element but adds it to every later one as it enters the
+//! pool, while the frontier mixes costs with and without it — misranking
+//! matches when a scored variable has children in the tree; here every
+//! element's score includes it exactly once.
+//!
 //! Cycles, which upstream cuts and re-checks, also take the heap path. DP-B
 //! enumerates until it has `k` matches and all matches tied with the `k`-th
 //! — a prefix of the sorted solution sequence — and orders those by the full
@@ -168,7 +179,8 @@ impl Default for TopKOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvalStats {
     /// BGP solutions produced, partial or complete: one per successful
-    /// extension of a solution by a triple pattern.
+    /// extension of a solution by a triple pattern, and one per solution a
+    /// bushy plan's join produces.
     pub bgp_bindings: u64,
     /// Evaluations (SELECT, sub-SELECT, CONSTRUCT, ASK, EXISTS) that streamed
     /// their WHERE solutions, able to stop early.
