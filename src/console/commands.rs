@@ -1903,7 +1903,7 @@ fn h_showpfn(c: &mut Console, args: &[String]) -> CmdResult {
 }
 
 /// `funcudb` of `kind` (1 create, 2 update from a JSON file; 3 delete, 4
-/// build by name); `what` names it in the messages.
+/// build by name) for command `name`.
 fn fun_cudb(c: &mut Console, args: &[String], name: &str, kind: &str) -> CmdResult {
     c.argc(args, &[1], name)?;
     let info = if kind == "1" || kind == "2" {
