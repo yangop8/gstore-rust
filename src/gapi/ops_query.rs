@@ -31,7 +31,7 @@ use crate::sparql_results::{
 };
 
 pub(super) fn register(reg: &mut Registry) {
-    reg.add(OpSpec::new("query", query).needs_db());
+    reg.add(OpSpec::new("query", query).needs_db().async_capable());
     reg.add(OpSpec::new("begin", begin).needs_db());
     reg.add(OpSpec::new("tquery", tquery).needs_db());
     reg.add(OpSpec::new("commit", commit).needs_db());
@@ -97,9 +97,9 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             ),
         );
     };
-    // `async=1` (an opt_id answered at once, the result fetched later with
-    // checkOperationState) belongs to the asynchronous-operations package;
-    // until then the query simply runs synchronously.
+    // `async=true` (an opt_id answered at once, the result fetched later with
+    // checkOperationState) is the dispatcher's: this then runs on a task
+    // runner, and the statement's task is that operation's (`tasks`).
     let parsed = crate::parser::sparql::parse(&sparql);
     let is_update = matches!(parsed, Ok(Query::Update(_)));
     let limit = match &parsed {
