@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [gzip, tls, zip]
+        feature: [gzip, tls, zip, readline]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +64,6 @@ jobs:
       - name: build
         run: cargo build -p gstore --all-targets --features ${{ matrix.feature }}
       - name: clippy
-        if: matrix.feature == 'zip'
         run: cargo clippy -p gstore --all-targets --features ${{ matrix.feature }} -- -D warnings
       - name: test
         run: cargo test -p gstore --features ${{ matrix.feature }}

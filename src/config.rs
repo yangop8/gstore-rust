@@ -32,10 +32,12 @@
 //!
 //! A few **Rust-only extension keys** tune the HTTP layer that upstream
 //! configures in code (`[server]`: `listen_addr`, `keep_alive_timeout`,
-//! `keep_alive_max`, `queue_size`, `cors`) and the diagnostic log that
+//! `keep_alive_max`, `queue_size`, `cors`), the diagnostic log that
 //! upstream configures in a log4cplus properties file (`[log]`: `log_level`,
-//! `log_file`, `log_days`, `log_stderr`, see [`crate::logging`]). They are
-//! documented on the fields below and in the example file.
+//! `log_file`, `log_days`, `log_stderr`, see [`crate::logging`]) and the
+//! limits a zip package must stay within (`[upload]`: `unzip_max_entries`,
+//! `unzip_max_size`, see [`crate::zipio`]). They are documented on the fields
+//! below and in the example file.
 
 use std::collections::BTreeSet;
 use std::fmt;
