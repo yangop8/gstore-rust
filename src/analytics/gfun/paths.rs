@@ -39,14 +39,16 @@
 //! # Resource bounds and cancellation
 //!
 //! All loops poll [`GFunCtx::check_cancel`] (per pair / source and every few
-//! thousand expanded vertices). The enumerating functions whose output can
-//! grow exponentially and that upstream does not bound ([`k_hop_enumerate`]
-//! with no or a negative `retNum`, [`shortest_paths`]) stop with a
-//! [`GStoreError::Query`] once a call would produce more than
-//! [`MAX_ENUMERATED_PATHS`] path entries, instead of exhausting memory (the
-//! upstream server would). Everything else is polynomial: BFS-style functions
-//! are `O(V + E)` per source / pair, `kHopReachable` does at most a constant
-//! number of vertex expansions (see its spec).
+//! thousand inner steps). The enumerating functions whose output can grow
+//! exponentially and that upstream does not bound ([`k_hop_enumerate`] with
+//! no or a negative `retNum`, [`shortest_paths`]) write their entries as they
+//! find them and stop with a [`GStoreError::Query`] once a call produces more
+//! than [`MAX_ENUMERATED_PATHS`] entries or [`MAX_ENUMERATED_BYTES`] of JSON,
+//! instead of exhausting memory (the upstream server would); their search
+//! time is not bounded (as upstream) beyond cancellation. Everything else is
+//! polynomial: BFS-style functions are `O(V + E)` per source / pair (the
+//! cycle / shortest-path primitives too), `kHopReachable` does at most a
+//! constant number of vertex expansions (see its spec).
 //!
 //! # The shared shortest-path primitive
 //!
@@ -90,6 +92,10 @@ use crate::model::id::{EntityLiteralId, PredId};
 /// out of memory instead).
 pub const MAX_ENUMERATED_PATHS: usize = 1_000_000;
 
+/// The most bytes of JSON one call of an enumerating function may produce
+/// (the same kind of guard as [`MAX_ENUMERATED_PATHS`], for long paths).
+pub const MAX_ENUMERATED_BYTES: usize = 256 << 20;
+
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
@@ -120,17 +126,48 @@ impl<'c, 'a> Poll<'c, 'a> {
     }
 }
 
-/// The error for exceeding [`MAX_ENUMERATED_PATHS`].
-fn too_many_paths(kind: GFnKind) -> GStoreError {
-    GStoreError::Query(format!(
-        "{}: more than {MAX_ENUMERATED_PATHS} paths; narrow the query{}",
-        kind.name(),
-        if kind == GFnKind::KHopEnumerate {
-            " or pass a retNum"
-        } else {
-            ""
+/// The output guard of the enumerating functions: entries are written to the
+/// result as they are found, and the call fails once it exceeds
+/// [`MAX_ENUMERATED_PATHS`] entries or [`MAX_ENUMERATED_BYTES`] bytes.
+struct OutputGuard {
+    kind: GFnKind,
+    max_paths: usize,
+    max_bytes: usize,
+    paths: usize,
+}
+
+impl OutputGuard {
+    fn new(kind: GFnKind) -> Self {
+        OutputGuard::with_limits(kind, MAX_ENUMERATED_PATHS, MAX_ENUMERATED_BYTES)
+    }
+
+    fn with_limits(kind: GFnKind, max_paths: usize, max_bytes: usize) -> Self {
+        OutputGuard {
+            kind,
+            max_paths,
+            max_bytes,
+            paths: 0,
         }
-    ))
+    }
+
+    /// Account for one more entry, already written to `list`.
+    fn emitted(&mut self, list: &JsonList) -> Result<()> {
+        self.paths += 1;
+        if self.paths > self.max_paths || list.as_str().len() > self.max_bytes {
+            return Err(GStoreError::Query(format!(
+                "{}: more than {} paths or {} bytes of output; narrow the query{}",
+                self.kind.name(),
+                self.max_paths,
+                self.max_bytes,
+                if self.kind == GFnKind::KHopEnumerate {
+                    " or pass a retNum"
+                } else {
+                    ""
+                }
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Upstream's `if (uid < 0)` (a missing node, or an id that wraps negative
@@ -1010,29 +1047,46 @@ pub fn shortest_path_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     Ok(GFunValue::Json(list.into_paths()))
 }
 
-/// `PathQueryHandler::kHopShortestPaths(u, v, directed, preds)`
-/// (kHopShortestPaths.cpp:27-194) for `u != v` on CSR nodes; appends the
-/// paths to `out`, counting against [`MAX_ENUMERATED_PATHS`] via `total`.
+/// Scratch space of [`all_shortest_paths`], reused across pairs.
+struct AspScratch {
+    dis: Dense<u32>,
+    visited: NodeMarks,
+    pre: HashMap<Node, Vec<Node>>,
+    nl: Vec<Node>,
+}
+
+/// `PathQueryHandler::kHopShortestPaths(u, v, directed, preds)` +
+/// `djstl_dfs` (kHopShortestPaths.cpp:5-194) for `u != v` on CSR nodes,
+/// writing one path entry per path (`src = ue`, `dst = ve`) as it is found.
 #[allow(clippy::too_many_arguments)]
 fn all_shortest_paths(
-    g: &CsrGraph,
-    dis: &mut Dense<u32>,
-    visited: &mut NodeMarks,
+    ctx: &GFunCtx<'_>,
+    sc: &mut AspScratch,
     poll: &mut Poll<'_, '_>,
-    u: Node,
-    v: Node,
+    guard: &mut OutputGuard,
+    list: &mut JsonList,
+    (u, ue): (Node, EntityLiteralId),
+    (v, ve): (Node, EntityLiteralId),
     directed: bool,
     preds: &PredFilter,
-    total: &mut usize,
-    out: &mut Vec<GPath>,
 ) -> Result<()> {
+    let g = ctx.csr;
+    let AspScratch {
+        dis,
+        visited,
+        pre,
+        nl,
+    } = sc;
     dis.reset();
     visited.clear();
-    let mut pre: HashMap<Node, Vec<Node>> = HashMap::new();
+    pre.clear();
+    // BFS from u over everything reachable (:36-109): `dis_pre[t]` collects
+    // the distinct predecessors at shortest distance in discovery order; the
+    // neighbours of an expanded vertex form a `std::set` whose unvisited
+    // members are enqueued ascending.
     let mut q = VecDeque::from([u]);
     dis.set(u, 0);
     visited.mark(u);
-    let mut nl: Vec<Node> = Vec::new();
     while let Some(x) = q.pop_front() {
         poll.tick()?;
         let distance = dis.get_or_zero(x) + 1;
@@ -1045,15 +1099,10 @@ fn all_shortest_paths(
                         dis.set(t, distance);
                         pre.entry(t).or_default().push(x);
                     }
-                    Some(d) if d > distance => {
-                        dis.set(t, distance);
-                        let l = pre.entry(t).or_default();
-                        l.clear();
-                        l.push(x);
-                    }
+                    // (`dis_u[t] > distance` cannot happen in a FIFO BFS.)
                     Some(d) if d == distance => {
-                        // `x` can only be the latest entry: it is the only
-                        // vertex being expanded.
+                        // `x` can only be the latest entry: entries are
+                        // appended while their vertex is being expanded.
                         let l = pre.entry(t).or_default();
                         if l.last() != Some(&x) {
                             l.push(x);
@@ -1065,23 +1114,23 @@ fn all_shortest_paths(
         }
         nl.sort_unstable();
         nl.dedup();
-        for &m in &nl {
+        for &m in nl.iter() {
             if visited.mark(m) {
                 q.push_back(m);
             }
         }
     }
 
-    // djstl_dfs: depth-first from v back to u over the predecessor lists.
-    let mut seqs: Vec<Vec<Node>> = Vec::new();
+    // djstl_dfs: depth-first from v back to u over the predecessor lists, in
+    // list order; every complete vertex sequence is fanned out right away.
     let mut stack: Vec<(Node, usize)> = vec![(v, 0)];
+    let mut seq: Vec<Node> = Vec::new();
     while let Some(&mut (x, ref mut i)) = stack.last_mut() {
         poll.tick()?;
         if x == u {
-            seqs.push(stack.iter().rev().map(|&(n, _)| n).collect());
-            if *total + seqs.len() > MAX_ENUMERATED_PATHS {
-                return Err(too_many_paths(GFnKind::ShortestPaths));
-            }
+            seq.clear();
+            seq.extend(stack.iter().rev().map(|&(n, _)| n));
+            fan_out(ctx, poll, guard, list, &seq, ue, ve, directed, preds)?;
             stack.pop();
             continue;
         }
@@ -1095,57 +1144,68 @@ fn all_shortest_paths(
             }
         }
     }
+    Ok(())
+}
 
-    // Fan every vertex sequence out over the predicates of each hop
-    // (ascending — std::set), all recorded forward.
-    let mut cands: Vec<PredId> = Vec::new();
-    for seq in seqs {
-        let mut paths: Vec<GPath> = vec![GPath::single(g.entity_of(u))];
-        for w in seq.windows(2) {
-            let (x, y) = (w[0], w[1]);
-            if x == v {
+/// The predicate fan-out of one shortest vertex sequence `u … v`
+/// (kHopShortestPaths.cpp:115-178): the candidates of a hop `x → y` are the
+/// predicates `p` with `x -p-> y` or (undirected) `y -p-> x`, ascending
+/// (`std::set`), recorded **forward** (plain id) either way. Upstream extends
+/// its path list in place with the first candidate and appends copies of the
+/// pre-hop list for each further one, so the first hop's choice varies
+/// fastest; the combinations are generated lazily in that order.
+#[allow(clippy::too_many_arguments)]
+fn fan_out(
+    ctx: &GFunCtx<'_>,
+    poll: &mut Poll<'_, '_>,
+    guard: &mut OutputGuard,
+    list: &mut JsonList,
+    seq: &[Node],
+    ue: EntityLiteralId,
+    ve: EntityLiteralId,
+    directed: bool,
+    preds: &PredFilter,
+) -> Result<()> {
+    let g = ctx.csr;
+    let mut cands: Vec<Vec<PredId>> = Vec::with_capacity(seq.len().saturating_sub(1));
+    for w in seq.windows(2) {
+        let (x, y) = (w[0], w[1]);
+        let mut c: Vec<PredId> = groups(g, x, preds, true, !directed)
+            .filter(|(_, outs, ins)| {
+                outs.binary_search(&y).is_ok() || ins.binary_search(&y).is_ok()
+            })
+            .map(|(p, _, _)| p)
+            .collect();
+        c.sort_unstable();
+        // `y` was discovered from `x` over an allowed edge, so `c` is never
+        // empty.
+        cands.push(c);
+    }
+    let mut path = GPath {
+        nodes: seq.iter().map(|&n| g.entity_of(n)).collect(),
+        edges: cands.iter().map(|c| fwd(c[0])).collect(),
+    };
+    let mut idx = vec![0usize; cands.len()];
+    loop {
+        poll.tick()?;
+        push_path_json(list.item(), ctx, ue, ve, &path);
+        guard.emitted(list)?;
+        // odometer step, hop 0 fastest
+        let mut h = 0;
+        loop {
+            let Some(i) = idx.get_mut(h) else {
+                return Ok(());
+            };
+            *i += 1;
+            if *i < cands[h].len() {
+                path.edges[h] = fwd(cands[h][*i]);
                 break;
             }
-            cands.clear();
-            for (p, outs, ins) in groups(g, x, preds, true, !directed) {
-                if outs.binary_search(&y).is_ok() || ins.binary_search(&y).is_ok() {
-                    cands.push(p);
-                }
-            }
-            cands.sort_unstable();
-            let pre_paths = if cands.len() > 1 {
-                paths.clone()
-            } else {
-                Vec::new()
-            };
-            let ye = g.entity_of(y);
-            for (pos, &p) in cands.iter().enumerate() {
-                if pos == 0 {
-                    for path in &mut paths {
-                        path.edges.push(fwd(p));
-                        path.nodes.push(ye);
-                    }
-                } else {
-                    if *total + out.len() + paths.len() + pre_paths.len() > MAX_ENUMERATED_PATHS {
-                        return Err(too_many_paths(GFnKind::ShortestPaths));
-                    }
-                    for base in &pre_paths {
-                        let mut path = base.clone();
-                        path.edges.push(fwd(p));
-                        path.nodes.push(ye);
-                        paths.push(path);
-                    }
-                }
-                poll.tick()?;
-            }
+            *i = 0;
+            path.edges[h] = fwd(cands[h][0]);
+            h += 1;
         }
-        if *total + out.len() + paths.len() > MAX_ENUMERATED_PATHS {
-            return Err(too_many_paths(GFnKind::ShortestPaths));
-        }
-        out.extend(paths);
     }
-    *total += out.len();
-    Ok(())
 }
 
 /// `shortestPaths(u, v, directed, preds)` — all shortest paths.
@@ -1153,10 +1213,11 @@ fn all_shortest_paths(
 /// **Upstream:** GE:2008-2011 / GE:3086-3089 → wrapper
 /// `GeneralEvaluation::kHopShortestPaths` (GE:4134-4159);
 /// `PathQueryHandler::kHopShortestPaths` + `djstl_dfs`
-/// (kHopShortestPaths.cpp:5-193).
+/// (kHopShortestPaths.cpp:5-194).
 ///
-/// **Per pair:** negative `u` or `v` → nothing; `u == v` → the empty-path
-/// entry; otherwise one path entry per path, in this order:
+/// **Per pair:** negative `u` or `v` → nothing (the wrapper's guard comes
+/// first, so two missing vertices give nothing either); `u == v` → the
+/// empty-path entry; otherwise one path entry per path, in this order:
 ///
 /// 1. BFS from `u` over everything reachable (out-edges, plus in-edges when
 ///    undirected, per predicate in filter order), recording for every vertex
@@ -1171,19 +1232,32 @@ fn all_shortest_paths(
 ///    with `x -p-> y` or (undirected) `y -p-> x`, ascending (`std::set`). The
 ///    first candidate extends the current path list in place; each further
 ///    candidate appends copies of the pre-hop list extended with it
-///    (kHopShortestPaths.cpp:141-171). All edges are recorded **forward**
-///    (plain predicate id) even when they were in-edges — reproduced.
+///    (kHopShortestPaths.cpp:141-171), so the first hop's predicate varies
+///    fastest. All edges are recorded **forward** (plain predicate id) even
+///    when they were in-edges — reproduced. Unlike `shortestPathCount`, the
+///    two directions of one predicate between the same vertices count once.
 ///
 /// The number of paths can be exponential and upstream does not bound it:
-/// more than [`MAX_ENUMERATED_PATHS`] entries in one call → error.
+/// more than [`MAX_ENUMERATED_PATHS`] entries (or [`MAX_ENUMERATED_BYTES`]
+/// of output) in one call → error.
 pub fn shortest_paths(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
+    shortest_paths_guarded(ctx, a, &mut OutputGuard::new(GFnKind::ShortestPaths))
+}
+
+fn shortest_paths_guarded(
+    ctx: &GFunCtx<'_>,
+    a: &GArgs,
+    guard: &mut OutputGuard,
+) -> Result<GFunValue> {
     let g = ctx.csr;
-    let mut dis = Dense::new(g.num_nodes());
-    let mut visited = NodeMarks::new(g.num_nodes());
+    let mut sc = AspScratch {
+        dis: Dense::new(g.num_nodes()),
+        visited: NodeMarks::new(g.num_nodes()),
+        pre: HashMap::new(),
+        nl: Vec::new(),
+    };
     let mut poll = Poll::new(ctx);
     let mut list = JsonList::new();
-    let mut total = 0usize;
-    let mut paths = Vec::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
         if negative(&u) || negative(&v) {
@@ -1191,28 +1265,23 @@ pub fn shortest_paths(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         }
         if u.entity == v.entity {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
-            total += 1;
+            guard.emitted(&list)?;
             continue;
         }
         let (Some(un), Some(vn)) = (csr_node(ctx, &u), csr_node(ctx, &v)) else {
             continue;
         };
-        paths.clear();
         all_shortest_paths(
-            g,
-            &mut dis,
-            &mut visited,
+            ctx,
+            &mut sc,
             &mut poll,
-            un,
-            vn,
+            guard,
+            &mut list,
+            (un, u.entity),
+            (vn, v.entity),
             a.directed,
             &a.preds,
-            &mut total,
-            &mut paths,
         )?;
-        for p in &paths {
-            push_path_json(list.item(), ctx, u.entity, v.entity, p);
-        }
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -1759,24 +1828,39 @@ impl<'g> NbrCursor<'g> {
     }
 }
 
+/// Scratch space of [`k_hop_enumerate_pair`], reused across pairs.
+struct EnumScratch {
+    bar: Dense<u32>,
+    /// All clear between pairs: the DFS unmarks what it marks.
+    on_stack: Vec<bool>,
+    nodes: Vec<Node>,
+}
+
 /// `PathQueryHandler::kHopEnumeratePath(u, v, retNum, directed, k, preds)`
-/// (kHopEnumeratePath.cpp:118-174, `bc_dfs` :5-104) for `u != v` on CSR nodes.
+/// (kHopEnumeratePath.cpp:118-174, `bc_dfs` :5-104) for `u != v` on CSR nodes,
+/// writing one path entry per path (`src = ue`, `dst = ve`) as it is found.
 #[allow(clippy::too_many_arguments)]
-fn k_hop_enumerate_nodes(
-    g: &CsrGraph,
-    bar: &mut Dense<u32>,
-    on_stack: &mut [bool],
+fn k_hop_enumerate_pair(
+    ctx: &GFunCtx<'_>,
+    sc: &mut EnumScratch,
     poll: &mut Poll<'_, '_>,
-    u: Node,
-    v: Node,
+    guard: &mut OutputGuard,
+    list: &mut JsonList,
+    (u, ue): (Node, EntityLiteralId),
+    (v, ve): (Node, EntityLiteralId),
     ret_num: i64,
     directed: bool,
     k: i64,
     preds: &PredFilter,
-    total: &mut usize,
-    out: &mut Vec<GPath>,
 ) -> Result<()> {
-    // Reverse k-BFS from v: bar[x] = hop distance x → v (0 when unreached).
+    let g = ctx.csr;
+    let EnumScratch {
+        bar,
+        on_stack,
+        nodes,
+    } = sc;
+    // Reverse k-BFS from v (:128-168): bar[x] = hop distance x → v, 0 when
+    // unreached (`bar[to] == 0` doubles as "unvisited"; v itself stays 0).
     bar.reset();
     let bar_of = |bar: &Dense<u32>, x: Node| i64::from(bar.get_or_zero(x));
     let mut q = VecDeque::from([v]);
@@ -1823,19 +1907,21 @@ fn k_hop_enumerate_nodes(
         }
         if to == v {
             // record the stack + v
-            let mut nodes: Vec<Node> = stack.iter().map(|f| f.0).collect();
+            nodes.clear();
+            nodes.extend(stack.iter().map(|f| f.0));
             nodes.push(v);
             let edges = stack
                 .iter()
                 .filter_map(|f| f.1)
                 .chain(std::iter::once(e))
                 .collect();
-            out.push(gpath(g, &nodes, edges));
-            if *total + out.len() > MAX_ENUMERATED_PATHS {
-                return Err(too_many_paths(GFnKind::KHopEnumerate));
-            }
+            push_path_json(list.item(), ctx, ue, ve, &gpath(g, nodes, edges));
             if budget > 0 {
                 budget -= 1;
+            }
+            if let Err(e) = guard.emitted(list) {
+                on_stack.iter_mut().for_each(|m| *m = false);
+                return Err(e);
             }
             continue;
         }
@@ -1846,7 +1932,6 @@ fn k_hop_enumerate_nodes(
     for (x, _, _) in stack.drain(..) {
         on_stack[x as usize] = false;
     }
-    *total += out.len();
     Ok(())
 }
 
@@ -1856,29 +1941,33 @@ fn k_hop_enumerate_nodes(
 /// **Upstream:** GE:1691-1719 / GE:2796-2823;
 /// `kHopEnumeratePath` + `bc_dfs` (kHopEnumeratePath.cpp:5-174).
 ///
-/// **Per pair:** `u == v` → the empty-path entry; negative `u`/`v` → nothing;
-/// otherwise `k' = if k < 0 { 999 } else { k }`, `retNum = a.ret_num`
-/// (`None` → `-1` = unlimited) and one path entry per enumerated path in
-/// discovery order:
+/// **Per pair:** `u == v` → the empty-path entry (checked first, so two
+/// missing vertices give it too); negative `u`/`v` → nothing; otherwise
+/// `k' = if k < 0 { 999 } else { k }`, `retNum = a.ret_num` (`None` → `-1`
+/// = unlimited) and one path entry per enumerated path in discovery order:
 ///
 /// 1. `bar[x]` = hop distance from `x` to `v` by a reverse BFS from `v`
 ///    (in-edges, plus out-edges when undirected, per predicate) that stops
 ///    expanding at distance `k'`. Unreached vertices keep `bar = 0` (so they
-///    are not pruned — kept).
+///    are not pruned — kept; the pruning never removes an output path).
 /// 2. DFS from `u` with a stack of `(vertex, edge)` (`u` with edge `-1`):
 ///    on reaching `v` record the path and pop; otherwise, while the stack
 ///    holds fewer than `k' + 1` vertices, for each predicate in filter order:
 ///    out-neighbours `t` (edge `pred`), then (undirected) in-neighbours
 ///    (edge `-pred-1`, i.e. reversed); skip `t` already on the stack (simple
 ///    paths) and `t` with `stack_len + bar[t] > k'`; recurse only while the
-///    remaining budget is non-zero.
+///    remaining budget is non-zero. So the result is every simple path
+///    `u → v` of at most `k'` edges that meets `v` only at its end, each
+///    predicate (and, undirected, each direction) a separate path.
 /// 3. Budget: starts at `retNum`, decremented per recorded path while
 ///    positive; a negative budget never reaches 0 (unlimited), `0` enumerates
 ///    nothing. Note that the budget is per pair (upstream calls
 ///    `kHopEnumeratePath` once per pair).
 ///
 /// Unbounded enumeration can be exponential: more than
-/// [`MAX_ENUMERATED_PATHS`] entries in one call → error.
+/// [`MAX_ENUMERATED_PATHS`] entries (or [`MAX_ENUMERATED_BYTES`] of output)
+/// in one call → error. The search itself is not bounded (neither is
+/// upstream's); it polls the cancellation flag.
 ///
 /// **Example** (SPARQL_QUERY.md): `kHopEnumerate(<Alice>, ?x, true, 3, {<like>, <focus>})`
 /// with `?x = <Carol>` → two paths `Alice -like-> Bob -like-> Eve -like-> Carol`
@@ -1889,21 +1978,29 @@ fn k_hop_enumerate_nodes(
 /// [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder)), which also matches
 /// the docs' other examples — the docs' order here is stale.
 pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
+    k_hop_enumerate_guarded(ctx, a, &mut OutputGuard::new(GFnKind::KHopEnumerate))
+}
+
+fn k_hop_enumerate_guarded(
+    ctx: &GFunCtx<'_>,
+    a: &GArgs,
+    guard: &mut OutputGuard,
+) -> Result<GFunValue> {
     let g = ctx.csr;
     let k = a.hop_limit();
     let ret_num = a.ret_num.unwrap_or(-1);
-    let mut bar = Dense::new(g.num_nodes());
-    // all clear between pairs: the DFS unmarks what it marks
-    let mut on_stack = vec![false; g.num_nodes()];
+    let mut sc = EnumScratch {
+        bar: Dense::new(g.num_nodes()),
+        on_stack: vec![false; g.num_nodes()],
+        nodes: Vec::new(),
+    };
     let mut poll = Poll::new(ctx);
     let mut list = JsonList::new();
-    let mut total = 0usize;
-    let mut paths = Vec::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
         if u.entity == v.entity {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
-            total += 1;
+            guard.emitted(&list)?;
             continue;
         }
         if negative(&u) || negative(&v) {
@@ -1913,24 +2010,19 @@ pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let (Some(un), Some(vn)) = (csr_node(ctx, &u), csr_node(ctx, &v)) else {
             continue;
         };
-        paths.clear();
-        k_hop_enumerate_nodes(
-            g,
-            &mut bar,
-            &mut on_stack,
+        k_hop_enumerate_pair(
+            ctx,
+            &mut sc,
             &mut poll,
-            un,
-            vn,
+            guard,
+            &mut list,
+            (un, u.entity),
+            (vn, v.entity),
             ret_num,
             a.directed,
             k,
             &a.preds,
-            &mut total,
-            &mut paths,
         )?;
-        for p in &paths {
-            push_path_json(list.item(), ctx, u.entity, v.entity, p);
-        }
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
