@@ -5,8 +5,9 @@
 //! [`ApiServer`] manages a *directory of named databases* and layers on the
 //! operational surface gStore exposes over HTTP:
 //!
-//! * **User management & RBAC** ([`crate::http_users`]) — a persistent user
-//!   store, `/login` returning a session token, and privilege-gated endpoints.
+//! * **User management & RBAC** ([`crate::http_users`], [`crate::sysdb`]) —
+//!   a persistent user store with per-database privileges, `/login` returning
+//!   a session token, and privilege-gated endpoints.
 //! * **Transactions over HTTP** — `/begin`, `/tquery`, `/commit`, `/rollback`,
 //!   mapping to [`Database::begin`]/[`commit`](Database::commit)/
 //!   [`rollback`](Database::rollback). See *Transactions* below.
@@ -103,6 +104,12 @@
 //! session token from `/login` (carried via `Authorization: Bearer …`, an
 //! `X-Session-Token` header, or a `session=`/`token=` parameter). Lacking a
 //! valid identity is `401`; lacking the required privilege is `403`.
+//! Privileges are those of the system store ([`crate::sysdb`]) and decided
+//! by the same rules as the `/api` layer: each endpoint counts as the
+//! upstream operation it performs and is checked on the database it targets
+//! (`/user/create`, `/user/grant` and `/user/revoke` grant on one database
+//! with `db_name=`, else on every database); `/build` and `/drop` are
+//! reserved to `root` (and `admin` users), as upstream.
 //!
 //! As with [`crate::server`], real TLS is out of scope — terminate HTTPS in a
 //! reverse proxy and do not send credentials over plain `http://` in production.

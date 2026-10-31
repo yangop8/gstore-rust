@@ -371,16 +371,51 @@ pub fn read_records(path: &Path) -> Vec<Json> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let line = line.strip_suffix(',').unwrap_or(line);
-            match json::parse(line) {
-                Ok(j @ Json::Obj(_)) => Some(j),
-                _ => None,
-            }
+    text.lines().filter_map(parse_record).collect()
+}
+
+/// One log line as a record (upstream also tolerates a trailing comma).
+fn parse_record(line: &str) -> Option<Json> {
+    let line = line.trim();
+    let line = line.strip_suffix(',').unwrap_or(line);
+    match json::parse(line) {
+        Ok(j @ Json::Obj(_)) => Some(j),
+        _ => None,
+    }
+}
+
+/// One page of the daily log file `path`, newest first, of the records whose
+/// string field `key` equals the wanted value for every `(key, value)` of
+/// `filters`. Without filters only the page's own lines are parsed — every
+/// non-blank line counts, and one that does not parse (torn by a crash) is
+/// left out of its page, as upstream does.
+fn page_of_file(
+    path: &Path,
+    filters: &[(&str, String)],
+    page_no: i64,
+    page_size: i64,
+) -> Result<Page, String> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if filters.is_empty() {
+        let page = paginate(lines.collect::<Vec<&str>>(), page_no, page_size)?;
+        return Ok(Page {
+            total_size: page.total_size,
+            total_page: page.total_page,
+            page_no: page.page_no,
+            page_size: page.page_size,
+            items: page.items.into_iter().filter_map(parse_record).collect(),
+        });
+    }
+    let records = lines
+        .filter_map(parse_record)
+        .filter(|r| {
+            filters
+                .iter()
+                .all(|(k, want)| r.get(k).and_then(Json::as_str) == Some(want.as_str()))
         })
-        .collect()
+        .collect();
+    paginate(records, page_no, page_size)
 }
 
 /// The transaction-log records, one per transaction (the last record of each
@@ -403,18 +438,18 @@ pub fn txn_records(root: &Path) -> Vec<Json> {
 
 /// One page of records, newest first.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Page {
+pub struct Page<T = Json> {
     pub total_size: usize,
     pub total_page: usize,
     pub page_no: usize,
     pub page_size: usize,
-    pub items: Vec<Json>,
+    pub items: Vec<T>,
 }
 
 /// Page `page_no` (from 1; below 1 is 1) of `page_size` records (below 1 is
 /// 10) of `records` (oldest first), newest first — upstream
 /// `get_file_lines`. A page beyond the last is an error naming the last.
-pub fn paginate(records: Vec<Json>, page_no: i64, page_size: i64) -> Result<Page, String> {
+pub fn paginate<T>(records: Vec<T>, page_no: i64, page_size: i64) -> Result<Page<T>, String> {
     let page_no = usize::try_from(page_no.max(1)).unwrap_or(1);
     let page_size = if page_size < 1 {
         DEFAULT_PAGE_SIZE as usize
@@ -440,7 +475,7 @@ pub fn paginate(records: Vec<Json>, page_no: i64, page_size: i64) -> Result<Page
     let start = end.saturating_sub(page_size);
     let mut items = records;
     items.truncate(end);
-    let mut items: Vec<Json> = items.drain(start..).collect();
+    let mut items: Vec<T> = items.drain(start..).collect();
     items.reverse();
     Ok(Page {
         total_size,
@@ -618,15 +653,13 @@ fn dates_response(msg: &str, dir: &Path) -> GResp {
     )
 }
 
-/// Keep the records whose `key` equals the parameter `param`, when given.
-fn filter_by(records: Vec<Json>, p: &Params, param: &str, key: &str) -> Vec<Json> {
-    match p.non_empty(param) {
-        None => records,
-        Some(want) => records
-            .into_iter()
-            .filter(|r| r.get(key).and_then(Json::as_str) == Some(want.as_str()))
-            .collect(),
-    }
+/// The record filters of a log request: for each `(parameter, record
+/// key)`, the parameter's value when given.
+fn filters<'k>(p: &Params, pairs: &[(&str, &'k str)]) -> Vec<(&'k str, String)> {
+    pairs
+        .iter()
+        .filter_map(|(param, key)| Some((*key, p.non_empty(param)?.trim().to_string())))
+        .collect()
 }
 
 /// `querylogdate` — the days with a query log, newest first.
@@ -653,13 +686,9 @@ pub(super) fn querylog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         (Err(r), _) | (_, Err(r)) => return r,
     };
     let dir = querylog_dir(ctx.inner.config(), ctx.root_dir());
-    let records = filter_by(
-        read_records(&dir.join(format!("{date}.log"))),
-        p,
-        "db_name",
-        "dbname",
-    );
-    match paginate(records, page_no, page_size) {
+    let path = dir.join(format!("{date}.log"));
+    let filters = filters(p, &[("db_name", "dbname")]);
+    match page_of_file(&path, &filters, page_no, page_size) {
         Ok(mut page) => {
             for item in &mut page.items {
                 for (code_name, doc_name) in QUERY_LOG_DOC_NAMES {
@@ -687,10 +716,9 @@ pub(super) fn accesslog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         (Err(r), _) | (_, Err(r)) => return r,
     };
     let dir = accesslog_dir(ctx.inner.config(), ctx.root_dir());
-    let records = read_records(&dir.join(format!("{date}.log")));
-    let records = filter_by(records, p, "db_name", "dbname");
-    let records = filter_by(records, p, "db_operation", "operation");
-    match paginate(records, page_no, page_size) {
+    let path = dir.join(format!("{date}.log"));
+    let filters = filters(p, &[("db_name", "dbname"), ("db_operation", "operation")]);
+    match page_of_file(&path, &filters, page_no, page_size) {
         Ok(page) => page_response("Get access log success.", page),
         Err(e) => GResp::error(Status::OperationFailed, format!("Get access log fail: {e}")),
     }
@@ -739,8 +767,28 @@ mod tests {
             paginate(recs(12), 4, 5).unwrap_err(),
             "more then max page number 3"
         );
-        let p = paginate(Vec::new(), 3, 5).unwrap();
+        let p = paginate(Vec::<Json>::new(), 3, 5).unwrap();
         assert_eq!((p.total_size, p.total_page, p.items.len()), (0, 0, 0));
+    }
+
+    #[test]
+    fn file_pages_parse_only_their_lines_unless_filtered() {
+        let path = std::env::temp_dir().join(format!(
+            "gstore_apilog_page_{}_{}.log",
+            std::process::id(),
+            clock::unix_millis()
+        ));
+        let text =
+            "{\"i\":1,\"k\":\"a\"}\n{\"i\":2,\"k\":\"b\"}\n{torn\n\n{\"i\":4,\"k\":\"a\"},\n";
+        fs::write(&path, text).unwrap();
+        let p = page_of_file(&path, &[], 1, 2).unwrap();
+        assert_eq!((p.total_size, p.total_page), (4, 2), "the torn line counts");
+        assert_eq!(ids(&p), vec![4], "but is not listed");
+        let p = page_of_file(&path, &[("k", "a".to_string())], 1, 10).unwrap();
+        assert_eq!((p.total_size, ids(&p)), (2, vec![4, 1]));
+        let missing = path.with_extension("nope");
+        assert_eq!(page_of_file(&missing, &[], 1, 10).unwrap().total_size, 0);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
