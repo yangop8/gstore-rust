@@ -1925,10 +1925,8 @@ fn k_hop_enumerate_pair(
             if budget > 0 {
                 budget -= 1;
             }
-            if let Err(e) = guard.emitted(list) {
-                on_stack.iter_mut().for_each(|m| *m = false);
-                return Err(e);
-            }
+            // (an error ends the whole call, scratch space included)
+            guard.emitted(list)?;
             continue;
         }
         let depth_edges = stack.len() as i64; // edges once `to` is pushed
@@ -2537,6 +2535,53 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// The resource guard of the enumerating functions, with small limits:
+    /// the diamond a -p-> b -p-> d, a -p-> c -p-> d, a -q-> b has three
+    /// shortest paths a → d and three simple paths of at most 2 hops.
+    #[test]
+    fn enumeration_output_guard() {
+        let g = graph(&[(0, 0, 1), (0, 0, 2), (1, 0, 3), (2, 0, 3), (0, 1, 1)]);
+        let d = crate::dict::Dictionary::new();
+        let ctx = GFunCtx::new(&g, &d);
+        let args = GArgs {
+            srcs: vec![GNode::from_node(&g, 0)],
+            dsts: vec![GNode::from_node(&g, 3)],
+            directed: true,
+            k: Some(2),
+            preds: PredFilter::from_ids([0, 1]),
+            ..GArgs::default()
+        };
+        let run = |kind, paths, bytes| {
+            let mut guard = OutputGuard::with_limits(kind, paths, bytes);
+            if kind == GFnKind::ShortestPaths {
+                shortest_paths_guarded(&ctx, &args, &mut guard)
+            } else {
+                k_hop_enumerate_guarded(&ctx, &args, &mut guard)
+            }
+        };
+        for kind in [GFnKind::ShortestPaths, GFnKind::KHopEnumerate] {
+            let full = run(kind, 3, usize::MAX).unwrap();
+            let GFunValue::Json(s) = &full else {
+                panic!("{full:?}")
+            };
+            assert_eq!(s.matches("{\"src\"").count(), 3, "{s}");
+            let err = run(kind, 2, usize::MAX).unwrap_err();
+            assert!(
+                matches!(&err, GStoreError::Query(m) if m.contains(kind.name())),
+                "{err}"
+            );
+            // The byte cap applies to the entries written so far (the
+            // envelope `{"paths":[…]}` adds 12 bytes).
+            assert_eq!(run(kind, 3, s.len() - 12).unwrap(), full);
+            assert!(run(kind, 3, s.len() - 13).is_err());
+        }
+        let guard = OutputGuard::new(GFnKind::ShortestPaths);
+        assert_eq!(
+            (guard.max_paths, guard.max_bytes),
+            (MAX_ENUMERATED_PATHS, MAX_ENUMERATED_BYTES)
+        );
     }
 
     #[test]
