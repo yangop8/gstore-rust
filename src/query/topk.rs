@@ -76,6 +76,15 @@
 //!   `double` and drops matches whose values are not numbers, which SPARQL
 //!   sorts first (ASC) or last (DESC); here such data takes the heap path.
 //!
+//! DP-B reads every candidate value of the tree once (the semi-join
+//! reduction), so it pays off when there are many more matches than values —
+//! a star or a one-to-many edge — not on a chain of one-to-one edges, where
+//! the heap is cheaper. Upstream runs DP-B on every such query; here the
+//! default [`DpbMode::Auto`] estimates the matches (root values times each
+//! tree edge's average fan-out, from the store's per-predicate statistics)
+//! and runs DP-B only when they outnumber the values it reads at least four
+//! times; [`DpbMode::Always`] skips the estimate.
+//!
 //! Cycles, which upstream cuts and re-checks, also take the heap path. DP-B
 //! enumerates until it has `k` matches and all matches tied with the `k`-th
 //! — a prefix of the sorted solution sequence — and orders those by the full
@@ -113,7 +122,22 @@ pub struct TopKOptions {
     pub bounded_heap: bool,
     /// `ORDER BY` linear expression + `LIMIT` over a tree-shaped BGP:
     /// enumerate the matches in key order (DP-B).
-    pub dpb: bool,
+    pub dpb: DpbMode,
+}
+
+/// When DP-B answers an `ORDER BY … LIMIT` query whose shape it handles
+/// ([`TopKOptions::dpb`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DpbMode {
+    /// Never: the bounded heap (or the full sort) answers.
+    Off,
+    /// When the store's statistics predict clearly more matches than DP-B
+    /// reads (the default): DP-B touches every candidate value of the tree
+    /// once, so on a query with about as many matches as values (a chain of
+    /// one-to-one edges) the heap is cheaper.
+    Auto,
+    /// Whenever the shape allows (for tests and benchmarks).
+    Always,
 }
 
 impl TopKOptions {
@@ -121,13 +145,13 @@ impl TopKOptions {
     pub const ALL: TopKOptions = TopKOptions {
         early_termination: true,
         bounded_heap: true,
-        dpb: true,
+        dpb: DpbMode::Auto,
     };
     /// Every optimization off: always evaluate in full, then sort and cut.
     pub const NONE: TopKOptions = TopKOptions {
         early_termination: false,
         bounded_heap: false,
-        dpb: false,
+        dpb: DpbMode::Off,
     };
 }
 
@@ -626,14 +650,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 None => Ok(Some(rows)),
             };
         }
-        if !self.topk.bounded_heap && !self.topk.dpb {
+        if !self.topk.bounded_heap && self.topk.dpb == DpbMode::Off {
             return Ok(None);
         }
         let ctx = OrderCtx::new(layout, &q.order_by, Some(&q.projection));
         if k == 0 {
             return Ok(Some(Vec::new()));
         }
-        if self.topk.dpb {
+        if self.topk.dpb != DpbMode::Off {
             if let Some(sols) = self.dpb_top_k(q, pattern, layout, &ctx, result_vars, k)? {
                 self.bump(|s| s.dpb_topk += 1);
                 return sols
@@ -1153,6 +1177,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             ch.sort_unstable();
         }
 
+        // Worth it? Estimate the matches (root values times each tree
+        // edge's average fan-out) against the values DP-B reads.
+        if self.topk.dpb == DpbMode::Auto {
+            let mut fanout_cache = HashMap::new();
+            let mut values: HashMap<usize, f64> = HashMap::from([(root, root_vals.len() as f64)]);
+            let (mut matches, mut input) = (root_vals.len() as f64, root_vals.len() as f64);
+            for &p in &bfs {
+                for &c in &children[p] {
+                    let f = self.dpb_fanout(&edge_pats[c], plans, unary.get(&c), &mut fanout_cache);
+                    let n = values[&p] * f;
+                    values.insert(c, n);
+                    matches *= f;
+                    input += n;
+                }
+            }
+            if matches < DPB_MIN_GAIN * input {
+                return None;
+            }
+        }
+
         // Top down: each parent value's children along each tree edge.
         let mut cand: HashMap<usize, Vec<u32>> = HashMap::from([(root, root_vals)]);
         let mut lists: EdgeLists = vec![HashMap::new(); width];
@@ -1232,6 +1276,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
         }
+
+        // Bottom up: the best score of each value's subtree — the first
+        // element of its FQ list, known before the list exists.
+        let mut best: Vec<HashMap<u32, i128>> = vec![HashMap::new(); width];
+        for &v in bfs.iter().rev() {
+            let mut b = HashMap::new();
+            for &x in reach.get(&v).into_iter().flatten() {
+                let mut total = score[v].get(&x).copied().unwrap_or(0);
+                for &c in &children[v] {
+                    let entries = lists[c].get(&x).map(Vec::as_slice).unwrap_or(&[]);
+                    total += entries
+                        .iter()
+                        .filter_map(|(y, _)| best[c].get(y).copied())
+                        .min()?;
+                }
+                b.insert(x, total);
+            }
+            best[v] = b;
+        }
         Some(DpbTree {
             root,
             roots,
@@ -1239,7 +1302,53 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             lists,
             edge_pred_vars,
             score,
+            best,
         })
+    }
+
+    /// The average number of children a parent value has along one tree
+    /// edge, from the store's statistics: the most selective of its
+    /// patterns, scaled down by the child's restrictions.
+    fn dpb_fanout(
+        &self,
+        pats: &[(usize, bool)],
+        plans: &[PatPlan],
+        unary: Option<&Vec<u32>>,
+        cache: &mut HashMap<Option<u32>, (f64, f64, f64)>,
+    ) -> f64 {
+        let mut fanout = f64::INFINITY;
+        let mut child_domain = f64::INFINITY;
+        for &(pi, fwd) in pats {
+            // (triples, distinct subjects, distinct objects) of the predicate
+            // (`None`: a predicate variable — the whole store).
+            let pred = match plans[pi].p {
+                Slot::Const(p) => Some(p),
+                Slot::Var(_) => None,
+            };
+            let (card, subj, obj) = *cache.entry(pred).or_insert_with(|| match pred {
+                Some(p) => (
+                    self.store.pred_card(p) as f64,
+                    self.store.pred_distinct_subj(p) as f64,
+                    self.store.pred_distinct_obj(p) as f64,
+                ),
+                None => (
+                    self.store.triple_count() as f64,
+                    self.store.distinct_subjects() as f64,
+                    self.store.distinct_objects() as f64,
+                ),
+            });
+            let (parents, children) = if fwd { (subj, obj) } else { (obj, subj) };
+            fanout = fanout.min(card / parents.max(1.0));
+            child_domain = child_domain.min(children.max(1.0));
+        }
+        if let Some(un) = unary {
+            fanout *= (un.len() as f64 / child_domain).min(1.0);
+        }
+        if fanout.is_finite() {
+            fanout
+        } else {
+            1.0
+        }
     }
 
     /// The children of parent value `u` along one tree edge (`pats`: the
@@ -1517,6 +1626,9 @@ type EdgeLists = Vec<HashMap<u32, Vec<EdgeEntry>>>;
 const MAX_COEF_SUM: i128 = 1 << 32;
 /// Largest constant term.
 const MAX_CONST: i128 = 1 << 62;
+/// [`DpbMode::Auto`] runs DP-B when it expects at least this many matches
+/// per value it reads.
+const DPB_MIN_GAIN: f64 = 4.0;
 
 /// `Σ coef[v]·?v + constant` with integer coefficients; `vars` are all the
 /// variables it reads (a zero coefficient still needs an integer value, or
@@ -1699,6 +1811,8 @@ struct DpbTree {
     edge_pred_vars: Vec<Vec<usize>>,
     /// Variable → value → its share of the score (absent: 0).
     score: Vec<HashMap<u32, i128>>,
+    /// Variable → value → the best score of its subtree's matches.
+    best: Vec<HashMap<u32, i128>>,
 }
 
 /// An `FQ` list: the matches of the subtree at one variable value, by score.
@@ -1727,7 +1841,10 @@ struct Fr {
     child_var: usize,
     /// `None` for the root list.
     parent: Option<u32>,
-    members: Vec<usize>,
+    /// The child values whose `FQ` lists are merged; an `FQ` list is only
+    /// created once its first element is taken (until then its best score
+    /// stands in for it).
+    members: Vec<u32>,
     started: bool,
     /// The computed elements: score, member, index into the member's list.
     pool: Vec<(i128, u32, u32)>,
@@ -1761,16 +1878,10 @@ impl<'t> DpbEnum<'t> {
 
     /// The root `FR` list (every valid root value).
     fn root(&mut self) -> usize {
-        let members = self
-            .t
-            .roots
-            .iter()
-            .map(|&r| self.fq_id(self.t.root, r))
-            .collect();
         self.frs.push(Fr {
             child_var: self.t.root,
             parent: None,
-            members,
+            members: self.t.roots.clone(),
             started: false,
             pool: Vec::new(),
             heap: BinaryHeap::new(),
@@ -1802,7 +1913,7 @@ impl<'t> DpbEnum<'t> {
             .map(Vec::as_slice)
             .unwrap_or(&[])
             .iter()
-            .map(|&(x, _)| self.fq_id(child_var, x))
+            .map(|&(x, _)| x)
             .collect();
         self.frs.push(Fr {
             child_var,
@@ -1829,22 +1940,26 @@ impl<'t> DpbEnum<'t> {
 
     fn fr_step(&mut self, id: usize) -> bool {
         if !self.frs[id].started {
-            self.frs[id].started = true;
-            for m in 0..self.frs[id].members.len() {
-                if m % 1024 == 1023 && self.cancelled() {
-                    return false;
-                }
-                let fq = self.frs[id].members[m];
-                if let Some(c) = self.fq_get(fq, 0) {
-                    self.frs[id].heap.push(Reverse((c, m as u32, 0)));
-                }
+            if self.cancelled() {
+                return false;
             }
+            let fr = &mut self.frs[id];
+            fr.started = true;
+            let best = &self.t.best[fr.child_var];
+            let first: Vec<Reverse<(i128, u32, u32)>> = fr
+                .members
+                .iter()
+                .enumerate()
+                .filter_map(|(m, x)| Some(Reverse((*best.get(x)?, m as u32, 0))))
+                .collect();
+            fr.heap = BinaryHeap::from(first);
         }
         let Some(Reverse((c, m, s))) = self.frs[id].heap.pop() else {
             return false;
         };
         self.frs[id].pool.push((c, m, s));
-        let fq = self.frs[id].members[m as usize];
+        let (var, x) = (self.frs[id].child_var, self.frs[id].members[m as usize]);
+        let fq = self.fq_id(var, x);
         if let Some(next) = self.fq_get(fq, s as usize + 1) {
             self.frs[id].heap.push(Reverse((next, m, s + 1)));
         }
@@ -1924,7 +2039,9 @@ impl<'t> DpbEnum<'t> {
                 }
             }
         }
-        self.fill_fq(fr.members[m as usize], s as usize, b);
+        if let Some(&fq) = self.fq_ids.get(&(fr.child_var, fr.members[m as usize])) {
+            self.fill_fq(fq, s as usize, b);
+        }
     }
 
     fn fill_fq(&self, id: usize, i: usize, b: &mut Binding) {

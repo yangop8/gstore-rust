@@ -15,7 +15,7 @@ use std::sync::Arc;
 use gstore::dict::Dictionary;
 use gstore::model::{IdTriple, Term};
 use gstore::parser::sparql::parse;
-use gstore::query::engine::{EvalStats, TopKOptions};
+use gstore::query::engine::{DpbMode, EvalStats, TopKOptions};
 use gstore::query::{Evaluator, FunctionRegistry, QueryResult, Value};
 use gstore::store::TripleStore;
 use gstore::GStoreError;
@@ -28,7 +28,14 @@ const PREFIX: &str = "PREFIX : <http://ex/> PREFIX xsd: <http://www.w3.org/2001/
 const HEAP_ONLY: TopKOptions = TopKOptions {
     early_termination: true,
     bounded_heap: true,
-    dpb: false,
+    dpb: DpbMode::Off,
+};
+
+/// DP-B wherever the shape allows, however small the data.
+const FORCE_DPB: TopKOptions = TopKOptions {
+    early_termination: true,
+    bounded_heap: true,
+    dpb: DpbMode::Always,
 };
 
 // ---- data ----------------------------------------------------------------
@@ -114,12 +121,14 @@ impl Data {
         (r, ev.stats())
     }
 
-    /// Run `q` fully, with the heap only and fully optimized; all three must
-    /// agree. Returns the optimized run's counters.
-    fn check(&self, q: &str) -> EvalStats {
+    /// Run `q` fully, with the heap only, with the default optimizations
+    /// and with DP-B forced; all four must agree. Returns the counters of
+    /// the last two runs.
+    fn check(&self, q: &str) -> Runs {
         let (full, _) = self.run(q, TopKOptions::NONE);
         let (heap, _) = self.run(q, HEAP_ONLY);
-        let (all, stats) = self.run(q, TopKOptions::ALL);
+        let (all, auto) = self.run(q, TopKOptions::ALL);
+        let (forced, always) = self.run(q, FORCE_DPB);
         assert_eq!(
             heap, full,
             "bounded heap / streaming differ from full evaluation:\n{q}"
@@ -128,8 +137,20 @@ impl Data {
             all, full,
             "optimized evaluation differs from full evaluation:\n{q}"
         );
-        stats
+        assert_eq!(
+            forced, full,
+            "forced DP-B differs from full evaluation:\n{q}"
+        );
+        Runs { auto, always }
     }
+}
+
+/// The counters of [`Data::check`]'s optimized runs.
+struct Runs {
+    /// With the default options.
+    auto: EvalStats,
+    /// With DP-B forced.
+    always: EvalStats,
 }
 
 /// Which values the generator puts on `:val` / `:w`.
@@ -371,9 +392,9 @@ fn randomized_queries_match_full_evaluation() {
         for _ in 0..40 {
             let q = random_query(&mut rng);
             let s = data.check(&q);
-            total.streamed += s.streamed;
-            total.heap_topk += s.heap_topk;
-            total.dpb_topk += s.dpb_topk;
+            total.streamed += s.auto.streamed;
+            total.heap_topk += s.auto.heap_topk;
+            total.dpb_topk += s.always.dpb_topk;
         }
     }
     // Every path ran many times.
@@ -451,7 +472,7 @@ fn dpb_matches_full_evaluation_on_tree_shaped_bgps() {
             runs += 1;
             // LIMIT 0 is answered before choosing a strategy.
             if !q.contains("LIMIT 0") {
-                assert_eq!(s.dpb_topk, 1, "DP-B was not used for:\n{q}");
+                assert_eq!(s.always.dpb_topk, 1, "DP-B was not used for:\n{q}");
                 used += 1;
             }
         }
@@ -472,8 +493,8 @@ fn dpb_falls_back_when_values_are_not_integers() {
             let shape = *rng.pick(DPB_SHAPES);
             let key = *rng.pick(DPB_KEYS);
             let s = data.check(&dpb_query(&mut rng, shape, key));
-            dpb += s.dpb_topk;
-            heap += s.heap_topk;
+            dpb += s.always.dpb_topk;
+            heap += s.always.heap_topk;
         }
     }
     assert!(heap > 50, "heap fallback used {heap} times");
@@ -507,8 +528,8 @@ fn dpb_declines_shapes_it_does_not_handle() {
     ] {
         let q = format!("{PREFIX}{q}");
         let s = data.check(&q);
-        assert_eq!(s.dpb_topk, 0, "{q}");
-        assert_eq!(s.heap_topk, 1, "{q}");
+        assert_eq!(s.always.dpb_topk, 0, "{q}");
+        assert_eq!(s.always.heap_topk, 1, "{q}");
     }
 }
 
@@ -754,6 +775,23 @@ fn dpb_enumerates_only_the_best_matches() {
     assert!(opt.dpb_matches <= 40, "{opt:?}");
 }
 
+#[test]
+fn dpb_auto_mode_skips_one_to_one_chains() {
+    // As many matches as values: DP-B would read as much as the heap does,
+    // so the default mode leaves the query to the heap; forced, DP-B gives
+    // the same rows.
+    let data = chains(2000, 1);
+    let q =
+        format!("{PREFIX}SELECT ?s ?v WHERE {{ ?s :p ?o . ?o :q ?v }} ORDER BY DESC(?v) LIMIT 5");
+    let (auto_rows, auto) = data.run(&q, TopKOptions::ALL);
+    let (forced_rows, forced) = data.run(&q, FORCE_DPB);
+    let (full_rows, _) = data.run(&q, TopKOptions::NONE);
+    assert_eq!(auto_rows, full_rows);
+    assert_eq!(forced_rows, full_rows);
+    assert_eq!((auto.dpb_topk, auto.heap_topk), (0, 1), "{auto:?}");
+    assert_eq!((forced.dpb_topk, forced.heap_topk), (1, 0), "{forced:?}");
+}
+
 // ---- cancellation ----------------------------------------------------------
 
 /// A function `STOP()` that raises the evaluator's cancel flag and is true.
@@ -784,7 +822,7 @@ fn cancellation_is_reported_on_every_path() {
         "ASK { ?h :a ?a . ?a :val ?x FILTER(STOP() && ?x < 0) }",
         "CONSTRUCT { ?h :r ?x } WHERE { ?h :a ?a . ?a :val ?x FILTER(STOP()) } LIMIT 2",
     ] {
-        for opts in [TopKOptions::ALL, HEAP_ONLY, TopKOptions::NONE] {
+        for opts in [TopKOptions::ALL, FORCE_DPB, HEAP_ONLY, TopKOptions::NONE] {
             let r = cancelling(&data, q, opts);
             assert!(matches!(r, Err(GStoreError::Cancelled)), "{q}: {r:?}");
         }

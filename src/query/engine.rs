@@ -187,7 +187,7 @@ use super::value::{
 #[path = "topk.rs"]
 mod topk;
 use topk::PreparedBgp;
-pub use topk::{EvalStats, TopKOptions};
+pub use topk::{DpbMode, EvalStats, TopKOptions};
 
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
