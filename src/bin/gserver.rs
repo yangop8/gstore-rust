@@ -103,6 +103,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
+use gstore::logging::{self, LogConfig};
+use gstore::{gs_announce, gs_error, gs_info, gs_warn};
 use gstore::server::{shutdown_on_signals, Server, ShutdownHandle, ShutdownReport};
 use gstore::{Database, LoadPolicy, StorageKind};
 
@@ -136,6 +138,11 @@ fn main() -> ExitCode {
     }
     let cfg = load_config(&cli);
     let target = Target::resolve(&cli, &cfg);
+    // A starting server reports the configuration once its diagnostic log is
+    // set up (see `start_foreground`); the other commands report it now.
+    if !matches!(cli.mode(), Mode::Start | Mode::Restart | Mode::Status) {
+        report_config(&cfg);
+    }
     let code = match cli.mode() {
         Mode::Start => start_foreground(&cli, &cfg, &target),
         Mode::Background => start_background(&cli, &target),
@@ -328,9 +335,9 @@ impl Cli {
 }
 
 /// Read `conf.ini` (the `-c` file, else `./conf/conf.ini` when present) and
-/// apply the command-line overrides.
+/// apply the command-line overrides. Its warnings are reported by
+/// [`report_config`].
 fn load_config(cli: &Cli) -> GStoreConfig {
-    let quiet = cli.mode() == Mode::Status;
     let mut cfg = match &cli.config {
         Some(path) => match GStoreConfig::load(path) {
             Ok(c) => c,
@@ -343,35 +350,30 @@ fn load_config(cli: &Cli) -> GStoreConfig {
             let default = Path::new("conf/conf.ini");
             if default.is_file() {
                 GStoreConfig::load(default).unwrap_or_else(|e| {
-                    eprintln!("gserver: cannot read '{}': {e}; using defaults", default.display());
-                    GStoreConfig::default()
+                    let mut c = GStoreConfig::default();
+                    c.warn(format!("cannot read '{}': {e}; using defaults", default.display()));
+                    c
                 })
             } else {
                 GStoreConfig::default()
             }
         }
     };
-    if !quiet {
-        if let Some(src) = cfg.source() {
-            println!("gserver: configuration from '{}'", src.display());
-        }
-        for w in cfg.warnings() {
-            eprintln!("gserver: conf.ini warning: {w}");
-        }
-        if cfg.db_suffix != gstore::DB_SUFFIX {
-            eprintln!(
-                "gserver: conf.ini warning: db_suffix '{}' is not supported yet; databases use '{}'",
-                cfg.db_suffix,
-                gstore::DB_SUFFIX
-            );
-        }
-        if cfg.root_username != gstore::http_users::ROOT_USER {
-            eprintln!(
-                "gserver: conf.ini warning: root_username '{}' is not supported yet; the root user is '{}'",
-                cfg.root_username,
-                gstore::http_users::ROOT_USER
-            );
-        }
+    if cfg.db_suffix != gstore::DB_SUFFIX {
+        let msg = format!(
+            "db_suffix '{}' is not supported yet; databases use '{}'",
+            cfg.db_suffix,
+            gstore::DB_SUFFIX
+        );
+        cfg.warn(msg);
+    }
+    if cfg.root_username != gstore::http_users::ROOT_USER {
+        let msg = format!(
+            "root_username '{}' is not supported yet; the root user is '{}'",
+            cfg.root_username,
+            gstore::http_users::ROOT_USER
+        );
+        cfg.warn(msg);
     }
     if let Some(p) = cli.port {
         cfg.port = p;
@@ -396,6 +398,51 @@ fn load_config(cli: &Cli) -> GStoreConfig {
         cfg.check_point = false;
     }
     cfg
+}
+
+/// Say where the configuration came from and log its warnings.
+fn report_config(cfg: &GStoreConfig) {
+    if let Some(src) = cfg.source() {
+        gs_announce!("gserver: configuration from '{}'", src.display());
+    }
+    for w in cfg.warnings() {
+        gs_warn!("conf.ini warning: {w}");
+    }
+}
+
+/// Set up the diagnostic log of a starting server (`conf.ini`'s `log_mode`
+/// properties file and `[log]` keys, then `GSTORE_LOG`; see
+/// [`gstore::logging`]) and record the startup.
+fn init_logging(cfg: &GStoreConfig) {
+    let (mut log_cfg, warnings) = LogConfig::from_gstore_config(cfg);
+    let env_warning = log_cfg.apply_env();
+    let opened = logging::init(&log_cfg);
+    gs_info!(
+        "gStore {} (gstore-rust) starting, pid {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
+    for w in warnings.iter().chain(env_warning.as_ref()) {
+        gs_warn!("log configuration: {w}");
+    }
+    match opened {
+        Ok(logger) => {
+            if let Some(path) = logger.file_path() {
+                gs_info!(
+                    "diagnostic log file '{}' (level {}, rolled daily)",
+                    path.display(),
+                    logging::filter_name(log_cfg.level)
+                );
+            }
+        }
+        Err(e) => {
+            let path = log_cfg.file.as_ref().map(|f| f.path.display().to_string());
+            gs_error!(
+                "cannot open the log file '{}': {e}; logging to standard error only",
+                path.unwrap_or_default()
+            );
+        }
+    }
 }
 
 /// What a gserver invocation serves, and where its pid file and log live.
@@ -565,8 +612,10 @@ fn live_server(target: &Target) -> Option<PidInfo> {
 // ---------------------------------------------------------------------------
 
 fn start_foreground(cli: &Cli, cfg: &GStoreConfig, target: &Target) -> u8 {
+    init_logging(cfg);
+    report_config(cfg);
     if live_server(target).is_some() {
-        println!("the server already running.");
+        gs_announce!("the server already running.");
         return 1;
     }
     let supervised = std::env::var(ENV_SUPERVISOR)
@@ -756,6 +805,7 @@ fn restart(cli: &Cli, cfg: &GStoreConfig, target: &Target) -> u8 {
     }
     println!("start server...");
     if background {
+        report_config(cfg);
         start_background(cli, target)
     } else {
         start_foreground(cli, cfg, target)
@@ -836,7 +886,7 @@ fn supervise(cli: &Cli) -> u8 {
     #[cfg(not(unix))]
     {
         let _ = cli;
-        eprintln!("gserver: deamon=on is only supported on unix; set deamon=off");
+        gs_error!("deamon=on is only supported on unix; set deamon=off");
         1
     }
     #[cfg(unix)]
@@ -859,7 +909,7 @@ fn supervise(cli: &Cli) -> u8 {
             });
         }
         let me = std::process::id();
-        println!("gserver: supervisor (pid {me}) started (deamon=on)");
+        gs_announce!("gserver: supervisor (pid {me}) started (deamon=on)");
         let mut backoff = Duration::from_secs(1);
         // Abnormal exits in a row, each within a minute of its start.
         let mut quick_failures = 0u32;
@@ -871,7 +921,7 @@ fn supervise(cli: &Cli) -> u8 {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("gserver: supervisor cannot start the server: {e}");
+                    gs_error!("supervisor cannot start the server: {e}");
                     return 1;
                 }
             };
@@ -885,14 +935,14 @@ fn supervise(cli: &Cli) -> u8 {
             let status = match status {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("gserver: supervisor lost its server: {e}");
+                    gs_error!("supervisor lost its server: {e}");
                     return 1;
                 }
             };
             // Abnormal: killed by a signal, or a Rust panic (exit code 101).
             let abnormal = status.signal().is_some() || status.code() == Some(101);
             if !abnormal || stopping.load(Ordering::SeqCst) {
-                println!("gserver: server stopped ({status}); supervisor exiting");
+                gs_announce!("gserver: server stopped ({status}); supervisor exiting");
                 return status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1);
             }
             if started.elapsed() > Duration::from_secs(60) {
@@ -901,14 +951,14 @@ fn supervise(cli: &Cli) -> u8 {
             }
             quick_failures += 1;
             if quick_failures >= MAX_QUICK_FAILURES {
-                eprintln!(
-                    "gserver: server stopped abnormally ({status}), {quick_failures} times in a row \
+                gs_error!(
+                    "server stopped abnormally ({status}), {quick_failures} times in a row \
                      shortly after starting; supervisor gives up"
                 );
                 return 1;
             }
-            eprintln!(
-                "gserver: server stopped abnormally ({status}); restarting in {}s",
+            gs_warn!(
+                "server stopped abnormally ({status}); restarting in {}s",
                 backoff.as_secs()
             );
             let until = Instant::now() + backoff;
@@ -936,11 +986,11 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
     let (report, handle) = match &target.kind {
         Kind::Api(root) => {
             if cli.rocksdb {
-                eprintln!("gserver: --rocksdb is ignored in API mode (the API manages its own databases)");
+                gs_warn!("--rocksdb is ignored in API mode (the API manages its own databases)");
             }
             if cfg.root_password == "123456" {
-                eprintln!(
-                    "warning: root is using the default password '123456'; \
+                gs_warn!(
+                    "root is using the default password '123456'; \
                      pass --password (or set root_password) before exposing this server"
                 );
             }
@@ -951,15 +1001,15 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             let server = match ApiServer::bind_with_config(served) {
                 Ok(s) => s.with_load_policy(load_policy),
                 Err(e) => {
-                    eprintln!("failed to start API server at {}:{}: {e}", cfg.listen_addr, cfg.port);
+                    gs_error!("failed to start API server at {}:{}: {e}", cfg.listen_addr, cfg.port);
                     return 1;
                 }
             };
             let root_s = root.display();
             if cfg.check_point {
-                println!("gserver: databases are stored under '{root_s}' (check_point on: every write is saved)");
+                gs_announce!("gserver: databases are stored under '{root_s}' (check_point on: every write is saved)");
             } else {
-                println!(
+                gs_announce!(
                     "gserver: databases are stored under '{root_s}' (check_point off: changes are saved \
                      on /checkpoint, /unload and shutdown)"
                 );
@@ -968,7 +1018,7 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             announce_pid(target, local, server.system_password(), background, supervisor);
             let handle = server.shutdown_handle();
             install_signals(&handle);
-            println!(
+            gs_announce!(
                 "gserver: {} worker threads, keep-alive {}s",
                 server.http_options().threads,
                 server.http_options().keep_alive_timeout.as_secs()
@@ -986,14 +1036,14 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                     .with_http_options(cfg.http_options())
                     .with_db_dir(dir),
                 Err(e) => {
-                    eprintln!("failed to bind {}:{}: {e}", cfg.listen_addr, cfg.port);
+                    gs_error!("failed to bind {}:{}: {e}", cfg.listen_addr, cfg.port);
                     return 1;
                 }
             };
             if cfg.check_point {
-                println!("gserver: database directory '{dir_s}' (check_point on: every update is saved there)");
+                gs_announce!("gserver: database directory '{dir_s}' (check_point on: every update is saved there)");
             } else {
-                println!(
+                gs_announce!(
                     "gserver: database directory '{dir_s}' (check_point off: changes are saved there on shutdown)"
                 );
             }
@@ -1007,7 +1057,7 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
     };
     let failed = print_report(&report);
     if handle.restart_requested() {
-        println!("gserver: restarting");
+        gs_announce!("gserver: restarting");
         let _ = io::stdout().flush();
         reexec(cli);
         // Only reached when exec failed.
@@ -1020,7 +1070,7 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
 
 fn install_signals(handle: &ShutdownHandle) {
     if shutdown_on_signals(handle.clone()) {
-        println!("gserver: Ctrl-C / SIGTERM shuts down gracefully (saving unsaved changes)");
+        gs_announce!("gserver: Ctrl-C / SIGTERM shuts down gracefully (saving unsaved changes)");
     }
 }
 
@@ -1040,9 +1090,9 @@ fn announce_pid(
         supervisor,
     };
     match write_pid_file(&target.pid_file, &info) {
-        Ok(()) => println!("gserver: pid {} (pid file '{}')", info.pid, target.pid_file.display()),
-        Err(e) => eprintln!(
-            "gserver: warning: cannot write pid file '{}': {e} (-t/-S/-k will not find this server)",
+        Ok(()) => gs_announce!("gserver: pid {} (pid file '{}')", info.pid, target.pid_file.display()),
+        Err(e) => gs_warn!(
+            "cannot write pid file '{}': {e} (-t/-S/-k will not find this server)",
             target.pid_file.display()
         ),
     }
@@ -1055,17 +1105,17 @@ fn run_api(server: &ApiServer, root: &str, cli: &Cli) -> ShutdownReport {
         match gstore::server::load_tls_config(cert, key) {
             Ok(cfg) => {
                 match server.local_addr() {
-                    Ok(a) => println!(
+                    Ok(a) => gs_announce!(
                         "gserver (API mode, TLS) on https://{a}  root={root}  user=root  \
                          (upstream /api protocol at /api; web console at /, POST /login /sparql \
                          /update /upload …; see /status)"
                     ),
-                    Err(_) => println!("gserver (API mode, TLS)  root={root}"),
+                    Err(_) => gs_announce!("gserver (API mode, TLS)  root={root}"),
                 }
                 return server.serve_forever_tls(cfg);
             }
             Err(e) => {
-                eprintln!("failed to load TLS cert/key: {e}");
+                gs_error!("failed to load TLS cert/key: {e}");
                 std::process::exit(1);
             }
         }
@@ -1073,12 +1123,12 @@ fn run_api(server: &ApiServer, root: &str, cli: &Cli) -> ShutdownReport {
     #[cfg(not(feature = "tls"))]
     let _ = cli;
     match server.local_addr() {
-        Ok(a) => println!(
+        Ok(a) => gs_announce!(
             "gserver (API mode) on http://{a}  root={root}  user=root  \
              (upstream /api protocol at /api; web console at /, POST /login /sparql /update \
              /upload …; see /status)"
         ),
-        Err(_) => println!("gserver (API mode)  root={root}"),
+        Err(_) => gs_announce!("gserver (API mode)  root={root}"),
     }
     server.serve_forever()
 }
@@ -1090,14 +1140,14 @@ fn run_single(server: &Server, cli: &Cli) -> ShutdownReport {
         match gstore::server::load_tls_config(cert, key) {
             Ok(cfg) => {
                 if let Ok(a) = server.local_addr() {
-                    println!(
+                    gs_announce!(
                         "gserver listening on https://{a}  (TLS; web console at /, POST /sparql, /update; GET /status)"
                     );
                 }
                 return server.serve_forever_tls(cfg);
             }
             Err(e) => {
-                eprintln!("failed to load TLS cert/key: {e}");
+                gs_error!("failed to load TLS cert/key: {e}");
                 std::process::exit(1);
             }
         }
@@ -1105,7 +1155,7 @@ fn run_single(server: &Server, cli: &Cli) -> ShutdownReport {
     #[cfg(not(feature = "tls"))]
     let _ = cli;
     if let Ok(a) = server.local_addr() {
-        println!("gserver listening on http://{a}  (web console at /, POST /sparql, /update; GET /status)");
+        gs_announce!("gserver listening on http://{a}  (web console at /, POST /sparql, /update; GET /status)");
     }
     server.serve_forever()
 }
@@ -1117,12 +1167,12 @@ fn reexec(cli: &Cli) {
     {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(self_exe()).args(cli.start_args()).exec();
-        eprintln!("gserver: restart failed: {err}");
+        gs_error!("restart failed: {err}");
     }
     #[cfg(not(unix))]
     {
         let _ = cli;
-        eprintln!("gserver: /restart re-execution is only supported on unix; the server stopped");
+        gs_error!("/restart re-execution is only supported on unix; the server stopped");
     }
 }
 
@@ -1173,21 +1223,21 @@ fn db_name_for(dir: &str) -> String {
 /// Print what the graceful shutdown did. Returns whether a save failed.
 fn print_report(report: &ShutdownReport) -> bool {
     if !report.drained {
-        eprintln!("gserver: some requests were still running when the shutdown grace period ended");
+        gs_warn!("some requests were still running when the shutdown grace period ended");
     }
     if report.rolled_back > 0 {
-        println!(
+        gs_announce!(
             "gserver: rolled back {} open transaction(s)",
             report.rolled_back
         );
     }
     for dir in &report.saved {
-        println!("gserver: saved database to '{}'", dir.display());
+        gs_announce!("gserver: saved database to '{}'", dir.display());
     }
     for (dir, e) in &report.failed {
-        eprintln!("gserver: FAILED to save database to '{}': {e}", dir.display());
+        gs_error!("FAILED to save database to '{}': {e}", dir.display());
     }
-    println!("gserver: shut down");
+    gs_announce!("gserver: shut down");
     !report.failed.is_empty()
 }
 
@@ -1198,15 +1248,15 @@ fn load_policy_for(dirs: &[String], allow_service: bool) -> LoadPolicy {
     let mut policy = LoadPolicy::restricted();
     if allow_service {
         policy.allow_remote = true;
-        println!("gserver: SPARQL SERVICE may contact remote endpoints");
+        gs_announce!("gserver: SPARQL SERVICE may contact remote endpoints");
     }
     for d in dirs {
         if !Path::new(d).is_dir() {
-            eprintln!("error: --load-dir '{d}' is not a directory");
+            gs_error!("--load-dir '{d}' is not a directory");
             std::process::exit(2);
         }
         policy = policy.with_allowed_dir(d);
-        println!("gserver: SPARQL LOAD may read files under '{d}'");
+        gs_announce!("gserver: SPARQL LOAD may read files under '{d}'");
     }
     policy
 }
@@ -1221,23 +1271,23 @@ fn open_or_exit(dir: &str, expect_rocksdb: bool) -> Database {
         && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
     if !path.exists() || is_empty_dir {
         if expect_rocksdb {
-            eprintln!("gserver: --rocksdb given but '{dir}' holds no database");
+            gs_error!("--rocksdb given but '{dir}' holds no database");
             std::process::exit(1);
         }
-        eprintln!("'{dir}' holds no database yet; serving a fresh empty database that will be saved there");
+        gs_warn!("'{dir}' holds no database yet; serving a fresh empty database that will be saved there");
         return Database::new(db_name_for(dir));
     }
     if expect_rocksdb && Database::storage_kind(path) != Some(StorageKind::RocksDb) {
-        eprintln!("gserver: --rocksdb given but '{dir}' is not a RocksDB-backed database");
+        gs_error!("--rocksdb given but '{dir}' is not a RocksDB-backed database");
         std::process::exit(1);
     }
     match Database::open(path) {
         Ok(db) => {
-            println!("gserver: opened '{dir}' ({} layout)", db.storage());
+            gs_announce!("gserver: opened '{dir}' ({} layout)", db.storage());
             db
         }
         Err(e) => {
-            eprintln!("gserver: could not open database '{dir}': {e}");
+            gs_error!("could not open database '{dir}': {e}");
             std::process::exit(1);
         }
     }

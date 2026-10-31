@@ -903,8 +903,14 @@ pub fn announce(target: &str, args: fmt::Arguments<'_>) {
         let _ = out.flush();
     }
     if enabled(Level::Info) {
-        if let Some(l) = current() {
-            l.log_to(Sinks::FileOnly, Level::Info, target, args);
+        if let Some(l) = current().filter(|l| l.file.is_some()) {
+            // `gserver: …` on the console; the record names its target anyway.
+            let msg = args.to_string();
+            let msg = msg
+                .strip_prefix(target)
+                .and_then(|m| m.strip_prefix(": "))
+                .unwrap_or(&msg);
+            l.log_to(Sinks::FileOnly, Level::Info, target, format_args!("{msg}"));
         }
     }
 }
