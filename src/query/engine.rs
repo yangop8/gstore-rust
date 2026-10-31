@@ -519,8 +519,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for b in &solutions {
+            let mut fresh = HashMap::new();
             for tp in &c.template {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
                     if seen.insert(t.to_string()) {
                         out.push(t);
                     }
@@ -561,7 +562,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // hold predicate ids (a different id space), and synthetic ids are
                 // computed values, not stored resources.
                 let want: Vec<usize> = if d.all {
-                    (0..layout.len()).filter(|&i| !layout.is_pred[i]).collect()
+                    (0..layout.len())
+                        .filter(|&i| !layout.is_pred[i] && !is_anon_var(&layout.names[i]))
+                        .collect()
                 } else {
                     d.targets
                         .iter()
@@ -633,15 +636,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut seen_d = HashSet::new();
         let mut seen_i = HashSet::new();
         for b in &sols {
+            let mut fresh = HashMap::new();
             for tp in delete {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
                     if seen_d.insert(t.to_string()) {
                         dels.push(t);
                     }
                 }
             }
             for tp in insert {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
                     if seen_i.insert(t.to_string()) {
                         ins.push(t);
                     }
@@ -651,20 +655,36 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok((dels, ins))
     }
 
-    /// Fill a template triple from a solution; `None` if any position is unbound.
+    /// Fill a template triple from a solution; `None` if any position is
+    /// unbound. A hidden blank-node variable (`[ … ]` / `( … )` in the
+    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind becomes
+    /// a fresh blank node, the same one for every template triple of this
+    /// solution: `fresh` holds them, and the caller starts a new map per
+    /// solution.
     fn instantiate_template(
         &self,
         tp: &TriplePattern,
         b: &Binding,
         layout: &VarLayout,
+        fresh: &mut HashMap<String, Term>,
     ) -> Option<Triple> {
-        let resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
+        let mut resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
             match pt {
                 PatternTerm::Term(t) => Some(t.clone()),
                 PatternTerm::Var(v) => {
-                    let idx = *layout.index.get(v)?;
-                    let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
-                    parse_term(&s).ok()
+                    let bound = layout.index.get(v).and_then(|&idx| {
+                        let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
+                        parse_term(&s).ok()
+                    });
+                    match bound {
+                        None if is_anon_var(v) => Some(
+                            fresh
+                                .entry(v.clone())
+                                .or_insert_with(|| Term::Blank(fresh_bnode_label()))
+                                .clone(),
+                        ),
+                        other => other,
+                    }
                 }
             }
         };
@@ -700,8 +720,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         &self,
         q: &SelectQuery,
     ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
-        let mut layout = VarLayout::build(&q.pattern);
-        let mut solutions = self.eval_pattern(&q.pattern, &layout);
+        let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
+        // A trailing `VALUES` block joins the solutions before the SELECT
+        // expressions, ORDER BY and projection (§18.2.4.3): without grouping
+        // that is a join with the WHERE pattern; after grouping it joins the
+        // aggregated rows (`join_values_rows`, below).
+        let with_values;
+        let pattern = match &q.values {
+            Some((vars, rows)) if !has_agg => {
+                let values = GraphPattern::Values(vars.clone(), rows.clone());
+                with_values = match &q.pattern {
+                    GraphPattern::Empty => values,
+                    p => GraphPattern::Join(Box::new(p.clone()), Box::new(values)),
+                };
+                &with_values
+            }
+            _ => &q.pattern,
+        };
+        let mut layout = VarLayout::build(pattern);
+        let mut solutions = self.eval_pattern(pattern, &layout);
         // A cancelled join short-circuits to empty bindings; surface it as an
         // error rather than a spurious empty result set.
         self.check_cancel()?;
@@ -723,7 +760,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // Upstream's LIMIT pushdown: a WHERE clause that is one BGP, with a
         // LIMIT and no ORDER BY, stops its BGP after LIMIT rows (OFFSET is not
         // added), so the functions only see those rows.
-        if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(&q.pattern) {
+        if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(pattern) {
             if let Some(limit) = q.limit {
                 solutions.truncate(limit);
             }
@@ -731,12 +768,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let bind_only = if gfns.is_empty() {
             HashSet::new()
         } else {
-            bind_only_vars(&q.pattern)
+            bind_only_vars(pattern)
         };
-        let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
         let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
         let mut rows = if !gfns.is_empty()
-            && (solutions.is_empty() || pattern_is_trivially_empty(&q.pattern))
+            && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
         {
             // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
             // function is evaluated once with its arguments read as constants
@@ -767,6 +803,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             vec![vec![value]]
         } else if has_agg {
             let mut rows = self.eval_aggregation(&solutions, &layout, &bind_only, q)?;
+            if let Some((vars, vrows)) = &q.values {
+                rows = self.join_values_rows(rows, &result_vars, &is_pred, vars, vrows);
+            }
             // Aggregated rows are ordered over the projected result layout —
             // ORDER BY here references group keys / aggregate aliases.
             if !q.order_by.is_empty() {
@@ -837,7 +876,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             solutions
                 .iter()
-                .map(|b| self.project_items(b, &layout, q))
+                .map(|b| self.project_items(b, &layout, q, &result_vars))
                 .collect::<Result<Vec<_>>>()?
         };
 
@@ -858,15 +897,65 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok((result_vars, is_pred, rows))
     }
 
+    /// Join aggregated result rows (columns `result_vars`) with a trailing
+    /// `VALUES` table: a row and a VALUES row are compatible when every
+    /// variable they share has the same term (a VALUES variable that is not a
+    /// result column is shared with nothing, as it would only extend the
+    /// solution before the projection drops it); each compatible pair gives a
+    /// row, its unbound columns filled from the VALUES row.
+    fn join_values_rows(
+        &self,
+        rows: Vec<Vec<Option<u32>>>,
+        result_vars: &[String],
+        is_pred: &[bool],
+        vars: &[String],
+        vrows: &[Vec<Option<Term>>],
+    ) -> Vec<Vec<Option<u32>>> {
+        let cols: Vec<Option<usize>> = vars
+            .iter()
+            .map(|v| result_vars.iter().position(|r| r == v))
+            .collect();
+        let mut out = Vec::new();
+        for row in &rows {
+            'values: for vrow in vrows {
+                let mut merged = row.clone();
+                for (cell, col) in vrow.iter().zip(&cols) {
+                    let (Some(term), Some(c)) = (cell, *col) else {
+                        continue;
+                    };
+                    match row[c] {
+                        Some(id) => {
+                            if self.id_to_term(id, is_pred[c]).as_ref() != Some(term) {
+                                continue 'values;
+                            }
+                        }
+                        // A predicate-typed column resolves its ids through the
+                        // predicate dictionary; a synthetic id resolves anywhere.
+                        None if is_pred[c] => {
+                            merged[c] = Some(self.extras.borrow_mut().intern(term))
+                        }
+                        None => merged[c] = Some(self.term_to_id(term)),
+                    }
+                }
+                out.push(merged);
+            }
+        }
+        out
+    }
+
     /// Project a single solution into result-variable order (no aggregation).
     fn project_items(
         &self,
         b: &Binding,
         layout: &VarLayout,
         q: &SelectQuery,
+        result_vars: &[String],
     ) -> Result<Vec<Option<u32>>> {
         match &q.projection {
-            Projection::All => Ok(layout.names.iter().map(|v| b[layout.index[v]]).collect()),
+            Projection::All => Ok(result_vars
+                .iter()
+                .map(|v| layout.index.get(v).and_then(|&i| b[i]))
+                .collect()),
             Projection::Items(items) => items
                 .iter()
                 .map(|it| match it {
@@ -1152,6 +1241,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
                 Some(Value::Bool(compare_values(*op, &x, &y)?))
             }
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => eval_in(expr, list, *negated, |e| {
+                self.eval_group_expr(e, sols, layout, key_vars, key)
+            }),
             Expr::And(a, b) => {
                 let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
                 let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
@@ -2179,6 +2275,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 self.eval_ebv(e, b, l).map(Value::Bool)
             }
             Expr::Compare(op, x, y) => self.eval_compare(*op, x, y, b, l).map(Value::Bool),
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => eval_in(expr, list, *negated, |e| self.eval_value(e, b, l)),
             Expr::Arith(op, x, y) => {
                 let a = numeric_view(self.eval_value(x, b, l)?);
                 let c = numeric_view(self.eval_value(y, b, l)?);
@@ -2382,6 +2483,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Box::new(self.subst_expr(x, b, layout)),
                 Box::new(self.subst_expr(y, b, layout)),
             ),
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => Expr::In {
+                expr: Box::new(self.subst_expr(expr, b, layout)),
+                list: list.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
+                negated: *negated,
+            },
             Expr::Arith(op, x, y) => Expr::Arith(
                 *op,
                 Box::new(self.subst_expr(x, b, layout)),
@@ -2699,6 +2809,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 value: gen_uuid(),
                 lang: None,
             }),
+            "CONTAINALL" | "CONTAINANY" => self.eval_contain(name == "CONTAINANY", args, b, l),
             "IF" => {
                 if self.eval_ebv(args.first()?, b, l)? {
                     self.eval_value(args.get(1)?, b, l)
@@ -2925,6 +3036,49 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // guards against the table and the dispatcher drifting apart.
             _ => None,
         }
+    }
+
+    /// gStore's `CONTAINALL(items, list [, sep])` / `CONTAINANY(items, list
+    /// [, sep])` (upstream `TempResult::doComp`). A *list* is a literal typed
+    /// `xsd:list` (`<http://www.w3.org/2001/XMLSchema#list>`) whose lexical
+    /// form holds items separated by `sep` (default `","`); items are trimmed
+    /// of spaces, and an empty last item is dropped (upstream `Util::split`).
+    /// `items` is such a list, or any other term standing for the one item
+    /// that is its lexical form (an IRI's IRI string). `list` must be a list.
+    ///
+    /// CONTAINALL is true iff every item of `items` occurs in `list`;
+    /// CONTAINANY iff some item of `list` occurs in `items`. Items compare as
+    /// strings. The result is an error (unbound) when `list` is not an
+    /// `xsd:list`, or `sep` is not a non-empty simple string.
+    ///
+    /// Divergences from upstream, whose behaviour here is accidental:
+    /// upstream only honours a one-character separator *literal* (any other
+    /// third argument silently means `","`), and turns a non-list `items`
+    /// term into an item by cutting the first and last character off its
+    /// N-Triples form, which mangles language-tagged and typed literals
+    /// (`"5"^^xsd:integer` becomes `5"^^<…#integer`); here the separator may
+    /// be any non-empty string expression and the item is the lexical form.
+    fn eval_contain(&self, any: bool, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
+        let sep = match args.get(2) {
+            None => ",".to_string(),
+            Some(e) => match self.eval_value(e, b, l)? {
+                Value::Str { value, lang: None } if !value.is_empty() => value,
+                _ => return None,
+            },
+        };
+        let items = match self.eval_value(args.first()?, b, l)? {
+            v @ Value::Typed { .. } if xsd_list_text(&v).is_some() => {
+                split_xsd_list(xsd_list_text(&v)?, &sep)
+            }
+            v => vec![v.lexical()],
+        };
+        let list_value = self.eval_value(args.get(1)?, b, l)?;
+        let list = split_xsd_list(xsd_list_text(&list_value)?, &sep);
+        Some(Value::Bool(if any {
+            list.iter().any(|y| items.contains(y))
+        } else {
+            items.iter().all(|x| list.contains(x))
+        }))
     }
 
     /// User-defined function fallback (gStore `pfnQuery`): a name that is not a
@@ -3746,6 +3900,80 @@ fn compare_values(op: CompareOp, a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
+/// gStore's list datatype, used by `CONTAINALL` / `CONTAINANY`.
+const XSD_LIST: &str = "http://www.w3.org/2001/XMLSchema#list";
+
+/// The lexical form of an `xsd:list` literal, if `v` is one.
+fn xsd_list_text(v: &Value) -> Option<&str> {
+    match v {
+        Value::Typed { value, datatype } if datatype == XSD_LIST => Some(value),
+        _ => None,
+    }
+}
+
+/// Split an `xsd:list` lexical form as upstream's `Util::split` does: items
+/// are separated by `sep` and trimmed of spaces; an empty last item (so also
+/// the only item of an empty list) is dropped, empty inner items are kept.
+fn split_xsd_list(text: &str, sep: &str) -> Vec<String> {
+    let mut items: Vec<String> = text.split(sep).map(|t| t.trim_matches(' ').to_string()).collect();
+    if items.last().is_some_and(String::is_empty) {
+        items.pop();
+    }
+    items
+}
+
+/// `lhs IN (list…)` / `lhs NOT IN (list…)` (SPARQL 1.1 §17.4.1.9-10), with
+/// `eval` evaluating an operand (`None` = error/unbound). The test is `=` on
+/// each list member in turn: IN is true as soon as one member is equal; an
+/// error in some comparison makes the result an error unless a later or
+/// earlier member is equal (`2 IN (1/0, 2)` is true, `2 IN (3, 1/0)` an
+/// error); otherwise it is false. NOT IN is the negation under the same error
+/// rule. An empty list gives false (true for NOT IN) whatever the left-hand
+/// side, as the spec's expansion into a `||`/`&&` chain of zero comparisons
+/// does; otherwise an error in the left-hand side is an error. Members are
+/// evaluated lazily, left to right, stopping at the first equal one.
+fn eval_in(
+    lhs: &Expr,
+    list: &[Expr],
+    negated: bool,
+    eval: impl Fn(&Expr) -> Option<Value>,
+) -> Option<Value> {
+    if list.is_empty() {
+        return Some(Value::Bool(negated));
+    }
+    let x = numeric_view(eval(lhs)?);
+    let mut error = false;
+    for e in list {
+        match eval(e).and_then(|y| in_equal(&x, &numeric_view(y))) {
+            Some(true) => return Some(Value::Bool(!negated)),
+            Some(false) => {}
+            None => error = true,
+        }
+    }
+    if error {
+        None
+    } else {
+        Some(Value::Bool(negated))
+    }
+}
+
+/// The `=` that IN / NOT IN apply: the value comparison of
+/// [`Value::sparql_eq`] where it is defined, else RDFterm-equal (§17.4.1.7):
+/// two terms that are not both literals cannot be the same term, so they are
+/// unequal (`2 IN (<http://ex/iri>, 2.0)` is true, `<a> NOT IN ("a")` true),
+/// while two literals the operator mapping cannot compare (e.g. `2` and
+/// `"2"`) are a type error.
+fn in_equal(a: &Value, b: &Value) -> Option<bool> {
+    a.sparql_eq(b).or_else(|| {
+        let literal = |v: &Value| !matches!(v, Value::Iri(_) | Value::Blank(_));
+        if literal(a) && literal(b) {
+            None
+        } else {
+            Some(false)
+        }
+    })
+}
+
 /// Sum numeric values (integer-preserving until a double appears).
 fn sum_values(vals: &[Value]) -> Value {
     // Accumulate through the numeric tower so decimals and big integers are
@@ -3780,6 +4008,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         }
         Expr::Not(a) | Expr::Unary(_, a) => expr_has_aggregate(a),
         Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().any(expr_has_aggregate),
+        Expr::In { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
         _ => false,
     }
 }
@@ -3845,6 +4076,10 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
         Expr::Not(a) | Expr::Unary(_, a) => expr_vars(a, out),
         Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
             args.iter().for_each(|a| expr_vars(a, out))
+        }
+        Expr::In { expr, list, .. } => {
+            expr_vars(expr, out);
+            list.iter().for_each(|a| expr_vars(a, out));
         }
         Expr::Aggregate { arg, .. } => {
             if let Some(a) = arg {
@@ -4093,6 +4328,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             Expr::Not(a) | Expr::Unary(_, a) => self.check_expr_calls(a),
             Expr::Builtin(_, args) => args.iter().try_for_each(|a| self.check_expr_calls(a)),
+            Expr::In { expr, list, .. } => {
+                self.check_expr_calls(expr)?;
+                list.iter().try_for_each(|a| self.check_expr_calls(a))
+            }
             Expr::Exists(_, p) => self.check_pattern_calls(p),
             Expr::Aggregate { arg, .. } => match arg {
                 Some(a) => self.check_expr_calls(a),
@@ -4519,6 +4758,11 @@ fn serialize_pattern_body(gp: &GraphPattern, out: &mut String) -> Option<()> {
 /// (which is itself valid SPARQL for IRIs/literals/blank nodes).
 fn render_pattern_term(pt: &PatternTerm) -> String {
     match pt {
+        // A hidden blank-node variable goes out as a blank node, which the
+        // remote reads as a non-distinguished variable.
+        PatternTerm::Var(v) if is_anon_var(v) => {
+            format!("_:anon{}", &v[ANON_VAR_PREFIX.len()..])
+        }
         PatternTerm::Var(v) => format!("?{v}"),
         PatternTerm::Term(t) => t.to_string(),
     }

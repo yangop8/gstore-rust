@@ -307,6 +307,15 @@ impl Lexer {
                     break;
                 }
             }
+            // BLANK_NODE_LABEL cannot end with '.': a trailing '.' is the
+            // statement terminator (`?s ?p _:b.`).
+            while label.ends_with('.') {
+                label.pop();
+                self.pos -= 1;
+            }
+            if label.is_empty() {
+                return Err(self.err("empty blank node label after '_:'"));
+            }
             Ok(Token::Blank(label))
         } else {
             self.lex_word_or_pname()
@@ -457,34 +466,87 @@ impl Lexer {
     }
 
     /// A bareword keyword/function, or a prefixed name `pfx:local`.
+    ///
+    /// The prefix (`PN_PREFIX`) may contain `-` and `.` (not as its last
+    /// character), e.g. `my-ns.v2:x`. The local part follows `PN_LOCAL`: name
+    /// characters, `-`, `.` and `:` (so `ex:a:b` has the local name `a:b`),
+    /// `%XX` percent-encodings (kept verbatim, as the grammar requires), and
+    /// `\`-escapes of `_~.-!$&'()*+,;=/?#@%` (the backslash is dropped:
+    /// `ex:a\-b` is `ex:` + `a-b`). An unescaped trailing `.` is the
+    /// statement terminator, not part of the name.
     fn lex_word_or_pname(&mut self) -> Result<Token> {
         let mut head = String::new();
-        while let Some(c) = self.peek() {
-            if is_name_char(c) {
-                head.push(c);
-                self.pos += 1;
-            } else {
-                break;
-            }
+        // A PN_PREFIX with '-' / '.' inside is only a prefix when ':' follows.
+        let mut end = self.pos;
+        while self
+            .chars
+            .get(end)
+            .is_some_and(|&c| is_pn_char(c) || c == '.')
+        {
+            end += 1;
         }
-        if self.peek() == Some(':') {
-            self.bump();
-            let mut local = String::new();
+        if end > self.pos && self.chars.get(end) == Some(&':') && self.chars[end - 1] != '.' {
+            head.extend(&self.chars[self.pos..end]);
+            self.pos = end;
+        } else {
             while let Some(c) = self.peek() {
-                // PN_LOCAL: letters, digits, '_', '-', '.', '%' (we keep it simple).
-                if is_name_char(c) || c == '-' || c == '.' || c == '%' {
-                    local.push(c);
+                if is_name_char(c) {
+                    head.push(c);
                     self.pos += 1;
                 } else {
                     break;
                 }
             }
-            // A trailing '.' belongs to the statement, not the local name.
-            while local.ends_with('.') {
-                local.pop();
-                self.pos -= 1;
+        }
+        if self.peek() == Some(':') {
+            self.bump();
+            // (char, consumed source chars, came from an escape)
+            let mut local: Vec<(char, usize, bool)> = Vec::new();
+            loop {
+                match self.peek() {
+                    Some(c) if is_pn_char(c) || c == '.' || c == ':' => {
+                        local.push((c, 1, false));
+                        self.pos += 1;
+                    }
+                    Some('%') => {
+                        let hex = |i: usize| {
+                            self.chars
+                                .get(self.pos + i)
+                                .copied()
+                                .filter(char::is_ascii_hexdigit)
+                        };
+                        let (Some(h1), Some(h2)) = (hex(1), hex(2)) else {
+                            return Err(self.err(format!(
+                                "invalid percent-encoding in prefixed name '{head}:{}…': '%' \
+                                 must be followed by two hex digits",
+                                local.iter().map(|x| x.0).collect::<String>()
+                            )));
+                        };
+                        // The whole `%XX` is kept verbatim (never decoded).
+                        local.extend([('%', 1, true), (h1, 1, true), (h2, 1, true)]);
+                        self.pos += 3;
+                    }
+                    Some('\\') => {
+                        let Some(c) = self.peek2().filter(|c| PN_LOCAL_ESC.contains(*c)) else {
+                            let shown = self.peek2().map(String::from).unwrap_or_default();
+                            return Err(self.err(format!(
+                                "invalid escape '\\{shown}' in prefixed name '{head}:{}…': \
+                                 only \\ followed by one of {PN_LOCAL_ESC} is allowed",
+                                local.iter().map(|x| x.0).collect::<String>()
+                            )));
+                        };
+                        local.push((c, 2, true));
+                        self.pos += 2;
+                    }
+                    _ => break,
+                }
             }
-            Ok(Token::PName(head, local))
+            // A trailing unescaped '.' belongs to the statement.
+            while let Some(&('.', n, false)) = local.last() {
+                local.pop();
+                self.pos -= n;
+            }
+            Ok(Token::PName(head, local.into_iter().map(|x| x.0).collect()))
         } else {
             if head.is_empty() {
                 return Err(self.err("expected a name"));
@@ -501,6 +563,18 @@ fn is_name_start(c: char) -> bool {
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
+
+/// `PN_CHARS`: name characters plus `-`, `·` and the combining ranges.
+fn is_pn_char(c: char) -> bool {
+    is_name_char(c)
+        || c == '-'
+        || c == '\u{00B7}'
+        || ('\u{0300}'..='\u{036F}').contains(&c)
+        || ('\u{203F}'..='\u{2040}').contains(&c)
+}
+
+/// The characters `PN_LOCAL_ESC` may escape with a backslash.
+const PN_LOCAL_ESC: &str = "_~.-!$&'()*+,;=/?#@%";
 
 #[cfg(test)]
 mod tests {

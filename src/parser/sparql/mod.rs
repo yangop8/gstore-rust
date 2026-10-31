@@ -110,6 +110,36 @@ enum VerbKind {
     Path(PathExpr),
 }
 
+/// How the anonymous blank nodes of the triples being parsed — `[]`,
+/// `[ :p :o ]` and the cells of a collection `( … )` — are represented.
+#[derive(Debug, Clone, Copy)]
+enum BnodeMode {
+    /// WHERE patterns and CONSTRUCT/INSERT templates: fresh hidden variables
+    /// ([`ANON_VAR_PREFIX`]). In a pattern they match like variables; in a
+    /// template the engine mints a fresh blank node per solution.
+    Var,
+    /// `INSERT DATA`: fresh blank-node terms, disjoint from the store's.
+    Fresh,
+    /// `DELETE DATA`, `DELETE WHERE` and DELETE templates, where SPARQL 1.1
+    /// Update forbids blank nodes; the string names the context.
+    Forbidden(&'static str),
+}
+
+/// Maximum nesting depth of `[ … ]` / `( … )`, so adversarial input errors
+/// out instead of overflowing the parser's stack.
+const MAX_NODE_NESTING: usize = 256;
+
+/// Keywords that start a clause, never a function call, in the positions
+/// where a bare call may appear (GROUP BY, HAVING, ORDER BY conditions).
+const CLAUSE_KEYWORDS: &[&str] = &[
+    "VALUES", "HAVING", "ORDER", "GROUP", "LIMIT", "OFFSET", "ASC", "DESC", "WHERE", "AS",
+];
+
+/// The keywords that open a non-triple element of a group graph pattern.
+const GROUP_PATTERN_KEYWORDS: &[&str] = &[
+    "FILTER", "OPTIONAL", "MINUS", "BIND", "VALUES", "GRAPH", "SERVICE", "UNION", "SELECT",
+];
+
 struct Parser<'s> {
     /// The request text, for constructs passed through verbatim (PFN's
     /// `jsonVars`) and for quoting the user's arguments in error messages.
@@ -120,6 +150,12 @@ struct Parser<'s> {
     pos: usize,
     prefixes: HashMap<String, String>,
     base: Option<String>,
+    /// Counter for the hidden variables of anonymous blank nodes.
+    anon: usize,
+    /// How anonymous blank nodes are represented where the parser is now.
+    bnode_mode: BnodeMode,
+    /// Current `[ … ]` / `( … )` nesting depth.
+    node_depth: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -134,7 +170,22 @@ impl<'s> Parser<'s> {
             pos: 0,
             prefixes,
             base: None,
+            anon: 0,
+            bnode_mode: BnodeMode::Var,
+            node_depth: 0,
         }
+    }
+
+    /// Run `f` with anonymous blank nodes represented as `mode`.
+    fn with_bnode_mode<T>(
+        &mut self,
+        mode: BnodeMode,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved = std::mem::replace(&mut self.bnode_mode, mode);
+        let r = f(self);
+        self.bnode_mode = saved;
+        r
     }
 
     /// The source text of tokens `from..to` (exclusive), whitespace between
@@ -209,7 +260,8 @@ impl<'s> Parser<'s> {
             "ASK" => Query::Ask(self.parse_ask()?),
             "CONSTRUCT" => Query::Construct(self.parse_construct()?),
             "DESCRIBE" => Query::Describe(self.parse_describe()?),
-            "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "CREATE" | "WITH" => {
+            "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "CREATE" | "WITH" | "ADD"
+            | "MOVE" | "COPY" => {
                 Query::Update(self.parse_update_sequence()?)
             }
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
@@ -268,9 +320,10 @@ impl<'s> Parser<'s> {
 
         self.skip_dataset_clauses()?;
         self.eat_keyword("WHERE"); // optional
-        let pattern = self.parse_group_graph_pattern()?;
-        let (group_by, having) = self.parse_group_having()?;
+        let mut pattern = self.parse_group_graph_pattern()?;
+        let (group_by, having) = self.parse_group_having(&mut pattern)?;
         let (order_by, limit, offset) = self.parse_solution_modifiers()?;
+        let values = self.parse_trailing_values()?;
 
         Ok(SelectQuery {
             distinct,
@@ -281,7 +334,28 @@ impl<'s> Parser<'s> {
             order_by,
             limit,
             offset,
+            values,
         })
+    }
+
+    /// The `ValuesClause` that may close a query (or a sub-SELECT):
+    /// `VALUES dataBlock`, if present.
+    fn parse_trailing_values(&mut self) -> Result<Option<ValuesTable>> {
+        if self.eat_keyword("VALUES") {
+            Ok(Some(self.parse_data_block()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Join a trailing `VALUES` block onto the WHERE pattern of a query form
+    /// without grouping (CONSTRUCT/ASK/DESCRIBE): SPARQL 1.1 §18.2.4.3 joins
+    /// it with the WHERE solutions before the solution modifiers.
+    fn join_trailing_values(pattern: GraphPattern, values: Option<ValuesTable>) -> GraphPattern {
+        match values {
+            Some((vars, rows)) => join_opt(pattern, GraphPattern::Values(vars, rows)),
+            None => pattern,
+        }
     }
 
     /// `*` or a list of `?v` / `(expr AS ?v)` projection items.
@@ -316,7 +390,14 @@ impl<'s> Parser<'s> {
     }
 
     /// `GROUP BY …` and `HAVING …` clauses (both optional, GROUP before HAVING).
-    fn parse_group_having(&mut self) -> Result<(Vec<Expr>, Vec<Expr>)> {
+    ///
+    /// A `GroupCondition` is a variable, a bare built-in or function call,
+    /// `( expr )`, or `( expr AS ?v )`. The last form binds `?v` to the
+    /// grouping value: `pattern` is extended with `BIND(expr AS ?v)` and the
+    /// group key is `?v` (§18.2.4.1), so the query may project `?v`.
+    /// `HAVING` takes one or more constraints (`HAVING (c1) (c2)`: all must
+    /// hold); a repeated `HAVING` keyword is accepted too.
+    fn parse_group_having(&mut self, pattern: &mut GraphPattern) -> Result<(Vec<Expr>, Vec<Expr>)> {
         let mut group_by = Vec::new();
         if self.keyword().as_deref() == Some("GROUP") {
             self.bump();
@@ -330,30 +411,84 @@ impl<'s> Parser<'s> {
                     Token::LParen => {
                         self.bump();
                         let e = self.parse_expr()?;
-                        // optional AS ?v (the bound var is ignored for grouping keys)
-                        self.eat_keyword("AS");
-                        if let Token::Var(_) = self.peek() {
-                            self.bump();
+                        if self.eat_keyword("AS") {
+                            let var = self.expect_var()?;
+                            self.expect(&Token::RParen, "')' after GROUP BY (… AS ?var)")?;
+                            let mut bound = Vec::new();
+                            pattern.collect_vars(&mut bound);
+                            if bound.contains(&var) {
+                                return Err(self.err(format!(
+                                    "GROUP BY (… AS ?{var}): ?{var} is already bound by the \
+                                     WHERE clause; the variable must be new"
+                                )));
+                            }
+                            let inner = std::mem::replace(pattern, GraphPattern::Empty);
+                            *pattern = GraphPattern::Extend(Box::new(inner), var.clone(), e);
+                            group_by.push(Expr::Var(var));
+                        } else {
+                            self.expect(&Token::RParen, "')'")?;
+                            group_by.push(e);
                         }
-                        self.expect(&Token::RParen, "')'")?;
-                        group_by.push(e);
                     }
-                    // GroupCondition ::= FunctionCall, e.g. `GROUP BY rs:WCC(?x)`.
-                    _ if self.at_iri_call() => group_by.push(self.parse_iri_call()?),
+                    // GroupCondition ::= BuiltInCall | FunctionCall, e.g.
+                    // `GROUP BY STR(?o)` or `GROUP BY rs:WCC(?x)`.
+                    _ if self.at_call() => group_by.push(self.parse_primary()?),
                     _ => break,
                 }
+            }
+            if group_by.is_empty() {
+                return Err(self.err(format!(
+                    "GROUP BY needs at least one condition (?var, (expr), (expr AS ?var) or a \
+                     function call), found {}",
+                    describe_token(self.peek())
+                )));
             }
         }
         let mut having = Vec::new();
         if self.keyword().as_deref() == Some("HAVING") {
             self.bump();
-            having.push(self.parse_constraint()?);
-            // each additional constraint must be preceded by another HAVING keyword
-            while self.eat_keyword("HAVING") {
-                having.push(self.parse_constraint()?);
+            if !self.at_constraint() {
+                return Err(self.err(format!(
+                    "HAVING needs a constraint, e.g. HAVING (COUNT(?x) > 1), found {}",
+                    describe_token(self.peek())
+                )));
+            }
+            loop {
+                if self.at_constraint() {
+                    having.push(self.parse_constraint()?);
+                } else if !self.eat_keyword("HAVING") {
+                    break;
+                }
             }
         }
         Ok((group_by, having))
+    }
+
+    /// Is the cursor at a bare `BuiltInCall` / `FunctionCall` — `NAME(…)`,
+    /// `EXISTS {…}`, `NOT EXISTS {…}`, `<iri>(…)`, `pfx:name(…)` — rather
+    /// than at a clause keyword such as `VALUES (?x) {…}`?
+    fn at_call(&self) -> bool {
+        if self.at_iri_call() {
+            return true;
+        }
+        let Token::Word(w) = self.peek() else {
+            return false;
+        };
+        let upper = w.to_ascii_uppercase();
+        if CLAUSE_KEYWORDS.contains(&upper.as_str()) {
+            return false;
+        }
+        match self.peek_at(1) {
+            Token::LParen => true,
+            Token::LBrace => upper == "EXISTS",
+            Token::Word(n) => upper == "NOT" && n.eq_ignore_ascii_case("EXISTS"),
+            _ => false,
+        }
+    }
+
+    /// Can a `Constraint` (`( expr )` or a bare call) start here?
+    fn at_constraint(&self) -> bool {
+        matches!(self.peek(), Token::LParen) || self.at_call()
     }
 
     fn expect_var(&mut self) -> Result<String> {
@@ -391,13 +526,20 @@ impl<'s> Parser<'s> {
             }
         }
         self.skip_dataset_clauses()?;
-        let pattern = if self.eat_keyword("WHERE") || matches!(self.peek(), Token::LBrace) {
+        let mut pattern = if self.eat_keyword("WHERE") || matches!(self.peek(), Token::LBrace) {
             Some(self.parse_group_graph_pattern()?)
         } else {
             None
         };
         // DESCRIBE ignores solution modifiers for our purposes; consume any.
         self.parse_solution_modifiers()?;
+        if let Some((vars, rows)) = self.parse_trailing_values()? {
+            let values = GraphPattern::Values(vars, rows);
+            pattern = Some(match pattern {
+                Some(p) => join_opt(p, values),
+                None => values,
+            });
+        }
         Ok(DescribeQuery {
             targets,
             all,
@@ -412,7 +554,10 @@ impl<'s> Parser<'s> {
         let pattern = self.parse_group_graph_pattern()?;
         // ASK ignores solution modifiers for our purposes; consume any present.
         self.parse_solution_modifiers()?;
-        Ok(AskQuery { pattern })
+        let values = self.parse_trailing_values()?;
+        Ok(AskQuery {
+            pattern: Self::join_trailing_values(pattern, values),
+        })
     }
 
     /// Skip `FROM <iri>` / `FROM NAMED <iri>` dataset clauses (not modeled).
@@ -587,59 +732,156 @@ impl<'s> Parser<'s> {
     /// Parse an inline `VALUES` block: `VALUES ?v { … }` or
     /// `VALUES (?a ?b) { (..) (..) }`. `UNDEF` becomes `None`.
     fn parse_inline_values(&mut self) -> Result<GraphPattern> {
+        let (vars, rows) = self.parse_data_block()?;
+        Ok(GraphPattern::Values(vars, rows))
+    }
+
+    /// `DataBlock ::= InlineDataOneVar | InlineDataFull`:
+    /// `?v { value* }`, or `( ?a … ) { ( value* ) … }` where `()` is an empty
+    /// variable list or an empty row. Every row must have exactly one value
+    /// per variable.
+    fn parse_data_block(&mut self) -> Result<ValuesTable> {
         let mut vars = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.bump();
             while let Token::Var(v) = self.peek() {
+                if vars.contains(v) {
+                    return Err(self.err(format!("VALUES declares ?{v} twice")));
+                }
                 vars.push(v.clone());
                 self.bump();
             }
-            self.expect(&Token::RParen, "')'")?;
+            self.expect(&Token::RParen, "')' closing the VALUES variable list")?;
             self.expect(&Token::LBrace, "'{'")?;
             let mut rows = Vec::new();
-            while matches!(self.peek(), Token::LParen) {
-                self.bump();
-                let mut row = Vec::with_capacity(vars.len());
-                while !matches!(self.peek(), Token::RParen) {
-                    row.push(self.parse_values_cell()?);
+            loop {
+                match self.peek() {
+                    Token::LParen => {
+                        self.bump();
+                        let mut row = Vec::with_capacity(vars.len());
+                        while !matches!(self.peek(), Token::RParen) {
+                            if matches!(self.peek(), Token::Eof) {
+                                return Err(self.err("unterminated VALUES row"));
+                            }
+                            row.push(self.parse_values_cell()?);
+                        }
+                        self.bump(); // ')'
+                        if row.len() != vars.len() {
+                            return Err(self.err(format!(
+                                "VALUES row {} has {} value(s) but {} variable(s) are declared",
+                                rows.len() + 1,
+                                row.len(),
+                                vars.len()
+                            )));
+                        }
+                        rows.push(row);
+                    }
+                    Token::RBrace => {
+                        self.bump();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected a VALUES row '( … )' or '}}', found {}",
+                            describe_token(other)
+                        )))
+                    }
                 }
-                self.bump(); // ')'
-                rows.push(row);
             }
-            self.expect(&Token::RBrace, "'}'")?;
-            Ok(GraphPattern::Values(vars, rows))
+            Ok((vars, rows))
         } else {
             // single-variable shorthand
-            let v = self.expect_var()?;
+            let v = match self.bump() {
+                Token::Var(v) => v,
+                other => {
+                    return Err(self.err(format!(
+                        "VALUES expects ?var {{ … }} or (?var …) {{ ( … ) … }}, found {}",
+                        describe_token(&other)
+                    )))
+                }
+            };
             vars.push(v);
             self.expect(&Token::LBrace, "'{'")?;
             let mut rows = Vec::new();
             while !matches!(self.peek(), Token::RBrace) {
+                if matches!(self.peek(), Token::Eof) {
+                    return Err(self.err("unterminated VALUES block"));
+                }
                 rows.push(vec![self.parse_values_cell()?]);
             }
             self.expect(&Token::RBrace, "'}'")?;
-            Ok(GraphPattern::Values(vars, rows))
+            Ok((vars, rows))
         }
     }
 
-    /// One `VALUES` cell: a term or `UNDEF`.
+    /// One `VALUES` cell (`DataBlockValue`): an IRI, a literal (including a
+    /// signed number or `true`/`false`) or `UNDEF`.
     fn parse_values_cell(&mut self) -> Result<Option<Term>> {
         if self.keyword().as_deref() == Some("UNDEF") {
             self.bump();
             return Ok(None);
         }
-        let tok = self.peek().clone();
-        let term = self.token_to_term(&tok)?;
-        self.bump();
-        Ok(Some(term))
+        match self.peek() {
+            Token::Var(v) => Err(self.err(format!(
+                "a VALUES cell must be an IRI, a literal or UNDEF, not the variable ?{v}"
+            ))),
+            Token::Blank(b) => Err(self.err(format!(
+                "a VALUES cell must be an IRI, a literal or UNDEF, not the blank node _:{b}"
+            ))),
+            _ => self.parse_term_token().map(Some),
+        }
     }
 
     // ---- CONSTRUCT --------------------------------------------------------
 
+    /// `CONSTRUCT { template } DatasetClause* WhereClause SolutionModifier`,
+    /// or the short form `CONSTRUCT DatasetClause* WHERE { TriplesTemplate? }
+    /// SolutionModifier`, whose template is its WHERE triples (§16.2.4: the
+    /// pattern must be a basic graph pattern — no FILTER, OPTIONAL, paths, …).
+    /// Either may end with a `VALUES` block.
     fn parse_construct(&mut self) -> Result<ConstructQuery> {
         self.expect_keyword("CONSTRUCT")?;
-        // CONSTRUCT { template } WHERE { … }
-        let mut template = Vec::new();
+        let (template, pattern) = if matches!(self.peek(), Token::LBrace) {
+            let template = self.parse_triples_only_block("a CONSTRUCT template", "")?;
+            self.skip_dataset_clauses()?;
+            self.eat_keyword("WHERE");
+            (template, self.parse_group_graph_pattern()?)
+        } else {
+            self.skip_dataset_clauses()?;
+            if !self.eat_keyword("WHERE") {
+                return Err(self.err(format!(
+                    "expected a CONSTRUCT template '{{ … }}' or the short form CONSTRUCT WHERE \
+                     {{ … }}, found {}",
+                    describe_token(self.peek())
+                )));
+            }
+            let triples = self.parse_triples_only_block(
+                "the CONSTRUCT WHERE { … } short form",
+                "; write CONSTRUCT { template } WHERE { … } for anything but triple patterns",
+            )?;
+            let pattern = if triples.is_empty() {
+                GraphPattern::Empty
+            } else {
+                GraphPattern::Bgp(triples.clone())
+            };
+            (triples, pattern)
+        };
+        let (order_by, limit, offset) = self.parse_solution_modifiers()?;
+        let values = self.parse_trailing_values()?;
+        Ok(ConstructQuery {
+            template,
+            pattern: Self::join_trailing_values(pattern, values),
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    /// `{ TriplesTemplate? }`: triple patterns only — no property paths, no
+    /// FILTER/OPTIONAL/… and no nested groups. `what` names the block and
+    /// `hint` is appended to the error for anything else.
+    fn parse_triples_only_block(&mut self, what: &str, hint: &str) -> Result<Vec<TriplePattern>> {
+        let mut triples = Vec::new();
         let mut paths = Vec::new();
         self.expect(&Token::LBrace, "'{'")?;
         loop {
@@ -651,51 +893,85 @@ impl<'s> Parser<'s> {
                 Token::Dot => {
                     self.bump();
                 }
-                Token::Eof => return Err(self.err("unexpected end of CONSTRUCT template")),
-                _ => self.parse_triples_same_subject(&mut template, &mut paths)?,
+                Token::Eof => return Err(self.err(format!("unexpected end of query in {what}"))),
+                Token::LBrace => {
+                    return Err(self.err(format!(
+                        "{what} allows only triple patterns, found a nested group '{{'{hint}"
+                    )))
+                }
+                Token::Word(w) if GROUP_PATTERN_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()) => {
+                    return Err(self.err(format!(
+                        "{what} allows only triple patterns, found {}{hint}",
+                        w.to_ascii_uppercase()
+                    )))
+                }
+                _ => self.parse_triples_same_subject(&mut triples, &mut paths)?,
             }
         }
         if !paths.is_empty() {
-            return Err(self.err("property paths are not allowed in a CONSTRUCT template"));
+            return Err(self.err(format!("property paths are not allowed in {what}{hint}")));
         }
-        self.skip_dataset_clauses()?;
-        self.eat_keyword("WHERE");
-        let pattern = self.parse_group_graph_pattern()?;
-        let (order_by, limit, offset) = self.parse_solution_modifiers()?;
-        Ok(ConstructQuery {
-            template,
-            pattern,
-            order_by,
-            limit,
-            offset,
-        })
+        Ok(triples)
     }
 
-    /// `subject  verb objlist (';' verb objlist)*`. Plain-predicate triples are
-    /// pushed to `bgp`; property-path predicates emit [`GraphPattern::Path`] into
-    /// `paths`.
+    /// `TriplesSameSubject(Path)`: `subject verb objlist (';' verb objlist)*`,
+    /// where the subject (and any object) may be a triples node — a blank
+    /// node property list `[ … ]` or a collection `( … )` — and a triples
+    /// node subject may stand alone (`[ :p :o ] .`). Plain-predicate triples
+    /// are pushed to `bgp`; property-path predicates emit
+    /// [`GraphPattern::Path`] into `paths`.
     fn parse_triples_same_subject(
         &mut self,
         bgp: &mut Vec<TriplePattern>,
         paths: &mut Vec<GraphPattern>,
     ) -> Result<()> {
-        let subject = self.parse_pattern_term()?;
+        // `[]` and `()` are plain terms (ANON / NIL), not triples nodes, so
+        // they need a property list like any other subject.
+        let triples_node = match self.peek() {
+            Token::LBracket => !matches!(self.peek_at(1), Token::RBracket),
+            Token::LParen => !matches!(self.peek_at(1), Token::RParen),
+            _ => false,
+        };
+        let subject = self.parse_graph_node(bgp, paths)?;
+        if triples_node && !self.starts_verb() {
+            return Ok(());
+        }
+        self.parse_property_list(&subject, bgp, paths)
+    }
+
+    /// `PropertyList(Path)NotEmpty` for `subject`:
+    /// `verb objlist (';' (verb objlist)?)*`.
+    fn parse_property_list(
+        &mut self,
+        subject: &PatternTerm,
+        bgp: &mut Vec<TriplePattern>,
+        paths: &mut Vec<GraphPattern>,
+    ) -> Result<()> {
         loop {
             let verb = self.parse_path_or_verb()?;
             // object list
             loop {
-                let object = self.parse_pattern_term()?;
+                // The triple linking to a triples-node object goes before the
+                // node's own triples, keeping the textual variable order.
+                let (bgp_mark, paths_mark) = (bgp.len(), paths.len());
+                let object = self.parse_graph_node(bgp, paths)?;
                 match &verb {
-                    VerbKind::Simple(p) => bgp.push(TriplePattern {
-                        subject: subject.clone(),
-                        predicate: p.clone(),
-                        object,
-                    }),
-                    VerbKind::Path(path) => paths.push(GraphPattern::Path(PathPattern {
-                        subject: subject.clone(),
-                        path: path.clone(),
-                        object,
-                    })),
+                    VerbKind::Simple(p) => bgp.insert(
+                        bgp_mark,
+                        TriplePattern {
+                            subject: subject.clone(),
+                            predicate: p.clone(),
+                            object,
+                        },
+                    ),
+                    VerbKind::Path(path) => paths.insert(
+                        paths_mark,
+                        GraphPattern::Path(PathPattern {
+                            subject: subject.clone(),
+                            path: path.clone(),
+                            object,
+                        }),
+                    ),
                 }
                 if matches!(self.peek(), Token::Comma) {
                     self.bump();
@@ -703,16 +979,133 @@ impl<'s> Parser<'s> {
                     break;
                 }
             }
-            if matches!(self.peek(), Token::Semicolon) {
+            // `;` may repeat, and may end the list (`:p :o ; .`).
+            let mut semicolon = false;
+            while matches!(self.peek(), Token::Semicolon) {
                 self.bump();
-                if self.starts_verb() {
-                    continue;
-                }
-                break;
+                semicolon = true;
             }
-            break;
+            if semicolon && self.starts_verb() {
+                continue;
+            }
+            return Ok(());
         }
+    }
+
+    /// A subject/object position (`GraphNode(Path)`): a variable, an RDF term,
+    /// or a triples node whose triples are emitted into `bgp`/`paths`.
+    fn parse_graph_node(
+        &mut self,
+        bgp: &mut Vec<TriplePattern>,
+        paths: &mut Vec<GraphPattern>,
+    ) -> Result<PatternTerm> {
+        match self.peek() {
+            Token::LBracket => self.parse_blank_node_property_list(bgp, paths),
+            Token::LParen => self.parse_collection(bgp, paths),
+            _ => self.parse_pattern_term(),
+        }
+    }
+
+    /// `[]` (an anonymous blank node) or `[ PropertyListNotEmpty ]` (a blank
+    /// node that is the subject of the listed triples).
+    fn parse_blank_node_property_list(
+        &mut self,
+        bgp: &mut Vec<TriplePattern>,
+        paths: &mut Vec<GraphPattern>,
+    ) -> Result<PatternTerm> {
+        self.expect(&Token::LBracket, "'['")?;
+        if matches!(self.peek(), Token::RBracket) {
+            self.bump();
+            return self.fresh_anon("[]");
+        }
+        self.enter_node()?;
+        let node = self.fresh_anon("[ … ]")?;
+        if !self.starts_verb() {
+            return Err(self.err(format!(
+                "expected a predicate in the blank node property list '[ … ]', found {}",
+                describe_token(self.peek())
+            )));
+        }
+        self.parse_property_list(&node, bgp, paths)?;
+        self.expect(&Token::RBracket, "']' closing the blank node property list")?;
+        self.node_depth -= 1;
+        Ok(node)
+    }
+
+    /// `( node+ )`, an RDF collection, expanded to an `rdf:first`/`rdf:rest`
+    /// chain of blank nodes ending in `rdf:nil`; `()` is `rdf:nil` itself.
+    fn parse_collection(
+        &mut self,
+        bgp: &mut Vec<TriplePattern>,
+        paths: &mut Vec<GraphPattern>,
+    ) -> Result<PatternTerm> {
+        let iri = |s: &str| PatternTerm::Term(Term::iri(s));
+        self.expect(&Token::LParen, "'('")?;
+        if matches!(self.peek(), Token::RParen) {
+            self.bump();
+            return Ok(iri(rdf::NIL));
+        }
+        self.enter_node()?;
+        let mut items = Vec::new();
+        while !matches!(self.peek(), Token::RParen) {
+            if matches!(self.peek(), Token::Eof) {
+                return Err(self.err("unterminated collection '( …': expected ')'"));
+            }
+            items.push(self.parse_graph_node(bgp, paths)?);
+        }
+        self.bump(); // ')'
+        let head = self.fresh_anon("a collection ( … )")?;
+        let mut cell = head.clone();
+        let last = items.len() - 1;
+        for (i, item) in items.into_iter().enumerate() {
+            bgp.push(TriplePattern {
+                subject: cell.clone(),
+                predicate: iri(rdf::FIRST),
+                object: item,
+            });
+            let next = if i == last {
+                iri(rdf::NIL)
+            } else {
+                self.fresh_anon("a collection ( … )")?
+            };
+            bgp.push(TriplePattern {
+                subject: cell,
+                predicate: iri(rdf::REST),
+                object: next.clone(),
+            });
+            cell = next;
+        }
+        self.node_depth -= 1;
+        Ok(head)
+    }
+
+    /// Enter a `[ … ]` / `( … )`, bounding the nesting depth.
+    fn enter_node(&mut self) -> Result<()> {
+        if self.node_depth >= MAX_NODE_NESTING {
+            return Err(self.err(format!(
+                "blank node property lists / collections are nested more than \
+                 {MAX_NODE_NESTING} deep"
+            )));
+        }
+        self.node_depth += 1;
         Ok(())
+    }
+
+    /// A fresh anonymous blank node (`what` is its syntax, for errors), as
+    /// the current [`BnodeMode`] represents it.
+    fn fresh_anon(&mut self, what: &str) -> Result<PatternTerm> {
+        match self.bnode_mode {
+            BnodeMode::Var => {
+                let name = format!("{ANON_VAR_PREFIX}{}", self.anon);
+                self.anon += 1;
+                Ok(PatternTerm::Var(name))
+            }
+            BnodeMode::Fresh => Ok(PatternTerm::Term(Term::Blank(fresh_bnode_label()))),
+            BnodeMode::Forbidden(ctx) => Err(self.err(format!(
+                "blank nodes are not allowed in {ctx} (SPARQL 1.1 Update), but {what} \
+                 denotes one"
+            ))),
+        }
     }
 
     /// Could the current token begin a verb (predicate or path)?
@@ -788,7 +1181,10 @@ impl<'s> Parser<'s> {
                     self.bump();
                     p = PathExpr::ZeroOrMore(Box::new(p));
                 }
-                Token::Plus => {
+                // `+7` touching its digits is a signed number (the object,
+                // as the tokenizer's longest match `INTEGER_POSITIVE` reads
+                // `:p +7`), not the one-or-more modifier.
+                Token::Plus if !self.at_signed_number() => {
                     self.bump();
                     p = PathExpr::OneOrMore(Box::new(p));
                 }
@@ -878,17 +1274,66 @@ impl<'s> Parser<'s> {
         Ok(PathExpr::NegatedSet(set))
     }
 
-    /// A triple-pattern position: a variable or a concrete term.
+    /// A triple-pattern position (`VarOrTerm`): a variable or a concrete term.
     fn parse_pattern_term(&mut self) -> Result<PatternTerm> {
         if let Token::Var(v) = self.peek() {
             let v = v.clone();
             self.bump();
             return Ok(PatternTerm::Var(v));
         }
-        let tok = self.peek().clone();
-        let term = self.token_to_term(&tok)?;
-        self.bump();
-        Ok(PatternTerm::Term(term))
+        Ok(PatternTerm::Term(self.parse_term_token()?))
+    }
+
+    /// Is the cursor at a sign immediately followed by a number (`-5`, `+1.5`)?
+    fn at_signed_number(&self) -> bool {
+        matches!(self.peek(), Token::Plus | Token::Minus)
+            && matches!(
+                self.peek_at(1),
+                Token::Integer(_) | Token::Decimal(_) | Token::Double(_)
+            )
+            && self.spans[self.pos].end == self.spans[self.pos + 1].start
+    }
+
+    /// A `GraphTerm` other than `[]`/`()`: an IRI, a literal, a blank node
+    /// label, a signed numeric literal (`-5`, `+1.5`, `-1.5e3`: the sign is
+    /// part of the literal and must touch the number, as in the
+    /// `INTEGER_NEGATIVE` & co. terminals) or a boolean (`true`/`false`).
+    fn parse_term_token(&mut self) -> Result<Term> {
+        match self.peek().clone() {
+            Token::Plus | Token::Minus => {
+                let sign = if matches!(self.peek(), Token::Plus) { "+" } else { "-" };
+                let adjacent = self.spans[self.pos].end == self.spans[self.pos + 1].start;
+                let (digits, datatype) = match self.peek_at(1) {
+                    Token::Integer(d) => (d.clone(), xsd::INTEGER),
+                    Token::Decimal(d) => (d.clone(), xsd::DECIMAL),
+                    Token::Double(d) => (d.clone(), xsd::DOUBLE),
+                    other => {
+                        return Err(self.err(format!(
+                            "expected a number after '{sign}', found {}",
+                            describe_token(other)
+                        )))
+                    }
+                };
+                if !adjacent {
+                    return Err(self.err(format!(
+                        "a signed number is written without a space after its sign: \
+                         {sign}{digits}"
+                    )));
+                }
+                self.bump();
+                self.bump();
+                Ok(Term::typed_literal(format!("{sign}{digits}"), datatype))
+            }
+            Token::Word(w) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false") => {
+                self.bump();
+                Ok(Term::typed_literal(w.to_ascii_lowercase(), xsd::BOOLEAN))
+            }
+            tok => {
+                let term = self.token_to_term(&tok)?;
+                self.bump();
+                Ok(term)
+            }
+        }
     }
 
     // ---- FILTER expressions ----------------------------------------------
@@ -931,6 +1376,35 @@ impl<'s> Parser<'s> {
 
     fn parse_relational(&mut self) -> Result<Expr> {
         let lhs = self.parse_additive()?;
+        // `expr IN ExpressionList` / `expr NOT IN ExpressionList`.
+        match self.keyword().as_deref() {
+            Some("IN") => {
+                self.bump();
+                let list = self.parse_expression_list("IN")?;
+                return Ok(Expr::In {
+                    expr: Box::new(lhs),
+                    list,
+                    negated: false,
+                });
+            }
+            Some("NOT") => {
+                if !matches!(self.peek_at(1), Token::Word(w) if w.eq_ignore_ascii_case("IN")) {
+                    return Err(self.err(format!(
+                        "expected IN after NOT in an expression (… NOT IN (…)), found {}",
+                        describe_token(self.peek_at(1))
+                    )));
+                }
+                self.bump();
+                self.bump();
+                let list = self.parse_expression_list("NOT IN")?;
+                return Ok(Expr::In {
+                    expr: Box::new(lhs),
+                    list,
+                    negated: true,
+                });
+            }
+            _ => {}
+        }
         let op = match self.peek() {
             Token::Eq => CompareOp::Eq,
             Token::Ne => CompareOp::Ne,
@@ -943,6 +1417,41 @@ impl<'s> Parser<'s> {
         self.bump();
         let rhs = self.parse_additive()?;
         Ok(Expr::Compare(op, Box::new(lhs), Box::new(rhs)))
+    }
+
+    /// `ExpressionList ::= NIL | '(' Expression ( ',' Expression )* ')'`, the
+    /// right-hand side of `op` (IN / NOT IN).
+    fn parse_expression_list(&mut self, op: &str) -> Result<Vec<Expr>> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "{op} expects a parenthesized list of expressions, e.g. ?x {op} (1, 2), found {}",
+                describe_token(self.peek())
+            )));
+        }
+        self.bump();
+        let mut list = Vec::new();
+        if matches!(self.peek(), Token::RParen) {
+            self.bump();
+            return Ok(list);
+        }
+        loop {
+            list.push(self.parse_expr()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.bump();
+                }
+                Token::RParen => {
+                    self.bump();
+                    return Ok(list);
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected ',' or ')' in the {op} list, found {}",
+                        describe_token(other)
+                    )))
+                }
+            }
+        }
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
@@ -1748,44 +2257,55 @@ impl<'s> Parser<'s> {
         Ok((order_by, limit, offset))
     }
 
+    /// `OrderCondition+`: `ASC( expr )` / `DESC( expr )` (a bare variable is
+    /// accepted after ASC/DESC too), `?var`, `( expr )`, or a bare
+    /// `Constraint` call — a built-in (`STRLEN(?x)`, `COUNT(?x)`, …) or a
+    /// function call by IRI (`xsd:integer(?z)`, `rs:BFSCOUNT(?x)`).
     fn parse_order_conditions(&mut self) -> Result<Vec<OrderCondition>> {
         let mut conds = Vec::new();
         loop {
-            let descending = match self.keyword().as_deref() {
-                Some("ASC") => {
+            let direction = match self.keyword().as_deref() {
+                Some(d @ ("ASC" | "DESC")) => {
+                    let d = d.to_string();
                     self.bump();
-                    false
+                    Some(d)
                 }
-                Some("DESC") => {
+                _ => None,
+            };
+            let expr = match self.peek() {
+                Token::LParen => {
                     self.bump();
-                    true
+                    let e = self.parse_expr()?;
+                    self.expect(&Token::RParen, "')'")?;
+                    e
                 }
-                _ => false,
+                Token::Var(v) => {
+                    let v = v.clone();
+                    self.bump();
+                    Expr::Var(v)
+                }
+                _ if direction.is_none() && self.at_call() => self.parse_primary()?,
+                other => {
+                    if let Some(d) = direction {
+                        return Err(self.err(format!(
+                            "{d} expects a bracketted expression, e.g. {d}(?x), found {}",
+                            describe_token(other)
+                        )));
+                    }
+                    break;
+                }
             };
-            // ASC/DESC take a bracketted expression; a bare var/expr also works.
-            let expr = if matches!(self.peek(), Token::LParen) {
-                self.bump();
-                let e = self.parse_expr()?;
-                self.expect(&Token::RParen, "')'")?;
-                e
-            } else if let Token::Var(v) = self.peek() {
-                let v = v.clone();
-                self.bump();
-                Expr::Var(v)
-            } else if self.at_iri_call() {
-                // Constraint ::= FunctionCall, e.g. `ORDER BY rs:BFSCOUNT(?x)`.
-                self.parse_iri_call()?
-            } else {
-                break;
-            };
-            conds.push(OrderCondition { expr, descending });
-            // Stop when the next token clearly isn't another order key.
-            if !matches!(self.peek(), Token::Var(_) | Token::LParen)
-                && !self.at_iri_call()
-                && !matches!(self.keyword().as_deref(), Some("ASC") | Some("DESC"))
-            {
-                break;
-            }
+            conds.push(OrderCondition {
+                expr,
+                descending: direction.as_deref() == Some("DESC"),
+            });
+        }
+        if conds.is_empty() {
+            return Err(self.err(format!(
+                "ORDER BY needs at least one condition (?var, ASC(…), DESC(…), (expr) or a \
+                 function call), found {}",
+                describe_token(self.peek())
+            )));
         }
         Ok(conds)
     }
@@ -1827,7 +2347,10 @@ impl<'s> Parser<'s> {
             Some("INSERT") => {
                 self.bump();
                 if self.eat_keyword("DATA") {
-                    Ok(UpdateOp::InsertData(self.parse_ground_block()?))
+                    // `[ … ]` / `( … )` insert fresh blank nodes (§3.1.1).
+                    let data =
+                        self.with_bnode_mode(BnodeMode::Fresh, |p| p.parse_ground_block())?;
+                    Ok(UpdateOp::InsertData(data))
                 } else {
                     let insert = self.parse_triple_template_block()?;
                     self.skip_using_clauses()?;
@@ -1843,11 +2366,16 @@ impl<'s> Parser<'s> {
             Some("DELETE") => {
                 self.bump();
                 if self.eat_keyword("DATA") {
-                    Ok(UpdateOp::DeleteData(self.parse_ground_block()?))
+                    let data = self.with_bnode_mode(BnodeMode::Forbidden("DELETE DATA"), |p| {
+                        p.parse_ground_block()
+                    })?;
+                    Ok(UpdateOp::DeleteData(data))
                 } else if self.eat_keyword("WHERE") {
                     // DELETE WHERE { triples }: the triples are both the match
                     // pattern and the delete template.
-                    let triples = self.parse_triple_template_block()?;
+                    let triples = self.with_bnode_mode(BnodeMode::Forbidden("DELETE WHERE"), |p| {
+                        p.parse_triple_template_block()
+                    })?;
                     let pattern = GraphPattern::Bgp(triples.clone());
                     Ok(UpdateOp::Modify {
                         delete: triples,
@@ -1855,7 +2383,10 @@ impl<'s> Parser<'s> {
                         pattern,
                     })
                 } else {
-                    let delete = self.parse_triple_template_block()?;
+                    let delete = self
+                        .with_bnode_mode(BnodeMode::Forbidden("a DELETE template"), |p| {
+                            p.parse_triple_template_block()
+                        })?;
                     let insert = if self.eat_keyword("INSERT") {
                         self.parse_triple_template_block()?
                     } else {
@@ -1907,6 +2438,25 @@ impl<'s> Parser<'s> {
                 let name = self.expect_graph_iri()?;
                 Ok(UpdateOp::Create { name, silent })
             }
+            Some(op @ ("ADD" | "MOVE" | "COPY")) => {
+                let op = op.to_string();
+                self.bump();
+                let silent = self.eat_keyword("SILENT");
+                let from = self.parse_graph_or_default(&op)?;
+                if !self.eat_keyword("TO") {
+                    return Err(self.err(format!(
+                        "expected TO in {op} [SILENT] (DEFAULT | [GRAPH] <iri>) TO (DEFAULT | \
+                         [GRAPH] <iri>), found {}",
+                        describe_token(self.peek())
+                    )));
+                }
+                let to = self.parse_graph_or_default(&op)?;
+                Ok(match op.as_str() {
+                    "ADD" => UpdateOp::Add { from, to, silent },
+                    "MOVE" => UpdateOp::Move { from, to, silent },
+                    _ => UpdateOp::Copy { from, to, silent },
+                })
+            }
             other => Err(self.err(format!("unsupported update operation {other:?}"))),
         }
     }
@@ -1933,6 +2483,22 @@ impl<'s> Parser<'s> {
             return Err(self.err("property paths are not allowed in an INSERT/DELETE template"));
         }
         Ok(patterns)
+    }
+
+    /// `GraphOrDefault ::= 'DEFAULT' | 'GRAPH'? iri` of ADD/MOVE/COPY:
+    /// `None` for the default graph.
+    fn parse_graph_or_default(&mut self, op: &str) -> Result<Option<String>> {
+        if self.eat_keyword("DEFAULT") {
+            return Ok(None);
+        }
+        self.eat_keyword("GRAPH");
+        match self.peek() {
+            Token::Iri(_) | Token::PName(..) => self.expect_graph_iri().map(Some),
+            other => Err(self.err(format!(
+                "{op} expects DEFAULT or a graph IRI ([GRAPH] <iri>), found {}",
+                describe_token(other)
+            ))),
+        }
     }
 
     /// `(DEFAULT | NAMED | ALL | GRAPH <iri>)` for CLEAR/DROP.
@@ -2134,7 +2700,10 @@ impl<'s> Parser<'s> {
                 })
             }
             Token::Word(w) if w == "a" => Ok(Term::iri(RDF_TYPE)),
-            other => Err(self.err(format!("cannot use {other:?} as a term"))),
+            other => Err(self.err(format!(
+                "expected an RDF term (a variable, IRI, literal or blank node), found {}",
+                describe_token(other)
+            ))),
         }
     }
 

@@ -329,6 +329,24 @@ enum UndoOp {
     Del(Option<u32>, IdTriple),
 }
 
+/// The graph-to-graph UPDATE operations (SPARQL 1.1 Update §3.2.3-3.2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphTransfer {
+    Add,
+    Move,
+    Copy,
+}
+
+impl GraphTransfer {
+    fn keyword(self) -> &'static str {
+        match self {
+            GraphTransfer::Add => "ADD",
+            GraphTransfer::Move => "MOVE",
+            GraphTransfer::Copy => "COPY",
+        }
+    }
+}
+
 impl Database {
     /// Create an empty, named database.
     pub fn new(name: impl Into<String>) -> Database {
@@ -1163,7 +1181,98 @@ impl Database {
             },
             // CREATE GRAPH only declares an (empty) graph; data ops create it.
             UpdateOp::Create { .. } => Ok(0),
+            UpdateOp::Add { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Add, from, to, silent)
+            }
+            UpdateOp::Move { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Move, from, to, silent)
+            }
+            UpdateOp::Copy { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Copy, from, to, silent)
+            }
         }
+    }
+
+    /// `ADD` / `MOVE` / `COPY [SILENT] from TO to` (SPARQL 1.1 Update
+    /// §3.2.3-3.2.5; a graph is `None` for `DEFAULT`). Returns the number of
+    /// triples changed: those cleared from the destination (COPY/MOVE), added
+    /// to it, and dropped from the source (MOVE).
+    ///
+    /// * The same graph on both sides is a no-op, whatever the operation.
+    /// * The destination is created as needed.
+    /// * A named source graph that holds no triples does not exist — this
+    ///   store keeps no empty named graphs (CREATE GRAPH declares nothing) —
+    ///   and the operation fails, as the spec allows, unless SILENT, which
+    ///   makes it a successful no-op. The default graph always exists.
+    fn transfer_graph(
+        &mut self,
+        op: GraphTransfer,
+        from: Option<String>,
+        to: Option<String>,
+        silent: bool,
+    ) -> Result<usize> {
+        if from == to {
+            return Ok(0);
+        }
+        let Some(triples) = self.graph_triples(from.as_deref()) else {
+            if silent {
+                return Ok(0);
+            }
+            return Err(GStoreError::Query(format!(
+                "{} failed: the source graph <{}> does not exist (it holds no triples); use {} \
+                 SILENT to ignore a missing source",
+                op.keyword(),
+                from.as_deref().unwrap_or_default(),
+                op.keyword()
+            )));
+        };
+        let mut changed = 0;
+        if matches!(op, GraphTransfer::Copy | GraphTransfer::Move) {
+            changed += match to.as_deref() {
+                None => self.clear_default(),
+                Some(g) => self.clear_named(g),
+            };
+        }
+        for t in &triples {
+            if self.insert_quad(t, to.as_deref())? {
+                changed += 1;
+            }
+        }
+        if op == GraphTransfer::Move {
+            changed += match from.as_deref() {
+                None => self.clear_default(),
+                Some(g) => self.clear_named(g),
+            };
+        }
+        Ok(changed)
+    }
+
+    /// Every triple of the default graph (`None`) or of a named graph, as
+    /// terms; `None` for a named graph that holds no triples.
+    fn graph_triples(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
+        let ids = match graph {
+            None => self.store.iter_all(),
+            Some(g) => {
+                let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
+                let ids: Vec<IdTriple> = self.named.get(&gid)?.iter_all().collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                ids
+            }
+        };
+        let term = |s: Option<&str>| s.and_then(|s| crate::parser::ntriples::parse_term(s).ok());
+        Some(
+            ids.into_iter()
+                .filter_map(|id| {
+                    Some(Triple::new(
+                        term(self.dict.id_to_string(id.sub))?,
+                        term(self.dict.predicate_to_string(id.pred))?,
+                        term(self.dict.id_to_string(id.obj))?,
+                    ))
+                })
+                .collect(),
+        )
     }
 
     /// Clear the default graph, returning the count cleared.

@@ -109,6 +109,9 @@ pub const BUILTINS: &[Builtin] = &[
     b("CLUSTERINGCOEFF", Arity::range(0, 1)),
     b("COALESCE", Arity::at_least(0)),
     b("CONCAT", Arity::at_least(0)),
+    // gStore's list tests: (items, list [, separator]).
+    b("CONTAINALL", Arity::range(2, 3)),
+    b("CONTAINANY", Arity::range(2, 3)),
     b("CONTAINS", n(2)),
     b("CYCLEBOOLEAN", n(0)),
     b("DATATYPE", n(1)),
