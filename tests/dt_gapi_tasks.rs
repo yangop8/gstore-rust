@@ -946,3 +946,100 @@ fn embedders_can_submit_background_work() {
     assert_eq!((int(&j, "state"), msg(&j)), (1, "reindexed".to_string()));
     assert_eq!(int(&j, "success_num"), 100);
 }
+
+/// With the `tls` feature a callback may be an `https://` URL, verified
+/// against `TaskConfig::callback_ca_file` (else the system bundle).
+#[cfg(feature = "tls")]
+#[test]
+fn callbacks_are_delivered_over_https_with_the_tls_feature() {
+    // A self-signed EC end-entity cert (CN=localhost, SAN DNS:localhost + IP
+    // 127.0.0.1) and its key — the pair of the `server.rs` TLS tests.
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvTCCAWOgAwIBAgIUKHclqAxNOvVOQ3kWyfFT+rCJUHwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMjIwMjkyMFoXDTM2MDYyOTIw
+MjkyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYHEfrA2tZnM3sdpdua9aH0oSv8G2EmRrc10JlY7xgVO8+6VoyIJqtvH5
+AxyPvu6UfMZMa+/UFLAmk+WCYEKCi6OBkjCBjzAdBgNVHQ4EFgQUJOZ8AYKC5S5i
+QJhbdtMpHgmjlaowHwYDVR0jBBgwFoAUJOZ8AYKC5S5iQJhbdtMpHgmjlaowGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIQCo
+ndoh3KosHMemvMMbjxtaNbbXmxGjfsgme3rBkLuziQIgFeUx/cU+Fpw/Dl5McuKP
+cCWfronEM/ASghi4/9ldMUI=
+-----END CERTIFICATE-----
+";
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUBOdoa9/azwl851s
+NPlNYkOXVnBaUKf3fk8J38AOaYehRANCAARgcR+sDa1mczex2l25r1ofShK/wbYS
+ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
+-----END PRIVATE KEY-----
+";
+    let dir = tmp_root("https_cb_certs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    std::fs::write(&cert, CERT_PEM).unwrap();
+    std::fs::write(&key, KEY_PEM).unwrap();
+    let tls_config = gstore::server::load_tls_config(&cert, &key).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let conn = rustls::ServerConnection::new(tls_config).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !req.ends_with(b"}") {
+            match tls.read(&mut buf) {
+                Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                _ => break,
+            }
+        }
+        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        tx.send(String::from_utf8_lossy(&req).into_owned()).unwrap();
+    });
+    let (srv, addr, _root) = start_with(
+        "https_cb",
+        TaskConfig {
+            callback_ca_file: Some(cert),
+            ..TaskConfig::default()
+        },
+    );
+    let j = api(
+        &addr,
+        &[
+            ("operation", "__asyncTest"),
+            ("async", "true"),
+            ("callback", &format!("https://localhost:{port}/secure-hook")),
+        ],
+    );
+    let opt_id = opt_id_of(&j);
+    let req = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(req.starts_with("POST /secure-hook HTTP/1.1\r\n"), "{req}");
+    let body = req.split_once("\r\n\r\n").unwrap().1;
+    let pushed = json::parse(body).unwrap();
+    assert_eq!(pushed.get("opt_id").and_then(Json::as_str), Some(opt_id.as_str()));
+    assert!(srv.task_manager().wait_async_idle(Duration::from_secs(30)));
+    let info = srv.task_manager().get(opt_id.parse().unwrap()).unwrap();
+    assert_eq!(info.callback_status.as_deref(), Some("delivered (HTTP 200)"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without the `tls` feature an `https://` callback is refused up front.
+#[cfg(not(feature = "tls"))]
+#[test]
+fn https_callbacks_need_the_tls_feature() {
+    let (_srv, addr, _root) = start("https_cb_off");
+    let j = api(
+        &addr,
+        &[
+            ("operation", "__asyncTest"),
+            ("async", "true"),
+            ("callback", "https://localhost:1/hook"),
+        ],
+    );
+    assert_eq!(code(&j), 1003, "{j}");
+    assert!(msg(&j).contains("tls"), "{j}");
+}

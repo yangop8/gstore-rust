@@ -952,6 +952,113 @@ mod tests {
         assert!(req.contains("\r\nHost: 127.0.0.1:"), "{req}");
     }
 
+    /// A self-signed EC end-entity cert (CN=localhost, SAN DNS:localhost + IP
+    /// 127.0.0.1) and its key — the same pair as the `server.rs` TLS tests.
+    #[cfg(feature = "tls")]
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvTCCAWOgAwIBAgIUKHclqAxNOvVOQ3kWyfFT+rCJUHwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMjIwMjkyMFoXDTM2MDYyOTIw
+MjkyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYHEfrA2tZnM3sdpdua9aH0oSv8G2EmRrc10JlY7xgVO8+6VoyIJqtvH5
+AxyPvu6UfMZMa+/UFLAmk+WCYEKCi6OBkjCBjzAdBgNVHQ4EFgQUJOZ8AYKC5S5i
+QJhbdtMpHgmjlaowHwYDVR0jBBgwFoAUJOZ8AYKC5S5iQJhbdtMpHgmjlaowGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIQCo
+ndoh3KosHMemvMMbjxtaNbbXmxGjfsgme3rBkLuziQIgFeUx/cU+Fpw/Dl5McuKP
+cCWfronEM/ASghi4/9ldMUI=
+-----END CERTIFICATE-----
+";
+
+    #[cfg(feature = "tls")]
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUBOdoa9/azwl851s
+NPlNYkOXVnBaUKf3fk8J38AOaYehRANCAARgcR+sDa1mczex2l25r1ofShK/wbYS
+ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
+-----END PRIVATE KEY-----
+";
+
+    /// An unrelated self-signed certificate (CN=other-ca): a valid root that
+    /// did not issue [`CERT_PEM`].
+    #[cfg(feature = "tls")]
+    const OTHER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBeTCCAR6gAwIBAgIUfJWIBdjY/8dCLv+oYH0m7P9hIrgwCgYIKoZIzj0EAwIw
+EzERMA8GA1UEAwwIb3RoZXItY2EwHhcNMjYxMDMxMTIzMzUzWhcNMzYxMDI4MTIz
+MzUzWjATMREwDwYDVQQDDAhvdGhlci1jYTBZMBMGByqGSM49AgEGCCqGSM49AwEH
+A0IABPen7Zo1/Ggc3JUCj+tkkD76osA2UJMESsotlGWGjvixxKzjTBDxg6CzRLUK
+zYHGM1cVp9hqTQBvkpvUlkHqqPCjUDBOMB0GA1UdDgQWBBSrD+I4q0sHlyaKbseJ
+McxIgQ8FfTAfBgNVHSMEGDAWgBSrD+I4q0sHlyaKbseJMcxIgQ8FfTAMBgNVHRMB
+Af8EAjAAMAoGCCqGSM49BAMCA0kAMEYCIQCEK8zaCbrSKDrvkMGiurz/ncmDQOUC
+mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
+-----END CERTIFICATE-----
+";
+
+    /// `post_with` speaks https (feature `tls`), trusting the given CA file
+    /// and refusing a certificate it cannot verify.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn post_over_https_verifies_the_server() {
+        let dir = std::env::temp_dir().join(format!("gstore_https_post_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        std::fs::write(&key, KEY_PEM).unwrap();
+        let config = crate::server::load_tls_config(&cert, &key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            // Two connections: the trusted exchange, then the refused one.
+            for _ in 0..2 {
+                let (sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let conn = rustls::ServerConnection::new(std::sync::Arc::clone(&config)).unwrap();
+                let mut tls = rustls::StreamOwned::new(conn, sock);
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !String::from_utf8_lossy(&req).ends_with("{\"x\":1}") {
+                    match tls.read(&mut buf) {
+                        Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                        _ => break,
+                    }
+                }
+                if !req.is_empty() {
+                    let _ = tls.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\ndone");
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                }
+                seen.push(String::from_utf8_lossy(&req).into_owned());
+            }
+            seen
+        });
+        let url = format!("https://localhost:{port}/secure");
+        let opts = PostOptions {
+            ca_file: Some(cert.clone()),
+            ..PostOptions::default()
+        };
+        let reply = post_with(&url, "application/json", br#"{"x":1}"#, &opts).unwrap();
+        assert_eq!((reply.status, reply.body.as_str()), (201, "done"));
+        // An empty CA bundle: nothing to verify against.
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let opts = PostOptions {
+            ca_file: Some(empty),
+            ..PostOptions::default()
+        };
+        assert!(post_with(&url, "application/json", b"{}", &opts).is_err());
+        // A bundle without the server's issuer: the handshake fails.
+        let other = dir.join("other.pem");
+        std::fs::write(&other, OTHER_CERT_PEM).unwrap();
+        let opts = PostOptions {
+            ca_file: Some(other),
+            ..PostOptions::default()
+        };
+        assert!(post_with(&url, "application/json", br#"{"x":1}"#, &opts).is_err());
+        let seen = server.join().unwrap();
+        assert!(seen[0].starts_with("POST /secure HTTP/1.1\r\n"), "{seen:?}");
+        assert!(seen[1].is_empty(), "nothing is sent to an unverified server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A refused connection is an error, not a hang.
     #[test]
     fn post_to_a_closed_port_fails_fast() {
