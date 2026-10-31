@@ -344,7 +344,7 @@ impl GResp {
             GBody::Json(body) => (
                 200,
                 "application/json".to_string(),
-                body.sorted().to_string().into_bytes(),
+                body.into_sorted().to_string().into_bytes(),
                 self.headers,
             ),
             GBody::Raw {

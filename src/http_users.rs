@@ -240,6 +240,9 @@ pub struct CredentialAttempt {
     tag: [u8; 32],
     /// The cache already vouched for these credentials.
     cached: bool,
+    /// Compute the re-hashed entry when the stored one needs migrating (off
+    /// for the read-only [`UserStore::check_credentials`]).
+    migrate: bool,
 }
 
 impl std::fmt::Debug for CredentialAttempt {
@@ -255,9 +258,11 @@ impl std::fmt::Debug for CredentialAttempt {
 
 impl CredentialAttempt {
     /// Phase 2 of a credential check: the deliberately slow password hash
-    /// (PBKDF2), skipped on a cache hit. Call it with no lock held. An unknown
-    /// user costs the same work as a wrong password (no user-enumeration
-    /// timing signal). Pass the result to [`UserStore::finish_check`].
+    /// (PBKDF2), skipped on a cache hit — and, for valid credentials whose
+    /// stored entry is not in the current format, the re-hashed entry (as
+    /// slow). Call it with no lock held. An unknown user costs the same work
+    /// as a wrong password (no user-enumeration timing signal). Pass the
+    /// result to [`UserStore::finish_check`].
     pub fn verify(self) -> CheckedCredentials {
         let outcome = if self.cached {
             CredentialCheck::Valid
@@ -281,14 +286,28 @@ impl CredentialAttempt {
                 }
             }
         };
+        // A valid secret migrates an entry not in the current format (or with
+        // fewer than PBKDF2_ITERATIONS iterations). A plaintext secret can
+        // migrate any entry; an MD5 digest only verifies an entry that is
+        // already MD5-based, so it can only refresh its parameters.
+        let rehashed = (self.migrate
+            && outcome == CredentialCheck::Valid
+            && self.stored.as_ref().is_some_and(PasswordHash::needs_upgrade))
+        .then(|| match self.form {
+            PasswordForm::Plain => Some(PasswordHash::new(&self.secret)),
+            PasswordForm::Md5Hex => {
+                normalize_md5_hex(&self.secret).map(|d| PasswordHash::from_md5_hex(&d))
+            }
+        })
+        .flatten();
         CheckedCredentials {
             name: self.name,
-            secret: self.secret,
             form: self.form,
             stored: self.stored,
             tag: self.tag,
             cached: self.cached,
             outcome,
+            rehashed,
         }
     }
 }
@@ -297,12 +316,25 @@ impl CredentialAttempt {
 /// with [`UserStore::finish_check`].
 pub struct CheckedCredentials {
     name: String,
-    secret: String,
     form: PasswordForm,
     stored: Option<PasswordHash>,
     tag: [u8; 32],
     cached: bool,
     outcome: CredentialCheck,
+    /// For valid credentials whose stored entry needs migrating: the entry
+    /// re-hashed into the current format (computed by `verify`, off-lock).
+    rehashed: Option<PasswordHash>,
+}
+
+/// Against which entry [`UserStore::finish_check`] honours a verified
+/// success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verified {
+    /// The entry it was verified against is still the user's.
+    Current,
+    /// The entry changed, but the same credentials were verified against the
+    /// new one meanwhile.
+    Meanwhile,
 }
 
 impl CheckedCredentials {
@@ -858,7 +890,9 @@ impl UserStore {
     /// ([`begin_check`](Self::begin_check)) instead, so the hash runs with the
     /// lock released.
     pub fn check_credentials(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
-        let checked = self.begin_check(name, secret, form).verify();
+        let mut attempt = self.begin_check(name, secret, form);
+        attempt.migrate = false;
+        let checked = attempt.verify();
         self.remember_valid(&checked);
         checked.outcome
     }
@@ -892,63 +926,67 @@ impl UserStore {
             stored,
             tag,
             cached,
+            migrate: true,
         }
     }
 
     /// Phase 3 of a credential check (cheap): record the outcome of a
     /// [`verify`](CredentialAttempt::verify)ed attempt — cache a success, and
-    /// transparently re-hash an entry that is not in the current format (or has
-    /// fewer than [`PBKDF2_ITERATIONS`] iterations), persisting the store. A
-    /// plaintext login can migrate any entry; an MD5-digest login can only
-    /// refresh the parameters of an entry already in the current format. A
-    /// failure to persist the upgrade does not fail the verification.
+    /// install the entry `verify` re-hashed when the stored one was not in the
+    /// current format (or had fewer than [`PBKDF2_ITERATIONS`] iterations),
+    /// persisting the store. A plaintext login can migrate any entry; an
+    /// MD5-digest login can only refresh the parameters of an entry already in
+    /// the current format. A failure to persist the upgrade does not fail the
+    /// verification.
     ///
-    /// A success is only honoured if the user's stored hash is still the one
-    /// it was verified against: a password changed (or a user dropped) between
-    /// [`begin_check`](Self::begin_check) and here makes it
-    /// [`Invalid`](CredentialCheck::Invalid).
+    /// The store may have changed since [`begin_check`](Self::begin_check). A
+    /// success is honoured if the user's stored hash is still the one it was
+    /// verified against, or if the very same credentials were verified against
+    /// the current entry meanwhile (a concurrent request with the same
+    /// password migrated it). A password changed (or a user dropped) in
+    /// between makes it [`Invalid`](CredentialCheck::Invalid).
     pub fn finish_check(&mut self, checked: CheckedCredentials) -> CredentialCheck {
-        if !self.remember_valid(&checked) {
-            return match checked.outcome {
+        match self.remember_valid(&checked) {
+            None => match checked.outcome {
                 CredentialCheck::Valid => CredentialCheck::Invalid,
                 other => other,
-            };
-        }
-        if let Some(u) = self.users.get_mut(&checked.name) {
-            if u.password.needs_upgrade() {
-                let rehashed = match checked.form {
-                    PasswordForm::Plain => Some(PasswordHash::new(&checked.secret)),
-                    // Valid ⇒ the entry is already MD5-based and `secret` is a
-                    // well-formed (normalized) digest.
-                    PasswordForm::Md5Hex => normalize_md5_hex(&checked.secret)
-                        .map(|d| PasswordHash::from_md5_hex(&d)),
-                };
-                if let Some(h) = rehashed {
-                    u.password = h;
-                    let _ = self.save();
+            },
+            Some(Verified::Meanwhile) => CredentialCheck::Valid,
+            Some(Verified::Current) => {
+                if let Some(h) = checked.rehashed {
+                    if let Some(u) = self.users.get_mut(&checked.name) {
+                        u.password = h;
+                        let _ = self.save();
+                    }
                 }
+                CredentialCheck::Valid
             }
         }
-        CredentialCheck::Valid
     }
 
-    /// Cache a valid outcome whose stored hash is still current; returns
-    /// whether `checked` is a success that may be honoured.
-    fn remember_valid(&self, checked: &CheckedCredentials) -> bool {
+    /// Whether a verified success may be honoured against the store as it is
+    /// now (`None`: no), and against which entry; a success against the
+    /// current entry is cached.
+    fn remember_valid(&self, checked: &CheckedCredentials) -> Option<Verified> {
         if checked.outcome != CredentialCheck::Valid {
-            return false;
+            return None;
         }
-        let current = self.users.get(&checked.name).map(|u| &u.password);
-        if current.is_none() || current != checked.stored.as_ref() {
-            return false;
+        let current = &self.users.get(&checked.name)?.password;
+        let mut cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (checked.name.clone(), checked.form.tag());
+        if Some(current) != checked.stored.as_ref() {
+            // The entry changed meanwhile. Changing a password or dropping the
+            // user clears the cache (`forget_verified`), so a cache hit means
+            // these credentials were verified against the current entry.
+            return cache
+                .get(&key)
+                .is_some_and(|t| constant_time_eq(t, &checked.tag))
+                .then_some(Verified::Meanwhile);
         }
         if !checked.cached {
-            self.verified
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((checked.name.clone(), checked.form.tag()), checked.tag);
+            cache.insert(key, checked.tag);
         }
-        true
+        Some(Verified::Current)
     }
 
     /// [`check_credentials`](Self::check_credentials), and on success
@@ -1429,6 +1467,86 @@ mod tests {
         let c = store.begin_check("eve", "pw", PasswordForm::Plain).verify();
         store.drop_user("eve").unwrap();
         assert_eq!(store.finish_check(c), CredentialCheck::Invalid);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The split check (`begin_check` → `verify` without the store →
+    /// `finish_check`) gives the same answers as `authenticate`, and a store
+    /// change while the slow step runs is honoured: a password change or a
+    /// drop invalidates the result, a concurrent migration with the same
+    /// password does not. (Ported from the gapi package's version of the
+    /// split check.)
+    #[test]
+    fn split_credential_checks_tolerate_concurrent_changes() {
+        let path = tmp("split");
+        let mut raw_hash = [0u8; HASH_LEN];
+        pbkdf2_hmac_sha256(b"danpw", b"0123456789abcdef", PBKDF2_ITERATIONS, &mut raw_hash);
+        fs::write(
+            &path,
+            format!(
+                "dan\tpbkdf2-sha256${PBKDF2_ITERATIONS}${}${}\tquery\n",
+                hex_encode(b"0123456789abcdef"),
+                hex_encode(&raw_hash)
+            ),
+        )
+        .unwrap();
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        let plain = PasswordForm::Plain;
+        let cached =
+            |store: &UserStore, name: &str, pw: &str| store.begin_check(name, pw, plain).cached;
+        let split =
+            |store: &UserStore, name: &str, pw: &str| store.begin_check(name, pw, plain).verify();
+
+        // Fresh credentials need the slow step; afterwards they are cached.
+        assert!(!cached(&store, ROOT_USER, "rootpw"));
+        let checked = split(&store, ROOT_USER, "rootpw");
+        assert_eq!(checked.outcome(), CredentialCheck::Valid);
+        assert_eq!(store.finish_check(checked), CredentialCheck::Valid);
+        assert!(cached(&store, ROOT_USER, "rootpw"));
+        // Wrong passwords and unknown users are never cached.
+        for (u, pw) in [(ROOT_USER, "nope"), ("nobody", "x")] {
+            let checked = split(&store, u, pw);
+            assert_eq!(store.finish_check(checked), CredentialCheck::Invalid);
+            assert!(!cached(&store, u, pw));
+        }
+
+        // Two concurrent first logins of an entry in the older format: both
+        // compute a migrated entry (off-lock); the first installs it, the
+        // second still succeeds (same password, verified against the new
+        // entry meanwhile) and installs nothing.
+        let a = split(&store, "dan", "danpw");
+        let b = split(&store, "dan", "danpw");
+        assert!(a.rehashed.is_some() && b.rehashed.is_some());
+        assert_eq!(store.finish_check(a), CredentialCheck::Valid);
+        let migrated = store.users.get("dan").unwrap().password.clone();
+        assert!(!migrated.needs_upgrade());
+        assert_eq!(store.finish_check(b), CredentialCheck::Valid);
+        assert_eq!(store.users.get("dan").unwrap().password, migrated);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("dan\tpbkdf2-sha256-md5$"), "{text}");
+        assert_eq!(
+            store.check_credentials("dan", &md5_hex("danpw"), PasswordForm::Md5Hex),
+            CredentialCheck::Valid
+        );
+        // A wrong password against the migrating entry is still refused.
+        let wrong = split(&store, "dan", "nope");
+        assert_eq!(store.finish_check(wrong), CredentialCheck::Invalid);
+
+        // A password change while the slow step runs invalidates its result.
+        store.add("eve", "old", BTreeSet::new()).unwrap();
+        let pending = split(&store, "eve", "old");
+        store.set_password("eve", "new").unwrap();
+        assert_eq!(store.finish_check(pending), CredentialCheck::Invalid);
+        assert!(!cached(&store, "eve", "old"), "never cached");
+        // Even when the new password is verified (and cached) meanwhile.
+        let pending = split(&store, "eve", "new");
+        store.set_password("eve", "newer").unwrap();
+        assert!(store.verify("eve", "newer"));
+        assert_eq!(store.finish_check(pending), CredentialCheck::Invalid);
+        // So does dropping the user.
+        let pending = split(&store, "eve", "newer");
+        store.drop_user("eve").unwrap();
+        assert_eq!(store.finish_check(pending), CredentialCheck::Invalid);
         let _ = fs::remove_file(&path);
     }
 

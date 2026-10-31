@@ -206,20 +206,29 @@ impl Json {
     /// duplicated key keeps only its last value). This is the order upstream
     /// gStore's `nlohmann::json` (a `std::map`) serializes objects in.
     pub fn sorted(&self) -> Json {
+        self.clone().into_sorted()
+    }
+
+    /// [`sorted`](Self::sorted), consuming the value — no deep copy, which
+    /// matters for a large query result about to be serialized.
+    pub fn into_sorted(self) -> Json {
         match self {
-            Json::Arr(items) => Json::Arr(items.iter().map(Json::sorted).collect()),
-            Json::Obj(entries) => {
+            Json::Arr(items) => Json::Arr(items.into_iter().map(Json::into_sorted).collect()),
+            Json::Obj(mut entries) => {
+                // A stable sort keeps equal keys in document order, so the
+                // last of each run is the one that wins: O(n log n), so a
+                // wide row object stays cheap.
+                entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
                 let mut out: Vec<(String, Json)> = Vec::with_capacity(entries.len());
                 for (k, v) in entries {
-                    match out.iter_mut().find(|(ok, _)| ok == k) {
-                        Some(slot) => slot.1 = v.sorted(),
-                        None => out.push((k.clone(), v.sorted())),
+                    match out.last_mut() {
+                        Some(last) if last.0 == k => last.1 = v,
+                        _ => out.push((k, v)),
                     }
                 }
-                out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                Json::Obj(out)
+                Json::Obj(out.into_iter().map(|(k, v)| (k, v.into_sorted())).collect())
             }
-            other => other.clone(),
+            other => other,
         }
     }
 
@@ -668,6 +677,8 @@ mod tests {
         let d = parse(r#"{"k":1,"k":2}"#).unwrap();
         assert_eq!(d.get("k").and_then(Json::as_i64), Some(2));
         assert_eq!(d.sorted().to_string(), r#"{"k":2}"#);
+        let d = parse(r#"{"b":1,"a":1,"c":0,"b":2,"a":3}"#).unwrap();
+        assert_eq!(d.sorted().to_string(), r#"{"a":3,"b":2,"c":0}"#);
         assert_eq!(o.remove("z"), Some(Json::from(2)));
         assert_eq!(o.to_string(), r#"{"a":"x"}"#);
     }
@@ -682,6 +693,12 @@ mod tests {
         assert_eq!(
             v.sorted().to_string(),
             r#"{"AnsNum":3,"StatusMsg":"ok","head":["y","x"],"results":{"a":2,"b":1}}"#
+        );
+        assert_eq!(v.clone().into_sorted(), v.sorted());
+        let nested = parse(r#"[{"b":{"z":1,"y":2,"z":3},"a":0}]"#).unwrap();
+        assert_eq!(
+            nested.into_sorted().to_string(),
+            r#"[{"a":0,"b":{"y":2,"z":3}}]"#
         );
     }
 
