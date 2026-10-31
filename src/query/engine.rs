@@ -424,6 +424,9 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Work counters ([`stats`](Self::stats)), shared with `GRAPH`
     /// sub-evaluators so their work counts too.
     stats: Rc<std::cell::Cell<EvalStats>>,
+    /// The most bytes of JSON one graph-function call may produce
+    /// ([`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
+    gfun_max_output: usize,
 }
 
 /// A source of the per-predicate CSR the advanced graph functions run on
@@ -469,6 +472,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             stats: Rc::default(),
+            gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
         }
     }
 
@@ -498,6 +502,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             stats: Rc::default(),
+            gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
         }
     }
 
@@ -557,6 +562,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// `AVG` over integers truncates too). See [`Value::arith_with`].
     pub fn with_integer_division(mut self, mode: IntegerDivision) -> Evaluator<'a, S> {
         self.integer_division = mode;
+        self
+    }
+
+    /// Bound the JSON one call of a gStore advanced graph function may
+    /// produce (default
+    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES));
+    /// a call that would exceed it fails the query (see
+    /// [`GFunCtx::with_max_output_bytes`]).
+    pub fn with_gfun_max_output_bytes(mut self, bytes: usize) -> Evaluator<'a, S> {
+        self.gfun_max_output = bytes;
         self
     }
 
@@ -1302,7 +1317,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
         let mut args = call.to_gargs(srcs, dsts, self.dict);
         args.where_empty = constant;
-        let mut ctx = GFunCtx::new(&csr, self.dict);
+        let mut ctx = GFunCtx::new(&csr, self.dict).with_max_output_bytes(self.gfun_max_output);
         if let Some(flag) = &self.cancel {
             ctx = ctx.with_cancel(flag);
         }
@@ -2049,6 +2064,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             integer_division: self.integer_division,
             topk: self.topk,
             stats: Rc::clone(&self.stats),
+            gfun_max_output: self.gfun_max_output,
         }
     }
 

@@ -174,6 +174,9 @@ pub struct Database {
     /// termination, DP-B) this database's queries may use (see
     /// [`set_topk_options`](Self::set_topk_options)); all on by default.
     topk: TopKOptions,
+    /// How many bytes of JSON one graph-function call may produce (see
+    /// [`set_gfun_max_output_bytes`](Self::set_gfun_max_output_bytes)).
+    gfun_max_output_bytes: usize,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
@@ -299,6 +302,39 @@ impl GraphTransfer {
     }
 }
 
+/// The query-evaluation settings a server applies to every database it opens,
+/// builds, creates or restores ([`Database::apply_query_settings`]); `gserver`
+/// reads them from `conf.ini`'s `[query]` section
+/// ([`GStoreConfig::query_settings`](crate::config::GStoreConfig::query_settings)).
+/// [`Default`] is what a database built in-process starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySettings {
+    /// How `/` divides two integers ([`Database::set_integer_division`];
+    /// `integer_division`).
+    pub integer_division: IntegerDivision,
+    /// The read-query cache's budget in bytes, 0 = off
+    /// ([`Database::set_query_cache_size`]; `query_cache_size`).
+    pub query_cache_bytes: usize,
+    /// The `LIMIT` / `ORDER BY` / `ASK` optimizations
+    /// ([`Database::set_topk_options`]; `early_termination`,
+    /// `topk_bounded_heap`, `topk_dpb`).
+    pub topk: TopKOptions,
+    /// The most bytes of JSON one graph-function call may produce
+    /// ([`Database::set_gfun_max_output_bytes`]; `gfun_max_output_bytes`).
+    pub gfun_max_output_bytes: usize,
+}
+
+impl Default for QuerySettings {
+    fn default() -> QuerySettings {
+        QuerySettings {
+            integer_division: IntegerDivision::default(),
+            query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
 impl Database {
     /// Create an empty, named database.
     pub fn new(name: impl Into<String>) -> Database {
@@ -313,6 +349,7 @@ impl Database {
             query_cache: RefCell::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
@@ -1034,7 +1071,8 @@ impl Database {
                     .with_service_allowed(self.load_policy.allow_remote)
                     .with_csr_provider(&csr)
                     .with_integer_division(self.integer_division)
-                    .with_topk_options(self.topk);
+                    .with_topk_options(self.topk)
+                    .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
                 let result = eval.evaluate(&q)?;
                 if cacheable {
                     self.query_cache.borrow_mut().put(
@@ -1384,7 +1422,8 @@ impl Database {
             let eval = eval
                 .with_service_allowed(db.load_policy.allow_remote)
                 .with_integer_division(db.integer_division)
-                .with_topk_options(db.topk);
+                .with_topk_options(db.topk)
+                .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
             if db.functions.is_empty() {
                 eval
             } else {
@@ -1936,8 +1975,9 @@ impl Database {
     /// are evicted to make room. Only deterministic read queries are cached
     /// (none calling `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, a
     /// user function, or using `SERVICE`), and every data change empties the
-    /// cache. Upstream gStore hard-codes its budget; the proposed `conf.ini`
-    /// key for this setting is `query_cache_size` (bytes).
+    /// cache. Upstream gStore hard-codes its budget (100 MB); the servers set
+    /// this from `conf.ini`'s `[query] query_cache_size` (bytes, see
+    /// [`QuerySettings`]).
     pub fn set_query_cache_size(&mut self, bytes: usize) {
         *self.query_cache.get_mut() = QueryCache::new(bytes);
     }
@@ -1962,9 +2002,9 @@ impl Database {
     /// updates: [`IntegerDivision::Decimal`] (the default, SPARQL 1.1:
     /// `7/2` = `3.5`) or [`IntegerDivision::Truncate`] (upstream gStore
     /// compatibility: `7/2` = `3`, and `AVG` over integers truncates).
-    /// Clears the query cache. The proposed `conf.ini` key is
-    /// `integer_division` (`decimal` | `truncate`, see
-    /// [`IntegerDivision::parse`]).
+    /// Clears the query cache. The servers set this from `conf.ini`'s
+    /// `[query] integer_division` (`decimal` | `truncate`, see
+    /// [`IntegerDivision::parse`] and [`QuerySettings`]).
     pub fn set_integer_division(&mut self, mode: IntegerDivision) {
         if self.integer_division != mode {
             self.integer_division = mode;
@@ -1985,7 +2025,9 @@ impl Database {
     /// changes how much work a query does — it exists for testing and
     /// benchmarking ([`TopKOptions::NONE`] evaluates every query in full).
     /// Clears the query cache, so the next query really runs with the new
-    /// options.
+    /// options. The servers set this from `conf.ini`'s `[query]` keys
+    /// `early_termination`, `topk_bounded_heap` and `topk_dpb` (see
+    /// [`QuerySettings`]).
     pub fn set_topk_options(&mut self, options: TopKOptions) {
         if self.topk != options {
             self.topk = options;
@@ -1997,6 +2039,51 @@ impl Database {
     /// [`set_topk_options`](Self::set_topk_options)).
     pub fn topk_options(&self) -> TopKOptions {
         self.topk
+    }
+
+    /// Bound the JSON one call of a gStore advanced graph function
+    /// (`shortestPaths(…)`, `kHopEnumerate(…)`, `PR(…)`, …) may produce in
+    /// this database's queries: a call that would exceed it fails with a
+    /// query error instead of building an unbounded result (upstream has no
+    /// bound). The default is
+    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES)
+    /// (256 MiB); the servers apply `conf.ini`'s `gfun_max_output_bytes`
+    /// (64 MiB by default, see [`crate::config`]). Clears the query cache.
+    pub fn set_gfun_max_output_bytes(&mut self, bytes: usize) {
+        if self.gfun_max_output_bytes != bytes {
+            self.gfun_max_output_bytes = bytes;
+            self.query_cache.get_mut().clear();
+        }
+    }
+
+    /// The graph-function output bound (see
+    /// [`set_gfun_max_output_bytes`](Self::set_gfun_max_output_bytes)).
+    pub fn gfun_max_output_bytes(&self) -> usize {
+        self.gfun_max_output_bytes
+    }
+
+    /// Apply a server's query-evaluation settings ([`QuerySettings`], from
+    /// `conf.ini`'s `[query]` section): integer-division mode, query-cache
+    /// budget, Top-K / early-termination options and graph-function output
+    /// bound. Each setter clears the query cache only when its value changes.
+    pub fn apply_query_settings(&mut self, settings: &QuerySettings) {
+        self.set_integer_division(settings.integer_division);
+        if self.query_cache_size() != settings.query_cache_bytes {
+            self.set_query_cache_size(settings.query_cache_bytes);
+        }
+        self.set_topk_options(settings.topk);
+        self.set_gfun_max_output_bytes(settings.gfun_max_output_bytes);
+    }
+
+    /// This database's current query-evaluation settings (see
+    /// [`apply_query_settings`](Self::apply_query_settings)).
+    pub fn query_settings(&self) -> QuerySettings {
+        QuerySettings {
+            integer_division: self.integer_division,
+            query_cache_bytes: self.query_cache_size(),
+            topk: self.topk,
+            gfun_max_output_bytes: self.gfun_max_output_bytes,
+        }
     }
 
     /// Whether a given SPARQL string is currently cached (tests).

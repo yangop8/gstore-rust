@@ -33,7 +33,9 @@
 //!   ([`gstore::gapi`]: `GET|POST /api` or `POST /` with `operation=…` and
 //!   per-request credentials, as the upstream SDKs send) with its `/shutdown`
 //!   and `/restart` routes. `conf.ini`'s `max_output_size` and `licensetype`
-//!   apply to it.
+//!   apply to it, and its `[query]` section (integer division, query cache,
+//!   Top-K / early termination, graph-function output bound) to every
+//!   database it serves.
 //! - `--api DIR`: the same, rooted at `DIR` (the legacy spelling; `--api`
 //!   without a `DIR` roots at `.` unless `conf.ini` sets `db_home`).
 //! - `DIR` without `--api` (legacy): serve the single database in `DIR` over the
@@ -43,6 +45,7 @@
 //!   updates are persisted back to it. A `DIR` that does not exist yet (or is an
 //!   empty directory) starts empty; one holding a database that cannot be opened
 //!   is an error. `--rocksdb` insists `DIR` holds a RocksDB database.
+//!   `conf.ini`'s `[query]` section applies to it as well.
 //!
 //! **Options** (precedence: flag > `conf.ini` > built-in default):
 //!
@@ -983,6 +986,7 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                 Ok(s) => s
                     .with_check_point(cfg.check_point)
                     .with_load_policy(load_policy)
+                    .with_query_settings(cfg.query_settings())
                     .with_http_options(cfg.http_options())
                     .with_db_dir(dir),
                 Err(e) => {

@@ -343,6 +343,17 @@ impl Server {
         self
     }
 
+    /// Apply query-evaluation settings to the served database: the
+    /// integer-division mode, the query-cache budget, the Top-K /
+    /// early-termination options and the graph-function output bound
+    /// ([`Database::apply_query_settings`]). `gserver` passes `conf.ini`'s
+    /// `[query]` section ([`crate::config::GStoreConfig::query_settings`]);
+    /// without this call the database keeps the settings it was given.
+    pub fn with_query_settings(self, settings: crate::db::QuerySettings) -> Server {
+        locked(&self.inner.db).apply_query_settings(&settings);
+        self
+    }
+
     /// Turn gStore's `check_point` policy on (the default) or off. When off,
     /// updates stay in memory and are saved only on graceful shutdown (an
     /// on-disk / RocksDB database still commits each update it writes through).

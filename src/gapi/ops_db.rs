@@ -650,7 +650,7 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     match Database::open(&dir) {
         Ok(opened) => {
             let mut st = ctx.state();
-            let slot = DbSlot::handle(opened, dir, false, &st.load_policy);
+            let slot = DbSlot::handle(opened, dir, false, &st.load_policy, &st.query_settings);
             st.dbs.insert(db.clone(), slot);
         }
         Err(e) => {
@@ -1590,7 +1590,7 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         if loaded.is_some() {
             if let Ok(old) = Database::open(&dir) {
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(old, dir.clone(), false, &st.load_policy);
+                let slot = DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
         }
@@ -1600,7 +1600,7 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         match Database::open(&dir) {
             Ok(restored) => {
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(restored, dir.clone(), false, &st.load_policy);
+                let slot = DbSlot::handle(restored, dir.clone(), false, &st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
             Err(e) => return fail(format!("the restored copy could not be opened: {e}")),

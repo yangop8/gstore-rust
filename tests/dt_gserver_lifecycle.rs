@@ -576,6 +576,81 @@ mod binary {
         assert!(err.contains("cannot read configuration file"), "{err}");
     }
 
+    /// `conf.ini`'s `[query]` section reaches the databases gserver serves,
+    /// in both modes: the multi-database server (a database built over REST)
+    /// and the legacy single-database invocation.
+    #[test]
+    fn conf_ini_query_section_applies_to_served_databases() {
+        let dir = tmp_dir("bin_query_conf");
+        let home = dir.join("dbhome");
+        let pid_file = home.join("gserver.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let port = free_port();
+        let ini = dir.join("q.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "[server]\nport={port}\n[system]\ndb_home=\"{}\"\nroot_password=\"pw\"\n\
+                 [query]\ninteger_division=truncate\nquery_cache_size=0\ntopk_dpb=off\n\
+                 gfun_max_output_bytes=32\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        let ini_s = ini.to_string_lossy().into_owned();
+        let div = "SELECT (7/2 AS ?x) WHERE {}";
+        let gfun = "SELECT (shortestPath(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) WHERE {}";
+
+        let (code, out, err) = gserver(&dir, &["-b", "-c", &ini_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        assert!(!err.contains("unknown key"), "the [query] keys are known: {err}");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let auth = [("Authorization", "Basic cm9vdDpwdw==")]; // root:pw
+        let (s, body) = request_h(
+            &addr,
+            "POST",
+            "/build?db_name=q",
+            &auth,
+            "<http://ex/a> <http://ex/p> <http://ex/b> .",
+        );
+        assert_eq!(s, 200, "{body}");
+        let (s, body) = request_h(&addr, "POST", "/sparql?db_name=q", &auth, div);
+        assert_eq!(s, 200, "{body}");
+        assert!(body.contains("\"value\":\"3\""), "integer_division=truncate: {body}");
+        // 32 bytes cannot hold the path's JSON: the call fails.
+        let (s, body) = request_h(&addr, "POST", "/sparql?db_name=q", &auth, gfun);
+        assert_eq!(s, 400, "{body}");
+        assert!(body.contains("bytes"), "gfun_max_output_bytes=32: {body}");
+        let (code, _, _) = gserver(&dir, &["-t", "-c", &ini_s]);
+        assert_eq!(code, 0);
+
+        // The single-database invocation applies the same section.
+        let db_dir = dir.join("one.db");
+        gstore::Database::build_from_str("one", "<http://ex/a> <http://ex/p> <http://ex/b> .")
+            .unwrap()
+            .save(&db_dir)
+            .unwrap();
+        let db_s = db_dir.to_string_lossy().into_owned();
+        let single_pid = dir.join("one.db.pid");
+        let _single = Cleanup {
+            dir: dir.join("unused"),
+            pid_file: single_pid.clone(),
+        };
+        let (code, out, err) = gserver(&dir, &["-b", &db_s, "-p", "0", "-c", &ini_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let addr = printed_addr(&out);
+        let (s, body) = request(&addr, "POST", "/sparql", div);
+        assert_eq!(s, 200, "{body}");
+        assert!(body.contains("\"value\":\"3\""), "integer_division=truncate: {body}");
+        let (s, body) = request(&addr, "POST", "/sparql", gfun);
+        assert_eq!(s, 400, "{body}");
+        let (code, _, _) = gserver(&dir, &["-t", &db_s]);
+        assert_eq!(code, 0);
+    }
+
     #[test]
     fn kill_and_restart_commands() {
         let dir = tmp_dir("bin_kill");

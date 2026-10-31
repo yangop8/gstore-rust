@@ -189,6 +189,29 @@ of racing it — unload it there (or use the server's API) first. The server's
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
 
+### Configuration (`conf.ini`)
+
+`gserver` reads upstream gStore's `conf.ini` (`./conf/conf.ini`, or `-c FILE`;
+see the commented [`conf/conf.ini.example`](conf/conf.ini.example)): every
+upstream key of `[server]`, `[system]`, `[log]`, `[backup]` and `[upload]`,
+with upstream's defaults, plus a few gstore-rust keys. The `[query]` section
+(gstore-rust only — upstream hard-codes these) sets how **every database the
+server serves** evaluates queries; it is applied to each database the server
+loads, builds, creates or restores (REST and `/api` alike, transaction
+snapshots included), and `refreshconf` re-applies it to the loaded ones:
+
+| key | default | meaning |
+|-----|---------|---------|
+| `integer_division` | `decimal` | `7/2` = `3.5` (SPARQL 1.1); `truncate` = upstream's `7/2` = `3` |
+| `query_cache_size` | `67108864` | per-database read-query cache budget in bytes; `0` = off |
+| `early_termination` | `on` | stop `LIMIT` / `ASK` / `EXISTS` evaluations once enough solutions are found |
+| `topk_bounded_heap` | `on` | `ORDER BY … LIMIT` keeps the best rows in a bounded heap |
+| `topk_dpb` | `auto` | DP-B Top-K for `ORDER BY <linear expr> LIMIT`: `auto`, `always`, `off` |
+| `gfun_max_output_bytes` | `67108864` | most bytes of JSON one graph-function call may produce (an embedded `Database` allows 256 MiB) |
+
+In code: `GStoreConfig::query_settings()`, `ApiServer::with_query_settings`,
+`Server::with_query_settings`, `Database::apply_query_settings`.
+
 ### Graph functions in SPARQL
 
 gStore 1.4's advanced functions (upstream `docs/en-us/SPARQL_QUERY.md`,

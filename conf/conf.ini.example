@@ -109,3 +109,29 @@ upload_max_body_size = 1073741824
 upload_allow_extensions = "nt|ttl|n3|rdf|txt"
 # allow compress package
 upload_allow_compress_packages = "zip"
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# How every database the server serves evaluates queries. gserver applies
+# these to each database it loads, builds, creates or restores (and re-applies
+# them to the loaded ones on /api refreshconf). Upstream has no keys for
+# them: its query cache budget (100 MB) is a constant and its integer division
+# always truncates. The values shown are the defaults.
+[query]
+# how '/' divides two integers: decimal (SPARQL 1.1: 7/2 = 3.5) or truncate
+# (upstream gStore: 7/2 = 3, AVG over integers truncates too)
+# integer_division=decimal
+# per-database read-query cache budget in bytes (0 turns the cache off);
+# results of deterministic read queries are cached until the data changes
+# query_cache_size=67108864
+# stop LIMIT (no ORDER BY), ASK and EXISTS evaluations as soon as enough
+# solutions are found
+# early_termination=on
+# answer ORDER BY ... LIMIT with a bounded heap instead of a full sort
+# topk_bounded_heap=on
+# DP-B Top-K for ORDER BY <linear expression> LIMIT over a tree-shaped BGP:
+# auto (when the statistics predict it pays off), always or off
+# topk_dpb=auto
+# the most bytes of JSON one graph-function call (shortestPaths, kHopEnumerate,
+# PR, ...) may produce before the query fails with an error (default 64 MiB;
+# an embedded Database allows 256 MiB)
+# gfun_max_output_bytes=67108864

@@ -64,7 +64,7 @@ pub fn db_dir_for(name: &str) -> String {
 }
 
 pub use concurrent::{ConcurrentDb, IsolationLevel};
-pub use db::{Database, LoadPolicy, StorageKind};
+pub use db::{Database, LoadPolicy, QuerySettings, StorageKind};
 pub use error::{GStoreError, Result};
 pub use model::{IdTriple, ObjectType, Term, Triple};
 pub use query::{FunctionRegistry, QueryResult, ResultSet, Value};

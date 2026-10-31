@@ -106,13 +106,15 @@ calls `RAND()` (`tests/dt_sparql_phase3_combo.rs`).
 - **New: upstream integer division.** `Database::set_integer_division(
   IntegerDivision::Truncate)` (and `Evaluator::with_integer_division`)
   switches to gStore's truncating integer division (`7/2` = `3`, also in
-  `AVG`). Proposed `conf.ini` key: `integer_division = decimal | truncate`.
+  `AVG`). `conf.ini` key (since the Phase 1 merge): `[query]
+  integer_division = decimal | truncate`.
 - **Changed: the query cache is bounded by memory.** It holds about 64 MiB
   of results by default (`Database::set_query_cache_size(bytes)`, 0 turns it
   off; `set_query_cache_capacity` is gone) and never caches queries using
   `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, `SERVICE` or a user
   function. `Database::query_cache_len()` / `query_cache_bytes()` report its
-  use. Proposed `conf.ini` key: `query_cache_size` (bytes). A CONSTRUCT
+  use. `conf.ini` key (since the Phase 1 merge): `[query]
+  query_cache_size` (bytes). A CONSTRUCT
   whose template has `[ … ]` / `( … )` nodes is not cached either (it mints
   fresh blank nodes on every run).
 - **Fixed: snapshot readers use the integer-division mode.**
@@ -206,8 +208,6 @@ functions) are now evaluated only for the solutions actually consumed.
 - `COUNT(DISTINCT …)` compares values, so `"01"^^xsd:integer` and
   `"1"^^xsd:integer` count as one there; `SUM` /
   `AVG` skip non-numeric values instead of failing.
-- The proposed `conf.ini` keys (`integer_division`, `query_cache_size`)
-  are not read yet: there is no `conf.ini` loader in this crate.
 - String functions do not apply SPARQL's argument-compatibility rules
   (`STRBEFORE("abc"@en, "b"@cy)` should be an error; `CONTAINS`,
   `STRSTARTS`, `STRENDS` do not check either), and `UCASE` / `LCASE` on an

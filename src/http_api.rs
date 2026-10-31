@@ -149,7 +149,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::config::GStoreConfig;
 use crate::db::dirlock::DirLock;
-use crate::db::{Database, LoadPolicy, LoadSource};
+use crate::db::{Database, LoadPolicy, LoadSource, QuerySettings};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::gapi::apilog::{ApiLogs, TxnState};
@@ -437,6 +437,8 @@ pub(crate) struct ReadSnapshot {
     /// policy at `/begin` (a server's restricted policy refuses it), so a
     /// read inside a transaction cannot bypass the `SERVICE` ban.
     allow_service: bool,
+    /// The database's graph-function output bound at `/begin`.
+    gfun_max_output_bytes: usize,
 }
 
 impl ReadSnapshot {
@@ -461,6 +463,7 @@ impl ReadSnapshot {
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
             allow_service: db.load_policy().allow_remote,
+            gfun_max_output_bytes: db.gfun_max_output_bytes(),
         }
     }
 
@@ -480,7 +483,8 @@ impl ReadSnapshot {
             .with_service_allowed(self.allow_service)
             .with_csr_provider(&csr)
             .with_integer_division(self.integer_division)
-            .with_topk_options(self.topk);
+            .with_topk_options(self.topk)
+            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
@@ -537,11 +541,21 @@ pub(crate) struct DbSlot {
 pub(crate) type DbHandle = Arc<Mutex<DbSlot>>;
 
 impl DbSlot {
-    /// A freshly loaded / built / restored database: clean when it matches
-    /// what is on disk at `dir`. The server's `LOAD` policy is installed on it
-    /// (clients must not make the server read arbitrary local files).
-    pub(crate) fn handle(mut db: Database, dir: PathBuf, dirty: bool, policy: &LoadPolicy) -> DbHandle {
+    /// A freshly loaded / built / created / restored database: clean when it
+    /// matches what is on disk at `dir`. The server's `LOAD` policy is
+    /// installed on it (clients must not make the server read arbitrary local
+    /// files), and so are its query-evaluation settings (`conf.ini`'s
+    /// `[query]` section: integer division, query cache, Top-K, graph-function
+    /// output bound). Every database the server serves passes through here.
+    pub(crate) fn handle(
+        mut db: Database,
+        dir: PathBuf,
+        dirty: bool,
+        policy: &LoadPolicy,
+        query: &QuerySettings,
+    ) -> DbHandle {
         db.set_load_policy(policy.clone());
+        db.apply_query_settings(query);
         // Hold `dir`'s inter-process lock while serving it (`crate::db::dirlock`):
         // a database opened from `dir` already does; one built in memory and
         // saved there takes it now. Best effort — a database not on disk yet
@@ -793,6 +807,10 @@ pub(crate) struct ApiState {
     /// The `LOAD` policy installed on every database this server serves
     /// (default [`LoadPolicy::restricted`]: SPARQL `LOAD` reads nothing).
     pub(crate) load_policy: LoadPolicy,
+    /// The query-evaluation settings installed on every database this server
+    /// serves ([`DbSlot::handle`]; `conf.ini`'s `[query]` section, default
+    /// [`GStoreConfig::query_settings`] of the default configuration).
+    pub(crate) query_settings: QuerySettings,
     /// Databases with a lifecycle operation (`/build`, `/load`, `/unload`,
     /// `/drop`, `/restore`, or an `/upload` that opens/creates the database)
     /// in progress. Those run with this lock released (they may wait for the
@@ -1004,7 +1022,8 @@ impl ApiInner {
     /// server can change: the settings request handlers read (database and
     /// user limits, upload, backup and log settings, `system_username`, …),
     /// the IP allow / deny lists, and the `/api` layer's `max_output_size` and
-    /// `licensetype`. The address, worker pool, connection settings,
+    /// `licensetype`, and the `[query]` evaluation settings (applied to the
+    /// loaded databases too). The address, worker pool, connection settings,
     /// `check_point` and the database home stay as they are until a restart.
     /// Without a file (a server configured in code) only the IP list files
     /// are re-read. Returns whether a file was re-read.
@@ -1023,8 +1042,27 @@ impl ApiInner {
             st.gapi.max_output_size = fresh.max_output_size;
             st.gapi.license_type = fresh.licensetype.clone();
         }
+        self.apply_query_settings(fresh.query_settings());
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(fresh);
         Ok(true)
+    }
+
+    /// Install `settings` as the query-evaluation settings of every database
+    /// this server serves: recorded for the databases it opens from now on
+    /// ([`DbSlot::handle`]) and applied to those already loaded — each slot
+    /// locked in turn with the state lock released (never both at once).
+    pub(crate) fn apply_query_settings(&self, settings: QuerySettings) {
+        let loaded: Vec<DbHandle> = {
+            let mut st = locked(&self.state);
+            st.query_settings = settings;
+            st.dbs.values().map(Arc::clone).collect()
+        };
+        for h in loaded {
+            let mut slot = locked(&h);
+            if !slot.retired {
+                slot.db.apply_query_settings(&settings);
+            }
+        }
     }
 
     /// The directory `/backup` writes into and `/restore` reads from:
@@ -1193,6 +1231,7 @@ impl ApiServer {
                     started: Instant::now(),
                     requests: 0,
                     load_policy: LoadPolicy::restricted(),
+                    query_settings: GStoreConfig::default().query_settings(),
                     busy: HashSet::new(),
                     gapi: GapiConfig::default(),
                 }),
@@ -1229,8 +1268,10 @@ impl ApiServer {
     /// `queue_size`), keep-alive, CORS and request body cap
     /// (`upload_max_body_size`) via [`GStoreConfig::http_options`], the
     /// `check_point` policy, the `system_username` accepted by `/shutdown`
-    /// and `/restart`, and the `/api` layer's `max_output_size` and
-    /// `licensetype` ([`GapiConfig`]). The whole configuration stays readable
+    /// and `/restart`, the `/api` layer's `max_output_size` and
+    /// `licensetype` ([`GapiConfig`]), and the `[query]` section's evaluation
+    /// settings ([`GStoreConfig::query_settings`], see
+    /// [`with_query_settings`](Self::with_query_settings)). The whole configuration stays readable
     /// by the request handlers (e.g. the IP list paths). `root_password` and
     /// `db_home` are [`bind`](Self::bind)'s arguments (or use
     /// [`bind_with_config`](Self::bind_with_config)). Apply other builders
@@ -1243,6 +1284,7 @@ impl ApiServer {
             st.gapi.max_output_size = config.max_output_size;
             st.gapi.license_type = config.licensetype.clone();
         }
+        self.inner.apply_query_settings(config.query_settings());
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = config.check_point;
             inner.ipfilter = IpFilter::from_config(&config);
@@ -1307,6 +1349,24 @@ impl ApiServer {
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
         self
+    }
+
+    /// The query-evaluation settings of every database this server serves —
+    /// those it loads, builds, creates or restores from now on, and those
+    /// already loaded: the integer-division mode, the query-cache budget, the
+    /// Top-K / early-termination options and the graph-function output bound
+    /// ([`Database::apply_query_settings`]). [`with_config`](Self::with_config)
+    /// sets them from `conf.ini`'s `[query]` section; the default is that of
+    /// an empty `conf.ini` ([`GStoreConfig::query_settings`]).
+    pub fn with_query_settings(self, settings: QuerySettings) -> ApiServer {
+        self.inner.apply_query_settings(settings);
+        self
+    }
+
+    /// The query-evaluation settings in effect (see
+    /// [`with_query_settings`](Self::with_query_settings)).
+    pub fn query_settings(&self) -> QuerySettings {
+        locked(&self.inner.state).query_settings
     }
 
     /// Bound the time a graceful shutdown waits for in-flight requests before
@@ -2252,7 +2312,7 @@ impl ApiInner {
             }
             let triples = db.triple_num();
             let mut st = locked(&inner.state);
-            let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+            let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
             st.dbs.insert(name.clone(), slot);
             // Registry bookkeeping (best effort: the registry is reconciled
             // with the database directories at every start anyway).
@@ -2294,7 +2354,7 @@ impl ApiInner {
             match Database::open(&dir) {
                 Ok(db) => {
                     let mut st = locked(&inner.state);
-                    let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                    let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                     st.dbs.insert(name.clone(), slot);
                     Resp::ok(&format!("database '{name}' loaded"))
                 }
@@ -2346,6 +2406,7 @@ impl ApiInner {
         let content = req.body_str();
         let dir = st.db_dir(&name);
         let policy = st.load_policy.clone();
+        let query = st.query_settings;
         Dispatch::Deferred(Box::new(move |inner| {
             let busy = loaded.is_none().then(|| BusyGuard {
                 inner,
@@ -2368,7 +2429,7 @@ impl ApiInner {
                         // A fresh database exists only in memory so far: dirty,
                         // so it is persisted even if nothing ends up inserted.
                         Ok(db) => {
-                            let h = DbSlot::handle(db, dir, fresh, &policy);
+                            let h = DbSlot::handle(db, dir, fresh, &policy, &query);
                             locked(&inner.state).dbs.insert(name.clone(), Arc::clone(&h));
                             h
                         }
@@ -3232,7 +3293,7 @@ impl ApiInner {
             match (installed, reopened) {
                 (Ok(()), Ok(db)) => {
                     let mut st = locked(&inner.state);
-                    let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                    let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                     st.dbs.insert(name.clone(), slot);
                     // A database restored under a new name joins the
                     // registry with the restoring user as its creator (best
@@ -3253,7 +3314,7 @@ impl ApiInner {
                     Database::discard_staged_restore(&staged);
                     if let (Ok(db), true) = (reopened, loaded.is_some()) {
                         let mut st = locked(&inner.state);
-                        let slot = DbSlot::handle(db, dir, false, &st.load_policy);
+                        let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                     }
                     Resp::fail(500, &format!("restore failed: {e}"))
@@ -5174,6 +5235,105 @@ mod tests {
         let (_, b) = api(&query);
         assert!(b.contains("length"), "{b}");
         assert!(Arc::ptr_eq(&reloaded, &cached().unwrap()));
+        server.shutdown();
+    }
+
+    /// The server's query-evaluation settings (`conf.ini` `[query]`) reach
+    /// every database it serves, whichever way it got loaded — REST build /
+    /// load / upload-create / restore, `/api` load / restore, a dropped and
+    /// recreated name — and a transaction's read snapshot; installing new
+    /// settings (as `refreshconf` does) re-applies them to loaded databases.
+    #[test]
+    fn query_settings_reach_every_served_database() {
+        use crate::query::{DpbMode, IntegerDivision, TopKOptions};
+        let custom = QuerySettings {
+            integer_division: IntegerDivision::Truncate,
+            query_cache_bytes: 12_345,
+            topk: TopKOptions {
+                early_termination: false,
+                bounded_heap: true,
+                dpb: DpbMode::Off,
+            },
+            gfun_max_output_bytes: 777,
+        };
+        let root = tmp_root("qsettings");
+        let server = Arc::new(
+            ApiServer::bind(&root, "root", "127.0.0.1:0")
+                .expect("bind")
+                .with_query_settings(custom),
+        );
+        assert_eq!(server.query_settings(), custom);
+        let addr = server.local_addr().expect("addr");
+        let s2 = Arc::clone(&server);
+        std::thread::spawn(move || s2.serve_forever());
+        let auth = basic("root", "root");
+        let rest = |method: &str, target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, method, target, Some(&auth), body))
+        };
+        let api = |body: String| split_status_body(&raw_request(&addr, "POST", "/api", None, &body));
+        let op = |op: &str, db: &str| {
+            format!(r#"{{"username":"root","password":"root","operation":"{op}","db_name":"{db}"}}"#)
+        };
+        let settings_of = |name: &str| {
+            let h = Arc::clone(locked(&server.inner.state).dbs.get(name).expect("loaded"));
+            let slot = locked(&h);
+            slot.db.query_settings()
+        };
+        const DATA: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        let div = "SELECT (7/2 AS ?x) WHERE {}";
+
+        // REST build.
+        assert_eq!(rest("POST", "/build?db_name=one", DATA).0, 200);
+        assert_eq!(settings_of("one"), custom);
+        let (_, b) = rest("POST", "/sparql?db_name=one", div);
+        assert!(b.contains("\"value\":\"3\""), "{b}");
+        // REST unload + load.
+        assert_eq!(rest("POST", "/unload?db_name=one", "").0, 200);
+        assert_eq!(rest("POST", "/load?db_name=one", "").0, 200);
+        assert_eq!(settings_of("one"), custom);
+        // /api unload + load.
+        let (_, b) = api(op("unload", "one"));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        let (_, b) = api(op("load", "one"));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        assert_eq!(settings_of("one"), custom);
+        // REST upload into a database that does not exist yet (created).
+        assert_eq!(rest("POST", "/upload?db_name=fresh&format=nt", DATA).0, 200);
+        assert_eq!(settings_of("fresh"), custom);
+        // REST backup + restore, then /api backup + restore.
+        let (s, b) = rest("POST", "/backup?db_name=one", "");
+        assert_eq!(s, 200, "{b}");
+        let path = b.split("\"path\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let (s, b) = rest("POST", &format!("/restore?db_name=one&path={path}"), "");
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(settings_of("one"), custom);
+        let (_, b) = api(op("backup", "one"));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        let (_, b) = api(op("restore", "one"));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        assert_eq!(settings_of("one"), custom);
+        // Drop and recreate the same name.
+        let (_, b) = api(op("drop", "fresh"));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        assert_eq!(rest("POST", "/build?db_name=fresh", DATA).0, 200);
+        assert_eq!(settings_of("fresh"), custom);
+        // A transaction's read snapshot divides like the database.
+        let (s, b) = rest("POST", "/begin?db_name=one", "");
+        assert_eq!(s, 200, "{b}");
+        let tid = b.split("\"TID\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let (_, b) = rest("POST", "/sparql?db_name=one", div);
+        assert!(b.contains("\"value\":\"3\""), "snapshot read: {b}");
+        let (_, b) = rest("POST", &format!("/tquery?tid={tid}"), div);
+        assert!(b.contains("\"value\":\"3\""), "transactional read: {b}");
+        assert_eq!(rest("POST", &format!("/rollback?tid={tid}"), "").0, 200);
+
+        // New settings (what refreshconf installs) reach the loaded ones.
+        let other = QuerySettings::default();
+        server.inner.apply_query_settings(other);
+        assert_eq!(settings_of("one"), other);
+        assert_eq!(settings_of("fresh"), other);
+        let (_, b) = rest("POST", "/sparql?db_name=one", div);
+        assert!(b.contains("\"value\":\"3.5\""), "{b}");
         server.shutdown();
     }
 

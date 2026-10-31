@@ -30,10 +30,16 @@
 //! install directory). A shipped, commented example lives in
 //! `conf/conf.ini.example`.
 //!
-//! A few **Rust-only extension keys** (all in `[server]`) tune the HTTP layer
-//! that upstream configures in code: `listen_addr`, `keep_alive_timeout`,
-//! `keep_alive_max`, `queue_size` and `cors`. They are documented on the
-//! fields below and in the example file.
+//! A few **Rust-only extension keys** tune what upstream configures in code
+//! (or not at all). In `[server]`, the HTTP layer: `listen_addr`,
+//! `keep_alive_timeout`, `keep_alive_max`, `queue_size` and `cors`. In a
+//! `[query]` section, how every served database evaluates queries
+//! ([`GStoreConfig::query_settings`], applied to each database the servers
+//! open, build, create or restore): `integer_division`, `query_cache_size`,
+//! `early_termination`, `topk_bounded_heap`, `topk_dpb` and
+//! `gfun_max_output_bytes`. Upstream has no key for any of them (its query
+//! cache budget, 100 MB, is a constant in `QueryCache.h`). They are
+//! documented on the fields below and in the example file.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -41,7 +47,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::db::{QuerySettings, DEFAULT_QUERY_CACHE_BYTES};
+use crate::query::{DpbMode, IntegerDivision, TopKOptions};
 use crate::server::HttpOptions;
+
+/// The servers' default for `gfun_max_output_bytes`: 64 MiB, the same bound
+/// the crate puts on a response it downloads (a federated `SERVICE` result,
+/// [`crate::http_client::Limits`]), and smaller than the 256 MiB an embedded
+/// [`Database`](crate::Database) allows
+/// ([`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES)):
+/// a server answers many clients at once and builds the response text from
+/// the function's JSON, so one call should not hold hundreds of MiB.
+pub const DEFAULT_GFUN_MAX_OUTPUT_BYTES: usize = 64 << 20;
 
 // ---------------------------------------------------------------------------
 // INI reader
@@ -218,6 +235,12 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("server", "keep_alive_max"),
     ("server", "queue_size"),
     ("server", "cors"),
+    ("query", "integer_division"),
+    ("query", "query_cache_size"),
+    ("query", "early_termination"),
+    ("query", "topk_bounded_heap"),
+    ("query", "topk_dpb"),
+    ("query", "gfun_max_output_bytes"),
 ];
 
 /// Accepted spellings that map onto a [`KNOWN_KEYS`] entry.
@@ -343,6 +366,31 @@ pub struct GStoreConfig {
     /// Allowed compressed upload package types (default `zip`).
     pub upload_allow_compress_packages: Vec<String>,
 
+    // ---- [query] (Rust extension) ---------------------------------------
+    /// *(Rust extension)* How `/` divides two integers: `decimal` (SPARQL
+    /// 1.1, `7/2` = `3.5`, the default) or `truncate` (upstream gStore,
+    /// `7/2` = `3`, `AVG` over integers truncates too); `w3c` / `upstream`
+    /// are accepted as aliases.
+    pub integer_division: IntegerDivision,
+    /// *(Rust extension)* Each database's read-query cache budget in bytes;
+    /// `0` turns the cache off (default 64 MiB,
+    /// [`DEFAULT_QUERY_CACHE_BYTES`]).
+    pub query_cache_size: usize,
+    /// *(Rust extension)* Stream `LIMIT` (no `ORDER BY`), `ASK` and `EXISTS`
+    /// evaluations and stop once enough solutions are found (default on).
+    pub early_termination: bool,
+    /// *(Rust extension)* Answer `ORDER BY … LIMIT` with a bounded heap
+    /// instead of a full sort (default on).
+    pub topk_bounded_heap: bool,
+    /// *(Rust extension)* When DP-B Top-K answers `ORDER BY <linear
+    /// expression> LIMIT` over a tree-shaped BGP: `auto` (when the
+    /// statistics predict it pays off, the default), `always` or `off`.
+    pub topk_dpb: DpbMode,
+    /// *(Rust extension)* The most bytes of JSON one graph-function call
+    /// (`shortestPaths(…)`, `kHopEnumerate(…)`, …) may produce before the
+    /// query fails (default [`DEFAULT_GFUN_MAX_OUTPUT_BYTES`], 64 MiB).
+    pub gfun_max_output_bytes: usize,
+
     // ---- provenance -----------------------------------------------------
     /// The file this configuration was loaded from, if any.
     source: Option<PathBuf>,
@@ -395,6 +443,12 @@ impl Default for GStoreConfig {
             upload_max_body_size: 1_073_741_824,
             upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt"),
             upload_allow_compress_packages: split_list("zip"),
+            integer_division: IntegerDivision::default(),
+            query_cache_size: DEFAULT_QUERY_CACHE_BYTES,
+            early_termination: true,
+            topk_bounded_heap: true,
+            topk_dpb: DpbMode::Auto,
+            gfun_max_output_bytes: DEFAULT_GFUN_MAX_OUTPUT_BYTES,
             source: None,
             explicit: BTreeSet::new(),
             warnings: Vec::new(),
@@ -599,6 +653,23 @@ impl GStoreConfig {
             }
             "upload_allow_extensions" => self.upload_allow_extensions = split_list(v),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages = split_list(v),
+            "integer_division" => {
+                self.integer_division =
+                    IntegerDivision::parse(v).ok_or_else(|| bad("decimal or truncate"))?
+            }
+            "query_cache_size" => {
+                self.query_cache_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
+            "early_termination" => {
+                self.early_termination = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "topk_bounded_heap" => {
+                self.topk_bounded_heap = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "topk_dpb" => self.topk_dpb = parse_dpb(v).ok_or_else(|| bad("auto, always or off"))?,
+            "gfun_max_output_bytes" => {
+                self.gfun_max_output_bytes = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         self.explicit.insert(key.to_string());
@@ -656,6 +727,21 @@ impl GStoreConfig {
             "upload_max_body_size" => self.upload_max_body_size.to_string(),
             "upload_allow_extensions" => self.upload_allow_extensions.join("|"),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
+            "integer_division" => match self.integer_division {
+                IntegerDivision::Decimal => "decimal",
+                IntegerDivision::Truncate => "truncate",
+            }
+            .to_string(),
+            "query_cache_size" => self.query_cache_size.to_string(),
+            "early_termination" => switch(self.early_termination),
+            "topk_bounded_heap" => switch(self.topk_bounded_heap),
+            "topk_dpb" => match self.topk_dpb {
+                DpbMode::Auto => "auto",
+                DpbMode::Always => "always",
+                DpbMode::Off => "off",
+            }
+            .to_string(),
+            "gfun_max_output_bytes" => self.gfun_max_output_bytes.to_string(),
             _ => return None,
         })
     }
@@ -703,6 +789,22 @@ impl GStoreConfig {
         }
     }
 
+    /// The query-evaluation settings of the `[query]` section, which the
+    /// servers apply to every database they open, build, create or restore
+    /// ([`Database::apply_query_settings`](crate::Database::apply_query_settings)).
+    pub fn query_settings(&self) -> QuerySettings {
+        QuerySettings {
+            integer_division: self.integer_division,
+            query_cache_bytes: self.query_cache_size,
+            topk: TopKOptions {
+                early_termination: self.early_termination,
+                bounded_heap: self.topk_bounded_heap,
+                dpb: self.topk_dpb,
+            },
+            gfun_max_output_bytes: self.gfun_max_output_bytes,
+        }
+    }
+
     /// Whether an upload named `file_name` has an allowed extension
     /// (`upload_allow_extensions` or `upload_allow_compress_packages`,
     /// compared case-insensitively).
@@ -724,6 +826,16 @@ fn canonical_key(key: &str) -> &str {
         .find(|(alias, _)| *alias == key)
         .map(|(_, k)| *k)
         .unwrap_or(key)
+}
+
+/// `topk_dpb`: `auto`, `always`, or `off` (`never` / `0` / `false` too).
+fn parse_dpb(v: &str) -> Option<DpbMode> {
+    match v.to_ascii_lowercase().as_str() {
+        "auto" => Some(DpbMode::Auto),
+        "always" | "on" => Some(DpbMode::Always),
+        "off" | "never" | "0" | "false" | "no" => Some(DpbMode::Off),
+        _ => None,
+    }
 }
 
 fn parse_port(v: &str) -> Option<u16> {
@@ -911,6 +1023,15 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.upload_max_body_size, 1_073_741_824);
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl", "n3", "rdf", "txt"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip"]);
+        // [query]: an embedded database's defaults, except the servers'
+        // smaller graph-function output bound.
+        assert_eq!(
+            c.query_settings(),
+            QuerySettings {
+                gfun_max_output_bytes: DEFAULT_GFUN_MAX_OUTPUT_BYTES,
+                ..QuerySettings::default()
+            }
+        );
         assert!(c.warnings().is_empty());
         assert!(KNOWN_KEYS.iter().all(|(_, k)| !c.is_set(k)));
         // Every known key has a textual value and round-trips through `set`.
@@ -973,7 +1094,10 @@ upload_allow_compress_packages = "zip"
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
                     [backup]\nbackup_path=/b\nmax_backups=11\n\
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
-                    upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n";
+                    upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
+                    [query]\ninteger_division=truncate\nquery_cache_size=0\n\
+                    early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
+                    gfun_max_output_bytes=4096\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)), "every key counted as set");
@@ -1011,6 +1135,22 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.value("deamon").unwrap(), "on");
         assert!(c.upload_allowed("data.TTL") && c.upload_allowed("x.tar"));
         assert!(!c.upload_allowed("x.exe") && !c.upload_allowed("noext"));
+
+        assert_eq!(
+            c.query_settings(),
+            QuerySettings {
+                integer_division: IntegerDivision::Truncate,
+                query_cache_bytes: 0,
+                topk: TopKOptions {
+                    early_termination: false,
+                    bounded_heap: false,
+                    dpb: DpbMode::Always,
+                },
+                gfun_max_output_bytes: 4096,
+            }
+        );
+        assert_eq!(c.value("integer_division").unwrap(), "truncate");
+        assert_eq!(c.value("topk_dpb").unwrap(), "always");
 
         let h = c.http_options();
         assert_eq!(h.threads, 4);

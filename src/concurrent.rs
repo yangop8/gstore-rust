@@ -204,6 +204,9 @@ pub struct Snapshot {
     /// [`LoadPolicy::allow_remote`](crate::db::LoadPolicy::allow_remote), so
     /// snapshot reads follow the same policy as [`Database::query`].
     allow_service: bool,
+    /// The database's graph-function output bound when the snapshot was
+    /// published.
+    gfun_max_output_bytes: usize,
 }
 
 impl Snapshot {
@@ -232,6 +235,7 @@ impl Snapshot {
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
             allow_service: db.load_policy().allow_remote,
+            gfun_max_output_bytes: db.gfun_max_output_bytes(),
         }
     }
 
@@ -262,7 +266,8 @@ impl Snapshot {
             .with_service_allowed(self.allow_service)
             .with_csr_provider(&csr)
             .with_integer_division(self.integer_division)
-            .with_topk_options(self.topk);
+            .with_topk_options(self.topk)
+            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
@@ -1005,7 +1010,8 @@ impl VersionView<'_> {
         let mut eval = Evaluator::new(&dict, &store)
             .with_service_allowed(latest.allow_service)
             .with_integer_division(latest.integer_division)
-            .with_topk_options(latest.topk);
+            .with_topk_options(latest.topk)
+            .with_gfun_max_output_bytes(latest.gfun_max_output_bytes);
         if !self.db.base.named.is_empty() {
             eval = eval.with_named(&self.db.base.named);
         }
@@ -1062,6 +1068,23 @@ mod tests {
         for r in [c.query(q), c.snapshot().query(q), c.version_view().query(q)] {
             let e = r.unwrap_err().to_string();
             assert!(e.contains("SERVICE is disabled"), "{e}");
+        }
+    }
+
+    /// Snapshot, transaction and version-view reads apply the database's
+    /// query settings — here the graph-function output bound.
+    #[test]
+    fn snapshot_reads_follow_the_query_settings() {
+        let mut db = crate::Database::build_from_str("conc_qs", DATA).unwrap();
+        db.apply_query_settings(&crate::db::QuerySettings {
+            gfun_max_output_bytes: 16,
+            ..crate::db::QuerySettings::default()
+        });
+        let c = ConcurrentDb::new(db);
+        let q = "SELECT (shortestPath(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) WHERE {}";
+        for r in [c.query(q), c.begin().query(q), c.version_view().query(q)] {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("bytes"), "{e}");
         }
     }
 
