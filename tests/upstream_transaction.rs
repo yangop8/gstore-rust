@@ -50,7 +50,13 @@ impl<'a> Txn<'a> {
             "tquery",
             &[("db_name", self.db), ("tid", &self.tid), ("sparql", sparql)],
         );
-        assert_eq!(code(&j), 0, "tid {} step {}: {sparql}: {j}", self.tid, self.step);
+        assert_eq!(
+            code(&j),
+            0,
+            "tid {} step {}: {sparql}: {j}",
+            self.tid,
+            self.step
+        );
         j
     }
 
@@ -169,16 +175,16 @@ fn transaction_test_script() {
     t.update("insert data {<V1> <R1> \"0\".}", 1);
     t.select(sel_r1, &["x", "y"], &[&["<V1>", "\"0\""]]);
     t.update("insert data {<V1> <R1> \"10\".}", 1);
-    t.select(sel_r1, &["x", "y"], &[&["<V1>", "\"0\""], &["<V1>", "\"10\""]]);
+    t.select(
+        sel_r1,
+        &["x", "y"],
+        &[&["<V1>", "\"0\""], &["<V1>", "\"10\""]],
+    );
     t.update("insert data {<V2> <R1> \"20\".}", 1);
     t.select(
         sel_r1,
         &["x", "y"],
-        &[
-            &["<V1>", "\"0\""],
-            &["<V1>", "\"10\""],
-            &["<V2>", "\"20\""],
-        ],
+        &[&["<V1>", "\"0\""], &["<V1>", "\"10\""], &["<V2>", "\"20\""]],
     );
     assert_eq!(t.step, 6);
     t.commit();
@@ -189,11 +195,23 @@ fn transaction_test_script() {
     let two = int_lit("2");
     let mut t = Txn::begin(&srv, db, "6");
     t.select(sel_v, &["v"], &[&["\"0\""], &["\"10\""]]);
-    t.update(&format!("delete data {{ <V1> <R1> \"0\"^^<{XSD_INTEGER}> }}"), 0);
-    t.update(&format!("insert data {{ <V1> <R1> \"1\"^^<{XSD_INTEGER}> }}"), 1);
+    t.update(
+        &format!("delete data {{ <V1> <R1> \"0\"^^<{XSD_INTEGER}> }}"),
+        0,
+    );
+    t.update(
+        &format!("insert data {{ <V1> <R1> \"1\"^^<{XSD_INTEGER}> }}"),
+        1,
+    );
     t.select(sel_v, &["v"], &[&["\"0\""], &["\"10\""], &[&one]]);
-    t.update(&format!("delete data {{ <V1> <R1> \"1\"^^<{XSD_INTEGER}> }}"), 1);
-    t.update(&format!("insert data {{ <V1> <R1> \"2\"^^<{XSD_INTEGER}> }}"), 1);
+    t.update(
+        &format!("delete data {{ <V1> <R1> \"1\"^^<{XSD_INTEGER}> }}"),
+        1,
+    );
+    t.update(
+        &format!("insert data {{ <V1> <R1> \"2\"^^<{XSD_INTEGER}> }}"),
+        1,
+    );
     t.select(sel_v, &["v"], &[&["\"0\""], &["\"10\""], &[&two]]);
     assert_eq!(t.step, 7);
     t.commit();
@@ -280,5 +298,9 @@ fn transaction_ids_are_numbered_per_loaded_database() {
     let j = srv.query("alpha", "select ?s where { ?s <p> <o> }");
     assert_eq!(int(&j, "AnsNum"), 2, "alpha's two commits: {j}");
     let j = srv.query("beta", "select ?s where { ?s <p> <o> }");
-    assert_eq!(int(&j, "AnsNum"), 0, "beta's transaction was rolled back: {j}");
+    assert_eq!(
+        int(&j, "AnsNum"),
+        0,
+        "beta's transaction was rolled back: {j}"
+    );
 }

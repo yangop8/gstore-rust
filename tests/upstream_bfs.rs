@@ -51,7 +51,10 @@ fn dataset(name: &str) -> &'static Dataset {
             let file = legacy_lubm(&dir);
             (Server::start_at(root, Some(&dir)), file)
         } else {
-            (Server::start_at(root, None), data(&format!("{name}/{name}.nt")))
+            (
+                Server::start_at(root, None),
+                data(&format!("{name}/{name}.nt")),
+            )
         };
         let db = format!("bfs_{name}");
         ok(&srv.build(&db, &file));

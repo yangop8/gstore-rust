@@ -44,13 +44,28 @@ fn run(ds: &Dataset) {
     // [3/7] batchRemove of the whole file removes every triple...
     let j = srv.op("batchRemove", &[("db_name", &db), ("file", &nt_str)]);
     ok(&j);
-    assert_eq!(int(&j, "success_num"), ds.triples, "{}: batchRemove", ds.name);
+    assert_eq!(
+        int(&j, "success_num"),
+        ds.triples,
+        "{}: batchRemove",
+        ds.name
+    );
     let j = srv.op("monitor", &[("db_name", &db)]);
-    assert_eq!(int(&j, "tripleNum"), 0, "{}: empty after batchRemove", ds.name);
+    assert_eq!(
+        int(&j, "tripleNum"),
+        0,
+        "{}: empty after batchRemove",
+        ds.name
+    );
     // [4/7] ...and batchInsert puts them back.
     let j = srv.op("batchInsert", &[("db_name", &db), ("file", &nt_str)]);
     ok(&j);
-    assert_eq!(int(&j, "success_num"), ds.triples, "{}: batchInsert", ds.name);
+    assert_eq!(
+        int(&j, "success_num"),
+        ds.triples,
+        "{}: batchInsert",
+        ds.name
+    );
     // [5/7] the queries, in order
     for (file, want) in ds.queries {
         let sparql = read(&data(&format!("{}/{file}", ds.name)));

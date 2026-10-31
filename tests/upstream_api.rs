@@ -71,15 +71,28 @@ fn api_test_script_on_small() {
     ok(&j);
     assert_eq!(int(&j, "AnsNum"), 10);
     // exportDb, then download what awk extracted.
-    let (text, j) = call(format!(r#"{{"operation":"export",{cred},"db_name":"{db}"}}"#));
+    let (text, j) = call(format!(
+        r#"{{"operation":"export",{cred},"db_name":"{db}"}}"#
+    ));
     ok(&j);
     let export_path = awk_field(&text, 10);
-    assert_eq!(export_path, string(&j, "filepath"), "awk's field 10 is filepath: {text}");
-    let (status, body) = http(&srv.addr, "GET", &format!("/file/download/{export_path}"), b"");
+    assert_eq!(
+        export_path,
+        string(&j, "filepath"),
+        "awk's field 10 is filepath: {text}"
+    );
+    let (status, body) = http(
+        &srv.addr,
+        "GET",
+        &format!("/file/download/{export_path}"),
+        b"",
+    );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body.lines().count(), 25);
     // backup (the restore uses the path awk extracts)
-    let (text, j) = call(format!(r#"{{"operation":"backup",{cred},"db_name":"{db}"}}"#));
+    let (text, j) = call(format!(
+        r#"{{"operation":"backup",{cred},"db_name":"{db}"}}"#
+    ));
     ok(&j);
     let backup_path = awk_field(&text, 10);
     assert_eq!(backup_path, string(&j, "backupfilepath"), "{text}");
@@ -114,18 +127,25 @@ fn api_test_script_on_small() {
     )));
     ok(&op(&format!(r#""rollback","db_name":"{db}","tid":"2""#)));
     let j = srv.query(db, "ask { <s> <p> <o> }");
-    assert!(j.to_string().contains("true"), "committed, not rolled back: {j}");
+    assert!(
+        j.to_string().contains("true"),
+        "committed, not rolled back: {j}"
+    );
     // checkpoint
     ok(&op(&format!(r#""checkpoint","db_name":"{db}""#)));
     // users: add, privileges, show, clear, password, delete
-    ok(&op(r#""usermanage","type":"1","op_username":"test","op_password":"123456""#));
+    ok(&op(
+        r#""usermanage","type":"1","op_username":"test","op_password":"123456""#,
+    ));
     ok(&op(&format!(
         r#""userprivilegemanage","type":"1","op_username":"test","privileges":"1,2,3","db_name":"{db}""#
     )));
     let j = op(r#""showuser""#);
     ok(&j);
     assert!(j.to_string().contains(r#""username":"test""#), "{j}");
-    ok(&op(r#""userprivilegemanage","type":"3","op_username":"test""#));
+    ok(&op(
+        r#""userprivilegemanage","type":"3","op_username":"test""#,
+    ));
     let j = call(
         r#"{"operation":"userpassword","username":"test","password":"123456","op_password":"111111"}"#
             .to_string(),
@@ -135,7 +155,9 @@ fn api_test_script_on_small() {
     ok(&op(r#""usermanage","type":"2","op_username":"test""#));
     // rename: unload first, then rename; drop the renamed database.
     ok(&op(&format!(r#""unload","db_name":"{db}""#)));
-    ok(&op(&format!(r#""rename","db_name":"{db}","new_name":"new{db}""#)));
+    ok(&op(&format!(
+        r#""rename","db_name":"{db}","new_name":"new{db}""#
+    )));
     ok(&op(&format!(
         r#""drop","db_name":"new{db}","is_backup":"false""#
     )));

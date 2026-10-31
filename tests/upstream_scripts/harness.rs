@@ -232,7 +232,10 @@ pub fn http_with(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .expect("status");
-    (status, String::from_utf8_lossy(&resp[split + 4..]).into_owned())
+    (
+        status,
+        String::from_utf8_lossy(&resp[split + 4..]).into_owned(),
+    )
 }
 
 /// The answer's `StatusCode`.
@@ -426,8 +429,16 @@ pub fn diff_rows(want: &[Vec<Cell>], got: &[Vec<Cell>]) -> String {
     for r in got {
         *count.entry(r).or_default() -= 1;
     }
-    let missing: Vec<_> = count.iter().filter(|(_, &n)| n > 0).map(|(r, n)| (r, *n)).collect();
-    let extra: Vec<_> = count.iter().filter(|(_, &n)| n < 0).map(|(r, n)| (r, -n)).collect();
+    let missing: Vec<_> = count
+        .iter()
+        .filter(|(_, &n)| n > 0)
+        .map(|(r, n)| (r, *n))
+        .collect();
+    let extra: Vec<_> = count
+        .iter()
+        .filter(|(_, &n)| n < 0)
+        .map(|(r, n)| (r, -n))
+        .collect();
     let shown = |v: &[(&&Vec<Cell>, i64)]| -> String {
         v.iter()
             .take(10)

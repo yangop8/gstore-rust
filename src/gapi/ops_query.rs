@@ -462,7 +462,10 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
         Ok(h) => h,
         Err(e) => return txn_error(&fail_prefix, e),
     };
-    match ctx.inner.end_txn(dbh.as_ref(), &db, tid, ctx.user(), commit) {
+    match ctx
+        .inner
+        .end_txn(dbh.as_ref(), &db, tid, ctx.user(), commit)
+    {
         Ok(warning) => {
             let mut r = GResp::success(done);
             if let Some(w) = warning {
