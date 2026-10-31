@@ -614,31 +614,21 @@ impl Database {
         log: &mut dyn import::ErrorLog,
         applied: &mut u64,
     ) -> Result<import::ImportReport> {
-        self.import_into(sources, "batch insert", opts, log, applied, None)
-    }
-
-    /// [`insert_sources`](Self::insert_sources) with the sources' default
-    /// graph redirected to named graph `default_graph` when given (`LOAD …
-    /// INTO GRAPH <g>`); statements of a named graph keep their graph.
-    fn import_into(
-        &mut self,
-        sources: &[import::Source],
-        what: &str,
-        opts: &import::ImportOptions,
-        log: &mut dyn import::ErrorLog,
-        applied: &mut u64,
-        default_graph: Option<&str>,
-    ) -> Result<import::ImportReport> {
-        import::import_sources(sources, what, opts, log, &mut |batch: &mut Vec<Quad>| {
-            for q in batch.drain(..) {
-                let graph = graph_iri(&q.graph);
-                let graph = graph.as_deref().or(default_graph);
-                if self.insert_quad(&q.into_triple(), graph)? {
-                    *applied += 1;
+        import::import_sources(
+            sources,
+            "batch insert",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                for q in batch.drain(..) {
+                    let graph = graph_iri(&q.graph);
+                    if self.insert_quad(&q.into_triple(), graph.as_deref())? {
+                        *applied += 1;
+                    }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     /// Remove the statements of RDF `sources` from this database (`gsub`,
@@ -808,8 +798,14 @@ impl Database {
     /// persistence write failed; that failure is reported by the next commit
     /// point).
     pub fn try_insert_triple(&mut self, t: &Triple) -> Result<bool> {
+        Ok(self.try_insert_triple_id(t)?.is_some())
+    }
+
+    /// [`try_insert_triple`](Self::try_insert_triple), returning the ids of a
+    /// newly added triple.
+    fn try_insert_triple_id(&mut self, t: &Triple) -> Result<Option<IdTriple>> {
         let Some((_, id)) = self.intern_for_insert(t, None)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let changed = self.store.insert(id);
         if changed {
@@ -836,7 +832,7 @@ impl Database {
             self.record_redo(b'I', None, id);
             self.persist_mutation(true, None, id);
         }
-        Ok(changed)
+        Ok(changed.then_some(id))
     }
 
     /// Fold a just-inserted default-graph triple into the VS-tree incrementally
@@ -879,7 +875,11 @@ impl Database {
         ) else {
             return false;
         };
-        let id = IdTriple::new(sub, pred, obj);
+        self.remove_default_id(IdTriple::new(sub, pred, obj))
+    }
+
+    /// Remove the default-graph triple `id`; `true` if it existed.
+    fn remove_default_id(&mut self, id: IdTriple) -> bool {
         let changed = self.store.remove(id);
         if changed {
             // Deletes deliberately invalidate (full rebuild on next save / query)
@@ -998,11 +998,21 @@ impl Database {
     /// Insert a triple into a named graph (`None` ⇒ default graph). Returns
     /// `true` if newly added.
     fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> Result<bool> {
+        Ok(self.insert_quad_id(t, graph)?.is_some())
+    }
+
+    /// [`insert_quad`](Self::insert_quad), returning the graph (`None` =
+    /// default) and ids of a newly added statement.
+    fn insert_quad_id(
+        &mut self,
+        t: &Triple,
+        graph: Option<&str>,
+    ) -> Result<Option<(Option<u32>, IdTriple)>> {
         let Some(g) = graph else {
-            return self.try_insert_triple(t);
+            return Ok(self.try_insert_triple_id(t)?.map(|id| (None, id)));
         };
         let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
-            return Ok(false);
+            return Ok(None);
         };
         let present = self
             .named
@@ -1012,7 +1022,7 @@ impl Database {
         // all (so a retry writes it again), and the error is reported at the
         // next commit point.
         if present || !self.persist_named_quad(true, gid, id) {
-            return Ok(false);
+            return Ok(None);
         }
         self.named.entry(gid).or_default().insert(id);
         self.touched();
@@ -1021,7 +1031,7 @@ impl Database {
         }
         self.record_redo(b'I', Some(gid), id);
         self.persist_mutation(true, Some(gid), id);
-        Ok(true)
+        Ok(Some((Some(gid), id)))
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
@@ -1038,7 +1048,11 @@ impl Database {
         ) else {
             return false;
         };
-        let id = IdTriple::new(sub, pred, obj);
+        self.remove_named_id(gid, IdTriple::new(sub, pred, obj))
+    }
+
+    /// Remove statement `id` from named graph `gid`; `true` if it existed.
+    fn remove_named_id(&mut self, gid: u32, id: IdTriple) -> bool {
         let present = self
             .named
             .get(&gid)
@@ -1136,8 +1150,9 @@ impl Database {
     /// WHERE clause of an UPDATE's `DELETE`/`INSERT … WHERE` (which may call a
     /// graph function in a sub-SELECT): it is evaluated before anything is
     /// applied, so a cancelled operation changes nothing — operations of the
-    /// same request before it stay applied, as after any failure. Mirrors
-    /// gStore's task cancellation.
+    /// same request before it stay applied, as after any failure. A `LOAD`
+    /// checks the flag between import batches and undoes what it inserted.
+    /// Mirrors gStore's task cancellation.
     ///
     /// The multi-database [`ApiServer`](crate::http_api::ApiServer) runs each
     /// connection on its own worker thread and executes queries without its
@@ -1262,7 +1277,8 @@ impl Database {
     }
 
     /// Apply one UPDATE operation, returning the number of triples it changed.
-    /// A `DELETE`/`INSERT … WHERE` evaluates its WHERE clause under `cancel`.
+    /// A `DELETE`/`INSERT … WHERE` evaluates its WHERE clause under `cancel`,
+    /// a `LOAD` reads its document under it.
     fn exec_update_op(
         &mut self,
         op: UpdateOp,
@@ -1314,15 +1330,12 @@ impl Database {
                 source,
                 silent,
                 into,
-            } => match self.load_rdf_source(&source, into.as_deref()) {
+            } => match self.load_rdf_source(&source, into.as_deref(), cancel) {
                 Ok(n) => Ok(n),
-                Err(e) => {
-                    if silent {
-                        Ok(0)
-                    } else {
-                        Err(e)
-                    }
-                }
+                // `SILENT` hides the failure of the load (which applied
+                // nothing), not a cancel of the request.
+                Err(e) if silent && !matches!(e, GStoreError::Cancelled) => Ok(0),
+                Err(e) => Err(e),
             },
             UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
                 GraphTarget::Default => Ok(self.clear_default()),
@@ -1609,13 +1622,32 @@ impl Database {
     /// `LOAD <iri> [INTO GRAPH <g>]`: read an RDF document into the store,
     /// subject to the [`LoadPolicy`]. Only local sources are read — a `file:`
     /// IRI or a bare path; remote (`http(s)://`, …) sources are never
-    /// retrieved by SPARQL (no network) and error. The format follows the
-    /// extension (see [`import::RdfFormat`]); the document streams in, its
-    /// blank nodes get their own scope, and its default-graph triples go to
-    /// the default graph — or to named graph `into`. N-Quads / TriG
-    /// statements of a named graph keep their graph. Strict: a statement that
-    /// does not parse fails the `LOAD` (what was inserted before it stays).
-    fn load_rdf_source(&mut self, source: &str, into: Option<&str>) -> Result<usize> {
+    /// retrieved by SPARQL (no network) and error. The document goes through
+    /// the bulk loaders' import pipeline: its format follows the extension
+    /// (see [`import::RdfFormat`]), it streams in, and its blank nodes get a
+    /// scope of their own (two `LOAD`s of one file never share a blank node).
+    ///
+    /// * Without `into`, the document is a dataset: its default-graph triples
+    ///   go to the default graph, and the statements of an N-Quads / TriG
+    ///   named graph to that graph.
+    /// * With `into` (SPARQL 1.1 Update §3.1.4: the operation inserts the
+    ///   document's triples into the graph it names, and changes no other):
+    ///   the document's default graph goes to named graph `into`, and the
+    ///   statements of its own named graphs are not loaded (counted, and
+    ///   reported in the diagnostic log) — as Jena reads a quad document
+    ///   into one graph. `LOAD <src>` without `INTO` loads them.
+    ///
+    /// Strict and atomic: a statement that does not parse, a cancel (checked
+    /// between batches) or any other failure fails the `LOAD` and undoes what
+    /// it had inserted, so a failed `LOAD` — `SILENT` or not — changes no
+    /// graph. The undo list holds 16 bytes per inserted statement. Returns
+    /// the number of statements inserted.
+    fn load_rdf_source(
+        &mut self,
+        source: &str,
+        into: Option<&str>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
         let path = match self.load_policy.resolve(source)? {
             LoadSource::Local(path) => path,
             LoadSource::Remote(_) => {
@@ -1625,16 +1657,57 @@ impl Database {
                 )))
             }
         };
-        let mut n = 0u64;
-        self.import_into(
+        let mut applied: Vec<(Option<u32>, IdTriple)> = Vec::new();
+        let mut skipped = 0u64;
+        let result = import::import_sources(
             &[import::Source::File(path)],
             "LOAD",
             &import::ImportOptions::strict(),
             &mut (),
-            &mut n,
-            into,
-        )?;
-        Ok(usize::try_from(n).unwrap_or(usize::MAX))
+            &mut |batch: &mut Vec<Quad>| {
+                if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return Err(GStoreError::Cancelled);
+                }
+                for q in batch.drain(..) {
+                    let graph = match (into, graph_iri(&q.graph)) {
+                        (None, g) => g,
+                        (Some(target), None) => Some(target.to_string()),
+                        (Some(_), Some(_)) => {
+                            skipped += 1;
+                            continue;
+                        }
+                    };
+                    if let Some(done) = self.insert_quad_id(&q.into_triple(), graph.as_deref())? {
+                        applied.push(done);
+                    }
+                }
+                Ok(())
+            },
+        );
+        if let Err(e) = result {
+            self.undo_inserts(applied);
+            return Err(e);
+        }
+        if skipped > 0 {
+            crate::gs_warn!(
+                "LOAD <{source}> INTO GRAPH <{}>: {skipped} statement(s) of the document's own \
+                 named graphs were not loaded (LOAD without INTO loads them)",
+                into.unwrap_or_default()
+            );
+        }
+        Ok(applied.len())
+    }
+
+    /// Undo inserts reported by [`insert_quad_id`](Self::insert_quad_id), in
+    /// reverse order, through the ordinary delete paths (so the transaction
+    /// undo log, the redo log and a persistent store see them too).
+    fn undo_inserts(&mut self, applied: Vec<(Option<u32>, IdTriple)>) {
+        for (graph, id) in applied.into_iter().rev() {
+            match graph {
+                None => self.remove_default_id(id),
+                Some(gid) => self.remove_named_id(gid, id),
+            };
+        }
     }
 
     /// Convenience: parse + ensure a SELECT result.
