@@ -830,6 +830,7 @@ impl ApiInner {
     pub(crate) fn weak_self(&self) -> Option<Weak<ApiInner>> {
         self.self_ref.get().cloned()
     }
+
     /// Whether a write must be saved before it is acknowledged: the
     /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
     pub(crate) fn save_writes(&self) -> bool {

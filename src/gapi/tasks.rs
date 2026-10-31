@@ -756,10 +756,7 @@ impl TaskManager {
     pub fn result(&self, id: u64) -> Option<TaskResult> {
         let (files, out) = {
             let mut st = self.shared.lock();
-            (
-                st.prune(),
-                st.tasks.get(&id).and_then(|r| r.result.clone()),
-            )
+            (st.prune(), st.tasks.get(&id).and_then(|r| r.result.clone()))
         };
         remove_files(files);
         out
@@ -1055,9 +1052,7 @@ fn deliver_callback(url: &str, body: &[u8], config: &TaskConfig) -> String {
             std::thread::sleep(backoff.min(Duration::from_secs(5)));
         }
         match http_client::post_with(url, "application/json", body, &opts) {
-            Ok(reply) if reply.status < 500 => {
-                return format!("delivered (HTTP {})", reply.status)
-            }
+            Ok(reply) if reply.status < 500 => return format!("delivered (HTTP {})", reply.status),
             Ok(reply) => last = format!("HTTP {}", reply.status),
             Err(e) => last = e.to_string(),
         }
@@ -1196,10 +1191,16 @@ mod tests {
         let after = now_ms();
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
         for &id in &ids {
-            assert_eq!((id >> SEQUENCE_BITS) & ((1 << WORKER_ID_BITS) - 1), WORKER_ID);
+            assert_eq!(
+                (id >> SEQUENCE_BITS) & ((1 << WORKER_ID_BITS) - 1),
+                WORKER_ID
+            );
             let t = opt_id_time_ms(id);
             // (5000 ids may run past the clock by a millisecond.)
-            assert!(t >= before && t <= after + 2, "{t} not in {before}..{after}");
+            assert!(
+                t >= before && t <= after + 2,
+                "{t} not in {before}..{after}"
+            );
         }
         assert_eq!(parse_opt_id(&format!(" {} ", ids[0])), Some(ids[0]));
         assert_eq!(parse_opt_id("x"), None);
@@ -1239,7 +1240,10 @@ mod tests {
         assert!(m.get(b).is_some() && m.get(c).is_some() && m.get(d).is_some());
         assert_eq!(m.running().len(), 1);
         assert!(m.cancel_flag(d).is_some());
-        assert!(m.cancel_flag(b).is_none(), "only running tasks have a live flag");
+        assert!(
+            m.cancel_flag(b).is_none(),
+            "only running tasks have a live flag"
+        );
         assert_eq!(m.request_cancel(12345), CancelOutcome::NotFound);
         // Finishing twice, or an unknown id, is harmless.
         m.finish(a, Some(true));
@@ -1284,7 +1288,10 @@ mod tests {
             Some(id.to_string().as_str())
         );
         assert!(m.wait_async_idle(Duration::from_secs(5)));
-        assert!(current().is_none(), "the caller's thread has no current task");
+        assert!(
+            current().is_none(),
+            "the caller's thread has no current task"
+        );
     }
 
     #[test]
@@ -1320,7 +1327,10 @@ mod tests {
             )
             .unwrap();
         let queued = m
-            .submit(spec(), Box::new(|_| unreachable!("cancelled before it ran")))
+            .submit(
+                spec(),
+                Box::new(|_| unreachable!("cancelled before it ran")),
+            )
             .unwrap();
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(m.get(long).unwrap().state, TaskState::Running);
@@ -1370,7 +1380,10 @@ mod tests {
             .unwrap();
         assert_eq!(wait_state(&m, id), TaskState::Succeeded);
         let info = m.get(id).unwrap();
-        assert_eq!((info.db_name.as_str(), info.sparql.as_str()), ("db1", "SELECT * {}"));
+        assert_eq!(
+            (info.db_name.as_str(), info.sparql.as_str()),
+            ("db1", "SELECT * {}")
+        );
         assert_eq!(m.list().len(), 1, "no second task was created");
     }
 
@@ -1398,19 +1411,32 @@ mod tests {
         let file = dir.join(format!("{q}.json"));
         assert_eq!(m.result(q), Some(TaskResult::File(file.clone())));
         assert_eq!(m.get(q).unwrap().result_file, Some(file.clone()));
-        assert_eq!(m.get(q).unwrap().success_num, 3, "AnsNum counts as success_num");
+        assert_eq!(
+            m.get(q).unwrap().success_num,
+            3,
+            "AnsNum counts as success_num"
+        );
         let loaded = m.result(q).unwrap().load().unwrap();
         assert_eq!(loaded.get("AnsNum").and_then(Json::as_i64), Some(3));
         // A small non-query result stays in memory; a big one spills.
         let small = m
-            .submit(spec("load"), Box::new(|_| Json::obj().with("StatusMsg", "ok")))
+            .submit(
+                spec("load"),
+                Box::new(|_| Json::obj().with("StatusMsg", "ok")),
+            )
             .unwrap();
         assert_eq!(wait_state(&m, small), TaskState::Succeeded);
         assert!(matches!(m.result(small), Some(TaskResult::Json(_))));
-        assert!(m.get(q).is_none(), "max_finished = 1 dropped the older result");
+        assert!(
+            m.get(q).is_none(),
+            "max_finished = 1 dropped the older result"
+        );
         assert!(!file.exists(), "and removed its file");
         let big = m
-            .submit(spec("load"), Box::new(|_| Json::obj().with("x", "y".repeat(100))))
+            .submit(
+                spec("load"),
+                Box::new(|_| Json::obj().with("x", "y".repeat(100))),
+            )
             .unwrap();
         assert_eq!(wait_state(&m, big), TaskState::Succeeded);
         assert!(matches!(m.result(big), Some(TaskResult::File(_))));
@@ -1432,7 +1458,11 @@ mod tests {
         let (running, _) = m.register("query", "", "", "u");
         std::thread::sleep(Duration::from_millis(80));
         let listed: Vec<u64> = m.list().iter().map(|t| t.opt_id).collect();
-        assert_eq!(listed, vec![running], "finished tasks expired, the running one stays");
+        assert_eq!(
+            listed,
+            vec![running],
+            "finished tasks expired, the running one stays"
+        );
     }
 
     #[test]
@@ -1456,7 +1486,9 @@ mod tests {
         while m.shared.lock().active == 0 {
             std::thread::sleep(Duration::from_millis(2));
         }
-        let second = m.submit(TaskSpec::default(), Box::new(|_| Json::obj())).unwrap();
+        let second = m
+            .submit(TaskSpec::default(), Box::new(|_| Json::obj()))
+            .unwrap();
         let err = m
             .submit(TaskSpec::default(), Box::new(|_| Json::obj()))
             .unwrap_err();
@@ -1496,12 +1528,22 @@ mod tests {
                 Box::new(|_| Json::obj()),
             )
             .unwrap();
-        assert_eq!(m.get(id).unwrap().callback_status.as_deref(), Some("pending"));
+        assert_eq!(
+            m.get(id).unwrap().callback_status.as_deref(),
+            Some("pending")
+        );
         assert!(m.wait_async_idle(Duration::from_secs(10)));
         let info = m.get(id).unwrap();
-        assert_eq!(info.state, TaskState::Succeeded, "a failed callback does not fail the task");
+        assert_eq!(
+            info.state,
+            TaskState::Succeeded,
+            "a failed callback does not fail the task"
+        );
         assert!(
-            info.callback_status.as_deref().unwrap().starts_with("failed:"),
+            info.callback_status
+                .as_deref()
+                .unwrap()
+                .starts_with("failed:"),
             "{:?}",
             info.callback_status
         );

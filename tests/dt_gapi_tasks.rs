@@ -130,7 +130,9 @@ fn api(addr: &SocketAddr, pairs: &[(&str, &str)]) -> Json {
 }
 
 fn code(j: &Json) -> i64 {
-    j.get("StatusCode").and_then(Json::as_i64).expect("StatusCode")
+    j.get("StatusCode")
+        .and_then(Json::as_i64)
+        .expect("StatusCode")
 }
 
 fn msg(j: &Json) -> String {
@@ -152,7 +154,10 @@ fn opt_id_of(j: &Json) -> String {
         .and_then(Json::as_str)
         .unwrap_or_else(|| panic!("no opt_id string in {j}"))
         .to_string();
-    assert!(id.parse::<u64>().is_ok(), "opt_id {id:?} is a decimal number");
+    assert!(
+        id.parse::<u64>().is_ok(),
+        "opt_id {id:?} is a decimal number"
+    );
     id
 }
 
@@ -261,7 +266,10 @@ fn wait_running_query(addr: &SocketAddr) -> String {
         {
             return t.get("opt_id").and_then(Json::as_str).unwrap().to_string();
         }
-        assert!(Instant::now() < until, "the query never showed up as running");
+        assert!(
+            Instant::now() < until,
+            "the query never showed up as running"
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -287,8 +295,15 @@ fn async_test_operation_lifecycle() {
             .with("success_num", 5)
             .with("failed_num", 2),
     );
-    assert!(started.elapsed() < Duration::from_millis(2500), "answered at once");
-    assert_eq!((code(&j), msg(&j)), (0, "Operation Success.".to_string()), "{j}");
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "answered at once"
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "Operation Success.".to_string()),
+        "{j}"
+    );
     let opt_id = opt_id_of(&j);
     let id: u64 = opt_id.parse().unwrap();
     // The upstream id layout: a millisecond timestamp since 2024-03-12.
@@ -300,7 +315,10 @@ fn async_test_operation_lifecycle() {
     assert!(t <= now + 5 && now - t < 60_000, "{t} vs {now}");
 
     // While it runs: state 0 with its progress (or the initial message).
-    let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", &opt_id)]);
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &opt_id)],
+    );
     assert_eq!((code(&j), int(&j, "state")), (0, 0), "{j}");
     assert!(
         ["test operation running", "Operation success"].contains(&msg(&j).as_str()),
@@ -311,13 +329,20 @@ fn async_test_operation_lifecycle() {
         .iter()
         .find(|t| t.get("opt_id").and_then(Json::as_str) == Some(opt_id.as_str()))
         .unwrap_or_else(|| panic!("{opt_id} not in {listed:?}"));
-    assert_eq!(item.get("operation").and_then(Json::as_str), Some("__asyncTest"));
+    assert_eq!(
+        item.get("operation").and_then(Json::as_str),
+        Some("__asyncTest")
+    );
     assert_eq!(int(item, "async"), 1);
     assert_eq!(int(item, "status"), 0);
     assert_eq!(int(item, "endTime"), 0);
     // REST /tasklist lists it as well.
     let r = rest(&addr, "GET", "/tasklist", "");
-    assert!(r.body.contains(&format!("\"opt_id\":\"{opt_id}\"")), "{}", r.body);
+    assert!(
+        r.body.contains(&format!("\"opt_id\":\"{opt_id}\"")),
+        "{}",
+        r.body
+    );
 
     // Done: state 1, the final message and the counts.
     let j = wait_done(&addr, &opt_id);
@@ -329,7 +354,10 @@ fn async_test_operation_lifecycle() {
     assert!(info.end_ms >= info.start_ms + 2900, "{info:?}");
     assert_eq!(info.user, "root");
     // The finished operation is listed under status 1, not 0.
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "1")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "1")],
+    );
     let list = j.get("list").and_then(Json::as_array).unwrap();
     let item = list
         .iter()
@@ -350,17 +378,28 @@ fn check_operation_state_answers_failures_and_errors() {
     assert_eq!(code(&j), 1005);
     assert_eq!(msg(&j), "the value of opt_id can not be empty!");
     for bad in ["123456789", "not-a-number"] {
-        let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", bad)]);
+        let j = api(
+            &addr,
+            &[("operation", "checkOperationState"), ("opt_id", bad)],
+        );
         assert_eq!((code(&j), msg(&j)), (1005, "opt_id not found.".to_string()));
     }
     // A failing and a panicking operation: state -1 with their message.
     let failing = opt_id_of(&api(
         &addr,
-        &[("operation", "__asyncTest"), ("async", "true"), ("fail", "1")],
+        &[
+            ("operation", "__asyncTest"),
+            ("async", "true"),
+            ("fail", "1"),
+        ],
     ));
     let panicking = opt_id_of(&api(
         &addr,
-        &[("operation", "__asyncTest"), ("async", "1"), ("panic", "true")],
+        &[
+            ("operation", "__asyncTest"),
+            ("async", "1"),
+            ("panic", "true"),
+        ],
     ));
     let j = wait_done(&addr, &failing);
     assert_eq!((code(&j), int(&j, "state")), (0, -1), "{j}");
@@ -369,7 +408,10 @@ fn check_operation_state_answers_failures_and_errors() {
     assert_eq!(int(&j, "state"), -1, "{j}");
     assert!(msg(&j).contains("panicked"), "{j}");
     // The server and its runners survive: another operation succeeds.
-    let ok = opt_id_of(&api(&addr, &[("operation", "__asyncTest"), ("async", "true")]));
+    let ok = opt_id_of(&api(
+        &addr,
+        &[("operation", "__asyncTest"), ("async", "true")],
+    ));
     assert_eq!(int(&wait_done(&addr, &ok), "state"), 1);
     // async on an operation without asynchronous support is ignored.
     let j = api(&addr, &[("operation", "testConnect"), ("async", "true")]);
@@ -405,11 +447,18 @@ fn async_query_result_is_fetched_with_check_operation_state() {
         &[
             ("operation", "query"),
             ("db_name", "aqdb"),
-            ("sparql", "SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY ?s"),
+            (
+                "sparql",
+                "SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY ?s",
+            ),
             ("async", "true"),
         ],
     );
-    assert_eq!((code(&j), msg(&j)), (0, "Operation Success.".to_string()), "{j}");
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "Operation Success.".to_string()),
+        "{j}"
+    );
     assert!(j.get("results").is_none(), "only the opt_id at first: {j}");
     let opt_id = opt_id_of(&j);
     // Finished: upstream answers the query result itself, plus "state": 1.
@@ -427,7 +476,10 @@ fn async_query_result_is_fetched_with_check_operation_state() {
     let file = root.join("export").join(format!("{opt_id}.json"));
     let saved = json::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(saved.get("AnsNum").and_then(Json::as_i64), Some(3));
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "1")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "1")],
+    );
     let item = j
         .get("list")
         .and_then(Json::as_array)
@@ -461,8 +513,14 @@ fn async_query_result_is_fetched_with_check_operation_state() {
     assert!(!msg(&j).is_empty());
     // The result file gone: upstream's read error.
     std::fs::remove_file(&file).unwrap();
-    let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", &opt_id)]);
-    assert_eq!((code(&j), msg(&j)), (9, "Read result file failed.".to_string()));
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (9, "Read result file failed.".to_string())
+    );
 }
 
 /// Accept one HTTP request on `listener`, answer `status`, and send the
@@ -526,16 +584,25 @@ fn callback_receives_the_result_and_failures_are_tolerated() {
         "{head}"
     );
     let pushed = json::parse(&body).unwrap();
-    assert_eq!(pushed.get("opt_id").and_then(Json::as_str), Some(opt_id.as_str()));
+    assert_eq!(
+        pushed.get("opt_id").and_then(Json::as_str),
+        Some(opt_id.as_str())
+    );
     assert_eq!(code(&pushed), 0);
     assert_eq!(msg(&pushed), "test operation done");
     assert_eq!(int(&pushed, "success_num"), 9);
     // By the time the callback arrives the state already reads finished.
-    let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", &opt_id)]);
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &opt_id)],
+    );
     assert_eq!(int(&j, "state"), 1, "{j}");
     srv.task_manager().wait_async_idle(Duration::from_secs(10));
     let info = srv.task_manager().get(opt_id.parse().unwrap()).unwrap();
-    assert_eq!(info.callback_status.as_deref(), Some("delivered (HTTP 200)"));
+    assert_eq!(
+        info.callback_status.as_deref(),
+        Some("delivered (HTTP 200)")
+    );
 
     // An unreachable callback does not fail the operation.
     let dead_port = {
@@ -555,7 +622,10 @@ fn callback_receives_the_result_and_failures_are_tolerated() {
     assert!(srv.task_manager().wait_async_idle(Duration::from_secs(30)));
     let info = srv.task_manager().get(dead.parse().unwrap()).unwrap();
     assert!(
-        info.callback_status.as_deref().unwrap().starts_with("failed:"),
+        info.callback_status
+            .as_deref()
+            .unwrap()
+            .starts_with("failed:"),
         "{info:?}"
     );
     // A failed operation is pushed too (an HTTP error answer is tolerated).
@@ -574,8 +644,14 @@ fn callback_receives_the_result_and_failures_are_tolerated() {
     let failed = opt_id_of(&j);
     let (_, body) = got.recv_timeout(Duration::from_secs(30)).unwrap();
     let pushed = json::parse(&body).unwrap();
-    assert_eq!((code(&pushed), msg(&pushed)), (1005, "test operation failed".to_string()));
-    assert_eq!(pushed.get("opt_id").and_then(Json::as_str), Some(failed.as_str()));
+    assert_eq!(
+        (code(&pushed), msg(&pushed)),
+        (1005, "test operation failed".to_string())
+    );
+    assert_eq!(
+        pushed.get("opt_id").and_then(Json::as_str),
+        Some(failed.as_str())
+    );
     assert!(srv.task_manager().wait_async_idle(Duration::from_secs(30)));
     let info = srv.task_manager().get(failed.parse().unwrap()).unwrap();
     assert_eq!(info.callback_status.as_deref(), Some("failed: HTTP 500"));
@@ -589,7 +665,11 @@ fn a_running_query_is_cancelled_through_the_upstream_operation() {
     let query = thread::spawn(move || {
         api(
             &addr_q,
-            &[("operation", "query"), ("db_name", "slow"), ("sparql", SLOW)],
+            &[
+                ("operation", "query"),
+                ("db_name", "slow"),
+                ("sparql", SLOW),
+            ],
         )
     });
     let opt_id = wait_running_query(&addr);
@@ -601,18 +681,37 @@ fn a_running_query_is_cancelled_through_the_upstream_operation() {
     assert_eq!(item.get("database").and_then(Json::as_str), Some("slow"));
     assert_eq!(item.get("sparql").and_then(Json::as_str), Some(SLOW));
     // A synchronous statement has no checkOperationState record (upstream).
-    let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", &opt_id)]);
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &opt_id)],
+    );
     assert_eq!(code(&j), 1005);
 
-    let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)]);
-    assert_eq!((code(&j), msg(&j)), (0, "query cancel successfully".to_string()), "{j}");
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "query cancel successfully".to_string()),
+        "{j}"
+    );
     let answer = query.join().unwrap();
     assert_ne!(code(&answer), 0, "the cancelled query fails: {answer}");
     assert!(msg(&answer).to_lowercase().contains("cancel"), "{answer}");
     // Upstream's answers for a task that is no longer running.
-    let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)]);
-    assert_eq!((code(&j), msg(&j)), (1005, "task already cancel".to_string()));
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "-1")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (1005, "task already cancel".to_string())
+    );
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "-1")],
+    );
     assert!(j
         .get("list")
         .and_then(Json::as_array)
@@ -620,24 +719,40 @@ fn a_running_query_is_cancelled_through_the_upstream_operation() {
         .iter()
         .any(|t| t.get("opt_id").and_then(Json::as_str) == Some(opt_id.as_str())));
     assert_eq!(
-        srv.task_manager().get(opt_id.parse().unwrap()).unwrap().state,
+        srv.task_manager()
+            .get(opt_id.parse().unwrap())
+            .unwrap()
+            .state,
         TaskState::Cancelled
     );
     for bad in ["", "999", "abc"] {
-        let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", bad)]);
+        let j = api(
+            &addr,
+            &[("operation", "operationTaskCancel"), ("opt_id", bad)],
+        );
         assert_eq!(code(&j), 1005, "{bad:?}: {j}");
     }
     // A finished query: "task already finish".
     let j = api(
         &addr,
-        &[("operation", "query"), ("db_name", "slow"), ("sparql", "ASK { ?s ?p ?o }")],
+        &[
+            ("operation", "query"),
+            ("db_name", "slow"),
+            ("sparql", "ASK { ?s ?p ?o }"),
+        ],
     );
     assert_eq!(code(&j), 0, "{j}");
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "1")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "1")],
+    );
     let done = j.get("list").and_then(Json::as_array).unwrap();
     let last = done.last().expect("the ASK is in the history");
     let last_id = last.get("opt_id").and_then(Json::as_str).unwrap();
-    let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", last_id)]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", last_id)],
+    );
     assert_eq!(
         (code(&j), msg(&j)),
         (1005, "task already finish, do not cancel".to_string())
@@ -653,7 +768,11 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
     let query = thread::spawn(move || {
         api(
             &addr_q,
-            &[("operation", "query"), ("db_name", "slow"), ("sparql", SLOW)],
+            &[
+                ("operation", "query"),
+                ("db_name", "slow"),
+                ("sparql", SLOW),
+            ],
         )
     });
     let opt_id = wait_running_query(&addr);
@@ -670,7 +789,10 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
     let addr_q = addr;
     let query = thread::spawn(move || rest(&addr_q, "POST", "/sparql?db_name=slow", SLOW));
     let opt_id = wait_running_query(&addr);
-    let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
     assert_eq!(code(&j), 0, "{j}");
     let r = query.join().unwrap();
     assert_eq!(r.status, 400, "{}", r.body);
@@ -687,12 +809,23 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
         ],
     );
     let opt_id = opt_id_of(&j);
-    assert_eq!(wait_running_query(&addr), opt_id, "the statement runs under the operation's id");
+    assert_eq!(
+        wait_running_query(&addr),
+        opt_id,
+        "the statement runs under the operation's id"
+    );
     let running = running_tasks_as(&addr, "root");
     assert_eq!(running.len(), 1, "{running:?}");
     assert_eq!(int(&running[0], "async"), 1);
-    let j = api(&addr, &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)]);
-    assert_eq!((code(&j), msg(&j)), (0, "query cancel successfully".to_string()), "{j}");
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "query cancel successfully".to_string()),
+        "{j}"
+    );
     let j = wait_done(&addr, &opt_id);
     assert_eq!(int(&j, "state"), -1, "{j}");
     assert!(msg(&j).to_lowercase().contains("cancel"), "{j}");
@@ -727,7 +860,11 @@ fn users_see_and_cancel_only_their_own_tasks() {
     };
     assert_eq!(ids("alice"), vec![opt_id.clone()]);
     assert!(ids("bob").is_empty(), "bob does not see alice's task");
-    assert_eq!(ids("admin2"), vec![opt_id.clone()], "an admin sees every task");
+    assert_eq!(
+        ids("admin2"),
+        vec![opt_id.clone()],
+        "an admin sees every task"
+    );
     // bob can neither read nor cancel it.
     let j = api_as(
         &addr,
@@ -760,7 +897,11 @@ fn users_see_and_cancel_only_their_own_tasks() {
     // The test operation stays root-only.
     let j = api_as(&addr, "admin2", &[("operation", "__asyncTest")]);
     assert_eq!(code(&j), 0, "{j}");
-    let j = api_as(&addr, "alice", &[("operation", "__asyncTest"), ("async", "true")]);
+    let j = api_as(
+        &addr,
+        "alice",
+        &[("operation", "__asyncTest"), ("async", "true")],
+    );
     assert_eq!(code(&j), 1004, "{j}");
 }
 
@@ -787,7 +928,12 @@ fn the_task_list_pages_like_upstream() {
     let j = page("2", "2");
     assert_eq!(code(&j), 0, "{j}");
     assert_eq!(
-        (int(&j, "pageNo"), int(&j, "pageSize"), int(&j, "totalPage"), int(&j, "totalSize")),
+        (
+            int(&j, "pageNo"),
+            int(&j, "pageSize"),
+            int(&j, "totalPage"),
+            int(&j, "totalSize")
+        ),
         (2, 2, 3, 5)
     );
     let got: Vec<&str> = j
@@ -797,24 +943,40 @@ fn the_task_list_pages_like_upstream() {
         .iter()
         .map(|t| t.get("opt_id").and_then(Json::as_str).unwrap())
         .collect();
-    assert_eq!(got, vec![ids[2].as_str(), ids[3].as_str()], "ordered by opt_id");
+    assert_eq!(
+        got,
+        vec![ids[2].as_str(), ids[3].as_str()],
+        "ordered by opt_id"
+    );
     // Defaults: page 1 of 10; status 0 (running) by default; any other
     // status lists everything.
     let j = page("", "");
     assert_eq!((int(&j, "pageNo"), int(&j, "pageSize")), (1, 10));
     let j = api(&addr, &[("operation", "operationTaskList")]);
     assert_eq!(int(&j, "totalSize"), 0, "nothing running: {j}");
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "2")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "2")],
+    );
     assert_eq!(int(&j, "totalSize"), 5);
     let j = page("x", "2");
     assert_eq!(code(&j), 1003, "{j}");
     // Upstream field types.
-    let item = j_first(&api(&addr, &[("operation", "operationTaskList"), ("status", "9")]));
+    let item = j_first(&api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "9")],
+    ));
     for key in ["opt_id", "operation", "database", "sparql", "resultFile"] {
-        assert!(item.get(key).and_then(Json::as_str).is_some(), "{key}: {item}");
+        assert!(
+            item.get(key).and_then(Json::as_str).is_some(),
+            "{key}: {item}"
+        );
     }
     for key in ["async", "status", "startTime", "endTime", "queryTime"] {
-        assert!(item.get(key).and_then(Json::as_i64).is_some(), "{key}: {item}");
+        assert!(
+            item.get(key).and_then(Json::as_i64).is_some(),
+            "{key}: {item}"
+        );
     }
 }
 
@@ -839,14 +1001,20 @@ fn finished_results_are_retained_within_bounds() {
         ids.push(id);
     }
     for (i, id) in ids.iter().enumerate() {
-        let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", id)]);
+        let j = api(
+            &addr,
+            &[("operation", "checkOperationState"), ("opt_id", id)],
+        );
         if i < 2 {
             assert_eq!(msg(&j), "opt_id not found.", "{i}: {j}");
         } else {
             assert_eq!(int(&j, "state"), 1, "{i}: {j}");
         }
     }
-    let j = api(&addr, &[("operation", "operationTaskList"), ("status", "1")]);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskList"), ("status", "1")],
+    );
     assert_eq!(int(&j, "totalSize"), 2, "{j}");
 
     // And for a limited time.
@@ -857,10 +1025,16 @@ fn finished_results_are_retained_within_bounds() {
             ..TaskConfig::default()
         },
     );
-    let id = opt_id_of(&api(&addr, &[("operation", "__asyncTest"), ("async", "true")]));
+    let id = opt_id_of(&api(
+        &addr,
+        &[("operation", "__asyncTest"), ("async", "true")],
+    ));
     assert_eq!(int(&wait_done(&addr, &id), "state"), 1);
     thread::sleep(Duration::from_millis(400));
-    let j = api(&addr, &[("operation", "checkOperationState"), ("opt_id", &id)]);
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &id)],
+    );
     assert_eq!(msg(&j), "opt_id not found.", "{j}");
 }
 
@@ -878,7 +1052,11 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
     // One operation that stops when cancelled, one that ignores it.
     let polite = opt_id_of(&api(
         &addr,
-        &[("operation", "__asyncTest"), ("async", "true"), ("sleep_ms", "60000")],
+        &[
+            ("operation", "__asyncTest"),
+            ("async", "true"),
+            ("sleep_ms", "60000"),
+        ],
     ));
     let stubborn = opt_id_of(&api(
         &addr,
@@ -892,7 +1070,11 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
     // Wait until both have started (they report progress first thing).
     let until = Instant::now() + Duration::from_secs(30);
     for id in [&polite, &stubborn] {
-        while srv.task_manager().get(id.parse().unwrap()).unwrap().status_msg
+        while srv
+            .task_manager()
+            .get(id.parse().unwrap())
+            .unwrap()
+            .status_msg
             != "test operation running"
         {
             assert!(Instant::now() < until, "operation {id} never started");
@@ -912,7 +1094,11 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
     assert_eq!(info.state, TaskState::Cancelled, "{info:?}");
     assert!(info.cancel_requested);
     let info = tm.get(stubborn.parse().unwrap()).unwrap();
-    assert_eq!(info.state, TaskState::Running, "still running past the bound: {info:?} after {took:?}");
+    assert_eq!(
+        info.state,
+        TaskState::Running,
+        "still running past the bound: {info:?} after {took:?}"
+    );
     assert!(info.cancel_requested);
     // No new asynchronous operation once shut down.
     let err = tm
@@ -984,7 +1170,8 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let (sock, _) = listener.accept().unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let conn = rustls::ServerConnection::new(tls_config).unwrap();
         let mut tls = rustls::StreamOwned::new(conn, sock);
         let mut req = Vec::new();
@@ -1020,10 +1207,16 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
     assert!(req.starts_with("POST /secure-hook HTTP/1.1\r\n"), "{req}");
     let body = req.split_once("\r\n\r\n").unwrap().1;
     let pushed = json::parse(body).unwrap();
-    assert_eq!(pushed.get("opt_id").and_then(Json::as_str), Some(opt_id.as_str()));
+    assert_eq!(
+        pushed.get("opt_id").and_then(Json::as_str),
+        Some(opt_id.as_str())
+    );
     assert!(srv.task_manager().wait_async_idle(Duration::from_secs(30)));
     let info = srv.task_manager().get(opt_id.parse().unwrap()).unwrap();
-    assert_eq!(info.callback_status.as_deref(), Some("delivered (HTTP 200)"));
+    assert_eq!(
+        info.callback_status.as_deref(),
+        Some("delivered (HTTP 200)")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

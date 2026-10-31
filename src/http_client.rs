@@ -344,7 +344,12 @@ fn read_to_eof<S: Read>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Err(timed_out())
             }
             // A TLS peer that closes without `close_notify` after sending its
@@ -947,7 +952,10 @@ mod tests {
         assert!(!reply.is_success());
         let req = server.join().unwrap();
         assert!(req.starts_with("POST /hook?k=v HTTP/1.1\r\n"), "{req}");
-        assert!(req.contains("\r\nContent-Type: application/json\r\n"), "{req}");
+        assert!(
+            req.contains("\r\nContent-Type: application/json\r\n"),
+            "{req}"
+        );
         assert!(req.contains("\r\nContent-Length: 15\r\n"), "{req}");
         assert!(req.contains("\r\nHost: 127.0.0.1:"), "{req}");
     }
@@ -1055,7 +1063,10 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
         assert!(post_with(&url, "application/json", br#"{"x":1}"#, &opts).is_err());
         let seen = server.join().unwrap();
         assert!(seen[0].starts_with("POST /secure HTTP/1.1\r\n"), "{seen:?}");
-        assert!(seen[1].is_empty(), "nothing is sent to an unverified server");
+        assert!(
+            seen[1].is_empty(),
+            "nothing is sent to an unverified server"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1074,7 +1085,8 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             },
             ..PostOptions::default()
         };
-        assert!(post_with(&format!("http://127.0.0.1:{port}/"), "text/plain", b"x", &opts).is_err());
+        let url = format!("http://127.0.0.1:{port}/");
+        assert!(post_with(&url, "text/plain", b"x", &opts).is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
