@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
-use crate::model::id::PredId;
+use crate::model::id::{is_entity_id, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
 use crate::store::{MutableStore, TripleSource};
@@ -196,11 +196,17 @@ fn gather<S: TripleSource>(
     }
 
     // --- range: (p range c), (x p y) ⇒ (y a c) ---
+    // Only for an entity `y`: a literal object (`x p "lit"`) cannot be the
+    // subject of a triple, so `"lit" a c` is never inferred (RDFS leaves that
+    // entailment to a generalized-RDF reasoner; an RDF store has no such
+    // triple).
     if let (Some(rng), Some(tp)) = (rng_p, type_p) {
         for (p_ent, c) in store.so_by_p(rng) {
             if let Some(p_pred) = ent_to_pred(dict, p_ent) {
                 for (_x, y) in store.so_by_p(p_pred) {
-                    new.push(IdTriple::new(y, tp, c));
+                    if is_entity_id(y) {
+                        new.push(IdTriple::new(y, tp, c));
+                    }
                 }
             }
         }
@@ -802,6 +808,35 @@ mod tests {
         let added = materialize(&mut d, &mut s);
         assert!(!added.is_empty());
         assert!(s.exists(alice, parent_p, bob)); // mother ⊑ₚ parent
+    }
+
+    /// Regression: `p range c` with `x p "lit"` used to infer `"lit" a c` — a
+    /// triple whose subject is a literal. Only entity objects are typed.
+    #[test]
+    fn range_never_types_a_literal_object() {
+        let mut d = Dictionary::new();
+        let typ = pred(&mut d, RDF_TYPE);
+        let rng = pred(&mut d, RDFS_RANGE);
+        let name_p = pred(&mut d, "name");
+        let name_e = ent(&mut d, "name");
+        let label = ent(&mut d, "Label");
+        let alice = ent(&mut d, "alice");
+        let bob = ent(&mut d, "bob");
+        let lit = d.intern_literal(&Term::plain_literal("Alice").dict_key());
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(name_e, rng, label));
+        s.insert(IdTriple::new(alice, name_p, lit));
+        s.insert(IdTriple::new(alice, name_p, bob));
+
+        let added = materialize(&mut d, &mut s);
+        assert!(!s.exists(lit, typ, label), "a literal was typed");
+        assert!(
+            added.iter().all(|t| is_entity_id(t.sub)),
+            "inferred a literal subject: {added:?}"
+        );
+        // The entity object is still typed.
+        assert!(s.exists(bob, typ, label));
+        assert_eq!(added.len(), 1);
     }
 
     #[test]
