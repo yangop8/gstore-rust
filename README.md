@@ -25,7 +25,7 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **1,700+ tests pass** across the workspace (incl. 142 for gNLQA), among them
+* **About 1,700 tests pass** across the workspace (incl. 142 for gNLQA), among them
   ports of upstream gStore's own test scripts; `cargo clippy --workspace
   --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
   planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
