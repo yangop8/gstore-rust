@@ -9,6 +9,11 @@
 //! (and is then migrated) by a plaintext request, and an `encryption=1`
 //! request against it is refused with `1001` and a message saying so.
 //!
+//! [`verify`] is the **single credential check** of the server's upstream
+//! protocol: [`authenticate`] (every authenticated operation) and the
+//! lifecycle path routes `/shutdown` / `/restart` (see `ops_lifecycle`, which
+//! also accept the per-run `system` user) both go through it.
+//!
 //! Privileges use the server's existing **global** privilege model
 //! ([`crate::http_users::Privilege`]) through the one function
 //! [`check_privilege`], which maps each operation to the privilege upstream's
@@ -20,6 +25,8 @@ use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{Ctx, SYSTEM_DB};
 use crate::http_users::{CredentialCheck, PasswordForm, Privilege, ROOT_USER};
+use crate::query::hash::md5_hex;
+use crate::server::{ct_eq, Request};
 
 /// Which of upstream's two IP checks is being made (`check_access_ip` stage
 /// `1`: every request; stage `2`: every operation but `login` /
@@ -47,41 +54,118 @@ pub fn note_auth_failure(_ctx: &Ctx<'_>) {}
 /// `login` (upstream `reset_access_ip_error_num`); a hook, a no-op here.
 pub fn note_login_success(_ctx: &Ctx<'_>) {}
 
+/// The credentials a request presents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+    /// `encryption=1`: [`password`](Self::password) is the password's
+    /// lowercase hex MD5 digest.
+    pub md5: bool,
+    /// Upstream's `inner=true` (honoured only with
+    /// [`GapiConfig::trust_inner_localhost`](super::GapiConfig)).
+    pub inner: bool,
+}
+
+impl Credentials {
+    /// `username`, `password`, `encryption` and `inner` from the request
+    /// parameters (absent values are empty / off).
+    pub fn from_params(params: &Params) -> Credentials {
+        Credentials {
+            username: params.str("username").unwrap_or_default(),
+            password: params.str("password").unwrap_or_default(),
+            md5: params.str("encryption").as_deref().map(str::trim) == Some("1"),
+            inner: params.bool("inner", false),
+        }
+    }
+
+    /// [`from_params`](Self::from_params), each of `username`, `password` and
+    /// `encryption` falling back to a request header of the same name when
+    /// the parameters lack it: upstream's `/shutdown` reads its credentials
+    /// from headers (and its docs say parameters — both work).
+    pub(crate) fn from_params_or_headers(params: &Params, req: &Request) -> Credentials {
+        let get = |key: &str| {
+            params
+                .str(key)
+                .or_else(|| req.header(key).map(str::to_string))
+        };
+        Credentials {
+            username: get("username").unwrap_or_default(),
+            password: get("password").unwrap_or_default(),
+            md5: get("encryption").as_deref().map(str::trim) == Some("1"),
+            inner: false,
+        }
+    }
+}
+
 /// Authenticate the request's `username` / `password` (`encryption=1`: the
 /// password's MD5 hex digest) and record the user in [`Ctx::user`].
 ///
 /// * either parameter missing (or the username empty) → `1003 "username or
 ///   password is empty"`;
-/// * unknown user or wrong password → `1001`;
-/// * `encryption=1` against an entry not yet migrated to the MD5-compatible
-///   format → `1001`, with a message asking for one plaintext login.
-///
-/// An upstream *inner* request (`inner=true` from `127.0.0.1`) skips the
-/// password check when [`GapiConfig::trust_inner_localhost`](super::GapiConfig)
-/// is on; the user must still exist.
+/// * otherwise [`verify`] (the system user is not accepted here).
 pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp> {
-    let (Some(username), Some(password)) = (params.str("username"), params.str("password")) else {
-        return Err(GResp::error(
-            Status::ParamIsIllegal,
-            "username or password is empty",
-        ));
-    };
-    if username.is_empty() {
+    if params.str("username").is_none() || params.str("password").is_none() {
         return Err(GResp::error(
             Status::ParamIsIllegal,
             "username or password is empty",
         ));
     }
+    let creds = Credentials::from_params(params);
+    if creds.username.is_empty() {
+        return Err(GResp::error(
+            Status::ParamIsIllegal,
+            "username or password is empty",
+        ));
+    }
+    verify(ctx, &creds, false)
+}
+
+/// The credential check: verify `creds` and record the user in
+/// [`Ctx::user`].
+///
+/// * with `accept_system`, `conf.ini`'s `system_username` with this run's
+///   system password (the one `gserver` writes to its pid file; with
+///   `encryption=1` its MD5 hex digest) is accepted — what upstream's
+///   `/shutdown` and `/restart` take;
+/// * an upstream *inner* request (`inner=true` from `127.0.0.1`) skips the
+///   password check when [`GapiConfig::trust_inner_localhost`](super::GapiConfig)
+///   is on; the user must still exist;
+/// * otherwise the user store: unknown user or wrong password → `1001`
+///   (recorded with [`note_auth_failure`]); `encryption=1` against an entry
+///   not yet migrated to the MD5-compatible format → `1001`, with a message
+///   asking for one plaintext login.
+pub fn verify(
+    ctx: &mut Ctx<'_>,
+    creds: &Credentials,
+    accept_system: bool,
+) -> Result<String, GResp> {
+    let username = creds.username.clone();
     let wrong = || {
         GResp::error(
             Status::AuthenticationFailed,
             "Username or password is wrong.",
         )
     };
-    if ctx.config.trust_inner_localhost
-        && params.bool("inner", false)
-        && ctx.remote_ip == "127.0.0.1"
-    {
+    if accept_system && username == ctx.inner.config().system_username {
+        let expected = ctx.inner.system_password();
+        let ok = !expected.is_empty()
+            && if creds.md5 {
+                ct_eq(
+                    creds.password.trim().to_ascii_lowercase().as_bytes(),
+                    md5_hex(expected).as_bytes(),
+                )
+            } else {
+                ct_eq(creds.password.as_bytes(), expected.as_bytes())
+            };
+        if ok {
+            ctx.user = Some(username.clone());
+            return Ok(username);
+        }
+        // Not the system password: fall through to the user store (where a
+        // user of that name, if any, is checked like any other).
+    }
+    if ctx.config.trust_inner_localhost && creds.inner && ctx.remote_ip == "127.0.0.1" {
         if !ctx.state().users.exists(&username) {
             return Err(wrong());
         }
@@ -89,7 +173,7 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
         ctx.user = Some(username.clone());
         return Ok(username);
     }
-    let form = if params.str("encryption").as_deref().map(str::trim) == Some("1") {
+    let form = if creds.md5 {
         PasswordForm::Md5Hex
     } else {
         PasswordForm::Plain
@@ -97,7 +181,10 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
     // The slow password hash runs with the state lock released (only the
     // lookup and the bookkeeping take it), so bad credentials cannot stall
     // other requests behind it.
-    let attempt = ctx.state().users.begin_check(&username, &password, form);
+    let attempt = ctx
+        .state()
+        .users
+        .begin_check(&username, &creds.password, form);
     let checked = attempt.verify();
     let outcome = ctx.state().users.finish_check(checked);
     match outcome {

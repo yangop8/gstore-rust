@@ -20,8 +20,9 @@
 //! * `POST /`;
 //! * `GET /?operation=…` — only with an `operation` parameter, so a plain
 //!   `GET /` still serves the web console;
-//! * the path routes operation packages register ([`Registry::add_path`],
-//!   e.g. upstream's `/shutdown`, `/file/upload`, `/file/download/*`).
+//! * the path routes operation packages register ([`Registry::add_path`]):
+//!   upstream's `/shutdown` and `/restart` (also under `/grpc/`; see
+//!   `ops_lifecycle`), and later `/file/upload`, `/file/download/*`.
 //!
 //! # Request flow
 //!
@@ -51,6 +52,7 @@
 
 pub mod auth;
 pub mod envelope;
+mod ops_lifecycle;
 mod ops_query;
 mod ops_sys;
 pub mod params;
@@ -318,6 +320,7 @@ pub fn registry() -> &'static Registry {
         let mut reg = Registry::default();
         ops_sys::register(&mut reg);
         ops_query::register(&mut reg);
+        ops_lifecycle::register(&mut reg);
         reg
     })
 }
@@ -530,5 +533,11 @@ mod tests {
         assert!(!wants(&req("PUT", "/api", None)));
         assert!(!wants(&req("POST", "/sparql", None)));
         assert!(!wants(&req("GET", "/console", None)));
+        // The lifecycle path routes (see `ops_lifecycle`).
+        for path in ["/shutdown", "/grpc/shutdown", "/restart", "/grpc/restart"] {
+            assert!(wants(&req("GET", path, None)), "{path}");
+            assert!(wants(&req("POST", path, None)), "{path}");
+            assert!(!wants(&req("DELETE", path, None)), "{path}");
+        }
     }
 }

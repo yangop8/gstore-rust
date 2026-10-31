@@ -29,7 +29,11 @@
 //!   `conf.ini`'s `db_home` (default `./dbhome/`) — gStore 1.4's gserver is
 //!   multi-database. Users/RBAC (user `root`, password `root_password`,
 //!   default `123456`), `/login`, `/build`, `/load`, `/upload`, transactions,
-//!   `/shutdown`, `/restart`, … and the web console at `/`.
+//!   … and the web console at `/`; also upstream's `/api` protocol
+//!   ([`gstore::gapi`]: `GET|POST /api` or `POST /` with `operation=…` and
+//!   per-request credentials, as the upstream SDKs send) with its `/shutdown`
+//!   and `/restart` routes. `conf.ini`'s `max_output_size` and `licensetype`
+//!   apply to it.
 //! - `--api DIR`: the same, rooted at `DIR` (the legacy spelling; `--api`
 //!   without a `DIR` roots at `.` unless `conf.ini` sets `db_home`).
 //! - `DIR` without `--api` (legacy): serve the single database in `DIR` over the
@@ -960,7 +964,8 @@ fn run_api(server: &ApiServer, root: &str, cli: &Cli) -> ShutdownReport {
                 match server.local_addr() {
                     Ok(a) => println!(
                         "gserver (API mode, TLS) on https://{a}  root={root}  user=root  \
-                         (web console at /, POST /login /sparql /update /upload …; see /status)"
+                         (upstream /api protocol at /api; web console at /, POST /login /sparql \
+                         /update /upload …; see /status)"
                     ),
                     Err(_) => println!("gserver (API mode, TLS)  root={root}"),
                 }
@@ -977,7 +982,8 @@ fn run_api(server: &ApiServer, root: &str, cli: &Cli) -> ShutdownReport {
     match server.local_addr() {
         Ok(a) => println!(
             "gserver (API mode) on http://{a}  root={root}  user=root  \
-             (web console at /, POST /login /sparql /update /upload …; see /status)"
+             (upstream /api protocol at /api; web console at /, POST /login /sparql /update \
+             /upload …; see /status)"
         ),
         Err(_) => println!("gserver (API mode)  root={root}"),
     }

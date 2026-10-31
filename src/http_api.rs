@@ -23,11 +23,16 @@
 //!   directly — no SPARQL text is ever built from user input.
 //! * **Logging & monitoring** — query / access / transaction logs and a live
 //!   `/monitor` (and `/status`) JSON snapshot.
-//! * **Server lifecycle** — upstream's `/shutdown` and `/restart` path routes
-//!   (root, or the `system` user with the per-run password `gserver` writes to
-//!   its pid file); see `ApiInner::handle_stop_route`. Connection handling
-//!   (worker pool, keep-alive, CORS, body cap) and `conf.ini` settings come from
-//!   [`ApiServer::with_config`] / [`ApiServer::with_http_options`].
+//! * **The upstream `/api` protocol** ([`crate::gapi`]) — `GET|POST /api`,
+//!   `POST /` and `GET /?operation=…` with per-request credentials and the
+//!   gStore JSON envelope, on the same state as the endpoints above; also
+//!   upstream's `/shutdown` and `/restart` path routes (root, or the `system`
+//!   user with the per-run password `gserver` writes to its pid file), checked
+//!   by the layer's one credential check (`gapi::auth::verify`).
+//! * **Configuration** — connection handling (worker pool, keep-alive, CORS,
+//!   body cap), the `check_point` policy, the `/api` output cap
+//!   (`max_output_size`) and `licensetype` come from `conf.ini` through
+//!   [`ApiServer::with_config`] / [`ApiServer::bind_with_config`].
 //!
 //! **Durability.** Each loaded database tracks whether it has unsaved changes.
 //! Under gStore's `check_point` policy (on by default,
@@ -121,10 +126,9 @@ use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
 use crate::model::{Term, Triple};
-use crate::query::hash::md5_hex;
 use crate::query::{Evaluator, QueryResult};
 use crate::server::{
-    ct_eq, err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
+    err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
     write_response_ext, write_response_maybe_gzip, BadRequest, ConnMeta, HttpOptions, Lifecycle,
     Request, ShutdownHandle, ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
 };
@@ -827,7 +831,6 @@ impl ApiInner {
 
     /// The `conf.ini` settings in effect (e.g. `max_output_size`, the IP list
     /// paths, log/backup/upload settings) for the request handlers.
-    #[allow(dead_code)]
     pub(crate) fn config(&self) -> &GStoreConfig {
         &self.config
     }
@@ -841,6 +844,30 @@ impl ApiInner {
             self.config.backup_path.clone()
         } else {
             self.root.join("backups")
+        }
+    }
+
+    /// This run's password of the `system` user (`conf.ini`'s
+    /// `system_username`), accepted by `/shutdown` and `/restart`; see
+    /// [`ApiServer::system_password`].
+    pub(crate) fn system_password(&self) -> &str {
+        &self.system_password
+    }
+
+    /// Whether a graceful shutdown has begun (requested, or already closing).
+    pub(crate) fn stopping(&self) -> bool {
+        self.life.stopping() || self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Begin a graceful shutdown, exactly as on `SIGTERM`; with `restart`,
+    /// flagged as a restart ([`ShutdownHandle::restart_requested`], on which
+    /// `gserver` re-executes itself). Returns at once: the request asking for
+    /// it is still in flight and is answered first.
+    pub(crate) fn request_stop(&self, restart: bool) {
+        if restart {
+            self.life.request_restart();
+        } else {
+            self.life.request_stop();
         }
     }
 
@@ -984,14 +1011,21 @@ impl ApiServer {
     /// Run with `conf.ini` settings: the worker pool (`thread_num`,
     /// `queue_size`), keep-alive, CORS and request body cap
     /// (`upload_max_body_size`) via [`GStoreConfig::http_options`], the
-    /// `check_point` policy, and the `system_username` accepted by
-    /// `/shutdown`. The whole configuration stays readable by the request
-    /// handlers (e.g. `max_output_size`, the IP list paths). `root_password` and
+    /// `check_point` policy, the `system_username` accepted by `/shutdown`
+    /// and `/restart`, and the `/api` layer's `max_output_size` and
+    /// `licensetype` ([`GapiConfig`]). The whole configuration stays readable
+    /// by the request handlers (e.g. the IP list paths). `root_password` and
     /// `db_home` are [`bind`](Self::bind)'s arguments (or use
     /// [`bind_with_config`](Self::bind_with_config)). Apply other builders
-    /// (`with_check_point`, `with_http_options`) after this one to override it.
+    /// (`with_check_point`, `with_http_options`, `with_max_output_size`,
+    /// `with_gapi_config`) after this one to override it.
     pub fn with_config(mut self, config: GStoreConfig) -> ApiServer {
         self.http = config.http_options();
+        {
+            let mut st = locked(&self.inner.state);
+            st.gapi.max_output_size = config.max_output_size;
+            st.gapi.license_type = config.licensetype.clone();
+        }
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = config.check_point;
             inner.config = config;
@@ -1493,15 +1527,6 @@ impl ApiInner {
             }
             return Dispatch::Done(Resp::ok("logged out"));
         }
-        // Upstream's path routes `/shutdown` and `/restart` (also under the
-        // documented `/grpc/` prefix): they check their own credentials.
-        if matches!(method, "GET" | "POST") {
-            match path {
-                "/shutdown" | "/grpc/shutdown" => return self.handle_stop_route(req, false),
-                "/restart" | "/grpc/restart" => return self.handle_stop_route(req, true),
-                _ => {}
-            }
-        }
         if method == "GET" && (path == "/" || path == "/console") {
             return Dispatch::Done(Resp::new(
                 200,
@@ -1654,86 +1679,6 @@ impl ApiInner {
             );
             Resp::new(200, JSON, body.into_bytes())
         }))
-    }
-
-    // ---- /shutdown and /restart -------------------------------------------
-
-    /// `/shutdown` and `/restart` — upstream `shutdown()` / `restart()` in
-    /// `src/Main/grpc.cpp`. API-level outcomes are HTTP 200 with the gStore
-    /// envelope `{"StatusCode":…,"StatusMsg":…}` (codes from upstream
-    /// `ServerStatusCode.h`).
-    ///
-    /// Credentials (`username`, `password`) come from the query string, a JSON
-    /// or form body, or request headers (upstream's `/shutdown` reads headers;
-    /// its docs say parameters — both work). Accepted callers:
-    ///
-    /// * the `system` user (`conf.ini`'s `system_username`) with this run's
-    ///   [system password](ApiServer::system_password) — what upstream's
-    ///   `gserver -t` sends, read from the pid file — `encryption=1` meaning the
-    ///   client sent its MD5 hex digest;
-    /// * `root` with its real password. (Upstream's `/restart` accepts any
-    ///   valid user; here both routes are root/system only.)
-    ///
-    /// On success the response is written first, then the server shuts down
-    /// gracefully exactly as on `SIGTERM` (in-flight requests finish, open
-    /// transactions roll back, dirty databases are saved); `/restart` also sets
-    /// [`ShutdownHandle::restart_requested`], on which `gserver` re-executes
-    /// itself.
-    fn handle_stop_route(&self, req: &Request, restart: bool) -> Dispatch {
-        let username = req.merged_param("username").unwrap_or_default();
-        let password = req.merged_param("password").unwrap_or_default();
-        let encrypted = req.merged_param("encryption").as_deref() == Some("1");
-        // Deferred: `root`'s password is checked with the state lock released
-        // (see `UserStore::begin_check`).
-        Dispatch::Deferred(Box::new(move |inner| {
-            inner.stop_route(&username, &password, encrypted, restart)
-        }))
-    }
-
-    /// The body of [`handle_stop_route`](Self::handle_stop_route); runs with
-    /// no lock held.
-    fn stop_route(&self, username: &str, password: &str, encrypted: bool, restart: bool) -> Resp {
-        let envelope = |code: i64, msg: &str| Resp::new(200, JSON, status_json(code, msg));
-        if self.life.stopping() || self.closing.load(Ordering::SeqCst) {
-            // Upstream answers StatusIPBlocked (1101) with this message.
-            return envelope(1101, "server is stopping, please waitting !");
-        }
-        if username.is_empty() {
-            return envelope(1003, "the value of username can not be empty!");
-        }
-        if password.is_empty() {
-            return envelope(1003, "the value of password can not be empty!");
-        }
-        let authenticated = if username == self.config.system_username {
-            let (presented, expected) = if encrypted {
-                (password.to_ascii_lowercase(), md5_hex(&self.system_password))
-            } else {
-                (password.to_string(), self.system_password.clone())
-            };
-            ct_eq(presented.as_bytes(), expected.as_bytes())
-        } else if username == ROOT_USER {
-            // The user store keeps salted PBKDF2 hashes, so an MD5 digest of
-            // the password (`encryption=1`) cannot be checked against it here.
-            !encrypted && {
-                let attempt =
-                    locked(&self.state).users.begin_check(username, password, PasswordForm::Plain);
-                let checked = attempt.verify();
-                locked(&self.state).users.finish_check(checked) == CredentialCheck::Valid
-            }
-        } else {
-            let action = if restart { "restart" } else { "stop" };
-            return envelope(1001, &format!("You have no rights to {action} the server."));
-        };
-        if !authenticated {
-            return envelope(1001, "Username or password is wrong.");
-        }
-        if restart {
-            self.life.request_restart();
-            envelope(0, "Server restarted successfully.")
-        } else {
-            self.life.request_stop();
-            envelope(0, "Server stopped successfully.")
-        }
     }
 
     // ---- query / update ---------------------------------------------------

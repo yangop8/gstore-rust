@@ -144,7 +144,19 @@ gconsole mydb                # interactive REPL (end a query with ';')
 gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
 gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
                              # tasks, backup/restore); default login root / 123456
+gserver                      # the same API server rooted at db_home (./dbhome/)
+                             # on port 9000, settings from ./conf/conf.ini
+gserver -b                   # … started in the background (-s: foreground)
+gserver -S | -t | -r | -k    # status / stop / restart / kill it (via its pid file)
 ```
+
+The multi-DB server also speaks upstream gStore's `/api` protocol (`GET|POST
+/api` or `POST /` with `operation=…`, per-request `username`/`password`,
+`encryption=1`, the `StatusCode` JSON envelope), so the upstream SDKs such as
+`GstoreConnector.py` work against it unchanged, plus upstream's `/shutdown`
+and `/restart` routes. Settings come from `conf.ini` (see
+`conf/conf.ini.example`; `-c FILE` picks another file, and command-line flags
+win over it).
 
 Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each

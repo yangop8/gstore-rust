@@ -127,8 +127,8 @@ fn shutdown_route_requires_root_or_system_credentials() {
     let (_, body) = request(&addr, "POST", "/shutdown", "username=joe&password=x");
     assert_eq!(status_code(&body), 1001, "{body}");
     assert!(body.contains("no rights"), "{body}");
-    // An MD5 digest cannot be checked against root's salted hash.
-    let digest = md5_hex("root");
+    // `encryption=1` with the MD5 digest of a wrong password.
+    let digest = md5_hex("nope");
     let (_, body) = request(
         &addr,
         "GET",
@@ -176,6 +176,33 @@ fn shutdown_route_accepts_the_system_user_from_headers_and_md5() {
     );
     assert_eq!((s, status_code(&body)), (200, 0), "{body}");
     join_within(serving, Duration::from_secs(20));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shutdown_route_checks_root_through_the_api_credential_check() {
+    // `/shutdown` verifies root with the `/api` layer's credential check, so
+    // root's MD5 digest (`encryption=1`) works there exactly as for any
+    // `/api` operation.
+    let root = tmp_dir("shutdown_root_md5");
+    let (server, addr, serving) = start_api(&root, |s| s);
+    let digest = md5_hex("root");
+    let (_, body) = request(
+        &addr,
+        "POST",
+        "/api",
+        &format!(r#"{{"operation":"login","username":"root","password":"{digest}","encryption":"1"}}"#),
+    );
+    assert_eq!(status_code(&body), 0, "{body}");
+    let (s, body) = request(
+        &addr,
+        "GET",
+        &format!("/shutdown?username=root&password={digest}&encryption=1"),
+        "",
+    );
+    assert_eq!((s, status_code(&body)), (200, 0), "{body}");
+    join_within(serving, Duration::from_secs(20));
+    assert!(!server.shutdown_handle().restart_requested());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -233,6 +260,7 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     let cfg = gstore::config::GStoreConfig::from_ini_str(&format!(
         "[server]\nport=0\nthread_num=2\nkeep_alive_timeout=0\nmax_output_size=7\ncors=off\n\
          [system]\ndb_home={}\nroot_password=cfgpw\nsystem_username=sys\ncheck_point=off\n\
+         licensetype=trial\n\
          [upload]\nupload_max_body_size=64\n",
         root.display()
     ));
@@ -243,6 +271,9 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     assert_eq!(server.http_options().max_body, 64);
     assert!(!server.check_point());
     assert_eq!(server.config().max_output_size, 7);
+    // The `/api` layer runs with the file's max_output_size and licensetype.
+    assert_eq!(server.gapi_config().max_output_size, 7);
+    assert_eq!(server.gapi_config().license_type, "trial");
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     let serving = thread::spawn(move || s2.serve_forever());
@@ -250,6 +281,10 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     // root_password seeds the user store.
     let (s, body) = request(&addr, "POST", "/login", "username=root&password=cfgpw");
     assert_eq!(s, 200, "{body}");
+    // The upstream `/api` protocol is served too, reporting the licensetype.
+    let (s, body) = request(&addr, "GET", "/api?operation=login&username=root&password=cfgpw", "");
+    assert_eq!((s, status_code(&body)), (200, 0), "{body}");
+    assert!(body.contains(r#""licensetype":"trial""#), "{body}");
     // keep_alive_timeout=0 ⇒ every response closes; cors=off ⇒ no CORS header.
     let mut sock = TcpStream::connect(addr).unwrap();
     sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -507,6 +542,13 @@ mod binary {
         let addr: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
         let (s, body) = request(&addr, "POST", "/login", "username=root&password=frominit");
         assert_eq!(s, 200, "root_password from conf.ini: {body}");
+        // The default mode serves the upstream `/api` protocol on the same
+        // users (per-request credentials, the gStore envelope).
+        let (s, body) = request(&addr, "GET", "/api?operation=login&username=root&password=frominit", "");
+        assert_eq!((s, status_code(&body)), (200, 0), "{body}");
+        assert!(body.contains("\"CoreVersion\""), "{body}");
+        let (s, body) = request(&addr, "POST", "/", r#"{"operation":"check"}"#);
+        assert_eq!((s, status_code(&body)), (200, 0), "{body}");
         let log = std::fs::read_to_string(home.join("gserver.log")).unwrap();
         assert!(log.contains("4 worker threads"), "thread_num from conf.ini: {log}");
         let (code, _, _) = gserver(&dir, &["-t", "-c", &ini_s]);
