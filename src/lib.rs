@@ -38,6 +38,8 @@ pub mod json;
 pub mod kvstore;
 pub mod model;
 pub mod parser;
+/// PFN: per-user graph functions run as sandboxed WebAssembly (`pfn-wasm`).
+pub mod pfn;
 pub mod query;
 pub mod reason;
 pub mod rpc;
