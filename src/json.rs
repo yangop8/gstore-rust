@@ -226,11 +226,7 @@ impl Json {
                         _ => out.push((k, v)),
                     }
                 }
-                Json::Obj(
-                    out.into_iter()
-                        .map(|(k, v)| (k, v.into_sorted()))
-                        .collect(),
-                )
+                Json::Obj(out.into_iter().map(|(k, v)| (k, v.into_sorted())).collect())
             }
             other => other,
         }
