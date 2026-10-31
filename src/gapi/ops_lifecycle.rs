@@ -67,6 +67,11 @@ fn stop(ctx: &mut Ctx<'_>, params: &Params, restart: bool) -> GResp {
         // Upstream answers StatusIPBlocked (1101) with this message.
         return GResp::error(Status::IpBlocked, "server is stopping, please waitting !");
     }
+    // The failed-login lockout holds here too: these routes check the root
+    // and system passwords, and must not be a way around it.
+    if let Err(r) = auth::check_ip(ctx, auth::IpStage::Operation) {
+        return r;
+    }
     let creds = Credentials::from_params_or_headers(params, ctx.req);
     for (name, value) in [("username", &creds.username), ("password", &creds.password)] {
         if value.is_empty() {

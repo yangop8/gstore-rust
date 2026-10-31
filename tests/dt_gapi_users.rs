@@ -966,9 +966,9 @@ fn deny_and_allow_lists_block_with_1101() {
     std::fs::write(&allow, "127.0.0.0-127.0.0.9\n").unwrap();
     let (_srv3, addr3) = start_with(&root2, cfg);
     assert_eq!(code(&root_api(&addr3, "login", &[])), 0);
-    // REST endpoints are not affected by the /api lists.
+    // The lists hold on the REST endpoints of the same listener too.
     let r = rest(&addr, "root", "GET", "/show", "");
-    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.status, 403, "{}", r.body);
 }
 
 #[test]

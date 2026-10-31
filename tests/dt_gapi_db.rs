@@ -1601,7 +1601,17 @@ fn batch_insert_and_remove_read_server_files_and_dirs() {
 
 #[test]
 fn build_backup_and_batch_insert_run_asynchronously_with_callbacks() {
-    let srv = start("async");
+    // The callbacks go to listeners on the loopback interface.
+    let srv = start_with(
+        "async",
+        |c| c,
+        |s| {
+            s.with_task_config(gstore::gapi::tasks::TaskConfig {
+                callback_allow_local: true,
+                ..Default::default()
+            })
+        },
+    );
     let a = &srv.addr;
     let lubm = srv.data_file("lubm.nt", LUBM);
     let more = srv.data_file("more.nt", MORE);

@@ -211,7 +211,7 @@ pub struct ApiLogs {
     /// sweep it triggers.
     io: Mutex<()>,
     /// When each open transaction began (ms), for its final record.
-    txn_begun: Mutex<HashMap<u64, u128>>,
+    txn_begun: Mutex<HashMap<(String, u64), u128>>,
 }
 
 impl ApiLogs {
@@ -246,7 +246,7 @@ impl ApiLogs {
         self.txn_begun
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(tid, begun);
+            .insert((db.to_string(), tid), begun);
         let rec = txn_record(db, tid, user, TxnState::Running, begun, None);
         let _guard = self.io();
         let _ = append_line(&txnlog_path(root), &record_line(rec));
@@ -260,7 +260,7 @@ impl ApiLogs {
             .txn_begun
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&tid)
+            .remove(&(db.to_string(), tid))
             .unwrap_or(ended);
         let rec = txn_record(db, tid, user, state, begun, Some(ended));
         let _guard = self.io();
@@ -476,11 +476,15 @@ pub fn txn_records(root: &Path) -> Vec<Json> {
     let mut order: Vec<String> = Vec::new();
     let mut last: HashMap<String, Json> = HashMap::new();
     for rec in read_records(&txnlog_path(root)) {
-        let tid = rec
-            .get("TID")
-            .and_then(Json::as_str)
-            .unwrap_or_default()
-            .to_string();
+        // Ids are numbered per database: two databases' transactions begun in
+        // the same millisecond share a `TID`.
+        let field = |k: &str| {
+            rec.get(k)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let tid = format!("{}\u{0}{}", field("db_name"), field("TID"));
         if last.insert(tid.clone(), rec).is_none() {
             order.push(tid);
         }
@@ -589,7 +593,7 @@ pub(super) fn log_access(ctx: &Ctx<'_>, params: &Params, resp: &GResp) {
     };
     ctx.inner
         .apilogs
-        .write_access(config, &ctx.inner.root, &rec);
+        .write_access(&config, &ctx.inner.root, &rec);
 }
 
 /// The final access-log record of asynchronous operation `info` (submitted
@@ -620,7 +624,7 @@ pub(crate) fn log_async_finish(inner: &crate::http_api::ApiInner, ip: &str, info
         opt_id: info.opt_id.to_string(),
         state: Some(info.state.state_code()),
     };
-    inner.apilogs.write_access(config, &inner.root, &rec);
+    inner.apilogs.write_access(&config, &inner.root, &rec);
 }
 
 /// Upstream's clean-up of a logged message: no line breaks, no runs of four
@@ -692,7 +696,9 @@ impl QueryLog {
             query_time,
             db_name: self.db,
         };
-        ctx.inner.apilogs.write_query(config, &ctx.inner.root, &rec);
+        ctx.inner
+            .apilogs
+            .write_query(&config, &ctx.inner.root, &rec);
     }
 }
 
@@ -756,7 +762,7 @@ fn filters<'k>(p: &Params, pairs: &[(&str, &'k str)]) -> Vec<(&'k str, String)> 
 
 /// `querylogdate` — the days with a query log, newest first.
 pub(super) fn querylogdate(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
-    let dir = querylog_dir(ctx.inner.config(), ctx.root_dir());
+    let dir = querylog_dir(&ctx.inner.config(), ctx.root_dir());
     dates_response("Get query log date success", &dir)
 }
 
@@ -777,7 +783,7 @@ pub(super) fn querylog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         (Ok(d), Ok(pg)) => (d, pg),
         (Err(r), _) | (_, Err(r)) => return r,
     };
-    let dir = querylog_dir(ctx.inner.config(), ctx.root_dir());
+    let dir = querylog_dir(&ctx.inner.config(), ctx.root_dir());
     let path = dir.join(format!("{date}.log"));
     let filters = filters(p, &[("db_name", "dbname")]);
     match page_of_file(&path, &filters, page_no, page_size) {
@@ -797,7 +803,7 @@ pub(super) fn querylog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 
 /// `accesslogdate` — the days with an access log, newest first.
 pub(super) fn accesslogdate(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
-    let dir = accesslog_dir(ctx.inner.config(), ctx.root_dir());
+    let dir = accesslog_dir(&ctx.inner.config(), ctx.root_dir());
     dates_response("Get access log date success", &dir)
 }
 
@@ -807,7 +813,7 @@ pub(super) fn accesslog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         (Ok(d), Ok(pg)) => (d, pg),
         (Err(r), _) | (_, Err(r)) => return r,
     };
-    let dir = accesslog_dir(ctx.inner.config(), ctx.root_dir());
+    let dir = accesslog_dir(&ctx.inner.config(), ctx.root_dir());
     let path = dir.join(format!("{date}.log"));
     let filters = filters(p, &[("db_name", "dbname"), ("db_operation", "operation")]);
     match page_of_file(&path, &filters, page_no, page_size) {
@@ -1007,6 +1013,34 @@ mod tests {
         assert_eq!(all[1].get("end_time").and_then(Json::as_str), Some("INF"));
         let tid = all[0].get("TID").and_then(Json::as_str).unwrap();
         assert!(tid.ends_with("_1"), "{tid}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Ids are numbered per database: transaction 1 of two databases, open
+    /// at once, keeps its own begin time and outcome.
+    #[test]
+    fn txn_records_tell_databases_apart() {
+        let root = std::env::temp_dir().join(format!(
+            "gstore_apilog_txn2_{}_{}",
+            std::process::id(),
+            clock::unix_millis()
+        ));
+        let logs = ApiLogs::new();
+        logs.txn_begin(&root, "dbaa", 1, "alice");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        logs.txn_begin(&root, "dbbb", 1, "bob");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        logs.txn_end(&root, "dbaa", 1, "alice", TxnState::Committed);
+        logs.txn_end(&root, "dbbb", 1, "bob", TxnState::RolledBack);
+        let all = txn_records(&root);
+        assert_eq!(all.len(), 2, "{all:?}");
+        let get = |j: &Json, k: &str| j.get(k).and_then(Json::as_str).unwrap().to_string();
+        let a = all.iter().find(|j| get(j, "db_name") == "dbaa").unwrap();
+        let b = all.iter().find(|j| get(j, "db_name") == "dbbb").unwrap();
+        assert_eq!(get(a, "state"), "COMMITED");
+        assert_eq!(get(b, "state"), "ROLLBACK");
+        assert!(get(a, "begin_time") < get(b, "begin_time"), "{a} {b}");
+        assert_ne!(get(b, "begin_time"), get(b, "end_time"), "{b}");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -672,8 +672,47 @@ fn start_background(cli: &Cli, target: &Target) -> u8 {
     }
 }
 
+/// The supervisor (`deamon=on`) the pid file names, if it is alive although
+/// the server it watches is not — it is waiting to restart a server that
+/// crashed.
+fn live_supervisor(target: &Target) -> Option<u32> {
+    let info = read_pid_file(&target.pid_file)?;
+    let pid = info.supervisor;
+    (pid != 0
+        && pid != std::process::id()
+        && proc_util::alive(pid)
+        && proc_util::is_gserver(pid))
+    .then_some(pid)
+}
+
 fn stop(target: &Target) -> u8 {
     let Some(info) = live_server(target) else {
+        // The server crashed and its supervisor waits to restart it: stopping
+        // the supervisor is what stops the service (it exits during its
+        // backoff, or stops the server it has just started).
+        if let Some(sup) = live_supervisor(target) {
+            println!("stopping gserver supervisor (pid {sup})...");
+            if let Err(e) = proc_util::signal(sup, proc_util::SIGTERM) {
+                eprintln!("gserver: cannot signal pid {sup}: {e}");
+                return 1;
+            }
+            if !proc_util::wait_exit(sup, STOP_TIMEOUT) {
+                eprintln!(
+                    "gserver: supervisor pid {sup} did not stop within {}s; use -k to force it",
+                    STOP_TIMEOUT.as_secs()
+                );
+                return 1;
+            }
+            // A server it started meanwhile was stopped by it; whatever the pid
+            // file names now is gone.
+            if let Some(info) = read_pid_file(&target.pid_file) {
+                if info.pid != std::process::id() && !proc_util::alive(info.pid) {
+                    let _ = fs::remove_file(&target.pid_file);
+                }
+            }
+            println!("the Server supervisor [{sup}] stop successfully.");
+            return 0;
+        }
         println!("server is inactive (dead).");
         if let Some(stale) = read_pid_file(&target.pid_file) {
             if stale.pid != std::process::id() {
@@ -766,9 +805,13 @@ fn status(target: &Target) -> u8 {
                 println!("\tSupervisor PID: {} (deamon=on)", info.supervisor);
             }
         }
-        None => {
-            println!("\tActive: inactive (dead)");
-        }
+        None => match live_supervisor(target) {
+            Some(sup) => {
+                println!("\tActive: activating (the server stopped; its supervisor restarts it)");
+                println!("\tSupervisor PID: {sup} (deamon=on)");
+            }
+            None => println!("\tActive: inactive (dead)"),
+        },
     }
     println!("\tPID file: {}", target.pid_file.display());
     println!("\tDocs: {DOCS}");

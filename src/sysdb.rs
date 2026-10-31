@@ -236,6 +236,10 @@ pub struct SysDb {
     dbs: BTreeMap<String, DbRecord>,
     /// Whether this open created the registry (the first start).
     first_start: bool,
+    /// The databases reconciling unregistered because their directory was
+    /// gone (removed outside the server), not yet taken by
+    /// [`take_vanished`](Self::take_vanished).
+    vanished: Vec<String>,
 }
 
 impl SysDb {
@@ -252,6 +256,7 @@ impl SysDb {
             path,
             dbs: BTreeMap::new(),
             first_start: false,
+            vanished: Vec::new(),
         };
         match fs::read_to_string(&sys.path) {
             Ok(text) => sys.dbs = parse_registry(&text, &sys.path)?,
@@ -263,6 +268,14 @@ impl SysDb {
             sys.save()?;
         }
         Ok(sys)
+    }
+
+    /// The databases reconciling unregistered since the last call because
+    /// their directory was gone — dropped outside the server (`gdrop`, `rm`):
+    /// their grants must go too ([`UserStore::forget_database`]), or a later
+    /// database of the same name would inherit them.
+    pub fn take_vanished(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.vanished)
     }
 
     /// Whether this registry was created by [`open`](Self::open) (the server
@@ -398,7 +411,9 @@ impl SysDb {
         let on_disk = database_dirs(&self.root);
         let mut changed = false;
         for (name, dir) in &on_disk {
-            if !self.dbs.contains_key(name) {
+            // A directory holding no database (one whose build was cut short)
+            // is not registered.
+            if !self.dbs.contains_key(name) && crate::Database::storage_kind(dir).is_some() {
                 let built_time = fs::metadata(dir)
                     .and_then(|m| m.modified())
                     .map(|t| clock::at(t).datetime())
@@ -414,10 +429,17 @@ impl SysDb {
                 changed = true;
             }
         }
-        let before = self.dbs.len();
-        self.dbs
-            .retain(|name, _| on_disk.contains_key(name) || loaded.iter().any(|l| l == name));
-        changed | (self.dbs.len() != before)
+        let gone: Vec<String> = self
+            .dbs
+            .keys()
+            .filter(|name| !on_disk.contains_key(*name) && !loaded.iter().any(|l| l == *name))
+            .cloned()
+            .collect();
+        for name in &gone {
+            self.dbs.remove(name);
+        }
+        self.vanished.extend(gone.iter().cloned());
+        changed | !gone.is_empty()
     }
 
     fn save_or_undo(&mut self, name: &str, before: Option<DbRecord>) -> io::Result<()> {
@@ -529,11 +551,15 @@ pub fn open_system(root: impl AsRef<Path>, root_password: &str) -> io::Result<(U
             fs::copy(&users_path, &backup)?;
         }
     }
-    let users = UserStore::open(&users_path, root_password)?;
+    let mut users = UserStore::open(&users_path, root_password)?;
     if migrate {
         users.save()?;
     }
-    let sysdb = SysDb::open(root)?;
+    let mut sysdb = SysDb::open(root)?;
+    // A database dropped while the server was down keeps no grants.
+    for name in sysdb.take_vanished() {
+        users.forget_database(&name)?;
+    }
     Ok((users, sysdb))
 }
 
@@ -845,11 +871,15 @@ mod tests {
     fn the_registry_persists_and_follows_the_disk() {
         let root = tmp_root("registry");
         fs::create_dir_all(root.join("old.db")).unwrap();
+        fs::write(root.join("old.db").join("meta.bin"), b"").unwrap();
         fs::create_dir_all(root.join("system.db")).unwrap();
         fs::create_dir_all(root.join("x.db.bak")).unwrap();
+        // A directory holding no database (a build cut short) is not one.
+        fs::create_dir_all(root.join("broken.db")).unwrap();
         let mut sys = SysDb::open(&root).unwrap();
         assert!(sys.first_start());
         assert_eq!(sys.names(), vec!["old".to_string()], "found on disk");
+        assert!(sys.take_vanished().is_empty());
         assert_eq!(sys.get("old").unwrap().creator, ROOT_USER);
         assert_eq!(sys.get("old").unwrap().built_time.len(), 19);
         fs::create_dir_all(root.join("lubm.db")).unwrap();
@@ -866,6 +896,8 @@ mod tests {
         let mut sys = SysDb::open(&root).unwrap();
         assert!(!sys.first_start());
         assert_eq!(sys.names(), vec!["lubm".to_string()]);
+        assert_eq!(sys.take_vanished(), vec!["old".to_string()]);
+        assert!(sys.take_vanished().is_empty());
         assert_eq!(sys.get("lubm"), Some(&rec));
         // In memory only (loaded, not yet saved): kept by a sync.
         sys.register("fresh", "root").unwrap();

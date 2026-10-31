@@ -327,6 +327,16 @@ impl IpFilter {
             .map(|(_, l)| l.entries.iter().cloned().collect())
     }
 
+    /// Use the list files `allow_path` / `deny_path` from now on (loaded
+    /// now; a configuration reload). The failed-login counts are kept.
+    pub fn reconfigure(&self, allow_path: Option<PathBuf>, deny_path: Option<PathBuf>) {
+        let fresh = IpFilter::new(allow_path, deny_path);
+        let fresh = fresh.state.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state();
+        st.allow = fresh.allow;
+        st.deny = fresh.deny;
+    }
+
     /// Re-read both list files.
     pub fn reload(&self) {
         let mut guard = self.state();

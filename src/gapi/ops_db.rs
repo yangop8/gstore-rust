@@ -47,7 +47,9 @@ use super::params::Params;
 use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
-use crate::http_api::{ApiInner, BusyGuard, DbHandle, DbSlot, OpError, OpErrorKind};
+use crate::http_api::{
+    may_restore_from, ApiInner, BusyGuard, DbHandle, DbSlot, OpError, OpErrorKind,
+};
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
 use crate::model::{Term, Triple};
@@ -79,6 +81,61 @@ pub(super) fn register(reg: &mut Registry) {
             .async_capable(),
     );
     reg.add(OpSpec::new("schema", schema).needs_db());
+    reg.add(OpSpec::new("init", init));
+}
+
+/// `init` — register existing database directories (upstream `init_task`;
+/// root only): `db_names`, comma-separated (or a JSON array). Each name is
+/// answered in `data` as `{"db_name","status","msg"}`: `"0"` / `"success"`
+/// when it was registered (with the caller as creator, now as built time),
+/// `"1"` with `"exist"` when it already is, with `"<db>.db is not exist."`
+/// when there is no such directory (one holding no database counts as
+/// none), or with the reason a name is not valid. Answers `0 "init database
+/// successfully!"` whatever the names' outcomes; no `db_names` is `1003`.
+fn init(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
+    let names: Vec<String> = p
+        .strings("db_names")
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return GResp::error(Status::ParamIsIllegal, "db_names can't be empty");
+    }
+    let user = ctx.user().to_string();
+    let built = clock::now().datetime();
+    let mut data = Json::arr();
+    for name in names {
+        let (status, msg) = {
+            let mut st = ctx.state();
+            if let Err(e) = check_db_name(&name) {
+                ("1", e)
+            } else if st.sysdb.contains(&name) {
+                ("1", "exist".to_string())
+            } else if Database::storage_kind(st.db_dir(&name)).is_none() {
+                ("1", format!("{name}{DB_SUFFIX} is not exist."))
+            } else {
+                match st.sysdb.register_at(&name, &user, &built) {
+                    Ok(()) => ("0", "success".to_string()),
+                    Err(_) => ("1", "fail".to_string()),
+                }
+            }
+        };
+        data.push(
+            Json::obj()
+                .with("db_name", name.as_str())
+                .with("status", status)
+                .with("msg", msg),
+        );
+    }
+    GResp::json(
+        Json::obj()
+            .with("StatusCode", 0)
+            .with("StatusMsg", "init database successfully!")
+            .with("data", data),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +248,11 @@ fn databases_on_disk(root: &Path) -> BTreeMap<String, PathBuf> {
     for entry in rd.flatten() {
         let fname = entry.file_name().to_string_lossy().into_owned();
         if let Some(name) = fname.strip_suffix(DB_SUFFIX) {
-            if check_db_name(name).is_ok() && entry.path().is_dir() {
+            // A directory holding no database (a build cut short) is not one.
+            if check_db_name(name).is_ok()
+                && entry.path().is_dir()
+                && Database::storage_kind(entry.path()).is_some()
+            {
                 out.insert(name.to_string(), entry.path());
             }
         }
@@ -880,19 +941,35 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return fail(e.to_string()),
     };
     let success_num = built.triple_num();
-    if let Err(e) = built.save(&dir) {
-        drop(built);
-        let _ = fs::remove_dir_all(&dir);
-        return fail(e.to_string());
-    }
+    // Written into a staging directory and renamed into place once complete:
+    // a build cut short (a crash, a shutdown that does not wait for it)
+    // leaves no `<db>.db` that would read as a built database.
+    let staging = PathBuf::from(format!("{}.build-tmp", dir.display()));
+    let _ = fs::remove_dir_all(&staging);
+    let saved = built
+        .save(&staging)
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            write_cost(
+                &staging,
+                i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            );
+            fs::rename(&staging, &dir).map_err(|e| e.to_string())
+        });
     drop(built);
-    write_cost(
-        &dir,
-        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
-    );
+    if let Err(e) = saved {
+        let _ = fs::remove_dir_all(&staging);
+        return fail(e);
+    }
     {
         let mut st = ctx.state();
         let creator = ctx.user().to_string();
+        // Still registered although it did not exist (`build` refuses an
+        // existing database): an earlier database of the name, dropped
+        // outside the server (`gdrop`). The new one starts without its grants.
+        if st.sysdb.contains(&db) {
+            let _ = st.users.forget_database(&db);
+        }
         // Best effort, like the REST endpoints: the registry is reconciled
         // with the directories at every start.
         let _ = st.sysdb.register(&db, &creator);
@@ -1078,19 +1155,26 @@ fn no_compress(op: &str) -> GResp {
 }
 
 /// The backups of `db` in `dir`: upstream's `<db>.db_<YYYYmmddHHMMSS>`
-/// entries (directories, or `.zip` files), sorted oldest first.
+/// entries (directories, or `.zip` files), sorted oldest first. A directory
+/// counts only when it is a backup of `db`: one this server recorded as such
+/// ([`crate::http_api::backup_owner`]), or one without that record that
+/// holds a database (made by upstream or by hand) — never one recorded as
+/// another database's, nor a directory holding no database, whatever its
+/// name says.
 fn backups_of(dir: &Path, db: &str) -> Vec<String> {
-    let prefix = format!("{db}{DB_SUFFIX}_");
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<String> = rd
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| crate::http_api::backup_name_db(n) == Some(db))
         .filter(|n| {
-            n.strip_prefix(&prefix)
-                .map(|ts| ts.strip_suffix(".zip").unwrap_or(ts))
-                .is_some_and(|ts| ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit()))
+            let p = dir.join(n);
+            match crate::http_api::backup_owner(&p) {
+                Some(owner) => owner == db,
+                None => p.is_file() || Database::storage_kind(&p).is_some(),
+            }
         })
         .collect();
     out.sort();
@@ -1217,11 +1301,17 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(t) => t,
         Err(r) => return r,
     };
-    // Never write into a backup (or a database) inside the backup directory.
+    // Never write into a backup (or a database) inside the backup directory,
+    // nor into a directory named like a backup (`<db>.db_<timestamp>`, where
+    // `backuppath` / `restore` look for a database's backups).
     if let Ok(canon_root) = fs::canonicalize(&root) {
         let mut cur = Some(target.as_path());
         while let Some(d) = cur.filter(|d| d.starts_with(&canon_root) && *d != canon_root) {
-            if Database::storage_kind(d).is_some() {
+            let backup_named = d
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| crate::http_api::backup_name_db(n).is_some());
+            if Database::storage_kind(d).is_some() || backup_named {
                 return GResp::error(
                     Status::ParamIsIllegal,
                     format!(
@@ -1276,6 +1366,10 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             }
         }
     };
+    // Recorded as a backup of `db` once complete (an interrupted backup holds
+    // no record, so `restore` never picks it for anyone but root).
+    let written =
+        written.and_then(|()| crate::http_api::mark_backup(&dest, &db).map_err(|e| e.to_string()));
     if let Err(e) = written {
         let _ = fs::remove_dir_all(&dest);
         return fail(e);
@@ -1310,12 +1404,15 @@ fn backuppath(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
 fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
     let root = ops_file::backup_dir(ctx);
+    let user = ctx.user().to_string();
+    let may_restore =
+        |ctx: &Ctx<'_>, path: &Path| may_restore_from(&ctx.state().users, &user, &db, path);
     let source = match p.non_empty("backup_path") {
         None => match backups_of(&root, &db)
             .into_iter()
             .rev()
             .map(|n| root.join(n))
-            .find(|p| p.is_dir())
+            .find(|p| p.is_dir() && may_restore(ctx, p))
         {
             Some(newest) => newest,
             None => {
@@ -1357,6 +1454,18 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             }
         }
     };
+    // The restore privilege on `db` restores `db`'s own backups: another
+    // database's backup would hand the caller that database's data.
+    if !may_restore(ctx, &source) {
+        return GResp::error(
+            Status::OperationConditionsAreNotSatisfied,
+            format!(
+                "You have no restore privilege on the backup '{}': it is not a backup of \
+                 database[{db}] (only root and admin users may restore another database's backup)",
+                p.str("backup_path").unwrap_or_default()
+            ),
+        );
+    }
     let fail = |msg: String| GResp::error(Status::OperationFailed, format!("Restore fail: {msg}"));
     if Database::storage_kind(&source).is_none() {
         return fail(format!(
@@ -1364,15 +1473,26 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             source.display()
         ));
     }
-    let dir = {
+    let max_dbs = ctx.inner.config().max_database_num;
+    let (dir, fresh) = {
         let mut st = ctx.state();
         if let Some(&tid) = st.db_txn.get(&db) {
             return in_txn(&db, tid);
         }
+        let dir = st.db_dir(&db);
+        // A restore that creates the database counts against
+        // `max_database_num`, as `build` does.
+        let fresh = !st.dbs.contains_key(&db) && !dir.exists();
+        if fresh && !st.sysdb.contains(&db) && st.database_limit_reached(max_dbs) {
+            return GResp::error(
+                Status::OperationConditionsAreNotSatisfied,
+                "The total number of databases more than max_databse_num.",
+            );
+        }
         if !st.busy.insert(db.clone()) {
             return busy(&db);
         }
-        st.db_dir(&db)
+        (dir, fresh)
     };
     let _busy = BusyGuard {
         inner: ctx.inner,
@@ -1444,12 +1564,20 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         }
     }
     {
+        // A database the restore created joins the registry with the caller
+        // as its creator. No grants: none left from an earlier database of
+        // the name (dropped outside the server) hold, and the caller — `root`
+        // or an `admin` user, or one holding the restore privilege on every
+        // database — is not given more than it had (upstream grants the
+        // creator everything; a user with only the restore privilege would
+        // gain all the others on the copy).
         let mut st = ctx.state();
-        if !st.sysdb.contains(&db) {
-            let user = ctx.user().to_string();
+        if fresh && st.sysdb.contains(&db) {
+            let _ = st.users.forget_database(&db);
+        }
+        if fresh || !st.sysdb.contains(&db) {
             let built = backup_time(&source).unwrap_or_else(|| clock::now().datetime());
             let _ = st.sysdb.register_at(&db, &user, &built);
-            let _ = st.users.grant_all_on(&user, &db);
         }
     }
     GResp::success("Database restore successfully.")
@@ -1654,16 +1782,29 @@ mod tests {
         let d = std::env::temp_dir().join(format!("gstore_opsdb_bk_{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
+        // Backup directories hold a database (here: its snapshot's meta file).
         for n in [
             "lubm.db_20240102000000",
             "lubm.db_20240101000000",
-            "lubm.db_20240103000000.zip",
             "xlubm.db_20240101000000",
             "lubm.db_2024",
             "lubm.db_20240101000000x",
         ] {
             fs::create_dir_all(d.join(n)).unwrap();
+            fs::write(d.join(n).join("meta.bin"), b"").unwrap();
         }
+        fs::write(d.join("lubm.db_20240103000000.zip"), b"zip").unwrap();
+        // Not backups of `lubm`, whatever their names say: one recorded as
+        // another database's, one holding no database.
+        fs::create_dir_all(d.join("lubm.db_20990101000000")).unwrap();
+        fs::write(d.join("lubm.db_20990101000000").join("meta.bin"), b"").unwrap();
+        crate::http_api::mark_backup(&d.join("lubm.db_20990101000000"), "other").unwrap();
+        fs::create_dir_all(
+            d.join("lubm.db_20980101000000")
+                .join("mine.db_20240101000000"),
+        )
+        .unwrap();
+        crate::http_api::mark_backup(&d.join("lubm.db_20240101000000"), "lubm").unwrap();
         assert_eq!(
             backups_of(&d, "lubm"),
             vec![

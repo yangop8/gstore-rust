@@ -742,6 +742,101 @@ mod binary {
         assert!(wait_dead(&supervisor, Duration::from_secs(10)), "the supervisor exited");
     }
 
+    /// A server killed while its supervisor waits to restart it: `-t` stops
+    /// the supervisor (instead of reporting the service dead and leaving it
+    /// to start a new server), and `-S` reports it.
+    #[test]
+    fn stop_during_the_supervisors_backoff_stops_the_service() {
+        let dir = tmp_dir("bin_backoff");
+        let home = dir.join("home");
+        let pid_file = home.join("gserver.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let ini = dir.join("d.ini");
+        std::fs::write(
+            &ini,
+            format!(
+                "[server]\nport={}\ndeamon=on\n[system]\ndb_home={}\n",
+                free_port(),
+                home.display()
+            ),
+        )
+        .unwrap();
+        let ini_s = ini.to_string_lossy().into_owned();
+        let (code, out, err) = gserver(&dir, &["-b", "-c", &ini_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let lines = pid_lines(&pid_file).unwrap();
+        let (server, supervisor) = (lines[0].clone(), lines[4].clone());
+        sigkill(&server);
+        assert!(wait_dead(&server, Duration::from_secs(10)));
+        let (code, out, err) = gserver(&dir, &["-t", "-c", &ini_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        assert!(
+            wait_dead(&supervisor, Duration::from_secs(20)),
+            "the supervisor was stopped: {out}"
+        );
+        // Nothing is started again.
+        thread::sleep(Duration::from_secs(2));
+        if let Some(l) = pid_lines(&pid_file) {
+            assert!(!alive(&l[0]), "a server was restarted: {l:?}\n{out}");
+        }
+        let (_, out, _) = gserver(&dir, &["-S", "-c", &ini_s]);
+        assert!(out.contains("inactive (dead)"), "{out}");
+    }
+
+    /// A second `SIGTERM` (a service manager signalling the process group,
+    /// the supervisor forwarding its own, `-t` run twice) does not kill a
+    /// graceful shutdown before its final save.
+    #[test]
+    fn a_repeated_sigterm_does_not_cut_the_final_save_short() {
+        let dir = tmp_dir("bin_double_term");
+        let db_dir = dir.join("t.db");
+        gstore::Database::build_from_str("t", "<http://ex/a> <http://ex/p> <http://ex/b> .")
+            .unwrap()
+            .save(&db_dir)
+            .unwrap();
+        let db_s = db_dir.to_string_lossy().into_owned();
+        let pid_file = dir.join("t.db.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let (code, out, err) = gserver(&dir, &["-b", &db_s, "-p", "0", "--no-checkpoint"]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let addr = printed_addr(&out);
+        let (s, body) = request(
+            &addr,
+            "POST",
+            "/update",
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        );
+        assert_eq!(s, 200, "{body}");
+        let pid = pid_lines(&pid_file).unwrap()[0].clone();
+        // An idle connection keeps the shutdown in its grace period.
+        let idle = TcpStream::connect(addr).unwrap();
+        let term = || {
+            let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        };
+        term();
+        thread::sleep(Duration::from_millis(300));
+        term();
+        thread::sleep(Duration::from_millis(300));
+        assert!(alive(&pid), "the second SIGTERM killed the shutting-down server");
+        drop(idle);
+        assert!(wait_dead(&pid, Duration::from_secs(30)));
+        let mut db = gstore::Database::open(&db_dir).unwrap();
+        let r = db
+            .query("ASK { <http://ex/x> <http://ex/p> <http://ex/y> }")
+            .unwrap();
+        assert_eq!(
+            r,
+            gstore::query::QueryResult::Ask(true),
+            "the acknowledged write was saved"
+        );
+    }
+
     #[test]
     fn the_legacy_single_database_invocation_works_with_the_lifecycle() {
         let dir = tmp_dir("bin_single");

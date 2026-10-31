@@ -292,8 +292,12 @@ fn transaction_ids_are_numbered_per_loaded_database() {
     assert!(body.contains("several databases"), "{body}");
     let (status, body) = srv.rest("POST", "/commit?tid=1&db_name=alpha", "");
     assert_eq!(status, 200, "{body}");
-    // Only beta's transaction 1 is open now: the bare id resolves to it.
+    // Only beta's transaction 1 is open now, but alpha's transaction 1 just
+    // ended: the bare id could be a retry of alpha's commit, so it is still
+    // ambiguous (it must not end beta's transaction).
     let (status, body) = srv.rest("POST", "/rollback?tid=1", "");
+    assert_eq!(status, 409, "{body}");
+    let (status, body) = srv.rest("POST", "/rollback?tid=1&db_name=beta", "");
     assert_eq!(status, 200, "{body}");
     let j = srv.query("alpha", "select ?s where { ?s <p> <o> }");
     assert_eq!(int(&j, "AnsNum"), 2, "alpha's two commits: {j}");

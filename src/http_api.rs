@@ -95,10 +95,12 @@
 //! (`1` SERIALIZABLE — the default, `2` SNAPSHOT, `3` READ_COMMITTED, see
 //! [`TxnIsolation`]); with a single writer every level is honoured. Like
 //! upstream, transaction ids are numbered per loaded database, starting at 1
-//! after each load; `/tquery`, `/commit` and `/rollback` take the database
-//! (`db_name`) to tell apart an id open on several databases (without it the
-//! id must be open on exactly one, else `409`). Unknown transaction ids are
-//! `404`; committing or rolling back a finished one is `409`.
+//! after each load; `/begin` answers the database (`db_name`) with the id,
+//! and `/tquery`, `/commit` and `/rollback` take it to tell apart an id open
+//! on several databases (without it the id must be open on exactly one and
+//! not recently ended on another — a retried `/commit` — else `409`).
+//! Unknown transaction ids are `404`; committing or rolling back a finished
+//! one is `409`.
 //!
 //! **Upstream protocol.** The same server also speaks upstream gStore 1.4's
 //! own protocol — `GET|POST /api` (and `POST /`, `GET /?operation=…`) with an
@@ -141,7 +143,7 @@ use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::GStoreConfig;
@@ -807,7 +809,10 @@ impl ApiState {
 
     /// The database of open transaction `tid`: on `db` when named, else the
     /// one database where `tid` is open. Ids are numbered per database, so
-    /// without a name an id open on several databases is ambiguous.
+    /// without a name an id is ambiguous when it is open on several databases
+    /// — or open on one and recently ended on another: a client retrying the
+    /// `/commit` of a transaction that already ended must not end another
+    /// database's transaction of the same number.
     pub(crate) fn open_txn_db(&self, db: Option<&str>, tid: u64) -> Result<String, OpError> {
         if let Some(db) = db {
             if self.txns.contains_key(&(db.to_string(), tid)) {
@@ -821,6 +826,22 @@ impl ApiState {
                 .map(|(d, _)| d)
                 .collect();
             on.sort();
+            if let [one] = on.as_slice() {
+                let ended_elsewhere = self
+                    .ended_txns
+                    .iter()
+                    .find(|(d, t, _)| *t == tid && d != *one);
+                if let Some((other, _, outcome)) = ended_elsewhere {
+                    return Err(OpError::new(
+                        OpErrorKind::Conflict,
+                        format!(
+                            "transaction {tid} is open on database '{one}' but transaction {tid} \
+                             of database '{other}' was {outcome} recently: name the database \
+                             (db_name)"
+                        ),
+                    ));
+                }
+            }
             match on.as_slice() {
                 [one] => return Ok((*one).clone()),
                 [] => {}
@@ -899,9 +920,10 @@ pub(crate) struct ApiInner {
     /// and `/restart` routes can stop it.
     life: Arc<Lifecycle>,
     /// The `conf.ini` settings this server runs with (built-in defaults unless
-    /// [`ApiServer::with_config`] supplied a file's). Read it through
+    /// [`ApiServer::with_config`] supplied a file's; `refreshconf` re-reads
+    /// the file — see [`ApiInner::refresh_config`]). Read it through
     /// [`ApiInner::config`].
-    config: GStoreConfig,
+    config: RwLock<Arc<GStoreConfig>>,
     /// Password of the `system` user (`system_username`) for `/shutdown` and
     /// `/restart`: random per run unless set with
     /// [`ApiServer::with_system_password`]; `gserver` writes it to the second
@@ -941,8 +963,36 @@ impl ApiInner {
 
     /// The `conf.ini` settings in effect (e.g. `max_output_size`, the IP list
     /// paths, log/backup/upload settings) for the request handlers.
-    pub(crate) fn config(&self) -> &GStoreConfig {
-        &self.config
+    pub(crate) fn config(&self) -> Arc<GStoreConfig> {
+        Arc::clone(&self.config.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Re-read the configuration file the server was started from (upstream
+    /// `refreshconf`, `APIUtil::refresh_conf`) and apply what a running
+    /// server can change: the settings request handlers read (database and
+    /// user limits, upload, backup and log settings, `system_username`, …),
+    /// the IP allow / deny lists, and the `/api` layer's `max_output_size` and
+    /// `licensetype`. The address, worker pool, connection settings,
+    /// `check_point` and the database home stay as they are until a restart.
+    /// Without a file (a server configured in code) only the IP list files
+    /// are re-read. Returns whether a file was re-read.
+    pub(crate) fn refresh_config(&self) -> std::io::Result<bool> {
+        let current = self.config();
+        let Some(path) = current.source().map(Path::to_path_buf) else {
+            self.ipfilter.reload();
+            return Ok(false);
+        };
+        let mut fresh = GStoreConfig::load(&path)?;
+        fresh.db_home = current.db_home.clone();
+        self.ipfilter
+            .reconfigure(fresh.ip_allow_path.clone(), fresh.ip_deny_path.clone());
+        {
+            let mut st = locked(&self.state);
+            st.gapi.max_output_size = fresh.max_output_size;
+            st.gapi.license_type = fresh.licensetype.clone();
+        }
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(fresh);
+        Ok(true)
     }
 
     /// The directory `/backup` writes into and `/restore` reads from:
@@ -950,8 +1000,9 @@ impl ApiInner {
     /// database, log or user file lives there, so a client-chosen backup
     /// target inside it cannot clobber one.
     pub(crate) fn backup_dir(&self) -> PathBuf {
-        if self.config.is_set("backup_path") {
-            self.config.backup_path.clone()
+        let config = self.config();
+        if config.is_set("backup_path") {
+            config.backup_path.clone()
         } else {
             self.root.join("backups")
         }
@@ -977,7 +1028,7 @@ impl ApiInner {
         if restart {
             self.life.request_restart();
         } else {
-            self.life.request_stop();
+            self.life.request_plain_stop();
         }
     }
 
@@ -1120,7 +1171,7 @@ impl ApiServer {
                 life: Arc::clone(&life),
                 ipfilter: IpFilter::from_config(&GStoreConfig::default()),
                 apilogs: ApiLogs::new(),
-                config: GStoreConfig::default(),
+                config: RwLock::new(Arc::new(GStoreConfig::default())),
                 system_password: new_system_password(),
                 tasks: TaskManager::default(),
                 self_ref: OnceLock::new(),
@@ -1163,14 +1214,14 @@ impl ApiServer {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = config.check_point;
             inner.ipfilter = IpFilter::from_config(&config);
-            inner.config = config;
+            *inner.config.get_mut().unwrap_or_else(PoisonError::into_inner) = Arc::new(config);
         }
         self
     }
 
     /// The `conf.ini` settings this server runs with.
-    pub fn config(&self) -> &GStoreConfig {
-        &self.inner.config
+    pub fn config(&self) -> Arc<GStoreConfig> {
+        self.inner.config()
     }
 
     /// Replace the connection settings (worker-pool size, keep-alive, CORS,
@@ -1292,7 +1343,7 @@ impl ApiServer {
     /// unsaved changes, and return from [`serve_forever`](Self::serve_forever).
     /// Returns immediately; join the serving thread to wait for completion.
     pub fn shutdown(&self) {
-        self.life.request_stop();
+        self.life.request_plain_stop();
     }
 
     /// The live cancel flag for an in-flight task, if it still exists. The
@@ -1447,7 +1498,7 @@ impl ApiInner {
         req: Result<Request, BadRequest>,
         meta: &ConnMeta,
     ) -> std::io::Result<bool> {
-        let req = match req {
+        let mut req = match req {
             Ok(r) => r,
             Err(bad) => {
                 let body = err_json(bad.message);
@@ -1455,6 +1506,9 @@ impl ApiInner {
                 return Ok(false);
             }
         };
+        // Upstream's reading of an `/api` request target (an encoded `?`, a
+        // trailing `/`).
+        crate::gapi::normalize_target(&mut req);
         // The TCP peer of this connection, recorded by `serve_connection` for
         // the worker thread (the upstream `/api` layer's remote IP).
         let peer = crate::server::current_peer();
@@ -1509,6 +1563,16 @@ impl ApiInner {
         if crate::gapi::wants(req) {
             let (resp, user_disp) = crate::gapi::serve(self, req, peer);
             return (Resp::from(resp), user_disp);
+        }
+        // The IP checks of the `/api` layer hold for every endpoint on this
+        // listener: the allow / deny lists, and the failed-login lockout for
+        // everything but `/login` (as `/api` exempts its `login`).
+        let ip = peer_ip(peer);
+        if !self.ipfilter.permits(&ip) {
+            return (Resp::fail(403, crate::gapi::ipfilter::BLOCKED_MSG), "-".to_string());
+        }
+        if req.path != "/login" && self.ipfilter.locked_out(&ip) {
+            return (Resp::fail(403, crate::gapi::ipfilter::LOCKED_MSG), "-".to_string());
         }
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
@@ -1639,6 +1703,8 @@ impl ApiInner {
             if st.users.finish_check(checked) == CredentialCheck::Valid {
                 return Some(u);
             }
+            // Counts towards the address's lockout, as a failed `/api` login.
+            self.ipfilter.note_failure(&peer_ip(crate::server::current_peer()));
         }
         if let Some(tok) = req.bearer_or_session_token() {
             if let Some(u) = st.users.session_user(&tok) {
@@ -1751,9 +1817,17 @@ impl ApiInner {
             ("POST", "/tquery") => return self.handle_tquery(st, req, &user),
             // Read-only monitoring endpoints defer their db reads off the state
             // lock (see Dispatch::Deferred) so they never wedge POST /cancel.
-            ("GET", "/status") => return self.handle_status(st),
-            ("GET", "/monitor") => return self.handle_monitor(st),
-            ("GET" | "POST", "/show") => return self.handle_show(st),
+            // Server-wide figures are `stat`'s (root and admin users only);
+            // the per-database listings show only the databases the caller
+            // may query, as `/api`'s `show` and `monitor`.
+            ("GET", "/status") => {
+                if !crate::sysdb::allowed(&st.users, &user, "stat", None) {
+                    return Dispatch::Done(self.forbidden());
+                }
+                return self.handle_status(st);
+            }
+            ("GET", "/monitor") => return self.handle_monitor(st, &user),
+            ("GET" | "POST", "/show") => return self.handle_show(st, &user),
             _ => {}
         }
 
@@ -1857,10 +1931,15 @@ impl ApiInner {
             let attempt =
                 locked(&inner.state).users.begin_check(&username, &password, PasswordForm::Plain);
             let checked = attempt.verify();
+            let ip = peer_ip(crate::server::current_peer());
             let mut st = locked(&inner.state);
             if st.users.finish_check(checked) != CredentialCheck::Valid {
+                inner.ipfilter.note_failure(&ip);
                 return Resp::fail(401, "invalid username or password");
             }
+            // As `/api`'s `login`: a successful login clears the address's
+            // failed-login count.
+            inner.ipfilter.reset(&ip);
             let token = st.users.start_session(&username);
             let priv_str = st
                 .users
@@ -2088,6 +2167,11 @@ impl ApiInner {
         let max_dbs = self.config().max_database_num;
         let exists =
             st.dbs.contains_key(&name) || st.sysdb.contains(&name) || st.db_dir(&name).exists();
+        // Still registered, but neither loaded nor on disk: dropped outside
+        // the server (`gdrop`). The new database must not inherit its grants.
+        let vanished = st.sysdb.contains(&name)
+            && !st.dbs.contains_key(&name)
+            && !st.db_dir(&name).exists();
         if !exists && st.database_limit_reached(max_dbs) {
             return Dispatch::Done(Resp::fail(
                 409,
@@ -2140,6 +2224,9 @@ impl ApiInner {
             st.dbs.insert(name.clone(), slot);
             // Registry bookkeeping (best effort: the registry is reconciled
             // with the database directories at every start anyway).
+            if vanished {
+                let _ = st.users.forget_database(&name);
+            }
             let _ = st.sysdb.register(&name, &creator);
             Resp::ok(&format!("database '{name}' built ({triples} triples)"))
         }))
@@ -2423,14 +2510,15 @@ impl ApiInner {
         }))
     }
 
-    fn handle_show(&self, st: &ApiState) -> Dispatch {
+    fn handle_show(&self, st: &ApiState, user: &str) -> Dispatch {
         // Snapshot the loaded-db handles under the state lock; the directory
         // scan and per-db counts run with the state lock released (see
         // Dispatch::Deferred).
         let root = st.root.clone();
         let loaded: HashMap<String, DbHandle> =
             st.dbs.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
-        Dispatch::Deferred(Box::new(move |_| {
+        let user = user.to_string();
+        Dispatch::Deferred(Box::new(move |inner| {
             let mut names: Vec<String> = Vec::new();
             // On-disk databases (directories ending in the .db suffix).
             if let Ok(rd) = fs::read_dir(&root) {
@@ -2451,6 +2539,10 @@ impl ApiInner {
             }
             names.sort();
             names.dedup();
+            {
+                let st = locked(&inner.state);
+                names.retain(|n| crate::sysdb::allowed(&st.users, &user, "query", Some(n)));
+            }
             let mut items = Vec::new();
             for n in &names {
                 let (is_loaded, triples, in_transaction, dirty) = match loaded.get(n) {
@@ -2511,9 +2603,13 @@ impl ApiInner {
         Dispatch::Deferred(Box::new(move |inner| {
             match inner.begin_txn(&dbh, &name, isolation, &user) {
                 Ok(tid) => {
+                    // `db_name` too: ids are numbered per database, so it
+                    // is what tells this transaction apart (pass it back to
+                    // `/tquery`, `/commit` and `/rollback`).
                     let body = format!(
-                        "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
+                        "{{\"StatusCode\":0,\"StatusMsg\":\"transaction started\",\"TID\":{},\"db_name\":{},\"isolevel\":{},\"IsolationLevel\":{}}}",
                         json_str(&tid.to_string()),
+                        json_str(&name),
                         isolation.code(),
                         json_str(isolation.name()),
                     );
@@ -2665,6 +2761,13 @@ impl ApiInner {
             Ok(name) => name,
             Err(e) => return Dispatch::Done(e.rest()),
         };
+        // The handle the transaction lives on, taken with the ownership check:
+        // ids restart at 1 when a database is loaded again, so the statement
+        // must run on this handle (refused once it is retired), never on
+        // whatever is loaded under the name by the time it runs.
+        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
+        };
         let Some(sparql) = req
             .param("sparql")
             .or_else(|| req.query_string())
@@ -2681,16 +2784,9 @@ impl ApiInner {
             } else {
                 "query"
             };
-            let dbh = {
-                let st = locked(&inner.state);
-                if !crate::sysdb::allowed(&st.users, &user, op, Some(&name)) {
-                    return inner.forbidden();
-                }
-                let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-                    return Resp::fail(404, &format!("database '{name}' is not loaded"));
-                };
-                dbh
-            };
+            if !crate::sysdb::allowed(&locked(&inner.state).users, &user, op, Some(&name)) {
+                return inner.forbidden();
+            }
             log_query(&inner.root, &name, &user, &sparql);
             match inner.run_in_txn_task(&dbh, &name, tid, &sparql, &user) {
                 Ok(r) => render_result(fmt, &r),
@@ -2803,6 +2899,18 @@ impl ApiInner {
         let txn = {
             let mut st = locked(&self.state);
             self.txn_for(&st, Some(db), tid, user)?;
+            // `dbh` was looked up before this lock was taken: if the database
+            // has been unloaded and loaded again since (which restarts its
+            // ids), (`db`, `tid`) is now another transaction on the new
+            // handle, and this request must not end it.
+            if let Some(h) = dbh {
+                if !st.dbs.get(db).is_some_and(|cur| Arc::ptr_eq(cur, h)) {
+                    return Err(OpError::new(
+                        OpErrorKind::TxnEnded,
+                        format!("transaction {tid} is not open on database '{db}'"),
+                    ));
+                }
+            }
             let txn = st
                 .txns
                 .remove(&(db.to_string(), tid))
@@ -2997,6 +3105,19 @@ impl ApiInner {
         if st.db_txn.contains_key(&name) {
             return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
         }
+        // A restore that creates the database counts against
+        // `max_database_num`, as a build does.
+        let fresh = !st.dbs.contains_key(&name) && !st.db_dir(&name).exists();
+        let max_dbs = self.config().max_database_num;
+        if fresh && !st.sysdb.contains(&name) && st.database_limit_reached(max_dbs) {
+            return Dispatch::Done(Resp::fail(
+                409,
+                &format!(
+                    "cannot restore '{name}': the server already holds max_database_num \
+                     ({max_dbs}) databases"
+                ),
+            ));
+        }
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
         }
@@ -3012,6 +3133,15 @@ impl ApiInner {
                 Ok(path) => path,
                 Err(r) => return r,
             };
+            if !may_restore_from(&locked(&inner.state).users, &user, &name, &path) {
+                return Resp::fail(
+                    403,
+                    &format!(
+                        "restore path refused: it is not a backup of database '{name}' (only \
+                         root and admin users may restore a database from another one's backup)"
+                    ),
+                );
+            }
             if Database::storage_kind(&path).is_none() {
                 return Resp::fail(
                     500,
@@ -3074,8 +3204,12 @@ impl ApiInner {
                     st.dbs.insert(name.clone(), slot);
                     // A database restored under a new name joins the
                     // registry with the restoring user as its creator (best
-                    // effort, as for /build; no privileges are granted).
-                    if !st.sysdb.contains(&name) {
+                    // effort, as for /build; no privileges are granted, and
+                    // none left from an earlier database of the name hold).
+                    if fresh && st.sysdb.contains(&name) {
+                        let _ = st.users.forget_database(&name);
+                    }
+                    if fresh || !st.sysdb.contains(&name) {
                         let _ = st.sysdb.register(&name, &user);
                     }
                     Resp::ok(&format!("database '{name}' restored"))
@@ -3262,10 +3396,11 @@ impl ApiInner {
         }))
     }
 
-    fn handle_monitor(&self, st: &ApiState) -> Dispatch {
+    fn handle_monitor(&self, st: &ApiState, user: &str) -> Dispatch {
         let mut entries: Vec<(String, DbHandle)> = st
             .dbs
             .iter()
+            .filter(|(n, _)| crate::sysdb::allowed(&st.users, user, "monitor", Some(n)))
             .map(|(n, d)| (n.clone(), Arc::clone(d)))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3327,6 +3462,13 @@ impl ApiInner {
             Some(db) => (BTreeSet::new(), Some((db, privs))),
             None => (privs, None),
         };
+        // The system user (`/shutdown`, `/restart`) is not a stored user.
+        if name == self.config().system_username {
+            return Resp::fail(
+                400,
+                &format!("'{name}' is the system user's name (system_username)"),
+            );
+        }
         if let Err(e) = st.users.add(&name, &password, global) {
             return Resp::fail(400, &e);
         }
@@ -3465,10 +3607,41 @@ impl ApiInner {
 
 // --- server-local paths named by clients --------------------------------------
 
-/// Marker a `/backup` writes into its target directory: the name of the
-/// database backed up there, so a later backup of a *different* database
-/// cannot overwrite it.
-const BACKUP_OWNER_FILE: &str = "BACKUP_OF";
+/// Marker every backup this server writes (`/backup`, `/api`'s `backup`)
+/// carries in its directory: the name of the database backed up there, so a
+/// later backup of a *different* database cannot overwrite it, and a restore
+/// knows whose data it holds ([`may_restore_from`]).
+pub(crate) const BACKUP_OWNER_FILE: &str = "BACKUP_OF";
+
+/// The database the backup at `dir` was recorded as a backup of (its
+/// [`BACKUP_OWNER_FILE`]), if any.
+pub(crate) fn backup_owner(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join(BACKUP_OWNER_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Record the backup at `dir` as one of database `db`.
+pub(crate) fn mark_backup(dir: &Path, db: &str) -> crate::Result<()> {
+    crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())
+}
+
+/// Whether `user` may restore database `db` from the backup at `source`:
+/// `root` and `admin` users any backup; anyone else — who holds the restore
+/// privilege on `db` only — only a backup this server recorded as one of `db`
+/// ([`backup_owner`]), so the privilege on one database never reads another
+/// database's data.
+pub(crate) fn may_restore_from(users: &UserStore, user: &str, db: &str, source: &Path) -> bool {
+    user == ROOT_USER || users.is_superuser(user) || backup_owner(source).as_deref() == Some(db)
+}
+
+/// The database a path component named like upstream's backups
+/// (`<db>.db_<YYYYmmddHHMMSS>`, or that with `.zip`) names, if it is one.
+pub(crate) fn backup_name_db(component: &str) -> Option<&str> {
+    let name = component.strip_suffix(".zip").unwrap_or(component);
+    let (db, ts) = name.rsplit_once(&format!("{}_", crate::DB_SUFFIX))?;
+    (ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit()) && !db.is_empty()).then_some(db)
+}
 
 /// The server-local file a `/build?db_path=` may read: what the server's LOAD
 /// policy allows (the same rules as SPARQL `LOAD`), and only a regular file —
@@ -3573,6 +3746,19 @@ fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Resu
         )
     };
     let base = fs::canonicalize(backup_dir).unwrap_or_default();
+    // A name of the form `<db>.db_<timestamp>` is where the `/api` layer
+    // looks for `<db>`'s backups: none may be named after another database.
+    if let Ok(rel) = target.strip_prefix(&base) {
+        for c in rel.components() {
+            let c = c.as_os_str().to_string_lossy();
+            if backup_name_db(&c).is_some_and(|db| db != name) {
+                return Err(conflict(&format!(
+                    "is named like a backup of database '{}'",
+                    backup_name_db(&c).unwrap_or_default()
+                )));
+            }
+        }
+    }
     let mut ancestor = target.parent();
     while let Some(dir) = ancestor.filter(|d| d.starts_with(&base) && *d != base) {
         if Database::storage_kind(dir).is_some() || dir.join(BACKUP_OWNER_FILE).exists() {
@@ -3841,15 +4027,30 @@ fn wants_inline(req: &Request) -> bool {
     )
 }
 
-/// Validate a database name: non-empty, ≤ 64 chars, `[A-Za-z0-9_-]` only (so it
-/// is a safe single path component).
+/// Validate a database name: 1 to 64 characters, each a letter or digit (of
+/// any script, so `测试库` is a name, as upstream), `_`, `-` or `.`, with no
+/// leading or trailing `.` and no `..` — a safe single path component that
+/// never needs quoting in the user table (`query@<db>`, comma separated) or
+/// the tab-separated logs. See [`DB_NAME_RULE`].
 pub(crate) fn valid_db_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.chars().count() <= 64
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
         && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
+
+/// The client address as the IP checks see it (`"unknown"` without one).
+pub(crate) fn peer_ip(peer: Option<SocketAddr>) -> String {
+    peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string())
+}
+
+/// The rule [`valid_db_name`] checks, for error messages.
+pub(crate) const DB_NAME_RULE: &str = "the database name may only contain letters, digits, '_', \
+                                       '-' and inner '.'s (at most 64 characters)";
 
 /// Append one line (with a trailing newline) to `root/file`, best effort.
 pub(crate) fn append_log(root: &Path, file: &str, line: &str) {
@@ -3906,9 +4107,17 @@ mod tests {
     #[test]
     fn validates_db_names() {
         assert!(valid_db_name("my_db-1"));
+        assert!(valid_db_name("lubm.v2"));
+        assert!(valid_db_name("测试库"));
         assert!(!valid_db_name(""));
         assert!(!valid_db_name("../etc"));
         assert!(!valid_db_name("a b"));
+        assert!(!valid_db_name(".x"));
+        assert!(!valid_db_name("x."));
+        assert!(!valid_db_name("a..b"));
+        assert!(!valid_db_name("a@b"));
+        assert!(!valid_db_name("a,b"));
+        assert!(!valid_db_name("*"));
     }
 
     // --- in-process HTTP client tests: upload, export download, console,
@@ -4236,7 +4445,8 @@ mod tests {
                             r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
                         )),
                     };
-                    assert!(s == 401 || s == 200, "unexpected status {s}");
+                    // 403: the address got locked out (failed logins).
+                    assert!(s == 401 || s == 200 || s == 403, "unexpected status {s}");
                     n += 1;
                 }
                 n
@@ -4253,10 +4463,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
-        // Authenticated requests are still served meanwhile.
+        // Authenticated requests are still served meanwhile (refused, 403,
+        // once the failed logins from this same address locked it out).
         let root = basic("root", "root");
         let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
-        assert_eq!(s, 200);
+        assert!(s == 200 || s == 403, "{s}");
         stop.store(true, Ordering::Relaxed);
         let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(attempts > 0);

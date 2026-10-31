@@ -472,8 +472,10 @@ fn async_query_result_is_fetched_with_check_operation_state() {
         .and_then(Json::as_array)
         .unwrap_or_else(|| panic!("no results in {j}"));
     assert_eq!(bindings.len(), 3);
-    // Written where upstream writes it: <export>/<opt_id>.json.
-    let file = root.join("export").join(format!("{opt_id}.json"));
+    // Written to <root>/tasks/<opt_id>.json — not to the export directory
+    // (upstream's place), which anyone may download from.
+    let file = root.join("tasks").join(format!("{opt_id}.json"));
+    assert!(!root.join("export").join(format!("{opt_id}.json")).exists());
     let saved = json::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(saved.get("AnsNum").and_then(Json::as_i64), Some(3));
     let j = api(
@@ -560,7 +562,14 @@ fn capture_one(listener: TcpListener, status: u16) -> mpsc::Receiver<(String, St
 
 #[test]
 fn callback_receives_the_result_and_failures_are_tolerated() {
-    let (srv, addr, _root) = start("callback");
+    // The callbacks go to listeners on the loopback interface.
+    let (srv, addr, _root) = start_with(
+        "callback",
+        TaskConfig {
+            callback_allow_local: true,
+            ..TaskConfig::default()
+        },
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/hook?src=gstore", listener.local_addr().unwrap());
     let got = capture_one(listener, 200);
@@ -1191,6 +1200,8 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         "https_cb",
         TaskConfig {
             callback_ca_file: Some(cert),
+            // The hook listens on the loopback interface.
+            callback_allow_local: true,
             ..TaskConfig::default()
         },
     );

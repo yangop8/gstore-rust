@@ -18,7 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::envelope::{GResp, Status};
 use super::params::Params;
-use super::{auth, required, Ctx, OpSpec, Registry};
+use super::{auth, required, tasks, Ctx, OpSpec, Registry};
 use crate::http_api::{
     log_query, ApiInner, DbHandle, JobOutput, OpError, OpErrorKind, QueryJob, TxnIsolation,
 };
@@ -56,10 +56,11 @@ enum OutFormat {
 
 impl OutFormat {
     /// The format named by `format=` (default `json`; an empty value is
-    /// `json` too). Unknown names are `None`: upstream answers them only after
-    /// running the query (and never for an update) with `1005 "Unknown result
-    /// format."`; this layer refuses them up front with `1003`, before
-    /// anything runs.
+    /// `json` too). Unknown names (e.g. the `html` older upstream docs list)
+    /// are `None`, and handled as upstream does: an update ignores the format,
+    /// a read is run and then answered `1005 "Unknown result format."` — or,
+    /// run asynchronously (where upstream does not check the format), as
+    /// `json`.
     fn parse(v: Option<&str>) -> Option<OutFormat> {
         match v.map(str::trim).unwrap_or("") {
             "" | "json" => Some(OutFormat::Json),
@@ -88,15 +89,8 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(r) => return r,
     };
     let fmt_param = p.str("format");
-    let Some(format) = OutFormat::parse(fmt_param.as_deref()) else {
-        return GResp::error(
-            Status::ParamIsIllegal,
-            format!(
-                "Unknown result format '{}': use json, file, n-triple or n-triple-file",
-                fmt_param.unwrap_or_default()
-            ),
-        );
-    };
+    let format = OutFormat::parse(fmt_param.as_deref())
+        .or_else(|| tasks::current().is_some().then_some(OutFormat::Json));
     // `async=true` (an opt_id answered at once, the result fetched later with
     // checkOperationState) is the dispatcher's: this then runs on a task
     // runner, and the statement's task is that operation's (`tasks`).
@@ -153,6 +147,9 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             update_response(changed, None, &query_time, &thread_id)
         }
         Ok(JobOutput::Read(result)) => {
+            let Some(format) = format else {
+                return GResp::error(Status::OperationFailed, "Unknown result format.");
+            };
             let rs = result_table(result);
             match read_response(ctx, &db, &rs, format, limit, &query_time, &thread_id) {
                 Ok(r) => r,

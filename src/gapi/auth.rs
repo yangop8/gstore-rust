@@ -142,7 +142,8 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
 /// * with `accept_system`, `conf.ini`'s `system_username` with this run's
 ///   system password (the one `gserver` writes to its pid file; with
 ///   `encryption=1` its MD5 hex digest) is accepted — what upstream's
-///   `/shutdown` and `/restart` take;
+///   `/shutdown` and `/restart` take — and that name is checked against
+///   nothing else;
 /// * an upstream *inner* request (`inner=true` from `127.0.0.1`) skips the
 ///   password check when [`GapiConfig::trust_inner_localhost`](super::GapiConfig)
 ///   is on; the user must still exist;
@@ -177,8 +178,11 @@ pub fn verify(
             ctx.user = Some(username.clone());
             return Ok(username);
         }
-        // Not the system password: fall through to the user store (where a
-        // user of that name, if any, is checked like any other).
+        // Only this run's system password admits the system user here: a
+        // stored user of that name (which can no longer be created, but may
+        // predate the rule) must not stop or restart the server.
+        note_auth_failure(ctx);
+        return Err(wrong());
     }
     if ctx.config.trust_inner_localhost && creds.inner && ctx.remote_ip == "127.0.0.1" {
         if !ctx.state().users.exists(&username) {

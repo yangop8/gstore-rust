@@ -122,6 +122,14 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     "Username already existed, add user failed.",
                 );
             }
+            if op_username == ctx.inner.config().system_username {
+                return GResp::error(
+                    Status::ParamIsIllegal,
+                    format!(
+                        "add user failed: '{op_username}' is the system user's name (system_username)"
+                    ),
+                );
+            }
             match st.users.add(&op_username, &op_password, BTreeSet::new()) {
                 Ok(()) => GResp::success("Add user done."),
                 Err(e) => GResp::error(Status::ParamIsIllegal, format!("add user failed: {e}")),

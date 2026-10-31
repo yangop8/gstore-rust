@@ -697,13 +697,9 @@ fn parse_privilege_column(list: &str) -> Option<PrivilegeColumn> {
 }
 
 /// Whether `db` may carry a per-database grant: a database name as the server
-/// accepts it (`[A-Za-z0-9_-]`, 1..=64 characters).
+/// accepts it ([`crate::http_api::valid_db_name`]).
 fn valid_grant_db(db: &str) -> bool {
-    !db.is_empty()
-        && db.len() <= 64
-        && db
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    crate::http_api::valid_db_name(db)
 }
 
 /// An issued login session.

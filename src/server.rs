@@ -404,7 +404,7 @@ impl Server {
     /// has unsaved changes, and return from [`serve_forever`](Self::serve_forever).
     /// Returns immediately; join the serving thread to wait for completion.
     pub fn shutdown(&self) {
-        self.life.request_stop();
+        self.life.request_plain_stop();
     }
 
     /// Accept connections until [`shutdown`](Self::shutdown), serving them on
@@ -512,9 +512,10 @@ impl ShutdownHandle {
         ShutdownHandle { life }
     }
 
-    /// Request a graceful shutdown (idempotent, non-blocking).
+    /// Request a graceful shutdown (idempotent, non-blocking). It also calls
+    /// off a [`restart`](Self::restart) requested earlier.
     pub fn shutdown(&self) {
-        self.life.request_stop();
+        self.life.request_plain_stop();
     }
 
     /// Whether a shutdown has been requested.
@@ -590,6 +591,15 @@ impl Lifecycle {
 
     pub(crate) fn restart_requested(&self) -> bool {
         self.restart.load(Ordering::SeqCst)
+    }
+
+    /// An explicit stop ([`ShutdownHandle::shutdown`], a signal, `/shutdown`):
+    /// [`request_stop`](Self::request_stop), and a restart requested earlier
+    /// is called off — the latest request wins, so an operator stopping the
+    /// server while a `/restart` is still shutting it down gets a stop.
+    pub(crate) fn request_plain_stop(&self) {
+        self.restart.store(false, Ordering::SeqCst);
+        self.request_stop();
     }
 
     /// Flag the shutdown and wake the accept loop with a throwaway
@@ -900,7 +910,11 @@ pub(crate) fn serve_connection<S: Read + Write>(
     peer: Option<SocketAddr>,
     first: InFlightGuard,
     env: &ConnEnv,
-    mut handle: impl FnMut(&mut S, Result<Request, BadRequest>, &ConnMeta) -> io::Result<bool>,
+    mut handle: impl FnMut(
+        &mut ResponseSink<S>,
+        Result<Request, BadRequest>,
+        &ConnMeta,
+    ) -> io::Result<bool>,
 ) {
     struct PeerScope;
     impl Drop for PeerScope {
@@ -914,7 +928,7 @@ pub(crate) fn serve_connection<S: Read + Write>(
     let opts = &*env.opts;
     let life = &env.life;
     let mut reader = BufReader::new(Timed {
-        inner: stream,
+        inner: ResponseSink::new(stream),
         ctl,
         deadline: None,
     });
@@ -944,7 +958,9 @@ pub(crate) fn serve_connection<S: Read + Write>(
             Ok(Some(r)) => r,
             Err(bad) => {
                 let meta = ConnMeta::new(false, idle, 0, opts.cors);
-                let _ = handle(&mut reader.get_mut().inner, Err(bad), &meta);
+                let stream = &mut reader.get_mut().inner;
+                stream.start_response(false);
+                let _ = handle(stream, Err(bad), &meta);
                 return;
             }
         };
@@ -965,6 +981,8 @@ pub(crate) fn serve_connection<S: Read + Write>(
             && !life.stopping();
         let meta = ConnMeta::new(keep, idle, max_requests.saturating_sub(served), opts.cors);
         let stream = &mut reader.get_mut().inner;
+        // A response to HEAD is written like any other, minus its body.
+        stream.start_response(req.method.eq_ignore_ascii_case("HEAD"));
         let kept = if opts.cors && req.method == "OPTIONS" {
             write_preflight(stream, &req, &meta).is_ok()
         } else {
@@ -973,6 +991,70 @@ pub(crate) fn serve_connection<S: Read + Write>(
         if !(kept && keep) || life.stopping() {
             return;
         }
+    }
+}
+
+/// A connection's transport as the response writers see it: everything
+/// passes through, except that while the response to a `HEAD` request is
+/// written ([`start_response`](Self::start_response)) its body — whatever
+/// follows the empty line that ends the header block — is dropped. Every
+/// route can then answer `HEAD` exactly like `GET` (same status and headers,
+/// `Content-Length` included, RFC 9110 §9.3.2), and a client reusing the
+/// connection never misreads a body it does not expect as the start of the
+/// next response.
+pub(crate) struct ResponseSink<S> {
+    inner: S,
+    /// Drop the body of the response being written.
+    head_only: bool,
+    /// How much of the header terminator `\r\n\r\n` the bytes written so
+    /// far end with (`4`: the header block is complete).
+    matched: u8,
+}
+
+impl<S> ResponseSink<S> {
+    fn new(inner: S) -> ResponseSink<S> {
+        ResponseSink {
+            inner,
+            head_only: false,
+            matched: 0,
+        }
+    }
+
+    /// A new response begins; `head_only` for the response to a `HEAD`.
+    fn start_response(&mut self, head_only: bool) {
+        self.head_only = head_only;
+        self.matched = 0;
+    }
+}
+
+impl<S: Read> Read for ResponseSink<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for ResponseSink<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.head_only {
+            return self.inner.write(buf);
+        }
+        // Pass the header block through, up to and including its end.
+        let mut n = 0;
+        while n < buf.len() && self.matched < 4 {
+            self.matched = match (self.matched, buf[n]) {
+                (0 | 2, b'\r') => self.matched + 1,
+                (1 | 3, b'\n') => self.matched + 1,
+                (_, b'\r') => 1,
+                _ => 0,
+            };
+            n += 1;
+        }
+        self.inner.write_all(&buf[..n])?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1293,8 +1375,9 @@ fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, 
 /// Arrange for `SIGINT`/`SIGTERM` to trigger `handle.shutdown()` (unix only;
 /// returns `false` — and does nothing — elsewhere or if the handlers could not
 /// be installed). A tiny watcher thread polls the flag the async-signal-safe
-/// handler sets. After the first signal the default disposition is restored,
-/// so a second Ctrl-C terminates the process immediately.
+/// handler sets. After the first signal `SIGINT` gets its default disposition
+/// back, so a second Ctrl-C terminates the process immediately; a repeated
+/// `SIGTERM` is ignored (see [`on_termination_signal`]).
 pub fn shutdown_on_signals(handle: ShutdownHandle) -> bool {
     on_termination_signal(move || handle.shutdown())
 }
@@ -1302,10 +1385,14 @@ pub fn shutdown_on_signals(handle: ShutdownHandle) -> bool {
 /// Run `f` once, on a watcher thread, when the process first receives
 /// `SIGINT` or `SIGTERM` (unix only; returns `false` — and does nothing —
 /// elsewhere or if the handlers could not be installed). After that first
-/// signal the default disposition is restored, so a second one terminates the
-/// process immediately. [`shutdown_on_signals`] is this with a graceful
-/// shutdown; `gserver`'s supervisor uses it to forward the signal to the
-/// server it watches.
+/// signal `SIGINT` gets its default disposition back, so a second Ctrl-C
+/// terminates the process immediately, while further `SIGTERM`s are ignored:
+/// one often arrives twice — a service manager signals the whole process
+/// group, `gserver`'s supervisor forwards the one it got, `gserver -t` is
+/// run again — and must not kill a graceful shutdown half-way through its
+/// final save (`gserver -k` sends `SIGKILL`). [`shutdown_on_signals`] is this
+/// with a graceful shutdown; `gserver`'s supervisor uses it to forward the
+/// signal to the server it watches.
 pub fn on_termination_signal(f: impl FnOnce() + Send + 'static) -> bool {
     #[cfg(unix)]
     {
@@ -1316,7 +1403,7 @@ pub fn on_termination_signal(f: impl FnOnce() + Send + 'static) -> bool {
             .name("gstore-signals".into())
             .spawn(move || loop {
                 if signals::received() {
-                    signals::restore_default();
+                    signals::restore_default_sigint();
                     f();
                     break;
                 }
@@ -1364,11 +1451,12 @@ mod signals {
         unsafe { signal(SIGINT, handler) != SIG_ERR && signal(SIGTERM, handler) != SIG_ERR }
     }
 
-    pub(super) fn restore_default() {
+    /// `SIGINT` back to its default disposition (`SIGTERM` keeps the
+    /// handler, which only sets the flag again).
+    pub(super) fn restore_default_sigint() {
         // SAFETY: restoring the default disposition is always valid.
         unsafe {
             signal(SIGINT, SIG_DFL);
-            signal(SIGTERM, SIG_DFL);
         }
     }
 
@@ -3249,5 +3337,54 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         assert!(body.contains("\"triples\":2"), "{body}");
         server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HEAD` response keeps its headers (`Content-Length` included) but
+    /// sends no body, so the next response on a kept-alive connection is
+    /// read as a response.
+    #[test]
+    fn head_responses_carry_no_body_on_a_kept_alive_connection() {
+        let (_srv, addr) = start();
+        let resp = http(
+            &addr,
+            "HEAD /status HTTP/1.1\r\nHost: x\r\n\r\n\
+             GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let (first, rest) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(first.starts_with("HTTP/1.1 405"), "{resp}");
+        assert!(first.contains("Content-Length: 18"), "{first}");
+        assert!(first.contains("Connection: keep-alive"), "{first}");
+        assert!(rest.starts_with("HTTP/1.1 200"), "the body leaked: {rest}");
+        assert!(rest.contains("\"triples\":2"), "{rest}");
+    }
+
+    #[test]
+    fn response_sink_drops_only_the_body_of_a_head_response() {
+        let mut sink = ResponseSink::new(Vec::new());
+        sink.start_response(true);
+        // The header terminator split across writes.
+        for part in [&b"HTTP/1.1 200 OK\r\nA: b\r"[..], b"\n\r", b"\nbody", b"more"] {
+            assert_eq!(sink.write(part).unwrap(), part.len());
+        }
+        assert_eq!(sink.inner, b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n");
+        sink.start_response(false);
+        sink.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody").unwrap();
+        assert!(sink.inner.ends_with(b"\r\n\r\nbody"));
+    }
+
+    /// The latest request wins: stopping the server while a restart is under
+    /// way (a signal, `gserver -t`) stops it.
+    #[test]
+    fn an_explicit_stop_calls_off_a_pending_restart() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let life = Lifecycle::new(listener.local_addr().unwrap());
+        let handle = ShutdownHandle::new(Arc::clone(&life));
+        handle.restart();
+        assert!(handle.restart_requested() && handle.is_shutdown());
+        handle.shutdown();
+        assert!(!handle.restart_requested() && handle.is_shutdown());
+        // A restart asked for once the shutdown is under way stays a shutdown.
+        handle.restart();
+        assert!(!handle.restart_requested());
     }
 }

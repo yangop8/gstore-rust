@@ -17,7 +17,7 @@
 //! and redirects are out of scope. Every exchange is bounded by [`Limits`].
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -82,6 +82,7 @@ pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<St
         request.as_bytes(),
         limits,
         None,
+        false,
         "SERVICE endpoint",
     )?;
     let reply = parse_reply(&raw)?;
@@ -118,6 +119,37 @@ pub struct PostOptions {
     /// trust. `None` = the system bundle (`$SSL_CERT_FILE`, else the usual
     /// Linux / BSD / macOS locations).
     pub ca_file: Option<PathBuf>,
+    /// Refuse to connect to a host-local address ([`is_local_addr`]):
+    /// checked on every address the host resolves to, right before
+    /// connecting to it (so a DNS answer cannot slip one past a check made
+    /// earlier).
+    pub refuse_local: bool,
+}
+
+/// Whether `ip` reaches this host or its link rather than a network service
+/// a client may name: loopback, unspecified, link-local (cloud metadata
+/// endpoints live there), multicast and broadcast addresses — IPv4, IPv6,
+/// and IPv4 mapped into IPv6.
+pub fn is_local_addr(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_local_addr(&IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// `POST` `body` (labelled `content_type`) to `url` with the default
@@ -169,6 +201,7 @@ pub fn post_with(
         &request,
         opts.limits,
         opts.ca_file.as_deref(),
+        opts.refuse_local,
         "HTTP endpoint",
     )?;
     parse_reply(&raw)
@@ -278,6 +311,7 @@ fn exchange(
     request: &[u8],
     limits: Limits,
     ca_file: Option<&Path>,
+    refuse_local: bool,
     what: &str,
 ) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + limits.total;
@@ -291,6 +325,13 @@ fn exchange(
     let mut stream = None;
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "endpoint host did not resolve");
     for addr in (target.host.as_str(), target.port).to_socket_addrs()? {
+        if refuse_local && is_local_addr(&addr.ip()) {
+            last_err = io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{what} address {} is host-local; refused", addr.ip()),
+            );
+            continue;
+        }
         match TcpStream::connect_timeout(&addr, remaining()?) {
             Ok(s) => {
                 stream = Some(s);
@@ -1068,6 +1109,46 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             "nothing is sent to an unverified server"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_local_addresses() {
+        for local in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "0.0.0.0",
+            "169.254.169.254",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_local_addr(&local.parse().unwrap()), "{local}");
+        }
+        for remote in ["10.0.0.1", "192.168.1.2", "8.8.8.8", "2001:db8::1", "fd00::1"] {
+            assert!(!is_local_addr(&remote.parse().unwrap()), "{remote}");
+        }
+    }
+
+    /// `refuse_local` refuses a loopback target without connecting to it.
+    #[test]
+    fn refuse_local_refuses_loopback_targets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let opts = PostOptions {
+            refuse_local: true,
+            ..PostOptions::default()
+        };
+        for host in ["127.0.0.1", "localhost"] {
+            let err = post_with(&format!("http://{host}:{port}/x"), "text/plain", b"x", &opts)
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        }
+        assert!(listener.accept().is_err(), "nothing connected");
     }
 
     /// A refused connection is an error, not a hang.

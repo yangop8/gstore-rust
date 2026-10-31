@@ -824,22 +824,26 @@ fn query_output_formats() {
     );
     let text = std::fs::read_to_string(root.join("export").join(s(&j, "FileName"))).unwrap();
     assert_eq!(text, "[empty result]\n");
-    // An unknown format is refused before anything runs: 1003, and an
-    // update with it is not applied.
+    // An unknown format, as upstream: a read runs and then answers 1005
+    // "Unknown result format."; an update ignores it and is applied.
     let j = q("xml", sel);
-    assert_eq!(code(&j), 1003, "{j}");
+    assert_eq!(
+        (code(&j), j.get("StatusMsg").and_then(Json::as_str)),
+        (1005, Some("Unknown result format.")),
+        "{j}"
+    );
     let j = q(
         "csv",
         "INSERT DATA { <http://ex/new> <http://ex/p> <http://ex/x> }",
     );
-    assert_eq!(code(&j), 1003);
+    assert_eq!(code(&j), 0, "{j}");
     let j = q(
         "json",
         "ASK { <http://ex/new> <http://ex/p> <http://ex/x> }",
     );
     assert_eq!(
         s(bindings(&j)[0].get("_askResult").unwrap(), "value"),
-        "false"
+        "true"
     );
 }
 

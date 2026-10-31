@@ -54,8 +54,10 @@
 //! [`TaskConfig::max_finished`] asynchronous and [`TaskConfig::max_history`]
 //! synchronous ones (oldest first out). An asynchronous `query` result — or
 //! any result over [`TaskConfig::spill_threshold`] bytes — is written to
-//! `<export dir>/<opt_id>.json` (upstream's location) instead of being held
-//! in memory; the file is removed when the task is dropped from retention.
+//! `<root>/tasks/<opt_id>.json` instead of being held in memory; the file is
+//! removed when the task is dropped from retention. (Upstream writes it to
+//! its export directory, which anyone may download from; here only
+//! `checkOperationState`, with its owner check, reads it.)
 //!
 //! # Callbacks
 //!
@@ -69,8 +71,12 @@
 //! ([`TaskInfo::callback_status`]) and never changes the task's state. The
 //! URL must be `http://…` (`https://…` with the `tls` feature) and is checked
 //! before the operation is accepted. As upstream, the server POSTs wherever
-//! the (authenticated, privileged) caller says — deploy it where its
-//! outbound connections are restricted if that matters.
+//! the (authenticated, privileged) caller says — except to a host-local
+//! address (loopback, link-local, …; see
+//! [`TaskConfig::callback_allow_local`]), checked on every address the host
+//! resolves to as the callback is delivered — so deploy it where its
+//! outbound connections are restricted if reaching other internal hosts
+//! matters.
 //!
 //! # Shutdown
 //!
@@ -153,6 +159,13 @@ pub struct TaskConfig {
     /// For `https://` callbacks (feature `tls`): the CA bundle to trust
     /// (`None` = the system bundle).
     pub callback_ca_file: Option<PathBuf>,
+    /// Deliver callbacks to host-local addresses too — loopback, link-local
+    /// (cloud metadata endpoints), unspecified, multicast
+    /// ([`http_client::is_local_addr`]). Off by default: a callback is the
+    /// server making a request on a client's behalf, and one to its own
+    /// loopback interface would reach services that trust local callers —
+    /// this server's own `/api` among them.
+    pub callback_allow_local: bool,
     /// How long `operationTaskCancel` waits for the task to stop before it
     /// answers (upstream waits until it stops).
     pub cancel_wait: Duration,
@@ -176,6 +189,7 @@ impl Default for TaskConfig {
             callback_timeout: Duration::from_secs(10),
             callback_retries: 0,
             callback_ca_file: None,
+            callback_allow_local: false,
             cancel_wait: Duration::from_secs(3),
             shutdown_wait: Duration::from_secs(5),
             spill_threshold: 256 * 1024,
@@ -1070,6 +1084,7 @@ fn deliver_callback(url: &str, body: &[u8], config: &TaskConfig) -> String {
             max_response: 1 << 20,
         },
         ca_file: config.callback_ca_file.clone(),
+        refuse_local: !config.callback_allow_local,
     };
     let mut last = String::new();
     for attempt in 0..=config.callback_retries {
@@ -1087,11 +1102,28 @@ fn deliver_callback(url: &str, body: &[u8], config: &TaskConfig) -> String {
 }
 
 /// Check a `callback` parameter: `http://…` (or `https://…` with the `tls`
-/// feature). The error is the message for a `1003` answer.
-pub fn check_callback_url(url: &str) -> Result<(), String> {
-    http_client::parse_url(url)
-        .map(|_| ())
-        .map_err(|e| format!("the callback address is invalid: {e}"))
+/// feature), and — unless `allow_local` ([`TaskConfig::callback_allow_local`])
+/// — not a host-local address written as such (an IP literal or
+/// `localhost`; a host name is checked again on every address it resolves to
+/// when the callback is delivered). The error is the message for a `1003`
+/// answer.
+pub fn check_callback_url(url: &str, allow_local: bool) -> Result<(), String> {
+    let target =
+        http_client::parse_url(url).map_err(|e| format!("the callback address is invalid: {e}"))?;
+    let host = target.host.trim_end_matches('.').to_ascii_lowercase();
+    let local = host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| http_client::is_local_addr(&ip));
+    if local && !allow_local {
+        return Err(format!(
+            "the callback address '{}' is a host-local address, which this server does not \
+             call back",
+            target.host
+        ));
+    }
+    Ok(())
 }
 
 // ---- the dispatcher hook ---------------------------------------------------
@@ -1106,7 +1138,8 @@ pub fn check_callback_url(url: &str) -> Result<(), String> {
 pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GResp {
     let callback = params.non_empty("callback");
     if let Some(url) = &callback {
-        if let Err(msg) = check_callback_url(url) {
+        let allow_local = ctx.inner.tasks.config().callback_allow_local;
+        if let Err(msg) = check_callback_url(url, allow_local) {
             return GResp::error(Status::ParamIsIllegal, msg);
         }
     }
@@ -1145,7 +1178,9 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
         user: ctx.user().to_string(),
         sparql: params.str("sparql").unwrap_or_default(),
         callback,
-        result_dir: Some(ctx.export_dir()),
+        // Not the export directory, which `/file/download` serves to anyone:
+        // a result is the task owner's (`checkOperationState`).
+        result_dir: Some(ctx.task_result_dir()),
     };
     // The access log: the dispatcher records the submission (`state` 0,
     // under the answered opt_id); this, the outcome.
@@ -1587,8 +1622,20 @@ mod tests {
             "{:?}",
             info.callback_status
         );
-        assert!(check_callback_url("http://127.0.0.1:1/x").is_ok());
-        assert!(check_callback_url("ftp://x").is_err());
+        assert!(check_callback_url("http://127.0.0.1:1/x", true).is_ok());
+        assert!(check_callback_url("http://example.com:1/x", false).is_ok());
+        assert!(check_callback_url("http://10.1.2.3/x", false).is_ok());
+        for local in [
+            "http://127.0.0.1:1/x",
+            "http://localhost/x",
+            "http://LOCALHOST./x",
+            "http://[::1]:9000/api",
+            "http://169.254.169.254/latest",
+            "http://0.0.0.0:9000/",
+        ] {
+            assert!(check_callback_url(local, false).is_err(), "{local}");
+        }
+        assert!(check_callback_url("ftp://x", true).is_err());
     }
 
     #[test]

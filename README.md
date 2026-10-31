@@ -156,7 +156,15 @@ The multi-DB server also speaks upstream gStore's `/api` protocol (`GET|POST
 `GstoreConnector.py` work against it unchanged, plus upstream's `/shutdown`
 and `/restart` routes. Settings come from `conf.ini` (see
 `conf/conf.ini.example`; `-c FILE` picks another file, and command-line flags
-win over it).
+win over it; `operation=refreshconf` re-reads it). Known differences from
+upstream: a database is **single-writer** — one transaction may be open on it
+at a time (a second `begin` answers `1008`), and while it is open other
+writes to it (`query` updates, `batchInsert`, …) answer `1004` until it is
+committed or rolled back, where upstream runs concurrent transactions; zip
+packages (`build`/`batchInsert`/`restore` from a `.zip`, `compress=true` for
+`backup`/`export`) are refused with `1003` for now; a user holding the restore
+privilege on a database restores only that database's own backups; and
+asynchronous results are kept out of the public export directory.
 
 Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each

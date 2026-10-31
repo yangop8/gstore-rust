@@ -70,8 +70,6 @@ impl Params {
             .and_then(|c| c.split(';').next())
             .map(|m| m.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        let text = String::from_utf8_lossy(body);
-        let trimmed = text.trim_start_matches('\u{FEFF}').trim();
         if media == "multipart/form-data" {
             let ctype = content_type.unwrap_or_default();
             let (fields, files) = parse_multipart(ctype, body)?;
@@ -84,7 +82,27 @@ impl Params {
                 }
                 p.files.push(f);
             }
-        } else if trimmed.is_empty() {
+            return Ok(p);
+        }
+        // Parsed in place: the body (which may be large, and is read before
+        // the caller is authenticated) is never copied into a decoded string.
+        // JSON and form bodies are text; any other body carries no parameters.
+        let text = match std::str::from_utf8(body) {
+            Ok(t) => t,
+            Err(_) => {
+                let first = body.iter().find(|b| !b.is_ascii_whitespace());
+                let textual = media == "application/json"
+                    || media == "application/x-www-form-urlencoded"
+                    || first == Some(&b'{')
+                    || body.contains(&b'=');
+                if textual {
+                    return Err("the request body is not valid UTF-8".to_string());
+                }
+                ""
+            }
+        };
+        let trimmed = text.trim_start_matches('\u{FEFF}').trim();
+        if trimmed.is_empty() {
             // No body parameters.
         } else if media == "application/json" || trimmed.starts_with('{') {
             match json::parse(trimmed) {
@@ -513,6 +531,29 @@ mod tests {
         assert!(
             Params::from_parts(None, Some("multipart/form-data; boundary=nope"), body).is_err()
         );
+    }
+
+    #[test]
+    fn bodies_that_are_not_text() {
+        // A binary body of another type carries no parameters.
+        let p = Params::from_parts(
+            Some("operation=check"),
+            Some("application/octet-stream"),
+            &[0xff, 0xfe, 0x00, 0x80],
+        )
+        .unwrap();
+        assert_eq!(p.keys().collect::<Vec<_>>(), ["operation"]);
+        // A JSON or form body must be UTF-8.
+        assert!(Params::from_parts(None, Some("application/json"), b"{\"a\":\"\xff\"}").is_err());
+        assert!(Params::from_parts(None, None, b"a=\xff").is_err());
+        // A multipart file is taken as bytes.
+        let mut body =
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.nt\"\r\n\r\n"
+                .to_vec();
+        body.extend_from_slice(&[0xff; 16]);
+        body.extend_from_slice(b"\r\n--B--\r\n");
+        let p = Params::from_parts(None, Some("multipart/form-data; boundary=B"), &body).unwrap();
+        assert_eq!(p.file("file").unwrap().data, [0xff; 16]);
     }
 
     #[test]

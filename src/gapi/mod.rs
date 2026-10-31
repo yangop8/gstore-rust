@@ -177,6 +177,13 @@ impl Ctx<'_> {
             .unwrap_or_else(|| self.inner.root.join("export"))
     }
 
+    /// Where asynchronous operations' results are kept
+    /// (`<root>/tasks`, see [`tasks`]): not under the export directory,
+    /// which `/file/download` serves without credentials.
+    pub fn task_result_dir(&self) -> PathBuf {
+        self.inner.root.join("tasks")
+    }
+
     /// The server state, locked. Hold it briefly and never wait for a
     /// database lock while holding it (the locking rule on `ApiState`).
     pub(crate) fn state(&self) -> MutexGuard<'_, ApiState> {
@@ -352,19 +359,79 @@ pub fn registry() -> &'static Registry {
 
 /// Whether `req` belongs to this layer (see the module docs' *Routing*).
 pub(crate) fn wants(req: &Request) -> bool {
-    let method = req.method.as_str();
+    wants_target(&req.method, &req.path, req.query.as_deref())
+}
+
+fn wants_target(method: &str, path: &str, query: Option<&str>) -> bool {
     let get_or_post = matches!(method, "GET" | "POST");
-    match req.path.as_str() {
+    match path {
         "/api" | "/grpc/api" | "/ghttp/api" => get_or_post,
         "/" => {
             method == "POST"
                 || (method == "GET"
-                    && req.query.as_deref().is_some_and(|q| {
+                    && query.is_some_and(|q| {
                         params::parse_form(q).iter().any(|(k, _)| k == "operation")
                     }))
         }
         path => registry().path_route(method, path).is_some(),
     }
+}
+
+/// Rewrite the request target of `req` the way upstream's server reads it,
+/// when that makes it one of this layer's routes (other requests are left
+/// alone):
+///
+/// * a percent-encoded `?` in the path — the upstream Java, Node.js, C++ and
+///   PHP SDKs URL-encode the whole `?operation=…&…` string of their default
+///   `GET` requests and append it to `/api` — is decoded and split into the
+///   path and the query, as upstream decodes the whole request URI before it
+///   parses it (`GRPCServer::process`). The decoded parameters are taken as
+///   they are (upstream does not decode them a second time);
+/// * one trailing `/` is ignored (`/api/` = `/api`; upstream `Router::call`).
+pub(crate) fn normalize_target(req: &mut Request) {
+    if wants(req) {
+        return;
+    }
+    let mut path = req.path.clone();
+    let mut query = req.query.clone();
+    if path.contains('%') {
+        let decoded = params::url_decode(&path);
+        if let Some((p, q)) = decoded.split_once('?') {
+            let q = requote_query(q);
+            query = Some(match query.filter(|orig| !orig.is_empty()) {
+                Some(orig) => format!("{q}&{orig}"),
+                None => q,
+            });
+            path = p.to_string();
+        }
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    // Only the exact routes: a file path under `/file/download/` decodes its
+    // own name.
+    let exact = matches!(path.as_str(), "/api" | "/grpc/api" | "/ghttp/api" | "/")
+        || registry()
+            .path_route(&req.method, &path)
+            .is_some_and(|r| !r.prefix);
+    if exact && wants_target(&req.method, &path, query.as_deref()) {
+        req.path = path;
+        req.query = query;
+    }
+}
+
+/// An already-decoded query string, re-encoded so that [`params::parse_form`]
+/// decodes every name and value back to itself (`%` and `+` escaped).
+fn requote_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for c in q.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '+' => out.push_str("%2B"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Serve one `/api` request (no lock held). Returns the response and the
@@ -464,8 +531,9 @@ pub const SYSTEM_DB: &str = "system";
 /// Validate a `db_name` like upstream's `check_param_value("db_name", …)`
 /// (non-empty, not the system database, at least 3 characters, no `.db`
 /// suffix), plus this server's rule that it be a safe single path component
-/// (`[A-Za-z0-9_-]`, at most 64 characters). The error is the message for a
-/// `1003` answer.
+/// ([`crate::http_api::valid_db_name`]: letters and digits — any script —,
+/// `_`, `-` and inner `.`s, at most 64 characters). The error is the message
+/// for a `1003` answer.
 pub fn check_db_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("the value of db_name can not be empty!".to_string());
@@ -483,10 +551,7 @@ pub fn check_db_name(name: &str) -> Result<(), String> {
         ));
     }
     if !crate::http_api::valid_db_name(name) {
-        return Err(
-            "the database name may only contain the characters A-Z a-z 0-9 _ - (at most 64)"
-                .to_string(),
-        );
+        return Err(crate::http_api::DB_NAME_RULE.to_string());
     }
     Ok(())
 }
@@ -510,13 +575,25 @@ mod tests {
     fn db_names_follow_upstream_rules() {
         assert!(check_db_name("lubm").is_ok());
         assert!(check_db_name("my_db-1").is_ok());
+        // Upstream accepts dots and names in any script.
+        assert!(check_db_name("lubm.v2").is_ok());
+        assert!(check_db_name("测试库").is_ok());
         for bad in [
             "",
             "system",
             "ab",
             "x.db",
             "../etc",
+            "..x",
+            ".hidden",
+            "x..y",
+            "a/b",
+            "a\\b",
             "a b c",
+            "a,b",
+            "a@b",
+            "a\tb",
+            "x.",
             &"x".repeat(65),
         ] {
             assert!(check_db_name(bad).is_err(), "{bad:?}");
@@ -595,6 +672,51 @@ mod tests {
             assert_eq!(requirement(spec.privilege), needed, "{op}");
             assert_eq!(spec.async_capable, is_async, "{op}");
         }
+    }
+
+    #[test]
+    fn upstream_request_targets_are_normalized() {
+        let norm = |method: &str, path: &str, query: Option<&str>| {
+            let mut r = Request {
+                method: method.into(),
+                path: path.into(),
+                query: query.map(Into::into),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            normalize_target(&mut r);
+            (r.path, r.query)
+        };
+        // The Java / Node.js / PHP / C++ SDKs' encoded `?operation=…`.
+        let (path, query) = norm(
+            "GET",
+            "/api%3Foperation%3Dlogin%26username%3Droot%26password%3D1%2B1%2525",
+            None,
+        );
+        assert_eq!(path, "/api");
+        let p = Params::from_parts(query.as_deref(), None, b"").unwrap();
+        assert_eq!(p.str("operation").as_deref(), Some("login"));
+        assert_eq!(p.str("username").as_deref(), Some("root"));
+        assert_eq!(p.str("password").as_deref(), Some("1+1%25"), "decoded once");
+        // Java's URLEncoder writes spaces as `+`.
+        let (path, query) = norm("GET", "/api%3Fsparql%3Dselect+%3Fx", Some("x=1"));
+        assert_eq!(path, "/api");
+        let p = Params::from_parts(query.as_deref(), None, b"").unwrap();
+        assert_eq!(p.str("sparql").as_deref(), Some("select ?x"));
+        assert_eq!(p.str("x").as_deref(), Some("1"));
+        // A trailing slash.
+        assert_eq!(norm("POST", "/api/", None).0, "/api");
+        assert_eq!(norm("GET", "/grpc/api/", None).0, "/grpc/api");
+        assert_eq!(norm("POST", "/file/upload/", None).0, "/file/upload");
+        assert_eq!(norm("GET", "/shutdown/", None).0, "/shutdown");
+        // Other requests are left alone.
+        assert_eq!(norm("GET", "/sparql/", None).0, "/sparql/");
+        assert_eq!(norm("GET", "/x%3Fy", None).0, "/x%3Fy");
+        assert_eq!(norm("GET", "/", None).0, "/");
+        assert_eq!(
+            norm("GET", "/file/download/a%3Fb.nt", None).0,
+            "/file/download/a%3Fb.nt"
+        );
     }
 
     #[test]

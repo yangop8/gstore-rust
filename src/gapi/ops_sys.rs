@@ -1,8 +1,9 @@
 //! System operations: `check`, `login`, `testConnect`, `getCoreVersion`,
-//! `stat` (upstream `grpc.cpp` `check_task` … `core_version_task`, `stat_task`).
+//! `stat`, `refreshconf` (upstream `grpc.cpp` `check_task` …
+//! `core_version_task`, `stat_task`, `refresh_conf_task`).
 
 use super::auth;
-use super::envelope::GResp;
+use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{Ctx, OpSpec, Registry};
 use crate::json::Json;
@@ -13,6 +14,23 @@ pub(super) fn register(reg: &mut Registry) {
     reg.add(OpSpec::new("testConnect", test_connect));
     reg.add(OpSpec::new("getCoreVersion", core_version));
     reg.add(OpSpec::new("stat", stat));
+    reg.add(OpSpec::new("refreshconf", refresh_conf));
+}
+
+/// `refreshconf` — re-read the configuration file (upstream
+/// `refresh_conf_task`; root only): see
+/// [`ApiInner::refresh_config`](crate::http_api::ApiInner::refresh_config)
+/// for what takes effect at once. Answers `0 "refreshing configuration
+/// success"`; a file that can no longer be read is `1005` (upstream reports
+/// success whatever happened).
+fn refresh_conf(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
+    match ctx.inner.refresh_config() {
+        Ok(_) => GResp::success("refreshing configuration success"),
+        Err(e) => GResp::error(
+            Status::OperationFailed,
+            format!("refreshing configuration failed: {e}"),
+        ),
+    }
 }
 
 /// `check` — the heartbeat; no credentials. Upstream answers with its process
