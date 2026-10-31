@@ -363,6 +363,28 @@ pub(super) fn create_unique(dir: &Path, stem: &str, ext: &str) -> std::io::Resul
     ))
 }
 
+/// Create directory `dir/<stem><n>` exclusively (`n` empty, then `_1`, `_2`,
+/// …), returning its path — where a zip package is unpacked (upstream:
+/// `<upload_path><zip name>_<YYYYmmddHHMMSS>`).
+pub(super) fn create_unique_dir(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    for n in 0u32..10_000 {
+        let path = if n == 0 {
+            dir.join(stem)
+        } else {
+            dir.join(format!("{stem}_{n}"))
+        };
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free directory name",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // /file/upload
 // ---------------------------------------------------------------------------

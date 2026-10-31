@@ -601,8 +601,14 @@ fn build_counts_parse_failures_and_refuses_bad_sources() {
             ("db_path", &zip),
         ],
     );
-    assert_eq!(code(&j), 1003);
-    assert!(msg(&j).contains("zip input not supported yet"), "{j}");
+    if cfg!(feature = "zip") {
+        // Not a zip: upstream's `ZipCode` 1 (the package cannot be opened).
+        assert_eq!(code(&j), 1, "{j}");
+        assert!(msg(&j).starts_with("zip format or data is error."), "{j}");
+    } else {
+        assert_eq!(code(&j), 1003);
+        assert!(msg(&j).contains("`zip` feature"), "{j}");
+    }
     let csv = srv.data_file("data.csv", "a,b");
     let j = api(
         a,
@@ -1109,7 +1115,14 @@ fn backups_rotate_list_and_restore_the_newest() {
             ("compress", "true"),
         ],
     );
-    assert_eq!(code(&j), 1003);
+    if cfg!(feature = "zip") {
+        // A zipped backup (tests/dt_zip_io.rs restores one).
+        ok(&j);
+        assert!(string(&j, "backupfilepath").ends_with(".zip"), "{j}");
+    } else {
+        assert_eq!(code(&j), 1003);
+        assert!(msg(&j).contains("`zip` feature"), "{j}");
+    }
     let j = api(a, &[("operation", "backup"), ("db_name", "nosuch")]);
     assert_eq!(
         (code(&j), msg(&j).as_str()),
@@ -1272,7 +1285,13 @@ fn export_writes_a_file_that_downloads_without_credentials() {
             ("compress", "1"),
         ],
     );
-    assert_eq!(code(&j), 1003);
+    if cfg!(feature = "zip") {
+        ok(&j);
+        assert!(string(&j, "filepath").ends_with(".zip"), "{j}");
+    } else {
+        assert_eq!(code(&j), 1003);
+        assert!(msg(&j).contains("`zip` feature"), "{j}");
+    }
 }
 
 #[test]
@@ -1433,8 +1452,8 @@ fn uploads_land_in_the_upload_dir_and_feed_build() {
         &body,
     );
     assert_eq!(code(&r.json()), 1001);
-    // A zip may be uploaded (it is a configured package type) but not built
-    // from yet.
+    // A zip may be uploaded (it is a configured package type); building from
+    // it needs the `zip` feature (and a real zip: this one is not).
     let j = upload(a, "bob", "pack.zip", b"PK\x03\x04");
     ok(&j);
     let j = api(
@@ -1445,8 +1464,8 @@ fn uploads_land_in_the_upload_dir_and_feed_build() {
             ("db_path", &string(&j, "filepath")),
         ],
     );
-    assert_eq!(code(&j), 1003);
-    // Only the uploads are in the upload directory.
+    assert_eq!(code(&j), if cfg!(feature = "zip") { 1 } else { 1003 }, "{j}");
+    // Only the uploads are in the upload directory (no unpacked leftovers).
     let names: Vec<String> = fs::read_dir(srv.upload_dir())
         .unwrap()
         .flatten()

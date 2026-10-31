@@ -785,21 +785,6 @@ pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
     Ok(count)
 }
 
-/// Pack a written export file into `<stem>.zip` beside it (the file named by
-/// its file name inside) and remove the file — upstream `export`'s
-/// `compress=true`. Returns the archive's path.
-pub fn compress_export(file: &Path) -> std::result::Result<PathBuf, ZipError> {
-    let entry = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| ZipError::Io(io::Error::other("export file without a name")))?
-        .to_string();
-    let dest = file.with_extension("zip");
-    pack_file(file, &dest, &entry)?;
-    let _ = std::fs::remove_file(file);
-    Ok(dest)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,10 +958,16 @@ mod tests {
             let d = tmp("exp");
             let f = d.join("db_20240101000000.nt");
             fs::write(&f, "<a> <b> <c> .\n").unwrap();
-            let z = compress_export(&f).unwrap();
-            assert_eq!(z, d.join("db_20240101000000.zip"));
-            assert!(!f.exists());
-            assert!(read_entry(&z, "db_20240101000000.nt", 100).unwrap().is_some());
+            let z = d.join("db_20240101000000.zip");
+            fs::write(&z, b"replaced").unwrap();
+            pack_file(&f, &z, "db_20240101000000.nt").unwrap();
+            assert!(!d.join("db_20240101000000.zip.part").exists());
+            assert_eq!(
+                read_entry(&z, "db_20240101000000.nt", 100).unwrap().as_deref(),
+                Some(&b"<a> <b> <c> .\n"[..])
+            );
+            let files = unpack(&z, &d.join("out"), &ZipLimits::default(), &nt).unwrap();
+            assert_eq!(files.len(), 1);
             let _ = fs::remove_dir_all(&d);
         }
     }
