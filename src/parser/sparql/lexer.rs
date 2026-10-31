@@ -6,6 +6,8 @@
 //! (read up to a closing `>` with no whitespace/illegal chars); on failure we
 //! fall back to the comparison operator.
 
+use std::ops::Range;
+
 use crate::error::{GStoreError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,11 +71,27 @@ pub enum Token {
 
 /// Tokenize an entire SPARQL string.
 pub fn tokenize(input: &str) -> Result<Vec<Token>> {
-    Lexer {
+    tokenize_spanned(input).map(|(tokens, _)| tokens)
+}
+
+/// Tokenize, also returning each token's source span as a byte range into
+/// `input` (the trailing [`Token::Eof`] gets the empty range at the end).
+/// The parser uses the spans to capture raw source text, e.g. a `PFN` call's
+/// JSON argument exactly as written.
+pub fn tokenize_spanned(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>)> {
+    let lexer = Lexer {
         chars: input.chars().collect(),
         pos: 0,
-    }
-    .run()
+    };
+    let (tokens, char_spans) = lexer.run()?;
+    // Char index → byte offset (one past the end maps to `input.len()`).
+    let mut byte_at: Vec<usize> = input.char_indices().map(|(b, _)| b).collect();
+    byte_at.push(input.len());
+    let spans = char_spans
+        .into_iter()
+        .map(|(s, e)| byte_at[s]..byte_at[e])
+        .collect();
+    Ok((tokens, spans))
 }
 
 struct Lexer {
@@ -100,13 +118,19 @@ impl Lexer {
         c
     }
 
-    fn run(mut self) -> Result<Vec<Token>> {
+    /// Lex the whole input: the tokens plus each token's `(start, end)` char
+    /// span.
+    #[allow(clippy::type_complexity)]
+    fn run(mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
         let mut out = Vec::new();
+        let mut spans = Vec::new();
         loop {
             self.skip_ws_and_comments();
+            let start = self.pos;
             let Some(c) = self.peek() else {
                 out.push(Token::Eof);
-                return Ok(out);
+                spans.push((start, start));
+                return Ok((out, spans));
             };
             let tok = match c {
                 '{' => self.single(Token::LBrace),
@@ -176,6 +200,7 @@ impl Lexer {
                 other => return Err(self.err(format!("unexpected character '{other}'"))),
             };
             out.push(tok);
+            spans.push((start, self.pos));
         }
     }
 

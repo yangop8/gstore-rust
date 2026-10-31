@@ -16,17 +16,18 @@ pub mod builtins;
 pub mod lexer;
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::error::{GStoreError, Result};
 use crate::model::Term;
 
 use ast::*;
-use lexer::{tokenize, Token};
+use lexer::{tokenize_spanned, Token};
 
 /// Parse a SPARQL query or update string.
 pub fn parse(input: &str) -> Result<Query> {
-    let tokens = tokenize(input)?;
-    Parser::new(tokens).parse_request()
+    let (tokens, spans) = tokenize_spanned(input)?;
+    Parser::new(input, tokens, spans).parse_request()
 }
 
 /// A parsed predicate position: a plain term, or a property path.
@@ -35,21 +36,46 @@ enum VerbKind {
     Path(PathExpr),
 }
 
-struct Parser {
+struct Parser<'s> {
+    /// The query text (for raw-source capture via `spans`).
+    src: &'s str,
     tokens: Vec<Token>,
+    /// Byte range of each token in `src` (parallel to `tokens`).
+    spans: Vec<Range<usize>>,
     pos: usize,
     prefixes: HashMap<String, String>,
     base: Option<String>,
+    /// Token index where the expression of the SELECT projection item
+    /// `(expr AS ?v)` currently being parsed starts. An upstream advanced
+    /// function that is only accepted as a whole projection item (see
+    /// [`GFnName::allowed_in_expressions`]) or a `PFN` call is accepted only
+    /// when its name sits exactly here.
+    projection_root: Option<usize>,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Parser {
+impl<'s> Parser<'s> {
+    fn new(src: &'s str, tokens: Vec<Token>, spans: Vec<Range<usize>>) -> Parser<'s> {
+        let mut prefixes = HashMap::new();
+        // The gstore-rust legacy function namespace is predeclared as `rs:`;
+        // a `PREFIX rs: <…>` in the query overrides it.
+        prefixes.insert("rs".to_string(), RS_FN_NS.to_string());
         Parser {
+            src,
             tokens,
+            spans,
             pos: 0,
-            prefixes: HashMap::new(),
+            prefixes,
             base: None,
+            projection_root: None,
         }
+    }
+
+    /// The source text of the token at index `i`.
+    fn token_text(&self, i: usize) -> &'s str {
+        self.spans
+            .get(i)
+            .and_then(|r| self.src.get(r.clone()))
+            .unwrap_or("")
     }
 
     // ---- token cursor -----------------------------------------------------
@@ -206,7 +232,21 @@ impl Parser {
                 Token::LParen => {
                     // (expr AS ?v)
                     self.bump();
-                    let expr = self.parse_expr()?;
+                    let start = self.pos;
+                    let outer = self.projection_root.replace(start);
+                    let expr = self.parse_expr();
+                    self.projection_root = outer;
+                    let expr = expr?;
+                    // A projection-only advanced function / PFN call must be
+                    // the whole expression, as upstream requires.
+                    if let Some(name) = self.projection_only_call_at(start) {
+                        if !matches!(expr, Expr::GraphFn { .. } | Expr::Pfn { .. }) {
+                            return Err(self.err(format!(
+                                "{name}(…) must be the entire projection expression: \
+                                 write SELECT ({name}(…) AS ?var)"
+                            )));
+                        }
+                    }
                     self.expect_keyword("AS")?;
                     let var = self.expect_var()?;
                     self.expect(&Token::RParen, "')'")?;
@@ -926,6 +966,12 @@ impl Parser {
                     self.expect_keyword("EXISTS")?;
                     let pat = self.parse_group_graph_pattern()?;
                     Ok(Expr::Exists(true, Box::new(pat)))
+                } else if upper == "PFN" {
+                    self.parse_pfn()
+                } else if let (Some(func), Token::LParen) =
+                    (GFnName::from_keyword(&upper), self.peek_at(1))
+                {
+                    self.parse_graph_fn(func)
                 } else if let Some(func) = agg_func(&upper) {
                     self.bump();
                     self.parse_aggregate(func)
@@ -942,6 +988,10 @@ impl Parser {
                     builtins::check_call(&upper, &args).map_err(|m| self.err(m))?;
                     Ok(Expr::Builtin(upper, args))
                 }
+            }
+            // `iri(args)` / `pfx:name(args)`: an IRI function call.
+            Token::Iri(_) | Token::PName(_, _) if matches!(self.peek_at(1), Token::LParen) => {
+                self.parse_iri_call()
             }
             Token::Iri(_)
             | Token::PName(_, _)
@@ -988,6 +1038,519 @@ impl Parser {
             distinct,
             arg,
             sep,
+        })
+    }
+
+    // ---- upstream advanced graph functions / PFN / IRI calls -------------
+
+    /// If the projection expression starting at token `start` begins with a
+    /// call that upstream only accepts as a whole projection item, its name as
+    /// written.
+    fn projection_only_call_at(&self, start: usize) -> Option<String> {
+        let Some(Token::Word(w)) = self.tokens.get(start) else {
+            return None;
+        };
+        let next = self.tokens.get(start + 1);
+        if w.eq_ignore_ascii_case("PFN") {
+            return Some(w.clone());
+        }
+        match GFnName::from_keyword(w) {
+            Some(f) if !f.allowed_in_expressions() && matches!(next, Some(Token::LParen)) => {
+                Some(w.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// An advanced graph function call (the current token is its name, the
+    /// next one `(`), parsed with the exact positional shape of its upstream
+    /// grammar alternative.
+    fn parse_graph_fn(&mut self, func: GFnName) -> Result<Expr> {
+        let call_pos = self.pos;
+        let written = match self.bump() {
+            Token::Word(w) => w,
+            _ => func.name().to_string(),
+        };
+        let after_name = self.pos;
+        let args = match self.parse_graph_fn_args(&written, func) {
+            Ok(args) => args,
+            Err(upstream_err) => {
+                // A bare name that used to be a gstore-rust legacy built-in:
+                // if the call has the legacy shape, point at `rs:`.
+                let legacy = func.keyword();
+                if !RS_LEGACY_FNS.contains(&legacy) {
+                    return Err(upstream_err);
+                }
+                let rs = legacy.to_ascii_lowercase();
+                self.pos = after_name;
+                if let Ok(args) = self.parse_arg_list() {
+                    if builtins::check_call(legacy, &args).is_ok() {
+                        let n = args.len();
+                        return Err(self.err(format!(
+                            "{written} expects the upstream gStore signature {}; \
+                             {written}(…) with {n} argument{} is the legacy gstore-rust form — \
+                             call the legacy function as rs:{rs}(…)",
+                            func.signature(),
+                            if n == 1 { "" } else { "s" },
+                        )));
+                    }
+                }
+                return Err(self.err(format!(
+                    "{} (the legacy gstore-rust function is rs:{rs}(…))",
+                    sparql_msg(upstream_err)
+                )));
+            }
+        };
+        if !func.allowed_in_expressions() && self.projection_root != Some(call_pos) {
+            return Err(self.err(format!(
+                "{written}(…) is only supported as a whole SELECT projection item, e.g. \
+                 SELECT ({written}(…) AS ?var); like upstream gStore, only simpleCycleBoolean, \
+                 cycleBoolean, shortestPathLen and kHopReachable may appear inside \
+                 FILTER/BIND/HAVING/ORDER BY or larger expressions"
+            )));
+        }
+        Ok(Expr::GraphFn { func, args })
+    }
+
+    /// A shape error for a call of `func` written as `written`.
+    fn gfn_err(&self, written: &str, func: GFnName, detail: String) -> GStoreError {
+        self.err(format!(
+            "{written} expects the upstream gStore signature {}: {detail}",
+            func.signature()
+        ))
+    }
+
+    /// `( arg , … )` for `func`, per its upstream shape (see [`gfn_shape`]).
+    fn parse_graph_fn_args(&mut self, written: &str, func: GFnName) -> Result<Vec<GArg>> {
+        self.expect(&Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        for (i, spec) in gfn_shape(func).iter().enumerate() {
+            if spec.optional {
+                let present = if i == 0 {
+                    // A leading optional node (clusterCoeff): present iff the
+                    // next token can start a varOrIri.
+                    matches!(self.peek(), Token::Var(_) | Token::Iri(_) | Token::PName(_, _))
+                } else {
+                    // A trailing optional argument: present iff a ',' follows.
+                    matches!(self.peek(), Token::Comma)
+                };
+                if !present {
+                    continue;
+                }
+            }
+            let argno = args.len() + 1;
+            let label = spec.slot.label();
+            if !args.is_empty() {
+                match self.peek() {
+                    Token::Comma => {
+                        self.bump();
+                    }
+                    Token::RParen => {
+                        let d = format!("missing argument {argno} ({label})");
+                        return Err(self.gfn_err(written, func, d));
+                    }
+                    other => {
+                        let d = format!(
+                            "expected ',' before argument {argno} ({label}), found {}",
+                            describe_token(other)
+                        );
+                        return Err(self.gfn_err(written, func, d));
+                    }
+                }
+            }
+            if matches!(self.peek(), Token::RParen) {
+                let d = format!("missing argument {argno} ({label})");
+                return Err(self.gfn_err(written, func, d));
+            }
+            let arg = self.parse_gfn_slot(spec.slot).map_err(|what| {
+                let d = format!("argument {argno} ({label}) must be {what}");
+                self.gfn_err(written, func, d)
+            })?;
+            args.push(arg);
+        }
+        match self.peek() {
+            Token::RParen => {
+                self.bump();
+                Ok(args)
+            }
+            Token::Comma => Err(self.gfn_err(
+                written,
+                func,
+                format!("too many arguments (more than {})", args.len()),
+            )),
+            other => {
+                let d = format!(
+                    "expected ')' after argument {}, found {}",
+                    args.len(),
+                    describe_token(other)
+                );
+                Err(self.gfn_err(written, func, d))
+            }
+        }
+    }
+
+    /// One advanced-function argument. The error is the "must be …" part of
+    /// the message (what was expected and what was found).
+    fn parse_gfn_slot(&mut self, slot: GSlot) -> std::result::Result<GArg, String> {
+        let found = |p: &Self| format!("found {}", describe_token(p.peek()));
+        match slot {
+            GSlot::Node(_) => match self.peek().clone() {
+                Token::Var(v) => {
+                    self.bump();
+                    Ok(GArg::Node(VarOrIri::Var(v)))
+                }
+                Token::Iri(_) | Token::PName(_, _) => {
+                    let iri = self.parse_gfn_iri()?;
+                    Ok(GArg::Node(VarOrIri::Iri(iri)))
+                }
+                _ => Err(format!("a ?variable or an IRI, {}", found(self))),
+            },
+            GSlot::Bool => match self.peek() {
+                Token::Word(w) if w.eq_ignore_ascii_case("true") => {
+                    self.bump();
+                    Ok(GArg::Bool(true))
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("false") => {
+                    self.bump();
+                    Ok(GArg::Bool(false))
+                }
+                _ => Err(format!("true or false, {}", found(self))),
+            },
+            GSlot::Int(_) => self.parse_gfn_int(true, true).map(GArg::Int),
+            GSlot::UInt(_) => self.parse_gfn_int(false, true).map(GArg::Int),
+            GSlot::Num(_) => self.parse_gfn_num().map(GArg::Num),
+            GSlot::Preds => self.parse_pred_set(),
+            GSlot::Named(key, kind) => {
+                match self.peek() {
+                    Token::Word(w) if w.eq_ignore_ascii_case(key) => {
+                        self.bump();
+                    }
+                    _ => return Err(format!("the named argument {key}=…, {}", found(self))),
+                }
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(format!("{key}=…, but '=' is missing ({})", found(self)));
+                }
+                self.bump();
+                let value = match kind {
+                    GNamedKind::UInt => GNum::Int(
+                        self.parse_gfn_int(false, false)
+                            .map_err(|e| format!("{key}=<unsigned integer>: {e}"))?,
+                    ),
+                    GNamedKind::Num => GNum::Num(
+                        self.parse_gfn_num()
+                            .map_err(|e| format!("{key}=<number>: {e}"))?,
+                    ),
+                };
+                Ok(GArg::Named {
+                    key: key.to_string(),
+                    value,
+                })
+            }
+        }
+    }
+
+    /// An IRI (`<…>` or a prefixed name) inside an advanced-function call,
+    /// fully expanded.
+    fn parse_gfn_iri(&mut self) -> std::result::Result<String, String> {
+        match self.peek().clone() {
+            Token::Iri(s) => {
+                self.bump();
+                Ok(self.resolve_iri(&s))
+            }
+            Token::PName(p, l) => {
+                let iri = self.expand_pname(&p, &l).map_err(sparql_msg)?;
+                self.bump();
+                Ok(iri)
+            }
+            other => Err(format!("an IRI, found {}", describe_token(&other))),
+        }
+    }
+
+    /// An integer argument: upstream `integerLiteral` (`signed`) or
+    /// `num_integer` (unsigned). Upstream reads these with `stoi`, so
+    /// `int32` bounds them unless `!int32` (`maxIter`, read with `stof`).
+    fn parse_gfn_int(&mut self, signed: bool, int32: bool) -> std::result::Result<i64, String> {
+        let what = if signed {
+            "an integer"
+        } else {
+            "an unsigned integer"
+        };
+        let neg = match self.peek() {
+            Token::Plus | Token::Minus if !signed => {
+                return Err(format!("{what} (no sign), found {}", describe_token(self.peek())))
+            }
+            Token::Plus => {
+                self.bump();
+                false
+            }
+            Token::Minus => {
+                self.bump();
+                true
+            }
+            _ => false,
+        };
+        let digits = match self.peek() {
+            Token::Integer(d) => d.clone(),
+            other => return Err(format!("{what}, found {}", describe_token(other))),
+        };
+        self.bump();
+        let text = if neg { format!("-{digits}") } else { digits };
+        let range_err = || {
+            if int32 {
+                format!("{what} in the 32-bit range upstream gStore reads it with, found {text}")
+            } else {
+                format!("{what} in the 64-bit range, found {text}")
+            }
+        };
+        let v: i64 = text.parse().map_err(|_| range_err())?;
+        if int32 && i32::try_from(v).is_err() {
+            return Err(range_err());
+        }
+        Ok(v)
+    }
+
+    /// A `numericLiteral` argument (signed integer, decimal or double).
+    fn parse_gfn_num(&mut self) -> std::result::Result<f64, String> {
+        let neg = match self.peek() {
+            Token::Plus => {
+                self.bump();
+                false
+            }
+            Token::Minus => {
+                self.bump();
+                true
+            }
+            _ => false,
+        };
+        let text = match self.peek() {
+            Token::Integer(d) | Token::Decimal(d) | Token::Double(d) => d.clone(),
+            other => return Err(format!("a number, found {}", describe_token(other))),
+        };
+        self.bump();
+        let v: f64 = text
+            .parse()
+            .map_err(|_| format!("a number, found {text}"))?;
+        Ok(if neg { -v } else { v })
+    }
+
+    /// `predSet`: `{}` or `{ iriOrNegIri ( , iriOrNegIri )* }`, where an entry
+    /// is an IRI, or `!` IRI to exclude it.
+    fn parse_pred_set(&mut self) -> std::result::Result<GArg, String> {
+        if !matches!(self.peek(), Token::LBrace) {
+            return Err(format!(
+                "a predicate set like {{}} or {{<p>, !<q>}}, found {}",
+                describe_token(self.peek())
+            ));
+        }
+        self.bump();
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+        if matches!(self.peek(), Token::RBrace) {
+            self.bump();
+            return Ok(GArg::PredSet { include, exclude });
+        }
+        loop {
+            let negated = matches!(self.peek(), Token::Not);
+            if negated {
+                self.bump();
+            }
+            let iri = self.parse_gfn_iri().map_err(|e| {
+                format!("a predicate set of IRIs, optionally negated with '!': expected {e}")
+            })?;
+            if negated {
+                exclude.push(iri);
+            } else {
+                include.push(iri);
+            }
+            match self.peek() {
+                Token::Comma => {
+                    self.bump();
+                }
+                Token::RBrace => {
+                    self.bump();
+                    return Ok(GArg::PredSet { include, exclude });
+                }
+                other => {
+                    return Err(format!(
+                        "a predicate set closed by '}}' (entries separated by ','), found {}",
+                        describe_token(other)
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `PFN.name({json})` (the documented form; upstream's HTTP layer rewrites
+    /// it to the grammar's `PFN name(…)`, which is accepted too). The current
+    /// token is the `PFN` keyword.
+    fn parse_pfn(&mut self) -> Result<Expr> {
+        let call_pos = self.pos;
+        let written = match self.bump() {
+            Token::Word(w) => w,
+            _ => "PFN".to_string(),
+        };
+        if matches!(self.peek(), Token::Dot) {
+            self.bump();
+        }
+        let name = match self.peek() {
+            Token::Word(n) => n.clone(),
+            other => {
+                return Err(self.err(format!(
+                    "{written} must be followed by the function name, as in \
+                     {written}.myFunc({{\"key\":\"value\"}}), found {}",
+                    describe_token(other)
+                )))
+            }
+        };
+        self.bump();
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(format!(
+                "{written}.{name}: expected '(' and a JSON object argument, found {}",
+                describe_token(self.peek())
+            )));
+        }
+        self.bump();
+        let json = self.parse_pfn_json(&written, &name)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(format!(
+                "{written}.{name}: expected ')' after the JSON argument, found {}",
+                describe_token(self.peek())
+            )));
+        }
+        self.bump();
+        if self.projection_root != Some(call_pos) {
+            return Err(self.err(format!(
+                "{written}.{name}(…) is only supported as a whole SELECT projection item, e.g. \
+                 SELECT ({written}.{name}({{…}}) AS ?var)"
+            )));
+        }
+        Ok(Expr::Pfn { name, json })
+    }
+
+    /// Upstream `jsonVars`: `{}` or `{ jsonVar (, jsonVar)* }` with
+    /// `jsonVar : string ':' string | string ':' '[' string (, string)* ']'`.
+    /// Returns upstream's `pfn_params` text (see [`Expr::Pfn`]).
+    fn parse_pfn_json(&mut self, written: &str, name: &str) -> Result<String> {
+        let ctx = format!("{written}.{name}");
+        if !matches!(self.peek(), Token::LBrace) {
+            return Err(self.err(format!(
+                "{ctx}: the argument must be a JSON object like {{\"key\":\"value\"}}, found {}",
+                describe_token(self.peek())
+            )));
+        }
+        self.bump();
+        let mut vars: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::RBrace) {
+            self.bump();
+            return Ok("{}".to_string());
+        }
+        loop {
+            let mut text = self.pfn_string(&ctx, "a string key")?;
+            match self.peek() {
+                Token::PName(p, l) if p.is_empty() && l.is_empty() => {
+                    text.push_str(self.token_text(self.pos));
+                    self.bump();
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "{ctx}: expected ':' after a JSON key, found {}",
+                        describe_token(other)
+                    )))
+                }
+            }
+            if matches!(self.peek(), Token::LBracket) {
+                text.push('[');
+                self.bump();
+                loop {
+                    text.push_str(&self.pfn_string(&ctx, "a string array element")?);
+                    match self.peek() {
+                        Token::Comma => {
+                            text.push(',');
+                            self.bump();
+                        }
+                        Token::RBracket => {
+                            text.push(']');
+                            self.bump();
+                            break;
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "{ctx}: expected ',' or ']' in a JSON array, found {}",
+                                describe_token(other)
+                            )))
+                        }
+                    }
+                }
+            } else {
+                text.push_str(&self.pfn_string(&ctx, "a string value or an array of strings")?);
+            }
+            vars.push(text);
+            match self.peek() {
+                Token::Comma => {
+                    self.bump();
+                }
+                Token::RBrace => {
+                    self.bump();
+                    return Ok(format!("{{{}}}", vars.join(",")));
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "{ctx}: expected ',' or '}}' in the JSON object, found {}",
+                        describe_token(other)
+                    )))
+                }
+            }
+        }
+    }
+
+    /// A plain string literal inside a PFN JSON argument, as written.
+    fn pfn_string(&mut self, ctx: &str, what: &str) -> Result<String> {
+        match self.peek() {
+            Token::Str {
+                lang: None,
+                datatype: None,
+                ..
+            } => {
+                let text = self.token_text(self.pos).to_string();
+                self.bump();
+                Ok(text)
+            }
+            other => Err(self.err(format!(
+                "{ctx}: expected {what} (upstream's JSON argument holds only plain string \
+                 literals), found {}",
+                describe_token(other)
+            ))),
+        }
+    }
+
+    /// `iri(args)` / `pfx:name(args)` — the current token is the IRI and the
+    /// next one `(`. Calls into the legacy namespace ([`RS_FN_NS`]) must name
+    /// a legacy function and match its arity.
+    fn parse_iri_call(&mut self) -> Result<Expr> {
+        let (iri, written) = match self.bump() {
+            Token::Iri(s) => (self.resolve_iri(&s), format!("<{s}>")),
+            Token::PName(p, l) => (self.expand_pname(&p, &l)?, format!("{p}:{l}")),
+            other => return Err(self.err(format!("expected an IRI, found {other:?}"))),
+        };
+        let args = self.parse_arg_list()?;
+        let Some(local) = iri.strip_prefix(RS_FN_NS) else {
+            return Ok(Expr::IriCall { iri, args });
+        };
+        let Some(name) = rs_legacy_name(&iri) else {
+            return Err(self.err(format!(
+                "{written}: unknown gstore-rust function '{local}' in <{RS_FN_NS}> (rs:); \
+                 available: {}",
+                RS_LEGACY_FNS
+                    .iter()
+                    .map(|n| format!("rs:{}", n.to_ascii_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        builtins::check_call(&name, &args).map_err(|m| self.err(format!("{written}: {m}")))?;
+        Ok(Expr::IriCall {
+            iri: format!("{RS_FN_NS}{name}"),
+            args,
         })
     }
 
@@ -1459,6 +2022,170 @@ impl Parser {
     }
 }
 
+/// The kind of one positional argument of an advanced graph function, as in
+/// upstream's `builtInCall` alternatives. The `&str`s label it in errors.
+#[derive(Debug, Clone, Copy)]
+enum GSlot {
+    /// `varOrIri`.
+    Node(&'static str),
+    /// `booleanLiteral` (`directed`).
+    Bool,
+    /// `integerLiteral` (signed).
+    Int(&'static str),
+    /// `num_integer` (unsigned).
+    UInt(&'static str),
+    /// `numericLiteral`.
+    Num(&'static str),
+    /// `predSet`.
+    Preds,
+    /// `KEYWORD '=' value` with the canonical key spelling.
+    Named(&'static str, GNamedKind),
+}
+
+impl GSlot {
+    fn label(self) -> &'static str {
+        match self {
+            GSlot::Node(l) | GSlot::Int(l) | GSlot::UInt(l) | GSlot::Num(l) => l,
+            GSlot::Bool => "directed",
+            GSlot::Preds => "pred_set",
+            GSlot::Named(k, _) => k,
+        }
+    }
+}
+
+/// The value kind of a named argument.
+#[derive(Debug, Clone, Copy)]
+enum GNamedKind {
+    /// `num_integer` (`maxIter`).
+    UInt,
+    /// `numericLiteral` (`alpha`, `tol`, `increase`).
+    Num,
+}
+
+/// One slot of a function's shape; `optional` slots are the grammar's `(…)?`
+/// groups — only ever a leading node (clusterCoeff) or the last argument.
+#[derive(Debug, Clone, Copy)]
+struct GSlotSpec {
+    slot: GSlot,
+    optional: bool,
+}
+
+const fn req(slot: GSlot) -> GSlotSpec {
+    GSlotSpec {
+        slot,
+        optional: false,
+    }
+}
+
+const fn opt(slot: GSlot) -> GSlotSpec {
+    GSlotSpec {
+        slot,
+        optional: true,
+    }
+}
+
+const G_U: GSlotSpec = req(GSlot::Node("u"));
+const G_V: GSlotSpec = req(GSlot::Node("v"));
+const G_DIR: GSlotSpec = req(GSlot::Bool);
+const G_PREDS: GSlotSpec = req(GSlot::Preds);
+const G_K: GSlotSpec = req(GSlot::Int("k"));
+const G_RET: GSlotSpec = req(GSlot::Int("retNum"));
+const G_OPT_RET: GSlotSpec = opt(GSlot::Int("retNum"));
+const G_MAXITER: GSlotSpec = req(GSlot::Named("maxIter", GNamedKind::UInt));
+const G_HOPCNT: GSlotSpec = req(GSlot::Int("hopCnt"));
+const G_ALPHA: GSlotSpec = req(GSlot::Named("alpha", GNamedKind::Num));
+const G_TOL: GSlotSpec = req(GSlot::Named("tol", GNamedKind::Num));
+const G_INCREASE: GSlotSpec = req(GSlot::Named("increase", GNamedKind::Num));
+const G_OPT_U: GSlotSpec = opt(GSlot::Node("u"));
+const G_OPT_KPLEX_K: GSlotSpec = opt(GSlot::UInt("k"));
+const G_TRUSS_ALPHA: GSlotSpec = req(GSlot::UInt("alpha"));
+const G_TRUSS_BETA: GSlotSpec = req(GSlot::UInt("beta"));
+const G_X: [GSlotSpec; 6] = [
+    req(GSlot::Num("x1")),
+    req(GSlot::Num("x2")),
+    req(GSlot::Num("x3")),
+    req(GSlot::Num("x4")),
+    req(GSlot::Num("x5")),
+    req(GSlot::Num("x6")),
+];
+
+/// The argument shape of each function, transcribed from upstream's
+/// `SPARQL.g4` `builtInCall` rule.
+fn gfn_shape(f: GFnName) -> &'static [GSlotSpec] {
+    use GFnName::*;
+    match f {
+        SimpleCyclePath | SimpleCycleBoolean | CyclePath | CycleBoolean | ShortestPath
+        | ShortestPathLen | ShortestPathCount | ShortestPaths => &[G_U, G_V, G_DIR, G_PREDS],
+        KHopReachable | KHopReachablePath => &[G_U, G_V, G_DIR, G_K, G_PREDS],
+        KHopEnumerate => &[G_U, G_V, G_DIR, G_K, G_PREDS, G_OPT_RET],
+        Ppr => &[G_U, G_HOPCNT, G_PREDS, G_RET],
+        TriangleCounting => &[G_DIR, G_PREDS],
+        ClosenessCentrality | BfsCount | Sssp | SsspLen | BetweennessCentrality => {
+            &[G_U, G_DIR, G_PREDS]
+        }
+        Pr => &[G_DIR, G_PREDS, G_RET, G_ALPHA, G_MAXITER, G_TOL],
+        LabelProp => &[G_DIR, G_PREDS, G_MAXITER],
+        Wcc | DiameterEstimation => &[G_PREDS],
+        ClusterCoeff => &[G_OPT_U, G_DIR, G_PREDS],
+        MaximumKplex => &[G_PREDS, G_OPT_KPLEX_K],
+        CoreTruss => &[G_PREDS, G_TRUSS_ALPHA, G_TRUSS_BETA],
+        KHopCount => &[G_U, G_DIR, G_K, G_PREDS],
+        KHopNeighbor | KHopAllNeighbors => &[G_U, G_DIR, G_K, G_PREDS, G_OPT_RET],
+        Louvain => &[G_DIR, G_PREDS, G_MAXITER, G_INCREASE],
+        ConfidenceDegree => &G_X,
+        JaccardSimilarity => &[G_U, G_PREDS, G_K, G_RET],
+        DegreeCorrelation => &[G_U, G_K, G_PREDS],
+    }
+}
+
+/// A token as the user would write it, for error messages.
+fn describe_token(t: &Token) -> String {
+    match t {
+        Token::Iri(s) => format!("<{s}>"),
+        Token::PName(p, l) => format!("{p}:{l}"),
+        Token::Var(v) => format!("?{v}"),
+        Token::Blank(b) => format!("_:{b}"),
+        Token::Str { value, .. } => format!("the string \"{value}\""),
+        Token::Integer(s) | Token::Decimal(s) | Token::Double(s) => s.clone(),
+        Token::Word(w) => format!("'{w}'"),
+        Token::LBrace => "'{'".into(),
+        Token::RBrace => "'}'".into(),
+        Token::LParen => "'('".into(),
+        Token::RParen => "')'".into(),
+        Token::LBracket => "'['".into(),
+        Token::RBracket => "']'".into(),
+        Token::Dot => "'.'".into(),
+        Token::Comma => "','".into(),
+        Token::Semicolon => "';'".into(),
+        Token::Star => "'*'".into(),
+        Token::Plus => "'+'".into(),
+        Token::Minus => "'-'".into(),
+        Token::Slash => "'/'".into(),
+        Token::Eq => "'='".into(),
+        Token::Ne => "'!='".into(),
+        Token::Lt => "'<'".into(),
+        Token::Gt => "'>'".into(),
+        Token::Le => "'<='".into(),
+        Token::Ge => "'>='".into(),
+        Token::And => "'&&'".into(),
+        Token::Or => "'||'".into(),
+        Token::Not => "'!'".into(),
+        Token::Caret => "'^'".into(),
+        Token::Pipe => "'|'".into(),
+        Token::Question => "'?'".into(),
+        Token::Eof => "the end of the query".into(),
+    }
+}
+
+/// The message inside a parse error (without the "SPARQL parse error: "
+/// prefix its `Display` adds), for wrapping into a larger message.
+fn sparql_msg(e: GStoreError) -> String {
+    match e {
+        GStoreError::SparqlParse(m) => m,
+        other => other.to_string(),
+    }
+}
+
 /// A cheap absolute-IRI check (has a scheme like `http:` / `urn:`).
 /// Conjoin two patterns, dropping a leading `Empty`.
 fn join_opt(left: GraphPattern, right: GraphPattern) -> GraphPattern {
@@ -1610,7 +2337,7 @@ mod tests {
         // single-arg, and multi-arg shapes all supported.
         let q = sel(
             "SELECT (SUBSTR(?s,1,2) AS ?a) (now() AS ?b) (md5(?s) AS ?c)
-                    (SHORTESTPATHLEN(<x>,<y>) AS ?d) (UUID() AS ?e) (if(true,1,2) AS ?f)
+                    (rs:SHORTESTPATHLEN(<x>,<y>) AS ?d) (UUID() AS ?e) (if(true,1,2) AS ?f)
              WHERE { ?s <p> ?o }",
         );
         let got: Vec<(String, usize)> = match &q.projection {
@@ -1618,6 +2345,11 @@ mod tests {
                 .iter()
                 .filter_map(|it| match it {
                     SelectItem::Expr(Expr::Builtin(n, args), _) => Some((n.clone(), args.len())),
+                    // Legacy graph built-ins colliding with an upstream advanced
+                    // function are called as `rs:name(…)`.
+                    SelectItem::Expr(Expr::IriCall { iri, args }, _) => {
+                        Some((rs_legacy_name(iri).expect("rs: legacy call"), args.len()))
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -1638,13 +2370,14 @@ mod tests {
 
     #[test]
     fn parses_graph_analytics_function_names() {
-        // The extended graph-analytics built-ins reach the evaluator through the
-        // same generic NAME(args) path — uppercased and case-insensitive — with
-        // zero-, one-, and two-argument shapes all supported.
+        // The extended (legacy gstore-rust) graph-analytics built-ins are called
+        // through the predeclared `rs:` namespace — the local name is
+        // case-insensitive and canonicalized to upper case — with zero-, one-,
+        // and two-argument shapes all supported.
         let q = sel(
-            "SELECT (SSSP(<a>,<b>) AS ?p) (khopCount(<a>,2) AS ?k)
-                    (TriangleCounting() AS ?t) (PPR(<a>,<b>) AS ?r)
-                    (DIAMETERESTIMATION() AS ?d) (BfsCount(<a>) AS ?c)
+            "SELECT (rs:SSSP(<a>,<b>) AS ?p) (rs:khopCount(<a>,2) AS ?k)
+                    (rs:TriangleCounting() AS ?t) (rs:ppr(<a>,<b>) AS ?r)
+                    (rs:DIAMETERESTIMATION() AS ?d) (rs:BfsCount(<a>) AS ?c)
              WHERE { ?s <p> ?o }",
         );
         let got: Vec<(String, usize)> = match &q.projection {
@@ -1652,6 +2385,11 @@ mod tests {
                 .iter()
                 .filter_map(|it| match it {
                     SelectItem::Expr(Expr::Builtin(n, args), _) => Some((n.clone(), args.len())),
+                    // Legacy graph built-ins colliding with an upstream advanced
+                    // function are called as `rs:name(…)`.
+                    SelectItem::Expr(Expr::IriCall { iri, args }, _) => {
+                        Some((rs_legacy_name(iri).expect("rs: legacy call"), args.len()))
+                    }
                     _ => None,
                 })
                 .collect(),

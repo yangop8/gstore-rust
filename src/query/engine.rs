@@ -358,6 +358,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         self.check_cancel()?;
+        if let Some(msg) = self.unwired_call(query) {
+            return Err(GStoreError::Query(msg));
+        }
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
@@ -815,7 +818,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .ebv()?,
             )),
             // Builtins over aggregate context are not supported.
-            Expr::Builtin(_, _) => None,
+            Expr::Builtin(_, _)
+            | Expr::IriCall { .. }
+            | Expr::GraphFn { .. }
+            | Expr::Pfn { .. } => None,
             // EXISTS in HAVING: test against the group's representative solution.
             Expr::Exists(neg, pat) => {
                 let rep = *sols.first()?;
@@ -1834,7 +1840,59 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             Expr::Exists(neg, pat) => Some(Value::Bool(self.eval_exists(*neg, pat, b, l))),
             // Aggregates only have meaning in group context (handled elsewhere).
             Expr::Aggregate { .. } => None,
+            // Not evaluable yet: `evaluate` rejects queries using them up front
+            // (see `unwired_call`).
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
+            // `rs:NAME(…)` runs the gstore-rust legacy built-in; any other IRI
+            // names a user-registered function (else `evaluate` rejected it).
+            Expr::IriCall { iri, args } => match rs_legacy_name(iri) {
+                Some(name) => self.eval_builtin(&name, args, b, l),
+                None => self.eval_custom_function(iri, args, b, l),
+            },
         }
+    }
+
+    /// Why `query` cannot be evaluated yet, if it calls an upstream advanced
+    /// graph function or `PFN` (parsed, but evaluation is not wired into the
+    /// engine yet) or an IRI function that is neither a gstore-rust legacy
+    /// function (`rs:`) nor registered.
+    fn unwired_call(&self, query: &Query) -> Option<String> {
+        let mut msg = None;
+        let mut check = |e: &Expr| {
+            if msg.is_some() {
+                return;
+            }
+            msg = match e {
+                Expr::GraphFn { func, .. } => Some(format!(
+                    "advanced function evaluation not wired yet: {}(…)",
+                    func.name()
+                )),
+                Expr::Pfn { name, .. } => Some(format!("PFN not supported yet: PFN.{name}(…)")),
+                Expr::IriCall { iri, .. }
+                    if rs_legacy_name(iri).is_none() && self.functions.get(iri).is_none() =>
+                {
+                    Some(format!("unsupported function <{iri}>"))
+                }
+                _ => None,
+            };
+        };
+        match query {
+            Query::Select(s) => visit_select_exprs(s, &mut check),
+            Query::Ask(a) => visit_pattern_exprs(&a.pattern, &mut check),
+            Query::Construct(c) => {
+                visit_pattern_exprs(&c.pattern, &mut check);
+                for o in &c.order_by {
+                    visit_expr(&o.expr, &mut check);
+                }
+            }
+            Query::Describe(d) => {
+                if let Some(p) = &d.pattern {
+                    visit_pattern_exprs(p, &mut check);
+                }
+            }
+            Query::Update(_) => {}
+        }
+        msg
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
@@ -1999,6 +2057,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 distinct: *distinct,
                 arg: arg.as_ref().map(|a| Box::new(self.subst_expr(a, b, layout))),
                 sep: sep.clone(),
+            },
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => e.clone(),
+            Expr::IriCall { iri, args } => Expr::IriCall {
+                iri: iri.clone(),
+                args: args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
             },
         }
     }
@@ -3055,8 +3118,86 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             expr_has_aggregate(a) || expr_has_aggregate(b)
         }
         Expr::Not(a) | Expr::Unary(_, a) => expr_has_aggregate(a),
-        Expr::Builtin(_, args) => args.iter().any(expr_has_aggregate),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().any(expr_has_aggregate),
         _ => false,
+    }
+}
+
+/// Visit every expression of a SELECT (projection, pattern, GROUP BY,
+/// HAVING, ORDER BY), recursively.
+fn visit_select_exprs(q: &SelectQuery, f: &mut dyn FnMut(&Expr)) {
+    if let Projection::Items(items) = &q.projection {
+        for it in items {
+            if let SelectItem::Expr(e, _) = it {
+                visit_expr(e, f);
+            }
+        }
+    }
+    visit_pattern_exprs(&q.pattern, f);
+    for e in q.group_by.iter().chain(&q.having) {
+        visit_expr(e, f);
+    }
+    for o in &q.order_by {
+        visit_expr(&o.expr, f);
+    }
+}
+
+/// Visit every expression inside a graph pattern, recursively.
+fn visit_pattern_exprs(gp: &GraphPattern, f: &mut dyn FnMut(&Expr)) {
+    match gp {
+        GraphPattern::Empty
+        | GraphPattern::Bgp(_)
+        | GraphPattern::Path(_)
+        | GraphPattern::Values(_, _) => {}
+        GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
+            visit_pattern_exprs(a, f);
+            visit_pattern_exprs(b, f);
+        }
+        GraphPattern::LeftJoin(a, b, es) => {
+            visit_pattern_exprs(a, f);
+            visit_pattern_exprs(b, f);
+            for e in es {
+                visit_expr(e, f);
+            }
+        }
+        GraphPattern::Filter(es, inner) => {
+            for e in es {
+                visit_expr(e, f);
+            }
+            visit_pattern_exprs(inner, f);
+        }
+        GraphPattern::Extend(inner, _, e) => {
+            visit_pattern_exprs(inner, f);
+            visit_expr(e, f);
+        }
+        GraphPattern::SubSelect(sq) => visit_select_exprs(sq, f),
+        GraphPattern::Graph(_, inner) => visit_pattern_exprs(inner, f),
+        GraphPattern::Service { pattern, .. } => visit_pattern_exprs(pattern, f),
+    }
+}
+
+/// Visit `e` and each of its sub-expressions (including those inside
+/// `EXISTS` patterns), parents first.
+fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    match e {
+        Expr::Var(_) | Expr::Const(_) | Expr::GraphFn { .. } | Expr::Pfn { .. } => {}
+        Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+        }
+        Expr::Not(a) | Expr::Unary(_, a) => visit_expr(a, f),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
+            for a in args {
+                visit_expr(a, f);
+            }
+        }
+        Expr::Exists(_, pat) => visit_pattern_exprs(pat, f),
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                visit_expr(a, f);
+            }
+        }
     }
 }
 
@@ -3933,24 +4074,24 @@ mod builtin_tests {
 
     #[test]
     fn cycleboolean_detects_directed_cycle() {
-        assert_eq!(lit(&scalar_on(false, "CYCLEBOOLEAN()")), "false");
-        assert_eq!(lit(&scalar_on(true, "CYCLEBOOLEAN()")), "true");
-        assert_eq!(lit(&scalar_on(true, "SIMPLECYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(false, "rs:cycleboolean()")), "false");
+        assert_eq!(lit(&scalar_on(true, "rs:cycleboolean()")), "true");
+        assert_eq!(lit(&scalar_on(true, "rs:simplecycleboolean()")), "true");
     }
 
     #[test]
     fn shortestpathlen_counts_edges() {
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:shortestpathlen(<http://ex/a>, <http://ex/d>)")),
             "3"
         );
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
+            lit(&scalar("rs:shortestpathlen(<http://ex/a>, <http://ex/a>)")),
             "0"
         );
         // d→a is unreachable in the acyclic graph ⇒ -1 sentinel.
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
+            lit(&scalar("rs:shortestpathlen(<http://ex/d>, <http://ex/a>)")),
             "-1"
         );
     }
@@ -3958,15 +4099,15 @@ mod builtin_tests {
     #[test]
     fn khopreachable_respects_budget() {
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
+            lit(&scalar("rs:khopreachable(<http://ex/a>, <http://ex/d>, 3)")),
             "true"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
+            lit(&scalar("rs:khopreachable(<http://ex/a>, <http://ex/d>, 2)")),
             "false"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
+            lit(&scalar("rs:khopreachable(<http://ex/a>, <http://ex/a>, 0)")),
             "true"
         );
     }
@@ -3976,44 +4117,44 @@ mod builtin_tests {
     #[test]
     fn sssp_serializes_the_path() {
         assert_eq!(
-            lit(&scalar("SSSP(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:sssp(<http://ex/a>, <http://ex/d>)")),
             "<http://ex/a> <http://ex/b> <http://ex/c> <http://ex/d>"
         );
         // Unreachable ⇒ empty (but bound) string.
-        assert_eq!(lit(&scalar("SSSP(<http://ex/d>, <http://ex/a>)")), "");
+        assert_eq!(lit(&scalar("rs:sssp(<http://ex/d>, <http://ex/a>)")), "");
     }
 
     #[test]
     fn sssplen_aliases_shortestpathlen() {
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
+        assert_eq!(lit(&scalar("rs:sssplen(<http://ex/a>, <http://ex/d>)")), "3");
+        assert_eq!(lit(&scalar("rs:sssplen(<http://ex/d>, <http://ex/a>)")), "-1");
     }
 
     #[test]
     fn shortestpaths_counts_distinct_paths() {
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
+        assert_eq!(lit(&scalar("rs:shortestpaths(<http://ex/a>, <http://ex/d>)")), "1");
+        assert_eq!(lit(&scalar("rs:shortestpaths(<http://ex/a>, <http://ex/a>)")), "1");
     }
 
     #[test]
     fn khop_count_and_neighbor_and_all() {
         // a's out-edges: b, "Hello World", <dt> ⇒ 3 nodes at exactly 1 hop.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:khopcount(<http://ex/a>, 1)")), "3");
         // Exactly 2 hops from a is just {c}.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 2)")), "1");
+        assert_eq!(lit(&scalar("rs:khopcount(<http://ex/a>, 2)")), "1");
         assert_eq!(
-            lit(&scalar("KHOPNEIGHBOR(<http://ex/a>, 2)")),
+            lit(&scalar("rs:khopneighbor(<http://ex/a>, 2)")),
             "<http://ex/c>"
         );
-        assert_eq!(lit(&scalar("KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
+        assert_eq!(lit(&scalar("rs:khopneighbor(<http://ex/b>, 1)")), "<http://ex/c>");
     }
 
     #[test]
     fn bfscount_counts_reachable() {
         // All reachable from a (excl. a): b, c, d, "Hello World", <dt> ⇒ 5.
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>)")), "5");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 1)")), "3");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 2)")), "4");
+        assert_eq!(lit(&scalar("rs:bfscount(<http://ex/a>)")), "5");
+        assert_eq!(lit(&scalar("rs:bfscount(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:bfscount(<http://ex/a>, 2)")), "4");
     }
 
     #[test]
@@ -4028,23 +4169,23 @@ mod builtin_tests {
     #[test]
     fn wcc_membership_and_size() {
         // Every node hangs off a ⇒ one weakly-connected component of 6 nodes.
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>, <http://ex/d>)")), "true");
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>)")), "6");
+        assert_eq!(lit(&scalar("rs:wcc(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("rs:wcc(<http://ex/a>)")), "6");
     }
 
     #[test]
     fn community_builtins_group_the_graph() {
         // The whole graph is one connected blob ⇒ same label-prop community.
-        assert_eq!(lit(&scalar("LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("rs:labelprop(<http://ex/a>, <http://ex/d>)")), "true");
         // Louvain returns a community size (≥ 1) for a known node.
-        let sz: usize = lit(&scalar("LOUVAIN(<http://ex/a>)")).parse().unwrap();
+        let sz: usize = lit(&scalar("rs:louvain(<http://ex/a>)")).parse().unwrap();
         assert!(sz >= 1);
     }
 
     #[test]
     fn triangle_and_clustering_are_zero_on_a_tree() {
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING()")), "0");
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING(<http://ex/a>)")), "0");
+        assert_eq!(lit(&scalar("rs:trianglecounting()")), "0");
+        assert_eq!(lit(&scalar("rs:trianglecounting(<http://ex/a>)")), "0");
         // Acyclic fan/path ⇒ no closed triples ⇒ transitivity 0.0.
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF()")), "0.0");
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF(<http://ex/a>)")), "0.0");
@@ -4053,12 +4194,12 @@ mod builtin_tests {
     #[test]
     fn centrality_builtins_rank_intermediate_nodes() {
         // A source node is never an intermediary ⇒ betweenness 0.
-        let bc_a: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
-        let bc_b: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
+        let bc_a: f64 = lit(&scalar("rs:betweennesscentrality(<http://ex/a>)")).parse().unwrap();
+        let bc_b: f64 = lit(&scalar("rs:betweennesscentrality(<http://ex/b>)")).parse().unwrap();
         assert_eq!(bc_a, 0.0);
         assert!(bc_b > 0.0);
         // a reaches five nodes ⇒ positive closeness.
-        let cc_a: f64 = lit(&scalar("CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let cc_a: f64 = lit(&scalar("rs:closenesscentrality(<http://ex/a>)")).parse().unwrap();
         assert!(cc_a > 0.0);
     }
 
@@ -4067,12 +4208,12 @@ mod builtin_tests {
         // JACCARDSIMILARITY is a dedicated graph function (literal-as-node is fine):
         // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
         assert_eq!(
-            lit(&scalar(r#"JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
+            lit(&scalar(r#"rs:jaccardsimilarity(<http://ex/b>, "Hello World")"#)),
             "0.5"
         );
-        // Node-mode SIMILARITY requires BOTH args to be IRIs naming graph nodes;
+        // Node-mode (legacy rs:) SIMILARITY requires BOTH args to be IRIs naming graph nodes;
         // a node vs itself has an identical neighbour set ⇒ 1.0.
-        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        assert_eq!(lit(&scalar("rs:similarity(<http://ex/a>, <http://ex/a>)")), "1.0");
         // Regression (#3): two STORED LITERALS must use STRING similarity, not
         // node cosine. Both are objects of <a>, so node mode would wrongly report
         // a cosine of 1.0; string (Jaro) similarity of these very different
@@ -4089,16 +4230,16 @@ mod builtin_tests {
 
     #[test]
     fn degree_correlation_and_diameter() {
-        let r: f64 = lit(&scalar("DEGREECORRELATION()")).parse().unwrap();
+        let r: f64 = lit(&scalar("rs:degreecorrelation()")).parse().unwrap();
         assert!(r.is_finite() && (-1.0..=1.0).contains(&r));
         // Undirected longest shortest path: leaf → a → b → c → d = 4.
-        assert_eq!(lit(&scalar("DIAMETERESTIMATION()")), "4");
+        assert_eq!(lit(&scalar("rs:diameterestimation()")), "4");
     }
 
     #[test]
     fn ppr_prefers_the_source() {
-        let self_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
-        let far_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
+        let self_score: f64 = lit(&scalar("rs:ppr(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
+        let far_score: f64 = lit(&scalar("rs:ppr(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
         assert!(self_score > far_score);
         assert!(far_score >= 0.0);
     }
@@ -4107,7 +4248,7 @@ mod builtin_tests {
     fn graph_builtin_inside_filter() {
         // Keep only rows where a can reach d within 3 hops (it can).
         assert_eq!(
-            count("<http://ex/a> <http://ex/name> ?n FILTER(SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
+            count("<http://ex/a> <http://ex/name> ?n FILTER(rs:sssplen(<http://ex/a>, <http://ex/d>) = 3)"),
             1
         );
     }
