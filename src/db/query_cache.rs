@@ -71,6 +71,11 @@ pub(crate) struct QueryCache {
     budget: usize,
     used: usize,
     tick: u64,
+    /// The database's [`mutation_count`](super::Database::mutation_count)
+    /// the cached results were computed at; a lookup or insert at another
+    /// count empties the cache first (a backstop to the explicit clearing
+    /// on every mutation).
+    generation: u64,
 }
 
 impl QueryCache {
@@ -81,11 +86,22 @@ impl QueryCache {
             budget,
             used: 0,
             tick: 0,
+            generation: 0,
         }
     }
 
-    /// Look up `key`, refreshing its recency and returning a clone on hit.
-    pub(crate) fn get(&mut self, key: &str) -> Option<QueryResult> {
+    /// Forget every result computed at another data generation.
+    fn sync(&mut self, generation: u64) {
+        if generation != self.generation {
+            self.clear();
+            self.generation = generation;
+        }
+    }
+
+    /// Look up `key` among the results computed at data generation
+    /// `generation`, refreshing its recency and returning a clone on hit.
+    pub(crate) fn get(&mut self, key: &str, generation: u64) -> Option<QueryResult> {
+        self.sync(generation);
         self.tick += 1;
         let tick = self.tick;
         let entry = self.map.get_mut(key)?;
@@ -95,10 +111,12 @@ impl QueryCache {
         Some(entry.result.clone())
     }
 
-    /// Cache `key → value`, evicting least-recently-used entries until it
-    /// fits the budget. A result above the per-entry limit (or any result,
-    /// with a zero budget) is not cached.
-    pub(crate) fn put(&mut self, key: String, value: QueryResult) {
+    /// Cache `key → value`, computed at data generation `generation`,
+    /// evicting least-recently-used entries until it fits the budget. A
+    /// result above the per-entry limit (or any result, with a zero budget)
+    /// is not cached.
+    pub(crate) fn put(&mut self, key: String, value: QueryResult, generation: u64) {
+        self.sync(generation);
         let bytes = key.len() + result_bytes(&value) + ENTRY_OVERHEAD;
         if self.budget == 0 || bytes > self.budget / MAX_ENTRY_FRACTION {
             return;
@@ -301,18 +319,23 @@ mod tests {
         // Room for exactly eight such entries (each at the per-entry limit).
         let mut c = QueryCache::new(8 * one);
         for k in ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8"] {
-            c.put(k.into(), rows(10));
+            c.put(k.into(), rows(10), 0);
         }
         assert_eq!(c.len(), 8);
         assert_eq!(c.bytes(), 8 * one);
-        c.get("q1"); // q2 is now the least recently used
-        c.put("q9".into(), rows(10));
+        c.get("q1", 0); // q2 is now the least recently used
+        c.put("q9".into(), rows(10), 0);
         assert_eq!(c.len(), 8);
         assert!(c.contains("q1") && c.contains("q9") && !c.contains("q2"));
         assert!(c.bytes() <= c.budget());
         // Re-putting a key replaces it without double counting.
-        c.put("q9".into(), rows(10));
+        c.put("q9".into(), rows(10), 0);
         assert_eq!(c.bytes(), 8 * one);
+        // Results of another data generation are never served.
+        assert!(c.get("q9", 1).is_none());
+        assert_eq!((c.len(), c.bytes()), (0, 0));
+        c.put("q1".into(), rows(10), 1);
+        assert!(c.get("q1", 1).is_some());
         c.clear();
         assert_eq!((c.len(), c.bytes()), (0, 0));
     }
@@ -320,12 +343,12 @@ mod tests {
     #[test]
     fn oversized_results_and_zero_budget_are_not_cached() {
         let mut c = QueryCache::new(8 * 1024);
-        c.put("big".into(), rows(1000));
+        c.put("big".into(), rows(1000), 0);
         assert_eq!(c.len(), 0);
-        c.put("small".into(), rows(1));
+        c.put("small".into(), rows(1), 0);
         assert_eq!(c.len(), 1);
         let mut off = QueryCache::new(0);
-        off.put("small".into(), rows(1));
+        off.put("small".into(), rows(1), 0);
         assert_eq!(off.len(), 0);
     }
 

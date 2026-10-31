@@ -635,7 +635,7 @@ fn query_cache_skips_non_deterministic_queries() {
         "SELECT (STRUUID() AS ?u) WHERE {}",
         "SELECT ?b WHERE { BIND(BNODE() AS ?b) }",
         "SELECT ?p WHERE { ?p <http://ex/salary> ?s } ORDER BY (RAND())",
-        "SELECT * WHERE { SERVICE SILENT <http://127.0.0.1:9/sparql> { ?s ?p ?o } }",
+        "SELECT * WHERE { SERVICE SILENT <urn:x-no-network:sparql> { ?s ?p ?o } }",
         "SELECT (<http://ex/fn#twice>(2) AS ?x) WHERE {}",
     ] {
         db.query(q).unwrap_or_else(|e| panic!("{q}: {e}"));

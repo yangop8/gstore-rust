@@ -972,7 +972,8 @@ impl Database {
                 // STRUUID()/BNODE(), SERVICE or user functions).
                 let cacheable = query_cache::is_cacheable(&q);
                 if cacheable {
-                    if let Some(cached) = self.query_cache.borrow_mut().get(sparql) {
+                    if let Some(cached) = self.query_cache.borrow_mut().get(sparql, self.mutations)
+                    {
                         return Ok(cached);
                     }
                 }
@@ -1001,9 +1002,11 @@ impl Database {
                     .with_integer_division(self.integer_division);
                 let result = eval.evaluate(&q)?;
                 if cacheable {
-                    self.query_cache
-                        .borrow_mut()
-                        .put(sparql.to_string(), result.clone());
+                    self.query_cache.borrow_mut().put(
+                        sparql.to_string(),
+                        result.clone(),
+                        self.mutations,
+                    );
                 }
                 Ok(result)
             }
