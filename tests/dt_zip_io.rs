@@ -1258,7 +1258,12 @@ mod with_zip {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("from 2 source(s)"), "{text}");
         assert!(!dir.join("z.db.unzip-tmp-0").exists());
-        assert_eq!(gstore::Database::open(dir.join("z.db")).unwrap().triple_num(), 4);
+        assert_eq!(
+            gstore::Database::open(dir.join("z.db"))
+                .unwrap()
+                .triple_num(),
+            4
+        );
         // An unsafe package builds nothing.
         fs::write(
             dir.join("evil.zip"),
@@ -1305,7 +1310,11 @@ mod with_zip {
 
         // gbackup -db NAME -z 1: ./backups/<db>.db_<timestamp>.zip; grestore
         // -l lists it and -db/-p restores it.
-        run(env!("CARGO_BIN_EXE_gbackup"), &["-db", "z", "-z", "1"], &dir);
+        run(
+            env!("CARGO_BIN_EXE_gbackup"),
+            &["-db", "z", "-z", "1"],
+            &dir,
+        );
         let backups: Vec<String> = fs::read_dir(dir.join("backups"))
             .unwrap()
             .flatten()
@@ -1324,7 +1333,12 @@ mod with_zip {
             &["-db", "z2", "-p", &path],
             &dir,
         );
-        assert_eq!(gstore::Database::open(dir.join("z2.db")).unwrap().triple_num(), 4);
+        assert_eq!(
+            gstore::Database::open(dir.join("z2.db"))
+                .unwrap()
+                .triple_num(),
+            4
+        );
         // The old order (the archive first) restores nothing and hints at
         // the order.
         let out = Command::new(env!("CARGO_BIN_EXE_grestore"))
