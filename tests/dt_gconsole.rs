@@ -792,6 +792,137 @@ fn the_local_mode_still_opens_databases_directly() {
     assert!(r.out.starts_with("Loaded database 'loc'"), "{r:?}");
     assert!(r.out.ends_with("bye.\n"), "{r:?}");
     assert!(r.err.contains("gconsole --local <db>"), "{r:?}");
+
+    // `import` goes through the bulk-load pipeline: any format by extension,
+    // N-Quads keep their named graph, a bad path is reported.
+    fs::write(
+        cwd.join("extra.ttl"),
+        "@prefix ex: <http://ex.org/> .\nex:a ex:p ex:b , ex:c .\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("extra.nq"),
+        "<http://ex.org/a> <http://ex.org/p> <http://ex.org/d> <http://ex.org/g> .\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", &path_str(&db)]);
+    let r = run(
+        cmd,
+        "import extra.ttl\n\
+         import extra.nq;\n\
+         import missing.ttl\n\
+         select ?o where { graph <http://ex.org/g> { ?s ?p ?o } };\n\
+         select (count(*) as ?n) where { <http://ex.org/a> ?p ?o };\n\
+         quit;\n",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("imported 2 new triple(s) from extra.ttl"),
+        "{r:?}"
+    );
+    assert!(
+        r.out.contains("imported 1 new triple(s) from extra.nq"),
+        "{r:?}"
+    );
+    assert!(r.out.contains("<http://ex.org/d>"), "{r:?}");
+    assert!(r.out.contains("\"2\"^^"), "{r:?}");
+    assert!(
+        r.err.contains("import failed after 0 new triple(s)"),
+        "{r:?}"
+    );
+}
+
+/// `create` / `batchinsert` / `batchremove` against a real server whose
+/// import is tolerant (upstream's): bad statements are skipped and counted,
+/// the console prints the server's `success_num` / `failed_num`, and the
+/// database's `parse_error.log` names each failure's line.
+#[test]
+fn tolerant_imports_print_the_servers_success_and_failed_counts() {
+    let cwd = scratch("gc_tolerant_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let srv = Server::start_with_dir("gc_tolerant", Some(&cwd));
+    fs::write(
+        cwd.join("t.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob .\n\
+         ex:alice ex:age \"30\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         ex:bob ex:age \"notanumber\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         ex:bob ex:name \"Bob\" .\n\
+         ex:carol ex:knows ex:alice ; ex:name \"Carol\" .\n\
+         ex:dave ex:broken <unterminated .\n\
+         ex:dave ex:name \"Dave\" .\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("more.nt"),
+        "<http://example.org/erin> <http://example.org/name> \"Erin\" .\n\
+         <http://example.org/erin> <http://example.org/age> \"x\"^^<http://www.w3.org/2001/XMLSchema#int> .\n\
+         <http://example.org/bob> <http://example.org/name> \"Bob\" .\n\
+         this is not a triple\n",
+    )
+    .unwrap();
+    fs::write(
+        cwd.join("del.nt"),
+        "<http://example.org/erin> <http://example.org/name> \"Erin\" .\n\
+         <http://example.org/nobody> <http://example.org/name> \"Nobody\" .\n\
+         broken line\n",
+    )
+    .unwrap();
+    let r = script(
+        &srv,
+        &cwd,
+        "create tolerant t.ttl;\n\
+         use tolerant;\n\
+         batchinsert more.nt;\n\
+         batchremove del.nt;\n\
+         select (count(*) as ?n) where { ?s ?p ?o };\n",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    // Build: 6 stored (the `<unterminated` line costs only itself), 2 failed.
+    // Insert: Erin's name is new, Bob's is a duplicate (not counted), the
+    // `xsd:int` literal and the garbage line fail. Remove: Erin's name
+    // existed, nobody's did not (not counted), one line fails.
+    for line in [
+        "RDF parse error num 2\nSee log file for details \nBuild RDF database tolerant successfully! use ",
+        "After inserted triples num 1,failed num 2,used ",
+        "After removed triples num 1,failed num 1,used ",
+        "\"6\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+    ] {
+        assert!(r.out.contains(line), "{line:?}: {r:?}");
+    }
+    let log = fs::read_to_string(srv.root.join("tolerant.db").join("parse_error.log")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 8, "{log}");
+    assert!(
+        lines[0].ends_with(&format!(
+            "build parser info, file path {}",
+            path_str(&fs::canonicalize(cwd.join("t.ttl")).unwrap())
+        )),
+        "{log}"
+    );
+    assert!(
+        lines[1].starts_with("Line 4 (") && lines[1].ends_with("Object integer value invalid"),
+        "{log}"
+    );
+    assert!(
+        lines[2].starts_with("Line 7 (") && lines[2].contains("invalid IRI"),
+        "{log}"
+    );
+    assert!(
+        lines[3].contains(" batch insert parser info, file path "),
+        "{log}"
+    );
+    assert!(
+        lines[4].starts_with("Line 2 (") && lines[4].ends_with("Object int value invalid"),
+        "{log}"
+    );
+    assert!(lines[5].starts_with("Line 4 ("), "{log}");
+    assert!(
+        lines[6].contains(" batch remove parser info, file path "),
+        "{log}"
+    );
+    assert!(lines[7].starts_with("Line 3 ("), "{log}");
 }
 
 // ---- a scripted fake server: exact requests, Ctrl-C -------------------------------

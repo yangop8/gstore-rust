@@ -10,12 +10,14 @@
 //!
 //! Type a SPARQL statement terminated by `;` to run it. Commands (with or
 //! without a final `;`): `help`, `stats`, `save`, `load <name>`,
-//! `import <file.nt>`, `quit` / `exit`.
+//! `import <file|dir|url>` (any RDF format the loaders read, chosen by the
+//! extension; N-Quads / TriG keep their named graphs), `quit` / `exit`.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{db_dir_for, Database, QueryResult, Triple};
+use crate::parser::import::{self, ImportOptions};
+use crate::{db_dir_for, Database, QueryResult};
 
 /// Run the embedded REPL on `target` (see the module docs); the process
 /// exit code.
@@ -153,16 +155,16 @@ fn run_query(db: &mut Database, query: &str) {
     }
 }
 
+/// `import <path>`: stream an RDF file (or every RDF file below a directory,
+/// or a URL) into the database through the bulk-load pipeline — strictly, so
+/// the first bad statement stops it.
 fn import_file(db: &mut Database, path: &str) {
-    let mut count = 0usize;
-    let res = crate::parser::ntriples::for_each_triple_file(path, |t: Triple| {
-        if db.try_insert_triple(&t)? {
-            count += 1;
-        }
-        Ok(())
+    let mut count = 0u64;
+    let res = import::sources_from_paths(&[path]).and_then(|sources| {
+        db.insert_sources(&sources, &ImportOptions::strict(), &mut (), &mut count)
     });
     match res {
-        Ok(()) => println!("imported {count} new triple(s) from {path}"),
+        Ok(_) => println!("imported {count} new triple(s) from {path}"),
         Err(e) => eprintln!("import failed after {count} new triple(s): {e}"),
     }
 }
@@ -174,7 +176,7 @@ fn print_help() {
          stats             show database statistics\n  \
          save              save the current database to <name>.db\n  \
          load <name>       load a database directory <name>.db\n  \
-         import <file.nt>  import triples from an N-Triples file\n  \
+         import <path>     import an RDF file (format by extension), a directory or a URL\n  \
          quit | exit       leave the console\n\
          otherwise: type a SPARQL query ending in ';'"
     );
