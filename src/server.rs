@@ -1164,6 +1164,9 @@ pub(crate) fn serve_connection<S: Conn>(
         let keep_alive = (http.keep_alive.is_some()
             && served < http.keep_alive_max
             && req.wants_keep_alive()
+            // A HEAD response still carries the body (its length framing
+            // would desynchronise the client), so it ends the connection.
+            && req.method != "HEAD"
             && !life.stopping())
         .then(|| {
             format!(
@@ -2994,6 +2997,8 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         let (_server, addr) = start();
         let resp = http(&addr, "GET /status HTTP/1.0\r\n\r\n");
         assert!(resp.contains("Connection: close"), "HTTP/1.0: {resp}");
+        let resp = http(&addr, "HEAD /status HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(resp.contains("Connection: close"), "HEAD: {resp}");
     }
 
     #[test]

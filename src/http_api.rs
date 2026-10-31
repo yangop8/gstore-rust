@@ -1636,7 +1636,7 @@ impl ApiInner {
     /// gStore's envelope at HTTP 200: `1003` for missing credentials, `1001`
     /// for wrong ones, `1101` once a stop is already under way.
     fn handle_lifecycle(&self, st: &mut ApiState, req: &Request, restart: bool) -> Resp {
-        if self.life.stopping() {
+        if self.is_stopping() {
             return gstore_resp(1101, "server is stopping, please waitting !");
         }
         let username = lifecycle_param(req, "username").unwrap_or_default();
@@ -1647,27 +1647,49 @@ impl ApiInner {
         if password.is_empty() {
             return gstore_resp(1003, "the password can not be empty!");
         }
-        let cfg = self.config();
-        let authorized = if username == cfg.system_username {
-            self.system_password
-                .as_deref()
-                .is_some_and(|p| ct_eq(p.as_bytes(), password.as_bytes()))
-        } else if username == ROOT_USER {
-            st.users.verify_and_upgrade(&username, &password)
-        } else {
-            let what = if restart { "restart" } else { "stop" };
-            return gstore_resp(1001, &format!("You have no rights to {what} the server."));
+        let authorized = match self.is_system_password(&username, &password) {
+            Some(ok) => ok,
+            None if username == ROOT_USER => st.users.verify_and_upgrade(&username, &password),
+            None => {
+                let what = if restart { "restart" } else { "stop" };
+                return gstore_resp(1001, &format!("You have no rights to {what} the server."));
+            }
         };
         if !authorized {
             return gstore_resp(1001, "the username or password is wrong.");
         }
+        self.stop_server(restart);
         if restart {
-            self.life.request_restart();
             gstore_resp(0, "Server restarted successfully.")
         } else {
-            self.life.request_stop();
             gstore_resp(0, "Server stopped successfully.")
         }
+    }
+
+    /// Whether a (graceful) stop of this server has begun.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.life.stopping()
+    }
+
+    /// Begin a graceful stop (a restart when `restart`): in-flight requests —
+    /// including the caller's — finish and are answered first.
+    pub(crate) fn stop_server(&self, restart: bool) {
+        if restart {
+            self.life.request_restart();
+        } else {
+            self.life.request_stop();
+        }
+    }
+
+    /// For the configured `system_username`: whether `password` is the system
+    /// password (`Some(false)` when none is configured). `None` for any other
+    /// user.
+    pub(crate) fn is_system_password(&self, username: &str, password: &str) -> Option<bool> {
+        (username == self.config().system_username).then(|| {
+            self.system_password
+                .as_deref()
+                .is_some_and(|p| ct_eq(p.as_bytes(), password.as_bytes()))
+        })
     }
 
     // ---- auth -------------------------------------------------------------
