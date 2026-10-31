@@ -13,26 +13,70 @@
 //! `server.rs`; some public endpoints chunk). HTTPS/auth/redirects out of scope.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use crate::model::Term;
 
 /// A single returned solution: each bound variable mapped to its RDF term.
 pub type ServiceSolution = Vec<(String, Term)>;
 
+/// Bounds on one [`sparql_post`] exchange, so a slow, dead or hostile
+/// endpoint cannot hold the query (and the database lock it runs under)
+/// indefinitely, nor make it buffer unbounded data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The whole exchange — connect, send, receive — must finish within this.
+    /// (A per-read timeout alone would let a peer trickling one byte at a time
+    /// keep it going forever.)
+    pub total: Duration,
+    /// Largest response accepted, headers included.
+    pub max_response: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            total: Duration::from_secs(30),
+            max_response: 64 << 20,
+        }
+    }
+}
+
 /// POST `query` to a SPARQL endpoint at `url` and return the raw response body.
 ///
 /// The body is sent verbatim with `Content-Type: application/sparql-query`,
 /// which [`crate::server`] accepts as the query text. Errors on a non-2xx
-/// status so callers can treat a remote failure like a connection failure.
+/// status so callers can treat a remote failure like a connection failure, and
+/// when the exchange exceeds the default [`Limits`].
 pub fn sparql_post(url: &str, query: &str) -> io::Result<String> {
+    sparql_post_with(url, query, Limits::default())
+}
+
+/// [`sparql_post`] with explicit [`Limits`].
+pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<String> {
     let (host, port, path) = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))?;
-    // Bound the request so a misbehaving/dead endpoint can't hang the query.
-    let timeout = Some(Duration::from_secs(15));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
+    let deadline = Instant::now() + limits.total;
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "SERVICE endpoint timed out");
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(timed_out)
+    };
+    let mut stream = None;
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "endpoint host did not resolve");
+    for addr in (host.as_str(), port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, remaining()?) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let mut stream = stream.ok_or(last_err)?;
+    stream.set_write_timeout(Some(remaining()?))?;
 
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
@@ -47,8 +91,29 @@ pub fn sparql_post(url: &str, query: &str) -> io::Result<String> {
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
+    // Read to EOF, re-arming the read timeout with what is left of the
+    // deadline before every read, and stop at the size cap.
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        stream.set_read_timeout(Some(remaining()?))?;
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Err(timed_out())
+            }
+            Err(e) => return Err(e),
+        };
+        if raw.len() + n > limits.max_response {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("SERVICE response larger than {} bytes", limits.max_response),
+            ));
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
     let text = String::from_utf8_lossy(&raw).into_owned();
 
     let (head, body) = text
@@ -385,6 +450,58 @@ impl JsonParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    /// Serve one connection: read the request, then run `respond` on it.
+    fn one_shot(respond: impl FnOnce(TcpStream) + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sparql", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            respond(s);
+        });
+        url
+    }
+
+    /// A peer that trickles its response (each byte well within a per-read
+    /// timeout) cannot stretch the exchange past the total deadline.
+    #[test]
+    fn a_trickling_endpoint_hits_the_total_deadline() {
+        let url = one_shot(|mut s| {
+            for _ in 0..100 {
+                if s.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let limits = Limits {
+            total: Duration::from_millis(700),
+            ..Limits::default()
+        };
+        let started = Instant::now();
+        let err = sparql_post_with(&url, "SELECT * WHERE { ?s ?p ?o }", limits).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    }
+
+    /// A response over the size cap is refused instead of buffered whole.
+    #[test]
+    fn an_oversized_response_is_refused() {
+        let url = one_shot(|mut s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(&vec![b' '; 300 * 1024]);
+        });
+        let limits = Limits {
+            max_response: 64 * 1024,
+            ..Limits::default()
+        };
+        let err = sparql_post_with(&url, "ASK {}", limits).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("larger than"), "{err}");
+    }
 
     #[test]
     fn parses_select_results_json() {

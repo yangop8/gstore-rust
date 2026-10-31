@@ -53,7 +53,11 @@
 //! - `--no-checkpoint`: turn off `check_point` (save every write before
 //!   acknowledging it); changes are then saved on graceful shutdown (and in API
 //!   mode on `/checkpoint` and `/unload`).
-//! - `--load-dir DIR` (repeatable): let SPARQL `LOAD` read files inside `DIR`.
+//! - `--load-dir DIR` (repeatable): let SPARQL `LOAD` (and, in API mode,
+//!   `/build?db_path=` and `/restore`) read files inside `DIR`.
+//! - `--allow-service`: let federated SPARQL `SERVICE` patterns contact remote
+//!   endpoints (off by default: a client could otherwise make the server send
+//!   requests to internal hosts).
 //! - `--pid-file FILE`, `--log-file FILE`: override the derived locations.
 //! - `--tls-cert FILE --tls-key FILE` (feature `tls`): serve HTTPS.
 //!
@@ -153,7 +157,8 @@ fn print_help() {
          \t--addr HOST\t\tBind address (default: conf.ini listen_addr, 127.0.0.1).\n\
          \t--password PW\t\tInitial root password (default: conf.ini root_password).\n\
          \t--no-checkpoint\t\tDo not save every write before acknowledging it.\n\
-         \t--load-dir DIR\t\tLet SPARQL LOAD read files under DIR (repeatable).\n\
+         \t--load-dir DIR\t\tLet LOAD, /build, /restore read files under DIR (repeatable).\n\
+         \t--allow-service\t\tLet SPARQL SERVICE contact remote endpoints.\n\
          \t--pid-file FILE\t\tPid file (default <db_home>/gserver.pid).\n\
          \t--log-file FILE\t\tLog of a background start (default <db_home>/gserver.log).\n\
          \t--api [DIR]\t\tServe the multi-database API rooted at DIR (the default mode).\n\
@@ -191,6 +196,7 @@ struct Cli {
     rocksdb: bool,
     no_checkpoint: bool,
     load_dirs: Vec<String>,
+    allow_service: bool,
     pid_file: Option<PathBuf>,
     log_file: Option<PathBuf>,
     dir: Option<PathBuf>,
@@ -253,6 +259,7 @@ impl Cli {
                 "--load-dir" => cli
                     .load_dirs
                     .push(value(&mut i, &arg)?.to_string_lossy().into_owned()),
+                "--allow-service" => cli.allow_service = true,
                 "--pid-file" => cli.pid_file = Some(value(&mut i, &arg)?.into()),
                 "--log-file" => cli.log_file = Some(value(&mut i, &arg)?.into()),
                 "--tls-cert" => cli.tls_cert = Some(value(&mut i, &arg)?.to_string_lossy().into_owned()),
@@ -826,7 +833,7 @@ fn supervise(cli: &Cli) -> u8 {
 /// Serve in this process until a graceful shutdown; then remove the pid file
 /// (or, for `/restart`, re-execute in place) and exit.
 fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 {
-    let load_policy = load_policy_for(&cli.load_dirs);
+    let load_policy = load_policy_for(&cli.load_dirs, cli.allow_service);
     let background = std::env::var_os(ENV_BACKGROUND).is_some();
     let addr = (cfg.listen_addr.as_str(), cfg.port);
     let (report, handle) = match &target.kind {
@@ -1086,9 +1093,14 @@ fn print_report(report: &ShutdownReport) -> bool {
 }
 
 /// The `LOAD` policy for the served databases: nothing may be loaded, except
-/// files inside the `--load-dir` directories.
-fn load_policy_for(dirs: &[String]) -> LoadPolicy {
+/// files inside the `--load-dir` directories; `SERVICE` may contact remote
+/// endpoints only with `--allow-service`.
+fn load_policy_for(dirs: &[String], allow_service: bool) -> LoadPolicy {
     let mut policy = LoadPolicy::restricted();
+    if allow_service {
+        policy.allow_remote = true;
+        println!("gserver: SPARQL SERVICE may contact remote endpoints");
+    }
     for d in dirs {
         if !Path::new(d).is_dir() {
             eprintln!("error: --load-dir '{d}' is not a directory");
@@ -1277,6 +1289,7 @@ mod tests {
         let c = cli(&["db/lubm.db", "--port", "0", "--no-checkpoint", "--load-dir", "x"]).unwrap();
         assert_eq!(c.dir.as_deref(), Some(Path::new("db/lubm.db")));
         assert!(c.no_checkpoint && c.port == Some(0) && c.load_dirs == ["x"]);
+        assert!(!c.allow_service && cli(&["--allow-service"]).unwrap().allow_service);
         let c = cli(&["root", "--api", "--password", "pw"]).unwrap();
         assert!(c.api && c.password.as_deref() == Some("pw"));
 

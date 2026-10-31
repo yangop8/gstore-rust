@@ -94,7 +94,8 @@ accesslog_path="logs/ipaccess/"
 accesslog_days=30
 
 [backup]
-# backup database path
+# backup database path. The HTTP API's /backup and /restore only write and read
+# backups inside it (when this key is not set: <db_home>/backups).
 backup_path="./backups/"
 # max backups file, if the number of backup files more than the value, system will remove the old backup files.
 max_backups=3

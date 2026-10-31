@@ -996,6 +996,9 @@ impl Database {
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
                 }
+                // `SERVICE` makes outbound requests: only where remote sources
+                // are allowed (not on a server's restricted policy).
+                eval = eval.with_service_allowed(self.load_policy.allow_remote);
                 let result = eval.evaluate(&q)?;
                 self.query_cache
                     .borrow_mut()
@@ -1058,8 +1061,12 @@ impl Database {
                 // Compute the ground delete/insert sets against the *current*
                 // data, then apply deletes before inserts (SPARQL semantics).
                 let (dels, ins) = {
-                    let eval = Evaluator::new(&self.dict, &self.store);
-                    eval.eval_update_modify(&delete, &insert, &pattern)
+                    let eval = Evaluator::new(&self.dict, &self.store)
+                        .with_service_allowed(self.load_policy.allow_remote);
+                    let sets = eval.eval_update_modify(&delete, &insert, &pattern);
+                    // A refused `SERVICE` in the WHERE clause fails the update.
+                    eval.check_cancel()?;
+                    sets
                 };
                 let mut changed = 0;
                 for t in &dels {

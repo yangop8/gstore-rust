@@ -51,6 +51,15 @@
 //! with `1001` and a message asking the user to log in once without
 //! encryption.
 //!
+//! **Checking without holding a lock.** The hash is deliberately slow (tens
+//! of milliseconds), and an unknown user costs the same as a wrong password. A
+//! server that keeps the store behind a shared lock therefore checks
+//! credentials in three phases — [`UserStore::begin_check`] (a cheap lookup,
+//! under the lock), [`CredentialAttempt::verify`] (the hash, with no lock
+//! held) and [`UserStore::finish_check`] (cache the success, migrate an old
+//! entry; under the lock again) — so clients sending bad credentials cannot
+//! serialize everyone else behind their hashes.
+//!
 //! A legacy entry may *fail* to verify if the binary was built with a toolchain
 //! whose `DefaultHasher` differs from the one that wrote it. To recover, reset
 //! the password offline with [`UserStore::reset_password_offline`] (for example
@@ -62,7 +71,8 @@
 //!
 //! `users.db` is rewritten atomically (temp file, `fsync`, rename, directory
 //! `fsync`), so a crash or a full disk mid-save leaves the previous file
-//! intact. A file with a line that does not parse (e.g. torn by an older build
+//! intact. It is created owner-only (`0600`), and a rewrite keeps whatever mode
+//! the operator gave it. A file with a line that does not parse (e.g. torn by an older build
 //! that rewrote it in place) is refused rather than loaded partially: skipping
 //! the damaged lines would silently drop those users — and could re-seed `root`
 //! with the command-line initial password. Fix or delete the reported line.
@@ -213,6 +223,106 @@ pub enum CredentialCheck {
     /// [`PasswordForm::Md5Hex`] client cannot be verified against it yet: the
     /// user must log in once with the plaintext password, which migrates it.
     NeedsPlaintextLogin,
+}
+
+/// A credential check in progress, from [`UserStore::begin_check`]: holds a
+/// copy of the user's stored hash, so the slow part
+/// ([`verify`](Self::verify)) needs no access to the store — and therefore no
+/// lock on it.
+pub struct CredentialAttempt {
+    name: String,
+    /// The presented secret (an MD5 digest normalized to lowercase).
+    secret: String,
+    form: PasswordForm,
+    /// The user's stored hash when the check began; `None` for an unknown user.
+    stored: Option<PasswordHash>,
+    /// The verified-credentials cache tag of (`name`, `form`, `secret`).
+    tag: [u8; 32],
+    /// The cache already vouched for these credentials.
+    cached: bool,
+}
+
+impl std::fmt::Debug for CredentialAttempt {
+    // Redacted: the secret stays out of logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialAttempt")
+            .field("name", &self.name)
+            .field("form", &self.form)
+            .field("cached", &self.cached)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialAttempt {
+    /// Phase 2 of a credential check: the deliberately slow password hash
+    /// (PBKDF2), skipped on a cache hit. Call it with no lock held. An unknown
+    /// user costs the same work as a wrong password (no user-enumeration
+    /// timing signal). Pass the result to [`UserStore::finish_check`].
+    pub fn verify(self) -> CheckedCredentials {
+        let outcome = if self.cached {
+            CredentialCheck::Valid
+        } else {
+            match &self.stored {
+                Some(hash) => match hash.verify_as(&self.secret, self.form) {
+                    Some(true) => CredentialCheck::Valid,
+                    Some(false) => CredentialCheck::Invalid,
+                    None => CredentialCheck::NeedsPlaintextLogin,
+                },
+                None => {
+                    // Burn the same work as a real check against a dummy entry.
+                    let dummy = PasswordHash::Pbkdf2Sha256 {
+                        input: Prehash::Md5Hex,
+                        iterations: PBKDF2_ITERATIONS,
+                        salt: vec![0u8; SALT_LEN],
+                        hash: [0u8; HASH_LEN],
+                    };
+                    let _ = std::hint::black_box(dummy.verify_as(&self.secret, self.form));
+                    CredentialCheck::Invalid
+                }
+            }
+        };
+        CheckedCredentials {
+            name: self.name,
+            secret: self.secret,
+            form: self.form,
+            stored: self.stored,
+            tag: self.tag,
+            cached: self.cached,
+            outcome,
+        }
+    }
+}
+
+/// A [`verify`](CredentialAttempt::verify)ed credential check, to be recorded
+/// with [`UserStore::finish_check`].
+pub struct CheckedCredentials {
+    name: String,
+    secret: String,
+    form: PasswordForm,
+    stored: Option<PasswordHash>,
+    tag: [u8; 32],
+    cached: bool,
+    outcome: CredentialCheck,
+}
+
+impl CheckedCredentials {
+    /// The outcome of the verification, before
+    /// [`finish_check`](UserStore::finish_check) re-checks that the stored
+    /// hash is still current.
+    pub fn outcome(&self) -> CredentialCheck {
+        self.outcome
+    }
+}
+
+impl std::fmt::Debug for CheckedCredentials {
+    // Redacted: the secret stays out of logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedCredentials")
+            .field("name", &self.name)
+            .field("form", &self.form)
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a stored PBKDF2 entry was computed over.
@@ -572,10 +682,14 @@ impl UserStore {
                 };
                 PasswordHash::Legacy { salt, hash }
             };
-            let privileges = cols
-                .next()
-                .and_then(Privilege::parse_list)
-                .unwrap_or_default();
+            // A missing or empty column is a user with no privileges; one that
+            // is present but does not parse (torn, or a token this version
+            // does not know) is malformed — loading it as "no privileges" and
+            // saving that back would silently revoke the user's access.
+            let privileges = match cols.next() {
+                None => BTreeSet::new(),
+                Some(list) => Privilege::parse_list(list).ok_or_else(malformed)?,
+            };
             self.users.insert(
                 name.to_string(),
                 User {
@@ -604,7 +718,9 @@ impl UserStore {
             let cred = u.password.encode();
             out.push_str(&format!("{}\t{cred}\t{}\n", u.name, u.privilege_str()));
         }
-        crate::db::fsutil::atomic_write(&self.path, out.as_bytes()).map_err(|e| match e {
+        // It holds password hashes: created owner-only, and a replacement keeps
+        // whatever mode the operator gave the existing file.
+        crate::db::fsutil::atomic_write_private(&self.path, out.as_bytes()).map_err(|e| match e {
             crate::error::GStoreError::Io(io) => io,
             other => io::Error::other(other.to_string()),
         })
@@ -672,7 +788,7 @@ impl UserStore {
         self.save().map_err(|e| e.to_string())
     }
 
-    /// Change a user's password.
+    /// Change a user's password, revoking the user's live sessions.
     pub fn set_password(&mut self, name: &str, password: &str) -> Result<(), String> {
         if password.is_empty() {
             return Err("password must not be empty".into());
@@ -683,6 +799,9 @@ impl UserStore {
             .ok_or_else(|| format!("user '{name}' does not exist"))?;
         user.password = PasswordHash::new(password);
         self.forget_verified(name);
+        // A changed (or admin-reset) password revokes the user's live sessions,
+        // so a token captured before the change stops working.
+        self.sessions.retain(|_, s| s.user != name);
         self.save().map_err(|e| e.to_string())
     }
 
@@ -733,71 +852,76 @@ impl UserStore {
     /// store. [`CredentialCheck::NeedsPlaintextLogin`] means `form` is
     /// [`PasswordForm::Md5Hex`] but the user's entry is in an older format
     /// that only a plaintext login can verify (and migrate).
+    ///
+    /// This runs the deliberately slow password hash in place. A caller that
+    /// keeps the store behind a shared lock should use the phased form
+    /// ([`begin_check`](Self::begin_check)) instead, so the hash runs with the
+    /// lock released.
     pub fn check_credentials(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
-        let Some(u) = self.users.get(name) else {
-            // Burn the same work as a real check against a fixed dummy entry.
-            let dummy = PasswordHash::Pbkdf2Sha256 {
-                input: Prehash::Md5Hex,
-                iterations: PBKDF2_ITERATIONS,
-                salt: vec![0u8; SALT_LEN],
-                hash: [0u8; HASH_LEN],
-            };
-            let _ = std::hint::black_box(dummy.verify_as(secret, form));
-            return CredentialCheck::Invalid;
-        };
+        let checked = self.begin_check(name, secret, form).verify();
+        self.remember_valid(&checked);
+        checked.outcome
+    }
+
+    /// Phase 1 of a credential check (cheap): look up `name`'s stored hash and
+    /// the verified-credentials cache. Then run [`CredentialAttempt::verify`]
+    /// (the slow PBKDF2) — with no lock held, so concurrent requests are not
+    /// serialized behind it — and hand the result to
+    /// [`finish_check`](Self::finish_check).
+    pub fn begin_check(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialAttempt {
         // The cache is keyed by the normalized secret, so `ABC…` and `abc…`
         // digests share an entry.
-        let normalized;
         let secret = match form {
-            PasswordForm::Plain => secret,
-            PasswordForm::Md5Hex => match normalize_md5_hex(secret) {
-                Some(d) => {
-                    normalized = d;
-                    &normalized
-                }
-                None => secret,
-            },
+            PasswordForm::Plain => secret.to_string(),
+            PasswordForm::Md5Hex => normalize_md5_hex(secret).unwrap_or_else(|| secret.to_string()),
         };
-        let key = (name.to_string(), form.tag());
         let tag = self
             .verified_key
             .mac(&[name.as_bytes(), &[0, form.tag()], secret.as_bytes()]);
-        let cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.get(&key).is_some_and(|t| constant_time_eq(t, &tag)) {
-            return CredentialCheck::Valid;
-        }
-        drop(cache);
-        match u.password.verify_as(secret, form) {
-            Some(true) => {
-                self.verified
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, tag);
-                CredentialCheck::Valid
-            }
-            Some(false) => CredentialCheck::Invalid,
-            None => CredentialCheck::NeedsPlaintextLogin,
+        let stored = self.users.get(name).map(|u| u.password.clone());
+        let cached = stored.is_some() && {
+            let cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .get(&(name.to_string(), form.tag()))
+                .is_some_and(|t| constant_time_eq(t, &tag))
+        };
+        CredentialAttempt {
+            name: name.to_string(),
+            secret,
+            form,
+            stored,
+            tag,
+            cached,
         }
     }
 
-    /// [`check_credentials`](Self::check_credentials), and on success
-    /// transparently re-hash an entry that is not in the current format (or
-    /// has fewer than [`PBKDF2_ITERATIONS`] iterations), persisting the store.
-    /// A plaintext login can migrate any entry; an MD5-digest login can only
+    /// Phase 3 of a credential check (cheap): record the outcome of a
+    /// [`verify`](CredentialAttempt::verify)ed attempt — cache a success, and
+    /// transparently re-hash an entry that is not in the current format (or has
+    /// fewer than [`PBKDF2_ITERATIONS`] iterations), persisting the store. A
+    /// plaintext login can migrate any entry; an MD5-digest login can only
     /// refresh the parameters of an entry already in the current format. A
     /// failure to persist the upgrade does not fail the verification.
-    pub fn authenticate(&mut self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
-        let outcome = self.check_credentials(name, secret, form);
-        if outcome != CredentialCheck::Valid {
-            return outcome;
+    ///
+    /// A success is only honoured if the user's stored hash is still the one
+    /// it was verified against: a password changed (or a user dropped) between
+    /// [`begin_check`](Self::begin_check) and here makes it
+    /// [`Invalid`](CredentialCheck::Invalid).
+    pub fn finish_check(&mut self, checked: CheckedCredentials) -> CredentialCheck {
+        if !self.remember_valid(&checked) {
+            return match checked.outcome {
+                CredentialCheck::Valid => CredentialCheck::Invalid,
+                other => other,
+            };
         }
-        if let Some(u) = self.users.get_mut(name) {
+        if let Some(u) = self.users.get_mut(&checked.name) {
             if u.password.needs_upgrade() {
-                let rehashed = match form {
-                    PasswordForm::Plain => Some(PasswordHash::new(secret)),
+                let rehashed = match checked.form {
+                    PasswordForm::Plain => Some(PasswordHash::new(&checked.secret)),
                     // Valid ⇒ the entry is already MD5-based and `secret` is a
-                    // well-formed digest.
-                    PasswordForm::Md5Hex => normalize_md5_hex(secret).map(|d| PasswordHash::from_md5_hex(&d)),
+                    // well-formed (normalized) digest.
+                    PasswordForm::Md5Hex => normalize_md5_hex(&checked.secret)
+                        .map(|d| PasswordHash::from_md5_hex(&d)),
                 };
                 if let Some(h) = rehashed {
                     u.password = h;
@@ -806,6 +930,34 @@ impl UserStore {
             }
         }
         CredentialCheck::Valid
+    }
+
+    /// Cache a valid outcome whose stored hash is still current; returns
+    /// whether `checked` is a success that may be honoured.
+    fn remember_valid(&self, checked: &CheckedCredentials) -> bool {
+        if checked.outcome != CredentialCheck::Valid {
+            return false;
+        }
+        let current = self.users.get(&checked.name).map(|u| &u.password);
+        if current.is_none() || current != checked.stored.as_ref() {
+            return false;
+        }
+        if !checked.cached {
+            self.verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((checked.name.clone(), checked.form.tag()), checked.tag);
+        }
+        true
+    }
+
+    /// [`check_credentials`](Self::check_credentials), and on success
+    /// transparently re-hash an entry that is not in the current format (see
+    /// [`finish_check`](Self::finish_check)). Runs the slow hash in place, like
+    /// `check_credentials`.
+    pub fn authenticate(&mut self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
+        let checked = self.begin_check(name, secret, form).verify();
+        self.finish_check(checked)
     }
 
     /// [`verify`](Self::verify), and on success transparently re-hash an entry
@@ -829,6 +981,13 @@ impl UserStore {
         if !self.verify_and_upgrade(name, password) {
             return None;
         }
+        Some(self.start_session(name))
+    }
+
+    /// Issue a session token for `name`, whose credentials the caller has
+    /// just verified (e.g. through [`begin_check`](Self::begin_check) …
+    /// [`finish_check`](Self::finish_check)).
+    pub fn start_session(&mut self, name: &str) -> String {
         let token = new_token();
         self.sessions.insert(
             token.clone(),
@@ -837,7 +996,7 @@ impl UserStore {
                 created: Instant::now(),
             },
         );
-        Some(token)
+        token
     }
 
     /// Resolve a session token to its username, pruning it if expired.
@@ -1241,6 +1400,85 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// The phased check runs its slow part on a detached attempt (no access to
+    /// the store, so a server can release its lock meanwhile), and a password
+    /// change that lands in between voids the success.
+    #[test]
+    fn phased_credential_check_runs_detached_and_respects_a_concurrent_change() {
+        let path = tmp("phased");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("eve", "pw", BTreeSet::new()).unwrap();
+        let checked = store.begin_check("eve", "pw", PasswordForm::Plain);
+        // The attempt is self-contained: verify it on another thread.
+        let checked = std::thread::spawn(move || checked.verify()).join().unwrap();
+        assert_eq!(checked.outcome(), CredentialCheck::Valid);
+        assert_eq!(store.finish_check(checked), CredentialCheck::Valid);
+        // Unknown users and wrong passwords.
+        for (u, p) in [("nobody", "pw"), ("eve", "bad")] {
+            let c = store.begin_check(u, p, PasswordForm::Plain).verify();
+            assert_eq!(store.finish_check(c), CredentialCheck::Invalid, "{u}:{p}");
+        }
+        // Verified against the old hash, finished after a change: refused,
+        // whether the success came from PBKDF2 or from the cache.
+        for _ in 0..2 {
+            let c = store.begin_check("eve", "pw", PasswordForm::Plain).verify();
+            store.set_password("eve", "pw").unwrap();
+            assert_eq!(store.finish_check(c), CredentialCheck::Invalid);
+            assert!(store.verify("eve", "pw"), "re-verifies against the new hash");
+        }
+        let c = store.begin_check("eve", "pw", PasswordForm::Plain).verify();
+        store.drop_user("eve").unwrap();
+        assert_eq!(store.finish_check(c), CredentialCheck::Invalid);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A password change (by the user or an admin reset) revokes the user's
+    /// live sessions: a token captured before the reset must stop working.
+    #[test]
+    fn password_change_revokes_the_users_sessions() {
+        let path = tmp("pwsess");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("alice", "oldpw", BTreeSet::new()).unwrap();
+        store.add("bob", "bobpw", BTreeSet::new()).unwrap();
+        let alice = store.login("alice", "oldpw").unwrap();
+        let bob = store.login("bob", "bobpw").unwrap();
+        store.set_password("alice", "newpw").unwrap();
+        assert_eq!(store.session_user(&alice), None, "alice's old session is revoked");
+        assert_eq!(store.session_user(&bob).as_deref(), Some("bob"), "others keep theirs");
+        let fresh = store.login("alice", "newpw").unwrap();
+        assert_eq!(store.session_user(&fresh).as_deref(), Some("alice"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A privileges column that is present but does not parse (torn mid-token,
+    /// or a token this version does not know) is refused like any other
+    /// malformed column — loading it as "no privileges" and saving that back
+    /// would silently revoke the user's access.
+    #[test]
+    fn a_malformed_privileges_column_is_refused() {
+        let path = tmp("privcol");
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store
+            .add("zed", "pw", BTreeSet::from([Privilege::Query, Privilege::Update]))
+            .unwrap();
+        let full = fs::read_to_string(&path).unwrap();
+        assert!(full.contains("\tquery,update\n"), "{full}");
+        for damaged in ["\tquery,upd\n", "\tquery,grant\n"] {
+            fs::write(&path, full.replace("\tquery,update\n", damaged)).unwrap();
+            let err = UserStore::open(&path, "rootpw").err().expect("must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{damaged:?}");
+        }
+        // An empty column (a user with no privileges) and a missing one (an
+        // old two-column entry) still load as "no privileges".
+        fs::write(&path, full.replace("\tquery,update\n", "\t\n")).unwrap();
+        let s = UserStore::open(&path, "rootpw").unwrap();
+        assert!(s.get("zed").unwrap().privileges.is_empty());
+        fs::write(&path, full.replace("\tquery,update\n", "\n")).unwrap();
+        let s = UserStore::open(&path, "rootpw").unwrap();
+        assert!(s.get("zed").unwrap().privileges.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn privileges_parse_names_and_numbers() {
         assert_eq!(Privilege::parse("query"), Some(Privilege::Query));
@@ -1340,6 +1578,25 @@ mod tests {
         assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&link);
+    }
+
+    /// `users.db` holds password hashes: it is created owner-only, and a save
+    /// (any user change, or a login that upgrades a legacy hash) keeps a mode
+    /// the operator set instead of resetting it to the default.
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_user_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("perms");
+        let mode = || fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        assert_eq!(mode(), 0o600, "a new user file is owner-only");
+        for m in [0o600, 0o640] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(m)).unwrap();
+            store.add(&format!("u{m:o}"), "pw", BTreeSet::new()).unwrap();
+            assert_eq!(mode(), m);
+        }
+        let _ = fs::remove_file(&path);
     }
 
     /// A torn `users.db` (cut mid-line, as an interrupted in-place rewrite

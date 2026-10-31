@@ -11,7 +11,13 @@
 //!   mapping to [`Database::begin`]/[`commit`](Database::commit)/
 //!   [`rollback`](Database::rollback). See *Transactions* below.
 //! * **Database lifecycle** — `/build`, `/load`, `/unload`, `/drop`, `/show`.
-//! * **Backup / restore / export** — `/backup`, `/restore`, `/export`.
+//!   A `/build?db_path=` reads a server-local file only as the server's
+//!   [`LoadPolicy`] allows (the policy of SPARQL `LOAD`; by default nothing).
+//! * **Backup / restore / export** — `/backup`, `/restore`, `/export`. Backups
+//!   are written only inside the server's backup directory (`<root>/backups`,
+//!   or `conf.ini`'s `backup_path`) and never over another database's files;
+//!   `/restore` reads from there, or from a directory the [`LoadPolicy`]
+//!   allows.
 //! * **Batch operations** — `/batchInsert`, `/batchRemove`: the payload is
 //!   parsed as RDF (N-Triples, or Turtle) and the ground triples are applied
 //!   directly — no SPARQL text is ever built from user input.
@@ -47,7 +53,12 @@
 //! **Locking.** Every database has its own lock, and no request ever waits for
 //! one while holding the server-wide state lock (see `ApiState`): a long
 //! query blocks only requests for *its* database, never `/cancel`,
-//! `/tasklist` or other databases.
+//! `/tasklist` or other databases. Nor does slow per-request work run under
+//! the state lock: password hashing (also for bad credentials), parsing a
+//! SPARQL statement to classify it, and parsing a batch payload all happen
+//! with it released. Every query — `/tquery` included — is a task that
+//! `/tasklist` lists and `/cancel` (or a shutdown past its grace period) can
+//! cancel.
 //!
 //! **Transactions.** At most one transaction is open per database, owned by
 //! the user who began it: only that user (or `root`) may `/tquery`, `/commit`
@@ -96,17 +107,19 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::GStoreConfig;
-use crate::db::{Database, LoadPolicy};
+use crate::db::{Database, LoadPolicy, LoadSource};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::gapi::GapiConfig;
-use crate::http_users::{Privilege, UserStore, ROOT_USER};
+use crate::http_users::{
+    CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
+};
 use crate::model::{Term, Triple};
 use crate::query::hash::md5_hex;
 use crate::query::{Evaluator, QueryResult};
@@ -673,9 +686,8 @@ pub(crate) struct TaskEntry {
 ///
 /// **Locking rule: never wait for a db lock while holding this lock.** A
 /// request that needs a database clones its handle here, releases this lock,
-/// and only then locks the database ([`Dispatch::Query`] /
-/// [`Dispatch::Deferred`]), re-checking under the db lock that the slot is
-/// still served. Holding a db lock, a thread may take this lock briefly (to
+/// and only then locks the database ([`Dispatch::Deferred`]), re-checking
+/// under the db lock that the slot is still served. Holding a db lock, a thread may take this lock briefly (to
 /// update a registry atomically with the slot) — that cannot deadlock, since
 /// whoever holds this lock never waits for a db lock. So a slow query on one
 /// database can never wedge this lock, `/cancel`, `/tasklist`, other
@@ -820,6 +832,18 @@ impl ApiInner {
         &self.config
     }
 
+    /// The directory `/backup` writes into and `/restore` reads from:
+    /// `conf.ini`'s `backup_path` when it is set, else `<root>/backups`. No
+    /// database, log or user file lives there, so a client-chosen backup
+    /// target inside it cannot clobber one.
+    pub(crate) fn backup_dir(&self) -> PathBuf {
+        if self.config.is_set("backup_path") {
+            self.config.backup_path.clone()
+        } else {
+            self.root.join("backups")
+        }
+    }
+
     /// Stop serving `name` (if loaded) *without* saving: take its handle out
     /// of the registry, then — with the state lock released — wait for any
     /// request still using it and retire the slot (see [`DbSlot::retire`]), so
@@ -859,15 +883,14 @@ type Handler = fn(&ApiInner, &mut ApiState, &Request, &str) -> Dispatch;
 /// `POST /cancel` can reach the task registry while it executes.
 enum Dispatch {
     Done(Resp),
-    Query(QueryJob),
     /// A response whose (possibly db-lock-contended or slow) work runs with
     /// the `ApiState` lock released — the closure captures cloned
     /// [`DbHandle`]s and does the locking itself (see the locking rule on
     /// [`ApiState`]); it gets the server to take the state lock briefly when
-    /// it must update a registry. Every endpoint that touches a database other
-    /// than through a [`QueryJob`] works this way, so a slow query holding one
-    /// db's lock cannot wedge the state lock and make `POST /cancel`
-    /// undeliverable.
+    /// it must update a registry. Every endpoint that touches a database or
+    /// does slow work (parsing a statement or payload, hashing a password)
+    /// works this way, so neither a slow query holding one db's lock nor a big
+    /// request can wedge the state lock and make `POST /cancel` undeliverable.
     Deferred(Box<dyn FnOnce(&ApiInner) -> Resp + Send>),
 }
 
@@ -1025,7 +1048,10 @@ impl ApiServer {
     /// The SPARQL `LOAD` policy for every database this server serves. The
     /// default, [`LoadPolicy::restricted`], lets `LOAD` read nothing — clients
     /// must not be able to make the server read arbitrary local files;
-    /// re-allow a directory with [`LoadPolicy::with_allowed_dir`].
+    /// re-allow a directory with [`LoadPolicy::with_allowed_dir`]. The same
+    /// policy governs `/build?db_path=` and the `/restore` sources outside the
+    /// backup directory, and its `allow_remote` whether federated `SERVICE`
+    /// patterns may contact remote endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
         self
@@ -1102,7 +1128,7 @@ impl ApiServer {
 
     /// The live cancel flag for an in-flight task, if it still exists. The
     /// engine's cooperative-cancellation hook ([`Database::query_cancellable`])
-    /// already consults this flag: `run_query` clones it into the [`QueryJob`]
+    /// already consults this flag: `prepare_query` clones it into the [`QueryJob`]
     /// that runs the query, `POST /cancel` sets it, and `/tasklist` reports it.
     /// This accessor lets an embedder reach the same flag directly.
     pub fn task_cancel_flag(&self, task_id: u64) -> Option<Arc<AtomicBool>> {
@@ -1288,24 +1314,32 @@ impl ApiInner {
             let (resp, user_disp) = crate::gapi::serve(self, req, peer);
             return (Resp::from(resp), user_disp);
         }
+        // Basic credentials are checked with the state lock held only to look
+        // the user up: the deliberately slow password hash runs with no lock
+        // held, so a client sending bad credentials (no account needed) cannot
+        // stall every other request — `/cancel` included — behind it.
+        let basic = parse_basic_auth(req).map(|(u, p)| {
+            let attempt = locked(&self.state).users.begin_check(&u, &p, PasswordForm::Plain);
+            (u, attempt.verify())
+        });
         // Short critical section: count the request, resolve the caller, route.
-        // A query endpoint returns `Dispatch::Query` so the actual (possibly
-        // long) execution happens below with the `ApiState` lock released.
+        // An endpoint with slow work (parsing, a query, I/O) returns
+        // `Dispatch::Deferred` so it runs below with the `ApiState` lock
+        // released.
         let (dispatch, user_disp) = {
             let mut st = locked(&self.state);
             st.requests += 1;
-            let user = self.resolve_user(&mut st, req);
+            let user = self.resolve_user(&mut st, req, basic);
             let user_disp = user.clone().unwrap_or_else(|| "-".to_string());
             let dispatch = self.dispatch(&mut st, req, user);
             (dispatch, user_disp)
         };
 
-        // Run any deferred query with NO `ApiState` lock held: this is what
+        // Run any deferred work with NO `ApiState` lock held: this is what
         // makes a concurrent `POST /cancel` (which needs that lock) deliverable
-        // while the query runs.
+        // while a query runs.
         let resp = match dispatch {
             Dispatch::Done(r) => r,
-            Dispatch::Query(job) => self.execute_query_job(job),
             Dispatch::Deferred(f) => f(self),
         };
         (resp, user_disp)
@@ -1391,12 +1425,19 @@ impl ApiInner {
         }
     }
 
-    /// Resolve the caller's identity from Basic auth or a session token.
-    fn resolve_user(&self, st: &mut ApiState, req: &Request) -> Option<String> {
-        if let Some((u, p)) = parse_basic_auth(req) {
+    /// Resolve the caller's identity from Basic auth (`basic`: the user and
+    /// the already-[`verify`](crate::http_users::CredentialAttempt::verify)ed
+    /// check of the request's Basic credentials) or a session token.
+    fn resolve_user(
+        &self,
+        st: &mut ApiState,
+        req: &Request,
+        basic: Option<(String, CheckedCredentials)>,
+    ) -> Option<String> {
+        if let Some((u, checked)) = basic {
             // Also migrates a legacy password hash on first successful use,
             // so Basic-auth-only clients get upgraded like `/login` users.
-            if st.users.verify_and_upgrade(&u, &p) {
+            if st.users.finish_check(checked) == CredentialCheck::Valid {
                 return Some(u);
             }
         }
@@ -1444,7 +1485,7 @@ impl ApiInner {
         // endpoints — the console itself only ever *reads* by calling back
         // into the (still auth-gated) `/sparql` from the browser.
         if path == "/login" {
-            return Dispatch::Done(self.handle_login(st, req));
+            return self.handle_login(req);
         }
         if path == "/logout" {
             if let Some(tok) = req.bearer_or_session_token() {
@@ -1456,12 +1497,8 @@ impl ApiInner {
         // documented `/grpc/` prefix): they check their own credentials.
         if matches!(method, "GET" | "POST") {
             match path {
-                "/shutdown" | "/grpc/shutdown" => {
-                    return Dispatch::Done(self.handle_stop_route(st, req, false))
-                }
-                "/restart" | "/grpc/restart" => {
-                    return Dispatch::Done(self.handle_stop_route(st, req, true))
-                }
+                "/shutdown" | "/grpc/shutdown" => return self.handle_stop_route(req, false),
+                "/restart" | "/grpc/restart" => return self.handle_stop_route(req, true),
                 _ => {}
             }
         }
@@ -1478,10 +1515,10 @@ impl ApiInner {
             None => return Dispatch::Done(self.unauthorized()),
         };
 
-        // Query endpoints defer execution (`Dispatch::Query`) so the query runs
-        // with the `ApiState` lock released; everything else runs under it here.
+        // Query endpoints defer classification and execution
+        // (`Dispatch::Deferred`) so they run with the `ApiState` lock released.
         match (method, path) {
-            ("GET" | "POST", "/sparql") => return self.handle_query(st, req, &user),
+            ("GET" | "POST", "/sparql") => return self.handle_query(req, &user),
             ("POST", "/update") => {
                 return if st.users.has_priv(&user, Privilege::Update) {
                     self.handle_update(st, req, &user)
@@ -1588,27 +1625,35 @@ impl ApiInner {
 
     // ---- auth -------------------------------------------------------------
 
-    fn handle_login(&self, st: &mut ApiState, req: &Request) -> Resp {
+    /// `/login`: verify the credentials — the slow password hash with the
+    /// state lock released (see [`UserStore::begin_check`]) — and issue a
+    /// session token.
+    fn handle_login(&self, req: &Request) -> Dispatch {
         let (Some(username), Some(password)) = (req.param("username"), req.param("password")) else {
-            return Resp::fail(400, "missing username or password");
+            return Dispatch::Done(Resp::fail(400, "missing username or password"));
         };
-        match st.users.login(&username, &password) {
-            Some(token) => {
-                let priv_str = st
-                    .users
-                    .get(&username)
-                    .map(|u| u.privilege_str())
-                    .unwrap_or_default();
-                let body = format!(
-                    "{{\"StatusCode\":0,\"StatusMsg\":\"login success\",\"session\":{},\"username\":{},\"privilege\":{}}}",
-                    json_str(&token),
-                    json_str(&username),
-                    json_str(&priv_str),
-                );
-                Resp::new(200, JSON, body.into_bytes())
+        Dispatch::Deferred(Box::new(move |inner| {
+            let attempt =
+                locked(&inner.state).users.begin_check(&username, &password, PasswordForm::Plain);
+            let checked = attempt.verify();
+            let mut st = locked(&inner.state);
+            if st.users.finish_check(checked) != CredentialCheck::Valid {
+                return Resp::fail(401, "invalid username or password");
             }
-            None => Resp::fail(401, "invalid username or password"),
-        }
+            let token = st.users.start_session(&username);
+            let priv_str = st
+                .users
+                .get(&username)
+                .map(|u| u.privilege_str())
+                .unwrap_or_default();
+            let body = format!(
+                "{{\"StatusCode\":0,\"StatusMsg\":\"login success\",\"session\":{},\"username\":{},\"privilege\":{}}}",
+                json_str(&token),
+                json_str(&username),
+                json_str(&priv_str),
+            );
+            Resp::new(200, JSON, body.into_bytes())
+        }))
     }
 
     // ---- /shutdown and /restart -------------------------------------------
@@ -1634,32 +1679,47 @@ impl ApiInner {
     /// transactions roll back, dirty databases are saved); `/restart` also sets
     /// [`ShutdownHandle::restart_requested`], on which `gserver` re-executes
     /// itself.
-    fn handle_stop_route(&self, st: &mut ApiState, req: &Request, restart: bool) -> Resp {
+    fn handle_stop_route(&self, req: &Request, restart: bool) -> Dispatch {
+        let username = req.merged_param("username").unwrap_or_default();
+        let password = req.merged_param("password").unwrap_or_default();
+        let encrypted = req.merged_param("encryption").as_deref() == Some("1");
+        // Deferred: `root`'s password is checked with the state lock released
+        // (see `UserStore::begin_check`).
+        Dispatch::Deferred(Box::new(move |inner| {
+            inner.stop_route(&username, &password, encrypted, restart)
+        }))
+    }
+
+    /// The body of [`handle_stop_route`](Self::handle_stop_route); runs with
+    /// no lock held.
+    fn stop_route(&self, username: &str, password: &str, encrypted: bool, restart: bool) -> Resp {
         let envelope = |code: i64, msg: &str| Resp::new(200, JSON, status_json(code, msg));
         if self.life.stopping() || self.closing.load(Ordering::SeqCst) {
             // Upstream answers StatusIPBlocked (1101) with this message.
             return envelope(1101, "server is stopping, please waitting !");
         }
-        let username = req.merged_param("username").unwrap_or_default();
-        let password = req.merged_param("password").unwrap_or_default();
         if username.is_empty() {
             return envelope(1003, "the value of username can not be empty!");
         }
         if password.is_empty() {
             return envelope(1003, "the value of password can not be empty!");
         }
-        let encrypted = req.merged_param("encryption").as_deref() == Some("1");
         let authenticated = if username == self.config.system_username {
             let (presented, expected) = if encrypted {
                 (password.to_ascii_lowercase(), md5_hex(&self.system_password))
             } else {
-                (password.clone(), self.system_password.clone())
+                (password.to_string(), self.system_password.clone())
             };
             ct_eq(presented.as_bytes(), expected.as_bytes())
         } else if username == ROOT_USER {
             // The user store keeps salted PBKDF2 hashes, so an MD5 digest of
             // the password (`encryption=1`) cannot be checked against it here.
-            !encrypted && st.users.verify_and_upgrade(&username, &password)
+            !encrypted && {
+                let attempt =
+                    locked(&self.state).users.begin_check(username, password, PasswordForm::Plain);
+                let checked = attempt.verify();
+                locked(&self.state).users.finish_check(checked) == CredentialCheck::Valid
+            }
         } else {
             let action = if restart { "restart" } else { "stop" };
             return envelope(1001, &format!("You have no rights to {action} the server."));
@@ -1678,26 +1738,51 @@ impl ApiInner {
 
     // ---- query / update ---------------------------------------------------
 
-    fn handle_query(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
+    /// `/sparql`: a read endpoint, where an UPDATE-shaped statement
+    /// additionally needs the Update privilege. Classifying the statement means
+    /// parsing it — possibly megabytes of text — so that happens with the state
+    /// lock released ([`Dispatch::Deferred`]); the lock is then taken briefly
+    /// to check the privilege and register the task.
+    fn handle_query(&self, req: &Request, user: &str) -> Dispatch {
         let Some(sparql) = req.param("sparql").or_else(|| req.query_string()) else {
             return Dispatch::Done(Resp::fail(400, "missing sparql/query parameter"));
         };
-        // A read endpoint: an UPDATE-shaped statement additionally needs Update.
-        let is_update = is_update_sparql(&sparql);
-        let need = if is_update {
-            Privilege::Update
-        } else {
-            Privilege::Query
-        };
-        if !st.users.has_priv(user, need) {
-            return Dispatch::Done(self.forbidden());
-        }
-        let Some(name) = self.pick_db(st, req) else {
-            return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
-        };
-        self.run_query(st, &name, &sparql, is_update, req, user)
+        let db = db_param(req);
+        let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
+        let user = user.to_string();
+        Dispatch::Deferred(Box::new(move |inner| {
+            let is_update = is_update_sparql(&sparql);
+            let need = if is_update {
+                Privilege::Update
+            } else {
+                Privilege::Query
+            };
+            let name = {
+                let st = locked(&inner.state);
+                if !st.users.has_priv(&user, need) {
+                    return inner.forbidden();
+                }
+                let Some(name) = pick_db_name(&st, db) else {
+                    return Resp::fail(400, "missing or ambiguous db parameter");
+                };
+                name
+            };
+            log_query(&inner.root, &name, &user, &sparql);
+            let prepared = {
+                let mut st = locked(&inner.state);
+                inner.prepare_query(&mut st, &name, sparql, is_update, fmt, &user)
+            };
+            let job = match prepared {
+                Ok(job) => job,
+                Err(r) => return r,
+            };
+            inner.execute_query_job(job)
+        }))
     }
 
+    /// `/update` (the caller holds the Update privilege): like
+    /// [`handle_query`](Self::handle_query), the statement is classified with
+    /// the state lock released.
     fn handle_update(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(sparql) = req
             .param("sparql")
@@ -1709,43 +1794,50 @@ impl ApiInner {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
-        let is_update = is_update_sparql(&sparql);
-        self.run_query(st, &name, &sparql, is_update, req, user)
+        let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
+        let user = user.to_string();
+        Dispatch::Deferred(Box::new(move |inner| {
+            let is_update = is_update_sparql(&sparql);
+            log_query(&inner.root, &name, &user, &sparql);
+            let prepared = {
+                let mut st = locked(&inner.state);
+                inner.prepare_query(&mut st, &name, sparql, is_update, fmt, &user)
+            };
+            let job = match prepared {
+                Ok(job) => job,
+                Err(r) => return r,
+            };
+            inner.execute_query_job(job)
+        }))
     }
 
-    /// Set up a SPARQL request against loaded database `name`: register the task,
-    /// clone the target database handle + cancel flag, and return a
-    /// [`Dispatch::Query`] so [`execute_query_job`](Self::execute_query_job) can
-    /// run it *without* the `ApiState` lock held (letting a concurrent
-    /// `POST /cancel` reach the task). Content negotiation is captured now; the
-    /// query log is appended here too.
-    fn run_query(
+    /// Set up a SPARQL request against loaded database `name`: register the
+    /// task, and clone the target database handle + cancel flag into a
+    /// [`QueryJob`] that
+    /// [`execute_query_job`](Self::execute_query_job) runs *without* the
+    /// `ApiState` lock held (letting a concurrent `POST /cancel` reach the
+    /// task). Called with the state lock held (briefly: nothing here is slow).
+    fn prepare_query(
         &self,
         st: &mut ApiState,
         name: &str,
-        sparql: &str,
+        sparql: String,
         is_update: bool,
-        req: &Request,
+        fmt: ResultFormat,
         user: &str,
-    ) -> Dispatch {
-        append_log(
-            &st.root,
-            "query.log",
-            &format!("{}\t{}\t{}\t{}", now_millis(), name, user, sparql.replace('\n', " ")),
-        );
-        let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
+    ) -> Result<QueryJob, Resp> {
         // Clone the target database handle — it has its own lock, independent of
         // the `ApiState` lock, so the query runs without blocking `/cancel`.
         let Some(db) = st.dbs.get(name).map(Arc::clone) else {
-            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
+            return Err(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        let (task_id, cancel) = self.register_task(st, name, sparql, user);
-        Dispatch::Query(QueryJob {
+        let (task_id, cancel) = self.register_task(st, name, &sparql, user);
+        Ok(QueryJob {
             db,
             name: name.to_string(),
             cancel,
             task_id,
-            sparql: sparql.to_string(),
+            sparql,
             is_update,
             fmt,
         })
@@ -1832,7 +1924,10 @@ impl ApiInner {
 
     /// `POST /build?db_name=…` (RDF in the body, or a server-local
     /// `db_path`). The parse and save run with the state lock released; the
-    /// name is reserved meanwhile ([`ApiState::busy`]).
+    /// name is reserved meanwhile ([`ApiState::busy`]). A `db_path` is read
+    /// only as the server's [`LoadPolicy`] allows — the policy that governs
+    /// SPARQL `LOAD`, so `/build` is not a way around it — and only if it is a
+    /// regular file.
     fn handle_build(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
@@ -1847,13 +1942,17 @@ impl ApiInner {
         let path = req.param("db_path").or_else(|| req.param("path"));
         let body = if path.is_none() { req.body_str() } else { String::new() };
         let dir = st.db_dir(&name);
+        let policy = st.load_policy.clone();
         Dispatch::Deferred(Box::new(move |inner| {
             let _busy = BusyGuard {
                 inner,
                 name: name.clone(),
             };
             let built = match path {
-                Some(path) => Database::build_from_files(name.clone(), &[path]),
+                Some(path) => match build_source(&policy, &path) {
+                    Ok(file) => Database::build_from_files(name.clone(), &[file]),
+                    Err(r) => return r,
+                },
                 None => Database::build_from_str(name.clone(), &body),
             };
             let db = match built {
@@ -2365,41 +2464,68 @@ impl ApiInner {
         else {
             return Dispatch::Done(Resp::fail(400, "missing sparql parameter"));
         };
-        let need = if is_update_sparql(&sparql) {
-            Privilege::Update
-        } else {
-            Privilege::Query
-        };
-        if !st.users.has_priv(user, need) {
-            return Dispatch::Done(self.forbidden());
-        }
-        append_log(
-            &st.root,
-            "query.log",
-            &format!("{}\t{}\t{}\t{}", now_millis(), name, user, sparql.replace('\n', " ")),
-        );
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
-        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
-        };
-        Dispatch::Deferred(Box::new(move |_| {
-            match Self::run_in_txn(&dbh, &name, tid, &sparql) {
+        let user = user.to_string();
+        // Classified (parsed) with the state lock released, like `/sparql`.
+        Dispatch::Deferred(Box::new(move |inner| {
+            let need = if is_update_sparql(&sparql) {
+                Privilege::Update
+            } else {
+                Privilege::Query
+            };
+            let dbh = {
+                let st = locked(&inner.state);
+                if !st.users.has_priv(&user, need) {
+                    return inner.forbidden();
+                }
+                let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
+                    return Resp::fail(404, &format!("database '{name}' is not loaded"));
+                };
+                dbh
+            };
+            log_query(&inner.root, &name, &user, &sparql);
+            match inner.run_in_txn_task(&dbh, &name, tid, &sparql, &user) {
                 Ok(r) => render_result(fmt, &r),
                 Err(e) => e.rest(),
             }
         }))
     }
 
+    /// [`run_in_txn`](Self::run_in_txn) as a registered task of `user`: listed
+    /// by `/tasklist`, and cancellable — by `/cancel`, and by a shutdown past
+    /// its grace period — like any other query. Must be called with no lock
+    /// held.
+    pub(crate) fn run_in_txn_task(
+        &self,
+        dbh: &DbHandle,
+        name: &str,
+        tid: u64,
+        sparql: &str,
+        user: &str,
+    ) -> Result<QueryResult, OpError> {
+        let (task_id, cancel) = {
+            let mut st = locked(&self.state);
+            self.register_task(&mut st, name, sparql, user)
+        };
+        let _task = TaskGuard {
+            inner: self,
+            id: task_id,
+        };
+        Self::run_in_txn(dbh, name, tid, sparql, Some(cancel))
+    }
+
     /// Run `sparql` inside open transaction `tid` on database `name` (handle
-    /// `dbh`). Must be called with no lock held. The transaction is re-checked
-    /// under the db lock, which `/commit` and `/rollback` also take before they
-    /// end it — so the statement either runs inside transaction `tid` or is
-    /// refused, never applied outside it.
+    /// `dbh`), cancellable through `cancel` when given. Must be called with no
+    /// lock held. The transaction is re-checked under the db lock, which
+    /// `/commit` and `/rollback` also take before they end it — so the
+    /// statement either runs inside transaction `tid` or is refused, never
+    /// applied outside it.
     pub(crate) fn run_in_txn(
         dbh: &DbHandle,
         name: &str,
         tid: u64,
         sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<QueryResult, OpError> {
         let mut slot = locked(dbh);
         if slot.retired || slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
@@ -2409,7 +2535,10 @@ impl ApiInner {
             ));
         }
         let before = slot.db.mutation_count();
-        let result = slot.db.query(sparql);
+        let result = match cancel {
+            Some(cancel) => slot.db.query_cancellable(sparql, cancel),
+            None => slot.db.query(sparql),
+        };
         // Also a failing UPDATE may have applied part of its operations.
         if slot.db.mutation_count() != before {
             if let Some(open) = slot.txn.as_mut() {
@@ -2577,24 +2706,39 @@ impl ApiInner {
 
     // ---- backup / restore / export ---------------------------------------
 
+    /// `POST /backup?db_name=…[&path=<dir>]` — write a full backup of the
+    /// database into `<dir>`, which must lie inside the server's
+    /// [backup directory](ApiInner::backup_dir) (a relative `path` is taken
+    /// relative to it; the default is `<name>.backup` there). A backup replaces
+    /// whatever database files its target holds, so a target that already
+    /// holds anything but an earlier backup of this same database is refused,
+    /// as is one nested inside another backup: a client can neither write
+    /// outside that directory nor clobber another database or its backups.
     fn handle_backup(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
-        let path = req
-            .param("path")
-            .or_else(|| req.param("backup_path"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| st.root.join(format!("{name}.backup")));
+        let requested = req.param("path").or_else(|| req.param("backup_path"));
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
-        Dispatch::Deferred(Box::new(move |_| {
+        Dispatch::Deferred(Box::new(move |inner| {
+            let path = match backup_target(&inner.backup_dir(), &name, requested.as_deref()) {
+                Ok(path) => path,
+                Err(r) => return r,
+            };
             // A backup of the live database would capture uncommitted writes.
             let slot = match Self::lock_for(&dbh, &name, "backing up") {
                 Ok(slot) => slot,
                 Err(r) => return r,
             };
+            // Claim the directory for this database before writing into it.
+            let claimed = fs::create_dir_all(&path).map_err(GStoreError::from).and_then(|()| {
+                crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
+            });
+            if let Err(e) = claimed {
+                return Resp::fail(500, &format!("backup failed: {e}"));
+            }
             match slot.db.backup(&path) {
                 Ok(()) => {
                     let body = format!(
@@ -2609,7 +2753,12 @@ impl ApiInner {
     }
 
     /// `POST /restore?db_name=…&path=<backup>` — replace the database with a
-    /// backup (any layout). The backup is copied next to the database's
+    /// backup (any layout). The backup must lie inside the server's
+    /// [backup directory](ApiInner::backup_dir) (a relative `path` is taken
+    /// relative to it) or in a directory the server's [`LoadPolicy`] lets
+    /// clients read (`gserver --load-dir`); anything else is refused, so a
+    /// client cannot make the server read other databases on the host. The
+    /// backup is copied next to the database's
     /// directory and validated *before* the loaded database is touched, so a
     /// corrupt backup changes nothing; only then is the loaded database retired
     /// (its unsaved changes saved first, so a failed swap loses nothing) and
@@ -2624,25 +2773,33 @@ impl ApiInner {
         if st.db_txn.contains_key(&name) {
             return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
         }
-        if Database::storage_kind(&path).is_none() {
-            return Dispatch::Done(Resp::fail(
-                500,
-                &format!("restore failed: '{path}' does not contain a database backup"),
-            ));
-        }
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
         }
         let dir = st.db_dir(&name);
+        let policy = st.load_policy.clone();
         Dispatch::Deferred(Box::new(move |inner| {
             let _busy = BusyGuard {
                 inner,
                 name: name.clone(),
             };
+            let path = match restore_source(&inner.backup_dir(), &policy, &path) {
+                Ok(path) => path,
+                Err(r) => return r,
+            };
+            if Database::storage_kind(&path).is_none() {
+                return Resp::fail(
+                    500,
+                    &format!(
+                        "restore failed: '{}' does not contain a database backup",
+                        path.display()
+                    ),
+                );
+            }
             // Copy the backup beside the database's own directory and validate
             // the copy — never open the backup in place, or later writes would
             // land in the backup. The loaded database is untouched so far.
-            let staged = match Database::stage_restore(Path::new(&path), &dir) {
+            let staged = match Database::stage_restore(&path, &dir) {
                 Ok(staged) => staged,
                 Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
             };
@@ -2762,28 +2919,31 @@ impl ApiInner {
             return Dispatch::Done(Resp::fail(400, "no triples supplied"));
         }
         let op = if insert { "batchInsert" } else { "batchRemove" };
-        let (format, triples) = match parse_batch_payload(req.param("format").as_deref(), &payload)
-        {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                return Dispatch::Done(Resp::fail(400, &format!("{op} payload is not valid RDF {e}")))
-            }
-        };
-        append_log(
-            &st.root,
-            "query.log",
-            &format!(
-                "{}\t{}\t{}\t{op} {} triple(s) ({format})",
-                now_millis(),
-                name,
-                user,
-                triples.len()
-            ),
-        );
-        let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
-            return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
-        };
+        let format_param = req.param("format");
+        let dbh = st.dbs.get(&name).map(Arc::clone);
+        let user = user.to_string();
+        // The payload (up to the request body cap) is parsed with the state
+        // lock released.
         Dispatch::Deferred(Box::new(move |inner| {
+            let (format, triples) = match parse_batch_payload(format_param.as_deref(), &payload) {
+                Ok(parsed) => parsed,
+                Err(e) => return Resp::fail(400, &format!("{op} payload is not valid RDF {e}")),
+            };
+            drop(payload);
+            append_log(
+                &inner.root,
+                "query.log",
+                &format!(
+                    "{}\t{}\t{}\t{op} {} triple(s) ({format})",
+                    now_millis(),
+                    name,
+                    user,
+                    triples.len()
+                ),
+            );
+            let Some(dbh) = dbh else {
+                return Resp::fail(404, &format!("database '{name}' is not loaded"));
+            };
             let mut slot = locked(&dbh);
             if slot.retired {
                 return Resp::fail(404, &format!("database '{name}' is not loaded"));
@@ -3004,13 +3164,7 @@ impl ApiInner {
     /// `db_name`/`db` parameter, or — when exactly one database is loaded — that
     /// one.
     fn pick_db(&self, st: &ApiState, req: &Request) -> Option<String> {
-        if let Some(n) = req.param("db_name").or_else(|| req.param("db")) {
-            return valid_db_name(&n).then_some(n);
-        }
-        if st.dbs.len() == 1 {
-            return st.dbs.keys().next().cloned();
-        }
-        None
+        pick_db_name(st, db_param(req))
     }
 
     /// A required, validated database name from `db_name`/`name`/`db`.
@@ -3033,6 +3187,194 @@ impl ApiInner {
 }
 
 // --- free helpers ------------------------------------------------------------
+
+// --- server-local paths named by clients --------------------------------------
+
+/// Marker a `/backup` writes into its target directory: the name of the
+/// database backed up there, so a later backup of a *different* database
+/// cannot overwrite it.
+const BACKUP_OWNER_FILE: &str = "BACKUP_OF";
+
+/// The server-local file a `/build?db_path=` may read: what the server's LOAD
+/// policy allows (the same rules as SPARQL `LOAD`), and only a regular file —
+/// never a device or FIFO that would never end.
+fn build_source(policy: &LoadPolicy, path: &str) -> Result<PathBuf, Resp> {
+    let refused = || {
+        Resp::fail(
+            403,
+            &format!(
+                "db_path '{path}' is not a readable file inside the directories the server's \
+                 load policy allows (see gserver --load-dir)"
+            ),
+        )
+    };
+    match policy.resolve(path) {
+        Ok(LoadSource::Local(file)) if fs::metadata(&file).is_ok_and(|m| m.is_file()) => Ok(file),
+        Ok(LoadSource::Local(_)) | Err(_) => Err(refused()),
+        Ok(LoadSource::Remote(_)) => Err(Resp::fail(
+            400,
+            &format!("db_path '{path}': building from a remote source is not supported"),
+        )),
+    }
+}
+
+/// Resolve a client-supplied path against `base`: a relative path is taken
+/// relative to `base`, `..` components are refused, and the result — its
+/// deepest existing ancestor canonicalized, so symlinks are resolved — must
+/// lie strictly inside the canonical `base`.
+fn confined_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
+    let mut joined = base.to_path_buf();
+    let mut any = false;
+    for c in Path::new(requested).components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => {
+                joined = PathBuf::from(c.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => return Err("'..' is not allowed in a path".into()),
+            Component::Normal(part) => {
+                joined.push(part);
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return Err("empty path".into());
+    }
+    let base = fs::canonicalize(base).map_err(|e| e.to_string())?;
+    // Canonicalize the deepest existing ancestor; re-append the rest (plain
+    // names, so nothing left to resolve).
+    let mut rest = Vec::new();
+    let mut existing = joined.as_path();
+    let mut target = loop {
+        match fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(_) => match (existing.file_name(), existing.parent()) {
+                (Some(f), Some(p)) => {
+                    rest.push(f.to_os_string());
+                    existing = p;
+                }
+                _ => return Err("unresolvable path".into()),
+            },
+        }
+    };
+    for part in rest.iter().rev() {
+        target.push(part);
+    }
+    if target.starts_with(&base) && target != base {
+        Ok(target)
+    } else {
+        Err("outside the directory".into())
+    }
+}
+
+/// Where a `/backup` of database `name` may write: `requested` (default
+/// `<name>.backup`) confined to `backup_dir`, not nested inside a directory
+/// holding a database (another backup), and either new, empty, or an earlier
+/// backup of `name` itself (see [`BACKUP_OWNER_FILE`]).
+fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Result<PathBuf, Resp> {
+    if let Err(e) = fs::create_dir_all(backup_dir) {
+        return Err(Resp::fail(
+            500,
+            &format!("backup failed: cannot create the backup directory: {e}"),
+        ));
+    }
+    let default = format!("{name}.backup");
+    let requested = requested.unwrap_or(&default);
+    let target = confined_path(backup_dir, requested).map_err(|why| {
+        Resp::fail(
+            403,
+            &format!(
+                "backup path '{requested}' refused ({why}): backups are written inside the \
+                 server's backup directory '{}' (a relative path is taken relative to it)",
+                backup_dir.display()
+            ),
+        )
+    })?;
+    let conflict = |what: &str| {
+        Resp::fail(
+            409,
+            &format!("backup path '{}' {what}; choose another path", target.display()),
+        )
+    };
+    let base = fs::canonicalize(backup_dir).unwrap_or_default();
+    let mut ancestor = target.parent();
+    while let Some(dir) = ancestor.filter(|d| d.starts_with(&base) && *d != base) {
+        if Database::storage_kind(dir).is_some() || dir.join(BACKUP_OWNER_FILE).exists() {
+            return Err(conflict("lies inside another backup"));
+        }
+        ancestor = dir.parent();
+    }
+    match fs::symlink_metadata(&target) {
+        Err(_) => Ok(target),
+        Ok(m) if m.is_dir() => {
+            let owner = fs::read_to_string(target.join(BACKUP_OWNER_FILE)).ok();
+            let empty = fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(false);
+            if empty || owner.as_deref() == Some(name) {
+                Ok(target)
+            } else {
+                Err(conflict(&format!("already holds data that is not a backup of '{name}'")))
+            }
+        }
+        Ok(_) => Err(conflict("exists and is not a directory")),
+    }
+}
+
+/// Where a `/restore` may read its backup from: `requested` inside
+/// `backup_dir` (relative paths resolve there), or a directory the server's
+/// LOAD policy lets clients read. Denials do not say whether the path exists.
+fn restore_source(
+    backup_dir: &Path,
+    policy: &LoadPolicy,
+    requested: &str,
+) -> Result<PathBuf, Resp> {
+    if let Ok(path) = confined_path(backup_dir, requested) {
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    if Path::new(requested).is_absolute() {
+        if let Some(path) = policy.allowed_local_dir(Path::new(requested)) {
+            return Ok(path);
+        }
+    }
+    Err(Resp::fail(
+        403,
+        &format!(
+            "restore path '{requested}' refused: a backup is restored from inside the server's \
+             backup directory '{}' (a relative path is taken relative to it) or from a directory \
+             the server's load policy allows (see gserver --load-dir)",
+            backup_dir.display()
+        ),
+    ))
+}
+
+/// Append a statement to `query.log` (no lock needed: `O_APPEND` keeps each
+/// line whole, and the text may be large, so callers do it off the state lock).
+pub(crate) fn log_query(root: &Path, db: &str, user: &str, sparql: &str) {
+    append_log(
+        root,
+        "query.log",
+        &format!("{}\t{}\t{}\t{}", now_millis(), db, user, sparql.replace('\n', " ")),
+    );
+}
+
+/// The request's `db_name`/`db` parameter, if any (see [`pick_db_name`]).
+fn db_param(req: &Request) -> Option<String> {
+    req.param("db_name").or_else(|| req.param("db"))
+}
+
+/// The target database of a request: the named one (`param`, validated), else
+/// the only loaded one.
+fn pick_db_name(st: &ApiState, param: Option<String>) -> Option<String> {
+    if let Some(n) = param {
+        return valid_db_name(&n).then_some(n);
+    }
+    if st.dbs.len() == 1 {
+        return st.dbs.keys().next().cloned();
+    }
+    None
+}
 
 /// Render a [`QueryResult`] into an HTTP response using the negotiated format.
 fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
@@ -3148,8 +3490,9 @@ pub(crate) fn is_update_sparql(s: &str) -> bool {
     // `# comment` line (the lexer skips comments) or unusual whitespace must not
     // be able to hide an UPDATE keyword from this check — otherwise a query-only
     // user could smuggle `# x\nINSERT DATA { … }` past the privilege gate and
-    // have `run_query` execute it. A parse failure is treated as non-update: it
-    // will fail to parse again in `run_query` and therefore never execute.
+    // have the query job execute it. A parse failure is treated as non-update:
+    // it will fail to parse again when the job runs and therefore never
+    // execute.
     matches!(
         crate::parser::sparql::parse(s),
         Ok(crate::parser::sparql::ast::Query::Update(_))
@@ -3275,7 +3618,7 @@ mod tests {
             "PREFIX : <http://x/> INSERT DATA { :a :b :c }"
         ));
         // A leading comment must not hide an UPDATE from the privilege gate:
-        // the lexer skips `#…` comments, so `run_query` would execute this.
+        // the lexer skips `#…` comments, so the query job would execute this.
         assert!(is_update_sparql("# harmless?\nINSERT DATA { <a> <b> <c> }"));
         assert!(is_update_sparql("  # x\n  DROP ALL"));
         assert!(!is_update_sparql("SELECT * WHERE { ?s ?p ?o }"));
@@ -3592,6 +3935,87 @@ mod tests {
     /// Extract the first `"id":<n>` from a `/tasklist` JSON body.
     /// Like `raw_request`, but gives up after `timeout` (`None`) instead of
     /// waiting forever for a wedged server.
+    /// Bad credentials cost a deliberately slow password hash (PBKDF2, also
+    /// for an unknown user). That hash must run with the state lock released:
+    /// otherwise every client sending bad credentials — no account needed —
+    /// holds the server-wide lock for the whole hash, and every other request
+    /// (`/cancel`, `/tasklist`, …) queues behind it. Sampled directly: while
+    /// clients hammer bad credentials through Basic auth, `/login`, `/shutdown`
+    /// and the `/api` protocol, the state lock must be free nearly always.
+    #[test]
+    fn bad_credentials_never_hash_under_the_state_lock() {
+        let (server, addr) = start("pbkdf2_lock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let bad = basic("nobody", "x");
+        let wrong = basic("root", "wrong");
+        let mut attackers = Vec::new();
+        for i in 0..3 {
+            let stop = Arc::clone(&stop);
+            let (bad, wrong) = (bad.clone(), wrong.clone());
+            attackers.push(std::thread::spawn(move || {
+                let mut n = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let (s, _) = match (i + n) % 5 {
+                        0 => split_status_body(&raw_request(&addr, "GET", "/status", Some(&bad), "")),
+                        1 => split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&wrong), "")),
+                        2 => split_status_body(&raw_request(
+                            &addr,
+                            "POST",
+                            "/login",
+                            None,
+                            "username=root&password=wrong",
+                        )),
+                        3 => split_status_body(&raw_request(
+                            &addr,
+                            "POST",
+                            "/shutdown",
+                            None,
+                            "username=root&password=wrong",
+                        )),
+                        _ => split_status_body(&raw_request(
+                            &addr,
+                            "POST",
+                            "/api",
+                            None,
+                            r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
+                        )),
+                    };
+                    assert!(s == 401 || s == 200, "unexpected status {s}");
+                    n += 1;
+                }
+                n
+            }));
+        }
+        // Let the attackers get going, then sample the lock for a while.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (mut samples, mut busy) = (0u32, 0u32);
+        let until = Instant::now() + std::time::Duration::from_millis(1500);
+        while Instant::now() < until {
+            samples += 1;
+            if server.inner.state.try_lock().is_err() {
+                busy += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        // Authenticated requests are still served meanwhile.
+        let root = basic("root", "root");
+        let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+        assert_eq!(s, 200);
+        stop.store(true, Ordering::Relaxed);
+        let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(attempts > 0);
+        assert!(
+            busy * 4 < samples,
+            "the state lock was held in {busy} of {samples} samples while bad credentials \
+             were being checked"
+        );
+        assert!(
+            server.inner.state.try_lock().is_ok(),
+            "the lock is free once the attackers stop"
+        );
+        server.shutdown();
+    }
+
     fn request_within(
         addr: &SocketAddr,
         method: &str,
@@ -3634,7 +4058,8 @@ mod tests {
         let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
         let (s, b) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=w", Some(&root), data));
         assert_eq!(s, 200, "build: {b}");
-        let backup = srv.root_dir().join("w.bak");
+        // Inside the server's backup directory (the only place `/backup` writes).
+        let backup = srv.root_dir().join("backups").join("w.bak");
         let backup = backup.display().to_string();
 
         // Run `target` while the db lock is held; `/tasklist` must stay live.
@@ -3840,6 +4265,119 @@ mod tests {
             !body.contains("http://a"),
             "a rolled-back tquery insert must not persist: {body}"
         );
+    }
+
+    /// A `/tquery` is a task like any other query: `/tasklist` lists it and
+    /// `/cancel` aborts it (and so does a shutdown past its grace period, which
+    /// cancels every registered task) — it must not hold the database lock
+    /// unreachably until it finishes on its own.
+    #[test]
+    fn a_running_tquery_is_listed_and_cancellable() {
+        let (_srv, addr) = start("tq_cancel");
+        let root = basic("root", "root");
+        let post = |target: &str, body: &str| -> (u16, String) {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&root), body))
+        };
+        let mut ttl = String::from("@prefix : <http://ex/> .\n");
+        for i in 0..600 {
+            ttl.push_str(&format!(":s{i} :p :o{i} .\n"));
+        }
+        assert_eq!(post("/build?db_name=t", &ttl).0, 200);
+        let (s, body) = post("/begin?db_name=t", "");
+        assert_eq!(s, 200, "{body}");
+        let tid = tid_of(&body);
+        // A FILTER over a cross product: checked for cancellation per row.
+        let slow = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?p1 ?b . ?c ?p2 ?d \
+                    FILTER(REGEX(CONCAT(STR(?a), STR(?d), STR(?b), STR(?c)), \"(x+x+)+y\")) }";
+        let (addr_q, root_q, tid_q) = (addr, root.clone(), tid.clone());
+        let query = std::thread::spawn(move || {
+            split_status_body(&raw_request(
+                &addr_q,
+                "POST",
+                &format!("/tquery?tid={tid_q}"),
+                Some(&root_q),
+                slow,
+            ))
+        });
+        let mut task = None;
+        for _ in 0..5000 {
+            let (_, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+            if let Some(id) = first_task_id(&body) {
+                assert!(body.contains("\"db\":\"t\"") && body.contains("\"user\":\"root\""), "{body}");
+                task = Some(id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let task = task.expect("the running /tquery must be listed by /tasklist");
+        let (s, body) = post(&format!("/cancel?id={task}"), "");
+        assert_eq!(s, 200, "{body}");
+        let (s, body) = query.join().unwrap();
+        assert_eq!(s, 400, "a cancelled /tquery fails: {body}");
+        assert!(body.to_lowercase().contains("cancel"), "{body}");
+        // The task is gone and the transaction is still usable.
+        let (_, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+        assert_eq!(first_task_id(&body), None, "{body}");
+        let (s, body) = post(&format!("/tquery?tid={tid}"), "ASK { ?s ?p ?o }");
+        assert_eq!(s, 200, "{body}");
+        assert_eq!(post(&format!("/rollback?tid={tid}"), "").0, 200);
+    }
+
+    /// Classifying a SPARQL statement (a full parse) and parsing a batch
+    /// payload — up to the request body cap — run with the state lock
+    /// released, so a big request cannot stall `/cancel` and every other
+    /// client behind it. Sampled directly while such requests are processed.
+    #[test]
+    fn statements_and_batch_payloads_are_parsed_off_the_state_lock() {
+        let (server, addr) = start("parse_off_lock");
+        let root = basic("root", "root");
+        assert_eq!(
+            split_status_body(&raw_request(&addr, "POST", "/build?db_name=b", Some(&root), "")).0,
+            200
+        );
+        let mut nt = String::new();
+        for i in 0..150_000 {
+            nt.push_str(&format!("<http://ex/s{i}> <http://ex/p> \"value number {i}\" .\n"));
+        }
+        let mut values = String::from("SELECT * WHERE { VALUES ?x { ");
+        for i in 0..150_000 {
+            values.push_str(&format!("<http://ex/s{i}> "));
+        }
+        values.push_str("} }");
+        let requests: Vec<(&str, String)> = vec![
+            ("/batchRemove?db_name=b", nt.clone()),
+            ("/batchRemove?db_name=b&format=ttl", nt),
+            ("/sparql?db_name=b", values.clone()),
+            ("/update?db_name=b", values),
+        ];
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (stop, root) = (Arc::clone(&stop), root.clone());
+            std::thread::spawn(move || {
+                for (target, body) in requests {
+                    let (s, b) = split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body));
+                    assert!(s == 200 || s == 400, "{target}: {s} {b}");
+                }
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let (mut samples, mut busy) = (0u32, 0u32);
+        while !stop.load(Ordering::Relaxed) {
+            samples += 1;
+            if server.inner.state.try_lock().is_err() {
+                busy += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        worker.join().unwrap();
+        assert!(samples > 20, "the requests took too little time to sample: {samples}");
+        // Parsing under the lock shows up as ~35% here; what remains without
+        // it (copying the body out of the request) is ~5%.
+        assert!(
+            busy * 8 < samples,
+            "the state lock was held in {busy} of {samples} samples while requests were parsed"
+        );
+        server.shutdown();
     }
 
     #[test]

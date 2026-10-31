@@ -150,7 +150,10 @@ Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each
 write before acknowledging it (gStore's `check_point`; `--no-checkpoint` defers
 saving to `/checkpoint`, `/unload` and the graceful shutdown on Ctrl-C/SIGTERM).
-SPARQL `LOAD` sent to a server reads nothing unless `--load-dir DIR` allows it.
+SPARQL `LOAD` (and `/build?db_path=`) sent to a server reads nothing unless
+`--load-dir DIR` allows it, `/backup` and `/restore` stay inside the server's
+backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
+`SERVICE` contacts no remote endpoint unless `--allow-service` is given.
 
 ### Library API
 

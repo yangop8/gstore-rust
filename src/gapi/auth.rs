@@ -94,7 +94,12 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
     } else {
         PasswordForm::Plain
     };
-    let outcome = ctx.state().users.authenticate(&username, &password, form);
+    // The slow password hash runs with the state lock released (only the
+    // lookup and the bookkeeping take it), so bad credentials cannot stall
+    // other requests behind it.
+    let attempt = ctx.state().users.begin_check(&username, &password, form);
+    let checked = attempt.verify();
+    let outcome = ctx.state().users.finish_check(checked);
     match outcome {
         CredentialCheck::Valid => {
             ctx.user = Some(username.clone());

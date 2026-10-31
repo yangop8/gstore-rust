@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::thread;
 
 use gstore::http_api::ApiServer;
+use gstore::Database;
 
 const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n";
 
@@ -259,16 +260,18 @@ fn http_transaction_commit_and_rollback() {
 fn backup_and_restore_roundtrip() {
     let (_srv, addr, root_dir) = start("bk");
     let root = basic("root", "root");
-    let backup_path = root_dir.join("bk_snapshot");
+    // Backups live in the server's backup directory (`<root>/backups`); a
+    // relative path is taken relative to it.
+    let backup_path = root_dir.join("backups").join("bk_snapshot");
 
     // Build with the original triple :a :p :b .
     let (s, _) = request(&addr, "POST", "/build?db_name=bk", Some(&root), DATA);
     assert_eq!(s, 200);
 
     // Backup the original state.
-    let target = format!("/backup?db_name=bk&path={}", backup_path.display());
-    let (s, body) = request(&addr, "POST", &target, Some(&root), "");
+    let (s, body) = request(&addr, "POST", "/backup?db_name=bk&path=bk_snapshot", Some(&root), "");
     assert_eq!(s, 200, "backup: {body}");
+    assert!(Database::storage_kind(&backup_path).is_some(), "backup written to {backup_path:?}: {body}");
 
     // Mutate after the backup: add :c :p :d .
     let (s, _) = request(

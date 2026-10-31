@@ -20,8 +20,7 @@ use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{auth, required, Ctx, OpSpec, Registry};
 use crate::http_api::{
-    append_log, now_millis, ApiInner, DbHandle, JobOutput, OpError, OpErrorKind, QueryJob,
-    TxnIsolation,
+    log_query, ApiInner, DbHandle, JobOutput, OpError, OpErrorKind, QueryJob, TxnIsolation,
 };
 use crate::json::Json;
 use crate::parser::sparql::ast::Query;
@@ -117,6 +116,12 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             "You have no update privilege",
         );
     }
+    if !ctx.state().dbs.contains_key(&db) {
+        let on_disk = ctx.state().db_dir(&db).is_dir();
+        return not_loaded(&db, on_disk);
+    }
+    // Logged with no lock held (the statement may be large).
+    log_query(ctx.root_dir(), &db, ctx.user(), &sparql);
     let job = {
         let mut st = ctx.state();
         let Some(dbh) = st.dbs.get(&db).map(Arc::clone) else {
@@ -124,17 +129,6 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             drop(st);
             return not_loaded(&db, on_disk);
         };
-        append_log(
-            &st.root,
-            "query.log",
-            &format!(
-                "{}\t{}\t{}\t{}",
-                now_millis(),
-                db,
-                ctx.user(),
-                sparql.replace('\n', " ")
-            ),
-        );
         let (task_id, cancel) = ctx.inner.register_task(&mut st, &db, &sparql, ctx.user());
         QueryJob {
             db: dbh,
@@ -409,18 +403,8 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(None) => return not_loaded(&db, true),
         Err(e) => return txn_error("Transaction query fail", e),
     };
-    append_log(
-        ctx.root_dir(),
-        "query.log",
-        &format!(
-            "{}\t{}\t{}\t{}",
-            now_millis(),
-            db,
-            ctx.user(),
-            sparql.replace('\n', " ")
-        ),
-    );
-    match ApiInner::run_in_txn(&dbh, &db, tid, &sparql) {
+    log_query(ctx.root_dir(), &db, ctx.user(), &sparql);
+    match ctx.inner.run_in_txn_task(&dbh, &db, tid, &sparql, ctx.user()) {
         Ok(QueryResult::Update { changed }) => {
             GResp::success("Transaction query success").with("AnsNum", changed)
         }

@@ -93,13 +93,54 @@ fn write_tmp<F>(path: &Path, fill: F) -> Result<PathBuf>
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<()>,
 {
-    let tmp = tmp_path(path);
-    let written = (|| -> Result<()> {
-        let file = OpenOptions::new()
+    write_tmp_mode(path, None, fill)
+}
+
+/// Create `tmp`, the staging file that will replace `path`, with the
+/// permissions the replacement must end up with: those of the existing `path`
+/// (an operator may have restricted them — renaming a default-mode temp file
+/// over it would silently undo that), else `new_mode` (unix mode bits, before
+/// the umask) for a file that does not exist yet, else the default. The file is
+/// created afresh with that mode, so it is never more permissive than the
+/// target, not even while empty.
+fn create_tmp(tmp: &Path, path: &Path, new_mode: Option<u32>) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let target = fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777);
+        // A stale temp file (from a crash) would keep its own mode.
+        remove_file_if_exists(tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        if let Some(mode) = target.or(new_mode) {
+            opts.mode(mode);
+        }
+        let file = opts.open(tmp)?;
+        if let Some(mode) = target {
+            // The umask may have cleared bits the target has: match it exactly.
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, new_mode);
+        Ok(OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp)?;
+            .open(tmp)?)
+    }
+}
+
+/// [`write_tmp`], creating the temp file as [`create_tmp`] does.
+fn write_tmp_mode<F>(path: &Path, new_mode: Option<u32>, fill: F) -> Result<PathBuf>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let tmp = tmp_path(path);
+    let written = (|| -> Result<()> {
+        let file = create_tmp(&tmp, path, new_mode)?;
         let mut w = BufWriter::new(file);
         fill(&mut w)?;
         let file = w.into_inner().map_err(|e| e.into_error())?;
@@ -116,12 +157,22 @@ where
 }
 
 /// Atomically replace `path` with whatever `fill` writes (temp file in the same
-/// directory → write → fsync → rename → fsync directory).
+/// directory → write → fsync → rename → fsync directory). The replacement
+/// keeps the permissions of the file it replaces.
 pub(crate) fn atomic_write_with<F>(path: &Path, fill: F) -> Result<()>
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<()>,
 {
-    let tmp = write_tmp(path, fill)?;
+    atomic_write_mode(path, None, fill)
+}
+
+/// [`atomic_write_with`]; a file that does not exist yet is created with unix
+/// mode `new_mode` (before the umask) when given.
+fn atomic_write_mode<F>(path: &Path, new_mode: Option<u32>, fill: F) -> Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let tmp = write_tmp_mode(path, new_mode, fill)?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
@@ -132,6 +183,16 @@ where
 /// Atomically replace `path` with `bytes`.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_with(path, |w| {
+        w.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+/// Atomically replace `path` with `bytes`, for a file holding secrets (e.g.
+/// password hashes): created owner-only (`0600`) when it does not exist yet;
+/// an existing file keeps its permissions.
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_mode(path, Some(0o600), |w| {
         w.write_all(bytes)?;
         Ok(())
     })
@@ -520,6 +581,37 @@ mod tests {
         let b: u32 = bincode::deserialize(&fs::read(dir.join("b.bin")).unwrap()).unwrap();
         assert_eq!((a, b), (2, 2), "the committed set is completed");
         assert!(!dir.join(SNAPSHOT_COMMIT_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An atomic replacement keeps the replaced file's permissions (renaming
+    /// a default-mode temp file over it would silently widen a restricted
+    /// one); a private file is created owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_keeps_the_targets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("perms");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let f = dir.join("f");
+        atomic_write(&f, b"1").unwrap();
+        for m in [0o600, 0o640, 0o664] {
+            fs::set_permissions(&f, fs::Permissions::from_mode(m)).unwrap();
+            atomic_write(&f, b"2").unwrap();
+            assert_eq!(mode(&f), m);
+            // Also when a stale temp file with a wider mode is lying around.
+            fs::write(tmp_path(&f), b"stale").unwrap();
+            fs::set_permissions(tmp_path(&f), fs::Permissions::from_mode(0o666)).unwrap();
+            atomic_write(&f, b"3").unwrap();
+            assert_eq!(mode(&f), m);
+            assert_eq!(fs::read(&f).unwrap(), b"3");
+        }
+        let secret = dir.join("secret");
+        atomic_write_private(&secret, b"s").unwrap();
+        assert_eq!(mode(&secret), 0o600);
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write_private(&secret, b"t").unwrap();
+        assert_eq!(mode(&secret), 0o640, "an existing file keeps its mode");
         let _ = fs::remove_dir_all(&dir);
     }
 

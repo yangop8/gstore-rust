@@ -183,10 +183,13 @@ fn api_unload_commits_and_reload_sees_the_writes() {
 #[test]
 fn api_restore_of_a_disk_backup_never_writes_into_the_backup() {
     let root = tmp_dir("api_restore_disk");
-    let backup = tmp_dir("api_restore_disk_backup").join("b.db");
+    let backup_dir = tmp_dir("api_restore_disk_backup");
+    let backup = backup_dir.join("b.db");
     build_disk(&backup);
 
-    let api = Api::start(&root, true, None);
+    // A backup outside the server's backup directory is restorable only from a
+    // directory the load policy allows.
+    let api = Api::start(&root, true, Some(LoadPolicy::restricted().with_allowed_dir(&backup_dir)));
     let (s, body) = api.root(
         "POST",
         &format!("/restore?db_name=r&path={}", backup.display()),
@@ -209,8 +212,16 @@ fn api_restore_of_a_disk_backup_never_writes_into_the_backup() {
     assert_eq!(s, 200, "{body}");
     assert!(body.contains("false"), "restored again from the backup: {body}");
     assert_eq!(api.root("POST", "/update?db_name=r", NEW_TRIPLE).0, 200);
-    // A path that holds no backup is refused before anything is replaced.
+    // A path outside the allowed directories, or one that holds no backup, is
+    // refused before anything is replaced.
     let (s, _) = api.root("POST", "/restore?db_name=r&path=/nonexistent/backup", "");
+    assert_eq!(s, 403);
+    std::fs::create_dir_all(backup_dir.join("empty")).unwrap();
+    let (s, _) = api.root(
+        "POST",
+        &format!("/restore?db_name=r&path={}", backup_dir.join("empty").display()),
+        "",
+    );
     assert_eq!(s, 500);
     api.stop();
 

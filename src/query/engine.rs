@@ -216,6 +216,12 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// guards against rebuilding.
     string_index: std::cell::RefCell<Option<Rc<StringIndex>>>,
     string_index_tried: std::cell::Cell<bool>,
+    /// Whether `SERVICE` may contact remote endpoints (see
+    /// [`with_service_allowed`](Self::with_service_allowed)).
+    allow_service: bool,
+    /// Set when a `SERVICE` was refused; like a cancel, it cuts evaluation
+    /// short and is reported as an error. Shared with `GRAPH` sub-evaluators.
+    service_denied: Rc<std::cell::Cell<bool>>,
 }
 
 /// Per-query memoization of whole-graph analytics results (see
@@ -250,6 +256,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            allow_service: true,
+            service_denied: Rc::new(std::cell::Cell::new(false)),
         }
     }
 
@@ -272,6 +280,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            allow_service: true,
+            service_denied: Rc::new(std::cell::Cell::new(false)),
         }
     }
 
@@ -302,16 +312,38 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self
     }
 
-    /// Whether cancellation has been requested.
-    fn cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    /// Allow or forbid federated `SERVICE` patterns (allowed by default). A
+    /// server that must not make outbound requests on a client's behalf
+    /// forbids them: a query using `SERVICE` then fails with an error — no
+    /// connection is attempted, `SILENT` or not. [`Database`](crate::Database)
+    /// sets this from its [`LoadPolicy`](crate::db::LoadPolicy)'s
+    /// `allow_remote`.
+    pub fn with_service_allowed(mut self, allowed: bool) -> Evaluator<'a, S> {
+        self.allow_service = allowed;
+        self
     }
 
-    /// `Err(Cancelled)` if cancellation was requested, else `Ok(())`.
-    fn check_cancel(&self) -> Result<()> {
-        if self.cancelled() {
+    /// Whether evaluation must stop early: cancellation was requested, or a
+    /// refused `SERVICE` already doomed the query.
+    fn cancelled(&self) -> bool {
+        self.service_denied.get()
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `Err` if evaluation was cut short — [`GStoreError::Cancelled`] when
+    /// cancellation was requested, a query error when a `SERVICE` was refused —
+    /// else `Ok(())`.
+    pub(crate) fn check_cancel(&self) -> Result<()> {
+        if self.service_denied.get() {
+            Err(GStoreError::Query(
+                "SERVICE is disabled: this server does not contact remote endpoints on a \
+                 client's behalf (its load policy does not allow remote sources)"
+                    .into(),
+            ))
+        } else if self.cancelled() {
             Err(GStoreError::Cancelled)
         } else {
             Ok(())
@@ -1172,6 +1204,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         };
 
+        // Refused outright when this evaluator may not contact remote
+        // endpoints (reported as an error by `check_cancel`).
+        if !self.allow_service {
+            self.service_denied.set(true);
+            return Vec::new();
+        }
+
         // Only constant-IRI endpoints are supported; a variable endpoint can't
         // be resolved without per-solution evaluation (uncommon — see backlog).
         let url = match endpoint {
@@ -1230,6 +1269,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()), // per-graph, not shared
             string_index: std::cell::RefCell::new(None), // per-graph store, own index
             string_index_tried: std::cell::Cell::new(false),
+            allow_service: self.allow_service,
+            service_denied: Rc::clone(&self.service_denied),
         }
     }
 

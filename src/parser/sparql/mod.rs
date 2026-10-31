@@ -23,6 +23,24 @@ use crate::model::Term;
 use ast::*;
 use lexer::{tokenize, Token};
 
+/// The deepest *recursive* nesting a SPARQL request may have: nested groups
+/// (`{ … }`, `OPTIONAL`, `MINUS`, `GRAPH`, `SERVICE`, `EXISTS`, sub-`SELECT`),
+/// sub-expressions (parenthesized, function and aggregate arguments), unary
+/// operators and parenthesized property paths. Deeper requests are refused
+/// with a parse error: the parser (and the evaluator after it) recurses once
+/// per level, and unbounded recursion would let one request overflow the
+/// stack — which aborts the whole process, not just the request.
+pub const MAX_NESTING_DEPTH: usize = 128;
+
+/// The tallest syntax tree a SPARQL request may produce. Besides the nesting
+/// of [`MAX_NESTING_DEPTH`], this counts every link of a left-deep chain —
+/// `a || b || c`, `1 + 2 + 3`, `p / q / r`, `{…} UNION {…} UNION {…}`, or the
+/// patterns of one group — each of which wraps everything before it in one
+/// more node. Chains cost no parser recursion, but evaluating (and even
+/// dropping) the tree recurses once per level, so they are bounded too —
+/// generously, as generated queries do use long `||` or `UNION` chains.
+pub const MAX_TREE_HEIGHT: usize = 1024;
+
 /// Parse a SPARQL query or update string.
 pub fn parse(input: &str) -> Result<Query> {
     let tokens = tokenize(input)?;
@@ -40,6 +58,20 @@ struct Parser {
     pos: usize,
     prefixes: HashMap<String, String>,
     base: Option<String>,
+    /// Nesting levels currently open (see [`Parser::nested`]).
+    depth: usize,
+    /// High-water mark of the tree height reached below the innermost open
+    /// [`Chain`] (absolute, i.e. including `depth`): how tall the operands
+    /// parsed so far are.
+    peak: usize,
+}
+
+/// A left-deep chain being parsed (see [`Parser::chain_begin`]).
+struct Chain {
+    /// The enclosing chain's [`Parser::peak`], restored (and raised) at the end.
+    saved_peak: usize,
+    /// Nodes wrapped around the operands so far.
+    links: usize,
 }
 
 impl Parser {
@@ -49,7 +81,57 @@ impl Parser {
             pos: 0,
             prefixes: HashMap::new(),
             base: None,
+            depth: 0,
+            peak: 0,
         }
+    }
+
+    // ---- nesting limit (see MAX_NESTING_DEPTH) ----------------------------
+
+    fn too_deep(&self) -> GStoreError {
+        self.err(format!(
+            "the request is nested too deeply (more than {MAX_NESTING_DEPTH} nested groups, \
+             sub-expressions or paths, or a syntax tree taller than {MAX_TREE_HEIGHT})"
+        ))
+    }
+
+    /// Run `f` one nesting level deeper (a group, a sub-expression, a unary
+    /// operator, a parenthesized path), failing past [`MAX_NESTING_DEPTH`].
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(self.too_deep());
+        }
+        self.depth += 1;
+        self.peak = self.peak.max(self.depth);
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
+    /// Start a left-deep chain (`a || b || …`, the patterns of a group, …).
+    /// Its operands are parsed at the current depth; each
+    /// [`chain_link`](Self::chain_link) wraps everything so far in one more
+    /// node, so the chain is as tall as its links plus its tallest operand.
+    fn chain_begin(&mut self) -> Chain {
+        Chain {
+            saved_peak: std::mem::replace(&mut self.peak, self.depth),
+            links: 0,
+        }
+    }
+
+    /// Account for one more node wrapped around the chain so far, failing
+    /// once the tree would be taller than [`MAX_TREE_HEIGHT`].
+    fn chain_link(&mut self, chain: &mut Chain) -> Result<()> {
+        chain.links += 1;
+        if self.peak + chain.links > MAX_TREE_HEIGHT {
+            return Err(self.too_deep());
+        }
+        Ok(())
+    }
+
+    /// Finish a chain: its height counts towards the enclosing one's.
+    fn chain_end(&mut self, chain: Chain) {
+        self.peak = chain.saved_peak.max(self.peak + chain.links);
     }
 
     // ---- token cursor -----------------------------------------------------
@@ -350,7 +432,13 @@ impl Parser {
     /// `VALUES`) fold into the running conjunction in textual order. All
     /// `FILTER`s in the group apply to the whole group (wrapped at the end).
     fn parse_group_graph_pattern(&mut self) -> Result<GraphPattern> {
+        self.nested(Self::parse_group_graph_pattern_inner)
+    }
+
+    fn parse_group_graph_pattern_inner(&mut self) -> Result<GraphPattern> {
         self.expect(&Token::LBrace, "'{'")?;
+        // Every construct folded into `current` wraps it in one more node.
+        let mut chain = self.chain_begin();
         let mut current = GraphPattern::Empty;
         let mut filters: Vec<Expr> = Vec::new();
         let mut pending: Vec<TriplePattern> = Vec::new();
@@ -363,9 +451,11 @@ impl Parser {
                 if !pending.is_empty() {
                     let bgp = GraphPattern::Bgp(std::mem::take(&mut pending));
                     current = join_opt(current, bgp);
+                    self.chain_link(&mut chain)?;
                 }
                 for p in std::mem::take(&mut pending_paths) {
                     current = join_opt(current, p);
+                    self.chain_link(&mut chain)?;
                 }
             };
         }
@@ -395,12 +485,14 @@ impl Parser {
                     };
                     current =
                         GraphPattern::LeftJoin(Box::new(current), Box::new(right), lj_filters);
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("MINUS") => {
                     self.bump();
                     flush!();
                     let right = self.parse_group_graph_pattern()?;
                     current = GraphPattern::Minus(Box::new(current), Box::new(right));
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("BIND") => {
                     self.bump();
@@ -411,12 +503,14 @@ impl Parser {
                     let var = self.expect_var()?;
                     self.expect(&Token::RParen, "')'")?;
                     current = GraphPattern::Extend(Box::new(current), var, expr);
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("VALUES") => {
                     self.bump();
                     flush!();
                     let values = self.parse_inline_values()?;
                     current = join_opt(current, values);
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("GRAPH") => {
                     self.bump();
@@ -424,6 +518,8 @@ impl Parser {
                     let gterm = self.parse_graph_term()?;
                     let inner = self.parse_group_graph_pattern()?;
                     current = join_opt(current, GraphPattern::Graph(gterm, Box::new(inner)));
+                    self.chain_link(&mut chain)?;
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Word(w) if w.eq_ignore_ascii_case("SERVICE") => {
                     self.bump();
@@ -439,6 +535,8 @@ impl Parser {
                             pattern: Box::new(inner),
                         },
                     );
+                    self.chain_link(&mut chain)?;
+                    self.chain_link(&mut chain)?;
                 }
                 Token::LBrace => {
                     flush!();
@@ -449,6 +547,7 @@ impl Parser {
                         self.parse_group_or_union()?
                     };
                     current = join_opt(current, node);
+                    self.chain_link(&mut chain)?;
                 }
                 Token::Eof => return Err(self.err("unexpected end of query inside '{ }'")),
                 _ => {
@@ -460,17 +559,22 @@ impl Parser {
 
         if !filters.is_empty() {
             current = GraphPattern::Filter(filters, Box::new(current));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(current)
     }
 
     /// `{…} ( UNION {…} )*` — a group, optionally unioned with more groups.
     fn parse_group_or_union(&mut self) -> Result<GraphPattern> {
+        let mut chain = self.chain_begin();
         let mut left = self.parse_group_graph_pattern()?;
         while self.eat_keyword("UNION") {
             let right = self.parse_group_graph_pattern()?;
             left = GraphPattern::Union(Box::new(left), Box::new(right));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(left)
     }
 
@@ -482,10 +586,12 @@ impl Parser {
 
     /// Parse `{ SELECT … }` into a [`GraphPattern::SubSelect`].
     fn parse_subselect_group(&mut self) -> Result<GraphPattern> {
-        self.expect(&Token::LBrace, "'{'")?;
-        let sq = self.parse_select()?;
-        self.expect(&Token::RBrace, "'}'")?;
-        Ok(GraphPattern::SubSelect(Box::new(sq)))
+        self.nested(|p| {
+            p.expect(&Token::LBrace, "'{'")?;
+            let sq = p.parse_select()?;
+            p.expect(&Token::RBrace, "'}'")?;
+            Ok(GraphPattern::SubSelect(Box::new(sq)))
+        })
     }
 
     /// Parse an inline `VALUES` block: `VALUES ?v { … }` or
@@ -653,36 +759,44 @@ impl Parser {
 
     fn parse_path(&mut self) -> Result<PathExpr> {
         // alternative: seq ( '|' seq )*
+        let mut chain = self.chain_begin();
         let mut left = self.parse_path_seq()?;
         while matches!(self.peek(), Token::Pipe) {
             self.bump();
             let right = self.parse_path_seq()?;
             left = PathExpr::Alt(Box::new(left), Box::new(right));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(left)
     }
 
     fn parse_path_seq(&mut self) -> Result<PathExpr> {
         // sequence: eltOrInverse ( '/' eltOrInverse )*
+        let mut chain = self.chain_begin();
         let mut left = self.parse_path_elt_or_inverse()?;
         while matches!(self.peek(), Token::Slash) {
             self.bump();
             let right = self.parse_path_elt_or_inverse()?;
             left = PathExpr::Seq(Box::new(left), Box::new(right));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(left)
     }
 
     fn parse_path_elt_or_inverse(&mut self) -> Result<PathExpr> {
         if matches!(self.peek(), Token::Caret) {
             self.bump();
-            Ok(PathExpr::Inverse(Box::new(self.parse_path_elt()?)))
+            self.nested(|p| Ok(PathExpr::Inverse(Box::new(p.parse_path_elt()?))))
         } else {
             self.parse_path_elt()
         }
     }
 
     fn parse_path_elt(&mut self) -> Result<PathExpr> {
+        // Each postfix modifier wraps the element in one more node.
+        let mut chain = self.chain_begin();
         let mut p = self.parse_path_primary()?;
         // postfix `*` / `+` / `?` modifiers (the lexer emits `?` with no name as
         // [`Token::Question`], so it no longer collides with the variable sigil).
@@ -702,7 +816,9 @@ impl Parser {
                 }
                 _ => break,
             }
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(p)
     }
 
@@ -710,7 +826,7 @@ impl Parser {
         match self.peek().clone() {
             Token::LParen => {
                 self.bump();
-                let p = self.parse_path()?;
+                let p = self.nested(Self::parse_path)?;
                 self.expect(&Token::RParen, "')'")?;
                 Ok(p)
             }
@@ -809,31 +925,40 @@ impl Parser {
         }
     }
 
+    /// Every (sub-)expression — parenthesized, a function or aggregate
+    /// argument, a projection, a `BIND` — is one nesting level.
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.nested(Self::parse_or)
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
+        let mut chain = self.chain_begin();
         let mut lhs = self.parse_and()?;
         while matches!(self.peek(), Token::Or) {
             self.bump();
             let rhs = self.parse_and()?;
             lhs = Expr::Or(Box::new(lhs), Box::new(rhs));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(lhs)
     }
 
     fn parse_and(&mut self) -> Result<Expr> {
+        let mut chain = self.chain_begin();
         let mut lhs = self.parse_relational()?;
         while matches!(self.peek(), Token::And) {
             self.bump();
             let rhs = self.parse_relational()?;
             lhs = Expr::And(Box::new(lhs), Box::new(rhs));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(lhs)
     }
 
     fn parse_relational(&mut self) -> Result<Expr> {
+        let mut chain = self.chain_begin();
         let lhs = self.parse_additive()?;
         let op = match self.peek() {
             Token::Eq => CompareOp::Eq,
@@ -842,14 +967,20 @@ impl Parser {
             Token::Gt => CompareOp::Gt,
             Token::Le => CompareOp::Le,
             Token::Ge => CompareOp::Ge,
-            _ => return Ok(lhs),
+            _ => {
+                self.chain_end(chain);
+                return Ok(lhs);
+            }
         };
         self.bump();
         let rhs = self.parse_additive()?;
+        self.chain_link(&mut chain)?;
+        self.chain_end(chain);
         Ok(Expr::Compare(op, Box::new(lhs), Box::new(rhs)))
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
+        let mut chain = self.chain_begin();
         let mut lhs = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
@@ -860,11 +991,14 @@ impl Parser {
             self.bump();
             let rhs = self.parse_multiplicative()?;
             lhs = Expr::Arith(op, Box::new(lhs), Box::new(rhs));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(lhs)
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
+        let mut chain = self.chain_begin();
         let mut lhs = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -875,26 +1009,25 @@ impl Parser {
             self.bump();
             let rhs = self.parse_unary()?;
             lhs = Expr::Arith(op, Box::new(lhs), Box::new(rhs));
+            self.chain_link(&mut chain)?;
         }
+        self.chain_end(chain);
         Ok(lhs)
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
-        match self.peek() {
-            Token::Not => {
-                self.bump();
-                Ok(Expr::Not(Box::new(self.parse_unary()?)))
-            }
-            Token::Minus => {
-                self.bump();
-                Ok(Expr::Unary(UnaryOp::Neg, Box::new(self.parse_unary()?)))
-            }
-            Token::Plus => {
-                self.bump();
-                Ok(Expr::Unary(UnaryOp::Plus, Box::new(self.parse_unary()?)))
-            }
-            _ => self.parse_primary(),
-        }
+        let op = match self.peek() {
+            Token::Not => None,
+            Token::Minus => Some(UnaryOp::Neg),
+            Token::Plus => Some(UnaryOp::Plus),
+            _ => return self.parse_primary(),
+        };
+        self.bump();
+        let operand = Box::new(self.nested(Self::parse_unary)?);
+        Ok(match op {
+            None => Expr::Not(operand),
+            Some(op) => Expr::Unary(op, operand),
+        })
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
@@ -1497,6 +1630,112 @@ fn is_absolute_iri(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Worst-case request shapes for stack depth: `n` levels of nesting (or
+    /// `n` links of a left-deep chain).
+    fn deep_shapes(n: usize) -> Vec<(&'static str, String)> {
+        let rep = |s: &str| s.repeat(n);
+        vec![
+            ("parens", format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}", rep("("), rep(")"))),
+            ("unary", format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}true) }}", rep("!"))),
+            ("calls", format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}?s{} != \"\") }}", rep("STR("), rep(")"))),
+            ("or", format!(
+                "SELECT * WHERE {{ ?s ?p ?o FILTER({}) }}",
+                (0..n).map(|i| format!("?o = {i}")).collect::<Vec<_>>().join(" || ")
+            )),
+            ("sum", format!("SELECT * WHERE {{ ?s ?p ?o FILTER(1{} > 0) }}", rep(" + 1"))),
+            ("groups", format!("SELECT * WHERE {}?s ?p ?o{}", rep("{ "), rep(" }"))),
+            ("optional-chain", format!("SELECT * WHERE {{ ?s ?p ?o {} }}", rep("OPTIONAL { ?s ?p ?o } "))),
+            ("optional-nest", format!("SELECT * WHERE {{ ?s ?p ?o {}{} }}", rep("OPTIONAL { ?s ?p ?o "), rep("} "))),
+            ("union", format!("SELECT * WHERE {{ {} }}", vec!["{ ?s ?p ?o }"; n].join(" UNION "))),
+            ("exists", format!("SELECT * WHERE {{ ?s ?p ?o {}{} }}", rep("FILTER EXISTS { ?s ?p ?o "), rep("} "))),
+            ("path-seq", format!("SELECT * WHERE {{ ?s {} ?o }}", vec!["<http://ex/p>"; n].join("/"))),
+            ("path-parens", format!("SELECT * WHERE {{ ?s {}<http://ex/p>{} ?o }}", rep("("), rep(")"))),
+            ("path-postfix", format!("SELECT * WHERE {{ ?s <http://ex/p>{} ?o }}", rep("?"))),
+            ("subselects", format!("SELECT * WHERE {{ {}?s ?p ?o{} }}", rep("{ SELECT * WHERE { "), rep(" } }"))),
+            ("binds", format!(
+                "SELECT * WHERE {{ ?s ?p ?o {} }}",
+                (0..n).map(|i| format!("BIND(1 AS ?b{i}) ")).collect::<String>()
+            )),
+            ("path-patterns", format!("SELECT * WHERE {{ {} }}", rep("?s <http://ex/p>+ ?o . "))),
+            ("chains-in-parens", {
+                let mut e = String::from("1");
+                for _ in 0..n.min(2000) {
+                    e = format!("({e} + 1 + 1 + 1)");
+                }
+                format!("SELECT * WHERE {{ ?s ?p ?o FILTER({e} > 0) }}")
+            }),
+            ("update", format!("DELETE {{ ?s ?p ?o }} WHERE {}?s ?p ?o{}", rep("{ "), rep(" }"))),
+        ]
+    }
+
+    /// Run `f` on a thread with the HTTP worker threads' stack.
+    fn on_worker_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(crate::server::WORKER_STACK_SIZE)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// A request nested 100 000 levels deep is a parse error — not a stack
+    /// overflow, which would abort the whole server process (no
+    /// `catch_unwind` can contain it).
+    #[test]
+    fn absurdly_deep_requests_are_refused_not_a_stack_overflow() {
+        on_worker_stack(|| {
+            for (name, q) in deep_shapes(100_000) {
+                match parse(&q) {
+                    Err(GStoreError::SparqlParse(m)) => {
+                        assert!(m.contains("nested too deeply"), "{name}: {m}")
+                    }
+                    other => panic!("{name}: expected a nesting error, got {other:?}"),
+                }
+            }
+        });
+    }
+
+    /// Requests just inside the limits still work end to end — parsed,
+    /// evaluated and dropped — on the server's worker stack, and long chains
+    /// (generated queries do use hundreds of `||` or `UNION` alternatives)
+    /// are allowed well past the nesting limit.
+    #[test]
+    fn requests_inside_the_limits_parse_and_evaluate() {
+        on_worker_stack(|| {
+            let mut db = crate::Database::build_from_str(
+                "d",
+                "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n",
+            )
+            .unwrap();
+            // Nesting: one level is spent on the outer group / FILTER.
+            let nested = MAX_NESTING_DEPTH / 2 - 2;
+            for (name, q) in deep_shapes(nested) {
+                db.query(&q).unwrap_or_else(|e| panic!("{name} at {nested}: {e}"));
+            }
+            // Chains: far longer than the nesting limit.
+            let long = MAX_TREE_HEIGHT - 8;
+            for (name, q) in deep_shapes(long) {
+                if matches!(
+                    name,
+                    "or" | "sum" | "optional-chain" | "union" | "path-seq" | "path-postfix" | "binds"
+                        | "path-patterns"
+                ) {
+                    db.query(&q).unwrap_or_else(|e| panic!("{name} at {long}: {e}"));
+                }
+            }
+        });
+        // The limits themselves.
+        assert!(parse(&deep_shapes(MAX_NESTING_DEPTH + 1)[0].1).is_err());
+        let or_chain = |n: usize| {
+            format!(
+                "ASK {{ FILTER({}) }}",
+                (0..n).map(|i| format!("{i} = 0")).collect::<Vec<_>>().join(" || ")
+            )
+        };
+        assert!(parse(&or_chain(MAX_TREE_HEIGHT - 8)).is_ok());
+        assert!(parse(&or_chain(MAX_TREE_HEIGHT + 1)).is_err());
+    }
 
     fn sel(q: &str) -> SelectQuery {
         match parse(q).unwrap() {

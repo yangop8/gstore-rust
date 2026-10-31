@@ -14,6 +14,11 @@
 //!   should start from it and opt specific directories back in with
 //!   [`LoadPolicy::with_allowed_dir`].
 //!
+//! The policy also covers the other ways a client can make the server reach
+//! outside its own data: federated `SERVICE` patterns (outbound HTTP) follow
+//! [`LoadPolicy::allow_remote`], and the HTTP API's `/build?db_path=` and
+//! `/restore` sources follow its local-file rules.
+//!
 //! When a policy lists allowed directories, a local source is
 //! **canonicalized** (`..` components and every symlink resolved, see
 //! [`std::fs::canonicalize`]) and must then lie inside one of the canonicalized
@@ -44,7 +49,11 @@ pub struct LoadPolicy {
     /// Whether a remote (`http://`, `https://`, … scheme) source may be named.
     /// This crate never fetches remote documents, so an allowed remote `LOAD`
     /// still fails with "not supported"; a disallowed one is refused by policy
-    /// before anything else happens.
+    /// before anything else happens. It also governs federated `SERVICE`
+    /// patterns, which do make outbound HTTP requests: a database whose policy
+    /// disallows remote sources refuses any query using `SERVICE` — so a
+    /// server on [`restricted`](Self::restricted) cannot be made to contact
+    /// internal hosts on a client's behalf.
     pub allow_remote: bool,
 }
 
@@ -129,6 +138,26 @@ impl LoadPolicy {
                 }
             }
         }
+    }
+
+    /// Whether a client may make the server read the local *directory* `path`
+    /// (e.g. a backup to restore from): the policy's rules for local files,
+    /// applied to a directory. Returns its canonical path when allowed, `None`
+    /// when not — uniformly, whether it is outside the allowed directories, is
+    /// not a directory, or does not exist.
+    pub fn allowed_local_dir(&self, path: &Path) -> Option<PathBuf> {
+        if !self.allow_local_files {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let inside = match &self.allowed_dirs {
+            None => true,
+            Some(dirs) => dirs
+                .iter()
+                .filter_map(|d| std::fs::canonicalize(d).ok())
+                .any(|d| canonical.starts_with(&d)),
+        };
+        (inside && canonical.is_dir()).then_some(canonical)
     }
 }
 
@@ -240,6 +269,24 @@ mod tests {
         assert!(p.resolve("/etc/hostname").is_err());
         assert!(p.resolve("file:///etc/hostname").is_err());
         assert!(p.resolve("http://e.org/x").is_err());
+    }
+
+    #[test]
+    fn allowed_local_dir_follows_the_file_rules() {
+        let base = std::env::temp_dir().join(format!("gstore_lp_dir_{}", std::process::id()));
+        let (inside, outside) = (base.join("allowed/sub"), base.join("other"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(base.join("allowed/f"), b"x").unwrap();
+        let p = LoadPolicy::restricted().with_allowed_dir(base.join("allowed"));
+        assert_eq!(p.allowed_local_dir(&inside), Some(std::fs::canonicalize(&inside).unwrap()));
+        assert_eq!(p.allowed_local_dir(&base.join("allowed/sub/../../other")), None);
+        assert_eq!(p.allowed_local_dir(&outside), None);
+        assert_eq!(p.allowed_local_dir(&base.join("allowed/f")), None, "not a directory");
+        assert_eq!(p.allowed_local_dir(&base.join("allowed/missing")), None);
+        assert_eq!(LoadPolicy::restricted().allowed_local_dir(&inside), None);
+        assert!(LoadPolicy::permissive().allowed_local_dir(&outside).is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -335,7 +335,9 @@ impl Server {
 
     /// Replace the SPARQL `LOAD` policy of the served database (the default is
     /// [`LoadPolicy::restricted`]), e.g. to let `LOAD` read one directory with
-    /// `LoadPolicy::restricted().with_allowed_dir(dir)`.
+    /// `LoadPolicy::restricted().with_allowed_dir(dir)`. Its `allow_remote`
+    /// also decides whether federated `SERVICE` patterns may contact remote
+    /// endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> Server {
         locked(&self.inner.db).set_load_policy(policy);
         self
@@ -653,6 +655,21 @@ pub(crate) struct ConnEnv {
     waiting: Arc<AtomicUsize>,
 }
 
+/// Stack size of the connection worker threads. Request handling recurses
+/// over client-supplied structure (a SPARQL request's syntax tree, nested
+/// RDF), bounded by the parsers' limits (e.g.
+/// [`MAX_NESTING_DEPTH`](crate::parser::sparql::MAX_NESTING_DEPTH)); this stack
+/// covers the deepest request they accept with a wide margin — a stack
+/// overflow would abort the whole server. Rust's 2 MiB thread default is
+/// enough for an optimized build but not for an unoptimized one, whose frames
+/// are several times larger. (8 MiB is also what C/C++ threads get by
+/// default on Linux; untouched stack pages cost no memory.)
+pub(crate) const WORKER_STACK_SIZE: usize = if cfg!(debug_assertions) {
+    16 << 20
+} else {
+    8 << 20
+};
+
 /// A fixed set of worker threads fed through a bounded queue. Dropping the
 /// pool closes the queue: the workers finish what is queued, then exit.
 struct WorkerPool {
@@ -672,6 +689,7 @@ impl WorkerPool {
             let waiting = Arc::clone(&waiting);
             let spawned = thread::Builder::new()
                 .name(format!("gstore-http-{i}"))
+                .stack_size(WORKER_STACK_SIZE)
                 .spawn(move || worker_loop(&rx, &waiting));
             if spawned.is_ok() {
                 started += 1;
@@ -1754,7 +1772,9 @@ impl Request {
     pub(crate) fn bearer_or_session_token(&self) -> Option<String> {
         if let Some(h) = self.header("authorization") {
             let h = h.trim_start();
-            if h.len() >= 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+            // `get` (not byte slicing): a multi-byte character across the
+            // prefix boundary must not panic.
+            if h.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) {
                 return Some(h[7..].trim().to_string());
             }
         }
@@ -2065,7 +2085,9 @@ pub(crate) fn parse_basic_auth(req: &Request) -> Option<(String, String)> {
 /// header value, returning the credentials token.
 fn strip_basic_prefix(h: &str) -> Option<&str> {
     let h = h.trim_start();
-    if h.len() >= 6 && h[..6].eq_ignore_ascii_case("basic ") {
+    // `get` (not byte slicing): a multi-byte character across the prefix
+    // boundary must not panic.
+    if h.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("basic ")) {
         Some(&h[6..])
     } else {
         None
@@ -3259,6 +3281,27 @@ mod tests {
         assert!(Request::parse(&mut &b""[..]).unwrap().is_none());
         let truncated = b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\nab";
         assert!(Request::parse(&mut &truncated[..]).is_err());
+    }
+
+    #[test]
+    fn a_non_ascii_authorization_header_is_rejected_without_a_panic() {
+        // A multi-byte character straddling the `Basic ` / `Bearer ` prefix
+        // boundary must not make the byte-indexed prefix check panic.
+        for value in ["abcde\u{e9}xyz", "abcdef\u{e9}xyz", "\u{e9}", "Basic\u{e9}", "Bearer\u{e9}x"] {
+            let raw = format!("GET / HTTP/1.1\r\nAuthorization: {value}\r\n\r\n");
+            let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+            assert_eq!(parse_basic_auth(&req), None, "{value:?}");
+            assert_eq!(req.bearer_or_session_token(), None, "{value:?}");
+            assert!(!req.authorized("u", "p"), "{value:?}");
+        }
+        // Well-formed headers still work, with the scheme in any case.
+        let raw = "GET / HTTP/1.1\r\nAuthorization: bAsIc dTpw\r\n\r\n";
+        let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(parse_basic_auth(&req), Some(("u".into(), "p".into())));
+        assert!(req.authorized("u", "p"));
+        let raw = "GET / HTTP/1.1\r\nAuthorization: BEARER tok\u{e9}n\r\n\r\n";
+        let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(req.bearer_or_session_token().as_deref(), Some("tok\u{e9}n"));
     }
 
     #[test]

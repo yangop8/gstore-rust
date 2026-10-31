@@ -184,8 +184,11 @@ fn api_restore_of_a_corrupt_backup_keeps_the_loaded_database_and_its_changes() {
     );
     assert_eq!(s, 200, "update: {b}");
 
-    for bad in [garbage_disk_backup(&base), {
-        let d = base.join("bad_snapshot");
+    // Corrupt backups inside the server's backup directory (where `/restore`
+    // reads from).
+    let backups = root.join("backups");
+    for bad in [garbage_disk_backup(&backups), {
+        let d = backups.join("bad_snapshot");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("meta.bin"), [0xFFu8; 4096]).unwrap();
         d

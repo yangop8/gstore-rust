@@ -27,6 +27,12 @@ use crate::model::{Term, Triple};
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
+/// Deepest element nesting accepted. The XML reader, the triple extractor and
+/// dropping the element tree all recurse once per level, so an unbounded depth
+/// would let one document overflow the stack — which aborts the process. Real
+/// RDF/XML nests a handful of levels; this matches the Turtle parser's limit.
+const MAX_NESTING_DEPTH: usize = 256;
+
 /// Parse an RDF/XML document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
     let root = XmlParser::new(content).parse_document()?;
@@ -86,6 +92,8 @@ impl XmlElement {
 struct XmlParser {
     chars: Vec<char>,
     pos: usize,
+    /// Elements currently open, bounded by [`MAX_NESTING_DEPTH`].
+    depth: usize,
 }
 
 impl XmlParser {
@@ -93,6 +101,7 @@ impl XmlParser {
         XmlParser {
             chars: s.chars().collect(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -194,8 +203,21 @@ impl XmlParser {
         self.parse_element()
     }
 
-    /// Parse an element starting at `<`.
+    /// Parse an element starting at `<`, refusing nesting deeper than
+    /// [`MAX_NESTING_DEPTH`].
     fn parse_element(&mut self) -> Result<XmlElement> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(self.err(format!(
+                "elements nested more than {MAX_NESTING_DEPTH} levels deep"
+            )));
+        }
+        self.depth += 1;
+        let el = self.parse_element_inner();
+        self.depth -= 1;
+        el
+    }
+
+    fn parse_element_inner(&mut self) -> Result<XmlElement> {
         if self.bump() != Some('<') {
             return Err(self.err("expected '<'"));
         }
@@ -899,6 +921,34 @@ mod tests {
 </rdf:RDF>"#;
         let ts = parse_str(doc).unwrap();
         assert_eq!(ts[0].object, Term::plain_literal("a < b & c"));
+    }
+
+    /// Elements nested 50 000 deep are a parse error, not a stack overflow
+    /// (which would abort the whole server: `/upload` and `/batchInsert`
+    /// accept RDF/XML); nesting within the limit still parses.
+    #[test]
+    fn absurdly_deep_nesting_is_refused_not_a_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let open = "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:ex=\"http://ex/\">";
+                let deep = format!("{open}{}{}</rdf:RDF>", "<a>".repeat(50_000), "</a>".repeat(50_000));
+                let err = parse_str(&deep).unwrap_err().to_string();
+                assert!(err.contains("nested more than"), "{err}");
+                // Striped node/property nesting just inside the limit.
+                let levels = MAX_NESTING_DEPTH / 2 - 1;
+                let mut doc = String::from(open);
+                for i in 0..levels {
+                    doc.push_str(&format!("<rdf:Description rdf:about=\"http://ex/n{i}\"><ex:next>"));
+                }
+                doc.push_str("<rdf:Description rdf:about=\"http://ex/end\"/>");
+                doc.push_str(&"</ex:next></rdf:Description>".repeat(levels));
+                doc.push_str("</rdf:RDF>");
+                assert_eq!(parse_str(&doc).unwrap().len(), levels);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
