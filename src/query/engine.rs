@@ -129,6 +129,18 @@
 //! mode, [`Evaluator::with_integer_division`] /
 //! [`Database::set_integer_division`](crate::Database::set_integer_division).
 //!
+//! # LIMIT, ORDER BY … LIMIT, ASK and EXISTS
+//!
+//! Step 5 above does not always materialize everything (module `topk`,
+//! source `src/query/topk.rs`): a SELECT or CONSTRUCT with `LIMIT` and no
+//! `ORDER BY`, `ASK` and `EXISTS` stream their solutions and stop early;
+//! `ORDER BY … LIMIT k` keeps the best `OFFSET + k` solutions in a bounded
+//! heap; and `ORDER BY` of an integer linear expression over a tree-shaped
+//! BGP enumerates matches in key order (upstream's DP-B). Each returns the
+//! exact rows, in the exact order, of the full evaluation — ties keep their
+//! WHERE order — and [`TopKOptions`] switches them off
+//! ([`Evaluator::with_topk_options`]); [`EvalStats`] counts the work.
+//!
 //! # SPARQL Update templates
 //!
 //! [`Evaluator::eval_update_modify`] instantiates `DELETE`/`INSERT` quad
@@ -168,6 +180,14 @@ use super::value::{
     parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
     IntegerDivision, NumericFn, Value, XSD_FLOAT,
 };
+
+// Top-K, bounded-heap ORDER BY and early termination for LIMIT / ASK /
+// EXISTS (docs/GAP_PLAN.md §3.4). A child module so it can drive the private
+// BGP/join machinery below.
+#[path = "topk.rs"]
+mod topk;
+use topk::PreparedBgp;
+pub use topk::{DpbMode, EvalStats, TopKOptions};
 
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -359,6 +379,12 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     gfun_csr: std::cell::RefCell<Option<Arc<CsrGraph>>>,
     /// How `/` divides two integers ([`with_integer_division`](Self::with_integer_division)).
     integer_division: IntegerDivision,
+    /// Which LIMIT / ORDER BY / ASK optimizations may run
+    /// ([`with_topk_options`](Self::with_topk_options); all on by default).
+    topk: TopKOptions,
+    /// Work counters ([`stats`](Self::stats)), shared with `GRAPH`
+    /// sub-evaluators so their work counts too.
+    stats: Rc<std::cell::Cell<EvalStats>>,
 }
 
 /// A source of the per-predicate CSR the advanced graph functions run on
@@ -400,6 +426,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            stats: Rc::default(),
         }
     }
 
@@ -425,6 +453,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            stats: Rc::default(),
         }
     }
 
@@ -551,9 +581,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
                 let layout = VarLayout::build(&a.pattern);
-                let solutions = self.eval_pattern(&a.pattern, &layout);
+                // Stops at the first solution (see `topk`).
+                let found = self.pattern_has_solution(&a.pattern, &layout);
                 self.check_cancel()?; // a mid-run cancel short-circuits to empty; report it
-                Ok(QueryResult::Ask(!solutions.is_empty()))
+                Ok(QueryResult::Ask(found))
             }
             Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
             Query::Describe(d) => Ok(QueryResult::Construct(self.eval_describe(d)?)),
@@ -567,12 +598,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// any template triple with an unbound variable. Returns de-duplicated triples.
     fn eval_construct(&self, c: &ConstructQuery) -> Result<Vec<Triple>> {
         let layout = VarLayout::build(&c.pattern);
-        let mut solutions = self.eval_pattern(&c.pattern, &layout);
+        // With a LIMIT, only the first (or, with ORDER BY, the best)
+        // OFFSET+LIMIT solutions are needed (see `topk`): already in order.
+        let (mut solutions, sorted) = match self.construct_fast_path(c, &layout)? {
+            Some(prefix) => (prefix, true),
+            None => (self.eval_pattern(&c.pattern, &layout), false),
+        };
         // A mid-run cancel short-circuits eval_pattern to empty; surface it as an
         // error rather than a bogus empty CONSTRUCT (which would also poison the
         // query cache). Mirrors eval_select_solutions / the ASK path.
         self.check_cancel()?;
-        if !c.order_by.is_empty() {
+        if !c.order_by.is_empty() && !sorted {
             self.sort_solutions(&mut solutions, &c.order_by, &layout);
         }
         let offset = c.offset.unwrap_or(0);
@@ -864,11 +900,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             _ => &q.pattern,
         };
         let mut layout = VarLayout::build(pattern);
-        let mut solutions = self.eval_pattern(pattern, &layout);
-        // A cancelled join short-circuits to empty bindings; surface it as an
-        // error rather than a spurious empty result set.
-        self.check_cancel()?;
-
         let result_vars = q.result_vars();
         // A result column is predicate-typed only if it is a plain pattern
         // variable that occurs in predicate position.
@@ -877,13 +908,36 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .map(|v| layout.index.get(v).is_some_and(|&i| layout.is_pred[i]))
             .collect();
 
+        // LIMIT without ORDER BY streams and stops early; ORDER BY + LIMIT
+        // keeps only the best OFFSET+LIMIT solutions (bounded heap, DP-B).
+        // Both return a long enough prefix of the rows the full evaluation
+        // below would produce (see `topk`).
+        if gfns.is_empty() && !has_agg {
+            if let Some(rows) = self.select_fast_path(q, pattern, &layout, &result_vars)? {
+                return Ok((result_vars, is_pred, apply_row_modifiers(q, rows)));
+            }
+        }
+
         // Upstream's LIMIT pushdown: a WHERE clause that is one BGP, with a
         // LIMIT and no ORDER BY, stops its BGP after LIMIT rows (OFFSET is not
         // added), so the functions only see those rows.
-        if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(pattern) {
-            if let Some(limit) = q.limit {
-                solutions.truncate(limit);
+        let gfn_limit = match q.limit {
+            Some(limit)
+                if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(pattern) =>
+            {
+                Some(limit)
             }
+            _ => None,
+        };
+        let mut solutions = match gfn_limit {
+            Some(limit) => self.first_solutions(pattern, &layout, limit),
+            None => self.eval_pattern(pattern, &layout),
+        };
+        // A cancelled join short-circuits to empty bindings; surface it as an
+        // error rather than a spurious empty result set.
+        self.check_cancel()?;
+        if let Some(limit) = gfn_limit {
+            solutions.truncate(limit);
         }
         let bind_only = if gfns.is_empty() {
             HashSet::new()
@@ -891,7 +945,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             bind_only_vars(pattern)
         };
         let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
-        let mut rows = if !gfns.is_empty()
+        let rows = if !gfns.is_empty()
             && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
         {
             // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
@@ -994,19 +1048,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // DISTINCT / OFFSET / LIMIT over the projected result rows (ORDER BY was
         // applied above — before projection for the non-aggregate path).
-        if q.distinct {
-            let mut seen = std::collections::HashSet::new();
-            rows.retain(|r| seen.insert(r.clone()));
-        }
-        let offset = q.offset.unwrap_or(0);
-        if offset > 0 {
-            rows.drain(0..offset.min(rows.len()));
-        }
-        if let Some(limit) = q.limit {
-            rows.truncate(limit);
-        }
-
-        Ok((result_vars, is_pred, rows))
+        Ok((result_vars, is_pred, apply_row_modifiers(q, rows)))
     }
 
     /// Where each variable of an aggregate query's trailing `VALUES` block
@@ -1911,6 +1953,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: self.integer_division,
+            topk: self.topk,
+            stats: Rc::clone(&self.stats),
         }
     }
 
@@ -2042,26 +2086,29 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a conjunction of patterns, joining smallest/connected first.
     fn eval_join(&self, conjuncts: &[&GraphPattern], layout: &VarLayout) -> Vec<Binding> {
         // Evaluate each conjunct independently, recording its variable set.
-        let mut parts: Vec<(Vec<Binding>, Vec<usize>)> = conjuncts
+        let mut parts: Vec<Option<(Vec<Binding>, Vec<usize>)>> = conjuncts
             .iter()
-            .map(|c| (self.eval_pattern(c, layout), pattern_vars(c, layout)))
+            .map(|c| Some((self.eval_pattern(c, layout), pattern_vars(c, layout))))
             .collect();
 
         // Start from the smallest result, then greedily join in a connected,
         // smallest-first order (a lightweight join optimizer).
-        let start = (0..parts.len())
-            .min_by_key(|&i| parts[i].0.len())
-            .unwrap_or(0);
-        let (mut acc, mut acc_vars) = parts.swap_remove(start);
-
-        while !parts.is_empty() {
-            let pick = (0..parts.len())
-                .min_by_key(|&i| {
-                    let connected = parts[i].1.iter().any(|v| acc_vars.contains(v));
-                    (!connected as u8, parts[i].0.len())
-                })
-                .unwrap();
-            let (rb, rv) = parts.swap_remove(pick);
+        let meta: Vec<(usize, &[usize])> = parts
+            .iter()
+            .map(|p| {
+                p.as_ref()
+                    .map(|(b, v)| (b.len(), v.as_slice()))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let order = greedy_join_order(&meta);
+        let mut order = order.into_iter();
+        let (mut acc, mut acc_vars) = order
+            .next()
+            .and_then(|i| parts[i].take())
+            .unwrap_or_default();
+        for pick in order {
+            let (rb, rv) = parts[pick].take().unwrap_or_default();
             acc = join_sets(&acc, &acc_vars, &rb, &rv);
             for v in rv {
                 if !acc_vars.contains(&v) {
@@ -2091,41 +2138,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         str_constraints: &HashMap<usize, Vec<String>>,
     ) -> Vec<Binding> {
-        // Compile patterns; a missing constant ⇒ the conjunction is empty.
-        let mut plans = Vec::with_capacity(tps.len());
-        for tp in tps {
-            match self.compile_pattern(tp, layout) {
-                Some(plan) => plans.push(plan),
-                None => return Vec::new(),
-            }
-        }
-        if plans.is_empty() {
-            return vec![vec![None; layout.len()]];
-        }
-
-        // Exact per-variable candidate sets from constant edges (gStore's
-        // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
-        let mut candidates = candidates::generate(&plans, self.store);
-        self.refine_candidates_with_vstree(&mut candidates, tps, layout);
-        // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
-        // plain REGEX) prune or seed candidate sets — a sound superset, so only
-        // the join shrinks (the exact FILTER still verifies each row).
-        if !str_constraints.is_empty() {
-            if let Some(idx) = self.string_index() {
-                candidates::refine_with_substrings(&mut candidates, str_constraints, &idx, &plans);
-            }
-        }
-
-        // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
-        // tree when one is strictly cheaper. Memoised so a structurally-identical
-        // BGP reuses the enumeration (gStore `plan_cache`).
-        let key = plans_key(&plans);
-        let plan = self
-            .plan_cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
-            .clone();
+        let (plans, candidates, plan) = match self.prepare_bgp(tps, layout, str_constraints) {
+            PreparedBgp::Empty => return Vec::new(),
+            PreparedBgp::Identity => return vec![vec![None; layout.len()]],
+            PreparedBgp::Plan(p) => (p.plans, p.cands, p.exec),
+        };
 
         if let Some(tree) = &plan.tree {
             // Bushy execution: build each side independently, then hash-join.
@@ -2154,6 +2171,58 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         solutions
     }
 
+    /// Compile a BGP and choose its execution plan — everything
+    /// [`eval_bgp_constrained`](Self::eval_bgp_constrained) does before it
+    /// runs the joins, shared with the streaming executor (`topk`) so both
+    /// enumerate the solutions in the same order.
+    fn prepare_bgp(
+        &self,
+        tps: &[TriplePattern],
+        layout: &VarLayout,
+        str_constraints: &HashMap<usize, Vec<String>>,
+    ) -> PreparedBgp {
+        // Compile patterns; a missing constant ⇒ the conjunction is empty.
+        let mut plans = Vec::with_capacity(tps.len());
+        for tp in tps {
+            match self.compile_pattern(tp, layout) {
+                Some(plan) => plans.push(plan),
+                None => return PreparedBgp::Empty,
+            }
+        }
+        if plans.is_empty() {
+            return PreparedBgp::Identity;
+        }
+
+        // Exact per-variable candidate sets from constant edges (gStore's
+        // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
+        let mut candidates = candidates::generate(&plans, self.store);
+        self.refine_candidates_with_vstree(&mut candidates, tps, layout);
+        // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
+        // plain REGEX) prune or seed candidate sets — a sound superset, so only
+        // the join shrinks (the exact FILTER still verifies each row).
+        if !str_constraints.is_empty() {
+            if let Some(idx) = self.string_index() {
+                candidates::refine_with_substrings(&mut candidates, str_constraints, &idx, &plans);
+            }
+        }
+
+        // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
+        // tree when one is strictly cheaper. Memoised so a structurally-identical
+        // BGP reuses the enumeration (gStore `plan_cache`).
+        let key = plans_key(&plans);
+        let plan = self
+            .plan_cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
+            .clone();
+        PreparedBgp::Plan(topk::BgpPlan {
+            plans,
+            cands: candidates,
+            exec: plan,
+        })
+    }
+
     /// Execute a binary-join tree: each `Leaf` scans its pattern from scratch and
     /// each `Join` hash-joins the two sub-results on their shared variables.
     /// Returns the bindings and the set of variable indices they bind.
@@ -2179,6 +2248,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 let (rb, rv) = self.eval_join_tree(r, plans, cands, layout);
                 let joined = join_sets(&lb, &lv, &rb, &rv);
+                self.note_bindings(joined.len());
                 let mut vars = lv;
                 for v in rv {
                     if !vars.contains(&v) {
@@ -2349,12 +2419,33 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         cands: &Candidates,
         out: &mut Vec<Binding>,
     ) {
+        let before = out.len();
+        for (s, p, o) in self.candidate_triples(binding, plan) {
+            // VS-tree filter: an entity variable's value must be a candidate.
+            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
+                continue;
+            }
+            let mut nb = binding.clone();
+            if unify(&mut nb, &plan.s, s)
+                && unify(&mut nb, &plan.p, p)
+                && unify(&mut nb, &plan.o, o)
+            {
+                out.push(nb);
+            }
+        }
+        self.note_bindings(out.len() - before);
+    }
+
+    /// The `(s, p, o)` triples that may extend `binding` by `plan`, in the
+    /// order of the tightest index for the positions `binding` already fixes.
+    /// This order is what makes the executor's solution order deterministic.
+    fn candidate_triples(&self, binding: &Binding, plan: &PatPlan) -> Vec<(u32, PredId, u32)> {
         let ks = slot_known(&plan.s, binding);
         let kp = slot_known(&plan.p, binding);
         let ko = slot_known(&plan.o, binding);
 
         // Enumerate candidate (s, p, o) triples from the tightest index.
-        let candidates: Vec<(u32, PredId, u32)> = match (ks, kp, ko) {
+        match (ks, kp, ko) {
             (Some(s), Some(p), Some(o)) => {
                 if self.store.exists(s, p, o) {
                     vec![(s, p, o)]
@@ -2404,20 +2495,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 .into_iter()
                 .map(|t| (t.sub, t.pred, t.obj))
                 .collect(),
-        };
-
-        for (s, p, o) in candidates {
-            // VS-tree filter: an entity variable's value must be a candidate.
-            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
-                continue;
-            }
-            let mut nb = binding.clone();
-            if unify(&mut nb, &plan.s, s)
-                && unify(&mut nb, &plan.p, p)
-                && unify(&mut nb, &plan.o, o)
-            {
-                out.push(nb);
-            }
         }
     }
 
@@ -2575,7 +2652,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn eval_exists(&self, negated: bool, pat: &GraphPattern, b: &Binding, outer: &VarLayout) -> bool {
         let bound = self.subst_pattern(pat, b, outer);
         let layout = VarLayout::build(&bound);
-        let found = !self.eval_pattern(&bound, &layout).is_empty();
+        let found = self.pattern_has_solution(&bound, &layout);
         found ^ negated
     }
 
@@ -4602,23 +4679,77 @@ fn eval_minus(
         return left; // no shared variables ⇒ MINUS removes nothing
     }
     left.into_iter()
-        .filter(|l| {
-            !right.iter().any(|r| {
-                let mut compatible = true;
-                let mut any_shared = false;
-                for &v in &shared {
-                    if let (Some(a), Some(b)) = (l[v], r[v]) {
-                        any_shared = true;
-                        if a != b {
-                            compatible = false;
-                            break;
-                        }
-                    }
-                }
-                compatible && any_shared
-            })
-        })
+        .filter(|l| !minus_removes(l, &right, &shared))
         .collect()
+}
+
+/// Whether MINUS drops `l`: some right solution is compatible with it on the
+/// `shared` variables and they share at least one bound one.
+fn minus_removes(l: &Binding, right: &[Binding], shared: &[usize]) -> bool {
+    right.iter().any(|r| {
+        let mut compatible = true;
+        let mut any_shared = false;
+        for &v in shared {
+            if let (Some(a), Some(b)) = (l[v], r[v]) {
+                any_shared = true;
+                if a != b {
+                    compatible = false;
+                    break;
+                }
+            }
+        }
+        compatible && any_shared
+    })
+}
+
+/// DISTINCT, OFFSET and LIMIT over a SELECT's projected rows, in that order.
+fn apply_row_modifiers(q: &SelectQuery, mut rows: Vec<Vec<Option<u32>>>) -> Vec<Vec<Option<u32>>> {
+    if q.distinct {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|r| seen.insert(r.clone()));
+    }
+    let offset = q.offset.unwrap_or(0);
+    if offset > 0 {
+        rows.drain(0..offset.min(rows.len()));
+    }
+    if let Some(limit) = q.limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+/// The order in which [`Evaluator::eval_join`] joins its conjuncts, given
+/// each one's `(solution count, variables)`: the smallest first, then
+/// repeatedly the smallest one connected to what is joined so far (any
+/// smallest one when none is connected); ties go to the conjunct the
+/// `swap_remove`-based selection meets first. The streaming join (`topk`)
+/// uses the same order, so both produce the solutions in the same order.
+fn greedy_join_order(parts: &[(usize, &[usize])]) -> Vec<usize> {
+    let mut rest: Vec<usize> = (0..parts.len()).collect();
+    let mut order = Vec::with_capacity(parts.len());
+    let Some(start) = (0..rest.len()).min_by_key(|&i| parts[rest[i]].0) else {
+        return order;
+    };
+    let first = rest.swap_remove(start);
+    let mut acc_vars: Vec<usize> = parts[first].1.to_vec();
+    order.push(first);
+    while !rest.is_empty() {
+        let pick = (0..rest.len())
+            .min_by_key(|&i| {
+                let (len, vars) = parts[rest[i]];
+                let connected = vars.iter().any(|v| acc_vars.contains(v));
+                (!connected as u8, len)
+            })
+            .unwrap_or(0);
+        let next = rest.swap_remove(pick);
+        for &v in parts[next].1 {
+            if !acc_vars.contains(&v) {
+                acc_vars.push(v);
+            }
+        }
+        order.push(next);
+    }
+    order
 }
 
 /// Flatten a (possibly nested) `Join` tree into its conjuncts.
