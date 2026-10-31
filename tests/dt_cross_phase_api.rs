@@ -29,7 +29,8 @@ const BASE: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
                     <http://ex/b> <http://ex/p> <http://ex/c> .\n";
 const EXTRA: &str = "<http://ex/c> <http://ex/p> <http://ex/d> .\n";
 const COUNT: &str = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
-const REACH: &str = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/d>, true, {}) AS ?l) WHERE {}";
+const REACH: &str =
+    "SELECT (shortestPathLen(<http://ex/a>, <http://ex/d>, true, {}) AS ?l) WHERE {}";
 const INSERT: &str = "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }";
 const DELETE: &str = "DELETE DATA { <http://ex/c> <http://ex/p> <http://ex/d> }";
 
@@ -100,14 +101,21 @@ fn every_write_path_invalidates_the_query_cache_and_the_csr() {
         string(&j, "TID")
     };
     let tquery = |srv: &Server, tid: &str, q: &str| {
-        let j = srv.op("tquery", &[("db_name", "cache"), ("tid", tid), ("sparql", q)]);
+        let j = srv.op(
+            "tquery",
+            &[("db_name", "cache"), ("tid", tid), ("sparql", q)],
+        );
         ok(&j);
         j
     };
     let tid = begin(&srv);
     tquery(&srv, &tid, INSERT);
     assert!(cell(&tquery(&srv, &tid, REACH)).contains("\"length\":3"));
-    assert_eq!(state(&srv, "cache"), without, "others read the begin-time snapshot");
+    assert_eq!(
+        state(&srv, "cache"),
+        without,
+        "others read the begin-time snapshot"
+    );
     ok(&srv.op("commit", &[("db_name", "cache"), ("tid", &tid)]));
     assert_eq!(state(&srv, "cache"), with, "after commit");
     let tid = begin(&srv);
@@ -174,7 +182,13 @@ fn update_forms_need_the_update_privilege_and_graph_functions_only_query() {
             "reader" => "Basic cmVhZGVyOnB3", // reader:pw
             _ => "Basic d3JpdGVyOnB3",        // writer:pw
         };
-        http_with(&srv.addr, "POST", target, &[("Authorization", auth)], sparql.as_bytes())
+        http_with(
+            &srv.addr,
+            "POST",
+            target,
+            &[("Authorization", auth)],
+            sparql.as_bytes(),
+        )
     };
 
     // Graph-function SELECTs (and a Phase 3 SELECT) are reads.
@@ -215,12 +229,22 @@ fn update_forms_need_the_update_privilege_and_graph_functions_only_query() {
         assert_eq!(s, 403, "{u}: {b}");
     }
     // Nothing changed meanwhile.
-    assert_eq!(cell(&srv.query("priv", COUNT)).trim_start_matches('"').split('"').next(), Some("3"));
+    assert_eq!(
+        cell(&srv.query("priv", COUNT))
+            .trim_start_matches('"')
+            .split('"')
+            .next(),
+        Some("3")
+    );
     for u in updates {
         let j = as_user("writer", u);
         assert_eq!(code(&j), 0, "{u}: {j}");
     }
-    let (s, b) = rest_as("writer", "/update?db_name=priv", "COPY DEFAULT TO <http://ex/g6>");
+    let (s, b) = rest_as(
+        "writer",
+        "/update?db_name=priv",
+        "COPY DEFAULT TO <http://ex/g6>",
+    );
     assert_eq!(s, 200, "{b}");
     // Transactions need the update privilege up front (upstream's
     // check_privilege for begin / tquery / commit / rollback), so a
@@ -239,5 +263,8 @@ fn update_forms_need_the_update_privilege_and_graph_functions_only_query() {
 }
 
 fn msg_of(j: &Json) -> String {
-    j.get("StatusMsg").and_then(Json::as_str).unwrap_or_default().to_string()
+    j.get("StatusMsg")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
