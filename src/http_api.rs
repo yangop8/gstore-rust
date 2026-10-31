@@ -489,6 +489,13 @@ impl DbSlot {
     /// (clients must not make the server read arbitrary local files).
     pub(crate) fn handle(mut db: Database, dir: PathBuf, dirty: bool, policy: &LoadPolicy) -> DbHandle {
         db.set_load_policy(policy.clone());
+        // Hold `dir`'s inter-process lock while serving it (`crate::db::dirlock`):
+        // a database opened from `dir` already does; one built in memory and
+        // saved there takes it now. Best effort — a database not on disk yet
+        // has nothing to lock (it is locked when it is next opened).
+        if dir.is_dir() && db.storage() != crate::StorageKind::RocksDb {
+            let _ = db.hold_dir_lock(&dir);
+        }
         Arc::new(Mutex::new(DbSlot {
             db,
             dir,

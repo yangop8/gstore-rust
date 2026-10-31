@@ -22,7 +22,8 @@
 //!   `GET /` still serves the web console;
 //! * the path routes operation packages register ([`Registry::add_path`]):
 //!   upstream's `/shutdown` and `/restart` (also under `/grpc/`; see
-//!   `ops_lifecycle`), and later `/file/upload`, `/file/download/*`.
+//!   `ops_lifecycle`), `/file/upload` and `/file/download[/*]` (also under
+//!   `/grpc/`; see `ops_file`).
 //!
 //! # Request flow
 //!
@@ -61,6 +62,8 @@ pub mod apilog;
 pub mod auth;
 pub mod envelope;
 pub mod ipfilter;
+mod ops_db;
+mod ops_file;
 mod ops_lifecycle;
 mod ops_query;
 mod ops_sys;
@@ -341,6 +344,8 @@ pub fn registry() -> &'static Registry {
         ops_lifecycle::register(&mut reg);
         ops_user::register(&mut reg);
         ops_task::register(&mut reg);
+        ops_db::register(&mut reg);
+        ops_file::register(&mut reg);
         reg
     })
 }
@@ -537,6 +542,21 @@ mod tests {
             "commit",
             "rollback",
             "checkpoint",
+            "show",
+            "load",
+            "loadcsr",
+            "unload",
+            "monitor",
+            "build",
+            "drop",
+            "rename",
+            "backup",
+            "backuppath",
+            "restore",
+            "export",
+            "batchInsert",
+            "batchRemove",
+            "schema",
         ] {
             assert!(names.contains(&op), "{op} missing from {names:?}");
         }
@@ -569,5 +589,17 @@ mod tests {
             assert!(wants(&req("POST", path, None)), "{path}");
             assert!(!wants(&req("DELETE", path, None)), "{path}");
         }
+        // The file routes (see `ops_file`).
+        for prefix in ["", "/grpc"] {
+            let at =
+                |method: &str, path: &str| wants(&req(method, &format!("{prefix}{path}"), None));
+            assert!(at("POST", "/file/upload"));
+            assert!(!at("GET", "/file/upload"));
+            assert!(at("POST", "/file/download"));
+            assert!(at("GET", "/file/download"));
+            assert!(at("GET", "/file/download/export/x.nt"));
+            assert!(!at("POST", "/file/download/x.nt"));
+        }
+        assert!(!wants(&req("GET", "/file/other", None)));
     }
 }

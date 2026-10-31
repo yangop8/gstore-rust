@@ -394,7 +394,13 @@ impl Database {
             )));
         }
         fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
-        match Database::storage_kind(dir) {
+        // The snapshot and on-disk layouts are locked against other processes
+        // before anything is read (see `dirlock`); RocksDB locks itself.
+        let lock = match Database::storage_kind(dir) {
+            Some(StorageKind::RocksDb) | None => None,
+            Some(_) => Some(super::dirlock::DirLock::acquire(dir)?),
+        };
+        let mut db = match Database::storage_kind(dir) {
             Some(StorageKind::RocksDb) => Database::open_rocks_layout(dir),
             Some(StorageKind::Disk) => Database::load_disk(dir),
             Some(StorageKind::Snapshot) => Database::load_snapshot(dir),
@@ -403,7 +409,26 @@ impl Database {
                  kvstore.kv or rocksdb/ store)",
                 dir.display()
             ))),
+        }?;
+        db.dir_lock = lock;
+        Ok(db)
+    }
+
+    /// Hold the inter-process lock of directory `dir` (see
+    /// [`dirlock`](super::dirlock)) for as long as this database lives — for a
+    /// database built in memory and saved into `dir` that is now served from
+    /// there ([`open`](Self::open) takes the lock itself). A no-op when the
+    /// database already holds `dir`'s lock; a lock on another directory is
+    /// released. Fails when another process holds `dir`.
+    pub fn hold_dir_lock<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
+        let dir = dir.as_ref();
+        if let (Some(held), Ok(canonical)) = (&self.dir_lock, fs::canonicalize(dir)) {
+            if held.dir() == canonical {
+                return Ok(());
+            }
         }
+        self.dir_lock = Some(super::dirlock::DirLock::acquire(dir)?);
+        Ok(())
     }
 
     /// Load a database from directory `dir`. Equivalent to [`open`](Self::open):
@@ -486,6 +511,7 @@ impl Database {
         // Dropping the sink closes the disk store (nothing left to flush).
         *self.disk.get_mut() = None;
         self.home = None;
+        self.dir_lock = None;
         if self.vstree.is_disk_backed() {
             // The paged node file belongs to the old directory.
             self.rebuild_index();
@@ -606,6 +632,41 @@ impl Database {
     /// Load a bincode snapshot directory (finishing an interrupted save first).
     pub(super) fn load_snapshot(dir: &Path) -> Result<Database> {
         fsutil::recover_snapshot(dir, SNAPSHOT_FILES)?;
+        Database::read_snapshot(dir)
+    }
+
+    /// An in-memory copy of the snapshot database in `dir`, read **without**
+    /// taking the directory's inter-process lock ([`dirlock`](super::dirlock))
+    /// and without touching the directory — to inspect a database another
+    /// process (a running `gserver`) may have open. Saves replace a snapshot
+    /// atomically, so the copy is either the state before a concurrent save
+    /// or the one after it (a read racing a save's final renames fails its
+    /// consistency check instead — retry). The copy is detached: it has no
+    /// [`home`](Self::home) and never writes back to `dir`. Only the snapshot
+    /// layout can be read this way; open an on-disk or RocksDB database with
+    /// [`open`](Self::open).
+    pub fn read_copy<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        let dir = dir.as_ref();
+        match Database::storage_kind(dir) {
+            Some(StorageKind::Snapshot) => {
+                let mut db = Database::read_snapshot(dir)?;
+                db.home = None;
+                Ok(db)
+            }
+            Some(kind) => Err(GStoreError::Database(format!(
+                "'{}' holds a {kind} database; read_copy reads snapshot databases only",
+                dir.display()
+            ))),
+            None => Err(GStoreError::Database(format!(
+                "'{}' does not contain a gStore database",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Read the snapshot files of `dir` (no recovery, see
+    /// [`load_snapshot`](Self::load_snapshot)).
+    fn read_snapshot(dir: &Path) -> Result<Database> {
         let meta: Meta = fsutil::read_bincode(&dir.join(META_FILE))?;
         let dict: Dictionary = fsutil::read_bincode(&dir.join(DICT_FILE))?;
         let store: TripleStore = fsutil::read_bincode(&dir.join(STORE_FILE))?;

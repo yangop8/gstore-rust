@@ -31,8 +31,11 @@ use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
 pub(crate) mod fsutil;
+mod admin;
+pub mod dirlock;
 mod persist;
 
+pub use admin::{SchemaEdge, SchemaGraph, SchemaNode};
 pub use persist::StorageKind;
 
 #[cfg(test)]
@@ -273,6 +276,10 @@ pub struct Database {
     /// references an id RocksDB has no dictionary entry for.
     #[cfg(feature = "rocksdb")]
     unpersisted_terms: HashSet<(crate::backend::rocks::TermSpace, u32)>,
+    /// The inter-process lock on the directory this database is open from
+    /// (see [`dirlock`]); declared last so it is released only after every
+    /// other field (the on-disk store included) has been dropped.
+    dir_lock: Option<dirlock::DirLock>,
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -348,6 +355,7 @@ impl Database {
             mutations: 0,
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
+            dir_lock: None,
         }
     }
 
