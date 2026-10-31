@@ -1516,8 +1516,10 @@ fn xsd_constructor_casts() {
     assert_eq!(e("xsd:float(\"0.1\")"), typed("0.1", "float"));
     assert_eq!(e("xsd:float(\"NaN\")"), typed("NaN", "float"));
     assert_eq!(e("xsd:float(1)"), typed("1", "float"));
-    // A float takes part in arithmetic and comparisons as a number.
-    assert_eq!(e("(xsd:float(\"1.5\") + 1)"), typed("2.5", "double"));
+    // A float takes part in arithmetic and comparisons as a number, and
+    // float + integer is a float (XPath type promotion).
+    assert_eq!(e("(xsd:float(\"1.5\") + 1)"), typed("2.5", "float"));
+    assert_eq!(e("(xsd:float(\"1.5\") + 1e0)"), typed("2.5", "double"));
     assert_eq!(e("(xsd:float(\"1.5\") > 1)"), typed("true", "boolean"));
     assert_eq!(e("(!xsd:float(\"0\"))"), typed("true", "boolean"));
     // xsd:boolean

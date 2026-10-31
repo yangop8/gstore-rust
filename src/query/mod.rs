@@ -16,7 +16,7 @@ pub mod value;
 pub use engine::Evaluator;
 pub use functions::{CustomFn, FunctionRegistry};
 pub use results::{QueryResult, ResultSet};
-pub use value::Value;
+pub use value::{IntegerDivision, NumericFn, Value};
 
 #[cfg(test)]
 mod tests {
