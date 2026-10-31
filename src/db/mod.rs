@@ -396,6 +396,12 @@ impl Database {
         self.csr_cache.peek(self.mutations).is_some()
     }
 
+    /// The cached CSR if it is current for the data (never builds) — lets a
+    /// read snapshot of this database share it instead of rebuilding.
+    pub fn cached_csr(&self) -> Option<std::sync::Arc<CsrGraph>> {
+        self.csr_cache.peek(self.mutations)
+    }
+
     /// Record an applied data mutation: invalidate cached query results and
     /// advance [`mutation_count`](Self::mutation_count).
     fn touched(&mut self) {
@@ -458,6 +464,14 @@ impl Database {
     /// Number of user-defined functions registered.
     pub fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// The user-defined functions registered on this database (a clone is
+    /// cheap and shares the closures). Read snapshots of the database hand
+    /// them to their evaluators, so a query sees the same functions there as
+    /// through [`query`](Self::query).
+    pub fn functions(&self) -> &FunctionRegistry {
+        &self.functions
     }
 
     /// Set which sources SPARQL `LOAD` may read. The default,

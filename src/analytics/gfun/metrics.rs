@@ -693,9 +693,11 @@ fn shortest_path_scale_pass_id(
 /// * **Per source:** `{"src":"‹u›","result":x}`, `x = to_string(local)`.
 ///   Upstream writes consecutive sources (and the global value, when a
 ///   missing source is mixed with real ones) without `,`; we separate them.
-///   (A variable with no bindings at all also lands here as "no source";
-///   upstream would print `{"paths":[]}` for a WHERE that has rows but never
-///   binds it — the [`GArgs`] model cannot express that case.)
+///   (A variable with no usable binding never reaches this function: the
+///   query engine answers `{"paths":[]}` itself, as upstream does for a
+///   WHERE that has rows but never binds it — see [`crate::query::engine`].
+///   So through SPARQL only the source-less form `clusterCoeff(directed,
+///   preds)` and a missing constant take the "no source" branch.)
 ///
 /// **Global** (:12-89, ignores `directed` — always undirected): empty `preds`
 /// → -1; for each vertex `c`, `S` = distinct in ∪ out neighbours; for each

@@ -67,3 +67,13 @@ namespace.
   under its full IRI or its local name; anything else is a query error
   (it used to evaluate to unbound). Registered functions now also work in
   the WHERE clause of `DELETE`/`INSERT … WHERE`.
+- **Changed: read snapshots answer like the database.** A transaction's read
+  snapshot (HTTP `/begin` … `/tquery`) and the `ConcurrentDb` snapshot,
+  transaction and version-view reads now see the functions registered with
+  `Database::register_function` (they used to evaluate such calls to
+  unbound, which the previous item would have turned into an error). Their
+  graph-function queries share one CSR per snapshot, reusing the database's
+  cached CSR when it has one, instead of rebuilding it on every query.
+- **Fixed: infinite `xsd:double` values print as XSD lexicals.** They are
+  written `INF` and `-INF` (they used to print as Rust's `inf` and `-inf`);
+  NaN stays `NaN`.

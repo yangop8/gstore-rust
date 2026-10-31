@@ -775,6 +775,15 @@ impl CsrCache {
         CsrCache::default()
     }
 
+    /// A cache already holding `graph` for `generation` — e.g. an immutable
+    /// read snapshot reusing the CSR its source database had cached for the
+    /// same data.
+    pub fn seeded(generation: u64, graph: Arc<CsrGraph>) -> CsrCache {
+        CsrCache {
+            slot: Mutex::new(Some((generation, graph))),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<(u64, Arc<CsrGraph>)>> {
         // The slot is a plain value; a panic during a build leaves it valid.
         self.slot.lock().unwrap_or_else(|e| e.into_inner())

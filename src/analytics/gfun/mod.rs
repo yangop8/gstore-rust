@@ -89,8 +89,13 @@
 //! skips repeated `(uid, vid)` pairs (GE:2628, GE:2666-2672); [`GArgs::pairs`] and
 //! [`GArgs::distinct_srcs`] reproduce that order. Functions with only one
 //! node argument loop over `srcs`; whole-graph functions (`PR`, `WCC`,
-//! `triangleCounting`, …) run once regardless. An empty `srcs` (a variable
-//! with no bindings) yields `{"paths":[]}` for per-source functions.
+//! `triangleCounting`, …) run once regardless. An empty `srcs` yields
+//! `{"paths":[]}` for per-source functions (but means "no source given" for
+//! `clusterCoeff`, see below). The query engine never passes an empty list
+//! for a variable argument: when a vertex variable has no usable binding it
+//! answers `{"paths":[]}` (`false` for `cycleBoolean`) itself, as upstream's
+//! loop never runs (see [`crate::query::engine`], "Advanced graph
+//! functions").
 //!
 //! Each node is a [`GNode`]: its entity id plus its CSR node, if any.
 //!
@@ -121,9 +126,9 @@
 //! `kHopNeighbor`'s key (`"dst"` there, `"neighbor"` otherwise); with
 //! several projections and no solutions upstream returns no row at all. In
 //! that constant path a *variable* argument is looked up as if it were an
-//! IRI and becomes a missing node — the engine should pass
-//! `srcs = [GNode::MISSING]` to reproduce it, or an empty list to emit
-//! `{"paths":[]}` (the engine package decides; document the choice).
+//! IRI and becomes a missing node. The query engine reproduces that: it
+//! passes `srcs = [GNode::MISSING]` for a variable argument and sets
+//! `where_empty` only on this path (see [`crate::query::engine`]).
 //!
 //! # FILTER-position forms
 //!

@@ -759,9 +759,14 @@ fn days_from_civil(y: i128, m: i128, d: i128) -> i128 {
 }
 
 /// Format a double without a trailing `.0`-less integer ambiguity, matching
-/// common SPARQL serializers closely enough for output.
+/// common SPARQL serializers closely enough for output. The special values use
+/// their XSD lexical forms (`INF`, `-INF`, `NaN`), not Rust's `inf` / `-inf`.
 fn format_double(d: f64) -> String {
-    if d == d.trunc() && d.is_finite() && d.abs() < 1e15 {
+    if d.is_nan() {
+        "NaN".to_string()
+    } else if d.is_infinite() {
+        if d > 0.0 { "INF" } else { "-INF" }.to_string()
+    } else if d == d.trunc() && d.abs() < 1e15 {
         format!("{:.1}", d)
     } else {
         d.to_string()
@@ -782,6 +787,25 @@ mod tests {
     fn typed_float_becomes_double() {
         let v = Value::from_term(&Term::typed_literal("161.5", xsd::DOUBLE));
         assert_eq!(v, Value::Double(161.5));
+    }
+
+    #[test]
+    fn special_doubles_use_xsd_lexicals_and_round_trip() {
+        for (d, lex) in [
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+            (f64::NAN, "NaN"),
+            (2.0, "2.0"),
+            (0.5, "0.5"),
+        ] {
+            assert_eq!(Value::Double(d).lexical(), lex);
+            let back = Value::from_term(&Term::typed_literal(lex, xsd::DOUBLE));
+            match back {
+                Value::Double(x) if d.is_nan() => assert!(x.is_nan(), "{lex}"),
+                Value::Double(x) => assert_eq!(x, d, "{lex}"),
+                other => panic!("{lex} → {other:?}"),
+            }
+        }
     }
 
     #[test]

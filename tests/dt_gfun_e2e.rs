@@ -1296,6 +1296,10 @@ fn xsd_constructor_casts() {
     assert_eq!(e("xsd:double(\"1e3\")"), typed("1000.0", "double"));
     assert_eq!(e("xsd:double(2)"), typed("2.0", "double"));
     assert_eq!(e("xsd:double(\"inf\")"), None);
+    // The special values print as their XSD lexicals, not Rust's inf / NaN.
+    assert_eq!(e("xsd:double(\"-INF\")"), typed("-INF", "double"));
+    assert_eq!(e("xsd:double(\"INF\")"), typed("INF", "double"));
+    assert_eq!(e("xsd:double(\"NaN\")"), typed("NaN", "double"));
     assert_eq!(
         e("(xsd:double(\"-INF\") < -1e308)"),
         typed("true", "boolean")
