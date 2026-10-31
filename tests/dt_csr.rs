@@ -445,6 +445,9 @@ fn every_function_dispatches_to_a_not_implemented_stub() {
     };
     assert_eq!(GFnKind::ALL.len(), 32);
     for kind in GFnKind::ALL {
+        if kind.family() == gfun::GFnFamily::Metrics {
+            continue; // ported: tests/dt_gfun_metric.rs
+        }
         let err = gfun::eval(kind, &ctx, &args).unwrap_err();
         assert!(gfun::is_not_implemented(&err), "{kind}: {err}");
         assert!(err.to_string().contains(kind.name()), "{kind}: {err}");
