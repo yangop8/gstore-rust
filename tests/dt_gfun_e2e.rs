@@ -19,10 +19,14 @@
 //!   (`getPredSetByStringList` skips unknown IRIs) and returns 0. The
 //!   document's 4 and 6.5 are the results over the data's own predicates,
 //!   `{}`, which the tests check as well.
-//! * The `kHopCount` / `kHopNeighbor` / `PR` / `labelProp` / `louvain` /
-//!   `WCC` / `clusterCoeff` / `PPR` sections show only the output *shape*
-//!   (the `kHopNeighbor` one even names a vertex, `<Car>`, absent from the
-//!   data); those functions are checked against the library
+//! * The `kHopCount` and `kHopNeighbor` sections show only the output shape
+//!   for Alice at depth 3 (the `kHopNeighbor` one names a vertex, `<Car>`,
+//!   absent from the data); the tests use the values that shape takes on the
+//!   sample data (Francis), traced in `dt_gfun_path.rs`.
+//! * The `PR` / `PPR` / `labelProp` / `louvain` / `WCC` / `clusterCoeff`
+//!   sections, and the functions the document does not describe
+//!   (`simpleCyclePath`, `SSSP`, `shortestPaths`, `maximumKplex`, …), give
+//!   no concrete output; those are checked against the library
 //!   (`gstore::analytics::gfun`, itself traced against upstream in
 //!   `dt_gfun_path.rs` / `dt_gfun_metric.rs`) on the same arguments, which
 //!   pins the engine's part: argument resolution, distinct bindings, row
@@ -317,6 +321,35 @@ fn doc_k_hop_reachable_and_path() {
         francis_to_alice()
     );
     assert_eq!(json(&mut db, &q("kHopReachablePath", 2)), EMPTY);
+}
+
+/// Upstream's regression suite: `scripts/test/parser_test/parser_q34.sql`
+/// and `parser_q35.sql` on `parser_d34.ttl` (the sample graph with Chinese
+/// predicate names; the file ends without a newline), expected
+/// `parser_r34.txt` / `parser_r35.txt` (pretty-printed there).
+#[test]
+fn upstream_parser_test_q34_q35() {
+    let data = SOCIAL
+        .replace("<focus>", "<关注>")
+        .replace("<dislike>", "<不喜欢>")
+        .replace("<like>", "<喜欢>");
+    let mut db = Database::build_from_str("parser_d34", data.trim_end()).unwrap();
+    assert_eq!(
+        json(
+            &mut db,
+            "select (shortestPathLen(<Francis>, ?x, true, {<喜欢>, <关注>}) as ?y)\nwhere\n{\n\t\
+             <Bob> ?pred ?x .\n\tMINUS { <Francis> <不喜欢> ?x . }\n}"
+        ),
+        r#"{"paths":[{"src":"<Francis>","dst":"<Alice>","length":3}]}"#
+    );
+    assert_eq!(
+        json(
+            &mut db,
+            "SELECT (kHopReachable(<Francis>, ?x, true, -1, {<喜欢>, <关注>}) AS ?y)\nWHERE\n{\n\t\
+             <Bob> ?pred ?x .\n\tMINUS { <Francis> <不喜欢> ?x . }\n}"
+        ),
+        r#"{"paths":[{"src":"<Francis>","dst":"<Alice>","value":"true"}]}"#
+    );
 }
 
 #[test]
@@ -1036,6 +1069,35 @@ fn constants_unknown_iris_and_literal_bindings() {
     );
 }
 
+/// A vertex variable that is unbound in every solution gives upstream's
+/// never-entered loop: no entry (`false` for cycleBoolean) — also for
+/// clusterCoeff, whose omitted vertex would mean the global coefficient.
+#[test]
+fn unbound_vertex_variables_give_no_entries() {
+    let mut db = social();
+    let where_clause = "WHERE { <Bob> <focus> ?x OPTIONAL { ?x <nope> ?z } }";
+    for f in [
+        "clusterCoeff(?z, false, {})",
+        "bfsCount(?z, true, {})",
+        "shortestPath(<Alice>, ?z, true, {})",
+        "shortestPath(?x, ?z, true, {})",
+    ] {
+        assert_eq!(
+            json(&mut db, &format!("SELECT ({f} AS ?c) {where_clause}")),
+            EMPTY,
+            "{f}"
+        );
+    }
+    let cell = only_cell(
+        &mut db,
+        &format!("SELECT (cycleBoolean(?z, <Carol>, true, {{}}) AS ?c) {where_clause}"),
+    );
+    assert_eq!(term(&cell), Some(Term::typed_literal("false", XSD_BOOLEAN)));
+    // With the vertex omitted, clusterCoeff is the global coefficient.
+    let global = json(&mut db, &format!("SELECT (clusterCoeff(false, {{}}) AS ?c) {where_clause}"));
+    assert!(global.starts_with(r#"{"paths":[0."#), "{global}");
+}
+
 #[test]
 fn graph_functions_in_sub_selects() {
     let mut db = social();
@@ -1148,6 +1210,23 @@ fn rs_legacy_functions_work_anywhere() {
         term(&rs.rows[0][0]).unwrap(),
         Term::typed_literal("2", format!("{XSD}integer"))
     );
+    // The bare SIMILARITY is upstream's Jaro similarity of the term strings
+    // (quotes included); the legacy one compares the lexical forms.
+    // ("martha"/"marhta": Jaro 17/18 on the bare strings.)
+    let upstream = gfun::metrics::jaro_similarity("\"martha\"", "\"marhta\"");
+    let legacy = 17.0 / 18.0;
+    assert!((upstream - legacy).abs() > 1e-3);
+    for (f, want) in [("SIMILARITY", upstream), ("rs:SIMILARITY", legacy)] {
+        let cell = only_cell(
+            &mut db,
+            &format!("SELECT ({f}(\"martha\", \"marhta\") AS ?s) WHERE {{}}"),
+        );
+        let Some(Term::Literal { value, .. }) = term(&cell) else {
+            panic!("{cell:?}")
+        };
+        let got: f64 = value.parse().unwrap();
+        assert!((got - want).abs() < 1e-6, "{f}: {got} vs {want}");
+    }
     // A query's own PREFIX rs: replaces the predeclared one.
     let e = query_err(
         &mut db,

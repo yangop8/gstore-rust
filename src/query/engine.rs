@@ -32,9 +32,11 @@
 //!   literal is passed as an edge-less vertex, as upstream passes its literal
 //!   id); a constant IRI is one vertex (unknown → upstream's `INVALID` id,
 //!   [`GNode::MISSING`]). Two vertex arguments are evaluated over the
-//!   cross product of their distinct values. The `predSet` resolves against
-//!   the dictionary (`{}` = every predicate, `!<p>` = every predicate but
-//!   these, unknown IRIs dropped).
+//!   cross product of their distinct values; a vertex variable without any
+//!   usable value gives no entry (`{"paths":[]}`, `false` for
+//!   `cycleBoolean`), as upstream's loop never runs. The `predSet` resolves
+//!   against the dictionary (`{}` = every predicate, `!<p>` = every
+//!   predicate but these, unknown IRIs dropped).
 //! * **Row shape** (GE:1508-2050, GE:2546-3108). A lone projected function
 //!   yields exactly one row computed over all solutions; next to other
 //!   projections there is one row per solution and the function's value is
@@ -81,7 +83,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use regex::Regex;
 
 use crate::analytics::csr::CsrGraph;
-use crate::analytics::gfun::{self, GCall, GFunCtx, GFunValue, GNode};
+use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
@@ -862,7 +864,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(VarOrIri::Var(v)) => self.distinct_gfn_nodes(v, sols, layout, &csr),
             }
         };
-        let mut args = call.to_gargs(nodes(&call.src), nodes(&call.dst), self.dict);
+        let (srcs, dsts) = (nodes(&call.src), nodes(&call.dst));
+        // A vertex argument whose variable has no usable binding: upstream's
+        // `for uid … for vid …` loop never runs, leaving `{"paths":[]}`
+        // (`false` for cycleBoolean). Decided here because the library reads
+        // an empty `srcs` as "no source given" (clusterCoeff's global form).
+        if (call.src.is_some() && srcs.is_empty()) || (call.dst.is_some() && dsts.is_empty()) {
+            let value = match call.kind {
+                GFnKind::CycleBoolean => Value::Bool(false),
+                _ => Value::Str {
+                    value: r#"{"paths":[]}"#.into(),
+                    lang: None,
+                },
+            };
+            return Ok(Some(self.value_to_id(&value)));
+        }
+        let mut args = call.to_gargs(srcs, dsts, self.dict);
         args.where_empty = constant;
         let mut ctx = GFunCtx::new(&csr, self.dict);
         if let Some(flag) = &self.cancel {
