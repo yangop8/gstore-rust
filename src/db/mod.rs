@@ -2221,7 +2221,11 @@ impl Database {
 
     /// Retract the triples of ledger `lines` (see
     /// [`crate::reason::manage`]) as one `DELETE DATA` through the update
-    /// path. Returns how many were removed.
+    /// path. Returns how many were removed. The opt-in statement log
+    /// (`update.log`) records that `DELETE DATA` text; a blank node in it is
+    /// written as its stored label, which SPARQL does not accept in `DELETE
+    /// DATA`, so replaying such a record fails (the triple-level redo log is
+    /// unaffected).
     pub(crate) fn reason_retract(
         &mut self,
         lines: &[String],
