@@ -406,6 +406,14 @@ impl Database {
         self.csr_cache.peek(self.mutations).is_some()
     }
 
+    /// A view of [`csr_is_cached`](Self::csr_is_cached) that can be read
+    /// without access to the database — so without waiting for whoever
+    /// holds it (a server's `show` reads it while a statement runs). A write
+    /// clears it; it reads `false` once the database is dropped.
+    pub fn csr_status(&self) -> crate::analytics::csr::CsrStatus {
+        self.csr_cache.status()
+    }
+
     /// The cached CSR if it is current for the data (never builds) — lets a
     /// read snapshot of this database share it instead of rebuilding.
     pub fn cached_csr(&self) -> Option<std::sync::Arc<CsrGraph>> {
@@ -1011,8 +1019,12 @@ impl Database {
 
     /// Like [`query`](Self::query) but cooperatively cancellable: when `cancel`
     /// flips to `true` (from another thread), an in-flight read aborts at the next
-    /// pattern/phase boundary with [`GStoreError::Cancelled`]. Updates ignore the
-    /// flag. Mirrors gStore's task cancellation.
+    /// pattern/phase boundary with [`GStoreError::Cancelled`]. So does the
+    /// WHERE clause of an UPDATE's `DELETE`/`INSERT … WHERE` (which may call a
+    /// graph function in a sub-SELECT): it is evaluated before anything is
+    /// applied, so a cancelled operation changes nothing — operations of the
+    /// same request before it stay applied, as after any failure. Mirrors
+    /// gStore's task cancellation.
     ///
     /// The multi-database [`ApiServer`](crate::http_api::ApiServer) runs each
     /// connection on its own worker thread and executes queries without its
@@ -1097,7 +1109,7 @@ impl Database {
                 let before = self.mutations;
                 let mut changed = 0;
                 for op in ops {
-                    match self.exec_update_op(op) {
+                    match self.exec_update_op(op, cancel.as_ref()) {
                         Ok(n) => changed += n,
                         Err(e) => return Err(self.failed_update(e, before)),
                     }
@@ -1137,7 +1149,12 @@ impl Database {
     }
 
     /// Apply one UPDATE operation, returning the number of triples it changed.
-    fn exec_update_op(&mut self, op: UpdateOp) -> Result<usize> {
+    /// A `DELETE`/`INSERT … WHERE` evaluates its WHERE clause under `cancel`.
+    fn exec_update_op(
+        &mut self,
+        op: UpdateOp,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
         match op {
             UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
@@ -1152,8 +1169,9 @@ impl Database {
                 // Compute the ground delete/insert quads against the *current*
                 // data, then apply deletes before inserts (SPARQL semantics).
                 // `modify_changes` evaluates the WHERE clause under this
-                // database's `SERVICE` policy: a refused `SERVICE` fails the
-                // update before anything is applied.
+                // database's `SERVICE` policy and the request's cancel flag:
+                // a refused `SERVICE` or a cancel fails the update before
+                // anything is applied.
                 let (dels, ins) = self.modify_changes(
                     &delete,
                     &insert,
@@ -1161,6 +1179,7 @@ impl Database {
                     with.as_deref(),
                     &using,
                     &using_named,
+                    cancel,
                 )?;
                 // A template triple outside `GRAPH { … }` targets the WITH
                 // graph, else the default graph.
@@ -1400,7 +1419,10 @@ impl Database {
     /// * otherwise with `WITH <g>`: the default graph is `<g>` (empty if it
     ///   does not exist) and every named graph is visible to `GRAPH`;
     /// * otherwise the store's default graph and all named graphs.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// The WHERE clause runs under `cancel` (the request's cancel flag), as
+    /// a read query does.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn modify_changes(
         &self,
         delete: &[QuadPattern],
@@ -1409,21 +1431,31 @@ impl Database {
         with: Option<&str>,
         using: &[String],
         using_named: &[String],
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
         let graph = |iri: &str| {
             self.dict
                 .entity_id(&Term::iri(iri).dict_key())
                 .and_then(|gid| self.named.get(&gid).map(|s| (gid, s)))
         };
-        fn prepare<'e, S: TripleSource>(db: &Database, eval: Evaluator<'e, S>) -> Evaluator<'e, S> {
+        fn prepare<'e, S: TripleSource>(
+            db: &Database,
+            eval: Evaluator<'e, S>,
+            cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        ) -> Evaluator<'e, S> {
             // IRI function calls in the WHERE clause reach the user-defined
             // functions, as in read queries; `SERVICE` follows the load
-            // policy (refused on a server's restricted policy), as in reads.
-            let eval = eval
+            // policy (refused on a server's restricted policy), as in reads;
+            // and the request's cancel flag stops it (a graph function in a
+            // sub-SELECT included), as in reads.
+            let mut eval = eval
                 .with_service_allowed(db.load_policy.allow_remote)
                 .with_integer_division(db.integer_division)
                 .with_topk_options(db.topk)
                 .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
+            if let Some(c) = cancel {
+                eval = eval.with_cancel(std::sync::Arc::clone(c));
+            }
             if db.functions.is_empty() {
                 eval
             } else {
@@ -1443,17 +1475,19 @@ impl Database {
                 .iter()
                 .filter_map(|iri| graph(iri).map(|(gid, s)| (gid, s.clone())))
                 .collect();
-            let eval = prepare(self, Evaluator::new(&self.dict, &merged)).with_named(&named);
+            let eval =
+                prepare(self, Evaluator::new(&self.dict, &merged), cancel).with_named(&named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         if let Some(w) = with {
             let empty = TripleStore::new();
             let store = graph(w).map_or(&empty, |(_, s)| s);
-            let eval = prepare(self, Evaluator::new(&self.dict, store)).with_named(&self.named);
+            let eval =
+                prepare(self, Evaluator::new(&self.dict, store), cancel).with_named(&self.named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         let csr = || self.csr();
-        let eval = prepare(self, Evaluator::new(&self.dict, &self.store))
+        let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel)
             .with_named(&self.named)
             .with_csr_provider(&csr);
         eval.eval_update_modify(delete, insert, pattern)
@@ -2329,6 +2363,64 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gstore_ut_{tag}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// An UPDATE's WHERE clause runs under the request's cancel flag, like a
+    /// read: a graph function in a sub-SELECT there (which may run for as
+    /// long as its `maxIter` says) is stopped by it, and a cancelled update
+    /// applies nothing — whichever dataset (`WITH`, `USING`, default) the
+    /// WHERE clause matches.
+    #[test]
+    fn updates_honour_the_cancel_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut db = Database::build_from_str("t", "").unwrap();
+        db.query(
+            "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> . \
+             <http://ex/b> <http://ex/p> <http://ex/c> . <http://ex/c> <http://ex/p> <http://ex/a> . \
+             GRAPH <http://ex/g> { <http://ex/a> <http://ex/p> <http://ex/b> } }",
+        )
+        .unwrap();
+        let before = db.mutation_count();
+        let sub = |iters: &str| {
+            format!(
+                "{{ SELECT (PR(true, {{}}, 3, alpha=0.85, maxIter={iters}, tol=-1) AS ?r) WHERE {{}} }}"
+            )
+        };
+        let forms = |iters: &str| {
+            let s = sub(iters);
+            [
+                format!("INSERT {{ <http://ex/x> <http://ex/pr> ?r }} WHERE {{ {s} }}"),
+                format!("WITH <http://ex/g> INSERT {{ <http://ex/x> <http://ex/pr> ?r }} WHERE {{ {s} }}"),
+                format!(
+                    "INSERT {{ <http://ex/x> <http://ex/pr> ?r }} USING <http://ex/g> WHERE {{ {s} }}"
+                ),
+                format!("DELETE {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o {s} }}"),
+            ]
+        };
+        // Flag already up: refused before anything is applied.
+        for u in forms("5") {
+            let r = db.query_cancellable(&u, Arc::new(AtomicBool::new(true)));
+            assert!(matches!(r, Err(GStoreError::Cancelled)), "{u}: {r:?}");
+            assert_eq!(db.mutation_count(), before, "{u}");
+        }
+        // Raised while a never-converging PageRank runs in the WHERE clause.
+        let u = &forms("2000000000")[0];
+        let flag = Arc::new(AtomicBool::new(false));
+        let raise = Arc::clone(&flag);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            raise.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let r = db.query_cancellable(u, flag);
+        stopper.join().unwrap();
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert_eq!(db.mutation_count(), before);
+        // Without a cancel the same statements run.
+        let r = db.query(&forms("5")[0]).unwrap();
+        assert!(matches!(r, QueryResult::Update { changed: 1 }), "{r:?}");
     }
 
     #[test]

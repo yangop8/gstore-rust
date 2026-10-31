@@ -657,21 +657,29 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         self.check_cancel()?;
         self.check_calls(query)?;
-        match query {
-            Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
+        let result = match query {
+            Query::Select(s) => QueryResult::Select(self.eval_select(s)?),
             Query::Ask(a) => {
                 let layout = VarLayout::build(&a.pattern);
                 // Stops at the first solution (see `topk`).
-                let found = self.pattern_has_solution(&a.pattern, &layout);
-                self.check_cancel()?; // a mid-run cancel short-circuits to empty; report it
-                Ok(QueryResult::Ask(found))
+                QueryResult::Ask(self.pattern_has_solution(&a.pattern, &layout))
             }
-            Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
-            Query::Describe(d) => Ok(QueryResult::Construct(self.eval_describe(d)?)),
-            Query::Update(_) => Err(GStoreError::Query(
-                "updates must be applied through Database, not the read evaluator".into(),
-            )),
-        }
+            Query::Construct(c) => QueryResult::Construct(self.eval_construct(c)?),
+            Query::Describe(d) => QueryResult::Construct(self.eval_describe(d)?),
+            Query::Update(_) => {
+                return Err(GStoreError::Query(
+                    "updates must be applied through Database, not the read evaluator".into(),
+                ))
+            }
+        };
+        // A cancel (or a refused `SERVICE`) cuts every later pattern short to
+        // "no solution" — also one met after the WHERE clause, in a
+        // projected / ORDER BY / HAVING `EXISTS` — so a result computed while
+        // it was up may be wrong. Report it instead of answering (a cached
+        // wrong answer would outlive the request). The flag only ever goes
+        // up: if it is down here, it was down throughout.
+        self.check_cancel()?;
+        Ok(result)
     }
 
     /// Evaluate CONSTRUCT: instantiate the template once per solution, skipping

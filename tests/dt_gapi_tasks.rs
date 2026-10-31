@@ -940,6 +940,107 @@ fn shutdown_cancels_a_running_graph_function_query() {
     assert!(r.body.to_lowercase().contains("cancel"), "{} {}", r.status, r.body);
 }
 
+/// An UPDATE whose WHERE clause runs that same graph function (in a
+/// sub-SELECT) is cancelled like a query — through `operationTaskCancel`,
+/// REST `/cancel`, and a shutdown past its grace period — applies nothing,
+/// and releases the database: neither the next request nor the shutdown's
+/// final save waits for the function to finish.
+#[test]
+fn an_update_running_a_graph_function_is_cancelled_like_a_query() {
+    let root = tmp_root("cancel_gfun_update");
+    let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+        .unwrap()
+        .with_check_point(false)
+        .with_shutdown_grace(Duration::from_millis(300));
+    let (srv, addr, serving) = serve(server);
+    build(&addr, "slow", &chain(300));
+    let update = "INSERT { <http://ex/x> <http://ex/pr> ?pr } WHERE { { SELECT (PR(true, {}, 3, \
+                  alpha=0.85, maxIter=2000000000, tol=-1) AS ?pr) WHERE {} } }";
+    let inserted = |addr: &SocketAddr| {
+        let j = api(
+            addr,
+            &[
+                ("operation", "query"),
+                ("db_name", "slow"),
+                ("sparql", "SELECT ?o WHERE { <http://ex/x> ?p ?o }"),
+            ],
+        );
+        assert_eq!(code(&j), 0, "{j}");
+        int(&j, "AnsNum") > 0
+    };
+
+    // A synchronous /api update, cancelled through operationTaskCancel.
+    let addr_q = addr;
+    let query = thread::spawn(move || {
+        api(
+            &addr_q,
+            &[
+                ("operation", "query"),
+                ("db_name", "slow"),
+                ("sparql", update),
+            ],
+        )
+    });
+    let opt_id = wait_running_query(&addr);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(code(&j), 0, "{j}");
+    let answer = query.join().unwrap();
+    assert_ne!(code(&answer), 0, "the cancelled update fails: {answer}");
+    assert!(msg(&answer).to_lowercase().contains("cancel"), "{answer}");
+    assert!(!inserted(&addr), "a cancelled update applies nothing");
+
+    // A REST update, cancelled through REST /cancel.
+    let addr_q = addr;
+    let query = thread::spawn(move || rest(&addr_q, "POST", "/update?db_name=slow", update));
+    let opt_id = wait_running_query(&addr);
+    let r = rest(&addr, "POST", &format!("/cancel?id={opt_id}"), "");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = query.join().unwrap();
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.to_lowercase().contains("cancel"), "{}", r.body);
+    assert!(!inserted(&addr));
+
+    // A graceful shutdown with the database dirty (check_point off) and
+    // the update still running: it is cancelled, and the final save runs.
+    let j = api(
+        &addr,
+        &[
+            ("operation", "query"),
+            ("db_name", "slow"),
+            (
+                "sparql",
+                "INSERT DATA { <http://ex/y> <http://ex/p> <http://ex/z> }",
+            ),
+        ],
+    );
+    assert_eq!(code(&j), 0, "{j}");
+    let addr_q = addr;
+    let query = thread::spawn(move || rest(&addr_q, "POST", "/update?db_name=slow", update));
+    wait_running_query(&addr);
+    let started = Instant::now();
+    srv.shutdown();
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        serving.join().unwrap();
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+        "the shutdown never finished: the update kept the database locked"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let r = query.join().unwrap();
+    assert!(
+        r.body.to_lowercase().contains("cancel"),
+        "{} {}",
+        r.status,
+        r.body
+    );
+}
+
 /// Graph functions stay within the server's output bound (`conf.ini`
 /// `[query] gfun_max_output_bytes`): a call whose JSON would exceed it fails
 /// the query with an error instead of building it, and the server goes on

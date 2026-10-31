@@ -796,6 +796,23 @@ fn query_output_formats() {
         r#"[["<http://ex/b>"]]"#
     );
     assert_eq!(n(&j, "AnsNum"), 1);
+    // A literal is printed as upstream stores it, its lexical form between
+    // quotes unescaped: stripping the quotes off a graph function's value
+    // gives its JSON.
+    let j = q(
+        "n-triple",
+        "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {}) AS ?y) WHERE {}",
+    );
+    assert_eq!(code(&j), 0, "{j}");
+    let cell = j.get("results").unwrap().as_array().unwrap()[0]
+        .as_array()
+        .unwrap()[0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let value = json::parse(&cell[1..cell.len() - 1])
+        .unwrap_or_else(|e| panic!("{cell} is not a quoted JSON value: {e:?}"));
+    assert!(value.get("paths").is_some(), "{cell}");
     // file: the JSON result goes to <root>/export/<FileName>.
     let j = q("file", sel);
     assert_eq!(code(&j), 0, "{j}");

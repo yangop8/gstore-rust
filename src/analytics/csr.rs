@@ -57,6 +57,7 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::dict::Dictionary;
@@ -757,6 +758,28 @@ impl CsrGraph {
 #[derive(Default)]
 pub struct CsrCache {
     slot: Mutex<Option<(u64, Arc<CsrGraph>)>>,
+    /// Whether `slot` holds a graph, readable without its lock (which a
+    /// build holds) — see [`status`](Self::status).
+    built: CsrStatus,
+}
+
+/// Whether a [`CsrCache`] holds a graph, readable without waiting — not
+/// for a build in progress, nor for whoever holds the owner (e.g. a server's
+/// per-database lock, held while a statement runs). A clone shares the
+/// state; it reads `false` once the cache is dropped.
+#[derive(Debug, Clone, Default)]
+pub struct CsrStatus(Arc<AtomicBool>);
+
+impl CsrStatus {
+    /// Whether the cache holds a graph (as of the last completed build or
+    /// clear; `false` while one is being rebuilt).
+    pub fn is_built(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, built: bool) {
+        self.0.store(built, Ordering::Release);
+    }
 }
 
 impl fmt::Debug for CsrCache {
@@ -779,9 +802,20 @@ impl CsrCache {
     /// read snapshot reusing the CSR its source database had cached for the
     /// same data.
     pub fn seeded(generation: u64, graph: Arc<CsrGraph>) -> CsrCache {
+        let built = CsrStatus::default();
+        built.set(true);
         CsrCache {
             slot: Mutex::new(Some((generation, graph))),
+            built,
         }
+    }
+
+    /// A lock-free view of whether this cache holds a graph (see
+    /// [`CsrStatus`]). For a cache keyed by a counter that is cleared
+    /// whenever the counter advances — [`Database`](crate::Database)'s —
+    /// that is whether a graph for the current generation is cached.
+    pub fn status(&self) -> CsrStatus {
+        self.built.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<(u64, Arc<CsrGraph>)>> {
@@ -806,8 +840,10 @@ impl CsrCache {
             }
         }
         *slot = None;
+        self.built.set(false);
         let g = Arc::new(build()?);
         *slot = Some((generation, Arc::clone(&g)));
+        self.built.set(true);
         Ok(g)
     }
 
@@ -826,7 +862,16 @@ impl CsrCache {
 
     /// Drop the cached graph.
     pub fn clear(&self) {
-        *self.lock() = None;
+        let mut slot = self.lock();
+        *slot = None;
+        self.built.set(false);
+    }
+}
+
+impl Drop for CsrCache {
+    fn drop(&mut self) {
+        // A status kept by someone else must not report a dropped graph.
+        self.built.set(false);
     }
 }
 

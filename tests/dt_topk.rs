@@ -829,6 +829,29 @@ fn cancellation_is_reported_on_every_path() {
     }
 }
 
+/// A cancel that lands after the WHERE clause — while projecting, ordering
+/// by an expression, aggregating or testing HAVING — still fails the query.
+/// An `EXISTS` evaluated after the flag is up finds nothing, so answering
+/// `Ok` would hand out wrong values (and the query cache would keep them).
+#[test]
+fn a_cancel_after_the_where_clause_is_reported_not_answered() {
+    let data = stars(4, 4);
+    for q in [
+        "SELECT ?h (STOP() AS ?s) (EXISTS { ?h :a ?x } AS ?e) WHERE { ?h :type :Hub }",
+        "SELECT ?h (STOP() AS ?s) (EXISTS { ?h :a ?x } AS ?e) WHERE { ?h :type :Hub } ORDER BY ?h LIMIT 3",
+        "SELECT ?h (EXISTS { ?h :a ?x } AS ?e) WHERE { ?h :type :Hub } ORDER BY (STOP()) ?h",
+        "SELECT ?h (COUNT(*) AS ?n) WHERE { ?h :a ?x } GROUP BY ?h HAVING (STOP() && EXISTS { ?h :b ?y })",
+        "SELECT ?h (SAMPLE(STOP()) AS ?s) (COUNT(*) AS ?n) WHERE { ?h :a ?x } GROUP BY ?h \
+         HAVING (EXISTS { ?h :b ?y })",
+        "SELECT (STOP() AS ?s) (NOT EXISTS { ?h :a ?x } AS ?e) WHERE { ?h :type :Hub } LIMIT 3",
+    ] {
+        for opts in [TopKOptions::ALL, FORCE_DPB, HEAP_ONLY, TopKOptions::NONE] {
+            let r = cancelling(&data, q, opts);
+            assert!(matches!(r, Err(GStoreError::Cancelled)), "{q}: {r:?}");
+        }
+    }
+}
+
 /// The database-level switch ([`gstore::Database::set_topk_options`]): it
 /// reaches the database's queries (same rows either way) and clears the
 /// query cache, so the next query really runs with the new options.

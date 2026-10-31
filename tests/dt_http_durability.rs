@@ -303,6 +303,51 @@ fn single_server_shutdown_wait_is_bounded() {
     );
 }
 
+/// A query still running when the grace period ends — here a graph function
+/// that would run for minutes — is cancelled, so a shutdown with unsaved
+/// changes (check_point off) still takes the database lock, saves them and
+/// returns.
+#[test]
+fn single_server_shutdown_cancels_a_running_query_and_saves() {
+    let dir = tmp_dir("single_cancel");
+    let server = Arc::new(
+        Server::bind(Database::build_from_str("b", DATA).unwrap(), "127.0.0.1:0")
+            .unwrap()
+            .with_db_dir(&dir)
+            .with_check_point(false)
+            .with_shutdown_grace(Duration::from_millis(300)),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+    let (s, b) = request(&addr, "POST", "/update", None, NEW_TRIPLE);
+    assert_eq!(s, 200, "{b}");
+    let slow = thread::spawn(move || {
+        request(
+            &addr,
+            "POST",
+            "/sparql",
+            None,
+            "SELECT (PR(true, {}, 3, alpha=0.85, maxIter=2000000000, tol=-1) AS ?r) WHERE {}",
+        )
+    });
+    thread::sleep(Duration::from_millis(500));
+    server.shutdown();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done_tx.send(serving.join().unwrap());
+    });
+    let report = done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the shutdown never finished: the running query kept the database locked");
+    assert!(!report.drained, "{report:?}");
+    assert_eq!(report.saved, vec![dir.clone()], "{report:?}");
+    assert!(on_disk_has_new_triple(&dir));
+    let (s, b) = slow.join().unwrap();
+    assert_eq!(s, 400, "{b}");
+    assert!(b.to_lowercase().contains("cancel"), "{b}");
+}
+
 // ---- multi-database ApiServer ----------------------------------------------
 
 struct Api {

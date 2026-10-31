@@ -57,6 +57,7 @@ use super::fmt::{
     cxx_g, cxx_g_f32, cxx_int_id, cxx_to_string, f32_round, paths_json, push_json_quoted,
     push_vert_list_json, JsonList,
 };
+use super::output_bound_exceeded;
 use super::traverse::{for_each_nbr, NbrOrder, NodeMarks};
 use super::{CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, Node, PredFilter};
 use crate::error::{GStoreError, Result};
@@ -77,6 +78,50 @@ pub const LABEL_PROP_SEED: u32 = 114_514;
 /// summed once per sweep and added to every vertex (mathematically equal,
 /// may differ from upstream in the last bits of the floating-point sums).
 pub const PR_EXACT_DANGLING_WORK: usize = 1 << 26;
+
+/// A metric function's output list, bounded while it is built: the call
+/// fails as soon as its entries pass [`GFunCtx::max_output_bytes`] (by at
+/// most the entry that crossed it), never after building an output of any
+/// size — `PPR` and `JaccardSimilarity` write up to `retNum` entries per
+/// distinct source, quadratic in the vertex count.
+struct BoundedList {
+    list: JsonList,
+    kind: GFnKind,
+    max_bytes: usize,
+}
+
+impl BoundedList {
+    fn new(ctx: &GFunCtx<'_>, kind: GFnKind) -> BoundedList {
+        BoundedList {
+            list: JsonList::new(),
+            kind,
+            max_bytes: ctx.max_output_bytes(),
+        }
+    }
+
+    /// `Err` once the elements written so far are over the bound.
+    fn check(&self) -> Result<()> {
+        if self.list.as_str().len() > self.max_bytes {
+            Err(output_bound_exceeded(self.kind, self.max_bytes))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Start the next element ([`JsonList::item`]), or fail if the list is
+    /// already over the bound.
+    fn item(&mut self) -> Result<&mut String> {
+        self.check()?;
+        Ok(self.list.item())
+    }
+
+    /// The finished `{"paths":[…]}` ([`JsonList::into_paths`]), or the
+    /// bound's error.
+    fn into_paths(self) -> Result<String> {
+        self.check()?;
+        Ok(self.list.into_paths())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // small shared helpers
@@ -201,7 +246,7 @@ pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             "PPR: retNum must not be negative (got {ret_num})"
         )));
     }
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::Ppr);
     let mut session = None;
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -214,7 +259,7 @@ pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             let session = session.get_or_insert_with(|| ppr::Session::new(ctx.csr, &a.preds));
             ppr::ssppr(ctx, session, &src, &a.preds, ret_num as usize, k)?
         };
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, ctx.gnode_str(&src));
         e.push_str(",\"results\":[");
@@ -230,7 +275,7 @@ pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         }
         e.push_str("]}");
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -333,16 +378,16 @@ pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         cxx_sort_by(&mut idx2val, |l, r| l.1 > r.1);
         idx2val.truncate(ret_num as usize);
     }
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::Pr);
     for (v, x) in idx2val {
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, node_name(ctx, v));
         e.push_str(",\"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +482,7 @@ fn triangle_count(ctx: &GFunCtx<'_>, f: &PredFilter, directed: bool) -> Result<i
 /// `"result":0.500000`.
 pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let g = ctx.csr;
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::ClosenessCentrality);
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         let (mut cnt, mut sum) = (1i32, 0i32);
@@ -461,14 +506,14 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         if x.is_nan() {
             x = -f64::NAN; // x86-64 default NaN of 0.0/0.0
         }
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, ctx.gnode_str(&src));
         e.push_str(",\"result\":");
         e.push_str(&cxx_to_string(x));
         e.push('}');
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +555,7 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// and which resolve to nothing, giving 0; over the data's own predicates,
 /// `{}`, the value is the doc's 6.5).
 pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::BetweennessCentrality);
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         if src.is_missing() {
@@ -520,14 +565,14 @@ pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue>
             Some(u) => betweenness_value(ctx, &a.preds, u, a.directed)?,
             None => 0.0,
         };
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, ctx.gnode_str(&src));
         e.push_str(", \"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 fn betweenness_value(ctx: &GFunCtx<'_>, f: &PredFilter, id: Node, directed: bool) -> Result<f64> {
@@ -722,27 +767,27 @@ pub fn cluster_coeff(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let x = global_cluster_coeff(ctx, &a.preds)?;
         return Ok(GFunValue::Json(paths_json(&cxx_to_string(x))));
     }
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::ClusterCoeff);
     let mut done_once = false;
     for src in srcs {
         ctx.check_cancel()?;
         if src.is_missing() {
             if !done_once {
                 let x = global_cluster_coeff(ctx, &a.preds)?;
-                out.item().push_str(&cxx_to_string(x));
+                out.item()?.push_str(&cxx_to_string(x));
                 done_once = true;
             }
             continue;
         }
         let x = local_cluster_coeff(ctx.csr, &a.preds, src.node, a.directed);
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, ctx.gnode_str(&src));
         e.push_str(",\"result\":");
         e.push_str(&cxx_to_string(x));
         e.push('}');
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 fn global_cluster_coeff(ctx: &GFunCtx<'_>, f: &PredFilter) -> Result<f64> {
@@ -978,11 +1023,11 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             r.push(g.entity_of(vid as Node));
         }
     }
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::LabelProp);
     for r in &res {
-        push_vert_list_json(out.item(), ctx, r);
+        push_vert_list_json(out.item()?, ctx, r);
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,11 +1091,11 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             res[comp[v as usize] as usize].push(e);
         }
     }
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::Wcc);
     for r in &res {
-        push_vert_list_json(out.item(), ctx, r);
+        push_vert_list_json(out.item()?, ctx, r);
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,14 +1373,14 @@ fn louvain_communities(
 pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
     let r = a.ret_num_or(10);
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::JaccardSimilarity);
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         let Some(u) = src.node else {
             continue; // missing: wrapper returns; isolated: N(u) is empty
         };
         for (v, js) in jaccard(ctx, &a.preds, u, k, r)? {
-            let e = out.item();
+            let e = out.item()?;
             e.push_str("{\"dst\":");
             e.push_str(node_name(ctx, v));
             e.push_str(", \"value\":");
@@ -1343,7 +1388,7 @@ pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             e.push('}');
         }
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 /// Upstream's candidate list order: each candidate is binary-inserted into a
@@ -1535,7 +1580,7 @@ fn k_hop_neighbor(
 /// `{"paths":[{"src":"<Alice>", "result":0.0429273}]}`.
 pub fn degree_correlation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
-    let mut out = JsonList::new();
+    let mut out = BoundedList::new(ctx, GFnKind::DegreeCorrelation);
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         if src.is_missing() {
@@ -1545,14 +1590,14 @@ pub fn degree_correlation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             Some(u) if !a.preds.is_empty() => degree_correlation_value(ctx.csr, &a.preds, u, k),
             _ => 0.0,
         };
-        let e = out.item();
+        let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, ctx.gnode_str(&src));
         e.push_str(", \"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
     }
-    Ok(GFunValue::Json(out.into_paths()))
+    Ok(GFunValue::Json(out.into_paths()?))
 }
 
 fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f64 {

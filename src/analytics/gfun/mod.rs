@@ -735,12 +735,23 @@ impl<'a> GFunCtx<'a> {
 // dispatch
 // ---------------------------------------------------------------------------
 
+/// The error of a call whose output passed `max_bytes`
+/// ([`GFunCtx::max_output_bytes`]).
+pub(crate) fn output_bound_exceeded(kind: GFnKind, max_bytes: usize) -> GStoreError {
+    GStoreError::Query(format!(
+        "{}: more than {max_bytes} bytes of output; narrow the query",
+        kind.name()
+    ))
+}
+
 /// Evaluate `kind` over `ctx` with `args`, producing the full upstream output.
 ///
-/// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`]: the
-/// path family checks it while it streams its entries (failing before an
-/// unbounded enumeration is built), the others — whose output is at most a
-/// few values per vertex — are checked here once computed.
+/// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`] while
+/// it is built: the path family checks it as it streams its entries, the
+/// metric family's lists as they grow (`PPR` and `JaccardSimilarity` write
+/// up to `retNum` entries per source), so a call fails at the bound instead
+/// of building an output of any size first. A scalar or fixed-shape output
+/// is checked here once computed.
 pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue> {
     ctx.check_cancel()?;
     let value = match kind {
@@ -783,11 +794,7 @@ pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue>
         (&value, kind.family() == GFnFamily::Paths)
     {
         if text.len() > ctx.max_output_bytes() {
-            return Err(GStoreError::Query(format!(
-                "{}: more than {} bytes of output; narrow the query",
-                kind.name(),
-                ctx.max_output_bytes()
-            )));
+            return Err(output_bound_exceeded(kind, ctx.max_output_bytes()));
         }
     }
     Ok(value)

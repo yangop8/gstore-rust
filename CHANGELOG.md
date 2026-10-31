@@ -58,6 +58,35 @@ newest first.
   that the Phase 3 update forms (`ADD` / `MOVE` / `COPY`, `WITH`, `LOAD …
   INTO`, `INSERT DATA` with `[ … ]`) need the update privilege while
   graph-function SELECTs need only query.
+- **Fixed (integration review).**
+  - The WHERE clause of a `DELETE`/`INSERT … WHERE` now runs under the
+    request's cancel flag. A graph function in a sub-SELECT there used to
+    ignore `/cancel`, `operationTaskCancel` and shutdown, which kept the
+    database locked and hung a graceful shutdown. A cancelled update
+    applies nothing.
+  - A cancel that arrives after the WHERE clause (while projecting,
+    ordering or aggregating, e.g. in a projected `EXISTS`) now fails the
+    query. It used to answer with wrong values, which the query cache then
+    kept. A refused `SERVICE` there is also reported, instead of reading as
+    `false`.
+  - `PPR`, `JaccardSimilarity` and the other metric functions stop as soon
+    as their output passes `gfun_max_output_bytes`. They used to build the
+    whole (quadratic) output first.
+  - The single-database `gserver` cancels the statements still running
+    when the shutdown grace period ends, so the final save of unsaved
+    changes no longer waits for them.
+  - `/api` `show` reads `csr` without the database's lock, and
+    `refreshconf` no longer waits for busy databases: it swaps the
+    configuration first, and a busy database takes the new `[query]`
+    settings the next time it is used (the most recent ones win). A
+    database created by `/upload` gets the settings in effect when it is
+    registered.
+  - `load` reports `csr` as whether the CSR is built (`"1"`/`"0"`), as
+    upstream does. It used to echo the request.
+  - **Changed:** `format=n-triple` prints literals as upstream does, with
+    the lexical form unescaped between quotes, so a graph function's value
+    is its JSON once the quotes are stripped. `n-triple-file` keeps
+    upstream's escaped form.
 
 ### Phase 3: SPARQL 1.1 grammar and semantics
 

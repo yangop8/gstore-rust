@@ -427,6 +427,12 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
              {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
         ),
         format!("ASK {{ SERVICE <{url}> {{ ?x ?y ?z }} FILTER(?x IN (<http://ex/a>)) }}"),
+        // Past the WHERE clause: a projected / ORDER BY `EXISTS` is refused
+        // too, not answered as `false`.
+        format!("SELECT ?s (EXISTS {{ SERVICE <{url}> {{ ?x ?y ?z }} }} AS ?e) WHERE {{ ?s ?p ?o }}"),
+        format!(
+            "SELECT ?s WHERE {{ ?s ?p ?o }} ORDER BY (NOT EXISTS {{ SERVICE <{url}> {{ ?x ?y ?z }} }})"
+        ),
     ];
     for q in &more_queries {
         let (s, b) = api.root("POST", "/sparql?db_name=d", q);

@@ -501,6 +501,53 @@ fn build_show_load_monitor_schema_unload() {
         (code(&j), msg(&j).as_str()),
         (0, "CSR loaded successfully.")
     );
+    // `load` on a loaded database reports whether its CSR is built (as
+    // upstream's `db_info->getDatabase()->csr`), not the request's `csr`:
+    // built by loadcsr, dropped by a write, built again by a graph-function
+    // query.
+    let j = api(a, &[("operation", "load"), ("db_name", "lubm")]);
+    assert_eq!(msg(&j), "The database already load yet.");
+    assert_eq!(string(&j, "csr"), "1", "{j}");
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            (
+                "sparql",
+                "DELETE DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }",
+            ),
+        ],
+    );
+    ok(&j);
+    let j = api(a, &[("operation", "load"), ("db_name", "lubm")]);
+    assert_eq!(string(&j, "csr"), "0", "{j}");
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            (
+                "sparql",
+                "INSERT DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }",
+            ),
+        ],
+    );
+    ok(&j);
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            (
+                "sparql",
+                "SELECT (kHopReachable(<http://ex/a>, <http://ex/u>, true, 1, {}) AS ?r) WHERE {}",
+            ),
+        ],
+    );
+    ok(&j);
+    let j = api(a, &[("operation", "load"), ("db_name", "lubm")]);
+    assert_eq!(string(&j, "csr"), "1", "{j}");
     let j = api(a, &[("operation", "loadcsr"), ("db_name", "two")]);
     assert_eq!(
         (code(&j), msg(&j).as_str()),

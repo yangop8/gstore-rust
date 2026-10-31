@@ -48,7 +48,7 @@ use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
 use crate::http_api::{
-    may_restore_from, ApiInner, BusyGuard, DbHandle, DbSlot, OpError, OpErrorKind,
+    may_restore_from, ApiInner, BusyGuard, DbCell, DbHandle, DbSlot, OpError, OpErrorKind,
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
@@ -562,12 +562,11 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         if is_loaded {
             // Whether the database's CSR (the graph functions' adjacency, see
             // `loadcsr`) is built for its current data — upstream reports
-            // `csr != nullptr`. The slot is locked with the state lock
-            // released (as `monitor` does). Transactions are always available.
-            let csr = handles.get(&r.database).is_some_and(|h| {
-                let slot = locked(h);
-                !slot.retired && slot.db.csr_is_cached()
-            });
+            // `csr != nullptr`. Read without the database's lock, so the
+            // list never waits for a statement running on a database (as
+            // upstream's, which reads the pointer unlocked). Transactions
+            // are always available.
+            let csr = handles.get(&r.database).is_some_and(|h| h.csr.is_built());
             item.set("csr", csr);
             item.set("txn", true);
         }
@@ -609,13 +608,25 @@ fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
 
 /// `load` — open `db_name` (any layout: snapshot, on-disk, RocksDB) and serve
 /// it. `csr=1` (or `true`) also loads the CSR cache ([`load_csr`]); the
-/// answer's `csr` echoes it (`"1"` / `"0"`). Already loaded: `0 "The
+/// answer's `csr` is whether the CSR is built (`"1"` / `"0"`), as upstream's.
+/// Already loaded: `0 "The
 /// database already load yet."` (upstream's text). Unknown: `1005
 /// "database[<db>] does not exist."`.
 fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
     let csr = p.bool("csr", false);
-    let csr_field = if csr { "1" } else { "0" };
+    // The answer's `csr`: whether the database's CSR is built for its
+    // current data — by this request's `csr=1`, by `loadcsr` or by a
+    // graph-function query — as upstream reports `db_info->getDatabase()->csr`
+    // (default "0"). Read without the database's lock, as `show` does.
+    let csr_field = |ctx: &Ctx<'_>| {
+        let built = ctx.state().dbs.get(&db).is_some_and(|h| h.csr.is_built());
+        if built {
+            "1"
+        } else {
+            "0"
+        }
+    };
     let dir = {
         let mut st = ctx.state();
         if st.dbs.contains_key(&db) {
@@ -625,7 +636,7 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     return r;
                 }
             }
-            return GResp::success("The database already load yet.").with("csr", csr_field);
+            return GResp::success("The database already load yet.").with("csr", csr_field(ctx));
         }
         let dir = st.db_dir(&db);
         if !st.busy.contains(&db) && !dir.is_dir() {
@@ -662,7 +673,7 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             return r;
         }
     }
-    GResp::success("Database loaded successfully.").with("csr", csr_field)
+    GResp::success("Database loaded successfully.").with("csr", csr_field(ctx))
 }
 
 /// `loadcsr` — build the CSR of a loaded database ([`load_csr`]): `0 "CSR
@@ -759,7 +770,7 @@ struct Inspection {
 struct CachedStats {
     /// The slot it was computed for: a `Weak` keeps the slot's allocation
     /// alive, so a later slot can never be mistaken for this one.
-    slot: Weak<Mutex<DbSlot>>,
+    slot: Weak<DbCell>,
     /// [`Database::mutation_count`] at computation: any write invalidates.
     mutations: u64,
     classes: Arc<Vec<(String, u64)>>,

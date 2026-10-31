@@ -142,7 +142,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -535,10 +535,34 @@ pub(crate) struct DbSlot {
     /// still held this handle: the slot then holds an empty placeholder that
     /// must never be queried, written or saved (it would overwrite `dir`).
     pub(crate) retired: bool,
+    /// The [`ApiInner::settings_gen`] whose `[query]` settings the database
+    /// has (`0`: those it was opened with — see
+    /// [`ApiInner::sync_query_settings`]).
+    pub(crate) settings_gen: u64,
+}
+
+/// One loaded database's lock ([`DbSlot`], reached through `Deref`), with
+/// what may be read without taking it.
+pub(crate) struct DbCell {
+    slot: Mutex<DbSlot>,
+    /// Whether the database's CSR is built for its current data
+    /// ([`Database::csr_is_cached`]), readable while a statement, a CSR
+    /// build or a batch holds the lock — `show` reports it without waiting
+    /// for them, as upstream reads `db_ptr->csr` without a lock. It reads
+    /// `false` once the slot is retired (its database dropped).
+    pub(crate) csr: crate::analytics::csr::CsrStatus,
+}
+
+impl std::ops::Deref for DbCell {
+    type Target = Mutex<DbSlot>;
+
+    fn deref(&self) -> &Mutex<DbSlot> {
+        &self.slot
+    }
 }
 
 /// A shared handle to one loaded database.
-pub(crate) type DbHandle = Arc<Mutex<DbSlot>>;
+pub(crate) type DbHandle = Arc<DbCell>;
 
 impl DbSlot {
     /// A freshly loaded / built / created / restored database: clean when it
@@ -563,14 +587,18 @@ impl DbSlot {
         if dir.is_dir() && db.storage() != crate::StorageKind::RocksDb {
             let _ = db.hold_dir_lock(&dir);
         }
-        Arc::new(Mutex::new(DbSlot {
-            db,
-            dir,
-            dirty,
-            txn: None,
-            next_tid: 1,
-            retired: false,
-        }))
+        Arc::new(DbCell {
+            csr: db.csr_status(),
+            slot: Mutex::new(DbSlot {
+                db,
+                dir,
+                dirty,
+                txn: None,
+                next_tid: 1,
+                retired: false,
+                settings_gen: 0,
+            }),
+        })
     }
 
     /// Retire this slot (its database is being unloaded, dropped or replaced):
@@ -996,6 +1024,12 @@ pub(crate) struct ApiInner {
     /// This value's own `Arc` (set when serving starts), so an asynchronous
     /// operation can outlive the request that submitted it.
     self_ref: OnceLock<Weak<ApiInner>>,
+    /// Counts the `[query]` settings installed
+    /// ([`apply_query_settings`](Self::apply_query_settings)); advanced
+    /// with [`ApiState::query_settings`], under the state lock. A database
+    /// whose [`DbSlot::settings_gen`] lags takes the current settings the
+    /// next time it is used ([`sync_query_settings`](Self::sync_query_settings)).
+    settings_gen: AtomicU64,
 }
 
 impl ApiInner {
@@ -1035,6 +1069,11 @@ impl ApiInner {
         };
         let mut fresh = GStoreConfig::load(&path)?;
         fresh.db_home = current.db_home.clone();
+        let fresh = Arc::new(fresh);
+        // Nothing below waits for a database (a busy one takes the new
+        // `[query]` settings when next used), so the whole file is in effect
+        // when the request is answered.
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh);
         self.ipfilter
             .reconfigure(fresh.ip_allow_path.clone(), fresh.ip_deny_path.clone());
         {
@@ -1043,26 +1082,48 @@ impl ApiInner {
             st.gapi.license_type = fresh.licensetype.clone();
         }
         self.apply_query_settings(fresh.query_settings());
-        *self.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(fresh);
         Ok(true)
     }
 
     /// Install `settings` as the query-evaluation settings of every database
     /// this server serves: recorded for the databases it opens from now on
-    /// ([`DbSlot::handle`]) and applied to those already loaded — each slot
-    /// locked in turn with the state lock released (never both at once).
+    /// ([`DbSlot::handle`]) and applied to those already loaded. Never waits
+    /// for a database (nor holds the state lock while locking one): a
+    /// database busy with a statement, a CSR build or a batch takes them
+    /// the next time it is used ([`sync_query_settings`](Self::sync_query_settings)).
     pub(crate) fn apply_query_settings(&self, settings: QuerySettings) {
         let loaded: Vec<DbHandle> = {
             let mut st = locked(&self.state);
             st.query_settings = settings;
+            self.settings_gen.fetch_add(1, Ordering::SeqCst);
             st.dbs.values().map(Arc::clone).collect()
         };
         for h in loaded {
-            let mut slot = locked(&h);
-            if !slot.retired {
-                slot.db.apply_query_settings(&settings);
-            }
+            let mut slot = match h.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+            };
+            self.sync_query_settings(&mut slot);
         }
+    }
+
+    /// Bring a locked database's `[query]` settings up to date, if new ones
+    /// were installed since it got its own (a database that was busy then).
+    /// Called whenever a database is locked to run a statement or begin a
+    /// transaction. The settings are read now, under the state lock (which
+    /// a db-lock holder may take, see [`ApiState`]), so of two settings
+    /// installed one after the other the later one always wins.
+    pub(crate) fn sync_query_settings(&self, slot: &mut DbSlot) {
+        if slot.retired || slot.settings_gen == self.settings_gen.load(Ordering::SeqCst) {
+            return;
+        }
+        let (gen, settings) = {
+            let st = locked(&self.state);
+            (self.settings_gen.load(Ordering::SeqCst), st.query_settings)
+        };
+        slot.db.apply_query_settings(&settings);
+        slot.settings_gen = gen;
     }
 
     /// The directory `/backup` writes into and `/restore` reads from:
@@ -1246,6 +1307,7 @@ impl ApiServer {
                 system_password: new_system_password(),
                 tasks: TaskManager::default(),
                 self_ref: OnceLock::new(),
+                settings_gen: AtomicU64::new(0),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -1739,6 +1801,7 @@ impl ApiInner {
                 format!("database '{}' was unloaded while this request waited", job.name),
             ));
         }
+        self.sync_query_settings(&mut slot);
         if let Some(open) = &slot.txn {
             if job.is_update {
                 return Err(txn_conflict_err(&job.name, open.tid));
@@ -2405,8 +2468,6 @@ impl ApiInner {
         let format = upload_format(req);
         let content = req.body_str();
         let dir = st.db_dir(&name);
-        let policy = st.load_policy.clone();
-        let query = st.query_settings;
         Dispatch::Deferred(Box::new(move |inner| {
             let busy = loaded.is_none().then(|| BusyGuard {
                 inner,
@@ -2429,8 +2490,14 @@ impl ApiInner {
                         // A fresh database exists only in memory so far: dirty,
                         // so it is persisted even if nothing ends up inserted.
                         Ok(db) => {
-                            let h = DbSlot::handle(db, dir, fresh, &policy, &query);
-                            locked(&inner.state).dbs.insert(name.clone(), Arc::clone(&h));
+                            // The policy and settings in effect now, read
+                            // under the lock the slot is registered under:
+                            // ones installed while the body was parsed
+                            // reach it (`apply_query_settings`).
+                            let mut st = locked(&inner.state);
+                            let h =
+                                DbSlot::handle(db, dir, fresh, &st.load_policy, &st.query_settings);
+                            st.dbs.insert(name.clone(), Arc::clone(&h));
                             h
                         }
                         Err(e) => {
@@ -2761,6 +2828,7 @@ impl ApiInner {
         if self.closing.load(Ordering::SeqCst) {
             return Err(OpError::new(OpErrorKind::ShuttingDown, "the server is shutting down"));
         }
+        self.sync_query_settings(&mut slot);
         let snapshot = Arc::new(ReadSnapshot::capture(&slot.db));
         if let Err(e) = slot.db.begin() {
             return Err(OpError::new(OpErrorKind::Failed, format!("begin failed: {e}")));
@@ -2905,7 +2973,7 @@ impl ApiInner {
             self.register_task(&mut st, name, sparql, user)
         };
         let mut task = TaskGuard::new(self, task_id);
-        let out = Self::run_in_txn(dbh, name, tid, sparql, Some(cancel));
+        let out = self.run_in_txn(dbh, name, tid, sparql, Some(cancel));
         task.set_ok(out.is_ok());
         out
     }
@@ -2917,6 +2985,7 @@ impl ApiInner {
     /// statement either runs inside transaction `tid` or is refused, never
     /// applied outside it.
     pub(crate) fn run_in_txn(
+        &self,
         dbh: &DbHandle,
         name: &str,
         tid: u64,
@@ -2930,6 +2999,7 @@ impl ApiInner {
                 format!("transaction {tid} is not open on database '{name}'"),
             ));
         }
+        self.sync_query_settings(&mut slot);
         let before = slot.db.mutation_count();
         let result = match cancel {
             Some(cancel) => slot.db.query_cancellable(sparql, cancel),
@@ -5359,6 +5429,146 @@ mod tests {
         let (_, b) = rest("POST", "/sparql?db_name=one", div);
         assert!(b.contains("\"value\":\"3.5\""), "{b}");
         server.shutdown();
+    }
+
+    /// `show` and `refreshconf` never wait for a busy database (a long
+    /// query, CSR build or batch holds its lock): `show` reads the CSR state
+    /// without that lock, and `refreshconf` replaces the configuration at
+    /// once — the request handlers' copy, the `/api` limits and the
+    /// `[query]` settings of every idle database — while a busy database
+    /// takes the new `[query]` settings the next time it is used. Of two
+    /// settings installed while it was busy, the later one wins.
+    #[test]
+    fn show_and_refreshconf_do_not_wait_for_a_busy_database() {
+        use std::sync::mpsc;
+        let root = tmp_root("busy_slot");
+        fs::create_dir_all(&root).unwrap();
+        let conf = root.join("conf.ini");
+        let write_conf = |cache: usize, max_out: usize| {
+            fs::write(
+                &conf,
+                format!(
+                    "[server]\nmax_output_size={max_out}\nip_deny_path=off\n\
+                     [query]\nquery_cache_size={cache}\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_conf(1000, 111);
+        let server = Arc::new(
+            ApiServer::bind(&root, "root", "127.0.0.1:0")
+                .expect("bind")
+                .with_config(GStoreConfig::load(&conf).unwrap()),
+        );
+        let addr = server.local_addr().expect("addr");
+        let s2 = Arc::clone(&server);
+        std::thread::spawn(move || s2.serve_forever());
+        let auth = basic("root", "root");
+        let rest = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        // An /api request answered on another thread, or `None` if it does
+        // not answer within 10 s.
+        let api_within = |op: &str| {
+            let (tx, rx) = mpsc::channel();
+            let body = format!(r#"{{"username":"root","password":"root","operation":"{op}"}}"#);
+            std::thread::spawn(move || {
+                let _ =
+                    tx.send(split_status_body(&raw_request(&addr, "POST", "/api", None, &body)).1);
+            });
+            rx.recv_timeout(Duration::from_secs(10)).ok()
+        };
+        const DATA: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        assert_eq!(rest("/build?db_name=busy", DATA).0, 200);
+        assert_eq!(rest("/build?db_name=idle", DATA).0, 200);
+        // A graph-function query caches busy's CSR.
+        let (s, b) = rest(
+            "/sparql?db_name=busy",
+            "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {}) AS ?l) WHERE {}",
+        );
+        assert_eq!(s, 200, "{b}");
+        let handle =
+            |name: &str| Arc::clone(locked(&server.inner.state).dbs.get(name).expect("loaded"));
+        let cache_of = |h: &DbHandle| locked(h).db.query_settings().query_cache_bytes;
+        let old = locked(&handle("idle")).db.query_settings();
+        assert_eq!(old.query_cache_bytes, 1000);
+
+        // busy's lock is held, as by a running statement.
+        let busy = handle("busy");
+        let guard = locked(&busy);
+        let shown = api_within("show").expect("show waited for the busy database");
+        assert!(shown.contains("\"StatusCode\":0"), "{shown}");
+        let listed = crate::json::parse(&shown).unwrap();
+        let csr_of = |name: &str| {
+            listed
+                .get("ResponseBody")
+                .and_then(crate::json::Json::as_array)
+                .unwrap()
+                .iter()
+                .find(|d| d.get("database").and_then(crate::json::Json::as_str) == Some(name))
+                .and_then(|d| d.get("csr"))
+                .and_then(crate::json::Json::as_bool)
+                .expect(name)
+        };
+        assert!(csr_of("busy"), "busy's CSR is built: {shown}");
+        assert!(!csr_of("idle"), "{shown}");
+
+        // refreshconf answers, with the new file in effect everywhere but on
+        // the busy database's [query] settings.
+        write_conf(2000, 222);
+        let j = api_within("refreshconf").expect("refreshconf waited for the busy database");
+        assert!(j.contains("refreshing configuration success"), "{j}");
+        assert_eq!(server.inner.config().max_output_size, 222);
+        assert_eq!(locked(&server.inner.state).gapi.max_output_size, 222);
+        let installed = locked(&server.inner.state).query_settings;
+        assert_eq!(installed.query_cache_bytes, 2000);
+        assert_eq!(cache_of(&handle("idle")), 2000);
+        assert_eq!(guard.db.query_settings(), old);
+        // A second refresh while still busy: the later file wins.
+        write_conf(3000, 333);
+        let j = api_within("refreshconf").expect("refreshconf waited for the busy database");
+        assert!(j.contains("refreshing configuration success"), "{j}");
+        drop(guard);
+        let (s, b) = rest("/sparql?db_name=busy", "ASK { ?s ?p ?o }");
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(cache_of(&busy), 3000);
+        assert_eq!(cache_of(&handle("idle")), 3000);
+        server.shutdown();
+    }
+
+    /// A database an `/upload` creates gets the `[query]` settings in effect
+    /// when it is registered, also when new ones were installed while the
+    /// upload was parsed (after the request was dispatched).
+    #[test]
+    fn an_uploaded_database_gets_the_settings_installed_meanwhile() {
+        let root = tmp_root("upload_settings");
+        let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+            .expect("bind")
+            .with_query_settings(QuerySettings::default());
+        let body = "<http://ex/a> <http://ex/p> <http://ex/b> .\n";
+        let raw = format!(
+            "POST /upload?db_name=fresh&format=nt HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        let dispatched = {
+            let mut st = locked(&server.inner.state);
+            let root = Some("root".to_string());
+            server.inner.dispatch(&mut st, &req, root)
+        };
+        let Dispatch::Deferred(work) = dispatched else {
+            panic!("an upload runs deferred")
+        };
+        let new = QuerySettings {
+            query_cache_bytes: 0,
+            gfun_max_output_bytes: 777,
+            ..QuerySettings::default()
+        };
+        server.inner.apply_query_settings(new);
+        let resp = work(&server.inner);
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let h = Arc::clone(locked(&server.inner.state).dbs.get("fresh").expect("created"));
+        assert_eq!(locked(&h).db.query_settings(), new);
     }
 
     #[test]

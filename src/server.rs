@@ -275,6 +275,12 @@ struct ServerInner {
     /// an update still in flight when the shutdown's final save runs (or that
     /// only gets the lock afterwards) is never acknowledged and then lost.
     closing: AtomicBool,
+    /// Raised when a graceful shutdown's grace period ends with requests
+    /// still running: every statement runs under it
+    /// ([`Database::query_cancellable`]), so one still running then — a
+    /// graph function may run for as long as its `maxIter` says — stops at
+    /// its next check and releases the database for the final save.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -294,6 +300,7 @@ impl Server {
                 dir: None,
                 check_point: true,
                 closing: AtomicBool::new(false),
+                cancel: Arc::new(AtomicBool::new(false)),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -423,8 +430,8 @@ impl Server {
     /// connection does not block the others (the [`Database`] itself is still
     /// serialized behind its `Mutex`). On shutdown the listener is closed, idle
     /// kept-alive connections are closed, in-flight requests are given up to the
-    /// grace period to finish, unsaved changes are saved, and a
-    /// [`ShutdownReport`] is returned.
+    /// grace period to finish (statements still running then are cancelled),
+    /// unsaved changes are saved, and a [`ShutdownReport`] is returned.
     pub fn serve_forever(&self) -> ShutdownReport {
         let drained = run_accept_loop(&self.listener, &self.life, self.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
@@ -475,6 +482,11 @@ impl Server {
             ..ShutdownReport::default()
         };
         self.inner.closing.store(true, Ordering::SeqCst);
+        if !drained {
+            // Past the grace period: stop the statements still running, so
+            // the save below does not wait for them (see `cancel`).
+            self.inner.cancel.store(true, Ordering::SeqCst);
+        }
         if self.inner.dirty.load(Ordering::SeqCst) {
             let db = locked(&self.inner.db);
             // Re-checked under the lock: the update may have saved itself.
@@ -1670,7 +1682,7 @@ impl ServerInner {
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let mut db = locked(&self.db);
         let before = db.mutation_count();
-        let mut result = db.query(sparql);
+        let mut result = db.query_cancellable(sparql, Arc::clone(&self.cancel));
         let mut warning = None;
         if db.mutation_count() != before {
             self.dirty.store(true, Ordering::SeqCst);

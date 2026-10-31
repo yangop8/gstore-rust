@@ -478,8 +478,11 @@ pub fn upstream_select_json(rs: &ResultSet, limit: Option<usize>) -> Json {
 /// A SELECT table in upstream's `format=n-triple` shape
 /// (`ResultSet::to_NT_TRIPLE_JSON`): `head` is the list of `?`-prefixed
 /// variable names and `results` a list of rows, each the list of its bound
-/// cells as N-Triples terms (upstream skips unbound cells within a row; so
-/// does this). At most `limit` rows.
+/// cells as upstream stores terms (upstream skips unbound cells within a
+/// row; so does this): IRIs and blank nodes in N-Triples form, a literal
+/// as its lexical form between `"` **unescaped**, then its `@lang` or
+/// `^^<datatype>` ([`upstream_term_text`]) — so a client strips the quotes
+/// off a graph function's value to get its JSON. At most `limit` rows.
 pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
     let head: Vec<Json> = rs.vars.iter().map(|v| Json::from(format!("?{v}"))).collect();
     let mut rows = Vec::new();
@@ -488,7 +491,7 @@ pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
             .iter()
             .flatten()
             .filter(|c| !c.is_empty())
-            .map(|c| Json::from(c.as_str()))
+            .map(|c| Json::from(upstream_term_text(c)))
             .collect();
         if !cells.is_empty() {
             rows.push(Json::Arr(cells));
@@ -497,6 +500,27 @@ pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
     Json::obj()
         .with("head", Json::Arr(head))
         .with("results", Json::Arr(rows))
+}
+
+/// A result cell (an N-Triples term) as upstream keeps it in a result set
+/// and `to_NT_TRIPLE_JSON` prints it: upstream stores a literal's lexical
+/// form unescaped (its parser decodes the escapes) and wraps it in `"`
+/// as is, before the `@lang` / `^^<datatype>`; other terms are unchanged.
+/// (The `n-triple-file` output escapes again, `NodeUtil::node2string`, as
+/// [`upstream_tsv`] does.)
+fn upstream_term_text(cell: &str) -> String {
+    match parse_term(cell) {
+        Ok(Term::Literal {
+            value,
+            datatype,
+            lang,
+        }) => match (lang, datatype) {
+            (Some(l), _) => format!("\"{value}\"@{l}"),
+            (None, Some(dt)) => format!("\"{value}\"^^<{dt}>"),
+            (None, None) => format!("\"{value}\""),
+        },
+        _ => cell.to_string(),
+    }
 }
 
 /// The text of upstream's `format=n-triple-file` output (`ResultSet::output`):
@@ -715,9 +739,38 @@ mod tests {
         let rs = sample();
         let j = upstream_ntriple_json(&rs, None);
         assert_eq!(j.get("head").unwrap().to_string(), r#"["?x","?y"]"#);
+        // Literals as upstream prints them: the lexical form unescaped.
         assert_eq!(
             j.get("results").unwrap().to_string(),
-            r#"[["<http://ex/a>","\"he said \\\"hi\\\", ok\""],["<http://ex/b>"]]"#
+            r#"[["<http://ex/a>","\"he said \"hi\", ok\""],["<http://ex/b>"]]"#
+        );
+        let cells = |cells: &[&str]| {
+            let rs = ResultSet {
+                vars: vec!["x".into()],
+                rows: cells.iter().map(|c| vec![Some(c.to_string())]).collect(),
+            };
+            upstream_ntriple_json(&rs, None)
+                .get("results")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_array().unwrap()[0].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cells(&[
+                r#""{\"paths\":[{\"src\":\"<Eve>\",\"length\":2}]}""#,
+                "\"a\\nb\"@en",
+                "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                "_:b0",
+            ]),
+            [
+                r#""{"paths":[{"src":"<Eve>","length":2}]}""#,
+                "\"a\nb\"@en",
+                "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                "_:b0",
+            ]
         );
         assert_eq!(upstream_ntriple_json(&rs, Some(1)).get("results").unwrap().as_array().unwrap().len(), 1);
         assert_eq!(
