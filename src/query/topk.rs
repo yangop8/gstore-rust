@@ -551,7 +551,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     let probe = right.get_or_insert_with(|| {
                         Probe::new(self.eval_join_tree(r, &p.plans, &p.cands, layout).0, &shared)
                     });
-                    probe.for_each_compatible(&lb, sink)
+                    probe.for_each_compatible(&lb, &mut |m| {
+                        self.note_bindings(1);
+                        sink(m)
+                    })
                 })
             }
         }

@@ -2232,6 +2232,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 let (rb, rv) = self.eval_join_tree(r, plans, cands, layout);
                 let joined = join_sets(&lb, &lv, &rb, &rv);
+                self.note_bindings(joined.len());
                 let mut vars = lv;
                 for v in rv {
                     if !vars.contains(&v) {
