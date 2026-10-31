@@ -32,7 +32,7 @@ The directory layout mirrors upstream's `GSTORE_HOME`, so the scripts' paths
 - The test *scripts* (`scripts/test/*.sh`) live in `tests/upstream_scripts/`,
   and upstream's Python SDK in `tests/upstream_scripts/python/`.
 - Nothing else exceeds a few hundred KB; the largest file kept is
-  `scripts/test/bfs_test/lubm/lubm_p4r.txt` (≈ 330 KB).
+  `scripts/test/bfs_test/lubm/lubm_p4r.txt` (≈ 385 KB; 2 MB in all).
 
 ## Known properties of the upstream expectations
 
