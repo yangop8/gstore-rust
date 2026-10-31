@@ -431,6 +431,12 @@ impl Database {
         Ok(())
     }
 
+    /// Whether this database holds a directory's inter-process lock (opened
+    /// with [`open`](Self::open), or after [`hold_dir_lock`](Self::hold_dir_lock)).
+    pub fn holds_dir_lock(&self) -> bool {
+        self.dir_lock.is_some()
+    }
+
     /// Load a database from directory `dir`. Equivalent to [`open`](Self::open):
     /// any layout is accepted.
     pub fn load<P: AsRef<Path>>(dir: P) -> Result<Database> {

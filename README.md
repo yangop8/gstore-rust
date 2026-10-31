@@ -167,6 +167,16 @@ SPARQL `LOAD` (and `/build?db_path=`) sent to a server reads nothing unless
 backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
 `SERVICE` contacts no remote endpoint unless `--allow-service` is given.
 
+A database directory is open in **one process at a time**: opening it takes an
+operating-system lock on `<name>.db/LOCK` (snapshot and `--disk` layouts;
+RocksDB locks itself), held for as long as the database is open. So while a
+`gserver` has a database loaded, `gquery`, `gadd`, `gconsole`, `gbackup`, … on
+the same directory fail with "… is locked by another process (pid N)" instead
+of racing it — unload it there (or use the server's API) first. The server's
+`drop`, `rename`, `restore` and rebuilding `/build` refuse a directory another
+process holds, too. `Database::read_copy` reads a detached copy of a snapshot
+database without the lock.
+
 ### Library API
 
 ```rust

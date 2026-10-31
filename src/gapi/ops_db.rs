@@ -23,7 +23,10 @@
 //! Inter-process safety: a database directory is locked while a process has
 //! it open ([`crate::db::dirlock`]); `drop`, `rename`, `restore` and the
 //! backup of an unloaded database take that lock first, so they never pull a
-//! directory from under another process.
+//! directory from under another process (the REST `/build`, `/drop` and
+//! `/restore` do the same, through the same `DirLock::acquire_existing`).
+//! `build` and the REST `/build` share the `max_database_num` count
+//! (`ApiState::database_limit_reached`).
 //!
 //! `build`, `load`, `loadcsr`, `unload`, `backup`, `restore`, `batchInsert`
 //! and `batchRemove` honour `async=true` (and `callback`) through the task
@@ -842,9 +845,7 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 "database already built.",
             );
         }
-        let mut names: HashSet<String> = st.sysdb.names().into_iter().collect();
-        names.extend(st.dbs.keys().cloned());
-        if names.len() >= max_dbs {
+        if st.database_limit_reached(max_dbs) {
             return GResp::error(
                 Status::OperationConditionsAreNotSatisfied,
                 "The total number of databases more than max_databse_num.",
@@ -946,13 +947,9 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         name: db.clone(),
     };
     // No other process may have it open.
-    let _lock = if dir.is_dir() {
-        match DirLock::acquire(&dir) {
-            Ok(l) => Some(l),
-            Err(e) => return GResp::error(Status::OperationFailed, format!("Drop fail: {e}")),
-        }
-    } else {
-        None
+    let _lock = match DirLock::acquire_existing(&dir) {
+        Ok(l) => l,
+        Err(e) => return GResp::error(Status::OperationFailed, format!("Drop fail: {e}")),
     };
     if let Some(h) = &loaded {
         let mut slot = locked(h);
@@ -1388,16 +1385,12 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return fail(e.to_string()),
     };
     // No other process may have the database open while it is swapped.
-    let probe = if dir.is_dir() {
-        match DirLock::acquire(&dir) {
-            Ok(l) => Some(l),
-            Err(e) => {
-                Database::discard_staged_restore(&staged);
-                return fail(e.to_string());
-            }
+    let probe = match DirLock::acquire_existing(&dir) {
+        Ok(l) => l,
+        Err(e) => {
+            Database::discard_staged_restore(&staged);
+            return fail(e.to_string());
         }
-    } else {
-        None
     };
     let loaded = ctx.state().dbs.get(&db).map(Arc::clone);
     if let Some(h) = &loaded {

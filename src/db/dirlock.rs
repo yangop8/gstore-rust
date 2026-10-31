@@ -114,6 +114,20 @@ impl DirLock {
         Ok(DirLock { dir: canonical })
     }
 
+    /// Lock `dir` like [`acquire`](Self::acquire) when it is a directory;
+    /// `Ok(None)` when there is nothing there (yet) to lock. The step every
+    /// server operation that replaces, renames or deletes a database
+    /// directory takes first — the REST endpoints of [`crate::http_api`] and
+    /// the `/api` operations alike — so none of them pulls a directory from
+    /// under another process.
+    pub fn acquire_existing(dir: &Path) -> Result<Option<DirLock>> {
+        if dir.is_dir() {
+            DirLock::acquire(dir).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// The canonical directory this lock holds.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -221,5 +235,10 @@ mod tests {
         let d = tmp("missing").join("nope");
         let e = DirLock::acquire(&d).unwrap_err().to_string();
         assert!(e.contains("cannot lock"), "{e}");
+        // ... unless the caller only wants an existing directory locked.
+        assert!(DirLock::acquire_existing(&d).unwrap().is_none());
+        let here = DirLock::acquire_existing(d.parent().unwrap()).unwrap();
+        assert!(here.is_some_and(|l| DirLock::held_here(l.dir())));
+        let _ = fs::remove_dir_all(d.parent().unwrap());
     }
 }

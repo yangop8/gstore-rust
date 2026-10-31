@@ -692,6 +692,19 @@ fn max_database_num_is_enforced() {
         msg(&j),
         "The total number of databases more than max_databse_num."
     );
+    // The REST endpoints that create a database count the same way; an
+    // existing one may still be rebuilt / uploaded into.
+    let auth = [("Authorization", "Basic cm9vdDpyb290")]; // root:root
+    for target in ["/build?db_name=three", "/upload?db_name=three"] {
+        let r = send(a, "POST", target, &auth, LUBM.as_bytes());
+        assert_eq!(r.status, 409, "{target}: {}", r.text());
+        assert!(r.text().contains("max_database_num"), "{}", r.text());
+        assert!(!srv.db_dir("three").exists(), "{target}");
+    }
+    for target in ["/build?db_name=one", "/upload?db_name=two"] {
+        let r = send(a, "POST", target, &auth, LUBM.as_bytes());
+        assert_eq!(r.status, 200, "{target}: {}", r.text());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,6 +1731,8 @@ fn a_loaded_database_is_locked_against_other_processes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A backup to try a restore from below.
+    ok(&api(a, &[("operation", "backup"), ("db_name", "lubm")]));
     // And while another process holds it, the server can neither load nor
     // drop it: `gconsole lubm` opens it and waits on its stdin.
     let mut child = Command::new(env!("CARGO_BIN_EXE_gconsole"))
@@ -1750,6 +1765,29 @@ fn a_loaded_database_is_locked_against_other_processes() {
     assert_eq!(code(&j), 1005, "{j}");
     assert!(msg(&j).contains("locked by another process"), "{j}");
     assert!(srv.db_dir("lubm").is_dir());
+    // The REST endpoints that rewrite, delete or swap the directory follow
+    // the same rule: `409`, and nothing changes.
+    let backup = fs::read_dir(srv.backup_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("lubm.db_"))
+        .expect("the backup taken above");
+    let auth = [("Authorization", "Basic cm9vdDpyb290")]; // root:root
+    for (target, body) in [
+        ("/drop?db_name=lubm".to_string(), ""),
+        ("/build?db_name=lubm".to_string(), LUBM),
+        (format!("/restore?db_name=lubm&path={backup}"), ""),
+    ] {
+        let r = send(a, "POST", &target, &auth, body.as_bytes());
+        assert_eq!(r.status, 409, "{target}: {}", r.text());
+        assert!(
+            r.text().contains("locked by another process"),
+            "{target}: {}",
+            r.text()
+        );
+        assert!(srv.db_dir("lubm").is_dir(), "{target}");
+    }
     // This process cannot open it either, but may read a detached copy.
     let e = gstore::Database::open(srv.db_dir("lubm")).unwrap_err();
     assert!(e.to_string().contains("locked by another process"), "{e}");

@@ -564,6 +564,39 @@ mod tests {
         assert!(registry().get("query").unwrap().needs_db);
     }
 
+    /// The database lifecycle operations carry upstream's privilege
+    /// (`APIUtil::check_privilege`) and async (`grpc.cpp`: the `*_task`s that
+    /// read `async`) metadata.
+    #[test]
+    fn lifecycle_operations_carry_upstream_privileges_and_async_flags() {
+        use crate::http_users::Privilege;
+        use crate::sysdb::{requirement, Requirement};
+        let p = Requirement::Privilege;
+        for (op, needed, is_async) in [
+            ("show", Requirement::Anyone, false),
+            ("load", p(Privilege::Load), true),
+            ("loadcsr", Requirement::RootOnly, true),
+            ("unload", p(Privilege::Unload), true),
+            ("monitor", p(Privilege::Query), false),
+            ("build", Requirement::RootOnly, true),
+            ("drop", Requirement::RootOnly, false),
+            ("rename", Requirement::RootOnly, false),
+            ("backup", p(Privilege::Backup), true),
+            ("backuppath", Requirement::RootOnly, false),
+            ("restore", p(Privilege::Restore), true),
+            ("export", p(Privilege::Export), false),
+            ("batchInsert", p(Privilege::Update), true),
+            ("batchRemove", p(Privilege::Update), true),
+            ("schema", Requirement::RootOnly, false),
+        ] {
+            let spec = registry().get(op).unwrap();
+            assert!(spec.auth, "{op}");
+            assert_eq!(spec.needs_db, op != "show", "{op}");
+            assert_eq!(requirement(spec.privilege), needed, "{op}");
+            assert_eq!(spec.async_capable, is_async, "{op}");
+        }
+    }
+
     #[test]
     fn routing_claims_only_upstream_paths() {
         let req = |method: &str, path: &str, query: Option<&str>| Request {

@@ -14,6 +14,14 @@
 //! * **Database lifecycle** — `/build`, `/load`, `/unload`, `/drop`, `/show`.
 //!   A `/build?db_path=` reads a server-local file only as the server's
 //!   [`LoadPolicy`] allows (the policy of SPARQL `LOAD`; by default nothing).
+//!   A database directory is locked against other processes while it is
+//!   served ([`crate::db::dirlock`]), and `/build` (over an existing
+//!   database), `/drop` and `/restore` take that lock before they rewrite,
+//!   delete or swap a directory — the rule the `/api` operations
+//!   (`gapi::ops_db`) follow too. Two REST semantics differ from upstream's
+//!   `/api` ones and are kept as Rust extensions: `/build` rebuilds an
+//!   existing database (`/api` `build` refuses it) and `/drop` deletes the
+//!   directory (`/api` `drop` keeps a `<db>.db.bak` by default).
 //! * **Backup / restore / export** — `/backup`, `/restore`, `/export`. Backups
 //!   are written only inside the server's backup directory (`<root>/backups`,
 //!   or `conf.ini`'s `backup_path`) and never over another database's files;
@@ -134,6 +142,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::GStoreConfig;
+use crate::db::dirlock::DirLock;
 use crate::db::{Database, LoadPolicy, LoadSource};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
@@ -533,6 +542,13 @@ impl DbSlot {
                 "refusing to save: a transaction is open (its writes are uncommitted)".into(),
             ));
         }
+        // Never write a directory another process holds (`crate::db::dirlock`):
+        // a database created in memory (`/upload` into a new name) takes the
+        // lock before its first save, and keeps it while it is served.
+        if !self.db.holds_dir_lock() && self.db.storage() != crate::StorageKind::RocksDb {
+            fs::create_dir_all(&self.dir)?;
+            self.db.hold_dir_lock(&self.dir)?;
+        }
         self.db.save(&self.dir)?;
         self.dirty = false;
         Ok(())
@@ -782,6 +798,15 @@ impl ApiState {
     /// The on-disk directory of database `name`.
     pub(crate) fn db_dir(&self, name: &str) -> PathBuf {
         self.root.join(crate::db_dir_for(name))
+    }
+
+    /// Whether `max` databases (`conf.ini`'s `max_database_num`) already
+    /// exist — registered or loaded — so no new one may be built. The one
+    /// count both `build`s use (the REST endpoint and the `/api` operation).
+    pub(crate) fn database_limit_reached(&self, max: usize) -> bool {
+        let mut names: HashSet<String> = self.sysdb.names().into_iter().collect();
+        names.extend(self.dbs.keys().cloned());
+        names.len() >= max
     }
 }
 
@@ -1992,12 +2017,32 @@ impl ApiInner {
     /// only as the server's [`LoadPolicy`] allows — the policy that governs
     /// SPARQL `LOAD`, so `/build` is not a way around it — and only if it is a
     /// regular file.
+    ///
+    /// REST-specific: an existing database is **rebuilt** in place (the `/api`
+    /// `build` refuses it with `1004 "database already built."`). Both share
+    /// the rest of the rules: a new database counts against
+    /// `max_database_num` ([`ApiState::database_limit_reached`]), and an
+    /// existing directory is locked against other processes
+    /// ([`DirLock::acquire_existing`]) before it is rewritten — `409` while
+    /// another process (a `gquery`, another server) has it open.
     fn handle_build(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         if st.db_txn.contains_key(&name) {
             return Dispatch::Done(Resp::fail(409, "database is busy in a transaction"));
+        }
+        let max_dbs = self.config().max_database_num;
+        let exists =
+            st.dbs.contains_key(&name) || st.sysdb.contains(&name) || st.db_dir(&name).exists();
+        if !exists && st.database_limit_reached(max_dbs) {
+            return Dispatch::Done(Resp::fail(
+                409,
+                &format!(
+                    "cannot build '{name}': the server already holds max_database_num \
+                     ({max_dbs}) databases"
+                ),
+            ));
         }
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
@@ -2023,6 +2068,12 @@ impl ApiInner {
             let db = match built {
                 Ok(db) => db,
                 Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+            };
+            // No other process may have the directory open while it is
+            // rewritten (shares the lock a loaded copy holds in this process).
+            let _dir_lock = match DirLock::acquire_existing(&dir) {
+                Ok(lock) => lock,
+                Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
             };
             // A rebuilt database replaces the loaded one: retire it (closing
             // its files) before its directory is rewritten.
@@ -2099,6 +2150,21 @@ impl ApiInner {
         }
         let loaded = st.dbs.get(&name).map(Arc::clone);
         if loaded.is_none() {
+            // Creating a database by uploading counts as a build (see
+            // `rest_allowed`), so the `max_database_num` limit applies.
+            let max_dbs = self.config().max_database_num;
+            if !st.sysdb.contains(&name)
+                && !st.db_dir(&name).exists()
+                && st.database_limit_reached(max_dbs)
+            {
+                return Dispatch::Done(Resp::fail(
+                    409,
+                    &format!(
+                        "cannot create '{name}': the server already holds max_database_num \
+                         ({max_dbs}) databases"
+                    ),
+                ));
+            }
             // Opening / creating it is a lifecycle operation on the name.
             if let Err(r) = st.claim(&name) {
                 return Dispatch::Done(r);
@@ -2250,6 +2316,16 @@ impl ApiInner {
         }))
     }
 
+    /// `POST /drop?db_name=…` — delete the database (`root` / `admin` only):
+    /// it is unloaded **without** saving and its directory is deleted; its
+    /// registry entry and every grant on it go.
+    ///
+    /// REST-specific: the directory is always deleted. The `/api` `drop`
+    /// (`gapi::ops_db`) follows upstream instead — by default
+    /// (`is_backup=true`) it saves and keeps the directory as `<db>.db.bak`,
+    /// deleting it only with `is_backup=false`. Both take the directory's
+    /// inter-process lock first ([`DirLock::acquire_existing`]): `409` while
+    /// another process has the database open.
     fn handle_drop(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
@@ -2265,6 +2341,12 @@ impl ApiInner {
             let _busy = BusyGuard {
                 inner,
                 name: name.clone(),
+            };
+            // No other process may have it open (shares the lock a loaded copy
+            // holds in this process, so it stays locked once that is retired).
+            let _dir_lock = match DirLock::acquire_existing(&dir) {
+                Ok(lock) => lock,
+                Err(e) => return Resp::fail(409, &format!("drop failed: {e}")),
             };
             // Retire (closing its store files) before the directory is deleted.
             let was_loaded = inner.retire_loaded(&name);
@@ -2844,7 +2926,13 @@ impl ApiInner {
     /// directory and validated *before* the loaded database is touched, so a
     /// corrupt backup changes nothing; only then is the loaded database retired
     /// (its unsaved changes saved first, so a failed swap loses nothing) and
-    /// the copy swapped in.
+    /// the copy swapped in — with the directory's inter-process lock held
+    /// ([`DirLock::acquire_existing`]; `409` while another process has the
+    /// database open), as the `/api` `restore` does.
+    ///
+    /// REST-specific: `path` is required and the restored database is left
+    /// loaded; the `/api` `restore` defaults to the newest backup in the
+    /// backup directory and reloads only a database that was loaded.
     fn handle_restore(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
@@ -2886,6 +2974,15 @@ impl ApiInner {
                 Ok(staged) => staged,
                 Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
             };
+            // No other process may have the database open while it is swapped
+            // (as the `/api` restore; shares a loaded copy's lock).
+            let probe = match DirLock::acquire_existing(&dir) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    Database::discard_staged_restore(&staged);
+                    return Resp::fail(409, &format!("restore failed: {e}"));
+                }
+            };
             let loaded = locked(&inner.state).dbs.get(&name).map(Arc::clone);
             if let Some(h) = &loaded {
                 let mut slot = locked(h);
@@ -2910,6 +3007,9 @@ impl ApiInner {
                 }
             }
             let installed = Database::install_restore(&staged, &dir);
+            // Release the probe before reopening: the directory at this path
+            // is a new one now, which the reopened database locks itself.
+            drop(probe);
             // Serve whatever the directory now holds: the restored copy, or —
             // if the swap failed — the previous database (saved above).
             let reopened = Database::open(&dir);
