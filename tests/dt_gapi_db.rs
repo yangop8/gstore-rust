@@ -1761,3 +1761,103 @@ fn a_loaded_database_is_locked_against_other_processes() {
     load(a, "lubm");
     assert_eq!(count(a, "lubm"), 5);
 }
+
+// ---------------------------------------------------------------------------
+// upstream's scripts/test/api_test.sh
+// ---------------------------------------------------------------------------
+
+/// Field `n` (1-based) of `text` split on `"` — how `api_test.sh` extracts
+/// `filepath` / `backupfilepath` (`awk -F '"' '{print $10}'`).
+fn awk_field(text: &str, n: usize) -> String {
+    text.split('"').nth(n - 1).unwrap_or_default().to_string()
+}
+
+fn raw_api(addr: &SocketAddr, body: &str) -> String {
+    let r = send(
+        addr,
+        "POST",
+        "/api",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    r.text()
+}
+
+#[test]
+fn the_upstream_api_test_script_runs_unmodified() {
+    // The script's data file, relative to the server's working directory
+    // (here the crate root), readable through the load policy.
+    let rdf = "testdata/lubm/lubm.nt";
+    let srv = start_with(
+        "apitest",
+        |c| c,
+        |s| s.with_load_policy(LoadPolicy::restricted().with_allowed_dir("testdata")),
+    );
+    let a = &srv.addr;
+    let cred = r#""username":"root","password":"root""#;
+    let call = |rest: &str| {
+        let body = raw_api(a, &format!("{{{rest},{cred}}}"));
+        (json::parse(&body).unwrap(), body)
+    };
+    let (j, _) = call(&format!(
+        r#""operation":"build","db_name":"lubm","db_path":"{rdf}""#
+    ));
+    ok(&j);
+    let triples = int(&j, "success_num");
+    assert!(triples > 0);
+    ok(&call(r#""operation":"show""#).0);
+    let (j, _) = call(r#""operation":"monitor","db_name":"lubm""#);
+    ok(&j);
+    assert_eq!(string(&j, "tripleNum"), triples.to_string());
+    ok(&call(r#""operation":"load","db_name":"lubm""#).0);
+    let (j, _) = call(
+        r#""operation":"query","db_name":"lubm","sparql":"select ?s ?p ?o where {?s ?p ?o.} limit 10""#,
+    );
+    assert_eq!(int(&j, "AnsNum"), 10);
+    // export → download what `awk` extracted.
+    let (j, body) = call(r#""operation":"export","db_name":"lubm""#);
+    ok(&j);
+    let export_path = awk_field(&body, 10);
+    assert_eq!(export_path, string(&j, "filepath"));
+    let r = send(a, "GET", &format!("/file/download/{export_path}"), &[], b"");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.text().lines().count() as i64, triples);
+    // backup → restore from what `awk` extracted.
+    let (j, body) = call(r#""operation":"backup","db_name":"lubm""#);
+    ok(&j);
+    let backup_path = awk_field(&body, 10);
+    assert_eq!(backup_path, string(&j, "backupfilepath"));
+    let (j, _) = call(&format!(
+        r#""operation":"batchRemove","db_name":"lubm","file":"{rdf}""#
+    ));
+    assert_eq!(int(&j, "success_num"), triples);
+    let (j, _) = call(&format!(
+        r#""operation":"batchInsert","db_name":"lubm","file":"{rdf}""#
+    ));
+    assert_eq!(int(&j, "success_num"), triples);
+    ok(&call(r#""operation":"unload","db_name":"lubm""#).0);
+    let (j, _) = call(r#""operation":"restore","db_name":"lubm","backup_path":"""#);
+    ok(&j);
+    ok(&call(&format!(
+        r#""operation":"restore","db_name":"lubm","backup_path":"{backup_path}""#
+    ))
+    .0);
+    ok(&call(r#""operation":"load","db_name":"lubm""#).0);
+    // The transaction steps.
+    let (j, _) = call(r#""operation":"begin","db_name":"lubm","isolevel":"1""#);
+    assert_eq!(string(&j, "TID"), "1");
+    ok(&call(
+        r#""operation":"tquery","db_name":"lubm","tid":"1","sparql":"insert data {<s> <p> <o>.}""#,
+    )
+    .0);
+    ok(&call(r#""operation":"commit","db_name":"lubm","tid":"1""#).0);
+    ok(&call(r#""operation":"checkpoint","db_name":"lubm""#).0);
+    // rename while loaded is refused (upstream too); the drops then clean up.
+    let (j, _) = call(r#""operation":"rename","db_name":"lubm","new_name":"newlubm""#);
+    assert_eq!(code(&j), 1005);
+    let (j, _) = call(r#""operation":"drop","db_name":"newlubm","is_backup":"false""#);
+    assert_eq!(code(&j), 1005);
+    ok(&call(r#""operation":"drop","db_name":"lubm","is_backup":"false""#).0);
+    assert!(!srv.db_dir("lubm").exists());
+}
