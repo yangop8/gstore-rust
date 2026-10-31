@@ -512,6 +512,104 @@ mod binary {
         assert_eq!(code, 0);
     }
 
+    /// Root's default password is never served beyond loopback; a password
+    /// file (`--password-file`, `$GSTORE_ROOT_PASSWORD_FILE`) sets it without
+    /// putting it on the command line.
+    #[test]
+    fn the_default_root_password_is_not_exposed() {
+        let dir = tmp_dir("bin_defpw");
+        let home = dir.join("home");
+        let home_s = home.to_string_lossy().into_owned();
+        let pid_file = home.join("gserver.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let (code, out, err) = gserver(
+            &dir,
+            &["-s", "--api", &home_s, "-p", "0", "--addr", "0.0.0.0"],
+        );
+        assert_eq!(code, 1, "stdout:{out}\nstderr:{err}");
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(!pid_file.exists());
+
+        // An unreadable password file is an error.
+        let (code, _, err) = gserver(
+            &dir,
+            &[
+                "-s",
+                "--api",
+                &home_s,
+                "-p",
+                "0",
+                "--password-file",
+                "missing",
+            ],
+        );
+        assert_eq!(code, 1);
+        assert!(err.contains("cannot read root's password"), "{err}");
+
+        // A fresh user store seeded from the file serves on every interface.
+        let other = dir.join("home2");
+        let other_s = other.to_string_lossy().into_owned();
+        let pw = dir.join("root_pw");
+        std::fs::write(&pw, "from-a-file\n").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gserver"))
+            .args(["-b", "--api", &other_s, "-p", "0", "--addr", "0.0.0.0"])
+            .env("GSTORE_ROOT_PASSWORD_FILE", &pw)
+            .env_remove("GSTORE_GSERVER_BACKGROUND")
+            .env_remove("GSTORE_GSERVER_SUPERVISOR")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = child.wait().unwrap();
+        let other_pid = other.join("gserver.pid");
+        let _cleanup2 = Cleanup {
+            dir: other.clone(),
+            pid_file: other_pid.clone(),
+        };
+        assert!(status.success(), "{status}");
+        let port = addr_of(&other_pid).port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (s, body) = request(
+            &addr,
+            "POST",
+            "/login",
+            "username=root&password=from-a-file",
+        );
+        assert_eq!(s, 200, "{body}");
+        let (code, _, _) = gserver(&dir, &["-t", "--api", &other_s]);
+        assert_eq!(code, 0);
+        // `--password-file` does the same for a new store.
+        let third = dir.join("home3");
+        let third_s = third.to_string_lossy().into_owned();
+        let pw_s = pw.to_string_lossy().into_owned();
+        let _cleanup3 = Cleanup {
+            dir: third.clone(),
+            pid_file: third.join("gserver.pid"),
+        };
+        let (code, out, err) = gserver(
+            &dir,
+            &[
+                "-b",
+                "--api",
+                &third_s,
+                "-p",
+                "0",
+                "--addr",
+                "0.0.0.0",
+                "--password-file",
+                &pw_s,
+            ],
+        );
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let (code, _, _) = gserver(&dir, &["-t", "--api", &third_s]);
+        assert_eq!(code, 0);
+    }
+
     #[test]
     fn conf_ini_configures_the_server_and_flags_override_it() {
         let dir = tmp_dir("bin_conf");

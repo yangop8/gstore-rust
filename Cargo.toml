@@ -31,6 +31,14 @@ flate2 = { version = "1", optional = true }
 # do not pull in `aws-lc-rs`/bindgen; `rustls-pemfile` loads the cert + key PEM.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = { version = "2", optional = true }
+# Optional line editing for `gconsole` (see the `readline` feature). OFF by
+# default: the default console reads plain lines. No default features: the
+# console keeps its own history file and needs no home-dir/file-lock helpers.
+rustyline = { version = "19", optional = true, default-features = false }
+# Optional zip packages (see the `zip` feature). OFF by default. No default
+# features: only the `deflate` method (pure Rust), no encryption / bzip2 /
+# lzma / zstd / time.
+zip = { version = "9", optional = true, default-features = false, features = ["deflate"] }
 
 [features]
 # Persistent RocksDB storage backend (see `src/backend/rocks.rs`).
@@ -41,6 +49,14 @@ gzip = ["dep:flate2"]
 # HTTPS/TLS listeners for the bundled `Server` / `ApiServer` (see the
 # `serve_forever_tls` methods and `load_tls_config` in `src/server.rs`).
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+# `gconsole` line editing: arrow keys / Emacs keys, history recall and tab
+# completion of command and database names (see `src/console/mod.rs`).
+readline = ["dep:rustyline"]
+# Zip packages in the `/api` layer and the CLI: `build` / `batchInsert` /
+# `batchRemove` from a `.zip` of RDF files, `backup compress=true` /
+# `restore` of a zipped backup, `export compress=true`, and `gexport --zip`
+# / `gbackup --zip` / `grestore x.zip` (see `src/zipio.rs`).
+zip = ["dep:zip"]
 
 [dev-dependencies]
 
@@ -99,6 +115,79 @@ path = "src/bin/gexport.rs"
 [[bin]]
 name = "gmonitor"
 path = "src/bin/gmonitor.rs"
+
+# ---- packaging (see docs/DEPLOY.md) -----------------------------------------
+# `cargo deb` (cargo-deb) and `cargo generate-rpm` (cargo-generate-rpm) build
+# .deb / .rpm packages from a release build: the binaries in /usr/bin, the
+# configuration in /etc/gstore, the systemd unit, the gstore system user
+# (sysusers.d) and its working directory /var/lib/gstore (tmpfiles.d).
+[package.metadata.deb]
+name = "gstore"
+maintainer = "gstore-rust maintainers <https://github.com/yangop8/gstore-rust/issues>"
+copyright = "gstore-rust contributors; gStore (c) PKUMOD, Peking University (BSD-3-Clause)"
+extended-description = """\
+gstore-rust is a Rust rewrite of gStore, an RDF triple store / graph database \
+answering SPARQL queries by subgraph matching. This package provides gserver, \
+an HTTP server speaking upstream gStore 1.4's /api protocol (run as the gserver \
+systemd service), the gconsole client and the command-line tools gbuild, \
+gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor and gnode."""
+section = "database"
+priority = "optional"
+depends = "$auto, adduser"
+conf-files = ["/etc/gstore/conf.ini"]
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/gserver", "usr/bin/", "755"],
+    ["target/release/gconsole", "usr/bin/", "755"],
+    ["target/release/gbuild", "usr/bin/", "755"],
+    ["target/release/gquery", "usr/bin/", "755"],
+    ["target/release/gadd", "usr/bin/", "755"],
+    ["target/release/gsub", "usr/bin/", "755"],
+    ["target/release/gdrop", "usr/bin/", "755"],
+    ["target/release/gshow", "usr/bin/", "755"],
+    ["target/release/gbackup", "usr/bin/", "755"],
+    ["target/release/grestore", "usr/bin/", "755"],
+    ["target/release/gexport", "usr/bin/", "755"],
+    ["target/release/gmonitor", "usr/bin/", "755"],
+    ["target/release/gnode", "usr/bin/", "755"],
+    ["conf/conf.ini.example", "etc/gstore/conf.ini", "640"],
+    ["conf/slog.properties.example", "etc/gstore/slog.properties.example", "644"],
+    ["conf/slog.stdout.properties.example", "etc/gstore/slog.stdout.properties.example", "644"],
+    ["packaging/systemd/gserver.service", "lib/systemd/system/gserver.service", "644"],
+    ["packaging/sysusers/gstore.conf", "usr/lib/sysusers.d/gstore.conf", "644"],
+    ["packaging/tmpfiles/gstore.conf", "usr/lib/tmpfiles.d/gstore.conf", "644"],
+    ["docs/DEPLOY.md", "usr/share/doc/gstore/DEPLOY.md", "644"],
+    ["README.md", "usr/share/doc/gstore/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "gstore"
+summary = "gStore RDF graph database (Rust rewrite): gserver and command-line tools"
+post_install_script = "packaging/rpm/post_install.sh"
+pre_uninstall_script = "packaging/rpm/pre_uninstall.sh"
+assets = [
+    { source = "target/release/gserver", dest = "/usr/bin/gserver", mode = "755" },
+    { source = "target/release/gconsole", dest = "/usr/bin/gconsole", mode = "755" },
+    { source = "target/release/gbuild", dest = "/usr/bin/gbuild", mode = "755" },
+    { source = "target/release/gquery", dest = "/usr/bin/gquery", mode = "755" },
+    { source = "target/release/gadd", dest = "/usr/bin/gadd", mode = "755" },
+    { source = "target/release/gsub", dest = "/usr/bin/gsub", mode = "755" },
+    { source = "target/release/gdrop", dest = "/usr/bin/gdrop", mode = "755" },
+    { source = "target/release/gshow", dest = "/usr/bin/gshow", mode = "755" },
+    { source = "target/release/gbackup", dest = "/usr/bin/gbackup", mode = "755" },
+    { source = "target/release/grestore", dest = "/usr/bin/grestore", mode = "755" },
+    { source = "target/release/gexport", dest = "/usr/bin/gexport", mode = "755" },
+    { source = "target/release/gmonitor", dest = "/usr/bin/gmonitor", mode = "755" },
+    { source = "target/release/gnode", dest = "/usr/bin/gnode", mode = "755" },
+    { source = "conf/conf.ini.example", dest = "/etc/gstore/conf.ini", mode = "640", config = "noreplace" },
+    { source = "conf/slog.properties.example", dest = "/etc/gstore/slog.properties.example", mode = "644" },
+    { source = "conf/slog.stdout.properties.example", dest = "/etc/gstore/slog.stdout.properties.example", mode = "644" },
+    { source = "packaging/systemd/gserver.service", dest = "/usr/lib/systemd/system/gserver.service", mode = "644" },
+    { source = "packaging/sysusers/gstore.conf", dest = "/usr/lib/sysusers.d/gstore.conf", mode = "644" },
+    { source = "packaging/tmpfiles/gstore.conf", dest = "/usr/lib/tmpfiles.d/gstore.conf", mode = "644" },
+    { source = "docs/DEPLOY.md", dest = "/usr/share/doc/gstore/DEPLOY.md", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/gstore/README.md", mode = "644", doc = true },
+]
 
 [profile.release]
 opt-level = 3

@@ -652,17 +652,25 @@ impl DbSlot {
     /// and only need committing, so there is no reason to leave them volatile.
     pub(crate) fn wrote(&mut self, check_point: bool) -> Option<String> {
         self.dirty = true;
-        if !check_point {
-            return self.db.sync().err().map(|e| {
-                format!("change applied in memory but could not be made durable: {e}")
-            });
+        let warning = if !check_point {
+            self.db.sync().err().map(|e| {
+                format!(
+                    "change to '{}' applied in memory but could not be made durable: {e}",
+                    self.dir.display()
+                )
+            })
+        } else {
+            self.save().err().map(|e| {
+                format!(
+                    "change applied in memory but saving to '{}' failed: {e}",
+                    self.dir.display()
+                )
+            })
+        };
+        if let Some(w) = &warning {
+            crate::gs_error!("{w}");
         }
-        self.save().err().map(|e| {
-            format!(
-                "change applied in memory but saving to '{}' failed: {e}",
-                self.dir.display()
-            )
-        })
+        warning
     }
 
     /// Run a read on behalf of a *non-transactional* caller: against the
@@ -1381,6 +1389,15 @@ impl ApiServer {
         self
     }
 
+    /// Whether `root` still has upstream's default password
+    /// ([`DEFAULT_ROOT_PASSWORD`](crate::config::DEFAULT_ROOT_PASSWORD)) —
+    /// as stored, whatever `conf.ini` says now (it seeds a new store only).
+    pub fn root_has_default_password(&self) -> bool {
+        locked(&self.inner.state)
+            .users
+            .verify(ROOT_USER, crate::config::DEFAULT_ROOT_PASSWORD)
+    }
+
     /// The password the `system` user (`conf.ini`'s `system_username`) must
     /// present to `/shutdown` or `/restart`. Upstream writes it to the second
     /// line of the pid file; `gserver` does the same.
@@ -1667,8 +1684,10 @@ impl ApiInner {
         // the worker thread (the upstream `/api` layer's remote IP).
         let peer = crate::server::current_peer();
 
+        let started = Instant::now();
         let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req, peer)))
             .unwrap_or_else(|_| {
+                crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
                 // The upstream protocol answers every outcome with HTTP 200.
                 let resp = if crate::gapi::wants(&req) {
                     Resp::from(crate::gapi::GResp::error(
@@ -1683,18 +1702,27 @@ impl ApiInner {
 
         // Access log. Written off-lock (O_APPEND keeps each line atomic); strict
         // request ordering is neither achievable nor needed once connections run
-        // concurrently.
+        // concurrently. The client's IP closes the line (after the fields
+        // earlier versions wrote, so readers of those keep working).
+        let ip = peer_ip(peer);
         append_log(
             &self.root,
             "access.log",
             &format!(
-                "{ts}\t{method}\t{path}\t{user}\t{status}",
+                "{ts}\t{method}\t{path}\t{user}\t{status}\t{ip}",
                 ts = now_millis(),
                 method = req.method,
                 path = req.path,
                 user = user_disp,
                 status = resp.status,
             ),
+        );
+        crate::gs_debug!(
+            "{ip} {} {} -> {} ({} ms, user {user_disp})",
+            req.method,
+            req.path,
+            resp.status,
+            started.elapsed().as_millis()
         );
 
         let enc = req.header("accept-encoding");
@@ -1760,10 +1788,20 @@ impl ApiInner {
     }
 
     /// Run a deferred [`QueryJob`] and render the outcome for the REST
-    /// endpoints (see [`run_query_job`](Self::run_query_job)).
-    fn execute_query_job(&self, job: QueryJob) -> Resp {
+    /// endpoints (see [`run_query_job`](Self::run_query_job)), recording it in
+    /// the query log (`qlog`).
+    fn execute_query_job(&self, job: QueryJob, qlog: RestQueryLog) -> Resp {
         let fmt = job.fmt;
-        match self.run_query_job(job) {
+        let out = self.run_query_job(job);
+        qlog.finish(
+            self,
+            match &out {
+                Ok(JobOutput::Read(result)) => Ok(answer_count(result)),
+                Ok(JobOutput::Updated { changed, .. }) => Ok(*changed),
+                Err(e) => Err(e),
+            },
+        );
+        match out {
             Ok(JobOutput::Read(result)) => render_result(fmt, &result),
             Ok(JobOutput::Updated { changed, warning }) => update_resp(changed, &warning),
             Err(e) => e.rest(),
@@ -2139,6 +2177,7 @@ impl ApiInner {
                 name
             };
             log_query(&inner.root, &name, &user, &sparql);
+            let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let prepared = {
                 let mut st = locked(&inner.state);
                 inner.prepare_query(&mut st, &name, sparql, is_update, fmt, &user)
@@ -2147,7 +2186,7 @@ impl ApiInner {
                 Ok(job) => job,
                 Err(r) => return r,
             };
-            inner.execute_query_job(job)
+            inner.execute_query_job(job, qlog)
         }))
     }
 
@@ -2173,6 +2212,7 @@ impl ApiInner {
         Dispatch::Deferred(Box::new(move |inner| {
             let is_update = is_update_sparql(&sparql);
             log_query(&inner.root, &name, &user, &sparql);
+            let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let prepared = {
                 let mut st = locked(&inner.state);
                 inner.prepare_query(&mut st, &name, sparql, is_update, fmt, &user)
@@ -2181,7 +2221,7 @@ impl ApiInner {
                 Ok(job) => job,
                 Err(r) => return r,
             };
-            inner.execute_query_job(job)
+            inner.execute_query_job(job, qlog)
         }))
     }
 
@@ -2949,7 +2989,10 @@ impl ApiInner {
                 return inner.forbidden();
             }
             log_query(&inner.root, &name, &user, &sparql);
-            match inner.run_in_txn_task(&dbh, &name, tid, &sparql, &user) {
+            let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
+            let out = inner.run_in_txn_task(&dbh, &name, tid, &sparql, &user);
+            qlog.finish(inner, out.as_ref().map(answer_count));
+            match out {
                 Ok(r) => render_result(fmt, &r),
                 Err(e) => e.rest(),
             }
@@ -3981,6 +4024,98 @@ pub(crate) fn log_query(root: &Path, db: &str, user: &str, sparql: &str) {
         "query.log",
         &format!("{}\t{}\t{}\t{}", now_millis(), db, user, sparql.replace('\n', " ")),
     );
+}
+
+/// The query-log record of a REST SPARQL request (`/sparql`, `/update`,
+/// `/tquery`): the same JSON record, in the same daily file
+/// (`querylog_path`), as the `/api` `query` operation writes
+/// ([`crate::gapi::apilog`]) — when it started, the client's IP, the
+/// statement, the number of answers (rows; `1` for ASK; triples for
+/// CONSTRUCT / DESCRIBE; triples changed for an UPDATE), the result format,
+/// the outcome (`statusCode` `0`, or the HTTP status of the error) and the
+/// latency in ms. [`start`](Self::start) it before the statement runs,
+/// [`finish`](Self::finish) it with the outcome. Written when
+/// `querylog_mode` is on.
+pub(crate) struct RestQueryLog {
+    db: String,
+    /// The statement (empty when the query log is off: not copied then).
+    sparql: String,
+    format: &'static str,
+    ip: String,
+    started: SystemTime,
+    timer: Instant,
+}
+
+impl RestQueryLog {
+    /// Must run on the request's worker thread (it reads the client's
+    /// address from [`crate::server::current_peer`]).
+    pub(crate) fn start(inner: &ApiInner, db: &str, sparql: &str, fmt: ResultFormat) -> RestQueryLog {
+        let on = inner.config().querylog_mode;
+        RestQueryLog {
+            db: db.to_string(),
+            sparql: if on { sparql.to_string() } else { String::new() },
+            format: format_name(fmt),
+            ip: peer_ip(crate::server::current_peer()),
+            started: SystemTime::now(),
+            timer: Instant::now(),
+        }
+    }
+
+    /// Record the outcome: the number of answers, or the error.
+    pub(crate) fn finish(self, inner: &ApiInner, outcome: Result<usize, &OpError>) {
+        let config = inner.config();
+        let query_time = self.timer.elapsed().as_millis() as u64;
+        crate::gs_debug!(
+            "query on '{}' from {}: {} in {query_time} ms",
+            self.db,
+            self.ip,
+            match &outcome {
+                Ok(n) => format!("{n} answer(s)"),
+                Err(e) => format!("failed ({})", e.msg),
+            }
+        );
+        if !config.querylog_mode {
+            return;
+        }
+        let (ans_num, status_code, status_msg) = match outcome {
+            Ok(n) => (i64::try_from(n).unwrap_or(i64::MAX), 0, "success".to_string()),
+            Err(e) => (0, i64::from(e.http()), e.msg.replace(['\r', '\n'], " ")),
+        };
+        let rec = crate::gapi::apilog::QueryLogRecord {
+            query_date_time: crate::sysdb::clock::at(self.started).datetime_ms(),
+            remote_ip: self.ip,
+            sparql: self.sparql,
+            ans_num,
+            format: self.format.to_string(),
+            file_name: String::new(),
+            status_code,
+            status_msg,
+            query_time,
+            db_name: self.db,
+        };
+        inner.apilogs.write_query(&config, &inner.root, &rec);
+    }
+}
+
+/// The number of answers of a query result: rows of a SELECT, `1` for an
+/// ASK, triples of a CONSTRUCT / DESCRIBE, triples changed by an UPDATE.
+fn answer_count(result: &QueryResult) -> usize {
+    match result {
+        QueryResult::Select(rs) => rs.row_count(),
+        QueryResult::Ask(_) => 1,
+        QueryResult::Construct(ts) => ts.len(),
+        QueryResult::Update { changed } => *changed,
+    }
+}
+
+/// The query log's name of a result format.
+fn format_name(fmt: ResultFormat) -> &'static str {
+    match fmt {
+        ResultFormat::Json => "json",
+        ResultFormat::Xml => "xml",
+        ResultFormat::Csv => "csv",
+        ResultFormat::Tsv => "tsv",
+    }
 }
 
 /// The database a REST `/user/*` request grants on: `db_name` (validated, and

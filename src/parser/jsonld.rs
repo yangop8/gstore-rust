@@ -45,24 +45,37 @@ use crate::error::{GStoreError, Result};
 use crate::json::Json;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
+use crate::parser::stream::BlankLabeler;
 
 /// The `rdf:` namespace (for `rdf:first`/`rdf:rest`/`rdf:nil` list chains).
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 /// Parse a JSON-LD document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
+    parse_str_with(content, &mut BlankLabeler::keep())
+}
+
+/// Parse a JSON-LD document, naming blank nodes with `labels`. The document
+/// is parsed whole; the bulk loaders refuse one larger than
+/// [`ImportOptions::max_document_bytes`](crate::parser::import::ImportOptions).
+pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Triple>> {
     let json = crate::json::parse(content).map_err(|e| GStoreError::RdfParse {
         line: e.line,
         msg: e.msg,
     })?;
-    let mut proc = Processor::default();
-    proc.process_top(&json, &Context::default())?;
+    let mut proc = Processor {
+        triples: Vec::new(),
+        labels: std::mem::take(labels),
+    };
+    let done = proc.process_top(&json, &Context::default());
+    *labels = proc.labels;
+    done?;
     Ok(proc.triples)
 }
 
 /// Parse a JSON-LD file into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::parser::import::read_document(path.as_ref())?;
     parse_str(&content)
 }
 
@@ -97,16 +110,24 @@ struct Context {
 #[derive(Default)]
 struct Processor {
     triples: Vec<Triple>,
-    bnode: usize,
+    /// Names author-written `_:` labels and minted nodes (see
+    /// [`BlankLabeler`]: a minted label never equals an author label).
+    labels: BlankLabeler,
 }
 
 impl Processor {
-    /// Mint a fresh blank node. The `~` marker keeps generated labels distinct
-    /// from author-written `_:` labels in practice (mirrors the Turtle parser).
+    /// Mint a fresh blank node.
     fn fresh_blank(&mut self) -> Term {
-        let t = Term::Blank(format!("jld~{}", self.bnode));
-        self.bnode += 1;
-        t
+        Term::Blank(self.labels.fresh())
+    }
+
+    /// Turn an expanded string into a [`Term`] (a blank node when it begins
+    /// `_:`, named through the labeler).
+    fn term(&self, expanded: &str) -> Term {
+        match to_term(expanded) {
+            Term::Blank(l) => Term::Blank(self.labels.explicit(&l)),
+            other => other,
+        }
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
@@ -208,7 +229,7 @@ impl Processor {
 
         // Subject identity.
         let subject = match get(pairs, "@id") {
-            Some(Json::Str(s)) => to_term(&expand_iri(&ctx, s, false, true)),
+            Some(Json::Str(s)) => self.term(&expand_iri(&ctx, s, false, true)),
             _ => self.fresh_blank(),
         };
 
@@ -218,7 +239,8 @@ impl Processor {
                 if let Json::Str(s) = tv {
                     let iri = expand_iri(&ctx, s, true, false);
                     if is_absolute_iri(&iri) || iri.starts_with("_:") {
-                        self.push(subject.clone(), rdf_type(), to_term(&iri));
+                        let ty = self.term(&iri);
+                        self.push(subject.clone(), rdf_type(), ty);
                     }
                 }
             }
@@ -372,8 +394,8 @@ impl Processor {
     /// A bare JSON string, honoring the term's `@type`/`@language` coercion.
     fn string_to_term(&self, s: &str, ctx: &Context, def: &TermDef) -> Term {
         match def.type_.as_deref() {
-            Some("@id") => to_term(&expand_iri(ctx, s, false, true)),
-            Some("@vocab") => to_term(&expand_iri(ctx, s, true, false)),
+            Some("@id") => self.term(&expand_iri(ctx, s, false, true)),
+            Some("@vocab") => self.term(&expand_iri(ctx, s, true, false)),
             Some(dt) => Term::typed_literal(s, dt),
             None => {
                 let lang = def.language.clone().or_else(|| ctx.language.clone());

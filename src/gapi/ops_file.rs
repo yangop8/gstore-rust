@@ -13,9 +13,9 @@
 //!
 //! | root | what lives there | read by | written by |
 //! |------|------------------|---------|------------|
-//! | upload dir (`upload_path`, else `<db home>/upload`) | uploaded RDF files | `build`, `batchInsert`, `batchRemove` | `/file/upload` |
+//! | upload dir (`upload_path`, else `<db home>/upload`) | uploaded RDF files and zip packages; packages unpacked for one operation | `build`, `batchInsert`, `batchRemove` | `/file/upload`; `build` / `batch*` unpacking a zip |
 //! | export dir (`<db home>/export` unless configured) | exports, `format=file` query results | the same, `/file/download` | `export`, `query` |
-//! | backup dir (`backup_path`, else `<db home>/backups`) | `<db>.db_<YYYYmmddHHMMSS>` backups | `restore` | `backup` |
+//! | backup dir (`backup_path`, else `<db home>/backups`) | `<db>.db_<YYYYmmddHHMMSS>` backups (directories, or `.zip` archives) | `restore` | `backup` |
 //! | the load policy's directories (`gserver --load-dir`) | server-local data sets | `build`, `batch*`, `restore` | — |
 //!
 //! Every path parameter is resolved like upstream — a relative path against
@@ -360,6 +360,28 @@ pub(super) fn create_unique(dir: &Path, stem: &str, ext: &str) -> std::io::Resul
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "no free file name",
+    ))
+}
+
+/// Create directory `dir/<stem><n>` exclusively (`n` empty, then `_1`, `_2`,
+/// …), returning its path — where a zip package is unpacked (upstream:
+/// `<upload_path><zip name>_<YYYYmmddHHMMSS>`).
+pub(super) fn create_unique_dir(dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    for n in 0u32..10_000 {
+        let path = if n == 0 {
+            dir.join(stem)
+        } else {
+            dir.join(format!("{stem}_{n}"))
+        };
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free directory name",
     ))
 }
 

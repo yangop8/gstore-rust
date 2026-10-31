@@ -26,6 +26,8 @@ pub mod backend;
 pub mod cluster;
 pub mod concurrent;
 pub mod config;
+/// `gconsole`: the interactive console, a client of gserver's `/api`.
+pub mod console;
 pub mod dict;
 pub mod error;
 /// The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).
@@ -36,6 +38,9 @@ pub mod http_users;
 /// A small dependency-free JSON value, parser and serializer.
 pub mod json;
 pub mod kvstore;
+/// Diagnostic logging (levels, standard error and a daily-rolling log file,
+/// the `gs_error!` … `gs_trace!` macros) — upstream's `SLOG_*` over log4cplus.
+pub mod logging;
 pub mod model;
 pub mod parser;
 pub mod query;
@@ -47,6 +52,9 @@ pub mod sparql_results;
 pub mod store;
 /// The system store: users, per-database privileges, the database registry.
 pub mod sysdb;
+/// Zip packages (feature `zip`) and export files: RDF packages for `build` /
+/// `batchInsert`, zipped backups and exports, N-Triples / N-Quads exports.
+pub mod zipio;
 
 pub mod db;
 

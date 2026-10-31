@@ -112,6 +112,47 @@ fn escape_literal(s: &str) -> String {
     out
 }
 
+/// A character IRIREF excludes (`[^#x00-#x20<>"{}|^`\\]`).
+fn excluded_from_iriref(c: char) -> bool {
+    c <= ' ' || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+}
+
+/// A dictionary key (a term in N-Triples form, see [`Term::dict_key`]) as the
+/// N-Triples / Turtle / N-Quads readers accept it back: in an IRI, or a
+/// literal's datatype IRI, every character IRIREF excludes (a space, a
+/// control character, `<>"{}|^`\`) becomes a `\uXXXX` escape, which the
+/// readers decode. The lenient readers let such IRIs into a database, so the
+/// exporters write keys through this to keep an export loadable. Any other
+/// key is returned as is.
+pub fn export_key(key: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use std::fmt::Write as _;
+    let (head, iri) = if let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) {
+        ("<", inner)
+    } else if key.starts_with('"') && key.ends_with('>') {
+        match key.rfind("\"^^<") {
+            Some(i) => (&key[..i + 4], &key[i + 4..key.len() - 1]),
+            None => return Cow::Borrowed(key),
+        }
+    } else {
+        return Cow::Borrowed(key);
+    };
+    if !iri.chars().any(excluded_from_iriref) {
+        return Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 16);
+    out.push_str(head);
+    for c in iri.chars() {
+        if excluded_from_iriref(c) {
+            let _ = write!(out, "\\u{:04X}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('>');
+    Cow::Owned(out)
+}
+
 /// Whether an object position holds an entity or a literal (gStore:
 /// `TripleWithObjType::ObjectType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

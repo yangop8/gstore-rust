@@ -52,9 +52,10 @@ use crate::http_api::{
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
-use crate::model::{Term, Triple};
+use crate::parser::import;
 use crate::server::locked;
 use crate::sysdb::{clock, DbRecord, DbStatus};
+use crate::zipio::{self, ExportFormat, ScratchDir, ZipError, ZipLimits};
 use crate::{Database, DB_SUFFIX};
 
 pub(super) fn register(reg: &mut Registry) {
@@ -329,61 +330,63 @@ fn schema_json(g: &SchemaGraph) -> Json {
 // ---------------------------------------------------------------------------
 // Reading RDF sources
 // ---------------------------------------------------------------------------
+//
+// `build`, `batchInsert` and `batchRemove` read their files through
+// [`crate::parser::import`], tolerantly like upstream: the files stream in
+// (N-Triples / N-Quads / Turtle / TriG with bounded memory; the format follows
+// the extension), a statement that does not parse — or is not RDF data (a
+// literal subject, a non-IRI predicate), or fails upstream's numeric literal
+// checks — is skipped and counted in `failed_num`, and logged to
+// `<db>.db/parse_error.log` in upstream's format: an `Info … <build|batch
+// insert|batch remove> parser info, file path <p>` line per file and a `Line
+// <n> (<statement>): <message>` line per skipped statement. (Upstream's
+// `batch_remove` forgets to pass its log path, so its failures go to stdout and
+// its `failed_num` is always 0; here removals are counted and logged like
+// inserts.) Every file of a `build` / `batchInsert` gets its own blank-node
+// scope, so `_:b` of two files — or of two calls — are two nodes; a
+// `batchRemove` reads blank-node labels verbatim (they must name stored
+// nodes, as an export writes them). N-Quads / TriG statements keep their
+// named graph.
+//
+// `remote=true` (upstream's parameter) makes each `db_path` / `file` value an
+// `http(s)://` URL: refused unless the server's load policy allows remote
+// sources (`gserver --allow-service`); the URL's file name must carry an
+// allowed extension; the body (at most 256 MiB) is downloaded into the upload
+// directory, read like a local file, and removed when the operation ends —
+// a download that fails answers upstream's `1005 "Download file '<url>'
+// failed."`.
+//
+// A source with a package extension (`upload_allow_compress_packages`,
+// `zip`) is a zip of RDF files (feature `zip`; without it `1003` naming the
+// feature), local or downloaded, handled like upstream's
+// `ApiHandler::uncompress_zip`: the package is checked — every file entry
+// must carry an allowed RDF extension, else upstream's `StatusCode` `3` "zip
+// format or data is error." (the codes are upstream's `ZipCode`s, see
+// [`crate::zipio`], which also lists the zip-slip and zip-bomb guards and
+// their `conf.ini` limits) — then unpacked into
+// `<upload dir>/<package name>_<YYYYmmddHHMMSS>`, its files read in path
+// order like any other source, and that directory removed when the
+// operation ends, whatever its outcome.
 
-/// RDF read from server-side files: the valid triples and how many
-/// statements could not be used.
+/// The import options of `build` / `batchInsert` (upstream: tolerant).
+fn load_options() -> import::ImportOptions {
+    import::ImportOptions::tolerant()
+}
+
+/// The resolved sources of an operation, and the downloaded copies and
+/// unpacked packages to remove when it ends (upstream's `temp_paths`).
 #[derive(Default)]
-struct Parsed {
-    triples: Vec<Triple>,
-    /// Statements that did not parse (or a whole file that did not), and
-    /// parsed statements that are not valid RDF data (a literal subject, a
-    /// non-IRI predicate) — upstream's `failed_num` (its parse error log).
-    failed: u64,
+struct Inputs {
+    sources: Vec<import::Source>,
+    temp: Vec<PathBuf>,
+    /// Unpacked zip packages (removed when dropped).
+    unpacked: Vec<ScratchDir>,
 }
 
-/// Whether a parsed triple is RDF data: an IRI or blank subject and an IRI
-/// predicate.
-fn valid_ground(t: &Triple) -> bool {
-    matches!(t.subject, Term::Iri(_) | Term::Blank(_)) && matches!(t.predicate, Term::Iri(_))
-}
-
-/// Parse one RDF file into `out` with upstream's per-statement accounting.
-/// The format follows the extension ([`crate::parser::parse_file_by_ext`]).
-/// When an N-Triples-like file (`nt`, `txt`, `n3`) does not parse as a
-/// whole, it is read again line by line, keeping the good statements and
-/// counting the bad ones (upstream logs them to `parse_error.log` and goes
-/// on); any other file that does not parse counts as one failure.
-fn parse_into(path: &Path, out: &mut Parsed) {
-    match crate::parser::parse_file_by_ext(path) {
-        Ok(ts) => {
-            for t in ts {
-                if valid_ground(&t) {
-                    out.triples.push(t);
-                } else {
-                    out.failed += 1;
-                }
-            }
-        }
-        Err(_) => {
-            let ext = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            if !matches!(ext.as_str(), "nt" | "ntriples" | "txt" | "n3") {
-                out.failed += 1;
-                return;
-            }
-            let Ok(bytes) = fs::read(path) else {
-                out.failed += 1;
-                return;
-            };
-            for (i, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
-                match crate::parser::ntriples::parse_line(line, i + 1) {
-                    Ok(Some(t)) if valid_ground(&t) => out.triples.push(t),
-                    Ok(None) => {}
-                    Ok(Some(_)) | Err(_) => out.failed += 1,
-                }
-            }
+impl Drop for Inputs {
+    fn drop(&mut self) {
+        for p in &self.temp {
+            let _ = fs::remove_file(p);
         }
     }
 }
@@ -397,17 +400,110 @@ enum SourceKind {
     Batch,
 }
 
-/// Resolve the RDF source files `requested` (named `param`) inside the
-/// server's source roots, checking each like upstream: it must exist (`1005`)
-/// and carry an allowed RDF extension (`1003 "The file suffix '<ext>' is not
-/// allowed."`); a compressed package (`zip`) is refused with `1003` until zip
-/// input is supported. Duplicates are read once.
+/// Check a source name's extension like upstream: `Ok(true)` for a
+/// compressed package (`upload_allow_compress_packages`: a zip, see the
+/// section comment; without the `zip` feature `1003` naming it), `Ok(false)`
+/// for an allowed RDF extension, else `1003 "The file suffix '<ext>' is not
+/// allowed."`.
+fn check_suffix(ctx: &Ctx<'_>, r: &str, name: &str) -> Result<bool, GResp> {
+    let ext = ops_file::suffix_of(name).unwrap_or_default();
+    if ops_file::is_package(ctx, ext) {
+        if !zipio::AVAILABLE {
+            return Err(GResp::error(
+                Status::ParamIsIllegal,
+                format!(
+                    "zip input ('{r}'): {}; unpack the package and pass its RDF files",
+                    zipio::FEATURE_MISSING
+                ),
+            ));
+        }
+        return Ok(true);
+    }
+    if !ops_file::is_rdf_ext(ctx, ext) {
+        return Err(GResp::error(
+            Status::ParamIsIllegal,
+            format!("The file suffix '{ext}' is not allowed."),
+        ));
+    }
+    Ok(false)
+}
+
+/// The answer to a failed zip operation: upstream's `ZipCode` as the
+/// `StatusCode` with its message (and what went wrong); `1003` without the
+/// `zip` feature; `1005` for an I/O failure.
+fn zip_answer(e: &ZipError) -> GResp {
+    match e {
+        ZipError::FeatureMissing => GResp::error(Status::ParamIsIllegal, zipio::FEATURE_MISSING),
+        ZipError::Unzip { code, .. } => GResp::error(
+            Status::from_code(code.code()).unwrap_or(Status::OperationFailed),
+            e.to_string(),
+        ),
+        ZipError::Io(_) => GResp::error(Status::OperationFailed, e.to_string()),
+    }
+}
+
+/// Unpack the zip package `zip` (see the section comment) into a fresh
+/// directory of the upload directory, adding its RDF files to `out`.
+fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GResp> {
+    let cfg = ctx.inner.config();
+    let limits = ZipLimits::from_config(&cfg);
+    let name = zip
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem: String = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(s, _)| s)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = ops_file::upload_dir(ctx);
+    let made = fs::create_dir_all(&dir).and_then(|()| {
+        ops_file::create_unique_dir(&dir, &format!("{stem}_{}", ops_file::timestamp_now()))
+    });
+    let scratch = match made {
+        Ok(p) => ScratchDir::adopt(p),
+        Err(e) => {
+            return Err(GResp::error(
+                Status::OperationFailed,
+                format!("cannot unpack '{name}': {e}"),
+            ))
+        }
+    };
+    let accept = |entry: &str| {
+        ops_file::suffix_of(entry).is_some_and(|e| {
+            cfg.upload_allow_extensions
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(e))
+        })
+    };
+    let files = zipio::unpack(zip, scratch.path(), &limits, &accept).map_err(|e| zip_answer(&e))?;
+    out.sources
+        .extend(files.into_iter().map(|f| import::Source::File(f.path)));
+    out.unpacked.push(scratch);
+    Ok(())
+}
+
+/// Resolve the RDF sources `requested` (named `param`): server-side files
+/// inside the server's source roots, checked like upstream — each must exist
+/// (`1005`) and carry an allowed RDF extension (see [`check_suffix`]) — or,
+/// with `remote`, URLs (see the section comment). Duplicates are read once.
 fn source_files(
     ctx: &Ctx<'_>,
     requested: &[String],
     param: &str,
     kind: SourceKind,
-) -> Result<Vec<PathBuf>, GResp> {
+    remote: bool,
+) -> Result<Inputs, GResp> {
+    if remote {
+        return remote_sources(ctx, requested, param);
+    }
     let roots = ops_file::source_roots(ctx);
     let bases = [ops_file::upload_dir(ctx)];
     let missing = |r: &str| {
@@ -417,7 +513,7 @@ fn source_files(
         };
         GResp::error(Status::OperationFailed, msg)
     };
-    let mut out: Vec<PathBuf> = Vec::new();
+    let mut out = Inputs::default();
     for r in requested {
         let path = match ops_file::resolve_existing(r, roots.as_deref(), &bases) {
             Ok(p) if p.is_file() => p,
@@ -426,29 +522,79 @@ fn source_files(
                 return Err(refusal.answer(param, r, roots.as_deref().unwrap_or_default()))
             }
         };
-        let ext = ops_file::suffix_of(r).unwrap_or_default();
-        if ops_file::is_package(ctx, ext) {
+        if check_suffix(ctx, r, r)? {
+            unpack_package(ctx, &path, &mut out)?;
+            continue;
+        }
+        let source = import::Source::File(path);
+        if !out.sources.contains(&source) {
+            out.sources.push(source);
+        }
+    }
+    Ok(out)
+}
+
+/// `remote=true`: download each URL into the upload directory.
+fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<Inputs, GResp> {
+    let allowed = ctx.state().load_policy.allow_remote;
+    let mut out = Inputs::default();
+    for r in requested {
+        let failed = || GResp::error(Status::OperationFailed, format!("Download file '{r}' failed."));
+        if !import::is_url(r) {
+            return Err(failed());
+        }
+        if !allowed {
             return Err(GResp::error(
                 Status::ParamIsIllegal,
-                format!("zip input not supported yet ('{r}'): unpack it and pass the RDF files"),
+                format!(
+                    "the {param} '{r}' is refused: the server's load policy does not allow \
+                     remote sources"
+                ),
             ));
         }
-        if !ops_file::is_rdf_ext(ctx, ext) {
-            return Err(GResp::error(
-                Status::ParamIsIllegal,
-                format!("The file suffix '{ext}' is not allowed."),
-            ));
-        }
-        if !out.contains(&path) {
-            out.push(path);
+        let path = import::url_path(r);
+        let name = path.rsplit('/').next().unwrap_or("");
+        let package = check_suffix(ctx, r, name)?;
+        let ext = ops_file::suffix_of(name).unwrap_or_default().to_string();
+        let stem: String = name
+            .strip_suffix(&format!(".{ext}"))
+            .unwrap_or(name)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let body = import::fetch_url(r, import::DEFAULT_MAX_DOCUMENT_BYTES).map_err(|_| failed())?;
+        let dir = ops_file::upload_dir(ctx);
+        let saved = fs::create_dir_all(&dir).and_then(|()| {
+            let (mut f, file) = ops_file::create_unique(
+                &dir,
+                &format!("{stem}_{}", clock::now().date_compact()),
+                &ext,
+            )?;
+            let path = dir.join(file);
+            // A failed write (a full disk, say) leaves no partial file behind.
+            if let Err(e) = std::io::Write::write_all(&mut f, &body) {
+                drop(f);
+                let _ = fs::remove_file(&path);
+                return Err(e);
+            }
+            Ok(path)
+        });
+        let local = saved.map_err(|_| failed())?;
+        out.temp.push(local.clone());
+        if package {
+            unpack_package(ctx, &local, &mut out)?;
+        } else {
+            out.sources.push(import::Source::File(local));
         }
     }
     Ok(out)
 }
 
 /// The RDF files directly inside directory `requested` (a `batchInsert`
-/// `dir`), sorted by name: those with an allowed RDF extension.
-fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Vec<PathBuf>, GResp> {
+/// `dir`), sorted by name: those with an allowed RDF extension. Each must
+/// lie inside the source roots itself, as a `file` must: a symlink in the
+/// directory that leads outside them refuses the request.
+fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
     let roots = ops_file::source_roots(ctx);
     let bases = [ops_file::upload_dir(ctx)];
     let dir = match ops_file::resolve_existing(requested, roots.as_deref(), &bases) {
@@ -463,7 +609,7 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Vec<PathBuf>, GResp> {
             return Err(refusal.answer("dir", requested, roots.as_deref().unwrap_or_default()))
         }
     };
-    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
         .map_err(|e| {
             GResp::error(
                 Status::OperationFailed,
@@ -480,8 +626,23 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Vec<PathBuf>, GResp> {
                     .is_some_and(|e| ops_file::is_rdf_ext(ctx, e))
         })
         .collect();
-    files.sort();
-    Ok(files)
+    entries.sort();
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // `is_file` followed a symlink: where it leads is confined too.
+        let shown = entry.to_string_lossy();
+        match ops_file::resolve_existing(&shown, roots.as_deref(), &[]) {
+            Ok(file) => files.push(file),
+            Err(refusal) => {
+                return Err(refusal.answer("file", &shown, roots.as_deref().unwrap_or_default()))
+            }
+        }
+    }
+    Ok(Inputs {
+        sources: files.into_iter().map(import::Source::File).collect(),
+        temp: Vec::new(),
+        unpacked: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -933,20 +1094,25 @@ fn schema(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
 // ---------------------------------------------------------------------------
 
 /// `build` — create database `db_name` from the server-side RDF files
-/// `db_path` (a string or an array; none = an empty database). Upstream's
-/// checks, in its order: each file exists (`1005 "RDF file '<p>' not
-/// exist."`, after the path confinement of `ops_file`) and has an allowed
-/// extension (`1003`; a `.zip` → `1003 "zip input not supported yet"`), the
+/// `db_path` (a string or an array; none = an empty database; URLs with
+/// `remote=true`; zip packages of RDF files, see "Reading RDF sources").
+/// Upstream's checks, in its order: each file exists (`1005 "RDF file '<p>'
+/// not exist."`, after the path confinement of `ops_file`) and has an
+/// allowed extension (`1003`), each package unpacks (its `ZipCode`), the
 /// database does not exist yet (`1004 "database already built."`), and the
-/// `max_database_num` limit. Statements that do not parse are skipped and
-/// counted. Answers `0 "Import RDF file to database done."` with
-/// `success_num` (the triples in the new database) and `failed_num`. The
-/// creator gets every privilege on the new database; it is not loaded.
+/// `max_database_num` limit. The files stream in;
+/// statements that fail are skipped, counted and logged to
+/// `<db>.db/parse_error.log` (see "Reading RDF sources" above). Answers `0
+/// "Import RDF file to database done."` with `success_num` (the distinct
+/// statements in the new database: triples plus named-graph quads) and
+/// `failed_num`. The creator gets every privilege on the new database; it
+/// is not loaded.
 fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
     let started = Instant::now();
     let requested = p.strings("db_path");
-    let files = match source_files(ctx, &requested, "db_path", SourceKind::Build) {
+    let remote = p.bool("remote", false);
+    let inputs = match source_files(ctx, &requested, "db_path", SourceKind::Build, remote) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -975,31 +1141,47 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         inner: ctx.inner,
         name: db.clone(),
     };
-    let mut parsed = Parsed::default();
-    for (i, f) in files.iter().enumerate() {
-        progress(
-            &format!("parsing RDF file {} of {}", i + 1, files.len()),
-            parsed.triples.len() as u64,
-        );
-        parse_into(f, &mut parsed);
-    }
-    progress("building the database", parsed.triples.len() as u64);
     let fail = |msg: String| {
         GResp::error(
             Status::OperationFailed,
             format!("Import RDF file to database failed:{msg}"),
         )
     };
-    let built = match Database::build_from_triples(db.clone(), parsed.triples) {
-        Ok(b) => b,
-        Err(e) => return fail(e.to_string()),
-    };
-    let success_num = built.triple_num();
     // Written into a staging directory and renamed into place once complete:
     // a build cut short (a crash, a shutdown that does not wait for it)
-    // leaves no `<db>.db` that would read as a built database.
+    // leaves no `<db>.db` that would read as a built database. The parse
+    // error log is written there too, so it lands in `<db>.db/`.
     let staging = PathBuf::from(format!("{}.build-tmp", dir.display()));
     let _ = fs::remove_dir_all(&staging);
+    let mut log = match import::ParseErrorLog::in_dir(&staging) {
+        Ok(l) => l,
+        Err(e) => return fail(e.to_string()),
+    };
+    progress(
+        &format!("parsing {} RDF file(s)", inputs.sources.len()),
+        0,
+    );
+    let (built, report) =
+        match Database::build_from_sources(db.clone(), &inputs.sources, &load_options(), &mut log)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                drop(log);
+                let _ = fs::remove_dir_all(&staging);
+                return fail(e.to_string());
+            }
+        };
+    drop(log);
+    drop(inputs);
+    progress("saving the database", report.statements);
+    let success_num = statement_count(&built);
+    if report.failed > 0 {
+        crate::gs_warn!(
+            "build '{db}': RDF parse error num {}; see {}",
+            report.failed,
+            dir.join(import::PARSE_ERROR_LOG).display()
+        );
+    }
     let saved = built
         .save(&staging)
         .map_err(|e| e.to_string())
@@ -1030,7 +1212,7 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         let _ = st.users.grant_all_on(&creator, &db);
     }
     GResp::success("Import RDF file to database done.")
-        .with("failed_num", parsed.failed)
+        .with("failed_num", report.failed)
         .with("success_num", success_num)
 }
 
@@ -1200,12 +1382,31 @@ fn rename(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 // backup / backuppath / restore / export
 // ---------------------------------------------------------------------------
 
-/// The `1003` answer to `compress=true` until zip output is supported.
+/// The `1003` answer to `compress=true` without the `zip` feature.
 fn no_compress(op: &str) -> GResp {
     GResp::error(
         Status::ParamIsIllegal,
-        format!("compress is not supported yet: {op} writes uncompressed output (omit compress)"),
+        format!(
+            "compress=true ({op}): {}; omit compress for uncompressed output",
+            zipio::FEATURE_MISSING
+        ),
     )
+}
+
+/// Whether `path` is a zipped backup this build can restore: a file named
+/// `….zip` (with the `zip` feature).
+fn is_zip_backup(path: &Path) -> bool {
+    zipio::AVAILABLE && path.is_file() && zipio::is_zip_name(path)
+}
+
+/// The database a zipped backup records itself as a backup of (its
+/// [`crate::http_api::BACKUP_OWNER_FILE`] entry, as
+/// [`crate::http_api::backup_owner`] reads a backup directory's).
+fn zip_backup_owner(zip: &Path) -> Option<String> {
+    zipio::read_entry(zip, crate::http_api::BACKUP_OWNER_FILE, 4096)
+        .ok()
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
 }
 
 /// The backups of `db` in `dir`: upstream's `<db>.db_<YYYYmmddHHMMSS>`
@@ -1225,7 +1426,12 @@ fn backups_of(dir: &Path, db: &str) -> Vec<String> {
         .filter(|n| crate::http_api::backup_name_db(n) == Some(db))
         .filter(|n| {
             let p = dir.join(n);
-            match crate::http_api::backup_owner(&p) {
+            let owner = if p.is_file() {
+                zip_backup_owner(&p)
+            } else {
+                crate::http_api::backup_owner(&p)
+            };
+            match owner {
                 Some(owner) => owner == db,
                 None => p.is_file() || Database::storage_kind(&p).is_some(),
             }
@@ -1335,11 +1541,14 @@ fn output_dir(
 /// there (the oldest go). Answers `0 "Database backup successfully."` with
 /// `backupfilepath`, which `restore` accepts. (Upstream's code ignores a
 /// `backup_path` parameter its documentation describes; it is honoured here,
-/// inside the backup directory.) `compress=true` (a zip) is refused until zip
-/// output is supported.
+/// inside the backup directory.) `compress=true` packs the backup into
+/// `<db>.db_<YYYYmmddHHMMSS>.zip` instead (upstream's archive: the backup's
+/// files at the archive root; the directory is removed) and answers that as
+/// `backupfilepath` — feature `zip`, else `1003` naming it.
 fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
-    if p.bool("compress", false) {
+    let compress = p.bool("compress", false);
+    if compress && !zipio::AVAILABLE {
         return no_compress("backup");
     }
     let root = ops_file::backup_dir(ctx);
@@ -1395,6 +1604,8 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     }
     let name = format!("{db}{DB_SUFFIX}_{}", ops_file::timestamp_now());
     let dest = target.join(&name);
+    let zip_name = format!("{name}.zip");
+    let zip_dest = target.join(&zip_name);
     progress("backing up", 0);
     let written = match dbh {
         Some(h) => {
@@ -1428,9 +1639,23 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         let _ = fs::remove_dir_all(&dest);
         return fail(e);
     }
+    let shown_name = if compress {
+        // The record travels inside the archive; a zip of the same second
+        // is replaced, like a directory.
+        progress("compressing the backup", 0);
+        let _ = fs::remove_file(&zip_dest);
+        if let Err(e) = Database::pack_backup(&dest, &zip_dest) {
+            let _ = fs::remove_dir_all(&dest);
+            let _ = fs::remove_file(&zip_dest);
+            return fail(format!("backup compress fail: {e}"));
+        }
+        zip_name
+    } else {
+        name
+    };
     rotate_backups(&target, &db, ctx.inner.config().max_backups);
     GResp::success("Database backup successfully.")
-        .with("backupfilepath", ops_file::shown(&shown, &name))
+        .with("backupfilepath", ops_file::shown(&shown, &shown_name))
 }
 
 /// `backuppath` — the backups of `db_name` in the server's backup directory
@@ -1453,20 +1678,27 @@ fn backuppath(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
 /// saved, swapped and loaded again. A database that does not exist yet is
 /// created (registered with the caller as creator and the backup's time as
 /// built time). Answers `0 "Database restore successfully."` (upstream's
-/// code; its docs show `"Database <db> restore successfully."`). A `.zip`
-/// backup is refused until zip input is supported.
+/// code; its docs show `"Database <db> restore successfully."`). A zipped
+/// backup (`….zip`, as `backup compress=true` writes; feature `zip`, else
+/// `1003` naming it) is unpacked beside the database under the `conf.ini`
+/// zip limits first (upstream `restore_databaseinfo`; a package that does not
+/// unpack: `1005 "backup uncompress fail: …"`); any other file is `1003
+/// "Backup file is not zip file."`.
 fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
     let root = ops_file::backup_dir(ctx);
     let user = ctx.user().to_string();
-    let may_restore =
-        |ctx: &Ctx<'_>, path: &Path| may_restore_from(&ctx.state().users, &user, &db, path);
+    // A zipped backup carries its record inside the archive.
+    let may_restore = |ctx: &Ctx<'_>, path: &Path| {
+        (is_zip_backup(path) && zip_backup_owner(path).as_deref() == Some(db.as_str()))
+            || may_restore_from(&ctx.state().users, &user, &db, path)
+    };
     let source = match p.non_empty("backup_path") {
         None => match backups_of(&root, &db)
             .into_iter()
             .rev()
             .map(|n| root.join(n))
-            .find(|p| p.is_dir() && may_restore(ctx, p))
+            .find(|p| (p.is_dir() || is_zip_backup(p)) && may_restore(ctx, p))
         {
             Some(newest) => newest,
             None => {
@@ -1485,14 +1717,12 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 dirs
             });
             match ops_file::resolve_existing(&r, roots.as_deref(), std::slice::from_ref(&root)) {
-                Ok(path) if path.is_dir() => path,
+                Ok(path) if path.is_dir() || is_zip_backup(&path) => path,
                 Ok(path) => {
-                    let ext = ops_file::suffix_of(&path.to_string_lossy())
-                        .unwrap_or_default()
-                        .to_string();
-                    let msg = if ops_file::is_package(ctx, &ext) {
+                    let msg = if zipio::is_zip_name(&path) {
                         format!(
-                            "zip input not supported yet ('{r}'): restore from a backup directory"
+                            "zip backup ('{r}'): {}; restore from a backup directory",
+                            zipio::FEATURE_MISSING
                         )
                     } else {
                         "Backup file is not zip file.".to_string()
@@ -1521,11 +1751,15 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         );
     }
     let fail = |msg: String| GResp::error(Status::OperationFailed, format!("Restore fail: {msg}"));
-    if Database::storage_kind(&source).is_none() {
-        return fail(format!(
+    let zipped = source.is_file();
+    let no_backup = |at: &Path| {
+        fail(format!(
             "'{}' does not contain a database backup",
-            source.display()
-        ));
+            at.display()
+        ))
+    };
+    if !zipped && Database::storage_kind(&source).is_none() {
+        return no_backup(&source);
     }
     let max_dbs = ctx.inner.config().max_database_num;
     let (dir, fresh) = {
@@ -1552,9 +1786,41 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         inner: ctx.inner,
         name: db.clone(),
     };
+    // A zipped backup is unpacked beside the database first (removed once
+    // staged); the name is reserved meanwhile, so no other restore of it
+    // shares the scratch directory.
+    let mut scratch = None;
+    let from = if zipped {
+        progress("uncompressing the backup", 0);
+        let mut at = dir.as_os_str().to_owned();
+        at.push(".unzip-tmp");
+        let s = match ScratchDir::fresh(PathBuf::from(at)) {
+            Ok(s) => s,
+            Err(e) => return fail(format!("cannot unpack the backup: {e}")),
+        };
+        let limits = ZipLimits::from_config(&ctx.inner.config());
+        let found = match Database::unpack_backup(&source, s.path(), &limits) {
+            Ok(found) => found,
+            Err(e) => {
+                return GResp::error(
+                    Status::OperationFailed,
+                    format!("backup uncompress fail: {e}"),
+                )
+            }
+        };
+        if Database::storage_kind(&found).is_none() {
+            return no_backup(&source);
+        }
+        scratch = Some(s);
+        found
+    } else {
+        source.clone()
+    };
     progress("restoring", 0);
     // Copy and validate first; nothing is touched if the backup is bad.
-    let staged = match Database::stage_restore(&source, &dir) {
+    let staged = Database::stage_restore(&from, &dir);
+    drop(scratch);
+    let staged = match staged {
         Ok(s) => s,
         Err(e) => return fail(e.to_string()),
     };
@@ -1637,17 +1903,44 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     GResp::success("Database restore successfully.")
 }
 
-/// `export` — write the loaded database `db_name` as N-Triples to
+/// `export` — write the loaded database `db_name` to
 /// `<db_path>/<db>_<YYYYmmddHHMMSS>.nt` (upstream's name; a numeric suffix
 /// keeps two exports of one second apart), `db_path` defaulting to the
 /// export directory and confined to it. Answers `0 "Export the database
 /// successfully."` with `filepath`, which `/file/download` serves.
-/// `compress=true` (a zip) is refused until zip output is supported.
+///
+/// The format (a Rust extension; upstream writes N-Triples): `format=nt` (or
+/// `ntriples` / `n-triples`) writes N-Triples — the default graph, as
+/// upstream; `format=nq` (`nquads` / `n-quads`) writes N-Quads to `….nq` —
+/// the default graph, then every named graph. Without `format` a database
+/// with named graphs is written as N-Quads (nothing is lost), any other as
+/// N-Triples (upstream's file). Another `format` is `1003`.
+///
+/// `compress=true` packs the file into `<db>_<YYYYmmddHHMMSS>.zip` (holding
+/// it by its file name; the file itself is removed) and answers that as
+/// `filepath`, like upstream — feature `zip`, else `1003` naming it; a
+/// failure to pack is upstream's `StatusCode` `2` `"export compress fail."`.
 fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
-    if p.bool("compress", false) {
+    let compress = p.bool("compress", false);
+    if compress && !zipio::AVAILABLE {
         return no_compress("export");
     }
+    let format = match p.non_empty("format") {
+        None => None,
+        Some(f) => match ExportFormat::parse(&f) {
+            Some(fmt) => Some(fmt),
+            None => {
+                return GResp::error(
+                    Status::ParamIsIllegal,
+                    format!(
+                        "the export format '{f}' is not supported (use nt for N-Triples or nq \
+                         for N-Quads)"
+                    ),
+                )
+            }
+        },
+    };
     let dbh = match loaded_handle(ctx, &db) {
         Ok(h) => h,
         Err(r) => return r,
@@ -1667,19 +1960,52 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(s) => s,
         Err(e) => return op_error(&db, "Export fail: ", e),
     };
+    let format = format.unwrap_or_else(|| ExportFormat::for_database(&slot.db));
     let stem = format!("{db}_{}", ops_file::timestamp_now());
-    let (file, name) = match ops_file::create_unique(&target, &stem, "nt") {
+    let (file, name) = match ops_file::create_unique(&target, &stem, format.extension()) {
         Ok(x) => x,
         Err(e) => return fail(e.to_string()),
     };
     let mut out = BufWriter::new(file);
-    let written = slot.db.export_ntriples(&mut out);
+    let written = zipio::write_export(&slot.db, format, &mut out);
     drop(slot);
     drop(out);
     if let Err(e) = written {
         let _ = fs::remove_file(target.join(&name));
         return fail(e.to_string());
     }
+    let name = if compress {
+        // `<stem>.zip` beside the file (a free name: another export of the
+        // same second may hold the plain one).
+        let file_stem = name
+            .rsplit_once('.')
+            .map_or(name.as_str(), |(s, _)| s)
+            .to_string();
+        let packed = match ops_file::create_unique(&target, &file_stem, "zip") {
+            Ok((_, zip)) => {
+                match zipio::pack_file(&target.join(&name), &target.join(&zip), &name) {
+                    Ok(()) => Ok(zip),
+                    Err(e) => {
+                        let _ = fs::remove_file(target.join(&zip));
+                        Err(e.to_string())
+                    }
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = fs::remove_file(target.join(&name));
+        match packed {
+            Ok(zip) => zip,
+            Err(e) => {
+                return GResp::error(
+                    Status::CompressError,
+                    format!("export compress fail. ({e})"),
+                )
+            }
+        }
+    } else {
+        name
+    };
     GResp::success("Export the database successfully.")
         .with("filepath", ops_file::shown(&shown, &name))
 }
@@ -1688,19 +2014,22 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 // batchInsert / batchRemove
 // ---------------------------------------------------------------------------
 
-/// `batchInsert` — insert the triples of server-side RDF files: `file` (a
-/// string or an array) or, when it is absent, every RDF file directly inside
-/// `dir` (upstream's documentation describes `dir`; its code reads only
-/// `file`). Answers `0 "Batch insert data successfully."` with `success_num`
-/// (triples inserted; duplicates are not counted) and `failed_num`
-/// (statements that did not parse or are not RDF data).
+/// `batchInsert` — insert the statements of server-side RDF files: `file` (a
+/// string or an array; URLs with `remote=true`) or, when it is absent, every
+/// RDF file directly inside `dir` (upstream's documentation describes `dir`;
+/// its code reads only `file`). The files stream in, each with its own
+/// blank-node scope; N-Quads / TriG statements go to their named graphs.
+/// Answers `0 "Batch insert data successfully."` with `success_num`
+/// (statements inserted; duplicates are not counted) and `failed_num`
+/// (statements skipped: see "Reading RDF sources", which also describes the
+/// `<db>.db/parse_error.log` entries).
 fn batch_insert(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     batch(ctx, p, true)
 }
 
-/// `batchRemove` — remove the triples of server-side RDF files (as
-/// [`batch_insert`]): `0 "Batch remove data successfully."`, `success_num`
-/// = triples removed.
+/// `batchRemove` — remove the statements of server-side RDF files (as
+/// [`batch_insert`]; blank-node labels are read verbatim): `0 "Batch remove
+/// data successfully."`, `success_num` = statements removed, `failed_num`.
 fn batch_remove(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     batch(ctx, p, false)
 }
@@ -1713,7 +2042,7 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
         ("Batch remove data successfully.", "Batch remove fail: ")
     };
     // Upstream's checks, in its order.
-    {
+    let dir = {
         let st = ctx.state();
         if !st.dbs.contains_key(&db) {
             return if st.db_dir(&db).is_dir() {
@@ -1728,10 +2057,12 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
                 )
             };
         }
-    }
+        st.db_dir(&db)
+    };
     let requested = p.strings("file");
-    let files = if !requested.is_empty() {
-        source_files(ctx, &requested, "file", SourceKind::Batch)
+    let remote = p.bool("remote", false);
+    let inputs = if !requested.is_empty() {
+        source_files(ctx, &requested, "file", SourceKind::Batch, remote)
     } else if let Some(d) = p.non_empty("dir") {
         dir_files(ctx, &d)
     } else {
@@ -1740,14 +2071,10 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
             "the value of file can not be empty!",
         ))
     };
-    let files = match files {
+    let inputs = match inputs {
         Ok(f) => f,
         Err(r) => return r,
     };
-    let mut parsed = Parsed::default();
-    for f in &files {
-        parse_into(f, &mut parsed);
-    }
     let dbh = match loaded_handle(ctx, &db) {
         Ok(h) => h,
         Err(_) => {
@@ -1767,38 +2094,49 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
     if let Some(open) = &slot.txn {
         return in_txn(&db, open.tid);
     }
+    // Upstream appends to the database's parse error log; a log that cannot
+    // be opened does not fail the operation (it is reported on stderr).
+    let mut file_log;
+    let mut no_log = ();
+    let log: &mut dyn import::ErrorLog = match import::ParseErrorLog::in_dir(&dir) {
+        Ok(l) => {
+            file_log = l;
+            &mut file_log
+        }
+        Err(e) => {
+            crate::gs_warn!("cannot open the parse error log of '{db}': {e}");
+            &mut no_log
+        }
+    };
+    progress(if insert { "inserting" } else { "removing" }, 0);
     let mut applied = 0u64;
-    let mut failure = None;
-    for (i, t) in parsed.triples.iter().enumerate() {
-        if i % 10_000 == 0 {
-            progress(if insert { "inserting" } else { "removing" }, applied);
-        }
-        let changed = if insert {
-            slot.db.try_insert_triple(t)
-        } else {
-            Ok(slot.db.remove_triple(t))
-        };
-        match changed {
-            Ok(true) => applied += 1,
-            Ok(false) => {}
-            Err(e) => {
-                failure = Some(e);
-                break;
-            }
-        }
-    }
+    let result = if insert {
+        slot.db
+            .insert_sources(&inputs.sources, &load_options(), log, &mut applied)
+    } else {
+        slot.db.remove_sources(
+            &inputs.sources,
+            &load_options().for_removal(),
+            log,
+            &mut applied,
+        )
+    };
     let warning = if applied > 0 {
         slot.wrote(ctx.inner.save_writes())
     } else {
         None
     };
     drop(slot);
-    if let Some(e) = failure {
-        return GResp::error(
-            Status::OperationFailed,
-            format!("{fail_prefix}stopped after applying {applied} triple(s): {e}"),
-        );
-    }
+    drop(inputs);
+    let report = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return GResp::error(
+                Status::OperationFailed,
+                format!("{fail_prefix}stopped after applying {applied} triple(s): {e}"),
+            )
+        }
+    };
     if let Some(w) = warning {
         // Upstream fails the operation when its check_point save fails (the
         // change stays applied in memory and is saved later).
@@ -1806,8 +2144,20 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
     }
     GResp::success(done)
         .with("success_num", applied)
-        .with("failed_num", parsed.failed)
+        .with("failed_num", report.failed)
 }
+
+/// The distinct statements a database holds: default-graph triples plus
+/// named-graph quads (`build`'s `success_num`).
+fn statement_count(db: &Database) -> u64 {
+    db.triple_num()
+        + db
+            .named_graphs()
+            .values()
+            .map(|g| g.triple_count())
+            .sum::<u64>()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1902,21 +2252,28 @@ mod tests {
         .unwrap();
         let bad_ttl = d.join("bad.ttl");
         fs::write(&bad_ttl, "@prefix : <http://x/> .\n:a :b \n").unwrap();
-        let mut parsed = Parsed::default();
-        parse_into(&good, &mut parsed);
-        assert_eq!(
-            (parsed.triples.len(), parsed.failed),
-            (1, 1),
-            "literal subject"
-        );
-        parse_into(&mixed, &mut parsed);
-        assert_eq!((parsed.triples.len(), parsed.failed), (3, 2));
-        parse_into(&bad_ttl, &mut parsed);
-        assert_eq!(
-            (parsed.triples.len(), parsed.failed),
-            (3, 3),
-            "a whole file"
-        );
+        let (mut stored, mut failed) = (0u64, 0u64);
+        let mut read = |f: &Path| {
+            let mut errors: Vec<(String, crate::parser::stream::SyntaxError)> = Vec::new();
+            let r = import::import_source(
+                &import::Source::File(f.to_path_buf()),
+                "build",
+                &load_options(),
+                &mut errors,
+                &mut |b: &mut Vec<crate::parser::nquads::Quad>| {
+                    b.clear();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(errors.len() as u64, r.failed);
+            stored += r.statements;
+            failed += r.failed;
+            (stored, failed)
+        };
+        assert_eq!(read(&good), (1, 1), "literal subject");
+        assert_eq!(read(&mixed), (3, 2));
+        assert_eq!(read(&bad_ttl), (3, 3), "an unterminated statement");
         let _ = fs::remove_dir_all(&d);
     }
 }

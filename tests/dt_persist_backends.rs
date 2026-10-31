@@ -400,10 +400,19 @@ fn gbuild_disk_dispatches_on_file_extension() {
     assert!(out.status.success(), "gbuild --disk failed: {out:?}");
     let mut db = Database::open(base.join("fmt.db")).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);
-    assert_eq!(db.triple_num(), 4, "3 Turtle triples + 1 flattened N-Quad");
+    // The N-Quad keeps its graph (it was flattened into the default graph
+    // before named graphs were preserved by the disk build).
+    assert_eq!(db.triple_num(), 3, "3 Turtle triples in the default graph");
     assert_eq!(
         col0(&mut db, "SELECT ?o WHERE { ?s <http://ex/knows> ?o }"),
-        ["<http://ex/b>", "<http://ex/c>", "<http://ex/e>"]
+        ["<http://ex/b>", "<http://ex/c>"]
+    );
+    assert_eq!(
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { GRAPH <http://ex/g> { ?s <http://ex/knows> ?o } }"
+        ),
+        ["<http://ex/e>"]
     );
     let _ = fs::remove_dir_all(&base);
 }
@@ -791,9 +800,10 @@ fn cli_backup_restore_of_a_disk_database() {
         &[name.to_str().unwrap(), bak.to_str().unwrap()],
     );
     let restored = base.join("restored");
+    // grestore <db_name> <backup_dir> (upstream's order).
     ok(
         env!("CARGO_BIN_EXE_grestore"),
-        &[bak.to_str().unwrap(), restored.to_str().unwrap()],
+        &[restored.to_str().unwrap(), bak.to_str().unwrap()],
     );
     let mut db = Database::open(base.join("restored.db")).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);

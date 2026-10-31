@@ -1,0 +1,20 @@
+# Keep the Docker build context small: the image needs only the workspace
+# manifests, the sources (src/, gnlqa/) and conf/ (see Dockerfile).
+target/
+**/target/
+.git/
+.github/
+.claude/
+tests/
+testdata/
+docs/
+scripts/
+packaging/
+# Databases, logs and backups a local run may have left in the tree.
+*.db/
+*.db
+dbhome/
+logs/
+backups/
+upload/
+*.log

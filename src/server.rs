@@ -769,7 +769,9 @@ fn worker_loop(rx: &Mutex<Receiver<Job>>, waiting: &AtomicUsize) {
         };
         waiting.fetch_sub(1, Ordering::SeqCst);
         // A panic is contained to this connection; the worker keeps serving.
-        let _ = catch_unwind(AssertUnwindSafe(job));
+        if catch_unwind(AssertUnwindSafe(job)).is_err() {
+            crate::gs_error!("a connection handler panicked; the connection was dropped");
+        }
     }
 }
 
@@ -795,6 +797,8 @@ pub(crate) fn run_accept_loop(
             waiting: Arc::clone(&waiting),
         };
         let pool = WorkerPool::start(opts.threads, opts.queue_len, waiting);
+        // When `accept` failures were last logged (at most once a second).
+        let mut accept_error_logged: Option<std::time::Instant> = None;
         while !life.stopping() {
             match sock.accept() {
                 Ok((stream, peer)) => {
@@ -817,7 +821,13 @@ pub(crate) fn run_accept_loop(
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 // E.g. EMFILE under a connection flood: back off instead of
                 // spinning on the failing accept.
-                Err(_) => thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    if accept_error_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                        crate::gs_warn!("accepting a connection failed: {e}; backing off");
+                        accept_error_logged = Some(std::time::Instant::now());
+                    }
+                    thread::sleep(Duration::from_millis(10))
+                }
             }
         }
         // Queued connections are still served (they hold in-flight guards);
@@ -1575,8 +1585,10 @@ impl ServerInner {
                 return Ok(true);
             }
         }
-        let reply = catch_unwind(AssertUnwindSafe(|| self.route(&req)))
-            .unwrap_or_else(|_| Reply::plain(500, "application/json", &err_json(PANIC_MSG)));
+        let reply = catch_unwind(AssertUnwindSafe(|| self.route(&req))).unwrap_or_else(|_| {
+            crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
+            Reply::plain(500, "application/json", &err_json(PANIC_MSG))
+        });
         // The client's `Accept-Encoding` (used to optionally compress buffered
         // bodies under the `gzip` feature; ignored without it).
         let enc = req.header("accept-encoding");
@@ -1688,10 +1700,12 @@ impl ServerInner {
             self.dirty.store(true, Ordering::SeqCst);
             if self.check_point || self.closing.load(Ordering::SeqCst) {
                 if let Err((dir, e)) = self.save_locked(&db) {
-                    warning = Some(format!(
+                    let msg = format!(
                         "update applied in memory but saving to '{}' failed: {e}",
                         dir.display()
-                    ));
+                    );
+                    crate::gs_error!("{msg}");
+                    warning = Some(msg);
                 }
             }
             if let Err(e) = &result {

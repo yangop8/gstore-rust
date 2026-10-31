@@ -30,16 +30,24 @@
 //! install directory). A shipped, commented example lives in
 //! `conf/conf.ini.example`.
 //!
-//! A few **Rust-only extension keys** tune what upstream configures in code
-//! (or not at all). In `[server]`, the HTTP layer: `listen_addr`,
-//! `keep_alive_timeout`, `keep_alive_max`, `queue_size` and `cors`. In a
-//! `[query]` section, how every served database evaluates queries
-//! ([`GStoreConfig::query_settings`], applied to each database the servers
-//! open, build, create or restore): `integer_division`, `query_cache_size`,
-//! `early_termination`, `topk_bounded_heap`, `topk_dpb` and
-//! `gfun_max_output_bytes`. Upstream has no key for any of them (its query
-//! cache budget, 100 MB, is a constant in `QueryCache.h`). They are
-//! documented on the fields below and in the example file.
+//! A few **Rust-only extension keys** tune what upstream configures in code,
+//! in a properties file, or not at all:
+//!
+//! * `[server]`: the HTTP layer — `listen_addr`, `keep_alive_timeout`,
+//!   `keep_alive_max`, `queue_size` and `cors`;
+//! * `[log]`: the diagnostic log that upstream configures in a log4cplus
+//!   properties file — `log_level`, `log_file`, `log_days`, `log_stderr`
+//!   (see [`crate::logging`]);
+//! * `[upload]`: the limits a zip package must stay within —
+//!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]);
+//! * `[query]`: how every served database evaluates queries
+//!   ([`GStoreConfig::query_settings`], applied to each database the servers
+//!   open, build, create or restore) — `integer_division`,
+//!   `query_cache_size`, `early_termination`, `topk_bounded_heap`, `topk_dpb`
+//!   and `gfun_max_output_bytes`. Upstream has no key for any of them (its
+//!   query cache budget, 100 MB, is a constant in `QueryCache.h`).
+//!
+//! They are documented on the fields below and in the example file.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -230,11 +238,17 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("upload", "upload_allow_extensions"),
     ("upload", "upload_allow_compress_packages"),
     // Rust-only extensions.
+    ("upload", "unzip_max_entries"),
+    ("upload", "unzip_max_size"),
     ("server", "listen_addr"),
     ("server", "keep_alive_timeout"),
     ("server", "keep_alive_max"),
     ("server", "queue_size"),
     ("server", "cors"),
+    ("log", "log_level"),
+    ("log", "log_file"),
+    ("log", "log_days"),
+    ("log", "log_stderr"),
     ("query", "integer_division"),
     ("query", "query_cache_size"),
     ("query", "early_termination"),
@@ -250,6 +264,10 @@ const KEY_ALIASES: &[(&str, &str)] = &[("daemon", "deamon")];
 fn section_of(key: &str) -> Option<&'static str> {
     KNOWN_KEYS.iter().find(|(_, k)| *k == key).map(|(s, _)| *s)
 }
+
+/// Upstream's default `root_password` (`conf.ini`), which every gStore
+/// install shares: `gserver` refuses to expose a root that still uses it.
+pub const DEFAULT_ROOT_PASSWORD: &str = "123456";
 
 /// gStore's server configuration: every key of upstream's `conf/conf.ini`
 /// (plus a few Rust-only HTTP knobs), typed, with upstream's defaults.
@@ -349,6 +367,21 @@ pub struct GStoreConfig {
     pub accesslog_path: PathBuf,
     /// Days of access logs to keep (default `30`).
     pub accesslog_days: u32,
+    /// *(Rust extension)* The diagnostic log's level — `trace`, `debug`,
+    /// `info`, `warn`, `error` or `off` — overriding the properties file
+    /// `log_mode` names (default unset: the file's root level, else `info`).
+    pub log_level: String,
+    /// *(Rust extension)* The diagnostic log file (rolled daily), or `off`
+    /// for none — overriding the properties file (default unset: the file's
+    /// `DailyRollingFileAppender`, else no file).
+    pub log_file: String,
+    /// *(Rust extension)* Days of rolled diagnostic log files kept, `0` for
+    /// all (applies when set; otherwise a properties file's log keeps them
+    /// all, as upstream's log4cplus, and one `log_file` sets keeps `30`).
+    pub log_days: u32,
+    /// *(Rust extension)* Write the diagnostic log to standard error too
+    /// (default on; applies when set, overriding the properties file).
+    pub log_stderr: bool,
 
     // ---- [backup] -------------------------------------------------------
     /// Backup directory (default `./backups/`).
@@ -365,6 +398,12 @@ pub struct GStoreConfig {
     pub upload_allow_extensions: Vec<String>,
     /// Allowed compressed upload package types (default `zip`).
     pub upload_allow_compress_packages: Vec<String>,
+    /// *(Rust extension)* Entries a zip package may hold to be unpacked
+    /// (`build` / `batchInsert` / `restore` of a `.zip`; default `10000`).
+    pub unzip_max_entries: usize,
+    /// *(Rust extension)* Bytes the files of a zip package may unpack to, in
+    /// all (default 10 GiB) — the zip-bomb guard of `crate::zipio`.
+    pub unzip_max_size: u64,
 
     // ---- [query] (Rust extension) ---------------------------------------
     /// *(Rust extension)* How `/` divides two integers: `decimal` (SPARQL
@@ -424,7 +463,7 @@ impl Default for GStoreConfig {
             db_home: PathBuf::from("./dbhome/"),
             db_suffix: ".db".to_string(),
             root_username: "root".to_string(),
-            root_password: "123456".to_string(),
+            root_password: DEFAULT_ROOT_PASSWORD.to_string(),
             system_username: "system".to_string(),
             pfn_base_path: PathBuf::from("./pfn/"),
             licensetype: "opensource".to_string(),
@@ -437,12 +476,18 @@ impl Default for GStoreConfig {
             accesslog_mode: true,
             accesslog_path: PathBuf::from("logs/ipaccess/"),
             accesslog_days: 30,
+            log_level: String::new(),
+            log_file: String::new(),
+            log_days: crate::logging::DEFAULT_LOG_DAYS,
+            log_stderr: true,
             backup_path: PathBuf::from("./backups/"),
             max_backups: 3,
             upload_path: PathBuf::from("./upload/"),
             upload_max_body_size: 1_073_741_824,
             upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt"),
             upload_allow_compress_packages: split_list("zip"),
+            unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
+            unzip_max_size: crate::zipio::DEFAULT_MAX_SIZE,
             integer_division: IntegerDivision::default(),
             query_cache_size: DEFAULT_QUERY_CACHE_BYTES,
             early_termination: true,
@@ -641,6 +686,14 @@ impl GStoreConfig {
             "accesslog_days" => {
                 self.accesslog_days = parse_num(v).ok_or_else(|| bad("a number of days"))?
             }
+            "log_level" => {
+                let level = crate::logging::Level::parse_filter(v)
+                    .map_err(|()| bad("trace, debug, info, warn, error or off"))?;
+                self.log_level = crate::logging::filter_name(level).to_string()
+            }
+            "log_file" => self.log_file = nonempty(v).ok_or_else(|| bad("a file path or off"))?.to_string(),
+            "log_days" => self.log_days = parse_num(v).ok_or_else(|| bad("a number of days"))?,
+            "log_stderr" => self.log_stderr = parse_switch(v).ok_or_else(|| bad("on or off"))?,
             "backup_path" => {
                 self.backup_path = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?)
             }
@@ -653,6 +706,12 @@ impl GStoreConfig {
             }
             "upload_allow_extensions" => self.upload_allow_extensions = split_list(v),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages = split_list(v),
+            "unzip_max_entries" => {
+                self.unzip_max_entries = parse_num(v).ok_or_else(|| bad("a number of entries"))?
+            }
+            "unzip_max_size" => {
+                self.unzip_max_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             "integer_division" => {
                 self.integer_division =
                     IntegerDivision::parse(v).ok_or_else(|| bad("decimal or truncate"))?
@@ -721,12 +780,18 @@ impl GStoreConfig {
             "accesslog_mode" => digit(self.accesslog_mode),
             "accesslog_path" => path(&self.accesslog_path),
             "accesslog_days" => self.accesslog_days.to_string(),
+            "log_level" => self.log_level.clone(),
+            "log_file" => self.log_file.clone(),
+            "log_days" => self.log_days.to_string(),
+            "log_stderr" => switch(self.log_stderr),
             "backup_path" => path(&self.backup_path),
             "max_backups" => self.max_backups.to_string(),
             "upload_path" => path(&self.upload_path),
             "upload_max_body_size" => self.upload_max_body_size.to_string(),
             "upload_allow_extensions" => self.upload_allow_extensions.join("|"),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
+            "unzip_max_entries" => self.unzip_max_entries.to_string(),
+            "unzip_max_size" => self.unzip_max_size.to_string(),
             "integer_division" => match self.integer_division {
                 IntegerDivision::Decimal => "decimal",
                 IntegerDivision::Truncate => "truncate",
@@ -1017,6 +1082,9 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.querylog_path, PathBuf::from("logs/endpoint/"));
         assert_eq!(c.accesslog_path, PathBuf::from("logs/ipaccess/"));
         assert_eq!((c.querylog_days, c.accesslog_days), (30, 30));
+        assert_eq!((c.log_level.as_str(), c.log_file.as_str()), ("", ""));
+        assert_eq!(c.log_days, 30);
+        assert!(c.log_stderr);
         assert_eq!(c.backup_path, PathBuf::from("./backups/"));
         assert_eq!(c.max_backups, 3);
         assert_eq!(c.upload_path, PathBuf::from("./upload/"));
@@ -1092,9 +1160,11 @@ upload_allow_compress_packages = "zip"
                     check_point=off\nbuild_multi_thread=off\n\
                     [log]\nlog_mode=l.properties\nquerylog_mode=0\nquerylog_path=q/\n\
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
+                    log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
                     [backup]\nbackup_path=/b\nmax_backups=11\n\
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
+                    unzip_max_entries=12\nunzip_max_size=4096\n\
                     [query]\ninteger_division=truncate\nquery_cache_size=0\n\
                     early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
                     gfun_max_output_bytes=4096\n";
@@ -1124,6 +1194,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!((c.querylog_days, c.accesslog_days), (9, 8));
         assert_eq!(c.querylog_path, PathBuf::from("q/"));
         assert_eq!(c.accesslog_path, PathBuf::from("a/"));
+        assert_eq!(c.log_level, "debug", "stored lower-case");
+        assert_eq!(c.log_file, "diag/gs.log");
+        assert_eq!(c.log_days, 7);
+        assert!(!c.log_stderr);
         assert_eq!(c.backup_path, PathBuf::from("/b"));
         assert_eq!(c.max_backups, 11);
         assert_eq!(c.upload_path, PathBuf::from("/u"));
@@ -1131,6 +1205,7 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip", "tar"]);
         assert_eq!(c.value("upload_allow_compress_packages").unwrap(), "zip|tar");
+        assert_eq!((c.unzip_max_entries, c.unzip_max_size), (12, 4096));
         assert_eq!(c.value("querylog_mode").unwrap(), "0");
         assert_eq!(c.value("deamon").unwrap(), "on");
         assert!(c.upload_allowed("data.TTL") && c.upload_allowed("x.tar"));
@@ -1183,6 +1258,24 @@ upload_allow_compress_packages = "zip"
         // The alias and the misplaced key are applied.
         assert!(c.deamon);
         assert_eq!(c.max_backups, 7);
+    }
+
+    #[test]
+    fn log_extension_keys_validate_their_values() {
+        let c = GStoreConfig::from_ini_str(
+            "[log]\nlog_level=chatty\nlog_days=many\nlog_stderr=maybe\nlog_file=\n",
+        );
+        let w = c.warnings().join("\n");
+        assert!(w.contains("invalid value 'chatty' for 'log_level'"), "{w}");
+        assert!(w.contains("'log_days'") && w.contains("'log_stderr'"), "{w}");
+        assert!(!c.is_set("log_level") && !c.is_set("log_file"));
+        let mut c = GStoreConfig::default();
+        c.set("log_level", "OFF").unwrap();
+        assert_eq!(c.value("log_level").unwrap(), "off");
+        c.set("log_level", "warning").unwrap();
+        assert_eq!(c.log_level, "warn");
+        c.set("log_file", "off").unwrap();
+        assert_eq!(c.value("log_file").unwrap(), "off");
     }
 
     #[test]

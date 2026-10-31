@@ -81,6 +81,7 @@ use crate::error::{GStoreError, Result};
 use crate::kvstore::DiskStore;
 use crate::model::id::is_literal_id;
 use crate::model::{IdTriple, Term, Triple};
+use crate::parser::import;
 use crate::signature::VsTree;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
@@ -724,12 +725,27 @@ impl Database {
     // ---- on-disk B+ tree KVstore ---------------------------------------------
 
     /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
-    /// files, detecting each file's format by extension (as
-    /// [`build_from_files`](Self::build_from_files) does). The triples and
+    /// files (and directories / URLs), detecting each file's format by
+    /// extension (as [`build_from_files`](Self::build_from_files) does). The
+    /// input streams in; the triples, named-graph quads (N-Quads / TriG) and
     /// dictionary are written to `kvstore.kv` through the page cache; the
     /// out-of-core VS-tree is written to `vstree.kv`. Other layouts' files in
-    /// `dir` are removed (a fresh build).
+    /// `dir` are removed (a fresh build). Strict.
     pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
+        let sources = import::sources_from_paths(files)?;
+        Database::build_disk_from_sources(dir, &sources, &import::ImportOptions::strict(), &mut ())
+            .map(|_| ())
+    }
+
+    /// [`build_disk`](Self::build_disk) from `sources` with explicit
+    /// [`import::ImportOptions`] (e.g. tolerant, logging skipped statements
+    /// to `log`); returns the import counts.
+    pub fn build_disk_from_sources<P: AsRef<Path>>(
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         remove_other_layouts(dir, StorageKind::Disk)?;
@@ -737,7 +753,9 @@ impl Database {
         // leftover WAL from a crashed earlier build can't replay into the new file.
         let kv = dir.join(KV_FILE);
         super::remove_file_and_wal(&kv);
-        let mut ds = DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
+        let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+        let report = ds.import_sources(sources, opts, log)?;
+        ds.flush()?;
         // Build the out-of-core VS-tree alongside the store, so a later
         // `load_disk` filters through it on disk instead of materializing it.
         let vskv = dir.join(VSTREE_KV_FILE);
@@ -745,7 +763,7 @@ impl Database {
         drop(write_vstree_kv(&vskv, vstree_entries(&ds))?);
         ds.mark_vstree_fresh();
         ds.flush()?;
-        Ok(())
+        Ok(report)
     }
 
     /// Whether directory `dir` holds an on-disk KVstore database.
@@ -821,35 +839,79 @@ impl Database {
         dir: P,
         content: &str,
     ) -> Result<Database> {
-        let triples = crate::parser::turtle::parse_str(content)?;
-        Database::create_rocksdb(name.into(), dir.as_ref(), triples)
+        let opts = import::ImportOptions {
+            blank_nodes: import::BlankNodes::Keep,
+            ..import::ImportOptions::strict()
+        };
+        let mut db = Database::new(name);
+        let mut acc = super::BuildAccumulator::default();
+        import::import_reader(
+            content.as_bytes(),
+            import::RdfFormat::Turtle,
+            "<string>",
+            &opts,
+            &mut (),
+            &mut |batch: &mut Vec<crate::parser::nquads::Quad>| acc.add(&mut db, batch),
+        )?;
+        Database::create_rocksdb(db, acc, dir.as_ref())
     }
 
-    /// Build a RocksDB-backed database in `dir` from RDF files, detecting each
-    /// file's format by extension (see [`build_from_files`](Self::build_from_files)).
+    /// Build a RocksDB-backed database in `dir` from RDF files (and
+    /// directories / URLs), detecting each file's format by extension (see
+    /// [`build_from_files`](Self::build_from_files)). The input streams in;
+    /// N-Quads / TriG statements keep their named graph (the `gspo` CF).
     #[cfg(feature = "rocksdb")]
     pub fn build_rocksdb_from_files<P: AsRef<Path>, Q: AsRef<Path>>(
         name: impl Into<String>,
         dir: P,
         files: &[Q],
     ) -> Result<Database> {
-        let mut triples = Vec::new();
-        for f in files {
-            triples.extend(crate::parser::parse_file_by_ext(f)?);
-        }
-        Database::create_rocksdb(name.into(), dir.as_ref(), triples)
+        let sources = import::sources_from_paths(files)?;
+        let (db, _) = Database::build_rocksdb_from_sources(
+            name,
+            dir,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )?;
+        Ok(db)
     }
 
+    /// [`build_rocksdb_from_files`](Self::build_rocksdb_from_files) from
+    /// `sources` with explicit [`import::ImportOptions`]; returns the import
+    /// counts too.
     #[cfg(feature = "rocksdb")]
-    fn create_rocksdb(name: String, dir: &Path, triples: Vec<Triple>) -> Result<Database> {
-        use crate::backend::rocks::RocksStore;
-        // Encode first: an exhausted id space must fail before anything in
-        // `dir` is replaced.
+    pub fn build_rocksdb_from_sources<P: AsRef<Path>>(
+        name: impl Into<String>,
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<(Database, import::ImportReport)> {
         let mut db = Database::new(name);
-        let ids: Vec<IdTriple> = triples
-            .iter()
-            .map(|t| db.encode_triple(t))
-            .collect::<Result<_>>()?;
+        let mut acc = super::BuildAccumulator::default();
+        let report = import::import_sources(
+            sources,
+            "build",
+            opts,
+            log,
+            &mut |batch: &mut Vec<crate::parser::nquads::Quad>| acc.add(&mut db, batch),
+        )?;
+        Ok((Database::create_rocksdb(db, acc, dir.as_ref())?, report))
+    }
+
+    /// Write an encoded build (`db`'s dictionary, `acc`'s ids) into a fresh
+    /// RocksDB store in `dir`.
+    #[cfg(feature = "rocksdb")]
+    fn create_rocksdb(
+        mut db: Database,
+        acc: super::BuildAccumulator,
+        dir: &Path,
+    ) -> Result<Database> {
+        use crate::backend::rocks::RocksStore;
+        // Everything is encoded already: an exhausted id space has failed
+        // before anything in `dir` is replaced.
+        let super::BuildAccumulator { default: ids, named } = acc;
         fs::create_dir_all(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
@@ -862,6 +924,15 @@ impl Database {
         crate::store::MutableStore::bulk_load(&mut rocks, ids);
         if let Some(e) = rocks.take_error() {
             return Err(GStoreError::Database(e));
+        }
+        // Named graphs: the `gspo` CF and the in-memory map.
+        for (gid, quads) in named {
+            for &id in &quads {
+                rocks.insert_quad(gid, id)?;
+            }
+            let mut graph = TripleStore::new();
+            graph.bulk_load(quads);
+            db.named.insert(gid, graph);
         }
         rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
         rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
@@ -1045,6 +1116,72 @@ impl Database {
     /// only the restore's own `<dir>.restore-*` siblings are ever touched.
     pub(crate) fn recover_restore(dir: &Path) -> Result<()> {
         fsutil::recover_dir_swap_as(dir, &fsutil::RESTORE_SWAP)
+    }
+
+    // ---- zipped backups (feature `zip`, see `crate::zipio`) ------------------
+
+    /// Pack the backup directory `dir` (a [`backup`](Self::backup) or
+    /// [`backup_dir`](Self::backup_dir) result) into the archive `zip`, then
+    /// remove `dir` — upstream's `backup compress=true` /
+    /// `gbackup -z 1`: `<db>.db_<YYYYmmddHHMMSS>.zip`, the backup's files at
+    /// the archive root. `dir` is kept when packing fails. Without the `zip`
+    /// feature this fails, naming the feature.
+    pub fn pack_backup<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, zip: Q) -> Result<()> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            return Err(GStoreError::Database(format!(
+                "backup '{}' is not a directory",
+                dir.display()
+            )));
+        }
+        crate::zipio::pack_dir(dir, zip.as_ref())?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Unpack the zipped backup `zip` into `scratch` (a fresh directory the
+    /// caller removes afterwards) under `limits`, and return the directory
+    /// holding the database: `scratch` itself (the upstream layout), or its
+    /// one sub-directory when the archive wraps the backup in a directory
+    /// (`zip -r x.zip lubm.db_…`). Whether that holds a database is the
+    /// caller's to check ([`storage_kind`](Self::storage_kind)).
+    pub fn unpack_backup(
+        zip: &Path,
+        scratch: &Path,
+        limits: &crate::zipio::ZipLimits,
+    ) -> std::result::Result<PathBuf, crate::zipio::ZipError> {
+        crate::zipio::unpack(zip, scratch, limits, &|_| true)?;
+        if Database::storage_kind(scratch).is_some() {
+            return Ok(scratch.to_path_buf());
+        }
+        let entries: Vec<PathBuf> = fs::read_dir(scratch)?.flatten().map(|e| e.path()).collect();
+        match entries.as_slice() {
+            [only] if only.is_dir() && Database::storage_kind(only).is_some() => Ok(only.clone()),
+            _ => Ok(scratch.to_path_buf()),
+        }
+    }
+
+    /// [`restore_into`](Self::restore_into) from a zipped backup (`grestore
+    /// x.zip`): unpacked under `limits` into `<target>.unzip-tmp` beside
+    /// `target` (removed afterwards), then validated and swapped in like a
+    /// backup directory. Without the `zip` feature this fails, naming it.
+    pub fn restore_from_zip<P: AsRef<Path>, Q: AsRef<Path>>(
+        zip: P,
+        target: Q,
+        limits: &crate::zipio::ZipLimits,
+    ) -> Result<()> {
+        let target = target.as_ref();
+        if !crate::zipio::AVAILABLE {
+            return Err(crate::zipio::ZipError::FeatureMissing.into());
+        }
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let mut scratch = target.as_os_str().to_owned();
+        scratch.push(".unzip-tmp");
+        let scratch = crate::zipio::ScratchDir::fresh(PathBuf::from(scratch))?;
+        let backup = Database::unpack_backup(zip.as_ref(), scratch.path(), limits)?;
+        Database::restore_into(&backup, target)
     }
 
     // ---- write-through hooks (called by the mutation paths) ----------------

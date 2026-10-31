@@ -105,9 +105,10 @@ fn grestore_of_a_corrupt_backup_fails_and_keeps_the_database() {
     let base = tmp_dir("grestore_garbage");
     let target = snapshot_target(&base);
     let bad = garbage_disk_backup(&base);
+    // grestore <db_name> <backup_dir> (upstream's order).
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_grestore"))
-        .arg(&bad)
         .arg(base.join("t"))
+        .arg(&bad)
         .output()
         .unwrap();
     assert!(!out.status.success(), "grestore must fail: {out:?}");

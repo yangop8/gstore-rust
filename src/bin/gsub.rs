@@ -3,31 +3,93 @@
 //! Mirrors gStore's `gsub` (load triples from a file, remove them, persist):
 //!
 //! ```text
-//! gsub <db_name> <rdf_file>
+//! gsub [--strict] <db_name> <source> [more sources ...]
+//! gsub -db <db_name> -f <file> [--strict]   # upstream 1.3
 //! ```
 //!
-//! The input format is chosen by file extension, exactly as `gadd`: `.nt`,
-//! `.ttl`, `.nq`, `.trig`, `.rdf`/`.xml`/`.owl`, `.jsonld`/`.json`,
-//! `.html`/`.xhtml`; anything else is parsed as Turtle. Quad formats are
-//! flattened to the default graph.
+//! Sources and formats exactly as `gadd` (files by extension, directories,
+//! `http(s)://` URLs, zip packages — upstream 1.3's `gsub -f x.zip`, feature
+//! `zip`, under the same `--unzip-max-size` / `--unzip-max-entries` limits);
+//! N-Quads / TriG statements are removed from their named graphs. Blank-node labels are read verbatim, so a file naming stored blank
+//! nodes (e.g. one written by `gexport`) removes them; anonymous `[]` nodes
+//! match nothing.
+//!
+//! A statement that does not parse is skipped, counted and logged to
+//! `<db_name>.db/parse_error.log`; `--strict` stops at the first one instead
+//! (what was removed before it stays removed and is saved).
 //!
 //! Any database layout is accepted ([`Database::open`] detects it): for an
 //! in-memory snapshot the database is re-saved; for an on-disk (`gbuild --disk`)
 //! or RocksDB database the change is written through to its store.
+//!
+//! Exit status: 0 removed, 1 failed, 2 invalid arguments; `-h`/`--help`.
+
+#[path = "common/cli.rs"]
+mod cli;
 
 use std::process::ExitCode;
 
-use gstore::model::Triple;
-use gstore::{db_dir_for, Database, Result};
+use gstore::parser::import::{self, ImportOptions, ParseErrorLog};
+use gstore::zipio::ZipLimits;
+use gstore::{db_dir_for, Database};
+
+const TOOL: cli::Tool = cli::Tool {
+    name: "gsub",
+    usage: "gsub [--strict] <db_name> <file | dir | url> [more ...]\n\
+            gsub -db <db_name> -f <file | zip> [--strict]",
+    help: "remove the triples of RDF files from a database\n\
+           \n\
+           Options:\n\
+           \t-h,--help\t\tDisplay this message.\n\
+           \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
+           \t-f,--file PATH\t\tThe RDF file (or directory, zip package or http(s) URL)\n\
+           \t\t\t\tto remove.\n\
+           \t--strict\t\tStop at the first statement that does not parse.\n\
+           \t--unzip-max-size BYTES\tThe most a zip package may unpack to (default\n\
+           \t\t\t\t10737418240; 0 = no limit).\n\
+           \t--unzip-max-entries N\tThe most entries a zip package may hold (default\n\
+           \t\t\t\t10000; 0 = no limit).",
+};
+
+const FILE: cli::Opt = cli::Opt {
+    short: "f",
+    long: "file",
+};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: {} <db_name> <rdf_file>", args[0]);
-        return ExitCode::FAILURE;
+    let mut args = match cli::parse(
+        &cli::argv(),
+        &[cli::DB, FILE, cli::UNZIP_MAX_SIZE, cli::UNZIP_MAX_ENTRIES],
+    ) {
+        Ok(cli::Parsed::Help) => {
+            TOOL.print_help();
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Args(a)) => a,
+        Err(e) => return TOOL.usage_error(&e),
+    };
+    let strict = args.take_flag(&["--strict"]);
+    if let Some(o) = args.unknown_option() {
+        return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
-    let dir = db_dir_for(&args[1]);
-    let file = &args[2];
+    let limits = match cli::zip_limits(&args, 2, 3, ZipLimits::default()) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
+    let (name, mut paths) = match args.value(0) {
+        Some(db) => (db.to_string(), args.rest.clone()),
+        None => match args.rest.split_first() {
+            Some((db, more)) => (db.clone(), more.to_vec()),
+            None => return TOOL.usage_error("missing the database name"),
+        },
+    };
+    if let Some(f) = args.value(1) {
+        paths.insert(0, f.to_string());
+    }
+    if paths.is_empty() {
+        return TOOL.usage_error("nothing to remove (give a file, a directory or a URL)");
+    }
+    let dir = db_dir_for(&name);
 
     let mut db = match Database::open(&dir) {
         Ok(db) => db,
@@ -36,31 +98,60 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    let triples = match read_triples(file) {
-        Ok(t) => t,
+    // Zip packages (upstream 1.3's `-f x.zip`) are unpacked first and read
+    // as directories; the scratch directories go when `_unpacked` drops.
+    let _unpacked = match cli::unpack_packages(&dir, &mut paths, &limits) {
+        Ok(u) => u,
         Err(e) => {
-            eprintln!("cannot read '{file}': {e}");
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sources = match import::sources_from_paths(&paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read the sources: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let opts = if strict {
+        ImportOptions::strict()
+    } else {
+        ImportOptions::tolerant()
+    }
+    .for_removal();
+    let mut log = match ParseErrorLog::in_dir(std::path::Path::new(&dir)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot open the parse error log of '{dir}': {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let removed = triples.iter().filter(|t| db.remove_triple(t)).count();
-
+    let mut removed = 0u64;
+    let result = db.remove_sources(&sources, &opts, &mut log, &mut removed);
     if let Err(e) = db.save(&dir) {
         eprintln!("removed {removed} triple(s) but saving failed: {e}");
         return ExitCode::FAILURE;
     }
+    let report = match result {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("removed {removed} triple(s), then failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     println!(
         "Removed {removed} triple(s) from '{dir}' ({} read; {} now total)",
-        triples.len(),
+        report.statements,
         db.triple_num()
     );
+    if report.failed > 0 {
+        println!(
+            "Skipped {} statement(s) that could not be read; see {}",
+            report.failed,
+            log.path().display()
+        );
+    }
     ExitCode::SUCCESS
-}
-
-/// Read triples from an RDF file, dispatching on the file extension (quad
-/// formats flattened to the default graph). See [`gstore::parser::parse_file_by_ext`].
-fn read_triples(path: &str) -> Result<Vec<Triple>> {
-    gstore::parser::parse_file_by_ext(path)
 }
