@@ -1042,7 +1042,8 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             let mut served = cfg.clone();
             served.db_home = root.clone();
             let server = match ApiServer::bind_with_config(served) {
-                Ok(s) => s.with_load_policy(load_policy),
+                // gserver owns the diagnostic log: refreshconf re-reads it.
+                Ok(s) => s.with_load_policy(load_policy).with_log_refresh(),
                 Err(e) => {
                     gs_error!("failed to start API server at {}:{}: {e}", cfg.listen_addr, cfg.port);
                     return 1;

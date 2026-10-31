@@ -101,7 +101,9 @@ accesslog_days=30
 # upstream's log4cplus does); when that file does
 # not exist the log goes to standard error at level info. These keys override
 # the properties file; the GSTORE_LOG environment variable (a level) overrides
-# log_level.
+# log_level. /api refreshconf re-reads log_mode's file and these keys and
+# reconfigures the log, as upstream's refreshconf re-runs log4cplus (the
+# querylog_* / accesslog_* keys above take effect at once too).
 # level: trace, debug, info, warn, error or off
 # log_level=info
 # log file, rolled daily into <file>.YYYY-MM-DD; off for none

@@ -1038,6 +1038,13 @@ pub(crate) struct ApiInner {
     /// whose [`DbSlot::settings_gen`] lags takes the current settings the
     /// next time it is used ([`sync_query_settings`](Self::sync_query_settings)).
     settings_gen: AtomicU64,
+    /// Whether `refreshconf` re-configures the process-wide diagnostic log
+    /// ([`crate::logging`]) from the re-read `conf.ini`, as upstream's
+    /// `Util::configure` re-runs log4cplus' `doConfigure(log_mode)`: the
+    /// configuration last installed, or `None` when this server does not own
+    /// the log (an embedded server; `gserver` opts in with
+    /// [`ApiServer::with_log_refresh`]).
+    log_refresh: Mutex<Option<crate::logging::LogConfig>>,
 }
 
 impl ApiInner {
@@ -1064,8 +1071,10 @@ impl ApiInner {
     /// server can change: the settings request handlers read (database and
     /// user limits, upload, backup and log settings, `system_username`, …),
     /// the IP allow / deny lists, and the `/api` layer's `max_output_size` and
-    /// `licensetype`, and the `[query]` evaluation settings (applied to the
-    /// loaded databases too). The address, worker pool, connection settings,
+    /// `licensetype`, the `[query]` evaluation settings (applied to the
+    /// loaded databases too) and — for a server that owns the diagnostic
+    /// log ([`ApiServer::with_log_refresh`]) — the log's `log_mode` / `[log]`
+    /// configuration, as upstream. The address, worker pool, connection settings,
     /// `check_point` and the database home stay as they are until a restart.
     /// Without a file (a server configured in code) only the IP list files
     /// are re-read. Returns whether a file was re-read.
@@ -1090,7 +1099,43 @@ impl ApiInner {
             st.gapi.license_type = fresh.licensetype.clone();
         }
         self.apply_query_settings(fresh.query_settings());
+        self.refresh_log(&fresh);
         Ok(true)
+    }
+
+    /// `refreshconf`'s part for the diagnostic log (see
+    /// [`ApiServer::with_log_refresh`]): re-install it when the re-read
+    /// configuration describes another log.
+    fn refresh_log(&self, fresh: &GStoreConfig) {
+        let mut last = locked(&self.log_refresh);
+        let Some(current) = last.as_mut() else {
+            return;
+        };
+        let (mut cfg, warnings) = crate::logging::LogConfig::from_gstore_config(fresh);
+        let env_warning = cfg.apply_env();
+        for w in warnings.iter().chain(env_warning.as_ref()) {
+            crate::gs_warn!("log configuration: {w}");
+        }
+        if cfg == *current {
+            return;
+        }
+        match crate::logging::init(&cfg) {
+            Ok(_) => crate::gs_info!(
+                "refreshconf: diagnostic log reconfigured (level {}, file {})",
+                crate::logging::filter_name(cfg.level),
+                cfg.file
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), |f| format!("'{}'", f.path.display()))
+            ),
+            Err(e) => crate::gs_error!(
+                "refreshconf: cannot open the log file '{}': {e}; logging to standard error only",
+                cfg.file
+                    .as_ref()
+                    .map(|f| f.path.display().to_string())
+                    .unwrap_or_default()
+            ),
+        }
+        *current = cfg;
     }
 
     /// Install `settings` as the query-evaluation settings of every database
@@ -1316,6 +1361,7 @@ impl ApiServer {
                 tasks: TaskManager::default(),
                 self_ref: OnceLock::new(),
                 settings_gen: AtomicU64::new(0),
+                log_refresh: Mutex::new(None),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -1427,6 +1473,21 @@ impl ApiServer {
     /// patterns may contact remote endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
+        self
+    }
+
+    /// Let `refreshconf` re-configure the process-wide diagnostic log
+    /// ([`crate::logging`]) from the re-read `conf.ini` — its `log_mode`
+    /// properties file and `[log]` keys, then `GSTORE_LOG` — as upstream's
+    /// `refreshconf` does (`Util::configure` re-runs log4cplus'
+    /// `doConfigure`). For the process that owns the log (`gserver`, which
+    /// installed it from the same configuration): the log is re-installed
+    /// only when the re-read configuration differs from what it was. An
+    /// embedded server leaves the log alone (the default).
+    pub fn with_log_refresh(self) -> ApiServer {
+        let (mut current, _) = crate::logging::LogConfig::from_gstore_config(&self.inner.config());
+        let _ = current.apply_env();
+        *locked(&self.inner.log_refresh) = Some(current);
         self
     }
 
