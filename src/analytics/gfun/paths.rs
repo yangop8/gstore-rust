@@ -874,7 +874,8 @@ pub fn shortest_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
             continue;
         }
-        if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)? {
+        if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)?
+        {
             push_path_json(list.item(), ctx, u.entity, v.entity, &p);
         }
     }
@@ -1511,7 +1512,9 @@ impl<'g> Khr<'g> {
         {
             // forward partial push (only on graphs with > ~10^8 vertices)
             let mut op = 0;
-            while (!cand1.is_empty() || !cand1_next.is_empty()) && op < push_bs && rmax_fwd > init_rmax
+            while (!cand1.is_empty() || !cand1_next.is_empty())
+                && op < push_bs
+                && rmax_fwd > init_rmax
             {
                 let Some((cur, level)) = cand1.pop_front() else {
                     std::mem::swap(&mut cand1, &mut cand1_next);
@@ -1574,7 +1577,9 @@ impl<'g> Khr<'g> {
 
             // backward partial push
             let mut op = 0;
-            while (!cand2.is_empty() || !cand2_next.is_empty()) && op < push_bs && rmax_bwd > init_rmax
+            while (!cand2.is_empty() || !cand2_next.is_empty())
+                && op < push_bs
+                && rmax_bwd > init_rmax
             {
                 let Some((cur, level)) = cand2.pop_front() else {
                     std::mem::swap(&mut cand2, &mut cand2_next);
@@ -1773,7 +1778,8 @@ pub fn k_hop_reachable_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
             continue;
         }
-        if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)? {
+        if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)?
+        {
             if p.len() as i64 <= k {
                 push_path_json(list.item(), ctx, u.entity, v.entity, &p);
             }
@@ -2089,7 +2095,9 @@ fn k_hop_neighbor_list(
     ret_num: i64,
 ) -> Result<Vec<Node>> {
     match csr_node(ctx, u) {
-        Some(s) => k_hop_neighbor_nodes(ctx.csr, visited, poll, s, a.directed, k, &a.preds, ret_num),
+        Some(s) => {
+            k_hop_neighbor_nodes(ctx.csr, visited, poll, s, a.directed, k, &a.preds, ret_num)
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -2434,7 +2442,13 @@ pub fn sssp(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
         let Some(s) = csr_node(ctx, &u) else {
-            push_path_json(list.item(), ctx, u.entity, u.entity, &GPath::single(u.entity));
+            push_path_json(
+                list.item(),
+                ctx,
+                u.entity,
+                u.entity,
+                &GPath::single(u.entity),
+            );
             continue;
         };
         let order = sssp_bfs(g, &mut parent, &mut poll, s, a.directed, &a.preds)?;
@@ -2533,7 +2547,11 @@ mod tests {
         let got: Vec<_> = groups(&g, 0, &asc, true, true).collect();
         assert_eq!(
             got,
-            vec![(0, &[1][..], &[][..]), (1, &[][..], &[3][..]), (2, &[2, 3][..], &[][..])]
+            vec![
+                (0, &[1][..], &[][..]),
+                (1, &[][..], &[3][..]),
+                (2, &[2, 3][..], &[][..])
+            ]
         );
         let list = PredFilter::from_ids([2, 7, 0]);
         let got: Vec<_> = groups(&g, 0, &list, true, false).collect();
