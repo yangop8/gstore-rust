@@ -85,7 +85,7 @@ const MINTED: char = '\u{0}';
 
 /// Parse an (X)HTML file containing RDFa into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::parser::import::read_document(path.as_ref())?;
     parse_str(&content)
 }
 

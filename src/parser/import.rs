@@ -697,6 +697,24 @@ fn read_bounded<R: Read>(mut reader: R, max: u64, what: &str) -> Result<Vec<u8>>
     Ok(buf)
 }
 
+/// Read a document parsed whole (RDF/XML, JSON-LD, RDFa) from `path`,
+/// refusing one larger than [`DEFAULT_MAX_DOCUMENT_BYTES`] — what the
+/// readers' own `parse_file` functions use.
+pub fn read_document(path: &Path) -> Result<String> {
+    let file = File::open(path)?;
+    let bytes = read_bounded(
+        file,
+        DEFAULT_MAX_DOCUMENT_BYTES,
+        &format!("'{}'", path.display()),
+    )?;
+    String::from_utf8(bytes).map_err(|_| {
+        GStoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+    })
+}
+
 /// Parse `reader` as `format` into `sink` (one statement at a time).
 pub fn parse_into<R: BufRead>(
     reader: R,

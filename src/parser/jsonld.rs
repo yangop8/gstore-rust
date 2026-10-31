@@ -75,7 +75,7 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
 
 /// Parse a JSON-LD file into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::parser::import::read_document(path.as_ref())?;
     parse_str(&content)
 }
 

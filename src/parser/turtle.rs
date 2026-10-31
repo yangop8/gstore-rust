@@ -1259,4 +1259,151 @@ mod tests {
             .collect();
         assert_eq!(blanks.len(), 2);
     }
+
+    #[test]
+    fn minted_labels_round_trip_through_parse_term() {
+        let ts = parse_str("@prefix : <http://e/> . :s :p [ :q ( :a ) ] .").unwrap();
+        for t in &ts {
+            for term in [&t.subject, &t.object] {
+                if let Term::Blank(_) = term {
+                    let back = crate::parser::ntriples::parse_term(&term.to_string()).unwrap();
+                    assert_eq!(&back, term);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lenient_local_names_like_upstream() {
+        let doc = "@prefix ex: <http://e/> .\n\
+                   ex:a/b ex:page#top ex:q?x=1&y=2 .\n\
+                   ex:a:b ex:p ex:c\\,d .\n\
+                   ex:s ex:p ex:o . # a comment after whitespace\n\
+                   ex:t ex:p ex:o .# a comment after the dot\n";
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 4);
+        assert_eq!(ts[0].subject, Term::iri("http://e/a/b"));
+        assert_eq!(ts[0].predicate, Term::iri("http://e/page#top"));
+        assert_eq!(ts[0].object, Term::iri("http://e/q?x=1&y=2"));
+        assert_eq!(ts[1].subject, Term::iri("http://e/a:b"));
+        assert_eq!(ts[1].object, Term::iri("http://e/c,d"));
+        assert_eq!(ts[3].object, Term::iri("http://e/o"));
+    }
+
+    /// A tolerant sink: collects statements and errors.
+    #[derive(Default)]
+    struct Tolerant {
+        quads: Vec<Quad>,
+        errors: Vec<SyntaxError>,
+    }
+
+    impl StatementSink for Tolerant {
+        fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
+            self.quads.append(quads);
+            Ok(())
+        }
+        fn error(&mut self, err: SyntaxError) -> Result<()> {
+            self.errors.push(err);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tolerant_parse_skips_the_bad_statement_and_resyncs_at_the_next_line() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :a :p :o1 .\n\
+                   :b :p undefined:x .\n\
+                   :c :p :o2 ; :q :o3 :extra .\n\
+                   :d :p :o3 .\n\
+                   \"lit\" :p :o4 .\n\
+                   :e :p \"bad \\q escape\" .\n\
+                   :f :p :o5 .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        // `:c`'s statement is dropped whole (no partial `:c :p :o2`); the
+        // literal subject is the import layer's business, not a syntax error.
+        assert_eq!(
+            subjects,
+            ["<http://e/a>", "<http://e/d>", "\"lit\"", "<http://e/f>"]
+        );
+        let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [3, 4, 7], "{:?}", sink.errors);
+        assert!(sink.errors[0].message.contains("undefined prefix"));
+        assert!(sink.errors[0].context.contains("<http://e/b>"));
+        // A strict parse of the same document stops at line 3.
+        let err = parse_str(doc).unwrap_err();
+        assert!(matches!(err, GStoreError::RdfParse { line: 3, .. }), "{err}");
+    }
+
+    #[test]
+    fn an_error_found_on_a_later_line_skips_that_line_like_upstream() {
+        // The unterminated collection swallows the next line's terms; the
+        // error surfaces on line 3, whose rest is discarded (upstream's
+        // `discardLine` does the same), so `:d` is lost and `:e` is kept.
+        let doc = "@prefix : <http://e/> .\n\
+                   :c :p ( :unterminated\n\
+                   :d :p :o3 .\n\
+                   :e :p :o4 .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.quads.len(), 1);
+        assert_eq!(sink.quads[0].subject, Term::iri("http://e/e"));
+        assert_eq!(sink.errors.len(), 1);
+        assert_eq!(sink.errors[0].line, 3);
+    }
+
+    #[test]
+    fn tolerant_trig_recovery_stays_inside_the_block() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :g {\n\
+                   :a :p :o .\n\
+                   :b :p ?bad .\n\
+                   :c :p :o\n\
+                   }\n\
+                   :d :p :o .\n";
+        let mut sink = Tolerant::default();
+        parse_reader_trig(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let got: Vec<(String, Option<Term>)> = sink
+            .quads
+            .iter()
+            .map(|q| (q.subject.to_string(), q.graph.clone()))
+            .collect();
+        let g = Some(Term::iri("http://e/g"));
+        assert_eq!(
+            got,
+            [
+                ("<http://e/a>".to_string(), g.clone()),
+                ("<http://e/c>".to_string(), g),
+                ("<http://e/d>".to_string(), None)
+            ]
+        );
+        assert_eq!(sink.errors.len(), 1);
+    }
+
+    #[test]
+    fn invalid_utf8_fails_only_its_statement() {
+        let mut doc = b"<http://e/a> <http://e/p> \"ok\" .\n<http://e/b> <http://e/p> \"".to_vec();
+        doc.extend_from_slice(b"\xff\xfe\" .\n<http://e/c> <http://e/p> \"ok\" .\n");
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_slice(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.quads.len(), 2);
+        assert_eq!(sink.errors.len(), 1);
+        assert!(sink.errors[0].message.contains("UTF-8"));
+        let mut strict = CollectQuads::default();
+        assert!(parse_reader(doc.as_slice(), BlankLabeler::keep(), &mut strict).is_err());
+    }
+
+    #[test]
+    fn scoped_labels_prefix_explicit_and_minted_nodes() {
+        let mut sink = CollectQuads::default();
+        parse_reader(
+            "_:x <http://e/p> [] .".as_bytes(),
+            BlankLabeler::scoped("S1"),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.quads[0].subject, Term::blank("S1_x"));
+        assert_eq!(sink.quads[0].object, Term::blank("S1-0"));
+    }
 }

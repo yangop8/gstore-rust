@@ -75,7 +75,7 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
 
 /// Parse an RDF/XML file into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::parser::import::read_document(path.as_ref())?;
     parse_str(&content)
 }
 
@@ -1218,5 +1218,131 @@ mod tests {
     #[test]
     fn bad_xml_errors() {
         assert!(parse_str("<rdf:RDF><unclosed></rdf:RDF>").is_err());
+    }
+
+    #[test]
+    fn internal_dtd_entities_expand_in_attributes_and_text() {
+        let doc = r#"<?xml version="1.0"?>
+<!DOCTYPE rdf:RDF [
+  <!-- the usual OWL preamble -->
+  <!ENTITY xsd "http://www.w3.org/2001/XMLSchema#" >
+  <!ENTITY ex 'http://ex/' >
+  <!ENTITY exa "&ex;a" >
+  <!ENTITY copy "&#169;">
+  <!ELEMENT ignored ANY>
+  <!ENTITY % pe "ignored">
+  %pe;
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:ex="&ex;">
+  <rdf:Description rdf:about="&exa;">
+    <ex:age rdf:datatype="&xsd;integer">7</ex:age>
+    <ex:note>&copy; &ex; &amp; more</ex:note>
+  </rdf:Description>
+</rdf:RDF>"#;
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].subject, Term::iri("http://ex/a"));
+        assert_eq!(
+            ts[0].object,
+            Term::typed_literal("7", "http://www.w3.org/2001/XMLSchema#integer")
+        );
+        assert_eq!(ts[1].predicate, Term::iri("http://ex/note"));
+        assert_eq!(ts[1].object, Term::plain_literal("© http://ex/ & more"));
+    }
+
+    #[test]
+    fn entity_bombs_and_external_entities_are_refused() {
+        // Billion laughs: each level multiplies the expansion by ten.
+        let mut dtd = String::from("<!ENTITY lol0 \"lol\">");
+        for i in 1..10 {
+            let prev = format!("&lol{};", i - 1);
+            dtd.push_str(&format!("<!ENTITY lol{i} \"{}\">", prev.repeat(10)));
+        }
+        let doc = format!(
+            "<!DOCTYPE rdf:RDF [{dtd}]><rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\">\
+             <rdf:Description rdf:about=\"http://ex/a\"><ex:p>&lol9;</ex:p></rdf:Description></rdf:RDF>"
+        );
+        let err = parse_str(&doc).unwrap_err().to_string();
+        assert!(err.contains("entity expansion limit"), "{err}");
+        // Many references to a mid-sized entity hit the per-document budget.
+        let big = "x".repeat(60_000);
+        let refs = "&big;".repeat(100);
+        let doc = format!(
+            "<!DOCTYPE r [<!ENTITY big \"{big}\">]><rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\">\
+             <rdf:Description rdf:about=\"http://ex/a\"><ex:p>{refs}</ex:p></rdf:Description></rdf:RDF>"
+        );
+        let err = parse_str(&doc).unwrap_err().to_string();
+        assert!(err.contains("entity expansion limit"), "{err}");
+        // An external entity is never fetched.
+        let doc = format!(
+            "<!DOCTYPE r [<!ENTITY ext SYSTEM \"file:///etc/passwd\">]><rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\">\
+             <rdf:Description rdf:about=\"http://ex/a\"><ex:p>&ext;</ex:p></rdf:Description></rdf:RDF>"
+        );
+        let err = parse_str(&doc).unwrap_err().to_string();
+        assert!(err.contains("external entity"), "{err}");
+        // An undeclared entity is an error, as before.
+        assert!(parse_str(&format!(
+            "<rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\"><rdf:Description rdf:about=\"&nope;\"/></rdf:RDF>"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn parse_type_collection_builds_an_rdf_list() {
+        let doc = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:ex="http://ex/">
+  <rdf:Description rdf:about="http://ex/basket">
+    <ex:has rdf:parseType="Collection">
+      <rdf:Description rdf:about="http://ex/banana"/>
+      <ex:Fruit rdf:about="http://ex/apple"/>
+      <rdf:Description rdf:about="http://ex/pear"/>
+    </ex:has>
+    <ex:none rdf:parseType="Collection"></ex:none>
+  </rdf:Description>
+</rdf:RDF>"#;
+        let ts = parse_str(doc).unwrap();
+        let nil = Term::iri(format!("{RDF_NS}nil"));
+        let has = find(&ts, "http://ex/has");
+        assert_eq!(has.len(), 1);
+        // Walk the list from its head.
+        let mut cell = has[0].object.clone();
+        let mut items = Vec::new();
+        while cell != nil {
+            let first = ts
+                .iter()
+                .find(|t| t.subject == cell && t.predicate == Term::iri(format!("{RDF_NS}first")))
+                .unwrap();
+            items.push(first.object.clone());
+            cell = ts
+                .iter()
+                .find(|t| t.subject == cell && t.predicate == Term::iri(format!("{RDF_NS}rest")))
+                .unwrap()
+                .object
+                .clone();
+        }
+        assert_eq!(
+            items,
+            [
+                Term::iri("http://ex/banana"),
+                Term::iri("http://ex/apple"),
+                Term::iri("http://ex/pear")
+            ]
+        );
+        // The typed node element still types its node.
+        assert!(ts.iter().any(|t| t.subject == Term::iri("http://ex/apple")
+            && t.object == Term::iri("http://ex/Fruit")));
+        assert_eq!(find(&ts, "http://ex/none")[0].object, nil);
+    }
+
+    #[test]
+    fn node_ids_and_minted_nodes_follow_the_labeler() {
+        let doc = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:ex="http://ex/">
+  <rdf:Description rdf:nodeID="n1"><ex:p rdf:parseType="Resource"><ex:q>v</ex:q></ex:p></rdf:Description>
+</rdf:RDF>"#;
+        let mut labels = BlankLabeler::scoped("S");
+        let ts = parse_str_with(doc, &mut labels).unwrap();
+        let p = find(&ts, "http://ex/p");
+        assert_eq!(p[0].subject, Term::blank("S_n1"));
+        assert_eq!(p[0].object, Term::blank("S-0"));
     }
 }
