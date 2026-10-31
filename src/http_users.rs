@@ -1083,7 +1083,10 @@ impl UserStore {
         let mut changed = false;
         for u in self.users.values_mut() {
             if let Some(set) = u.db_privileges.get(from).cloned() {
-                u.db_privileges.entry(to.to_string()).or_default().extend(set);
+                u.db_privileges
+                    .entry(to.to_string())
+                    .or_default()
+                    .extend(set);
                 changed = true;
             }
         }
@@ -1900,6 +1903,77 @@ mod tests {
             assert!(store.has_priv("alice", Privilege::Update));
             assert!(!store.has_priv("alice", Privilege::Query));
         }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_database_grants_persist_and_are_scoped() {
+        let path = tmp("perdb");
+        {
+            let mut store = UserStore::open(&path, "rootpw").unwrap();
+            store
+                .add("alice", "pw", BTreeSet::from([Privilege::Export]))
+                .unwrap();
+            let qu = BTreeSet::from([Privilege::Query, Privilege::Update]);
+            store.grant_on("alice", "lubm", &qu).unwrap();
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm"));
+            assert!(!store.has_priv_on("alice", Privilege::Query, "movie"));
+            assert!(
+                !store.has_priv("alice", Privilege::Query),
+                "not on every database"
+            );
+            assert!(store.has_priv_on("alice", Privilege::Export, "movie"), "global");
+            assert!(store.has_priv_anywhere("alice", Privilege::Update));
+            assert!(!store.has_priv_anywhere("alice", Privilege::Backup));
+            assert!(store
+                .grant_on("alice", "lubm", &BTreeSet::from([Privilege::Admin]))
+                .is_err());
+            assert!(store
+                .grant_on("alice", "../x", &BTreeSet::from([Privilege::Query]))
+                .is_err());
+            assert!(store
+                .grant_on(ROOT_USER, "lubm", &BTreeSet::from([Privilege::Query]))
+                .is_err());
+            store
+                .revoke_on("alice", "lubm", &BTreeSet::from([Privilege::Update]))
+                .unwrap();
+            assert!(!store.has_priv_on("alice", Privilege::Update, "lubm"));
+            assert_eq!(
+                store.get("alice").unwrap().privilege_str(),
+                "export,query@lubm"
+            );
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\texport,query@lubm\n"), "{text}");
+        {
+            let mut store = UserStore::open(&path, "rootpw").unwrap();
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm"));
+            // Rename (copy) and drop (forget) a database's grants.
+            assert!(store.copy_database_privileges("lubm", "lubm2").unwrap());
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm2"));
+            assert!(store.forget_database("lubm").unwrap());
+            assert!(!store.forget_database("lubm").unwrap());
+            assert!(!store.has_priv_on("alice", Privilege::Query, "lubm"));
+            // The creator of a database gets every per-database privilege.
+            store.grant_all_on("alice", "fresh").unwrap();
+            for p in Privilege::PER_DATABASE {
+                assert!(store.has_priv_on("alice", p, "fresh"), "{p:?}");
+            }
+            assert_eq!(
+                store.get("alice").unwrap().databases_with(Privilege::Load),
+                vec!["fresh"]
+            );
+            store.clear_privileges("alice").unwrap();
+            let alice = store.get("alice").unwrap();
+            assert!(alice.privileges.is_empty() && alice.db_privileges.is_empty());
+        }
+        // Per-database tokens that do not parse are refused like any other.
+        for bad in ["query@", "admin@lubm", "query@a/b", "nope@lubm"] {
+            fs::write(&path, format!("zed\t{}\t{bad}\n", hash_password("pw"))).unwrap();
+            let err = UserStore::open(&path, "rootpw").err().expect(bad);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad}");
+        }
+        assert_eq!(Privilege::Export.code(), 7);
         let _ = fs::remove_file(&path);
     }
 

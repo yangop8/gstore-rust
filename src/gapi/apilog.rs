@@ -398,10 +398,7 @@ pub fn txn_records(root: &Path) -> Vec<Json> {
             order.push(tid);
         }
     }
-    order
-        .into_iter()
-        .filter_map(|t| last.remove(&t))
-        .collect()
+    order.into_iter().filter_map(|t| last.remove(&t)).collect()
 }
 
 /// One page of records, newest first.
@@ -494,7 +491,9 @@ pub(super) fn log_access(ctx: &Ctx<'_>, params: &Params, resp: &GResp) {
         filepath: String::new(),
         opt_id: String::new(),
     };
-    ctx.inner.apilogs.write_access(config, &ctx.inner.root, &rec);
+    ctx.inner
+        .apilogs
+        .write_access(config, &ctx.inner.root, &rec);
 }
 
 /// Upstream's clean-up of a logged message: no line breaks, no runs of four
@@ -521,7 +520,11 @@ impl QueryLog {
         let on = ctx.inner.config().querylog_mode;
         QueryLog {
             db: db.to_string(),
-            sparql: if on { sparql.to_string() } else { String::new() },
+            sparql: if on {
+                sparql.to_string()
+            } else {
+                String::new()
+            },
             format: format
                 .map(str::trim)
                 .filter(|f| !f.is_empty())
@@ -562,9 +565,7 @@ impl QueryLog {
             query_time,
             db_name: self.db,
         };
-        ctx.inner
-            .apilogs
-            .write_query(config, &ctx.inner.root, &rec);
+        ctx.inner.apilogs.write_query(config, &ctx.inner.root, &rec);
     }
 }
 
@@ -763,7 +764,10 @@ mod tests {
         rec.operation = "login".into();
         rec.db_name.clear();
         let j = record_line(rec.to_json());
-        assert!(!j.contains("state") && !j.contains("num") && !j.contains("dbname"), "{j}");
+        assert!(
+            !j.contains("state") && !j.contains("num") && !j.contains("dbname"),
+            "{j}"
+        );
         assert_eq!(clean_msg("a\r\n    b"), "ab");
     }
 

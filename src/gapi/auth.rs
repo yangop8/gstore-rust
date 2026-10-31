@@ -25,9 +25,9 @@
 //! [`super::ipfilter`].
 
 use super::envelope::{GResp, Status};
+use super::ipfilter;
 use super::params::Params;
 use super::{Ctx, SYSTEM_DB};
-use super::ipfilter;
 use crate::http_users::{CredentialCheck, PasswordForm};
 use crate::query::hash::md5_hex;
 use crate::server::{ct_eq, Request};

@@ -478,7 +478,9 @@ fn parse_registry(text: &str, path: &Path) -> io::Result<BTreeMap<String, DbReco
     let mut out = BTreeMap::new();
     let list = match doc.get("databases") {
         None => return Ok(out),
-        Some(l) => l.as_array().ok_or_else(|| bad("databases is not an array".into()))?,
+        Some(l) => l
+            .as_array()
+            .ok_or_else(|| bad("databases is not an array".into()))?,
     };
     for item in list {
         let field = |k: &str| item.get(k).and_then(Json::as_str).map(str::to_string);
@@ -585,7 +587,10 @@ pub mod clock {
     /// `t` in local time.
     pub fn at(t: SystemTime) -> LocalTime {
         let (secs, millis) = match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX / 2), d.subsec_millis()),
+            Ok(d) => (
+                i64::try_from(d.as_secs()).unwrap_or(i64::MAX / 2),
+                d.subsec_millis(),
+            ),
             Err(_) => (0, 0),
         };
         from_unix(secs.saturating_add(utc_offset_secs(secs)), millis)
@@ -682,7 +687,8 @@ pub mod clock {
         }
         let _ = (tm.tm_sec, tm.tm_isdst, tm.tm_zone);
         // Offsets are within ±26 hours; anything else is garbage.
-        let off = i64::from(tm.tm_gmtoff);
+        // `long` is 64-bit on every target this is compiled for.
+        let off: i64 = tm.tm_gmtoff;
         if off.abs() <= 26 * 3600 {
             off
         } else {
@@ -713,7 +719,10 @@ pub mod clock {
             // Leap day, end of a century, before the epoch.
             assert_eq!(from_unix(951_782_400, 0).datetime(), "2000-02-29 00:00:00");
             assert_eq!(from_unix(-1, 0).datetime(), "1969-12-31 23:59:59");
-            assert_eq!(from_unix(4_102_444_799, 0).datetime(), "2099-12-31 23:59:59");
+            assert_eq!(
+                from_unix(4_102_444_799, 0).datetime(),
+                "2099-12-31 23:59:59"
+            );
         }
 
         #[test]
@@ -771,7 +780,9 @@ mod tests {
             requirement("restore"),
             Requirement::Privilege(Privilege::Restore)
         );
-        for op in ["build", "drop", "showuser", "ipmanage", "querylog", "rename"] {
+        for op in [
+            "build", "drop", "showuser", "ipmanage", "querylog", "rename",
+        ] {
             assert_eq!(requirement(op), Requirement::RootOnly, "{op}");
         }
     }

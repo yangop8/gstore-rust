@@ -106,9 +106,14 @@ impl Rule {
     fn parse(entry: &str) -> Option<Rule> {
         let entry = entry.trim();
         if let Some((a, b)) = entry.split_once('-') {
-            let (a, b) = (a.trim().parse::<IpAddr>().ok()?, b.trim().parse::<IpAddr>().ok()?);
+            let (a, b) = (
+                a.trim().parse::<IpAddr>().ok()?,
+                b.trim().parse::<IpAddr>().ok()?,
+            );
             let (lo, hi, v4) = match (normalize(a), normalize(b)) {
-                (IpAddr::V4(a), IpAddr::V4(b)) => (u128::from(u32::from(a)), u128::from(u32::from(b)), true),
+                (IpAddr::V4(a), IpAddr::V4(b)) => {
+                    (u128::from(u32::from(a)), u128::from(u32::from(b)), true)
+                }
                 (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a), u128::from(b), false),
                 _ => return None,
             };
@@ -128,7 +133,10 @@ impl Rule {
             }
             return Some(Rule::Pattern(octets));
         }
-        entry.parse::<IpAddr>().ok().map(|a| Rule::Exact(normalize(a)))
+        entry
+            .parse::<IpAddr>()
+            .ok()
+            .map(|a| Rule::Exact(normalize(a)))
     }
 
     fn matches(&self, ip: IpAddr) -> bool {
@@ -323,10 +331,8 @@ impl IpFilter {
     pub fn reload(&self) {
         let mut guard = self.state();
         let st = &mut *guard;
-        for slot in [&mut st.allow, &mut st.deny] {
-            if let Some((path, list)) = slot {
-                *list = IpList::load(path);
-            }
+        for (path, list) in [&mut st.allow, &mut st.deny].into_iter().flatten() {
+            *list = IpList::load(path);
         }
     }
 
@@ -468,7 +474,7 @@ mod tests {
                        #1.1.1.1-1.1.1.2\n#    3. do not include extra space\n";
         assert!(IpList::parse(shipped).entries.is_empty());
         let l = IpList::parse(
-            "10.0.0.1\n192.168.1.120-192.168.1.129\r\n 172.16.*.* \nshort\n1.2.3.4 # c\n::1\n",
+            "10.0.0.1\n192.168.1.120-192.168.1.129\r\n 172.16.*.* \nshort\n1.2.3.4 # c\n::1\nfe80::1:2\n",
         );
         assert_eq!(l.entries.len(), 4, "{:?}", l.entries);
         let m = |ip: &str| l.matches(ip.parse().ok().map(normalize));
@@ -478,7 +484,11 @@ mod tests {
         assert!(!m("192.168.1.130") && !m("192.168.1.119"));
         assert!(m("172.16.200.3"));
         assert!(!m("172.17.0.1"));
-        assert!(m("::1"));
+        assert!(m("fe80::1:2"));
+        assert!(
+            !m("::1"),
+            "a line shorter than 7 characters is skipped, as upstream"
+        );
         assert!(m("::ffff:10.0.0.1"), "IPv4-mapped peers match IPv4 entries");
         assert!(!m("1.2.3.4"), "a line with # is a comment");
     }
@@ -523,6 +533,26 @@ mod tests {
             none.save(ListKind::Deny, &["1.2.3.4".into()]),
             Err(SaveError::NotConfigured(ListKind::Deny))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_picks_up_edited_list_files() {
+        let dir = tmp("reload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let deny = dir.join("deny");
+        std::fs::write(&deny, "10.9.9.9\n").unwrap();
+        let f = IpFilter::new(None, Some(deny.clone()));
+        assert!(f.permits("10.9.9.8"));
+        std::fs::write(&deny, "10.9.9.0-10.9.9.255\n").unwrap();
+        assert!(f.permits("10.9.9.8"), "not re-read on its own");
+        f.reload();
+        assert!(!f.permits("10.9.9.8"));
+        assert_eq!(
+            f.entries(ListKind::Deny),
+            Some(vec!["10.9.9.0-10.9.9.255".to_string()])
+        );
+        assert_eq!(f.entries(ListKind::Allow), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

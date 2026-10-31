@@ -118,12 +118,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::GStoreConfig;
-use crate::gapi::apilog::{ApiLogs, TxnState};
-use crate::gapi::ipfilter::IpFilter;
-use crate::sysdb::SysDb;
 use crate::db::{Database, LoadPolicy, LoadSource};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
+use crate::gapi::apilog::{ApiLogs, TxnState};
+use crate::gapi::ipfilter::IpFilter;
 use crate::gapi::GapiConfig;
 use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
@@ -137,6 +136,7 @@ use crate::server::{
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::{TripleSource, TripleStore};
+use crate::sysdb::SysDb;
 
 const JSON: &str = "application/json";
 const SPARQL_JSON: &str = "application/sparql-results+json";

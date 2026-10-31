@@ -39,7 +39,9 @@ const MASKED_PASSWORD: &str = "******";
 
 /// A string parameter, trimmed (`""` when absent).
 fn param(p: &Params, name: &str) -> String {
-    p.str(name).map(|s| s.trim().to_string()).unwrap_or_default()
+    p.str(name)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Upstream's `check_param_value` for a plain parameter: `1003 "the value
