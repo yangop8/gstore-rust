@@ -186,13 +186,15 @@ pub struct SelectQuery {
 
 impl SelectQuery {
     /// The output variable names, in column order. `SELECT *` lists the
-    /// variables of the WHERE pattern, then those only the trailing `VALUES`
-    /// binds; hidden blank-node variables ([`is_anon_var`]) are not listed.
+    /// in-scope variables of the WHERE pattern
+    /// ([`GraphPattern::collect_in_scope_vars`]: not those only a `MINUS`
+    /// mentions), then those only the trailing `VALUES` binds; hidden
+    /// blank-node variables ([`is_anon_var`]) are not listed.
     pub fn result_vars(&self) -> Vec<String> {
         match &self.projection {
             Projection::All => {
                 let mut v = Vec::new();
-                self.pattern.collect_vars(&mut v);
+                self.pattern.collect_in_scope_vars(&mut v);
                 if let Some((vars, _)) = &self.values {
                     for x in vars {
                         if !v.contains(x) {
@@ -409,6 +411,57 @@ impl GraphPattern {
                 }
                 pattern.collect_vars(out);
             }
+        }
+    }
+
+    /// Collect the pattern's *in-scope* variables (SPARQL 1.1 §18.2.1), in
+    /// appearance order — the variables `SELECT *` projects. This is
+    /// [`collect_vars`](Self::collect_vars) except that the right-hand side
+    /// of `MINUS` contributes nothing: §18.2.1 gives `MINUS` no in-scope
+    /// variables of its own, so `SELECT * { ?s ?p ?o MINUS { ?x ?y ?z } }`
+    /// has the columns `?s ?p ?o` only.
+    pub fn collect_in_scope_vars(&self, out: &mut Vec<String>) {
+        match self {
+            GraphPattern::Minus(a, _) => a.collect_in_scope_vars(out),
+            GraphPattern::Join(a, b) | GraphPattern::Union(a, b) => {
+                a.collect_in_scope_vars(out);
+                b.collect_in_scope_vars(out);
+            }
+            GraphPattern::LeftJoin(a, b, _) => {
+                a.collect_in_scope_vars(out);
+                b.collect_in_scope_vars(out);
+            }
+            GraphPattern::Filter(_, inner) => inner.collect_in_scope_vars(out),
+            GraphPattern::Extend(inner, v, _) => {
+                inner.collect_in_scope_vars(out);
+                if !out.contains(v) {
+                    out.push(v.clone());
+                }
+            }
+            GraphPattern::Graph(GraphTerm::Var(v), inner) => {
+                if !out.contains(v) {
+                    out.push(v.clone());
+                }
+                inner.collect_in_scope_vars(out);
+            }
+            GraphPattern::Graph(_, inner) => inner.collect_in_scope_vars(out),
+            GraphPattern::Service {
+                endpoint, pattern, ..
+            } => {
+                if let ServiceRef::Var(v) = endpoint {
+                    if !out.contains(v) {
+                        out.push(v.clone());
+                    }
+                }
+                pattern.collect_in_scope_vars(out);
+            }
+            // Leaves (BGP, path, VALUES, sub-SELECT projection) and the
+            // empty group: everything they bind is in scope.
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _)
+            | GraphPattern::SubSelect(_) => self.collect_vars(out),
         }
     }
 }

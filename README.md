@@ -37,6 +37,8 @@ off-box on the paths you allow — see [Answering modes](#answering-modes--priva
 ```bash
 cargo build --release           # gStore CLIs + gnlqa
 cargo test --workspace          # run the tests
+# upstream's scripts/test/parser_test.sh (50 SPARQL cases), in-process, per-case table:
+cargo test --test dt_upstream_parser_suite -- --nocapture
 ```
 
 ### A) Use gStore directly (SPARQL)

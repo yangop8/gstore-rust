@@ -1463,6 +1463,7 @@ fn clone_layout(l: &VarLayout) -> VarLayout {
         index: l.index.clone(),
         names: l.names.clone(),
         is_pred: l.is_pred.clone(),
+        pred_alias: l.pred_alias.clone(),
     }
 }
 
