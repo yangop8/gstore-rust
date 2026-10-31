@@ -1399,11 +1399,11 @@ impl<'s> Parser<'s> {
                 )),
             },
             GSlot::Int => self
-                .parse_gfn_integer(true)
+                .parse_gfn_integer(true, true)
                 .map(GArg::Int)
                 .map_err(|m| format!("argument {argno} must be an integerLiteral: {m}")),
             GSlot::UInt => self
-                .parse_gfn_integer(false)
+                .parse_gfn_integer(false, true)
                 .map(GArg::Int)
                 .map_err(|m| format!("argument {argno} must be an unsigned integer: {m}")),
             GSlot::Num => self
@@ -1434,7 +1434,8 @@ impl<'s> Parser<'s> {
                 }
                 self.bump();
                 let value = if matches!(slot, GSlot::NamedUInt(_)) {
-                    self.parse_gfn_integer(false).map(GNum::Int)
+                    // `maxIter` goes through `stof` upstream: no `int` bound.
+                    self.parse_gfn_integer(false, false).map(GNum::Int)
                 } else {
                     self.parse_gfn_number().map(GNum::Num)
                 }
@@ -1448,8 +1449,12 @@ impl<'s> Parser<'s> {
     }
 
     /// An optionally signed integer (`integerLiteral`), or with `signed ==
-    /// false` an unsigned one (`num_integer`), as an `i64`.
-    fn parse_gfn_integer(&mut self, signed: bool) -> std::result::Result<i64, String> {
+    /// false` an unsigned one (`num_integer`), as an `i64`. With `int32`, the
+    /// value must fit a C `int`: upstream reads every positional integer
+    /// argument (`k`, `retNum`, `hopCnt`, `maximumKplex`'s `k`, `coreTruss`'s
+    /// two parameters) with `std::stoi`, which throws `out_of_range` — a
+    /// failed query — instead of wrapping (QueryParser.cpp:526-567).
+    fn parse_gfn_integer(&mut self, signed: bool, int32: bool) -> std::result::Result<i64, String> {
         let sign = match self.peek() {
             Token::Plus => "+",
             Token::Minus => "-",
@@ -1462,9 +1467,17 @@ impl<'s> Parser<'s> {
         if !signed && !sign.is_empty() {
             return Err(format!("found signed {sign}{digits}"));
         }
-        let n = format!("{sign}{digits}")
-            .parse::<i64>()
-            .map_err(|_| format!("{sign}{digits} is out of the 64-bit integer range"))?;
+        let n = format!("{sign}{digits}").parse::<i64>().ok();
+        let n = if int32 {
+            n.filter(|v| i32::try_from(*v).is_ok()).ok_or_else(|| {
+                format!(
+                    "{sign}{digits} is out of the 32-bit int range \
+                     (upstream reads it with stoi)"
+                )
+            })?
+        } else {
+            n.ok_or_else(|| format!("{sign}{digits} is out of the 64-bit integer range"))?
+        };
         self.pos += digits_at;
         self.bump();
         Ok(n)

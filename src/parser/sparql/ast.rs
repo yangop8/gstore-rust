@@ -466,7 +466,9 @@ pub enum GArg {
     /// `booleanLiteral` (the `directed` flag).
     Bool(bool),
     /// `integerLiteral` (signed: `k`, `retNum`, `hopCnt`, …) or `num_integer`
-    /// (unsigned: `maximumKplex`'s `k`, `coreTruss`'s two parameters).
+    /// (unsigned: `maximumKplex`'s `k`, `coreTruss`'s two parameters). Always
+    /// within the C `int` range: upstream reads these with `stoi`, so a
+    /// larger literal is a parse error.
     Int(i64),
     /// `numericLiteral` (`confidenceDegree`'s six weights), always as `f64`.
     Num(f64),

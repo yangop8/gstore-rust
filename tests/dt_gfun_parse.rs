@@ -698,15 +698,40 @@ fn signed_and_large_integers() {
     assert_eq!(k("0"), 0);
     assert_eq!(k("+7"), 7);
     assert_eq!(k("-1"), -1);
-    assert_eq!(k("9223372036854775807"), i64::MAX);
-    assert_eq!(k("-9223372036854775808"), i64::MIN);
-    let m = call_err("kHopCount(<a>, true, 9223372036854775808, {})");
+    assert_eq!(k("007"), 7);
+    assert_eq!(k("- 1"), -1);
+    // Positional integers are read with `stoi` upstream: they must fit a C
+    // `int`; anything larger is an error, never a wrap.
+    assert_eq!(k("2147483647"), i64::from(i32::MAX));
+    assert_eq!(k("-2147483648"), i64::from(i32::MIN));
+    for big in [
+        "2147483648",
+        "-2147483649",
+        "9223372036854775808",
+        "99999999999999999999999",
+    ] {
+        let m = call_err(&format!("kHopCount(<a>, true, {big}, {{}})"));
+        assert_contains(
+            &m,
+            &[
+                "argument 3 must be an integerLiteral",
+                &format!("{big} is out of the 32-bit int range"),
+            ],
+        );
+    }
+    let m = call_err("coreTruss({}, 2, 3000000000)");
     assert_contains(
         &m,
-        &[
-            "argument 3 must be an integerLiteral",
-            "out of the 64-bit integer range",
-        ],
+        &["argument 3 must be an unsigned integer", "32-bit int range"],
+    );
+    let m = call_err("maximumKplex({}, 2147483648)");
+    assert_contains(&m, &["argument 2", "32-bit int range"]);
+    let m = call_err("PPR(<a>, 2, {}, 4294967296)");
+    assert_contains(&m, &["argument 4", "32-bit int range"]);
+    // `maxIter=` goes through `stof` upstream: no `int` bound.
+    assert_eq!(
+        call("labelProp(true, {}, maxIter=5000000000)").1[2],
+        named_int("maxIter", 5_000_000_000)
     );
     let m = call_err("kHopCount(<a>, true, 2.5, {})");
     assert_contains(&m, &["argument 3 must be an integerLiteral: found 2.5"]);
