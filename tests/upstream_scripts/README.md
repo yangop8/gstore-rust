@@ -18,6 +18,7 @@ integration tests (`tests/upstream_*.rs`).
 | `python/example/POST-example.py` | `api/http/python/example/POST-example.py` | 1, 2 |
 | `python/sdk_check.py` | — (written for this suite) | — |
 | `harness.rs` | — (the Rust tests' shared harness) | — |
+| `parser_cases.rs` | — (`parser_test.sh`'s numbers and the documented divergences, shared by `tests/upstream_parser.rs` and `tests/dt_upstream_parser_suite.rs`) | — |
 
 The shell scripts need no change: they run from `GSTORE_HOME`, read the HTTP
 port from `./conf/conf.ini` and their data from `./data/…` and
@@ -51,8 +52,9 @@ the Rust server gives (and SPARQL requires), accepted by the checks:
   4 (its `extract_json_num` turns an answer without `AnsNum` into 0).
 - `parser_test.sh` records `AnsNum` 0 for cases 15 and 17, whose result files
   (`testdata/upstream/scripts/test/parser_test/parser_r15.txt`, `_r17.txt`)
-  hold 4 and 1 rows; cases 33–35 need the phase 2 graph functions, 42 and 50
-  phase 3 SPARQL fixes.
+  hold 4 and 1 rows (the W3C answers; `parser_cases.rs` here documents both
+  for the Rust suites). Every other case — the graph functions (33–35)
+  included — must pass.
 
 `GstoreConnector.py`'s `uploadFile` (it posts a file object as JSON) and
 `downloadFile` (it names an undefined variable) cannot work against any

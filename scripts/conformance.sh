@@ -225,21 +225,22 @@ check_api() {
 }
 
 # parser_test.sh: 50 cases (build count + AnsNum). The cases that may fail
-# are known: 15 and 17 (the script records AnsNum 0 where its own result files
-# and SPARQL give 4 and 1), 33-35 (phase 2: graph functions), 42 and 50
-# (phase 3: UCASE keeps the language tag; a variable joined across predicate
-# and subject/object positions). Any other failing case fails the suite.
+# are known: 15 and 17, where the script records AnsNum 0 but its own result
+# files and SPARQL give 4 and 1 (the documented divergences of
+# tests/upstream_scripts/parser_cases.rs). Any other failing case — the graph
+# functions (33-35), UCASE's language tag (42) and the variable shared by
+# predicate and subject positions (50) included — fails the suite.
 check_parser() {
     local log=$LOGS/parser.log failing unexpected=""
     run_script parser parser_test.sh || { echo "parser_test.sh exited non-zero"; return 1; }
     failing=$(strip_colors "$log" | grep -o '❌ 用例 #[0-9]* 校验失败' | grep -o '[0-9]*' | tr '\n' ' ')
     for n in $failing; do
-        case " 15 17 33 34 35 42 50 " in
+        case " 15 17 " in
             *" $n "*) ;;
             *) unexpected+="$n " ;;
         esac
     done
-    echo "failing cases: ${failing:-none} (known: 15 17 33 34 35 42 50)"
+    echo "failing cases: ${failing:-none} (known: 15 17)"
     [ -z "$unexpected" ] || { echo "unexpected failures: $unexpected"; return 1; }
     [ "$(strip_colors "$log" | grep -c '用例 #[0-9]* 校验')" = 50 ] || { echo "not all 50 cases ran"; return 1; }
 }
