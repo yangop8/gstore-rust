@@ -94,7 +94,19 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
     } else {
         PasswordForm::Plain
     };
-    let outcome = ctx.state().users.authenticate(&username, &password, form);
+    // Every request carries its credentials, so verification must not hold
+    // the server-wide state lock through PBKDF2: a burst of wrong passwords
+    // (which never hit the verified-credentials cache) would otherwise stall
+    // every other request, `/cancel` included. Only the cheap set-up and
+    // bookkeeping steps run under the lock.
+    let prepared = ctx.state().users.begin_check(&username, &password, form);
+    let outcome = match prepared {
+        Ok(outcome) => outcome,
+        Err(pending) => {
+            let checked = pending.run();
+            ctx.state().users.finish_check(checked)
+        }
+    };
     match outcome {
         CredentialCheck::Valid => {
             ctx.user = Some(username.clone());

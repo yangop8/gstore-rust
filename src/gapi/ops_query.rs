@@ -375,6 +375,20 @@ fn tid_param(p: &Params) -> Result<u64, GResp> {
     })
 }
 
+/// Upstream's first transaction check (`ApiHandler::transaction_check`):
+/// `tquery` / `commit` / `rollback` on a database that is not loaded answer
+/// `1004 "Database txn is not loaded yet."` before the `tid` is looked at.
+fn txn_db_loaded(ctx: &Ctx<'_>, db: &str) -> Result<(), GResp> {
+    if ctx.state().dbs.contains_key(db) {
+        Ok(())
+    } else {
+        Err(GResp::error(
+            Status::OperationConditionsAreNotSatisfied,
+            "Database txn is not loaded yet.",
+        ))
+    }
+}
+
 /// Resolve transaction `tid` of the caller on `db`: its database's handle.
 /// A transaction on another database is a wrong id for this one (upstream
 /// keeps one transaction manager per database).
@@ -396,6 +410,9 @@ fn txn_target(ctx: &Ctx<'_>, db: &str, tid: u64) -> Result<Option<DbHandle>, OpE
 /// upstream leaves at 0 — here the number of answers).
 fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = ctx.db_name.clone().unwrap_or_default();
+    if let Err(r) = txn_db_loaded(ctx, &db) {
+        return r;
+    }
     let tid = match tid_param(p) {
         Ok(t) => t,
         Err(r) => return r,
@@ -455,6 +472,9 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
     };
     let fail_prefix = format!("Transaction {verb} fail");
     let db = ctx.db_name.clone().unwrap_or_default();
+    if let Err(r) = txn_db_loaded(ctx, &db) {
+        return r;
+    }
     let tid = match tid_param(p) {
         Ok(t) => t,
         Err(r) => return r,
@@ -501,10 +521,18 @@ fn checkpoint(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
         let st = ctx.state();
         match st.dbs.get(&db).map(Arc::clone) {
             Some(h) => h,
+            // Upstream's `validate_databaseinfo` answers (both `1005`).
+            None if st.db_dir(&db).is_dir() => {
+                return GResp::error(
+                    Status::OperationFailed,
+                    format!("database[{db}] is not loaded yet"),
+                )
+            }
             None => {
-                let on_disk = st.db_dir(&db).is_dir();
-                drop(st);
-                return not_loaded(&db, on_disk);
+                return GResp::error(
+                    Status::OperationFailed,
+                    format!("database[{db}] does not exist"),
+                )
             }
         }
     };

@@ -209,14 +209,20 @@ impl Json {
         match self {
             Json::Arr(items) => Json::Arr(items.iter().map(Json::sorted).collect()),
             Json::Obj(entries) => {
+                // Stable sort by key, then keep the last entry of each run of
+                // equal keys (the "last wins" duplicate rule): O(n log n), so
+                // a wide row object stays cheap.
+                let mut idx: Vec<usize> = (0..entries.len()).collect();
+                idx.sort_by(|&a, &b| entries[a].0.as_bytes().cmp(entries[b].0.as_bytes()));
                 let mut out: Vec<(String, Json)> = Vec::with_capacity(entries.len());
-                for (k, v) in entries {
-                    match out.iter_mut().find(|(ok, _)| ok == k) {
-                        Some(slot) => slot.1 = v.sorted(),
-                        None => out.push((k.clone(), v.sorted())),
+                for (n, &i) in idx.iter().enumerate() {
+                    let is_last_of_key = idx
+                        .get(n + 1)
+                        .is_none_or(|&j| entries[j].0 != entries[i].0);
+                    if is_last_of_key {
+                        out.push((entries[i].0.clone(), entries[i].1.sorted()));
                     }
                 }
-                out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
                 Json::Obj(out)
             }
             other => other.clone(),
@@ -668,6 +674,8 @@ mod tests {
         let d = parse(r#"{"k":1,"k":2}"#).unwrap();
         assert_eq!(d.get("k").and_then(Json::as_i64), Some(2));
         assert_eq!(d.sorted().to_string(), r#"{"k":2}"#);
+        let d = parse(r#"{"b":1,"a":1,"c":0,"b":2,"a":3}"#).unwrap();
+        assert_eq!(d.sorted().to_string(), r#"{"a":3,"b":2,"c":0}"#);
         assert_eq!(o.remove("z"), Some(Json::from(2)));
         assert_eq!(o.to_string(), r#"{"a":"x"}"#);
     }

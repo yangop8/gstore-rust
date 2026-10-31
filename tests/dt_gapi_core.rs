@@ -907,7 +907,30 @@ fn query_on_missing_or_unloaded_databases() {
     let j = root_api(&addr, "begin", &[("db_name", "udb")]);
     assert_eq!((code(&j), msg(&j)), (1004, "Database is not loaded yet."));
     let j = root_api(&addr, "checkpoint", &[("db_name", "udb")]);
-    assert_eq!(code(&j), 1005);
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (1005, "database[udb] is not loaded yet")
+    );
+    let j = root_api(&addr, "checkpoint", &[("db_name", "nosuch")]);
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (1005, "database[nosuch] does not exist")
+    );
+    // Upstream checks that the database is loaded before it looks at the tid.
+    for op in ["tquery", "commit", "rollback"] {
+        for db in ["udb", "nosuch"] {
+            let j = root_api(
+                &addr,
+                op,
+                &[("db_name", db), ("tid", "1"), ("sparql", "ASK {}")],
+            );
+            assert_eq!(
+                (code(&j), msg(&j)),
+                (1004, "Database txn is not loaded yet."),
+                "{op} on {db}"
+            );
+        }
+    }
 }
 
 // ---- transactions -----------------------------------------------------------
