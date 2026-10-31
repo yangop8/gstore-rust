@@ -709,6 +709,77 @@ fn rest_queries_are_in_the_json_query_log_with_ip_count_and_latency() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Phase 2's graph functions and Phase 3's update forms are recorded in the
+/// query log like any other statement: over REST (`/sparql`, `/update`) and
+/// over `/api` `query`, with their answer counts.
+#[test]
+fn graph_functions_and_phase3_updates_are_in_the_query_log() {
+    let root = tmp_dir("rest_querylog_gfun");
+    let data_dir = root.join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let extra = data_dir.join("extra.ttl");
+    fs::write(&extra, "<http://ex/c> <http://ex/p> <http://ex/d> .\n").unwrap();
+    let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+        .unwrap()
+        .with_load_policy(gstore::LoadPolicy::restricted().with_allowed_dir(&data_dir));
+    let server = Arc::new(server);
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    std::thread::spawn(move || s2.serve_forever());
+    let (st, body) = request(&addr, "POST", "/build?db_name=gfx", DATA);
+    assert_eq!(st, 200, "{body}");
+
+    let gfun = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?l) WHERE {}";
+    let (st, body) = request(&addr, "POST", "/sparql?db_name=gfx", gfun);
+    assert_eq!(st, 200, "{body}");
+    let copy = "COPY DEFAULT TO <http://ex/g>";
+    let (st, body) = request(&addr, "POST", "/update?db_name=gfx", copy);
+    assert_eq!(st, 200, "{body}");
+    let with =
+        "WITH <http://ex/g> DELETE { ?s <http://ex/name> ?n } WHERE { ?s <http://ex/name> ?n }";
+    let (st, body) = request(&addr, "POST", "/sparql?db_name=gfx", with);
+    assert_eq!(st, 200, "{body}");
+    let load = format!("LOAD <{}> INTO GRAPH <http://ex/h>", extra.display());
+    let (st, body) = request(&addr, "POST", "/update?db_name=gfx", &load);
+    assert_eq!(st, 200, "{body}");
+    let api_gfun = "SELECT (kHopCount(<http://ex/a>, true, 1, {}) AS ?n) WHERE {}";
+    let (st, body) = request(
+        &addr,
+        "POST",
+        "/api",
+        &Json::obj()
+            .with("operation", "query")
+            .with("username", "root")
+            .with("password", "root")
+            .with("db_name", "gfx")
+            .with("sparql", api_gfun)
+            .to_string(),
+    );
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(n(&json::parse(&body).unwrap(), "StatusCode"), 0, "{body}");
+
+    let recs = query_records(&root);
+    let by_sparql = |q: &str| {
+        recs.iter()
+            .find(|r| s(r, "sparql") == q)
+            .unwrap_or_else(|| panic!("{q} is not in the query log: {recs:?}"))
+    };
+    for (q, ans) in [
+        (gfun, 1),
+        (copy, 3),
+        (with, 1),
+        (load.as_str(), 1),
+        (api_gfun, 1),
+    ] {
+        let r = by_sparql(q);
+        assert_eq!((n(r, "statusCode"), n(r, "ansNum")), (0, ans), "{r}");
+        assert_eq!(s(r, "dbname"), "gfx");
+        assert_eq!(s(r, "remoteIP"), "127.0.0.1");
+    }
+    server.shutdown();
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn the_rest_query_log_follows_querylog_mode_and_path() {
     let root = tmp_dir("rest_querylog_cfg");
