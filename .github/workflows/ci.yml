@@ -33,6 +33,21 @@ jobs:
           key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The PFN runtime is mostly feature-gated code: lint that configuration too.
+  clippy-pfn-wasm:
+    name: clippy (gstore, all targets, --features pfn-wasm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-pfn-wasm
+      - run: cargo clippy -p gstore --all-targets --features pfn-wasm -- -D warnings
+
   test:
     name: test (workspace, default features)
     runs-on: ubuntu-latest
@@ -52,7 +67,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [gzip, tls]
+        # pfn-wasm: the sandboxed WebAssembly runtime of PFN user functions
+        # (its tests run the docs/PFN.md examples; see also clippy-pfn-wasm).
+        feature: [gzip, tls, pfn-wasm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

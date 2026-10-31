@@ -11,6 +11,71 @@ developed in parallel from the same base and merged; the first section
 below records what joining them changed, the following ones each phase,
 newest first.
 
+### Phase 4: PFN personalized functions (`docs/PFN.md`)
+
+- **New: `funquery`, `funcudb`, `funreview` on `/api`** (upstream
+  `ApiPFNOperation.cpp`), open to every user (as upstream grants them) and
+  acting on the caller's own functions only. `funcudb` `type` `1`/`2`/`3`/`4`
+  creates, updates, deletes and compiles, with upstream's messages
+  (`"Function create success."`, `"Function build fail: …"`, a compilation
+  error answered as the compiler's message, the `1003` parameter errors);
+  `funquery` lists upstream's six `funInfo` fields filtered by `funName` /
+  `funStatus`; `funreview` returns the generated module text, URL-encoded.
+  Statuses `"1"` (not compiled), `"2"` (compiled), `"3"` (failed);
+  `funBody` / `funSubs` are URL-decoded as upstream does. Functions are
+  stored as upstream stores them, per user: `<pfn_base_path>/src/<user>/
+  data.json` (+ the generated source) and `lib/<user>/lib<name><md5>.wasm`.
+- **New: `SELECT (PFN.name({…}) AS ?v)` is evaluated** (it was a query
+  error): with upstream's projection shape and argument handling
+  (`pfnQuery` / `pfnQueryByVar`: the argument canonicalized, `"?x"` values
+  replaced by every distinct binding, one call per combination in sorted
+  order, the outputs as a JSON array; one call with the argument as written
+  when there is no solution). The `/api` `query` operation answers upstream's
+  `{"results": …}` document (without `AnsNum` / `OutputLimit` / `ThreadId`
+  for a statement starting `select (pfn.`); elsewhere the value is a plain
+  literal. A query calls the functions of the user it runs for.
+- **Runtime: sandboxed WebAssembly, new optional feature `pfn-wasm`**
+  (`wasmi` 2.0.0 with `std`, `validate`, `auto-dispatch` only; `wat` 1.263.0
+  without the component model). The default build gains no dependency.
+  A body is WebAssembly text wrapped into a module that imports the
+  `"gstore"` host interface (`GraphCtx`: vertex / edge / predicate counts,
+  per-predicate out- / in-degrees and neighbours, id ↔ string, the
+  arguments, `emit*` output); a complete `(module …)` or a
+  `wasm-base64:` binary module is accepted too. Compilation validates the
+  module and its imports / exports and refuses WASI, other imports and
+  start functions. Each call runs in a fresh instance under an instruction
+  budget (fuel, checked with the query's cancel flag between slices, so
+  `operationTaskCancel` and `/cancel` stop a looping function), a memory cap,
+  the `gfun_max_output_bytes` output bound and bounds-checked guest
+  pointers; traps are query errors. Without the feature, management works and
+  compiling / calling fail with an error naming `pfn-wasm`.
+- **New `conf.ini` `[pfn]` section** (Rust extension): `pfn_fuel_per_call`
+  (10^9), `pfn_max_memory_pages` (1024), `pfn_max_module_bytes` (1 MiB),
+  `pfn_max_functions` (100), applied with the `[query]` settings (and by
+  `refreshconf`); upstream's `[system] pfn_base_path` now places the
+  functions (default `<db_home>/pfn`).
+- **API:** `gstore::pfn` (`PfnRegistry`, `PfnCaller`, `PfnInfo`,
+  `PfnLimits`, `GraphCtx` / `CsrGraphCtx`, `ResolvedFn`),
+  `Evaluator::with_pfn`, `Database::set_pfn_caller` / `pfn_caller` /
+  `set_pfn_limits` / `pfn_limits` / `query_as`, `QuerySettings::pfn`,
+  `ApiServer::pfn_registry`. `ConcurrentDb` snapshots, version views and
+  transactions, and HTTP transaction snapshots carry the caller.
+- **Query cache:** PFN queries are never cached (their result depends on
+  the caller and on the function's version) — now documented and tested.
+- **Deliberate divergences from upstream** (all in `docs/PFN.md`):
+  WebAssembly text instead of C++ (upstream bodies must be rewritten);
+  limits where upstream has none; a function returning `0` fails the query
+  (upstream ignores the `bool`); a call whose argument names no variable
+  runs once next to solutions (upstream answers `[]`); `lastTime` stamped on
+  create / update / compile (upstream: compile only); names restricted to
+  SPARQL words (≤ 64 characters); sources under `src/` instead of `cpp/`;
+  `funquery` paging (`pageNo` / `pageSize`) is an extension.
+- **Changed tests:** `config::every_key_is_read_from_its_section` reads a
+  `[pfn]` section too (it requires every known key), and the
+  `QuerySettings` literals of two existing tests gained the `pfn` field;
+  an engine test calls graph functions through the new projection-call
+  dispatcher. No assertion was weakened.
+
 ### Integrating Phases 2 and 3 with the Phase 1 server
 
 - **Security limits cover the new grammar.** The SPARQL parser's nesting
