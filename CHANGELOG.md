@@ -11,6 +11,57 @@ developed in parallel from the same base and merged; the first section
 below records what joining them changed, the following ones each phase,
 newest first.
 
+### Phase 4: reasoning rules (`reasonManage`, GAP_PLAN §3.2)
+
+- **`reasonManage` (types 1-8)** on the `/api` server — add, list, compile,
+  execute, disable, show, delete, check upstream gStore 1.4's JSON inference
+  rules, with upstream's parameters (`db_name`, `type`, `ruleinfo`,
+  `rulename`), response fields (`list`/`num`; `insert_sparql`,
+  `delete_sparql`, `check_sparql`; `insert_sparql`, `select_sparql`,
+  `AnsNum`; `delete_sparql`, `AnsNum`; `ruleinfo`; `check_sparql`,
+  `effectNum`), status strings (`新建`, `已编译`, `已执行`, `已失效`,
+  `已校验`), codes and messages. Root (and `admin` users) only, as upstream.
+  Rules live in `<db>.db/reason_rule_files/<rulename>.json` (upstream's
+  layout; compact JSON, sorted keys), survive unload / load and restarts, and
+  are carried by `backup` / `restore` (also the library's `Database::backup`,
+  `backup_dir` and `restore_into`) and removed by `drop`.
+- **Compiler** (`reason::compile`): upstream's `insert`, `delete`, `check`
+  and `select` statements byte for byte, relation (`type` 1) and property
+  (`type` 0) rules, `logic` 0 (`UNION`) and 1 (join), filters. Inferred
+  triples use upstream's `<Rule:label>` predicates.
+- **Execution** goes through the database's normal update path (query cache,
+  CSR, write-through, update / redo logs, commit point, check_point save,
+  query log, task registry and cancellation); refused (`1004`) while a
+  transaction is open on the database.
+- **Exact retraction** (differs from upstream): each execution records the
+  triples the rule owns (`reason_rule_files/inferred/<rulename>.nt`);
+  disabling deletes exactly those no other rule owns. Facts asserted before
+  the rule ran, and triples another executed rule also infers, survive —
+  upstream's `delete where {?x <Rule:label> ?y.}` would delete them. A rule
+  executed by upstream gStore (no record) is retracted upstream's way.
+- **Hardening** (differs from upstream, which splices rule strings into
+  SPARQL): every pattern / `return` term must be one SPARQL term, every
+  filter one bracket-balanced expression, the label part of one IRI, and
+  `return` variables must be bound — validated with the crate's own lexer and
+  parser, and the compiled statements are parsed again and shape-checked.
+  Execute only ever runs the statement compiled from the definition (a rule
+  edited after compiling must be recompiled; compiled fields sent with `add`
+  are dropped). Rule names must be safe file names; at most 1000 rules per
+  database, 1 MiB per rule file.
+- Other deliberate differences: an executed rule cannot be recompiled
+  (upstream then lets it be deleted with its triples left behind) and stays
+  `已执行` when checked; a top-level `||` filter among several is
+  parenthesized; `type` may be a number and `ruleinfo` a string; `list` is
+  sorted by name; a database that does not exist answers `1005` (upstream
+  creates its directory). Upstream's documentation shows the compiled text
+  with extra spaces; the text here is what its 1.4 code produces.
+- **Library API**: `Database::reason_add`, `reason_list`, `reason_compile`,
+  `reason_execute`, `reason_disable`, `reason_show`, `reason_delete`,
+  `reason_check`, `reason_db_dir`, `set_reason_db_dir`; a database without a
+  directory keeps its rules in memory (and writes them into its backups).
+- **Fix: RDFS range** no longer infers `"lit" rdf:type C` — a triple with a
+  literal subject — from `p rdfs:range C` and `x p "lit"`.
+
 ### Integrating Phases 2 and 3 with the Phase 1 server
 
 - **Security limits cover the new grammar.** The SPARQL parser's nesting
