@@ -233,7 +233,7 @@ fn read_response(
         OutFormat::NTriple => (upstream_ntriple_json(rs, shown), None),
         // File outputs are not capped (upstream resets the output limit).
         OutFormat::File => {
-            let text = upstream_select_json(rs, None).sorted().to_string();
+            let text = upstream_select_json(rs, None).into_sorted().to_string();
             (
                 Json::obj(),
                 Some(write_result_file(ctx, db, thread_id, "json", &text)?),
