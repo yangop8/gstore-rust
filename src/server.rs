@@ -889,12 +889,11 @@ pub(crate) fn merge_headers<'a>(
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// A fixed-size pool of worker threads fed from a bounded FIFO queue.
+/// A pool of at most `max_threads` worker threads fed from a bounded FIFO
+/// queue. Threads are started on demand — when a job arrives and no worker is
+/// idle — so an idle server holds none beyond those it once needed.
 pub(crate) struct WorkerPool {
     shared: Arc<PoolShared>,
-    /// Worker threads actually started (thread creation can fail under a
-    /// resource limit; with none, jobs run on the submitting thread).
-    workers: usize,
 }
 
 struct PoolShared {
@@ -904,51 +903,54 @@ struct PoolShared {
     /// Signalled when a queued job is taken (room in the queue).
     room: Condvar,
     capacity: usize,
+    max_threads: usize,
 }
 
 struct PoolState {
     jobs: VecDeque<Job>,
     closed: bool,
+    /// Worker threads started (and not exited).
+    workers: usize,
+    /// Started workers that have not yet looked at the queue.
+    starting: usize,
+    /// Workers waiting for work.
+    idle: usize,
+    /// Wake-ups handed to idle workers and not yet consumed: `idle - wakeups`
+    /// workers are free for a new job.
+    wakeups: usize,
 }
 
 impl WorkerPool {
-    pub(crate) fn new(threads: usize, capacity: usize) -> WorkerPool {
-        let shared = Arc::new(PoolShared {
-            state: Mutex::new(PoolState {
-                jobs: VecDeque::new(),
-                closed: false,
+    pub(crate) fn new(max_threads: usize, capacity: usize) -> WorkerPool {
+        WorkerPool {
+            shared: Arc::new(PoolShared {
+                state: Mutex::new(PoolState {
+                    jobs: VecDeque::new(),
+                    closed: false,
+                    workers: 0,
+                    starting: 0,
+                    idle: 0,
+                    wakeups: 0,
+                }),
+                work: Condvar::new(),
+                room: Condvar::new(),
+                capacity: capacity.max(1),
+                max_threads: max_threads.max(1),
             }),
-            work: Condvar::new(),
-            room: Condvar::new(),
-            capacity: capacity.max(1),
-        });
-        let mut workers = 0;
-        for i in 0..threads.max(1) {
-            let sh = Arc::clone(&shared);
-            let spawned = thread::Builder::new()
-                .name(format!("gstore-http-{i}"))
-                .spawn(move || worker_loop(&sh));
-            if spawned.is_ok() {
-                workers += 1;
-            }
         }
-        WorkerPool { shared, workers }
     }
 
     /// Queue `job`, waiting while the queue is full (backpressure). Gives up —
     /// dropping the job — once `give_up()` turns true while waiting. Returns
     /// whether the job was queued (or run).
     pub(crate) fn submit(&self, job: Job, give_up: impl Fn() -> bool) -> bool {
-        if self.workers == 0 {
-            let _ = catch_unwind(AssertUnwindSafe(job));
-            return true;
-        }
-        let mut st = locked(&self.shared.state);
-        while st.jobs.len() >= self.shared.capacity && !st.closed {
+        let sh = &self.shared;
+        let mut st = locked(&sh.state);
+        while st.jobs.len() >= sh.capacity && !st.closed {
             if give_up() {
                 return false;
             }
-            st = match self.shared.room.wait_timeout(st, Duration::from_millis(50)) {
+            st = match sh.room.wait_timeout(st, Duration::from_millis(50)) {
                 Ok((g, _)) => g,
                 Err(e) => e.into_inner().0,
             };
@@ -957,8 +959,38 @@ impl WorkerPool {
             return false;
         }
         st.jobs.push_back(job);
+        if st.idle > st.wakeups {
+            st.wakeups += 1;
+            drop(st);
+            sh.work.notify_one();
+            return true;
+        }
+        if st.workers >= sh.max_threads {
+            return true; // every worker is busy: the job waits its turn
+        }
+        st.workers += 1;
+        st.starting += 1;
+        let n = st.workers;
         drop(st);
-        self.shared.work.notify_one();
+        let worker = Arc::clone(sh);
+        let spawned = thread::Builder::new()
+            .name(format!("gstore-http-{n}"))
+            .spawn(move || worker_loop(&worker));
+        if spawned.is_err() {
+            // E.g. the OS thread limit. With no worker at all, run the queue
+            // here rather than strand it.
+            let mut st = locked(&sh.state);
+            st.workers -= 1;
+            st.starting -= 1;
+            if st.workers == 0 {
+                let jobs: Vec<Job> = st.jobs.drain(..).collect();
+                drop(st);
+                sh.room.notify_all();
+                for j in jobs {
+                    let _ = catch_unwind(AssertUnwindSafe(j));
+                }
+            }
+        }
         true
     }
 
@@ -986,32 +1018,36 @@ impl Drop for WorkerPool {
 pub(crate) struct QueueProbe(Arc<PoolShared>);
 
 impl QueueProbe {
+    /// Queued jobs no worker is on its way to take.
     pub(crate) fn queued(&self) -> usize {
-        locked(&self.0.state).jobs.len()
+        let st = locked(&self.0.state);
+        st.jobs.len().saturating_sub(st.wakeups + st.starting)
     }
 }
 
 fn worker_loop(shared: &PoolShared) {
+    let mut st = locked(&shared.state);
+    st.starting -= 1;
     loop {
-        let job = {
-            let mut st = locked(&shared.state);
-            loop {
-                if let Some(j) = st.jobs.pop_front() {
-                    break Some(j);
-                }
-                if st.closed {
-                    break None;
-                }
-                st = shared.work.wait(st).unwrap_or_else(|e| e.into_inner());
-            }
-        };
-        match job {
-            Some(j) => {
-                shared.room.notify_one();
-                // A panicking connection must not take its worker down.
-                let _ = catch_unwind(AssertUnwindSafe(j));
-            }
-            None => return,
+        if let Some(job) = st.jobs.pop_front() {
+            drop(st);
+            shared.room.notify_one();
+            // A panicking connection must not take its worker down.
+            let _ = catch_unwind(AssertUnwindSafe(job));
+            st = locked(&shared.state);
+            continue;
+        }
+        if st.closed {
+            st.workers -= 1;
+            return;
+        }
+        st.idle += 1;
+        while st.wakeups == 0 && !st.closed {
+            st = shared.work.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.idle -= 1;
+        if st.wakeups > 0 {
+            st.wakeups -= 1;
         }
     }
 }
@@ -2862,6 +2898,61 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
             .unwrap()
             .unwrap();
         assert!(!req.wants_keep_alive());
+    }
+
+    #[test]
+    fn worker_pool_grows_on_demand_up_to_its_bound_and_applies_backpressure() {
+        use std::sync::mpsc;
+        let pool = WorkerPool::new(3, 100);
+        assert_eq!(locked(&pool.shared.state).workers, 0, "no thread before work");
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..12 {
+            let (r, p, tx) = (Arc::clone(&running), Arc::clone(&peak), tx.clone());
+            assert!(pool.submit(
+                Box::new(move || {
+                    let n = r.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(n, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(20));
+                    r.fetch_sub(1, Ordering::SeqCst);
+                    tx.send(()).unwrap();
+                }),
+                || false
+            ));
+        }
+        for _ in 0..12 {
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 3, "at most max_threads at once");
+        assert_eq!(locked(&pool.shared.state).workers, 3);
+        // A panicking job does not cost the pool its worker.
+        let (tx2, rx2) = mpsc::channel();
+        pool.submit(Box::new(|| panic!("job panic")), || false);
+        pool.submit(Box::new(move || tx2.send(()).unwrap()), || false);
+        rx2.recv_timeout(Duration::from_secs(10)).unwrap();
+        pool.close();
+
+        // Backpressure: one worker, a queue of one. With the worker blocked
+        // and the queue full, a submission waits — and gives up when told to.
+        let pool = WorkerPool::new(1, 1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel();
+        pool.submit(
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            }),
+            || false,
+        );
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(pool.submit(Box::new(|| {}), || false), "fills the queue");
+        assert_eq!(pool.queue_probe().queued(), 1);
+        let t0 = Instant::now();
+        let gave_up = !pool.submit(Box::new(|| {}), || t0.elapsed() > Duration::from_millis(200));
+        assert!(gave_up && t0.elapsed() >= Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        pool.close();
     }
 
     #[test]

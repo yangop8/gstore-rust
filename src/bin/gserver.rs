@@ -154,7 +154,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
         *i += 1;
-        args.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))
+        args.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{flag} needs a value"))
     };
     while i < args.len() {
         let a = args[i].as_str();
@@ -334,8 +336,14 @@ impl PidInfo {
         let pid = lines.next()?.trim().parse().ok()?;
         let system_password = lines.next()?.trim().to_string();
         let background = lines.next().map(|l| l.trim() == "1").unwrap_or(false);
-        let port = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
-        let supervisor = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+        let port = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
+        let supervisor = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0);
         Some(PidInfo {
             pid,
             system_password,
@@ -522,7 +530,10 @@ fn cmd_start(opts: &Opts, cfg: &GStoreConfig, args: &[String]) -> u8 {
     let supervised = std::env::var(ENV_SUPERVISOR).is_ok();
     if !supervised {
         if let Some(info) = running_server(cfg) {
-            println!("the server already running. (pid {}, port {})", info.pid, info.port);
+            println!(
+                "the server already running. (pid {}, port {})",
+                info.pid, info.port
+            );
             return 1;
         }
         if cfg.deamon && cfg!(unix) {
@@ -540,7 +551,10 @@ fn cmd_background(cfg: &GStoreConfig, args: &[String]) -> u8 {
         return 2;
     }
     if let Some(info) = running_server(cfg) {
-        println!("the server already running. (pid {}, port {})", info.pid, info.port);
+        println!(
+            "the server already running. (pid {}, port {})",
+            info.pid, info.port
+        );
         return 1;
     }
     if let Err(e) = fs::create_dir_all(&cfg.db_home) {
@@ -548,7 +562,11 @@ fn cmd_background(cfg: &GStoreConfig, args: &[String]) -> u8 {
         return 1;
     }
     let log_path = cfg.server_log_file();
-    let log = match fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    let log = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!("gserver: cannot open log '{}': {e}", log_path.display());
@@ -567,7 +585,11 @@ fn cmd_background(cfg: &GStoreConfig, args: &[String]) -> u8 {
         .env(ENV_BACKGROUND, "1")
         .env_remove(ENV_SUPERVISOR)
         .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().map(Into::into).unwrap_or(std::process::Stdio::null()))
+        .stdout(
+            log.try_clone()
+                .map(Into::into)
+                .unwrap_or(std::process::Stdio::null()),
+        )
         .stderr(log);
     #[cfg(unix)]
     {
@@ -596,7 +618,9 @@ fn cmd_background(cfg: &GStoreConfig, args: &[String]) -> u8 {
             return 1;
         }
         if let Some(info) = read_pid_file(&cfg.pid_file()) {
-            if (info.pid == child_pid || info.supervisor == child_pid) && port_answers(cfg, info.port) {
+            if (info.pid == child_pid || info.supervisor == child_pid)
+                && port_answers(cfg, info.port)
+            {
                 println!(
                     "gserver started in the background (pid {}): http://{}  (log: {})",
                     info.pid,
@@ -637,7 +661,10 @@ fn cmd_stop(cfg: &GStoreConfig) -> u8 {
             info.pid
         };
         if !sys::signal(target, sys::SIGTERM) {
-            eprintln!("gserver: cannot signal process {target}: {}", io::Error::last_os_error());
+            eprintln!(
+                "gserver: cannot signal process {target}: {}",
+                io::Error::last_os_error()
+            );
             return 1;
         }
         let grace = Duration::from_secs(cfg.shutdown_grace.saturating_add(60));
@@ -704,7 +731,11 @@ fn cmd_status(cfg: &GStoreConfig) -> u8 {
             }
             println!(
                 "\tMode: {}",
-                if info.background { "background" } else { "foreground" }
+                if info.background {
+                    "background"
+                } else {
+                    "foreground"
+                }
             );
             println!("\tPid file: {}", cfg.pid_file().display());
         }
@@ -847,7 +878,9 @@ fn supervise(cfg: &GStoreConfig, args: &[String]) -> u8 {
         } else {
             quick_failures += 1;
             if quick_failures >= 10 {
-                eprintln!("gserver: server failed {quick_failures} times in a row; supervisor gives up");
+                eprintln!(
+                    "gserver: server failed {quick_failures} times in a row; supervisor gives up"
+                );
                 remove_pid_file_of(&cfg.pid_file(), child.id());
                 return 1;
             }
@@ -943,14 +976,23 @@ fn run_multi(opts: &Opts, cfg: &GStoreConfig) -> u8 {
     let pid_path = cfg.pid_file();
     if let Err(e) = create_pid_file(&pid_path, &info) {
         if e.kind() == io::ErrorKind::AlreadyExists {
-            println!("the server already running. (pid file '{}')", pid_path.display());
+            println!(
+                "the server already running. (pid file '{}')",
+                pid_path.display()
+            );
         } else {
-            eprintln!("gserver: cannot write pid file '{}': {e}", pid_path.display());
+            eprintln!(
+                "gserver: cannot write pid file '{}': {e}",
+                pid_path.display()
+            );
         }
         return 1;
     }
     if cfg.check_point {
-        println!("gserver: databases are stored under '{}' (check_point on: every write is saved)", root.display());
+        println!(
+            "gserver: databases are stored under '{}' (check_point on: every write is saved)",
+            root.display()
+        );
     } else {
         println!(
             "gserver: databases are stored under '{}' (check_point off: changes are saved on \
@@ -1087,7 +1129,9 @@ fn run_single(opts: &Opts, cfg: &GStoreConfig, dir: &str) -> ExitCode {
         }
     };
     if cfg.check_point {
-        println!("gserver: database directory '{dir}' (check_point on: every update is saved there)");
+        println!(
+            "gserver: database directory '{dir}' (check_point on: every update is saved there)"
+        );
     } else {
         println!("gserver: database directory '{dir}' (check_point off: changes are saved there on shutdown)");
     }
@@ -1103,7 +1147,11 @@ fn run_single(opts: &Opts, cfg: &GStoreConfig, dir: &str) -> ExitCode {
                     Err(_) => println!("gserver (TLS) listening on {host}:{}", cfg.port),
                 }
                 let ok = print_report(&server.serve_forever_tls(tls));
-                return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+                return if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
             }
             Err(e) => {
                 eprintln!("failed to load TLS cert/key: {e}");
@@ -1153,7 +1201,10 @@ fn print_report(report: &ShutdownReport) -> bool {
         println!("gserver: saved database to '{}'", dir.display());
     }
     for (dir, e) in &report.failed {
-        eprintln!("gserver: FAILED to save database to '{}': {e}", dir.display());
+        eprintln!(
+            "gserver: FAILED to save database to '{}': {e}",
+            dir.display()
+        );
     }
     println!("gserver: shut down");
     report.failed.is_empty()
@@ -1179,8 +1230,8 @@ fn load_policy_for(dirs: &[String]) -> Result<LoadPolicy, String> {
 /// stand-in could later be saved over the real database.
 fn open_db(dir: &str, expect_rocksdb: bool) -> Result<Database, String> {
     let path = Path::new(dir);
-    let is_empty_dir = path.is_dir()
-        && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
+    let is_empty_dir =
+        path.is_dir() && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
     if !path.exists() || is_empty_dir {
         if expect_rocksdb {
             return Err(format!("--rocksdb given but '{dir}' holds no database"));
@@ -1189,7 +1240,9 @@ fn open_db(dir: &str, expect_rocksdb: bool) -> Result<Database, String> {
         return Ok(Database::new(db_name_for(dir)));
     }
     if expect_rocksdb && Database::storage_kind(path) != Some(StorageKind::RocksDb) {
-        return Err(format!("--rocksdb given but '{dir}' is not a RocksDB-backed database"));
+        return Err(format!(
+            "--rocksdb given but '{dir}' is not a RocksDB-backed database"
+        ));
     }
     match Database::open(path) {
         Ok(db) => {
@@ -1221,7 +1274,10 @@ mod tests {
         assert_eq!(o.positional.as_deref(), Some("x.db"));
         assert!(o.no_checkpoint);
         assert!(parse_args(&args("-t -k")).is_err(), "two commands");
-        assert!(parse_args(&args("-t -t")).is_ok(), "a repeated command is fine");
+        assert!(
+            parse_args(&args("-t -t")).is_ok(),
+            "a repeated command is fine"
+        );
         assert!(parse_args(&args("--port")).is_err());
         assert!(parse_args(&args("--bogus")).is_err());
         assert!(parse_args(&args("a b")).is_err());
@@ -1245,11 +1301,17 @@ mod tests {
             supervisor: 7,
         };
         let text = info.render();
-        assert!(text.starts_with("42\nabc\n1\n"), "upstream's first three lines: {text}");
+        assert!(
+            text.starts_with("42\nabc\n1\n"),
+            "upstream's first three lines: {text}"
+        );
         assert_eq!(PidInfo::parse(&text), Some(info));
         // Upstream's own (3-line) file parses too.
         let up = PidInfo::parse("1234\n5678\n0\n").unwrap();
-        assert_eq!((up.pid, up.port, up.supervisor, up.background), (1234, 0, 0, false));
+        assert_eq!(
+            (up.pid, up.port, up.supervisor, up.background),
+            (1234, 0, 0, false)
+        );
         assert_eq!(PidInfo::parse("garbage"), None);
     }
 
@@ -1258,19 +1320,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gserver_cfg_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let ini = dir.join("conf.ini");
-        fs::write(&ini, "[server]\nport=9555\nthread_num=7\n[system]\ndb_home=/conf/home\n").unwrap();
+        fs::write(
+            &ini,
+            "[server]\nport=9555\nthread_num=7\n[system]\ndb_home=/conf/home\n",
+        )
+        .unwrap();
         let ini_s = ini.to_string_lossy().into_owned();
         let cfg = load_config(&parse_args(&args(&format!("-c {ini_s}"))).unwrap()).unwrap();
         assert_eq!((cfg.port, cfg.thread_num), (9555, 7));
         assert_eq!(cfg.db_home, PathBuf::from("/conf/home"));
         assert_eq!(cfg.max_output_size, 100_000, "default");
         let cfg = load_config(
-            &parse_args(&args(&format!("-c {ini_s} -p 9600 --api /cli/root --no-checkpoint")))
-                .unwrap(),
+            &parse_args(&args(&format!(
+                "-c {ini_s} -p 9600 --api /cli/root --no-checkpoint"
+            )))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(cfg.port, 9600);
-        assert_eq!(cfg.db_home, PathBuf::from("/cli/root"), "--api root is the db home");
+        assert_eq!(
+            cfg.db_home,
+            PathBuf::from("/cli/root"),
+            "--api root is the db home"
+        );
         assert!(!cfg.check_point);
         assert!(load_config(&parse_args(&args("-c /no/such/conf.ini")).unwrap()).is_err());
         let _ = fs::remove_dir_all(&dir);

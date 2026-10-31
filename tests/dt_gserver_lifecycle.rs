@@ -34,14 +34,23 @@ fn tmp_home(tag: &str) -> PathBuf {
 }
 
 /// Send one request (`Connection: close`) and return `(status, head, body)`.
-fn http(addr: &SocketAddr, method: &str, target: &str, headers: &[(&str, &str)], body: &str) -> (u16, String, String) {
+fn http(
+    addr: &SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
     for (k, v) in headers {
         raw.push_str(&format!("{k}: {v}\r\n"));
     }
-    raw.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
+    raw.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
     s.write_all(raw.as_bytes()).unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
@@ -56,7 +65,9 @@ fn http(addr: &SocketAddr, method: &str, target: &str, headers: &[(&str, &str)],
 
 /// The `"StatusCode"` of a gStore JSON envelope.
 fn status_code(body: &str) -> i64 {
-    let i = body.find("\"StatusCode\":").unwrap_or_else(|| panic!("no StatusCode: {body}"));
+    let i = body
+        .find("\"StatusCode\":")
+        .unwrap_or_else(|| panic!("no StatusCode: {body}"));
     body[i + 13..]
         .trim_start()
         .split(|c: char| !(c == '-' || c.is_ascii_digit()))
@@ -70,7 +81,14 @@ fn status_code(body: &str) -> i64 {
 // ApiServer: /shutdown, /restart, keep-alive, CORS (in-process)
 // ---------------------------------------------------------------------------
 
-fn start_api(home: &Path, tune: impl FnOnce(ApiServer) -> ApiServer) -> (Arc<ApiServer>, SocketAddr, thread::JoinHandle<gstore::server::ShutdownReport>) {
+fn start_api(
+    home: &Path,
+    tune: impl FnOnce(ApiServer) -> ApiServer,
+) -> (
+    Arc<ApiServer>,
+    SocketAddr,
+    thread::JoinHandle<gstore::server::ShutdownReport>,
+) {
     let server = Arc::new(tune(ApiServer::bind(home, "root", "127.0.0.1:0").unwrap()));
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
@@ -88,14 +106,32 @@ fn shutdown_route_requires_root_or_system_credentials() {
     assert_eq!((st, status_code(&body)), (200, 1003), "{body}");
     // Wrong root password (JSON body), wrong system password (headers), and a
     // user that is neither: authentication failed.
-    let (st, _, body) = http(&addr, "POST", "/shutdown", &[("Content-Type", "application/json")], r#"{"username":"root","password":"nope"}"#);
+    let (st, _, body) = http(
+        &addr,
+        "POST",
+        "/shutdown",
+        &[("Content-Type", "application/json")],
+        r#"{"username":"root","password":"nope"}"#,
+    );
     assert_eq!((st, status_code(&body)), (200, 1001), "{body}");
-    let (_, _, body) = http(&addr, "GET", "/shutdown", &[("username", "system"), ("password", "guess")], "");
+    let (_, _, body) = http(
+        &addr,
+        "GET",
+        "/shutdown",
+        &[("username", "system"), ("password", "guess")],
+        "",
+    );
     assert_eq!(status_code(&body), 1001, "{body}");
     let (_, _, body) = http(&addr, "GET", "/shutdown?username=alice&password=x", &[], "");
     assert_eq!(status_code(&body), 1001, "{body}");
     assert!(!server.shutdown_handle().is_shutdown(), "still serving");
-    let (st, _, _) = http(&addr, "GET", "/status", &[("Authorization", ROOT_BASIC)], "");
+    let (st, _, _) = http(
+        &addr,
+        "GET",
+        "/status",
+        &[("Authorization", ROOT_BASIC)],
+        "",
+    );
     assert_eq!(st, 200);
 
     // Root's credentials (form body) stop it gracefully.
@@ -120,7 +156,13 @@ fn system_account_from_the_pid_file_may_stop_and_restart() {
     let home = tmp_home("system_route");
     let (_server, addr, serving) = start_api(&home, |s| s.with_system_password("s3cret"));
     // Upstream's `gserver -t` sends the system credentials as headers.
-    let (_, _, body) = http(&addr, "POST", "/restart", &[("username", "system"), ("password", "s3cret")], "");
+    let (_, _, body) = http(
+        &addr,
+        "POST",
+        "/restart",
+        &[("username", "system"), ("password", "s3cret")],
+        "",
+    );
     assert_eq!(status_code(&body), 0, "{body}");
     assert!(body.contains("Server restarted successfully."), "{body}");
     let report = serving.join().unwrap();
@@ -128,11 +170,29 @@ fn system_account_from_the_pid_file_may_stop_and_restart() {
 
     // Without a configured system password the system account cannot log in.
     let (_server, addr, serving) = start_api(&home, |s| s);
-    let (_, _, body) = http(&addr, "POST", "/shutdown", &[("username", "system"), ("password", "")], "");
+    let (_, _, body) = http(
+        &addr,
+        "POST",
+        "/shutdown",
+        &[("username", "system"), ("password", "")],
+        "",
+    );
     assert_eq!(status_code(&body), 1003, "{body}");
-    let (_, _, body) = http(&addr, "POST", "/shutdown", &[("username", "system"), ("password", "x")], "");
+    let (_, _, body) = http(
+        &addr,
+        "POST",
+        "/shutdown",
+        &[("username", "system"), ("password", "x")],
+        "",
+    );
     assert_eq!(status_code(&body), 1001, "{body}");
-    let (_, _, body) = http(&addr, "GET", "/shutdown?username=root&password=root", &[], "");
+    let (_, _, body) = http(
+        &addr,
+        "GET",
+        "/shutdown?username=root&password=root",
+        &[],
+        "",
+    );
     assert_eq!(status_code(&body), 0, "{body}");
     assert!(!serving.join().unwrap().restart);
     let _ = std::fs::remove_dir_all(&home);
@@ -162,21 +222,27 @@ fn read_one<R: BufRead>(r: &mut R) -> (String, String) {
 #[test]
 fn api_server_keeps_connections_alive_and_answers_preflights() {
     let home = tmp_home("keepalive");
-    let (server, addr, serving) = start_api(&home, |s| s.with_keep_alive(Some(Duration::from_secs(5)), 10));
+    let (server, addr, serving) = start_api(&home, |s| {
+        s.with_keep_alive(Some(Duration::from_secs(5)), 10)
+    });
     let s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut w = s.try_clone().unwrap();
     let mut r = BufReader::new(s);
     for target in ["/status", "/show"] {
-        w.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {ROOT_BASIC}\r\n\r\n").as_bytes())
-            .unwrap();
+        w.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {ROOT_BASIC}\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
         let (head, body) = read_one(&mut r);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(head.contains("Connection: keep-alive"), "{head}");
         assert!(!body.is_empty());
     }
     // A /shutdown on the kept-alive connection closes it after its response.
-    w.write_all(b"GET /shutdown?username=root&password=root HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    w.write_all(b"GET /shutdown?username=root&password=root HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
     let (head, body) = read_one(&mut r);
     assert!(head.contains("Connection: close"), "{head}");
     assert_eq!(status_code(&body), 0, "{body}");
@@ -188,19 +254,44 @@ fn api_server_keeps_connections_alive_and_answers_preflights() {
 
     // CORS: upstream's /file/* preflights, and a configured origin everywhere.
     let (server, addr, serving) = start_api(&home, |s| s);
-    let (st, head, body) = http(&addr, "OPTIONS", "/file/upload", &[("Origin", "http://ui")], "");
+    let (st, head, body) = http(
+        &addr,
+        "OPTIONS",
+        "/file/upload",
+        &[("Origin", "http://ui")],
+        "",
+    );
     assert_eq!(st, 200);
     assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
-    assert!(head.contains("Access-Control-Allow-Methods: POST"), "{head}");
+    assert!(
+        head.contains("Access-Control-Allow-Methods: POST"),
+        "{head}"
+    );
     assert_eq!(body, "ok");
     server.shutdown();
     serving.join().unwrap();
     let cfg = GStoreConfig::from_ini_str("[server]\ncors_allow_origin=http://ui\n");
     let (server, addr, serving) = start_api(&home, |s| s.with_config(cfg));
-    let (_, head, _) = http(&addr, "GET", "/status", &[("Authorization", ROOT_BASIC)], "");
-    assert!(head.contains("Access-Control-Allow-Origin: http://ui"), "{head}");
-    assert_eq!(server.config().cors_allow_origin.as_deref(), Some("http://ui"));
-    assert_eq!(server.config().db_home, home, "db_home is the server's root");
+    let (_, head, _) = http(
+        &addr,
+        "GET",
+        "/status",
+        &[("Authorization", ROOT_BASIC)],
+        "",
+    );
+    assert!(
+        head.contains("Access-Control-Allow-Origin: http://ui"),
+        "{head}"
+    );
+    assert_eq!(
+        server.config().cors_allow_origin.as_deref(),
+        Some("http://ui")
+    );
+    assert_eq!(
+        server.config().db_home,
+        home,
+        "db_home is the server's root"
+    );
     server.shutdown();
     serving.join().unwrap();
     let _ = std::fs::remove_dir_all(&home);
@@ -225,7 +316,9 @@ fn api_server_worker_pool_is_bounded_by_thread_num() {
     extra
         .write_all(format!("GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: {ROOT_BASIC}\r\nConnection: close\r\n\r\n").as_bytes())
         .unwrap();
-    extra.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_millis(700)))
+        .unwrap();
     let mut b = [0u8; 1];
     let early = extra.read(&mut b);
     assert!(
@@ -237,7 +330,9 @@ fn api_server_worker_pool_is_bounded_by_thread_num() {
     let mut done = String::new();
     slow[0].read_to_string(&mut done).unwrap();
     assert!(done.starts_with("HTTP/1.1 200"), "{done}");
-    extra.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut resp = String::new();
     extra.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
@@ -366,12 +461,22 @@ mod binary {
         let home = Home::new("bg");
         let out = home.run(&["-b", "--password", "root"]);
         assert!(out.status.success(), "{}\nlog:\n{}", text(&out), home.log());
-        assert!(text(&out).contains("started in the background"), "{}", text(&out));
+        assert!(
+            text(&out).contains("started in the background"),
+            "{}",
+            text(&out)
+        );
         let (pid, syspw, background, port, supervisor) = home.pid_info().expect("pid file");
         assert!(alive(pid) && background && port != 0 && supervisor == 0);
         assert_eq!(syspw.len(), 32, "a generated system password");
         let addr = home.addr();
-        let (st, _, body) = http(&addr, "GET", "/status", &[("Authorization", ROOT_BASIC)], "");
+        let (st, _, body) = http(
+            &addr,
+            "GET",
+            "/status",
+            &[("Authorization", ROOT_BASIC)],
+            "",
+        );
         assert_eq!(st, 200, "{body}");
 
         // -S reports it; a second start is refused (foreground or background).
@@ -391,15 +496,27 @@ mod binary {
         // -t stops it gracefully, waits for the exit and clears the pid file.
         let out = home.run(&["-t"]);
         assert!(out.status.success(), "{}", text(&out));
-        assert!(text(&out).contains(&format!("the Server [{pid}] stop successfully.")), "{}", text(&out));
+        assert!(
+            text(&out).contains(&format!("the Server [{pid}] stop successfully.")),
+            "{}",
+            text(&out)
+        );
         assert!(!alive(pid), "-t returns after the server exited");
         assert!(!home.pid_file().exists());
         let log = home.log();
         assert!(log.contains("gserver: shut down"), "{log}");
         let out = home.run(&["-S"]);
-        assert!(text(&out).contains("Active: inactive (dead)"), "{}", text(&out));
+        assert!(
+            text(&out).contains("Active: inactive (dead)"),
+            "{}",
+            text(&out)
+        );
         let out = home.run(&["-t"]);
-        assert!(out.status.success() && text(&out).contains("server is inactive (dead)."), "{}", text(&out));
+        assert!(
+            out.status.success() && text(&out).contains("server is inactive (dead)."),
+            "{}",
+            text(&out)
+        );
     }
 
     #[test]
@@ -427,13 +544,20 @@ mod binary {
     #[test]
     fn restart_command_and_route() {
         let home = Home::new("restart");
-        assert!(home.run(&["-b", "--password", "root"]).status.success(), "{}", home.log());
+        assert!(
+            home.run(&["-b", "--password", "root"]).status.success(),
+            "{}",
+            home.log()
+        );
         let (pid1, ..) = home.pid_info().unwrap();
         // -r of a background server restarts it in the background.
         let out = home.run(&["-r", "--password", "root"]);
         assert!(out.status.success(), "{}\nlog:\n{}", text(&out), home.log());
         let s = text(&out);
-        assert!(s.contains("stop server...") && s.contains("start server..."), "{s}");
+        assert!(
+            s.contains("stop server...") && s.contains("start server..."),
+            "{s}"
+        );
         let (pid2, _, background, ..) = home.pid_info().unwrap();
         assert!(pid2 != pid1 && background && !alive(pid1));
 
@@ -458,15 +582,32 @@ mod binary {
         let _ = port;
         let log = home.log();
         assert!(log.contains("gserver: restarting"), "{log}");
-        let (st, _, _) = http(&home.addr(), "GET", "/status", &[("Authorization", ROOT_BASIC)], "");
+        let (st, _, _) = http(
+            &home.addr(),
+            "GET",
+            "/status",
+            &[("Authorization", ROOT_BASIC)],
+            "",
+        );
         assert_eq!(st, 200);
 
         // /shutdown with the system account from the pid file stops it.
         let (pid, syspw, ..) = home.pid_info().unwrap();
-        let (_, _, body) = http(&home.addr(), "POST", "/shutdown", &[("username", "system"), ("password", &syspw)], "");
+        let (_, _, body) = http(
+            &home.addr(),
+            "POST",
+            "/shutdown",
+            &[("username", "system"), ("password", &syspw)],
+            "",
+        );
         assert_eq!(status_code(&body), 0, "{body}");
-        wait_until("the server to exit", Duration::from_secs(30), || !alive(pid));
-        assert!(!home.pid_file().exists(), "a clean exit removes the pid file");
+        wait_until("the server to exit", Duration::from_secs(30), || {
+            !alive(pid)
+        });
+        assert!(
+            !home.pid_file().exists(),
+            "a clean exit removes the pid file"
+        );
     }
 
     #[test]
@@ -492,9 +633,18 @@ mod binary {
         assert_eq!(bound, port, "conf.ini port");
         let log = home.log();
         assert!(log.contains("3 worker threads"), "{log}");
-        assert!(log.contains("unknown key 'bogus_key'"), "an unknown key only warns: {log}");
+        assert!(
+            log.contains("unknown key 'bogus_key'"),
+            "an unknown key only warns: {log}"
+        );
         // root_password from the file seeded the user store.
-        let (st, _, _) = http(&home.addr(), "GET", "/status", &[("Authorization", ROOT_BASIC)], "");
+        let (st, _, _) = http(
+            &home.addr(),
+            "GET",
+            "/status",
+            &[("Authorization", ROOT_BASIC)],
+            "",
+        );
         assert_eq!(st, 200);
         // -S / -t find the server through the same conf.ini (db_home).
         assert!(text(&home.run_raw(&["-S", "-c", conf_s])).contains("active (running)"));
@@ -521,10 +671,17 @@ mod binary {
         let out = home.run(&["-b", "-c", conf_s]);
         assert!(out.status.success(), "{}\nlog:\n{}", text(&out), home.log());
         let (pid, _, _, _, supervisor) = home.pid_info().unwrap();
-        assert!(supervisor != 0 && alive(supervisor) && alive(pid), "supervised");
+        assert!(
+            supervisor != 0 && alive(supervisor) && alive(pid),
+            "supervised"
+        );
 
         // The server dies from SIGKILL: the supervisor starts a new one.
-        assert!(Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+        assert!(Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success());
         wait_until("a restarted server", Duration::from_secs(30), || {
             home.pid_info().is_some_and(|(p, _, _, port, sup)| {
                 p != pid
@@ -540,7 +697,10 @@ mod binary {
         assert!(out.status.success(), "{}\nlog:\n{}", text(&out), home.log());
         assert!(!alive(pid2) && !alive(supervisor));
         thread::sleep(Duration::from_millis(1500));
-        assert!(!home.pid_file().exists(), "nothing was restarted after the stop");
+        assert!(
+            !home.pid_file().exists(),
+            "nothing was restarted after the stop"
+        );
     }
 
     #[test]
@@ -549,7 +709,11 @@ mod binary {
         let db = home.dir.join("x.db");
         let out = home.run_raw(&[db.to_str().unwrap(), "-b"]);
         assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-        assert!(text(&out).contains("manage the multi-database server"), "{}", text(&out));
+        assert!(
+            text(&out).contains("manage the multi-database server"),
+            "{}",
+            text(&out)
+        );
         let out = home.run_raw(&["--help"]);
         assert!(out.status.success());
         assert!(text(&out).contains("-b, --background"), "{}", text(&out));

@@ -119,7 +119,10 @@ impl Ini {
                 continue;
             }
             let Some(sec) = section.clone() else {
-                ini.warn(line_no, &format!("key '{key}' is outside any [section]; ignored"));
+                ini.warn(
+                    line_no,
+                    &format!("key '{key}' is outside any [section]; ignored"),
+                );
                 continue;
             };
             let value = unquote(value.trim());
@@ -561,9 +564,7 @@ impl GStoreConfig {
             "upload_path" => self.upload_path = PathBuf::from(v),
             "upload_max_body_size" => self.upload_max_body_size = parse_num(key, v)?,
             "upload_allow_extensions" => self.upload_allow_extensions = split_list(v),
-            "upload_allow_compress_packages" => {
-                self.upload_allow_compress_packages = split_list(v)
-            }
+            "upload_allow_compress_packages" => self.upload_allow_compress_packages = split_list(v),
             _ => unreachable!("every KNOWN_KEYS entry is handled"),
         }
         Ok(())
@@ -609,7 +610,11 @@ impl GStoreConfig {
     /// [`KNOWN_KEYS`] order (secrets masked) — for logging what a server runs with.
     pub fn summary(&self) -> Vec<(&'static str, &'static str, String)> {
         let p = |p: &Path| p.display().to_string();
-        let op = |p: &Option<PathBuf>| p.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+        let op = |p: &Option<PathBuf>| {
+            p.as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
         let onoff = |b: bool| if b { "on" } else { "off" }.to_string();
         let mut rows = Vec::new();
         for (section, keys) in KNOWN_KEYS {
@@ -668,8 +673,11 @@ impl GStoreConfig {
 }
 
 fn parse_num<T: std::str::FromStr>(key: &str, v: &str) -> Result<T, ConfigError> {
-    v.parse()
-        .map_err(|_| ConfigError(format!("invalid value '{v}' for '{key}'; the default is kept")))
+    v.parse().map_err(|_| {
+        ConfigError(format!(
+            "invalid value '{v}' for '{key}'; the default is kept"
+        ))
+    })
 }
 
 /// Upstream switches are `on`/`off` (and `1`/`0` for the log modes); the
@@ -806,11 +814,20 @@ upload_allow_compress_packages = "zip"
         let ini = Ini::parse("orphan=1\n[s]\nno equals sign\nk=1\nk=2\n=v\n[broken\n");
         assert_eq!(ini.get("s", "k"), Some("1"), "the first duplicate wins");
         let w = ini.warnings().join("\n");
-        assert!(w.contains("line 1") && w.contains("outside any [section]"), "{w}");
+        assert!(
+            w.contains("line 1") && w.contains("outside any [section]"),
+            "{w}"
+        );
         assert!(w.contains("line 3") && w.contains("without '='"), "{w}");
-        assert!(w.contains("line 5") && w.contains("duplicate key 'k'"), "{w}");
+        assert!(
+            w.contains("line 5") && w.contains("duplicate key 'k'"),
+            "{w}"
+        );
         assert!(w.contains("line 6") && w.contains("empty key"), "{w}");
-        assert!(w.contains("line 7") && w.contains("malformed section"), "{w}");
+        assert!(
+            w.contains("line 7") && w.contains("malformed section"),
+            "{w}"
+        );
     }
 
     #[test]
@@ -825,7 +842,10 @@ upload_allow_compress_packages = "zip"
         assert!(!cfg.deamon);
         assert_eq!(cfg.max_output_size, 100_000, "commented out: default");
         assert_eq!(cfg.ip_allow_path, None, "empty: unset");
-        assert_eq!(cfg.ip_deny_path, Some(PathBuf::from("./conf/ipDeny.config")));
+        assert_eq!(
+            cfg.ip_deny_path,
+            Some(PathBuf::from("./conf/ipDeny.config"))
+        );
         // The file's values override the code defaults…
         assert_eq!(cfg.min_memory, 1024);
         assert_eq!(cfg.min_million_disk, 200);
@@ -848,7 +868,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(cfg.max_backups, 3);
         assert_eq!(cfg.upload_path, PathBuf::from("./upload/"));
         assert_eq!(cfg.upload_max_body_size, 1_073_741_824);
-        assert_eq!(cfg.upload_allow_extensions, ["nt", "ttl", "n3", "rdf", "txt"]);
+        assert_eq!(
+            cfg.upload_allow_extensions,
+            ["nt", "ttl", "n3", "rdf", "txt"]
+        );
         assert_eq!(cfg.upload_allow_compress_packages, ["zip"]);
         assert!(cfg.upload_extension_allowed("TTL") && cfg.upload_extension_allowed(".zip"));
         assert!(!cfg.upload_extension_allowed("exe"));
@@ -894,7 +917,10 @@ upload_allow_compress_packages = "zip"
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         assert_eq!((c.port, c.tcp_port, c.thread_num), (9123, 9124, 4));
-        assert_eq!((c.max_database_num, c.max_user_num, c.max_output_size), (7, 8, 50));
+        assert_eq!(
+            (c.max_database_num, c.max_user_num, c.max_output_size),
+            (7, 8, 50)
+        );
         assert!(c.deamon);
         assert_eq!(c.ip_allow_path, Some(PathBuf::from("allow.cfg")));
         assert_eq!(c.ip_deny_path, Some(PathBuf::from("deny.cfg")));
@@ -906,26 +932,39 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.shutdown_grace, 2);
         assert_eq!(c.db_home, PathBuf::from("/tmp/h"));
         assert_eq!(c.pid_file(), PathBuf::from("/tmp/h").join(PID_FILE_NAME));
-        assert_eq!((c.root_username.as_str(), c.root_password.as_str()), ("admin", "pw"));
+        assert_eq!(
+            (c.root_username.as_str(), c.root_password.as_str()),
+            ("admin", "pw")
+        );
         assert_eq!(c.system_username, "sys");
         assert_eq!(c.pfn_base_path, PathBuf::from("p/"));
         assert_eq!(c.licensetype, "x");
-        assert_eq!((c.min_memory, c.min_million_disk, c.min_million_memory), (1, 2, 3));
+        assert_eq!(
+            (c.min_memory, c.min_million_disk, c.min_million_memory),
+            (1, 2, 3)
+        );
         assert!(c.resource_check && !c.check_point && c.build_multi_thread);
         assert_eq!(c.log_mode, "l");
         assert!(!c.querylog_mode && !c.accesslog_mode);
         assert_eq!((c.querylog_days, c.accesslog_days), (5, 6));
         assert_eq!(c.querylog_path, PathBuf::from("q/"));
         assert_eq!(c.accesslog_path, PathBuf::from("a/"));
-        assert_eq!((c.backup_path.clone(), c.max_backups), (PathBuf::from("b/"), 9));
+        assert_eq!(
+            (c.backup_path.clone(), c.max_backups),
+            (PathBuf::from("b/"), 9)
+        );
         assert_eq!(c.upload_path, PathBuf::from("u/"));
         assert_eq!(c.upload_max_body_size, 10);
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip", "tar"]);
         // Every known key appears in the summary, with the password masked.
         let rows = c.summary();
-        assert!(rows.iter().any(|(s, k, v)| *s == "server" && *k == "port" && v == "9123"));
-        assert!(rows.iter().any(|(_, k, v)| *k == "root_password" && v == "******"));
+        assert!(rows
+            .iter()
+            .any(|(s, k, v)| *s == "server" && *k == "port" && v == "9123"));
+        assert!(rows
+            .iter()
+            .any(|(_, k, v)| *k == "root_password" && v == "******"));
         assert!(!rows.iter().any(|(_, _, v)| v == "pw"));
     }
 
@@ -945,7 +984,10 @@ upload_allow_compress_packages = "zip"
         assert!(w.contains("thread_num must be at least 1"), "{w}");
         assert!(w.contains("unknown key 'bogus' in [server]"), "{w}");
         assert!(w.contains("invalid switch 'maybe'"), "{w}");
-        assert!(w.contains("'port' belongs in [server], not [system]"), "{w}");
+        assert!(
+            w.contains("'port' belongs in [server], not [system]"),
+            "{w}"
+        );
         assert!(w.contains("db_suffix '.gdb' is not supported"), "{w}");
         assert!(w.contains("unknown key 'key' in [nosuch]"), "{w}");
     }
@@ -977,7 +1019,10 @@ upload_allow_compress_packages = "zip"
         let mut c = GStoreConfig::load(&path).unwrap();
         assert_eq!(c.source.as_deref(), Some(path.as_path()));
         assert_eq!((c.port, c.thread_num), (9555, 3), "file over default");
-        assert_eq!(c.max_output_size, 100_000, "default where the file is silent");
+        assert_eq!(
+            c.max_output_size, 100_000,
+            "default where the file is silent"
+        );
         c.port = 9600; // a command-line flag
         assert_eq!(c.port, 9600);
         // A later file layered on top overrides the earlier one.

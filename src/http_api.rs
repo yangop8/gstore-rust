@@ -62,6 +62,18 @@
 //! handler answers `500` with a JSON error and the locks it poisoned are
 //! recovered, so the server keeps serving.
 //!
+//! **Lifecycle routes.** `GET|POST /shutdown` and `/restart` (upstream
+//! `grpc.cpp`) take `username`/`password` from headers, the query string or
+//! the body, accept `root` or the `system` account (its password is set with
+//! [`ApiServer::with_system_password`]; `gserver` generates it and keeps it in
+//! its pid file), and answer gStore's envelope at HTTP 200 (`StatusCode` 0,
+//! 1001, 1003 or 1101) before stopping gracefully; `/restart` sets
+//! [`ShutdownReport::restart`](crate::server::ShutdownReport::restart).
+//!
+//! **Configuration.** [`ApiServer::with_config`] applies a `conf.ini`
+//! ([`crate::config::GStoreConfig`]): worker pool size, keep-alive, body cap,
+//! CORS, shutdown grace, `check_point`; the rest is readable by the API.
+//!
 //! It reuses the dependency-free HTTP primitives (request parsing, response
 //! writing, content negotiation, Basic-auth parsing) from [`crate::server`], so
 //! it remains std-only and the existing `/sparql`, `/update`, `/status`
@@ -843,8 +855,8 @@ impl ApiState {
 
 /// The parity HTTP API server. Construct with [`ApiServer::bind`], then drive it
 /// with [`serve_forever`](ApiServer::serve_forever) (e.g. in a background
-/// thread) until [`shutdown`](ApiServer::shutdown). Each accepted connection is
-/// handled on its own worker thread.
+/// thread) until [`shutdown`](ApiServer::shutdown). Connections are served by a
+/// bounded worker pool with HTTP/1.1 keep-alive (see [`crate::server`]).
 pub struct ApiServer {
     /// Shared with every connection worker (behind an `Arc`).
     inner: Arc<ApiInner>,
@@ -1181,10 +1193,12 @@ impl ApiServer {
             .map(|t| Arc::clone(&t.cancel))
     }
 
-    /// Accept connections until [`shutdown`](Self::shutdown), handling each on
-    /// its own worker thread. A long-running query on one connection holds only
-    /// its database's lock, so concurrent requests — crucially `POST /cancel` —
-    /// proceed on other workers. Returns what the shutdown did.
+    /// Accept connections until [`shutdown`](Self::shutdown), serving them on
+    /// a pool of `thread_num` workers ([`with_thread_num`](Self::with_thread_num);
+    /// further connections queue). A long-running query on one connection
+    /// holds only its database's lock, so concurrent requests — crucially
+    /// `POST /cancel` — proceed on other workers (as long as one is free).
+    /// Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
         let inner = Arc::clone(&self.inner);
         let drained = serve_pooled(
