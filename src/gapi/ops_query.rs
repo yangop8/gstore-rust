@@ -121,7 +121,7 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         return not_loaded(&db, on_disk);
     }
     // Logged with no lock held (the statement may be large).
-    log_query(ctx.root_dir(), &db, ctx.user(), &sparql);
+    let query_log = super::apilog::QueryLog::start(ctx, &db, &sparql, fmt_param.as_deref());
     let job = {
         let mut st = ctx.state();
         let Some(dbh) = st.dbs.get(&db).map(Arc::clone) else {
@@ -160,6 +160,7 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             }
         }
     };
+    query_log.finish(ctx, &resp);
     resp.with_header("Cache-Control", "no-cache")
         .with_header("Pragma", "no-cache")
         .with_header("Expires", "0")

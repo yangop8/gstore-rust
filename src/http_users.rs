@@ -77,24 +77,40 @@
 //! the damaged lines would silently drop those users — and could re-seed `root`
 //! with the command-line initial password. Fix or delete the reported line.
 //!
-//! Privilege model (matching gStore's numeric privileges 1..7 plus an `admin`
-//! super-privilege):
+//! ## Privileges
 //!
-//! | # | name      | gates                                  |
-//! |---|-----------|----------------------------------------|
-//! | 1 | `query`   | `/sparql`, read `/tquery`, `/export`   |
-//! | 2 | `load`    | `/build`, `/load`                      |
-//! | 3 | `unload`  | `/unload`, `/drop`                     |
-//! | 4 | `update`  | `/update`, `/batchInsert`, txns        |
-//! | 5 | `backup`  | `/backup`                              |
-//! | 6 | `restore` | `/restore`                             |
-//! | 7 | `export`  | `/export`                              |
-//! | - | `admin`   | user management + logs (implies all)   |
+//! gStore's privileges are granted **per database** (upstream's `setpriv
+//! <user> <db>` / the `userprivilegemanage` operation), with the numeric
+//! codes 1..7 upstream uses; a privilege may also be granted on **every**
+//! database at once (a Rust extension: the global privileges of the earlier,
+//! database-agnostic model, which `/user/create` and `/user/grant` without a
+//! `db_name` still grant), plus the legacy `admin` super-privilege:
+//!
+//! | # | name      | gates (operation names, see [`crate::sysdb::requirement`]) |
+//! |---|-----------|-------------------------------------------------------------|
+//! | 1 | `query`   | `query`, `monitor` (`/sparql` reads, read `/tquery`)        |
+//! | 2 | `load`    | `load`                                                      |
+//! | 3 | `unload`  | `unload`                                                    |
+//! | 4 | `update`  | `update`, `batchInsert`/`batchRemove`, transactions, `checkpoint` |
+//! | 5 | `backup`  | `backup`                                                    |
+//! | 6 | `restore` | `restore`                                                   |
+//! | 7 | `export`  | `export`                                                    |
+//! | - | `admin`   | everything `root` may do (global only)                      |
+//!
+//! Everything else (`build`, `drop`, user management, logs, IP lists, …) is
+//! reserved to `root` (and `admin` users), as upstream. The mapping from
+//! operations to privileges lives in [`crate::sysdb`].
+//!
+//! The third column of `users.db` lists a user's grants as comma-separated
+//! tokens: `query` (on every database), `query@lubm` (on database `lubm`
+//! only) and `admin`. Files written before per-database grants existed hold
+//! only the first kind and load unchanged — their privileges keep applying to
+//! every database.
 //!
 //! The built-in `root` user always holds every privilege and cannot be dropped
 //! or have its privileges changed (gStore semantics).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
@@ -176,6 +192,32 @@ impl Privilege {
             "admin" | "8" => Privilege::Admin,
             _ => return None,
         })
+    }
+
+    /// The seven per-database privileges upstream defines, in code order
+    /// (`1` query … `7` export).
+    pub const PER_DATABASE: [Privilege; 7] = [
+        Privilege::Query,
+        Privilege::Load,
+        Privilege::Unload,
+        Privilege::Update,
+        Privilege::Backup,
+        Privilege::Restore,
+        Privilege::Export,
+    ];
+
+    /// Upstream's numeric code (`1` query … `7` export; `8` for `admin`).
+    pub fn code(self) -> u8 {
+        match self {
+            Privilege::Query => 1,
+            Privilege::Load => 2,
+            Privilege::Unload => 3,
+            Privilege::Update => 4,
+            Privilege::Backup => 5,
+            Privilege::Restore => 6,
+            Privilege::Export => 7,
+            Privilege::Admin => 8,
+        }
     }
 
     /// Parse a comma-separated privilege list (names and/or numeric codes),
@@ -565,25 +607,103 @@ pub fn verify_password_md5(stored: &str, md5_hex_digest: &str) -> Option<bool> {
 pub struct User {
     pub name: String,
     password: PasswordHash,
+    /// Privileges held on **every** database (and `admin`).
     pub privileges: BTreeSet<Privilege>,
+    /// Privileges held on one database: database name → privileges.
+    pub db_privileges: BTreeMap<String, BTreeSet<Privilege>>,
 }
 
 impl User {
-    /// Whether this user holds `p` (a `root`/`Admin` user holds everything).
+    /// Whether this user holds `p` on every database (a `root`/`Admin` user
+    /// holds everything). Per-database grants do not count — see
+    /// [`has_on`](Self::has_on).
     pub fn has(&self, p: Privilege) -> bool {
-        self.name == ROOT_USER
-            || self.privileges.contains(&Privilege::Admin)
-            || self.privileges.contains(&p)
+        self.is_superuser() || self.privileges.contains(&p)
     }
 
-    /// Render the granted privileges as a sorted comma-separated string.
-    pub fn privilege_str(&self) -> String {
-        self.privileges
-            .iter()
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
+    /// Whether this user holds `p` on database `db`: on every database, or
+    /// granted on `db` itself (a `root`/`Admin` user holds everything).
+    pub fn has_on(&self, p: Privilege, db: &str) -> bool {
+        self.has(p) || self.db_privileges.get(db).is_some_and(|s| s.contains(&p))
     }
+
+    /// Whether this user holds `p` on at least one database.
+    pub fn has_anywhere(&self, p: Privilege) -> bool {
+        self.has(p) || self.db_privileges.values().any(|s| s.contains(&p))
+    }
+
+    /// `root`, or a user holding the legacy `admin` privilege: allowed
+    /// everything `root` is.
+    pub fn is_superuser(&self) -> bool {
+        self.name == ROOT_USER || self.privileges.contains(&Privilege::Admin)
+    }
+
+    /// The databases this user was granted `p` on explicitly, sorted
+    /// (privileges held on every database are not listed).
+    pub fn databases_with(&self, p: Privilege) -> Vec<&str> {
+        self.db_privileges
+            .iter()
+            .filter(|(_, s)| s.contains(&p))
+            .map(|(db, _)| db.as_str())
+            .collect()
+    }
+
+    /// Render the granted privileges as a sorted comma-separated string: the
+    /// privileges held on every database by name (`query`), then the
+    /// per-database grants as `query@lubm` (the `users.db` column format).
+    pub fn privilege_str(&self) -> String {
+        let mut out: Vec<String> = self
+            .privileges
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        for (db, privs) in &self.db_privileges {
+            out.extend(privs.iter().map(|p| format!("{}@{db}", p.as_str())));
+        }
+        out.join(",")
+    }
+}
+
+/// The parsed privilege column of a `users.db` line: the privileges held on
+/// every database, and the per-database grants.
+type PrivilegeColumn = (BTreeSet<Privilege>, BTreeMap<String, BTreeSet<Privilege>>);
+
+/// Parse a `users.db` privilege column (see the module docs): `query` (every
+/// database), `query@lubm` (one database), `admin`. `None` when a token does
+/// not parse — an unknown privilege, an invalid database name, or `admin`
+/// bound to one database.
+fn parse_privilege_column(list: &str) -> Option<PrivilegeColumn> {
+    let mut global = BTreeSet::new();
+    let mut per_db: BTreeMap<String, BTreeSet<Privilege>> = BTreeMap::new();
+    for tok in list.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.split_once('@') {
+            None => {
+                global.insert(Privilege::parse(tok)?);
+            }
+            Some((p, db)) => {
+                let p = Privilege::parse(p)?;
+                if p == Privilege::Admin || !valid_grant_db(db) {
+                    return None;
+                }
+                per_db.entry(db.to_string()).or_default().insert(p);
+            }
+        }
+    }
+    Some((global, per_db))
+}
+
+/// Whether `db` may carry a per-database grant: a database name as the server
+/// accepts it (`[A-Za-z0-9_-]`, 1..=64 characters).
+fn valid_grant_db(db: &str) -> bool {
+    !db.is_empty()
+        && db.len() <= 64
+        && db
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// An issued login session.
@@ -652,6 +772,7 @@ impl UserStore {
                 name: ROOT_USER.to_string(),
                 password: PasswordHash::new(password),
                 privileges: BTreeSet::from([Privilege::Admin]),
+                db_privileges: BTreeMap::new(),
             },
         );
         true
@@ -718,9 +839,9 @@ impl UserStore {
             // is present but does not parse (torn, or a token this version
             // does not know) is malformed — loading it as "no privileges" and
             // saving that back would silently revoke the user's access.
-            let privileges = match cols.next() {
-                None => BTreeSet::new(),
-                Some(list) => Privilege::parse_list(list).ok_or_else(malformed)?,
+            let (privileges, db_privileges) = match cols.next() {
+                None => (BTreeSet::new(), BTreeMap::new()),
+                Some(list) => parse_privilege_column(list).ok_or_else(malformed)?,
             };
             self.users.insert(
                 name.to_string(),
@@ -728,6 +849,7 @@ impl UserStore {
                     name: name.to_string(),
                     password,
                     privileges,
+                    db_privileges,
                 },
             );
         }
@@ -801,6 +923,7 @@ impl UserStore {
                 name: name.to_string(),
                 password: PasswordHash::new(password),
                 privileges,
+                db_privileges: BTreeMap::new(),
             },
         );
         self.save().map_err(|e| e.to_string())
@@ -847,9 +970,13 @@ impl UserStore {
         self.modify_privs(name, |p| p.retain(|x| !privs.contains(x)))
     }
 
-    /// Clear all privileges from a user (gStore privilege type "3").
+    /// Clear all privileges from a user — on every database and per database
+    /// (gStore privilege type "3").
     pub fn clear_privileges(&mut self, name: &str) -> Result<(), String> {
-        self.modify_privs(name, |p| p.clear())
+        self.modify_user(name, |u| {
+            u.privileges.clear();
+            u.db_privileges.clear();
+        })
     }
 
     fn modify_privs(
@@ -857,6 +984,12 @@ impl UserStore {
         name: &str,
         f: impl FnOnce(&mut BTreeSet<Privilege>),
     ) -> Result<(), String> {
+        self.modify_user(name, |u| f(&mut u.privileges))
+    }
+
+    /// Apply `f` to user `name` (never `root`) and persist the store. When
+    /// the save fails the change is undone, so memory and disk agree.
+    fn modify_user(&mut self, name: &str, f: impl FnOnce(&mut User)) -> Result<(), String> {
         if name == ROOT_USER {
             return Err("cannot change privileges for the root user".into());
         }
@@ -864,8 +997,103 @@ impl UserStore {
             .users
             .get_mut(name)
             .ok_or_else(|| format!("user '{name}' does not exist"))?;
-        f(&mut user.privileges);
-        self.save().map_err(|e| e.to_string())
+        let before = user.clone();
+        f(user);
+        if let Err(e) = self.save() {
+            self.users.insert(name.to_string(), before);
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+
+    // ---- per-database privileges -------------------------------------------
+
+    /// Grant privileges on database `db` to a user (upstream
+    /// `userprivilegemanage` type 1). `admin` cannot be granted per database,
+    /// and `root`'s privileges are immutable.
+    pub fn grant_on(
+        &mut self,
+        name: &str,
+        db: &str,
+        privs: &BTreeSet<Privilege>,
+    ) -> Result<(), String> {
+        check_grant(db, privs)?;
+        self.modify_user(name, |u| {
+            u.db_privileges
+                .entry(db.to_string())
+                .or_default()
+                .extend(privs.iter().copied());
+        })
+    }
+
+    /// Revoke privileges on database `db` from a user (upstream
+    /// `userprivilegemanage` type 2). Privileges the user holds on every
+    /// database are not affected (revoke those with [`revoke`](Self::revoke)).
+    pub fn revoke_on(
+        &mut self,
+        name: &str,
+        db: &str,
+        privs: &BTreeSet<Privilege>,
+    ) -> Result<(), String> {
+        check_grant(db, privs)?;
+        self.modify_user(name, |u| {
+            if let Some(set) = u.db_privileges.get_mut(db) {
+                set.retain(|p| !privs.contains(p));
+                if set.is_empty() {
+                    u.db_privileges.remove(db);
+                }
+            }
+        })
+    }
+
+    /// Grant user `name` every per-database privilege on `db` — what upstream
+    /// does for a database's creator (`init_privilege`). A no-op for `root`
+    /// (who holds everything) and for an unknown user.
+    pub fn grant_all_on(&mut self, name: &str, db: &str) -> Result<(), String> {
+        if name == ROOT_USER || !self.users.contains_key(name) {
+            return Ok(());
+        }
+        self.grant_on(name, db, &BTreeSet::from(Privilege::PER_DATABASE))
+    }
+
+    /// Drop every user's grants on database `db` (it was dropped, so a later
+    /// database of the same name starts without them — upstream
+    /// `remove_databaseinfo`). Returns whether anything changed.
+    pub fn forget_database(&mut self, db: &str) -> io::Result<bool> {
+        let mut changed = false;
+        for u in self.users.values_mut() {
+            changed |= u.db_privileges.remove(db).is_some();
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
+    /// Give every user holding grants on database `from` the same grants on
+    /// `to` (upstream `copy_privilege`, used when a database is renamed).
+    /// Returns whether anything changed.
+    pub fn copy_database_privileges(&mut self, from: &str, to: &str) -> io::Result<bool> {
+        if !valid_grant_db(to) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid database name '{to}'"),
+            ));
+        }
+        let mut changed = false;
+        for u in self.users.values_mut() {
+            if let Some(set) = u.db_privileges.get(from).cloned() {
+                u.db_privileges
+                    .entry(to.to_string())
+                    .or_default()
+                    .extend(set);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
     }
 
     // ---- authentication ---------------------------------------------------
@@ -1059,9 +1287,26 @@ impl UserStore {
         self.sessions.remove(token).is_some()
     }
 
-    /// Whether `name` holds privilege `p` (unknown user ⇒ false).
+    /// Whether `name` holds privilege `p` on every database (unknown user ⇒
+    /// false). See [`has_priv_on`](Self::has_priv_on) for one database.
     pub fn has_priv(&self, name: &str, p: Privilege) -> bool {
         self.users.get(name).is_some_and(|u| u.has(p))
+    }
+
+    /// Whether `name` holds privilege `p` on database `db` (unknown user ⇒
+    /// false).
+    pub fn has_priv_on(&self, name: &str, p: Privilege, db: &str) -> bool {
+        self.users.get(name).is_some_and(|u| u.has_on(p, db))
+    }
+
+    /// Whether `name` holds privilege `p` on at least one database.
+    pub fn has_priv_anywhere(&self, name: &str, p: Privilege) -> bool {
+        self.users.get(name).is_some_and(|u| u.has_anywhere(p))
+    }
+
+    /// Whether `name` is `root` or holds the legacy `admin` privilege.
+    pub fn is_superuser(&self, name: &str) -> bool {
+        self.users.get(name).is_some_and(User::is_superuser)
     }
 }
 
@@ -1131,6 +1376,18 @@ pub fn random_bytes(buf: &mut [u8]) {
         let block = ctx.finalize();
         chunk.copy_from_slice(&block[..chunk.len()]);
     }
+}
+
+/// Validate a per-database grant: a valid database name, and no `admin`
+/// (which exists only as a global privilege).
+fn check_grant(db: &str, privs: &BTreeSet<Privilege>) -> Result<(), String> {
+    if !valid_grant_db(db) {
+        return Err(format!("invalid database name '{db}'"));
+    }
+    if privs.contains(&Privilege::Admin) {
+        return Err("admin cannot be granted on a single database".into());
+    }
+    Ok(())
 }
 
 /// Validate a username: non-empty, ≤ 64 chars, ASCII alphanumeric plus `_`/`-`,
@@ -1646,6 +1903,77 @@ mod tests {
             assert!(store.has_priv("alice", Privilege::Update));
             assert!(!store.has_priv("alice", Privilege::Query));
         }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_database_grants_persist_and_are_scoped() {
+        let path = tmp("perdb");
+        {
+            let mut store = UserStore::open(&path, "rootpw").unwrap();
+            store
+                .add("alice", "pw", BTreeSet::from([Privilege::Export]))
+                .unwrap();
+            let qu = BTreeSet::from([Privilege::Query, Privilege::Update]);
+            store.grant_on("alice", "lubm", &qu).unwrap();
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm"));
+            assert!(!store.has_priv_on("alice", Privilege::Query, "movie"));
+            assert!(
+                !store.has_priv("alice", Privilege::Query),
+                "not on every database"
+            );
+            assert!(store.has_priv_on("alice", Privilege::Export, "movie"), "global");
+            assert!(store.has_priv_anywhere("alice", Privilege::Update));
+            assert!(!store.has_priv_anywhere("alice", Privilege::Backup));
+            assert!(store
+                .grant_on("alice", "lubm", &BTreeSet::from([Privilege::Admin]))
+                .is_err());
+            assert!(store
+                .grant_on("alice", "../x", &BTreeSet::from([Privilege::Query]))
+                .is_err());
+            assert!(store
+                .grant_on(ROOT_USER, "lubm", &BTreeSet::from([Privilege::Query]))
+                .is_err());
+            store
+                .revoke_on("alice", "lubm", &BTreeSet::from([Privilege::Update]))
+                .unwrap();
+            assert!(!store.has_priv_on("alice", Privilege::Update, "lubm"));
+            assert_eq!(
+                store.get("alice").unwrap().privilege_str(),
+                "export,query@lubm"
+            );
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\texport,query@lubm\n"), "{text}");
+        {
+            let mut store = UserStore::open(&path, "rootpw").unwrap();
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm"));
+            // Rename (copy) and drop (forget) a database's grants.
+            assert!(store.copy_database_privileges("lubm", "lubm2").unwrap());
+            assert!(store.has_priv_on("alice", Privilege::Query, "lubm2"));
+            assert!(store.forget_database("lubm").unwrap());
+            assert!(!store.forget_database("lubm").unwrap());
+            assert!(!store.has_priv_on("alice", Privilege::Query, "lubm"));
+            // The creator of a database gets every per-database privilege.
+            store.grant_all_on("alice", "fresh").unwrap();
+            for p in Privilege::PER_DATABASE {
+                assert!(store.has_priv_on("alice", p, "fresh"), "{p:?}");
+            }
+            assert_eq!(
+                store.get("alice").unwrap().databases_with(Privilege::Load),
+                vec!["fresh"]
+            );
+            store.clear_privileges("alice").unwrap();
+            let alice = store.get("alice").unwrap();
+            assert!(alice.privileges.is_empty() && alice.db_privileges.is_empty());
+        }
+        // Per-database tokens that do not parse are refused like any other.
+        for bad in ["query@", "admin@lubm", "query@a/b", "nope@lubm"] {
+            fs::write(&path, format!("zed\t{}\t{bad}\n", hash_password("pw"))).unwrap();
+            let err = UserStore::open(&path, "rootpw").err().expect(bad);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad}");
+        }
+        assert_eq!(Privilege::Export.code(), 7);
         let _ = fs::remove_file(&path);
     }
 

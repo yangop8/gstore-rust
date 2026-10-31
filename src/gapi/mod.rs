@@ -38,7 +38,12 @@
 //! 5. validate `db_name` when the operation needs one — `1003`;
 //! 6. the privilege check ([`auth::check_privilege`]) — denied →
 //!    `1004 "You have no <operation> privilege"` (upstream's code for it);
-//! 7. run the operation's handler.
+//! 7. run the operation's handler;
+//! 8. record the answered operation in the access log ([`apilog`]).
+//!
+//! The IP checks are those of [`ipfilter`]: the allow / deny lists at step 1,
+//! the failed-login lockout (every operation but `login` / `testConnect`)
+//! before step 4.
 //!
 //! Handlers run with **no lock held**; they take the server state lock only
 //! briefly (see the locking rule on `ApiState` in [`crate::http_api`]).
@@ -50,11 +55,14 @@
 //! `fn(&mut Ctx, &Params) -> GResp`; its [`OpSpec`] says whether it needs
 //! credentials, a `db_name`, and whether it can run asynchronously.
 
+pub mod apilog;
 pub mod auth;
 pub mod envelope;
+pub mod ipfilter;
 mod ops_lifecycle;
 mod ops_query;
 mod ops_sys;
+mod ops_user;
 pub mod params;
 
 use std::collections::HashMap;
@@ -323,6 +331,7 @@ pub fn registry() -> &'static Registry {
         ops_sys::register(&mut reg);
         ops_query::register(&mut reg);
         ops_lifecycle::register(&mut reg);
+        ops_user::register(&mut reg);
         reg
     })
 }
@@ -376,6 +385,13 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
         Ok(p) => p,
         Err(e) => return GResp::error(Status::ParamIsIllegal, e),
     };
+    let resp = route(ctx, &params);
+    apilog::log_access(ctx, &params, &resp);
+    resp
+}
+
+/// Steps 3-7 of the request flow (see the module docs).
+fn route(ctx: &mut Ctx<'_>, params: &Params) -> GResp {
     let reg = registry();
     if !matches!(
         ctx.req.path.as_str(),
@@ -383,7 +399,7 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
     ) {
         if let Some(route) = reg.path_route(&ctx.req.method, &ctx.req.path) {
             ctx.op = route.name.to_string();
-            return (route.handler)(ctx, &params);
+            return (route.handler)(ctx, params);
         }
     }
     let Some(op) = params.non_empty("operation") else {
@@ -394,7 +410,7 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
         return GResp::error(Status::OperationUndefined, "");
     };
     if !spec.auth {
-        return (spec.handler)(ctx, &params);
+        return (spec.handler)(ctx, params);
     }
     // Upstream exempts login / testConnect from the second (operation-level)
     // IP check.
@@ -403,7 +419,7 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
             return r;
         }
     }
-    if let Err(r) = auth::authenticate(ctx, &params) {
+    if let Err(r) = auth::authenticate(ctx, params) {
         return r;
     }
     let db_name = params.str("db_name");
@@ -422,7 +438,7 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
             format!("You have no {op} privilege"),
         );
     }
-    (spec.handler)(ctx, &params)
+    (spec.handler)(ctx, params)
 }
 
 /// The name of upstream's system database, which no operation may target.

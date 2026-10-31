@@ -5,8 +5,9 @@
 //! [`ApiServer`] manages a *directory of named databases* and layers on the
 //! operational surface gStore exposes over HTTP:
 //!
-//! * **User management & RBAC** ([`crate::http_users`]) — a persistent user
-//!   store, `/login` returning a session token, and privilege-gated endpoints.
+//! * **User management & RBAC** ([`crate::http_users`], [`crate::sysdb`]) —
+//!   a persistent user store with per-database privileges, `/login` returning
+//!   a session token, and privilege-gated endpoints.
 //! * **Transactions over HTTP** — `/begin`, `/tquery`, `/commit`, `/rollback`,
 //!   mapping to [`Database::begin`]/[`commit`](Database::commit)/
 //!   [`rollback`](Database::rollback). See *Transactions* below.
@@ -103,11 +104,17 @@
 //! session token from `/login` (carried via `Authorization: Bearer …`, an
 //! `X-Session-Token` header, or a `session=`/`token=` parameter). Lacking a
 //! valid identity is `401`; lacking the required privilege is `403`.
+//! Privileges are those of the system store ([`crate::sysdb`]) and decided
+//! by the same rules as the `/api` layer: each endpoint counts as the
+//! upstream operation it performs and is checked on the database it targets
+//! (`/user/create`, `/user/grant` and `/user/revoke` grant on one database
+//! with `db_name=`, else on every database); `/build` and `/drop` are
+//! reserved to `root` (and `admin` users), as upstream.
 //!
 //! As with [`crate::server`], real TLS is out of scope — terminate HTTPS in a
 //! reverse proxy and do not send credentials over plain `http://` in production.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
@@ -121,6 +128,8 @@ use crate::config::GStoreConfig;
 use crate::db::{Database, LoadPolicy, LoadSource};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
+use crate::gapi::apilog::{ApiLogs, TxnState};
+use crate::gapi::ipfilter::IpFilter;
 use crate::gapi::GapiConfig;
 use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
@@ -134,6 +143,7 @@ use crate::server::{
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::{TripleSource, TripleStore};
+use crate::sysdb::SysDb;
 
 const JSON: &str = "application/json";
 const SPARQL_JSON: &str = "application/sparql-results+json";
@@ -700,7 +710,11 @@ pub(crate) struct TaskEntry {
 /// with no lock held and take this one only briefly.
 pub(crate) struct ApiState {
     pub(crate) root: PathBuf,
+    /// The user table of the system store: users, passwords, and their
+    /// per-database privileges (see [`crate::sysdb`]).
     pub(crate) users: UserStore,
+    /// The database registry of the system store (creator, built time).
+    pub(crate) sysdb: SysDb,
     /// Loaded, in-memory databases by name. Each is behind its own `Mutex` (and
     /// an `Arc` so a worker can clone the handle and run a query without holding
     /// the outer `ApiState` lock).
@@ -820,6 +834,11 @@ pub(crate) struct ApiInner {
     /// [`ApiServer::with_system_password`]; `gserver` writes it to the second
     /// line of its pid file, as upstream does.
     system_password: String,
+    /// The `/api` layer's IP allow / deny lists and failed-login lockout
+    /// (from the configuration's `ip_allow_path` / `ip_deny_path`).
+    pub(crate) ipfilter: IpFilter,
+    /// The query / access / transaction log writers.
+    pub(crate) apilogs: ApiLogs,
 }
 
 impl ApiInner {
@@ -962,7 +981,9 @@ impl ApiServer {
     ) -> std::io::Result<ApiServer> {
         let root = root_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let users = UserStore::open(root.join("users.db"), root_password)?;
+        // The system store: `users.db` (users, per-database privileges) and
+        // `system.json` (the database registry), migrated on first start.
+        let (users, sysdb) = crate::sysdb::open_system(&root, root_password)?;
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         let life = Lifecycle::new(addr);
@@ -971,6 +992,7 @@ impl ApiServer {
                 state: Mutex::new(ApiState {
                     root: root.clone(),
                     users,
+                    sysdb,
                     dbs: HashMap::new(),
                     txns: HashMap::new(),
                     db_txn: HashMap::new(),
@@ -988,6 +1010,8 @@ impl ApiServer {
                 grace: DEFAULT_SHUTDOWN_GRACE,
                 closing: AtomicBool::new(false),
                 life: Arc::clone(&life),
+                ipfilter: IpFilter::from_config(&GStoreConfig::default()),
+                apilogs: ApiLogs::new(),
                 config: GStoreConfig::default(),
                 system_password: new_system_password(),
             }),
@@ -1028,6 +1052,7 @@ impl ApiServer {
         }
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = config.check_point;
+            inner.ipfilter = IpFilter::from_config(&config);
             inner.config = config;
         }
         self
@@ -1248,7 +1273,7 @@ impl ApiServer {
             if let Some(open) = slot.txn.take() {
                 let _ = slot.db.rollback();
                 let mut st = locked(&inner.state);
-                st.txns.remove(&open.tid);
+                let owner = st.txns.remove(&open.tid).map(|t| t.owner).unwrap_or_default();
                 st.db_txn.remove(&name);
                 st.remember_ended(open.tid, "rolled back");
                 append_log(
@@ -1256,6 +1281,9 @@ impl ApiServer {
                     "txn.log",
                     &format!("{}\trollback\t{}\t{}\t(shutdown)", now_millis(), name, open.tid),
                 );
+                inner
+                    .apilogs
+                    .txn_end(&st.root, &name, open.tid, &owner, TxnState::RolledBack);
                 report.rolled_back += 1;
             }
             if slot.dirty {
@@ -1496,18 +1524,57 @@ impl ApiInner {
         Resp::fail(403, "permission denied: insufficient privilege")
     }
 
-    /// Run `f` only if `user` holds privilege `p`, else `403`.
+    /// Run `f` only if `user` may perform upstream operation `op` (a
+    /// database-independent one — user management, logs, …: `root` and
+    /// `admin` users only), else `403`. See [`crate::sysdb::allowed`].
     fn guarded(
         &self,
         st: &mut ApiState,
         user: &str,
-        p: Privilege,
+        op: &str,
         f: impl FnOnce(&Self, &mut ApiState) -> Resp,
     ) -> Resp {
-        if st.users.has_priv(user, p) {
+        if crate::sysdb::allowed(&st.users, user, op, None) {
             f(self, st)
         } else {
             self.forbidden()
+        }
+    }
+
+    /// The privilege check of a REST endpoint performing upstream operation
+    /// `op`: the rules of the `/api` layer ([`crate::sysdb::allowed`]) on the
+    /// database the endpoint's handler targets, resolved here exactly as the
+    /// handler resolves it (under the same state-lock hold). When it cannot be
+    /// resolved the request is let through, and the handler refuses it the
+    /// same way for everyone (`400` missing database, `404` unknown
+    /// transaction, …). `build` and `drop` are reserved to `root` (and
+    /// `admin` users), as upstream; `/upload` into an existing database needs
+    /// the update privilege on it, and creating one by uploading counts as a
+    /// `build`.
+    fn rest_allowed(&self, st: &ApiState, req: &Request, user: &str, op: &str) -> bool {
+        let target = match op {
+            "load" | "unload" | "restore" | "build" | "drop" => self.req_db_name(req),
+            "upload" => {
+                let Some(name) = self.req_db_name(req) else {
+                    return true;
+                };
+                let exists = st.dbs.contains_key(&name) || st.db_dir(&name).is_dir();
+                let op = if exists { "update" } else { "build" };
+                return crate::sysdb::allowed(&st.users, user, op, Some(&name));
+            }
+            "commit" | "rollback" => self
+                .txn_id(req)
+                .and_then(|tid| st.txns.get(&tid))
+                .map(|t| t.db.clone()),
+            _ => self.pick_db(st, req),
+        };
+        match target {
+            Some(db) => crate::sysdb::allowed(&st.users, user, op, Some(&db)),
+            // Root-only operations are decided without a database.
+            None if crate::sysdb::requirement(op) == crate::sysdb::Requirement::RootOnly => {
+                crate::sysdb::allowed(&st.users, user, op, None)
+            }
+            None => true,
         }
     }
 
@@ -1544,13 +1611,7 @@ impl ApiInner {
         // (`Dispatch::Deferred`) so they run with the `ApiState` lock released.
         match (method, path) {
             ("GET" | "POST", "/sparql") => return self.handle_query(req, &user),
-            ("POST", "/update") => {
-                return if st.users.has_priv(&user, Privilege::Update) {
-                    self.handle_update(st, req, &user)
-                } else {
-                    Dispatch::Done(self.forbidden())
-                };
-            }
+            ("POST", "/update") => return self.handle_update(st, req, &user),
             ("POST", "/tquery") => return self.handle_tquery(st, req, &user),
             // Read-only monitoring endpoints defer their db reads off the state
             // lock (see Dispatch::Deferred) so they never wedge POST /cancel.
@@ -1562,33 +1623,31 @@ impl ApiInner {
 
         // Endpoints that touch a database run their db work deferred (with the
         // state lock released, see the locking rule on `ApiState`).
+        // Each is checked as the upstream operation it performs (see
+        // `rest_allowed`), on its target database.
         let deferred = match (method, path) {
-            ("POST", "/build") => Some((Privilege::Load, Self::handle_build as Handler)),
-            ("POST", "/load") => Some((Privilege::Load, Self::handle_load as Handler)),
-            ("POST", "/upload") => Some((Privilege::Load, Self::handle_upload as Handler)),
-            ("POST", "/unload") => Some((Privilege::Unload, Self::handle_unload as Handler)),
-            ("POST", "/drop") => Some((Privilege::Unload, Self::handle_drop as Handler)),
-            ("POST", "/begin") => Some((Privilege::Update, Self::handle_begin as Handler)),
-            ("POST", "/commit") => Some((Privilege::Update, Self::handle_commit as Handler)),
-            ("POST", "/rollback") => Some((Privilege::Update, Self::handle_rollback as Handler)),
-            ("POST", "/checkpoint") => {
-                Some((Privilege::Update, Self::handle_checkpoint as Handler))
-            }
-            ("POST", "/backup") => Some((Privilege::Backup, Self::handle_backup as Handler)),
-            ("POST", "/restore") => Some((Privilege::Restore, Self::handle_restore as Handler)),
-            ("GET" | "POST", "/export") => {
-                Some((Privilege::Export, Self::handle_export as Handler))
-            }
+            ("POST", "/build") => Some(("build", Self::handle_build as Handler)),
+            ("POST", "/load") => Some(("load", Self::handle_load as Handler)),
+            ("POST", "/upload") => Some(("upload", Self::handle_upload as Handler)),
+            ("POST", "/unload") => Some(("unload", Self::handle_unload as Handler)),
+            ("POST", "/drop") => Some(("drop", Self::handle_drop as Handler)),
+            ("POST", "/begin") => Some(("begin", Self::handle_begin as Handler)),
+            ("POST", "/commit") => Some(("commit", Self::handle_commit as Handler)),
+            ("POST", "/rollback") => Some(("rollback", Self::handle_rollback as Handler)),
+            ("POST", "/checkpoint") => Some(("checkpoint", Self::handle_checkpoint as Handler)),
+            ("POST", "/backup") => Some(("backup", Self::handle_backup as Handler)),
+            ("POST", "/restore") => Some(("restore", Self::handle_restore as Handler)),
+            ("GET" | "POST", "/export") => Some(("export", Self::handle_export as Handler)),
             ("POST", "/batchInsert") => {
-                Some((Privilege::Update, Self::handle_batch_insert as Handler))
+                Some(("batchInsert", Self::handle_batch_insert as Handler))
             }
             ("POST", "/batchRemove") => {
-                Some((Privilege::Update, Self::handle_batch_remove as Handler))
+                Some(("batchRemove", Self::handle_batch_remove as Handler))
             }
             _ => None,
         };
-        if let Some((need, handler)) = deferred {
-            return if st.users.has_priv(&user, need) {
+        if let Some((op, handler)) = deferred {
+            return if self.rest_allowed(st, req, &user, op) {
                 handler(self, st, req, &user)
             } else {
                 Dispatch::Done(self.forbidden())
@@ -1596,39 +1655,40 @@ impl ApiInner {
         }
 
         let resp = match (method, path) {
-            ("POST", "/user/create") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("POST", "/user/create") => self.guarded(st, &user, "usermanage", |s, st| {
                 s.handle_user_create(st, req)
             }),
-            ("POST", "/user/drop") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("POST", "/user/drop") => self.guarded(st, &user, "usermanage", |s, st| {
                 s.handle_user_drop(st, req)
             }),
             ("POST", "/user/password") => self.handle_user_password(st, req, &user),
-            ("POST", "/user/grant") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("POST", "/user/grant") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, true)
             }),
-            ("POST", "/user/revoke") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("POST", "/user/revoke") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, false)
             }),
-            ("GET", "/user/show") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("GET", "/user/show") => self.guarded(st, &user, "showuser", |s, st| {
                 s.handle_user_show(st)
             }),
-            ("GET", "/querylog") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("GET", "/querylog") => self.guarded(st, &user, "querylog", |s, st| {
                 s.read_log(st, "query.log")
             }),
-            ("GET", "/accesslog") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("GET", "/accesslog") => self.guarded(st, &user, "accesslog", |s, st| {
                 s.read_log(st, "access.log")
             }),
-            ("GET", "/txnlog") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("GET", "/txnlog") => self.guarded(st, &user, "txnlog", |s, st| {
                 s.read_log(st, "txn.log")
             }),
-            ("GET", "/tasklist") => self.guarded(st, &user, Privilege::Admin, |s, st| {
+            ("GET", "/tasklist") => self.guarded(st, &user, "tasklist", |s, st| {
                 s.handle_tasklist(st)
             }),
             ("POST", "/cancel") => {
-                // Either privilege can cancel: Update (only your *own* long-running
-                // work) or Admin (an operator cancelling anyone's).
-                let is_admin = st.users.has_priv(&user, Privilege::Admin);
-                if is_admin || st.users.has_priv(&user, Privilege::Update) {
+                // Either privilege can cancel: Update on some database (only
+                // your *own* long-running work) or Admin (an operator
+                // cancelling anyone's).
+                let is_admin = st.users.is_superuser(&user);
+                if is_admin || st.users.has_priv_anywhere(&user, Privilege::Update) {
                     self.handle_cancel(st, req, &user, is_admin)
                 } else {
                     self.forbidden()
@@ -1697,19 +1757,15 @@ impl ApiInner {
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let is_update = is_update_sparql(&sparql);
-            let need = if is_update {
-                Privilege::Update
-            } else {
-                Privilege::Query
-            };
+            let op = if is_update { "update" } else { "query" };
             let name = {
                 let st = locked(&inner.state);
-                if !st.users.has_priv(&user, need) {
-                    return inner.forbidden();
-                }
                 let Some(name) = pick_db_name(&st, db) else {
                     return Resp::fail(400, "missing or ambiguous db parameter");
                 };
+                if !crate::sysdb::allowed(&st.users, &user, op, Some(&name)) {
+                    return inner.forbidden();
+                }
                 name
             };
             log_query(&inner.root, &name, &user, &sparql);
@@ -1739,6 +1795,9 @@ impl ApiInner {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
+        if !crate::sysdb::allowed(&st.users, user, "update", Some(&name)) {
+            return Dispatch::Done(self.forbidden());
+        }
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
@@ -1873,7 +1932,7 @@ impl ApiInner {
     /// only as the server's [`LoadPolicy`] allows — the policy that governs
     /// SPARQL `LOAD`, so `/build` is not a way around it — and only if it is a
     /// regular file.
-    fn handle_build(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    fn handle_build(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
@@ -1888,6 +1947,7 @@ impl ApiInner {
         let body = if path.is_none() { req.body_str() } else { String::new() };
         let dir = st.db_dir(&name);
         let policy = st.load_policy.clone();
+        let creator = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let _busy = BusyGuard {
                 inner,
@@ -1914,6 +1974,9 @@ impl ApiInner {
             let mut st = locked(&inner.state);
             let slot = DbSlot::handle(db, dir, false, &st.load_policy);
             st.dbs.insert(name.clone(), slot);
+            // Registry bookkeeping (best effort: the registry is reconciled
+            // with the database directories at every start anyway).
+            let _ = st.sysdb.register(&name, &creator);
             Resp::ok(&format!("database '{name}' built ({triples} triples)"))
         }))
     }
@@ -2154,6 +2217,13 @@ impl ApiInner {
             if !was_loaded && !existed_on_disk {
                 return Resp::fail(404, &format!("database '{name}' does not exist"));
             }
+            // Gone: unregister it and drop every grant on it, so a later
+            // database of the same name starts without them (best effort).
+            {
+                let mut st = locked(&inner.state);
+                let _ = st.sysdb.unregister(&name);
+                let _ = st.users.forget_database(&name);
+            }
             Resp::ok(&format!("database '{name}' dropped"))
         }))
     }
@@ -2366,6 +2436,7 @@ impl ApiInner {
                 isolation.name()
             ),
         );
+        self.apilogs.txn_begin(&self.root, name, tid, user);
         Ok(tid)
     }
 
@@ -2413,14 +2484,14 @@ impl ApiInner {
         let user = user.to_string();
         // Classified (parsed) with the state lock released, like `/sparql`.
         Dispatch::Deferred(Box::new(move |inner| {
-            let need = if is_update_sparql(&sparql) {
-                Privilege::Update
+            let op = if is_update_sparql(&sparql) {
+                "update"
             } else {
-                Privilege::Query
+                "query"
             };
             let dbh = {
                 let st = locked(&inner.state);
-                if !st.users.has_priv(&user, need) {
+                if !crate::sysdb::allowed(&st.users, &user, op, Some(&name)) {
                     return inner.forbidden();
                 }
                 let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
@@ -2578,6 +2649,13 @@ impl ApiInner {
                 txn.isolation.name()
             ),
         );
+        let state = if commit {
+            TxnState::Committed
+        } else {
+            TxnState::RolledBack
+        };
+        self.apilogs
+            .txn_end(&self.root, &txn.db, tid, &txn.owner, state);
         match result {
             Some(Ok(warning)) => Ok(warning),
             Some(Err(e)) => Err(OpError::new(OpErrorKind::Failed, format!("{verb} failed: {e}"))),
@@ -3019,10 +3097,26 @@ impl ApiInner {
         let Some(privs) = Privilege::parse_list(&privileges) else {
             return Resp::fail(400, "invalid privileges (use names or codes 1..8)");
         };
-        match st.users.add(&name, &password, privs) {
-            Ok(()) => Resp::ok(&format!("user '{name}' created")),
-            Err(e) => Resp::fail(400, &e),
+        // With a `db_name` the privileges are granted on that database only;
+        // without, on every database.
+        let db = match grant_db_param(req) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        let (global, on_db) = match db {
+            Some(db) => (BTreeSet::new(), Some((db, privs))),
+            None => (privs, None),
+        };
+        if let Err(e) = st.users.add(&name, &password, global) {
+            return Resp::fail(400, &e);
         }
+        if let Some((db, privs)) = on_db.filter(|(_, p)| !p.is_empty()) {
+            if let Err(e) = st.users.grant_on(&name, &db, &privs) {
+                let _ = st.users.drop_user(&name);
+                return Resp::fail(400, &e);
+            }
+        }
+        Resp::ok(&format!("user '{name}' created"))
     }
 
     fn handle_user_drop(&self, st: &mut ApiState, req: &Request) -> Resp {
@@ -3047,7 +3141,7 @@ impl ApiInner {
             return Resp::fail(400, "missing op_password");
         };
         // A user may change their own password; only admins may change others'.
-        let is_admin = st.users.has_priv(user, Privilege::Admin);
+        let is_admin = st.users.is_superuser(user);
         if target != user && !is_admin {
             return self.forbidden();
         }
@@ -3074,10 +3168,16 @@ impl ApiInner {
         let Some(privs) = Privilege::parse_list(&privileges) else {
             return Resp::fail(400, "invalid privileges (use names or codes 1..8)");
         };
-        let res = if grant {
-            st.users.grant(&name, &privs)
-        } else {
-            st.users.revoke(&name, &privs)
+        // With a `db_name`: on that database only; without, on every database.
+        let db = match grant_db_param(req) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        let res = match (grant, db) {
+            (true, Some(db)) => st.users.grant_on(&name, &db, &privs),
+            (false, Some(db)) => st.users.revoke_on(&name, &db, &privs),
+            (true, None) => st.users.grant(&name, &privs),
+            (false, None) => st.users.revoke(&name, &privs),
         };
         let verb = if grant { "granted" } else { "revoked" };
         match res {
@@ -3089,10 +3189,20 @@ impl ApiInner {
     fn handle_user_show(&self, st: &mut ApiState) -> Resp {
         let mut items = Vec::new();
         for u in st.users.list() {
+            let global: Vec<&str> = u.privileges.iter().map(|p| p.as_str()).collect();
+            let per_db: Vec<String> = u
+                .db_privileges
+                .iter()
+                .map(|(db, ps)| {
+                    let names: Vec<&str> = ps.iter().map(|p| p.as_str()).collect();
+                    format!("{}:{}", json_str(db), json_str(&names.join(",")))
+                })
+                .collect();
             items.push(format!(
-                "{{\"username\":{},\"privileges\":{},\"is_root\":{}}}",
+                "{{\"username\":{},\"privileges\":{},\"db_privileges\":{{{}}},\"is_root\":{}}}",
                 json_str(&u.name),
-                json_str(&u.privilege_str()),
+                json_str(&global.join(",")),
+                per_db.join(","),
                 u.name == ROOT_USER,
             ));
         }
@@ -3302,6 +3412,16 @@ pub(crate) fn log_query(root: &Path, db: &str, user: &str, sparql: &str) {
         "query.log",
         &format!("{}\t{}\t{}\t{}", now_millis(), db, user, sparql.replace('\n', " ")),
     );
+}
+
+/// The database a REST `/user/*` request grants on: `db_name` (validated, and
+/// never the system database), or `None` — on every database.
+fn grant_db_param(req: &Request) -> Result<Option<String>, Resp> {
+    match req.param("db_name").filter(|s| !s.trim().is_empty()) {
+        None => Ok(None),
+        Some(db) if valid_db_name(&db) && db != crate::sysdb::SYSTEM_DB => Ok(Some(db)),
+        Some(_) => Err(Resp::fail(400, "invalid db_name")),
+    }
 }
 
 /// The request's `db_name`/`db` parameter, if any (see [`pick_db_name`]).
