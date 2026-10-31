@@ -64,6 +64,34 @@ jobs:
       - name: test
         run: cargo test -p gstore --features ${{ matrix.feature }}
 
+  # Upstream gStore 1.4's own test scripts (scripts/test/*.sh) and Python SDK,
+  # run unmodified against the Rust gserver (see scripts/conformance.sh).
+  conformance:
+    name: conformance (upstream test scripts + Python SDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl, wget, python3-requests
+        run: sudo apt-get update && sudo apt-get install -y curl wget python3 python3-requests
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance
+      - name: scripts/conformance.sh
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/conformance.sh
+      - name: upload the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs
+          path: |
+            ${{ runner.temp }}/gstore-conformance.*/conformance-logs
+            ${{ runner.temp }}/gstore-conformance.*/dbhome/gserver.log
+          if-no-files-found: ignore
+
   rocksdb:
     name: test (gstore, --features rocksdb)
     runs-on: ubuntu-latest

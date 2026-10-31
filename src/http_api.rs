@@ -93,9 +93,12 @@
 //! and triple indexes — an open transaction roughly doubles its database's
 //! memory footprint until it ends. `/begin` accepts gStore's `isolevel`
 //! (`1` SERIALIZABLE — the default, `2` SNAPSHOT, `3` READ_COMMITTED, see
-//! [`TxnIsolation`]); with a single writer every level is honoured. Unknown
-//! transaction ids are `404`; committing or rolling back a finished one is
-//! `409`.
+//! [`TxnIsolation`]); with a single writer every level is honoured. Like
+//! upstream, transaction ids are numbered per loaded database, starting at 1
+//! after each load; `/tquery`, `/commit` and `/rollback` take the database
+//! (`db_name`) to tell apart an id open on several databases (without it the
+//! id must be open on exactly one, else `409`). Unknown transaction ids are
+//! `404`; committing or rolling back a finished one is `409`.
 //!
 //! **Upstream protocol.** The same server also speaks upstream gStore 1.4's
 //! own protocol — `GET|POST /api` (and `POST /`, `GET /?operation=…`) with an
@@ -483,6 +486,13 @@ pub(crate) struct DbSlot {
     pub(crate) dirty: bool,
     /// The open HTTP transaction on this database, if any.
     pub(crate) txn: Option<OpenTxn>,
+    /// The next transaction id to hand out on this database. Like upstream
+    /// gStore, which creates a `Txn_manager` (its counter starting at 1) for
+    /// every database it loads, ids are small, sequential and numbered per
+    /// loaded database: the first transaction after a load is `1` — the
+    /// upstream test scripts address it so. Ownership checks, not
+    /// unguessable ids, keep transactions apart.
+    pub(crate) next_tid: u64,
     /// Set once the database was unloaded, dropped or replaced while a request
     /// still held this handle: the slot then holds an empty placeholder that
     /// must never be queried, written or saved (it would overwrite `dir`).
@@ -510,6 +520,7 @@ impl DbSlot {
             dir,
             dirty,
             txn: None,
+            next_tid: 1,
             retired: false,
         }))
     }
@@ -734,18 +745,15 @@ pub(crate) struct ApiState {
     /// an `Arc` so a worker can clone the handle and run a query without holding
     /// the outer `ApiState` lock).
     pub(crate) dbs: HashMap<String, DbHandle>,
-    /// Open transactions by id.
-    pub(crate) txns: HashMap<u64, Txn>,
+    /// Open transactions by (database, id). Transaction ids are numbered per
+    /// loaded database (see [`DbSlot::next_tid`]), so the same id can be open
+    /// on two databases at once.
+    pub(crate) txns: HashMap<(String, u64), Txn>,
     /// The single open transaction per database (single-writer), if any.
     pub(crate) db_txn: HashMap<String, u64>,
-    /// Recently finished transactions (`tid`, outcome), newest last, bounded by
-    /// [`ENDED_TXN_MEMORY`].
-    pub(crate) ended_txns: VecDeque<(u64, &'static str)>,
-    /// The next transaction id to hand out. Like upstream gStore's
-    /// `Txn_manager` (whose counter starts at 1), ids are small and sequential
-    /// — the upstream test scripts address the first transaction as `tid=1`.
-    /// Ownership checks, not unguessable ids, keep transactions apart.
-    pub(crate) next_tid: u64,
+    /// Recently finished transactions (database, `tid`, outcome), newest last,
+    /// bounded by [`ENDED_TXN_MEMORY`].
+    pub(crate) ended_txns: VecDeque<(String, u64, &'static str)>,
     pub(crate) started: Instant,
     pub(crate) requests: u64,
     /// The `LOAD` policy installed on every database this server serves
@@ -780,19 +788,62 @@ impl ApiState {
         }
     }
 
-    pub(crate) fn remember_ended(&mut self, tid: u64, outcome: &'static str) {
+    pub(crate) fn remember_ended(&mut self, db: &str, tid: u64, outcome: &'static str) {
         if self.ended_txns.len() >= ENDED_TXN_MEMORY {
             self.ended_txns.pop_front();
         }
-        self.ended_txns.push_back((tid, outcome));
+        self.ended_txns.push_back((db.to_string(), tid, outcome));
     }
 
-    pub(crate) fn ended_outcome(&self, tid: u64) -> Option<&'static str> {
+    /// How transaction `tid` of database `db` (any database when `None`)
+    /// ended, if it is remembered.
+    pub(crate) fn ended_outcome(&self, db: Option<&str>, tid: u64) -> Option<&'static str> {
         self.ended_txns
             .iter()
             .rev()
-            .find(|(t, _)| *t == tid)
-            .map(|(_, o)| *o)
+            .find(|(d, t, _)| *t == tid && db.is_none_or(|db| d == db))
+            .map(|(_, _, o)| *o)
+    }
+
+    /// The database of open transaction `tid`: on `db` when named, else the
+    /// one database where `tid` is open. Ids are numbered per database, so
+    /// without a name an id open on several databases is ambiguous.
+    pub(crate) fn open_txn_db(&self, db: Option<&str>, tid: u64) -> Result<String, OpError> {
+        if let Some(db) = db {
+            if self.txns.contains_key(&(db.to_string(), tid)) {
+                return Ok(db.to_string());
+            }
+        } else {
+            let mut on: Vec<&String> = self
+                .txns
+                .keys()
+                .filter(|(_, t)| *t == tid)
+                .map(|(d, _)| d)
+                .collect();
+            on.sort();
+            match on.as_slice() {
+                [one] => return Ok((*one).clone()),
+                [] => {}
+                many => {
+                    let names: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+                    return Err(OpError::new(
+                        OpErrorKind::Conflict,
+                        format!(
+                            "transaction {tid} is open on several databases ({}): name the \
+                             database (db_name)",
+                            names.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(match self.ended_outcome(db, tid) {
+            Some(outcome) => OpError::new(
+                OpErrorKind::TxnEnded,
+                format!("transaction {tid} is not running (already {outcome})"),
+            ),
+            None => OpError::new(OpErrorKind::TxnUnknown, format!("no open transaction {tid}")),
+        })
     }
 
     /// The on-disk directory of database `name`.
@@ -1056,7 +1107,6 @@ impl ApiServer {
                     txns: HashMap::new(),
                     db_txn: HashMap::new(),
                     ended_txns: VecDeque::new(),
-                    next_tid: 1,
                     started: Instant::now(),
                     requests: 0,
                     load_policy: LoadPolicy::restricted(),
@@ -1353,9 +1403,13 @@ impl ApiServer {
             if let Some(open) = slot.txn.take() {
                 let _ = slot.db.rollback();
                 let mut st = locked(&inner.state);
-                let owner = st.txns.remove(&open.tid).map(|t| t.owner).unwrap_or_default();
+                let owner = st
+                    .txns
+                    .remove(&(name.clone(), open.tid))
+                    .map(|t| t.owner)
+                    .unwrap_or_default();
                 st.db_txn.remove(&name);
-                st.remember_ended(open.tid, "rolled back");
+                st.remember_ended(&name, open.tid, "rolled back");
                 append_log(
                     &st.root,
                     "txn.log",
@@ -1647,8 +1701,7 @@ impl ApiInner {
             }
             "commit" | "rollback" => self
                 .txn_id(req)
-                .and_then(|tid| st.txns.get(&tid))
-                .map(|t| t.db.clone()),
+                .and_then(|tid| st.open_txn_db(self.req_db_name(req).as_deref(), tid).ok()),
             _ => self.pick_db(st, req),
         };
         match target {
@@ -2542,15 +2595,14 @@ impl ApiInner {
                 let _ = slot.db.rollback();
                 return Err(e);
             }
-            // Sequential, like upstream (see `ApiState::next_tid`); skip any id
-            // still known so a wrapped counter never reuses one.
-            let mut tid = st.next_tid.max(1);
-            while st.txns.contains_key(&tid) || st.ended_outcome(tid).is_some() {
-                tid = tid.checked_add(1).unwrap_or(1);
-            }
-            st.next_tid = tid.checked_add(1).unwrap_or(1);
+            // Sequential per loaded database, like upstream (see
+            // `DbSlot::next_tid`). An id this database used before it was last
+            // (re)loaded starts a new life: forget how it ended then.
+            let tid = slot.next_tid.max(1);
+            slot.next_tid = tid.checked_add(1).unwrap_or(1);
+            st.ended_txns.retain(|(d, t, _)| !(*t == tid && d == name));
             st.txns.insert(
-                tid,
+                (name.to_string(), tid),
                 Txn {
                     db: name.to_string(),
                     owner: user.to_string(),
@@ -2582,22 +2634,20 @@ impl ApiInner {
         Ok(tid)
     }
 
-    /// Look up open transaction `tid` for `user`: unknown ids are `404`, already
-    /// finished ones `409`, and someone else's transaction `403` (only the
+    /// Look up open transaction `tid` of database `db` (when not named: the one
+    /// database where `tid` is open, see [`ApiState::open_txn_db`]) for `user`:
+    /// unknown ids are `404`, already finished ones `409`, an id open on
+    /// several databases `409`, and someone else's transaction `403` (only the
     /// owner or `root` may touch it). Returns the transaction's database.
-    pub(crate) fn txn_for(&self, st: &ApiState, tid: u64, user: &str) -> Result<String, OpError> {
-        let Some(txn) = st.txns.get(&tid) else {
-            return Err(match st.ended_outcome(tid) {
-                Some(outcome) => OpError::new(
-                    OpErrorKind::TxnEnded,
-                    format!("transaction {tid} is not running (already {outcome})"),
-                ),
-                None => OpError::new(
-                    OpErrorKind::TxnUnknown,
-                    format!("no open transaction {tid}"),
-                ),
-            });
-        };
+    pub(crate) fn txn_for(
+        &self,
+        st: &ApiState,
+        db: Option<&str>,
+        tid: u64,
+        user: &str,
+    ) -> Result<String, OpError> {
+        let name = st.open_txn_db(db, tid)?;
+        let txn = &st.txns[&(name, tid)];
         if txn.owner != user && user != ROOT_USER {
             return Err(OpError::new(
                 OpErrorKind::NotOwner,
@@ -2611,7 +2661,7 @@ impl ApiInner {
         let Some(tid) = self.txn_id(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
-        let name = match self.txn_for(st, tid, user) {
+        let name = match self.txn_for(st, self.req_db_name(req).as_deref(), tid, user) {
             Ok(name) => name,
             Err(e) => return Dispatch::Done(e.rest()),
         };
@@ -2718,7 +2768,7 @@ impl ApiInner {
         let Some(tid) = self.txn_id(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
-        let db_name = match self.txn_for(st, tid, user) {
+        let db_name = match self.txn_for(st, self.req_db_name(req).as_deref(), tid, user) {
             Ok(name) => name,
             Err(e) => return Dispatch::Done(e.rest()),
         };
@@ -2726,21 +2776,22 @@ impl ApiInner {
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let verb = if commit { "commit" } else { "rollback" };
-            match inner.end_txn(dbh.as_ref(), tid, &user, commit) {
+            match inner.end_txn(dbh.as_ref(), &db_name, tid, &user, commit) {
                 Ok(warning) => Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning),
                 Err(e) => e.rest(),
             }
         }))
     }
 
-    /// Commit (or roll back) open transaction `tid` on behalf of `user`;
-    /// `dbh` is the handle of its database (looked up beforehand, `None` when
-    /// it is no longer loaded). Must be called with no lock held. Returns the
-    /// warning of a failed check_point save after a commit that changed data
-    /// (the commit itself stands).
+    /// Commit (or roll back) open transaction `tid` of database `db` on behalf
+    /// of `user`; `dbh` is the handle of `db` (looked up beforehand, `None`
+    /// when it is no longer loaded). Must be called with no lock held. Returns
+    /// the warning of a failed check_point save after a commit that changed
+    /// data (the commit itself stands).
     pub(crate) fn end_txn(
         &self,
         dbh: Option<&DbHandle>,
+        db: &str,
         tid: u64,
         user: &str,
         commit: bool,
@@ -2751,10 +2802,13 @@ impl ApiInner {
         // /begin, /tquery and a concurrent /commit of the same tid).
         let txn = {
             let mut st = locked(&self.state);
-            self.txn_for(&st, tid, user)?;
-            let txn = st.txns.remove(&tid).expect("checked by txn_for");
+            self.txn_for(&st, Some(db), tid, user)?;
+            let txn = st
+                .txns
+                .remove(&(db.to_string(), tid))
+                .expect("checked by txn_for");
             st.db_txn.remove(&txn.db);
-            st.remember_ended(tid, if commit { "committed" } else { "rolled back" });
+            st.remember_ended(db, tid, if commit { "committed" } else { "rolled back" });
             txn
         };
         let result = match slot.as_mut().filter(|s| !s.retired) {

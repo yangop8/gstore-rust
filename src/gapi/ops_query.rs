@@ -385,17 +385,11 @@ fn txn_db_loaded(ctx: &Ctx<'_>, db: &str) -> Result<(), GResp> {
 }
 
 /// Resolve transaction `tid` of the caller on `db`: its database's handle.
-/// A transaction on another database is a wrong id for this one (upstream
-/// keeps one transaction manager per database).
+/// Ids are numbered per database (upstream keeps one transaction manager per
+/// loaded database), so `tid` is only looked up on `db`.
 fn txn_target(ctx: &Ctx<'_>, db: &str, tid: u64) -> Result<Option<DbHandle>, OpError> {
     let st = ctx.state();
-    let name = ctx.inner.txn_for(&st, tid, ctx.user())?;
-    if name != db {
-        return Err(OpError::new(
-            OpErrorKind::TxnUnknown,
-            format!("transaction {tid} does not belong to database '{db}'"),
-        ));
-    }
+    let name = ctx.inner.txn_for(&st, Some(db), tid, ctx.user())?;
     Ok(st.dbs.get(&name).map(Arc::clone))
 }
 
@@ -468,7 +462,10 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
         Ok(h) => h,
         Err(e) => return txn_error(&fail_prefix, e),
     };
-    match ctx.inner.end_txn(dbh.as_ref(), tid, ctx.user(), commit) {
+    match ctx
+        .inner
+        .end_txn(dbh.as_ref(), &db, tid, ctx.user(), commit)
+    {
         Ok(warning) => {
             let mut r = GResp::success(done);
             if let Some(w) = warning {
