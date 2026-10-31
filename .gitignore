@@ -19,3 +19,7 @@ gnlqa.conf
 
 # macOS Finder metadata
 .DS_Store
+
+# Python bytecode (scripts/conformance.sh runs upstream's Python SDK)
+__pycache__/
+*.pyc
