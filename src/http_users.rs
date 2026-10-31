@@ -215,6 +215,16 @@ pub enum CredentialCheck {
     NeedsPlaintextLogin,
 }
 
+/// How [`UserStore::begin_check`] starts a credential check.
+#[derive(Debug)]
+pub enum CheckStart {
+    /// The outcome is known without the slow step (recently verified).
+    Done(CredentialCheck),
+    /// The slow step is needed: [`PendingCheck::run`] it (without the
+    /// store), then hand the result to [`UserStore::finish_check`].
+    Pending(PendingCheck),
+}
+
 /// A credential check set up by [`UserStore::begin_check`], to be [`run`]
 /// without the store borrowed (it does the slow PBKDF2 work) and then handed
 /// to [`UserStore::finish_check`].
@@ -825,8 +835,8 @@ impl UserStore {
     /// that only a plaintext login can verify (and migrate).
     pub fn check_credentials(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
         let pending = match self.prepare(name, secret, form, false) {
-            Ok(outcome) => return outcome,
-            Err(pending) => pending,
+            CheckStart::Done(outcome) => return outcome,
+            CheckStart::Pending(pending) => pending,
         };
         let checked = pending.run_verify_only();
         if checked.outcome == CredentialCheck::Valid {
@@ -847,8 +857,8 @@ impl UserStore {
     /// should split the check with [`begin_check`](Self::begin_check) instead.
     pub fn authenticate(&mut self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
         match self.begin_check(name, secret, form) {
-            Ok(outcome) => outcome,
-            Err(pending) => {
+            CheckStart::Done(outcome) => outcome,
+            CheckStart::Pending(pending) => {
                 let checked = pending.run();
                 self.finish_check(checked)
             }
@@ -859,15 +869,15 @@ impl UserStore {
     /// in three so the slow PBKDF2 work can run **without** the store borrowed
     /// (e.g. with the server's state lock released):
     ///
-    /// 1. `begin_check` (store borrowed, fast): `Ok(outcome)` when the answer
-    ///    is known at once — the same credentials verified recently (the
-    ///    verified-credentials cache) and the entry needs no re-hash; else a
-    ///    [`PendingCheck`] holding a copy of the stored verifier;
+    /// 1. `begin_check` (store borrowed, fast): [`CheckStart::Done`] when the
+    ///    answer is known at once — the same credentials verified recently
+    ///    (the verified-credentials cache) and the entry needs no re-hash;
+    ///    else [`CheckStart::Pending`] with a copy of the stored verifier;
     /// 2. [`PendingCheck::run`] (no borrow, slow): verify, and compute the
     ///    re-hashed entry if the user's entry needs migrating;
     /// 3. [`finish_check`](Self::finish_check) (store borrowed mutably, fast):
     ///    remember the verified credentials and install the re-hashed entry.
-    pub fn begin_check(&self, name: &str, secret: &str, form: PasswordForm) -> Result<CredentialCheck, PendingCheck> {
+    pub fn begin_check(&self, name: &str, secret: &str, form: PasswordForm) -> CheckStart {
         self.prepare(name, secret, form, true)
     }
 
@@ -920,7 +930,7 @@ impl UserStore {
         secret: &str,
         form: PasswordForm,
         upgrading: bool,
-    ) -> Result<CredentialCheck, PendingCheck> {
+    ) -> CheckStart {
         // The cache is keyed by the normalized secret, so `ABC…` and `abc…`
         // digests share an entry.
         let secret = match form {
@@ -940,10 +950,10 @@ impl UserStore {
         };
         if let Some(stored) = &pending.stored {
             if self.cached(&pending) && !(upgrading && stored.needs_upgrade()) {
-                return Ok(CredentialCheck::Valid);
+                return CheckStart::Done(CredentialCheck::Valid);
             }
         }
-        Err(pending)
+        CheckStart::Pending(pending)
     }
 
     /// Whether `pending`'s credentials are in the verified-credentials cache.
@@ -1539,23 +1549,29 @@ mod tests {
         .unwrap();
         let mut store = UserStore::open(&path, "rootpw").unwrap();
         let plain = PasswordForm::Plain;
+        let needs_slow_step = |store: &UserStore, name: &str, pw: &str| -> bool {
+            matches!(store.begin_check(name, pw, plain), CheckStart::Pending(_))
+        };
         let split = |store: &UserStore, name: &str, pw: &str| -> CheckedCredentials {
-            store
-                .begin_check(name, pw, plain)
-                .expect_err("not cached yet")
-                .run()
+            match store.begin_check(name, pw, plain) {
+                CheckStart::Pending(p) => p.run(),
+                CheckStart::Done(o) => panic!("{name}: answered from the cache ({o:?})"),
+            }
         };
 
         // Fresh credentials need the slow step; afterwards they are cached.
         let checked = split(&store, ROOT_USER, "rootpw");
         assert_eq!(checked.outcome(), CredentialCheck::Valid);
         assert_eq!(store.finish_check(checked), CredentialCheck::Valid);
-        assert_eq!(store.begin_check(ROOT_USER, "rootpw", plain).unwrap(), CredentialCheck::Valid);
+        assert!(matches!(
+            store.begin_check(ROOT_USER, "rootpw", plain),
+            CheckStart::Done(CredentialCheck::Valid)
+        ));
         // Wrong passwords and unknown users are never cached.
         for (u, pw) in [(ROOT_USER, "nope"), ("nobody", "x")] {
             let checked = split(&store, u, pw);
             assert_eq!(store.finish_check(checked), CredentialCheck::Invalid);
-            assert!(store.begin_check(u, pw, plain).is_err());
+            assert!(needs_slow_step(&store, u, pw));
         }
 
         // Two concurrent first logins of an entry in the older format: both
@@ -1577,7 +1593,7 @@ mod tests {
         let pending = split(&store, "eve", "old");
         store.set_password("eve", "new").unwrap();
         assert_eq!(store.finish_check(pending), CredentialCheck::Invalid);
-        assert!(store.begin_check("eve", "old", plain).is_err(), "never cached");
+        assert!(needs_slow_step(&store, "eve", "old"), "never cached");
         // So does dropping the user.
         let pending = split(&store, "eve", "new");
         store.drop_user("eve").unwrap();

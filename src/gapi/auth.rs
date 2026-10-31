@@ -19,7 +19,7 @@
 use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{Ctx, SYSTEM_DB};
-use crate::http_users::{CredentialCheck, PasswordForm, Privilege, ROOT_USER};
+use crate::http_users::{CheckStart, CredentialCheck, PasswordForm, Privilege, ROOT_USER};
 
 /// Which of upstream's two IP checks is being made (`check_access_ip` stage
 /// `1`: every request; stage `2`: every operation but `login` /
@@ -101,8 +101,8 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
     // bookkeeping steps run under the lock.
     let prepared = ctx.state().users.begin_check(&username, &password, form);
     let outcome = match prepared {
-        Ok(outcome) => outcome,
-        Err(pending) => {
+        CheckStart::Done(outcome) => outcome,
+        CheckStart::Pending(pending) => {
             let checked = pending.run();
             ctx.state().users.finish_check(checked)
         }
