@@ -389,6 +389,24 @@ fn rdfs_inference_invalidates() {
     ));
 }
 
+/// A data change releases the CSR built for the old data at once, instead
+/// of keeping it alive until the next graph-function query (with
+/// `ConcurrentDb`, whose reads go to snapshots, possibly forever).
+#[test]
+fn a_mutation_releases_the_stale_csr() {
+    let mut db = social();
+    db.preload_csr().unwrap();
+    let stale = Arc::downgrade(&db.cached_csr().unwrap());
+    db.query("INSERT DATA { <Zed> <like> <Alice> }").unwrap();
+    assert!(!db.csr_is_cached());
+    assert!(stale.upgrade().is_none(), "stale CSR still alive");
+    let cdb = gstore::ConcurrentDb::new(social());
+    cdb.write(|db| db.preload_csr()).unwrap();
+    let stale = cdb.write(|db| Arc::downgrade(&db.cached_csr().unwrap()));
+    cdb.update("INSERT DATA { <Zed> <like> <Alice> }").unwrap();
+    assert!(stale.upgrade().is_none(), "writer's stale CSR still alive");
+}
+
 #[test]
 fn preload_builds_eagerly() {
     let db = social();

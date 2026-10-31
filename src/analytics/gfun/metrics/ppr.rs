@@ -251,7 +251,10 @@ pub(super) fn ssppr(
         .into_iter()
         .map(|v| (v, v2ppr.get(v).unwrap_or(0.0)))
         .collect();
-    let mut topk: Vec<(Option<Node>, f64)> = vec![(None, 0.0); ret_num];
+    // `topk.resize(retNum)`: slots beyond `v2ppr` stay `(0, 0.0)` and are
+    // trimmed below (keeping at least one), so one unfilled slot behaves
+    // like all of them — never allocate more (`retNum` may be `INT_MAX`).
+    let mut topk: Vec<(Option<Node>, f64)> = vec![(None, 0.0); ret_num.min(items.len() + 1)];
     let sorted = cxx_partial_sort_copy_by(&items, ret_num, |l, r| l.1 > r.1);
     for (slot, (v, x)) in topk.iter_mut().zip(sorted) {
         *slot = (Some(v), x);
@@ -840,7 +843,10 @@ fn if_stop(
     let error_2 = 1.0 + epsilon;
     topk_filter.clean();
     let temp_bounds: Vec<(Node, f64)> = lower.occur.iter().map(|&v| (v, lower.get(v))).collect();
-    let mut topk: Vec<(Node, f64)> = vec![(0, 0.0); ret_num];
+    // `topk.resize(retNum)`: the unfilled `(0, 0.0)` slots all repeat the
+    // same checks on vertex 0, and the last one is `topk[retNum - 1]`, so
+    // one of them stands for all (`retNum` may be `INT_MAX`).
+    let mut topk: Vec<(Node, f64)> = vec![(0, 0.0); ret_num.min(temp_bounds.len() + 1)];
     let sorted = cxx_partial_sort_copy_by(&temp_bounds, ret_num, |l, r| l.1 > r.1);
     for (slot, x) in topk.iter_mut().zip(sorted) {
         *slot = x;
@@ -852,7 +858,7 @@ fn if_stop(
             return false;
         }
     }
-    let low_bound_k = topk[ret_num - 1].1;
+    let low_bound_k = topk[topk.len() - 1].1;
     if low_bound_k <= delta {
         return false;
     }
@@ -870,4 +876,54 @@ fn if_stop(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::IdTriple;
+
+    /// `if_stop` with a `retNum` beyond the vertex count behaves as with
+    /// `n + 1` (one unfilled `(0, 0.0)` slot stands for all of them) and
+    /// allocates nothing `retNum`-sized.
+    #[test]
+    fn if_stop_with_a_huge_ret_num() {
+        // 4 vertices: 0 -> 1 -> 2 -> 3 over predicate 0.
+        let g = CsrGraph::from_id_triples(
+            [(0, 1), (1, 2), (2, 3)]
+                .iter()
+                .map(|&(s, o)| IdTriple::new(s, 0, o))
+                .collect(),
+        )
+        .unwrap();
+        let n = g.num_nodes();
+        assert_eq!(n, 4);
+        let run = |ret_num: usize| {
+            // Equal positive bounds pass the ratio checks; `delta` below
+            // `threshold` reaches the top-k part.
+            let upper = IMap::all_keys(n, 0.5);
+            let lower = IMap::all_keys(n, 0.5);
+            let mut topk_filter = IMap::new(n);
+            let mut v2ppr = V2Ppr::new(&g);
+            let mut temp = Vec::new();
+            if_stop(
+                ret_num,
+                0.001,
+                1.0,
+                0.5,
+                &mut topk_filter,
+                &upper,
+                &lower,
+                &mut v2ppr,
+                &mut temp,
+            )
+        };
+        // retNum <= n: the k-th lower bound (0.5) is above delta → stop.
+        assert!(run(2));
+        assert!(run(n));
+        // retNum > n: the k-th slot is unfilled (0.0 <= delta) → go on.
+        assert!(!run(n + 1));
+        assert!(!run(i32::MAX as usize));
+        assert!(!run(usize::MAX >> 1));
+    }
 }

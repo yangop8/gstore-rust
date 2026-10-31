@@ -402,10 +402,12 @@ impl Database {
         self.csr_cache.peek(self.mutations)
     }
 
-    /// Record an applied data mutation: invalidate cached query results and
-    /// advance [`mutation_count`](Self::mutation_count).
+    /// Record an applied data mutation: invalidate cached query results,
+    /// drop the now stale CSR (so it is not kept alive until the next graph
+    /// function query) and advance [`mutation_count`](Self::mutation_count).
     fn touched(&mut self) {
         self.query_cache.get_mut().clear();
+        self.csr_cache.clear();
         self.mutations += 1;
     }
 
@@ -1055,6 +1057,16 @@ impl Database {
                 Ok(result)
             }
             Query::Update(ops) => {
+                // Reject a statically invalid request (an unknown IRI
+                // function, a graph function in FILTER/BIND, …) before any of
+                // its operations is applied.
+                if ops.iter().any(|op| matches!(op, UpdateOp::Modify { .. })) {
+                    let mut eval = Evaluator::new(&self.dict, &self.store);
+                    if !self.functions.is_empty() {
+                        eval = eval.with_functions(self.functions.clone());
+                    }
+                    eval.check_update_calls(&ops)?;
+                }
                 let before = self.mutations;
                 let mut changed = 0;
                 for op in ops {

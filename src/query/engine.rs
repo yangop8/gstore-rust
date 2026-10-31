@@ -27,8 +27,10 @@
 //!   nested use is a query error that points to the legacy `rs:` function.
 //! * **Arguments.** A variable vertex argument contributes the *distinct*
 //!   values it is bound to across the WHERE solutions, in first-appearance
-//!   order (rows where it is unbound are skipped; a computed value that is
-//!   not a stored term is skipped, as upstream skips string columns; a stored
+//!   order (rows where it is unbound are skipped; a variable bound only by
+//!   `BIND` has no usable value at all, whatever it computes, because
+//!   upstream keeps BIND results in string columns and skips them; another
+//!   computed value that is not a stored term is skipped too; a stored
 //!   literal is passed as an edge-less vertex, as upstream passes its literal
 //!   id); a constant IRI is one vertex (unknown → upstream's `INVALID` id,
 //!   [`GNode::MISSING`]). Two vertex arguments are evaluated over the
@@ -51,6 +53,16 @@
 //!   OFFSET and LIMIT apply to the rows as usual. Next to standard aggregates
 //!   (`COUNT` …) without GROUP BY the query keeps SPARQL's one-row aggregate
 //!   semantics (upstream would emit one mostly empty row per solution).
+//! * **LIMIT pushdown.** When the WHERE clause is a single BGP (triple
+//!   patterns only) with a LIMIT and no ORDER BY, upstream stops the BGP
+//!   after LIMIT rows (`singleBGP` + the `limitK` strategy; OFFSET is not
+//!   added), so the functions — and GROUP BY, aggregates and the row shape
+//!   above — see only the first LIMIT solutions (in this engine's solution
+//!   order; upstream's depends on its join order). OFFSET and LIMIT then
+//!   apply to the rows as usual.
+//! * **HAVING.** Upstream treats a projected function as an aggregate, so
+//!   without GROUP BY the solutions form one group and a failing HAVING
+//!   leaves every function value unbound (the rows stay).
 //! * **Values.** The `{"paths":[…]}` JSON text is a plain literal, exactly as
 //!   upstream emits it; `cycleBoolean` is an `xsd:boolean`;
 //!   `confidenceDegree`'s JSON array (upstream's `pfn_type`, which replaces
@@ -708,6 +720,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // upstream's row shape — see the module docs, "Advanced graph
         // functions".
         let gfns = graph_fn_items(q)?;
+        // Upstream's LIMIT pushdown: a WHERE clause that is one BGP, with a
+        // LIMIT and no ORDER BY, stops its BGP after LIMIT rows (OFFSET is not
+        // added), so the functions only see those rows.
+        if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(&q.pattern) {
+            if let Some(limit) = q.limit {
+                solutions.truncate(limit);
+            }
+        }
+        let bind_only = if gfns.is_empty() {
+            HashSet::new()
+        } else {
+            bind_only_vars(&q.pattern)
+        };
         let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
         let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
         let mut rows = if !gfns.is_empty()
@@ -722,6 +747,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     &gfns[0].call,
                     &[],
                     &layout,
+                    &bind_only,
                     true,
                 )?]]
             } else {
@@ -729,16 +755,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         } else if only_gfn && !has_agg {
             // A lone graph function over the solutions: exactly one row
-            // (upstream reserves `resultSz = 1`, GE:2041-2050).
+            // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
+            // form one group: a failing HAVING leaves the value unset
+            // (GE:2071-2075).
             let all: Vec<&Binding> = solutions.iter().collect();
-            vec![vec![self.eval_graph_fn(
-                &gfns[0].call,
-                &all,
-                &layout,
-                false,
-            )?]]
+            let value = if self.having_holds(q, &all, &layout) {
+                self.eval_graph_fn(&gfns[0].call, &all, &layout, &bind_only, false)?
+            } else {
+                None
+            };
+            vec![vec![value]]
         } else if has_agg {
-            let mut rows = self.eval_aggregation(&solutions, &layout, q)?;
+            let mut rows = self.eval_aggregation(&solutions, &layout, &bind_only, q)?;
             // Aggregated rows are ordered over the projected result layout —
             // ORDER BY here references group keys / aggregate aliases.
             if !q.order_by.is_empty() {
@@ -750,13 +778,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // Graph functions next to other projections: one row per
             // solution, each function's value on the *last* solution only
             // (upstream writes it to `result.back()`, GE:3100-3108; "last" is
-            // in WHERE order, before ORDER BY). The value becomes a column
+            // in WHERE order, before ORDER BY), or on none when HAVING fails
+            // over the solutions as one group. The value becomes a column
             // under its alias so ORDER BY can refer to it.
             if !gfns.is_empty() {
                 let all: Vec<&Binding> = solutions.iter().collect();
+                let keep = self.having_holds(q, &all, &layout);
                 let mut values = Vec::with_capacity(gfns.len());
                 for g in &gfns {
-                    values.push(self.eval_graph_fn(&g.call, &all, &layout, false)?);
+                    values.push(if keep {
+                        self.eval_graph_fn(&g.call, &all, &layout, &bind_only, false)?
+                    } else {
+                        None
+                    });
                 }
                 for (g, v) in gfns.iter().zip(values) {
                     if layout.index.contains_key(&g.alias) {
@@ -856,13 +890,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// node), the `predSet` against the dictionary, and run the gfun library
     /// on the shared CSR. `constant` is upstream's no-solution path, where a
     /// variable argument is looked up as if it were an IRI and so is a
-    /// missing vertex. Returns the value's id (a plain-literal JSON text, an
-    /// `xsd:boolean` for `cycleBoolean`, …).
+    /// missing vertex. A variable in `bind_only` ([`bind_only_vars`]) has no
+    /// usable binding: upstream keeps BIND results in string columns and
+    /// rejects them as vertices ("src must be an entity", GE:2583-2606),
+    /// whatever their value. Returns the value's id (a plain-literal JSON
+    /// text, an `xsd:boolean` for `cycleBoolean`, …).
     fn eval_graph_fn(
         &self,
         call: &GCall,
         sols: &[&Binding],
         layout: &VarLayout,
+        bind_only: &HashSet<String>,
         constant: bool,
     ) -> Result<Option<u32>> {
         let csr = self.gfun_csr()?;
@@ -871,6 +909,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 None => Vec::new(),
                 Some(VarOrIri::Iri(iri)) => vec![gfun::iri_node(&csr, self.dict, iri)],
                 Some(VarOrIri::Var(_)) if constant => vec![GNode::MISSING],
+                Some(VarOrIri::Var(v)) if bind_only.contains(v) => Vec::new(),
                 Some(VarOrIri::Var(v)) => self.distinct_gfn_nodes(v, sols, layout, &csr),
             }
         };
@@ -913,9 +952,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// The distinct vertices a graph-function variable is bound to across
     /// `sols`, in first-appearance order. Unbound rows are skipped (GE:2582
-    /// `!= INVALID`); a computed value that is not a stored term (a BIND /
-    /// VALUES result outside the dictionary — upstream's string columns,
-    /// "src must be an entity", GE:2577) is skipped; a stored literal is
+    /// `!= INVALID`); a computed value that is not a stored term (e.g. a
+    /// VALUES result outside the dictionary, like upstream's string columns,
+    /// "src must be an entity", GE:2577) is skipped (variables bound only by
+    /// BIND never get here, see `eval_graph_fn`); a stored literal is
     /// passed with its dictionary id and no CSR vertex, as upstream passes
     /// its literal id (it has no edges and prints as its literal text); a
     /// predicate-position binding is the entity with the same IRI, if any.
@@ -957,10 +997,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Group solutions and compute aggregates / projected expressions.
+    /// `bind_only` is [`bind_only_vars`] of the pattern, for the projected
+    /// graph functions.
     fn eval_aggregation(
         &self,
         solutions: &[Binding],
         layout: &VarLayout,
+        bind_only: &HashSet<String>,
         q: &SelectQuery,
     ) -> Result<Vec<Vec<Option<u32>>>> {
         // Group key = the GROUP BY expression values (empty ⇒ one group).
@@ -1008,12 +1051,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for key in &order {
             let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
             // HAVING: drop groups failing any constraint.
-            let keep = q.having.iter().all(|h| {
-                self.eval_group_expr(h, &sols, layout, &key_vars, key)
-                    .and_then(|v| v.ebv())
-                    == Some(true)
-            });
-            if !keep {
+            if !self.group_passes_having(q, &sols, layout, &key_vars, key) {
                 continue;
             }
             let mut row = Vec::with_capacity(items.len());
@@ -1027,7 +1065,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     // (upstream: once per GROUP BY group, GE:2546-2620).
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         let call = GCall::from_ast(*func, args)?;
-                        self.eval_graph_fn(&call, &sols, layout, false)?
+                        self.eval_graph_fn(&call, &sols, layout, bind_only, false)?
                     }
                     SelectItem::Expr(e, _) => self
                         .eval_group_expr(e, &sols, layout, &key_vars, key)
@@ -1041,6 +1079,28 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     // ---- aggregate / group-expression evaluation -------------------------
+
+    /// Whether a group's solutions satisfy every HAVING constraint of `q`.
+    fn group_passes_having(
+        &self,
+        q: &SelectQuery,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        key_vars: &HashMap<String, usize>,
+        key: &[Option<u32>],
+    ) -> bool {
+        q.having.iter().all(|h| {
+            self.eval_group_expr(h, sols, layout, key_vars, key)
+                .and_then(|v| v.ebv())
+                == Some(true)
+        })
+    }
+
+    /// HAVING over all of `sols` as one group (no GROUP BY) — upstream treats
+    /// a projected graph function as an aggregate, so its HAVING applies.
+    fn having_holds(&self, q: &SelectQuery, sols: &[&Binding], layout: &VarLayout) -> bool {
+        self.group_passes_having(q, sols, layout, &HashMap::new(), &[])
+    }
 
     /// Evaluate an expression in group context (may contain aggregates).
     fn eval_group_expr(
@@ -3811,6 +3871,55 @@ fn pattern_is_trivially_empty(gp: &GraphPattern) -> bool {
     }
 }
 
+/// Upstream's `singleBGP` (QueryParser.cpp:1033-1034): the WHERE clause is
+/// triple patterns only — no FILTER, OPTIONAL, UNION, BIND, VALUES, MINUS,
+/// property path, … — which enables its LIMIT pushdown. (The parser folds
+/// a bare nested group `{ { … } }` of triple patterns into one BGP, so that
+/// counts here too; upstream would not push its LIMIT down.)
+fn pattern_is_single_bgp(gp: &GraphPattern) -> bool {
+    matches!(gp, GraphPattern::Bgp(tps) if !tps.is_empty())
+}
+
+/// The variables `gp` binds only through `BIND` (no triple, path, VALUES,
+/// sub-SELECT or `GRAPH ?g` binds them too). Upstream always stores a BIND
+/// result in a string column (`TempResult::doBind`, TempResult.cpp:1566),
+/// which a graph function rejects as a vertex, whether or not the value is
+/// a stored term.
+fn bind_only_vars(gp: &GraphPattern) -> HashSet<String> {
+    fn walk(gp: &GraphPattern, binds: &mut Vec<String>, other: &mut Vec<String>) {
+        match gp {
+            GraphPattern::Extend(inner, v, _) => {
+                walk(inner, binds, other);
+                binds.push(v.clone());
+            }
+            GraphPattern::Join(a, b)
+            | GraphPattern::Union(a, b)
+            | GraphPattern::Minus(a, b)
+            | GraphPattern::LeftJoin(a, b, _) => {
+                walk(a, binds, other);
+                walk(b, binds, other);
+            }
+            GraphPattern::Filter(_, inner) | GraphPattern::Service { pattern: inner, .. } => {
+                walk(inner, binds, other)
+            }
+            GraphPattern::Graph(g, inner) => {
+                if let GraphTerm::Var(v) = g {
+                    other.push(v.clone());
+                }
+                walk(inner, binds, other);
+            }
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _)
+            | GraphPattern::SubSelect(_) => gp.collect_vars(other),
+        }
+    }
+    let (mut binds, mut other) = (Vec::new(), Vec::new());
+    walk(gp, &mut binds, &mut other);
+    binds.into_iter().filter(|v| !other.contains(v)).collect()
+}
+
 // ---------------------------------------------------------------------------
 // call validation (before evaluation)
 // ---------------------------------------------------------------------------
@@ -3886,8 +3995,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(p) => self.check_pattern_calls(p),
                 None => Ok(()),
             },
-            Query::Update(_) => Ok(()),
+            Query::Update(ops) => self.check_update_calls(ops),
         }
+    }
+
+    /// The same checks for every `WHERE` clause of an UPDATE request. They
+    /// only read the request and the function registry, so
+    /// [`Database`](crate::Database) runs them before the first operation:
+    /// a statically invalid request is rejected as a whole, with nothing
+    /// applied.
+    pub fn check_update_calls(&self, ops: &[UpdateOp]) -> Result<()> {
+        ops.iter().try_for_each(|op| match op {
+            UpdateOp::Modify { pattern, .. } => self.check_pattern_calls(pattern),
+            _ => Ok(()),
+        })
     }
 
     fn check_select_calls(&self, s: &SelectQuery) -> Result<()> {
@@ -5565,11 +5686,11 @@ mod gfun_engine_tests {
         let layout = VarLayout::build(&q.pattern);
         // `eval_graph_fn` does not check the flag itself: the library does,
         // through the context the evaluator hands it.
-        let r = ev.eval_graph_fn(&items[0].call, &[], &layout, true);
+        let r = ev.eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true);
         assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
         flag.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(ev
-            .eval_graph_fn(&items[0].call, &[], &layout, true)
+            .eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true)
             .unwrap()
             .is_some());
     }

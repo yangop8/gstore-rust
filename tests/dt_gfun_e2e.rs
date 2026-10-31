@@ -897,13 +897,15 @@ fn next_to_other_projections_the_value_is_on_the_last_row() {
     );
     assert_eq!(rs.rows.len(), 2);
     assert_eq!(rs.rows.iter().filter(|r| r[0].is_some()).count(), 1);
-    // LIMIT / OFFSET / DISTINCT apply to the rows as usual.
+    // LIMIT on a single BGP is pushed below the function (upstream's
+    // limitK): it sees the first solution only, which is the last row.
     let rs = select(
         &mut db,
         "SELECT ?x (bfsCount(?x, true, {}) AS ?c) WHERE { <Francis> <dislike> ?x } LIMIT 1",
     );
     assert_eq!(rs.rows.len(), 1);
-    assert_eq!(rs.rows[0][1], None);
+    assert_eq!(plain(&rs.rows[0][1]), bfs(&lib, xs[..1].to_vec()));
+    // OFFSET / DISTINCT apply to the rows as usual.
     let rs = select(
         &mut db,
         "SELECT ?x (bfsCount(?x, true, {}) AS ?c) WHERE { <Francis> <dislike> ?x } OFFSET 1",
@@ -955,6 +957,217 @@ fn group_by_evaluates_once_per_group() {
     );
     assert_eq!(rs.rows.len(), 1);
     assert!(plain(&rs.rows[0][1]).contains("<Carol>"));
+}
+
+/// Upstream pushes LIMIT into a WHERE clause that is a single BGP when there
+/// is no ORDER BY (`singleBGP`, GE:921-926, the limitK strategy): the BGP
+/// stops after LIMIT rows (OFFSET is not added), so the functions see only
+/// those.
+#[test]
+fn single_bgp_limit_is_pushed_below_graph_functions() {
+    let mut db = social();
+    let lib_db = social();
+    let lib = Lib::new(&lib_db);
+    // `?x <like> ?y` has five solutions with five distinct ?x.
+    let xs = bindings(&mut db, "?x <like> ?y");
+    assert_eq!(xs.len(), 5);
+    let alice = lib.nodes(&["<Alice>"]);
+    let len_to_alice = |srcs: &[GNode]| {
+        lib.json(
+            GFnKind::ShortestPathLen,
+            &GArgs {
+                srcs: srcs.to_vec(),
+                dsts: alice.clone(),
+                directed: true,
+                ..args(lib.all())
+            },
+        )
+    };
+    // A lone function: one row over the first LIMIT solutions.
+    let got = json(
+        &mut db,
+        "SELECT (shortestPathLen(?x, <Alice>, true, {}) AS ?l) WHERE { ?x <like> ?y } LIMIT 1",
+    );
+    assert_eq!(got, len_to_alice(&xs[..1]));
+    // Next to a variable: LIMIT rows, the value on the last of them.
+    let rs = select(
+        &mut db,
+        "SELECT ?x (shortestPathLen(?x, <Alice>, true, {}) AS ?l) WHERE { ?x <like> ?y } LIMIT 2",
+    );
+    assert_eq!(rs.rows.len(), 2);
+    assert_eq!(rs.rows[0][1], None);
+    assert_eq!(plain(&rs.rows[1][1]), len_to_alice(&xs[..2]));
+    // OFFSET is applied to the rows afterwards (the BGP still stops after
+    // LIMIT rows).
+    let rs = select(
+        &mut db,
+        "SELECT ?x (shortestPathLen(?x, <Alice>, true, {}) AS ?l) WHERE { ?x <like> ?y } \
+         LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(plain(&rs.rows[0][1]), len_to_alice(&xs[..2]));
+    // GROUP BY groups only those solutions.
+    let rs = select(
+        &mut db,
+        "SELECT ?y (bfsCount(?x, true, {}) AS ?c) WHERE { ?x <like> ?y } GROUP BY ?y LIMIT 1",
+    );
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(plain(&rs.rows[0][1]), bfs(&lib, xs[..1].to_vec()));
+    // No pushdown with ORDER BY, or when the WHERE clause is more than one
+    // BGP: the function sees every solution.
+    let all = len_to_alice(&xs);
+    let rs = select(
+        &mut db,
+        "SELECT ?x (shortestPathLen(?x, <Alice>, true, {}) AS ?l) WHERE { ?x <like> ?y } \
+         ORDER BY DESC(?x) LIMIT 5",
+    );
+    let values: Vec<_> = rs.rows.iter().filter_map(|r| r[1].as_ref()).collect();
+    assert_eq!(values.len(), 1);
+    assert_eq!(plain(&Some(values[0].clone())), all);
+    assert_eq!(
+        json(
+            &mut db,
+            "SELECT (shortestPathLen(?x, <Alice>, true, {}) AS ?l) \
+             WHERE { ?x <like> ?y FILTER(?y != <Nobody>) } LIMIT 1"
+        ),
+        all
+    );
+    // Queries without a graph function keep SPARQL's LIMIT semantics.
+    let rs = select(
+        &mut db,
+        "SELECT (COUNT(?x) AS ?n) WHERE { ?x <like> ?y } LIMIT 1",
+    );
+    assert_eq!(
+        term(&rs.rows[0][0]).unwrap(),
+        Term::typed_literal("5", format!("{XSD}integer"))
+    );
+}
+
+/// A projected function is an aggregate upstream, so without GROUP BY all
+/// solutions form one group and a failing HAVING leaves the function value
+/// unset (GE:2071-2075) — the same HAVING that drops a COUNT row.
+#[test]
+fn having_applies_to_graph_functions_without_group_by() {
+    let mut db = social();
+    let q = |having: &str| {
+        format!(
+            "SELECT (bfsCount(<Alice>, true, {{}}) AS ?l) WHERE {{ ?x <like> ?y }} HAVING ({having})"
+        )
+    };
+    let full = json(&mut db, &q("COUNT(?x) > 1"));
+    assert!(full.contains("<Alice>"), "{full}");
+    assert_eq!(only_cell(&mut db, &q("COUNT(?x) > 100")), None);
+    let rs = select(
+        &mut db,
+        "SELECT (COUNT(?x) AS ?c) WHERE { ?x <like> ?y } HAVING (COUNT(?x) > 100)",
+    );
+    assert!(rs.rows.is_empty());
+    // Several functions: the rows stay, no value is written.
+    let mut two = |having: &str| {
+        select(
+            &mut db,
+            &format!(
+                "SELECT (bfsCount(?x, true, {{}}) AS ?c) (kHopCount(?x, true, 1, {{}}) AS ?k) \
+                 WHERE {{ <Francis> <dislike> ?x }} HAVING ({having})"
+            ),
+        )
+    };
+    let rs = two("COUNT(?x) = 2");
+    assert_eq!(rs.rows.len(), 2);
+    assert!(rs.rows[1].iter().all(Option::is_some));
+    let rs = two("COUNT(?x) > 2");
+    assert_eq!(rs.rows.len(), 2);
+    assert!(
+        rs.rows.iter().flatten().all(Option::is_none),
+        "{:?}",
+        rs.rows
+    );
+}
+
+/// Upstream keeps every BIND result in a string column
+/// (TempResult::doBind) and rejects it as a vertex (GE:2583-2606), whether
+/// or not the value is a stored term: `{"paths":[]}`.
+#[test]
+fn bind_results_are_never_vertices() {
+    let mut db = social();
+    for q in [
+        "SELECT (bfsCount(?z, true, {}) AS ?l) WHERE { ?x <like> ?y . BIND(<Alice> AS ?z) }",
+        "SELECT (bfsCount(?z, true, {}) AS ?l) WHERE { ?x <like> ?y . BIND(IRI(\"Alice\") AS ?z) }",
+        "SELECT (bfsCount(?z, true, {}) AS ?l) WHERE { ?x <like> ?y . BIND(?y AS ?z) }",
+        "SELECT (shortestPath(?x, ?z, true, {}) AS ?l) WHERE { ?x <like> ?y . BIND(?y AS ?z) }",
+    ] {
+        assert_eq!(json(&mut db, q), EMPTY, "{q}");
+    }
+    let cell = only_cell(
+        &mut db,
+        "SELECT (cycleBoolean(?x, ?z, true, {}) AS ?b) WHERE { ?x <like> ?y . BIND(?y AS ?z) }",
+    );
+    assert_eq!(term(&cell), Some(Term::typed_literal("false", XSD_BOOLEAN)));
+    // The BIND variable's source is still a vertex.
+    assert_ne!(
+        json(
+            &mut db,
+            "SELECT (bfsCount(?y, true, {}) AS ?l) WHERE { ?x <like> ?y . BIND(?y AS ?z) }"
+        ),
+        EMPTY
+    );
+    // A variable a triple pattern binds too is read from the triple's id
+    // column: a vertex.
+    let lib_db = social();
+    let lib = Lib::new(&lib_db);
+    assert_eq!(
+        json(
+            &mut db,
+            "SELECT (bfsCount(?z, true, {}) AS ?l) WHERE { BIND(<Alice> AS ?z) ?z <like> ?y }"
+        ),
+        bfs(&lib, lib.nodes(&["<Alice>"]))
+    );
+}
+
+/// Static call checks run over every operation of an UPDATE request before
+/// the first one is applied: a typo in a later operation rejects the whole
+/// request.
+#[test]
+fn statically_invalid_updates_apply_nothing() {
+    let mut db = social();
+    let before = db.triple_num();
+    let mutations = db.mutation_count();
+    for (bad, msg) in [
+        (
+            "FILTER(<http://ex/fn/typo>(?o))",
+            "unknown function <http://ex/fn/typo>",
+        ),
+        (
+            "BIND(shortestPathLen(?s, ?o, false, {}) AS ?l)",
+            "only evaluated as the whole expression",
+        ),
+        (
+            "FILTER(kHopReachable(?s, <Carol>, true, 3, {}))",
+            "only evaluated as the whole expression",
+        ),
+    ] {
+        let e = query_err(
+            &mut db,
+            &format!(
+                "INSERT DATA {{ <New> <like> <New2> }} ; \
+                 DELETE {{ ?s <like> ?o }} WHERE {{ ?s <like> ?o {bad} }}"
+            ),
+        );
+        assert!(e.contains(msg), "{bad}: {e}");
+        assert_eq!(db.triple_num(), before, "{bad}");
+        assert_eq!(db.mutation_count(), mutations, "{bad}");
+        assert!(
+            select(&mut db, "SELECT ?o WHERE { <New> <like> ?o }")
+                .rows
+                .is_empty(),
+            "{bad}"
+        );
+    }
+    // A valid request still runs every operation.
+    db.query("INSERT DATA { <New> <like> <New2> } ; DELETE WHERE { <New> <like> ?o }")
+        .unwrap();
+    assert_eq!(db.triple_num(), before);
+    assert!(db.mutation_count() > mutations);
 }
 
 #[test]
@@ -1043,22 +1256,18 @@ fn constants_unknown_iris_and_literal_bindings() {
         "SELECT (bfsCount(?n, true, {}) AS ?y) WHERE { <Zed> <age> ?n }",
     );
     assert_eq!(got, bfs(&lib, vec![GNode::resolve(&lib.csr, Some(lit))]));
-    // A computed value outside the dictionary is not a vertex (upstream's
-    // string column); a computed IRI that is stored is.
-    assert_eq!(
-        json(
-            &mut db,
-            "SELECT (bfsCount(?v, true, {}) AS ?y) WHERE { BIND(<http://nowhere/> AS ?v) }"
-        ),
-        EMPTY
-    );
-    assert_eq!(
-        json(
-            &mut db,
-            "SELECT (bfsCount(?v, true, {}) AS ?y) WHERE { BIND(<Alice> AS ?v) }"
-        ),
-        constant
-    );
+    // A BIND result is never a vertex (upstream's string column, "src must
+    // be an entity"), even when it is a stored IRI.
+    for bind in ["<http://nowhere/>", "<Alice>"] {
+        assert_eq!(
+            json(
+                &mut db,
+                &format!("SELECT (bfsCount(?v, true, {{}}) AS ?y) WHERE {{ BIND({bind} AS ?v) }}")
+            ),
+            EMPTY,
+            "{bind}"
+        );
+    }
     // A variable the WHERE clause never binds: no vertex.
     assert_eq!(
         json(

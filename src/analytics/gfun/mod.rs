@@ -574,27 +574,56 @@ impl GArgs {
 
     /// `srcs` without repeated entities, in order.
     pub fn distinct_srcs(&self) -> Vec<GNode> {
-        let mut seen = HashSet::new();
-        self.srcs
-            .iter()
-            .copied()
-            .filter(|n| seen.insert(n.entity))
-            .collect()
+        distinct_nodes(&self.srcs)
     }
 
     /// The `(src, dst)` cross product in upstream loop order (outer `srcs`,
     /// inner `dsts`), skipping repeated entity pairs (GE:2666-2672).
-    pub fn pairs(&self) -> Vec<(GNode, GNode)> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for &u in &self.srcs {
-            for &v in &self.dsts {
-                if seen.insert((u.entity, v.entity)) {
-                    out.push((u, v));
-                }
-            }
+    ///
+    /// Lazy: the product is walked as a nested loop over the distinct
+    /// `srcs` and `dsts` (which yields exactly the pairs not seen before, in
+    /// the same order), so a caller that stops early or is cancelled never
+    /// pays for the rest, and no `|srcs| · |dsts|` list or pair set is built.
+    pub fn pairs(&self) -> impl Iterator<Item = (GNode, GNode)> {
+        Pairs {
+            srcs: self.distinct_srcs(),
+            dsts: distinct_nodes(&self.dsts),
+            i: 0,
+            j: 0,
         }
-        out
+    }
+}
+
+/// `nodes` without repeated entities, in first-appearance order.
+fn distinct_nodes(nodes: &[GNode]) -> Vec<GNode> {
+    let mut seen = HashSet::new();
+    nodes
+        .iter()
+        .copied()
+        .filter(|n| seen.insert(n.entity))
+        .collect()
+}
+
+/// The iterator of [`GArgs::pairs`].
+struct Pairs {
+    srcs: Vec<GNode>,
+    dsts: Vec<GNode>,
+    i: usize,
+    j: usize,
+}
+
+impl Iterator for Pairs {
+    type Item = (GNode, GNode);
+
+    fn next(&mut self) -> Option<(GNode, GNode)> {
+        let u = *self.srcs.get(self.i)?;
+        let v = *self.dsts.get(self.j)?;
+        self.j += 1;
+        if self.j == self.dsts.len() {
+            self.j = 0;
+            self.i += 1;
+        }
+        Some((u, v))
     }
 }
 
@@ -622,7 +651,7 @@ pub enum GFunValue {
 }
 
 /// Everything a graph function may read: the CSR, the dictionary (id ↔
-/// string) and a cooperative cancellation flag.
+/// string), a cooperative cancellation flag and the output size limit.
 #[derive(Debug, Clone, Copy)]
 pub struct GFunCtx<'a> {
     /// The graph.
@@ -630,15 +659,18 @@ pub struct GFunCtx<'a> {
     /// The dictionary the CSR's ids belong to.
     pub dict: &'a Dictionary,
     cancel: Option<&'a AtomicBool>,
+    max_output_bytes: usize,
 }
 
 impl<'a> GFunCtx<'a> {
-    /// A context without cancellation.
+    /// A context without cancellation, with the default output limit
+    /// [`paths::MAX_OUTPUT_BYTES`].
     pub fn new(csr: &'a CsrGraph, dict: &'a Dictionary) -> GFunCtx<'a> {
         GFunCtx {
             csr,
             dict,
             cancel: None,
+            max_output_bytes: paths::MAX_OUTPUT_BYTES,
         }
     }
 
@@ -646,6 +678,19 @@ impl<'a> GFunCtx<'a> {
     pub fn with_cancel(mut self, flag: &'a AtomicBool) -> GFunCtx<'a> {
         self.cancel = Some(flag);
         self
+    }
+
+    /// Set how many bytes of JSON one call of a path-family function may
+    /// produce before it fails with a [`GStoreError::Query`] (see
+    /// [`paths`] "Resource bounds").
+    pub fn with_max_output_bytes(mut self, bytes: usize) -> GFunCtx<'a> {
+        self.max_output_bytes = bytes;
+        self
+    }
+
+    /// The output limit set by [`with_max_output_bytes`](Self::with_max_output_bytes).
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
     }
 
     /// Whether cancellation was requested.
@@ -785,12 +830,39 @@ mod tests {
             dsts: vec![n(5), n(6)],
             ..GArgs::default()
         };
-        let p: Vec<(u32, u32)> = a
-            .pairs()
-            .iter()
-            .map(|(u, v)| (u.entity, v.entity))
-            .collect();
+        let p: Vec<(u32, u32)> = a.pairs().map(|(u, v)| (u.entity, v.entity)).collect();
         assert_eq!(p, vec![(1, 5), (1, 6), (2, 5), (2, 6)]);
+        // The lazy nested loop yields exactly what the eager "skip seen
+        // pairs" loop (upstream's `unique_pairs`) yields, repeated
+        // destinations and the shared MISSING entity included.
+        let seq = |xs: &[u32]| -> Vec<GNode> {
+            xs.iter()
+                .map(|&e| if e == 0 { GNode::MISSING } else { n(e) })
+                .collect()
+        };
+        for (s, d) in [
+            (&[3, 0, 3, 4, 0][..], &[4, 4, 0, 7, 3, 7][..]),
+            (&[1], &[]),
+            (&[], &[1, 2]),
+            (&[9, 9, 9], &[9]),
+        ] {
+            let a = GArgs {
+                srcs: seq(s),
+                dsts: seq(d),
+                ..GArgs::default()
+            };
+            let mut seen = HashSet::new();
+            let mut eager = Vec::new();
+            for u in &a.srcs {
+                for v in &a.dsts {
+                    if seen.insert((u.entity, v.entity)) {
+                        eager.push((u.entity, v.entity));
+                    }
+                }
+            }
+            let lazy: Vec<_> = a.pairs().map(|(u, v)| (u.entity, v.entity)).collect();
+            assert_eq!(lazy, eager, "{s:?} x {d:?}");
+        }
         let s: Vec<u32> = a.distinct_srcs().iter().map(|u| u.entity).collect();
         assert_eq!(s, vec![1, 2]);
         assert_eq!(GNode::MISSING.upstream_id(), -1);

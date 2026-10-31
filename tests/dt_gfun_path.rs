@@ -1509,6 +1509,63 @@ fn every_path_function_honours_cancellation() {
     }
 }
 
+/// `SSSP` prints a whole path per reachable vertex — `O(V²)` text on a
+/// chain — so it stops with a query error once its output passes the
+/// context's limit (default `paths::MAX_OUTPUT_BYTES`) instead of exhausting
+/// memory; so does every other function that writes entries.
+#[test]
+fn every_path_function_bounds_its_output() {
+    let chain: String = (0..100)
+        .map(|i| format!("<n{i}> <next> <n{}> .\n", i + 1))
+        .collect();
+    let fx = Fx::new(&chain);
+    let c = fx.call().src(&["n0"]).directed(true);
+    let full = c.json(GFnKind::Sssp);
+    assert!(full.len() > 200_000, "{}", full.len());
+    let limited = |bytes| gfun::eval(GFnKind::Sssp, &fx.ctx().with_max_output_bytes(bytes), &c.a);
+    // The limit applies to the entries (the envelope adds 12 bytes).
+    assert_eq!(
+        limited(full.len() - 12).unwrap(),
+        GFunValue::Json(full.clone())
+    );
+    let err = limited(full.len() / 2).unwrap_err();
+    assert!(
+        matches!(&err, GStoreError::Query(m) if m.starts_with("SSSP: more than") && m.contains("bytes")),
+        "{err}"
+    );
+    assert_eq!(fx.ctx().max_output_bytes(), gfun::paths::MAX_OUTPUT_BYTES);
+    // Every function with entries, over the social graph's all-pairs product.
+    let s = Fx::social();
+    let c = s.call().src(&NAMES).dst(&NAMES).directed(false).k(3);
+    let mut unbounded = Vec::new();
+    for kind in GFnKind::ALL {
+        if kind.family() != gfun::GFnFamily::Paths {
+            continue;
+        }
+        match gfun::eval(kind, &s.ctx(), &c.a).unwrap() {
+            GFunValue::Json(text) if text != r#"{"paths":[]}"# => {}
+            _ => {
+                unbounded.push(kind);
+                continue;
+            }
+        }
+        let r = gfun::eval(kind, &s.ctx().with_max_output_bytes(1), &c.a);
+        assert!(
+            matches!(&r, Err(GStoreError::Query(m)) if m.contains("bytes of output")),
+            "{kind}: {r:?}"
+        );
+    }
+    // Only the functions that never write an entry.
+    assert_eq!(
+        unbounded,
+        [
+            GFnKind::SimpleCyclePath,
+            GFnKind::SimpleCycleBoolean,
+            GFnKind::CycleBoolean
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // randomized consistency checks against reference implementations
 // ---------------------------------------------------------------------------

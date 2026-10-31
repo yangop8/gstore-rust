@@ -790,8 +790,11 @@ impl CsrCache {
     }
 
     /// The graph for `generation`: the cached one if it was built for that
-    /// generation, otherwise `build()`'s result (which is then cached). A
-    /// failed build leaves the previous entry in place.
+    /// generation, otherwise `build()`'s result (which is then cached). An
+    /// entry for another generation is dropped *before* the build, so the
+    /// old and the new graph are never both held by the cache (upstream
+    /// also resets its CSR before rebuilding, GeneralEvaluation.cpp:141-143);
+    /// a failed build leaves the cache empty.
     pub fn get_or_build<F>(&self, generation: u64, build: F) -> Result<Arc<CsrGraph>>
     where
         F: FnOnce() -> Result<CsrGraph>,
@@ -802,6 +805,7 @@ impl CsrCache {
                 return Ok(Arc::clone(g));
             }
         }
+        *slot = None;
         let g = Arc::new(build()?);
         *slot = Some((generation, Arc::clone(&g)));
         Ok(g)
@@ -976,11 +980,19 @@ mod tests {
         assert!(!Arc::ptr_eq(&g1, &g3));
         assert_eq!(builds, 2);
         assert_eq!(cache.cached_generation(), Some(2));
-        // A failed build keeps the old entry.
+        // A rebuild drops the stale entry first: the build no longer sees
+        // it, and a failed build leaves the cache empty.
+        let weak = Arc::downgrade(&g3);
+        drop((g1, g2, g3));
         assert!(cache
-            .get_or_build(3, || Err(GStoreError::Database("x".into())))
+            .get_or_build(3, || {
+                assert!(weak.upgrade().is_none(), "stale CSR alive during the build");
+                Err(GStoreError::Database("x".into()))
+            })
             .is_err());
-        assert_eq!(cache.cached_generation(), Some(2));
+        assert_eq!(cache.cached_generation(), None);
+        cache.get_or_build(3, || Ok(CsrGraph::empty())).unwrap();
+        assert_eq!(cache.cached_generation(), Some(3));
         cache.clear();
         assert_eq!(cache.cached_generation(), None);
     }

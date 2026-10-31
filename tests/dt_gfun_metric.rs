@@ -933,6 +933,17 @@ fn personalized_pagerank() {
         ppr(&s, &["<Alice>", "<Francis>"], -1, 10),
         r#"{"paths":[{"src":"<Alice>","results":[{"dst":"<Alice>","PPR":0.301205},{"dst":"<Bob>","PPR":0.263309},{"dst":"<Eve>","PPR":0.197658},{"dst":"<Carol>","PPR":0.181169},{"dst":"<Francis>","PPR":0.0442897},{"dst":"<Dave>","PPR":0.0123699}]},{"src":"<Francis>","results":[{"dst":"<Francis>","PPR":0.271995},{"dst":"<Carol>","PPR":0.232286},{"dst":"<Eve>","PPR":0.182508},{"dst":"<Bob>","PPR":0.161556},{"dst":"<Alice>","PPR":0.077394},{"dst":"<Dave>","PPR":0.0742609}]}]}"#
     );
+    // Any retNum beyond the 6 vertices gives the same output, without
+    // retNum-sized buffers: INT_MAX (and larger, saturated to it) used to
+    // abort the whole process on a failed 32 GiB allocation.
+    let want = ppr(&s, &["<Alice>", "<Francis>"], -1, 10);
+    for ret in [7, 1 << 20, i64::from(i32::MAX), i64::MAX] {
+        assert_eq!(ppr(&s, &["<Alice>", "<Francis>"], -1, ret), want, "{ret}");
+    }
+    assert_eq!(
+        ppr(&g, &["<a>"], -1, i64::from(i32::MAX)),
+        ppr(&g, &["<a>"], -1, 5)
+    );
 }
 
 // ---------------------------------------------------------------------------

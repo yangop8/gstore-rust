@@ -39,16 +39,23 @@
 //! # Resource bounds and cancellation
 //!
 //! All loops poll [`GFunCtx::check_cancel`] (per pair / source and every few
-//! thousand inner steps). The enumerating functions whose output can grow
-//! exponentially and that upstream does not bound ([`k_hop_enumerate`] with
-//! no or a negative `retNum`, [`shortest_paths`]) write their entries as they
-//! find them and stop with a [`GStoreError::Query`] once a call produces more
-//! than [`MAX_ENUMERATED_PATHS`] entries or [`MAX_ENUMERATED_BYTES`] of JSON,
-//! instead of exhausting memory (the upstream server would); their search
-//! time is not bounded (as upstream) beyond cancellation. Everything else is
-//! polynomial: BFS-style functions are `O(V + E)` per source / pair (the
-//! cycle / shortest-path primitives too), `kHopReachable` does at most a
-//! constant number of vertex expansions (see its spec).
+//! thousand inner steps); [`GArgs::pairs`] is walked lazily, so a call that
+//! stops early or is cancelled never builds the whole `srcs × dsts` product.
+//! The enumerating functions whose output can grow exponentially and that
+//! upstream does not bound ([`k_hop_enumerate`] with no or a negative
+//! `retNum`, [`shortest_paths`]) write their entries as they find them and
+//! stop with a [`GStoreError::Query`] once a call produces more than
+//! [`MAX_ENUMERATED_PATHS`] entries; their search time is not bounded (as
+//! upstream) beyond cancellation. Everything else is polynomial: BFS-style
+//! functions are `O(V + E)` per source / pair (the cycle / shortest-path
+//! primitives too), `kHopReachable` does at most a constant number of vertex
+//! expansions (see its spec). Polynomial output can still outgrow memory —
+//! `SSSP` prints a whole path per reachable vertex, `O(V²)` text on a chain,
+//! and the per-pair functions write an entry per pair of a quadratic
+//! product — so **every** function here stops with a [`GStoreError::Query`]
+//! once its JSON exceeds [`GFunCtx::max_output_bytes`] (default
+//! [`MAX_OUTPUT_BYTES`]), instead of exhausting memory (the upstream server
+//! would).
 //!
 //! # The shared shortest-path primitive
 //!
@@ -92,9 +99,11 @@ use crate::model::id::{EntityLiteralId, PredId};
 /// out of memory instead).
 pub const MAX_ENUMERATED_PATHS: usize = 1_000_000;
 
-/// The most bytes of JSON one call of an enumerating function may produce
-/// (the same kind of guard as [`MAX_ENUMERATED_PATHS`], for long paths).
-pub const MAX_ENUMERATED_BYTES: usize = 256 << 20;
+/// The default for the most bytes of JSON one call of any function of this
+/// module may produce before it fails with a [`GStoreError::Query`]
+/// ([`GFunCtx::max_output_bytes`]; the same kind of guard as
+/// [`MAX_ENUMERATED_PATHS`]).
+pub const MAX_OUTPUT_BYTES: usize = 256 << 20;
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -126,9 +135,10 @@ impl<'c, 'a> Poll<'c, 'a> {
     }
 }
 
-/// The output guard of the enumerating functions: entries are written to the
-/// result as they are found, and the call fails once it exceeds
-/// [`MAX_ENUMERATED_PATHS`] entries or [`MAX_ENUMERATED_BYTES`] bytes.
+/// The output guard: entries are written to the result as they are found,
+/// and the call fails once it exceeds `max_paths` entries (enumerating
+/// functions: [`MAX_ENUMERATED_PATHS`]) or `max_bytes` bytes
+/// ([`GFunCtx::max_output_bytes`]).
 struct OutputGuard {
     kind: GFnKind,
     max_paths: usize,
@@ -137,8 +147,14 @@ struct OutputGuard {
 }
 
 impl OutputGuard {
-    fn new(kind: GFnKind) -> Self {
-        OutputGuard::with_limits(kind, MAX_ENUMERATED_PATHS, MAX_ENUMERATED_BYTES)
+    /// The guard of the enumerating functions (entry and byte limits).
+    fn new(ctx: &GFunCtx<'_>, kind: GFnKind) -> Self {
+        OutputGuard::with_limits(kind, MAX_ENUMERATED_PATHS, ctx.max_output_bytes())
+    }
+
+    /// The byte limit alone, for every other function.
+    fn bytes(ctx: &GFunCtx<'_>, kind: GFnKind) -> Self {
+        OutputGuard::with_limits(kind, usize::MAX, ctx.max_output_bytes())
     }
 
     fn with_limits(kind: GFnKind, max_paths: usize, max_bytes: usize) -> Self {
@@ -154,11 +170,14 @@ impl OutputGuard {
     fn emitted(&mut self, list: &JsonList) -> Result<()> {
         self.paths += 1;
         if self.paths > self.max_paths || list.as_str().len() > self.max_bytes {
+            let limits = if self.max_paths == usize::MAX {
+                format!("{} bytes", self.max_bytes)
+            } else {
+                format!("{} paths or {} bytes", self.max_paths, self.max_bytes)
+            };
             return Err(GStoreError::Query(format!(
-                "{}: more than {} paths or {} bytes of output; narrow the query{}",
+                "{}: more than {limits} of output; narrow the query{}",
                 self.kind.name(),
-                self.max_paths,
-                self.max_bytes,
                 if self.kind == GFnKind::KHopEnumerate {
                     " or pass a retNum"
                 } else {
@@ -806,6 +825,7 @@ pub fn simple_cycle_boolean(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 pub fn cycle_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut sc = CycleScratch::new(ctx.csr);
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::CyclePath);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
@@ -814,6 +834,7 @@ pub fn cycle_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         }
         if let Some(p) = cycle(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)? {
             push_path_json(list.item(), ctx, u.entity, v.entity, &p);
+            guard.emitted(&list)?;
         }
     }
     Ok(GFunValue::Json(list.into_paths()))
@@ -867,16 +888,19 @@ pub fn cycle_boolean(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 pub fn shortest_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut sc = SpScratch::new(ctx.csr);
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::ShortestPath);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
         if u.entity == v.entity {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
+            guard.emitted(&list)?;
             continue;
         }
         if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)?
         {
             push_path_json(list.item(), ctx, u.entity, v.entity, &p);
+            guard.emitted(&list)?;
         }
     }
     Ok(GFunValue::Json(list.into_paths()))
@@ -896,6 +920,7 @@ pub fn shortest_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 pub fn shortest_path_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut sc = SpScratch::new(ctx.csr);
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::ShortestPathLen);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
@@ -910,6 +935,7 @@ pub fn shortest_path_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let s = list.item();
         push_src_dst(s, ctx, &u, ",", v.entity);
         s.push_str(&format!(",\"length\":{len}}}"));
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -1028,6 +1054,7 @@ pub fn shortest_path_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         td: Dense::new(n),
     };
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::ShortestPathCount);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
@@ -1044,6 +1071,7 @@ pub fn shortest_path_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let s = list.item();
         push_src_dst(s, ctx, &u, ", ", v.entity);
         s.push_str(&format!(", \"count\":{count}}}"));
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -1239,10 +1267,10 @@ fn fan_out(
 ///    two directions of one predicate between the same vertices count once.
 ///
 /// The number of paths can be exponential and upstream does not bound it:
-/// more than [`MAX_ENUMERATED_PATHS`] entries (or [`MAX_ENUMERATED_BYTES`]
-/// of output) in one call → error.
+/// more than [`MAX_ENUMERATED_PATHS`] entries (or
+/// [`GFunCtx::max_output_bytes`] of output) in one call → error.
 pub fn shortest_paths(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
-    shortest_paths_guarded(ctx, a, &mut OutputGuard::new(GFnKind::ShortestPaths))
+    shortest_paths_guarded(ctx, a, &mut OutputGuard::new(ctx, GFnKind::ShortestPaths))
 }
 
 fn shortest_paths_guarded(
@@ -1732,6 +1760,7 @@ fn k_hop_reachable_nodes(
 /// → `"false"`, with `k = -1` → `"true"`) come out unchanged.
 pub fn k_hop_reachable(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::KHopReachable);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
@@ -1752,6 +1781,7 @@ pub fn k_hop_reachable(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         } else {
             ",\"value\":\"false\"}"
         });
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -1771,17 +1801,20 @@ pub fn k_hop_reachable_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
     let mut sc = SpScratch::new(ctx.csr);
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::KHopReachablePath);
     let mut list = JsonList::new();
     for (u, v) in a.pairs() {
         ctx.check_cancel()?;
         if u.entity == v.entity {
             push_path_json(list.item(), ctx, u.entity, v.entity, &GPath::empty());
+            guard.emitted(&list)?;
             continue;
         }
         if let Some(p) = shortest_path_args(ctx, &mut sc, &mut poll, &u, &v, a.directed, &a.preds)?
         {
             if p.len() as i64 <= k {
                 push_path_json(list.item(), ctx, u.entity, v.entity, &p);
+                guard.emitted(&list)?;
             }
         }
     }
@@ -1969,8 +2002,8 @@ fn k_hop_enumerate_pair(
 ///    `kHopEnumeratePath` once per pair).
 ///
 /// Unbounded enumeration can be exponential: more than
-/// [`MAX_ENUMERATED_PATHS`] entries (or [`MAX_ENUMERATED_BYTES`] of output)
-/// in one call → error. The search itself is not bounded (neither is
+/// [`MAX_ENUMERATED_PATHS`] entries (or [`GFunCtx::max_output_bytes`] of
+/// output) in one call → error. The search itself is not bounded (neither is
 /// upstream's); it polls the cancellation flag.
 ///
 /// **Example** (SPARQL_QUERY.md): `kHopEnumerate(<Alice>, ?x, true, 3, {<like>, <focus>})`
@@ -1982,7 +2015,7 @@ fn k_hop_enumerate_pair(
 /// [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder)), which also matches
 /// the docs' other examples — the docs' order here is stale.
 pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
-    k_hop_enumerate_guarded(ctx, a, &mut OutputGuard::new(GFnKind::KHopEnumerate))
+    k_hop_enumerate_guarded(ctx, a, &mut OutputGuard::new(ctx, GFnKind::KHopEnumerate))
 }
 
 fn k_hop_enumerate_guarded(
@@ -2119,6 +2152,7 @@ pub fn k_hop_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.k.unwrap_or(-1);
     let mut visited = NodeMarks::new(ctx.csr.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::KHopCount);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2127,6 +2161,7 @@ pub fn k_hop_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         s.push_str("{\"src\":");
         push_json_quoted(s, ctx.gnode_str(&u));
         s.push_str(&format!(",\"depth\":{k}, \"count\":{n}}}"));
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -2155,6 +2190,7 @@ pub fn k_hop_neighbor(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let key = if a.where_empty { "dst" } else { "neighbor" };
     let mut visited = NodeMarks::new(ctx.csr.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::KHopNeighbor);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2170,6 +2206,7 @@ pub fn k_hop_neighbor(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             push_json_quoted(s, ctx.node_str(n));
         }
         s.push_str("]}");
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -2254,6 +2291,7 @@ pub fn k_hop_all_neighbors(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut dis = Dense::new(g.num_nodes());
     let mut visited = NodeMarks::new(g.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::KHopAllNeighbors);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2288,6 +2326,7 @@ pub fn k_hop_all_neighbors(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             push_json_quoted(s, ctx.entity_str(e));
         }
         s.push_str("]}");
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -2348,6 +2387,7 @@ fn bfs_count_nodes(
 pub fn bfs_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut visited = NodeMarks::new(ctx.csr.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::BfsCount);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2366,6 +2406,7 @@ pub fn bfs_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             s.push_str(&format!("{{\"depth\":{d}, \"count\":{c}}}"));
         }
         s.push_str("]}");
+        guard.emitted(&list)?;
     }
     Ok(GFunValue::Json(list.into_paths()))
 }
@@ -2436,6 +2477,7 @@ pub fn sssp(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let g = ctx.csr;
     let mut parent = Dense::new(g.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::Sssp);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2447,6 +2489,7 @@ pub fn sssp(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                 u.entity,
                 &GPath::single(u.entity),
             );
+            guard.emitted(&list)?;
             continue;
         };
         let order = sssp_bfs(g, &mut parent, &mut poll, s, a.directed, &a.preds)?;
@@ -2470,6 +2513,7 @@ pub fn sssp(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             edges.reverse();
             let path = gpath(g, &nodes, edges);
             push_path_json(list.item(), ctx, u.entity, g.entity_of(t), &path);
+            guard.emitted(&list)?;
         }
     }
     Ok(GFunValue::Json(list.into_paths()))
@@ -2490,6 +2534,7 @@ pub fn sssp_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut parent = Dense::new(g.num_nodes());
     let mut dist = Dense::<u32>::new(g.num_nodes());
     let mut poll = Poll::new(ctx);
+    let mut guard = OutputGuard::bytes(ctx, GFnKind::SsspLen);
     let mut list = JsonList::new();
     for u in a.distinct_srcs() {
         ctx.check_cancel()?;
@@ -2497,6 +2542,7 @@ pub fn sssp_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             let item = list.item();
             push_src_dst(item, ctx, &u, ",", u.entity);
             item.push_str(",\"length\":0}");
+            guard.emitted(&list)?;
             continue;
         };
         let order = sssp_bfs(g, &mut parent, &mut poll, s, a.directed, &a.preds)?;
@@ -2517,6 +2563,7 @@ pub fn sssp_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             let item = list.item();
             push_src_dst(item, ctx, &u, ",", g.entity_of(t));
             item.push_str(&format!(",\"length\":{}}}", dist.get_or_zero(t)));
+            guard.emitted(&list)?;
         }
     }
     Ok(GFunValue::Json(list.into_paths()))
@@ -2577,11 +2624,14 @@ mod tests {
             assert_eq!(run(kind, 3, s.len() - 12).unwrap(), full);
             assert!(run(kind, 3, s.len() - 13).is_err());
         }
-        let guard = OutputGuard::new(GFnKind::ShortestPaths);
+        let guard = OutputGuard::new(&ctx, GFnKind::ShortestPaths);
         assert_eq!(
             (guard.max_paths, guard.max_bytes),
-            (MAX_ENUMERATED_PATHS, MAX_ENUMERATED_BYTES)
+            (MAX_ENUMERATED_PATHS, MAX_OUTPUT_BYTES)
         );
+        let small = ctx.with_max_output_bytes(10);
+        let guard = OutputGuard::bytes(&small, GFnKind::Sssp);
+        assert_eq!((guard.max_paths, guard.max_bytes), (usize::MAX, 10));
     }
 
     #[test]

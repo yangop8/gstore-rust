@@ -27,13 +27,16 @@
 //! # Cost bounds
 //!
 //! Upstream's algorithms are kept, including their asymptotic cost, with
-//! three exceptions that avoid blow-ups without changing any output:
+//! four exceptions that avoid blow-ups without changing any output:
 //! `betweennessCentrality` counts shortest paths by dynamic programming
 //! instead of enumerating them (upstream's DFS is exponential on graphs with
 //! many equal-length paths; the `int` sums are reproduced exactly because
 //! wrapping arithmetic is a ring), `labelProp` counts neighbour labels
-//! sparsely instead of clearing an `n`-sized array per vertex, and `louvain`
-//! precomputes each super-node's incoming weight once per round. `PR` keeps
+//! sparsely instead of clearing an `n`-sized array per vertex, `louvain`
+//! precomputes each super-node's incoming weight once per round, and
+//! `JaccardSimilarity` orders its candidates with one sort instead of one
+//! `O(m)` vector insert each (quadratic on hub vertices). `PPR` never
+//! allocates its `retNum`-sized top-k buffers beyond the vertex count. `PR` keeps
 //! upstream's `O(n · dangling)` sweep up to [`PR_EXACT_DANGLING_WORK`]
 //! additions per sweep and aggregates the dangling mass beyond that (see
 //! [`pr`]). `PPR`, `maximumKplex` and `coreTruss` keep upstream's costs
@@ -183,7 +186,9 @@ fn nbr_set(g: &CsrGraph, v: Node, f: &PredFilter) -> Vec<Node> {
 ///
 /// **Edge cases:** `retNum = 0` → `"results":[]` (upstream: the same after
 /// out-of-bounds reads); negative `retNum` → error (upstream:
-/// `std::length_error` from `resize`). A missing `u` → no entry (upstream
+/// `std::length_error` from `resize`); a `retNum` beyond the vertex count
+/// gives the same output as `n + 1`, without upstream's `retNum`-sized
+/// buffers (one `INT_MAX` request would otherwise abort the process). A missing `u` → no entry (upstream
 /// writes through index `-1`, undefined behaviour). Every random walk and
 /// `delta` round polls the cancellation flag; the walk count is upstream's
 /// (`ω · rsum` per round, `ω ≈ 2.5 · ln(2/pfail) / (δ · ε²)`).
@@ -1329,7 +1334,7 @@ pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let Some(u) = src.node else {
             continue; // missing: wrapper returns; isolated: N(u) is empty
         };
-        for (v, js) in jaccard(ctx.csr, &a.preds, u, k, r) {
+        for (v, js) in jaccard(ctx, &a.preds, u, k, r)? {
             let e = out.item();
             e.push_str("{\"dst\":");
             e.push_str(node_name(ctx, v));
@@ -1341,27 +1346,37 @@ pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     Ok(GFunValue::Json(out.into_paths()))
 }
 
-fn jaccard(g: &CsrGraph, f: &PredFilter, u: Node, k: i64, ret_num: i64) -> Vec<(Node, f32)> {
+/// Upstream's candidate list order: each candidate is binary-inserted into a
+/// list sorted by descending score, *before* existing equal scores
+/// (JaccardSimilarity.cpp:30-45). That is the candidates sorted by score
+/// (descending), ties latest-first — computed with one sort instead of `m`
+/// `O(m)` vector inserts, which made hub vertices quadratic.
+fn sort_like_binary_insert(cands: &mut Vec<(Node, f32)>) {
+    let mut indexed: Vec<(usize, (Node, f32))> = cands.drain(..).enumerate().collect();
+    // Scores are finite and never -0.0, so `total_cmp` is upstream's `>`.
+    indexed.sort_by(|(i, x), (j, y)| y.1.total_cmp(&x.1).then(j.cmp(i)));
+    cands.extend(indexed.into_iter().map(|(_, c)| c));
+}
+
+fn jaccard(
+    ctx: &GFunCtx<'_>,
+    f: &PredFilter,
+    u: Node,
+    k: i64,
+    ret_num: i64,
+) -> Result<Vec<(Node, f32)>> {
+    let g = ctx.csr;
     let uids = nbr_set(g, u, f);
     if uids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let in_uids = |x: Node| uids.binary_search(&x).is_ok();
-    let binary_insert = |a: &mut Vec<(Node, f32)>, p: (Node, f32)| {
-        let (mut l, mut r) = (0usize, a.len());
-        while l < r {
-            let loc = l + (r - l) / 2;
-            if a[loc].1 > p.1 {
-                l = loc + 1;
-            } else {
-                r = loc;
-            }
-        }
-        a.insert(l, p);
-    };
+    // Candidates in insertion order; ordered once at the end.
     let mut js_list: Vec<(Node, f32)> = Vec::new();
     let mut no_used: BTreeSet<Node> = BTreeSet::new();
     for &w in &uids {
+        // per candidate: a hub's neighbour may itself be a hub
+        ctx.check_cancel()?;
         let comp = nbr_set(g, w, f);
         let mut num: f32 = 0.0;
         let mut total = (uids.len() + comp.len()) as f32;
@@ -1384,10 +1399,11 @@ fn jaccard(g: &CsrGraph, f: &PredFilter, u: Node, k: i64, ret_num: i64) -> Vec<(
         } else {
             0.0
         };
-        binary_insert(&mut js_list, (w, js));
+        js_list.push((w, js));
     }
     if k > 1 {
         for &w in &no_used {
+            ctx.check_cancel()?;
             let comp = nbr_set(g, w, f);
             let mut num: f32 = 0.0;
             let mut total = (uids.len() + comp.len()) as f32;
@@ -1409,9 +1425,10 @@ fn jaccard(g: &CsrGraph, f: &PredFilter, u: Node, k: i64, ret_num: i64) -> Vec<(
             } else {
                 0.0
             };
-            binary_insert(&mut js_list, (w, js));
+            js_list.push((w, js));
         }
     }
+    sort_like_binary_insert(&mut js_list);
     if (js_list.len() as u64) < ret_num as u64 {
         let khop = k_hop_neighbor(g, u, false, k, f, ret_num);
         let mut others: BTreeSet<Node> = BTreeSet::new();
@@ -1422,7 +1439,7 @@ fn jaccard(g: &CsrGraph, f: &PredFilter, u: Node, k: i64, ret_num: i64) -> Vec<(
         }
     }
     js_list.truncate(ret_num.max(0) as usize);
-    js_list
+    Ok(js_list)
 }
 
 /// `PathQueryHandler::kHopNeighbor` (kHopNeighbor.cpp:12-76): the vertices
@@ -1894,6 +1911,59 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One sort reproduces upstream's sequence of binary inserts
+    /// (JaccardSimilarity.cpp:30-45) exactly, ties included.
+    #[test]
+    fn jaccard_sort_matches_binary_insert() {
+        fn binary_insert(a: &mut Vec<(Node, f32)>, p: (Node, f32)) {
+            let (mut l, mut r) = (0usize, a.len());
+            while l < r {
+                let loc = l + (r - l) / 2;
+                if a[loc].1 > p.1 {
+                    l = loc + 1;
+                } else {
+                    r = loc;
+                }
+            }
+            a.insert(l, p);
+        }
+        let mut rng = GlibcRand::new(7);
+        for len in [0usize, 1, 2, 5, 17, 200] {
+            for buckets in [1, 3, 50] {
+                let cands: Vec<(Node, f32)> = (0..len as Node)
+                    .map(|v| (v, (rng.rand() % buckets) as f32 / 4.0))
+                    .collect();
+                let mut want = Vec::new();
+                for &c in &cands {
+                    binary_insert(&mut want, c);
+                }
+                let mut got = cands.clone();
+                sort_like_binary_insert(&mut got);
+                assert_eq!(got, want, "len {len}, {buckets} scores");
+            }
+        }
+    }
+
+    /// The candidate loops poll the cancellation flag (the caller only
+    /// checks it once per source).
+    #[test]
+    fn jaccard_polls_cancellation() {
+        use crate::model::IdTriple;
+        // a hub 0 with leaves 1..=50 over predicate 0
+        let g =
+            CsrGraph::from_id_triples((1..=50).map(|v| IdTriple::new(v, 0, 0)).collect()).unwrap();
+        let d = crate::dict::Dictionary::new();
+        let f = PredFilter::from_ids([0]);
+        let ctx = GFunCtx::new(&g, &d);
+        let hub = g.node_of(0).unwrap();
+        assert_eq!(jaccard(&ctx, &f, hub, 2, 10).unwrap().len(), 10);
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            jaccard(&ctx.with_cancel(&flag), &f, hub, 2, 10),
+            Err(GStoreError::Cancelled)
+        ));
+    }
 
     #[test]
     #[allow(clippy::excessive_precision)] // goldens as C printed them (%.9g)
