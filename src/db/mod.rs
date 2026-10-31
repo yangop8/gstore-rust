@@ -1013,6 +1013,9 @@ impl Database {
                 if let Some(cached) = self.query_cache.borrow_mut().get(sparql) {
                     return Ok(cached);
                 }
+                // The advanced graph functions run on this database's cached
+                // CSR (see `csr`), built only when a query needs it.
+                let csr = || self.csr();
                 // Use the VS-tree as a candidate filter only while it is
                 // consistent with the store; otherwise evaluate without it.
                 let mut eval = if self.index_valid {
@@ -1030,6 +1033,7 @@ impl Database {
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
                 }
+                eval = eval.with_csr_provider(&csr);
                 let result = eval.evaluate(&q)?;
                 self.query_cache
                     .borrow_mut()
@@ -1092,7 +1096,13 @@ impl Database {
                 // Compute the ground delete/insert sets against the *current*
                 // data, then apply deletes before inserts (SPARQL semantics).
                 let (dels, ins) = {
-                    let eval = Evaluator::new(&self.dict, &self.store);
+                    let csr = || self.csr();
+                    let mut eval = Evaluator::new(&self.dict, &self.store).with_csr_provider(&csr);
+                    // IRI function calls in the WHERE clause reach the
+                    // user-defined functions, as in read queries.
+                    if !self.functions.is_empty() {
+                        eval = eval.with_functions(self.functions.clone());
+                    }
                     eval.eval_update_modify(&delete, &insert, &pattern)?
                 };
                 let mut changed = 0;

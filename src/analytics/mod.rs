@@ -20,6 +20,18 @@
 //! weighted PageRank, and a branch-and-bound top-k subgraph query (mirroring
 //! gStore's `topk` module).  The unweighted [`GraphView`] API is unchanged.
 //!
+//! # Two graph layers
+//!
+//! * [`csr`] + [`gfun`] — gStore 1.4's per-predicate CSR (entities only) and
+//!   its advanced SPARQL graph functions (`shortestPath`, `PR`, `WCC`, …)
+//!   with upstream-exact semantics and output. The query engine evaluates
+//!   them as `SELECT (f(…) AS ?v)` projections on the database's cached CSR.
+//! * [`GraphView`] / [`WeightedGraphView`] — the original gstore-rust
+//!   analytics (predicates ignored, literals as nodes). They back the library
+//!   API above and the legacy SPARQL functions, which now live in the `rs:`
+//!   namespace (`rs:SSSP(<a>, <b>)`, `rs:WCC(<a>, <b>)`, …) and keep their
+//!   semantics.
+//!
 //! # Deferred work
 //! * (none currently tracked here)
 

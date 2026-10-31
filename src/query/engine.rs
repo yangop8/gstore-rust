@@ -10,14 +10,80 @@
 //! 3. Cost-based join ordering (see [`crate::query::optimizer`]).
 //! 4. Iteratively extend partial bindings by indexed lookups + unification.
 //! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
+//!
+//! # Advanced graph functions (gStore 1.4)
+//!
+//! Upstream's advanced functions — `shortestPath(?x, <b>, true, {<p>})`,
+//! `PR(true, {}, 10, alpha=0.85, maxIter=100, tol=0.001)`, `WCC({})`, … (the
+//! parser's [`Expr::GraphFn`]) — are evaluated as upstream's
+//! `GeneralEvaluation::getFinalResult` does, by the engine-independent library
+//! [`crate::analytics::gfun`] over the per-predicate
+//! [`CsrGraph`]:
+//!
+//! * **Where.** Only as the whole expression of a SELECT projection,
+//!   `(f(…) AS ?v)`. Upstream also *parses* `simpleCycleBoolean`,
+//!   `cycleBoolean`, `shortestPathLen` and `kHopReachable` inside FILTER but
+//!   never evaluates them there (no case in `TempResult::doComp`); here any
+//!   nested use is a query error that points to the legacy `rs:` function.
+//! * **Arguments.** A variable vertex argument contributes the *distinct*
+//!   values it is bound to across the WHERE solutions, in first-appearance
+//!   order (rows where it is unbound are skipped; a computed value that is
+//!   not a stored term is skipped, as upstream skips string columns; a stored
+//!   literal is passed as an edge-less vertex, as upstream passes its literal
+//!   id); a constant IRI is one vertex (unknown → upstream's `INVALID` id,
+//!   [`GNode::MISSING`]). Two vertex arguments are evaluated over the
+//!   cross product of their distinct values; a vertex variable without any
+//!   usable value gives no entry (`{"paths":[]}`, `false` for
+//!   `cycleBoolean`), as upstream's loop never runs. The `predSet` resolves
+//!   against the dictionary (`{}` = every predicate, `!<p>` = every
+//!   predicate but these, unknown IRIs dropped).
+//! * **Row shape** (GE:1508-2050, GE:2546-3108). A lone projected function
+//!   yields exactly one row computed over all solutions; next to other
+//!   projections there is one row per solution and the function's value is
+//!   on the *last* one only (WHERE order, before ORDER BY), the other rows
+//!   leave it unbound; with GROUP BY it is computed once per group. ORDER BY
+//!   variables that are not projected count as projections, because upstream
+//!   appends them to its projection list. With no solutions — including
+//!   `WHERE {}`, which upstream evaluates to an empty table — a lone function
+//!   is evaluated once with its variables read as IRIs (so they are missing
+//!   vertices; `kHopNeighbor` then names its list `"dst"`, as upstream's
+//!   separate code path does) and anything else yields no row. DISTINCT,
+//!   OFFSET and LIMIT apply to the rows as usual. Next to standard aggregates
+//!   (`COUNT` …) without GROUP BY the query keeps SPARQL's one-row aggregate
+//!   semantics (upstream would emit one mostly empty row per solution).
+//! * **Values.** The `{"paths":[…]}` JSON text is a plain literal, exactly as
+//!   upstream emits it; `cycleBoolean` is an `xsd:boolean`;
+//!   `confidenceDegree`'s JSON array (upstream's `pfn_type`, which replaces
+//!   the whole upstream response) is a plain literal too.
+//! * **CSR.** [`Database`](crate::Database) hands its cached CSR to the
+//!   evaluator ([`Evaluator::with_csr_provider`]): it is built on the first
+//!   graph-function query after a data change and shared by later queries.
+//! * **Cancellation.** The library polls the evaluator's cancel flag.
+//!
+//! `PFN.name({…})` parses but is not evaluated yet (a query error).
+//!
+//! # IRI function calls
+//!
+//! `<iri>(…)` / `pfx:name(…)` ([`Expr::IriCall`]) is, in order: a legacy
+//! gstore-rust graph built-in in the predeclared `rs:` namespace
+//! (`<urn:gstore-rust:fn:NAME>`, e.g. `rs:SSSPLEN(<a>, <b>)`, unchanged
+//! semantics, usable anywhere); a SPARQL 1.1 XSD constructor cast
+//! (`xsd:string`, `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:float`,
+//! `xsd:boolean`, `xsd:dateTime`, and `xsd:date`; a cast the §17.5 table
+//! forbids or an invalid lexical form is an expression error, i.e. unbound);
+//! or a user function registered on the [`Database`](crate::Database) under
+//! the full IRI or its local name. Any other IRI call is a query error.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
+use crate::analytics::csr::CsrGraph;
+use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
@@ -26,7 +92,7 @@ use crate::model::id::PredId;
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
-use crate::parser::sparql::{builtins, rs_function_name};
+use crate::parser::sparql::{builtins, rs_function_name, RS_NAMESPACE};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
@@ -216,7 +282,20 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// guards against rebuilding.
     string_index: std::cell::RefCell<Option<Rc<StringIndex>>>,
     string_index_tried: std::cell::Cell<bool>,
+    /// Where gStore's advanced graph functions get their per-predicate CSR
+    /// ([`with_csr_provider`](Self::with_csr_provider)): the
+    /// [`Database`](crate::Database)'s cached [`Database::csr`](crate::Database::csr),
+    /// shared across queries. Without one the evaluator builds a CSR of its
+    /// own store on first use (once per query).
+    csr_provider: Option<&'a CsrProvider<'a>>,
+    /// The CSR obtained for this query (from the provider or built), kept so
+    /// several graph functions / groups in one query share it.
+    gfun_csr: std::cell::RefCell<Option<Arc<CsrGraph>>>,
 }
+
+/// A source of the per-predicate CSR the advanced graph functions run on
+/// (see [`Evaluator::with_csr_provider`]).
+pub type CsrProvider<'a> = dyn Fn() -> Result<Arc<CsrGraph>> + 'a;
 
 /// Per-query memoization of whole-graph analytics results (see
 /// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
@@ -250,6 +329,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
         }
     }
 
@@ -272,6 +353,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
         }
     }
 
@@ -300,6 +383,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     pub fn with_cancel(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Evaluator<'a, S> {
         self.cancel = Some(flag);
         self
+    }
+
+    /// Supply the per-predicate CSR that gStore's advanced graph functions
+    /// (`shortestPath(…)`, `PR(…)`, …) run on. [`Database`](crate::Database)
+    /// passes its cached [`Database::csr`](crate::Database::csr), so the CSR
+    /// is built once per data version and shared across queries; the provider
+    /// is only called when a query actually projects a graph function.
+    /// Without a provider the evaluator builds a CSR of its own store the
+    /// first time a query needs one.
+    pub fn with_csr_provider(mut self, provider: &'a CsrProvider<'a>) -> Evaluator<'a, S> {
+        self.csr_provider = Some(provider);
+        self
+    }
+
+    /// The CSR for the advanced graph functions of this query (see
+    /// [`with_csr_provider`](Self::with_csr_provider)).
+    fn gfun_csr(&self) -> Result<Arc<CsrGraph>> {
+        if let Some(csr) = self.gfun_csr.borrow().as_ref() {
+            return Ok(Arc::clone(csr));
+        }
+        let csr = match self.csr_provider {
+            Some(provider) => provider()?,
+            None => Arc::new(CsrGraph::build(self.store)?),
+        };
+        *self.gfun_csr.borrow_mut() = Some(Arc::clone(&csr));
+        Ok(csr)
     }
 
     /// Whether cancellation has been requested.
@@ -358,9 +467,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         self.check_cancel()?;
-        if let Some(msg) = unwired_call(query) {
-            return Err(GStoreError::Query(msg));
-        }
+        self.check_calls(query)?;
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
@@ -506,9 +613,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[TriplePattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<Triple>, Vec<Triple>)> {
-        if let Some(msg) = unwired_in_pattern(pattern) {
-            return Err(GStoreError::Query(msg));
-        }
+        self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
         let mut dels = Vec::new();
@@ -597,8 +702,42 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .map(|v| layout.index.get(v).is_some_and(|&i| layout.is_pred[i]))
             .collect();
 
+        // gStore's advanced graph functions, `(shortestPath(…) AS ?v)`: each is
+        // computed once over the distinct bindings of its vertex arguments
+        // across all solutions (per group with GROUP BY) and placed with
+        // upstream's row shape — see the module docs, "Advanced graph
+        // functions".
+        let gfns = graph_fn_items(q)?;
         let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
-        let mut rows = if has_agg {
+        let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
+        let mut rows = if !gfns.is_empty()
+            && (solutions.is_empty() || pattern_is_trivially_empty(&q.pattern))
+        {
+            // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
+            // function is evaluated once with its arguments read as constants
+            // (a variable is looked up as an IRI and is missing); next to
+            // other projections there is no row at all.
+            if only_gfn {
+                vec![vec![self.eval_graph_fn(
+                    &gfns[0].call,
+                    &[],
+                    &layout,
+                    true,
+                )?]]
+            } else {
+                Vec::new()
+            }
+        } else if only_gfn && !has_agg {
+            // A lone graph function over the solutions: exactly one row
+            // (upstream reserves `resultSz = 1`, GE:2041-2050).
+            let all: Vec<&Binding> = solutions.iter().collect();
+            vec![vec![self.eval_graph_fn(
+                &gfns[0].call,
+                &all,
+                &layout,
+                false,
+            )?]]
+        } else if has_agg {
             let mut rows = self.eval_aggregation(&solutions, &layout, q)?;
             // Aggregated rows are ordered over the projected result layout —
             // ORDER BY here references group keys / aggregate aliases.
@@ -608,6 +747,35 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             rows
         } else {
+            // Graph functions next to other projections: one row per
+            // solution, each function's value on the *last* solution only
+            // (upstream writes it to `result.back()`, GE:3100-3108; "last" is
+            // in WHERE order, before ORDER BY). The value becomes a column
+            // under its alias so ORDER BY can refer to it.
+            if !gfns.is_empty() {
+                let all: Vec<&Binding> = solutions.iter().collect();
+                let mut values = Vec::with_capacity(gfns.len());
+                for g in &gfns {
+                    values.push(self.eval_graph_fn(&g.call, &all, &layout, false)?);
+                }
+                for (g, v) in gfns.iter().zip(values) {
+                    if layout.index.contains_key(&g.alias) {
+                        return Err(GStoreError::Query(format!(
+                            "?{} is already bound by the WHERE clause; ({}(…) AS ?v) needs a \
+                             fresh variable",
+                            g.alias,
+                            g.call.kind.name()
+                        )));
+                    }
+                    layout.index.insert(g.alias.clone(), layout.names.len());
+                    layout.names.push(g.alias.clone());
+                    layout.is_pred.push(false);
+                    let last = solutions.len().saturating_sub(1);
+                    for (i, b) in solutions.iter_mut().enumerate() {
+                        b.push(if i == last { v } else { None });
+                    }
+                }
+            }
             // SPARQL evaluates ORDER BY over the *pre-projection* solution
             // sequence, so it may sort by a pattern variable that is not selected
             // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
@@ -669,12 +837,123 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 .iter()
                 .map(|it| match it {
                     SelectItem::Var(v) => Ok(layout.index.get(v).and_then(|&i| b[i])),
+                    // Computed up front into the alias column (see
+                    // `eval_select_solutions`).
+                    SelectItem::Expr(Expr::GraphFn { .. }, alias) => {
+                        Ok(layout.index.get(alias).and_then(|&i| b[i]))
+                    }
                     SelectItem::Expr(e, _) => {
                         Ok(self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
                     }
                 })
                 .collect(),
         }
+    }
+
+    /// Evaluate a projected advanced graph function over `sols` (all the
+    /// WHERE solutions, or one GROUP BY group): resolve each vertex argument
+    /// to its distinct bindings across `sols` (a constant IRI to its one
+    /// node), the `predSet` against the dictionary, and run the gfun library
+    /// on the shared CSR. `constant` is upstream's no-solution path, where a
+    /// variable argument is looked up as if it were an IRI and so is a
+    /// missing vertex. Returns the value's id (a plain-literal JSON text, an
+    /// `xsd:boolean` for `cycleBoolean`, …).
+    fn eval_graph_fn(
+        &self,
+        call: &GCall,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        constant: bool,
+    ) -> Result<Option<u32>> {
+        let csr = self.gfun_csr()?;
+        let nodes = |arg: &Option<VarOrIri>| -> Vec<GNode> {
+            match arg {
+                None => Vec::new(),
+                Some(VarOrIri::Iri(iri)) => vec![gfun::iri_node(&csr, self.dict, iri)],
+                Some(VarOrIri::Var(_)) if constant => vec![GNode::MISSING],
+                Some(VarOrIri::Var(v)) => self.distinct_gfn_nodes(v, sols, layout, &csr),
+            }
+        };
+        let (srcs, dsts) = (nodes(&call.src), nodes(&call.dst));
+        // A vertex argument whose variable has no usable binding: upstream's
+        // `for uid … for vid …` loop never runs, leaving `{"paths":[]}`
+        // (`false` for cycleBoolean). Decided here because the library reads
+        // an empty `srcs` as "no source given" (clusterCoeff's global form).
+        if (call.src.is_some() && srcs.is_empty()) || (call.dst.is_some() && dsts.is_empty()) {
+            let value = match call.kind {
+                GFnKind::CycleBoolean => Value::Bool(false),
+                _ => Value::Str {
+                    value: r#"{"paths":[]}"#.into(),
+                    lang: None,
+                },
+            };
+            return Ok(Some(self.value_to_id(&value)));
+        }
+        let mut args = call.to_gargs(srcs, dsts, self.dict);
+        args.where_empty = constant;
+        let mut ctx = GFunCtx::new(&csr, self.dict);
+        if let Some(flag) = &self.cancel {
+            ctx = ctx.with_cancel(flag);
+        }
+        let value = match gfun::eval(call.kind, &ctx, &args)? {
+            // Upstream stores the JSON text as a plain literal (GE:1578,
+            // GE:2019). `confidenceDegree`'s `pfn_type` result replaces the
+            // whole upstream response with `{"results": …}`; this engine has
+            // no such response mode and returns its JSON as a plain literal.
+            GFunValue::Json(text) | GFunValue::ResultsJson(text) => Value::Str {
+                value: text,
+                lang: None,
+            },
+            GFunValue::Bool(v) => Value::Bool(v),
+            GFunValue::Int(v) => Value::Int(v),
+            GFunValue::Num(v) => Value::Double(v),
+        };
+        Ok(Some(self.value_to_id(&value)))
+    }
+
+    /// The distinct vertices a graph-function variable is bound to across
+    /// `sols`, in first-appearance order. Unbound rows are skipped (GE:2582
+    /// `!= INVALID`); a computed value that is not a stored term (a BIND /
+    /// VALUES result outside the dictionary — upstream's string columns,
+    /// "src must be an entity", GE:2577) is skipped; a stored literal is
+    /// passed with its dictionary id and no CSR vertex, as upstream passes
+    /// its literal id (it has no edges and prints as its literal text); a
+    /// predicate-position binding is the entity with the same IRI, if any.
+    /// A variable the WHERE clause never binds has no bindings.
+    fn distinct_gfn_nodes(
+        &self,
+        var: &str,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        csr: &CsrGraph,
+    ) -> Vec<GNode> {
+        let Some(&idx) = layout.index.get(var) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for b in sols {
+            let Some(id) = b[idx] else { continue };
+            if is_synth(id) {
+                continue;
+            }
+            let entity = if layout.is_pred[idx] {
+                match self
+                    .dict
+                    .predicate_to_string(id)
+                    .and_then(|key| self.dict.entity_id(key))
+                {
+                    Some(e) => e,
+                    None => continue,
+                }
+            } else {
+                id
+            };
+            if seen.insert(entity) {
+                out.push(GNode::resolve(csr, Some(entity)));
+            }
+        }
+        out
     }
 
     /// Group solutions and compute aggregates / projected expressions.
@@ -744,6 +1023,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         sols.first()
                             .and_then(|b| layout.index.get(v).and_then(|&i| b[i]))
                     }),
+                    // An advanced graph function over the group's solutions
+                    // (upstream: once per GROUP BY group, GE:2546-2620).
+                    SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
+                        let call = GCall::from_ast(*func, args)?;
+                        self.eval_graph_fn(&call, &sols, layout, false)?
+                    }
                     SelectItem::Expr(e, _) => self
                         .eval_group_expr(e, &sols, layout, &key_vars, key)
                         .map(|v| self.value_to_id(&v)),
@@ -824,8 +1109,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             )),
             // Builtins over aggregate context are not supported.
             Expr::Builtin(_, _) | Expr::IriCall { .. } => None,
-            // Advanced functions / PFN are rejected before evaluation starts
-            // (see `unwired_call`).
+            // A projected advanced function is evaluated per group by
+            // `eval_aggregation`; nested ones and PFN are rejected before
+            // evaluation starts (`check_calls`).
             Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
             // EXISTS in HAVING: test against the group's representative solution.
             Expr::Exists(neg, pat) => {
@@ -1241,6 +1527,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()), // per-graph, not shared
             string_index: std::cell::RefCell::new(None), // per-graph store, own index
             string_index_tried: std::cell::Cell::new(false),
+            // Graph functions inside a GRAPH block run over that named graph:
+            // its CSR is built from the sub-evaluator's own store.
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
         }
     }
 
@@ -1813,7 +2103,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
             Expr::Not(x) => self.eval_ebv(x, b, l).map(|v| !v),
-            _ => self.eval_value(e, b, l)?.ebv(),
+            _ => numeric_view(self.eval_value(e, b, l)?).ebv(),
         }
     }
 
@@ -1830,29 +2120,38 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             Expr::Compare(op, x, y) => self.eval_compare(*op, x, y, b, l).map(Value::Bool),
             Expr::Arith(op, x, y) => {
-                let a = self.eval_value(x, b, l)?;
-                let c = self.eval_value(y, b, l)?;
+                let a = numeric_view(self.eval_value(x, b, l)?);
+                let c = numeric_view(self.eval_value(y, b, l)?);
                 eval_arith(*op, a, c)
             }
             Expr::Unary(op, x) => {
-                let v = self.eval_value(x, b, l)?;
+                let v = numeric_view(self.eval_value(x, b, l)?);
                 match op {
                     UnaryOp::Plus => Some(v),
                     UnaryOp::Neg => v.negate(),
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
-            // `rs:NAME(…)` is the legacy gstore-rust built-in NAME; any other
-            // IRI is looked up among the user-defined functions. The bare
-            // `SIMILARITY` is upstream's string similarity, so the legacy
-            // node/string SIMILARITY is only reachable as `rs:SIMILARITY`.
+            // `rs:NAME(…)` is the legacy gstore-rust built-in NAME (unchanged
+            // semantics); `xsd:T(x)` is a SPARQL 1.1 cast; any other IRI is a
+            // user-defined function (checked before evaluation, see
+            // `check_iri_call`). The bare `SIMILARITY` is upstream's string
+            // similarity, so the legacy node/string SIMILARITY is only
+            // reachable as `rs:SIMILARITY`.
             Expr::IriCall { iri, args } => match rs_function_name(iri) {
                 Some("SIMILARITY") => self.eval_legacy_similarity(args, b, l),
                 Some(name) => self.eval_builtin(name, args, b, l),
-                None => self.eval_custom_function(iri, args, b, l),
+                None => match XsdCast::from_iri(iri) {
+                    Some(target) => match args.as_slice() {
+                        [arg] => xsd_cast(target, &self.eval_value(arg, b, l)?),
+                        _ => None,
+                    },
+                    None => self.eval_iri_function(iri, args, b, l),
+                },
             },
-            // Advanced functions / PFN are rejected before evaluation starts
-            // (see `unwired_call`).
+            // An advanced graph function only evaluates as a whole SELECT
+            // projection (`eval_graph_fn`); elsewhere, and PFN anywhere, the
+            // query is rejected before evaluation starts (`check_calls`).
             Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
             Expr::Exists(neg, pat) => Some(Value::Bool(self.eval_exists(*neg, pat, b, l))),
             // Aggregates only have meaning in group context (handled elsewhere).
@@ -2062,8 +2361,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         b: &Binding,
         l: &VarLayout,
     ) -> Option<bool> {
-        let a = self.eval_value(x, b, l)?;
-        let c = self.eval_value(y, b, l)?;
+        let a = numeric_view(self.eval_value(x, b, l)?);
+        let c = numeric_view(self.eval_value(y, b, l)?);
         compare_values(op, &a, &c)
     }
 
@@ -2587,6 +2886,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         f(&argv)
     }
 
+    /// A user function called through its IRI: registered under the full IRI,
+    /// else under the IRI's local name (`ex:double(…)` reaches a function
+    /// registered as `"double"`).
+    fn eval_iri_function(
+        &self,
+        iri: &str,
+        args: &[Expr],
+        b: &Binding,
+        l: &VarLayout,
+    ) -> Option<Value> {
+        let f = self.user_iri_function(iri)?;
+        let mut argv = Vec::with_capacity(args.len());
+        for a in args {
+            argv.push(self.eval_value(a, b, l)?);
+        }
+        f(&argv)
+    }
+
     /// Resolve a graph built-in node argument to its dictionary entity id.
     /// `None` when the term is not in the store (so it cannot be a graph node).
     fn node_id(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<u32> {
@@ -2856,6 +3173,306 @@ fn value_to_term(v: &Value) -> Term {
     }
 }
 
+/// `xsd:float`, produced by the `xsd:float(…)` cast.
+const XSD_FLOAT: &str = "http://www.w3.org/2001/XMLSchema#float";
+/// `xsd:date`, produced by the `xsd:date(…)` cast.
+const XSD_DATE: &str = "http://www.w3.org/2001/XMLSchema#date";
+
+/// [`Value`] has no `xsd:float` variant: a float read from the store is an
+/// `f64` [`Value::Double`], but the `xsd:float(…)` cast keeps its datatype as
+/// a [`Value::Typed`] so it projects as `"…"^^xsd:float`. Arithmetic and
+/// comparisons see such a value as the number it is.
+fn numeric_view(v: Value) -> Value {
+    match &v {
+        Value::Typed { value, datatype } if datatype == XSD_FLOAT => {
+            match parse_xsd_double(value) {
+                Some(x) => Value::Double(x),
+                None => v,
+            }
+        }
+        _ => v,
+    }
+}
+
+/// Whether `s` (already whitespace-trimmed) is an `xsd:integer` lexical.
+fn is_integer_lexical(s: &str) -> bool {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Whether `s` (already trimmed) is an `xsd:decimal` lexical (no exponent).
+fn is_decimal_lexical(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    !(int.is_empty() && frac.is_empty())
+        && int.bytes().all(|c| c.is_ascii_digit())
+        && frac.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Parse an `xsd:double` / `xsd:float` lexical (decimal mantissa with an
+/// optional exponent, `INF`, `+INF`, `-INF`, `NaN`); Rust spellings such as
+/// `inf` or `infinity` are not XSD lexicals and are rejected.
+fn parse_xsd_double(s: &str) -> Option<f64> {
+    let s = s.trim();
+    match s {
+        "INF" | "+INF" => return Some(f64::INFINITY),
+        "-INF" => return Some(f64::NEG_INFINITY),
+        "NaN" => return Some(f64::NAN),
+        _ => {}
+    }
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    if !is_decimal_lexical(mantissa) || !exponent.is_none_or(is_integer_lexical) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// The `xsd:float` lexical of `x` rounded to single precision.
+fn xsd_float_lexical(x: f64) -> String {
+    let f = x as f32;
+    if f.is_nan() {
+        "NaN".into()
+    } else if f.is_infinite() {
+        if f > 0.0 { "INF" } else { "-INF" }.into()
+    } else {
+        f.to_string()
+    }
+}
+
+/// A float result of the `xsd:float(…)` cast.
+fn float_value(x: f64) -> Value {
+    Value::Typed {
+        value: xsd_float_lexical(x),
+        datatype: XSD_FLOAT.into(),
+    }
+}
+
+/// An integer from an `xsd:integer` lexical (`i64`, else `i128`).
+fn integer_value(lexical: &str) -> Option<Value> {
+    match Value::from_term(&Term::typed_literal(lexical, xsd::INTEGER)) {
+        v @ (Value::Int(_) | Value::BigInt(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// A decimal from an `xsd:decimal` lexical (`None` beyond its `i128` range).
+fn decimal_value(lexical: &str) -> Option<Value> {
+    match Value::from_term(&Term::typed_literal(lexical, xsd::DECIMAL)) {
+        v @ Value::Decimal(_) => Some(v),
+        _ => None,
+    }
+}
+
+/// The integer part of a finite double (`None` for NaN / ±INF or beyond `i128`).
+fn integer_from_f64(x: f64) -> Option<Value> {
+    if !x.is_finite() {
+        return None;
+    }
+    let t = x.trunc();
+    if t.abs() < 9.0e18 {
+        return Some(Value::Int(t as i64));
+    }
+    if t.abs() < 1.7e38 {
+        return Some(Value::BigInt(t as i128));
+    }
+    None
+}
+
+/// What an XSD cast reads its argument as (SPARQL 1.1 §17.5, the rows of the
+/// casting table).
+enum CastSource<'v> {
+    Iri(&'v str),
+    Str(&'v str),
+    Number(&'v Value),
+    Float(f64),
+    Bool(bool),
+    DateTime(&'v str),
+    Date(&'v str),
+    /// A literal of another datatype: castable to `xsd:string` only.
+    Other(&'v str),
+}
+
+/// The SPARQL 1.1 XSD constructor functions (§17.5): `xsd:string(?x)`,
+/// `xsd:integer(?x)`, `xsd:decimal`, `xsd:double`, `xsd:float`,
+/// `xsd:boolean`, `xsd:dateTime`, plus `xsd:date` (XPath casting rules).
+/// `None` (an expression error: FILTER false, BIND/projection unbound) for a
+/// cast the table forbids — blank nodes, language-tagged strings, IRIs to
+/// anything but `xsd:string`, ill-typed literals, NaN/INF to an integer or
+/// decimal, … — and for a string whose lexical form is invalid for the
+/// target type.
+fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
+    let src = match v {
+        Value::Iri(s) => CastSource::Iri(s),
+        Value::Blank(_) => return None,
+        Value::Str { lang: Some(_), .. } => return None,
+        Value::Str { value, lang: None } => CastSource::Str(value),
+        Value::Int(_) | Value::BigInt(_) | Value::Decimal(_) | Value::Double(_) => {
+            CastSource::Number(v)
+        }
+        Value::Bool(b) => CastSource::Bool(*b),
+        Value::Typed { value, datatype } => match datatype.as_str() {
+            XSD_DATETIME => CastSource::DateTime(value),
+            XSD_DATE => CastSource::Date(value),
+            XSD_FLOAT => CastSource::Float(parse_xsd_double(value)?),
+            // A datatype the value layer reads as a number (its "0" is
+            // numeric) or a boolean, whose literal nevertheless stayed
+            // `Typed`, is an ill-typed literal ("abc"^^xsd:integer): not
+            // castable at all.
+            dt if Value::from_term(&Term::typed_literal("0", dt)).is_numeric() => return None,
+            xsd::BOOLEAN => return None,
+            _ => CastSource::Other(value),
+        },
+    };
+    let string = |s: String| Value::Str {
+        value: s,
+        lang: None,
+    };
+    match target {
+        XsdCast::String => Some(match src {
+            CastSource::Iri(s) | CastSource::Str(s) | CastSource::Other(s) => string(s.into()),
+            CastSource::DateTime(s) | CastSource::Date(s) => string(s.into()),
+            CastSource::Number(n) => string(n.lexical()),
+            CastSource::Float(x) => string(xsd_float_lexical(x)),
+            CastSource::Bool(b) => string(b.to_string()),
+        }),
+        XsdCast::Integer => match src {
+            CastSource::Str(s) => {
+                let s = s.trim();
+                is_integer_lexical(s).then(|| integer_value(s)).flatten()
+            }
+            CastSource::Number(n @ (Value::Int(_) | Value::BigInt(_))) => Some(n.clone()),
+            CastSource::Number(Value::Decimal(d)) => {
+                // Truncate toward zero: the integer part of the lexical form.
+                let lex = Value::Decimal(*d).lexical();
+                let int = lex.split('.').next().unwrap_or("0");
+                integer_value(if int == "-0" || int == "-" { "0" } else { int })
+            }
+            CastSource::Number(n) => integer_from_f64(n.as_f64()?),
+            CastSource::Float(x) => integer_from_f64(x),
+            CastSource::Bool(b) => Some(Value::Int(b as i64)),
+            _ => None,
+        },
+        XsdCast::Decimal => match src {
+            CastSource::Str(s) => {
+                let s = s.trim();
+                is_decimal_lexical(s).then(|| decimal_value(s)).flatten()
+            }
+            CastSource::Number(Value::Decimal(d)) => Some(Value::Decimal(*d)),
+            CastSource::Number(n @ (Value::Int(_) | Value::BigInt(_))) => {
+                decimal_value(&n.lexical())
+            }
+            CastSource::Number(n) => {
+                let x = n.as_f64()?;
+                // Rust prints a finite f64 positionally (never with an
+                // exponent), the shortest digits that round-trip.
+                x.is_finite()
+                    .then(|| decimal_value(&x.to_string()))
+                    .flatten()
+            }
+            CastSource::Float(x) => {
+                let f = x as f32;
+                f.is_finite()
+                    .then(|| decimal_value(&f.to_string()))
+                    .flatten()
+            }
+            CastSource::Bool(b) => decimal_value(if b { "1.0" } else { "0.0" }),
+            _ => None,
+        },
+        XsdCast::Double | XsdCast::Float => {
+            let x = match src {
+                CastSource::Str(s) => parse_xsd_double(s)?,
+                CastSource::Number(n) => n.as_f64()?,
+                CastSource::Float(x) => x,
+                CastSource::Bool(b) => f64::from(u8::from(b)),
+                _ => return None,
+            };
+            Some(match target {
+                XsdCast::Float => float_value(x),
+                _ => Value::Double(x),
+            })
+        }
+        XsdCast::Boolean => match src {
+            CastSource::Str(s) => match s.trim() {
+                "true" | "1" => Some(Value::Bool(true)),
+                "false" | "0" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            CastSource::Number(n) => {
+                let x = n.as_f64()?;
+                Some(Value::Bool(x != 0.0 && !x.is_nan()))
+            }
+            CastSource::Float(x) => Some(Value::Bool(x != 0.0 && !x.is_nan())),
+            CastSource::Bool(b) => Some(Value::Bool(b)),
+            _ => None,
+        },
+        XsdCast::DateTime => {
+            let lexical = match src {
+                CastSource::Str(s) | CastSource::DateTime(s) => {
+                    let s = s.trim();
+                    (s.contains('T') && parse_datetime_parts(s).is_some()).then(|| s.to_string())?
+                }
+                // xs:date → xs:dateTime: midnight, same timezone (XPath).
+                CastSource::Date(s) => {
+                    let s = s.trim();
+                    if s.contains('T') || parse_datetime_parts(s).is_none() {
+                        return None;
+                    }
+                    let (date, tz) = split_date_tz(s);
+                    format!("{date}T00:00:00{tz}")
+                }
+                _ => return None,
+            };
+            Some(Value::Typed {
+                value: lexical,
+                datatype: XSD_DATETIME.into(),
+            })
+        }
+        XsdCast::Date => {
+            let lexical = match src {
+                CastSource::Str(s) | CastSource::Date(s) => {
+                    let s = s.trim();
+                    (!s.contains('T') && parse_datetime_parts(s).is_some())
+                        .then(|| s.to_string())?
+                }
+                // xs:dateTime → xs:date: the date part, same timezone.
+                CastSource::DateTime(s) => {
+                    let s = s.trim();
+                    parse_datetime_parts(s)?;
+                    let (date_time, tz) = split_date_tz(s);
+                    let date = date_time.split('T').next()?;
+                    format!("{date}{tz}")
+                }
+                _ => return None,
+            };
+            Some(Value::Typed {
+                value: lexical,
+                datatype: XSD_DATE.into(),
+            })
+        }
+    }
+}
+
+/// Split a valid `xsd:date` / `xsd:dateTime` lexical into the part before
+/// its timezone and the timezone (`Z`, `±hh:mm`, or empty).
+fn split_date_tz(s: &str) -> (&str, &str) {
+    if let Some(body) = s.strip_suffix('Z') {
+        return (body, "Z");
+    }
+    // A `±hh:mm` zone is the last six characters. Without a zone those end
+    // in `-MM-DD` (a date: `:` missing) or `mm:ss` / fractional digits (a
+    // dateTime: no leading sign), so the shape test cannot misfire.
+    if let Some(at) = s.len().checked_sub(6).filter(|&at| s.is_char_boundary(at)) {
+        let (body, tz) = s.split_at(at);
+        if tz.starts_with(['+', '-']) && tz.as_bytes()[3] == b':' {
+            return (body, tz);
+        }
+    }
+    (s, "")
+}
+
 /// A value's lexical form plus its language tag (preserved by `SUBSTR`/`REPLACE`
 /// when the input is a language-tagged string literal).
 fn str_and_lang(v: &Value) -> (String, Option<String>) {
@@ -3107,79 +3724,295 @@ fn expr_has_aggregate(e: &Expr) -> bool {
     }
 }
 
-/// Upstream advanced graph functions ([`Expr::GraphFn`]) and `PFN` calls
-/// parse, but evaluating them is not wired into the engine yet: report the
-/// first one in `q` so the query fails cleanly instead of yielding unbound
-/// values.
-fn unwired_call(q: &Query) -> Option<String> {
-    match q {
-        Query::Select(s) => unwired_in_select(s),
-        Query::Ask(a) => unwired_in_pattern(&a.pattern),
-        Query::Construct(c) => unwired_in_pattern(&c.pattern)
-            .or_else(|| c.order_by.iter().find_map(|o| unwired_in_expr(&o.expr))),
-        Query::Describe(d) => d.pattern.as_ref().and_then(unwired_in_pattern),
-        Query::Update(_) => None,
-    }
+// ---------------------------------------------------------------------------
+// advanced graph functions: projection shape
+// ---------------------------------------------------------------------------
+
+/// A SELECT projection item `(f(…) AS ?alias)` whose expression is an
+/// upstream advanced graph function.
+struct GraphFnItem {
+    call: GCall,
+    alias: String,
 }
 
-fn unwired_in_select(s: &SelectQuery) -> Option<String> {
-    let items: &[SelectItem] = match &s.projection {
-        Projection::Items(items) => items,
-        Projection::All => &[],
+/// The advanced graph functions projected by `q`, in projection order.
+fn graph_fn_items(q: &SelectQuery) -> Result<Vec<GraphFnItem>> {
+    let Projection::Items(items) = &q.projection else {
+        return Ok(Vec::new());
     };
     items
         .iter()
-        .find_map(|it| match it {
-            SelectItem::Expr(e, _) => unwired_in_expr(e),
-            SelectItem::Var(_) => None,
+        .filter_map(|it| match it {
+            SelectItem::Expr(Expr::GraphFn { func, args }, alias) => {
+                Some(GCall::from_ast(*func, args).map(|call| GraphFnItem {
+                    call,
+                    alias: alias.clone(),
+                }))
+            }
+            _ => None,
         })
-        .or_else(|| unwired_in_pattern(&s.pattern))
-        .or_else(|| s.group_by.iter().chain(&s.having).find_map(unwired_in_expr))
-        .or_else(|| s.order_by.iter().find_map(|o| unwired_in_expr(&o.expr)))
+        .collect()
 }
 
-fn unwired_in_pattern(gp: &GraphPattern) -> Option<String> {
-    match gp {
-        GraphPattern::Empty
-        | GraphPattern::Bgp(_)
-        | GraphPattern::Path(_)
-        | GraphPattern::Values(_, _) => None,
-        GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
-            unwired_in_pattern(a).or_else(|| unwired_in_pattern(b))
+/// The size of upstream's projection list for `q`: the projected items plus
+/// every ORDER BY variable that is not projected (upstream appends those to
+/// `proj`, GE:1418-1437, and the row shape of a graph function depends on
+/// whether `proj` has a single entry).
+fn upstream_projection_len(q: &SelectQuery) -> usize {
+    let projected = q.result_vars();
+    let mut extra: Vec<String> = Vec::new();
+    for o in &q.order_by {
+        let mut vars = Vec::new();
+        expr_vars(&o.expr, &mut vars);
+        for v in vars {
+            if !projected.contains(&v) && !extra.contains(&v) {
+                extra.push(v);
+            }
         }
-        GraphPattern::LeftJoin(a, b, fs) => unwired_in_pattern(a)
-            .or_else(|| unwired_in_pattern(b))
-            .or_else(|| fs.iter().find_map(unwired_in_expr)),
-        GraphPattern::Filter(fs, inner) => fs
-            .iter()
-            .find_map(unwired_in_expr)
-            .or_else(|| unwired_in_pattern(inner)),
-        GraphPattern::Extend(inner, _, e) => {
-            unwired_in_pattern(inner).or_else(|| unwired_in_expr(e))
+    }
+    projected.len() + extra.len()
+}
+
+/// The variables an expression mentions (not those of nested patterns).
+fn expr_vars(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Var(v) => out.push(v.clone()),
+        Expr::Const(_) | Expr::Exists(_, _) | Expr::Pfn { .. } => {}
+        Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+            expr_vars(a, out);
+            expr_vars(b, out);
         }
-        GraphPattern::SubSelect(sq) => unwired_in_select(sq),
-        GraphPattern::Graph(_, inner) => unwired_in_pattern(inner),
-        GraphPattern::Service { pattern, .. } => unwired_in_pattern(pattern),
+        Expr::Not(a) | Expr::Unary(_, a) => expr_vars(a, out),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
+            args.iter().for_each(|a| expr_vars(a, out))
+        }
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                expr_vars(a, out);
+            }
+        }
+        Expr::GraphFn { args, .. } => {
+            for a in args {
+                if let GArg::Node(VarOrIri::Var(v)) = a {
+                    out.push(v.clone());
+                }
+            }
+        }
     }
 }
 
-fn unwired_in_expr(e: &Expr) -> Option<String> {
-    match e {
-        Expr::GraphFn { func, .. } => Some(format!(
-            "advanced function evaluation not wired yet: {}(…)",
-            func.name()
-        )),
-        Expr::Pfn { name, .. } => Some(format!("PFN not supported yet: PFN.{name}(…)")),
-        Expr::Var(_) | Expr::Const(_) => None,
-        Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
-            unwired_in_expr(a).or_else(|| unwired_in_expr(b))
+/// `WHERE {}`: upstream evaluates it to no rows at all (its result table is
+/// created empty, GE:1390-1394), where SPARQL has one empty solution.
+fn pattern_is_trivially_empty(gp: &GraphPattern) -> bool {
+    match gp {
+        GraphPattern::Empty => true,
+        GraphPattern::Bgp(tps) => tps.is_empty(),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// call validation (before evaluation)
+// ---------------------------------------------------------------------------
+
+/// The `xsd:` namespace of the SPARQL 1.1 constructor (cast) functions.
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// The target of an XSD constructor function call, `xsd:integer(?x)` & co.
+/// (SPARQL 1.1 §17.5, plus `xsd:date`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XsdCast {
+    String,
+    Integer,
+    Decimal,
+    Double,
+    Float,
+    Boolean,
+    DateTime,
+    Date,
+}
+
+impl XsdCast {
+    /// The cast an IRI function call names, if any (XSD local names are
+    /// case-sensitive).
+    fn from_iri(iri: &str) -> Option<XsdCast> {
+        Some(match iri.strip_prefix(XSD_NS)? {
+            "string" => XsdCast::String,
+            "integer" => XsdCast::Integer,
+            "decimal" => XsdCast::Decimal,
+            "double" => XsdCast::Double,
+            "float" => XsdCast::Float,
+            "boolean" => XsdCast::Boolean,
+            "dateTime" => XsdCast::DateTime,
+            "date" => XsdCast::Date,
+            _ => return None,
+        })
+    }
+}
+
+/// The local name of a function IRI (after the last `#`, `/` or `:`), for
+/// looking up user functions registered under a bare name.
+fn iri_local_name(iri: &str) -> &str {
+    iri.rsplit(['#', '/', ':']).next().unwrap_or(iri)
+}
+
+impl<'a, S: TripleSource> Evaluator<'a, S> {
+    /// Reject, before evaluation, the calls this engine cannot evaluate, so
+    /// the query fails with a clear message instead of silently yielding
+    /// unbound values:
+    ///
+    /// * an upstream advanced graph function anywhere but as the whole
+    ///   expression of a SELECT projection (upstream gStore parses
+    ///   `simpleCycleBoolean`/`cycleBoolean`/`shortestPathLen`/`kHopReachable`
+    ///   inside FILTER — QueryParser.cpp:866-930 — but `TempResult::doComp`
+    ///   has no case for them, so they never evaluate there);
+    /// * an advanced function whose arguments do not fit its signature (the
+    ///   parser never produces one, but an AST may be built by hand);
+    /// * `PFN.name({…})` (personalised functions arrive in a later phase);
+    /// * an IRI function call that is neither an XSD cast, nor a legacy `rs:`
+    ///   function, nor a user function registered under its IRI or its local
+    ///   name.
+    fn check_calls(&self, q: &Query) -> Result<()> {
+        match q {
+            Query::Select(s) => self.check_select_calls(s),
+            Query::Ask(a) => self.check_pattern_calls(&a.pattern),
+            Query::Construct(c) => {
+                self.check_pattern_calls(&c.pattern)?;
+                c.order_by
+                    .iter()
+                    .try_for_each(|o| self.check_expr_calls(&o.expr))
+            }
+            Query::Describe(d) => match &d.pattern {
+                Some(p) => self.check_pattern_calls(p),
+                None => Ok(()),
+            },
+            Query::Update(_) => Ok(()),
         }
-        Expr::Not(a) | Expr::Unary(_, a) => unwired_in_expr(a),
-        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
-            args.iter().find_map(unwired_in_expr)
+    }
+
+    fn check_select_calls(&self, s: &SelectQuery) -> Result<()> {
+        if let Projection::Items(items) = &s.projection {
+            for it in items {
+                match it {
+                    // The one place an advanced function evaluates.
+                    SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
+                        GCall::from_ast(*func, args)?;
+                    }
+                    SelectItem::Expr(e, _) => self.check_expr_calls(e)?,
+                    SelectItem::Var(_) => {}
+                }
+            }
         }
-        Expr::Exists(_, p) => unwired_in_pattern(p),
-        Expr::Aggregate { arg, .. } => arg.as_deref().and_then(unwired_in_expr),
+        self.check_pattern_calls(&s.pattern)?;
+        for e in s.group_by.iter().chain(&s.having) {
+            self.check_expr_calls(e)?;
+        }
+        s.order_by
+            .iter()
+            .try_for_each(|o| self.check_expr_calls(&o.expr))
+    }
+
+    fn check_pattern_calls(&self, gp: &GraphPattern) -> Result<()> {
+        match gp {
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _) => Ok(()),
+            GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
+                self.check_pattern_calls(a)?;
+                self.check_pattern_calls(b)
+            }
+            GraphPattern::LeftJoin(a, b, fs) => {
+                self.check_pattern_calls(a)?;
+                self.check_pattern_calls(b)?;
+                fs.iter().try_for_each(|e| self.check_expr_calls(e))
+            }
+            GraphPattern::Filter(fs, inner) => {
+                fs.iter().try_for_each(|e| self.check_expr_calls(e))?;
+                self.check_pattern_calls(inner)
+            }
+            GraphPattern::Extend(inner, _, e) => {
+                self.check_pattern_calls(inner)?;
+                self.check_expr_calls(e)
+            }
+            GraphPattern::SubSelect(sq) => self.check_select_calls(sq),
+            GraphPattern::Graph(_, inner) => self.check_pattern_calls(inner),
+            GraphPattern::Service { pattern, .. } => self.check_pattern_calls(pattern),
+        }
+    }
+
+    fn check_expr_calls(&self, e: &Expr) -> Result<()> {
+        match e {
+            Expr::GraphFn { func, .. } => {
+                let name = func.name();
+                let mut msg = format!(
+                    "{name}(…) is only evaluated as the whole expression of a SELECT \
+                     projection, e.g. SELECT ({name}(…) AS ?v); upstream gStore parses it \
+                     inside FILTER but never evaluates it there"
+                );
+                if rs_function_name(&format!("{RS_NAMESPACE}{}", func.keyword())).is_some() {
+                    msg.push_str(&format!(
+                        "; the legacy gstore-rust function rs:{}(…) works anywhere",
+                        func.keyword()
+                    ));
+                }
+                Err(GStoreError::Query(msg))
+            }
+            Expr::Pfn { name, .. } => Err(GStoreError::Query(format!(
+                "PFN not supported yet (Phase 4): PFN.{name}(…)"
+            ))),
+            Expr::IriCall { iri, args } => {
+                self.check_iri_call(iri, args.len())?;
+                args.iter().try_for_each(|a| self.check_expr_calls(a))
+            }
+            Expr::Var(_) | Expr::Const(_) => Ok(()),
+            Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+                self.check_expr_calls(a)?;
+                self.check_expr_calls(b)
+            }
+            Expr::Not(a) | Expr::Unary(_, a) => self.check_expr_calls(a),
+            Expr::Builtin(_, args) => args.iter().try_for_each(|a| self.check_expr_calls(a)),
+            Expr::Exists(_, p) => self.check_pattern_calls(p),
+            Expr::Aggregate { arg, .. } => match arg {
+                Some(a) => self.check_expr_calls(a),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// An IRI function call must name an `rs:` legacy function (the parser
+    /// checked name and arity), a one-argument XSD cast, or a registered user
+    /// function (by full IRI, else by local name).
+    fn check_iri_call(&self, iri: &str, nargs: usize) -> Result<()> {
+        if rs_function_name(iri).is_some() {
+            return Ok(());
+        }
+        if XsdCast::from_iri(iri).is_some() {
+            if nargs != 1 {
+                return Err(GStoreError::Query(format!(
+                    "the cast <{iri}>(…) takes exactly one argument, got {nargs}"
+                )));
+            }
+            return Ok(());
+        }
+        if self.user_iri_function(iri).is_some() {
+            return Ok(());
+        }
+        Err(GStoreError::Query(format!(
+            "unknown function <{iri}>: it is not an XSD cast (xsd:string, xsd:integer, \
+             xsd:decimal, xsd:double, xsd:float, xsd:boolean, xsd:dateTime, xsd:date), not a \
+             legacy gstore-rust function (<{RS_NAMESPACE}NAME>, rs:NAME), and no user function \
+             is registered under this IRI or its local name \"{}\"",
+            iri_local_name(iri)
+        )))
+    }
+
+    /// The user function an IRI call reaches: registered under the full IRI,
+    /// else under its local name.
+    fn user_iri_function(&self, iri: &str) -> Option<&super::functions::CustomFn> {
+        self.functions
+            .get(iri)
+            .or_else(|| self.functions.get(iri_local_name(iri)))
     }
 }
 
@@ -4637,5 +5470,178 @@ mod pfn_tests {
         // Real ABS(-5)=5, not the custom 999.
         assert!(rs.rows[0][0].as_ref().unwrap().contains('5'));
         assert!(!rs.rows[0][0].as_ref().unwrap().contains("999"));
+    }
+}
+
+/// Advanced graph functions inside the evaluator: CSR sourcing, cancellation
+/// and the cast helpers (end-to-end behaviour: `tests/dt_gfun_e2e.rs`).
+#[cfg(test)]
+mod gfun_engine_tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::parser::sparql::parse;
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    /// `a -p-> b -p-> c`.
+    fn fixture() -> (Dictionary, TripleStore) {
+        let mut d = Dictionary::new();
+        let a = d.intern_term(&Term::iri("http://ex/a"));
+        let b = d.intern_term(&Term::iri("http://ex/b"));
+        let c = d.intern_term(&Term::iri("http://ex/c"));
+        let p = d.intern_predicate(&Term::iri("http://ex/p").dict_key());
+        let mut s = TripleStore::new();
+        s.bulk_load(vec![IdTriple::new(a, p, b), IdTriple::new(b, p, c)]);
+        (d, s)
+    }
+
+    fn cells(r: QueryResult) -> Vec<Vec<Option<String>>> {
+        match r {
+            QueryResult::Select(rs) => rs.rows,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    const TWO_FNS: &str = "SELECT (kHopCount(<http://ex/a>, true, 2, {}) AS ?k) \
+                           (bfsCount(?x, true, {}) AS ?b) WHERE { ?x <http://ex/p> ?y }";
+
+    #[test]
+    fn without_a_provider_the_evaluator_builds_its_own_csr() {
+        let (d, s) = fixture();
+        let q = parse("SELECT (SSSPLen(<http://ex/a>, true, {}) AS ?r) WHERE {}").unwrap();
+        let rows = cells(Evaluator::new(&d, &s).evaluate(&q).unwrap());
+        assert_eq!(rows.len(), 1);
+        let cell = rows[0][0].clone().unwrap();
+        let Ok(Term::Literal {
+            value,
+            datatype: None,
+            lang: None,
+        }) = parse_term(&cell)
+        else {
+            panic!("not a plain literal: {cell}")
+        };
+        assert_eq!(
+            value,
+            // Upstream's order (an `unordered_map` walk), see gfun::paths.
+            r#"{"paths":[{"src":"<http://ex/a>","dst":"<http://ex/c>","length":2},{"src":"<http://ex/a>","dst":"<http://ex/b>","length":1},{"src":"<http://ex/a>","dst":"<http://ex/a>","length":0}]}"#
+        );
+    }
+
+    #[test]
+    fn the_provider_is_asked_once_per_query_and_only_when_needed() {
+        let (d, s) = fixture();
+        let calls = Cell::new(0);
+        let shared = Arc::new(CsrGraph::build(&s).unwrap());
+        let provider = || {
+            calls.set(calls.get() + 1);
+            Ok(Arc::clone(&shared))
+        };
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&provider);
+        // Two functions (the second over two rows) share one CSR.
+        let rows = cells(ev.evaluate(&parse(TWO_FNS).unwrap()).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(calls.get(), 1);
+        // No graph function, no CSR.
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&provider);
+        ev.evaluate(&parse("SELECT ?x WHERE { ?x <http://ex/p> ?y }").unwrap())
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // A failing provider fails the query.
+        let failing = || Err(GStoreError::Database("no CSR".into()));
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&failing);
+        let e = ev.evaluate(&parse(TWO_FNS).unwrap()).unwrap_err();
+        assert!(e.to_string().contains("no CSR"), "{e}");
+    }
+
+    #[test]
+    fn graph_functions_run_under_the_evaluators_cancel_flag() {
+        let (d, s) = fixture();
+        let flag = Arc::new(AtomicBool::new(true));
+        let ev = Evaluator::new(&d, &s).with_cancel(Arc::clone(&flag));
+        let Query::Select(q) = parse(TWO_FNS).unwrap() else {
+            unreachable!()
+        };
+        let items = graph_fn_items(&q).unwrap();
+        let layout = VarLayout::build(&q.pattern);
+        // `eval_graph_fn` does not check the flag itself: the library does,
+        // through the context the evaluator hands it.
+        let r = ev.eval_graph_fn(&items[0].call, &[], &layout, true);
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(ev
+            .eval_graph_fn(&items[0].call, &[], &layout, true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn upstream_projection_length_counts_unprojected_order_by_variables() {
+        let len = |q: &str| match parse(q).unwrap() {
+            Query::Select(s) => upstream_projection_len(&s),
+            _ => unreachable!(),
+        };
+        let f = "(WCC({}) AS ?w)";
+        assert_eq!(len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }}")), 1);
+        assert_eq!(
+            len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?w")),
+            1
+        );
+        assert_eq!(
+            len(&format!(
+                "SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?x DESC(?y)"
+            )),
+            3
+        );
+        assert_eq!(
+            len(&format!(
+                "SELECT ?x {f} WHERE {{ ?x ?p ?y }} ORDER BY (STR(?x))"
+            )),
+            2
+        );
+        assert!(pattern_is_trivially_empty(&GraphPattern::Empty));
+        assert!(pattern_is_trivially_empty(&GraphPattern::Bgp(Vec::new())));
+    }
+
+    #[test]
+    fn cast_helpers() {
+        assert_eq!(parse_xsd_double("1e3"), Some(1000.0));
+        assert_eq!(parse_xsd_double(" -.5E-1 "), Some(-0.05));
+        assert_eq!(parse_xsd_double("+INF"), Some(f64::INFINITY));
+        assert!(parse_xsd_double("NaN").unwrap().is_nan());
+        for bad in [
+            "inf", "Infinity", "nan", "1e", "e3", "1.2.3", "", "0x10", "1_000",
+        ] {
+            assert_eq!(parse_xsd_double(bad), None, "{bad}");
+        }
+        assert!(is_integer_lexical("+12"));
+        assert!(!is_integer_lexical("-") && !is_integer_lexical("1.0"));
+        assert!(is_decimal_lexical(".5") && is_decimal_lexical("5."));
+        assert!(!is_decimal_lexical("."));
+        assert_eq!(xsd_float_lexical(0.1), "0.1");
+        assert_eq!(xsd_float_lexical(f64::NEG_INFINITY), "-INF");
+        assert_eq!(xsd_float_lexical(1e40), "INF");
+        assert_eq!(split_date_tz("2020-01-01"), ("2020-01-01", ""));
+        assert_eq!(split_date_tz("-0044-03-15"), ("-0044-03-15", ""));
+        assert_eq!(split_date_tz("2020-01-01Z"), ("2020-01-01", "Z"));
+        assert_eq!(split_date_tz("2020-01-01-05:00"), ("2020-01-01", "-05:00"));
+        assert_eq!(
+            split_date_tz("2020-01-01T10:00:00"),
+            ("2020-01-01T10:00:00", "")
+        );
+        assert_eq!(
+            split_date_tz("2020-01-01T10:00:00.5+01:30"),
+            ("2020-01-01T10:00:00.5", "+01:30")
+        );
+        assert_eq!(iri_local_name("http://ex/fn#double"), "double");
+        assert_eq!(iri_local_name("http://ex/fn/double"), "double");
+        assert_eq!(iri_local_name("urn:x:double"), "double");
+        assert_eq!(
+            XsdCast::from_iri(&format!("{XSD_NS}integer")),
+            Some(XsdCast::Integer)
+        );
+        assert_eq!(XsdCast::from_iri(&format!("{XSD_NS}Integer")), None);
+        // Typed floats are numbers to arithmetic.
+        assert_eq!(numeric_view(float_value(1.5)), Value::Double(1.5));
+        assert_eq!(numeric_view(Value::Int(1)), Value::Int(1));
     }
 }

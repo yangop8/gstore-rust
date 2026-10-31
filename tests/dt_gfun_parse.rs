@@ -1233,29 +1233,40 @@ fn query_err(db: &mut Database, q: &str) -> String {
     }
 }
 
+/// A projected advanced function evaluates (end-to-end coverage:
+/// `dt_gfun_e2e.rs`); the FILTER-position forms upstream parses but never
+/// evaluates, and PFN, are clean errors.
 #[test]
-fn advanced_functions_and_pfn_are_a_clean_not_wired_yet_error() {
+fn projected_functions_evaluate_filter_forms_and_pfn_are_clean_errors() {
     let mut db = Database::build_from_str("gfun_parse", DATA).unwrap();
-    let m = query_err(
-        &mut db,
-        "SELECT (shortestPath(<http://ex/a>, <http://ex/c>, true, {}) AS ?p) WHERE {}",
-    );
-    assert_contains(
-        &m,
-        &["advanced function evaluation not wired yet: shortestPath"],
+    let rs = db
+        .select("SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?p) WHERE {}")
+        .unwrap();
+    assert_eq!(
+        rs.rows,
+        vec![vec![Some(
+            r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/c>\",\"length\":2}]}""#
+                .to_string()
+        )]]
     );
     let m = query_err(
         &mut db,
         "SELECT ?x WHERE { ?x <http://ex/p> ?y FILTER(cycleBoolean(?x, ?y, true, {})) }",
     );
-    assert_contains(&m, &["not wired yet: cycleBoolean"]);
+    assert_contains(
+        &m,
+        &[
+            "cycleBoolean(…) is only evaluated as the whole expression of a SELECT projection",
+            "rs:CYCLEBOOLEAN(…)",
+        ],
+    );
     let m = query_err(&mut db, "SELECT (PFN.f({\"k\":\"v\"}) AS ?z) WHERE {}");
-    assert_contains(&m, &["PFN not supported yet: PFN.f"]);
+    assert_contains(&m, &["PFN not supported yet (Phase 4): PFN.f"]);
     let m = query_err(
         &mut db,
         "ASK { ?x <http://ex/p> ?y FILTER(kHopReachable(?x, ?y, true, 1, {})) }",
     );
-    assert_contains(&m, &["not wired yet: kHopReachable"]);
+    assert_contains(&m, &["kHopReachable(…) is only evaluated"]);
 }
 
 #[test]
@@ -1266,12 +1277,12 @@ fn advanced_functions_in_an_update_where_are_a_clean_error() {
         (
             "DELETE { ?x <http://ex/p> ?y } WHERE { ?x <http://ex/p> ?y \
              FILTER(shortestPathLen(?x, ?y, true, {}) = 1) }",
-            "not wired yet: shortestPathLen",
+            "shortestPathLen(…) is only evaluated",
         ),
         (
             "INSERT { ?x <http://ex/q> ?y } WHERE { ?x <http://ex/p> ?y \
              OPTIONAL { ?y <http://ex/p> ?z FILTER(kHopReachable(?x, ?z, true, 2, {})) } }",
-            "not wired yet: kHopReachable",
+            "kHopReachable(…) is only evaluated",
         ),
     ] {
         let e = match db.query(q) {
@@ -1298,11 +1309,9 @@ fn iri_calls_reach_functions_registered_under_their_iri() {
         let cell = rs.rows[0][0].clone().unwrap_or_default();
         assert!(cell.starts_with("\"42\""), "{q}: {cell}");
     }
-    // Unregistered IRI: evaluates to unbound.
-    let rs = db
-        .select("SELECT (<http://ex/fn/none>(1) AS ?v) WHERE {}")
-        .unwrap();
-    assert_eq!(rs.rows, vec![vec![None]]);
+    // Unregistered IRI: a query error.
+    let m = query_err(&mut db, "SELECT (<http://ex/fn/none>(1) AS ?v) WHERE {}");
+    assert_contains(&m, &["unknown function <http://ex/fn/none>"]);
 }
 
 #[test]

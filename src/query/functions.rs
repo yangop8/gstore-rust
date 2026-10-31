@@ -27,11 +27,15 @@
 //!
 //! An IRI call — `<http://ex/fn>(?x)` or, with `PREFIX ex: <http://ex/>`,
 //! `ex:fn(?x)` (SPARQL `iriOrFunction`) — is looked up by its fully expanded
-//! IRI, so register such a function under that IRI (`"http://ex/fn"`, matched
-//! case-insensitively like every name). The predeclared `rs:` namespace
+//! IRI (`"http://ex/fn"`, matched case-insensitively like every name), and
+//! failing that by its local name (`"fn"`, the part after the last `#`, `/`
+//! or `:`), so a function registered under a bare name is also reachable
+//! through any namespace. The predeclared `rs:` namespace
 //! ([`crate::parser::sparql::RS_NAMESPACE`]) is reserved for the legacy
-//! gstore-rust graph built-ins (`rs:SSSP(…)`) and never reaches the registry;
-//! an IRI call with no registered function evaluates to unbound.
+//! gstore-rust graph built-ins (`rs:SSSP(…)`) and the `xsd:` constructor
+//! names (`xsd:integer(…)`, …) are SPARQL casts; neither reaches the
+//! registry. An IRI call that matches none of these is a query error,
+//! reported before evaluation starts.
 //!
 //! ## Signature
 //!
