@@ -26,6 +26,8 @@ pub mod backend;
 pub mod cluster;
 pub mod concurrent;
 pub mod config;
+/// `gconsole`: the interactive console, a client of gserver's `/api`.
+pub mod console;
 pub mod dict;
 pub mod error;
 /// The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).

@@ -31,6 +31,10 @@ flate2 = { version = "1", optional = true }
 # do not pull in `aws-lc-rs`/bindgen; `rustls-pemfile` loads the cert + key PEM.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = { version = "2", optional = true }
+# Optional line editing for `gconsole` (see the `readline` feature). OFF by
+# default: the default console reads plain lines. No default features: the
+# console keeps its own history file and needs no home-dir/file-lock helpers.
+rustyline = { version = "19", optional = true, default-features = false }
 
 [features]
 # Persistent RocksDB storage backend (see `src/backend/rocks.rs`).
@@ -41,6 +45,9 @@ gzip = ["dep:flate2"]
 # HTTPS/TLS listeners for the bundled `Server` / `ApiServer` (see the
 # `serve_forever_tls` methods and `load_tls_config` in `src/server.rs`).
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+# `gconsole` line editing: arrow keys / Emacs keys, history recall and tab
+# completion of command and database names (see `src/console/mod.rs`).
+readline = ["dep:rustyline"]
 
 [dev-dependencies]
 
