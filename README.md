@@ -25,7 +25,7 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **~720 tests pass** across the workspace (incl. 142 for gNLQA); `cargo clippy
+* **~1,400 tests pass** across the workspace (incl. 159 for gNLQA); `cargo clippy
   --workspace --all-targets -- -D warnings` is clean.
 
 ---
