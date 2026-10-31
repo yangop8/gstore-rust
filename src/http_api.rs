@@ -92,7 +92,7 @@ use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
-use crate::query::{Evaluator, FunctionRegistry, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
 use crate::server::{
     err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, spawn_worker,
     write_response_ext, write_response_maybe_gzip, Lifecycle, Request, ShutdownHandle,
@@ -342,6 +342,8 @@ struct ReadSnapshot {
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
     functions: FunctionRegistry,
+    /// The database's integer-division mode at `/begin`.
+    integer_division: IntegerDivision,
     csr: CsrCache,
 }
 
@@ -361,6 +363,7 @@ impl ReadSnapshot {
             store,
             named: db.named_graphs().clone(),
             functions: db.functions().clone(),
+            integer_division: db.integer_division(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
@@ -379,7 +382,9 @@ impl ReadSnapshot {
         // The snapshot never changes, so its CSR is cached under one
         // generation for the transaction's lifetime.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
-        let mut eval = Evaluator::new(&self.dict, &self.store).with_csr_provider(&csr);
+        let mut eval = Evaluator::new(&self.dict, &self.store)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
@@ -2840,6 +2845,26 @@ mod tests {
         assert!(!valid_db_name(""));
         assert!(!valid_db_name("../etc"));
         assert!(!valid_db_name("a b"));
+    }
+
+    /// A transaction's read snapshot divides integers in the database's mode.
+    #[test]
+    fn read_snapshot_keeps_the_integer_division_mode() {
+        let q = "SELECT (7/2 AS ?x) WHERE {}";
+        let cell = |snap: &ReadSnapshot| match snap.query(q, None).unwrap() {
+            QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
+            other => panic!("expected Select, got {other:?}"),
+        };
+        let mut db = Database::new("snap_div");
+        assert_eq!(
+            cell(&ReadSnapshot::capture(&db)),
+            "\"3.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"
+        );
+        db.set_integer_division(IntegerDivision::Truncate);
+        assert_eq!(
+            cell(&ReadSnapshot::capture(&db)),
+            "\"3\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        );
     }
 
     /// A transaction's read snapshot answers like the database itself:

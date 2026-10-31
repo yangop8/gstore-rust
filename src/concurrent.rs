@@ -89,7 +89,7 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
-use crate::query::{Evaluator, FunctionRegistry, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
 use crate::store::{TripleSource, TripleStore};
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
@@ -194,6 +194,8 @@ pub struct Snapshot {
     named: BTreeMap<u32, TripleStore>,
     version: u64,
     functions: FunctionRegistry,
+    /// The database's integer-division mode when the snapshot was published.
+    integer_division: IntegerDivision,
     csr: CsrCache,
 }
 
@@ -217,6 +219,7 @@ impl Snapshot {
             named: db.named_graphs().clone(),
             version,
             functions: db.functions().clone(),
+            integer_division: db.integer_division(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
@@ -246,7 +249,9 @@ impl Snapshot {
         let q = sparql::parse(sparql)?;
         // The snapshot never changes: one CSR generation for its lifetime.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
-        let mut eval = Evaluator::new(&self.dict, &self.store).with_csr_provider(&csr);
+        let mut eval = Evaluator::new(&self.dict, &self.store)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
@@ -984,8 +989,9 @@ impl VersionView<'_> {
             .unwrap()
             .materialize_into(self.version, &mut dict, &mut store);
         let q = sparql::parse(sparql)?;
-        let functions = self.db.snapshot().functions.clone();
-        let mut eval = Evaluator::new(&dict, &store);
+        let latest = self.db.snapshot();
+        let functions = latest.functions.clone();
+        let mut eval = Evaluator::new(&dict, &store).with_integer_division(latest.integer_division);
         if !self.db.base.named.is_empty() {
             eval = eval.with_named(&self.db.base.named);
         }
