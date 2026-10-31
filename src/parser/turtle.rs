@@ -210,9 +210,48 @@ impl<R: BufRead> Parser<R> {
                         .join(" ");
                     sink.error(SyntaxError::from_error(&e).with_context(context))?;
                     // Tolerant: resynchronise at the next line.
-                    self.src.discard_line();
+                    self.resync();
                     self.src.take_bad_utf8();
                 }
+            }
+        }
+    }
+
+    /// After a failed statement: skip the rest of the line (upstream's
+    /// `discardLine`). Inside a TriG block a `}` on that line (outside a
+    /// string, IRI or comment) still closes the block, and parsing resumes
+    /// right after it — otherwise one bad statement on a block's last line
+    /// would pull everything after the block into it.
+    fn resync(&mut self) {
+        if !(self.trig && self.in_block) {
+            self.src.discard_line();
+            return;
+        }
+        let mut quote: Option<char> = None;
+        let mut in_iri = false;
+        while let Some(c) = self.src.bump() {
+            match c {
+                '\n' => return,
+                '\\' if quote.is_some() => {
+                    self.src.bump();
+                }
+                '"' | '\'' if !in_iri => match quote {
+                    Some(q) if q == c => quote = None,
+                    None => quote = Some(c),
+                    Some(_) => {}
+                },
+                '<' if quote.is_none() => in_iri = true,
+                '>' if in_iri => in_iri = false,
+                '#' if quote.is_none() && !in_iri => {
+                    self.src.discard_line();
+                    return;
+                }
+                '}' if quote.is_none() && !in_iri => {
+                    self.in_block = false;
+                    self.graph = None;
+                    return;
+                }
+                _ => {}
             }
         }
     }
@@ -1379,6 +1418,35 @@ mod tests {
             ]
         );
         assert_eq!(sink.errors.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_statement_on_a_block_s_last_line_still_closes_the_block() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :g { :a :p \"}\" . :bad :p }\n\
+                   :d :p :o .\n\
+                   :h { :x :p :y . :z :p ?q # } in a comment\n\
+                   :w :p :v }\n\
+                   :e :p :o .\n";
+        let mut sink = Tolerant::default();
+        parse_reader_trig(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let got: Vec<(String, Option<Term>)> = sink
+            .quads
+            .iter()
+            .map(|q| (q.subject.to_string(), q.graph.clone()))
+            .collect();
+        let (g, h) = (Some(Term::iri("http://e/g")), Some(Term::iri("http://e/h")));
+        assert_eq!(
+            got,
+            [
+                ("<http://e/a>".to_string(), g),
+                ("<http://e/d>".to_string(), None),
+                ("<http://e/x>".to_string(), h.clone()),
+                ("<http://e/w>".to_string(), h),
+                ("<http://e/e>".to_string(), None),
+            ]
+        );
+        assert_eq!(sink.errors.len(), 2);
     }
 
     #[test]
