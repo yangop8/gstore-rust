@@ -877,7 +877,7 @@ mod with_zip {
         let zname = zip.file_name().unwrap().to_string_lossy().into_owned();
         assert!(zname.starts_with("quad_") && zname.ends_with(".zip"), "{zname}");
         let inner = format!("{}.nq", zname.trim_end_matches(".zip"));
-        assert_eq!(entries(&zip), [inner.clone()]);
+        assert_eq!(entries(&zip), std::slice::from_ref(&inner));
         assert!(!zip.with_file_name(&inner).exists(), "the plain file is removed");
         // It downloads, and it builds a database again (round trip).
         let (status, body) = send(
