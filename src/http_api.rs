@@ -2838,7 +2838,7 @@ impl ApiInner {
     /// corrupt backup changes nothing; only then is the loaded database retired
     /// (its unsaved changes saved first, so a failed swap loses nothing) and
     /// the copy swapped in.
-    fn handle_restore(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    fn handle_restore(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
@@ -2853,6 +2853,7 @@ impl ApiInner {
         }
         let dir = st.db_dir(&name);
         let policy = st.load_policy.clone();
+        let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let _busy = BusyGuard {
                 inner,
@@ -2910,6 +2911,12 @@ impl ApiInner {
                     let mut st = locked(&inner.state);
                     let slot = DbSlot::handle(db, dir, false, &st.load_policy);
                     st.dbs.insert(name.clone(), slot);
+                    // A database restored under a new name joins the
+                    // registry with the restoring user as its creator (best
+                    // effort, as for /build; no privileges are granted).
+                    if !st.sysdb.contains(&name) {
+                        let _ = st.sysdb.register(&name, &user);
+                    }
                     Resp::ok(&format!("database '{name}' restored"))
                 }
                 (Ok(()), Err(e)) => {

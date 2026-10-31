@@ -6,9 +6,13 @@
 //! **Who may use them.** Upstream lets only `root` call them (they are not in
 //! its `check_privilege` table). Here any authenticated user may — for **their
 //! own** tasks (so whoever submitted an `async` operation can poll and cancel
-//! it); `root` and `admin`-privileged users see and cancel every task. Another
-//! user's task reads as not found. (The REST `/cancel` keeps its own rule:
-//! Update privilege for your own tasks, Admin for any.)
+//! it), and only while they still hold, on the task's database, the
+//! per-database privilege its operation needs ([`crate::sysdb::allowed`]; a
+//! SPARQL statement, `query`, needs query or update): a revoked grant also
+//! hides the operation's state and result. `root` and `admin`-privileged
+//! users see and cancel every task. Any other task reads as not found. (The
+//! REST `/cancel` keeps its own rule: Update privilege for your own tasks,
+//! Admin for any.)
 //!
 //! Also here: the hidden test-only operation `__asyncTest` (see
 //! [`tasks::enable_test_ops`]).
@@ -19,8 +23,9 @@ use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::tasks::{self, CancelOutcome, TaskInfo, TaskState};
 use super::{Ctx, OpSpec, Registry};
-use crate::http_users::Privilege;
+use crate::http_users::UserStore;
 use crate::json::Json;
+use crate::sysdb;
 
 /// The privilege the dispatcher checks for the task operations: one every
 /// authenticated user has (upstream's "anyone" class); the handlers then
@@ -41,14 +46,43 @@ pub(super) fn register(reg: &mut Registry) {
     reg.add(OpSpec::new(TEST_OP, test_op).async_capable());
 }
 
-/// Whether the caller sees every task (root, or the Admin privilege).
-fn sees_all(ctx: &Ctx<'_>) -> bool {
-    ctx.is_root() || ctx.state().users.has_priv(ctx.user(), Privilege::Admin)
+/// Who is asking, as far as task visibility goes: every task for `root`
+/// and `admin`-privileged users, else their own (see the module docs).
+struct Viewer {
+    user: String,
+    all: bool,
 }
 
-/// Whether the caller may see (and cancel) `task`.
-fn visible(ctx: &Ctx<'_>, all: bool, task: &TaskInfo) -> bool {
-    all || task.user == ctx.user()
+impl Viewer {
+    fn of(ctx: &Ctx<'_>) -> Viewer {
+        let user = ctx.user().to_string();
+        let all = ctx.is_root() || ctx.state().users.is_superuser(&user);
+        Viewer { user, all }
+    }
+
+    /// Whether the viewer may see (and cancel) `task`; `users` is the user
+    /// store (the state lock held only for the check).
+    fn sees(&self, users: &UserStore, task: &TaskInfo) -> bool {
+        if self.all {
+            return true;
+        }
+        if task.user != self.user {
+            return false;
+        }
+        let db = Some(task.db_name.as_str()).filter(|d| !d.is_empty());
+        let allowed = |op: &str| sysdb::allowed(users, &self.user, op, db);
+        if task.operation == "query" {
+            // A statement (`query` also runs updates).
+            allowed("query") || allowed("update")
+        } else {
+            allowed(&task.operation)
+        }
+    }
+
+    /// [`sees`](Self::sees), taking the state lock for it.
+    fn sees_one(&self, ctx: &Ctx<'_>, task: &TaskInfo) -> bool {
+        self.all || self.sees(&ctx.state().users, task)
+    }
 }
 
 /// `checkOperationState` — the state of an asynchronous operation (`opt_id`).
@@ -78,12 +112,12 @@ fn check_operation_state(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let Some(id) = tasks::parse_opt_id(&raw) else {
         return not_found();
     };
-    let all = sees_all(ctx);
+    let viewer = Viewer::of(ctx);
     let Some(info) = ctx
         .inner
         .tasks
         .get(id)
-        .filter(|t| t.is_async && visible(ctx, all, t))
+        .filter(|t| t.is_async && viewer.sees_one(ctx, t))
     else {
         return not_found();
     };
@@ -137,9 +171,9 @@ fn task_cancel(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             }
         },
     };
-    let all = sees_all(ctx);
+    let viewer = Viewer::of(ctx);
     let tm = &ctx.inner.tasks;
-    if !tm.get(id).is_some_and(|t| visible(ctx, all, &t)) {
+    if !tm.get(id).is_some_and(|t| viewer.sees_one(ctx, &t)) {
         return not_found();
     }
     match tm.request_cancel(id) {
@@ -185,15 +219,16 @@ fn task_list(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let page_no = if page_no <= 0 { 1 } else { page_no as u64 };
     let page_size = if page_size <= 0 { 10 } else { page_size as u64 };
     let every = !(-1..=1).contains(&status);
-    let all = sees_all(ctx);
-    let tasks: Vec<TaskInfo> = ctx
-        .inner
-        .tasks
-        .list()
-        .into_iter()
-        .filter(|t| visible(ctx, all, t))
-        .filter(|t| every || t.state.list_status() == status)
-        .collect();
+    let viewer = Viewer::of(ctx);
+    let tasks: Vec<TaskInfo> = {
+        let listed = ctx.inner.tasks.list();
+        let st = ctx.state();
+        listed
+            .into_iter()
+            .filter(|t| viewer.sees(&st.users, t))
+            .filter(|t| every || t.state.list_status() == status)
+            .collect()
+    };
     let total = tasks.len() as u64;
     let start = (page_no - 1).saturating_mul(page_size);
     let mut list = Json::arr();

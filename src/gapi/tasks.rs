@@ -329,6 +329,11 @@ pub enum CancelOutcome {
 /// (`{"StatusCode":…,"StatusMsg":…, …}`).
 pub type TaskJob = Box<dyn FnOnce(&TaskHandle) -> Json + Send + 'static>;
 
+/// Run once an asynchronous operation has ended — its outcome recorded,
+/// before its callback is delivered — with the task's final snapshot (see
+/// [`TaskManager::submit_with_hook`]). A panic in it is contained.
+pub type FinishHook = Box<dyn FnOnce(&TaskInfo) + Send + 'static>;
+
 /// The running task's side of the manager: its id, cancellation flag and
 /// progress reporting.
 #[derive(Clone)]
@@ -427,6 +432,7 @@ struct Job {
     callback: Option<String>,
     result_dir: Option<PathBuf>,
     run: TaskJob,
+    on_finish: Option<FinishHook>,
 }
 
 fn now_ms() -> u64 {
@@ -692,6 +698,20 @@ impl TaskManager {
     /// `1005` answer) once [`close`](Self::close)d, or when
     /// [`TaskConfig::max_pending`] operations already wait.
     pub fn submit(&self, spec: TaskSpec, run: TaskJob) -> Result<u64, String> {
+        self.submit_with_hook(spec, run, None)
+    }
+
+    /// [`submit`](Self::submit), and run `on_finish` with the task's final
+    /// snapshot once it has ended (on its runner thread, before its callback
+    /// is delivered and before [`wait_async_idle`](Self::wait_async_idle)
+    /// sees it done) — how `/api` writes an asynchronous operation's final
+    /// access-log record.
+    pub fn submit_with_hook(
+        &self,
+        spec: TaskSpec,
+        run: TaskJob,
+        on_finish: Option<FinishHook>,
+    ) -> Result<u64, String> {
         let (id, spawn, files) = {
             let mut st = self.shared.lock();
             if st.closed {
@@ -715,6 +735,7 @@ impl TaskManager {
                 callback: spec.callback.clone().filter(|c| !c.trim().is_empty()),
                 result_dir: spec.result_dir.clone(),
                 run,
+                on_finish,
             });
             let spawn = st.workers < st.config.workers.max(1);
             if spawn {
@@ -995,7 +1016,7 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
         }
         _ => TaskResult::Json(envelope),
     };
-    let config = {
+    let (config, info) = {
         let mut st = shared.lock();
         let cancelled = job.cancel.load(Ordering::Relaxed);
         if let Some(r) = st.tasks.get_mut(&job.id) {
@@ -1017,12 +1038,17 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
             TaskState::Failed
         };
         st.end(job.id, state);
+        // Taken before the prune, which may already retire it.
+        let info = st.tasks.get(&job.id).map(Inner::snapshot);
         let files = st.prune();
         let config = st.config.clone();
         drop(st);
         remove_files(files);
-        config
+        (config, info)
     };
+    if let (Some(hook), Some(info)) = (job.on_finish, info) {
+        let _ = catch_unwind(AssertUnwindSafe(|| hook(&info)));
+    }
     shared.changed.notify_all();
     if let Some(url) = job.callback {
         let outcome = deliver_callback(&url, text.as_bytes(), &config);
@@ -1121,6 +1147,16 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
         callback,
         result_dir: Some(ctx.export_dir()),
     };
+    // The access log: the dispatcher records the submission (`state` 0,
+    // under the answered opt_id); this, the outcome.
+    let on_finish: FinishHook = {
+        let (weak, ip) = (weak.clone(), ctx.remote_ip.clone());
+        Box::new(move |info: &TaskInfo| {
+            if let Some(inner) = weak.upgrade() {
+                super::apilog::log_async_finish(&inner, &ip, info);
+            }
+        })
+    };
     let job: TaskJob = Box::new(move |_task: &TaskHandle| {
         let Some(inner) = weak.upgrade() else {
             return error_envelope(Status::OperationFailed, "the server has stopped");
@@ -1146,7 +1182,11 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
             None => error_envelope(Status::OperationFailed, ""),
         }
     });
-    match ctx.inner.tasks.submit(task_spec, job) {
+    match ctx
+        .inner
+        .tasks
+        .submit_with_hook(task_spec, job, Some(on_finish))
+    {
         Ok(id) => GResp::json(
             Json::obj()
                 .with("StatusCode", 0)

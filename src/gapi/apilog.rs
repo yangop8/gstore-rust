@@ -19,7 +19,13 @@
 //!   (when a `db_name` was given), `state` (for the operations upstream can
 //!   run asynchronously), `num` / `fail_num` (the `success_num` /
 //!   `failed_num` of `build`, `batchInsert`, `batchRemove`). Written when
-//!   `accesslog_mode` is on.
+//!   `accesslog_mode` is on. An operation run asynchronously (`async=true`)
+//!   is recorded under its `opt_id`: once when submitted (`state` 0), and
+//!   again when it ends — its final `code` / `msg` and `state` (`1`
+//!   succeeded, `-1` failed or cancelled), with the submission's
+//!   `createtime`. Upstream rewrites the record in place; here the final
+//!   record is appended and the reader lists one record per `opt_id` (the
+//!   final one, where the submission was), as for the transaction log.
 //! * **transaction log** — `<root>/logs/transaction.json` (upstream's
 //!   `logs/transaction.json`): `db_name`, `TID` (`<begin ms>_<tid>`, as
 //!   upstream), `user`, `state` (`RUNNING`, then `COMMITED` / `ROLLBACK`),
@@ -60,6 +66,7 @@ use std::time::{Duration, SystemTime};
 
 use super::envelope::{GResp, Status};
 use super::params::Params;
+use super::tasks::TaskInfo;
 use super::{required, Ctx};
 use crate::config::GStoreConfig;
 use crate::json::{self, Json};
@@ -137,6 +144,10 @@ pub struct AccessLogRecord {
     pub fail_num: u64,
     pub filepath: String,
     pub opt_id: String,
+    /// The `state` of an asynchronous operation's final record (upstream's
+    /// `1` succeeded, `-1` failed); `None` derives it (see
+    /// [`to_json`](Self::to_json)).
+    pub state: Option<i64>,
 }
 
 impl AccessLogRecord {
@@ -160,7 +171,8 @@ impl AccessLogRecord {
 
     /// The stored form (upstream `DBAccessLogInfo::toJSON`). A finished
     /// operation has `state` 1; one registered under an `opt_id` (still
-    /// running) 0.
+    /// running) 0, unless [`state`](Self::state) says otherwise. Every record
+    /// with an `opt_id` carries a `state`.
     pub fn to_json(&self) -> Json {
         let mut j = Json::obj()
             .with("ip", self.ip.as_str())
@@ -168,8 +180,9 @@ impl AccessLogRecord {
             .with("code", self.code)
             .with("msg", self.msg.as_str())
             .with("createtime", self.createtime.as_str());
-        if Self::has_state(&self.operation) {
-            j.set("state", if self.opt_id.is_empty() { 1 } else { 0 });
+        if Self::has_state(&self.operation) || !self.opt_id.is_empty() {
+            let derived = if self.opt_id.is_empty() { 1 } else { 0 };
+            j.set("state", self.state.unwrap_or(derived));
         }
         if !self.opt_id.is_empty() {
             j.set("opt_id", self.opt_id.as_str());
@@ -386,9 +399,11 @@ fn parse_record(line: &str) -> Option<Json> {
 
 /// One page of the daily log file `path`, newest first, of the records whose
 /// string field `key` equals the wanted value for every `(key, value)` of
-/// `filters`. Without filters only the page's own lines are parsed — every
-/// non-blank line counts, and one that does not parse (torn by a crash) is
-/// left out of its page, as upstream does.
+/// `filters`, an asynchronous operation's records folded into one
+/// ([`fold_opt_ids`]). Without filters and without such records only the
+/// page's own lines are parsed — every non-blank line counts, and one that
+/// does not parse (torn by a crash) is left out of its page, as upstream
+/// does.
 fn page_of_file(
     path: &Path,
     filters: &[(&str, String)],
@@ -397,7 +412,7 @@ fn page_of_file(
 ) -> Result<Page, String> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    if filters.is_empty() {
+    if filters.is_empty() && !text.contains("\"opt_id\"") {
         let page = paginate(lines.collect::<Vec<&str>>(), page_no, page_size)?;
         return Ok(Page {
             total_size: page.total_size,
@@ -407,8 +422,8 @@ fn page_of_file(
             items: page.items.into_iter().filter_map(parse_record).collect(),
         });
     }
-    let records = lines
-        .filter_map(parse_record)
+    let records = fold_opt_ids(lines.filter_map(parse_record).collect())
+        .into_iter()
         .filter(|r| {
             filters
                 .iter()
@@ -416,6 +431,43 @@ fn page_of_file(
         })
         .collect();
     paginate(records, page_no, page_size)
+}
+
+/// One record per `opt_id` (an asynchronous operation's submission and
+/// final records, see the module docs): its final record — a non-zero
+/// `state`, else the latest — where its first was. Records without an
+/// `opt_id` are kept as they are, in order.
+fn fold_opt_ids(records: Vec<Json>) -> Vec<Json> {
+    let is_final = |r: &Json| {
+        r.get("state")
+            .and_then(Json::as_i64)
+            .is_some_and(|s| s != 0)
+    };
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Json> = Vec::with_capacity(records.len());
+    for rec in records {
+        let id = rec
+            .get("opt_id")
+            .and_then(Json::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let Some(id) = id else {
+            out.push(rec);
+            continue;
+        };
+        match slot.get(&id) {
+            Some(&i) => {
+                if is_final(&rec) || !is_final(&out[i]) {
+                    out[i] = rec;
+                }
+            }
+            None => {
+                slot.insert(id, out.len());
+                out.push(rec);
+            }
+        }
+    }
+    out
 }
 
 /// The transaction-log records, one per transaction (the last record of each
@@ -492,9 +544,10 @@ pub fn paginate<T>(records: Vec<T>, page_no: i64, page_size: i64) -> Result<Page
 
 /// The access-log hook of the dispatcher: record one answered operation
 /// (upstream registers the same callback in `checkRequest`). Unknown
-/// operations are not recorded, nor an asynchronous run of an operation that
-/// supports `async=1` (which records itself under its `opt_id`, as
-/// upstream).
+/// operations are not recorded. An accepted asynchronous submission
+/// (`async=true` on an operation that supports it, answered with an
+/// `opt_id`) is recorded under that `opt_id` with `state` 0; its runner
+/// records the outcome later ([`log_async_finish`]).
 pub(super) fn log_access(ctx: &Ctx<'_>, params: &Params, resp: &GResp) {
     if ctx.op.is_empty() || resp.status_code() == Status::OperationUndefined.code() {
         return;
@@ -503,11 +556,18 @@ pub(super) fn log_access(ctx: &Ctx<'_>, params: &Params, resp: &GResp) {
     if !config.accesslog_mode {
         return;
     }
-    if let Some(spec) = super::registry().get(&ctx.op) {
-        if spec.async_capable && params.bool("async", false) {
-            return;
-        }
-    }
+    let submitted = super::registry()
+        .get(&ctx.op)
+        .is_some_and(|spec| spec.async_capable && params.bool("async", false));
+    let opt_id = if submitted {
+        resp.body_json()
+            .and_then(|b| b.get("opt_id"))
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        String::new()
+    };
     let count = |key: &str| {
         resp.body_json()
             .and_then(|b| b.get(key))
@@ -524,11 +584,43 @@ pub(super) fn log_access(ctx: &Ctx<'_>, params: &Params, resp: &GResp) {
         num: count("success_num"),
         fail_num: count("failed_num"),
         filepath: String::new(),
-        opt_id: String::new(),
+        opt_id,
+        state: None,
     };
     ctx.inner
         .apilogs
         .write_access(config, &ctx.inner.root, &rec);
+}
+
+/// The final access-log record of asynchronous operation `info` (submitted
+/// from `ip`): its outcome under its `opt_id`, dated like its submission
+/// record (upstream `update_access_log`). Run by the task manager once the
+/// operation has ended.
+pub(crate) fn log_async_finish(inner: &crate::http_api::ApiInner, ip: &str, info: &TaskInfo) {
+    let config = inner.config();
+    if !config.accesslog_mode {
+        return;
+    }
+    let started = SystemTime::UNIX_EPOCH + Duration::from_millis(info.start_ms);
+    let filepath = match (&info.result_file, &info.filepath) {
+        (Some(file), _) if info.operation == "query" => file.display().to_string(),
+        (_, Some(path)) => path.clone(),
+        _ => String::new(),
+    };
+    let rec = AccessLogRecord {
+        ip: ip.to_string(),
+        operation: info.operation.clone(),
+        code: info.status_code.unwrap_or(Status::OperationFailed.code()),
+        msg: clean_msg(&info.status_msg),
+        createtime: clock::at(started).datetime(),
+        db_name: info.db_name.clone(),
+        num: info.success_num,
+        fail_num: info.failed_num,
+        filepath,
+        opt_id: info.opt_id.to_string(),
+        state: Some(info.state.state_code()),
+    };
+    inner.apilogs.write_access(config, &inner.root, &rec);
 }
 
 /// Upstream's clean-up of a logged message: no line breaks, no runs of four
@@ -817,6 +909,83 @@ mod tests {
             "{j}"
         );
         assert_eq!(clean_msg("a\r\n    b"), "ab");
+    }
+
+    #[test]
+    fn async_records_fold_into_their_final_record() {
+        let submitted = AccessLogRecord {
+            ip: "127.0.0.1".into(),
+            operation: "query".into(),
+            code: 0,
+            msg: "Operation Success.".into(),
+            createtime: "2026-01-02 03:04:05".into(),
+            db_name: "lubm".into(),
+            opt_id: "77".into(),
+            ..Default::default()
+        };
+        let j = record_line(submitted.to_json());
+        assert!(
+            j.contains("\"opt_id\":\"77\"") && j.contains("\"state\":0"),
+            "{j}"
+        );
+        let finished = AccessLogRecord {
+            code: 14,
+            msg: "failed".into(),
+            state: Some(-1),
+            ..submitted.clone()
+        };
+        let j = record_line(finished.to_json());
+        assert!(
+            j.contains("\"state\":-1") && j.contains("\"code\":14"),
+            "{j}"
+        );
+        // An operation the access log gives no state still gets one under
+        // an opt_id.
+        let other = AccessLogRecord {
+            operation: "__asyncTest".into(),
+            opt_id: "78".into(),
+            ..Default::default()
+        };
+        assert!(record_line(other.to_json()).contains("\"state\":0"));
+
+        let plain = |i: i64| Json::obj().with("i", i);
+        let rec = |id: &str, state: i64, i: i64| {
+            Json::obj()
+                .with("opt_id", id)
+                .with("state", state)
+                .with("i", i)
+        };
+        // The final record wins, at the submission's place — also when it
+        // was written first (a fast operation).
+        let folded = fold_opt_ids(vec![
+            plain(1),
+            rec("a", 0, 2),
+            rec("b", 1, 3),
+            plain(4),
+            rec("a", 1, 5),
+            rec("b", 0, 6),
+            rec("c", 0, 7),
+        ]);
+        let got: Vec<i64> = folded
+            .iter()
+            .map(|j| j.get("i").and_then(Json::as_i64).unwrap())
+            .collect();
+        assert_eq!(got, vec![1, 5, 3, 4, 7]);
+
+        let path = std::env::temp_dir().join(format!(
+            "gstore_apilog_fold_{}_{}.log",
+            std::process::id(),
+            clock::unix_millis()
+        ));
+        let lines: Vec<String> = [plain(1), rec("a", 0, 2), plain(3), rec("a", -1, 4)]
+            .into_iter()
+            .map(record_line)
+            .collect();
+        fs::write(&path, lines.join("\n")).unwrap();
+        let p = page_of_file(&path, &[], 1, 10).unwrap();
+        assert_eq!(p.total_size, 3);
+        assert_eq!(ids(&p), vec![3, 4, 1]);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
