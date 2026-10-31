@@ -725,14 +725,27 @@ impl TaskManager {
         Ok(id)
     }
 
-    /// A snapshot of task `id`.
+    /// A snapshot of task `id` (`None` once it left retention).
     pub fn get(&self, id: u64) -> Option<TaskInfo> {
-        self.shared.lock().tasks.get(&id).map(Inner::snapshot)
+        let (files, out) = {
+            let mut st = self.shared.lock();
+            (st.prune(), st.tasks.get(&id).map(Inner::snapshot))
+        };
+        remove_files(files);
+        out
     }
 
     /// The result envelope of finished asynchronous task `id`.
     pub fn result(&self, id: u64) -> Option<TaskResult> {
-        self.shared.lock().tasks.get(&id)?.result.clone()
+        let (files, out) = {
+            let mut st = self.shared.lock();
+            (
+                st.prune(),
+                st.tasks.get(&id).and_then(|r| r.result.clone()),
+            )
+        };
+        remove_files(files);
+        out
     }
 
     /// Every retained task (running and finished), by `opt_id`.
