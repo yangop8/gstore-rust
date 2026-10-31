@@ -1280,6 +1280,7 @@ fn xsd_constructor_casts() {
     // A float takes part in arithmetic and comparisons as a number.
     assert_eq!(e("(xsd:float(\"1.5\") + 1)"), typed("2.5", "double"));
     assert_eq!(e("(xsd:float(\"1.5\") > 1)"), typed("true", "boolean"));
+    assert_eq!(e("(!xsd:float(\"0\"))"), typed("true", "boolean"));
     // xsd:boolean
     assert_eq!(e("xsd:boolean(\"1\")"), typed("true", "boolean"));
     assert_eq!(e("xsd:boolean(\"false\")"), typed("false", "boolean"));

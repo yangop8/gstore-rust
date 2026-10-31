@@ -2093,7 +2093,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
             Expr::Not(x) => self.eval_ebv(x, b, l).map(|v| !v),
-            _ => self.eval_value(e, b, l)?.ebv(),
+            _ => numeric_view(self.eval_value(e, b, l)?).ebv(),
         }
     }
 
