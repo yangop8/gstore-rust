@@ -123,8 +123,7 @@ fi
 cat "$LOGS/gserver-start.log"
 
 # ---- 4. the suites -------------------------------------------------------------
-declare -A RESULT
-declare -A DETAIL
+SUMMARY=()
 FAILED=0
 
 strip_colors() { sed 's/\x1b\[[0-9;]*m//g' "$1"; }
@@ -273,7 +272,7 @@ check_python() {
 for suite in "${SUITES[@]}"; do
     if [ "$suite" = python ] && ! { command -v python3 >/dev/null 2>&1 && python3 -c 'import requests' 2>/dev/null; }; then
         say "suite python: SKIPPED (python3 with the requests module is not available)"
-        RESULT[$suite]=SKIP
+        SUMMARY+=("$(printf '  %-12s %-5s' "$suite" SKIP)")
         continue
     fi
     say "suite $suite"
@@ -283,21 +282,19 @@ for suite in "${SUITES[@]}"; do
     secs=$(($(date +%s) - start))
     [ -n "$out" ] && echo "$out"
     if [ $rc -eq 0 ]; then
-        RESULT[$suite]=PASS
+        result=PASS
     else
-        RESULT[$suite]=FAIL
+        result=FAIL
         FAILED=1
         echo "---- last lines of $LOGS/$suite.log:"
         tail -n 15 "$LOGS/$suite.log" 2>/dev/null | strip_colors /dev/stdin | cut -c1-300
     fi
-    DETAIL[$suite]="${secs}s"
+    SUMMARY+=("$(printf '  %-12s %-5s %ss' "$suite" "$result" "$secs")")
 done
 
 # ---- 5. summary ----------------------------------------------------------------
 say "summary (gserver on port $PORT)"
-for suite in "${SUITES[@]}"; do
-    printf '  %-12s %-5s %s\n' "$suite" "${RESULT[$suite]}" "${DETAIL[$suite]:-}"
-done
+printf '%s\n' "${SUMMARY[@]}"
 if [ "$FAILED" = 1 ]; then
     echo "conformance: FAILED"
     KEEP=1
