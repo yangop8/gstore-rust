@@ -68,6 +68,26 @@ impl Database {
         Ok(db)
     }
 
+    /// Write the default graph as N-Triples to `out` (upstream
+    /// `Database::export_db`; what `gexport` writes). Returns the number of
+    /// triples written.
+    pub fn export_ntriples(&self, out: &mut dyn std::io::Write) -> Result<u64> {
+        let mut count = 0u64;
+        for t in self.store.iter_all() {
+            let (Some(s), Some(p), Some(o)) = (
+                self.dict.id_to_string(t.sub),
+                self.dict.predicate_to_string(t.pred),
+                self.dict.id_to_string(t.obj),
+            ) else {
+                continue;
+            };
+            writeln!(out, "{s} {p} {o} .")?;
+            count += 1;
+        }
+        out.flush()?;
+        Ok(count)
+    }
+
     /// The number of distinct subjects of the default graph (upstream
     /// `monitor`'s `subjectNum`).
     pub fn subject_num(&self) -> usize {
@@ -239,6 +259,10 @@ mod tests {
                 },
             ]
         );
+        let mut out = Vec::new();
+        assert_eq!(db.export_ntriples(&mut out).unwrap(), 6);
+        let back = crate::parser::ntriples::parse_str(&String::from_utf8(out).unwrap()).unwrap();
+        assert_eq!(back.len(), 6);
         // No rdf:type at all: empty statistics and graph.
         let plain = Database::build_from_str("p", "<http://x> <http://y> <http://z> .").unwrap();
         assert!(plain.type_statistics().is_empty());
