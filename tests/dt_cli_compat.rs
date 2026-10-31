@@ -104,10 +104,20 @@ fn upstream_option_spellings_work_for_every_tool() {
     // gquery -db NAME -q FILE, and the long spellings with -f RESULTFILE.
     fs::write(dir.join("q.sql"), "SELECT ?o WHERE { <root> <contain> ?o }").unwrap();
     let r = ok(GQUERY, &["-db", "lubm", "-q", "q.sql"], &dir);
-    assert!(r.out.contains("<node0>") && r.err.contains("5 row(s)"), "{r:?}");
+    assert!(
+        r.out.contains("<node0>") && r.err.contains("5 row(s)"),
+        "{r:?}"
+    );
     let r = ok(
         GQUERY,
-        &["--database", "lubm", "--queryfile", "q.sql", "-f", "result.txt"],
+        &[
+            "--database",
+            "lubm",
+            "--queryfile",
+            "q.sql",
+            "-f",
+            "result.txt",
+        ],
         &dir,
     );
     assert!(r.out.is_empty(), "the result went to the file: {r:?}");
@@ -115,7 +125,11 @@ fn upstream_option_spellings_work_for_every_tool() {
     let result = fs::read_to_string(dir.join("result.txt")).unwrap();
     assert!(result.contains("<node4>"), "{result}");
     // -e still works with -db; and the positional form is unchanged.
-    let r = ok(GQUERY, &["-db", "lubm", "-e", "ASK { <root> <contain> <node0> }"], &dir);
+    let r = ok(
+        GQUERY,
+        &["-db", "lubm", "-e", "ASK { <root> <contain> <node0> }"],
+        &dir,
+    );
     assert_eq!(r.out.trim(), "true");
     let r = ok(GQUERY, &["lubm", "q.sql"], &dir);
     assert!(r.out.contains("<node0>"), "{r:?}");
@@ -123,7 +137,11 @@ fn upstream_option_spellings_work_for_every_tool() {
     // gadd -db NAME -f FILE / -dir DIR; gsub -db NAME --file FILE.
     fs::write(dir.join("add.nt"), "<x1> <p> <y1> .\n").unwrap();
     fs::create_dir(dir.join("more")).unwrap();
-    fs::write(dir.join("more").join("m.nt"), "<x2> <p> <y2> .\n<x3> <p> <y3> .\n").unwrap();
+    fs::write(
+        dir.join("more").join("m.nt"),
+        "<x2> <p> <y2> .\n<x3> <p> <y3> .\n",
+    )
+    .unwrap();
     ok(GADD, &["-db", "lubm", "-f", "add.nt"], &dir);
     assert_eq!(triples("lubm", &dir), 26);
     ok(GADD, &["--database", "lubm", "-dir", "more"], &dir);
@@ -135,7 +153,10 @@ fn upstream_option_spellings_work_for_every_tool() {
 
     // gmonitor -db / gshow -db.
     let r = ok(GMONITOR, &["-db", "lubm"], &dir);
-    assert!(r.out.contains("triple_num") && r.out.contains("25"), "{r:?}");
+    assert!(
+        r.out.contains("triple_num") && r.out.contains("25"),
+        "{r:?}"
+    );
     let r = ok(GSHOW, &["--database", "lubm"], &dir);
     assert!(r.out.contains("triples   : 25"), "{r:?}");
 
@@ -181,7 +202,10 @@ fn gexport_writes_where_upstream_does() {
     // -f FILE.nt: that file.
     ok(GEXPORT, &["-db", "x", "-f", "dump.nt"], &dir);
     assert_eq!(
-        fs::read_to_string(dir.join("dump.nt")).unwrap().lines().count(),
+        fs::read_to_string(dir.join("dump.nt"))
+            .unwrap()
+            .lines()
+            .count(),
         25
     );
     // The positional form is unchanged.
@@ -206,7 +230,10 @@ fn grestore_takes_the_database_then_the_backup() {
     // The old order is refused, with a hint, and restores nothing.
     let r = run(GRESTORE, &["bak", "dst2"], &dir);
     assert_eq!(r.code, 1, "{r:?}");
-    assert!(r.err.contains("backup directory 'dst2' does not exist"), "{r:?}");
+    assert!(
+        r.err.contains("backup directory 'dst2' does not exist"),
+        "{r:?}"
+    );
     assert!(r.err.contains("grestore <db_name> <backup_dir>"), "{r:?}");
     assert!(!dir.join("bak.db").exists() && !dir.join("dst2.db").exists());
 
@@ -321,7 +348,10 @@ fn gbuild_builds_empty_databases_and_never_overwrites_silently() {
     let r = run(GBUILD, &["e2", nt], &dir);
     assert_eq!(r.code, 1, "{r:?}");
     assert!(r.err.contains("already exists"), "{r:?}");
-    assert!(r.err.contains("gdrop") && r.err.contains("--force"), "{r:?}");
+    assert!(
+        r.err.contains("gdrop") && r.err.contains("--force"),
+        "{r:?}"
+    );
     assert_eq!(triples("e2", &dir), 0, "untouched");
     let r = run(GBUILD, &["-db", "e", "-f", nt], &dir);
     assert_eq!(r.code, 1, "{r:?}");
@@ -330,7 +360,10 @@ fn gbuild_builds_empty_databases_and_never_overwrites_silently() {
     let r = ok(GBUILD, &["--force", "e2", nt], &dir);
     assert!(r.out.contains("triples=25"), "{r:?}");
     let r = ok(GSHOW, &["e2"], &dir);
-    assert!(r.out.contains("in-memory") || r.out.contains("snapshot"), "{r:?}");
+    assert!(
+        r.out.contains("in-memory") || r.out.contains("snapshot"),
+        "{r:?}"
+    );
     // A directory that exists but is empty is not a database: built into.
     fs::create_dir(dir.join("fresh.db")).unwrap();
     ok(GBUILD, &["fresh", nt], &dir);

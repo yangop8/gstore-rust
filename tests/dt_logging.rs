@@ -82,7 +82,11 @@ fn levels_filter_what_each_sink_records() {
     log.log(Level::Debug, "t", format_args!("debug {}", 2));
     log.log(Level::Info, "t", format_args!("info {}", 3));
     log.log(Level::Warn, "t", format_args!("warn {}", 4));
-    log.log(Level::Error, "gstore::http_api", format_args!("error {}", 5));
+    log.log(
+        Level::Error,
+        "gstore::http_api",
+        format_args!("error {}", 5),
+    );
     let text = read(&path);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "{text}");
@@ -109,10 +113,7 @@ fn levels_filter_what_each_sink_records() {
     log.log(Level::Info, "t", format_args!("not me"));
     log.log(Level::Warn, "t", format_args!("me"));
     assert_eq!(read(&path2).lines().count(), 1);
-    let off = LogConfig {
-        level: None,
-        ..cfg
-    };
+    let off = LogConfig { level: None, ..cfg };
     let log = Logger::with_clock(&off, Arc::clone(&clock) as Arc<dyn Clock>).unwrap();
     assert_eq!(log.max_level(), None);
     assert!(!log.enabled(Level::Error));
@@ -140,7 +141,10 @@ fn the_log_file_rolls_over_at_midnight_of_the_injected_clock() {
     assert!(!rolled.contains("second day"));
     let current = read(&path);
     assert_eq!(current.lines().count(), 1, "{current}");
-    assert!(current.starts_with("2026-10-31 00:00:02.000 [ INFO]"), "{current}");
+    assert!(
+        current.starts_with("2026-10-31 00:00:02.000 [ INFO]"),
+        "{current}"
+    );
 
     // Several days later: the file holds the second day only.
     clock.set_unix(at(2026, 11, 3, 12, 0, 0));
@@ -187,7 +191,10 @@ fn a_file_left_by_an_earlier_run_on_an_earlier_day_is_rolled_when_opened() {
     let log = file_logger(&path, Level::Info, 30, &clock);
     log.log(Level::Info, "t", format_args!("same day"));
     let text = read(&path);
-    assert!(text.contains("new run") && text.contains("same day"), "{text}");
+    assert!(
+        text.contains("new run") && text.contains("same day"),
+        "{text}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -226,9 +233,15 @@ fn two_processes_sharing_a_log_file_roll_it_once() {
     b.log(Level::Info, "b", format_args!("b day two"));
     assert_eq!(names(&dir), ["all.log", "all.log.2026-10-30"]);
     let old = read(&dir.join("all.log.2026-10-30"));
-    assert!(old.contains("a day one") && old.contains("b day one"), "{old}");
+    assert!(
+        old.contains("a day one") && old.contains("b day one"),
+        "{old}"
+    );
     let new = read(&path);
-    assert!(new.contains("a day two") && new.contains("b day two"), "{new}");
+    assert!(
+        new.contains("a day two") && new.contains("b day two"),
+        "{new}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -354,7 +367,10 @@ fn configuration_comes_from_the_properties_file_and_the_log_keys() {
          log4cplus.appender.S.Threshold=WARN\n\
          log4cplus.appender.X=log4cplus::SocketAppender\n",
     );
-    assert_eq!((lc.level, lc.stderr, lc.file), (Some(Level::Error), Some(Level::Warn), None));
+    assert_eq!(
+        (lc.level, lc.stderr, lc.file),
+        (Some(Level::Error), Some(Level::Warn), None)
+    );
     assert_eq!(w.len(), 2, "{w:?}");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -405,19 +421,44 @@ fn the_macros_write_through_the_installed_logger() {
     gstore::gs_trace!("not formatted {}", count());
     gstore::gs_announce!("a banner line");
     gstore::gs_announce!("dt_logging: a prefixed banner line");
-    assert_eq!(evaluated.get(), 4, "a disabled level does not format its arguments");
+    assert_eq!(
+        evaluated.get(),
+        4,
+        "a disabled level does not format its arguments"
+    );
     // (only this test's records: servers other tests run concurrently log
     // through the same process-wide logger)
     let text = read(&path);
-    let lines: Vec<&str> = text.lines().filter(|l| l.contains("[dt_logging]")).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("[dt_logging]"))
+        .collect();
     assert_eq!(lines.len(), 6, "{text}");
-    assert!(lines[0].ends_with("[ERROR] [dt_logging] an error 1"), "{text}");
-    assert!(lines[1].ends_with("[ WARN] [dt_logging] a warning 2"), "{text}");
-    assert!(lines[2].ends_with("[ INFO] [dt_logging] lifecycle event 3"), "{text}");
-    assert!(lines[3].ends_with("[DEBUG] [dt_logging] details 4"), "{text}");
-    assert!(lines[4].ends_with("[ INFO] [dt_logging] a banner line"), "{text}");
+    assert!(
+        lines[0].ends_with("[ERROR] [dt_logging] an error 1"),
+        "{text}"
+    );
+    assert!(
+        lines[1].ends_with("[ WARN] [dt_logging] a warning 2"),
+        "{text}"
+    );
+    assert!(
+        lines[2].ends_with("[ INFO] [dt_logging] lifecycle event 3"),
+        "{text}"
+    );
+    assert!(
+        lines[3].ends_with("[DEBUG] [dt_logging] details 4"),
+        "{text}"
+    );
+    assert!(
+        lines[4].ends_with("[ INFO] [dt_logging] a banner line"),
+        "{text}"
+    );
     // The console's `target: ` prefix is not repeated after the record's target.
-    assert!(lines[5].ends_with("[ INFO] [dt_logging] a prefixed banner line"), "{text}");
+    assert!(
+        lines[5].ends_with("[ INFO] [dt_logging] a prefixed banner line"),
+        "{text}"
+    );
     // The timestamp is the real local time.
     let today = Date::of(&SystemClockProbe.local(SystemTime::now())).iso();
     assert!(lines[0].starts_with(&today), "{} vs {today}", lines[0]);
@@ -434,7 +475,10 @@ fn the_macros_write_through_the_installed_logger() {
     };
     assert!(logging::init(&bad).is_err());
     let now = logging::current().unwrap();
-    assert_eq!((now.file_path(), now.max_level()), (None, Some(Level::Warn)));
+    assert_eq!(
+        (now.file_path(), now.max_level()),
+        (None, Some(Level::Warn))
+    );
 
     logging::reset();
     assert!(logging::current().is_none());
@@ -541,7 +585,11 @@ fn rest_queries_are_in_the_json_query_log_with_ip_count_and_latency() {
     let tid = json::parse(&body)
         .unwrap()
         .get("TID")
-        .and_then(|t| t.as_str().map(str::to_string).or_else(|| t.as_i64().map(|i| i.to_string())))
+        .and_then(|t| {
+            t.as_str()
+                .map(str::to_string)
+                .or_else(|| t.as_i64().map(|i| i.to_string()))
+        })
         .expect("TID");
     let (st, body) = request(
         &addr,
@@ -553,7 +601,11 @@ fn rest_queries_are_in_the_json_query_log_with_ip_count_and_latency() {
 
     let recs = query_records(&root);
     assert_eq!(recs.len(), 5, "{recs:?}");
-    let by_sparql = |q: &str| recs.iter().find(|r| s(r, "sparql") == q).unwrap_or_else(|| panic!("{q}: {recs:?}"));
+    let by_sparql = |q: &str| {
+        recs.iter()
+            .find(|r| s(r, "sparql") == q)
+            .unwrap_or_else(|| panic!("{q}: {recs:?}"))
+    };
     let sel = by_sparql(select);
     assert_eq!(s(sel, "remoteIP"), "127.0.0.1");
     assert_eq!(s(sel, "dbname"), "lg");
@@ -604,8 +656,14 @@ fn rest_queries_are_in_the_json_query_log_with_ip_count_and_latency() {
         .expect("a /sparql access record");
     let fields: Vec<&str> = sparql_line.split('\t').collect();
     assert_eq!(fields.len(), 6, "{sparql_line}");
-    assert_eq!(&fields[1..], ["POST", "/sparql", "root", "200", "127.0.0.1"]);
-    assert!(access.lines().all(|l| l.ends_with("\t127.0.0.1")), "{access}");
+    assert_eq!(
+        &fields[1..],
+        ["POST", "/sparql", "root", "200", "127.0.0.1"]
+    );
+    assert!(
+        access.lines().all(|l| l.ends_with("\t127.0.0.1")),
+        "{access}"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -621,7 +679,10 @@ fn the_rest_query_log_follows_querylog_mode_and_path() {
         request(&addr, "POST", "/sparql?db_name=q", "ASK { ?s ?p ?o }").0,
         200
     );
-    assert!(!root.join("logs").join("endpoint").exists(), "query log off");
+    assert!(
+        !root.join("logs").join("endpoint").exists(),
+        "query log off"
+    );
     // The plain-text REST access log is unconditional.
     assert!(read(&root.join("access.log")).contains("\t/sparql\t"));
 

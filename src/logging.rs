@@ -222,7 +222,10 @@ impl Clock for ManualClock {
 
     fn local(&self, t: SystemTime) -> LocalTime {
         let (secs, millis) = match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => (i64::try_from(d.as_secs()).unwrap_or(i64::MAX / 2), d.subsec_millis()),
+            Ok(d) => (
+                i64::try_from(d.as_secs()).unwrap_or(i64::MAX / 2),
+                d.subsec_millis(),
+            ),
             Err(e) => (-(i64::try_from(e.duration().as_secs()).unwrap_or(0)), 0),
         };
         clock::from_unix(secs, millis)
@@ -261,7 +264,9 @@ impl Date {
         }
         let digits = |r: std::ops::Range<usize>| -> Option<u32> {
             let part = s.get(r)?;
-            part.bytes().all(|c| c.is_ascii_digit()).then(|| part.parse().ok())?
+            part.bytes()
+                .all(|c| c.is_ascii_digit())
+                .then(|| part.parse().ok())?
         };
         let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
         ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(Date {
@@ -462,10 +467,7 @@ impl LogConfig {
             match fs::read_to_string(props) {
                 Ok(text) => {
                     let (c, w) = LogConfig::from_properties(&text);
-                    warnings.extend(
-                        w.into_iter()
-                            .map(|w| format!("{}: {w}", props.display())),
-                    );
+                    warnings.extend(w.into_iter().map(|w| format!("{}: {w}", props.display())));
                     c
                 }
                 Err(e) => {
@@ -814,7 +816,12 @@ impl Logger {
 }
 
 /// One record as a line: `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [target] message\n`.
-pub fn format_line(now: &LocalTime, level: Level, target: &str, args: fmt::Arguments<'_>) -> String {
+pub fn format_line(
+    now: &LocalTime,
+    level: Level,
+    target: &str,
+    args: fmt::Arguments<'_>,
+) -> String {
     let mut line = format!("{} [{:>5}] [{target}] {args}", now.datetime_ms(), level);
     line.push('\n');
     line
@@ -1011,6 +1018,9 @@ mod tests {
         let (c, w) =
             LogConfig::from_properties(include_str!("../conf/slog.stdout.properties.example"));
         assert!(w.is_empty(), "{w:?}");
-        assert_eq!((c.level, c.stderr, c.file), (Some(Level::Trace), Some(Level::Trace), None));
+        assert_eq!(
+            (c.level, c.stderr, c.file),
+            (Some(Level::Trace), Some(Level::Trace), None)
+        );
     }
 }
