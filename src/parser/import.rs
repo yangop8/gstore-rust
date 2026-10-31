@@ -401,7 +401,14 @@ pub fn expand_sources<S: AsRef<str>>(inputs: &[S], policy: &LoadPolicy) -> Resul
             let mut files = Vec::new();
             walk_rdf_files(&dir, &mut files)?;
             files.sort();
-            out.extend(files.into_iter().map(Source::File));
+            for f in files {
+                // Each file passes the policy itself: a symlink inside an
+                // allowed directory must not lead outside it.
+                match policy.resolve(&f.to_string_lossy())? {
+                    LoadSource::Local(p) => out.push(Source::File(p)),
+                    LoadSource::Remote(u) => out.push(Source::Url(u)),
+                }
+            }
             continue;
         }
         match policy.resolve(input)? {

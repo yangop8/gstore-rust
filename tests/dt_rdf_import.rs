@@ -510,6 +510,18 @@ fn directory_sources_load_every_rdf_file_sorted_and_recursively() {
     assert!(import::expand_sources(&input, &LoadPolicy::restricted()).is_err());
     let allowed = LoadPolicy::restricted().with_allowed_dir(&dir);
     assert_eq!(import::expand_sources(&input, &allowed).unwrap().len(), 4);
+    // A symlink inside the allowed directory may not lead out of it.
+    #[cfg(unix)]
+    {
+        let outside = tmp("dirsrc_outside");
+        let secret = write(&outside.join("secret.nt"), "<http://e/x> <http://e/y> <http://e/z> .\n");
+        std::os::unix::fs::symlink(&secret, data.join("link.nt")).unwrap();
+        let err = import::expand_sources(&input, &allowed).unwrap_err();
+        assert!(err.to_string().contains("load policy"), "{err}");
+        // Trusted paths (the CLI's own arguments) follow it.
+        assert_eq!(import::sources_from_paths(&[&data]).unwrap().len(), 5);
+        let _ = fs::remove_dir_all(&outside);
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -663,6 +675,15 @@ fn named_graphs_survive_every_build_path() {
     // On disk.
     Database::build_disk(dir.join("disk.db"), &[&tg, &nq]).unwrap();
     check(&mut Database::open(dir.join("disk.db")).unwrap());
+    // RocksDB (the `gspo` column family), built and reopened.
+    #[cfg(feature = "rocksdb")]
+    {
+        let rdir = dir.join("rocks.db");
+        let mut built = Database::build_rocksdb_from_files("r", &rdir, &[&tg, &nq]).unwrap();
+        check(&mut built);
+        drop(built);
+        check(&mut Database::open(&rdir).unwrap());
+    }
     // gadd-style inserts into an existing database, and LOAD.
     let mut db = Database::new("i");
     let mut n = 0;
