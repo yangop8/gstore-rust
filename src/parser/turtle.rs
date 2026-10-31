@@ -1,4 +1,4 @@
-//! Turtle (subset) parser.
+//! Turtle and TriG reader (streaming).
 //!
 //! gStore's `RDFParser` accepts Turtle as well as N-Triples; several bundled
 //! datasets (e.g. `data/lubm/lubm.nt`) are actually Turtle — they open with
@@ -13,51 +13,144 @@
 //! * IRIs, blank nodes, plain/typed/lang literals, numeric & boolean literals
 //! * `[ … ]` blank-node property lists and `( … )` collections (lowered to an
 //!   `rdf:first`/`rdf:rest`/`rdf:nil` chain), including nesting
+//! * with [`parse_reader_trig`], TriG graph blocks (see [`crate::parser::trig`])
+//!
+//! # Streaming
+//!
+//! The reader pulls characters from a [`BufRead`] through a
+//! [`CharSource`](crate::parser::stream::CharSource): memory holds the
+//! reader's buffer, a few characters of lookahead and the statement being
+//! parsed — never the document. Each completed statement's triples go to a
+//! [`StatementSink`] (inside a TriG block too, so one huge graph block is not
+//! buffered either).
+//!
+//! # Errors and recovery
+//!
+//! A statement that does not parse is reported to the sink. A strict sink
+//! stops the parse there. A tolerant sink lets it go on the way upstream
+//! gStore's `TurtleParser` recovers (`RDFParser::parseFile` +
+//! `TurtleParser::discardLine`): the statement's triples are dropped, the rest
+//! of the line the error was detected on is skipped, and parsing resumes at
+//! the next line (still inside the current TriG block, if any).
+//!
+//! # Extension: lenient local names
+//!
+//! Like upstream's lexer, which ends a prefixed name only at whitespace or
+//! one of `[](),;:.`, a local name may also contain `/ # ? = & ~ ! $ * + @`
+//! (`ex:a/b`, `ex:page#top`) — strict Turtle requires a `\` escape for them.
+//! A `#` *inside* a name is therefore part of it (`ex:a#b`); a comment starts
+//! at a `#` after whitespace. Standard `:` in local names, `%HH` and `\`
+//! escapes are accepted too. This applies to the RDF loader only, not to
+//! SPARQL, which has its own lexer.
 
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::nquads::Quad;
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
+use crate::parser::stream::{
+    BlankLabeler, CharSource, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
+};
 
 /// Parse a Turtle document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
-    parse_str_scoped(content, "g")
+    collect(content.as_bytes(), BlankLabeler::keep(), false)
 }
 
-/// Like [`parse_str`], but mints anonymous blank nodes under `bnode_scope`. A
-/// caller that parses several documents into one graph — e.g. TriG parsing each
-/// `{ … }` block separately — passes a distinct scope per document so their
-/// anonymous `[ … ]` / `( … )` nodes stay distinct instead of both restarting at
-/// `g~0` and colliding. `~` cannot appear in a parsed `_:` label, so a minted
-/// label never collides with an explicit blank node either.
+/// Like [`parse_str`], but mints anonymous blank nodes as
+/// `genid-<n>-<bnode_scope>` (see [`BlankLabeler::keep_with_suffix`]). A
+/// caller that parses several documents into one graph passes a distinct
+/// scope per document so their anonymous `[ … ]` / `( … )` nodes stay
+/// distinct instead of both restarting at `genid-0`. Explicit labels are kept
+/// (one starting `genid-` is escaped, so a minted label never collides with
+/// an explicit blank node either).
 pub fn parse_str_scoped(content: &str, bnode_scope: &str) -> Result<Vec<Triple>> {
-    let mut p = Parser::new(content, bnode_scope);
-    p.parse_document()?;
-    Ok(p.triples)
+    collect(
+        content.as_bytes(),
+        BlankLabeler::keep_with_suffix(bnode_scope),
+        false,
+    )
 }
 
-/// Parse a Turtle file into triples.
+/// Parse a Turtle file into triples (streamed from disk).
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
-    parse_str(&content)
+    let file = std::fs::File::open(path)?;
+    collect(
+        BufReader::with_capacity(DEFAULT_WINDOW, file),
+        BlankLabeler::keep(),
+        false,
+    )
 }
 
-struct Parser {
-    chars: Vec<char>,
-    pos: usize,
-    line: usize,
-    prefixes: std::collections::HashMap<String, String>,
+fn collect<R: BufRead>(reader: R, labels: BlankLabeler, trig: bool) -> Result<Vec<Triple>> {
+    let mut sink = CollectQuads::default();
+    run(reader, labels, trig, &mut sink)?;
+    Ok(sink.quads.into_iter().map(Quad::into_triple).collect())
+}
+
+/// Stream a Turtle document from `reader` into `sink`, one statement at a
+/// time (every quad's graph is `None`). Blank nodes are named by `labels`.
+pub fn parse_reader<R: BufRead>(
+    reader: R,
+    labels: BlankLabeler,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    run(reader, labels, false, sink)
+}
+
+/// Stream a TriG document from `reader` into `sink`: Turtle plus `{ … }`,
+/// `<g> { … }` and `GRAPH <g> { … }` blocks, whose statements carry the
+/// block's graph label.
+pub fn parse_reader_trig<R: BufRead>(
+    reader: R,
+    labels: BlankLabeler,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    run(reader, labels, true, sink)
+}
+
+fn run<R: BufRead>(
+    reader: R,
+    labels: BlankLabeler,
+    trig: bool,
+    sink: &mut dyn StatementSink,
+) -> Result<()> {
+    let mut p = Parser {
+        src: CharSource::new(reader),
+        prefixes: HashMap::new(),
+        base: None,
+        out: Vec::new(),
+        graph: None,
+        in_block: false,
+        trig,
+        labels,
+        depth: 0,
+        ctx: [None, None, None],
+    };
+    p.run(sink)
+}
+
+struct Parser<R> {
+    src: CharSource<R>,
+    prefixes: HashMap<String, String>,
     base: Option<String>,
-    triples: Vec<Triple>,
-    /// Counter for fresh blank nodes minted by `[ … ]` / `( … )`.
-    bnode: usize,
-    /// Scope prefix for minted blank labels (`<scope>~<n>`), kept distinct across
-    /// documents parsed into one graph (see [`parse_str_scoped`]).
-    bnode_scope: String,
+    /// The triples of the statement being parsed (as quads of `graph`).
+    out: Vec<Quad>,
+    /// TriG: the graph of the block being read (`None` = default graph).
+    graph: Option<Term>,
+    /// TriG: inside a `{ … }` block.
+    in_block: bool,
+    trig: bool,
+    labels: BlankLabeler,
     /// Current `[ … ]` / `( … )` nesting depth, bounded by `MAX_NESTING_DEPTH` so
     /// adversarially deep input errors out instead of overflowing the stack.
     depth: usize,
+    /// Subject / predicate / object of the current statement, for the error
+    /// log context.
+    ctx: [Option<Term>; 3],
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
@@ -67,52 +160,122 @@ const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 /// against a stack overflow on pathological input, mirroring the JSON-LD reader).
 const MAX_NESTING_DEPTH: usize = 256;
 
-impl Parser {
-    fn new(s: &str, bnode_scope: &str) -> Parser {
-        Parser {
-            chars: s.chars().collect(),
-            pos: 0,
-            line: 1,
-            prefixes: std::collections::HashMap::new(),
-            base: None,
-            triples: Vec::new(),
-            bnode: 0,
-            bnode_scope: bnode_scope.to_string(),
-            depth: 0,
+/// A character a (strict Turtle) local name may continue with.
+fn is_std_local_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | ':' | '%' | '\u{00B7}')
+        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+}
+
+/// A character a local name may contain in the lenient loader (see the
+/// module docs): the standard ones plus upstream's extras.
+fn is_lenient_local_char(c: char) -> bool {
+    is_std_local_char(c) || matches!(c, '/' | '#' | '?' | '=' | '&' | '~' | '!' | '$' | '*' | '+' | '@')
+}
+
+/// Characters a `\`-escape may produce in a local name (`PN_LOCAL_ESC`).
+const LOCAL_ESCAPES: &str = "_~.-!$&'()*+,;=/?#@%";
+
+impl<R: BufRead> Parser<R> {
+    /// Drive the parse: one statement at a time into `sink`.
+    fn run(&mut self, sink: &mut dyn StatementSink) -> Result<()> {
+        loop {
+            self.ctx = [None, None, None];
+            let item = self.next_item();
+            if let Some(e) = self.src.take_io_error() {
+                return Err(e.into());
+            }
+            let item = match item {
+                // Decoded as U+FFFD: the statement is not what the file says.
+                Ok(_) if self.src.take_bad_utf8() => Err(self.err("invalid UTF-8")),
+                other => other,
+            };
+            match item {
+                Ok(true) => {
+                    if !self.out.is_empty() {
+                        sink.statement(&mut self.out)?;
+                        self.out.clear();
+                    }
+                }
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    self.out.clear();
+                    self.depth = 0;
+                    let context = self
+                        .ctx
+                        .iter()
+                        .flatten()
+                        .map(Term::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    sink.error(SyntaxError::from_error(&e).with_context(context))?;
+                    // Tolerant: resynchronise at the next line.
+                    self.resync();
+                    self.src.take_bad_utf8();
+                }
+            }
         }
     }
 
-    /// Mint a fresh, document-unique blank node for an anonymous construct. The
-    /// `~` cannot appear in a parsed `_:` label, so a minted label can never
-    /// collide with an explicit blank node written in the document.
+    /// After a failed statement: skip the rest of the line (upstream's
+    /// `discardLine`). Inside a TriG block a `}` on that line (outside a
+    /// string, IRI or comment) still closes the block, and parsing resumes
+    /// right after it — otherwise one bad statement on a block's last line
+    /// would pull everything after the block into it.
+    fn resync(&mut self) {
+        if !(self.trig && self.in_block) {
+            self.src.discard_line();
+            return;
+        }
+        let mut quote: Option<char> = None;
+        let mut in_iri = false;
+        while let Some(c) = self.src.bump() {
+            match c {
+                '\n' => return,
+                '\\' if quote.is_some() => {
+                    self.src.bump();
+                }
+                '"' | '\'' if !in_iri => match quote {
+                    Some(q) if q == c => quote = None,
+                    None => quote = Some(c),
+                    Some(_) => {}
+                },
+                '<' if quote.is_none() => in_iri = true,
+                '>' if in_iri => in_iri = false,
+                '#' if quote.is_none() && !in_iri => {
+                    self.src.discard_line();
+                    return;
+                }
+                '}' if quote.is_none() && !in_iri => {
+                    self.in_block = false;
+                    self.graph = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Mint a fresh blank node for an anonymous construct.
     fn fresh_blank(&mut self) -> Term {
-        let label = format!("{}~{}", self.bnode_scope, self.bnode);
-        self.bnode += 1;
-        Term::Blank(label)
+        Term::Blank(self.labels.fresh())
     }
 
     fn err(&self, msg: impl Into<String>) -> GStoreError {
         GStoreError::RdfParse {
-            line: self.line,
+            line: self.src.line(),
             msg: msg.into(),
         }
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    fn peek(&mut self) -> Option<char> {
+        self.src.peek()
     }
-    fn peek2(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+    fn peek2(&mut self) -> Option<char> {
+        self.src.peek_at(1)
     }
     fn bump(&mut self) -> Option<char> {
-        let c = self.peek();
-        if let Some(c) = c {
-            self.pos += 1;
-            if c == '\n' {
-                self.line += 1;
-            }
-        }
-        c
+        self.src.bump()
     }
 
     fn skip_ws(&mut self) {
@@ -134,34 +297,95 @@ impl Parser {
         }
     }
 
-    fn eof(&self) -> bool {
-        self.pos >= self.chars.len()
+    fn eof(&mut self) -> bool {
+        self.src.at_eof()
     }
 
-    fn parse_document(&mut self) -> Result<()> {
-        loop {
-            self.skip_ws();
-            if self.eof() {
-                return Ok(());
-            }
-            match self.peek() {
-                Some('@') => self.parse_directive()?,
-                Some(c) if c.is_ascii_alphabetic() && self.looks_like_keyword_directive() => {
-                    self.parse_sparql_directive()?
-                }
-                _ => self.parse_triples_statement()?,
+    /// Emit one triple of the current statement (in the current graph).
+    fn emit(&mut self, s: Term, p: Term, o: Term) {
+        self.out.push(Quad::new(s, p, o, self.graph.clone()));
+    }
+
+    /// Whether the next characters spell `word` (ASCII, case-insensitive)
+    /// followed by a character `boundary` accepts.
+    fn keyword_ahead(&mut self, word: &str, boundary: fn(char) -> bool) -> bool {
+        for (i, w) in word.chars().enumerate() {
+            match self.src.peek_at(i) {
+                Some(c) if c.eq_ignore_ascii_case(&w) => {}
+                _ => return false,
             }
         }
+        self.src.peek_at(word.len()).is_some_and(boundary)
     }
 
-    /// Is the upcoming bareword a SPARQL-style `PREFIX`/`BASE` directive?
-    fn looks_like_keyword_directive(&self) -> bool {
-        let word: String = self.chars[self.pos..]
-            .iter()
-            .take(6)
-            .collect::<String>()
-            .to_ascii_uppercase();
-        word.starts_with("PREFIX") || word.starts_with("BASE")
+    /// Parse the next top-level item: a directive, a statement, or (TriG) a
+    /// block boundary. `Ok(false)` at the end of the input.
+    fn next_item(&mut self) -> Result<bool> {
+        self.skip_ws();
+        if self.eof() {
+            if self.in_block {
+                self.in_block = false;
+                self.graph = None;
+                return Err(self.err("unterminated graph block (missing '}')"));
+            }
+            return Ok(false);
+        }
+        if self.in_block {
+            if self.peek() == Some('}') {
+                self.bump();
+                self.in_block = false;
+                self.graph = None;
+                // An optional `.` may follow a graph block (lenient).
+                self.skip_ws();
+                if self.peek() == Some('.') {
+                    self.bump();
+                }
+                return Ok(true);
+            }
+            self.parse_block_statement()?;
+            return Ok(true);
+        }
+        match self.peek() {
+            Some('@') => self.parse_directive()?,
+            Some(_) if self.keyword_ahead("PREFIX", char::is_whitespace) => {
+                self.parse_sparql_directive("PREFIX")?
+            }
+            Some(_) if self.keyword_ahead("BASE", |c| c.is_whitespace() || c == '<') => {
+                self.parse_sparql_directive("BASE")?
+            }
+            Some('{') if self.trig => {
+                self.bump();
+                self.in_block = true;
+                self.graph = None;
+            }
+            Some(_) if self.trig && self.keyword_ahead("GRAPH", |c| c.is_whitespace() || c == '<') => {
+                for _ in 0..5 {
+                    self.bump();
+                }
+                self.skip_ws();
+                let label = self.parse_graph_label()?;
+                self.skip_ws();
+                self.expect('{')?;
+                self.in_block = true;
+                self.graph = Some(label);
+            }
+            _ => self.parse_triples_statement()?,
+        }
+        Ok(true)
+    }
+
+    /// A graph label after `GRAPH`: an IRI, prefixed name, blank node or `[]`.
+    fn parse_graph_label(&mut self) -> Result<Term> {
+        if self.peek() == Some('[') {
+            self.bump();
+            self.skip_ws();
+            self.expect(']')?;
+            return Ok(self.fresh_blank());
+        }
+        match self.parse_term(true)? {
+            t @ (Term::Iri(_) | Term::Blank(_)) => Ok(t),
+            other => Err(self.err(format!("invalid graph label {other}"))),
+        }
     }
 
     fn parse_directive(&mut self) -> Result<()> {
@@ -187,22 +411,20 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_sparql_directive(&mut self) -> Result<()> {
-        let kw = self.read_bareword().to_ascii_uppercase();
-        match kw.as_str() {
-            "PREFIX" => {
-                self.skip_ws();
-                let ns = self.read_prefix_ns()?;
-                self.skip_ws();
-                let iri = self.parse_iriref()?;
-                self.prefixes.insert(ns, iri);
-            }
-            "BASE" => {
-                self.skip_ws();
-                let iri = self.parse_iriref()?;
-                self.base = Some(iri);
-            }
-            other => return Err(self.err(format!("unknown directive '{other}'"))),
+    fn parse_sparql_directive(&mut self, kw: &str) -> Result<()> {
+        for _ in 0..kw.len() {
+            self.bump();
+        }
+        if kw == "PREFIX" {
+            self.skip_ws();
+            let ns = self.read_prefix_ns()?;
+            self.skip_ws();
+            let iri = self.parse_iriref()?;
+            self.prefixes.insert(ns, iri);
+        } else {
+            self.skip_ws();
+            let iri = self.parse_iriref()?;
+            self.base = Some(iri);
         }
         Ok(())
     }
@@ -224,6 +446,8 @@ impl Parser {
         Err(self.err("expected ':' in prefix declaration"))
     }
 
+    /// A top-level statement. In TriG, a subject followed by `{` is a graph
+    /// block's label instead.
     fn parse_triples_statement(&mut self) -> Result<()> {
         self.skip_ws();
         // A `[ … ]` blank-node property list subject already emits its own
@@ -232,25 +456,57 @@ impl Parser {
         // grammar still requires a predicate-object list after it.
         let subject_is_blank_list = self.peek() == Some('[');
         let subject = self.parse_term(false)?;
+        self.ctx[0] = Some(subject.clone());
         self.skip_ws();
+        if self.trig && self.peek() == Some('{') {
+            if !matches!(subject, Term::Iri(_) | Term::Blank(_)) || !self.out.is_empty() {
+                return Err(self.err(format!("invalid graph label {subject}")));
+            }
+            self.bump();
+            self.in_block = true;
+            self.graph = Some(subject);
+            return Ok(());
+        }
         if subject_is_blank_list && self.peek() == Some('.') {
             self.expect_dot()?;
             return Ok(());
         }
         self.parse_predicate_object_list(&subject)?;
-        self.expect_dot()?;
-        Ok(())
+        self.expect_dot()
+    }
+
+    /// A statement inside a TriG block: its final `.` may be omitted before
+    /// the closing `}`.
+    fn parse_block_statement(&mut self) -> Result<()> {
+        let subject_is_blank_list = self.peek() == Some('[');
+        let subject = self.parse_term(false)?;
+        self.ctx[0] = Some(subject.clone());
+        self.skip_ws();
+        let standalone = subject_is_blank_list && matches!(self.peek(), Some('.') | Some('}'));
+        if !standalone {
+            self.parse_predicate_object_list(&subject)?;
+            self.skip_ws();
+        }
+        match self.peek() {
+            Some('.') => {
+                self.bump();
+                Ok(())
+            }
+            Some('}') => Ok(()),
+            other => Err(self.err(format!("expected '.' or '}}', found {other:?}"))),
+        }
     }
 
     fn parse_predicate_object_list(&mut self, subject: &Term) -> Result<()> {
         loop {
             self.skip_ws();
             let predicate = self.parse_verb()?;
+            self.ctx[1] = Some(predicate.clone());
             // object list
             loop {
                 let object = self.parse_term(false)?;
-                self.triples
-                    .push(Triple::new(subject.clone(), predicate.clone(), object));
+                self.ctx[2] = Some(object.clone());
+                self.emit(subject.clone(), predicate.clone(), object);
                 self.skip_ws();
                 if self.peek() == Some(',') {
                     self.bump();
@@ -262,8 +518,16 @@ impl Parser {
             if self.peek() == Some(';') {
                 self.bump();
                 self.skip_ws();
-                // trailing ';' before '.' is allowed
-                if self.peek() == Some('.') || self.eof() {
+                // trailing ';' before '.' (or `]` / `}`) is allowed
+                if matches!(self.peek(), Some('.') | Some(']') | Some('}') | None) {
+                    break;
+                }
+                // `; ;` repeated separators are allowed too
+                while self.peek() == Some(';') {
+                    self.bump();
+                    self.skip_ws();
+                }
+                if matches!(self.peek(), Some('.') | Some(']') | Some('}') | None) {
                     break;
                 }
                 continue;
@@ -276,7 +540,11 @@ impl Parser {
     fn parse_verb(&mut self) -> Result<Term> {
         self.skip_ws();
         // 'a' keyword (must be standalone)
-        if self.peek() == Some('a') && self.peek2().is_none_or(|c| c.is_whitespace() || c == '<') {
+        if self.peek() == Some('a')
+            && self
+                .peek2()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, '<' | '[' | '(' | '"'))
+        {
             self.bump();
             return Ok(Term::iri(RDF_TYPE));
         }
@@ -288,8 +556,9 @@ impl Parser {
         self.skip_ws();
         // Every `[ … ]` / `( … )` nesting level enters through exactly one
         // `parse_term`, so bounding depth here bounds the whole recursion. On the
-        // error path the count is not restored, but that only aborts the parse;
-        // the success path below decrements so sibling terms are unaffected.
+        // error path the count is not restored, but that only aborts the
+        // statement (the driver resets it); the success path below decrements
+        // so sibling terms are unaffected.
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
             return Err(self.err("blank-node / collection nesting too deep"));
@@ -299,7 +568,7 @@ impl Parser {
             Some('"') | Some('\'') if !verb_pos => self.parse_literal(),
             Some('[') if !verb_pos => self.parse_blank_node_property_list(),
             Some('(') if !verb_pos => self.parse_collection(),
-            Some('_') => self.parse_blank(),
+            Some('_') if self.peek2() == Some(':') => self.parse_blank(),
             Some(c) if (c.is_ascii_digit() || c == '+' || c == '-' || c == '.') && !verb_pos => {
                 self.parse_numeric()
             }
@@ -352,15 +621,13 @@ impl Parser {
         let mut current = head.clone();
         let n = items.len();
         for (i, item) in items.into_iter().enumerate() {
-            self.triples
-                .push(Triple::new(current.clone(), first.clone(), item));
+            self.emit(current.clone(), first.clone(), item);
             let next = if i + 1 < n {
                 self.fresh_blank()
             } else {
                 nil.clone()
             };
-            self.triples
-                .push(Triple::new(current.clone(), rest.clone(), next.clone()));
+            self.emit(current.clone(), rest.clone(), next.clone());
             current = next;
         }
         Ok(head)
@@ -405,16 +672,18 @@ impl Parser {
         if label.is_empty() {
             return Err(self.err("empty blank node label"));
         }
-        Ok(Term::Blank(label))
+        Ok(Term::Blank(self.labels.explicit(&label)))
     }
 
     fn parse_prefixed_or_keyword(&mut self, verb_pos: bool) -> Result<Term> {
         // Could be `prefix:local`, `:local`, or a boolean literal.
-        let start = self.pos;
         let mut prefix = String::new();
         while let Some(c) = self.peek() {
             // Stop at the ':' that ends the prefix, or any term separator.
-            if c == ':' || c.is_whitespace() || matches!(c, '.' | ';' | ',') {
+            if c == ':'
+                || c.is_whitespace()
+                || matches!(c, '.' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\'')
+            {
                 break;
             }
             prefix.push(c);
@@ -422,7 +691,7 @@ impl Parser {
         }
         if self.peek() == Some(':') {
             self.bump();
-            let local = self.read_pn_local();
+            let local = self.read_pn_local()?;
             let ns = self
                 .prefixes
                 .get(&prefix)
@@ -433,35 +702,45 @@ impl Parser {
         if !verb_pos && (prefix == "true" || prefix == "false") {
             return Ok(Term::typed_literal(prefix, xsd::BOOLEAN));
         }
-        self.pos = start;
+        let found = prefix
+            .chars()
+            .next()
+            .or_else(|| self.peek())
+            .unwrap_or(' ');
         Err(self.err(format!(
-            "expected a prefixed name or IRI, found '{}'",
-            self.peek().unwrap_or(' ')
+            "expected a prefixed name or IRI, found '{found}'"
         )))
     }
 
-    fn read_pn_local(&mut self) -> String {
+    /// The local part of a prefixed name (lenient, see the module docs).
+    fn read_pn_local(&mut self) -> Result<String> {
         let mut local = String::new();
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' || c == '-' || c == '%' {
-                local.push(c);
-                self.bump();
+            if c == '\\' {
+                match self.peek2() {
+                    Some(e) if LOCAL_ESCAPES.contains(e) => {
+                        self.bump();
+                        self.bump();
+                        local.push(e);
+                    }
+                    _ => return Err(self.err("invalid escape in prefixed name")),
+                }
             } else if c == '.' {
                 // A '.' is part of the local name only if a name char follows.
-                if self
-                    .peek2()
-                    .is_some_and(|n| n.is_alphanumeric() || n == '_' || n == '-' || n == '%')
-                {
+                if self.peek2().is_some_and(is_std_local_char) {
                     local.push('.');
                     self.bump();
                 } else {
                     break;
                 }
+            } else if is_lenient_local_char(c) {
+                local.push(c);
+                self.bump();
             } else {
                 break;
             }
         }
-        local
+        Ok(local)
     }
 
     fn parse_literal(&mut self) -> Result<Term> {
@@ -481,9 +760,7 @@ impl Parser {
                 }
                 Some(c) if c == quote => {
                     if triple {
-                        if self.peek2() == Some(quote)
-                            && self.chars.get(self.pos + 2).copied() == Some(quote)
-                        {
+                        if self.peek2() == Some(quote) && self.src.peek_at(2) == Some(quote) {
                             self.bump();
                             self.bump();
                             self.bump();
@@ -634,7 +911,8 @@ impl Parser {
             self.bump();
             Ok(())
         } else {
-            Err(self.err(format!("expected '{c}', found {:?}", self.peek())))
+            let found = self.peek();
+            Err(self.err(format!("expected '{c}', found {found:?}")))
         }
     }
 
@@ -650,6 +928,7 @@ impl Parser {
         }
     }
 }
+
 
 fn is_absolute_iri(s: &str) -> bool {
     match s.find(':') {
@@ -1018,5 +1297,181 @@ mod tests {
             })
             .collect();
         assert_eq!(blanks.len(), 2);
+    }
+
+    #[test]
+    fn minted_labels_round_trip_through_parse_term() {
+        let ts = parse_str("@prefix : <http://e/> . :s :p [ :q ( :a ) ] .").unwrap();
+        for t in &ts {
+            for term in [&t.subject, &t.object] {
+                if let Term::Blank(_) = term {
+                    let back = crate::parser::ntriples::parse_term(&term.to_string()).unwrap();
+                    assert_eq!(&back, term);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lenient_local_names_like_upstream() {
+        let doc = "@prefix ex: <http://e/> .\n\
+                   ex:a/b ex:page#top ex:q?x=1&y=2 .\n\
+                   ex:a:b ex:p ex:c\\,d .\n\
+                   ex:s ex:p ex:o . # a comment after whitespace\n\
+                   ex:t ex:p ex:o .# a comment after the dot\n";
+        let ts = parse_str(doc).unwrap();
+        assert_eq!(ts.len(), 4);
+        assert_eq!(ts[0].subject, Term::iri("http://e/a/b"));
+        assert_eq!(ts[0].predicate, Term::iri("http://e/page#top"));
+        assert_eq!(ts[0].object, Term::iri("http://e/q?x=1&y=2"));
+        assert_eq!(ts[1].subject, Term::iri("http://e/a:b"));
+        assert_eq!(ts[1].object, Term::iri("http://e/c,d"));
+        assert_eq!(ts[3].object, Term::iri("http://e/o"));
+    }
+
+    /// A tolerant sink: collects statements and errors.
+    #[derive(Default)]
+    struct Tolerant {
+        quads: Vec<Quad>,
+        errors: Vec<SyntaxError>,
+    }
+
+    impl StatementSink for Tolerant {
+        fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
+            self.quads.append(quads);
+            Ok(())
+        }
+        fn error(&mut self, err: SyntaxError) -> Result<()> {
+            self.errors.push(err);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tolerant_parse_skips_the_bad_statement_and_resyncs_at_the_next_line() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :a :p :o1 .\n\
+                   :b :p undefined:x .\n\
+                   :c :p :o2 ; :q :o3 :extra .\n\
+                   :d :p :o3 .\n\
+                   \"lit\" :p :o4 .\n\
+                   :e :p \"bad \\q escape\" .\n\
+                   :f :p :o5 .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        // `:c`'s statement is dropped whole (no partial `:c :p :o2`); the
+        // literal subject is the import layer's business, not a syntax error.
+        assert_eq!(
+            subjects,
+            ["<http://e/a>", "<http://e/d>", "\"lit\"", "<http://e/f>"]
+        );
+        let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [3, 4, 7], "{:?}", sink.errors);
+        assert!(sink.errors[0].message.contains("undefined prefix"));
+        assert!(sink.errors[0].context.contains("<http://e/b>"));
+        // A strict parse of the same document stops at line 3.
+        let err = parse_str(doc).unwrap_err();
+        assert!(matches!(err, GStoreError::RdfParse { line: 3, .. }), "{err}");
+    }
+
+    #[test]
+    fn an_error_found_on_a_later_line_skips_that_line_like_upstream() {
+        // The unterminated collection swallows the next line's terms; the
+        // error surfaces on line 3, whose rest is discarded (upstream's
+        // `discardLine` does the same), so `:d` is lost and `:e` is kept.
+        let doc = "@prefix : <http://e/> .\n\
+                   :c :p ( :unterminated\n\
+                   :d :p :o3 .\n\
+                   :e :p :o4 .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.quads.len(), 1);
+        assert_eq!(sink.quads[0].subject, Term::iri("http://e/e"));
+        assert_eq!(sink.errors.len(), 1);
+        assert_eq!(sink.errors[0].line, 3);
+    }
+
+    #[test]
+    fn tolerant_trig_recovery_stays_inside_the_block() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :g {\n\
+                   :a :p :o .\n\
+                   :b :p ?bad .\n\
+                   :c :p :o\n\
+                   }\n\
+                   :d :p :o .\n";
+        let mut sink = Tolerant::default();
+        parse_reader_trig(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let got: Vec<(String, Option<Term>)> = sink
+            .quads
+            .iter()
+            .map(|q| (q.subject.to_string(), q.graph.clone()))
+            .collect();
+        let g = Some(Term::iri("http://e/g"));
+        assert_eq!(
+            got,
+            [
+                ("<http://e/a>".to_string(), g.clone()),
+                ("<http://e/c>".to_string(), g),
+                ("<http://e/d>".to_string(), None)
+            ]
+        );
+        assert_eq!(sink.errors.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_statement_on_a_block_s_last_line_still_closes_the_block() {
+        let doc = "@prefix : <http://e/> .\n\
+                   :g { :a :p \"}\" . :bad :p }\n\
+                   :d :p :o .\n\
+                   :h { :x :p :y . :z :p ?q # } in a comment\n\
+                   :w :p :v }\n\
+                   :e :p :o .\n";
+        let mut sink = Tolerant::default();
+        parse_reader_trig(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let got: Vec<(String, Option<Term>)> = sink
+            .quads
+            .iter()
+            .map(|q| (q.subject.to_string(), q.graph.clone()))
+            .collect();
+        let (g, h) = (Some(Term::iri("http://e/g")), Some(Term::iri("http://e/h")));
+        assert_eq!(
+            got,
+            [
+                ("<http://e/a>".to_string(), g),
+                ("<http://e/d>".to_string(), None),
+                ("<http://e/x>".to_string(), h.clone()),
+                ("<http://e/w>".to_string(), h),
+                ("<http://e/e>".to_string(), None),
+            ]
+        );
+        assert_eq!(sink.errors.len(), 2);
+    }
+
+    #[test]
+    fn invalid_utf8_fails_only_its_statement() {
+        let mut doc = b"<http://e/a> <http://e/p> \"ok\" .\n<http://e/b> <http://e/p> \"".to_vec();
+        doc.extend_from_slice(b"\xff\xfe\" .\n<http://e/c> <http://e/p> \"ok\" .\n");
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_slice(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.quads.len(), 2);
+        assert_eq!(sink.errors.len(), 1);
+        assert!(sink.errors[0].message.contains("UTF-8"));
+        let mut strict = CollectQuads::default();
+        assert!(parse_reader(doc.as_slice(), BlankLabeler::keep(), &mut strict).is_err());
+    }
+
+    #[test]
+    fn scoped_labels_prefix_explicit_and_minted_nodes() {
+        let mut sink = CollectQuads::default();
+        parse_reader(
+            "_:x <http://e/p> [] .".as_bytes(),
+            BlankLabeler::scoped("S1"),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.quads[0].subject, Term::blank("S1_x"));
+        assert_eq!(sink.quads[0].object, Term::blank("S1-0"));
     }
 }

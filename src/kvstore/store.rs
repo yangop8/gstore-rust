@@ -26,7 +26,8 @@ use crate::dict::{Dictionary, DiskTermSource};
 use crate::error::Result;
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
-use crate::parser::{sparql, turtle};
+use crate::parser::nquads::Quad;
+use crate::parser::{import, sparql};
 use crate::query::{Evaluator, QueryResult};
 use crate::store::{MutableStore, TripleSource, TripleStore};
 
@@ -200,24 +201,65 @@ impl DiskStore {
         Ok(store)
     }
 
-    /// Build a disk store from RDF files. The format of each file is detected by
+    /// Build a disk store from RDF files (directories and URLs expand, see
+    /// [`import::sources_from_paths`]). The format of each file is detected by
     /// its extension exactly as for an in-memory build (N-Triples / Turtle /
-    /// N-Quads / TriG / RDF-XML / JSON-LD / RDFa; unknown → Turtle), via
-    /// [`crate::parser::parse_file_by_ext`]; quad formats are flattened into the
-    /// default graph, matching `Database::build_from_files`.
+    /// N-Quads / TriG / RDF-XML / JSON-LD / RDFa; unknown → Turtle). The input
+    /// streams in; N-Quads / TriG statements keep their named graph (the GSPO
+    /// quad index), matching `Database::build_from_files`. Strict.
     pub fn build_files<P1: AsRef<Path>, P2: AsRef<Path>>(
         path: P1,
         cache_pages: usize,
         rdf_files: &[P2],
     ) -> Result<DiskStore> {
         let mut store = DiskStore::open(path, cache_pages)?;
-        for f in rdf_files {
-            for t in crate::parser::parse_file_by_ext(f)? {
-                store.insert_triple(&t)?;
-            }
-        }
+        let sources = import::sources_from_paths(rdf_files)?;
+        store.import_sources(&sources, &import::ImportOptions::strict(), &mut ())?;
         store.flush()?;
         Ok(store)
+    }
+
+    /// Stream RDF `sources` into this store (see [`crate::parser::import`]):
+    /// default-graph statements into the triple indexes, named-graph ones into
+    /// the GSPO quad index. Returns the import counts.
+    pub fn import_sources(
+        &mut self,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<import::ImportReport> {
+        import::import_sources(
+            sources,
+            "build",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                for q in batch.drain(..) {
+                    self.insert_quad(&q)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Insert one imported quad (a default-graph triple when it has no graph;
+    /// a graph label is an IRI). Returns `true` if newly added.
+    fn insert_quad(&mut self, q: &Quad) -> Result<bool> {
+        match &q.graph {
+            None => self.insert_keys(
+                &q.subject.dict_key(),
+                &q.predicate.dict_key(),
+                &q.object.dict_key(),
+                q.object.is_literal(),
+            ),
+            Some(g) => self.insert_quad_keys(
+                &g.dict_key(),
+                &q.subject.dict_key(),
+                &q.predicate.dict_key(),
+                &q.object.dict_key(),
+                q.object.is_literal(),
+            ),
+        }
     }
 
     /// Build a disk store from an in-memory RDF document (handy for tests).
@@ -227,9 +269,23 @@ impl DiskStore {
         content: &str,
     ) -> Result<DiskStore> {
         let mut store = DiskStore::open(path, cache_pages)?;
-        for t in turtle::parse_str(content)? {
-            store.insert_triple(&t)?;
-        }
+        let opts = import::ImportOptions {
+            blank_nodes: import::BlankNodes::Keep,
+            ..import::ImportOptions::strict()
+        };
+        import::import_reader(
+            content.as_bytes(),
+            import::RdfFormat::Turtle,
+            "<string>",
+            &opts,
+            &mut (),
+            &mut |batch: &mut Vec<Quad>| {
+                for q in batch.drain(..) {
+                    store.insert_quad(&q)?;
+                }
+                Ok(())
+            },
+        )?;
         store.flush()?;
         Ok(store)
     }
@@ -1493,7 +1549,13 @@ mod tests {
         let nq = dir.join("d.nq");
         std::fs::write(&nq, "<http://ex/d> <http://ex/p> <http://ex/e> <http://ex/g> .\n").unwrap();
         let ds = DiskStore::build_files(dir.join("kv"), 64, &[&ttl, &nq]).unwrap();
-        assert_eq!(ds.triple_count(), 3);
+        // The N-Quads statement keeps its graph: two default-graph triples and
+        // one named-graph quad (no longer flattened into the default graph).
+        assert_eq!(ds.triple_count(), 2);
+        assert_eq!(ds.quad_count(), 1);
+        let quads = ds.quads().unwrap();
+        let g = ds.id_to_string(quads[0].0).unwrap();
+        assert_eq!(g.as_deref(), Some("<http://ex/g>"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

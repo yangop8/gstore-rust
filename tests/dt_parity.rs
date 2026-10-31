@@ -139,7 +139,8 @@ fn gadd_reads_each_new_format() {
     let base = run(env!("CARGO_BIN_EXE_gshow"), &[name.as_os_str()]);
     assert!(String::from_utf8_lossy(&base.stdout).contains("triples   : 25"));
 
-    // N-Quads (graph term is flattened into the default graph).
+    // N-Quads: the statement with a graph term goes to that named graph (it
+    // was flattened into the default graph before named graphs were kept).
     let nq = tmp("d.nq");
     std::fs::write(&nq, "<nqs> <nqp> <nqo> <g1> .\n<nqs> <nqp> \"lit\" .\n").unwrap();
     let a1 = run(
@@ -179,10 +180,16 @@ fn gadd_reads_each_new_format() {
     assert!(a3.status.success(), "gadd rdf: {a3:?}");
     assert!(String::from_utf8_lossy(&a3.stdout).contains("Added 1 new triple(s)"));
 
-    // 25 + 2 + 2 + 1 = 30.
+    // Default graph: 25 + 1 (N-Quads) + 1 (TriG) + 1 (RDF/XML) = 28; the
+    // N-Quads <g1> and TriG :g statements are in two named graphs.
     let show = run(env!("CARGO_BIN_EXE_gshow"), &[name.as_os_str()]);
     assert!(
-        String::from_utf8_lossy(&show.stdout).contains("triples   : 30"),
+        String::from_utf8_lossy(&show.stdout).contains("named_graphs: 2"),
+        "final show: {}",
+        String::from_utf8_lossy(&show.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("triples   : 28"),
         "final show: {}",
         String::from_utf8_lossy(&show.stdout)
     );

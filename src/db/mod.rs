@@ -24,8 +24,10 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
+use crate::parser::import;
+use crate::parser::nquads::Quad;
+use crate::parser::sparql;
 use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
-use crate::parser::{sparql, turtle};
 use crate::query::{Evaluator, FunctionRegistry, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
@@ -448,23 +450,46 @@ impl Database {
         &self.load_policy
     }
 
-    /// Build a database by importing one or more RDF files. The format of each
-    /// file is detected by extension (N-Triples/Turtle/N-Quads/TriG/RDF-XML/
-    /// JSON-LD/RDFa; unknown → Turtle) via [`parser::parse_file_by_ext`].
+    /// Build a database by importing RDF sources: files (format by extension —
+    /// N-Triples/Turtle/N-Quads/TriG/RDF-XML/JSON-LD/RDFa, unknown → Turtle;
+    /// see [`import::RdfFormat`]), directories (every RDF file below them,
+    /// sorted) and `http(s)://` URLs. Streaming formats are read with bounded
+    /// memory; N-Quads / TriG statements keep their named graph; every source
+    /// gets its own blank-node scope. Strict: the first statement that fails
+    /// is the error (see [`build_from_sources`](Self::build_from_sources) for
+    /// a tolerant build).
     pub fn build_from_files<P: AsRef<Path>>(
         name: impl Into<String>,
         files: &[P],
     ) -> Result<Database> {
-        let mut db = Database::new(name);
-        let mut id_triples: Vec<IdTriple> = Vec::new();
-        for f in files {
-            for t in crate::parser::parse_file_by_ext(f)? {
-                id_triples.push(db.encode_triple(&t)?);
-            }
-        }
-        db.store.bulk_load(id_triples);
-        db.rebuild_index();
+        let sources = import::sources_from_paths(files)?;
+        let (db, _) =
+            Database::build_from_sources(name, &sources, &import::ImportOptions::strict(), &mut ())?;
         Ok(db)
+    }
+
+    /// Build a database from `sources` with explicit [`import::ImportOptions`]
+    /// (strict or tolerant, blank-node scoping, limits), reporting skipped
+    /// statements to `log` (e.g. an [`import::ParseErrorLog`]). Quads are
+    /// encoded batch by batch as they stream in; the default graph is indexed
+    /// once at the end. Returns the database and the import counts.
+    pub fn build_from_sources(
+        name: impl Into<String>,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<(Database, import::ImportReport)> {
+        let mut db = Database::new(name);
+        let mut acc = BuildAccumulator::default();
+        let report = import::import_sources(
+            sources,
+            "build",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| acc.add(&mut db, batch),
+        )?;
+        acc.finish(&mut db);
+        Ok((db, report))
     }
 
     /// Build a database from an in-memory RDF document (Turtle / N-Triples).
@@ -477,6 +502,8 @@ impl Database {
     /// through `progress` as it moves through the stages (gStore's
     /// `DatabaseProgressStatus`): RDF parse → dictionary build → index build →
     /// done. Useful for a progress bar / status endpoint on large loads.
+    /// Parsing and dictionary encoding overlap (the document streams in
+    /// batches). Strict; blank-node labels are kept as written.
     pub fn build_from_str_with_progress<F: FnMut(BuildProgress)>(
         name: impl Into<String>,
         content: &str,
@@ -484,17 +511,93 @@ impl Database {
     ) -> Result<Database> {
         let mut db = Database::new(name);
         progress(BuildProgress::RdfParse);
-        let triples = turtle::parse_str(content)?;
-        progress(BuildProgress::Dictionary);
-        let mut id_triples: Vec<IdTriple> = Vec::with_capacity(triples.len());
-        for t in &triples {
-            id_triples.push(db.encode_triple(t)?);
+        let opts = import::ImportOptions {
+            blank_nodes: import::BlankNodes::Keep,
+            ..import::ImportOptions::strict()
+        };
+        let mut acc = BuildAccumulator::default();
+        let mut announced = false;
+        import::import_reader(
+            content.as_bytes(),
+            import::RdfFormat::Turtle,
+            "<string>",
+            &opts,
+            &mut (),
+            &mut |batch: &mut Vec<Quad>| {
+                if !announced {
+                    progress(BuildProgress::Dictionary);
+                    announced = true;
+                }
+                acc.add(&mut db, batch)
+            },
+        )?;
+        if !announced {
+            progress(BuildProgress::Dictionary);
         }
-        db.store.bulk_load(id_triples);
         progress(BuildProgress::Index);
-        db.rebuild_index();
+        acc.finish(&mut db);
         progress(BuildProgress::Done);
         Ok(db)
+    }
+
+    /// Insert the statements of RDF `sources` into this database (`gadd`,
+    /// `/api` `batchInsert`): like [`build_from_sources`](Self::build_from_sources)
+    /// but through the ordinary insert path (transaction log, redo log,
+    /// write-through to a persistent layout, incremental index). N-Quads /
+    /// TriG statements go to their named graph. `applied` counts the
+    /// statements that were new (duplicates are not), and stays accurate when
+    /// an error stops the import part-way.
+    pub fn insert_sources(
+        &mut self,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+        applied: &mut u64,
+    ) -> Result<import::ImportReport> {
+        import::import_sources(
+            sources,
+            "batch insert",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                for q in batch.drain(..) {
+                    let graph = graph_iri(&q.graph);
+                    if self.insert_quad(&q.into_triple(), graph.as_deref())? {
+                        *applied += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Remove the statements of RDF `sources` from this database (`gsub`,
+    /// `/api` `batchRemove`); `applied` counts the statements that existed.
+    /// Pass options [`for_removal`](import::ImportOptions::for_removal) so
+    /// blank-node labels are read verbatim: a statement can only name a
+    /// stored blank node by its stored label (as an export writes it).
+    pub fn remove_sources(
+        &mut self,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+        applied: &mut u64,
+    ) -> Result<import::ImportReport> {
+        import::import_sources(
+            sources,
+            "batch remove",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                for q in batch.drain(..) {
+                    let graph = graph_iri(&q.graph);
+                    if self.delete_quad(&q.into_triple(), graph.as_deref()) {
+                        *applied += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     // (RocksDB / on-disk / snapshot persistence lives in `persist.rs`.)
@@ -1205,10 +1308,14 @@ impl Database {
         }
     }
 
-    /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
-    /// graph, subject to the [`LoadPolicy`]. Only local sources are fetched — a
-    /// `file:` IRI or a bare path; remote (`http(s)://`, …) sources are never
-    /// retrieved (no network) and error.
+    /// `LOAD <iri>`: read an RDF document, subject to the [`LoadPolicy`]. Only
+    /// local sources are read — a `file:` IRI or a bare path; remote
+    /// (`http(s)://`, …) sources are never retrieved by SPARQL (no network)
+    /// and error. The format follows the extension (see
+    /// [`import::RdfFormat`]); the document streams in, N-Quads / TriG
+    /// statements go to their named graphs, and its blank nodes get their own
+    /// scope. Strict: a statement that does not parse fails the `LOAD` (what
+    /// was inserted before it stays).
     fn load_rdf_source(&mut self, source: &str) -> Result<usize> {
         let path = match self.load_policy.resolve(source)? {
             LoadSource::Local(path) => path,
@@ -1219,14 +1326,14 @@ impl Database {
                 )))
             }
         };
-        let triples = turtle::parse_file(&path)?;
-        let mut n = 0;
-        for t in &triples {
-            if self.try_insert_triple(t)? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        let mut n = 0u64;
+        self.insert_sources(
+            &[import::Source::File(path)],
+            &import::ImportOptions::strict(),
+            &mut (),
+            &mut n,
+        )?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
     /// Convenience: parse + ensure a SELECT result.
@@ -1606,7 +1713,8 @@ impl Database {
             let triple_str = std::str::from_utf8(&bytes[gend..tend])
                 .map_err(|_| GStoreError::Database("non-UTF-8 redo.log triple".into()))?;
             let graph_opt = if graph.is_empty() { None } else { Some(graph) };
-            for t in turtle::parse_str(triple_str)? {
+            // N-Triples (verbatim blank labels: the record names stored nodes).
+            for t in crate::parser::ntriples::parse_str(triple_str)? {
                 match op {
                     'I' => {
                         self.insert_quad(&t, graph_opt)?;
@@ -1764,16 +1872,78 @@ impl Database {
     }
 
     /// Build a database from an N-Triples file using `threads` parser threads
-    /// (gStore's multi-threaded load). The file is split into line-aligned
-    /// chunks parsed in parallel; interning + indexing run serially afterward
-    /// (the dictionary is the single synchronization point).
+    /// (gStore's multi-threaded load). The file streams in rounds of
+    /// `threads` line-aligned chunks of about 1 MiB, each round parsed in
+    /// parallel and then interned serially (the dictionary is the single
+    /// synchronization point) — memory holds one round of text, not the file.
+    /// Indexing runs once at the end.
     pub fn build_from_ntriples_parallel<P: AsRef<Path>>(
         name: impl Into<String>,
         path: P,
         threads: usize,
     ) -> Result<Database> {
-        let content = fs::read_to_string(path)?;
-        Database::build_from_ntriples_str_parallel(name, &content, threads)
+        use std::io::BufRead;
+        const CHUNK_BYTES: usize = 1 << 20;
+        let threads = threads.max(1);
+        let mut reader = std::io::BufReader::with_capacity(
+            crate::parser::stream::DEFAULT_WINDOW,
+            fs::File::open(path)?,
+        );
+        let mut db = Database::new(name);
+        let mut ids: Vec<IdTriple> = Vec::new();
+        let mut lines_before = 0usize;
+        loop {
+            // One round: up to `threads` chunks, each ending at a line break,
+            // with the number of lines that precede it (for error lines).
+            let mut chunks: Vec<(usize, String)> = Vec::with_capacity(threads);
+            for _ in 0..threads {
+                let mut buf = Vec::new();
+                let mut lines = 0usize;
+                while buf.len() < CHUNK_BYTES && reader.read_until(b'\n', &mut buf)? > 0 {
+                    lines += 1;
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let text = String::from_utf8(buf).map_err(|_| GStoreError::RdfParse {
+                    line: lines_before + 1,
+                    msg: "invalid UTF-8 in this chunk of the file".into(),
+                })?;
+                chunks.push((lines_before, text));
+                lines_before += lines;
+            }
+            if chunks.is_empty() {
+                break;
+            }
+            let parsed: Vec<Result<Vec<Triple>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|(before, text)| {
+                        scope.spawn(move || {
+                            crate::parser::ntriples::parse_str(text).map_err(|e| match e {
+                                GStoreError::RdfParse { line, msg } => GStoreError::RdfParse {
+                                    line: line + before,
+                                    msg,
+                                },
+                                other => other,
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("parser thread panicked"))
+                    .collect()
+            });
+            for chunk in parsed {
+                for t in chunk? {
+                    ids.push(db.encode_triple(&t)?);
+                }
+            }
+        }
+        db.store.bulk_load(ids);
+        db.rebuild_index();
+        Ok(db)
     }
 
     /// Parallel-parse an in-memory N-Triples document with `threads` threads,
@@ -1807,6 +1977,52 @@ impl Database {
         db.store.bulk_load(ids);
         db.rebuild_index();
         Ok(db)
+    }
+}
+
+/// The named-graph IRI of an imported quad (`None` = the default graph). The
+/// import pipeline has already turned a blank-node label into an IRI.
+fn graph_iri(graph: &Option<Term>) -> Option<String> {
+    match graph {
+        Some(Term::Iri(g)) => Some(g.clone()),
+        Some(Term::Blank(l)) => Some(format!("{}{l}", import::BNODE_GRAPH_PREFIX)),
+        Some(Term::Literal { .. }) | None => None,
+    }
+}
+
+/// Collects a streaming build: quads are encoded batch by batch; the default
+/// graph's ids (12 bytes a triple) are bulk-loaded once at the end, named
+/// graphs per graph.
+#[derive(Default)]
+pub(crate) struct BuildAccumulator {
+    default: Vec<IdTriple>,
+    named: HashMap<u32, Vec<IdTriple>>,
+}
+
+impl BuildAccumulator {
+    /// Encode a batch of quads into `db`'s dictionary.
+    pub(crate) fn add(&mut self, db: &mut Database, batch: &mut Vec<Quad>) -> Result<()> {
+        for q in batch.drain(..) {
+            let graph = graph_iri(&q.graph);
+            let id = db.encode_triple(&q.into_triple())?;
+            match graph {
+                None => self.default.push(id),
+                Some(g) => {
+                    let gid = db.dict.try_intern_entity(&Term::iri(g).dict_key())?;
+                    self.named.entry(gid).or_default().push(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load the collected ids into `db` and build its index.
+    pub(crate) fn finish(self, db: &mut Database) {
+        db.store.bulk_load(self.default);
+        for (gid, ids) in self.named {
+            db.named.entry(gid).or_default().bulk_load(ids);
+        }
+        db.rebuild_index();
     }
 }
 

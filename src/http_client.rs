@@ -207,6 +207,99 @@ pub fn post_with(
     parse_reply(&raw)
 }
 
+/// The response to a [`get_with`]: its HTTP status and raw body bytes (a
+/// `Transfer-Encoding: chunked` body is decoded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpGetReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl HttpGetReply {
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// `GET` `url` (`http://`, or `https://` with the `tls` feature) asking for
+/// `accept`, within `opts` (time, size, local-address policy), and return the
+/// status and body, whatever the status. Used to download RDF sources
+/// (`gbuild`/`gadd` URLs, `/api` `remote` files, SPARQL `LOAD`).
+pub fn get_with(url: &str, accept: &str, opts: &PostOptions) -> io::Result<HttpGetReply> {
+    let target = parse_url(url)?;
+    if accept.contains(['\r', '\n']) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "malformed Accept"));
+    }
+    let default_port = if target.tls { 443 } else { 80 };
+    let host_header = if target.port == default_port {
+        host_for_header(&target.host)
+    } else {
+        format!("{}:{}", host_for_header(&target.host), target.port)
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host_header}\r\n\
+         User-Agent: gstore-rust/0.1\r\n\
+         Accept: {accept}\r\n\
+         Connection: close\r\n\r\n",
+        path = target.path,
+    );
+    let raw = exchange(
+        &target,
+        request.as_bytes(),
+        opts.limits,
+        opts.ca_file.as_deref(),
+        opts.refuse_local,
+        "HTTP endpoint",
+    )?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?;
+    let chunked = head.lines().skip(1).any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    let body = &raw[split + 4..];
+    let body = if chunked {
+        dechunk(body)?
+    } else {
+        body.to_vec()
+    };
+    Ok(HttpGetReply { status, body })
+}
+
+/// Decode a `Transfer-Encoding: chunked` body.
+fn dechunk(mut b: &[u8]) -> io::Result<Vec<u8>> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed chunked body");
+    let mut out = Vec::new();
+    loop {
+        let eol = b.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
+        let size_line = std::str::from_utf8(&b[..eol]).map_err(|_| bad())?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| bad())?;
+        b = &b[eol + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        if b.len() < size + 2 {
+            return Err(bad());
+        }
+        out.extend_from_slice(&b[..size]);
+        b = &b[size + 2..];
+    }
+}
+
 /// A parsed `http://` / `https://` URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpUrl {
