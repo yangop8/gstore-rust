@@ -1,6 +1,6 @@
 # Changelog
 
-## Phase 5 — RDF I/O and gconsole (GAP_PLAN §4.2, §5)
+## Phase 5 — RDF I/O, gconsole and operations (GAP_PLAN §4.2, §5)
 
 ### RDF import
 
@@ -56,9 +56,88 @@
   still works. Its `import` command now accepts any RDF format, a directory
   or a URL.
 
+### Zip packages and export (feature `zip`)
+
+- New optional cargo feature `zip` (zip 9, deflate only, pure Rust); the
+  default build gains no dependency. `src/zipio.rs`.
+- `/api` `build` / `batchInsert` / `batchRemove` read a `.zip` of RDF files
+  (local, uploaded or `remote=true`), unpacked as upstream does into the
+  upload directory and removed afterwards; every entry needs an allowed RDF
+  extension. Errors carry upstream's zip codes (1–6).
+- Safety: a package is checked in full before anything is written. Absolute
+  or `..` entry names are refused (zip-slip), symlink entries ignored,
+  encrypted entries refused. New `[upload]` keys `unzip_max_entries`
+  (default 10000) and `unzip_max_size` (default 10 GiB, also enforced on the
+  bytes actually written).
+- `backup compress=true` writes `<db>.db_<timestamp>.zip` (upstream's
+  layout); `restore` takes it (1005 when it does not unpack); rotation and
+  the "newest backup" choice include zips.
+- `export` gains `format` (`nt` / `nq`); `compress=true` writes a `.zip`.
+  *Behaviour change:* without `format`, a database with named graphs is
+  exported as N-Quads (`.nq`) instead of N-Triples that dropped them.
+- CLI: `gexport --format nt|nq` and `-z` / `out.zip`; `gbackup -z` /
+  `x.zip`; `grestore` of a `.zip`; `gbuild` of a `.zip` package (upstream
+  1.3's `gbuild -f x.zip`). `gconsole`'s `restore` passes a zip path to the
+  server like a directory.
+- Without the feature every zip path answers `1003` (the CLI exits 1),
+  naming the feature.
+
+### Diagnostic, query and access logs
+
+- `src/logging.rs`, no new dependency: levels `error`…`trace`, standard
+  error and a file rolled at local midnight into `FILE.YYYY-MM-DD`, with
+  retention in days. Configured as upstream through `conf.ini`'s `log_mode`
+  (a log4cplus properties file; upstream's two are shipped as
+  `conf/slog*.properties.example`), plus the keys `log_level`, `log_file`,
+  `log_days`, `log_stderr` and the `GSTORE_LOG` variable.
+- `gserver`'s diagnostics go through it (handler panics, accept failures,
+  failed saves; each request at `debug`); its startup lines on standard
+  output are also recorded in the file.
+- The REST `/sparql`, `/update` and `/tquery` now write upstream's JSON
+  query-log record (client IP, answer count, latency, status, format,
+  database), so `/api querylog` lists them. Each line of
+  `<db_home>/access.log` gains the client IP as a sixth field.
+
+### Legacy command-line tools
+
+- All ten tools take upstream 1.3's options (`-db`/`--database`,
+  `-f`/`--file`, `-p`/`--path`, `-q`, `-l`, `-z`, …) besides their own,
+  answer `-h`/`--help`, and exit `0` (done), `1` (failed) or `2` (invalid
+  arguments).
+- *Behaviour change:* `grestore` takes the database first, then the backup,
+  as upstream; the old order fails with a hint and restores nothing.
+  `grestore -l NAME` lists its backups.
+- `gshow` with no argument lists every database (upstream's
+  database/creator/built_time table); `gshow NAME` still shows its counts.
+- `gbuild` without a source builds an empty database, and refuses to
+  overwrite an existing one unless `--force`.
+- `gexport -db NAME [-f DIR]` writes `<db>_<timestamp>.nt` (`.nq` / `.zip`
+  as chosen); `gbackup -db NAME [-p DIR]` creates
+  `DIR/<db>.db_<timestamp>` (default `./backups/`).
+
+### Packaging
+
+- `Dockerfile` (builder on the MSRV toolchain, `debian:bookworm-slim`
+  runtime, user `gstore`, port 9000, volumes `/var/lib/gstore` and
+  `/etc/gstore`, a health check on `/api?operation=check`, `--build-arg
+  FEATURES`), and `.dockerignore`.
+- `packaging/systemd/gserver.service` (graceful stop by `SIGTERM`,
+  `Restart=on-failure`, hardening), sysusers.d / tmpfiles.d entries, and
+  cargo-deb / cargo-generate-rpm metadata with maintainer scripts.
+- `docs/DEPLOY.md` covers the container, the service, the packages, the
+  configuration and logs, and the tools.
+
+### CI
+
+- The feature matrix builds, clippies and tests `gzip`, `tls`, `zip` and
+  `readline`.
+
 ### Not yet
 
-- Zip input and N-Quads/zip export (next round).
+- The Docker image and the deb / rpm packages were built and linted but not
+  yet installed and run on a live host in CI.
+- `gconsole`'s `backup` / `export` have no compress or format switch (as
+  upstream's console); use the `/api` or `gbackup` / `gexport`.
 - The legacy REST payload endpoints (`/upload`, the `/batchInsert` body)
   still parse whole and drop graph labels.
 - JSON-LD `@graph` with an `@id` is flattened into the default graph.

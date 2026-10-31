@@ -125,3 +125,5 @@
 > - 测试:默认workspace **689全过**;`--features rocksdb` 编译+lib全过;`--features gzip`/`tls` 各自编译+测试(含 `gzip_compresses_when_accepted`/`tls_https_round_trip`)+ clippy `--all-targets` 零告警(默认/gzip/tls/rocksdb 四组合)。
 >
 > **至此原"深度/子集项"仅剩**:RDFa/JSON-LD的完整1.1语义(仍common-subset);Decimal为i128界(非任意精度,刻意零依赖界)、÷与SUM走f64;StringIndex惰性按查询构建(未做持久化Database级索引)。**刻意偏离仍不补**:gRPC线格式、多语言客户端SDK、.so热加载UDF、发行工程。
+>
+> 更新(Phase 5 集成,GAP_PLAN §4.2 + §5):**zip**(feature `zip`,默认关):`/api` build/batchInsert/batchRemove 读 zip 包、`backup compress=true` / `restore` zip 备份、`export compress=true` 与 `format=nt|nq`(含命名图时默认 N-Quads),`gbuild`/`gexport`/`gbackup`/`grestore` 同步支持;**日志**:`src/logging.rs` 按上游 `log_mode` 属性文件 + 扩展键分级、按天滚动与保留,REST 查询写 JSON 查询日志,访问日志带 IP;**老工具**:上游 1.3 参数拼写、`grestore` 参数顺序与上游一致、`gshow` 列出全部库、`gbuild` 建空库与防覆盖;**发行工程**:Dockerfile、systemd unit、deb/rpm 元数据(见 `docs/DEPLOY.md`)——此前"刻意偏离"中的 Docker/RPM/DEB 已补齐(loongarch 仍未做)。

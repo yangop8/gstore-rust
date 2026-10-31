@@ -39,6 +39,15 @@ cargo build --release           # gStore CLIs + gnlqa
 cargo test --workspace          # run the tests
 ```
 
+The default build is dependency-light. Optional cargo features (all off by
+default): `zip` (zip packages, zipped backups and exports), `gzip` (HTTP
+response compression, `.gz` sources), `tls` (HTTPS listeners), `readline`
+(`gconsole` line editing) — all pure Rust — and `rocksdb` (the RocksDB
+backend; needs clang). For example `cargo build --release -p gstore
+--features "zip gzip"`. To run `gserver` in a container or as a systemd
+service, or from `.deb` / `.rpm` packages, see
+[`docs/DEPLOY.md`](docs/DEPLOY.md).
+
 ### A) Use gStore directly (SPARQL)
 
 ```bash
@@ -135,7 +144,9 @@ Remaining large-refactor items are tracked in
 ### CLI tools
 
 A database is a `<name>.db` directory. Main tools (there are more — `gadd`,
-`gsub`, `gdrop`, `gshow`, `gbackup`, `grestore`, `gexport`, `gmonitor`, `gnode`):
+`gsub`, `gdrop`, `gshow`, `gbackup`, `grestore`, `gexport`, `gmonitor`, `gnode`;
+the [command-line tools section of `docs/DEPLOY.md`](docs/DEPLOY.md#command-line-tools)
+lists them in upstream 1.3's spelling):
 
 ```bash
 gbuild mydb data.nt          # build a DB from RDF (add --disk for the on-disk B+ tree)
@@ -149,7 +160,19 @@ gserver                      # the same API server rooted at db_home (./dbhome/)
                              # on port 9000, settings from ./conf/conf.ini
 gserver -b                   # … started in the background (-s: foreground)
 gserver -S | -t | -r | -k    # status / stop / restart / kill it (via its pid file)
+gexport mydb out.nq          # N-Quads (every graph); out.nt: the default graph;
+                             # -z / out.zip: zipped (feature zip)
+gbackup [-z] mydb bak        # a backup directory (or bak.zip)
+grestore mydb2 bak           # the database first, then the backup (dir or .zip)
 ```
+
+The tools also take upstream 1.3's options (`-db NAME`, `-f FILE`, `-p PATH`,
+`-l`, `-z 0|1`, …), answer `-h`/`--help`, and exit with `0` (done), `1`
+(failed) or `2` (invalid arguments). `gbuild` without a source builds an
+empty database and refuses to overwrite an existing one unless `--force`;
+`gbuild x.zip` reads a zip package (feature `zip`); `gshow` with no argument
+lists every database in the current directory. *Changed:* `grestore` used
+to take the backup first.
 
 The multi-DB server also speaks upstream gStore's `/api` protocol (`GET|POST
 /api` or `POST /` with `operation=…`, per-request `username`/`password`,
@@ -162,10 +185,24 @@ upstream: a database is **single-writer** — one transaction may be open on it
 at a time (a second `begin` answers `1008`), and while it is open other
 writes to it (`query` updates, `batchInsert`, …) answer `1004` until it is
 committed or rolled back, where upstream runs concurrent transactions; zip
-packages (`build`/`batchInsert`/`restore` from a `.zip`, `compress=true` for
-`backup`/`export`) are refused with `1003` for now; a user holding the restore
+packages (`build`/`batchInsert`/`batchRemove`/`restore` from a `.zip`,
+`compress=true` for `backup`/`export`) need the `zip` feature — without it
+they answer `1003` naming the feature — and are unpacked only within
+`conf.ini`'s `unzip_max_entries` / `unzip_max_size`, refusing unsafe entry
+names; `export` takes an optional `format` (`nt` / `nq`) and, without it,
+writes N-Quads (`.nq`) for a database with named graphs where upstream's
+N-Triples would drop them; a user holding the restore
 privilege on a database restores only that database's own backups; and
 asynchronous results are kept out of the public export directory.
+
+**Logs.** `gserver` writes a diagnostic log (errors, warnings, lifecycle
+events) configured like upstream's: `conf.ini`'s `log_mode` names a log4cplus
+properties file (`conf/slog.properties.example`), with the gstore-rust keys
+`log_level`, `log_file`, `log_days`, `log_stderr` and the `GSTORE_LOG`
+variable on top; files roll over daily. Every SPARQL statement — `/api`
+`query` and the REST `/sparql`, `/update`, `/tquery` — is recorded in the
+JSON query log with the client IP, answer count and latency, and the access
+logs carry the client IP (see [`docs/DEPLOY.md`](docs/DEPLOY.md#configuration-and-logs)).
 
 Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each
@@ -312,11 +349,16 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `query`       | algebra eval, joins, optimizer, FILTER, aggregates     |
 | `analytics`   | CSR graph algorithms (paths, centrality, communities)  |
 | `server` / `http_api` / `http_users` | HTTP SPARQL server, conneg, auth |
+| `gapi`        | upstream gStore 1.4's `/api` operations                 |
+| `console`     | `gconsole`, the `/api` client (and `--local` REPL)      |
+| `logging`     | diagnostic log: levels, daily rolling file, retention   |
+| `zipio`       | zip packages, zipped backups / exports (feature `zip`) |
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
 | `reason`      | RDFS / rule reasoning                                   |
 | `db`          | `Database` facade + persistence (mem & disk)           |
 | `gnlqa/`      | LLM natural-language QA layer (separate crate)          |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`, `gserver`, …            |
+| `packaging/`, `Dockerfile` | systemd unit, deb/rpm scripts, container image ([`docs/DEPLOY.md`](docs/DEPLOY.md)) |
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the gStore architecture and the mapping
 to gStore's C++ modules.

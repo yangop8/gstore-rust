@@ -36,9 +36,9 @@ user `gstore`.
 
 ```bash
 docker build -t gstore-rust .
-# optional features: gzip / tls are pure Rust; rocksdb makes the builder
-# install clang for bindgen
-docker build --build-arg FEATURES="gzip tls" -t gstore-rust .
+# optional features: gzip / tls / zip are pure Rust; rocksdb makes the
+# builder install clang for bindgen
+docker build --build-arg FEATURES="gzip tls zip" -t gstore-rust .
 
 docker run -d --name gstore -p 9000:9000 \
     -v gstore-data:/var/lib/gstore \
@@ -176,6 +176,17 @@ documents every key and the gstore-rust extensions). Command-line flags win
 over it: `-c FILE`, `-p/--port`, `--addr`, `--password`, `--db-home`,
 `--thread-num`, `--no-checkpoint`, `--load-dir`, … (`gserver -h`).
 
+**Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
+and `batchRemove` read a `.zip` of RDF files (each entry needs an extension
+from `upload_allow_extensions`, which by default omits `nq`), `backup
+compress=true` writes `<db>.db_<timestamp>.zip`, `restore` takes such an
+archive, and `export compress=true` zips the export file. A package is
+checked in full before anything is unpacked: unsafe entry names (absolute,
+`..`) are refused, and `[upload] unzip_max_entries` (default 10000) and
+`unzip_max_size` (default 10 GiB, counted on the bytes actually written)
+bound what it may unpack to. Without the feature these requests answer
+`1003`, naming it.
+
 **Diagnostic log** (errors, warnings, startup and shutdown events — the
 analogue of upstream's log4cplus `SLOG_*` log):
 
@@ -226,10 +237,14 @@ gadd -db lubm -f more.nt           # or -dir DIR
 gsub -db lubm -f old.nt
 gshow                              # every database here (or --db-home DIR); gshow lubm: its counts
 gmonitor -db lubm
-gexport -db lubm [-f DIR]          # writes DIR/lubm_<timestamp>.nt
+gexport -db lubm [-f DIR]          # writes DIR/lubm_<timestamp>.nt (.nq with named graphs)
+gexport -db lubm -z 1              # lubm_<timestamp>.zip holding the export (feature zip)
+gexport -db lubm --format nq       # N-Quads: the default graph, then every named graph
 gbackup -db lubm [-p ./backups/]   # creates ./backups/lubm.db_<timestamp>
-grestore -l lubm                   # lists those backups
-grestore -db lubm -p ./backups/lubm.db_<timestamp>   # = grestore lubm <backup>
+gbackup -db lubm -z 1              # ./backups/lubm.db_<timestamp>.zip (feature zip)
+grestore -l lubm                   # lists those backups, zipped ones included
+grestore -db lubm -p ./backups/lubm.db_<timestamp>   # = grestore lubm <backup>; a .zip too
+gbuild -db lubm2 -f lubm.zip       # the RDF files of a zip package (feature zip)
 gdrop -db lubm --yes               # the confirmation is required (upstream asks none)
 ```
 
