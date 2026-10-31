@@ -1683,6 +1683,11 @@ fn a_loaded_database_is_locked_against_other_processes() {
     assert_eq!(code(&j), 1005, "{j}");
     assert!(msg(&j).contains("locked by another process"), "{j}");
     assert!(srv.db_dir("lubm").is_dir());
+    // This process cannot open it either, but may read a detached copy.
+    let e = gstore::Database::open(srv.db_dir("lubm")).unwrap_err();
+    assert!(e.to_string().contains("locked by another process"), "{e}");
+    let copy = gstore::Database::read_copy(srv.db_dir("lubm")).unwrap();
+    assert_eq!((copy.triple_num(), copy.home()), (5, None));
     // The child exits: the lock is gone with it.
     drop(stdin);
     let _ = child.wait();

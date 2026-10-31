@@ -107,8 +107,9 @@ fn json_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Whether the database saved at `dir` contains `<s> <p> <o>` (full IRIs).
+/// Read as a detached copy: a `gserver` child may hold the directory's lock.
 fn on_disk_has(dir: &Path, s: &str, p: &str, o: &str) -> bool {
-    let mut db = Database::load(dir).expect("load saved database");
+    let mut db = Database::read_copy(dir).expect("read saved database");
     match db.query(&format!("ASK {{ <{s}> <{p}> <{o}> }}")).unwrap() {
         QueryResult::Ask(b) => b,
         other => panic!("unexpected {other:?}"),

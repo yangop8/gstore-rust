@@ -632,6 +632,41 @@ impl Database {
     /// Load a bincode snapshot directory (finishing an interrupted save first).
     pub(super) fn load_snapshot(dir: &Path) -> Result<Database> {
         fsutil::recover_snapshot(dir, SNAPSHOT_FILES)?;
+        Database::read_snapshot(dir)
+    }
+
+    /// An in-memory copy of the snapshot database in `dir`, read **without**
+    /// taking the directory's inter-process lock ([`dirlock`](super::dirlock))
+    /// and without touching the directory — to inspect a database another
+    /// process (a running `gserver`) may have open. Saves replace a snapshot
+    /// atomically, so the copy is either the state before a concurrent save
+    /// or the one after it (a read racing a save's final renames fails its
+    /// consistency check instead — retry). The copy is detached: it has no
+    /// [`home`](Self::home) and never writes back to `dir`. Only the snapshot
+    /// layout can be read this way; open an on-disk or RocksDB database with
+    /// [`open`](Self::open).
+    pub fn read_copy<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        let dir = dir.as_ref();
+        match Database::storage_kind(dir) {
+            Some(StorageKind::Snapshot) => {
+                let mut db = Database::read_snapshot(dir)?;
+                db.home = None;
+                Ok(db)
+            }
+            Some(kind) => Err(GStoreError::Database(format!(
+                "'{}' holds a {kind} database; read_copy reads snapshot databases only",
+                dir.display()
+            ))),
+            None => Err(GStoreError::Database(format!(
+                "'{}' does not contain a gStore database",
+                dir.display()
+            ))),
+        }
+    }
+
+    /// Read the snapshot files of `dir` (no recovery, see
+    /// [`load_snapshot`](Self::load_snapshot)).
+    fn read_snapshot(dir: &Path) -> Result<Database> {
         let meta: Meta = fsutil::read_bincode(&dir.join(META_FILE))?;
         let dict: Dictionary = fsutil::read_bincode(&dir.join(DICT_FILE))?;
         let store: TripleStore = fsutil::read_bincode(&dir.join(STORE_FILE))?;
