@@ -23,6 +23,9 @@
 //! # Deferred work
 //! * (none currently tracked here)
 
+pub mod csr;
+pub mod gfun;
+
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;

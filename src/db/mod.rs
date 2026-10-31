@@ -267,6 +267,11 @@ pub struct Database {
     /// Advances on every applied data mutation (see
     /// [`mutation_count`](Self::mutation_count)).
     mutations: u64,
+    /// Lazily built per-predicate CSR of the default graph for the advanced
+    /// graph functions, tagged with the [`mutations`](Self::mutations) value it
+    /// was built at (see [`csr`](Self::csr)). A `Mutex` so `&self` readers can
+    /// fill it; dropped eagerly by every mutation.
+    csr_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<crate::analytics::csr::CsrGraph>)>>,
     /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
     /// failed (e.g. interned by a reasoner run whose term write failed). The
     /// next insert that uses one writes it first, so no persisted triple ever
@@ -346,6 +351,7 @@ impl Database {
             persist_error: RefCell::new(None),
             load_policy: LoadPolicy::default(),
             mutations: 0,
+            csr_cache: std::sync::Mutex::new(None),
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
         }
@@ -367,6 +373,43 @@ impl Database {
     fn touched(&mut self) {
         self.query_cache.get_mut().clear();
         self.mutations += 1;
+        // The generation tag alone keeps a stale CSR from being served; dropping
+        // it here also frees its memory right away.
+        *self.csr_cache.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The per-predicate CSR graph of the **default graph** used by the
+    /// advanced graph functions (upstream `GeneralEvaluation::loadCSR` /
+    /// `prepPathQuery`), built on first use and cached until the next data
+    /// mutation (the cache is keyed by [`mutation_count`](Self::mutation_count),
+    /// which every insert, delete, clear, LOAD, inference and rollback
+    /// advances). Concurrent callers share one build.
+    ///
+    /// Named graphs are not part of it: upstream gStore has a single graph per
+    /// database, and its CSR covers exactly that graph.
+    pub fn csr(&self) -> Result<std::sync::Arc<crate::analytics::csr::CsrGraph>> {
+        let mut slot = self.csr_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((generation, graph)) = slot.as_ref() {
+            if *generation == self.mutations {
+                return Ok(std::sync::Arc::clone(graph));
+            }
+        }
+        let graph = std::sync::Arc::new(crate::analytics::csr::CsrGraph::build(&self.store)?);
+        *slot = Some((self.mutations, std::sync::Arc::clone(&graph)));
+        Ok(graph)
+    }
+
+    /// Build the CSR now instead of on the first graph-function query
+    /// (upstream's `loadcsr` API and the `csr=1` load option).
+    pub fn preload_csr(&self) -> Result<()> {
+        self.csr().map(|_| ())
+    }
+
+    /// Whether an up-to-date CSR is currently cached (upstream reports
+    /// `csr_loaded`-style status for `loadcsr`).
+    pub fn csr_is_loaded(&self) -> bool {
+        let slot = self.csr_cache.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(slot.as_ref(), Some((generation, _)) if *generation == self.mutations)
     }
 
     /// Rebuild the VS-tree from the current store and mark the index valid.
