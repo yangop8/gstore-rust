@@ -261,6 +261,44 @@ fn database_lifecycle_commands() {
     assert_eq!(r.code, 1, "{r:?}");
 }
 
+/// Upstream's console has no compress switch on `backup` / `export`, but
+/// its `restore <db> <path>` hands the path to the server, which takes a
+/// zipped backup (`backup compress=true`, `gbackup -z`) as well as a
+/// directory (feature `zip`).
+#[cfg(feature = "zip")]
+#[test]
+fn restore_takes_a_zipped_backup() {
+    let srv = Server::start("gc_zip_restore");
+    let cwd = scratch("gc_zip_restore_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    ok(&srv.build("small", &data("small/small.nt")));
+    let j = srv.op("backup", &[("db_name", "small"), ("compress", "true")]);
+    ok(&j);
+    let archive = harness::string(&j, "backupfilepath");
+    assert!(archive.ends_with(".zip"), "{j:?}");
+    let add = path_str(&data("small/small_add.nt"));
+    let r = script(
+        &srv,
+        &cwd,
+        &format!(
+            "use small;\n\
+             batchinsert {add};\n\
+             unload;\n\
+             restore small {archive};\n\
+             use small;\n\
+             select (count(*) as ?n) where {{ ?s ?p ?o }};\n"
+        ),
+    );
+    for line in [
+        "After inserted triples num 6,failed num 0,used ",
+        "Database small restored successfully.\n",
+        "\"25\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+    ] {
+        assert!(r.out.contains(line), "{line:?}: {r:?}");
+    }
+    assert_eq!(r.code, 0, "{r:?}");
+}
+
 #[test]
 fn sparql_statements_tables_and_multi_line_input() {
     let srv = Server::start("gc_sparql");
