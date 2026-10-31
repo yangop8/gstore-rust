@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! gadd [--strict] <db_name> <source> [more sources ...]
+//! gadd -db <db_name> (-f <file> | -dir <directory>) [--strict]   # upstream 1.3
 //! ```
 //!
 //! A source is a file, a directory (every RDF file below it, recursively,
@@ -22,24 +23,67 @@
 //! Any database layout is accepted ([`Database::open`] detects it): for an
 //! in-memory snapshot the database is re-saved; for an on-disk (`gbuild --disk`)
 //! or RocksDB database the change is written through to its store.
+//!
+//! Exit status: 0 inserted, 1 failed, 2 invalid arguments; `-h`/`--help`.
+
+#[path = "common/cli.rs"]
+mod cli;
 
 use std::process::ExitCode;
 
 use gstore::parser::import::{self, ImportOptions, ParseErrorLog};
 use gstore::{db_dir_for, Database};
 
+const TOOL: cli::Tool = cli::Tool {
+    name: "gadd",
+    usage: "gadd [--strict] <db_name> <file | dir | url> [more ...]\n\
+            gadd -db <db_name> (-f <file> | -dir <directory>) [--strict]",
+    help: "insert the triples of RDF files into a database\n\
+           \n\
+           Options:\n\
+           \t-h,--help\t\tDisplay this message.\n\
+           \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
+           \t-f,--file PATH\t\tThe RDF file (or directory, or http(s) URL) to insert.\n\
+           \t-dir,--directory DIR\tA directory of RDF files to insert.\n\
+           \t--strict\t\tStop at the first statement that does not parse.",
+};
+
+const FILE: cli::Opt = cli::Opt {
+    short: "f",
+    long: "file",
+};
+const DIRECTORY: cli::Opt = cli::Opt {
+    short: "dir",
+    long: "directory",
+};
+
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().collect();
-    let strict = args.iter().any(|a| a == "--strict");
-    args.retain(|a| a != "--strict");
-    if args.len() < 3 {
-        eprintln!(
-            "usage: {} [--strict] <db_name> <file | dir | url> [more ...]",
-            args[0]
-        );
-        return ExitCode::FAILURE;
+    let mut args = match cli::parse(&cli::argv(), &[cli::DB, FILE, DIRECTORY]) {
+        Ok(cli::Parsed::Help) => {
+            TOOL.print_help();
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Args(a)) => a,
+        Err(e) => return TOOL.usage_error(&e),
+    };
+    let strict = args.take_flag(&["--strict"]);
+    if let Some(o) = args.unknown_option() {
+        return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
-    let dir = db_dir_for(&args[1]);
+    let (name, mut paths) = match args.value(0) {
+        Some(db) => (db.to_string(), args.rest.clone()),
+        None => match args.rest.split_first() {
+            Some((db, more)) => (db.clone(), more.to_vec()),
+            None => return TOOL.usage_error("missing the database name"),
+        },
+    };
+    for v in [args.value(2), args.value(1)].into_iter().flatten() {
+        paths.insert(0, v.to_string());
+    }
+    if paths.is_empty() {
+        return TOOL.usage_error("nothing to insert (give a file, a directory or a URL)");
+    }
+    let dir = db_dir_for(&name);
 
     let mut db = match Database::open(&dir) {
         Ok(db) => db,
@@ -48,7 +92,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sources = match import::sources_from_paths(&args[2..]) {
+    let sources = match import::sources_from_paths(&paths) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot read the sources: {e}");

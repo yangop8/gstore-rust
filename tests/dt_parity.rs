@@ -102,9 +102,10 @@ fn full_cli_lifecycle() {
     let restored = tmp("restored");
     let restored_dir = format!("{}.db", restored.display());
     let _ = std::fs::remove_dir_all(&restored_dir);
+    // grestore <db_name> <backup_dir> (upstream's order, `-db` then `-p`).
     let rs = run(
         env!("CARGO_BIN_EXE_grestore"),
-        &[backup.as_os_str(), restored.as_os_str()],
+        &[restored.as_os_str(), backup.as_os_str()],
     );
     assert!(rs.status.success(), "grestore failed: {rs:?}");
     let show3 = run(env!("CARGO_BIN_EXE_gshow"), &[restored.as_os_str()]);
@@ -202,10 +203,11 @@ fn gadd_reads_each_new_format() {
 
 #[test]
 fn wrong_args_exit_nonzero() {
+    // (`gshow` is not here: without arguments it lists every database, as
+    // upstream's — see tests/dt_cli_compat.rs.)
     for bin in [
         env!("CARGO_BIN_EXE_gadd"),
         env!("CARGO_BIN_EXE_gsub"),
-        env!("CARGO_BIN_EXE_gshow"),
         env!("CARGO_BIN_EXE_gexport"),
         env!("CARGO_BIN_EXE_gbackup"),
         env!("CARGO_BIN_EXE_grestore"),

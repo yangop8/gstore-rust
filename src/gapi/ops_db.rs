@@ -1103,8 +1103,8 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     progress("saving the database", report.statements);
     let success_num = statement_count(&built);
     if report.failed > 0 {
-        eprintln!(
-            "gserver: build '{db}': RDF parse error num {}; see {}",
+        crate::gs_warn!(
+            "build '{db}': RDF parse error num {}; see {}",
             report.failed,
             dir.join(import::PARSE_ERROR_LOG).display()
         );
@@ -2031,7 +2031,7 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
             &mut file_log
         }
         Err(e) => {
-            eprintln!("gserver: cannot open the parse error log of '{db}': {e}");
+            crate::gs_warn!("cannot open the parse error log of '{db}': {e}");
             &mut no_log
         }
     };

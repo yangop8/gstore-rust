@@ -38,6 +38,9 @@ pub mod http_users;
 /// A small dependency-free JSON value, parser and serializer.
 pub mod json;
 pub mod kvstore;
+/// Diagnostic logging (levels, standard error and a daily-rolling log file,
+/// the `gs_error!` … `gs_trace!` macros) — upstream's `SLOG_*` over log4cplus.
+pub mod logging;
 pub mod model;
 pub mod parser;
 pub mod query;

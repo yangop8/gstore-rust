@@ -1190,7 +1190,7 @@ mod with_zip {
         run(env!("CARGO_BIN_EXE_gbackup"), &["--zip", "q", "bk"], &dir);
         assert!(dir.join("bk.zip").is_file());
         assert!(!dir.join("bk").exists() && !dir.join("bk.zip.backup-tmp").exists());
-        run(env!("CARGO_BIN_EXE_grestore"), &["bk.zip", "r"], &dir);
+        run(env!("CARGO_BIN_EXE_grestore"), &["r", "bk.zip"], &dir);
         assert!(!dir.join("r.db.unzip-tmp").exists());
         let restored = gstore::Database::open(dir.join("r.db")).unwrap();
         assert_eq!(restored.triple_num(), 1);

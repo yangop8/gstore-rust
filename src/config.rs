@@ -30,10 +30,12 @@
 //! install directory). A shipped, commented example lives in
 //! `conf/conf.ini.example`.
 //!
-//! A few **Rust-only extension keys** (all in `[server]`) tune the HTTP layer
-//! that upstream configures in code: `listen_addr`, `keep_alive_timeout`,
-//! `keep_alive_max`, `queue_size` and `cors`. They are documented on the
-//! fields below and in the example file.
+//! A few **Rust-only extension keys** tune the HTTP layer that upstream
+//! configures in code (`[server]`: `listen_addr`, `keep_alive_timeout`,
+//! `keep_alive_max`, `queue_size`, `cors`) and the diagnostic log that
+//! upstream configures in a log4cplus properties file (`[log]`: `log_level`,
+//! `log_file`, `log_days`, `log_stderr`, see [`crate::logging`]). They are
+//! documented on the fields below and in the example file.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -220,6 +222,10 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("server", "keep_alive_max"),
     ("server", "queue_size"),
     ("server", "cors"),
+    ("log", "log_level"),
+    ("log", "log_file"),
+    ("log", "log_days"),
+    ("log", "log_stderr"),
 ];
 
 /// Accepted spellings that map onto a [`KNOWN_KEYS`] entry.
@@ -328,6 +334,20 @@ pub struct GStoreConfig {
     pub accesslog_path: PathBuf,
     /// Days of access logs to keep (default `30`).
     pub accesslog_days: u32,
+    /// *(Rust extension)* The diagnostic log's level — `trace`, `debug`,
+    /// `info`, `warn`, `error` or `off` — overriding the properties file
+    /// `log_mode` names (default unset: the file's root level, else `info`).
+    pub log_level: String,
+    /// *(Rust extension)* The diagnostic log file (rolled daily), or `off`
+    /// for none — overriding the properties file (default unset: the file's
+    /// `DailyRollingFileAppender`, else no file).
+    pub log_file: String,
+    /// *(Rust extension)* Days of rolled diagnostic log files kept, `0` for
+    /// all (default `30`, upstream's `MaxBackupIndex`; applies when set).
+    pub log_days: u32,
+    /// *(Rust extension)* Write the diagnostic log to standard error too
+    /// (default on; applies when set, overriding the properties file).
+    pub log_stderr: bool,
 
     // ---- [backup] -------------------------------------------------------
     /// Backup directory (default `./backups/`).
@@ -397,6 +417,10 @@ impl Default for GStoreConfig {
             accesslog_mode: true,
             accesslog_path: PathBuf::from("logs/ipaccess/"),
             accesslog_days: 30,
+            log_level: String::new(),
+            log_file: String::new(),
+            log_days: crate::logging::DEFAULT_LOG_DAYS,
+            log_stderr: true,
             backup_path: PathBuf::from("./backups/"),
             max_backups: 3,
             upload_path: PathBuf::from("./upload/"),
@@ -597,6 +621,14 @@ impl GStoreConfig {
             "accesslog_days" => {
                 self.accesslog_days = parse_num(v).ok_or_else(|| bad("a number of days"))?
             }
+            "log_level" => {
+                let level = crate::logging::Level::parse_filter(v)
+                    .map_err(|()| bad("trace, debug, info, warn, error or off"))?;
+                self.log_level = crate::logging::filter_name(level).to_string()
+            }
+            "log_file" => self.log_file = nonempty(v).ok_or_else(|| bad("a file path or off"))?.to_string(),
+            "log_days" => self.log_days = parse_num(v).ok_or_else(|| bad("a number of days"))?,
+            "log_stderr" => self.log_stderr = parse_switch(v).ok_or_else(|| bad("on or off"))?,
             "backup_path" => {
                 self.backup_path = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?)
             }
@@ -666,6 +698,10 @@ impl GStoreConfig {
             "accesslog_mode" => digit(self.accesslog_mode),
             "accesslog_path" => path(&self.accesslog_path),
             "accesslog_days" => self.accesslog_days.to_string(),
+            "log_level" => self.log_level.clone(),
+            "log_file" => self.log_file.clone(),
+            "log_days" => self.log_days.to_string(),
+            "log_stderr" => switch(self.log_stderr),
             "backup_path" => path(&self.backup_path),
             "max_backups" => self.max_backups.to_string(),
             "upload_path" => path(&self.upload_path),
@@ -923,6 +959,9 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.querylog_path, PathBuf::from("logs/endpoint/"));
         assert_eq!(c.accesslog_path, PathBuf::from("logs/ipaccess/"));
         assert_eq!((c.querylog_days, c.accesslog_days), (30, 30));
+        assert_eq!((c.log_level.as_str(), c.log_file.as_str()), ("", ""));
+        assert_eq!(c.log_days, 30);
+        assert!(c.log_stderr);
         assert_eq!(c.backup_path, PathBuf::from("./backups/"));
         assert_eq!(c.max_backups, 3);
         assert_eq!(c.upload_path, PathBuf::from("./upload/"));
@@ -989,6 +1028,7 @@ upload_allow_compress_packages = "zip"
                     check_point=off\nbuild_multi_thread=off\n\
                     [log]\nlog_mode=l.properties\nquerylog_mode=0\nquerylog_path=q/\n\
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
+                    log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
                     [backup]\nbackup_path=/b\nmax_backups=11\n\
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
@@ -1019,6 +1059,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!((c.querylog_days, c.accesslog_days), (9, 8));
         assert_eq!(c.querylog_path, PathBuf::from("q/"));
         assert_eq!(c.accesslog_path, PathBuf::from("a/"));
+        assert_eq!(c.log_level, "debug", "stored lower-case");
+        assert_eq!(c.log_file, "diag/gs.log");
+        assert_eq!(c.log_days, 7);
+        assert!(!c.log_stderr);
         assert_eq!(c.backup_path, PathBuf::from("/b"));
         assert_eq!(c.max_backups, 11);
         assert_eq!(c.upload_path, PathBuf::from("/u"));
@@ -1063,6 +1107,24 @@ upload_allow_compress_packages = "zip"
         // The alias and the misplaced key are applied.
         assert!(c.deamon);
         assert_eq!(c.max_backups, 7);
+    }
+
+    #[test]
+    fn log_extension_keys_validate_their_values() {
+        let c = GStoreConfig::from_ini_str(
+            "[log]\nlog_level=chatty\nlog_days=many\nlog_stderr=maybe\nlog_file=\n",
+        );
+        let w = c.warnings().join("\n");
+        assert!(w.contains("invalid value 'chatty' for 'log_level'"), "{w}");
+        assert!(w.contains("'log_days'") && w.contains("'log_stderr'"), "{w}");
+        assert!(!c.is_set("log_level") && !c.is_set("log_file"));
+        let mut c = GStoreConfig::default();
+        c.set("log_level", "OFF").unwrap();
+        assert_eq!(c.value("log_level").unwrap(), "off");
+        c.set("log_level", "warning").unwrap();
+        assert_eq!(c.log_level, "warn");
+        c.set("log_file", "off").unwrap();
+        assert_eq!(c.value("log_file").unwrap(), "off");
     }
 
     #[test]

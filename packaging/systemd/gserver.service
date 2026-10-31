@@ -1,0 +1,58 @@
+# systemd unit for gserver, the gstore-rust HTTP API server (upstream gStore
+# 1.4's /api protocol). Installed by the deb/rpm packages as
+# /lib/systemd/system/gserver.service (deb) or
+# /usr/lib/systemd/system/gserver.service (rpm). See docs/DEPLOY.md.
+#
+#   systemctl enable --now gserver
+#   journalctl -u gserver          # gserver's diagnostic log (standard error)
+#
+# Configuration: /etc/gstore/conf.ini. Data (dbhome/, backups/, logs/,
+# upload/): /var/lib/gstore, the working directory, against which every
+# relative conf.ini path is resolved; /var/lib/gstore/conf -> /etc/gstore
+# (created by tmpfiles.d) so conf.ini's ./conf/... paths resolve too.
+# Leave conf.ini's `deamon` off: systemd restarts the server itself.
+
+[Unit]
+Description=gStore RDF graph database server (gserver)
+Documentation=https://github.com/yangop8/gstore-rust
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# gserver -s runs in the foreground and does not fork.
+Type=simple
+User=gstore
+Group=gstore
+WorkingDirectory=/var/lib/gstore
+StateDirectory=gstore
+StateDirectoryMode=0750
+ExecStart=/usr/bin/gserver -s -c /etc/gstore/conf.ini
+# Stopping: SIGTERM to gserver (what `gserver -t` sends) shuts it down
+# gracefully — in-flight requests finish (up to 10 s), open transactions roll
+# back, unsaved changes are saved — then it exits 0. Only the main process is
+# signalled (a deamon=on supervisor forwards the signal to its server once).
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=5s
+# Upstream raises the descriptor limit to 65535 for its server.
+LimitNOFILE=65535
+
+# Hardening: gserver writes only below its working directory. (/etc/gstore is
+# read-only to it: to let operation=ipmanage edit the IP lists, point
+# ip_deny_path / ip_allow_path at files below /var/lib/gstore.)
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/gstore
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

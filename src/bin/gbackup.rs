@@ -4,7 +4,14 @@
 //!
 //! ```text
 //! gbackup [-z|--zip [0|1]] <db_name> <backup_dir | backup.zip>
+//! gbackup -db <db_name> [-p <backup_path>] [-z 0|1]   # upstream 1.3
 //! ```
+//!
+//! The positional form writes the backup *into* `<backup_dir>`. Upstream's
+//! form writes it, as upstream does, into a new directory
+//! `<backup_path>/<db_name>.db_<timestamp>` (milliseconds since the epoch;
+//! `backup_path` defaults to `./backups/` and is created when missing) —
+//! the path `grestore -db <db_name> -p …` takes.
 //!
 //! For an in-memory (bincode) database this writes a consistent snapshot into
 //! `<backup_dir>`. For an on-disk (KVstore) database it copies the database
@@ -16,9 +23,13 @@
 //!
 //! `-z` / `--zip` (upstream's `gbackup -z 1`), or a destination ending in
 //! `.zip`, packs the backup into a zip archive instead (feature `zip`):
-//! `<backup_dir>.zip` (or the `.zip` named), the backup's files at the archive
-//! root — the form the `/api` `backup compress=true` writes and `grestore` /
-//! the `/api` `restore` accept.
+//! `<backup_dir>.zip` (or the `.zip` named; upstream's form:
+//! `<backup_path>/<db_name>.db_<timestamp>.zip`), the backup's files at the
+//! archive root — the form the `/api` `backup compress=true` writes and
+//! `grestore` / the `/api` `restore` accept.
+
+#[path = "common/cli.rs"]
+mod cli;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,11 +37,34 @@ use std::process::ExitCode;
 use gstore::db::StorageKind;
 use gstore::{db_dir_for, zipio, Database};
 
-fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().collect();
-    // `-z` / `--zip`, optionally followed by upstream's `0` / `1`.
+const TOOL: cli::Tool = cli::Tool {
+    name: "gbackup",
+    usage: "gbackup [-z|--zip [0|1]] <db_name> <backup_dir | backup.zip>\n\
+            gbackup -db <db_name> [-p <backup_path>] [-z 0|1]",
+    help: "back up a database\n\
+           \n\
+           Options:\n\
+           \t-h,--help\t\tDisplay this message.\n\
+           \t-db,--database NAME\tThe database name.\n\
+           \t-p,--path DIR\t\tWhere the backup <db_name>.db_<timestamp> is created\n\
+           \t\t\t\t(default ./backups/).\n\
+           \t-z,--zip [0|1]\t\t1: pack the backup into a zip archive\n\
+           \t\t\t\t(needs the `zip` cargo feature).",
+};
+
+const PATH: cli::Opt = cli::Opt {
+    short: "p",
+    long: "path",
+};
+
+/// Upstream's default backup directory (`conf.ini` `backup_path`).
+const DEFAULT_BACKUP_PATH: &str = "./backups/";
+
+/// Take `-z` / `--zip`, optionally followed by upstream's `0` / `1`, out of
+/// `args`: whether to zip.
+fn take_zip_flag(args: &mut Vec<String>) -> bool {
     let mut zip = false;
-    if let Some(i) = args.iter().position(|a| a == "-z" || a == "--zip") {
+    while let Some(i) = args.iter().position(|a| a == "-z" || a == "--zip") {
         args.remove(i);
         zip = match args.get(i).map(String::as_str) {
             Some("0") => {
@@ -44,9 +78,58 @@ fn main() -> ExitCode {
             _ => true,
         };
     }
+    zip
+}
+
+/// The command line in the positional form (`<prog> <db_name> <backup_dir>`,
+/// then any other argument) and whether to zip: upstream's `-db NAME [-p
+/// PATH]` is translated to a new timestamped directory under `PATH`. `Err`
+/// carries the exit status (`--help`, invalid arguments).
+fn command_line() -> Result<(Vec<String>, bool), ExitCode> {
+    let mut args = match cli::parse(&cli::argv(), &[cli::DB, PATH]) {
+        Ok(cli::Parsed::Help) => {
+            TOOL.print_help();
+            return Err(ExitCode::SUCCESS);
+        }
+        Ok(cli::Parsed::Args(a)) => a,
+        Err(e) => return Err(TOOL.usage_error(&e)),
+    };
+    let zip = take_zip_flag(&mut args.rest);
+    if let Some(o) = args.unknown_option() {
+        return Err(TOOL.usage_error(&format!("unknown option '{o}'")));
+    }
+    let mut out = vec![TOOL.name.to_string()];
+    if !args.any_legacy() {
+        out.append(&mut args.rest);
+        return Ok((out, zip));
+    }
+    let name = match args.value(0) {
+        Some(db) => db.to_string(),
+        None => match args.rest.iter().position(|a| !a.starts_with('-')) {
+            Some(i) => args.rest.remove(i),
+            None => return Err(TOOL.usage_error("missing the database name")),
+        },
+    };
+    let base = args.value(1).unwrap_or(DEFAULT_BACKUP_PATH);
+    let target = std::path::Path::new(base).join(format!(
+        "{}{}_{}",
+        cli::db_base_name(&name),
+        gstore::DB_SUFFIX,
+        cli::timestamp()
+    ));
+    out.push(name);
+    out.push(target.to_string_lossy().into_owned());
+    out.append(&mut args.rest);
+    Ok((out, zip))
+}
+
+fn main() -> ExitCode {
+    let (args, zip) = match command_line() {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
     if args.len() != 3 {
-        eprintln!("usage: {} [-z|--zip] <db_name> <backup_dir>", args[0]);
-        return ExitCode::FAILURE;
+        return TOOL.usage_error("");
     }
     let dir = db_dir_for(&args[1]);
     let backup = &args[2];
