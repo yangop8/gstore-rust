@@ -4195,6 +4195,30 @@ mod tests {
         assert!(!is_update_sparql(
             "PREFIX : <http://x/> SELECT * WHERE { ?s ?p ?o }"
         ));
+        // The SPARQL 1.1 update forms of Phase 3 are updates.
+        for u in [
+            "ADD <http://g/1> TO <http://g/2>",
+            "MOVE SILENT DEFAULT TO GRAPH <http://g/2>",
+            "COPY <http://g/1> TO DEFAULT",
+            "WITH <http://g/1> DELETE { ?s ?p ?o } INSERT { ?o ?p ?s } WHERE { ?s ?p ?o }",
+            "WITH <http://g/1> DELETE WHERE { ?s ?p ?o }",
+            "DELETE { ?s ?p ?o } USING NAMED <http://g/1> WHERE { GRAPH ?g { ?s ?p ?o } }",
+            "LOAD <file:///x.nt> INTO GRAPH <http://g/1>",
+            "INSERT DATA { <a> <b> [ <c> ( 1 2 ) ] }",
+            "CREATE GRAPH <http://g/3> ; COPY DEFAULT TO <http://g/3>",
+        ] {
+            assert!(is_update_sparql(u), "{u}");
+        }
+        // Graph-function and other Phase 2/3 SELECTs are reads.
+        for q in [
+            "SELECT (shortestPath(<a>, <b>, true, {<p>, !<q>}) AS ?v) WHERE {}",
+            "SELECT (PR(true, {}, 3, alpha=0.85, maxIter=10, tol=0.01) AS ?r) WHERE {}",
+            "SELECT (rs:SSSPLEN(?a, ?b) AS ?l) WHERE { ?a <p> ?b }",
+            "SELECT ?x WHERE { ?x <p> ?y FILTER(?y IN (1, 2)) } VALUES ?x { <a> }",
+            "CONSTRUCT WHERE { ?s <p> [ <q> ?o ] }",
+        ] {
+            assert!(!is_update_sparql(q), "{q}");
+        }
     }
 
     #[test]

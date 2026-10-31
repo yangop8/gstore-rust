@@ -137,3 +137,107 @@ fn every_write_path_invalidates_the_query_cache_and_the_csr() {
     srv.load("cache");
     assert_eq!(state(&srv, "cache"), with, "after drop and rebuild");
 }
+
+#[test]
+fn update_forms_need_the_update_privilege_and_graph_functions_only_query() {
+    let data = scratch("xphase_priv_data");
+    let base = write_file(&data, "base.nt", &format!("{BASE}{EXTRA}"));
+    let srv = Server::start_with_dir("xphase_priv", Some(&data));
+    ok(&srv.build("priv", Path::new(&base)));
+    srv.load("priv");
+    for (user, privileges) in [("reader", "query"), ("writer", "query,update")] {
+        ok(&srv.op(
+            "usermanage",
+            &[("type", "1"), ("op_username", user), ("op_password", "pw")],
+        ));
+        ok(&srv.op(
+            "userprivilegemanage",
+            &[
+                ("type", "1"),
+                ("op_username", user),
+                ("db_name", "priv"),
+                ("privileges", privileges),
+            ],
+        ));
+    }
+    let as_user = |user: &str, sparql: &str| {
+        let body = Json::obj()
+            .with("operation", "query")
+            .with("username", user)
+            .with("password", "pw")
+            .with("db_name", "priv")
+            .with("sparql", sparql);
+        srv.post_raw(&body.to_string())
+    };
+    let rest_as = |user: &str, target: &str, sparql: &str| {
+        let auth = match user {
+            "reader" => "Basic cmVhZGVyOnB3", // reader:pw
+            _ => "Basic d3JpdGVyOnB3",        // writer:pw
+        };
+        http_with(&srv.addr, "POST", target, &[("Authorization", auth)], sparql.as_bytes())
+    };
+
+    // Graph-function SELECTs (and a Phase 3 SELECT) are reads.
+    for q in [
+        REACH,
+        "SELECT (PR(true, {}, 2, alpha=0.85, maxIter=10, tol=0.001) AS ?r) WHERE {}",
+        "SELECT ?s WHERE { ?s <http://ex/p> ?o FILTER(?o IN (<http://ex/b>, <http://ex/c>)) } \
+         VALUES ?s { <http://ex/a> }",
+    ] {
+        let j = as_user("reader", q);
+        assert_eq!(code(&j), 0, "{q}: {j}");
+        let (s, b) = rest_as("reader", "/sparql?db_name=priv", q);
+        assert_eq!(s, 200, "{q}: {b}");
+    }
+
+    // Every Phase 3 update form is an update.
+    let updates = [
+        "ADD DEFAULT TO <http://ex/g1>",
+        "COPY DEFAULT TO <http://ex/g2>",
+        "MOVE SILENT <http://ex/g2> TO <http://ex/g3>",
+        "WITH <http://ex/g1> DELETE { ?s ?p ?o } INSERT { ?s <http://ex/q> ?o } WHERE { ?s ?p ?o }",
+        "WITH <http://ex/g1> DELETE WHERE { ?s <http://ex/q> ?o }",
+        "INSERT { GRAPH <http://ex/g4> { ?s ?p ?o } } USING <http://ex/g3> WHERE { ?s ?p ?o }",
+        "LOAD SILENT <file:///nonexistent/data.nt> INTO GRAPH <http://ex/g5>",
+        "INSERT DATA { <http://ex/x> <http://ex/p> [ <http://ex/q> ( 1 2 ) ] }",
+        "PREFIX ex: <http://ex/>\n# a comment cannot hide it\nCOPY SILENT GRAPH ex:g1 TO DEFAULT",
+    ];
+    for u in updates {
+        let j = as_user("reader", u);
+        assert_eq!(
+            (code(&j), msg_of(&j).as_str()),
+            (1004, "You have no update privilege"),
+            "{u}"
+        );
+        let (s, b) = rest_as("reader", "/sparql?db_name=priv", u);
+        assert_eq!(s, 403, "{u}: {b}");
+        let (s, b) = rest_as("reader", "/update?db_name=priv", u);
+        assert_eq!(s, 403, "{u}: {b}");
+    }
+    // Nothing changed meanwhile.
+    assert_eq!(cell(&srv.query("priv", COUNT)).trim_start_matches('"').split('"').next(), Some("3"));
+    for u in updates {
+        let j = as_user("writer", u);
+        assert_eq!(code(&j), 0, "{u}: {j}");
+    }
+    let (s, b) = rest_as("writer", "/update?db_name=priv", "COPY DEFAULT TO <http://ex/g6>");
+    assert_eq!(s, 200, "{b}");
+    // Transactions need the update privilege up front (upstream's
+    // check_privilege for begin / tquery / commit / rollback), so a
+    // query-only user cannot run any of these forms inside one either.
+    let (s, b) = rest_as("reader", "/begin?db_name=priv", "");
+    assert_eq!(s, 403, "{b}");
+    let j = srv.post_raw(
+        &Json::obj()
+            .with("operation", "begin")
+            .with("username", "reader")
+            .with("password", "pw")
+            .with("db_name", "priv")
+            .to_string(),
+    );
+    assert_eq!(code(&j), 1004, "{j}");
+}
+
+fn msg_of(j: &Json) -> String {
+    j.get("StatusMsg").and_then(Json::as_str).unwrap_or_default().to_string()
+}
