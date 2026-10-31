@@ -10,6 +10,18 @@
 //! `DELETE/INSERT … WHERE`, `DELETE WHERE`, `LOAD`, `CLEAR`/`DROP`/`CREATE`,
 //! `;`-separated sequences); named graphs (`GRAPH`); and federated query
 //! (`SERVICE [SILENT] (<iri> | ?var) { … }`).
+//!
+//! gStore extensions, following upstream's `SPARQL.g4` / `QueryParser.cpp`:
+//! the advanced graph functions (`shortestPath(?x, <b>, true, {<p>, !<q>})`,
+//! `PR(true, {}, 10, alpha=0.85, maxIter=100, tol=1e-6)`, …) parse into
+//! [`Expr::GraphFn`] with each alternative's exact positional shape, and
+//! `PFN.name({"k":"v"})` into [`Expr::Pfn`]. As upstream, most of them are
+//! accepted only as a whole SELECT projection item `(f(…) AS ?v)`; the four
+//! of [`GFnName::allowed_in_expressions`] may appear in any expression.
+//! IRI function calls `iri(args)` parse into [`Expr::IriCall`]; the prefix
+//! `rs:` is predeclared as the gstore-rust legacy function namespace
+//! ([`RS_FN_NS`]), so the legacy graph built-ins whose bare names now follow
+//! upstream signatures stay reachable as `rs:sssp(?a, ?b)` etc.
 
 pub mod ast;
 pub mod builtins;
@@ -1129,7 +1141,10 @@ impl<'s> Parser<'s> {
                 let present = if i == 0 {
                     // A leading optional node (clusterCoeff): present iff the
                     // next token can start a varOrIri.
-                    matches!(self.peek(), Token::Var(_) | Token::Iri(_) | Token::PName(_, _))
+                    matches!(
+                        self.peek(),
+                        Token::Var(_) | Token::Iri(_) | Token::PName(_, _)
+                    )
                 } else {
                     // A trailing optional argument: present iff a ',' follows.
                     matches!(self.peek(), Token::Comma)
@@ -1277,7 +1292,10 @@ impl<'s> Parser<'s> {
         };
         let neg = match self.peek() {
             Token::Plus | Token::Minus if !signed => {
-                return Err(format!("{what} (no sign), found {}", describe_token(self.peek())))
+                return Err(format!(
+                    "{what} (no sign), found {}",
+                    describe_token(self.peek())
+                ))
             }
             Token::Plus => {
                 self.bump();
@@ -1450,6 +1468,14 @@ impl<'s> Parser<'s> {
                 Token::PName(p, l) if p.is_empty() && l.is_empty() => {
                     text.push_str(self.token_text(self.pos));
                     self.bump();
+                }
+                // `"k":1` / `"k":true` lex as the prefixed name `:1` / `:true`:
+                // a non-string value.
+                Token::PName(p, l) if p.is_empty() => {
+                    return Err(self.err(format!(
+                        "{ctx}: expected a string value or an array of strings (upstream's \
+                         JSON argument holds only plain string literals), found {l}"
+                    )))
                 }
                 other => {
                     return Err(self.err(format!(

@@ -411,17 +411,26 @@ pub enum Expr {
     /// positional shape of the function's alternative in upstream's
     /// `builtInCall` grammar rule exactly (see [`GFnName::signature`]); an
     /// optional argument the query omitted is absent from `args`.
-    GraphFn { func: GFnName, args: Vec<GArg> },
+    GraphFn {
+        func: GFnName,
+        args: Vec<GArg>,
+    },
     /// An upstream personalized-function call `PFN.name({"k":"v", …})`.
     /// `json` is upstream's `pfn_params` text: `{`, the `jsonVar`s with the
     /// whitespace between their tokens removed (strings verbatim, quotes and
     /// escapes as written) joined by `,`, then `}`.
-    Pfn { name: String, json: String },
+    Pfn {
+        name: String,
+        json: String,
+    },
     /// An IRI function call `<iri>(args)` / `pfx:name(args)` (SPARQL
     /// `iriOrFunction`). `iri` is fully expanded. Calls into the gstore-rust
     /// legacy namespace ([`RS_FN_NS`], predeclared prefix `rs:`) are
     /// canonicalized to `urn:gstore-rust:fn:NAME` with `NAME` upper-cased.
-    IriCall { iri: String, args: Vec<Expr> },
+    IriCall {
+        iri: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// The namespace of the gstore-rust legacy functions, predeclared as the

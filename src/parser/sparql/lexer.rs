@@ -601,6 +601,35 @@ mod tests {
     }
 
     #[test]
+    fn spans_are_byte_ranges_of_each_token() {
+        let src = "PFN.f({ \"ké\" : \"v\\\"w\" }) # c\n<é>";
+        let (toks, spans) = tokenize_spanned(src).unwrap();
+        assert_eq!(toks.len(), spans.len());
+        let texts: Vec<&str> = spans.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "PFN",
+                ".",
+                "f",
+                "(",
+                "{",
+                "\"ké\"",
+                ":",
+                "\"v\\\"w\"",
+                "}",
+                ")",
+                "<é>",
+                ""
+            ]
+        );
+        assert_eq!(toks.last(), Some(&Token::Eof));
+        assert_eq!(spans.last(), Some(&(src.len()..src.len())));
+        // `tokenize` is the same stream without the spans.
+        assert_eq!(tokenize(src).unwrap(), toks);
+    }
+
+    #[test]
     fn skips_comments() {
         let t = lex("?x # comment here\n?y");
         assert_eq!(t[0], Token::Var("x".into()));
