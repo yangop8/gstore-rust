@@ -1102,6 +1102,19 @@ fn backups_rotate_list_and_restore_the_newest() {
         (code(&j), msg(&j).as_str()),
         (1004, "Database[nosuch] does not exist.")
     );
+    // The SDKs' default backup_path (`./backups`, upstream's default
+    // directory) names the backup directory itself.
+    let j = api(
+        a,
+        &[
+            ("operation", "backup"),
+            ("db_name", "lubm"),
+            ("backup_path", "./backups"),
+        ],
+    );
+    ok(&j);
+    let p = PathBuf::from(string(&j, "backupfilepath"));
+    assert_eq!(p.parent().unwrap(), srv.backup_dir(), "{}", p.display());
     // A sub-directory of the backup directory is a valid backup_path.
     let j = api(
         a,
@@ -1202,6 +1215,20 @@ fn export_writes_a_file_that_downloads_without_credentials() {
     );
     assert_eq!(r.status, 416);
 
+    // Upstream's own defaults name the export directory itself.
+    for same in ["./", "export", "./export/"] {
+        let j = api(
+            a,
+            &[
+                ("operation", "export"),
+                ("db_name", "lubm"),
+                ("db_path", same),
+            ],
+        );
+        ok(&j);
+        let p = PathBuf::from(string(&j, "filepath"));
+        assert_eq!(p.parent().unwrap(), srv.root.join("export"), "{same}");
+    }
     // An export into a sub-directory; refused targets and compress.
     let j = api(
         a,

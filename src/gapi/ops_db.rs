@@ -1134,14 +1134,33 @@ fn rotate_backups(dir: &Path, db: &str, max: usize) {
     }
 }
 
+/// A path as written, without leading `./` and trailing `/` (`.` → empty).
+fn lexical(path: &str) -> &str {
+    let mut p = path.trim();
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest;
+    }
+    let p = p.trim_end_matches('/');
+    if p == "." {
+        ""
+    } else {
+        p
+    }
+}
+
 /// The directory a `backup` (`backup_path`) or `export` (`db_path`) writes
 /// into — `requested` inside `root`, else `root` itself — and how to show it
 /// in the answer (as the client named it when it is relative to the working
-/// directory; else under `root` as configured).
+/// directory; else under `root` as configured). A `requested` path written
+/// as one of `aliases` names `root` itself: upstream's own defaults, which
+/// SDKs send (`./backups`; `export` / the gStore root `./` for exports —
+/// upstream's code writes every backup and export to its configured
+/// directory, whatever these parameters say).
 fn output_dir(
     requested: Option<&str>,
     root: &Path,
     param: &str,
+    aliases: &[&str],
 ) -> Result<(PathBuf, PathBuf), GResp> {
     let io = |e: std::io::Error| {
         GResp::error(
@@ -1150,6 +1169,10 @@ fn output_dir(
         )
     };
     fs::create_dir_all(root).map_err(io)?;
+    let requested = requested.filter(|r| {
+        let r = lexical(r);
+        !aliases.iter().any(|a| lexical(a) == r) && lexical(&root.to_string_lossy()) != r
+    });
     let Some(r) = requested else {
         let canon = fs::canonicalize(root).map_err(io)?;
         return Ok((canon, root.to_path_buf()));
@@ -1186,7 +1209,14 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     }
     let root = ops_file::backup_dir(ctx);
     let requested = p.non_empty("backup_path");
-    let (target, shown) = match output_dir(requested.as_deref(), &root, "backup_path") {
+    let configured = ctx
+        .inner
+        .config()
+        .backup_path
+        .to_string_lossy()
+        .into_owned();
+    let aliases = [configured.as_str(), "backups"];
+    let (target, shown) = match output_dir(requested.as_deref(), &root, "backup_path", &aliases) {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -1449,7 +1479,8 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     };
     let root = ctx.export_dir();
     let requested = p.non_empty("db_path");
-    let (target, shown) = match output_dir(requested.as_deref(), &root, "db_path") {
+    let (target, shown) = match output_dir(requested.as_deref(), &root, "db_path", &["", "export"])
+    {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -1606,6 +1637,15 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_compare_as_written() {
+        assert_eq!(lexical("./backups/"), "backups");
+        assert_eq!(lexical("././x//"), "x");
+        assert_eq!(lexical("./"), "");
+        assert_eq!(lexical("."), "");
+        assert_eq!(lexical("/abs/dir/"), "/abs/dir");
+    }
 
     #[test]
     fn labels_lose_brackets_and_namespaces_like_upstream() {
