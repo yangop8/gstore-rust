@@ -680,8 +680,8 @@ impl<'a> GFunCtx<'a> {
         self
     }
 
-    /// Set how many bytes of JSON one call of a path-family function may
-    /// produce before it fails with a [`GStoreError::Query`] (see
+    /// Set how many bytes of JSON one call of any function may produce
+    /// before it fails with a [`GStoreError::Query`] (see [`eval`] and
     /// [`paths`] "Resource bounds").
     pub fn with_max_output_bytes(mut self, bytes: usize) -> GFunCtx<'a> {
         self.max_output_bytes = bytes;
@@ -736,9 +736,14 @@ impl<'a> GFunCtx<'a> {
 // ---------------------------------------------------------------------------
 
 /// Evaluate `kind` over `ctx` with `args`, producing the full upstream output.
+///
+/// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`]: the
+/// path family checks it while it streams its entries (failing before an
+/// unbounded enumeration is built), the others — whose output is at most a
+/// few values per vertex — are checked here once computed.
 pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue> {
     ctx.check_cancel()?;
-    match kind {
+    let value = match kind {
         GFnKind::SimpleCyclePath => paths::simple_cycle_path(ctx, args),
         GFnKind::SimpleCycleBoolean => paths::simple_cycle_boolean(ctx, args),
         GFnKind::CyclePath => paths::cycle_path(ctx, args),
@@ -771,7 +776,21 @@ pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue>
         GFnKind::ConfidenceDegree => metrics::confidence_degree(ctx, args),
         GFnKind::MaximumKplex => metrics::maximum_kplex(ctx, args),
         GFnKind::CoreTruss => metrics::core_truss(ctx, args),
+    }?;
+    // (The path family's guard already bounded its entries as it wrote them,
+    // the 12-byte `{"paths":[…]}` envelope aside.)
+    if let (GFunValue::Json(text) | GFunValue::ResultsJson(text), false) =
+        (&value, kind.family() == GFnFamily::Paths)
+    {
+        if text.len() > ctx.max_output_bytes() {
+            return Err(GStoreError::Query(format!(
+                "{}: more than {} bytes of output; narrow the query",
+                kind.name(),
+                ctx.max_output_bytes()
+            )));
+        }
     }
+    Ok(value)
 }
 
 #[cfg(test)]

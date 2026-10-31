@@ -840,6 +840,144 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
     assert!(msg(&j).to_lowercase().contains("cancel"), "{j}");
 }
 
+/// A graph-function query that runs until cancelled: PageRank with a
+/// negative tolerance never converges, and `maxIter` is two billion sweeps.
+/// The PR loop polls the query's cancel flag every sweep (and every 1024
+/// vertices).
+const SLOW_GFUN: &str = "SELECT (PR(true, {}, 3, alpha=0.85, maxIter=2000000000, tol=-1) AS ?pr) \
+                         WHERE {}";
+
+/// Graph functions honour the same cancellation as every other query: an
+/// `/api` query (synchronous and `async=true`) cancelled through
+/// `operationTaskCancel` (the async one then reported by
+/// `checkOperationState`), and a REST query cancelled through `/cancel`.
+#[test]
+fn graph_function_queries_are_cancelled_like_any_query() {
+    let (_srv, addr, _root) = start("cancel_gfun");
+    build(&addr, "slow", &chain(300));
+    let gfun_args: [(&str, &str); 3] = [
+        ("operation", "query"),
+        ("db_name", "slow"),
+        ("sparql", SLOW_GFUN),
+    ];
+
+    // A synchronous /api query, cancelled through operationTaskCancel.
+    let addr_q = addr;
+    let query = thread::spawn(move || api(&addr_q, &gfun_args));
+    let opt_id = wait_running_query(&addr);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(code(&j), 0, "{j}");
+    let answer = query.join().unwrap();
+    assert_ne!(code(&answer), 0, "the cancelled query fails: {answer}");
+    assert!(msg(&answer).to_lowercase().contains("cancel"), "{answer}");
+
+    // An asynchronous /api query: checkOperationState reports the cancel.
+    let mut async_args = gfun_args.to_vec();
+    async_args.push(("async", "true"));
+    let opt_id = opt_id_of(&api(&addr, &async_args));
+    assert_eq!(wait_running_query(&addr), opt_id);
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &opt_id)],
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "query cancel successfully".to_string()),
+        "{j}"
+    );
+    let j = wait_done(&addr, &opt_id);
+    assert_eq!(int(&j, "state"), -1, "{j}");
+    assert!(msg(&j).to_lowercase().contains("cancel"), "{j}");
+
+    // A REST query, cancelled through REST /cancel.
+    let addr_q = addr;
+    let query = thread::spawn(move || rest(&addr_q, "POST", "/sparql?db_name=slow", SLOW_GFUN));
+    let opt_id = wait_running_query(&addr);
+    let r = rest(&addr, "POST", &format!("/cancel?id={opt_id}"), "");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = query.join().unwrap();
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.to_lowercase().contains("cancel"), "{}", r.body);
+
+    // The database still answers graph-function queries afterwards.
+    let j = api(
+        &addr,
+        &[
+            ("operation", "query"),
+            ("db_name", "slow"),
+            ("sparql", "SELECT (PR(true, {}, 1, alpha=0.85, maxIter=5, tol=0.1) AS ?pr) WHERE {}"),
+        ],
+    );
+    assert_eq!(code(&j), 0, "{j}");
+}
+
+/// A graceful shutdown cancels a graph-function query still running past
+/// the grace period, as it does any other query, and returns in bounded
+/// time.
+#[test]
+fn shutdown_cancels_a_running_graph_function_query() {
+    let root = tmp_root("shutdown_gfun");
+    let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+        .unwrap()
+        .with_shutdown_grace(Duration::from_millis(300));
+    let (srv, addr, serving) = serve(server);
+    build(&addr, "slow", &chain(300));
+    let addr_q = addr;
+    let query = thread::spawn(move || rest(&addr_q, "POST", "/sparql?db_name=slow", SLOW_GFUN));
+    wait_running_query(&addr);
+    let started = Instant::now();
+    srv.shutdown();
+    serving.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the shutdown waited {:?}",
+        started.elapsed()
+    );
+    let r = query.join().unwrap();
+    assert!(r.body.to_lowercase().contains("cancel"), "{} {}", r.status, r.body);
+}
+
+/// Graph functions stay within the server's output bound (`conf.ini`
+/// `[query] gfun_max_output_bytes`): a call whose JSON would exceed it fails
+/// the query with an error instead of building it, and the server goes on
+/// answering. (The row cap `max_output_size` caps rows as for any query: a
+/// graph function's result is one row.)
+#[test]
+fn graph_function_output_is_bounded_by_the_server_setting() {
+    let root = tmp_root("gfun_bound");
+    let settings = gstore::QuerySettings {
+        gfun_max_output_bytes: 64,
+        ..gstore::QuerySettings::default()
+    };
+    let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+        .unwrap()
+        .with_query_settings(settings);
+    let (_srv, addr, _h) = serve(server);
+    build(&addr, "big", &chain(300));
+    let all = "SELECT (kHopNeighbor(<http://ex/s1>, false, 2, {}) AS ?n) WHERE {}";
+    let paths = "SELECT (PR(true, {}, -1, alpha=0.85, maxIter=5, tol=0.1) AS ?pr) WHERE {}";
+    for q in [all, paths] {
+        let j = api(&addr, &[("operation", "query"), ("db_name", "big"), ("sparql", q)]);
+        if q == paths {
+            assert_ne!(code(&j), 0, "300 vertices' scores exceed 64 bytes: {j}");
+            assert!(msg(&j).contains("bytes"), "{j}");
+        } else {
+            assert_eq!(code(&j), 0, "a small result fits: {j}");
+        }
+        let r = rest(&addr, "POST", "/sparql?db_name=big", q);
+        if q == paths {
+            assert_eq!(r.status, 400, "{}", r.body);
+        } else {
+            assert_eq!(r.status, 200, "{}", r.body);
+        }
+    }
+    let j = api(&addr, &[("operation", "query"), ("db_name", "big"), ("sparql", "ASK { ?s ?p ?o }")]);
+    assert_eq!(code(&j), 0, "{j}");
+}
+
 #[test]
 fn users_see_and_cancel_only_their_own_tasks() {
     let (_srv, addr, _root) = start("owners");
