@@ -38,7 +38,7 @@
 //! additions per sweep and aggregates the dangling mass beyond that (see
 //! [`pr`]). `PPR`, `maximumKplex` and `coreTruss` keep upstream's costs
 //! (random-walk counts, the exponential branch and bound per ego network,
-//! bounded to ego networks of 16384 vertices; see [`maximum_kplex`]).
+//! bounded to ego networks of 8192 vertices; see [`maximum_kplex`]).
 //! Every long loop polls the cancellation flag ([`GFunCtx::check_cancel`]).
 
 mod grisu;
@@ -1753,7 +1753,7 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// the reported set can contain repeats or non-members.
 ///
 /// **Errors:** `k = 0` (upstream throws in `resize(-2)`), a `k` whose fake
-/// solution exceeds 2^20 slots, an ego network beyond 16384 vertices (the
+/// solution exceeds 2^20 slots, an ego network beyond 8192 vertices (the
 /// `Searcher` allocates `n²` matrices), and the upstream `assert`s that fail
 /// on some graphs (gStore aborts there).
 pub fn maximum_kplex(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {

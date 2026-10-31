@@ -44,7 +44,7 @@ type Ept = i64;
 /// Largest ego network (vertices) the `Searcher` loads: it allocates an
 /// `n × n` byte matrix and an `n × n` `int` matrix (upstream has no limit
 /// and is killed by the OOM killer instead).
-const MAX_SEARCHER_N: i32 = 16_384;
+const MAX_SEARCHER_N: i32 = 8_192;
 
 /// Largest fake solution `2k - 2` accepted (upstream allocates and prints it).
 pub(super) const MAX_FAKE_KPLEX: i64 = 1 << 20;
@@ -2704,7 +2704,7 @@ fn with_big_stack<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     std::thread::scope(|s| {
         let h = std::thread::Builder::new()
             .name("gfun-kplex".into())
-            .stack_size(256 << 20)
+            .stack_size(64 << 20)
             .spawn_scoped(s, f)
             .map_err(|e| kerr(format!("maximumKplex: cannot start worker: {e}")))?;
         h.join()
