@@ -187,7 +187,11 @@ impl<'g> V2Ppr<'g> {
 
     /// The vertices in iteration order.
     fn nodes(&self) -> Vec<Node> {
-        self.order.keys().into_iter().map(|k| self.node(k)).collect()
+        self.order
+            .keys()
+            .into_iter()
+            .map(|k| self.node(k))
+            .collect()
     }
 
     fn len(&self) -> usize {
@@ -751,7 +755,13 @@ fn nth_element_desc(v: &mut [f64], nth: usize) {
 }
 
 /// libstdc++ `__heap_select(first, middle, last)` with `less`.
-fn heap_select(v: &mut [f64], first: usize, middle: usize, last: usize, less: impl Fn(f64, f64) -> bool + Copy) {
+fn heap_select(
+    v: &mut [f64],
+    first: usize,
+    middle: usize,
+    last: usize,
+    less: impl Fn(f64, f64) -> bool + Copy,
+) {
     let len = middle - first;
     if len > 1 {
         let mut parent = (len - 2) / 2;
@@ -775,7 +785,14 @@ fn heap_select(v: &mut [f64], first: usize, middle: usize, last: usize, less: im
 }
 
 /// libstdc++ `__adjust_heap` + `__push_heap`.
-fn adjust_heap(v: &mut [f64], first: usize, mut hole: usize, len: usize, value: f64, less: impl Fn(f64, f64) -> bool) {
+fn adjust_heap(
+    v: &mut [f64],
+    first: usize,
+    mut hole: usize,
+    len: usize,
+    value: f64,
+    less: impl Fn(f64, f64) -> bool,
+) {
     let top = hole;
     let mut child = hole;
     while len > 0 && child < (len - 1) / 2 {

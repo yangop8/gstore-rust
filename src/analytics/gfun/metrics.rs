@@ -5,7 +5,11 @@
 //! the specification in each doc comment was re-checked line by line against
 //! the C++ (`src/Query/Algorithm/*.cpp`, `PathQueryHandler.cpp`, the output
 //! builders in `GeneralEvaluation.cpp`); where the earlier stub specification
-//! was wrong or incomplete the doc says so ("Spec fix").
+//! was wrong or incomplete the doc says so ("Spec fix"). The ports were also
+//! compared with the upstream sources compiled with g++ 13 (-O2, asserts on,
+//! like gStore's default build) on tens of thousands of random graphs and
+//! arguments: outputs are byte-identical except where upstream crashes, and
+//! `PPR` where upstream reads uninitialised heap memory.
 //!
 //! Spec conventions are those of [`paths`](super::paths) ("GE:n", entries,
 //! `‹u›`, literal ports). Whole-graph functions run once per call regardless
@@ -32,8 +36,10 @@
 //! precomputes each super-node's incoming weight once per round. `PR` keeps
 //! upstream's `O(n · dangling)` sweep up to [`PR_EXACT_DANGLING_WORK`]
 //! additions per sweep and aggregates the dangling mass beyond that (see
-//! [`pr`]). Every long loop polls the cancellation flag
-//! ([`GFunCtx::check_cancel`]).
+//! [`pr`]). `PPR`, `maximumKplex` and `coreTruss` keep upstream's costs
+//! (random-walk counts, the exponential branch and bound per ego network,
+//! bounded to ego networks of 16384 vertices; see [`maximum_kplex`]).
+//! Every long loop polls the cancellation flag ([`GFunCtx::check_cancel`]).
 
 mod grisu;
 mod kplex;
@@ -45,11 +51,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::cxx::{cxx_sort_by, CxxUnorderedOrder, GlibcRand};
 use super::fmt::{
-    cxx_g, cxx_g_f32, cxx_int_id, cxx_to_string, f32_round, paths_json,
-    push_json_quoted, push_vert_list_json, JsonList,
+    cxx_g, cxx_g_f32, cxx_int_id, cxx_to_string, f32_round, paths_json, push_json_quoted,
+    push_vert_list_json, JsonList,
 };
 use super::traverse::{for_each_nbr, NbrOrder, NodeMarks};
-use super::{CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, GNode, Node, PredFilter};
+use super::{CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, Node, PredFilter};
 use crate::error::{GStoreError, Result};
 use crate::model::id::EntityLiteralId;
 
@@ -149,17 +155,22 @@ fn nbr_set(g: &CsrGraph, v: Node, f: &PredFilter) -> Vec<Node> {
 /// **Spec fixes / quirks reproduced:**
 /// * The `delta` loop runs only while `delta >= 1/n`, i.e. never on graphs
 ///   with **fewer than 4 vertices**: `v2ppr` stays empty and the result is
-///   the single default slot `{"dst":"‹entity 0›","PPR":0}`.
+///   the single default slot `{"dst":"‹vertex 0›","PPR":0}` (for every
+///   source).
 /// * Otherwise a source without out-edges keeps all mass: `{u: 1}`
 ///   (SSPPR.cpp:159-165); this also holds for an isolated source.
 /// * `kth_ppr` (SSPPR.cpp:5-20) indexes `v2ppr` with the PPR *values*
 ///   (`v2ppr[it->second]`, a `double` converted to an `int` key), so it reads
 ///   — and, if absent, inserts with value 0 — vertex `0` (vertex `1` for a
-///   value of exactly 1.0). The insertion changes `v2ppr`'s iteration order
-///   and can surface vertex 0 in the output; reproduced. When `retNum`
-///   exceeds `v2ppr.size()` upstream reads out of bounds (UB); we take 0.
+///   value of exactly 1.0), while iterating the map. The insertion changes
+///   `v2ppr`'s iteration order and can surface vertex 0 in the output.
+/// * `kth_ppr`'s buffer is a function-`static` vector: with `retNum` larger
+///   than `v2ppr` it returns a stale value an earlier call (an earlier
+///   source of the same query, upstream: of the process) left behind, and
+///   `0.0` where upstream reads foreign heap memory. This decides how many
+///   `delta` rounds run, i.e. the values printed.
 /// * `if_stop`'s scan (SSPPR.cpp:74-91) evaluates `v2ppr[nodeid]` for
-///   every vertex outside the current top-k, inserting zeros — reproduced.
+///   every vertex outside the current top-k, inserting zeros.
 ///
 /// **Top-k extraction** (SSPPR.cpp:178-190): `topk.resize(retNum)`, then
 /// `partial_sort_copy` of the `unordered_map<int,double>` `v2ppr` (iterated
@@ -168,9 +179,14 @@ fn nbr_set(g: &CsrGraph, v: Node, f: &PredFilter) -> Vec<Node> {
 /// ([`cxx_partial_sort_copy_by`](super::cxx::cxx_partial_sort_copy_by));
 /// unfilled slots stay `(0, 0.0)`; then trailing entries with value `0` are
 /// dropped but **at least one entry is kept** — an all-zero result prints
-/// vertex id 0 with `"PPR":0` (quirk). `retNum <= 0` → `"results":[]`
-/// (upstream: UB / `length_error`). Missing `u` → no entry (upstream writes
-/// through index `-1`).
+/// vertex 0 with `"PPR":0` (quirk).
+///
+/// **Edge cases:** `retNum = 0` → `"results":[]` (upstream: the same after
+/// out-of-bounds reads); negative `retNum` → error (upstream:
+/// `std::length_error` from `resize`). A missing `u` → no entry (upstream
+/// writes through index `-1`, undefined behaviour). Every random walk and
+/// `delta` round polls the cancellation flag; the walk count is upstream's
+/// (`ω · rsum` per round, `ω ≈ 2.5 · ln(2/pfail) / (δ · ε²)`).
 pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let ret_num = to_int(a.ret_num.unwrap_or(-1));
     let k = to_int(a.k.unwrap_or(-1));
@@ -258,7 +274,9 @@ pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     if ret_num > node_num {
         ret_num = node_num;
     }
-    let nei: Vec<usize> = (0..n as Node).map(|v| degree(g, v, f, a.directed)).collect();
+    let nei: Vec<usize> = (0..n as Node)
+        .map(|v| degree(g, v, f, a.directed))
+        .collect();
     let dangling: Vec<usize> = (0..n).filter(|&v| nei[v] == 0).collect();
     let exact = dangling.len().saturating_mul(n) <= PR_EXACT_DANGLING_WORK;
     let nf = n as f64;
@@ -511,11 +529,12 @@ fn betweenness_value(ctx: &GFunCtx<'_>, f: &PredFilter, id: Node, directed: bool
         return Ok(0.0);
     }
     let g = ctx.csr;
-    let mut vertex: Vec<Node> = super::traverse::bfs_order(g, id, f, Direction::Both, NbrOrder::PerPredOutThenIn)
-        .into_iter()
-        .map(|(v, _)| v)
-        .filter(|&v| v != id)
-        .collect();
+    let mut vertex: Vec<Node> =
+        super::traverse::bfs_order(g, id, f, Direction::Both, NbrOrder::PerPredOutThenIn)
+            .into_iter()
+            .map(|(v, _)| v)
+            .filter(|&v| v != id)
+            .collect();
     if vertex.len() <= 1 {
         return Ok(0.0);
     }
@@ -864,19 +883,31 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         for vid in 0..n {
             tick(ctx, vid)?;
             let mut max_cnt = 0;
-            for_each_nbr(g, vid as Node, f, dir, NbrOrder::PerPredInThenOut, |to, _, _| {
-                let l = labels[to as usize] as usize;
-                if cnt[l] == 0 {
-                    touched.push(l as u32);
-                }
-                cnt[l] += 1;
-                if max_cnt < cnt[l] {
-                    max_cnt = cnt[l];
-                }
-            });
+            for_each_nbr(
+                g,
+                vid as Node,
+                f,
+                dir,
+                NbrOrder::PerPredInThenOut,
+                |to, _, _| {
+                    let l = labels[to as usize] as usize;
+                    if cnt[l] == 0 {
+                        touched.push(l as u32);
+                    }
+                    cnt[l] += 1;
+                    if max_cnt < cnt[l] {
+                        max_cnt = cnt[l];
+                    }
+                },
+            );
             if max_cnt > 0 {
                 max_lbl.clear();
-                max_lbl.extend(touched.iter().copied().filter(|&l| cnt[l as usize] == max_cnt));
+                max_lbl.extend(
+                    touched
+                        .iter()
+                        .copied()
+                        .filter(|&l| cnt[l as usize] == max_cnt),
+                );
                 max_lbl.sort_unstable();
                 let pick = rng.rand() % max_lbl.len() as i32;
                 labels[vid] = max_lbl[pick as usize];
@@ -983,13 +1014,20 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         order.insert(i64::from(cxx_int_id(g.entity_of(start))));
         queue.push_back(start);
         while let Some(u) = queue.pop_front() {
-            for_each_nbr(g, u, f, Direction::Both, NbrOrder::PerPredInThenOut, |v, _, _| {
-                if comp[v as usize] == u32::MAX {
-                    comp[v as usize] = ncomp;
-                    order.insert(i64::from(cxx_int_id(g.entity_of(v))));
-                    queue.push_back(v);
-                }
-            });
+            for_each_nbr(
+                g,
+                u,
+                f,
+                Direction::Both,
+                NbrOrder::PerPredInThenOut,
+                |v, _, _| {
+                    if comp[v as usize] == u32::MAX {
+                        comp[v as usize] = ncomp;
+                        order.insert(i64::from(cxx_int_id(g.entity_of(v))));
+                        queue.push_back(v);
+                    }
+                },
+            );
         }
         ncomp += 1;
     }
@@ -1097,10 +1135,18 @@ fn louvain_communities(
     for &p in f.preds() {
         for &vid in &vids {
             for &out_vid in g.in_nbrs(vid, p) {
-                *weights.entry(out_vid).or_default().entry(vid).or_insert(0.0) += 1.0;
+                *weights
+                    .entry(out_vid)
+                    .or_default()
+                    .entry(vid)
+                    .or_insert(0.0) += 1.0;
                 m += 1.0;
                 if !directed {
-                    *weights.entry(vid).or_default().entry(out_vid).or_insert(0.0) += 1.0;
+                    *weights
+                        .entry(vid)
+                        .or_default()
+                        .entry(out_vid)
+                        .or_insert(0.0) += 1.0;
                     m += 1.0;
                 }
             }
@@ -1381,7 +1427,14 @@ fn jaccard(g: &CsrGraph, f: &PredFilter, u: Node, k: i64, ret_num: i64) -> Vec<(
 /// undirected) all predicates' in-edges, then all out-edges; returns as
 /// soon as `retNum >= 0` vertices were collected (note `retNum = 0` still
 /// returns the first one). `k == 0` → empty.
-fn k_hop_neighbor(g: &CsrGraph, s: Node, directed: bool, k: i64, f: &PredFilter, ret_num: i64) -> Vec<Node> {
+fn k_hop_neighbor(
+    g: &CsrGraph,
+    s: Node,
+    directed: bool,
+    k: i64,
+    f: &PredFilter,
+    ret_num: i64,
+) -> Vec<Node> {
     let mut cnt: Vec<Node> = Vec::new();
     let mut visited = vec![false; g.num_nodes()];
     if s as usize >= visited.len() {
@@ -1672,8 +1725,8 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 
 /// `maximumKplex(preds [, k])` — a maximum k-plex.
 ///
-/// **Upstream:** GE:1580-1597 / GE:2634-2651 (written before the pair loop,
-/// once); `PathQueryHandler::maximumKplex` (PathQueryHandler.cpp:3012-3017)
+/// **Upstream:** GE:1580-1597 / GE:2634-2651 (written once, before the pair
+/// loop); `PathQueryHandler::maximumKplex` (PathQueryHandler.cpp:3012-3017)
 /// over namespace `MaxKPX` (PathQueryHandler.cpp:298-3011). `k = a.k`,
 /// default 1 (QueryParser.cpp:532-536). Ported in the private `kplex` module.
 ///
@@ -1682,35 +1735,37 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 ///
 /// **Algorithm:** literal port of `MaxKPX::Graph::read` (an undirected simple
 /// graph from every edge in `preds`, both directions, sorted, self-loops and
-/// parallel edges removed, PathQueryHandler.cpp:1717-1745) and
-/// `Graph::search` (max-degree heuristic, degeneracy ordering, core
-/// shrinking, oriented triangle counting, core-truss co-pruning and the
-/// branch-and-bound `Searcher` per ego network).
+/// parallel edges removed, PathQueryHandler.cpp:1696-1743) and
+/// `Graph::search` (:1745-1977: max-degree heuristic, degeneracy ordering,
+/// core shrinking, oriented triangle counting, core-truss co-pruning and the
+/// branch-and-bound `Searcher` per ego network, :489-1565).
 ///
-/// **Quirks kept:** `search` starts from `kplex.resize(2k - 2)` — a fake
-/// solution of `2k - 2` copies of vertex 0, printed as such when no larger
-/// k-plex exists (e.g. `k = 3` on a graph whose maximum 3-plex has fewer
-/// than 4 vertices). `k = 0` makes upstream throw (`resize(-2)`): reported
-/// as an error, as is a `k` whose fake solution would exceed 2^24 slots.
+/// **Quirks kept** (see the `kplex` module docs for the full list):
+/// `search` starts from `kplex.resize(2k - 2)` — a fake solution of `2k - 2`
+/// copies of vertex 0, printed as such when no larger k-plex is found (e.g.
+/// `k = 2` on a graph without edges in `preds` → `[‹v0›,‹v0›]`); the ego
+/// network ids are mapped through an array the pruning step overwrote, so
+/// the reported set can contain repeats or non-members.
+///
+/// **Errors:** `k = 0` (upstream throws in `resize(-2)`), a `k` whose fake
+/// solution exceeds 2^20 slots, an ego network beyond 16384 vertices (the
+/// `Searcher` allocates `n²` matrices), and the upstream `assert`s that fail
+/// on some graphs (gStore aborts there).
 pub fn maximum_kplex(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.k.unwrap_or(1);
-    if k < 1 {
-        return Err(GStoreError::Query(format!(
-            "maximumKplex: k must be at least 1 (got {k})"
-        )));
-    }
-    if k > (1 << 23) {
-        return Err(GStoreError::Query(format!("maximumKplex: k too large ({k})")));
-    }
-    let res = kplex::maximum_kplex(ctx, &a.preds, k as i32)?;
-    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(ctx, "kplex", &res))))
+    let k = i32::try_from(k)
+        .map_err(|_| GStoreError::Query(format!("maximumKplex: k out of range ({k})")))?;
+    let res = kplex::maximum_kplex(ctx, &a.preds, k)?;
+    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(
+        ctx, "kplex", &res,
+    ))))
 }
 
 /// `coreTruss(preds, alpha, beta)` — the (alpha-core, beta-truss) remainder.
 ///
 /// **Upstream:** GE:1598-1610 / GE:2652-2664 (once, before the pair loop);
 /// `PathQueryHandler::coreTruss` (PathQueryHandler.cpp:3019-3023) →
-/// `MaxKPX::Graph::peel` (PathQueryHandler.cpp:1979-2066).
+/// `MaxKPX::Graph::peel` (PathQueryHandler.cpp:1979-2066) with `K = 1`.
 /// `alpha = a.nums[0]`, `beta = a.nums[1]` as integers (missing → 0).
 ///
 /// **Output:** `{"paths":[{"coreTruss":[‹a›,‹b›,…]}]}` — IRIs **unquoted**.
@@ -1718,20 +1773,34 @@ pub fn maximum_kplex(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// **Algorithm:** literal port of `peel`: build the simple undirected graph
 /// as for [`maximum_kplex`]; degeneracy ordering; `shrink_graph` (keep
 /// vertices with core number `>= alpha`); oriented triangle counting;
-/// `peeling` removes vertices of degree `< alpha` and edges with triangle
-/// support `< beta`; output the remaining vertices with non-zero degree in
-/// linear-heap pop order, mapped back to the original vertices.
-/// Upstream asserts a non-empty graph (`assert(n>0 && m>0)`, compiled out in
-/// release builds) — an empty one yields `{"coreTruss":[]}`.
+/// `peeling` removes vertices of degree `< alpha` and edges in fewer than
+/// `beta` triangles until both hold; output the remaining vertices with
+/// non-zero degree in linear-heap pop order (ascending degree, last touched
+/// first), mapped back to the original vertices.
+///
+/// **Quirk kept:** `peel` pops `n` times from a heap that lost the peeled
+/// vertices; every failed pop reads the uninitialised `int u`, which the
+/// g++ -O2 build materialises as 0 — so the shrunk graph's vertex 0 is
+/// appended once per peeled vertex while it has edges.
+///
+/// **Spec fix:** upstream asserts a graph with edges in `preds`
+/// (`assert(n>0 && m>0)`; gStore's default build keeps asserts, so it
+/// aborts); the port returns `{"coreTruss":[]}`. Negative `alpha` / `beta`
+/// are errors (upstream throws in `kplex.resize(alpha)`).
 pub fn core_truss(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let num = |i: usize| a.nums.get(i).map_or(0, |&x| d2i(x));
     let res = kplex::core_truss(ctx, &a.preds, num(0), num(1))?;
-    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(ctx, "coreTruss", &res))))
+    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(
+        ctx,
+        "coreTruss",
+        &res,
+    ))))
 }
 
 /// `{"<key>":[a,b,…]}` with the vertices' strings spliced in unquoted.
 /// Vertex ids are upstream vertex ids (= node indices); an id without a node
-/// (the fake `0` of an empty graph) prints entity id `v`'s string.
+/// (the fake `0` of a graph without CSR vertices) prints entity id `v`'s
+/// string, as upstream's `getStringByID(v)` does.
 fn vertex_list_unquoted(ctx: &GFunCtx<'_>, key: &str, vs: &[i32]) -> String {
     let mut s = format!("{{\"{key}\":[");
     for (i, &v) in vs.iter().enumerate() {
@@ -1813,10 +1882,6 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
     let mf = m as f32;
     (mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0
 }
-
-/// Keep [`GNode`] in the public signature docs reachable from here.
-#[allow(dead_code)]
-fn _gnode_doc(_: GNode) {}
 
 #[cfg(test)]
 mod tests {
