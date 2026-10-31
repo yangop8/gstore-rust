@@ -429,6 +429,34 @@ fn order_by_bare_builtin_and_function_calls() {
     assert_eq!(ordered(&mut db, &q), vec![vec![ex("d1")], vec![ex("d2")]]);
 }
 
+/// The brief's example shape, `ORDER BY STRLEN(?x) DESC(?y) xsd:integer(?z)`,
+/// with the Phase 2 IRI-call casts re-verified as keys and projections.
+#[test]
+fn order_by_builtin_desc_and_cast_keys_together() {
+    let mut db = Database::build_from_str(
+        "ord",
+        r#"@prefix : <http://ex/> .
+           :a :x "bb" ; :y 1 ; :z "10" .
+           :b :x "cc" ; :y 1 ; :z "9" .
+           :c :x "dd" ; :y 2 ; :z "5" .
+           :d :x "e" ; :y 0 ; :z "7" ."#,
+    )
+    .expect("build");
+    let q = format!(
+        "{P} SELECT ?s (xsd:integer(?z) AS ?i) WHERE {{ ?s :x ?x ; :y ?y ; :z ?z }} \
+         ORDER BY STRLEN(?x) DESC(?y) xsd:integer(?z)"
+    );
+    assert_eq!(
+        ordered(&mut db, &q),
+        vec![
+            vec![ex("d"), int("7")],
+            vec![ex("c"), int("5")],
+            vec![ex("b"), int("9")],
+            vec![ex("a"), int("10")],
+        ]
+    );
+}
+
 #[test]
 fn order_by_errors() {
     let m = parse_err("SELECT * WHERE { ?s ?p ?o } ORDER BY LIMIT 1");
@@ -877,6 +905,25 @@ fn move_replaces_the_destination_and_drops_the_source() {
     );
     assert_eq!(n, 3);
     assert_eq!(objects(&mut db, Some("http://ex/g4")), vec![ex("o0")]);
+}
+
+#[test]
+fn move_and_copy_roll_back_with_the_transaction() {
+    let mut db = graph_db();
+    db.begin().unwrap();
+    update(&mut db, "MOVE <http://ex/g1> TO DEFAULT");
+    update(&mut db, "COPY DEFAULT TO <http://ex/g2>");
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g2")),
+        vec![ex("o1"), ex("o2")]
+    );
+    db.rollback().unwrap();
+    assert_eq!(objects(&mut db, None), vec![ex("o0")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g1")),
+        vec![ex("o1"), ex("o2")]
+    );
+    assert_eq!(objects(&mut db, Some("http://ex/g2")), vec![ex("old")]);
 }
 
 #[test]
