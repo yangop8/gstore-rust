@@ -78,14 +78,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::GStoreConfig;
 use crate::db::{Database, LoadPolicy};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
@@ -93,8 +94,8 @@ use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
 use crate::query::{Evaluator, QueryResult};
 use crate::server::{
-    err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, spawn_worker,
-    write_response_ext, write_response_maybe_gzip, Lifecycle, Request, ShutdownHandle,
+    ct_eq, err_json, locked, merge_headers, ntriples_body, parse_basic_auth, serve_pooled,
+    write_response_maybe_gzip, ConnHeaders, HttpOptions, Lifecycle, Request, ShutdownHandle,
     ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
@@ -236,6 +237,214 @@ impl Resp {
 /// Build a `{"StatusCode":code,"StatusMsg":"msg"}` JSON body.
 fn status_json(code: i64, msg: &str) -> Vec<u8> {
     format!("{{\"StatusCode\":{code},\"StatusMsg\":{}}}", json_str(msg)).into_bytes()
+}
+
+/// An upstream-style outcome: HTTP 200 whatever the gStore status `code`
+/// (`0` success, `1001` authentication failed, `1003` illegal parameter,
+/// `1101` refused, … — upstream `src/Server/ServerStatusCode.h`).
+fn gstore_resp(code: i64, msg: &str) -> Resp {
+    Resp::new(200, JSON, status_json(code, msg))
+}
+
+/// A credential parameter of the `/shutdown` / `/restart` routes: a request
+/// header first (upstream's `gserver -t` sends `username`/`password` as
+/// headers), then the query string, then the body — a JSON object's
+/// top-level member, or a form field.
+fn lifecycle_param(req: &Request, key: &str) -> Option<String> {
+    if let Some(v) = req.header(key) {
+        return Some(v.to_string());
+    }
+    if let Some(v) = req.query.as_deref().and_then(|q| form_value(q, key)) {
+        return Some(v);
+    }
+    let body = req.body.trim_ascii_start();
+    if body.first() == Some(&b'{') {
+        return json_member(body, key);
+    }
+    form_value(&String::from_utf8_lossy(body), key)
+}
+
+/// `key` in an `application/x-www-form-urlencoded` string.
+fn form_value(qs: &str, key: &str) -> Option<String> {
+    qs.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (url_unescape(k) == key).then(|| url_unescape(v))
+    })
+}
+
+fn url_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The top-level member `key` of a JSON object, as a string (a string member
+/// unescaped, a number/boolean verbatim; objects, arrays and `null` give
+/// `None`). A deliberately small scanner for the lifecycle routes' two
+/// credentials.
+fn json_member(body: &[u8], key: &str) -> Option<String> {
+    let mut sc = JsonScan { b: body, i: 0 };
+    sc.ws();
+    sc.eat(b'{')?;
+    loop {
+        sc.ws();
+        if sc.peek()? == b'}' {
+            return None;
+        }
+        let k = sc.string()?;
+        sc.ws();
+        sc.eat(b':')?;
+        sc.ws();
+        if k == key {
+            return match sc.peek()? {
+                b'"' => sc.string(),
+                b'{' | b'[' | b'n' => None,
+                _ => Some(sc.scalar()),
+            };
+        }
+        sc.skip_value(0)?;
+        sc.ws();
+        match sc.peek()? {
+            b',' => sc.i += 1,
+            _ => return None,
+        }
+    }
+}
+
+struct JsonScan<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl JsonScan<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn ws(&mut self) {
+        while self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> Option<()> {
+        (self.peek()? == c).then(|| self.i += 1)
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        let h = self.b.get(self.i..self.i + 4)?;
+        self.i += 4;
+        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
+    }
+
+    fn string(&mut self) -> Option<String> {
+        self.eat(b'"')?;
+        let mut out = Vec::new();
+        loop {
+            let c = self.peek()?;
+            self.i += 1;
+            match c {
+                b'"' => return String::from_utf8(out).ok(),
+                b'\\' => {
+                    let e = self.peek()?;
+                    self.i += 1;
+                    let ch = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let hi = self.hex4()?;
+                            let cp = if (0xD800..0xDC00).contains(&hi) {
+                                self.eat(b'\\')?;
+                                self.eat(b'u')?;
+                                let lo = self.hex4()?;
+                                0x10000 + ((hi - 0xD800) << 10) + (lo.checked_sub(0xDC00)?)
+                            } else {
+                                hi
+                            };
+                            char::from_u32(cp)?
+                        }
+                        _ => return None,
+                    };
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+                c => out.push(c),
+            }
+        }
+    }
+
+    fn scalar(&mut self) -> String {
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|c| !matches!(c, b',' | b'}' | b']') && !c.is_ascii_whitespace())
+        {
+            self.i += 1;
+        }
+        String::from_utf8_lossy(&self.b[start..self.i]).into_owned()
+    }
+
+    /// Skip one value (bounded nesting).
+    fn skip_value(&mut self, depth: usize) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        match self.peek()? {
+            b'"' => self.string().map(|_| ()),
+            open @ (b'{' | b'[') => {
+                let close = if open == b'{' { b'}' } else { b']' };
+                self.i += 1;
+                loop {
+                    self.ws();
+                    if self.peek()? == close {
+                        self.i += 1;
+                        return Some(());
+                    }
+                    if open == b'{' {
+                        self.string()?;
+                        self.ws();
+                        self.eat(b':')?;
+                        self.ws();
+                    }
+                    self.skip_value(depth + 1)?;
+                    self.ws();
+                    if self.peek()? == b',' {
+                        self.i += 1;
+                    }
+                }
+            }
+            _ => {
+                if self.scalar().is_empty() {
+                    None
+                } else {
+                    Some(())
+                }
+            }
+        }
+    }
 }
 
 /// `,"warning":"…"` when there is a warning, else empty (spliced into a JSON
@@ -643,6 +852,8 @@ pub struct ApiServer {
     listener: Mutex<Option<TcpListener>>,
     addr: SocketAddr,
     life: Arc<Lifecycle>,
+    /// Worker pool, keep-alive, body cap and CORS settings.
+    http: HttpOptions,
 }
 
 /// The shared, thread-safe part of an [`ApiServer`]: everything a connection
@@ -662,9 +873,39 @@ struct ApiInner {
     /// transaction may begin — so a write still in flight when the shutdown's
     /// final save runs cannot be acknowledged and then lost.
     closing: AtomicBool,
+    /// The server's stop/in-flight bookkeeping (shared with [`ApiServer`]), so
+    /// the `/shutdown` and `/restart` routes can stop it.
+    life: Arc<Lifecycle>,
+    /// The `conf.ini` settings this server runs with (see
+    /// [`ApiServer::with_config`]); replaceable at runtime by a config reload.
+    config: RwLock<Arc<GStoreConfig>>,
+    /// The password of the `system_username` account that may `/shutdown` and
+    /// `/restart` (generated by `gserver` and kept in its pid file).
+    system_password: Option<String>,
 }
 
 impl ApiInner {
+    /// The configuration this server runs with (a cheap `Arc` clone). Other
+    /// modules read settings such as `max_output_size` or the IP list paths
+    /// from here.
+    pub(crate) fn config(&self) -> Arc<GStoreConfig> {
+        match self.config.read() {
+            Ok(c) => Arc::clone(&c),
+            Err(e) => Arc::clone(&e.into_inner()),
+        }
+    }
+
+    /// Replace the configuration (e.g. after re-reading `conf.ini`). Settings
+    /// fixed at start — the port, the worker pool, keep-alive — keep their
+    /// values until a restart.
+    #[allow(dead_code)]
+    pub(crate) fn replace_config(&self, cfg: GStoreConfig) {
+        match self.config.write() {
+            Ok(mut c) => *c = Arc::new(cfg),
+            Err(e) => *e.into_inner() = Arc::new(cfg),
+        }
+    }
+
     /// Whether a write must be saved before it is acknowledged: the
     /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
     fn save_writes(&self) -> bool {
@@ -766,6 +1007,12 @@ impl ApiServer {
         let users = UserStore::open(root.join("users.db"), root_password)?;
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
+        let life = Lifecycle::new(addr);
+        let config = GStoreConfig {
+            db_home: root.clone(),
+            root_password: root_password.to_string(),
+            ..GStoreConfig::default()
+        };
         Ok(ApiServer {
             inner: Arc::new(ApiInner {
                 state: Mutex::new(ApiState {
@@ -785,11 +1032,79 @@ impl ApiServer {
                 check_point: true,
                 grace: DEFAULT_SHUTDOWN_GRACE,
                 closing: AtomicBool::new(false),
+                life: Arc::clone(&life),
+                config: RwLock::new(Arc::new(config)),
+                system_password: None,
             }),
             listener: Mutex::new(Some(listener)),
             addr,
-            life: Lifecycle::new(addr),
+            life,
+            http: HttpOptions::default(),
         })
+    }
+
+    /// Run with the settings of a `conf.ini` ([`GStoreConfig`]): the worker
+    /// pool (`thread_num`), keep-alive, the request body cap, CORS, the
+    /// shutdown grace period and `check_point` take effect here; the whole
+    /// configuration stays readable by the API (e.g. `max_output_size`, the IP
+    /// lists, `system_username`). The databases' directory is the one given to
+    /// [`bind`](Self::bind) — `db_home` is recorded as that root.
+    pub fn with_config(mut self, mut cfg: GStoreConfig) -> ApiServer {
+        self.http = HttpOptions::from_config(&cfg);
+        cfg.db_home = self.inner.root.clone();
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.check_point = cfg.check_point;
+            inner.grace = Duration::from_secs(cfg.shutdown_grace);
+            inner.config = RwLock::new(Arc::new(cfg));
+        }
+        self
+    }
+
+    /// The configuration this server runs with.
+    pub fn config(&self) -> Arc<GStoreConfig> {
+        self.inner.config()
+    }
+
+    /// Size the worker pool serving connections (default
+    /// [`DEFAULT_THREAD_NUM`](crate::server::DEFAULT_THREAD_NUM); at least 1).
+    /// Connections beyond it wait in a bounded queue.
+    pub fn with_thread_num(mut self, n: usize) -> ApiServer {
+        self.http.threads = n.max(1);
+        self
+    }
+
+    /// HTTP/1.1 keep-alive: keep an idle connection open for `idle` between
+    /// requests and serve at most `max_requests` on it. `None` (or
+    /// `max_requests <= 1`) closes every connection after one response.
+    pub fn with_keep_alive(mut self, idle: Option<Duration>, max_requests: usize) -> ApiServer {
+        self.http.keep_alive = idle.filter(|_| max_requests > 1);
+        self.http.keep_alive_max = max_requests.max(1);
+        self
+    }
+
+    /// Cap request bodies at `bytes` (default 256 MiB); larger ones are
+    /// answered `413 Payload Too Large`.
+    pub fn with_max_body_size(mut self, bytes: usize) -> ApiServer {
+        self.http.max_body = bytes;
+        self
+    }
+
+    /// Send `Access-Control-Allow-Origin: origin` on every response and answer
+    /// CORS preflights on every path (default: only `/file/*`, as upstream).
+    pub fn with_cors_origin(mut self, origin: Option<&str>) -> ApiServer {
+        self.http.cors_origin = origin.map(str::to_string);
+        self
+    }
+
+    /// Let the `system_username` account (from the configuration, default
+    /// `system`) `/shutdown` and `/restart` the server with `password` — the
+    /// credential `gserver` generates at start and keeps in its pid file
+    /// (upstream's `system` user). Root's credentials work regardless.
+    pub fn with_system_password(mut self, password: &str) -> ApiServer {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.system_password = Some(password.to_string());
+        }
+        self
     }
 
     /// Turn gStore's `check_point` policy on (the default) or off. When on,
@@ -871,14 +1186,17 @@ impl ApiServer {
     /// its database's lock, so concurrent requests — crucially `POST /cancel` —
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, |stream, guard| {
-            let inner = Arc::clone(&self.inner);
-            spawn_worker(move || {
-                let _in_flight = guard;
-                let mut stream = stream;
-                let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut stream)));
-            });
-        });
+        let inner = Arc::clone(&self.inner);
+        let drained = serve_pooled(
+            &self.listener,
+            &self.life,
+            self.inner.grace,
+            &self.http,
+            Some,
+            move |s: &mut std::net::TcpStream, req: &Request, conn: &ConnHeaders| {
+                inner.handle_request(s, req, conn)
+            },
+        );
         self.finish_shutdown(drained)
     }
 
@@ -887,17 +1205,17 @@ impl ApiServer {
     /// `tls` feature.
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, |stream, guard| {
-            let inner = Arc::clone(&self.inner);
-            let config = Arc::clone(&config);
-            spawn_worker(move || {
-                let _in_flight = guard;
-                if let Ok(conn) = rustls::ServerConnection::new(config) {
-                    let mut tls = rustls::StreamOwned::new(conn, stream);
-                    let _ = catch_unwind(AssertUnwindSafe(|| inner.handle(&mut tls)));
-                }
-            });
-        });
+        let inner = Arc::clone(&self.inner);
+        let drained = serve_pooled(
+            &self.listener,
+            &self.life,
+            self.inner.grace,
+            &self.http,
+            move |stream| crate::server::tls_wrap(&config, stream),
+            move |s: &mut crate::server::TlsConn, req: &Request, conn: &ConnHeaders| {
+                inner.handle_request(s, req, conn)
+            },
+        );
         self.finish_shutdown(drained)
     }
 
@@ -919,6 +1237,7 @@ impl ApiServer {
         }
         let mut report = ShutdownReport {
             drained,
+            restart: self.life.restart_requested(),
             ..ShutdownReport::default()
         };
         // Clone the handles, then lock each database with the state lock
@@ -961,19 +1280,20 @@ impl ApiServer {
 }
 
 impl ApiInner {
-    /// Handle one connection (one request). Generic over the transport so the
-    /// same path serves plain TCP and `rustls` TLS streams. Everything between
-    /// parsing and writing runs under `catch_unwind`: a panicking handler
-    /// answers `500` (JSON) and the locks it poisoned are recovered by
-    /// [`locked`], so the server keeps serving.
-    fn handle<S: Read + Write>(&self, stream: &mut S) -> std::io::Result<()> {
-        let req = match Request::parse(stream) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(()),
-            Err(_) => return write_response_ext(stream, 400, JSON, &[], &err_json("bad request")),
-        };
-
-        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req)))
+    /// Answer one parsed request on its connection (see
+    /// [`crate::server::serve_connection`], which parses requests and keeps
+    /// the connection alive). Generic over the transport so the same path
+    /// serves plain TCP and `rustls` TLS streams. Everything between parsing
+    /// and writing runs under `catch_unwind`: a panicking handler answers `500`
+    /// (JSON) and the locks it poisoned are recovered by [`locked`], so the
+    /// server keeps serving. Returns whether the connection may be reused.
+    fn handle_request<S: Write>(
+        &self,
+        stream: &mut S,
+        req: &Request,
+        conn: &ConnHeaders,
+    ) -> std::io::Result<bool> {
+        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(req)))
             .unwrap_or_else(|_| (Resp::fail(500, PANIC_MSG), "-".to_string()));
 
         // Access log. Written off-lock (O_APPEND keeps each line atomic); strict
@@ -998,7 +1318,12 @@ impl ApiInner {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        write_response_maybe_gzip(stream, resp.status, &resp.ctype, &extra, &resp.body, enc)
+        // Connection (keep-alive) and CORS headers; computed after the
+        // handler ran, so a response to `/shutdown` closes its connection.
+        let conn_hdrs = conn.headers();
+        let extra = merge_headers(&extra, &conn_hdrs);
+        write_response_maybe_gzip(stream, resp.status, &resp.ctype, &extra, &resp.body, enc)?;
+        Ok(conn.keeps_alive())
     }
 
     /// Route and execute one request, returning the response and the caller's
@@ -1157,6 +1482,11 @@ impl ApiInner {
             }
             return Dispatch::Done(Resp::ok("logged out"));
         }
+        // Upstream's lifecycle routes (`grpc.cpp` `/shutdown`, `/restart`)
+        // check their own credentials: root's, or the `system` account's.
+        if matches!(method, "GET" | "POST") && (path == "/shutdown" || path == "/restart") {
+            return Dispatch::Done(self.handle_lifecycle(st, req, path == "/restart"));
+        }
         if method == "GET" && (path == "/" || path == "/console") {
             return Dispatch::Done(Resp::new(
                 200,
@@ -1276,6 +1606,54 @@ impl ApiInner {
             _ => Resp::fail(404, "not found"),
         };
         Dispatch::Done(resp)
+    }
+
+    // ---- lifecycle ----------------------------------------------------------
+
+    /// `/shutdown` and `/restart` (upstream `grpc.cpp` `shutdown()` /
+    /// `restart()`): stop the server gracefully — in-flight requests finish,
+    /// open transactions roll back, dirty databases are saved — after this
+    /// response is written; `/restart` additionally flags the stop as a restart
+    /// ([`ShutdownReport::restart`]), which `gserver` follows by re-executing
+    /// itself. Credentials (`username`/`password`) are read from request headers
+    /// (as upstream's `gserver -t` sends them), the query string, or a form /
+    /// JSON body. Accepted: `root` with its password, or `system_username`
+    /// with the system password `gserver` keeps in its pid file. Outcomes use
+    /// gStore's envelope at HTTP 200: `1003` for missing credentials, `1001`
+    /// for wrong ones, `1101` once a stop is already under way.
+    fn handle_lifecycle(&self, st: &mut ApiState, req: &Request, restart: bool) -> Resp {
+        if self.life.stopping() {
+            return gstore_resp(1101, "server is stopping, please waitting !");
+        }
+        let username = lifecycle_param(req, "username").unwrap_or_default();
+        let password = lifecycle_param(req, "password").unwrap_or_default();
+        if username.is_empty() {
+            return gstore_resp(1003, "the username can not be empty!");
+        }
+        if password.is_empty() {
+            return gstore_resp(1003, "the password can not be empty!");
+        }
+        let cfg = self.config();
+        let authorized = if username == cfg.system_username {
+            self.system_password
+                .as_deref()
+                .is_some_and(|p| ct_eq(p.as_bytes(), password.as_bytes()))
+        } else if username == ROOT_USER {
+            st.users.verify_and_upgrade(&username, &password)
+        } else {
+            let what = if restart { "restart" } else { "stop" };
+            return gstore_resp(1001, &format!("You have no rights to {what} the server."));
+        };
+        if !authorized {
+            return gstore_resp(1001, "the username or password is wrong.");
+        }
+        if restart {
+            self.life.request_restart();
+            gstore_resp(0, "Server restarted successfully.")
+        } else {
+            self.life.request_stop();
+            gstore_resp(0, "Server stopped successfully.")
+        }
     }
 
     // ---- auth -------------------------------------------------------------
@@ -2795,6 +3173,7 @@ fn new_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn detects_update_statements() {
