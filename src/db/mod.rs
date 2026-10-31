@@ -2031,8 +2031,10 @@ impl Database {
     /// The directory whose `reason_rule_files/` holds this database's
     /// upstream-format reasoning rules: the one set with
     /// [`set_reason_db_dir`](Self::set_reason_db_dir), else the database's
-    /// [`home`](Self::home). `None`: the rules are kept in memory (and live as
-    /// long as this value).
+    /// [`home`](Self::home). `None`: the rules are kept in memory and live as
+    /// long as this value — [`backup`](Self::backup) writes them into the
+    /// backup, [`save`](Self::save) does not (open the saved directory, or
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), to keep rules there).
     pub fn reason_db_dir(&self) -> Option<PathBuf> {
         self.reason_home.dir.clone().or_else(|| self.home.clone())
     }

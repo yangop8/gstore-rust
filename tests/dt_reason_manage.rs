@@ -653,6 +653,29 @@ fn a_rule_executed_elsewhere_is_retracted_upstream_style() {
     ok(&reason(a, "fam", "7", "舅舅"));
 }
 
+#[test]
+fn re_executing_a_rule_executed_elsewhere_takes_over_its_triples() {
+    let srv = start("legacy2");
+    let a = &srv.addr;
+    family_db(&srv, "fam");
+    ok(&add_rule(a, "fam", UNCLE));
+    ok(&reason(a, "fam", "3", "舅舅"));
+    // Upstream gStore executed it: its triple is there, no ledger.
+    let path = srv.rule_file("fam", "舅舅");
+    let mut doc = json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+    doc.set("status", "已执行");
+    fs::write(&path, doc.sorted().to_string()).unwrap();
+    update(a, "fam", "INSERT DATA { <张三> <Rule:舅舅> <李四> . }");
+    let j = reason(a, "fam", "4", "舅舅");
+    ok(&j);
+    assert_eq!(int(&j, "AnsNum"), 0);
+    // Now recorded as the rule's own: disabling retracts it.
+    let j = reason(a, "fam", "5", "舅舅");
+    ok(&j);
+    assert_eq!(int(&j, "AnsNum"), 1);
+    assert!(!ask(a, "fam", "<张三> <Rule:舅舅> <李四>"));
+}
+
 // ---------------------------------------------------------------------------
 // Refusals and errors
 // ---------------------------------------------------------------------------

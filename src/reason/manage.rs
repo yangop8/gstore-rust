@@ -47,7 +47,8 @@
 //! triple changes nothing in an RDF store) is indistinguishable from the
 //! inferred one and is retracted with it. A rule marked executed without a
 //! ledger (executed by upstream gStore before the database was moved here)
-//! is retracted with upstream's `delete_sparql`.
+//! is retracted with upstream's `delete_sparql`; executing it again records
+//! the triples it derives that are already there as its own.
 //!
 //! The `delete_sparql` reported by compile / disable is upstream's text.
 //!
@@ -424,7 +425,12 @@ pub fn execute(
         return Err(failed(STALE));
     }
     refuse_in_transaction(db)?;
-    let mut ledger = store.ledger(name)?.unwrap_or_default();
+    let recorded = store.ledger(name)?;
+    // Executed by upstream gStore (no ledger): the triples it derives that
+    // are already there are taken as its own, as upstream's retraction
+    // would treat them.
+    let legacy = recorded.is_none() && status_of(&doc) == status::EXECUTED;
+    let mut ledger = recorded.unwrap_or_default();
     let report = db
         .reason_infer(&compiled.insert_sparql, cancel)
         .map_err(|e| failed(e.to_string()))?;
@@ -434,7 +440,11 @@ pub fn execute(
         .filter(|(line, existed)| *existed && !ledger.contains(line))
         .map(|(line, _)| line.clone())
         .collect();
-    ledger.extend(held_by_others(store, name, &existing)?);
+    if legacy {
+        ledger.extend(existing);
+    } else {
+        ledger.extend(held_by_others(store, name, &existing)?);
+    }
     ledger.extend(report.inserted.iter().cloned());
     // Recorded even when the update failed part-way: what it added is owned.
     store.set_ledger(name, Some(&ledger))?;
