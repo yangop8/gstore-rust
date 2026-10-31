@@ -395,8 +395,11 @@ fn blank_nodes_never_merge_across_files_or_batches() {
         assert_eq!(t.to_string(), s);
     }
     // A removal names stored nodes verbatim: an export-style file removes
-    // exactly those triples.
-    let stored = blank_subjects(&mut db, "http://ex/p");
+    // exactly those triples. (Pick a node whose object is "a": the labels'
+    // random scopes leave the result order unspecified, and b.nt's node has
+    // "b".)
+    let stored = col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> \"a\" }");
+    assert_eq!(stored.len(), 3, "{stored:?}");
     let victim = write(
         &dir.join("victim.nt"),
         &format!("{} <http://ex/p> \"a\" .\n", stored[0]),
