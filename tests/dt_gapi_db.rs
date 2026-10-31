@@ -500,10 +500,36 @@ fn build_show_load_monitor_schema_unload() {
     assert_eq!(string(&subjects[0], "name"), "http://ex/onto#Person");
     assert_eq!(int(&subjects[0], "value"), 2);
     assert!(j.get("schema").and_then(|s| s.get("nodes")).is_some());
+    // The statistics follow writes (they are cached until the data changes).
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            (
+                "sparql",
+                "INSERT DATA { <http://ex/z> \
+                 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/onto#Person> }",
+            ),
+        ],
+    );
+    ok(&j);
+    let j = api(a, &[("operation", "monitor"), ("db_name", "lubm")]);
+    let subjects = j.get("subjectList").and_then(Json::as_array).unwrap();
+    assert_eq!(int(&subjects[0], "value"), 3, "{j}");
+    assert_eq!(string(&j, "tripleNum"), "6");
+    // Like upstream, an unloaded database is reported too (from disk).
     let j = api(a, &[("operation", "monitor"), ("db_name", "two")]);
+    ok(&j);
+    assert_eq!(string(&j, "tripleNum"), "7");
+    assert_eq!(string(&j, "status"), "already_built");
+    assert_eq!(int(&j, "subjectNum"), 5);
+    let j = api(a, &[("operation", "schema"), ("db_name", "two")]);
+    ok(&j);
+    let j = api(a, &[("operation", "monitor"), ("db_name", "nosuch")]);
     assert_eq!(
         (code(&j), msg(&j).as_str()),
-        (1005, "database[two] is not loaded yet")
+        (1005, "database[nosuch] does not exist")
     );
 
     // schema: classes, literal properties, relations (upstream's shape).

@@ -31,11 +31,11 @@
 //!
 //! [`ApiState::busy`]: crate::http_api::ApiState
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use super::envelope::{GResp, Status};
@@ -636,47 +636,143 @@ fn unload(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
     GResp::success("Database unloaded.")
 }
 
-/// `monitor` — statistics of a loaded database (upstream
-/// `MessageMonitorResponse`): `database`, `creator`, `builtTime`,
-/// `tripleNum` (a string), `entityNum`, `literalNum`, `subjectNum`,
-/// `predicateNum`, `connectionNum` (requests served by the `/api` layer and
-/// the REST endpoints), `lockNum`, `diskUsed` (MB; `0` with `disk=0`),
-/// `costTime` (the build time, ms), `status`, `subjectList` (`{"name","value"}`
-/// per `rdf:type` class: its number of instances) and `schema` (as
-/// [`schema`]).
+/// The statistics `monitor` and `schema` report of one database instance.
+struct Inspection {
+    triples: u64,
+    stats: crate::db::DbStats,
+    subjects: usize,
+    classes: Arc<Vec<(String, u64)>>,
+    graph: Arc<SchemaGraph>,
+    in_txn: bool,
+    status: DbStatus,
+}
+
+/// A cached class statistics + schema graph of one loaded database instance
+/// (they take a pass over the data; Workbench polls `monitor`).
+struct CachedStats {
+    /// The slot it was computed for: a `Weak` keeps the slot's allocation
+    /// alive, so a later slot can never be mistaken for this one.
+    slot: Weak<Mutex<DbSlot>>,
+    /// [`Database::mutation_count`] at computation: any write invalidates.
+    mutations: u64,
+    classes: Arc<Vec<(String, u64)>>,
+    graph: Arc<SchemaGraph>,
+}
+
+fn stats_cache() -> &'static Mutex<HashMap<String, CachedStats>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedStats>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The class statistics and schema graph of loaded database `db` (`slot`,
+/// locked, of handle `h`), cached until the database changes.
+fn class_stats(
+    db: &str,
+    h: &DbHandle,
+    slot: &DbSlot,
+) -> (Arc<Vec<(String, u64)>>, Arc<SchemaGraph>) {
+    let mutations = slot.db.mutation_count();
+    let this = Arc::downgrade(h);
+    if let Some(c) = locked(stats_cache()).get(db) {
+        if c.mutations == mutations && Weak::ptr_eq(&c.slot, &this) {
+            return (Arc::clone(&c.classes), Arc::clone(&c.graph));
+        }
+    }
+    let classes = Arc::new(slot.db.type_statistics());
+    let graph = Arc::new(slot.db.schema_graph());
+    locked(stats_cache()).insert(
+        db.to_string(),
+        CachedStats {
+            slot: this,
+            mutations,
+            classes: Arc::clone(&classes),
+            graph: Arc::clone(&graph),
+        },
+    );
+    (classes, graph)
+}
+
+/// Inspect database `db`: the loaded instance, else — upstream reads an
+/// unloaded database's statistics from its files — a temporary copy (a
+/// snapshot read without the directory lock, another layout opened under
+/// it), the database name reserved meanwhile. `1005` when it does not exist
+/// or cannot be read.
+fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
+    let (dbh, dir) = {
+        let st = ctx.state();
+        (st.dbs.get(db).map(Arc::clone), st.db_dir(db))
+    };
+    if let Some(h) = dbh {
+        let slot = locked(&h);
+        if !slot.retired {
+            let (classes, graph) = class_stats(db, &h, &slot);
+            return Ok(Inspection {
+                triples: slot.committed_triple_num(),
+                stats: slot.db.stats(),
+                subjects: slot.db.subject_num(),
+                classes,
+                graph,
+                in_txn: slot.txn.is_some(),
+                status: DbStatus::Loaded,
+            });
+        }
+    }
+    if !dir.is_dir() {
+        return Err(not_loaded(db, false));
+    }
+    let _busy = claim(ctx, db)?;
+    let copy = if Database::storage_kind(&dir) == Some(crate::StorageKind::Snapshot) {
+        Database::read_copy(&dir)
+    } else {
+        Database::open(&dir)
+    };
+    let copy = copy.map_err(|e| {
+        GResp::error(
+            Status::OperationFailed,
+            format!("database[{db}] could not be read: {e}"),
+        )
+    })?;
+    Ok(Inspection {
+        triples: copy.triple_num(),
+        stats: copy.stats(),
+        subjects: copy.subject_num(),
+        classes: Arc::new(copy.type_statistics()),
+        graph: Arc::new(copy.schema_graph()),
+        in_txn: false,
+        status: DbStatus::AlreadyBuilt,
+    })
+}
+
+/// `monitor` — statistics of a database (upstream `MessageMonitorResponse`):
+/// `database`, `creator`, `builtTime`, `tripleNum` (a string), `entityNum`,
+/// `literalNum`, `subjectNum`, `predicateNum`, `connectionNum` (requests
+/// served by the `/api` layer and the REST endpoints), `lockNum`, `diskUsed`
+/// (MB; `0` with `disk=0`), `costTime` (the build time, ms), `status`,
+/// `subjectList` (`{"name","value"}` per `rdf:type` class: its number of
+/// instances) and `schema` (as [`schema`]). Like upstream, an unloaded
+/// database is reported too (read from disk; its docs say it must be
+/// loaded, its code and test script do not).
 fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let db = db_of(ctx);
-    let dbh = match loaded_handle(ctx, &db) {
-        Ok(h) => h,
+    let ins = match inspect(ctx, &db) {
+        Ok(i) => i,
         Err(r) => return r,
     };
-    let (record, connections) = {
+    let (record, connections, dir) = {
         let st = ctx.state();
-        (st.sysdb.get(&db).cloned(), st.requests)
+        (st.sysdb.get(&db).cloned(), st.requests, st.db_dir(&db))
     };
-    let slot = locked(&dbh);
-    if slot.retired {
-        return not_loaded(&db, true);
-    }
-    let triples = slot.committed_triple_num();
-    let stats = slot.db.stats();
-    let subjects = slot.db.subject_num();
-    let classes = slot.db.type_statistics();
-    let graph = slot.db.schema_graph();
-    let lock_num = i64::from(slot.txn.is_some());
-    let dir = slot.dir.clone();
-    drop(slot);
     let disk_used = if p.str("disk").as_deref() == Some("0") {
         0
     } else {
         dir_size(&dir) >> 20
     };
     let mut subject_list = Json::arr();
-    for (class, n) in classes {
+    for (class, n) in ins.classes.iter() {
         subject_list.push(
             Json::obj()
-                .with("name", clear_brackets(&class))
-                .with("value", n),
+                .with("name", clear_brackets(class))
+                .with("value", *n),
         );
     }
     let (creator, built_time) = record.map_or_else(
@@ -687,37 +783,31 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         .with("database", db.as_str())
         .with("creator", creator)
         .with("builtTime", built_time)
-        .with("tripleNum", triples.to_string())
-        .with("entityNum", stats.entity_num)
-        .with("literalNum", stats.literal_num)
-        .with("subjectNum", subjects)
-        .with("predicateNum", stats.predicate_num)
+        .with("tripleNum", ins.triples.to_string())
+        .with("entityNum", ins.stats.entity_num)
+        .with("literalNum", ins.stats.literal_num)
+        .with("subjectNum", ins.subjects)
+        .with("predicateNum", ins.stats.predicate_num)
         .with("connectionNum", connections)
-        .with("lockNum", lock_num)
+        .with("lockNum", i64::from(ins.in_txn))
         .with("diskUsed", disk_used)
         .with("costTime", read_cost(&dir))
-        .with("status", DbStatus::Loaded.as_str())
+        .with("status", ins.status.as_str())
         .with("subjectList", subject_list)
-        .with("schema", schema_json(&graph))
+        .with("schema", schema_json(&ins.graph))
 }
 
-/// `schema` — the class / property graph of a loaded database (upstream
+/// `schema` — the class / property graph of a database (upstream
 /// `schema_task`: `ResponseBody` = `{"nodes":[…],"edges":[…]}`, see
-/// [`crate::db::SchemaGraph`]). Computed from the current data on every call,
-/// so upstream's `refresh=true` is implied.
+/// [`crate::db::SchemaGraph`]), loaded or not (as [`monitor`]). Always
+/// current — derived from the data, cached until it changes — so upstream's
+/// `refresh=true` is implied.
 fn schema(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
     let db = db_of(ctx);
-    let dbh = match loaded_handle(ctx, &db) {
-        Ok(h) => h,
-        Err(r) => return r,
-    };
-    let slot = locked(&dbh);
-    if slot.retired {
-        return not_loaded(&db, true);
+    match inspect(ctx, &db) {
+        Ok(ins) => GResp::success("success").with("ResponseBody", schema_json(&ins.graph)),
+        Err(r) => r,
     }
-    let graph = slot.db.schema_graph();
-    drop(slot);
-    GResp::success("success").with("ResponseBody", schema_json(&graph))
 }
 
 // ---------------------------------------------------------------------------
