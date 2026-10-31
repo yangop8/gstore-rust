@@ -135,3 +135,22 @@ upload_allow_compress_packages = "zip"
 # PR, ...) may produce before the query fails with an error (default 64 MiB;
 # an embedded Database allows 256 MiB)
 # gfun_max_output_bytes=67108864
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# Sandbox limits of PFN user functions (funcudb / funquery / funreview, and
+# SELECT (PFN.name({...}) AS ?v) in queries). gstore-rust runs PFN functions as
+# WebAssembly in an interpreter (cargo feature pfn-wasm) instead of compiling
+# C++ with g++ and dlopen()ing it like upstream; see docs/PFN.md. They live
+# under [system]'s pfn_base_path (upstream's key; when it is not set:
+# <db_home>/pfn). The output of one call is bounded by [query]'s
+# gfun_max_output_bytes. The values shown are the defaults.
+[pfn]
+# the most WebAssembly instructions one function call may run (0 = unlimited;
+# a call is also stopped when its query is cancelled)
+# pfn_fuel_per_call=1000000000
+# the most 64 KiB pages a function's memory may grow to (1024 = 64 MiB)
+# pfn_max_memory_pages=1024
+# the largest function module, source text and compiled binary, in bytes
+# pfn_max_module_bytes=1048576
+# the most functions one user may own
+# pfn_max_functions=100

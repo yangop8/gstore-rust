@@ -1261,7 +1261,7 @@ fn projected_functions_evaluate_filter_forms_and_pfn_are_clean_errors() {
         ],
     );
     let m = query_err(&mut db, "SELECT (PFN.f({\"k\":\"v\"}) AS ?z) WHERE {}");
-    assert_contains(&m, &["PFN not supported yet (Phase 4): PFN.f"]);
+    assert_contains(&m, &["PFN.f(…): no PFN function registry is attached"]);
     let m = query_err(
         &mut db,
         "ASK { ?x <http://ex/p> ?y FILTER(kHopReachable(?x, ?y, true, 1, {})) }",

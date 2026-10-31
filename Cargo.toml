@@ -31,6 +31,14 @@ flate2 = { version = "1", optional = true }
 # do not pull in `aws-lc-rs`/bindgen; `rustls-pemfile` loads the cert + key PEM.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = { version = "2", optional = true }
+# Optional sandboxed WebAssembly runtime for PFN user functions (see the
+# `pfn-wasm` feature, `src/pfn/` and `docs/PFN.md`). OFF by default. `wasmi`
+# 2.0 is a pure-Rust interpreter (no JIT, no C toolchain); only `std`,
+# module validation and its automatic dispatch-backend selection are enabled
+# (no WAT parser, SIMD or memory64 inside wasmi). `wat` 1.x (without the
+# component model) turns the WebAssembly text users write into modules.
+wasmi = { version = "2.0.0", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
+wat = { version = "1.263.0", optional = true, default-features = false }
 
 [features]
 # Persistent RocksDB storage backend (see `src/backend/rocks.rs`).
@@ -41,6 +49,11 @@ gzip = ["dep:flate2"]
 # HTTPS/TLS listeners for the bundled `Server` / `ApiServer` (see the
 # `serve_forever_tls` methods and `load_tls_config` in `src/server.rs`).
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+# PFN user graph functions: compile WebAssembly text into validated modules
+# and run them sandboxed (fuel, memory and output limits, cancellable; see
+# `src/pfn/wasm.rs`). Without it PFN metadata management still works, and
+# compiling or calling a function fails with an error naming this feature.
+pfn-wasm = ["dep:wasmi", "dep:wat"]
 
 [dev-dependencies]
 

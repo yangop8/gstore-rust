@@ -248,6 +248,14 @@ snapshots included), and `refreshconf` re-applies it to the loaded ones:
 In code: `GStoreConfig::query_settings()`, `ApiServer::with_query_settings`,
 `Server::with_query_settings`, `Database::apply_query_settings`.
 
+A `[pfn]` section (gstore-rust only) sets the sandbox limits of
+[PFN user functions](#pfn-user-graph-functions), applied the same way:
+`pfn_fuel_per_call` (instructions per call, default 10^9, `0` = unlimited),
+`pfn_max_memory_pages` (default 1024 = 64 MiB), `pfn_max_module_bytes`
+(default 1 MiB) and `pfn_max_functions` (per user, default 100). Upstream's
+`[system] pfn_base_path` (default here: `<db_home>/pfn`) is where the
+functions are stored.
+
 ### Graph functions in SPARQL
 
 gStore 1.4's advanced functions (upstream `docs/en-us/SPARQL_QUERY.md`,
@@ -285,8 +293,8 @@ eagerly, as the server's `loadcsr` and `load` with `csr=1` do). A call is
 cancelled like any query (`/cancel`, `operationTaskCancel`, shutdown) and its
 JSON is bounded (`[query] gfun_max_output_bytes`, 64 MiB on a server). Upstream parses `cycleBoolean`,
 `simpleCycleBoolean`, `shortestPathLen` and `kHopReachable` inside `FILTER` but
-never evaluates them there; here that is a clear error. `PFN.name({…})` parses
-but is not evaluated yet.
+never evaluates them there; here that is a clear error. `PFN.name({…})` calls a
+user's own function (see [PFN](#pfn-user-graph-functions) below).
 
 **The `rs:` namespace (breaking change).** The functions gstore-rust offered
 before — bare names such as `SSSP(?a, ?b)`, usable in `FILTER`/`BIND` and
@@ -411,6 +419,33 @@ upstream's `delete where {?x <Rule:label> ?y.}`.
   answer `1005 "database[<db>] does not exist"` (upstream creates its
   directory).
 
+### PFN: user graph functions
+
+gStore 1.4's personalized functions — each user's own graph functions,
+managed with the `/api` operations `funquery`, `funcudb` (create / update /
+delete / compile) and `funreview`, and called as
+`SELECT (PFN.name({"src":"<…>", …}) AS ?v) WHERE {…}` — are supported with
+upstream's requests, messages, statuses, storage layout and answers (a
+`query` answers `{"results": …}`). The difference is the runtime: upstream
+compiles a C++ body with `g++` and `dlopen()`s it, gstore-rust compiles a
+**WebAssembly text** body and runs it **sandboxed** in an interpreter — it
+can only call the gStore host interface (vertices, edges, per-predicate
+neighbours, id ↔ string, its arguments, an output buffer), under an
+instruction budget, a memory cap, the output bound and the query's cancel
+flag. Every user reaches only their own functions.
+
+The runtime is the cargo feature `pfn-wasm` (`wasmi` + `wat`, off by
+default): without it, function management works but compiling and calling
+fail with an error naming the feature.
+
+```sh
+cargo build --release --features pfn-wasm
+```
+
+[`docs/PFN.md`](docs/PFN.md) is the guide: the host interface, two complete
+examples (out-degree; k-hop count along a predicate set), the limits and every
+difference from upstream.
+
 ### Library API
 
 ```rust
@@ -473,6 +508,7 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `gapi` / `sysdb` / `config` | upstream `/api` protocol, system database (privileges, logs), `conf.ini` |
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
 | `reason`      | upstream inference rules (`reasonManage`), RDFS, textual rules |
+| `pfn`         | PFN user graph functions: per-user registry, `GraphCtx`, sandboxed WebAssembly runtime (`pfn-wasm`) |
 | `db`          | `Database` facade + persistence (mem & disk)           |
 | `gnlqa/`      | LLM natural-language QA layer (separate crate)          |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`, `gserver`, …            |

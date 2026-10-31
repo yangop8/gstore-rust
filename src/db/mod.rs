@@ -177,6 +177,13 @@ pub struct Database {
     /// How many bytes of JSON one graph-function call may produce (see
     /// [`set_gfun_max_output_bytes`](Self::set_gfun_max_output_bytes)).
     gfun_max_output_bytes: usize,
+    /// Whose PFN functions this database's queries call, from which registry
+    /// (see [`set_pfn_caller`](Self::set_pfn_caller)); a server passes the
+    /// caller per query instead ([`query_as`](Self::query_as)).
+    pfn: Option<crate::pfn::PfnCaller>,
+    /// The sandbox limits PFN calls run under (see
+    /// [`set_pfn_limits`](Self::set_pfn_limits)).
+    pfn_limits: crate::pfn::PfnLimits,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
@@ -326,7 +333,11 @@ pub struct QuerySettings {
     pub topk: TopKOptions,
     /// The most bytes of JSON one graph-function call may produce
     /// ([`Database::set_gfun_max_output_bytes`]; `gfun_max_output_bytes`).
+    /// Also bounds what one PFN call may emit.
     pub gfun_max_output_bytes: usize,
+    /// The sandbox limits of PFN functions ([`Database::set_pfn_limits`];
+    /// `conf.ini`'s `[pfn]` section).
+    pub pfn: crate::pfn::PfnLimits,
 }
 
 impl Default for QuerySettings {
@@ -336,6 +347,7 @@ impl Default for QuerySettings {
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
             topk: TopKOptions::default(),
             gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: crate::pfn::PfnLimits::default(),
         }
     }
 }
@@ -355,6 +367,8 @@ impl Database {
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: None,
+            pfn_limits: crate::pfn::PfnLimits::default(),
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
@@ -1020,7 +1034,7 @@ impl Database {
 
     /// Parse and run a SPARQL request. SELECT/ASK read; INSERT/DELETE DATA write.
     pub fn query(&mut self, sparql: &str) -> Result<QueryResult> {
-        self.query_inner(sparql, None)
+        self.query_inner(sparql, None, None)
     }
 
     /// Like [`query`](Self::query) but cooperatively cancellable: when `cancel`
@@ -1041,13 +1055,28 @@ impl Database {
         sparql: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<QueryResult> {
-        self.query_inner(sparql, Some(cancel))
+        self.query_inner(sparql, Some(cancel), None)
+    }
+
+    /// [`query`](Self::query) / [`query_cancellable`](Self::query_cancellable)
+    /// on behalf of `pfn`: `PFN.name({…})` calls reach `pfn`'s functions (a
+    /// server passes the authenticated user, see [`crate::pfn::PfnCaller`])
+    /// instead of the [installed caller](Self::set_pfn_caller), under this
+    /// database's PFN limits.
+    pub fn query_as(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        self.query_inner(sparql, cancel, pfn)
     }
 
     fn query_inner(
         &mut self,
         sparql: &str,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<QueryResult> {
         let q = sparql::parse(sparql)?;
         match q {
@@ -1079,6 +1108,11 @@ impl Database {
                 // Make user-defined functions (PFN) visible to this query.
                 if !self.functions.is_empty() {
                     eval = eval.with_functions(self.functions.clone());
+                }
+                // gStore's PFN functions: the caller's, under this database's
+                // limits (never cached, see `query_cache::is_cacheable`).
+                if let Some(caller) = pfn.or(self.pfn.as_ref()) {
+                    eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
                 }
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
@@ -1473,6 +1507,9 @@ impl Database {
                 .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
             if let Some(c) = cancel {
                 eval = eval.with_cancel(std::sync::Arc::clone(c));
+            }
+            if let Some(caller) = db.pfn_caller() {
+                eval = eval.with_pfn(caller);
             }
             if db.functions.is_empty() {
                 eval
@@ -2376,10 +2413,41 @@ impl Database {
         self.gfun_max_output_bytes
     }
 
+    /// Let this database's queries call `caller`'s PFN functions
+    /// (`PFN.name({…})`, see [`crate::pfn`]); `None` (the default) makes a PFN
+    /// call a query error. For an embedded database this is the one caller
+    /// every query runs as; a server leaves it unset and passes the
+    /// authenticated user with each query ([`query_as`](Self::query_as)).
+    /// [`ConcurrentDb`](crate::ConcurrentDb) snapshots carry it. The caller's
+    /// limits are replaced by this database's
+    /// ([`set_pfn_limits`](Self::set_pfn_limits)) when a query runs.
+    pub fn set_pfn_caller(&mut self, caller: Option<crate::pfn::PfnCaller>) {
+        self.pfn = caller;
+    }
+
+    /// The installed PFN caller (see [`set_pfn_caller`](Self::set_pfn_caller)),
+    /// with this database's PFN limits.
+    pub fn pfn_caller(&self) -> Option<crate::pfn::PfnCaller> {
+        self.pfn.clone().map(|c| c.with_limits(self.pfn_limits))
+    }
+
+    /// The sandbox limits PFN calls of this database's queries run under
+    /// (instruction budget, memory; `conf.ini`'s `[pfn]` section). PFN results
+    /// are never cached, so no cache needs clearing.
+    pub fn set_pfn_limits(&mut self, limits: crate::pfn::PfnLimits) {
+        self.pfn_limits = limits;
+    }
+
+    /// The PFN limits (see [`set_pfn_limits`](Self::set_pfn_limits)).
+    pub fn pfn_limits(&self) -> crate::pfn::PfnLimits {
+        self.pfn_limits
+    }
+
     /// Apply a server's query-evaluation settings ([`QuerySettings`], from
-    /// `conf.ini`'s `[query]` section): integer-division mode, query-cache
-    /// budget, Top-K / early-termination options and graph-function output
-    /// bound. Each setter clears the query cache only when its value changes.
+    /// `conf.ini`'s `[query]` and `[pfn]` sections): integer-division mode,
+    /// query-cache budget, Top-K / early-termination options, graph-function
+    /// output bound and PFN limits. Each setter clears the query cache only
+    /// when its value changes.
     pub fn apply_query_settings(&mut self, settings: &QuerySettings) {
         self.set_integer_division(settings.integer_division);
         if self.query_cache_size() != settings.query_cache_bytes {
@@ -2387,6 +2455,7 @@ impl Database {
         }
         self.set_topk_options(settings.topk);
         self.set_gfun_max_output_bytes(settings.gfun_max_output_bytes);
+        self.set_pfn_limits(settings.pfn);
     }
 
     /// This database's current query-evaluation settings (see
@@ -2397,6 +2466,7 @@ impl Database {
             query_cache_bytes: self.query_cache_size(),
             topk: self.topk,
             gfun_max_output_bytes: self.gfun_max_output_bytes,
+            pfn: self.pfn_limits,
         }
     }
 
