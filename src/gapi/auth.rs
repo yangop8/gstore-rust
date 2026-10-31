@@ -14,17 +14,21 @@
 //! lifecycle path routes `/shutdown` / `/restart` (see `ops_lifecycle`, which
 //! also accept the per-run `system` user) both go through it.
 //!
-//! Privileges use the server's existing **global** privilege model
-//! ([`crate::http_users::Privilege`]) through the one function
-//! [`check_privilege`], which maps each operation to the privilege upstream's
-//! `APIUtil::check_privilege` (`src/Api/APIUtil.cpp` ~1197-1280) requires.
-//! (Upstream grants privileges per database; a later package replaces this
-//! function's body accordingly.)
+//! Privileges are granted **per database**, as upstream: [`check_privilege`]
+//! maps each operation to the privilege upstream's `APIUtil::check_privilege`
+//! (`src/Api/APIUtil.cpp` ~1197-1280) requires and checks the caller's grants
+//! on the target database through the system store ([`crate::sysdb::allowed`],
+//! which the REST endpoints use too).
+//!
+//! The IP checks ([`check_ip`]) and the failed-login lockout
+//! ([`note_auth_failure`], [`note_login_success`]) are those of
+//! [`super::ipfilter`].
 
 use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{Ctx, SYSTEM_DB};
-use crate::http_users::{CredentialCheck, PasswordForm, Privilege, ROOT_USER};
+use super::ipfilter;
+use crate::http_users::{CredentialCheck, PasswordForm};
 use crate::query::hash::md5_hex;
 use crate::server::{ct_eq, Request};
 
@@ -37,22 +41,33 @@ pub enum IpStage {
     Operation,
 }
 
-/// The IP access check (upstream `APIUtil::check_access_ip`). This core
-/// package keeps no allow/deny lists, so every address passes; the
-/// configuration package plugs its `ip_allow` / `ip_deny` lists and the
-/// failed-login lockout in here (answering `1101 IPBlocked`).
-pub fn check_ip(_ctx: &Ctx<'_>, _stage: IpStage) -> Result<(), GResp> {
-    Ok(())
+/// The IP access check (upstream `APIUtil::check_access_ip`), answering
+/// `1101 IPBlocked`: at [`IpStage::Connect`] the allow / deny lists, at
+/// [`IpStage::Operation`] the failed-login lockout (see [`super::ipfilter`]).
+pub fn check_ip(ctx: &Ctx<'_>, stage: IpStage) -> Result<(), GResp> {
+    let filter = &ctx.inner.ipfilter;
+    let (blocked, msg) = match stage {
+        IpStage::Connect => (!filter.permits(&ctx.remote_ip), ipfilter::BLOCKED_MSG),
+        IpStage::Operation => (filter.locked_out(&ctx.remote_ip), ipfilter::LOCKED_MSG),
+    };
+    if blocked {
+        Err(GResp::error(Status::IpBlocked, msg))
+    } else {
+        Ok(())
+    }
 }
 
 /// Record a failed authentication from the caller's address (upstream
-/// `update_access_ip_error_num`); a hook for the configuration package's
-/// lockout, a no-op here.
-pub fn note_auth_failure(_ctx: &Ctx<'_>) {}
+/// `update_access_ip_error_num`); enough of them lock the address out.
+pub fn note_auth_failure(ctx: &Ctx<'_>) {
+    ctx.inner.ipfilter.note_failure(&ctx.remote_ip);
+}
 
 /// Clear the caller's failed-authentication count after a successful
-/// `login` (upstream `reset_access_ip_error_num`); a hook, a no-op here.
-pub fn note_login_success(_ctx: &Ctx<'_>) {}
+/// `login` (upstream `reset_access_ip_error_num`).
+pub fn note_login_success(ctx: &Ctx<'_>) {
+    ctx.inner.ipfilter.reset(&ctx.remote_ip);
+}
 
 /// The credentials a request presents.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,35 +222,7 @@ pub fn verify(
     }
 }
 
-/// What an operation requires of a (non-root) caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Requirement {
-    /// Any authenticated user.
-    Anyone,
-    /// The given privilege.
-    Privilege(Privilege),
-    /// Only `root` (or an `admin`-privileged user): upstream's
-    /// `check_privilege` grants every operation not listed to `root` alone.
-    RootOnly,
-}
-
-/// The requirement of operation `op`, after upstream's
-/// `APIUtil::check_privilege`.
-pub fn requirement(op: &str) -> Requirement {
-    match op {
-        "login" | "testConnect" | "getCoreVersion" | "funquery" | "funcudb" | "funreview"
-        | "check" | "show" | "userpassword" | "upload" | "download" => Requirement::Anyone,
-        "query" | "monitor" => Requirement::Privilege(Privilege::Query),
-        "update" | "batchInsert" | "batchRemove" | "begin" | "tquery" | "commit" | "rollback"
-        | "checkpoint" => Requirement::Privilege(Privilege::Update),
-        "load" => Requirement::Privilege(Privilege::Load),
-        "unload" => Requirement::Privilege(Privilege::Unload),
-        "restore" => Requirement::Privilege(Privilege::Restore),
-        "backup" => Requirement::Privilege(Privilege::Backup),
-        "export" => Requirement::Privilege(Privilege::Export),
-        _ => Requirement::RootOnly,
-    }
-}
+pub use crate::sysdb::{requirement, Requirement};
 
 /// Whether the authenticated caller may run operation `op` (an upstream
 /// operation name, or a privilege name such as `"update"` for an operation
@@ -243,9 +230,9 @@ pub fn requirement(op: &str) -> Requirement {
 ///
 /// Like upstream: nobody may target the `system` database, `root` may do
 /// everything else, and other users need the privilege [`requirement`] maps
-/// `op` to — here from the global privilege model (an `admin`-privileged
-/// user counts as `root`). This is the single seam a per-database privilege
-/// model replaces.
+/// `op` to **on `db_name`** — granted on that database, or on every database
+/// (an `admin`-privileged user counts as `root`). See
+/// [`crate::sysdb::allowed`], which decides.
 pub fn check_privilege(ctx: &Ctx<'_>, op: &str, db_name: Option<&str>) -> bool {
     if db_name == Some(SYSTEM_DB) {
         return false;
@@ -253,20 +240,13 @@ pub fn check_privilege(ctx: &Ctx<'_>, op: &str, db_name: Option<&str>) -> bool {
     let Some(user) = ctx.user.as_deref() else {
         return false;
     };
-    if user == ROOT_USER {
-        return true;
-    }
-    let st = ctx.state();
-    match requirement(op) {
-        Requirement::Anyone => st.users.exists(user),
-        Requirement::Privilege(p) => st.users.has_priv(user, p),
-        Requirement::RootOnly => st.users.has_priv(user, Privilege::Admin),
-    }
+    crate::sysdb::allowed(&ctx.state().users, user, op, db_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_users::Privilege;
 
     #[test]
     fn requirements_follow_upstream_check_privilege() {

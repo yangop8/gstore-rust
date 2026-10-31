@@ -45,6 +45,8 @@ pub mod server;
 pub mod signature;
 pub mod sparql_results;
 pub mod store;
+/// The system store: users, per-database privileges, the database registry.
+pub mod sysdb;
 
 pub mod db;
 
