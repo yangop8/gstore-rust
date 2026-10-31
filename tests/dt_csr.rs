@@ -359,7 +359,7 @@ fn gfun_dispatch_reaches_every_function() {
     assert_eq!(ctx.get_out_vert_id(a, like, 0), bob);
     assert_eq!(ctx.get_out_vert_id(a, like, 1), -1, "past the end is -1");
     // Carol is liked by Eve and Francis (ascending entity id).
-    let mut likers = vec![i64::from(ent(&db, "Eve")), i64::from(ent(&db, "Francis"))];
+    let mut likers = [i64::from(ent(&db, "Eve")), i64::from(ent(&db, "Francis"))];
     likers.sort_unstable();
     assert_eq!(ctx.get_in_size(carol, like), 2);
     assert_eq!(

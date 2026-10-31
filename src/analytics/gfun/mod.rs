@@ -74,7 +74,10 @@
 //! **Unordered containers.** Where upstream output order comes from a
 //! `std::unordered_map`/`unordered_set` (path node lists, `SSSP`, `SSSPLen`,
 //! `WCC`), reproduce it with [`cxx::CxxHashOrder`] fed with upstream's
-//! insertion sequence. `std::map`/`std::set` order is ascending key.
+//! insertion sequence of upstream's `int` keys — entity ids
+//! ([`json::upstream_int`]), never [`NodeId`]s: the bucket of a key depends on
+//! its value. `std::map`/`std::set` order is ascending key (ascending entity id
+//! = ascending node id).
 //!
 //! **Vertex domain.** Upstream addresses vertices by entity id and sizes
 //! scratch arrays by `getVertNum()`; whole-graph loops run

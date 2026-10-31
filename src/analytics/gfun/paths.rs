@@ -210,11 +210,13 @@ pub fn k_hop_reachable_path(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue>
 /// returns nothing for `u < 0 || v < 0` or an empty graph; a reverse BFS from
 /// `v` (in-neighbours, plus out-neighbours when undirected) computes the
 /// barrier `bar[x]` = hop distance to `v` (0 = unreached or `v`), bounded by
-/// `k`; then a DFS from `u` keeps a stack of `(node, edge code)` and extends
-/// it, per predicate, with out-neighbours (code `p`) and — if undirected —
-/// in-neighbours (code `-p-1`) that are not on the stack, while
-/// `stack_len + bar[to] <= k` (`stack_len` counts `u`) and the budget is not
-/// exhausted; reaching `v` records the stack as a path. `retNum` is the budget
+/// `k`; then a DFS from `u` keeps a stack of `(node, edge code)` (seeded with
+/// `(u, -1)`) and, while the current path is shorter than `k` hops
+/// (`stack_len - 1 < k`, `stack_len` counting `u`), extends it per predicate
+/// with out-neighbours (code `p`) and — if undirected — in-neighbours (code
+/// `-p-1`) that are not on the stack, provided `stack_len + bar[to] <= k` and
+/// the budget is not exhausted; reaching `v` records the stack as a path
+/// (`[u, c1, x1, c2, ..., v]`). Here `k` is `hop(k)`. `retNum` is the budget
 /// (`None` = upstream `-1` = unlimited; each recorded path decrements a
 /// positive budget; `0` records nothing).
 ///
