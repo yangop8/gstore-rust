@@ -350,3 +350,21 @@ fn not_loaded(db: &str, on_disk: bool) -> GResp {
     };
     GResp::error(Status::OperationFailed, msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::sysdb::{requirement, Requirement};
+
+    /// Upstream's metadata: root-only (`check_privilege` grants it to no
+    /// other user), a database required, synchronous.
+    #[test]
+    fn reason_manage_is_registered_root_only_and_synchronous() {
+        let spec = super::super::registry()
+            .get("reasonManage")
+            .expect("registered");
+        assert!(spec.auth);
+        assert!(spec.needs_db);
+        assert!(!spec.async_capable);
+        assert_eq!(requirement(spec.privilege), Requirement::RootOnly);
+    }
+}
