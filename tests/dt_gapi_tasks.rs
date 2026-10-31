@@ -660,7 +660,7 @@ fn callback_receives_the_result_and_failures_are_tolerated() {
 #[test]
 fn a_running_query_is_cancelled_through_the_upstream_operation() {
     let (srv, addr, _root) = start("cancel_up");
-    build(&addr, "slow", &chain(600));
+    build(&addr, "slow", &chain(1200));
     let addr_q = addr;
     let query = thread::spawn(move || {
         api(
@@ -762,7 +762,7 @@ fn a_running_query_is_cancelled_through_the_upstream_operation() {
 #[test]
 fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
     let (_srv, addr, _root) = start("cancel_cross");
-    build(&addr, "slow", &chain(600));
+    build(&addr, "slow", &chain(1200));
     // An /api query, cancelled through REST /cancel.
     let addr_q = addr;
     let query = thread::spawn(move || {
@@ -834,7 +834,7 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
 #[test]
 fn users_see_and_cancel_only_their_own_tasks() {
     let (_srv, addr, _root) = start("owners");
-    build(&addr, "slow", &chain(600));
+    build(&addr, "slow", &chain(1200));
     add_user(&addr, "alice", "query");
     add_user(&addr, "bob", "query,update");
     add_user(&addr, "admin2", "admin");
