@@ -1154,10 +1154,7 @@ impl Database {
         if Database::storage_kind(scratch).is_some() {
             return Ok(scratch.to_path_buf());
         }
-        let entries: Vec<PathBuf> = fs::read_dir(scratch)?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
+        let entries: Vec<PathBuf> = fs::read_dir(scratch)?.flatten().map(|e| e.path()).collect();
         match entries.as_slice() {
             [only] if only.is_dir() && Database::storage_kind(only).is_some() => Ok(only.clone()),
             _ => Ok(scratch.to_path_buf()),

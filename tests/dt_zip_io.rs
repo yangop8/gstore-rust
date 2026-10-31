@@ -10,9 +10,9 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 #[cfg(feature = "zip")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -204,24 +204,44 @@ fn without_the_feature_every_zip_path_is_a_clean_1003() {
     let zip = srv.data_file("data.zip", b"PK\x03\x04");
     names_feature(&api(
         a,
-        &[("operation", "build"), ("db_name", "zipped"), ("db_path", &zip)],
+        &[
+            ("operation", "build"),
+            ("db_name", "zipped"),
+            ("db_path", &zip),
+        ],
     ));
     ok(&api(
         a,
-        &[("operation", "build"), ("db_name", "lubm"), ("db_path", &lubm)],
+        &[
+            ("operation", "build"),
+            ("db_name", "lubm"),
+            ("db_path", &lubm),
+        ],
     ));
     ok(&api(a, &[("operation", "load"), ("db_name", "lubm")]));
     names_feature(&api(
         a,
-        &[("operation", "batchInsert"), ("db_name", "lubm"), ("file", &zip)],
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "lubm"),
+            ("file", &zip),
+        ],
     ));
     names_feature(&api(
         a,
-        &[("operation", "backup"), ("db_name", "lubm"), ("compress", "true")],
+        &[
+            ("operation", "backup"),
+            ("db_name", "lubm"),
+            ("compress", "true"),
+        ],
     ));
     names_feature(&api(
         a,
-        &[("operation", "export"), ("db_name", "lubm"), ("compress", "true")],
+        &[
+            ("operation", "export"),
+            ("db_name", "lubm"),
+            ("compress", "true"),
+        ],
     ));
     fs::create_dir_all(srv.backup_dir()).unwrap();
     let zipped = srv.backup_dir().join("lubm.db_20240101000000.zip");
@@ -239,7 +259,11 @@ fn without_the_feature_every_zip_path_is_a_clean_1003() {
     // The export format works without the feature.
     let j = api(
         a,
-        &[("operation", "export"), ("db_name", "lubm"), ("format", "nq")],
+        &[
+            ("operation", "export"),
+            ("db_name", "lubm"),
+            ("format", "nq"),
+        ],
     );
     ok(&j);
     assert!(string(&j, "filepath").ends_with(".nq"), "{j}");
@@ -306,7 +330,10 @@ mod with_zip {
     fn start_nq(tag: &str) -> Srv {
         start_with(
             tag,
-            |c| c.set("upload_allow_extensions", "nt|ttl|n3|rdf|txt|nq").unwrap(),
+            |c| {
+                c.set("upload_allow_extensions", "nt|ttl|n3|rdf|txt|nq")
+                    .unwrap()
+            },
             |s| s,
         )
     }
@@ -361,7 +388,11 @@ mod with_zip {
         );
         let j = api(
             a,
-            &[("operation", "build"), ("db_name", "lubm"), ("db_path", &pkg)],
+            &[
+                ("operation", "build"),
+                ("db_name", "lubm"),
+                ("db_path", &pkg),
+            ],
         );
         ok(&j);
         assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (7, 0));
@@ -372,10 +403,7 @@ mod with_zip {
 
         // A package mixed with a plain file in one batchInsert.
         let more = srv.data_file("more.zip", &package(&[E::File("m.nt", MORE.as_bytes())]));
-        let plain = srv.data_file(
-            "plain.nt",
-            b"<http://ex/z> <http://ex/p> <http://ex/y> .\n",
-        );
+        let plain = srv.data_file("plain.nt", b"<http://ex/z> <http://ex/p> <http://ex/y> .\n");
         let body = Json::obj()
             .with("operation", "batchInsert")
             .with("username", "root")
@@ -398,7 +426,11 @@ mod with_zip {
         assert_eq!(count(a, "lubm"), 10);
         let j = api(
             a,
-            &[("operation", "batchRemove"), ("db_name", "lubm"), ("file", &more)],
+            &[
+                ("operation", "batchRemove"),
+                ("db_name", "lubm"),
+                ("file", &more),
+            ],
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 2);
@@ -406,21 +438,35 @@ mod with_zip {
         // A statement that does not parse is counted, like a plain file's.
         let bad = srv.data_file(
             "bad.zip",
-            &package(&[E::File("x.nt", b"<http://ex/q> <http://ex/p> <http://ex/r> .\nnot rdf\n")]),
+            &package(&[E::File(
+                "x.nt",
+                b"<http://ex/q> <http://ex/p> <http://ex/r> .\nnot rdf\n",
+            )]),
         );
         let j = api(
             a,
-            &[("operation", "batchInsert"), ("db_name", "lubm"), ("file", &bad)],
+            &[
+                ("operation", "batchInsert"),
+                ("db_name", "lubm"),
+                ("file", &bad),
+            ],
         );
         ok(&j);
         assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (1, 1));
-        assert_eq!(srv.uploads(), ["bad.zip", "data.zip", "more.zip", "plain.nt"]);
+        assert_eq!(
+            srv.uploads(),
+            ["bad.zip", "data.zip", "more.zip", "plain.nt"]
+        );
 
         // A package of N-Quads keeps its named graphs.
         let nq = srv.data_file("quads.zip", &package(&[E::File("q.nq", QUADS.as_bytes())]));
         let j = api(
             a,
-            &[("operation", "build"), ("db_name", "quads"), ("db_path", &nq)],
+            &[
+                ("operation", "build"),
+                ("db_name", "quads"),
+                ("db_path", &nq),
+            ],
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 4);
@@ -437,8 +483,10 @@ mod with_zip {
         let mut body = Vec::new();
         for (k, v) in [("username", "root"), ("password", "root")] {
             body.extend_from_slice(
-                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
-                    .as_bytes(),
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
             );
         }
         body.extend_from_slice(
@@ -464,7 +512,11 @@ mod with_zip {
         assert!(filepath.ends_with(".zip"), "{filepath}");
         let j = api(
             a,
-            &[("operation", "build"), ("db_name", "upz"), ("db_path", &filepath)],
+            &[
+                ("operation", "build"),
+                ("db_name", "upz"),
+                ("db_path", &filepath),
+            ],
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 5);
@@ -519,7 +571,10 @@ mod with_zip {
         {
             let j = build(
                 &format!("slip{i}.zip"),
-                &package(&[E::File("ok.nt", LUBM.as_bytes()), E::File(evil, LUBM.as_bytes())]),
+                &package(&[
+                    E::File("ok.nt", LUBM.as_bytes()),
+                    E::File(evil, LUBM.as_bytes()),
+                ]),
             );
             refused(&j, 3);
             assert!(msg(&j).contains("not a relative path"), "{j}");
@@ -528,7 +583,12 @@ mod with_zip {
         assert!(!Path::new("/tmp/gstore_zip_evil.nt").exists());
         // 3: more entries than unzip_max_entries.
         let many: Vec<(String, &[u8])> = (0..5)
-            .map(|i| (format!("f{i}.nt"), &b"<http://ex/a> <http://ex/p> <http://ex/b> .\n"[..]))
+            .map(|i| {
+                (
+                    format!("f{i}.nt"),
+                    &b"<http://ex/a> <http://ex/p> <http://ex/b> .\n"[..],
+                )
+            })
             .collect();
         let many: Vec<E<'_>> = many.iter().map(|(n, d)| E::File(n, d)).collect();
         let j = build("many.zip", &package(&many));
@@ -551,7 +611,10 @@ mod with_zip {
         // A symbolic-link entry is ignored: the package's files load.
         let j = build(
             "link.zip",
-            &package(&[E::File("lubm.nt", LUBM.as_bytes()), E::Link("passwd.nt", "/etc/passwd")]),
+            &package(&[
+                E::File("lubm.nt", LUBM.as_bytes()),
+                E::Link("passwd.nt", "/etc/passwd"),
+            ]),
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 5);
@@ -568,7 +631,11 @@ mod with_zip {
                 while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
                     head.push(b[0]);
                 }
-                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 let found = line.split_whitespace().nth(1) == Some(path);
                 let (status, payload): (&str, &[u8]) = if found {
                     ("200 OK", &body)
@@ -619,7 +686,11 @@ mod with_zip {
         let srv = start("pkgpolicy");
         let j = api(
             &srv.addr,
-            &[("operation", "build"), ("db_name", "xxx"), ("db_path", pkg.to_str().unwrap())],
+            &[
+                ("operation", "build"),
+                ("db_name", "xxx"),
+                ("db_path", pkg.to_str().unwrap()),
+            ],
         );
         assert_eq!(code(&j), 1003, "{j}");
         assert!(msg(&j).contains("is refused"), "{j}");
@@ -632,7 +703,11 @@ mod with_zip {
         );
         let j = api(
             &srv2.addr,
-            &[("operation", "build"), ("db_name", "xxx"), ("db_path", pkg.to_str().unwrap())],
+            &[
+                ("operation", "build"),
+                ("db_name", "xxx"),
+                ("db_path", pkg.to_str().unwrap()),
+            ],
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 5);
@@ -652,12 +727,20 @@ mod with_zip {
         let lubm = srv.data_file("lubm.nt", LUBM.as_bytes());
         ok(&api(
             a,
-            &[("operation", "build"), ("db_name", "lubm"), ("db_path", &lubm)],
+            &[
+                ("operation", "build"),
+                ("db_name", "lubm"),
+                ("db_path", &lubm),
+            ],
         ));
         ok(&api(a, &[("operation", "load"), ("db_name", "lubm")]));
         let j = api(
             a,
-            &[("operation", "backup"), ("db_name", "lubm"), ("compress", "true")],
+            &[
+                ("operation", "backup"),
+                ("db_name", "lubm"),
+                ("compress", "true"),
+            ],
         );
         ok(&j);
         assert_eq!(msg(&j), "Database backup successfully.");
@@ -671,7 +754,10 @@ mod with_zip {
         assert!(zip.is_file());
         // Upstream's archive: the backup's files at the root, the directory
         // itself gone.
-        assert!(!srv.backup_dir().join(name.trim_end_matches(".zip")).exists());
+        assert!(!srv
+            .backup_dir()
+            .join(name.trim_end_matches(".zip"))
+            .exists());
         let names = entries(&zip);
         assert!(names.iter().any(|n| n == "meta.bin"), "{names:?}");
         assert!(names.iter().all(|n| !n.starts_with("lubm.db")), "{names:?}");
@@ -684,7 +770,11 @@ mod with_zip {
         let more = srv.data_file("more.nt", b"<http://ex/c> <http://ex/p> <http://ex/d> .\n");
         ok(&api(
             a,
-            &[("operation", "batchInsert"), ("db_name", "lubm"), ("file", &more)],
+            &[
+                ("operation", "batchInsert"),
+                ("db_name", "lubm"),
+                ("file", &more),
+            ],
         ));
         assert_eq!(count(a, "lubm"), 6);
         let j = api(
@@ -702,7 +792,11 @@ mod with_zip {
         // Without backup_path: the newest backup — the archive.
         ok(&api(
             a,
-            &[("operation", "batchInsert"), ("db_name", "lubm"), ("file", &more)],
+            &[
+                ("operation", "batchInsert"),
+                ("db_name", "lubm"),
+                ("file", &more),
+            ],
         ));
         ok(&api(a, &[("operation", "restore"), ("db_name", "lubm")]));
         assert_eq!(count(a, "lubm"), 5);
@@ -825,7 +919,10 @@ mod with_zip {
             ],
         );
         assert_eq!(code(&j), 1005, "{j}");
-        assert!(msg(&j).contains("does not contain a database backup"), "{j}");
+        assert!(
+            msg(&j).contains("does not contain a database backup"),
+            "{j}"
+        );
         // Any other file is not a backup.
         let other = srv.backup_dir().join("notes.tar");
         fs::write(&other, b"x").unwrap();
@@ -837,7 +934,10 @@ mod with_zip {
                 ("backup_path", other.to_str().unwrap()),
             ],
         );
-        assert_eq!((code(&j), msg(&j).as_str()), (1003, "Backup file is not zip file."));
+        assert_eq!(
+            (code(&j), msg(&j).as_str()),
+            (1003, "Backup file is not zip file.")
+        );
         assert_eq!(count(a, "lubm"), 5);
     }
 
@@ -848,14 +948,22 @@ mod with_zip {
         let lubm = srv.data_file("lubm.nt", LUBM.as_bytes());
         ok(&api(
             a,
-            &[("operation", "build"), ("db_name", "lubm"), ("db_path", &lubm)],
+            &[
+                ("operation", "build"),
+                ("db_name", "lubm"),
+                ("db_path", &lubm),
+            ],
         ));
         // Not loaded: backed up from disk, zipped.
         let mut made = Vec::new();
         for _ in 0..3 {
             let j = api(
                 a,
-                &[("operation", "backup"), ("db_name", "lubm"), ("compress", "1")],
+                &[
+                    ("operation", "backup"),
+                    ("db_name", "lubm"),
+                    ("compress", "1"),
+                ],
             );
             ok(&j);
             made.push(string(&j, "backupfilepath"));
@@ -870,7 +978,11 @@ mod with_zip {
         assert!(!Path::new(&made[0]).exists());
         ok(&api(
             a,
-            &[("operation", "restore"), ("db_name", "lubm2"), ("backup_path", &made[2])],
+            &[
+                ("operation", "restore"),
+                ("db_name", "lubm2"),
+                ("backup_path", &made[2]),
+            ],
         ));
         ok(&api(a, &[("operation", "load"), ("db_name", "lubm2")]));
         assert_eq!(count(a, "lubm2"), 5);
@@ -887,7 +999,11 @@ mod with_zip {
         let nq = srv.data_file("q.nq", QUADS.as_bytes());
         ok(&api(
             a,
-            &[("operation", "build"), ("db_name", "quad"), ("db_path", &nq)],
+            &[
+                ("operation", "build"),
+                ("db_name", "quad"),
+                ("db_path", &nq),
+            ],
         ));
         ok(&api(a, &[("operation", "load"), ("db_name", "quad")]));
         // Named graphs: N-Quads by default, nothing lost.
@@ -904,7 +1020,11 @@ mod with_zip {
         // format=nt: the default graph only (upstream's export).
         let j = api(
             a,
-            &[("operation", "export"), ("db_name", "quad"), ("format", "nt")],
+            &[
+                ("operation", "export"),
+                ("db_name", "quad"),
+                ("format", "nt"),
+            ],
         );
         ok(&j);
         let nt = PathBuf::from(string(&j, "filepath"));
@@ -915,23 +1035,37 @@ mod with_zip {
         );
         let j = api(
             a,
-            &[("operation", "export"), ("db_name", "quad"), ("format", "turtle")],
+            &[
+                ("operation", "export"),
+                ("db_name", "quad"),
+                ("format", "turtle"),
+            ],
         );
         assert_eq!(code(&j), 1003, "{j}");
 
         // compress=true: `<db>_<ts>.zip` holding the export by name.
         let j = api(
             a,
-            &[("operation", "export"), ("db_name", "quad"), ("compress", "true")],
+            &[
+                ("operation", "export"),
+                ("db_name", "quad"),
+                ("compress", "true"),
+            ],
         );
         ok(&j);
         assert_eq!(msg(&j), "Export the database successfully.");
         let zip = PathBuf::from(string(&j, "filepath"));
         let zname = zip.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(zname.starts_with("quad_") && zname.ends_with(".zip"), "{zname}");
+        assert!(
+            zname.starts_with("quad_") && zname.ends_with(".zip"),
+            "{zname}"
+        );
         let inner = format!("{}.nq", zname.trim_end_matches(".zip"));
         assert_eq!(entries(&zip), std::slice::from_ref(&inner));
-        assert!(!zip.with_file_name(&inner).exists(), "the plain file is removed");
+        assert!(
+            !zip.with_file_name(&inner).exists(),
+            "the plain file is removed"
+        );
         // It downloads, and it builds a database again (round trip).
         let (status, body) = send(
             a,
@@ -945,7 +1079,11 @@ mod with_zip {
         let copy = srv.data_file("export_copy.zip", &body);
         let j = api(
             a,
-            &[("operation", "build"), ("db_name", "quad2"), ("db_path", &copy)],
+            &[
+                ("operation", "build"),
+                ("db_name", "quad2"),
+                ("db_path", &copy),
+            ],
         );
         ok(&j);
         assert_eq!(int(&j, "success_num"), 4);
@@ -957,10 +1095,21 @@ mod with_zip {
         let lubm = srv.data_file("lubm.nt", LUBM.as_bytes());
         ok(&api(
             a,
-            &[("operation", "build"), ("db_name", "lubm"), ("db_path", &lubm)],
+            &[
+                ("operation", "build"),
+                ("db_name", "lubm"),
+                ("db_path", &lubm),
+            ],
         ));
         ok(&api(a, &[("operation", "load"), ("db_name", "lubm")]));
-        let j = api(a, &[("operation", "export"), ("db_name", "lubm"), ("compress", "1")]);
+        let j = api(
+            a,
+            &[
+                ("operation", "export"),
+                ("db_name", "lubm"),
+                ("compress", "1"),
+            ],
+        );
         ok(&j);
         let zip = PathBuf::from(string(&j, "filepath"));
         let only = entries(&zip);
@@ -973,7 +1122,11 @@ mod with_zip {
     // -----------------------------------------------------------------------
 
     fn run(bin: &str, args: &[&str], cwd: &Path) -> std::process::Output {
-        let out = Command::new(bin).args(args).current_dir(cwd).output().unwrap();
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "{bin} {args:?}: {}",
@@ -990,16 +1143,38 @@ mod with_zip {
 
         // gexport: the format by extension or flag; zipped.
         run(env!("CARGO_BIN_EXE_gexport"), &["q", "out.nq"], &dir);
-        assert_eq!(fs::read_to_string(dir.join("out.nq")).unwrap().lines().count(), 4);
+        assert_eq!(
+            fs::read_to_string(dir.join("out.nq"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
         run(env!("CARGO_BIN_EXE_gexport"), &["q", "out.nt"], &dir);
-        assert_eq!(fs::read_to_string(dir.join("out.nt")).unwrap().lines().count(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.join("out.nt"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         run(
             env!("CARGO_BIN_EXE_gexport"),
             &["--format", "nq", "q", "plain"],
             &dir,
         );
-        assert_eq!(fs::read_to_string(dir.join("plain")).unwrap().lines().count(), 4);
-        run(env!("CARGO_BIN_EXE_gexport"), &["-z", "1", "q", "dump.nq"], &dir);
+        assert_eq!(
+            fs::read_to_string(dir.join("plain"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        run(
+            env!("CARGO_BIN_EXE_gexport"),
+            &["-z", "1", "q", "dump.nq"],
+            &dir,
+        );
         assert_eq!(entries(&dir.join("dump.zip")), ["dump.nq"]);
         run(env!("CARGO_BIN_EXE_gexport"), &["q", "auto.zip"], &dir);
         assert_eq!(entries(&dir.join("auto.zip")), ["auto.nq"]);
@@ -1040,7 +1215,10 @@ mod with_zip {
                 ("backup_path", in_backups.to_str().unwrap()),
             ],
         ));
-        ok(&api(&srv.addr, &[("operation", "load"), ("db_name", "quad")]));
+        ok(&api(
+            &srv.addr,
+            &[("operation", "load"), ("db_name", "quad")],
+        ));
         assert_eq!(graph_count(&srv.addr, "quad"), 3);
         let _ = fs::remove_dir_all(&dir);
     }

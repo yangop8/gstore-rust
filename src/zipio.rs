@@ -264,10 +264,7 @@ pub fn unpack(
     let plan = check(&archive, limits, accept)?;
     fs::create_dir_all(dest).map_err(|e| ZipError::unzip(ZipCode::WriteError, e.to_string()))?;
     let write_err = |what: &Path, e: &dyn fmt::Display| {
-        ZipError::unzip(
-            ZipCode::WriteError,
-            format!("'{}': {e}", what.display()),
-        )
+        ZipError::unzip(ZipCode::WriteError, format!("'{}': {e}", what.display()))
     };
     let mut budget = limits.max_size;
     let mut out = Vec::new();
@@ -815,7 +812,10 @@ mod tests {
     #[test]
     fn formats_and_names() {
         assert_eq!(ExportFormat::parse("NQ"), Some(ExportFormat::NQuads));
-        assert_eq!(ExportFormat::parse("n-triples"), Some(ExportFormat::NTriples));
+        assert_eq!(
+            ExportFormat::parse("n-triples"),
+            Some(ExportFormat::NTriples)
+        );
         assert_eq!(ExportFormat::parse("ttl"), None);
         assert_eq!(
             ExportFormat::from_path(Path::new("x/out.nquads")),
@@ -838,8 +838,13 @@ mod tests {
     #[cfg(not(feature = "zip"))]
     #[test]
     fn without_the_feature_everything_names_it() {
-        let e = unpack(Path::new("x.zip"), Path::new("d"), &ZipLimits::default(), &|_| true)
-            .unwrap_err();
+        let e = unpack(
+            Path::new("x.zip"),
+            Path::new("d"),
+            &ZipLimits::default(),
+            &|_| true,
+        )
+        .unwrap_err();
         assert!(matches!(e, ZipError::FeatureMissing));
         assert!(e.to_string().contains("`zip` feature"), "{e}");
         assert!(pack_dir(Path::new("."), Path::new("x.zip")).is_err());
@@ -1044,7 +1049,9 @@ mod tests {
             pack_file(&f, &z, "db_20240101000000.nt").unwrap();
             assert!(!d.join("db_20240101000000.zip.part").exists());
             assert_eq!(
-                read_entry(&z, "db_20240101000000.nt", 100).unwrap().as_deref(),
+                read_entry(&z, "db_20240101000000.nt", 100)
+                    .unwrap()
+                    .as_deref(),
                 Some(&b"<a> <b> <c> .\n"[..])
             );
             let files = unpack(&z, &d.join("out"), &ZipLimits::default(), &nt).unwrap();

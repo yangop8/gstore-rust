@@ -455,7 +455,13 @@ fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GRe
         .rsplit_once('.')
         .map_or(name.as_str(), |(s, _)| s)
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let dir = ops_file::upload_dir(ctx);
     let made = fs::create_dir_all(&dir).and_then(|()| {
@@ -477,8 +483,7 @@ fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GRe
                 .any(|a| a.eq_ignore_ascii_case(e))
         })
     };
-    let files =
-        zipio::unpack(zip, scratch.path(), &limits, &accept).map_err(|e| zip_answer(&e))?;
+    let files = zipio::unpack(zip, scratch.path(), &limits, &accept).map_err(|e| zip_answer(&e))?;
     out.sources
         .extend(files.into_iter().map(|f| import::Source::File(f.path)));
     out.unpacked.push(scratch);
@@ -1674,7 +1679,12 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     }
     let fail = |msg: String| GResp::error(Status::OperationFailed, format!("Restore fail: {msg}"));
     let zipped = source.is_file();
-    let no_backup = |at: &Path| fail(format!("'{}' does not contain a database backup", at.display()));
+    let no_backup = |at: &Path| {
+        fail(format!(
+            "'{}' does not contain a database backup",
+            at.display()
+        ))
+    };
     if !zipped && Database::storage_kind(&source).is_none() {
         return no_backup(&source);
     }
@@ -1899,13 +1909,15 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             .map_or(name.as_str(), |(s, _)| s)
             .to_string();
         let packed = match ops_file::create_unique(&target, &file_stem, "zip") {
-            Ok((_, zip)) => match zipio::pack_file(&target.join(&name), &target.join(&zip), &name) {
-                Ok(()) => Ok(zip),
-                Err(e) => {
-                    let _ = fs::remove_file(target.join(&zip));
-                    Err(e.to_string())
+            Ok((_, zip)) => {
+                match zipio::pack_file(&target.join(&name), &target.join(&zip), &name) {
+                    Ok(()) => Ok(zip),
+                    Err(e) => {
+                        let _ = fs::remove_file(target.join(&zip));
+                        Err(e.to_string())
+                    }
                 }
-            },
+            }
             Err(e) => Err(e.to_string()),
         };
         let _ = fs::remove_file(target.join(&name));
