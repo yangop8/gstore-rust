@@ -54,6 +54,9 @@
 //! - `--addr HOST`: bind address (`listen_addr`, default 127.0.0.1).
 //! - `--password PW`: root's password when the user store is first created
 //!   (`root_password`).
+//! - `--db-home DIR`: where the multi-database server keeps its databases
+//!   (`db_home`, default `./dbhome/`).
+//! - `--thread-num N`: the worker-pool size (`thread_num`, default 30).
 //! - `--no-checkpoint`: turn off `check_point` (save every write before
 //!   acknowledging it); changes are then saved on graceful shutdown (and in API
 //!   mode on `/checkpoint` and `/unload`).
@@ -81,8 +84,9 @@
 //!
 //! **`deamon=on`** (`conf.ini`, upstream's spelling): a supervisor process runs
 //! the server as its child and restarts it, with a bounded exponential backoff
-//! (1 s … 30 s), when it dies abnormally (killed by a signal, or a panic); a
-//! normal exit — including a graceful stop — ends the supervisor too.
+//! (1 s … 30 s), when it dies abnormally (killed by a signal, or a panic); it
+//! gives up after 10 such failures in a row, each within a minute of its
+//! start. A normal exit — including a graceful stop — ends the supervisor too.
 //!
 //! **Signals.** `SIGINT` (Ctrl-C) and `SIGTERM` trigger a graceful shutdown; a
 //! second Ctrl-C terminates immediately. `POST /restart` (root or system
@@ -160,6 +164,8 @@ fn print_help() {
          \t-p,--port N\t\tPort (default: conf.ini port, 9000).\n\
          \t--addr HOST\t\tBind address (default: conf.ini listen_addr, 127.0.0.1).\n\
          \t--password PW\t\tInitial root password (default: conf.ini root_password).\n\
+         \t--db-home DIR\t\tDatabase directory (default: conf.ini db_home, ./dbhome/).\n\
+         \t--thread-num N\t\tWorker threads (default: conf.ini thread_num, 30).\n\
          \t--no-checkpoint\t\tDo not save every write before acknowledging it.\n\
          \t--load-dir DIR\t\tLet LOAD, /build, /restore read files under DIR (repeatable).\n\
          \t--allow-service\t\tLet SPARQL SERVICE contact remote endpoints.\n\
@@ -196,6 +202,10 @@ struct Cli {
     port: Option<u16>,
     addr: Option<String>,
     password: Option<String>,
+    /// `--db-home DIR`: conf.ini's `db_home`.
+    db_home: Option<String>,
+    /// `--thread-num N`: conf.ini's `thread_num` (validated when parsed).
+    thread_num: Option<String>,
     api: bool,
     rocksdb: bool,
     no_checkpoint: bool,
@@ -256,6 +266,20 @@ impl Cli {
                 "--addr" => cli.addr = Some(value(&mut i, &arg)?.to_string_lossy().into_owned()),
                 "--password" => {
                     cli.password = Some(value(&mut i, &arg)?.to_string_lossy().into_owned())
+                }
+                "--db-home" => {
+                    let v = value(&mut i, &arg)?.to_string_lossy().into_owned();
+                    if v.trim().is_empty() {
+                        return Err("--db-home needs a directory".into());
+                    }
+                    cli.db_home = Some(v);
+                }
+                "--thread-num" => {
+                    let v = value(&mut i, &arg)?.to_string_lossy().into_owned();
+                    if !v.trim().parse::<usize>().is_ok_and(|n| n >= 1) {
+                        return Err(format!("invalid --thread-num '{v}' (a positive integer)"));
+                    }
+                    cli.thread_num = Some(v);
                 }
                 "--api" => cli.api = true,
                 "--rocksdb" => cli.rocksdb = true,
@@ -357,6 +381,16 @@ fn load_config(cli: &Cli) -> GStoreConfig {
     }
     if let Some(pw) = &cli.password {
         cfg.root_password = pw.clone();
+    }
+    // Both were validated by `Cli::parse`; `set` also marks them as given, so
+    // `--api` without a DIR roots at `--db-home`.
+    for (key, value) in [("db_home", &cli.db_home), ("thread_num", &cli.thread_num)] {
+        if let Some(v) = value {
+            if let Err(e) = cfg.set(key, v) {
+                eprintln!("gserver: {e}");
+                std::process::exit(2);
+            }
+        }
     }
     if cli.no_checkpoint {
         cfg.check_point = false;
@@ -745,8 +779,13 @@ fn status(target: &Target) -> u8 {
 // supervisor (deamon=on)
 // ---------------------------------------------------------------------------
 
+/// The supervisor stops restarting a server that died abnormally this many
+/// times in a row, each within a minute of its start (a crash loop).
+const MAX_QUICK_FAILURES: u32 = 10;
+
 /// Run the server as a child and restart it after an abnormal exit, with a
-/// bounded exponential backoff. A normal exit (graceful stop, startup error)
+/// bounded exponential backoff; it gives up after [`MAX_QUICK_FAILURES`]
+/// quick failures in a row. A normal exit (graceful stop, startup error)
 /// ends the supervisor with the child's exit code. `SIGINT`/`SIGTERM` are
 /// forwarded to the child once (it runs in its own process group, so a
 /// terminal's Ctrl-C reaches only the supervisor).
@@ -779,6 +818,8 @@ fn supervise(cli: &Cli) -> u8 {
         let me = std::process::id();
         println!("gserver: supervisor (pid {me}) started (deamon=on)");
         let mut backoff = Duration::from_secs(1);
+        // Abnormal exits in a row, each within a minute of its start.
+        let mut quick_failures = 0u32;
         loop {
             let mut cmd = Command::new(self_exe());
             cmd.args(cli.start_args())
@@ -813,6 +854,15 @@ fn supervise(cli: &Cli) -> u8 {
             }
             if started.elapsed() > Duration::from_secs(60) {
                 backoff = Duration::from_secs(1);
+                quick_failures = 0;
+            }
+            quick_failures += 1;
+            if quick_failures >= MAX_QUICK_FAILURES {
+                eprintln!(
+                    "gserver: server stopped abnormally ({status}), {quick_failures} times in a row \
+                     shortly after starting; supervisor gives up"
+                );
+                return 1;
             }
             eprintln!(
                 "gserver: server stopped abnormally ({status}); restarting in {}s",
@@ -1304,6 +1354,10 @@ mod tests {
         assert!(cli(&["-p"]).is_err());
         assert!(cli(&["--bogus"]).is_err());
         assert!(cli(&["a", "b"]).is_err());
+        for bad in [["--thread-num", "0"], ["--thread-num", "x"], ["--db-home", " "]] {
+            assert!(cli(&bad).is_err(), "{bad:?}");
+        }
+        assert!(cli(&["--thread-num"]).is_err());
     }
 
     #[test]
@@ -1346,6 +1400,16 @@ mod tests {
         );
         assert_eq!((c.port, c.thread_num, c.root_password.as_str()), (9600, 3, "cli"));
         assert!(!c.check_point);
+        // --thread-num and --db-home override the file too; --db-home also
+        // roots a bare `--api`.
+        let c = load_config(
+            &cli(&["-S", "-c", &ini_s, "--thread-num", "5", "--db-home", "/srv/h"]).unwrap(),
+        );
+        assert_eq!((c.thread_num, c.db_home.as_path()), (5, Path::new("/srv/h")));
+        assert_eq!(c.http_options().threads, 5);
+        let args = cli(&["--api", "--db-home", "/srv/h"]).unwrap();
+        let t = Target::resolve(&args, &load_config(&args));
+        assert_eq!(t.kind, Kind::Api(PathBuf::from("/srv/h")));
         let _ = fs::remove_dir_all(&dir);
     }
 
