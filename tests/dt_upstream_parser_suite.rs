@@ -78,26 +78,27 @@ struct Divergence {
 
 /// The single table of documented divergences from upstream's expectations.
 ///
-/// In both entries upstream's own result file agrees with W3C and only the
-/// script's `ans_expected` differs: `parser_test.sh`'s `get_json_val` reads a
-/// missing `AnsNum` as -1 and counts 0 and -1 as equal, so a 0 there records
-/// that upstream's `/api` answered without an `AnsNum` (its MINUS evaluation
-/// failed), not that the query has no solutions.
+/// In both entries only the script's `ans_expected` differs: upstream's own
+/// result file agrees with W3C. The script's `get_json_val` reads a missing
+/// `AnsNum` as -1 and counts 0 and -1 as equal, so a 0 there means upstream's
+/// `/api` answered 0 rows *or* no `AnsNum` at all; either way it is not the
+/// spec's answer. (Upstream's `TempResult::doMinus` itself keeps every row
+/// when the two sides share no variable, as W3C does.)
 const DIVERGENCES: &[Divergence] = &[
     Divergence {
         case: 15,
         ans_num: 4,
-        reason: "nested MINUS (SPARQL 1.1 §8.3.3 example): the inner MINUS keeps only \
-                 :bob2 (:bob1 is a Jones), the outer one removes :bob2, DISTINCT ?s leaves \
-                 :alice :bob1 :carol :dave = 4 rows, exactly parser_r15.txt; the script \
-                 records 0 (no AnsNum from upstream)",
+        reason: "nested MINUS (a variant of the SPARQL 1.1 §8.2 example): the inner \
+                 MINUS keeps only :bob2 (:bob1 is a Jones), the outer one removes :bob2, \
+                 DISTINCT ?s leaves :alice :bob1 :carol :dave = 4 rows, exactly \
+                 parser_r15.txt; the script records 0",
     },
     Divergence {
         case: 17,
         ans_num: 1,
         reason: "MINUS { :a :b :c } binds no variable, so no solution shares a variable \
-                 with it and nothing is removed (SPARQL 1.1 §8.3.2): 1 row, exactly \
-                 parser_r17.txt; the script records 0 (no AnsNum from upstream)",
+                 with it and nothing is removed (SPARQL 1.1 §8.3.2, this very example): \
+                 1 row, exactly parser_r17.txt; the script records 0",
     },
 ];
 
