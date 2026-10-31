@@ -109,3 +109,8 @@ upload_max_body_size = 1073741824
 upload_allow_extensions = "nt|ttl|n3|rdf|txt"
 # allow compress package
 upload_allow_compress_packages = "zip"
+# (gstore-rust extension, feature `zip`) limits a zip package must stay within
+# to be unpacked by build / batchInsert / batchRemove / restore: its number of
+# entries, and the bytes its files unpack to in all (zip-bomb guard).
+unzip_max_entries = 10000
+unzip_max_size = 10737418240

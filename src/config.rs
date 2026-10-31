@@ -213,6 +213,8 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("upload", "upload_allow_extensions"),
     ("upload", "upload_allow_compress_packages"),
     // Rust-only extensions.
+    ("upload", "unzip_max_entries"),
+    ("upload", "unzip_max_size"),
     ("server", "listen_addr"),
     ("server", "keep_alive_timeout"),
     ("server", "keep_alive_max"),
@@ -342,6 +344,12 @@ pub struct GStoreConfig {
     pub upload_allow_extensions: Vec<String>,
     /// Allowed compressed upload package types (default `zip`).
     pub upload_allow_compress_packages: Vec<String>,
+    /// *(Rust extension)* Entries a zip package may hold to be unpacked
+    /// (`build` / `batchInsert` / `restore` of a `.zip`; default `10000`).
+    pub unzip_max_entries: usize,
+    /// *(Rust extension)* Bytes the files of a zip package may unpack to, in
+    /// all (default 10 GiB) — the zip-bomb guard of `crate::zipio`.
+    pub unzip_max_size: u64,
 
     // ---- provenance -----------------------------------------------------
     /// The file this configuration was loaded from, if any.
@@ -395,6 +403,8 @@ impl Default for GStoreConfig {
             upload_max_body_size: 1_073_741_824,
             upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt"),
             upload_allow_compress_packages: split_list("zip"),
+            unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
+            unzip_max_size: crate::zipio::DEFAULT_MAX_SIZE,
             source: None,
             explicit: BTreeSet::new(),
             warnings: Vec::new(),
@@ -599,6 +609,12 @@ impl GStoreConfig {
             }
             "upload_allow_extensions" => self.upload_allow_extensions = split_list(v),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages = split_list(v),
+            "unzip_max_entries" => {
+                self.unzip_max_entries = parse_num(v).ok_or_else(|| bad("a number of entries"))?
+            }
+            "unzip_max_size" => {
+                self.unzip_max_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         self.explicit.insert(key.to_string());
@@ -656,6 +672,8 @@ impl GStoreConfig {
             "upload_max_body_size" => self.upload_max_body_size.to_string(),
             "upload_allow_extensions" => self.upload_allow_extensions.join("|"),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
+            "unzip_max_entries" => self.unzip_max_entries.to_string(),
+            "unzip_max_size" => self.unzip_max_size.to_string(),
             _ => return None,
         })
     }
@@ -973,7 +991,8 @@ upload_allow_compress_packages = "zip"
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
                     [backup]\nbackup_path=/b\nmax_backups=11\n\
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
-                    upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n";
+                    upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
+                    unzip_max_entries=12\nunzip_max_size=4096\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)), "every key counted as set");
@@ -1007,6 +1026,7 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip", "tar"]);
         assert_eq!(c.value("upload_allow_compress_packages").unwrap(), "zip|tar");
+        assert_eq!((c.unzip_max_entries, c.unzip_max_size), (12, 4096));
         assert_eq!(c.value("querylog_mode").unwrap(), "0");
         assert_eq!(c.value("deamon").unwrap(), "on");
         assert!(c.upload_allowed("data.TTL") && c.upload_allowed("x.tar"));

@@ -1118,6 +1118,72 @@ impl Database {
         fsutil::recover_dir_swap_as(dir, &fsutil::RESTORE_SWAP)
     }
 
+    // ---- zipped backups (feature `zip`, see `crate::zipio`) ------------------
+
+    /// Pack the backup directory `dir` (a [`backup`](Self::backup) or
+    /// [`backup_dir`](Self::backup_dir) result) into the archive `zip`, then
+    /// remove `dir` — upstream's `backup compress=true` /
+    /// `gbackup -z 1`: `<db>.db_<YYYYmmddHHMMSS>.zip`, the backup's files at
+    /// the archive root. `dir` is kept when packing fails. Without the `zip`
+    /// feature this fails, naming the feature.
+    pub fn pack_backup<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, zip: Q) -> Result<()> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            return Err(GStoreError::Database(format!(
+                "backup '{}' is not a directory",
+                dir.display()
+            )));
+        }
+        crate::zipio::pack_dir(dir, zip.as_ref())?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Unpack the zipped backup `zip` into `scratch` (a fresh directory the
+    /// caller removes afterwards) under `limits`, and return the directory
+    /// holding the database: `scratch` itself (the upstream layout), or its
+    /// one sub-directory when the archive wraps the backup in a directory
+    /// (`zip -r x.zip lubm.db_…`). Whether that holds a database is the
+    /// caller's to check ([`storage_kind`](Self::storage_kind)).
+    pub fn unpack_backup(
+        zip: &Path,
+        scratch: &Path,
+        limits: &crate::zipio::ZipLimits,
+    ) -> std::result::Result<PathBuf, crate::zipio::ZipError> {
+        crate::zipio::unpack(zip, scratch, limits, &|_| true)?;
+        if Database::storage_kind(scratch).is_some() {
+            return Ok(scratch.to_path_buf());
+        }
+        let entries: Vec<PathBuf> = fs::read_dir(scratch)?.flatten().map(|e| e.path()).collect();
+        match entries.as_slice() {
+            [only] if only.is_dir() && Database::storage_kind(only).is_some() => Ok(only.clone()),
+            _ => Ok(scratch.to_path_buf()),
+        }
+    }
+
+    /// [`restore_into`](Self::restore_into) from a zipped backup (`grestore
+    /// x.zip`): unpacked under `limits` into `<target>.unzip-tmp` beside
+    /// `target` (removed afterwards), then validated and swapped in like a
+    /// backup directory. Without the `zip` feature this fails, naming it.
+    pub fn restore_from_zip<P: AsRef<Path>, Q: AsRef<Path>>(
+        zip: P,
+        target: Q,
+        limits: &crate::zipio::ZipLimits,
+    ) -> Result<()> {
+        let target = target.as_ref();
+        if !crate::zipio::AVAILABLE {
+            return Err(crate::zipio::ZipError::FeatureMissing.into());
+        }
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let mut scratch = target.as_os_str().to_owned();
+        scratch.push(".unzip-tmp");
+        let scratch = crate::zipio::ScratchDir::fresh(PathBuf::from(scratch))?;
+        let backup = Database::unpack_backup(zip.as_ref(), scratch.path(), limits)?;
+        Database::restore_into(&backup, target)
+    }
+
     // ---- write-through hooks (called by the mutation paths) ----------------
 
     /// Record a persistence failure to report at the next commit point.
