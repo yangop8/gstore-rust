@@ -429,7 +429,8 @@ fn csr_cache_is_shared_across_threads() {
 // gfun skeleton
 // ---------------------------------------------------------------------------
 
-/// Temporary: every function is still a stub. The packages porting the
+/// Temporary: every metric function is still a stub (the path family is
+/// ported and tested in `dt_gfun_path.rs`). The packages porting the
 /// functions replace this test with real ones.
 #[test]
 fn every_function_dispatches_to_a_not_implemented_stub() {
@@ -445,6 +446,9 @@ fn every_function_dispatches_to_a_not_implemented_stub() {
     };
     assert_eq!(GFnKind::ALL.len(), 32);
     for kind in GFnKind::ALL {
+        if kind.family() == gfun::GFnFamily::Paths {
+            continue;
+        }
         let err = gfun::eval(kind, &ctx, &args).unwrap_err();
         assert!(gfun::is_not_implemented(&err), "{kind}: {err}");
         assert!(err.to_string().contains(kind.name()), "{kind}: {err}");
