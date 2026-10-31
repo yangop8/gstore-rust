@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use gstore::analytics::csr::{CsrCache, CsrGraph, Direction, EdgeDir, Node, PredFilter};
-use gstore::analytics::gfun::{
-    self, cxx, fmt, metrics, ArgSlot, GArgs, GFnKind, GFunCtx, GFunValue, GNode,
-};
+use gstore::analytics::gfun::{cxx, fmt, metrics, ArgSlot, GFnKind, GFunCtx, GFunValue, GNode};
 use gstore::{Database, QueryResult};
 
 const SOCIAL: &str = "
@@ -428,34 +426,6 @@ fn csr_cache_is_shared_across_threads() {
 // ---------------------------------------------------------------------------
 // gfun skeleton
 // ---------------------------------------------------------------------------
-
-/// Temporary: both families are ported (paths in `dt_gfun_path.rs`, metrics
-/// in `dt_gfun_metric.rs`); the integration wiring removes this test.
-#[test]
-fn every_function_dispatches_to_a_not_implemented_stub() {
-    let db = social();
-    let g = db.csr().unwrap();
-    let ctx = GFunCtx::new(&g, db.dict());
-    let alice = GNode::resolve(&g, Some(eid(&db, "Alice")));
-    let args = GArgs {
-        srcs: vec![alice],
-        dsts: vec![alice],
-        preds: PredFilter::all(db.dict()),
-        ..GArgs::default()
-    };
-    assert_eq!(GFnKind::ALL.len(), 32);
-    for kind in GFnKind::ALL {
-        if kind.family() == gfun::GFnFamily::Paths {
-            continue; // ported: tests/dt_gfun_path.rs
-        }
-        if kind.family() == gfun::GFnFamily::Metrics {
-            continue; // ported: tests/dt_gfun_metric.rs
-        }
-        let err = gfun::eval(kind, &ctx, &args).unwrap_err();
-        assert!(gfun::is_not_implemented(&err), "{kind}: {err}");
-        assert!(err.to_string().contains(kind.name()), "{kind}: {err}");
-    }
-}
 
 #[test]
 fn function_table_covers_the_upstream_grammar() {

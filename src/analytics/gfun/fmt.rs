@@ -78,60 +78,19 @@ pub fn cxx_to_string(x: f64) -> String {
     format!("{x:.6}")
 }
 
-/// `nlohmann::json(x).dump()` for a double: the shortest round-trip digits,
-/// formatted with nlohmann's rules — integral values keep a `.0`
-/// (`1.0`, `100000.0`), decimal exponents in `(-4, 15]` print positionally
-/// (`0.0001`, `123.456789`), others in scientific form with a signed,
-/// at-least-two-digit exponent (`1e-05`, `1.5e+20`). Non-finite values dump
-/// as `null`.
+/// `nlohmann::json(x).dump()` for a double, bit-exact: integral values keep a
+/// `.0` (`1.0`, `100000.0`), decimal exponents in `(-4, 15]` print
+/// positionally (`0.0001`, `123.456789`), others in scientific form with a
+/// signed, at-least-two-digit exponent (`1e-05`, `1.5e+20`). Non-finite values
+/// dump as `null`.
 ///
-/// (nlohmann uses Grisu2, which in rare cases emits a longer-than-shortest
-/// digit string; Rust's formatter is always shortest. The two agree on every
-/// value the graph functions produce in practice.)
+/// The digits are nlohmann's Grisu2 digits, which round-trip but are not
+/// always the shortest (`35.0 / 127.0` dumps as `0.27559055118110237`, not
+/// `0.2755905511811024`), so a shortest-digits formatter is not a substitute:
+/// this delegates to the exact port
+/// [`metrics::nlohmann_dump_f64`](super::metrics::nlohmann_dump_f64).
 pub fn nlohmann_f64(x: f64) -> String {
-    if !x.is_finite() {
-        return "null".to_string();
-    }
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
-    }
-    let neg = x < 0.0;
-    let sci = format!("{:e}", x.abs()); // shortest round-trip, e.g. "1.2345e-7"
-    let (mant, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
-    let k = digits.len() as i32;
-    let n = exp + 1; // value = 0.d1d2…dk × 10^n
-    const MIN_EXP: i32 = -4;
-    const MAX_EXP: i32 = 15;
-    let mut out = String::new();
-    if neg {
-        out.push('-');
-    }
-    if k <= n && n <= MAX_EXP {
-        out.push_str(&digits);
-        out.extend(std::iter::repeat_n('0', (n - k) as usize));
-        out.push_str(".0");
-    } else if 0 < n && n <= MAX_EXP {
-        out.push_str(&digits[..n as usize]);
-        out.push('.');
-        out.push_str(&digits[n as usize..]);
-    } else if MIN_EXP < n && n <= 0 {
-        out.push_str("0.");
-        out.extend(std::iter::repeat_n('0', (-n) as usize));
-        out.push_str(&digits);
-    } else {
-        out.push_str(&digits[..1]);
-        if k > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        let e = n - 1;
-        out.push('e');
-        out.push(if e < 0 { '-' } else { '+' });
-        out.push_str(&format!("{:02}", e.abs()));
-    }
-    out
+    super::metrics::nlohmann_dump_f64(x)
 }
 
 /// Upstream parses `alpha=`, `tol=`, `increase=` and `maxIter=` with C
@@ -511,6 +470,8 @@ mod tests {
         assert_eq!(nlohmann_f64(1.5e20), "1.5e+20");
         assert_eq!(nlohmann_f64(123456789012345.0), "123456789012345.0");
         assert_eq!(nlohmann_f64(1234567890123456.0), "1.234567890123456e+15");
+        // Grisu2 digits, not the shortest round-trip form (0.2755905511811024).
+        assert_eq!(nlohmann_f64(35.0 / 127.0), "0.27559055118110237");
     }
 
     #[test]

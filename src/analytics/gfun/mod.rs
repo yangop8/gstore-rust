@@ -724,19 +724,6 @@ pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue>
     }
 }
 
-/// Message prefix of [`not_implemented`] errors.
-const NOT_IMPLEMENTED: &str = "graph function not implemented yet: ";
-
-/// The error a not-yet-ported function returns.
-pub fn not_implemented(kind: GFnKind) -> GStoreError {
-    GStoreError::Query(format!("{NOT_IMPLEMENTED}{}", kind.name()))
-}
-
-/// Whether `e` is a [`not_implemented`] error.
-pub fn is_not_implemented(e: &GStoreError) -> bool {
-    matches!(e, GStoreError::Query(m) if m.starts_with(NOT_IMPLEMENTED))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

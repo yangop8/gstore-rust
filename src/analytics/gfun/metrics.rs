@@ -1673,10 +1673,11 @@ pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// `[[‹v›, x], …]` for every vertex in node order, e.g.
 /// `[["<Alice>",0.5],["<Bob>",1.0]]` — strings escaped like nlohmann
 /// ([`push_json_quoted`](super::fmt::push_json_quoted)), numbers via
-/// [`nlohmann_dump_f64`] (an exact Grisu2 port: nlohmann's digits are not
-/// always the shortest round-trip form, e.g. `0.27559055118110237`, so
-/// [`fmt::nlohmann_f64`](super::fmt::nlohmann_f64) is not used). **Spec fix:** an empty graph
-/// dumps the never-assigned `nlohmann::json` value: `null`.
+/// [`nlohmann_dump_f64`] (an exact Grisu2 port, which
+/// [`fmt::nlohmann_f64`](super::fmt::nlohmann_f64) delegates to: nlohmann's
+/// digits are not always the shortest round-trip form, e.g.
+/// `0.27559055118110237`). **Spec fix:** an empty graph dumps the
+/// never-assigned `nlohmann::json` value: `null`.
 ///
 /// **x:** undirected BFS from `v` (per predicate: out, then in); `cnt` =
 /// reached vertices including `v`, `sum` = Σ distances (C `unsigned`);

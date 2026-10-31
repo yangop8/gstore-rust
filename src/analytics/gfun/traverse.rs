@@ -6,7 +6,7 @@
 //! two edge directions when they expand a vertex, and that order decides
 //! which of several equally short paths / which first neighbour wins. The
 //! three patterns that occur are captured by [`NbrOrder`]; pick the one the
-//! upstream function uses (each stub's docs say which):
+//! upstream function uses (each function's docs say which):
 //!
 //! | [`NbrOrder`]               | upstream loop                                                     | used by (examples)                                   |
 //! |----------------------------|-------------------------------------------------------------------|------------------------------------------------------|
