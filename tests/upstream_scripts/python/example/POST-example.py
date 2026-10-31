@@ -5,13 +5,14 @@
 # Last Modified: 2019-5-15 18:26
 # Description: a simple POST-example of python API
 """
+import os
 import sys
 sys.path.append('../src')
 import GstoreConnector
 
 # before you run this example, make sure that you have started up ghttp service (using bin/ghttp port)
 IP = "127.0.0.1"
-Port = 9000
+Port = int(os.environ.get("GSTORE_PORT", "9000"))  # gstore-rust conformance: port from the environment (upstream: 9000)
 username = "root"
 password = "123456"
 sparql = "select ?x where \
@@ -42,11 +43,11 @@ res = gc.showuser("POST")
 print(res)
 
 # query
-res = gc.query("lubm", "json", sparql, "POST")
+res = gc.query("lubm", sparql, "json", "POST")  # gstore-rust conformance: arguments in GstoreConnector.query's order (upstream passes "json" as the SPARQL)
 print(res)
 
 # query and save the result in a file
-gc.fquery("lubm", "json", sparql, filename, "POST")
+gc.fquery("lubm", sparql, filename, "json", "POST")  # gstore-rust conformance: GstoreConnector.fquery's argument order
 
 # save the database if you have changed the database
 res = gc.checkpoint("lubm", "POST")
