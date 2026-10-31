@@ -25,8 +25,11 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **~720 tests pass** across the workspace (incl. 142 for gNLQA); `cargo clippy
-  --workspace --all-targets -- -D warnings` is clean.
+* **1,700+ tests pass** across the workspace (incl. 142 for gNLQA), among them
+  ports of upstream gStore's own test scripts; `cargo clippy --workspace
+  --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
+  planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
+  [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -39,6 +42,8 @@ cargo build --release           # gStore CLIs + gnlqa
 cargo test --workspace          # run the tests
 # upstream's scripts/test/parser_test.sh (50 SPARQL cases), in-process, per-case table:
 cargo test --test dt_upstream_parser_suite -- --nocapture
+# upstream's own test scripts and Python SDK against a real gserver
+scripts/conformance.sh
 ```
 
 ### A) Use gStore directly (SPARQL)
@@ -104,10 +109,19 @@ optimizer and a VS-tree signature filter.
 * **Cost-based optimizer** — Selinger DP join ordering over predicate statistics.
 * **VS-tree signature index** — a port of gStore's 944-bit signatures + signature
   tree, used as a sound query-time candidate filter.
-* **SPARQL 1.1 subset** — `SELECT`/`ASK`/`CONSTRUCT`/`DESCRIBE`, BGP, `UNION`,
-  `OPTIONAL`, `MINUS`, `FILTER`, `BIND`, `VALUES`, sub-`SELECT`, aggregates,
-  property paths (`/ ^ | * + !`), `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and
-  SPARQL UPDATE (`INSERT`/`DELETE`).
+* **SPARQL 1.1** — `SELECT`/`ASK`/`CONSTRUCT` (also `CONSTRUCT WHERE`)/
+  `DESCRIBE`, BGP, `UNION`, `OPTIONAL`, `MINUS`, `FILTER` (with `IN` / `NOT
+  IN`), `BIND`, `VALUES` (inline and trailing), sub-`SELECT`, aggregates (also
+  inside expressions, several `HAVING` constraints, `GROUP BY (expr AS ?v)`),
+  property paths (`/ ^ | * + !`), `[ … ]` / `( … )` blank-node syntax, named
+  graphs, `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, and SPARQL UPDATE (`INSERT`/
+  `DELETE` `DATA` and `WHERE` with `WITH` / `USING` / `GRAPH` templates,
+  `LOAD [INTO GRAPH]`, `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE`, `COPY`). Typed
+  literals are validated and compare by value; a byte-bounded query cache;
+  gStore's `CONTAINALL` / `CONTAINANY`.
+* **Top-K and early termination** — `LIMIT` / `ASK` / `EXISTS` stop as soon as
+  they have their answer, `ORDER BY … LIMIT` uses a bounded heap or upstream's
+  DP-B enumeration, with exactly the rows of a full evaluation.
 * **RDF input formats** — N-Triples, Turtle, N-Quads, TriG, RDF/XML, and
   (dependency-free, common-subset) **JSON-LD** and **RDFa**; detected by file
   extension (`parser::parse_file_by_ext`).
@@ -121,9 +135,12 @@ optimizer and a VS-tree signature filter.
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
   — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
-* **HTTP server** with content negotiation, users/auth, streaming, file
-  upload/download, a built-in web console (`GET /`), and a task registry with
-  cancellation (`server` / `http_api` / `http_users`).
+* **HTTP server** speaking upstream gStore's **`/api` protocol** (the upstream
+  SDKs work unchanged) and a REST/SPARQL-protocol API: content negotiation,
+  users with per-database privileges, IP lists, query/access/transaction logs,
+  asynchronous operations with callbacks, file upload/download, a built-in web
+  console (`GET /`), task cancellation, and upstream's `conf.ini` and
+  `gserver` lifecycle (`server` / `http_api` / `gapi` / `sysdb` / `config`).
 * **Transactions** — commit/rollback, per-key MVCC + snapshot isolation, four
   named isolation levels, and full + **incremental** backup/restore.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
@@ -154,22 +171,6 @@ gserver -b                   # … started in the background (-s: foreground)
 gserver -S | -t | -r | -k    # status / stop / restart / kill it (via its pid file)
 ```
 
-The multi-DB server also speaks upstream gStore's `/api` protocol (`GET|POST
-/api` or `POST /` with `operation=…`, per-request `username`/`password`,
-`encryption=1`, the `StatusCode` JSON envelope), so the upstream SDKs such as
-`GstoreConnector.py` work against it unchanged, plus upstream's `/shutdown`
-and `/restart` routes. Settings come from `conf.ini` (see
-`conf/conf.ini.example`; `-c FILE` picks another file, and command-line flags
-win over it; `operation=refreshconf` re-reads it). Known differences from
-upstream: a database is **single-writer** — one transaction may be open on it
-at a time (a second `begin` answers `1008`), and while it is open other
-writes to it (`query` updates, `batchInsert`, …) answer `1004` until it is
-committed or rolled back, where upstream runs concurrent transactions; zip
-packages (`build`/`batchInsert`/`restore` from a `.zip`, `compress=true` for
-`backup`/`export`) are refused with `1003` for now; a user holding the restore
-privilege on a database restores only that database's own backups; and
-asynchronous results are kept out of the public export directory.
-
 Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each
 write before acknowledging it (gStore's `check_point`; `--no-checkpoint` defers
@@ -189,12 +190,45 @@ of racing it — unload it there (or use the server's API) first. The server's
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
 
+### Upstream `/api` compatibility and conformance
+
+The multi-DB server speaks upstream gStore 1.4's `/api` protocol (`GET|POST
+/api` or `POST /` with `operation=…`, per-request `username`/`password`,
+`encryption=1`, the `StatusCode` JSON envelope): the database, user, privilege,
+transaction, log and task operations with upstream's parameters, fields, codes
+and messages, so the upstream SDKs such as `GstoreConnector.py` work against
+it unchanged, plus upstream's `/shutdown` and `/restart` routes. Its graph
+functions answer as upstream's (see below), and `loadcsr` / `load` with
+`csr=1` build the adjacency they run on ahead of the first query. Known
+differences from upstream: a database is **single-writer** — one transaction
+may be open on it at a time (a second `begin` answers `1008`), and while it is
+open other writes to it (`query` updates, `batchInsert`, …) answer `1004`
+until it is committed or rolled back, where upstream runs concurrent
+transactions; zip packages (`build`/`batchInsert`/`restore` from a `.zip`,
+`compress=true` for `backup`/`export`) are refused with `1003` for now; a user
+holding the restore privilege on a database restores only that database's own
+backups; and asynchronous results are kept out of the public export directory.
+
+Conformance is tested against upstream's own material, vendored under
+[`testdata/upstream/`](testdata/upstream/README.md):
+
+- `tests/upstream_*.rs` replay upstream's `basic_test.sh`, `parser_test.sh`
+  (all 50 cases), `bfs_test`, `update_test.sh`, `transaction_test.sh` and
+  `api_test.sh` over `/api`;
+- `tests/dt_upstream_parser_suite.rs` runs the same 50 parser cases
+  in-process, comparing every row with upstream's result files, with the
+  Top-K optimizations on and off (two cases follow W3C where upstream's
+  script records a different count; both suites document them in one table);
+- `scripts/conformance.sh` starts the real `gserver` and runs upstream's
+  scripts and Python SDK against it unmodified.
+
 ### Configuration (`conf.ini`)
 
 `gserver` reads upstream gStore's `conf.ini` (`./conf/conf.ini`, or `-c FILE`;
 see the commented [`conf/conf.ini.example`](conf/conf.ini.example)): every
 upstream key of `[server]`, `[system]`, `[log]`, `[backup]` and `[upload]`,
-with upstream's defaults, plus a few gstore-rust keys. The `[query]` section
+with upstream's defaults, plus a few gstore-rust keys. Command-line flags win
+over the file; `operation=refreshconf` re-reads it. The `[query]` section
 (gstore-rust only — upstream hard-codes these) sets how **every database the
 server serves** evaluates queries; it is applied to each database the server
 loads, builds, creates or restores (REST and `/api` alike, transaction
@@ -245,7 +279,9 @@ computed once — a lone function yields one row; next to other projected
 variables its value is on the last row; with `GROUP BY`, once per group. The
 functions run on a per-predicate CSR that each database builds on the first
 such query after a change and then reuses (`Database::preload_csr` builds it
-eagerly, like upstream's `loadcsr`). Upstream parses `cycleBoolean`,
+eagerly, as the server's `loadcsr` and `load` with `csr=1` do). A call is
+cancelled like any query (`/cancel`, `operationTaskCancel`, shutdown) and its
+JSON is bounded (`[query] gfun_max_output_bytes`, 64 MiB on a server). Upstream parses `cycleBoolean`,
 `simpleCycleBoolean`, `shortestPathLen` and `kHopReachable` inside `FILTER` but
 never evaluates them there; here that is a clear error. `PFN.name({…})` parses
 but is not evaluated yet.
@@ -334,9 +370,10 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `kvstore` / `backend` | on-disk pager + B+ trees; RocksDB backend      |
 | `signature`   | signatures + VS-tree candidate filter                  |
 | `parser`      | N-Triples/Turtle/N-Quads/TriG/RDF-XML/JSON-LD/RDFa; SPARQL (query + update) |
-| `query`       | algebra eval, joins, optimizer, FILTER, aggregates     |
-| `analytics`   | CSR graph algorithms (paths, centrality, communities)  |
+| `query`       | algebra eval, joins, optimizer, FILTER, aggregates, Top-K |
+| `analytics`   | CSR graph algorithms; `analytics::gfun`: upstream's 32 advanced functions |
 | `server` / `http_api` / `http_users` | HTTP SPARQL server, conneg, auth |
+| `gapi` / `sysdb` / `config` | upstream `/api` protocol, system database (privileges, logs), `conf.ini` |
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
 | `reason`      | RDFS / rule reasoning                                   |
 | `db`          | `Database` facade + persistence (mem & disk)           |

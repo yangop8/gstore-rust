@@ -4,6 +4,61 @@ All notable changes to gstore-rust are recorded here.
 
 ## Unreleased
 
+The work toward upstream gStore 1.4 parity (`docs/GAP_PLAN.md`) lands in
+phases. Phases 0 and 1 (durability and hardening; the upstream `/api`
+server) and Phases 2 and 3 (graph functions; SPARQL 1.1 and Top-K) were
+developed in parallel from the same base and merged; the first section
+below records what joining them changed, the following ones each phase,
+newest first.
+
+### Integrating Phases 2 and 3 with the Phase 1 server
+
+- **Security limits cover the new grammar.** The SPARQL parser's nesting
+  limit (128) and tree-height limit (1024) now also bound every construct
+  Phases 2 and 3 added: `[ … ]` / `( … )` triples nodes (their own cap of
+  256 is gone — they count towards the global nesting limit, in patterns,
+  templates, `CONSTRUCT WHERE` and `INSERT DATA`), `IN` / `NOT IN` lists,
+  graph-function and `rs:` calls, sub-selects with a trailing `VALUES`,
+  `GROUP BY (… AS ?v)` (each binding is one more node) and the `GRAPH`
+  blocks of `DELETE WHERE`. `WITH <g> WITH <g> …` is refused up front
+  instead of recursing once per `WITH`.
+- **`SERVICE` stays disabled on every evaluation path.** The Top-K / early
+  termination / DP-B paths, graph-function queries, named-graph updates
+  (`WITH`, `USING`, `GRAPH` templates) and — **fixed** — reads answered
+  from an open HTTP transaction's snapshot (which used to contact remote
+  endpoints on a restricted server) and `ConcurrentDb` snapshots all follow
+  the load policy (`gserver --allow-service` to opt in). `LOAD … INTO
+  GRAPH` follows the `LoadPolicy` like `LOAD`.
+- **`loadcsr` and `load` with `csr=1` build the CSR** the graph functions
+  run on (`Database::preload_csr`); `loadcsr` answers upstream's "CSR
+  already loaded." when it is current, and `show` reports `csr` truthfully.
+- **New: `conf.ini` `[query]` section** — `integer_division`,
+  `query_cache_size`, `early_termination`, `topk_bounded_heap`, `topk_dpb`
+  and `gfun_max_output_bytes` — applied to every database the servers
+  load, build, create or restore (and re-applied by `refreshconf`).
+  **API:** `QuerySettings`, `Database::apply_query_settings` /
+  `query_settings` / `set_gfun_max_output_bytes`,
+  `Evaluator::with_gfun_max_output_bytes`, `GStoreConfig::query_settings`,
+  `ApiServer::with_query_settings`, `Server::with_query_settings`.
+- **Changed: every graph function's output is bounded**, not only the path
+  family's: the metric and community functions (`PR`, `WCC`, `louvain`, …)
+  fail with a "… bytes of output" error past the bound (64 MiB on the
+  servers, 256 MiB for an embedded `Database`). Graph-function queries are
+  cancelled by `operationTaskCancel`, REST `/cancel` and a graceful
+  shutdown like any query.
+- **Tests.** The `/api` run of upstream's `parser_test.sh`
+  (`tests/upstream_parser.rs`) now runs all 50 cases (33–35, 42 and 50
+  were waiting for these phases); it and the in-process suite share one
+  vendored copy (`testdata/upstream/scripts/test/parser_test/`) and one
+  table of the script's numbers and documented divergences (#15, #17,
+  `tests/upstream_scripts/parser_cases.rs`). `tests/dt_cross_phase_api.rs`
+  checks that every Phase 1 write path (`batchInsert`, `batchRemove`,
+  updates, transaction commit and rollback, `restore`, an overwriting
+  `/build`, drop and rebuild) leaves no stale query-cache or CSR answer, and
+  that the Phase 3 update forms (`ADD` / `MOVE` / `COPY`, `WITH`, `LOAD …
+  INTO`, `INSERT DATA` with `[ … ]`) need the update privilege while
+  graph-function SELECTs need only query.
+
 ### Phase 3: SPARQL 1.1 grammar and semantics
 
 This phase closes the SPARQL 1.1 grammar gaps of `docs/GAP_PLAN.md` §4.1 and
@@ -220,7 +275,7 @@ functions) are now evaluated only for the solutions actually consumed.
   `{ ?a :p+ ?b } LIMIT n` without a total `ORDER BY` can return different
   rows on different runs (with or without the Top-K optimizations).
 
-### Breaking: SPARQL graph functions follow gStore 1.4
+### Phase 2 (breaking): SPARQL graph functions follow gStore 1.4
 
 The advanced graph functions of upstream gStore 1.4 (`docs/en-us/SPARQL_QUERY.md`,
 "Advanced functions") now parse and evaluate with upstream's signatures,
@@ -293,3 +348,111 @@ namespace.
 - **Fixed: infinite `xsd:double` values print as XSD lexicals.** They are
   written `INF` and `-INF` (they used to print as Rust's `inf` and `-inf`);
   NaN stays `NaN`.
+
+### Phase 1: upstream gStore 1.4's `/api` protocol and server
+
+The multi-database server speaks upstream gStore's wire protocol, so the
+upstream SDKs and test scripts run against it unchanged
+(`scripts/conformance.sh`).
+
+- **New: the `/api` protocol** (`src/gapi`): `GET|POST /api`, `POST /`,
+  `/grpc/api` and `GET /?operation=` dispatched by operation name with
+  per-request credentials (`encryption=1` MD5 too) and upstream's HTTP-200
+  `StatusCode` envelope, upstream's response fields, codes and messages
+  (upstream's *code* wins where its docs differ). Operations: `check`,
+  `login`, `testConnect`, `getCoreVersion`, `stat`, `init`, `refreshconf`;
+  `query` (JSON / file formats, `max_output_size`), `begin`, `tquery`,
+  `commit`, `rollback`, `checkpoint`; `show`, `load`, `loadcsr`, `unload`,
+  `monitor`, `build`, `drop`, `rename`, `backup`, `backuppath`, `restore`,
+  `export`, `batchInsert`, `batchRemove`, `schema`; `showuser`,
+  `usermanage`, `userprivilegemanage`, `userpassword`, `ipmanage`,
+  `querylog`, `accesslog`, `txnlog`; `checkOperationState`,
+  `operationTaskCancel`, `operationTaskList`; `/file/upload` and
+  `/file/download`. The SDKs' encoded `?operation=…` targets are decoded as
+  upstream does.
+- **New: `conf.ini`** (`src/config.rs`, `conf/conf.ini.example`): every key
+  of upstream's file with upstream's defaults; unknown keys and bad values
+  warn. Precedence: command-line flag > `conf.ini` > default.
+- **New: `gserver` lifecycle** as upstream's: `-s` / `-b` (background) /
+  `-t` / `-r` / `-k` / `-S`, `-c conf.ini`, `-p`, `--db-home`,
+  `--thread-num`; a pid file with a per-run `system` password; the
+  `deamon=on` supervisor (gives up on a crash loop); `/shutdown` and
+  `/restart` routes. The default mode is the multi-database API rooted at
+  `db_home`.
+- **New: HTTP layer** — a bounded worker pool (`thread_num`, a queue with
+  back-pressure), HTTP/1.1 keep-alive, CORS / `OPTIONS`, a request body cap
+  (`upload_max_body_size`, 413), chunked bodies, `Expect: 100-continue`,
+  and a deadline on the whole request head.
+- **New: system database** (`src/sysdb.rs`): per-database privileges
+  (`query@lubm`, …) with upstream's `check_privilege` table, a database
+  registry, IP allow / deny lists and the failed-login lockout (REST
+  included), and upstream's query / access / transaction logs.
+- **New: asynchronous tasks** (`src/gapi/tasks.rs`): `async=true`
+  operations get an `opt_id`, run on bounded runner threads, keep their
+  results (bounded, with a TTL) and POST them to a `callback` URL (HTTPS
+  with the `tls` feature; host-local addresses refused). Running SPARQL
+  statements and operations share one registry with REST `/tasklist` and
+  `/cancel`; a shutdown cancels them and waits, bounded.
+- **New: database lifecycle and confinement** — every server-side path is
+  canonicalized and confined to its configured root; an inter-process
+  `LOCK` on each database directory (a second process gets a clear error;
+  `drop`, `rename`, `restore` and a rebuilding `/build` take it first);
+  `max_database_num` enforced by every path that creates a database;
+  backups record their database (`BACKUP_OF`) and a non-admin restore takes
+  only its own database's backups.
+- **Changed: transaction ids are numbered per loaded database** (the first
+  after a load is `1`, as upstream's per-database `Txn_manager`); REST
+  requests may name `db_name` to disambiguate.
+- **Security** (`8d48fb5`): password checks run off the server's state
+  lock (bad credentials cannot stall other clients); SPARQL nesting is
+  bounded (128 levels, a 1024-node tree height) and HTTP workers get an
+  explicit stack, so a deeply nested request is a 400, not a process-wide
+  stack overflow; RDF/XML nesting is limited; `/build?db_path=` follows the
+  `LoadPolicy`; `/backup` writes only inside the backup directory and
+  `/restore` reads only from there or allowed directories; federated
+  `SERVICE` is refused on servers unless `--allow-service` (the client has
+  a 30 s deadline and a 64 MiB response cap); changing a password revokes
+  the user's sessions.
+- **Conformance suite**: upstream's test data, `parser_test` and
+  `bfs_test` vendored under `testdata/upstream/`; Rust ports of
+  `basic_test.sh`, `parser_test.sh`, `bfs_test`, `update_test.sh`,
+  `transaction_test.sh` and `api_test.sh` (`tests/upstream_*.rs`); and
+  `scripts/conformance.sh`, which runs upstream's own scripts and Python
+  SDK against `gserver` (a CI job).
+- Known differences from upstream (README): a database is single-writer
+  (one open transaction; other writes answer `1004` meanwhile), and zip
+  packages are not supported yet.
+
+### Phase 0: durability, data safety and hardening
+
+- **Persistence.** On-disk (`kvstore.kv`) databases write every committed
+  mutation through to the store (WAL commit points; named graphs in a quad
+  tree); RocksDB databases keep their dictionary, named graphs and name in
+  column families, sync at commit points and make transactions
+  crash-atomic (an undo journal in the same write batch); snapshot saves
+  are crash-atomic as a set. `Database::open` detects the layout; every
+  CLI tool and server opens databases with it.
+- **Restore** stages and validates a backup before swapping it in as a
+  whole directory, so a corrupt backup no longer destroys the target.
+- **HTTP servers** are durable: the `check_point` policy saves every write
+  before it is acknowledged (`gserver --no-checkpoint` defers saving), a
+  graceful shutdown (SIGINT / SIGTERM, `ShutdownHandle`) waits for
+  in-flight requests and saves, partial-update failures are saved and
+  reported, no handler waits for a database lock while holding the state
+  lock, each request is isolated with `catch_unwind`, and transactions
+  give non-owners a begin-time snapshot (no dirty reads).
+  `/batchInsert` / `/batchRemove` apply parsed triples, never SPARQL text
+  built from input.
+- **`LoadPolicy`** for SPARQL `LOAD`: permissive for the library, but
+  `LoadPolicy::restricted()` on servers (`gserver --load-dir DIR` re-allows
+  a directory); sources are canonicalized and confined, and denials do not
+  reveal whether a file exists.
+- **Hardening.** Bounded dictionary id spaces (entities, literals,
+  predicates) with checked `try_insert_*` paths instead of silent
+  misclassification; built-in function arity checked at parse time and the
+  crafted-query panics removed (`STR()`, `ORDER BY RAND()`, overflows);
+  stable, versioned PBKDF2-HMAC-SHA256 password hashes (legacy hashes
+  migrate on login) and atomic `users.db` writes.
+- **Cluster** (experimental): single-write RPC framing, client writes
+  acknowledged only once committed, per-peer replication senders, fallible
+  shard reads; a CI workflow.
