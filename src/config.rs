@@ -37,9 +37,13 @@
 //! ([`GStoreConfig::query_settings`], applied to each database the servers
 //! open, build, create or restore): `integer_division`, `query_cache_size`,
 //! `early_termination`, `topk_bounded_heap`, `topk_dpb` and
-//! `gfun_max_output_bytes`. Upstream has no key for any of them (its query
-//! cache budget, 100 MB, is a constant in `QueryCache.h`). They are
-//! documented on the fields below and in the example file.
+//! `gfun_max_output_bytes`. In a `[pfn]` section, the sandbox limits of PFN
+//! user functions (applied the same way, `crate::pfn`): `pfn_fuel_per_call`,
+//! `pfn_max_memory_pages`, `pfn_max_module_bytes` and `pfn_max_functions`
+//! (upstream's only PFN key is `[system]`'s `pfn_base_path`, the directory
+//! the functions live in — read here too). Upstream has no key for any of
+//! them (its query cache budget, 100 MB, is a constant in `QueryCache.h`).
+//! They are documented on the fields below and in the example file.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -241,6 +245,10 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("query", "topk_bounded_heap"),
     ("query", "topk_dpb"),
     ("query", "gfun_max_output_bytes"),
+    ("pfn", "pfn_fuel_per_call"),
+    ("pfn", "pfn_max_memory_pages"),
+    ("pfn", "pfn_max_module_bytes"),
+    ("pfn", "pfn_max_functions"),
 ];
 
 /// Accepted spellings that map onto a [`KNOWN_KEYS`] entry.
@@ -389,7 +397,23 @@ pub struct GStoreConfig {
     /// *(Rust extension)* The most bytes of JSON one graph-function call
     /// (`shortestPaths(…)`, `kHopEnumerate(…)`, …) may produce before the
     /// query fails (default [`DEFAULT_GFUN_MAX_OUTPUT_BYTES`], 64 MiB).
+    /// Also bounds the text one PFN function call may emit.
     pub gfun_max_output_bytes: usize,
+
+    // ---- [pfn] (Rust extension) -----------------------------------------
+    /// *(Rust extension)* The most WebAssembly instructions one PFN function
+    /// call may run; `0` = unlimited (it still stops when the query is
+    /// cancelled). Default [`crate::pfn::DEFAULT_FUEL_PER_CALL`] (10^9).
+    pub pfn_fuel_per_call: u64,
+    /// *(Rust extension)* The most 64 KiB pages a PFN function's memory may
+    /// grow to (1..=65536; default 1024 = 64 MiB).
+    pub pfn_max_memory_pages: u32,
+    /// *(Rust extension)* The largest PFN module, source and compiled, in
+    /// bytes (default 1 MiB).
+    pub pfn_max_module_bytes: usize,
+    /// *(Rust extension)* The most PFN functions one user may own (default
+    /// 100).
+    pub pfn_max_functions: usize,
 
     // ---- provenance -----------------------------------------------------
     /// The file this configuration was loaded from, if any.
@@ -449,6 +473,10 @@ impl Default for GStoreConfig {
             topk_bounded_heap: true,
             topk_dpb: DpbMode::Auto,
             gfun_max_output_bytes: DEFAULT_GFUN_MAX_OUTPUT_BYTES,
+            pfn_fuel_per_call: crate::pfn::DEFAULT_FUEL_PER_CALL,
+            pfn_max_memory_pages: crate::pfn::DEFAULT_MAX_MEMORY_PAGES,
+            pfn_max_module_bytes: crate::pfn::DEFAULT_MAX_MODULE_BYTES,
+            pfn_max_functions: crate::pfn::DEFAULT_MAX_FUNCTIONS,
             source: None,
             explicit: BTreeSet::new(),
             warnings: Vec::new(),
@@ -670,6 +698,21 @@ impl GStoreConfig {
             "gfun_max_output_bytes" => {
                 self.gfun_max_output_bytes = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
             }
+            "pfn_fuel_per_call" => {
+                self.pfn_fuel_per_call =
+                    parse_num(v).ok_or_else(|| bad("a number of instructions (0 = unlimited)"))?
+            }
+            "pfn_max_memory_pages" => {
+                self.pfn_max_memory_pages = parse_num(v)
+                    .filter(|n| (1..=65_536).contains(n))
+                    .ok_or_else(|| bad("a number of 64 KiB pages, 1 to 65536"))?
+            }
+            "pfn_max_module_bytes" => {
+                self.pfn_max_module_bytes = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
+            "pfn_max_functions" => {
+                self.pfn_max_functions = parse_num(v).ok_or_else(|| bad("an integer"))?
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         self.explicit.insert(key.to_string());
@@ -742,6 +785,10 @@ impl GStoreConfig {
             }
             .to_string(),
             "gfun_max_output_bytes" => self.gfun_max_output_bytes.to_string(),
+            "pfn_fuel_per_call" => self.pfn_fuel_per_call.to_string(),
+            "pfn_max_memory_pages" => self.pfn_max_memory_pages.to_string(),
+            "pfn_max_module_bytes" => self.pfn_max_module_bytes.to_string(),
+            "pfn_max_functions" => self.pfn_max_functions.to_string(),
             _ => return None,
         })
     }
@@ -802,6 +849,12 @@ impl GStoreConfig {
                 dpb: self.topk_dpb,
             },
             gfun_max_output_bytes: self.gfun_max_output_bytes,
+            pfn: crate::pfn::PfnLimits {
+                fuel_per_call: self.pfn_fuel_per_call,
+                max_memory_pages: self.pfn_max_memory_pages,
+                max_module_bytes: self.pfn_max_module_bytes,
+                max_functions: self.pfn_max_functions,
+            },
         }
     }
 
@@ -1097,7 +1150,9 @@ upload_allow_compress_packages = "zip"
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
                     [query]\ninteger_division=truncate\nquery_cache_size=0\n\
                     early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
-                    gfun_max_output_bytes=4096\n";
+                    gfun_max_output_bytes=4096\n\
+                    [pfn]\npfn_fuel_per_call=0\npfn_max_memory_pages=2\n\
+                    pfn_max_module_bytes=5000\npfn_max_functions=3\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)), "every key counted as set");
@@ -1147,6 +1202,12 @@ upload_allow_compress_packages = "zip"
                     dpb: DpbMode::Always,
                 },
                 gfun_max_output_bytes: 4096,
+                pfn: crate::pfn::PfnLimits {
+                    fuel_per_call: 0,
+                    max_memory_pages: 2,
+                    max_module_bytes: 5000,
+                    max_functions: 3,
+                },
             }
         );
         assert_eq!(c.value("integer_division").unwrap(), "truncate");

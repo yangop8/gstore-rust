@@ -207,6 +207,10 @@ pub struct Snapshot {
     /// The database's graph-function output bound when the snapshot was
     /// published.
     gfun_max_output_bytes: usize,
+    /// The database's PFN caller (with its PFN limits) when the snapshot was
+    /// published ([`Database::set_pfn_caller`]): `PFN.name(…)` queries on the
+    /// snapshot call the same user's functions as the database's own.
+    pfn: Option<crate::pfn::PfnCaller>,
 }
 
 impl Snapshot {
@@ -236,6 +240,7 @@ impl Snapshot {
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
             allow_service: db.load_policy().allow_remote,
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
+            pfn: db.pfn_caller(),
         }
     }
 
@@ -273,6 +278,9 @@ impl Snapshot {
         }
         if !self.functions.is_empty() {
             eval = eval.with_functions(self.functions.clone());
+        }
+        if let Some(caller) = &self.pfn {
+            eval = eval.with_pfn(caller.clone());
         }
         eval.evaluate(&q)
     }
@@ -1017,6 +1025,11 @@ impl VersionView<'_> {
         }
         if !functions.is_empty() {
             eval = eval.with_functions(functions);
+        }
+        // Like the user-defined functions, the PFN caller is the latest
+        // snapshot's (functions are not versioned data).
+        if let Some(caller) = &latest.pfn {
+            eval = eval.with_pfn(caller.clone());
         }
         eval.evaluate(&q)
     }

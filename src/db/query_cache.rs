@@ -306,7 +306,12 @@ fn expr_ok(e: &Expr) -> bool {
         Expr::Aggregate { arg, .. } => arg.as_deref().is_none_or(expr_ok),
         // Upstream's graph functions are deterministic for given data.
         Expr::GraphFn { .. } => true,
-        // User code.
+        // User code — and its result depends on more than the query text and
+        // the data: on the calling user (each user has their own functions)
+        // and on the function's current version (an update, a recompilation
+        // or a delete changes it without touching the database). The cache is
+        // keyed by the text and the data version only, so a PFN query is
+        // never cached.
         Expr::Pfn { .. } => false,
     }
 }
@@ -387,6 +392,23 @@ mod tests {
             "SELECT ?s WHERE { ?s ?p ?o FILTER EXISTS { ?s ?q ?r FILTER(RAND() < 0.5) } }",
             "SELECT * WHERE { { SELECT (COUNT(RAND()) AS ?c) WHERE {} } }",
             "INSERT DATA { <a> <b> <c> }",
+        ] {
+            assert!(!ok(q), "{q} must not be cached");
+        }
+    }
+
+    /// A PFN result depends on the caller and on the function's version,
+    /// neither of which is part of the cache key: never cached, wherever the
+    /// call is (top level, sub-SELECT, next to cacheable projections).
+    #[test]
+    fn pfn_queries_are_never_cacheable() {
+        let ok = |q: &str| is_cacheable(&parse(q).unwrap());
+        for q in [
+            r#"SELECT (PFN.f({"src":"<a>"}) AS ?v) WHERE {}"#,
+            r#"SELECT (PFN f({}) AS ?v) WHERE { ?s ?p ?o }"#,
+            r#"SELECT ?s (PFN.f({"src":"?s"}) AS ?v) WHERE { ?s ?p ?o }"#,
+            r#"SELECT * WHERE { { SELECT (PFN.f({}) AS ?v) WHERE {} } }"#,
+            r#"SELECT ?s (PFN.f({}) AS ?v) WHERE { ?s ?p ?o } GROUP BY ?s"#,
         ] {
             assert!(!ok(q), "{q} must not be cached");
         }

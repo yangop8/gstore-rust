@@ -65,6 +65,7 @@ pub mod ipfilter;
 mod ops_db;
 mod ops_file;
 mod ops_lifecycle;
+mod ops_pfn;
 mod ops_query;
 mod ops_sys;
 mod ops_task;
@@ -353,6 +354,7 @@ pub fn registry() -> &'static Registry {
         ops_task::register(&mut reg);
         ops_db::register(&mut reg);
         ops_file::register(&mut reg);
+        ops_pfn::register(&mut reg);
         reg
     })
 }
