@@ -500,8 +500,9 @@ fn download_file(ctx: &Ctx<'_>, requested: &str, reach: Reach) -> Option<PathBuf
         (Ok(_), None) => true,
         (Err(_), _) => false,
     };
-    let in_root =
-        |roots: &[PathBuf]| resolve_existing(requested, Some(roots), &[export.clone()]).ok();
+    let in_root = |roots: &[PathBuf]| {
+        resolve_existing(requested, Some(roots), std::slice::from_ref(&export)).ok()
+    };
     let file = |p: PathBuf| p.is_file().then_some(p);
     if export_public || reach == Reach::Admin {
         if let Some(p) = in_root(std::slice::from_ref(&export)) {
@@ -672,7 +673,10 @@ mod tests {
             Ok(abs.clone())
         );
         // Relative to a base.
-        assert_eq!(resolve_existing("sub/a.nt", rs, &[root.clone()]), Ok(abs));
+        assert_eq!(
+            resolve_existing("sub/a.nt", rs, std::slice::from_ref(&root)),
+            Ok(abs)
+        );
         // Traversal, outside (existing or not), missing inside.
         let trav = format!("{}/sub/../../outside/secret.nt", root.display());
         assert_eq!(

@@ -591,12 +591,14 @@ mod tests {
         }
         // The file routes (see `ops_file`).
         for prefix in ["", "/grpc"] {
-            assert!(wants(&req("POST", &format!("{prefix}/file/upload"), None)));
-            assert!(!wants(&req("GET", &format!("{prefix}/file/upload"), None)));
-            assert!(wants(&req("POST", &format!("{prefix}/file/download"), None)));
-            assert!(wants(&req("GET", &format!("{prefix}/file/download"), None)));
-            assert!(wants(&req("GET", &format!("{prefix}/file/download/export/x.nt"), None)));
-            assert!(!wants(&req("POST", &format!("{prefix}/file/download/x.nt"), None)));
+            let at =
+                |method: &str, path: &str| wants(&req(method, &format!("{prefix}{path}"), None));
+            assert!(at("POST", "/file/upload"));
+            assert!(!at("GET", "/file/upload"));
+            assert!(at("POST", "/file/download"));
+            assert!(at("GET", "/file/download"));
+            assert!(at("GET", "/file/download/export/x.nt"));
+            assert!(!at("POST", "/file/download/x.nt"));
         }
         assert!(!wants(&req("GET", "/file/other", None)));
     }
