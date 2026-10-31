@@ -500,29 +500,33 @@ fn download_file(ctx: &Ctx<'_>, requested: &str, reach: Reach) -> Option<PathBuf
         (Ok(_), None) => true,
         (Err(_), _) => false,
     };
-    let in_root = |roots: &[PathBuf]| {
-        resolve_existing(requested, Some(roots), std::slice::from_ref(&export)).ok()
+    // A relative name is taken inside the root, or — `export/x.nt`, as
+    // upstream's answers name files — inside the root's parent.
+    let in_root = |root: PathBuf| {
+        let mut bases = vec![root.clone()];
+        bases.extend(root.parent().map(Path::to_path_buf));
+        resolve_existing(requested, Some(std::slice::from_ref(&root)), &bases).ok()
     };
     let file = |p: PathBuf| p.is_file().then_some(p);
     if export_public || reach == Reach::Admin {
-        if let Some(p) = in_root(std::slice::from_ref(&export)) {
+        if let Some(p) = in_root(export) {
             return file(p);
         }
     }
     if reach == Reach::Public {
         return None;
     }
-    if let Some(p) = in_root(&[upload_dir(ctx)]) {
+    if let Some(p) = in_root(upload_dir(ctx)) {
         return file(p);
     }
     if reach != Reach::Admin {
         return None;
     }
-    if let Some(p) = in_root(&[backup_dir(ctx)]) {
+    if let Some(p) = in_root(backup_dir(ctx)) {
         return file(p);
     }
     // A database directory under the home: `<home>/<name>.db/…` only.
-    let p = in_root(std::slice::from_ref(&home))?;
+    let p = in_root(home)?;
     let rel = p.strip_prefix(canon_home.as_ref()?).ok()?;
     let mut parts = rel.components();
     let first = parts.next()?.as_os_str().to_string_lossy().into_owned();

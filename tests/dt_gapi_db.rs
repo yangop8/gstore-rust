@@ -1161,6 +1161,18 @@ fn export_writes_a_file_that_downloads_without_credentials() {
     assert_eq!((r.status, r.text()), (200, content.clone()));
     let r = send(
         a,
+        "GET",
+        &format!("/file/download/export/{fname}"),
+        &[],
+        b"",
+    );
+    assert_eq!(
+        (r.status, r.text()),
+        (200, content.clone()),
+        "upstream's export/ prefix"
+    );
+    let r = send(
+        a,
         "POST",
         "/file/download",
         &[("Content-Type", "application/x-www-form-urlencoded")],
@@ -1288,6 +1300,8 @@ fn downloads_are_confined_to_their_roots() {
     };
     let r = with("bob", &lubm);
     assert_eq!((r.status, r.text()), (200, LUBM.to_string()));
+    let r = with("bob", "lubm.nt");
+    assert_eq!((r.status, r.text()), (200, LUBM.to_string()), "by name");
     not_found(&with("bob", dbfile.to_str().unwrap()));
     let r = with("root", dbfile.to_str().unwrap());
     assert_eq!(r.status, 200);
