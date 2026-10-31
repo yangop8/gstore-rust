@@ -130,7 +130,7 @@ pub fn shortest_path_count(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue> 
 
 /// `shortestPaths(u, v, directed, predSet)` — *all* shortest paths.
 ///
-/// GE ~2008/~3086 → `GeneralEvaluation::kHopShortestPaths` (GE ~4146);
+/// GE ~2008/~3086 → `GeneralEvaluation::kHopShortestPaths` (GE ~4134);
 /// algorithm `kHopShortestPaths.cpp:27` (+ `djstl_dfs`, `:5`). Per pair:
 /// `u < 0 || v < 0` → nothing; `u == v` → `SEP` + `PATH(u, u, [])`; else
 /// BFS from `u` (out-neighbours, plus in-neighbours when undirected) recording
@@ -262,7 +262,7 @@ pub fn k_hop_neighbor(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue> {
 /// `kHopAllNeighbors(u, directed, k, predSet [, retNum])` — every node within
 /// `hop(k)` hops, `u` included.
 ///
-/// GE ~2012/~3090 → `GeneralEvaluation::kHopAllNeighbors` (GE ~4170):
+/// GE ~2012/~3090 → `GeneralEvaluation::kHopAllNeighbors` (GE ~4161):
 /// `u < 0` → nothing; `max_depth = hop(k)`, `max_retNum = retNum < 0 ? 100 :
 /// retNum` (absent = -1 → 100). Algorithm `kHopAllNeighbors.cpp:5`: BFS from
 /// `u` (out-neighbours, plus in-neighbours when undirected; neighbours of a

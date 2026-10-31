@@ -2,12 +2,12 @@
 //!
 //! Mirrors upstream gStore's `CSR` (`src/Database/CSR.{h,cpp}`) exactly as
 //! `GeneralEvaluation::loadCSR` builds it (`src/Query/GeneralEvaluation.cpp`
-//! ~137-226) and `CSRQueryHandler` reads it (`src/Query/Algorithm/
+//! ~138-261) and `CSRQueryHandler` reads it (`src/Query/Algorithm/
 //! CSRQueryHandler.cpp`):
 //!
 //! * **Entities only.** A triple `(s, p, o)` becomes an edge `s -p-> o` only
 //!   when `o` is an entity (IRI / blank node); triples with a literal object are
-//!   skipped (GE.cpp ~163-170, ~199-200). Subjects are always entities.
+//!   skipped (GE.cpp ~173, ~210). Subjects are always entities.
 //! * **Per predicate.** Edges keep their predicate. Two triples `(s, p1, o)`
 //!   and `(s, p2, o)` are two edges (one per predicate) — exactly like
 //!   upstream's one-CSR-per-predicate layout; nothing is de-duplicated across
@@ -18,8 +18,8 @@
 //!   and [`Dir::In`] address the same two adjacencies.
 //! * **Vertex set.** `n` = the number of distinct entities that occur in at
 //!   least one entity–entity edge (any predicate) — upstream's `csr[1].n`
-//!   (GE.cpp ~209-216, `CSRQueryHandler::getVertNum`). `m` = the total number
-//!   of entity–entity edges, counted per predicate (`csr[1].m`, GE.cpp ~218-221).
+//!   (GE.cpp ~239-245, `CSRQueryHandler::getVertNum`). `m` = the total number
+//!   of entity–entity edges, counted per predicate (`csr[1].m`, GE.cpp ~247-250).
 //!   Self-loops `(s, p, s)` are kept.
 //! * **Neighbour order.** Within one predicate, out-neighbours are listed in
 //!   ascending object id and in-neighbours in ascending subject id (upstream
@@ -45,7 +45,7 @@
 //! # Predicate filters
 //!
 //! [`PredFilter`] is upstream's resolved `pred_id_set`
-//! (`GeneralEvaluation::getPredSetByStringList`, GE.cpp ~4165-4206): the empty
+//! (`GeneralEvaluation::getPredSetByStringList`, GE.cpp ~4181-4222): the empty
 //! set `{}` means every predicate, a positive list means exactly those (unknown
 //! IRIs dropped, duplicates dropped, first-appearance order kept), and any `!<p>`
 //! exclusion means "every predicate except the excluded ones" — positive
@@ -247,7 +247,7 @@ impl CsrGraph {
                 u32::MAX
             )));
         }
-        let mut nodes: Vec<EntityLiteralId> = Vec::with_capacity(raw.len().min(1 << 20) * 2);
+        let mut nodes: Vec<EntityLiteralId> = Vec::with_capacity(raw.len() * 2);
         for &(s, _, o) in &raw {
             nodes.push(s);
             nodes.push(o);
@@ -640,7 +640,7 @@ impl PredFilter {
     }
 
     /// Resolve a parsed predicate set against the dictionary with upstream
-    /// semantics (`getPredSetByStringList`, GE.cpp ~4165-4206):
+    /// semantics (`getPredSetByStringList`, GE.cpp ~4181-4222):
     ///
     /// * `include` and `exclude` both empty → every predicate;
     /// * only `include` → those predicates that exist, deduplicated, in
@@ -691,8 +691,9 @@ impl PredFilter {
     /// Upstream's materialised `pred_id_set` vector, in its exact order:
     /// ascending ids of the predicate space minus exclusions for `All` /
     /// `Exclude`, the list itself for `Include`. The space is the larger of
-    /// the resolve-time dictionary count and `csr`'s [`pred_slots`]
-    /// (`CsrGraph::pred_slots`), so every predicate with an edge is covered.
+    /// the resolve-time dictionary count and `csr`'s
+    /// [`pred_slots`](CsrGraph::pred_slots), so every predicate with an edge
+    /// is covered.
     pub fn pred_ids(&self, csr: &CsrGraph) -> Vec<PredId> {
         match &self.kind {
             FilterKind::Include(l) => l.clone(),

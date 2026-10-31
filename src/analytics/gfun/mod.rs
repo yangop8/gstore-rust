@@ -8,7 +8,7 @@
 //! * argument parsing — `src/Parser/QueryParser.cpp` ~395-600;
 //! * evaluation + output — `src/Query/GeneralEvaluation.cpp` ("GE"): the
 //!   all-constant branch ~1538-2058 and the WHERE-backed branch ~2547-3110,
-//!   the helpers ~3404-3454 (`pathVec2JSON`, `vertVec2JSON`) and ~4093-4206;
+//!   the helpers ~3404-3454 (`pathVec2JSON`, `vertVec2JSON`) and ~4093-4222;
 //! * algorithms — `src/Query/Algorithm/*.cpp` (`PathQueryHandler`).
 //!
 //! This module holds the shared vocabulary ([`GFnKind`], [`GArgs`],
@@ -502,6 +502,40 @@ impl<'a> GFunCtx<'a> {
     /// The entity id of a node.
     pub fn entity(&self, node: NodeId) -> EntityLiteralId {
         self.csr.entity_of(node)
+    }
+
+    /// Upstream `CSRQueryHandler::getOutSize(vid, pred)` on an upstream vertex
+    /// id (an entity id as `int`; `-1` or a non-vertex has no neighbours).
+    /// For bug-compatible ports that index neighbours by position.
+    pub fn get_out_size(&self, vid: i64, pred: PredId) -> usize {
+        self.upstream_node(vid)
+            .map_or(0, |n| self.csr.out_neighbors(n, pred).len())
+    }
+
+    /// Upstream `getOutVertID(vid, pred, pos)`: the `pos`-th out-neighbour's
+    /// entity id, or `-1` when `pos >= getOutSize(vid, pred)`.
+    pub fn get_out_vert_id(&self, vid: i64, pred: PredId, pos: usize) -> i64 {
+        self.upstream_node(vid)
+            .and_then(|n| self.csr.out_neighbors(n, pred).get(pos).copied())
+            .map_or(-1, |m| i64::from(self.csr.entity_of(m)))
+    }
+
+    /// Upstream `getInSize(vid, pred)` (see [`get_out_size`](Self::get_out_size)).
+    pub fn get_in_size(&self, vid: i64, pred: PredId) -> usize {
+        self.upstream_node(vid)
+            .map_or(0, |n| self.csr.in_neighbors(n, pred).len())
+    }
+
+    /// Upstream `getInVertID(vid, pred, pos)`: the `pos`-th in-neighbour's
+    /// entity id, or `-1` past the end.
+    pub fn get_in_vert_id(&self, vid: i64, pred: PredId, pos: usize) -> i64 {
+        self.upstream_node(vid)
+            .and_then(|n| self.csr.in_neighbors(n, pred).get(pos).copied())
+            .map_or(-1, |m| i64::from(self.csr.entity_of(m)))
+    }
+
+    fn upstream_node(&self, vid: i64) -> Option<NodeId> {
+        u32::try_from(vid).ok().and_then(|id| self.csr.node_of(id))
     }
 }
 

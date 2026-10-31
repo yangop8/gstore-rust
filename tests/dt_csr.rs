@@ -295,9 +295,11 @@ fn csr_graph_is_shareable_across_threads() {
     assert!(Arc::ptr_eq(&g1, &db.csr().unwrap()));
 }
 
-/// Temporary: until the path/metric packages land, every graph function
-/// returns the clean not-implemented error (the next packages replace this
-/// test with real expectations).
+/// Temporary: every graph function is reachable through the dispatcher and,
+/// while it is still a stub, fails with the clean not-implemented error that
+/// names it. (The path/metric packages replace the stubs and add real
+/// expectations; an implemented function must return its declared kind for
+/// these complete arguments.)
 #[test]
 fn gfun_dispatch_reaches_every_function() {
     let db = Database::build_from_str("social", SOCIAL).unwrap();
@@ -308,8 +310,16 @@ fn gfun_dispatch_reaches_every_function() {
         srcs: vec![alice],
         dsts: vec![ent(&db, "Carol")],
         src_given: true,
+        directed: true,
+        k: Some(2),
+        ret_num: Some(3),
         preds: PredFilter::all(db.dict().predicate_num() as u32),
-        ..GArgs::default()
+        alpha: Some(0.85),
+        max_iter: Some(10.0),
+        tol: Some(1e-6),
+        increase: Some(0.1),
+        extra: vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        empty_where: true,
     };
     for kind in GFnKind::ALL {
         match gfun::eval(kind, &ctx, &args) {
@@ -317,7 +327,15 @@ fn gfun_dispatch_reaches_every_function() {
                 assert!(gfun::is_not_implemented(&e), "{kind}: unexpected error {e}");
                 assert!(e.to_string().contains(kind.name()), "{kind}: {e}");
             }
-            Ok(v) => panic!("{kind} is still a stub but returned {v:?}"),
+            Ok(v) => {
+                let got = match v {
+                    gfun::GFunValue::Json(_) => gfun::GFunValueKind::Json,
+                    gfun::GFunValue::Bool(_) => gfun::GFunValueKind::Bool,
+                    gfun::GFunValue::Int(_) => gfun::GFunValueKind::Int,
+                    gfun::GFunValue::Num(_) => gfun::GFunValueKind::Num,
+                };
+                assert_eq!(got, kind.output_kind(), "{kind}");
+            }
         }
     }
     // Cancellation is checked before dispatch.
@@ -332,4 +350,22 @@ fn gfun_dispatch_reaches_every_function() {
     assert_eq!(ctx.term(alice), "<Alice>");
     assert_eq!(ctx.pred_iri(pred(&db, "like")), "<like>");
     assert_eq!(ctx.term(gfun::INVALID_ENTITY_LITERAL_ID), "");
+
+    // Upstream-style positional neighbour access on entity ids.
+    let (like, focus) = (pred(&db, "like"), pred(&db, "focus"));
+    let (bob, carol) = (i64::from(ent(&db, "Bob")), i64::from(ent(&db, "Carol")));
+    let a = i64::from(alice);
+    assert_eq!(ctx.get_out_size(a, like), 1);
+    assert_eq!(ctx.get_out_vert_id(a, like, 0), bob);
+    assert_eq!(ctx.get_out_vert_id(a, like, 1), -1, "past the end is -1");
+    // Carol is liked by Eve and Francis (ascending entity id).
+    let mut likers = vec![i64::from(ent(&db, "Eve")), i64::from(ent(&db, "Francis"))];
+    likers.sort_unstable();
+    assert_eq!(ctx.get_in_size(carol, like), 2);
+    assert_eq!(
+        (ctx.get_in_vert_id(carol, like, 0), ctx.get_in_vert_id(carol, like, 1)),
+        (likers[0], likers[1])
+    );
+    assert_eq!(ctx.get_in_size(carol, focus), 0);
+    assert_eq!((ctx.get_out_size(-1, like), ctx.get_out_vert_id(-1, like, 0)), (0, -1));
 }

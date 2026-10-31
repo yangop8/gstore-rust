@@ -109,7 +109,7 @@ pub fn closeness_centrality(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue>
 
 /// `betweennessCentrality(u, directed, predSet)`.
 ///
-/// GE ~1996/~3074 → `GeneralEvaluation::betweennessCentrality` (GE ~4100):
+/// GE ~1996/~3074 → `GeneralEvaluation::betweennessCentrality` (GE ~4099):
 /// `u < 0` → nothing. Algorithm `betweennessCentrality.cpp:233` (+
 /// `getAllNeighborsById` `:5`, `shortestPathScalePassId` `:74`, the DFS
 /// helpers `:50`): empty `pred_id_set` → 0; `vertex =
@@ -215,7 +215,7 @@ pub fn louvain(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue> {
 
 /// `JaccardSimilarity(u, predSet, k, retNum)` — the nodes most similar to `u`.
 ///
-/// GE ~2000/~3078 → `GeneralEvaluation::JaccardSimilarity` (GE ~4108): `u <
+/// GE ~2000/~3078 → `GeneralEvaluation::JaccardSimilarity` (GE ~4107): `u <
 /// 0` → nothing; `max_depth = hop(k)`, `max_retNum = retNum < 0 ? 10 :
 /// retNum`. Algorithm `JaccardSimilarity.cpp:6` in **`f32`** arithmetic:
 /// `N(x)` = in ∪ out neighbours (a `std::set`, direction ignored); empty
@@ -239,7 +239,7 @@ pub fn jaccard_similarity(_ctx: &GFunCtx<'_>, _a: &GArgs) -> Result<GFunValue> {
 /// `degreeCorrelation(u, k, predSet)` — Pearson correlation of adjacent
 /// degrees in `u`'s `k`-hop neighbourhood.
 ///
-/// GE ~2004/~3082 → `GeneralEvaluation::degreeCorrelation` (GE ~4126): `u <
+/// GE ~2004/~3082 → `GeneralEvaluation::degreeCorrelation` (GE ~4125): `u <
 /// 0` → nothing; `max_depth = hop(k)`. Algorithm `degreeCorrelation.cpp:5`:
 /// empty `pred_id_set` → 0; a BFS from `u` over out ∪ in neighbours (a
 /// `std::set` per node) within `max_depth` records each dequeued node's degree
@@ -349,7 +349,8 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
     }
     let (s_len, t_len) = (s.len() as i64, t.len() as i64);
     if contains(s, t) {
-        return (t_len as f32 / s_len as f32 + t_len as f32 / t_len as f32 + 1.0) / 3.0;
+        // Upstream: (t/s + t/t + 1) / 3, where t/t is exactly 1.
+        return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
     }
     let window = t_len / 2 - 1;
     let mut sv = vec![-1i64; s.len()];

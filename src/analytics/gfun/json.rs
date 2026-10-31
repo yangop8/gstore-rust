@@ -147,7 +147,7 @@ impl Sep {
     }
 }
 
-/// `GeneralEvaluation::pathVec2JSON(src, dst, path, ss)` (GE ~3404-3440):
+/// `GeneralEvaluation::pathVec2JSON(src, dst, path, ss)` (GE ~3404-3441):
 ///
 /// ```text
 /// {"src":"<S>","dst":"<D>","edges":[{"fromNode":a,"toNode":b,"predIRI":"<p>"},...],"nodes":[{"nodeIndex":id,"nodeIRI":"<iri>"},...]}
