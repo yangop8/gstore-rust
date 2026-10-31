@@ -557,6 +557,59 @@ mod with_zip {
         assert_eq!(int(&j, "success_num"), 5);
     }
 
+    /// A one-route HTTP server answering `GET <path>` with `body`.
+    fn serve_bytes(path: &'static str, body: Vec<u8>) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+                    head.push(b[0]);
+                }
+                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+                let found = line.split_whitespace().nth(1) == Some(path);
+                let (status, payload): (&str, &[u8]) = if found {
+                    ("200 OK", &body)
+                } else {
+                    ("404 Not Found", b"")
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = s.write_all(payload);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn remote_packages_are_downloaded_and_unpacked() {
+        let http = serve_bytes("/data.zip", package(&[E::File("lubm.nt", LUBM.as_bytes())]));
+        let mut policy = LoadPolicy::restricted();
+        policy.allow_remote = true;
+        let srv = start_with("remotepkg", |_| {}, move |s| s.with_load_policy(policy));
+        let url = format!("http://{http}/data.zip");
+        let j = api(
+            &srv.addr,
+            &[
+                ("operation", "build"),
+                ("db_name", "remote"),
+                ("db_path", &url),
+                ("remote", "true"),
+            ],
+        );
+        ok(&j);
+        assert_eq!(int(&j, "success_num"), 5);
+        // The download and the unpacked directory are both gone.
+        assert!(srv.uploads().is_empty(), "{:?}", srv.uploads());
+    }
+
     #[test]
     fn the_load_policy_applies_to_the_package_path() {
         let elsewhere = tmp_root("pkg_elsewhere");

@@ -954,6 +954,87 @@ mod tests {
         }
 
         #[test]
+        fn symlinks_are_ignored() {
+            let d = tmp("link");
+            let z = d.join("l.zip");
+            let mut zw = zip::ZipWriter::new(fs::File::create(&z).unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.add_symlink("evil.nt", "/etc/passwd", opts).unwrap();
+            zw.start_file("ok.nt", opts).unwrap();
+            zw.write_all(b"x").unwrap();
+            zw.finish().unwrap();
+            let out = d.join("out");
+            let files = unpack(&z, &out, &ZipLimits::default(), &nt).unwrap();
+            assert_eq!(files.len(), 1);
+            assert!(fs::symlink_metadata(out.join("evil.nt")).is_err());
+            // A package of links only holds no file.
+            let z2 = d.join("l2.zip");
+            let mut zw = zip::ZipWriter::new(fs::File::create(&z2).unwrap());
+            zw.add_symlink("a.nt", "/etc/passwd", opts).unwrap();
+            zw.finish().unwrap();
+            let e = unpack(&z2, &d.join("o2"), &ZipLimits::default(), &nt).unwrap_err();
+            assert_eq!(e.code(), Some(ZipCode::EmptyDir));
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        /// Overwrite every 4-byte little-endian `from` at the size fields of
+        /// the local (offset 22) and central (offset 24) headers with `to`.
+        fn lie_about_sizes(bytes: &mut [u8], from: u32, to: u32) {
+            let mut patched = 0;
+            for i in 0..bytes.len().saturating_sub(4) {
+                let sig = &bytes[i..i + 4];
+                let at = if sig == b"PK\x03\x04" {
+                    i + 22
+                } else if sig == b"PK\x01\x02" {
+                    i + 24
+                } else {
+                    continue;
+                };
+                if bytes[at..at + 4] == from.to_le_bytes() {
+                    bytes[at..at + 4].copy_from_slice(&to.to_le_bytes());
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 2, "both headers patched");
+        }
+
+        #[test]
+        fn a_header_that_lies_does_not_unpack_more_than_the_limit() {
+            let d = tmp("lie");
+            let z = d.join("bomb.zip");
+            let big = vec![b' '; 1 << 20];
+            let mut zw = zip::ZipWriter::new(fs::File::create(&z).unwrap());
+            zw.start_file(
+                "bomb.nt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zw.write_all(&big).unwrap();
+            zw.finish().unwrap();
+            let mut bytes = fs::read(&z).unwrap();
+            lie_about_sizes(&mut bytes, 1 << 20, 100);
+            fs::write(&z, &bytes).unwrap();
+            let limits = ZipLimits {
+                max_size: 4096,
+                ..ZipLimits::default()
+            };
+            let out = d.join("out");
+            // The header claims 100 bytes; whatever happens, no more than the
+            // limit reaches the disk.
+            let res = unpack(&z, &out, &limits, &nt);
+            let on_disk: u64 = fs::read_dir(&out)
+                .map(|rd| rd.flatten().map(|e| e.metadata().unwrap().len()).sum())
+                .unwrap_or(0);
+            assert!(on_disk <= limits.max_size, "{on_disk} bytes written");
+            match res {
+                Err(e) => assert_eq!(e.code(), Some(ZipCode::WriteError), "{e}"),
+                Ok(files) => assert!(files.iter().all(|f| f.size <= 100)),
+            }
+            let _ = fs::remove_dir_all(&d);
+        }
+
+        #[test]
         fn export_archives_hold_the_file_by_name() {
             let d = tmp("exp");
             let f = d.join("db_20240101000000.nt");
