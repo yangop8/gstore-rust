@@ -162,4 +162,16 @@ fn main() {
              ?a :val ?x . ?b :val ?y . ?c :val ?z }} ORDER BY DESC(?x + 2*?y - ?z) LIMIT 10"
         ),
     );
+
+    // Fan-out 5: about four matches per value DP-B reads, the default
+    // mode's threshold.
+    let data = stars(400 * scale, 5);
+    bench(
+        "DP-B star fan-out 5",
+        &data,
+        &format!(
+            "{p}SELECT ?h ?x ?y ?z WHERE {{ ?h :type :Hub . ?h :a ?a . ?h :b ?b . ?h :c ?c . \
+             ?a :val ?x . ?b :val ?y . ?c :val ?z }} ORDER BY (?x + ?y + ?z) LIMIT 10"
+        ),
+    );
 }

@@ -77,13 +77,15 @@
 //!   sorts first (ASC) or last (DESC); here such data takes the heap path.
 //!
 //! DP-B reads every candidate value of the tree once (the semi-join
-//! reduction), so it pays off when there are many more matches than values —
-//! a star or a one-to-many edge — not on a chain of one-to-one edges, where
-//! the heap is cheaper. Upstream runs DP-B on every such query; here the
-//! default [`DpbMode::Auto`] estimates the matches (root values times each
-//! tree edge's average fan-out, from the store's per-predicate statistics)
-//! and runs DP-B only when they outnumber the values it reads at least four
-//! times; [`DpbMode::Always`] skips the estimate.
+//! reduction), at about the cost the heap path pays per match, so it pays
+//! off when there are more matches than values — a star or a one-to-many
+//! edge — not on a chain of one-to-one edges, where the heap is cheaper
+//! (`examples/topk_bench.rs`: 3× slower there, 12× faster on a star with
+//! fan-out 5, 100× with fan-out 20). Upstream runs DP-B on every such query;
+//! here the default [`DpbMode::Auto`] estimates the matches (root values
+//! times each tree edge's average fan-out, from the store's per-predicate
+//! statistics) and runs DP-B only when they outnumber the values it reads
+//! at least twice; [`DpbMode::Always`] skips the estimate.
 //!
 //! Cycles, which upstream cuts and re-checks, also take the heap path. DP-B
 //! enumerates until it has `k` matches and all matches tied with the `k`-th
@@ -1628,7 +1630,7 @@ const MAX_COEF_SUM: i128 = 1 << 32;
 const MAX_CONST: i128 = 1 << 62;
 /// [`DpbMode::Auto`] runs DP-B when it expects at least this many matches
 /// per value it reads.
-const DPB_MIN_GAIN: f64 = 4.0;
+const DPB_MIN_GAIN: f64 = 2.0;
 
 /// `Σ coef[v]·?v + constant` with integer coefficients; `vars` are all the
 /// variables it reads (a zero coefficient still needs an integer value, or
