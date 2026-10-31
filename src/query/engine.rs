@@ -10,6 +10,67 @@
 //! 3. Cost-based join ordering (see [`crate::query::optimizer`]).
 //! 4. Iteratively extend partial bindings by indexed lookups + unification.
 //! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
+//!
+//! # Advanced graph functions (gStore 1.4)
+//!
+//! Upstream's advanced functions — `shortestPath(?x, <b>, true, {<p>})`,
+//! `PR(true, {}, 10, alpha=0.85, maxIter=100, tol=0.001)`, `WCC({})`, … (the
+//! parser's [`Expr::GraphFn`]) — are evaluated as upstream's
+//! `GeneralEvaluation::getFinalResult` does, by the engine-independent library
+//! [`crate::analytics::gfun`] over the per-predicate
+//! [`CsrGraph`]:
+//!
+//! * **Where.** Only as the whole expression of a SELECT projection,
+//!   `(f(…) AS ?v)`. Upstream also *parses* `simpleCycleBoolean`,
+//!   `cycleBoolean`, `shortestPathLen` and `kHopReachable` inside FILTER but
+//!   never evaluates them there (no case in `TempResult::doComp`); here any
+//!   nested use is a query error that points to the legacy `rs:` function.
+//! * **Arguments.** A variable vertex argument contributes the *distinct*
+//!   values it is bound to across the WHERE solutions, in first-appearance
+//!   order (rows where it is unbound are skipped; a computed value that is
+//!   not a stored term is skipped, as upstream skips string columns; a stored
+//!   literal is passed as an edge-less vertex, as upstream passes its literal
+//!   id); a constant IRI is one vertex (unknown → upstream's `INVALID` id,
+//!   [`GNode::MISSING`]). Two vertex arguments are evaluated over the
+//!   cross product of their distinct values. The `predSet` resolves against
+//!   the dictionary (`{}` = every predicate, `!<p>` = every predicate but
+//!   these, unknown IRIs dropped).
+//! * **Row shape** (GE:1508-2050, GE:2546-3108). A lone projected function
+//!   yields exactly one row computed over all solutions; next to other
+//!   projections there is one row per solution and the function's value is
+//!   on the *last* one only (WHERE order, before ORDER BY), the other rows
+//!   leave it unbound; with GROUP BY it is computed once per group. ORDER BY
+//!   variables that are not projected count as projections, because upstream
+//!   appends them to its projection list. With no solutions — including
+//!   `WHERE {}`, which upstream evaluates to an empty table — a lone function
+//!   is evaluated once with its variables read as IRIs (so they are missing
+//!   vertices; `kHopNeighbor` then names its list `"dst"`, as upstream's
+//!   separate code path does) and anything else yields no row. DISTINCT,
+//!   OFFSET and LIMIT apply to the rows as usual. Next to standard aggregates
+//!   (`COUNT` …) without GROUP BY the query keeps SPARQL's one-row aggregate
+//!   semantics (upstream would emit one mostly empty row per solution).
+//! * **Values.** The `{"paths":[…]}` JSON text is a plain literal, exactly as
+//!   upstream emits it; `cycleBoolean` is an `xsd:boolean`;
+//!   `confidenceDegree`'s JSON array (upstream's `pfn_type`, which replaces
+//!   the whole upstream response) is a plain literal too.
+//! * **CSR.** [`Database`](crate::Database) hands its cached CSR to the
+//!   evaluator ([`Evaluator::with_csr_provider`]): it is built on the first
+//!   graph-function query after a data change and shared by later queries.
+//! * **Cancellation.** The library polls the evaluator's cancel flag.
+//!
+//! `PFN.name({…})` parses but is not evaluated yet (a query error).
+//!
+//! # IRI function calls
+//!
+//! `<iri>(…)` / `pfx:name(…)` ([`Expr::IriCall`]) is, in order: a legacy
+//! gstore-rust graph built-in in the predeclared `rs:` namespace
+//! (`<urn:gstore-rust:fn:NAME>`, e.g. `rs:SSSPLEN(<a>, <b>)`, unchanged
+//! semantics, usable anywhere); a SPARQL 1.1 XSD constructor cast
+//! (`xsd:string`, `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:float`,
+//! `xsd:boolean`, `xsd:dateTime`, and `xsd:date`; a cast the §17.5 table
+//! forbids or an invalid lexical form is an expression error, i.e. unbound);
+//! or a user function registered on the [`Database`](crate::Database) under
+//! the full IRI or its local name. Any other IRI call is a query error.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -3136,7 +3197,7 @@ fn parse_xsd_double(s: &str) -> Option<f64> {
         Some(i) => (&s[..i], Some(&s[i + 1..])),
         None => (s, None),
     };
-    if !is_decimal_lexical(mantissa) || !exponent.map_or(true, is_integer_lexical) {
+    if !is_decimal_lexical(mantissa) || !exponent.is_none_or(is_integer_lexical) {
         return None;
     }
     s.parse().ok()
