@@ -114,13 +114,14 @@ use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::GStoreConfig;
 use crate::db::{Database, LoadPolicy, LoadSource};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
+use crate::gapi::tasks::{TaskConfig, TaskManager};
 use crate::gapi::GapiConfig;
 use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
@@ -664,24 +665,6 @@ pub(crate) enum JobOutput {
     },
 }
 
-/// One in-flight query/update task, tracked so `/tasklist` can list it and
-/// `/cancel` can flag it for cancellation.
-///
-/// `cancel` is a live cooperative-cancellation flag: it is cloned into the
-/// [`QueryJob`] that runs the query (off the [`ApiState`] lock) and threaded
-/// into [`Database::query_cancellable`], which polls it and aborts an in-flight
-/// read with [`GStoreError::Cancelled`](crate::GStoreError::Cancelled). A
-/// concurrent `POST /cancel` sets it while the query is still executing.
-pub(crate) struct TaskEntry {
-    pub(crate) db: String,
-    /// A short, log-safe snippet of the query text (newlines flattened,
-    /// truncated) — not necessarily the full statement.
-    pub(crate) query: String,
-    pub(crate) user: String,
-    pub(crate) started: Instant,
-    pub(crate) cancel: Arc<AtomicBool>,
-}
-
 /// Mutable server state guarded by a single mutex. The registries here are all
 /// cheap to touch, so this lock is only ever held briefly; the *databases* live
 /// behind their own per-db locks ([`ApiState::dbs`]) so a long query holds only
@@ -717,8 +700,6 @@ pub(crate) struct ApiState {
     /// — the upstream test scripts address the first transaction as `tid=1`.
     /// Ownership checks, not unguessable ids, keep transactions apart.
     pub(crate) next_tid: u64,
-    /// In-flight query/update tasks by id (see [`TaskEntry`]).
-    pub(crate) tasks: HashMap<u64, TaskEntry>,
     pub(crate) started: Instant,
     pub(crate) requests: u64,
     /// The `LOAD` policy installed on every database this server serves
@@ -820,9 +801,26 @@ pub(crate) struct ApiInner {
     /// [`ApiServer::with_system_password`]; `gserver` writes it to the second
     /// line of its pid file, as upstream does.
     system_password: String,
+    /// Running SPARQL statements and asynchronous operations (`/tasklist`,
+    /// `/cancel`, and the `/api` layer's `opt_id` operations). Its own lock,
+    /// independent of the state lock: a cancellation never waits for it.
+    /// Every statement is registered here — see
+    /// [`register_task`](Self::register_task) — and cancelled through the
+    /// flag it hands out (cloned into the [`QueryJob`] and threaded into
+    /// [`Database::query_cancellable`], which polls it and aborts an
+    /// in-flight read with [`GStoreError::Cancelled`](crate::GStoreError::Cancelled)).
+    pub(crate) tasks: TaskManager,
+    /// This value's own `Arc` (set when serving starts), so an asynchronous
+    /// operation can outlive the request that submitted it.
+    self_ref: OnceLock<Weak<ApiInner>>,
 }
 
 impl ApiInner {
+    /// A weak handle on this value's `Arc`, once the server serves (`None`
+    /// before [`ApiServer::serve_forever`]).
+    pub(crate) fn weak_self(&self) -> Option<Weak<ApiInner>> {
+        self.self_ref.get().cloned()
+    }
     /// Whether a write must be saved before it is acknowledged: the
     /// check_point policy, or a shutdown in progress (see [`closing`](Self::closing)).
     pub(crate) fn save_writes(&self) -> bool {
@@ -927,8 +925,9 @@ pub(crate) struct QueryJob {
     /// The target database (its own lock, independent of `ApiState`).
     pub(crate) db: DbHandle,
     pub(crate) name: String,
-    /// Shared with the [`TaskEntry`] in [`ApiState::tasks`]; a concurrent
-    /// `/cancel` flips it and [`Database::query_cancellable`] observes it.
+    /// The task's flag in [`ApiInner::tasks`]; a concurrent `/cancel` (or
+    /// `operationTaskCancel`) flips it and [`Database::query_cancellable`]
+    /// observes it.
     pub(crate) cancel: Arc<AtomicBool>,
     /// The registry id to unregister once the query finishes.
     pub(crate) task_id: u64,
@@ -938,16 +937,34 @@ pub(crate) struct QueryJob {
     pub(crate) fmt: ResultFormat,
 }
 
-/// Unregisters a task when dropped — also when the query panics — so the
-/// `/tasklist` registry never keeps a dead entry.
+/// Ends a task when dropped — also when the query panics (then as failed) —
+/// so the task registry never lists a dead statement as running. Record the
+/// outcome with [`set_ok`](Self::set_ok) first.
 pub(crate) struct TaskGuard<'a> {
     pub(crate) inner: &'a ApiInner,
     pub(crate) id: u64,
+    pub(crate) ok: Option<bool>,
+}
+
+impl<'a> TaskGuard<'a> {
+    pub(crate) fn new(inner: &'a ApiInner, id: u64) -> TaskGuard<'a> {
+        TaskGuard {
+            inner,
+            id,
+            ok: None,
+        }
+    }
+
+    /// Whether the statement succeeded (a failure after a cancellation
+    /// request counts as cancelled).
+    pub(crate) fn set_ok(&mut self, ok: bool) {
+        self.ok = Some(ok);
+    }
 }
 
 impl Drop for TaskGuard<'_> {
     fn drop(&mut self) {
-        locked(&self.inner.state).tasks.remove(&self.id);
+        self.inner.tasks.finish(self.id, self.ok);
     }
 }
 
@@ -976,7 +993,6 @@ impl ApiServer {
                     db_txn: HashMap::new(),
                     ended_txns: VecDeque::new(),
                     next_tid: 1,
-                    tasks: HashMap::new(),
                     started: Instant::now(),
                     requests: 0,
                     load_policy: LoadPolicy::restricted(),
@@ -990,6 +1006,8 @@ impl ApiServer {
                 life: Arc::clone(&life),
                 config: GStoreConfig::default(),
                 system_password: new_system_password(),
+                tasks: TaskManager::default(),
+                self_ref: OnceLock::new(),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -1166,10 +1184,23 @@ impl ApiServer {
     /// that runs the query, `POST /cancel` sets it, and `/tasklist` reports it.
     /// This accessor lets an embedder reach the same flag directly.
     pub fn task_cancel_flag(&self, task_id: u64) -> Option<Arc<AtomicBool>> {
-        locked(&self.inner.state)
-            .tasks
-            .get(&task_id)
-            .map(|t| Arc::clone(&t.cancel))
+        self.inner.tasks.cancel_flag(task_id)
+    }
+
+    /// Replace the background task manager's settings (asynchronous
+    /// operation runners, result retention, callback delivery, cancellation
+    /// and shutdown waits; default [`TaskConfig::default`]).
+    pub fn with_task_config(self, config: TaskConfig) -> ApiServer {
+        self.inner.tasks.set_config(config);
+        self
+    }
+
+    /// The background task manager: running SPARQL statements (`/tasklist`,
+    /// `operationTaskList`) and asynchronous operations (`opt_id`,
+    /// `checkOperationState`). An embedder may submit its own background
+    /// work through it ([`TaskManager::submit`]).
+    pub fn task_manager(&self) -> &TaskManager {
+        &self.inner.tasks
     }
 
     /// Accept connections until [`shutdown`](Self::shutdown) (or `/shutdown`,
@@ -1178,6 +1209,7 @@ impl ApiServer {
     /// its database's lock, so concurrent requests — crucially `POST /cancel` —
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
+        let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
         let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
             Box::new(move || {
@@ -1195,6 +1227,7 @@ impl ApiServer {
     /// `tls` feature.
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
+        let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
         let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
@@ -1222,12 +1255,17 @@ impl ApiServer {
     fn finish_shutdown(&self, mut drained: bool) -> ShutdownReport {
         let inner = &self.inner;
         inner.closing.store(true, Ordering::SeqCst);
+        inner.tasks.close();
         if !drained {
-            for t in locked(&inner.state).tasks.values() {
-                t.cancel.store(true, Ordering::Relaxed);
-            }
+            inner.tasks.cancel_all();
             drained = self.life.wait_idle(Duration::from_secs(2));
         }
+        // Asynchronous operations are not requests: they had no grace period
+        // of their own, so ask them to stop now and wait for them, bounded
+        // (`TaskConfig::shutdown_wait`) — one that ignores the request keeps
+        // running past this point, against databases about to be retired.
+        inner.tasks.cancel_all();
+        let _ = inner.tasks.wait_async_idle(inner.tasks.config().shutdown_wait);
         let mut report = ShutdownReport {
             drained,
             ..ShutdownReport::default()
@@ -1401,12 +1439,15 @@ impl ApiInner {
     /// `/tquery`s). A write that changed data marks the database dirty and is
     /// saved before the lock is released under the check_point policy.
     pub(crate) fn run_query_job(&self, job: QueryJob) -> Result<JobOutput, OpError> {
-        // Declared before the db guard so it drops *after* it: the registry is
-        // touched (state lock) only once the db lock is released.
-        let _task = TaskGuard {
-            inner: self,
-            id: job.task_id,
-        };
+        // Ends the task (also on a panic) once the job — and so its db lock —
+        // is done.
+        let mut task = TaskGuard::new(self, job.task_id);
+        let out = self.run_query_job_locked(job);
+        task.set_ok(out.is_ok());
+        out
+    }
+
+    fn run_query_job_locked(&self, job: QueryJob) -> Result<JobOutput, OpError> {
         let mut slot = locked(&job.db);
         #[cfg(test)]
         if job.sparql.contains("__gstore_test_panic__") {
@@ -1621,15 +1662,15 @@ impl ApiInner {
             ("GET", "/txnlog") => self.guarded(st, &user, Privilege::Admin, |s, st| {
                 s.read_log(st, "txn.log")
             }),
-            ("GET", "/tasklist") => self.guarded(st, &user, Privilege::Admin, |s, st| {
-                s.handle_tasklist(st)
+            ("GET", "/tasklist") => self.guarded(st, &user, Privilege::Admin, |s, _| {
+                s.handle_tasklist()
             }),
             ("POST", "/cancel") => {
                 // Either privilege can cancel: Update (only your *own* long-running
                 // work) or Admin (an operator cancelling anyone's).
                 let is_admin = st.users.has_priv(&user, Privilege::Admin);
                 if is_admin || st.users.has_priv(&user, Privilege::Update) {
-                    self.handle_cancel(st, req, &user, is_admin)
+                    self.handle_cancel(req, &user, is_admin)
                 } else {
                     self.forbidden()
                 }
@@ -1790,50 +1831,49 @@ impl ApiInner {
 
     // ---- task registry / cancellation --------------------------------------
 
-    /// Register a new in-flight task for `db`/`sparql`/`user`, returning its id
+    /// Register a new in-flight SPARQL task for `db`/`sparql`/`user` in the
+    /// task manager ([`ApiInner::tasks`]), returning its id (its `opt_id`)
     /// and cancel flag. The [`TaskGuard`] in
-    /// [`execute_query_job`](Self::execute_query_job) unregisters it once the
-    /// query completes (success, error, or panic).
+    /// [`run_query_job`](Self::run_query_job) ends it once the query
+    /// completes (success, error, or panic). Run by an asynchronous operation
+    /// (an `async` `query`), the statement belongs to that operation's task
+    /// instead (see [`TaskManager::register`]). The state lock the caller may
+    /// hold is not needed (the manager has its own); the parameter keeps the
+    /// call sites unchanged.
     pub(crate) fn register_task(
         &self,
-        st: &mut ApiState,
+        _st: &mut ApiState,
         db: &str,
         sparql: &str,
         user: &str,
     ) -> (u64, Arc<AtomicBool>) {
-        let mut id = new_id();
-        while st.tasks.contains_key(&id) {
-            id = new_id();
-        }
-        let snippet: String = sparql.replace(['\n', '\r', '\t'], " ").chars().take(200).collect();
-        let cancel = Arc::new(AtomicBool::new(false));
-        st.tasks.insert(
-            id,
-            TaskEntry {
-                db: db.to_string(),
-                query: snippet,
-                user: user.to_string(),
-                started: Instant::now(),
-                cancel: Arc::clone(&cancel),
-            },
-        );
-        (id, cancel)
+        self.tasks.register("query", db, sparql, user)
     }
 
-    fn handle_tasklist(&self, st: &mut ApiState) -> Resp {
-        let mut ids: Vec<u64> = st.tasks.keys().copied().collect();
-        ids.sort_unstable();
+    /// `GET /tasklist` (Admin): the running tasks — SPARQL statements and
+    /// asynchronous operations — oldest first. `id` is the task's `opt_id`
+    /// (also given as a string, `opt_id`, for clients whose JSON numbers are
+    /// doubles).
+    fn handle_tasklist(&self) -> Resp {
         let mut items = Vec::new();
-        for id in ids {
-            let t = &st.tasks[&id];
+        for t in self.tasks.running() {
+            let snippet: String = t
+                .sparql
+                .replace(['\n', '\r', '\t'], " ")
+                .chars()
+                .take(200)
+                .collect();
             items.push(format!(
-                "{{\"id\":{},\"db\":{},\"user\":{},\"query\":{},\"elapsed_ms\":{},\"cancelled\":{}}}",
-                id,
-                json_str(&t.db),
+                "{{\"id\":{id},\"opt_id\":\"{id}\",\"operation\":{},\"async\":{},\"db\":{},\
+                 \"user\":{},\"query\":{},\"elapsed_ms\":{},\"cancelled\":{}}}",
+                json_str(&t.operation),
+                t.is_async,
+                json_str(&t.db_name),
                 json_str(&t.user),
-                json_str(&t.query),
-                t.started.elapsed().as_millis(),
-                t.cancel.load(Ordering::Relaxed),
+                json_str(&snippet),
+                t.elapsed.as_millis(),
+                t.cancel_requested,
+                id = t.opt_id,
             ));
         }
         let body = format!(
@@ -1843,25 +1883,28 @@ impl ApiInner {
         Resp::new(200, JSON, body.into_bytes())
     }
 
-    fn handle_cancel(&self, st: &mut ApiState, req: &Request, user: &str, is_admin: bool) -> Resp {
+    /// `POST /cancel?id=…` (Admin: any task; Update: only your own): raise a
+    /// running task's cancellation flag.
+    fn handle_cancel(&self, req: &Request, user: &str, is_admin: bool) -> Resp {
         let Some(id) = req
             .param("id")
             .or_else(|| req.param("task_id"))
+            .or_else(|| req.param("opt_id"))
             .or_else(|| req.param("tid"))
             .and_then(|s| s.trim().parse::<u64>().ok())
         else {
             return Resp::fail(400, "missing or malformed id/task_id parameter");
         };
-        match st.tasks.get(&id) {
-            Some(t) => {
+        match self.tasks.get(id) {
+            Some(t) if !t.state.is_finished() => {
                 // A non-admin may only cancel tasks they started; admins cancel any.
                 if !is_admin && t.user != user {
                     return Resp::fail(403, &format!("task {id} belongs to another user"));
                 }
-                t.cancel.store(true, Ordering::Relaxed);
+                self.tasks.request_cancel(id);
                 Resp::ok(&format!("cancel requested for task {id}"))
             }
-            None => Resp::fail(404, &format!("no active task {id}")),
+            _ => Resp::fail(404, &format!("no active task {id}")),
         }
     }
 
@@ -2452,11 +2495,10 @@ impl ApiInner {
             let mut st = locked(&self.state);
             self.register_task(&mut st, name, sparql, user)
         };
-        let _task = TaskGuard {
-            inner: self,
-            id: task_id,
-        };
-        Self::run_in_txn(dbh, name, tid, sparql, Some(cancel))
+        let mut task = TaskGuard::new(self, task_id);
+        let out = Self::run_in_txn(dbh, name, tid, sparql, Some(cancel));
+        task.set_ok(out.is_ok());
+        out
     }
 
     /// Run `sparql` inside open transaction `tid` on database `name` (handle
@@ -3538,19 +3580,6 @@ fn new_system_password() -> String {
     u64::from_le_bytes(b).to_string()
 }
 
-/// A fresh, non-zero transaction id.
-fn new_id() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(now_millis());
-    let id = h.finish();
-    if id == 0 {
-        1
-    } else {
-        id
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3838,34 +3867,18 @@ mod tests {
             let mut st = server.inner.state.lock().unwrap();
             st.users.add("alice", "pw", BTreeSet::from([Privilege::Update])).unwrap();
             st.users.add("bob", "pw", BTreeSet::from([Privilege::Update])).unwrap();
-            st.tasks.insert(
-                42,
-                TaskEntry {
-                    db: "d".into(),
-                    query: "q".into(),
-                    user: "alice".into(),
-                    started: Instant::now(),
-                    cancel: Arc::new(AtomicBool::new(false)),
-                },
-            );
         }
+        let (id, cancel) = server.inner.tasks.register("query", "d", "q", "alice");
+        let target = format!("/cancel?id={id}");
         let cancel_as = |user: &str, pass: &str| -> u16 {
             let auth = basic(user, pass);
             let (status, _) =
-                split_status_body(&raw_request(&addr, "POST", "/cancel?id=42", Some(&auth), ""));
+                split_status_body(&raw_request(&addr, "POST", &target, Some(&auth), ""));
             status
         };
-        let flag = || server.inner.state.lock().unwrap().tasks[&42].cancel.load(Ordering::Relaxed);
-        let reset = || server
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .tasks
-            .get_mut(&42)
-            .unwrap()
-            .cancel
-            .store(false, Ordering::Relaxed);
+        let flag = || cancel.load(Ordering::Relaxed);
+        let reset = || cancel.store(false, Ordering::Relaxed);
+        assert!(Arc::ptr_eq(&server.task_cancel_flag(id).unwrap(), &cancel));
 
         assert_eq!(cancel_as("bob", "pw"), 403, "non-owner non-admin must be forbidden");
         assert!(!flag(), "a forbidden cancel must not set the flag");

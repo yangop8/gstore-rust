@@ -38,7 +38,9 @@
 //! 5. validate `db_name` when the operation needs one — `1003`;
 //! 6. the privilege check ([`auth::check_privilege`]) — denied →
 //!    `1004 "You have no <operation> privilege"` (upstream's code for it);
-//! 7. run the operation's handler.
+//! 7. run the operation's handler — or, for `async=true` on an operation
+//!    registered [`async_capable`](OpSpec::async_capable), hand it to the
+//!    background task manager ([`tasks`]) and answer with its `opt_id`.
 //!
 //! Handlers run with **no lock held**; they take the server state lock only
 //! briefly (see the locking rule on `ApiState` in [`crate::http_api`]).
@@ -55,7 +57,9 @@ pub mod envelope;
 mod ops_lifecycle;
 mod ops_query;
 mod ops_sys;
+mod ops_task;
 pub mod params;
+pub mod tasks;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -203,8 +207,12 @@ pub struct OpSpec {
     /// Whether a valid `db_name` is required (validated before the handler
     /// runs, available as [`Ctx::db_name`]).
     pub needs_db: bool,
-    /// Whether the operation honours `async=1` (informational; the handler
-    /// implements it).
+    /// Whether the operation honours `async=true` (upstream's `jsonBoolParam`:
+    /// `true` / `"true"` / `"1"`). The dispatcher then runs the handler on
+    /// the task manager's runner threads ([`tasks::run_async`]) and answers
+    /// with an `opt_id` at once; the handler itself is written synchronously
+    /// (it sees `async=false`) and may reach its task through
+    /// [`tasks::current`] (cancellation flag, progress).
     pub async_capable: bool,
 }
 
@@ -323,6 +331,7 @@ pub fn registry() -> &'static Registry {
         ops_sys::register(&mut reg);
         ops_query::register(&mut reg);
         ops_lifecycle::register(&mut reg);
+        ops_task::register(&mut reg);
         reg
     })
 }
@@ -421,6 +430,9 @@ fn dispatch(ctx: &mut Ctx<'_>) -> GResp {
             Status::OperationConditionsAreNotSatisfied,
             format!("You have no {op} privilege"),
         );
+    }
+    if spec.async_capable && params.bool("async", false) {
+        return tasks::run_async(ctx, spec, &params);
     }
     (spec.handler)(ctx, &params)
 }
