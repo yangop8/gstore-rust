@@ -288,8 +288,11 @@ pub fn unpack(
         let mut w = io::BufWriter::new(file);
         // One byte more than the budget: reading it means the data is larger
         // than the header said and the limit allows.
-        let written = io::copy(&mut io::Read::take(&mut entry, budget + 1), &mut w)
-            .map_err(|e| write_err(&item.rel, &e))?;
+        let written = io::copy(
+            &mut io::Read::take(&mut entry, budget.saturating_add(1)),
+            &mut w,
+        )
+        .map_err(|e| write_err(&item.rel, &e))?;
         if written > budget {
             drop(w);
             let _ = fs::remove_file(&target);
@@ -345,7 +348,7 @@ pub fn read_entry(
     let mut buf = Vec::new();
     entry
         .by_ref()
-        .take(max + 1)
+        .take(max.saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| ZipError::unzip(ZipCode::WriteError, e.to_string()))?;
     if buf.len() as u64 > max {
