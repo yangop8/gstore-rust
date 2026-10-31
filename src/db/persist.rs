@@ -966,6 +966,9 @@ impl Database {
         } else {
             fsutil::discard_dir(&rocks_dst)?;
         }
+        // The reasoning rules (`reason_rule_files/`), as upstream's
+        // whole-directory copy carries them.
+        crate::reason::store::copy_rule_dir(src, dst)?;
         fsutil::sync_dir(dst)
     }
 
@@ -1012,7 +1015,10 @@ impl Database {
         let built = (|| -> Result<()> {
             match kind {
                 // Loading validates the snapshot (meta vs. contents).
-                StorageKind::Snapshot => Database::load_snapshot(backup)?.save(&staged),
+                StorageKind::Snapshot => {
+                    Database::load_snapshot(backup)?.save(&staged)?;
+                    crate::reason::store::copy_rule_dir(backup, &staged)
+                }
                 _ => {
                     Database::backup_dir(backup, &staged)?;
                     remove_other_layouts(&staged, kind)?;

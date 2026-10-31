@@ -1404,7 +1404,12 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             };
             // Upstream replaces a backup of the same second.
             let _ = fs::remove_dir_all(&dest);
-            slot.db.backup(&dest).map_err(|e| e.to_string())
+            slot.db
+                .backup(&dest)
+                // The reasoning rules of the directory it is served from
+                // (`reasonManage`), as upstream's whole-directory copy.
+                .and_then(|()| crate::reason::store::copy_rule_dir(&slot.dir, &dest))
+                .map_err(|e| e.to_string())
         }
         None => {
             let _busy = match claim(ctx, &db) {

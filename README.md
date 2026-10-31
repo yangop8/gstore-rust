@@ -146,7 +146,9 @@ optimizer and a VS-tree signature filter.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
-* **RDFS/rule reasoning** (`reason`), an **RPC cluster** (`rpc` / `cluster`), and
+* **Reasoning** (`reason`) — upstream's JSON inference rules over `/api`
+  (`reasonManage`, see [Reasoning](#reasoning-reasonmanage)) and RDFS
+  materialization; an **RPC cluster** (`rpc` / `cluster`), and
   **concurrency/MVCC** (`concurrent`).
 
 Remaining large-refactor items are tracked in
@@ -314,6 +316,101 @@ naming its `rs:` replacement. Other IRI function calls are SPARQL 1.1 casts
 `Database::register_function` under the IRI or its local name; anything else is
 an error.
 
+### Reasoning (`reasonManage`)
+
+Upstream gStore 1.4's inference rules (`src/Reason`, `/api` operation
+`reasonManage`): a rule is a JSON object whose conditions are triple patterns
+and filters, compiled to a SPARQL `INSERT … WHERE`; executing it adds the
+inferred triples under the predicate `<Rule:label>`, disabling it retracts
+them.
+
+```json
+{"rulename": "舅舅", "description": "母亲的男性同胞是舅舅", "isenable": 1,
+ "type": 1, "logic": 1,
+ "conditions": [{"patterns": [
+     {"subject": "?x", "predicate": "<母亲>", "object": "?y"},
+     {"subject": "?y", "predicate": "<父亲>", "object": "?z"},
+     {"subject": "?k", "predicate": "<父亲>", "object": "?z"},
+     {"subject": "?k", "predicate": "<性别>", "object": "\"男\"^^<http://www.w3.org/2001/XMLSchema#string>"}],
+   "filters": []}],
+ "return": {"source": "?x", "target": "?k", "label": "舅舅"}}
+```
+
+`type` `1` infers a relation (`source <Rule:label> target`), `0` a property
+(`source <Rule:label> value`); `logic` `0` makes the conditions alternatives
+(`UNION`), `1` requires them all; a condition's `filters` are SPARQL
+expressions that must all hold. The rule above compiles — byte for byte as
+upstream 1.4 — to
+
+```sparql
+insert { ?x <Rule:舅舅> ?k. } where { ?x <母亲> ?y. ?y <父亲> ?z. ?k <父亲> ?z. ?k <性别> "男"^^<http://www.w3.org/2001/XMLSchema#string>.}
+```
+
+| `type` | operation | answer | rule `status` |
+|---|---|---|---|
+| `1` | add (`ruleinfo`) | `StatusMsg` names the rule file | `新建` |
+| `2` | list | `list`, `num` | — |
+| `3` | compile (`rulename`) | `insert_sparql`, `delete_sparql`, `check_sparql` | `已编译` |
+| `4` | execute | `insert_sparql`, `select_sparql`, `AnsNum` (triples added) | `已执行` |
+| `5` | disable | `delete_sparql`, `AnsNum` (triples retracted) | `已失效` |
+| `6` | show | `ruleinfo` | — |
+| `7` | delete | — | (file removed) |
+| `8` | check | `check_sparql`, `effectNum` (matches) | `已校验` |
+
+Only `root` (and `admin` users) may call it, as upstream. Rules are stored per
+database in `<db>.db/reason_rule_files/<rulename>.json` (upstream's layout and
+format), so they survive unload / load and restarts, move with `rename`, are
+carried by `backup` / `restore` and removed by `drop`; a database without a
+directory (built in memory through the library) keeps them in memory. The
+library offers the same lifecycle: `Database::reason_add`, `reason_list`,
+`reason_compile`, `reason_execute`, `reason_disable`, `reason_show`,
+`reason_delete`, `reason_check`.
+
+Execution is an ordinary autocommit update (query cache, CSR, write-through,
+durability and the query log behave as for a `query` update, and it can be
+cancelled); execute and disable are refused (`1004`) while a transaction is
+open on the database, and execute / disable / check need it loaded.
+
+**Retraction is exact.** Each execution records which triples the rule owns
+(`reason_rule_files/inferred/<rulename>.nt`): those it added, and those it
+derived that another executed rule already owns. Disabling deletes exactly the
+owned triples no other rule also owns. So a fact asserted with an ordinary
+predicate is never touched; a `<Rule:…>` triple that was already in the
+database before the rule ran (asserted by a user) survives; a triple two rules
+infer survives until both are disabled. A triple a user inserts *after* the
+rule inferred it is the same RDF triple and is retracted with the rule. A rule
+that upstream gStore executed (no ownership record) is retracted with
+upstream's `delete where {?x <Rule:label> ?y.}`.
+
+**Differences from upstream**, deliberate:
+
+- Every rule is validated when it is added and compiled: each pattern or
+  `return` term must be exactly one SPARQL term (variable, full `<IRI>`,
+  literal, number, boolean, `a`), a filter one complete expression whose
+  brackets balance, the label part of one IRI, and a `return` variable must
+  occur in the patterns. Upstream splices the strings into SPARQL verbatim,
+  so a rule could inject SPARQL; here such a rule is refused (`1005 "Add
+  Reason Rule Fail. …"`). Prefixed names are refused (a rule has no
+  `PREFIX`es).
+- Rule names must be safe file names (no `/`, `\`, `..`, leading `.`, control
+  characters; at most 128 characters), at most 1000 rules per database and
+  1 MiB per rule file.
+- Execute runs the statement compiled from the rule's definition, never text
+  stored in the file: a rule edited after compiling must be compiled again;
+  compiled fields a client sends with `add` are dropped.
+- An executed rule cannot be recompiled (upstream allows it, resets the
+  status to `已编译` and thereby lets the rule be deleted while its triples
+  stay); checking an executed rule keeps it `已执行`.
+- When a condition has several filters and one has a top-level `||`, that
+  filter is parenthesized (upstream's plain `&&` join would change its
+  meaning).
+- Upstream's documentation shows the compiled text with extra spaces
+  (`where {  ?x … . }`); the text here is what upstream 1.4's code produces.
+- `type` may be a JSON number and `ruleinfo` a string holding the object;
+  `list` is sorted by rule name; operations on a database that does not exist
+  answer `1005 "database[<db>] does not exist"` (upstream creates its
+  directory).
+
 ### Library API
 
 ```rust
@@ -375,7 +472,7 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `server` / `http_api` / `http_users` | HTTP SPARQL server, conneg, auth |
 | `gapi` / `sysdb` / `config` | upstream `/api` protocol, system database (privileges, logs), `conf.ini` |
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
-| `reason`      | RDFS / rule reasoning                                   |
+| `reason`      | upstream inference rules (`reasonManage`), RDFS, textual rules |
 | `db`          | `Database` facade + persistence (mem & disk)           |
 | `gnlqa/`      | LLM natural-language QA layer (separate crate)          |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`, `gserver`, …            |
