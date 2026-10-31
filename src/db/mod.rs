@@ -195,8 +195,13 @@ pub struct Database {
     /// successive incrementals chain contiguously. Interior-mutable because both
     /// backup methods take `&self`.
     backup_offset: Cell<u64>,
-    /// User-defined forward-chaining reasoning rules (gStore's `ReasonHelper`).
+    /// User-defined forward-chaining reasoning rules (the crate's textual
+    /// `body => head` rules, see [`crate::reason::RuleSet`]).
     rules: crate::reason::RuleSet,
+    /// Where upstream-format reasoning rules (`reasonManage`, see
+    /// [`reason_add`](Self::reason_add)) are kept: a directory override, or
+    /// memory for a database without a directory.
+    reason_home: crate::reason::store::RuleHome,
     /// User-defined scalar SPARQL functions (gStore's PFN, as a safe in-process
     /// registry rather than dlopen `.so` plugins). Passed to every read-query
     /// evaluator; consulted for any function name that is not a built-in.
@@ -355,6 +360,7 @@ impl Database {
             redo_pending: Vec::new(),
             backup_offset: Cell::new(0),
             rules: crate::reason::RuleSet::new(),
+            reason_home: crate::reason::store::RuleHome::default(),
             functions: FunctionRegistry::new(),
             home: None,
             disk: RefCell::new(None),
@@ -1095,37 +1101,49 @@ impl Database {
                 }
                 Ok(result)
             }
-            Query::Update(ops) => {
-                // Reject a statically invalid request (an unknown IRI
-                // function, a graph function in FILTER/BIND, …) before any of
-                // its operations is applied.
-                if ops.iter().any(|op| matches!(op, UpdateOp::Modify { .. })) {
-                    let mut eval = Evaluator::new(&self.dict, &self.store);
-                    if !self.functions.is_empty() {
-                        eval = eval.with_functions(self.functions.clone());
-                    }
-                    eval.check_update_calls(&ops)?;
-                }
-                let before = self.mutations;
-                let mut changed = 0;
-                for op in ops {
-                    match self.exec_update_op(op, cancel.as_ref()) {
-                        Ok(n) => changed += n,
-                        Err(e) => return Err(self.failed_update(e, before)),
-                    }
-                }
-                // Append the applied statement to the update log, if enabled.
-                if let Some(path) = self.update_log.clone() {
-                    append_update_log(&path, sparql, changed)?;
-                }
-                // Outside a transaction each UPDATE request is a commit point:
-                // its write-through is made durable before it is acknowledged.
-                if self.txn.is_none() {
-                    self.commit_point()?;
-                }
-                Ok(QueryResult::Update { changed })
+            Query::Update(ops) => self.run_update(sparql, ops, cancel),
+        }
+    }
+
+    /// Apply the parsed operations `ops` of UPDATE request `sparql` (the
+    /// text the update log records): the write path of
+    /// [`query`](Self::query), shared with the reasoning rules
+    /// ([`reason_execute`](Self::reason_execute) /
+    /// [`reason_disable`](Self::reason_disable)).
+    fn run_update(
+        &mut self,
+        sparql: &str,
+        ops: Vec<UpdateOp>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<QueryResult> {
+        // Reject a statically invalid request (an unknown IRI
+        // function, a graph function in FILTER/BIND, …) before any of
+        // its operations is applied.
+        if ops.iter().any(|op| matches!(op, UpdateOp::Modify { .. })) {
+            let mut eval = Evaluator::new(&self.dict, &self.store);
+            if !self.functions.is_empty() {
+                eval = eval.with_functions(self.functions.clone());
+            }
+            eval.check_update_calls(&ops)?;
+        }
+        let before = self.mutations;
+        let mut changed = 0;
+        for op in ops {
+            match self.exec_update_op(op, cancel.as_ref()) {
+                Ok(n) => changed += n,
+                Err(e) => return Err(self.failed_update(e, before)),
             }
         }
+        // Append the applied statement to the update log, if enabled.
+        if let Some(path) = self.update_log.clone() {
+            append_update_log(&path, sparql, changed)?;
+        }
+        // Outside a transaction each UPDATE request is a commit point:
+        // its write-through is made durable before it is acknowledged.
+        if self.txn.is_none() {
+            self.commit_point()?;
+        }
+        Ok(QueryResult::Update { changed })
     }
 
     /// An UPDATE failed with `e` after its earlier operations (or part of the
@@ -1550,6 +1568,7 @@ impl Database {
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
         self.save(backup_dir)?;
+        self.backup_reason_rules(backup_dir)?;
         let off = self.redo_log_len();
         self.backup_offset.set(off);
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
@@ -1998,6 +2017,261 @@ impl Database {
         let added = self.infer(|dict, store, insert| rules.apply_with(dict, store, insert));
         self.rules = rules;
         self.record_inferred(added)
+    }
+
+    // ---- upstream reasoning rules (`reasonManage`) --------------------------
+    //
+    // The lifecycle of upstream gStore's JSON rules — add, list, compile,
+    // execute, disable, show, delete, check — implemented in
+    // `crate::reason::manage` (see its docs for the states, the `Rule:`
+    // predicates and the ledger that makes retraction exact). Rules live in
+    // `<dir>/reason_rule_files/` for a database with a directory, else in
+    // memory (see `reason_db_dir`).
+
+    /// The directory whose `reason_rule_files/` holds this database's
+    /// upstream-format reasoning rules: the one set with
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), else the database's
+    /// [`home`](Self::home). `None`: the rules are kept in memory (and live as
+    /// long as this value).
+    pub fn reason_db_dir(&self) -> Option<PathBuf> {
+        self.reason_home.dir.clone().or_else(|| self.home.clone())
+    }
+
+    /// Keep this database's reasoning rules in `<dir>/reason_rule_files/`
+    /// (a server sets it to the directory it serves the database from, which
+    /// a database built in memory and saved there does not know as its
+    /// [`home`](Self::home)). Rules held in memory until now are not moved.
+    pub fn set_reason_db_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.reason_home.dir = Some(dir.into());
+    }
+
+    /// Run `f` with this database and its rule store.
+    fn with_rule_store<R>(
+        &mut self,
+        f: impl FnOnce(&mut Database, &mut crate::reason::store::RuleStore<'_>) -> R,
+    ) -> R {
+        use crate::reason::store::RuleStore;
+        match self.reason_db_dir() {
+            Some(dir) => f(self, &mut RuleStore::dir(dir)),
+            None => {
+                let mut mem = std::mem::take(&mut self.reason_home.mem);
+                let out = f(self, &mut RuleStore::Memory(&mut mem));
+                self.reason_home.mem = mem;
+                out
+            }
+        }
+    }
+
+    /// Add an upstream reasoning rule (`reasonManage` type 1) from its JSON
+    /// object (`rulename`, `type`, `logic`, `conditions`, `return`, …; see
+    /// [`crate::reason::rules`]). It is validated — so that it can never
+    /// inject SPARQL — and stored with status `新建`.
+    pub fn reason_add(
+        &mut self,
+        ruleinfo: &crate::json::Json,
+    ) -> std::result::Result<crate::reason::manage::Added, crate::reason::ReasonError> {
+        let now = crate::sysdb::clock::now().datetime();
+        self.with_rule_store(|_, store| crate::reason::manage::add(store, ruleinfo, &now))
+    }
+
+    /// Every reasoning rule's JSON, by name (type 2).
+    pub fn reason_list(
+        &mut self,
+    ) -> std::result::Result<Vec<crate::json::Json>, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::list(store))
+    }
+
+    /// Compile a rule to its SPARQL statements (type 3; status `已编译`).
+    pub fn reason_compile(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::CompiledRule, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::compile(store, name))
+    }
+
+    /// Execute a compiled rule (type 4; status `已执行`): its `INSERT … WHERE`
+    /// runs through the normal update path, and the triples it infers are
+    /// recorded so that [`reason_disable`](Self::reason_disable) retracts
+    /// exactly them. Refused inside a transaction.
+    pub fn reason_execute(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Executed, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| crate::reason::manage::execute(db, store, name, None))
+    }
+
+    /// Disable a compiled rule (type 5; status `已失效`), retracting the
+    /// triples it inferred that no other rule also inferred. Refused inside
+    /// a transaction.
+    pub fn reason_disable(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Disabled, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| crate::reason::manage::disable(db, store, name, None))
+    }
+
+    /// A rule's JSON (type 6).
+    pub fn reason_show(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::json::Json, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::show(store, name))
+    }
+
+    /// Delete a rule that is not executed (type 7); returns upstream's
+    /// message.
+    pub fn reason_delete(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<String, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::delete(store, name))
+    }
+
+    /// Count a compiled rule's matches (type 8; `effectNum`, status
+    /// `已校验` unless executed).
+    pub fn reason_check(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Checked, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| {
+            crate::reason::manage::check(store, name, |sparql| db.query(sparql))
+        })
+    }
+
+    /// Whether the default graph holds `t` (no interning).
+    pub(crate) fn contains_triple(&self, t: &Triple) -> bool {
+        let (Some(sub), Some(pred), Some(obj)) = (
+            self.dict.entity_id(&t.subject.dict_key()),
+            self.dict.predicate_id(&t.predicate.dict_key()),
+            self.dict.term_id(&t.object),
+        ) else {
+            return false;
+        };
+        self.store.exists(sub, pred, obj)
+    }
+
+    /// Run a rule's compiled `INSERT … WHERE` (one operation, default graph)
+    /// through the update path, reporting which triples it derived, which
+    /// of them existed before, and which it added. An error before anything
+    /// was applied (parse, WHERE evaluation, cancellation) is `Err`; the
+    /// update's own outcome is the report's `result`.
+    pub(crate) fn reason_infer(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<crate::reason::manage::InferReport> {
+        use crate::reason::manage::{ledger_line, InferReport};
+        let Query::Update(ops) = sparql::parse(sparql)? else {
+            return Err(GStoreError::Query(
+                "a reasoning rule must compile to an update".into(),
+            ));
+        };
+        let [UpdateOp::Modify {
+            with: None,
+            delete,
+            insert,
+            using,
+            using_named,
+            pattern,
+        }] = ops.as_slice()
+        else {
+            return Err(GStoreError::Query(
+                "a reasoning rule must compile to one INSERT … WHERE".into(),
+            ));
+        };
+        let (_, ins) = self.modify_changes(
+            delete,
+            insert,
+            pattern,
+            None,
+            using,
+            using_named,
+            cancel.as_ref(),
+        )?;
+        let mut seen = HashSet::new();
+        let mut derived: Vec<(String, bool, Triple)> = Vec::new();
+        for (g, t) in ins {
+            if g.is_some() {
+                continue;
+            }
+            let line = ledger_line(&t);
+            if seen.insert(line.clone()) {
+                let existed = self.contains_triple(&t);
+                derived.push((line, existed, t));
+            }
+        }
+        let result = match self.run_update(sparql, ops, cancel) {
+            Ok(QueryResult::Update { changed }) => Ok(changed),
+            Ok(_) => Ok(0),
+            Err(e) => Err(e.to_string()),
+        };
+        let inserted = derived
+            .iter()
+            .filter(|(_, existed, t)| !existed && self.contains_triple(t))
+            .map(|(line, _, _)| line.clone())
+            .collect();
+        Ok(InferReport {
+            derived: derived.into_iter().map(|(l, e, _)| (l, e)).collect(),
+            inserted,
+            result,
+        })
+    }
+
+    /// Retract the triples of ledger `lines` (see
+    /// [`crate::reason::manage`]) as one `DELETE DATA` through the update
+    /// path. Returns how many were removed.
+    pub(crate) fn reason_retract(
+        &mut self,
+        lines: &[String],
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
+        let mut ground = Vec::with_capacity(lines.len());
+        let mut text = String::from("DELETE DATA {");
+        for line in lines {
+            let Some(t) = crate::reason::manage::parse_ledger_line(line) else {
+                continue;
+            };
+            text.push_str(&format!(" {} {} {} .", t.subject, t.predicate, t.object));
+            ground.push(GroundTriple {
+                subject: t.subject,
+                predicate: t.predicate,
+                object: t.object,
+                graph: None,
+            });
+        }
+        text.push_str(" }");
+        if ground.is_empty() {
+            return Ok(0);
+        }
+        match self.run_update(&text, vec![UpdateOp::DeleteData(ground)], cancel)? {
+            QueryResult::Update { changed } => Ok(changed),
+            _ => Ok(0),
+        }
+    }
+
+    /// Run SPARQL UPDATE `sparql` (a rule's compiled statement) through the
+    /// update path; the number of triples changed.
+    pub(crate) fn reason_update(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
+        let Query::Update(ops) = sparql::parse(sparql)? else {
+            return Err(GStoreError::Query("not an update".into()));
+        };
+        match self.run_update(sparql, ops, cancel)? {
+            QueryResult::Update { changed } => Ok(changed),
+            _ => Ok(0),
+        }
+    }
+
+    /// Carry this database's reasoning rules into backup directory `dst`
+    /// (upstream's backup copies the whole database directory).
+    fn backup_reason_rules(&self, dst: &Path) -> Result<()> {
+        match self.reason_db_dir() {
+            Some(src) => crate::reason::store::copy_rule_dir(&src, dst),
+            None => crate::reason::store::write_memory_rules(&self.reason_home.mem, dst),
+        }
     }
 
     // ---- query cache / evaluation options ---------------------------------

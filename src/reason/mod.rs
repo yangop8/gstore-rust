@@ -1,6 +1,26 @@
-//! RDFS entailment by forward-chaining materialization.
+//! Reasoning: upstream gStore's rule management (`reasonManage`), RDFS
+//! entailment, and the crate's own textual rules.
 //!
-//! Corresponds to gStore's `src/Reason`. Given a store that mixes data and an
+//! # Upstream rules (`reasonManage`)
+//!
+//! The JSON rules of upstream gStore's `src/Reason` (`ReasonHelper`) and its
+//! `/api` operation `reasonManage` (types 1-8):
+//!
+//! * [`rules`] — the rule JSON model and its validation (no rule can inject
+//!   SPARQL);
+//! * [`compile`] — rule → upstream's `INSERT … WHERE`, `DELETE WHERE`,
+//!   count and select statements, byte for byte;
+//! * [`store`] — where rules live (`<db>/reason_rule_files/`, or memory);
+//! * [`manage`] — the lifecycle (add, list, compile, execute, disable, show,
+//!   delete, check), with exact retraction of inferred triples.
+//!
+//! The [`Database`](crate::Database) methods `reason_add` … `reason_check`
+//! expose it to embedders; the `/api` server answers `reasonManage` with it
+//! (`crate::gapi`).
+//!
+//! # RDFS entailment
+//!
+//! Given a store that mixes data and an
 //! RDFS schema, [`materialize`] computes the RDFS closure and inserts every
 //! entailed triple, iterating to a fixpoint. It implements the core
 //! schema-driven rules (the ones that actually change query answers):
@@ -12,12 +32,20 @@
 //! | subproperty transitivity | `p ⊑ₚ q`, `q ⊑ₚ r` | `p ⊑ₚ r` |
 //! | subproperty propagation  | `p ⊑ₚ q`, `x p y` | `x q y` |
 //! | domain | `p domain c`, `x p y` | `x a c` |
-//! | range  | `p range c`,  `x p y` | `y a c` |
+//! | range  | `p range c`,  `x p y` | `y a c` (only for an entity `y`: a literal is never typed) |
 //!
 //! Note the id-space subtlety: a property used as the *subject* of a schema
 //! triple (`p rdfs:subPropertyOf q`) is interned as an **entity**, while the same
 //! property in data (`x p y`) is a **predicate** — two different id spaces sharing
 //! the dictionary key. [`ent_to_pred`] bridges them through the dictionary.
+
+pub mod compile;
+pub mod manage;
+pub mod rules;
+pub mod store;
+
+pub use compile::CompiledRule;
+pub use manage::{ReasonError, ReasonErrorKind};
 
 use std::collections::HashMap;
 
