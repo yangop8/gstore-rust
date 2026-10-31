@@ -5111,6 +5111,72 @@ mod tests {
         assert!(parse_batch_payload(None, "DROP ALL").is_err());
     }
 
+    /// `/api` `loadcsr` (and `load` with `csr=1`) build the database's CSR
+    /// ahead of time, and the graph-function queries that follow run on that
+    /// very CSR (the same `Arc`, never rebuilt) until a write invalidates it.
+    #[test]
+    fn loadcsr_builds_the_csr_that_graph_function_queries_then_use() {
+        let (server, addr) = start("loadcsr");
+        let api = |body: &str| split_status_body(&raw_request(&addr, "POST", "/api", None, body));
+        let op = |extra: &str| {
+            format!(r#"{{"username":"root","password":"root","db_name":"gfn",{extra}}}"#)
+        };
+        let ttl = "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n";
+        let file = tmp_root("loadcsr_data");
+        fs::create_dir_all(&file).unwrap();
+        let file = file.join("g.nt");
+        fs::write(&file, ttl).unwrap();
+        // Builds go through the server's directory confinement: allow ours.
+        locked(&server.inner.state).load_policy =
+            LoadPolicy::restricted().with_allowed_dir(file.parent().unwrap());
+        let (s, b) = api(&op(&format!(
+            r#""operation":"build","db_path":"{}""#,
+            file.display()
+        )));
+        assert_eq!(s, 200, "{b}");
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        let (_, b) = api(&op(r#""operation":"load""#));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        let cached = || {
+            let h = Arc::clone(locked(&server.inner.state).dbs.get("gfn").unwrap());
+            let slot = locked(&h);
+            slot.db.cached_csr()
+        };
+        assert!(cached().is_none(), "nothing built before loadcsr");
+        let (_, b) = api(&op(r#""operation":"loadcsr""#));
+        assert!(b.contains("CSR loaded successfully."), "{b}");
+        let preloaded = cached().expect("loadcsr built the CSR");
+        let (_, b) = api(&op(r#""operation":"loadcsr""#));
+        assert!(b.contains("CSR already loaded."), "{b}");
+        let (_, b) = api(&op(r#""operation":"show""#));
+        assert!(b.contains("\"csr\":true"), "{b}");
+
+        let sp = r#"SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?l) WHERE {}"#;
+        let query = op(&format!(r#""operation":"query","sparql":{}"#, json_str(sp)));
+        let (_, b) = api(&query);
+        assert!(b.contains("length"), "{b}");
+        assert!(
+            Arc::ptr_eq(&preloaded, &cached().unwrap()),
+            "the graph-function query ran on the preloaded CSR"
+        );
+        // A write invalidates it; the next graph-function query rebuilds it,
+        // and `load csr=1` on the loaded database builds it again too.
+        let insert = r#"INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }"#;
+        let (_, b) = api(&op(&format!(r#""operation":"query","sparql":{}"#, json_str(insert))));
+        assert!(b.contains("\"StatusCode\":0"), "{b}");
+        assert!(cached().is_none(), "a write drops the CSR");
+        let (_, b) = api(&op(r#""operation":"show""#));
+        assert!(b.contains("\"csr\":false"), "{b}");
+        let (_, b) = api(&op(r#""operation":"load","csr":"1""#));
+        assert!(b.contains("The database already load yet."), "{b}");
+        let reloaded = cached().expect("load csr=1 built it");
+        assert!(!Arc::ptr_eq(&preloaded, &reloaded));
+        let (_, b) = api(&query);
+        assert!(b.contains("length"), "{b}");
+        assert!(Arc::ptr_eq(&reloaded, &cached().unwrap()));
+        server.shutdown();
+    }
+
     #[test]
     fn invalid_ground_triples_are_not_applied() {
         let t = |s: Term, p: Term| Triple::new(s, p, Term::iri("http://o"));

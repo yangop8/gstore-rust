@@ -496,16 +496,20 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Vec<PathBuf>, GResp> {
 fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let only = p.non_empty("db_name");
     let user = ctx.user().to_string();
-    let (records, loaded, busy_names, txn_dbs, root) = {
+    let (records, handles, busy_names, txn_dbs, root) = {
         let st = ctx.state();
         (
             st.sysdb.records().cloned().collect::<Vec<DbRecord>>(),
-            st.dbs.keys().cloned().collect::<HashSet<String>>(),
+            st.dbs
+                .iter()
+                .map(|(k, h)| (k.clone(), Arc::clone(h)))
+                .collect::<BTreeMap<String, DbHandle>>(),
             st.busy.clone(),
             st.db_txn.keys().cloned().collect::<HashSet<String>>(),
             st.root.clone(),
         )
     };
+    let loaded: HashSet<String> = handles.keys().cloned().collect();
     // The registry, reconciled with the directories on disk (a database
     // built or removed outside the server) and the loaded databases.
     let on_disk = databases_on_disk(&root);
@@ -556,9 +560,15 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             read_cost(&root.join(crate::db_dir_for(&r.database))),
         );
         if is_loaded {
-            // No CSR cache yet (a later phase adds one); transactions are
-            // always available.
-            item.set("csr", false);
+            // Whether the database's CSR (the graph functions' adjacency, see
+            // `loadcsr`) is built for its current data — upstream reports
+            // `csr != nullptr`. The slot is locked with the state lock
+            // released (as `monitor` does). Transactions are always available.
+            let csr = handles.get(&r.database).is_some_and(|h| {
+                let slot = locked(h);
+                !slot.retired && slot.db.csr_is_cached()
+            });
+            item.set("csr", csr);
             item.set("txn", true);
         }
         body.push(item);
@@ -566,12 +576,36 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     GResp::success("Get the database list successfully!").with("ResponseBody", body)
 }
 
-/// The CSR cache hook of `load csr=1` / `loadcsr`.
-///
-/// TODO(CSR cache): a later phase builds the per-database CSR the advanced
-/// graph functions use here. Until then those functions build what they need
-/// per query, so there is nothing to load and this succeeds without work.
-fn load_csr(_ctx: &Ctx<'_>, _db: &str) {}
+/// The CSR cache hook of `load csr=1` / `loadcsr`: build loaded database
+/// `db`'s per-predicate CSR now ([`Database::preload_csr`]) instead of on
+/// its first graph-function query (upstream `Database::loadCSR`). Every
+/// later graph-function query reuses it until the data changes (any write
+/// invalidates it; the next graph-function query, or `loadcsr`, rebuilds
+/// it). `Ok(true)` when it was already built for the current data. The
+/// database's slot is locked meanwhile (upstream holds its `csr_lock`), the
+/// state lock is not.
+fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
+    let handle = ctx.state().dbs.get(db).map(Arc::clone);
+    let Some(handle) = handle else {
+        return Err(GResp::error(
+            Status::OperationFailed,
+            format!("database[{db}] is not loaded yet"),
+        ));
+    };
+    let slot = locked(&handle);
+    if slot.retired {
+        return Err(GResp::error(
+            Status::OperationFailed,
+            format!("database[{db}] is not loaded yet"),
+        ));
+    }
+    if slot.db.csr_is_cached() {
+        return Ok(true);
+    }
+    slot.db.preload_csr().map(|()| false).map_err(|e| {
+        GResp::error(Status::OperationFailed, format!("load csr fail: {e}"))
+    })
+}
 
 /// `load` — open `db_name` (any layout: snapshot, on-disk, RocksDB) and serve
 /// it. `csr=1` (or `true`) also loads the CSR cache ([`load_csr`]); the
@@ -587,7 +621,9 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         if st.dbs.contains_key(&db) {
             drop(st);
             if csr {
-                load_csr(ctx, &db);
+                if let Err(r) = load_csr(ctx, &db) {
+                    return r;
+                }
             }
             return GResp::success("The database already load yet.").with("csr", csr_field);
         }
@@ -622,20 +658,27 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         }
     }
     if csr {
-        load_csr(ctx, &db);
+        if let Err(r) = load_csr(ctx, &db) {
+            return r;
+        }
     }
     GResp::success("Database loaded successfully.").with("csr", csr_field)
 }
 
-/// `loadcsr` — load the CSR cache of a loaded database ([`load_csr`]):
-/// `0 "CSR loaded successfully."`.
+/// `loadcsr` — build the CSR of a loaded database ([`load_csr`]): `0 "CSR
+/// loaded successfully."`, or upstream's `0 "CSR already loaded."` when it
+/// is already built for the current data; `1005 "load csr fail: …"` if the
+/// build fails.
 fn loadcsr(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
     let db = db_of(ctx);
     let st = ctx.state();
     if st.dbs.contains_key(&db) {
         drop(st);
-        load_csr(ctx, &db);
-        return GResp::success("CSR loaded successfully.");
+        return match load_csr(ctx, &db) {
+            Ok(true) => GResp::success("CSR already loaded."),
+            Ok(false) => GResp::success("CSR loaded successfully."),
+            Err(r) => r,
+        };
     }
     if st.db_dir(&db).is_dir() {
         GResp::error(

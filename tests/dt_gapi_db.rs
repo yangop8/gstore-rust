@@ -468,6 +468,33 @@ fn build_show_load_monitor_schema_unload() {
     let d = &j.get("ResponseBody").and_then(Json::as_array).unwrap()[0];
     assert_eq!(string(d, "status"), "loaded");
 
+    // The `load csr=1` above built the CSR (Database::preload_csr), so
+    // `show` reports it and `loadcsr` answers upstream's "already loaded";
+    // a write (here one triple removed and put back) drops it and `loadcsr`
+    // builds it again.
+    let j = api(a, &[("operation", "show"), ("db_name", "lubm")]);
+    let d = &j.get("ResponseBody").and_then(Json::as_array).unwrap()[0];
+    assert_eq!(d.get("csr").and_then(Json::as_bool), Some(true), "{d}");
+    let j = api(a, &[("operation", "loadcsr"), ("db_name", "lubm")]);
+    assert_eq!((code(&j), msg(&j).as_str()), (0, "CSR already loaded."));
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            ("sparql", "DELETE DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }"),
+        ],
+    );
+    ok(&j);
+    let j = api(
+        a,
+        &[
+            ("operation", "query"),
+            ("db_name", "lubm"),
+            ("sparql", "INSERT DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }"),
+        ],
+    );
+    ok(&j);
     // loadcsr: loaded → success; not loaded → 1005.
     let j = api(a, &[("operation", "loadcsr"), ("db_name", "lubm")]);
     assert_eq!(
