@@ -83,12 +83,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::db::Database;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
-use crate::query::{Evaluator, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::store::{TripleSource, TripleStore};
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
@@ -182,11 +183,27 @@ impl IsolationLevel {
 }
 
 /// An immutable, consistent view of the data at one committed version.
+///
+/// Queries see the user-defined functions registered on the database when
+/// the snapshot was published, and gStore's advanced graph functions run on
+/// one CSR of the snapshot shared by all its readers (the database's cached
+/// CSR when it had one for this data, otherwise built on first use).
 pub struct Snapshot {
     dict: Dictionary,
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
     version: u64,
+    functions: FunctionRegistry,
+    /// The database's integer-division mode when the snapshot was published.
+    integer_division: IntegerDivision,
+    /// The database's Top-K / early-termination options when the snapshot
+    /// was published.
+    topk: TopKOptions,
+    csr: CsrCache,
+    /// Whether `SERVICE` may contact remote endpoints: the database's
+    /// [`LoadPolicy::allow_remote`](crate::db::LoadPolicy::allow_remote), so
+    /// snapshot reads follow the same policy as [`Database::query`].
+    allow_service: bool,
 }
 
 impl Snapshot {
@@ -208,6 +225,13 @@ impl Snapshot {
             store,
             named: db.named_graphs().clone(),
             version,
+            functions: db.functions().clone(),
+            integer_division: db.integer_division(),
+            topk: db.topk_options(),
+            csr: db
+                .cached_csr()
+                .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
+            allow_service: db.load_policy().allow_remote,
         }
     }
 
@@ -232,9 +256,18 @@ impl Snapshot {
     /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         let q = sparql::parse(sparql)?;
-        let mut eval = Evaluator::new(&self.dict, &self.store);
+        // The snapshot never changes: one CSR generation for its lifetime.
+        let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
+        let mut eval = Evaluator::new(&self.dict, &self.store)
+            .with_service_allowed(self.allow_service)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
+        }
+        if !self.functions.is_empty() {
+            eval = eval.with_functions(self.functions.clone());
         }
         eval.evaluate(&q)
     }
@@ -955,7 +988,9 @@ impl VersionView<'_> {
 
     /// Run a read query as of this view's version. Materializes the visible
     /// default-graph state on demand — the base snapshot plus chain overrides
-    /// `<= version` — then evaluates against it.
+    /// `<= version` — then evaluates against it (so a graph-function query
+    /// builds its CSR from that state). User-defined functions are the ones
+    /// of the latest published snapshot: they are not versioned data.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         let mut dict = self.db.base.dict.clone();
         let mut store = self.db.base.store.clone();
@@ -965,9 +1000,17 @@ impl VersionView<'_> {
             .unwrap()
             .materialize_into(self.version, &mut dict, &mut store);
         let q = sparql::parse(sparql)?;
-        let mut eval = Evaluator::new(&dict, &store);
+        let latest = self.db.snapshot();
+        let functions = latest.functions.clone();
+        let mut eval = Evaluator::new(&dict, &store)
+            .with_service_allowed(latest.allow_service)
+            .with_integer_division(latest.integer_division)
+            .with_topk_options(latest.topk);
         if !self.db.base.named.is_empty() {
             eval = eval.with_named(&self.db.base.named);
+        }
+        if !functions.is_empty() {
+            eval = eval.with_functions(functions);
         }
         eval.evaluate(&q)
     }
@@ -1006,6 +1049,22 @@ mod tests {
         }
     }
 
+    /// Snapshot and version-view reads follow the wrapped database's
+    /// `SERVICE` policy, like `Database::query`: a restricted policy refuses
+    /// `SERVICE` with an error before any request is made.
+    #[test]
+    fn snapshot_reads_follow_the_service_policy() {
+        let mut db = crate::Database::build_from_str("conc_svc", DATA).unwrap();
+        db.set_load_policy(crate::db::LoadPolicy::restricted());
+        let c = ConcurrentDb::new(db);
+        // Port 9 (discard) on loopback: never contacted when refused.
+        let q = "SELECT * WHERE { SERVICE <http://127.0.0.1:9/sparql> { ?s ?p ?o } }";
+        for r in [c.query(q), c.snapshot().query(q), c.version_view().query(q)] {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("SERVICE is disabled"), "{e}");
+        }
+    }
+
     fn snap_count(s: &Snapshot, q: &str) -> usize {
         match s.query(q).unwrap() {
             QueryResult::Select(rs) => rs.row_count(),
@@ -1018,6 +1077,53 @@ mod tests {
             QueryResult::Select(rs) => rs.row_count(),
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    /// Snapshot, transaction and version-view reads see the user-defined
+    /// functions registered on the database (an unregistered IRI call is a
+    /// query error), and a snapshot's graph-function reads share one CSR — the
+    /// writer database's cached one when it had one.
+    #[test]
+    fn snapshots_see_user_functions_and_share_one_csr() {
+        const FN: &str = "SELECT (<http://ex/fn/double>(21) AS ?v) WHERE {}";
+        const SP: &str = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) \
+                          WHERE {}";
+        const SP_JSON: &str =
+            r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/b>\",\"length\":1}]}""#;
+        fn cell(r: Result<QueryResult>) -> String {
+            match r.unwrap() {
+                QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+        let c = cdb();
+        c.write(|db| {
+            db.register_function("http://ex/fn/double", |args| {
+                Some(crate::query::Value::Int(args.first()?.as_f64()? as i64 * 2))
+            });
+        });
+        assert!(cell(c.query(FN)).starts_with("\"42\""));
+        assert!(cell(c.begin().query(FN)).starts_with("\"42\""));
+        assert!(cell(c.version_view().query(FN)).starts_with("\"42\""));
+
+        // Built on the first graph-function read, then shared.
+        let snap = c.snapshot();
+        assert!(snap.csr.peek(0).is_none());
+        assert_eq!(cell(snap.query(SP)), SP_JSON);
+        let built = snap
+            .csr
+            .peek(0)
+            .expect("built by the first graph-function read");
+        assert_eq!(cell(c.query(SP)), SP_JSON);
+        assert!(Arc::ptr_eq(&built, &snap.csr.peek(0).unwrap()));
+        assert_eq!(cell(c.version_view().query(SP)), SP_JSON);
+
+        // A CSR the writer database cached seeds the next published snapshot.
+        c.write(|db| db.preload_csr().unwrap());
+        let snap = c.snapshot();
+        let cached = c.writer.lock().unwrap().cached_csr().unwrap();
+        assert!(Arc::ptr_eq(&snap.csr.peek(0).unwrap(), &cached));
+        assert_eq!(cell(snap.query(SP)), SP_JSON);
     }
 
     fn triple(s: &str, p: &str, o: &str) -> Triple {

@@ -37,6 +37,8 @@ off-box on the paths you allow — see [Answering modes](#answering-modes--priva
 ```bash
 cargo build --release           # gStore CLIs + gnlqa
 cargo test --workspace          # run the tests
+# upstream's scripts/test/parser_test.sh (50 SPARQL cases), in-process, per-case table:
+cargo test --test dt_upstream_parser_suite -- --nocapture
 ```
 
 ### A) Use gStore directly (SPARQL)
@@ -109,11 +111,13 @@ optimizer and a VS-tree signature filter.
 * **RDF input formats** — N-Triples, Turtle, N-Quads, TriG, RDF/XML, and
   (dependency-free, common-subset) **JSON-LD** and **RDFa**; detected by file
   extension (`parser::parse_file_by_ext`).
-* **Graph functions callable in SPARQL** (24) — `SSSP`/`SSSPLEN`, `KHOPCOUNT`/
-  `KHOPNEIGHBOR`/`KHOPREACHABLE`, `WCC`, `LOUVAIN`, `LABELPROP`,
-  `BETWEENNESSCENTRALITY`, `CLOSENESSCENTRALITY`, `TRIANGLECOUNTING`,
-  `CLUSTERINGCOEFF`, `PPR`, `JACCARDSIMILARITY`, `DIAMETERESTIMATION`, … (gStore's
-  built-in graph-analysis functions).
+* **gStore 1.4's advanced graph functions in SPARQL** (32) — `shortestPath`,
+  `kHopReachable`, `kHopEnumerate`, `SSSP`, `bfsCount`, `PR`, `PPR`, `WCC`,
+  `louvain`, `labelProp`, `closenessCentrality`, `betweennessCentrality`,
+  `triangleCounting`, `clusterCoeff`, `JaccardSimilarity`, `maximumKplex`,
+  `coreTruss`, … with upstream's syntax, semantics and JSON output; the older
+  gstore-rust graph functions remain available as `rs:NAME(…)` (see
+  [Graph functions in SPARQL](#graph-functions-in-sparql)).
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
   — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
@@ -184,6 +188,72 @@ of racing it — unload it there (or use the server's API) first. The server's
 `drop`, `rename`, `restore` and rebuilding `/build` refuse a directory another
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
+
+### Graph functions in SPARQL
+
+gStore 1.4's advanced functions (upstream `docs/en-us/SPARQL_QUERY.md`,
+"Advanced functions") are written as a SELECT projection, with upstream's
+argument syntax: vertices as variables or IRIs, a `directed` boolean, a
+predicate set (`{}` = every predicate, `{<p>, <q>}`, `{!<p>}` = all but `<p>`)
+and, for some, integers or named parameters (`alpha=`, `maxIter=`, `tol=`,
+`increase=`). Keywords are case-insensitive.
+
+```sparql
+SELECT (shortestPath(<Francis>, ?x, true, {<like>, <focus>}) AS ?y)
+WHERE { <Bob> ?pred ?x . MINUS { <Francis> <dislike> ?x . } }
+```
+
+returns one row whose `?y` is the plain literal
+
+```json
+{"paths":[{"src":"<Francis>","dst":"<Alice>","edges":[{"fromNode":4,"toNode":3,"predIRI":"<like>"},…],"nodes":[…]}]}
+```
+
+| family | functions |
+|--------|-----------|
+| paths | `simpleCyclePath`, `simpleCycleBoolean`, `cyclePath`, `cycleBoolean`, `shortestPath`, `shortestPathLen`, `shortestPathCount`, `shortestPaths`, `kHopReachable`, `kHopReachablePath`, `kHopEnumerate`, `kHopCount`, `kHopNeighbor`, `kHopAllNeighbors`, `bfsCount`, `SSSP`, `SSSPLen` |
+| importance | `PR`, `PPR`, `closenessCentrality`, `betweennessCentrality`, `triangleCounting`, `diameterEstimation` |
+| communities | `WCC`, `labelProp`, `louvain`, `maximumKplex`, `coreTruss` |
+| correlation | `clusterCoeff`, `JaccardSimilarity`, `degreeCorrelation`, `confidenceDegree` |
+
+As upstream: a variable argument stands for all its distinct values in the
+WHERE solutions (two vertex arguments: their cross product), and the result is
+computed once — a lone function yields one row; next to other projected
+variables its value is on the last row; with `GROUP BY`, once per group. The
+functions run on a per-predicate CSR that each database builds on the first
+such query after a change and then reuses (`Database::preload_csr` builds it
+eagerly, like upstream's `loadcsr`). Upstream parses `cycleBoolean`,
+`simpleCycleBoolean`, `shortestPathLen` and `kHopReachable` inside `FILTER` but
+never evaluates them there; here that is a clear error. `PFN.name({…})` parses
+but is not evaluated yet.
+
+**The `rs:` namespace (breaking change).** The functions gstore-rust offered
+before — bare names such as `SSSP(?a, ?b)`, usable in `FILTER`/`BIND` and
+computed per row over a predicate-blind graph — now live in the IRI namespace
+`<urn:gstore-rust:fn:>`, predeclared as the prefix `rs:` (a query's own
+`PREFIX rs:` replaces it), with unchanged semantics and usable anywhere:
+
+| before | now | upstream function of that name |
+|--------|-----|--------------------------------|
+| `SSSP(?a, ?b)` (path as text) | `rs:SSSP(?a, ?b)` | `SSSP(u, directed, preds)` |
+| `SSSPLEN(?a, ?b)`, `SHORTESTPATHLEN(?a, ?b)` | `rs:SSSPLEN(…)`, `rs:SHORTESTPATHLEN(…)` | `SSSPLen(u, …)`, `shortestPathLen(u, v, …)` |
+| `KHOPREACHABLE(?a, ?b, k)` | `rs:KHOPREACHABLE(…)` | `kHopReachable(u, v, directed, k, preds)` |
+| `KHOPCOUNT(?a, k)`, `KHOPNEIGHBOR(?a, k)`, `KHOPALLNEIGHBORS(?a, k)` | `rs:KHOPCOUNT(…)` … | `kHopCount(u, directed, k, preds)` … |
+| `BFSCOUNT(?a [, k])`, `SHORTESTPATHS(?a, ?b)` (path count) | `rs:BFSCOUNT(…)`, `rs:SHORTESTPATHS(…)` | `bfsCount(u, …)`, `shortestPaths(u, v, …)` |
+| `CYCLEBOOLEAN()`, `SIMPLECYCLEBOOLEAN()` (graph has a cycle) | `rs:CYCLEBOOLEAN()` … | `cycleBoolean(u, v, directed, preds)` … |
+| `WCC(?a [, ?b])`, `LOUVAIN(…)`, `LABELPROP(…)` (component size / same community) | `rs:WCC(…)` … | `WCC(preds)`, `louvain(…)`, `labelProp(…)` |
+| `PPR(?src, ?target)` (one score) | `rs:PPR(…)` | `PPR(u, hopCnt, preds, retNum)` (FORA top-k) |
+| `BETWEENNESSCENTRALITY(?a)`, `CLOSENESSCENTRALITY(?a)` | `rs:…(?a)` | `betweennessCentrality(u, directed, preds)`, … |
+| `TRIANGLECOUNTING([?a])`, `DEGREECORRELATION()`, `DIAMETERESTIMATION()`, `JACCARDSIMILARITY(?a, ?b)` | `rs:…(…)` | `triangleCounting(directed, preds)`, … |
+| `CLUSTERINGCOEFF([?a])`, `KHOPENUMERATEPATH(?a, k)` | unchanged, or `rs:…` | — (upstream: `clusterCoeff`, `kHopEnumerate`) |
+| `SIMILARITY(?a, ?b)` (node / string similarity) | `rs:SIMILARITY(?a, ?b)` | `SIMILARITY(a, b)` = upstream's Jaro string similarity |
+
+A bare call with the old argument shape (`SSSP(?a, ?b)`) is a parse error
+naming its `rs:` replacement. Other IRI function calls are SPARQL 1.1 casts
+(`xsd:integer(?x)`, `xsd:decimal`, `xsd:double`, `xsd:float`, `xsd:boolean`,
+`xsd:string`, `xsd:dateTime`, `xsd:date`) or functions registered with
+`Database::register_function` under the IRI or its local name; anything else is
+an error.
 
 ### Library API
 

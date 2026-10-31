@@ -13,10 +13,10 @@ pub mod planner;
 pub mod results;
 pub mod value;
 
-pub use engine::Evaluator;
+pub use engine::{DpbMode, EvalStats, Evaluator, TopKOptions};
 pub use functions::{CustomFn, FunctionRegistry};
 pub use results::{QueryResult, ResultSet};
-pub use value::Value;
+pub use value::{IntegerDivision, NumericFn, Value};
 
 #[cfg(test)]
 mod tests {

@@ -101,6 +101,28 @@ fn deep_groups(n: usize) -> String {
     format!("SELECT * WHERE {}?s ?p ?o{}", "{ ".repeat(n), " }".repeat(n))
 }
 
+/// Phase 2/3 grammar: nested `[ … ]` triples nodes, `IN` lists and
+/// `INSERT DATA` blank-node property lists share the same nesting limit.
+fn deep_triples_nodes(n: usize) -> String {
+    format!(
+        "SELECT * WHERE {{ ?s <http://ex/p> {}?o{} }}",
+        "[ <http://ex/p> ".repeat(n),
+        " ]".repeat(n)
+    )
+}
+
+fn deep_in_lists(n: usize) -> String {
+    format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}", "?o IN (".repeat(n), ")".repeat(n))
+}
+
+fn deep_insert_data(n: usize) -> String {
+    format!(
+        "INSERT DATA {{ <http://ex/x> <http://ex/p> {}1{} }}",
+        "( ".repeat(n),
+        " )".repeat(n)
+    )
+}
+
 fn deep_rdfxml(n: usize) -> String {
     format!(
         "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">{}{}</rdf:RDF>",
@@ -115,7 +137,14 @@ fn deep_rdfxml(n: usize) -> String {
 fn deeply_nested_sparql_is_refused_by_the_api_server() {
     let api = Api::start("deep_api", None);
     assert_eq!(api.root("POST", "/build?db_name=d", DATA).0, 200);
-    for q in [deep_filter(100_000), deep_groups(100_000), deep_filter(1000)] {
+    for q in [
+        deep_filter(100_000),
+        deep_groups(100_000),
+        deep_filter(1000),
+        deep_triples_nodes(100_000),
+        deep_in_lists(100_000),
+        deep_insert_data(100_000),
+    ] {
         for target in ["/sparql?db_name=d", "/update?db_name=d"] {
             let (s, b) = api.root("POST", target, &q);
             assert_eq!(s, 400, "{target}: {b}");
@@ -142,7 +171,12 @@ fn deeply_nested_sparql_is_refused_by_the_single_database_server() {
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     thread::spawn(move || s2.serve_forever());
-    for q in [deep_filter(100_000), deep_groups(100_000)] {
+    for q in [
+        deep_filter(100_000),
+        deep_groups(100_000),
+        deep_triples_nodes(100_000),
+        deep_in_lists(100_000),
+    ] {
         let (s, b) = request(&addr, "POST", "/sparql", false, &q);
         assert_eq!(s, 400, "{b}");
     }
@@ -375,6 +409,62 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
     );
     let (s, b) = api.root("POST", "/update?db_name=d", &update);
     assert_eq!(s, 400, "{b}");
+    // Every evaluation path added by the graph-function and SPARQL 1.1
+    // phases is under the same policy: Top-K / early termination (LIMIT,
+    // ORDER BY … LIMIT, CONSTRUCT … LIMIT), sub-selects with a trailing
+    // VALUES, graph-function projections, IN filters, and the named-graph
+    // updates (WITH, USING, GRAPH templates).
+    let more_queries = [
+        format!("SELECT ?x WHERE {{ SERVICE <{url}> {{ ?x ?y ?z }} }} LIMIT 1"),
+        format!("SELECT ?x WHERE {{ SERVICE <{url}> {{ ?x ?y ?z }} }} ORDER BY ?x LIMIT 1"),
+        format!("CONSTRUCT {{ ?x ?y ?z }} WHERE {{ SERVICE <{url}> {{ ?x ?y ?z }} }} LIMIT 1"),
+        format!(
+            "SELECT ?x WHERE {{ {{ SELECT ?x WHERE {{ SERVICE <{url}> {{ ?x ?y ?z }} }} VALUES ?v \
+             {{ 1 }} }} }}"
+        ),
+        format!(
+            "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {{}}) AS ?l) WHERE \
+             {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
+        ),
+        format!("ASK {{ SERVICE <{url}> {{ ?x ?y ?z }} FILTER(?x IN (<http://ex/a>)) }}"),
+    ];
+    for q in &more_queries {
+        let (s, b) = api.root("POST", "/sparql?db_name=d", q);
+        assert_eq!(s, 400, "{q}: {b}");
+        assert!(b.contains("SERVICE is disabled") && !b.contains("internal-secret"), "{b}");
+    }
+    for update in [
+        format!(
+            "WITH <http://ex/g> INSERT {{ <http://ex/leak> <http://ex/p> ?x }} WHERE \
+             {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
+        ),
+        format!(
+            "INSERT {{ <http://ex/leak> <http://ex/p> ?x }} USING <http://ex/g> WHERE \
+             {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
+        ),
+        format!(
+            "INSERT {{ GRAPH <http://ex/g> {{ <http://ex/leak> <http://ex/p> ?x }} }} WHERE \
+             {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
+        ),
+    ] {
+        let (s, b) = api.root("POST", "/update?db_name=d", &update);
+        assert_eq!(s, 400, "{update}: {b}");
+        assert!(b.contains("SERVICE is disabled"), "{b}");
+    }
+    // A read answered from an open transaction's snapshot is no way around it.
+    let (s, b) = api.root("POST", "/begin?db_name=d", "");
+    assert_eq!(s, 200, "{b}");
+    let tid = b.split("\"TID\":\"").nth(1).and_then(|x| x.split('"').next()).unwrap().to_string();
+    for q in queries.iter().chain(&more_queries) {
+        let (s, b) = api.root("POST", "/sparql?db_name=d", q);
+        assert_eq!(s, 400, "snapshot read {q}: {b}");
+        assert!(b.contains("SERVICE is disabled") && !b.contains("internal-secret"), "{b}");
+    }
+    let (s, b) = api.root("POST", &format!("/tquery?tid={tid}"), &queries[0]);
+    assert_eq!(s, 400, "{b}");
+    assert_eq!(api.root("POST", &format!("/rollback?tid={tid}"), "").0, 200);
+    let (_, b) = api.root("POST", "/sparql?db_name=d", "SELECT ?o WHERE { <http://ex/leak> ?p ?o }");
+    assert!(!b.contains("internal-secret"), "{b}");
 
     // The single-database server (unauthenticated, restricted by default).
     let db = Database::build_from_str("s", DATA).unwrap();

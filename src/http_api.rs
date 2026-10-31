@@ -146,6 +146,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::config::GStoreConfig;
 use crate::db::dirlock::DirLock;
 use crate::db::{Database, LoadPolicy, LoadSource};
@@ -159,7 +160,7 @@ use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
 use crate::model::{Term, Triple};
-use crate::query::{Evaluator, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::server::{
     err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
     write_response_ext, write_response_maybe_gzip, BadRequest, ConnMeta, HttpOptions, Lifecycle,
@@ -415,13 +416,27 @@ const ENDED_TXN_MEMORY: usize = 1024;
 ///
 /// Memory cost: the dictionary, the default-graph triple indexes and the named
 /// graphs are cloned, so an open transaction roughly doubles its database's
-/// in-memory footprint until it commits or rolls back. User-defined functions
-/// and the VS-tree are not part of the snapshot (the VS-tree is only a
-/// candidate-pruning accelerator, so results are unchanged).
+/// in-memory footprint until it commits or rolls back. The VS-tree is not
+/// part of the snapshot (it is only a candidate-pruning accelerator, so
+/// results are unchanged). The user-defined functions registered at `/begin`
+/// are shared with it (the registry is reference-counted), and the advanced
+/// graph functions run on one CSR of the snapshot — the database's cached one
+/// when it had one for this data, otherwise built on the first graph-function
+/// read — shared by every read until the transaction ends.
 pub(crate) struct ReadSnapshot {
     dict: Dictionary,
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
+    functions: FunctionRegistry,
+    /// The database's integer-division mode at `/begin`.
+    integer_division: IntegerDivision,
+    /// The database's Top-K / early-termination options at `/begin`.
+    topk: TopKOptions,
+    csr: CsrCache,
+    /// Whether `SERVICE` may contact remote endpoints: the database's load
+    /// policy at `/begin` (a server's restricted policy refuses it), so a
+    /// read inside a transaction cannot bypass the `SERVICE` ban.
+    allow_service: bool,
 }
 
 impl ReadSnapshot {
@@ -439,6 +454,13 @@ impl ReadSnapshot {
             dict: db.dict().clone(),
             store,
             named: db.named_graphs().clone(),
+            functions: db.functions().clone(),
+            integer_division: db.integer_division(),
+            topk: db.topk_options(),
+            csr: db
+                .cached_csr()
+                .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
+            allow_service: db.load_policy().allow_remote,
         }
     }
 
@@ -451,9 +473,19 @@ impl ReadSnapshot {
                 "updates cannot run against a transaction's read snapshot".into(),
             ));
         }
-        let mut eval = Evaluator::new(&self.dict, &self.store);
+        // The snapshot never changes, so its CSR is cached under one
+        // generation for the transaction's lifetime.
+        let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
+        let mut eval = Evaluator::new(&self.dict, &self.store)
+            .with_service_allowed(self.allow_service)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
+        }
+        if !self.functions.is_empty() {
+            eval = eval.with_functions(self.functions.clone());
         }
         if let Some(c) = cancel {
             eval = eval.with_cancel(c);
@@ -4118,6 +4150,76 @@ mod tests {
         assert!(!valid_db_name("a@b"));
         assert!(!valid_db_name("a,b"));
         assert!(!valid_db_name("*"));
+    }
+
+    /// A transaction's read snapshot divides integers in the database's mode.
+    #[test]
+    fn read_snapshot_keeps_the_integer_division_mode() {
+        let q = "SELECT (7/2 AS ?x) WHERE {}";
+        let cell = |snap: &ReadSnapshot| match snap.query(q, None).unwrap() {
+            QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
+            other => panic!("expected Select, got {other:?}"),
+        };
+        let mut db = Database::new("snap_div");
+        assert_eq!(
+            cell(&ReadSnapshot::capture(&db)),
+            "\"3.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"
+        );
+        db.set_integer_division(IntegerDivision::Truncate);
+        assert_eq!(
+            cell(&ReadSnapshot::capture(&db)),
+            "\"3\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        );
+    }
+
+    /// A transaction's read snapshot answers like the database itself:
+    /// registered IRI functions resolve (an unregistered IRI call is a query
+    /// error since the engine's graph-function integration), and the graph
+    /// functions share one CSR — the database's cached one when it had one.
+    #[test]
+    fn read_snapshot_sees_user_functions_and_shares_one_csr() {
+        const DATA: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+                            <http://ex/b> <http://ex/p> <http://ex/c> .\n";
+        const SP: &str = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?p) \
+                          WHERE {}";
+        const SP_JSON: &str =
+            r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/c>\",\"length\":2}]}""#;
+        fn cell(r: crate::Result<QueryResult>) -> String {
+            match r.unwrap() {
+                QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+        let mut db = Database::build_from_str("snap_gfun", DATA).unwrap();
+        db.register_function("http://ex/fn/double", |args| {
+            Some(crate::query::Value::Int(args.first()?.as_f64()? as i64 * 2))
+        });
+
+        // No CSR cached at capture: the first graph-function read builds one,
+        // later reads reuse it.
+        let snap = ReadSnapshot::capture(&db);
+        assert!(snap.csr.peek(0).is_none());
+        let v = cell(snap.query("SELECT (<http://ex/fn/double>(21) AS ?v) WHERE {}", None));
+        assert!(v.starts_with("\"42\""), "{v}");
+        assert!(
+            snap.csr.peek(0).is_none(),
+            "built only when a query needs it"
+        );
+        assert_eq!(cell(snap.query(SP, None)), SP_JSON);
+        let built = snap
+            .csr
+            .peek(0)
+            .expect("built by the first graph-function read");
+        assert_eq!(cell(snap.query(SP, None)), SP_JSON);
+        assert!(Arc::ptr_eq(&built, &snap.csr.peek(0).unwrap()));
+
+        // A CSR the database already cached is shared, not rebuilt.
+        db.preload_csr().unwrap();
+        let snap = ReadSnapshot::capture(&db);
+        let seeded = snap.csr.peek(0).expect("seeded from the database");
+        assert!(Arc::ptr_eq(&seeded, &db.cached_csr().unwrap()));
+        assert_eq!(cell(snap.query(SP, None)), SP_JSON);
+        assert!(Arc::ptr_eq(&seeded, &snap.csr.peek(0).unwrap()));
     }
 
     // --- in-process HTTP client tests: upload, export download, console,

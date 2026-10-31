@@ -242,6 +242,9 @@ fn api_load_is_restricted_unless_a_directory_is_allowed() {
     let file = data_dir.join("extra.nt");
     std::fs::write(&file, "<http://ex/l> <http://ex/p> <http://ex/m> .\n").unwrap();
     let load = format!("LOAD <file://{}>", file.display());
+    // `LOAD … INTO GRAPH` (SPARQL 1.1 Update) follows the same policy.
+    let load_into = format!("LOAD <file://{}> INTO GRAPH <http://ex/lg>", file.display());
+    let in_graph = "ASK { GRAPH <http://ex/lg> { <http://ex/l> <http://ex/p> <http://ex/m> } }";
 
     // Default: LOAD reads nothing.
     let root = tmp_dir("api_load_default");
@@ -256,6 +259,19 @@ fn api_load_is_restricted_unless_a_directory_is_allowed() {
         "ASK { <http://ex/l> <http://ex/p> <http://ex/m> }",
     );
     assert!(body.contains("false"), "{body}");
+    let (s, body) = api.root("POST", "/update?db_name=w", &load_into);
+    assert_ne!(s, 200, "{body}");
+    assert!(body.contains("load policy"), "{body}");
+    let (_, body) = api.root("POST", "/sparql?db_name=w", in_graph);
+    assert!(body.contains("false"), "{body}");
+    // Outside the allowed set even with a directory allowed elsewhere.
+    let (s, body) = api.root(
+        "POST",
+        "/update?db_name=w",
+        "LOAD <file:///etc/passwd> INTO GRAPH <http://ex/lg>",
+    );
+    assert_ne!(s, 200, "{body}");
+    assert!(body.contains("load policy"), "{body}");
     api.stop();
 
     // With the directory allowed, the same LOAD works.
@@ -274,6 +290,17 @@ fn api_load_is_restricted_unless_a_directory_is_allowed() {
         "ASK { <http://ex/l> <http://ex/p> <http://ex/m> }",
     );
     assert!(body.contains("true"), "{body}");
+    let (s, body) = api.root("POST", "/update?db_name=w", &load_into);
+    assert_eq!(s, 200, "{body}");
+    let (_, body) = api.root("POST", "/sparql?db_name=w", in_graph);
+    assert!(body.contains("true"), "{body}");
+    let (s, body) = api.root(
+        "POST",
+        "/update?db_name=w",
+        "LOAD <file:///etc/passwd> INTO GRAPH <http://ex/lg>",
+    );
+    assert_ne!(s, 200, "{body}");
+    assert!(body.contains("load policy"), "{body}");
     api.stop();
 }
 

@@ -10,14 +10,156 @@
 //! 3. Cost-based join ordering (see [`crate::query::optimizer`]).
 //! 4. Iteratively extend partial bindings by indexed lookups + unification.
 //! 5. Apply FILTER, ORDER BY, DISTINCT, OFFSET/LIMIT, and projection.
+//!
+//! # Advanced graph functions (gStore 1.4)
+//!
+//! Upstream's advanced functions — `shortestPath(?x, <b>, true, {<p>})`,
+//! `PR(true, {}, 10, alpha=0.85, maxIter=100, tol=0.001)`, `WCC({})`, … (the
+//! parser's [`Expr::GraphFn`]) — are evaluated as upstream's
+//! `GeneralEvaluation::getFinalResult` does, by the engine-independent library
+//! [`crate::analytics::gfun`] over the per-predicate
+//! [`CsrGraph`]:
+//!
+//! * **Where.** Only as the whole expression of a SELECT projection,
+//!   `(f(…) AS ?v)`. Upstream also *parses* `simpleCycleBoolean`,
+//!   `cycleBoolean`, `shortestPathLen` and `kHopReachable` inside FILTER but
+//!   never evaluates them there (no case in `TempResult::doComp`); here any
+//!   nested use is a query error that points to the legacy `rs:` function.
+//! * **Arguments.** A variable vertex argument contributes the *distinct*
+//!   values it is bound to across the WHERE solutions, in first-appearance
+//!   order (rows where it is unbound are skipped; a variable bound only by
+//!   `BIND` has no usable value at all, whatever it computes, because
+//!   upstream keeps BIND results in string columns and skips them; another
+//!   computed value that is not a stored term is skipped too; a stored
+//!   literal is passed as an edge-less vertex, as upstream passes its literal
+//!   id); a constant IRI is one vertex (unknown → upstream's `INVALID` id,
+//!   [`GNode::MISSING`]). Two vertex arguments are evaluated over the
+//!   cross product of their distinct values; a vertex variable without any
+//!   usable value gives no entry (`{"paths":[]}`, `false` for
+//!   `cycleBoolean`), as upstream's loop never runs. The `predSet` resolves
+//!   against the dictionary (`{}` = every predicate, `!<p>` = every
+//!   predicate but these, unknown IRIs dropped).
+//! * **Row shape** (GE:1508-2050, GE:2546-3108). A lone projected function
+//!   yields exactly one row computed over all solutions; next to other
+//!   projections there is one row per solution and the function's value is
+//!   on the *last* one only (WHERE order, before ORDER BY), the other rows
+//!   leave it unbound; with GROUP BY it is computed once per group. ORDER BY
+//!   variables that are not projected count as projections, because upstream
+//!   appends them to its projection list. With no solutions — including
+//!   `WHERE {}`, which upstream evaluates to an empty table — a lone function
+//!   is evaluated once with its variables read as IRIs (so they are missing
+//!   vertices; `kHopNeighbor` then names its list `"dst"`, as upstream's
+//!   separate code path does) and anything else yields no row. DISTINCT,
+//!   OFFSET and LIMIT apply to the rows as usual. Next to standard aggregates
+//!   (`COUNT` …) without GROUP BY the query keeps SPARQL's one-row aggregate
+//!   semantics (upstream would emit one mostly empty row per solution).
+//! * **LIMIT pushdown.** When the WHERE clause is a single BGP (triple
+//!   patterns only) with a LIMIT and no ORDER BY, upstream stops the BGP
+//!   after LIMIT rows (`singleBGP` + the `limitK` strategy; OFFSET is not
+//!   added), so the functions — and GROUP BY, aggregates and the row shape
+//!   above — see only the first LIMIT solutions (in this engine's solution
+//!   order; upstream's depends on its join order). OFFSET and LIMIT then
+//!   apply to the rows as usual.
+//! * **HAVING.** Upstream treats a projected function as an aggregate, so
+//!   without GROUP BY the solutions form one group and a failing HAVING
+//!   leaves every function value unbound (the rows stay).
+//! * **Values.** The `{"paths":[…]}` JSON text is a plain literal, exactly as
+//!   upstream emits it; `cycleBoolean` is an `xsd:boolean`;
+//!   `confidenceDegree`'s JSON array (upstream's `pfn_type`, which replaces
+//!   the whole upstream response) is a plain literal too.
+//! * **CSR.** [`Database`](crate::Database) hands its cached CSR to the
+//!   evaluator ([`Evaluator::with_csr_provider`]): it is built on the first
+//!   graph-function query after a data change and shared by later queries.
+//! * **Cancellation.** The library polls the evaluator's cancel flag.
+//!
+//! `PFN.name({…})` parses but is not evaluated yet (a query error).
+//!
+//! # IRI function calls
+//!
+//! `<iri>(…)` / `pfx:name(…)` ([`Expr::IriCall`]) is, in order: a legacy
+//! gstore-rust graph built-in in the predeclared `rs:` namespace
+//! (`<urn:gstore-rust:fn:NAME>`, e.g. `rs:SSSPLEN(<a>, <b>)`, unchanged
+//! semantics, usable anywhere); a SPARQL 1.1 XSD constructor cast
+//! (`xsd:string`, `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:float`,
+//! `xsd:boolean`, `xsd:dateTime`, and `xsd:date`; a cast the §17.5 table
+//! forbids or an invalid lexical form is an expression error, i.e. unbound);
+//! or a user function registered on the [`Database`](crate::Database) under
+//! the full IRI or its local name. Any other IRI call is a query error.
+//!
+//! # SPARQL 1.1 details
+//!
+//! * `IN` / `NOT IN` follow §17.4.1.9-10: `=` on each member, where two
+//!   terms that are not both literals are simply unequal (RDFterm-equal) and
+//!   two incomparable literals are a type error; an error only counts when
+//!   no member is equal (see `eval_in`).
+//! * A trailing `VALUES` block ([`SelectQuery::values`]) joins the WHERE
+//!   solutions of a query without grouping; after GROUP BY / aggregation it
+//!   joins the aggregated rows on their projected names (a VALUES variable
+//!   that is not a result column only multiplies the rows), before ORDER BY.
+//! * A hidden blank-node variable ([`ANON_VAR_PREFIX`], from `[ … ]` /
+//!   `( … )`) never shows in `SELECT *` / `DESCRIBE *`; in a CONSTRUCT or
+//!   INSERT template, one the solution does not bind is a fresh blank node per
+//!   solution.
+//! * gStore's `CONTAINALL` / `CONTAINANY` test `xsd:list` literals (see
+//!   `eval_contain`).
+//!
+//! # Aggregate queries
+//!
+//! A SELECT is an aggregate query when it has `GROUP BY`, an aggregate in a
+//! SELECT expression, `HAVING`, or an aggregate in `ORDER BY` (the last two
+//! form one implicit group). As SPARQL 1.1 §18.2.4.1 specifies, every
+//! aggregate in the SELECT expressions, `HAVING` and `ORDER BY` is computed
+//! once per group into a hidden column of the group's row, and the
+//! expressions are then evaluated over that row like any other expression —
+//! so built-ins, casts, arithmetic, `IF` and `COALESCE` wrap aggregates
+//! freely (`ROUND(AVG(?x))`, `(SUM(?a)/COUNT(?a) AS ?avg)`,
+//! `HAVING (STR(COUNT(*)) = "2")`, `ORDER BY DESC(SUM(?x))`). SELECT
+//! expressions are evaluated left to right, so a later one may use an earlier
+//! alias, and `ORDER BY` may use any alias. `GROUP BY ?v` groups by the term
+//! `?v` is bound to (two different terms with equal values, such as
+//! `"1"^^xsd:integer` and `"01"^^xsd:integer`, are different groups). A
+//! variable that is neither grouped nor aggregated reads its value in the
+//! group's first solution (SPARQL would reject the query).
+//!
+//! # Arithmetic
+//!
+//! Numbers follow XPath type promotion (see [`Value`]). Dividing two integers
+//! gives an `xsd:decimal` by default (`7/2` = `3.5`); upstream gStore's
+//! truncating integer division (`7/2` = `3`, also inside `AVG`) is an opt-in
+//! mode, [`Evaluator::with_integer_division`] /
+//! [`Database::set_integer_division`](crate::Database::set_integer_division).
+//!
+//! # LIMIT, ORDER BY … LIMIT, ASK and EXISTS
+//!
+//! Step 5 above does not always materialize everything (module `topk`,
+//! source `src/query/topk.rs`): a SELECT or CONSTRUCT with `LIMIT` and no
+//! `ORDER BY`, `ASK` and `EXISTS` stream their solutions and stop early;
+//! `ORDER BY … LIMIT k` keeps the best `OFFSET + k` solutions in a bounded
+//! heap; and `ORDER BY` of an integer linear expression over a tree-shaped
+//! BGP enumerates matches in key order (upstream's DP-B). Each returns the
+//! exact rows, in the exact order, of the full evaluation — ties keep their
+//! WHERE order — and [`TopKOptions`] switches them off
+//! ([`Evaluator::with_topk_options`] /
+//! [`Database::set_topk_options`](crate::Database::set_topk_options));
+//! [`EvalStats`] counts the work.
+//!
+//! # SPARQL Update templates
+//!
+//! [`Evaluator::eval_update_modify`] instantiates `DELETE`/`INSERT` quad
+//! templates (`GRAPH <g> { … }` / `GRAPH ?g { … }` blocks included) per WHERE
+//! solution; the [`Database`](crate::Database) chooses the WHERE dataset
+//! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
+use crate::analytics::csr::CsrGraph;
+use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
@@ -26,7 +168,7 @@ use crate::model::id::PredId;
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
-use crate::parser::sparql::builtins;
+use crate::parser::sparql::{builtins, rs_function_name, RS_NAMESPACE};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{TripleSource, TripleStore};
 
@@ -35,7 +177,19 @@ use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
 use super::results::{QueryResult, ResultSet};
-use super::value::{format_xsd_datetime_utc, order_key, parse_datetime_parts, DateTimeParts, Value};
+use super::value::{
+    format_xsd_datetime_utc, is_decimal_lexical, is_integer_lexical, order_key,
+    parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
+    IntegerDivision, NumericFn, Value, XSD_FLOAT,
+};
+
+// Top-K, bounded-heap ORDER BY and early termination for LIMIT / ASK /
+// EXISTS (docs/GAP_PLAN.md §3.4). A child module so it can drive the private
+// BGP/join machinery below.
+#[path = "topk.rs"]
+mod topk;
+use topk::PreparedBgp;
+pub use topk::{DpbMode, EvalStats, TopKOptions};
 
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -51,17 +205,30 @@ struct VarLayout {
     index: HashMap<String, usize>,
     /// Index → name, in first-appearance order (drives `SELECT *`).
     names: Vec<String>,
-    /// Whether each variable ever appears in predicate position (→ resolve its
-    /// id via the predicate dictionary rather than the entity/literal one).
+    /// Whether each variable's ids are *predicate*-dictionary ids (→ resolve
+    /// them via the predicate dictionary rather than the entity/literal one):
+    /// true for a variable that appears only in predicate position.
     is_pred: Vec<bool>,
+    /// Mixed variables: a variable in predicate position that is also bound
+    /// some other way (subject/object, BIND, VALUES, sub-SELECT, GRAPH, …).
+    /// Its own slot holds entity/literal-space ids (`is_pred` false) and its
+    /// predicate-position occurrences bind the hidden predicate-space slot
+    /// it maps to here; [`Evaluator::eval_bgp_constrained`] keeps the two
+    /// in step (same RDF term), so joins never compare a predicate id with
+    /// an entity id.
+    pred_alias: HashMap<usize, usize>,
 }
+
+/// Name prefix of the hidden predicate-space slot of a mixed variable (see
+/// [`VarLayout::pred_alias`]); a SPARQL variable name cannot contain NUL.
+const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
         // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
         let mut names = Vec::new();
         pattern.collect_vars(&mut names);
-        let index: HashMap<String, usize> = names
+        let mut index: HashMap<String, usize> = names
             .iter()
             .enumerate()
             .map(|(i, v)| (v.clone(), i))
@@ -75,10 +242,27 @@ impl VarLayout {
                 is_pred[index[v]] = true;
             }
         }
+        // A predicate variable bound any other way too is mixed: it keeps
+        // entity-space ids and gets a hidden predicate-space slot.
+        let mut node_bound = HashSet::new();
+        node_bound_vars(pattern, &mut node_bound);
+        let mut pred_alias = HashMap::new();
+        for i in 0..names.len() {
+            if is_pred[i] && node_bound.contains(&names[i]) {
+                is_pred[i] = false;
+                let hidden = format!("{PRED_ALIAS_PREFIX}{}", names[i]);
+                let h = names.len();
+                index.insert(hidden.clone(), h);
+                names.push(hidden);
+                is_pred.push(true);
+                pred_alias.insert(i, h);
+            }
+        }
         VarLayout {
             index,
             names,
             is_pred,
+            pred_alias,
         }
     }
 
@@ -93,6 +277,7 @@ impl VarLayout {
             index,
             names,
             is_pred,
+            pred_alias: HashMap::new(),
         }
     }
 
@@ -222,7 +407,28 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Set when a `SERVICE` was refused; like a cancel, it cuts evaluation
     /// short and is reported as an error. Shared with `GRAPH` sub-evaluators.
     service_denied: Rc<std::cell::Cell<bool>>,
+    /// Where gStore's advanced graph functions get their per-predicate CSR
+    /// ([`with_csr_provider`](Self::with_csr_provider)): the
+    /// [`Database`](crate::Database)'s cached [`Database::csr`](crate::Database::csr),
+    /// shared across queries. Without one the evaluator builds a CSR of its
+    /// own store on first use (once per query).
+    csr_provider: Option<&'a CsrProvider<'a>>,
+    /// The CSR obtained for this query (from the provider or built), kept so
+    /// several graph functions / groups in one query share it.
+    gfun_csr: std::cell::RefCell<Option<Arc<CsrGraph>>>,
+    /// How `/` divides two integers ([`with_integer_division`](Self::with_integer_division)).
+    integer_division: IntegerDivision,
+    /// Which LIMIT / ORDER BY / ASK optimizations may run
+    /// ([`with_topk_options`](Self::with_topk_options); all on by default).
+    topk: TopKOptions,
+    /// Work counters ([`stats`](Self::stats)), shared with `GRAPH`
+    /// sub-evaluators so their work counts too.
+    stats: Rc<std::cell::Cell<EvalStats>>,
 }
+
+/// A source of the per-predicate CSR the advanced graph functions run on
+/// (see [`Evaluator::with_csr_provider`]).
+pub type CsrProvider<'a> = dyn Fn() -> Result<Arc<CsrGraph>> + 'a;
 
 /// Per-query memoization of whole-graph analytics results (see
 /// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
@@ -258,6 +464,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
+            integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            stats: Rc::default(),
         }
     }
 
@@ -282,6 +493,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
+            integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            stats: Rc::default(),
         }
     }
 
@@ -321,6 +537,41 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     pub fn with_service_allowed(mut self, allowed: bool) -> Evaluator<'a, S> {
         self.allow_service = allowed;
         self
+    }
+
+    /// Supply the per-predicate CSR that gStore's advanced graph functions
+    /// (`shortestPath(…)`, `PR(…)`, …) run on. [`Database`](crate::Database)
+    /// passes its cached [`Database::csr`](crate::Database::csr), so the CSR
+    /// is built once per data version and shared across queries; the provider
+    /// is only called when a query actually projects a graph function.
+    /// Without a provider the evaluator builds a CSR of its own store the
+    /// first time a query needs one.
+    pub fn with_csr_provider(mut self, provider: &'a CsrProvider<'a>) -> Evaluator<'a, S> {
+        self.csr_provider = Some(provider);
+        self
+    }
+
+    /// Choose how `/` divides two integers: SPARQL 1.1's decimal quotient
+    /// ([`IntegerDivision::Decimal`], the default: `7/2` = `3.5`) or upstream
+    /// gStore's truncation ([`IntegerDivision::Truncate`]: `7/2` = `3`, and
+    /// `AVG` over integers truncates too). See [`Value::arith_with`].
+    pub fn with_integer_division(mut self, mode: IntegerDivision) -> Evaluator<'a, S> {
+        self.integer_division = mode;
+        self
+    }
+
+    /// The CSR for the advanced graph functions of this query (see
+    /// [`with_csr_provider`](Self::with_csr_provider)).
+    fn gfun_csr(&self) -> Result<Arc<CsrGraph>> {
+        if let Some(csr) = self.gfun_csr.borrow().as_ref() {
+            return Ok(Arc::clone(csr));
+        }
+        let csr = match self.csr_provider {
+            Some(provider) => provider()?,
+            None => Arc::new(CsrGraph::build(self.store)?),
+        };
+        *self.gfun_csr.borrow_mut() = Some(Arc::clone(&csr));
+        Ok(csr)
     }
 
     /// Whether evaluation must stop early: cancellation was requested, or a
@@ -390,13 +641,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
         self.check_cancel()?;
+        self.check_calls(query)?;
         match query {
             Query::Select(s) => Ok(QueryResult::Select(self.eval_select(s)?)),
             Query::Ask(a) => {
                 let layout = VarLayout::build(&a.pattern);
-                let solutions = self.eval_pattern(&a.pattern, &layout);
+                // Stops at the first solution (see `topk`).
+                let found = self.pattern_has_solution(&a.pattern, &layout);
                 self.check_cancel()?; // a mid-run cancel short-circuits to empty; report it
-                Ok(QueryResult::Ask(!solutions.is_empty()))
+                Ok(QueryResult::Ask(found))
             }
             Query::Construct(c) => Ok(QueryResult::Construct(self.eval_construct(c)?)),
             Query::Describe(d) => Ok(QueryResult::Construct(self.eval_describe(d)?)),
@@ -410,12 +663,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// any template triple with an unbound variable. Returns de-duplicated triples.
     fn eval_construct(&self, c: &ConstructQuery) -> Result<Vec<Triple>> {
         let layout = VarLayout::build(&c.pattern);
-        let mut solutions = self.eval_pattern(&c.pattern, &layout);
+        // With a LIMIT, only the first (or, with ORDER BY, the best)
+        // OFFSET+LIMIT solutions are needed (see `topk`): already in order.
+        let (mut solutions, sorted) = match self.construct_fast_path(c, &layout)? {
+            Some(prefix) => (prefix, true),
+            None => (self.eval_pattern(&c.pattern, &layout), false),
+        };
         // A mid-run cancel short-circuits eval_pattern to empty; surface it as an
         // error rather than a bogus empty CONSTRUCT (which would also poison the
         // query cache). Mirrors eval_select_solutions / the ASK path.
         self.check_cancel()?;
-        if !c.order_by.is_empty() {
+        if !c.order_by.is_empty() && !sorted {
             self.sort_solutions(&mut solutions, &c.order_by, &layout);
         }
         let offset = c.offset.unwrap_or(0);
@@ -429,8 +687,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for b in &solutions {
+            let mut fresh = HashMap::new();
             for tp in &c.template {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                // A triple with a literal subject or a non-IRI predicate is
+                // not RDF and is left out (§16.2).
+                if let Some(t) = self
+                    .instantiate_template(tp, b, &layout, &mut fresh)
+                    .filter(|t| !t.subject.is_literal() && matches!(t.predicate, Term::Iri(_)))
+                {
                     if seen.insert(t.to_string()) {
                         out.push(t);
                     }
@@ -471,7 +735,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // hold predicate ids (a different id space), and synthetic ids are
                 // computed values, not stored resources.
                 let want: Vec<usize> = if d.all {
-                    (0..layout.len()).filter(|&i| !layout.is_pred[i]).collect()
+                    (0..layout.len())
+                        .filter(|&i| !layout.is_pred[i] && !is_anon_var(&layout.names[i]))
+                        .collect()
                 } else {
                     d.targets
                         .iter()
@@ -522,63 +788,123 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok(out)
     }
 
-    /// Compute the ground triples a `DELETE … INSERT … WHERE` modify would
-    /// remove and add: evaluate the WHERE pattern, then instantiate each
-    /// template against every solution (skipping template triples with an
-    /// unbound variable), de-duplicated. The caller (Database) applies deletes
-    /// before inserts. Read-only — does not mutate the store.
+    /// Compute the ground quads a `DELETE … INSERT … WHERE` modify would
+    /// remove and add: evaluate the WHERE pattern over this evaluator's
+    /// dataset (its store is the default graph, [`with_named`](Self::with_named)
+    /// the named graphs), then instantiate each template against every
+    /// solution, de-duplicated. Each quad comes with its target graph IRI —
+    /// the template's `GRAPH <iri>`, or the IRI `GRAPH ?g` is bound to — or
+    /// `None` for a template outside any `GRAPH` block (the caller's default
+    /// graph, i.e. the `WITH` graph if there is one). A template quad is
+    /// skipped for a solution that leaves one of its variables unbound or
+    /// would make an illegal triple (a literal or blank-node predicate, a
+    /// literal subject, a graph name that is not an IRI) — SPARQL 1.1 Update
+    /// §3.1.3. The caller (Database) applies deletes before inserts.
+    /// Read-only — does not mutate the store. Fails, like
+    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced
+    /// graph function or `PFN` that the engine cannot evaluate yet.
+    #[allow(clippy::type_complexity)]
     pub fn eval_update_modify(
         &self,
-        delete: &[TriplePattern],
-        insert: &[TriplePattern],
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
         pattern: &GraphPattern,
-    ) -> (Vec<Triple>, Vec<Triple>) {
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
+        self.check_cancel()?;
         let mut dels = Vec::new();
         let mut ins = Vec::new();
         let mut seen_d = HashSet::new();
         let mut seen_i = HashSet::new();
         for b in &sols {
-            for tp in delete {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
-                    if seen_d.insert(t.to_string()) {
-                        dels.push(t);
-                    }
-                }
-            }
-            for tp in insert {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
-                    if seen_i.insert(t.to_string()) {
-                        ins.push(t);
+            // One map per solution: a `[ … ]` / `( … )` node of the
+            // templates is the same fresh blank node across this solution's
+            // quads, and a new one for the next solution.
+            let mut fresh = HashMap::new();
+            for (templates, out, seen) in [
+                (delete, &mut dels, &mut seen_d),
+                (insert, &mut ins, &mut seen_i),
+            ] {
+                for q in templates {
+                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh) else {
+                        continue;
+                    };
+                    if seen.insert((quad.0.clone(), quad.1.to_string())) {
+                        out.push(quad);
                     }
                 }
             }
         }
-        (dels, ins)
+        Ok((dels, ins))
     }
 
-    /// Fill a template triple from a solution; `None` if any position is unbound.
+    /// Fill a quad template from a solution (see
+    /// [`eval_update_modify`](Self::eval_update_modify)); `None` if a
+    /// variable is unbound or the result is not a legal quad. `fresh` is as
+    /// for [`instantiate_template`](Self::instantiate_template).
+    fn instantiate_quad(
+        &self,
+        q: &QuadPattern,
+        b: &Binding,
+        layout: &VarLayout,
+        fresh: &mut HashMap<String, Term>,
+    ) -> Option<(Option<String>, Triple)> {
+        let graph = match &q.graph {
+            None => None,
+            Some(GraphTerm::Iri(iri)) => Some(iri.clone()),
+            Some(GraphTerm::Var(v)) => match self.binding_term(v, b, layout)? {
+                Term::Iri(iri) => Some(iri),
+                _ => return None,
+            },
+        };
+        let t = self.instantiate_template(&q.triple, b, layout, fresh)?;
+        if t.subject.is_literal() || !matches!(t.predicate, Term::Iri(_)) {
+            return None;
+        }
+        Some((graph, t))
+    }
+
+    /// The term variable `v` is bound to in `b`, resolved in the variable's
+    /// own id space (a predicate-position variable holds predicate ids).
+    fn binding_term(&self, v: &str, b: &Binding, layout: &VarLayout) -> Option<Term> {
+        let idx = *layout.index.get(v)?;
+        let s = self.resolve_string(b[idx], layout.is_pred[idx])?;
+        parse_term(&s).ok()
+    }
+
+    /// Fill a template triple from a solution; `None` if any position is
+    /// unbound. A hidden blank-node variable (`[ … ]` / `( … )` in the
+    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind becomes
+    /// a fresh blank node, the same one for every template triple of this
+    /// solution: `fresh` holds them, and the caller starts a new map per
+    /// solution.
     fn instantiate_template(
         &self,
         tp: &TriplePattern,
         b: &Binding,
         layout: &VarLayout,
+        fresh: &mut HashMap<String, Term>,
     ) -> Option<Triple> {
-        let resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
+        let mut resolve = |pt: &PatternTerm| -> Option<Term> {
             match pt {
                 PatternTerm::Term(t) => Some(t.clone()),
-                PatternTerm::Var(v) => {
-                    let idx = *layout.index.get(v)?;
-                    let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
-                    parse_term(&s).ok()
-                }
+                PatternTerm::Var(v) => match self.binding_term(v, b, layout) {
+                    None if is_anon_var(v) => Some(
+                        fresh
+                            .entry(v.clone())
+                            .or_insert_with(|| Term::Blank(fresh_bnode_label()))
+                            .clone(),
+                    ),
+                    other => other,
+                },
             }
         };
         Some(Triple::new(
-            resolve(&tp.subject, false)?,
-            resolve(&tp.predicate, true)?,
-            resolve(&tp.object, false)?,
+            resolve(&tp.subject)?,
+            resolve(&tp.predicate)?,
+            resolve(&tp.object)?,
         ))
     }
 
@@ -607,12 +933,38 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         &self,
         q: &SelectQuery,
     ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
-        let mut layout = VarLayout::build(&q.pattern);
-        let mut solutions = self.eval_pattern(&q.pattern, &layout);
-        // A cancelled join short-circuits to empty bindings; surface it as an
-        // error rather than a spurious empty result set.
-        self.check_cancel()?;
-
+        // gStore's advanced graph functions, `(shortestPath(…) AS ?v)`: each is
+        // computed once over the distinct bindings of its vertex arguments
+        // across all solutions (per group with GROUP BY) and placed with
+        // upstream's row shape — see the module docs, "Advanced graph
+        // functions".
+        let gfns = graph_fn_items(q)?;
+        // An aggregate query: GROUP BY, an aggregate in a SELECT expression,
+        // or HAVING / an aggregate in ORDER BY (one implicit group). Next to
+        // a projected graph function, HAVING keeps upstream's row shape
+        // instead (see the module docs).
+        let has_agg = !q.group_by.is_empty()
+            || projection_has_aggregate(&q.projection)
+            || (gfns.is_empty()
+                && (!q.having.is_empty()
+                    || q.order_by.iter().any(|o| expr_has_aggregate(&o.expr))));
+        // A trailing `VALUES` block joins the solutions before the SELECT
+        // expressions, ORDER BY and projection (§18.2.4.3): without grouping
+        // that is a join with the WHERE pattern; after grouping it joins the
+        // group rows after HAVING (in `eval_aggregation`).
+        let with_values;
+        let pattern = match &q.values {
+            Some((vars, rows)) if !has_agg => {
+                let values = GraphPattern::Values(vars.clone(), rows.clone());
+                with_values = match &q.pattern {
+                    GraphPattern::Empty => values,
+                    p => GraphPattern::Join(Box::new(p.clone()), Box::new(values)),
+                };
+                &with_values
+            }
+            _ => &q.pattern,
+        };
+        let mut layout = VarLayout::build(pattern);
         let result_vars = q.result_vars();
         // A result column is predicate-typed only if it is a plain pattern
         // variable that occurs in predicate position.
@@ -621,17 +973,113 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .map(|v| layout.index.get(v).is_some_and(|&i| layout.is_pred[i]))
             .collect();
 
-        let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
-        let mut rows = if has_agg {
-            let mut rows = self.eval_aggregation(&solutions, &layout, q)?;
-            // Aggregated rows are ordered over the projected result layout —
-            // ORDER BY here references group keys / aggregate aliases.
-            if !q.order_by.is_empty() {
-                let result_layout = VarLayout::from_vars(result_vars.clone(), is_pred.clone());
-                self.sort_solutions(&mut rows, &q.order_by, &result_layout);
+        // LIMIT without ORDER BY streams and stops early; ORDER BY + LIMIT
+        // keeps only the best OFFSET+LIMIT solutions (bounded heap, DP-B).
+        // Both return a long enough prefix of the rows the full evaluation
+        // below would produce (see `topk`).
+        if gfns.is_empty() && !has_agg {
+            if let Some(rows) = self.select_fast_path(q, pattern, &layout, &result_vars)? {
+                return Ok((result_vars, is_pred, apply_row_modifiers(q, rows)));
             }
-            rows
+        }
+
+        // Upstream's LIMIT pushdown: a WHERE clause that is one BGP, with a
+        // LIMIT and no ORDER BY, stops its BGP after LIMIT rows (OFFSET is not
+        // added), so the functions only see those rows.
+        let gfn_limit = match q.limit {
+            Some(limit)
+                if !gfns.is_empty() && q.order_by.is_empty() && pattern_is_single_bgp(pattern) =>
+            {
+                Some(limit)
+            }
+            _ => None,
+        };
+        let mut solutions = match gfn_limit {
+            Some(limit) => self.first_solutions(pattern, &layout, limit),
+            None => self.eval_pattern(pattern, &layout),
+        };
+        // A cancelled join short-circuits to empty bindings; surface it as an
+        // error rather than a spurious empty result set.
+        self.check_cancel()?;
+        if let Some(limit) = gfn_limit {
+            solutions.truncate(limit);
+        }
+        let bind_only = if gfns.is_empty() {
+            HashSet::new()
         } else {
+            bind_only_vars(pattern)
+        };
+        let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
+        let rows = if !gfns.is_empty()
+            && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
+        {
+            // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
+            // function is evaluated once with its arguments read as constants
+            // (a variable is looked up as an IRI and is missing); next to
+            // other projections there is no row at all.
+            if only_gfn {
+                vec![vec![self.eval_graph_fn(
+                    &gfns[0].call,
+                    &[],
+                    &layout,
+                    &bind_only,
+                    true,
+                )?]]
+            } else {
+                Vec::new()
+            }
+        } else if only_gfn && !has_agg {
+            // A lone graph function over the solutions: exactly one row
+            // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
+            // form one group: a failing HAVING leaves the value unset
+            // (GE:2071-2075).
+            let all: Vec<&Binding> = solutions.iter().collect();
+            let value = if self.having_holds(q, &all, &layout) {
+                self.eval_graph_fn(&gfns[0].call, &all, &layout, &bind_only, false)?
+            } else {
+                None
+            };
+            vec![vec![value]]
+        } else if has_agg {
+            // Grouped, filtered by HAVING, joined with a trailing VALUES and
+            // ordered by ORDER BY there.
+            self.eval_aggregation(&solutions, &layout, &bind_only, q)?
+        } else {
+            // Graph functions next to other projections: one row per
+            // solution, each function's value on the *last* solution only
+            // (upstream writes it to `result.back()`, GE:3100-3108; "last" is
+            // in WHERE order, before ORDER BY), or on none when HAVING fails
+            // over the solutions as one group. The value becomes a column
+            // under its alias so ORDER BY can refer to it.
+            if !gfns.is_empty() {
+                let all: Vec<&Binding> = solutions.iter().collect();
+                let keep = self.having_holds(q, &all, &layout);
+                let mut values = Vec::with_capacity(gfns.len());
+                for g in &gfns {
+                    values.push(if keep {
+                        self.eval_graph_fn(&g.call, &all, &layout, &bind_only, false)?
+                    } else {
+                        None
+                    });
+                }
+                for (g, v) in gfns.iter().zip(values) {
+                    if layout.index.contains_key(&g.alias) {
+                        return Err(GStoreError::Query(format!(
+                            "?{} is already bound by the WHERE clause; ({}(…) AS ?v) needs a \
+                             fresh variable",
+                            g.alias,
+                            g.call.kind.name()
+                        )));
+                    }
+                    layout.index.insert(g.alias.clone(), layout.names.len());
+                    layout.names.push(g.alias.clone());
+                    layout.is_pred.push(false);
+                    let last = solutions.len().saturating_sub(1);
+                    for (i, b) in solutions.iter_mut().enumerate() {
+                        b.push(if i == last { v } else { None });
+                    }
+                }
+            }
             // SPARQL evaluates ORDER BY over the *pre-projection* solution
             // sequence, so it may sort by a pattern variable that is not selected
             // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
@@ -647,9 +1095,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                                 layout.names.push(alias.clone());
                                 layout.is_pred.push(false);
                                 for b in solutions.iter_mut() {
-                                    let v =
-                                        self.eval_value(e, b, &layout).map(|v| self.value_to_id(&v));
-                                    b.push(v);
+                                    // The column exists (unbound) while its
+                                    // expression is evaluated, so a reference
+                                    // to the alias itself reads unbound
+                                    // instead of indexing past the end — as
+                                    // the Top-K path (`order_extend`) does.
+                                    b.push(None);
+                                    b[idx] = self.eval_id(e, b, &layout);
                                 }
                             }
                         }
@@ -659,25 +1111,121 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             solutions
                 .iter()
-                .map(|b| self.project_items(b, &layout, q))
+                .map(|b| self.project_items(b, &layout, q, &result_vars))
                 .collect::<Result<Vec<_>>>()?
         };
 
         // DISTINCT / OFFSET / LIMIT over the projected result rows (ORDER BY was
         // applied above — before projection for the non-aggregate path).
-        if q.distinct {
-            let mut seen = std::collections::HashSet::new();
-            rows.retain(|r| seen.insert(r.clone()));
-        }
-        let offset = q.offset.unwrap_or(0);
-        if offset > 0 {
-            rows.drain(0..offset.min(rows.len()));
-        }
-        if let Some(limit) = q.limit {
-            rows.truncate(limit);
-        }
+        Ok((result_vars, is_pred, apply_row_modifiers(q, rows)))
+    }
 
-        Ok((result_vars, is_pred, rows))
+    /// Where each variable of an aggregate query's trailing `VALUES` block
+    /// meets the group rows (see [`eval_aggregation`](Self::eval_aggregation)),
+    /// adding a column to `glayout` for a variable it does not have.
+    fn values_columns(
+        &self,
+        vars: &[String],
+        q: &SelectQuery,
+        items: &[SelectItem],
+        alias_cols: &[Option<usize>],
+        glayout: &mut VarLayout,
+    ) -> Vec<ValuesCol> {
+        vars.iter()
+            .map(|v| {
+                let alias = items.iter().zip(alias_cols).find_map(|(it, col)| match it {
+                    SelectItem::Expr(_, a) if a == v => *col,
+                    _ => None,
+                });
+                if let Some(col) = alias {
+                    return ValuesCol::Alias(col);
+                }
+                if let Some(&i) = glayout.index.get(v) {
+                    let grouped = q
+                        .group_by
+                        .iter()
+                        .any(|e| matches!(e, Expr::Var(g) if g == v))
+                        || items
+                            .iter()
+                            .any(|it| matches!(it, SelectItem::Var(x) if x == v));
+                    return if grouped {
+                        ValuesCol::Match(i)
+                    } else {
+                        ValuesCol::Bind(i)
+                    };
+                }
+                let i = glayout.names.len();
+                glayout.index.insert(v.clone(), i);
+                glayout.names.push(v.clone());
+                glayout.is_pred.push(false);
+                ValuesCol::Bind(i)
+            })
+            .collect()
+    }
+
+    /// Join one group row with one row of a trailing `VALUES` block over the
+    /// [`ValuesCol::Match`] / [`ValuesCol::Bind`] columns: `None` when a
+    /// matched column holds a different term, else the row with the VALUES
+    /// terms bound (an `UNDEF` cell leaves the column as it is). Alias
+    /// columns are checked later, by [`values_alias_join`](Self::values_alias_join).
+    fn values_join_row(
+        &self,
+        gb: &Binding,
+        vrow: &[Option<Term>],
+        cols: &[ValuesCol],
+        glayout: &VarLayout,
+    ) -> Option<Binding> {
+        let mut merged = gb.clone();
+        for (cell, col) in vrow.iter().zip(cols) {
+            let Some(term) = cell else { continue };
+            match *col {
+                ValuesCol::Match(c) => match gb[c] {
+                    Some(id) if self.id_to_term(id, glayout.is_pred[c]).as_ref() != Some(term) => {
+                        return None
+                    }
+                    Some(_) => {}
+                    None => merged[c] = Some(self.values_cell_id(term, glayout.is_pred[c])),
+                },
+                ValuesCol::Bind(c) => {
+                    merged[c] = Some(self.values_cell_id(term, glayout.is_pred[c]))
+                }
+                ValuesCol::Alias(_) => {}
+            }
+        }
+        Some(merged)
+    }
+
+    /// The [`ValuesCol::Alias`] half of the VALUES join, once the SELECT
+    /// expressions are in `gb`: `false` when an alias holds a different term
+    /// than the VALUES row; an unbound alias takes the VALUES term.
+    fn values_alias_join(
+        &self,
+        gb: &mut Binding,
+        vrow: &[Option<Term>],
+        cols: &[ValuesCol],
+    ) -> bool {
+        for (cell, col) in vrow.iter().zip(cols) {
+            let (Some(term), ValuesCol::Alias(c)) = (cell, *col) else {
+                continue;
+            };
+            match gb[c] {
+                Some(id) if self.id_to_term(id, false).as_ref() != Some(term) => return false,
+                Some(_) => {}
+                None => gb[c] = Some(self.term_to_id(term)),
+            }
+        }
+        true
+    }
+
+    /// The id a VALUES term takes in a column: a predicate-typed column
+    /// resolves its ids through the predicate dictionary, so a term goes
+    /// there as a synthetic id (which resolves anywhere).
+    fn values_cell_id(&self, term: &Term, is_pred: bool) -> u32 {
+        if is_pred {
+            self.extras.borrow_mut().intern(term)
+        } else {
+            self.term_to_id(term)
+        }
     }
 
     /// Project a single solution into result-variable order (no aggregation).
@@ -686,29 +1234,173 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         b: &Binding,
         layout: &VarLayout,
         q: &SelectQuery,
+        result_vars: &[String],
     ) -> Result<Vec<Option<u32>>> {
         match &q.projection {
-            Projection::All => Ok(layout.names.iter().map(|v| b[layout.index[v]]).collect()),
+            Projection::All => Ok(result_vars
+                .iter()
+                .map(|v| layout.index.get(v).and_then(|&i| b[i]))
+                .collect()),
             Projection::Items(items) => items
                 .iter()
                 .map(|it| match it {
                     SelectItem::Var(v) => Ok(layout.index.get(v).and_then(|&i| b[i])),
-                    SelectItem::Expr(e, _) => {
-                        Ok(self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
+                    // Computed up front into the alias column (see
+                    // `eval_select_solutions`).
+                    SelectItem::Expr(Expr::GraphFn { .. }, alias) => {
+                        Ok(layout.index.get(alias).and_then(|&i| b[i]))
                     }
+                    SelectItem::Expr(e, _) => Ok(self.eval_id(e, b, layout)),
                 })
                 .collect(),
         }
     }
 
-    /// Group solutions and compute aggregates / projected expressions.
+    /// Evaluate a projected advanced graph function over `sols` (all the
+    /// WHERE solutions, or one GROUP BY group): resolve each vertex argument
+    /// to its distinct bindings across `sols` (a constant IRI to its one
+    /// node), the `predSet` against the dictionary, and run the gfun library
+    /// on the shared CSR. `constant` is upstream's no-solution path, where a
+    /// variable argument is looked up as if it were an IRI and so is a
+    /// missing vertex. A variable in `bind_only` ([`bind_only_vars`]) has no
+    /// usable binding: upstream keeps BIND results in string columns and
+    /// rejects them as vertices ("src must be an entity", GE:2583-2606),
+    /// whatever their value. Returns the value's id (a plain-literal JSON
+    /// text, an `xsd:boolean` for `cycleBoolean`, …).
+    fn eval_graph_fn(
+        &self,
+        call: &GCall,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        bind_only: &HashSet<String>,
+        constant: bool,
+    ) -> Result<Option<u32>> {
+        let csr = self.gfun_csr()?;
+        let nodes = |arg: &Option<VarOrIri>| -> Vec<GNode> {
+            match arg {
+                None => Vec::new(),
+                Some(VarOrIri::Iri(iri)) => vec![gfun::iri_node(&csr, self.dict, iri)],
+                Some(VarOrIri::Var(_)) if constant => vec![GNode::MISSING],
+                Some(VarOrIri::Var(v)) if bind_only.contains(v) => Vec::new(),
+                Some(VarOrIri::Var(v)) => self.distinct_gfn_nodes(v, sols, layout, &csr),
+            }
+        };
+        let (srcs, dsts) = (nodes(&call.src), nodes(&call.dst));
+        // A vertex argument whose variable has no usable binding: upstream's
+        // `for uid … for vid …` loop never runs, leaving `{"paths":[]}`
+        // (`false` for cycleBoolean). Decided here because the library reads
+        // an empty `srcs` as "no source given" (clusterCoeff's global form).
+        if (call.src.is_some() && srcs.is_empty()) || (call.dst.is_some() && dsts.is_empty()) {
+            let value = match call.kind {
+                GFnKind::CycleBoolean => Value::Bool(false),
+                _ => Value::Str {
+                    value: r#"{"paths":[]}"#.into(),
+                    lang: None,
+                },
+            };
+            return Ok(Some(self.value_to_id(&value)));
+        }
+        let mut args = call.to_gargs(srcs, dsts, self.dict);
+        args.where_empty = constant;
+        let mut ctx = GFunCtx::new(&csr, self.dict);
+        if let Some(flag) = &self.cancel {
+            ctx = ctx.with_cancel(flag);
+        }
+        let value = match gfun::eval(call.kind, &ctx, &args)? {
+            // Upstream stores the JSON text as a plain literal (GE:1578,
+            // GE:2019). `confidenceDegree`'s `pfn_type` result replaces the
+            // whole upstream response with `{"results": …}`; this engine has
+            // no such response mode and returns its JSON as a plain literal.
+            GFunValue::Json(text) | GFunValue::ResultsJson(text) => Value::Str {
+                value: text,
+                lang: None,
+            },
+            GFunValue::Bool(v) => Value::Bool(v),
+            GFunValue::Int(v) => Value::Int(v),
+            GFunValue::Num(v) => Value::Double(v),
+        };
+        Ok(Some(self.value_to_id(&value)))
+    }
+
+    /// The distinct vertices a graph-function variable is bound to across
+    /// `sols`, in first-appearance order. Unbound rows are skipped (GE:2582
+    /// `!= INVALID`); a computed value that is not a stored term (e.g. a
+    /// VALUES result outside the dictionary, like upstream's string columns,
+    /// "src must be an entity", GE:2577) is skipped (variables bound only by
+    /// BIND never get here, see `eval_graph_fn`); a stored literal is
+    /// passed with its dictionary id and no CSR vertex, as upstream passes
+    /// its literal id (it has no edges and prints as its literal text); a
+    /// predicate-position binding is the entity with the same IRI, if any.
+    /// A variable the WHERE clause never binds has no bindings.
+    fn distinct_gfn_nodes(
+        &self,
+        var: &str,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        csr: &CsrGraph,
+    ) -> Vec<GNode> {
+        let Some(&idx) = layout.index.get(var) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for b in sols {
+            let Some(id) = b[idx] else { continue };
+            if is_synth(id) {
+                continue;
+            }
+            let entity = if layout.is_pred[idx] {
+                match self
+                    .dict
+                    .predicate_to_string(id)
+                    .and_then(|key| self.dict.entity_id(key))
+                {
+                    Some(e) => e,
+                    None => continue,
+                }
+            } else {
+                id
+            };
+            if seen.insert(entity) {
+                out.push(GNode::resolve(csr, Some(entity)));
+            }
+        }
+        out
+    }
+
+    /// Group solutions and compute the projected rows of an aggregate query
+    /// (one per group that passes HAVING, sorted by ORDER BY), following
+    /// SPARQL 1.1 §18.2.4.1: every aggregate in the SELECT expressions,
+    /// HAVING and ORDER BY is computed once per group into a hidden column
+    /// of the group's row, and the expressions — with the aggregates replaced
+    /// by those columns — are then ordinary expressions over the row. So
+    /// builtins wrapping aggregates (`ROUND(AVG(?x))`, `STR(COUNT(*))`,
+    /// `SUM(?a)/COUNT(?a)`, `COALESCE(MIN(?x), 0)`, `IF(COUNT(*) > 1, …)`)
+    /// evaluate like any other expression. SELECT expressions are evaluated
+    /// in order (a later one may use an earlier alias) and ORDER BY sees the
+    /// aliases. A group row binds each GROUP BY variable to the group's key
+    /// and, as before, every other WHERE variable to its value in the group's
+    /// first solution. `bind_only` is [`bind_only_vars`] of the pattern, for
+    /// the projected graph functions.
     fn eval_aggregation(
         &self,
         solutions: &[Binding],
         layout: &VarLayout,
+        bind_only: &HashSet<String>,
         q: &SelectQuery,
     ) -> Result<Vec<Vec<Option<u32>>>> {
-        // Group key = the GROUP BY expression values (empty ⇒ one group).
+        let items = match &q.projection {
+            Projection::Items(items) => items,
+            Projection::All => {
+                return Err(GStoreError::Query(
+                    "SELECT * with aggregation is not allowed".into(),
+                ))
+            }
+        };
+
+        // Group key = the GROUP BY expression values (empty ⇒ one group). A
+        // plain variable keys by its bound term itself (RDF term identity, in
+        // the variable's own id space); an expression by its computed value.
         use std::collections::hash_map::Entry;
         let mut order: Vec<Vec<Option<u32>>> = Vec::new();
         let mut groups: HashMap<Vec<Option<u32>>, Vec<usize>> = HashMap::new();
@@ -716,7 +1408,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let key: Vec<Option<u32>> = q
                 .group_by
                 .iter()
-                .map(|e| self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
+                .map(|e| match e {
+                    Expr::Var(v) => layout.index.get(v).and_then(|&vi| b[vi]),
+                    e => self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)),
+                })
                 .collect();
             match groups.entry(key.clone()) {
                 Entry::Occupied(mut o) => o.get_mut().push(i),
@@ -732,128 +1427,178 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             groups.insert(Vec::new(), Vec::new());
         }
 
-        // Map GROUP BY variables to their key column, for projecting group vars.
-        let mut key_vars: HashMap<String, usize> = HashMap::new();
-        for (ki, e) in q.group_by.iter().enumerate() {
-            if let Expr::Var(v) = e {
-                key_vars.insert(v.clone(), ki);
-            }
+        // §18.2.4.1: lift every aggregate into a hidden group-row column.
+        let mut aggs: Vec<Expr> = Vec::new();
+        let lifted_items: Vec<Option<Expr>> = items
+            .iter()
+            .map(|it| match it {
+                SelectItem::Expr(Expr::GraphFn { .. }, _) | SelectItem::Var(_) => None,
+                SelectItem::Expr(e, _) => Some(lift_aggregates(e, &mut aggs)),
+            })
+            .collect();
+        let having: Vec<Expr> = q
+            .having
+            .iter()
+            .map(|h| lift_aggregates(h, &mut aggs))
+            .collect();
+        let order_by: Vec<OrderCondition> = q
+            .order_by
+            .iter()
+            .map(|o| OrderCondition {
+                expr: lift_aggregates(&o.expr, &mut aggs),
+                descending: o.descending,
+            })
+            .collect();
+        let mut glayout = group_layout(layout, aggs.len());
+        // One column per SELECT expression alias.
+        let mut alias_cols = Vec::with_capacity(items.len());
+        for it in items {
+            alias_cols.push(match it {
+                SelectItem::Var(_) => None,
+                SelectItem::Expr(_, alias) => Some(match glayout.index.get(alias) {
+                    Some(&i) => {
+                        glayout.is_pred[i] = false;
+                        i
+                    }
+                    None => {
+                        let i = glayout.names.len();
+                        glayout.index.insert(alias.clone(), i);
+                        glayout.names.push(alias.clone());
+                        glayout.is_pred.push(false);
+                        i
+                    }
+                }),
+            });
         }
 
-        let items = match &q.projection {
-            Projection::Items(items) => items,
-            Projection::All => {
-                return Err(GStoreError::Query(
-                    "SELECT * with aggregation is not allowed".into(),
-                ))
-            }
+        // A trailing VALUES block (§18.2.4.3) joins the group rows after
+        // HAVING: on the GROUP BY and projected variables, and on the SELECT
+        // aliases once they are computed (as the join of the projected rows
+        // would); any other VALUES variable is not in scope after grouping,
+        // so the VALUES row binds it, visible to the SELECT expressions.
+        let values_cols = match &q.values {
+            Some((vars, _)) => self.values_columns(vars, q, items, &alias_cols, &mut glayout),
+            None => Vec::new(),
         };
 
-        let mut rows = Vec::new();
+        let mut grows: Vec<Binding> = Vec::new();
         for key in &order {
             let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
+            let gb = self.group_row(&sols, layout, &glayout, &aggs);
             // HAVING: drop groups failing any constraint.
-            let keep = q.having.iter().all(|h| {
-                self.eval_group_expr(h, &sols, layout, &key_vars, key)
-                    .and_then(|v| v.ebv())
-                    == Some(true)
-            });
-            if !keep {
+            if !having
+                .iter()
+                .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
+            {
                 continue;
             }
-            let mut row = Vec::with_capacity(items.len());
+            // An advanced graph function over the group's solutions
+            // (upstream: once per GROUP BY group, GE:2546-2620).
+            let mut gfn_values: Vec<Option<Option<u32>>> = Vec::with_capacity(items.len());
             for it in items {
-                let val = match it {
-                    SelectItem::Var(v) => key_vars.get(v).and_then(|&ki| key[ki]).or_else(|| {
-                        sols.first()
-                            .and_then(|b| layout.index.get(v).and_then(|&i| b[i]))
-                    }),
-                    SelectItem::Expr(e, _) => self
-                        .eval_group_expr(e, &sols, layout, &key_vars, key)
-                        .map(|v| self.value_to_id(&v)),
-                };
-                row.push(val);
+                gfn_values.push(match it {
+                    SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
+                        let call = GCall::from_ast(*func, args)?;
+                        Some(self.eval_graph_fn(&call, &sols, layout, bind_only, false)?)
+                    }
+                    _ => None,
+                });
             }
-            rows.push(row);
+            let joined: Vec<(Binding, Option<&Vec<Option<Term>>>)> = match &q.values {
+                None => vec![(gb, None)],
+                Some((_, vrows)) => vrows
+                    .iter()
+                    .filter_map(|vrow| {
+                        self.values_join_row(&gb, vrow, &values_cols, &glayout)
+                            .map(|row| (row, Some(vrow)))
+                    })
+                    .collect(),
+            };
+            for (mut gb, vrow) in joined {
+                for ((lifted, gfn), col) in lifted_items.iter().zip(&gfn_values).zip(&alias_cols) {
+                    let Some(col) = *col else { continue };
+                    gb[col] = match (gfn, lifted) {
+                        (Some(v), _) => *v,
+                        (None, Some(e)) => self.eval_id(e, &gb, &glayout),
+                        (None, None) => None,
+                    };
+                }
+                if let Some(vrow) = vrow {
+                    if !self.values_alias_join(&mut gb, vrow, &values_cols) {
+                        continue;
+                    }
+                }
+                grows.push(gb);
+            }
         }
-        Ok(rows)
+        if !order_by.is_empty() {
+            self.sort_solutions(&mut grows, &order_by, &glayout);
+        }
+        Ok(grows
+            .iter()
+            .map(|gb| {
+                items
+                    .iter()
+                    .zip(&alias_cols)
+                    .map(|(it, col)| match (it, col) {
+                        (SelectItem::Var(v), _) => glayout.index.get(v).and_then(|&i| gb[i]),
+                        (_, Some(col)) => gb[*col],
+                        (_, None) => None,
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
-    // ---- aggregate / group-expression evaluation -------------------------
-
-    /// Evaluate an expression in group context (may contain aggregates).
-    fn eval_group_expr(
+    /// A group's row (see [`eval_aggregation`](Self::eval_aggregation)) over
+    /// `glayout` (the WHERE `layout` extended by [`group_layout`] and maybe
+    /// alias columns): the group's first solution, then the value of each
+    /// lifted aggregate of `aggs` (an error leaves its column unbound).
+    fn group_row(
         &self,
-        e: &Expr,
         sols: &[&Binding],
         layout: &VarLayout,
-        key_vars: &HashMap<String, usize>,
-        key: &[Option<u32>],
-    ) -> Option<Value> {
-        match e {
-            Expr::Aggregate {
+        glayout: &VarLayout,
+        aggs: &[Expr],
+    ) -> Binding {
+        let mut gb: Binding = match sols.first() {
+            Some(b) => (*b).clone(),
+            None => vec![None; layout.len()],
+        };
+        gb.resize(glayout.len(), None);
+        for (i, a) in aggs.iter().enumerate() {
+            if let Expr::Aggregate {
                 func,
                 distinct,
                 arg,
                 sep,
-            } => self.eval_aggregate(
-                *func,
-                *distinct,
-                arg.as_deref(),
-                sep.as_deref(),
-                sols,
-                layout,
-            ),
-            Expr::Var(name) => {
-                if let Some(&ki) = key_vars.get(name) {
-                    self.id_to_value(key[ki]?, false)
-                } else {
-                    // Non-grouped variable inside an expression ⇒ SAMPLE-like.
-                    let idx = *layout.index.get(name)?;
-                    self.resolve_value(idx, sols.first()?, layout)
-                }
-            }
-            Expr::Const(t) => Some(Value::from_term(t)),
-            Expr::Arith(op, a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
-                eval_arith(*op, x, y)
-            }
-            Expr::Unary(op, x) => {
-                let v = self.eval_group_expr(x, sols, layout, key_vars, key)?;
-                match op {
-                    UnaryOp::Plus => Some(v),
-                    UnaryOp::Neg => v.negate(),
-                }
-            }
-            Expr::Compare(op, a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
-                Some(Value::Bool(compare_values(*op, &x, &y)?))
-            }
-            Expr::And(a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
-                Some(Value::Bool(x? && y?))
-            }
-            Expr::Or(a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
-                Some(Value::Bool(x? || y?))
-            }
-            Expr::Not(x) => Some(Value::Bool(
-                !self
-                    .eval_group_expr(x, sols, layout, key_vars, key)?
-                    .ebv()?,
-            )),
-            // Builtins over aggregate context are not supported.
-            Expr::Builtin(_, _) => None,
-            // EXISTS in HAVING: test against the group's representative solution.
-            Expr::Exists(neg, pat) => {
-                let rep = *sols.first()?;
-                Some(Value::Bool(self.eval_exists(*neg, pat, rep, layout)))
+            } = a
+            {
+                gb[layout.len() + i] = self
+                    .eval_aggregate(*func, *distinct, arg.as_deref(), sep.as_deref(), sols, layout)
+                    .map(|v| self.value_to_id(&v));
             }
         }
+        gb
+    }
+
+    /// HAVING over all of `sols` as one group (no GROUP BY) — upstream treats
+    /// a projected graph function as an aggregate, so its HAVING applies.
+    fn having_holds(&self, q: &SelectQuery, sols: &[&Binding], layout: &VarLayout) -> bool {
+        if q.having.is_empty() {
+            return true;
+        }
+        let mut aggs = Vec::new();
+        let having: Vec<Expr> = q
+            .having
+            .iter()
+            .map(|h| lift_aggregates(h, &mut aggs))
+            .collect();
+        let glayout = group_layout(layout, aggs.len());
+        let gb = self.group_row(sols, layout, &glayout, &aggs);
+        having
+            .iter()
+            .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
     }
 
     /// Compute one aggregate over a group's solutions.
@@ -867,12 +1612,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
     ) -> Option<Value> {
         // COUNT(*) counts solutions; COUNT(DISTINCT *) counts the distinct
-        // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup whole bindings
-        // before counting when the DISTINCT modifier is present.
+        // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup bindings before
+        // counting when the DISTINCT modifier is present. A mapping holds
+        // only the query's own variables: the hidden variables of `[]` /
+        // `( … )` (existential blank nodes, which `SELECT DISTINCT *` leaves
+        // out too) and a mixed predicate variable's predicate-space twin are
+        // not part of it.
         if func == AggFunc::Count && arg.is_none() {
             if distinct {
-                let mut seen: HashSet<&Binding> = HashSet::new();
-                let n = sols.iter().filter(|&&b| seen.insert(b)).count();
+                let visible: Vec<usize> = (0..layout.len())
+                    .filter(|&i| {
+                        let name = &layout.names[i];
+                        !is_anon_var(name) && !name.starts_with(PRED_ALIAS_PREFIX)
+                    })
+                    .collect();
+                let mut seen: HashSet<Vec<Option<u32>>> = HashSet::new();
+                let n = sols
+                    .iter()
+                    .filter(|b| {
+                        seen.insert(
+                            visible
+                                .iter()
+                                .map(|&i| b.get(i).copied().flatten())
+                                .collect(),
+                        )
+                    })
+                    .count();
                 return Some(Value::Int(n as i64));
             }
             return Some(Value::Int(sols.len() as i64));
@@ -896,12 +1661,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(match func {
             AggFunc::Count => Value::Int(vals.len() as i64),
             AggFunc::Sum => sum_values(&vals),
+            // Avg(S) = Sum(S) / Count(S) with the query's division (so an
+            // integer average is a decimal, or truncated in upstream mode);
+            // 0 for an empty group (§18.5.1.4).
             AggFunc::Avg => {
                 if vals.is_empty() {
                     Value::Int(0)
                 } else {
-                    let s = sum_values(&vals).as_f64().unwrap_or(0.0);
-                    Value::Double(s / vals.len() as f64)
+                    sum_values(&vals).arith_with(
+                        ArithOp::Div,
+                        &Value::Int(vals.len() as i64),
+                        self.integer_division,
+                    )?
                 }
             }
             AggFunc::Min => vals.into_iter().reduce(|a, b| {
@@ -1158,8 +1929,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let vi = layout.index[var];
                 for b in &mut sols {
                     // BIND error/unbound leaves the variable unbound (no row drop).
-                    if let Some(v) = self.eval_value(expr, b, layout) {
-                        b[vi] = Some(self.value_to_id(&v));
+                    if let Some(id) = self.eval_id(expr, b, layout) {
+                        b[vi] = Some(id);
                     }
                 }
                 sols
@@ -1271,6 +2042,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: self.allow_service,
             service_denied: Rc::clone(&self.service_denied),
+            // Graph functions inside a GRAPH block run over that named graph:
+            // its CSR is built from the sub-evaluator's own store.
+            csr_provider: None,
+            gfun_csr: std::cell::RefCell::new(None),
+            integer_division: self.integer_division,
+            topk: self.topk,
+            stats: Rc::clone(&self.stats),
         }
     }
 
@@ -1379,17 +2157,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (col, id) in r.into_iter().enumerate() {
                     if let Some(idx) = slots[col] {
                         // A predicate-typed inner column carries a *predicate*-
-                        // dictionary id, but the outer layout may not know this
-                        // slot is predicate-typed (`collect_triples` does not
-                        // recurse into sub-SELECTs), so resolving it later via the
-                        // entity/literal dictionary would be wrong. Re-mint such a
-                        // value as a synthetic term, which resolves correctly
-                        // regardless of the outer `is_pred` flag and stays
-                        // join-consistent (the interner is idempotent per term).
+                        // dictionary id, but a variable a sub-SELECT binds is
+                        // never predicate-typed in the outer layout (it is
+                        // entity-space, or mixed, see `VarLayout::build`).
+                        // Re-mint such a value in the entity space with
+                        // `term_to_id`: the term's dictionary id when it has
+                        // one — so it joins with the same IRI bound elsewhere
+                        // — else a synthetic id (idempotent per term).
                         b[idx] = match id {
-                            Some(pid) if is_pred[col] && !is_synth(pid) => self
-                                .id_to_term(pid, true)
-                                .map(|t| self.extras.borrow_mut().intern(&t)),
+                            Some(pid) if is_pred[col] && !is_synth(pid) => {
+                                self.id_to_term(pid, true).map(|t| self.term_to_id(&t))
+                            }
                             other => other,
                         };
                     }
@@ -1402,26 +2180,29 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a conjunction of patterns, joining smallest/connected first.
     fn eval_join(&self, conjuncts: &[&GraphPattern], layout: &VarLayout) -> Vec<Binding> {
         // Evaluate each conjunct independently, recording its variable set.
-        let mut parts: Vec<(Vec<Binding>, Vec<usize>)> = conjuncts
+        let mut parts: Vec<Option<(Vec<Binding>, Vec<usize>)>> = conjuncts
             .iter()
-            .map(|c| (self.eval_pattern(c, layout), pattern_vars(c, layout)))
+            .map(|c| Some((self.eval_pattern(c, layout), pattern_vars(c, layout))))
             .collect();
 
         // Start from the smallest result, then greedily join in a connected,
         // smallest-first order (a lightweight join optimizer).
-        let start = (0..parts.len())
-            .min_by_key(|&i| parts[i].0.len())
-            .unwrap_or(0);
-        let (mut acc, mut acc_vars) = parts.swap_remove(start);
-
-        while !parts.is_empty() {
-            let pick = (0..parts.len())
-                .min_by_key(|&i| {
-                    let connected = parts[i].1.iter().any(|v| acc_vars.contains(v));
-                    (!connected as u8, parts[i].0.len())
-                })
-                .unwrap();
-            let (rb, rv) = parts.swap_remove(pick);
+        let meta: Vec<(usize, &[usize])> = parts
+            .iter()
+            .map(|p| {
+                p.as_ref()
+                    .map(|(b, v)| (b.len(), v.as_slice()))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let order = greedy_join_order(&meta);
+        let mut order = order.into_iter();
+        let (mut acc, mut acc_vars) = order
+            .next()
+            .and_then(|i| parts[i].take())
+            .unwrap_or_default();
+        for pick in order {
+            let (rb, rv) = parts[pick].take().unwrap_or_default();
             acc = join_sets(&acc, &acc_vars, &rb, &rv);
             for v in rv {
                 if !acc_vars.contains(&v) {
@@ -1451,41 +2232,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         str_constraints: &HashMap<usize, Vec<String>>,
     ) -> Vec<Binding> {
-        // Compile patterns; a missing constant ⇒ the conjunction is empty.
-        let mut plans = Vec::with_capacity(tps.len());
-        for tp in tps {
-            match self.compile_pattern(tp, layout) {
-                Some(plan) => plans.push(plan),
-                None => return Vec::new(),
-            }
-        }
-        if plans.is_empty() {
-            return vec![vec![None; layout.len()]];
-        }
+        let (plans, candidates, plan) = match self.prepare_bgp(tps, layout, str_constraints) {
+            PreparedBgp::Empty => return Vec::new(),
+            PreparedBgp::Identity => return vec![vec![None; layout.len()]],
+            PreparedBgp::Plan(p) => (p.plans, p.cands, p.exec),
+        };
 
-        // Exact per-variable candidate sets from constant edges (gStore's
-        // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
-        let mut candidates = candidates::generate(&plans, self.store);
-        self.refine_candidates_with_vstree(&mut candidates, tps, layout);
-        // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
-        // plain REGEX) prune or seed candidate sets — a sound superset, so only
-        // the join shrinks (the exact FILTER still verifies each row).
-        if !str_constraints.is_empty() {
-            if let Some(idx) = self.string_index() {
-                candidates::refine_with_substrings(&mut candidates, str_constraints, &idx, &plans);
-            }
+        // A mixed variable in predicate position (see `VarLayout::pred_alias`)
+        // joins across id spaces: run the left-deep order with translation.
+        // (The streaming executor in `topk` does the same, depth first.)
+        let mixed = mixed_slots(&plans, layout);
+        if !mixed.is_empty() {
+            return self.eval_mixed_pipeline(&plans, &plan.order, &candidates, layout, &mixed);
         }
-
-        // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
-        // tree when one is strictly cheaper. Memoised so a structurally-identical
-        // BGP reuses the enumeration (gStore `plan_cache`).
-        let key = plans_key(&plans);
-        let plan = self
-            .plan_cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
-            .clone();
 
         if let Some(tree) = &plan.tree {
             // Bushy execution: build each side independently, then hash-join.
@@ -1514,6 +2273,176 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         solutions
     }
 
+    /// Compile a BGP and choose its execution plan — everything
+    /// [`eval_bgp_constrained`](Self::eval_bgp_constrained) does before it
+    /// runs the joins, shared with the streaming executor (`topk`) so both
+    /// enumerate the solutions in the same order.
+    fn prepare_bgp(
+        &self,
+        tps: &[TriplePattern],
+        layout: &VarLayout,
+        str_constraints: &HashMap<usize, Vec<String>>,
+    ) -> PreparedBgp {
+        // Compile patterns; a missing constant ⇒ the conjunction is empty.
+        let mut plans = Vec::with_capacity(tps.len());
+        for tp in tps {
+            match self.compile_pattern(tp, layout) {
+                Some(plan) => plans.push(plan),
+                None => return PreparedBgp::Empty,
+            }
+        }
+        if plans.is_empty() {
+            return PreparedBgp::Identity;
+        }
+
+        // Exact per-variable candidate sets from constant edges (gStore's
+        // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
+        let mut candidates = candidates::generate(&plans, self.store);
+        self.refine_candidates_with_vstree(&mut candidates, tps, layout);
+        // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
+        // plain REGEX) prune or seed candidate sets — a sound superset, so only
+        // the join shrinks (the exact FILTER still verifies each row).
+        if !str_constraints.is_empty() {
+            if let Some(idx) = self.string_index() {
+                candidates::refine_with_substrings(&mut candidates, str_constraints, &idx, &plans);
+            }
+        }
+
+        // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
+        // tree when one is strictly cheaper. Memoised so a structurally-identical
+        // BGP reuses the enumeration (gStore `plan_cache`).
+        let key = plans_key(&plans);
+        let plan = self
+            .plan_cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
+            .clone();
+        PreparedBgp::Plan(topk::BgpPlan {
+            plans,
+            cands: candidates,
+            exec: plan,
+        })
+    }
+
+    /// The left-deep pipeline of a BGP in which a *mixed* variable `x` (bound
+    /// in predicate position and some other way, e.g. `?x ?p ?o . ?s ?x ?y`)
+    /// occurs in predicate position; `mixed` lists its `(x, hidden)` slot
+    /// pairs ([`VarLayout::pred_alias`]). Predicate positions bind the hidden
+    /// slot with predicate-dictionary ids, every other position binds `x`
+    /// with entity/literal ids, and the two must name the same RDF term:
+    ///
+    /// * before a pattern binds the hidden slot, a bound `x` is translated
+    ///   into it (no predicate with that IRI ⇒ the row cannot match);
+    /// * after each pattern, a bound hidden slot is translated back into `x`
+    ///   (bound if unbound, else it must agree).
+    ///
+    /// The hidden slots are cleared at the end, so the solutions carry `x`
+    /// only, in the entity space its layout entry says. Joins thus stay
+    /// index-driven instead of a cross product filtered afterwards.
+    fn eval_mixed_pipeline(
+        &self,
+        plans: &[PatPlan],
+        order: &[usize],
+        cands: &Candidates,
+        layout: &VarLayout,
+        mixed: &[(usize, usize)],
+    ) -> Vec<Binding> {
+        let mut caches = MixedCaches::default();
+        let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
+        let mut fresh = Vec::new();
+        for &pi in order {
+            if self.cancelled() {
+                return Vec::new();
+            }
+            let plan = &plans[pi];
+            let mut next = Vec::new();
+            for binding in &solutions {
+                let mut b = binding.clone();
+                if !self.mixed_enter(&mut b, plan, mixed, &mut caches) {
+                    continue;
+                }
+                self.extend(&b, plan, cands, &mut fresh);
+                for mut nb in fresh.drain(..) {
+                    if self.mixed_leave(&mut nb, mixed, &mut caches) {
+                        next.push(nb);
+                    }
+                }
+            }
+            solutions = next;
+            if solutions.is_empty() {
+                break;
+            }
+        }
+        for b in &mut solutions {
+            mixed_clear(b, mixed);
+        }
+        solutions
+    }
+
+    /// Before `plan` extends `b` in a mixed pipeline
+    /// ([`eval_mixed_pipeline`](Self::eval_mixed_pipeline)): translate each
+    /// bound mixed variable whose hidden slot `plan` binds into that slot.
+    /// `false` when its IRI names no predicate (the row cannot match).
+    fn mixed_enter(
+        &self,
+        b: &mut Binding,
+        plan: &PatPlan,
+        mixed: &[(usize, usize)],
+        caches: &mut MixedCaches,
+    ) -> bool {
+        for &(x, h) in mixed {
+            let (Some(id), None, Slot::Var(p)) = (b[x], b[h], plan.p) else {
+                continue;
+            };
+            if p != h {
+                continue;
+            }
+            let pid = *caches
+                .to_pred
+                .entry(id)
+                .or_insert_with(|| self.iri_predicate_id(id));
+            match pid {
+                Some(pid) => b[h] = Some(pid),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// After a pattern extended a row of a mixed pipeline: translate each
+    /// bound hidden slot back into its mixed variable (bound if unbound,
+    /// else it must agree). `false` when they disagree (drop the row).
+    fn mixed_leave(
+        &self,
+        nb: &mut Binding,
+        mixed: &[(usize, usize)],
+        caches: &mut MixedCaches,
+    ) -> bool {
+        for &(x, h) in mixed {
+            let Some(pid) = nb[h] else { continue };
+            let node = *caches
+                .to_node
+                .entry(pid)
+                .or_insert_with(|| self.id_to_term(pid, true).map(|t| self.term_to_id(&t)));
+            match (node, nb[x]) {
+                (Some(n), None) => nb[x] = Some(n),
+                (Some(n), Some(cur)) if n == cur => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The predicate-dictionary id of the IRI an entity-space `id` names, if
+    /// that IRI is a predicate (for [`eval_mixed_pipeline`](Self::eval_mixed_pipeline)).
+    fn iri_predicate_id(&self, id: u32) -> Option<u32> {
+        match self.id_to_term(id, false)? {
+            t @ Term::Iri(_) => self.dict.predicate_id(&t.dict_key()),
+            _ => None,
+        }
+    }
+
     /// Execute a binary-join tree: each `Leaf` scans its pattern from scratch and
     /// each `Join` hash-joins the two sub-results on their shared variables.
     /// Returns the bindings and the set of variable indices they bind.
@@ -1539,6 +2468,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 let (rb, rv) = self.eval_join_tree(r, plans, cands, layout);
                 let joined = join_sets(&lb, &lv, &rb, &rv);
+                self.note_bindings(joined.len());
                 let mut vars = lv;
                 for v in rv {
                     if !vars.contains(&v) {
@@ -1690,7 +2620,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     fn compile_pred_slot(&self, pt: &PatternTerm, layout: &VarLayout) -> Option<Slot> {
         match pt {
-            PatternTerm::Var(v) => Some(Slot::Var(layout.index[v])),
+            // A mixed variable binds its hidden predicate-space slot here.
+            PatternTerm::Var(v) => {
+                let i = layout.index[v];
+                Some(Slot::Var(layout.pred_alias.get(&i).copied().unwrap_or(i)))
+            }
             PatternTerm::Term(Term::Iri(iri)) => self
                 .dict
                 .predicate_id(&Term::iri(iri.clone()).dict_key())
@@ -1709,12 +2643,33 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         cands: &Candidates,
         out: &mut Vec<Binding>,
     ) {
+        let before = out.len();
+        for (s, p, o) in self.candidate_triples(binding, plan) {
+            // VS-tree filter: an entity variable's value must be a candidate.
+            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
+                continue;
+            }
+            let mut nb = binding.clone();
+            if unify(&mut nb, &plan.s, s)
+                && unify(&mut nb, &plan.p, p)
+                && unify(&mut nb, &plan.o, o)
+            {
+                out.push(nb);
+            }
+        }
+        self.note_bindings(out.len() - before);
+    }
+
+    /// The `(s, p, o)` triples that may extend `binding` by `plan`, in the
+    /// order of the tightest index for the positions `binding` already fixes.
+    /// This order is what makes the executor's solution order deterministic.
+    fn candidate_triples(&self, binding: &Binding, plan: &PatPlan) -> Vec<(u32, PredId, u32)> {
         let ks = slot_known(&plan.s, binding);
         let kp = slot_known(&plan.p, binding);
         let ko = slot_known(&plan.o, binding);
 
         // Enumerate candidate (s, p, o) triples from the tightest index.
-        let candidates: Vec<(u32, PredId, u32)> = match (ks, kp, ko) {
+        match (ks, kp, ko) {
             (Some(s), Some(p), Some(o)) => {
                 if self.store.exists(s, p, o) {
                     vec![(s, p, o)]
@@ -1764,20 +2719,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 .into_iter()
                 .map(|t| (t.sub, t.pred, t.obj))
                 .collect(),
-        };
-
-        for (s, p, o) in candidates {
-            // VS-tree filter: an entity variable's value must be a candidate.
-            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
-                continue;
-            }
-            let mut nb = binding.clone();
-            if unify(&mut nb, &plan.s, s)
-                && unify(&mut nb, &plan.p, p)
-                && unify(&mut nb, &plan.o, o)
-            {
-                out.push(nb);
-            }
         }
     }
 
@@ -1813,6 +2754,50 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         };
         let term = parse_term(s).ok()?;
         Some(Value::from_term(&term))
+    }
+
+    /// Evaluate an expression to the RDF term it denotes, for what sees
+    /// terms rather than values — `STR`, `DATATYPE`, `sameTerm` and the copy
+    /// `BIND(… AS ?v)` / `(… AS ?v)` binds. A variable denotes the term it is
+    /// bound to and a constant itself (so `"05"^^xsd:unsignedByte` keeps its
+    /// lexical form and datatype, which its [`Value`], an integer, does
+    /// not), as does the `COALESCE` / `IF` argument chosen; anything else
+    /// the term of its computed value.
+    fn eval_term(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<Term> {
+        match e {
+            Expr::Var(name) => {
+                let idx = *l.index.get(name)?;
+                self.id_to_term((*b.get(idx)?)?, l.is_pred[idx])
+            }
+            Expr::Const(t) => Some(t.clone()),
+            Expr::Builtin(name, args) if name == "COALESCE" => {
+                args.iter().find_map(|a| self.eval_term(a, b, l))
+            }
+            Expr::Builtin(name, args) if name == "IF" => match args.as_slice() {
+                [c, then, other] => {
+                    if self.eval_ebv(c, b, l)? {
+                        self.eval_term(then, b, l)
+                    } else {
+                        self.eval_term(other, b, l)
+                    }
+                }
+                _ => None,
+            },
+            _ => self.eval_value(e, b, l).map(|v| value_to_term(&v)),
+        }
+    }
+
+    /// The id of the term [`eval_term`](Self::eval_term) gives, for a column
+    /// that holds entity/literal-space ids: a variable's own id when it is
+    /// in that space (so a copy is the very same term), else the term's.
+    fn eval_id(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<u32> {
+        if let Expr::Var(name) = e {
+            let idx = *l.index.get(name)?;
+            if !l.is_pred[idx] {
+                return *b.get(idx)?;
+            }
+        }
+        self.eval_term(e, b, l).map(|t| self.term_to_id(&t))
     }
 
     // ---- expression evaluation -------------------------------------------
@@ -1859,23 +2844,73 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 self.eval_ebv(e, b, l).map(Value::Bool)
             }
             Expr::Compare(op, x, y) => self.eval_compare(*op, x, y, b, l).map(Value::Bool),
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => eval_in(expr, list, *negated, |e| self.eval_value(e, b, l)),
             Expr::Arith(op, x, y) => {
                 let a = self.eval_value(x, b, l)?;
                 let c = self.eval_value(y, b, l)?;
-                eval_arith(*op, a, c)
+                a.arith_with(*op, &c, self.integer_division)
             }
             Expr::Unary(op, x) => {
                 let v = self.eval_value(x, b, l)?;
                 match op {
-                    UnaryOp::Plus => Some(v),
+                    // op:numeric-unary-plus: a type error for a non-number.
+                    UnaryOp::Plus => v.is_numeric().then_some(v),
                     UnaryOp::Neg => v.negate(),
                 }
             }
             Expr::Builtin(name, args) => self.eval_builtin(name, args, b, l),
+            // `rs:NAME(…)` is the legacy gstore-rust built-in NAME (unchanged
+            // semantics); `xsd:T(x)` is a SPARQL 1.1 cast; any other IRI is a
+            // user-defined function (checked before evaluation, see
+            // `check_iri_call`). The bare `SIMILARITY` is upstream's string
+            // similarity, so the legacy node/string SIMILARITY is only
+            // reachable as `rs:SIMILARITY`.
+            Expr::IriCall { iri, args } => match rs_function_name(iri) {
+                Some("SIMILARITY") => self.eval_legacy_similarity(args, b, l),
+                Some(name) => self.eval_builtin(name, args, b, l),
+                None => match XsdCast::from_iri(iri) {
+                    Some(target) => match args.as_slice() {
+                        [arg] => xsd_cast(target, &self.eval_value(arg, b, l)?),
+                        _ => None,
+                    },
+                    None => self.eval_iri_function(iri, args, b, l),
+                },
+            },
+            // An advanced graph function only evaluates as a whole SELECT
+            // projection (`eval_graph_fn`); elsewhere, and PFN anywhere, the
+            // query is rejected before evaluation starts (`check_calls`).
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
             Expr::Exists(neg, pat) => Some(Value::Bool(self.eval_exists(*neg, pat, b, l))),
             // Aggregates only have meaning in group context (handled elsewhere).
             Expr::Aggregate { .. } => None,
         }
+    }
+
+    /// `rs:SIMILARITY(a, b)`, the legacy gstore-rust SIMILARITY. Polymorphic,
+    /// but dispatched on IRI-ness (NOT mere dictionary membership): node
+    /// similarity (neighbour-set cosine overlap) only when BOTH arguments are
+    /// IRIs naming graph nodes; otherwise Jaro string similarity of the
+    /// lexical forms. This keeps string similarity working for literals — a
+    /// stored literal must never be silently reinterpreted as a graph node
+    /// (which would make SIMILARITY on data-bound strings data-dependent and
+    /// non-compositional).
+    fn eval_legacy_similarity(&self, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
+        let av = self.eval_value(args.first()?, b, l)?;
+        let cv = self.eval_value(args.get(1)?, b, l)?;
+        if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
+            if let (Some(a), Some(c)) =
+                (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
+            {
+                if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
+                    return Some(Value::Double(sim));
+                }
+            }
+        }
+        Some(Value::Double(jaro_similarity(&av.lexical(), &cv.lexical())))
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
@@ -1885,15 +2920,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn eval_exists(&self, negated: bool, pat: &GraphPattern, b: &Binding, outer: &VarLayout) -> bool {
         let bound = self.subst_pattern(pat, b, outer);
         let layout = VarLayout::build(&bound);
-        let found = !self.eval_pattern(&bound, &layout).is_empty();
+        let found = self.pattern_has_solution(&bound, &layout);
         found ^ negated
     }
 
     /// An id resolved back to its RDF term (synthetic, predicate, or
     /// entity/literal — routed by `is_pred` exactly as [`resolve_string`]).
     fn id_to_term(&self, id: u32, is_pred: bool) -> Option<Term> {
-        let s = self.resolve_string(Some(id), is_pred)?;
-        parse_term(&s).ok()
+        if is_synth(id) {
+            return self.extras.borrow().term(id).cloned();
+        }
+        let s = if is_pred {
+            self.dict.predicate_to_string(id)?
+        } else {
+            self.dict.id_to_string(id)?
+        };
+        parse_term(s).ok()
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term
@@ -2018,6 +3060,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Box::new(self.subst_expr(x, b, layout)),
                 Box::new(self.subst_expr(y, b, layout)),
             ),
+            Expr::In {
+                expr,
+                list,
+                negated,
+            } => Expr::In {
+                expr: Box::new(self.subst_expr(expr, b, layout)),
+                list: list.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
+                negated: *negated,
+            },
             Expr::Arith(op, x, y) => Expr::Arith(
                 *op,
                 Box::new(self.subst_expr(x, b, layout)),
@@ -2027,6 +3078,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 n.clone(),
                 args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
             ),
+            Expr::IriCall { iri, args } => Expr::IriCall {
+                iri: iri.clone(),
+                args: args.iter().map(|a| self.subst_expr(a, b, layout)).collect(),
+            },
+            Expr::GraphFn { .. } | Expr::Pfn { .. } => e.clone(),
             Expr::Exists(neg, pat) => {
                 Expr::Exists(*neg, Box::new(self.subst_pattern(pat, b, layout)))
             }
@@ -2076,8 +3132,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return None;
         }
         match name {
+            // The term's own lexical form ("05"^^xsd:unsignedByte is "05").
             "STR" => Some(Value::Str {
-                value: self.eval_value(args.first()?, b, l)?.lexical(),
+                value: match self.eval_term(args.first()?, b, l)? {
+                    Term::Literal { value, .. } => value,
+                    Term::Iri(s) | Term::Blank(s) => s,
+                },
                 lang: None,
             }),
             "STRLEN" => {
@@ -2086,20 +3146,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
-            "ABS" => match self.eval_value(args.first()?, b, l)? {
-                // `i64::abs(i64::MIN)` overflows (panics in debug, wraps to a
-                // negative value in release); widen to `BigInt` like `negate`.
-                Value::Int(i) => Some(
-                    i.checked_abs()
-                        .map(Value::Int)
-                        .unwrap_or(Value::BigInt((i as i128).abs())),
-                ),
-                Value::Double(d) => Some(Value::Double(d.abs())),
-                v => v.as_f64().map(|x| Value::Double(x.abs())),
-            },
-            "CEIL" => self.num1(args, b, l, f64::ceil, |i| i),
-            "FLOOR" => self.num1(args, b, l, f64::floor, |i| i),
-            "ROUND" => self.num1(args, b, l, f64::round, |i| i),
+            // Type-preserving (an integer stays an integer, a decimal a
+            // decimal, a float a float); `ROUND` rounds halves upward.
+            "ABS" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Abs),
+            "CEIL" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Ceil),
+            "FLOOR" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Floor),
+            "ROUND" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Round),
             "ISNUMERIC" => Some(Value::Bool(self.eval_value(args.first()?, b, l)?.is_numeric())),
             "ISIRI" | "ISURI" => Some(Value::Bool(matches!(
                 self.eval_value(args.first()?, b, l)?,
@@ -2114,6 +3166,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Value::Int(_)
                     | Value::BigInt(_)
                     | Value::Decimal(_)
+                    | Value::Float(_)
                     | Value::Double(_)
                     | Value::Bool(_)
                     | Value::Str { .. }
@@ -2130,37 +3183,43 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 })
             }
-            "DATATYPE" => {
-                let v = self.eval_value(args.first()?, b, l)?;
-                Some(Value::Iri(datatype_iri(&v)?))
-            }
+            // The term's own datatype ("5"^^xsd:unsignedByte is
+            // xsd:unsignedByte); IRIs and blank nodes have none.
+            "DATATYPE" => match self.eval_term(args.first()?, b, l)? {
+                Term::Literal { lang: Some(_), .. } => Some(Value::Iri(RDF_LANG_STRING.into())),
+                Term::Literal { datatype, .. } => Some(Value::Iri(
+                    datatype.unwrap_or_else(|| xsd::STRING.to_owned()),
+                )),
+                Term::Iri(_) | Term::Blank(_) => None,
+            },
             "CONTAINS" => self.str2_bool(args, b, l, |a, c| a.contains(&c)),
             "STRSTARTS" => self.str2_bool(args, b, l, |a, c| a.starts_with(&c)),
             "STRENDS" => self.str2_bool(args, b, l, |a, c| a.ends_with(&c)),
-            "STRBEFORE" => self.str2(args, b, l, |a, c| {
-                a.split_once(&c)
-                    .map(|(p, _)| p.to_string())
-                    .unwrap_or_default()
-            }),
-            "STRAFTER" => self.str2(args, b, l, |a, c| {
-                a.split_once(&c)
-                    .map(|(_, s)| s.to_string())
-                    .unwrap_or_default()
-            }),
+            "STRBEFORE" => self.str_split(args, b, l, true),
+            "STRAFTER" => self.str_split(args, b, l, false),
+            // §17.4.3.12: the language tag survives when every argument
+            // carries the same one; otherwise the result is a simple literal.
             "CONCAT" => {
                 let mut out = String::new();
+                let mut common: Option<Option<String>> = None;
                 for a in args {
-                    out.push_str(&self.eval_value(a, b, l)?.lexical());
+                    let (s, lang) = str_and_lang(&self.eval_value(a, b, l)?);
+                    out.push_str(&s);
+                    common = match common {
+                        None => Some(lang),
+                        Some(c) if c == lang => Some(c),
+                        Some(_) => Some(None),
+                    };
                 }
                 Some(Value::Str {
                     value: out,
-                    lang: None,
+                    lang: common.flatten(),
                 })
             }
             "SAMETERM" => {
-                let a = self.eval_value(args.first()?, b, l)?;
-                let c = self.eval_value(args.get(1)?, b, l)?;
-                Some(Value::Bool(a == c))
+                let a = self.eval_term(args.first()?, b, l)?;
+                let c = self.eval_term(args.get(1)?, b, l)?;
+                Some(Value::Bool(same_term(&a, &c)))
             }
             "COALESCE" => args.iter().find_map(|a| self.eval_value(a, b, l)),
             "REGEX" => {
@@ -2258,25 +3317,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(lang_matches(&tag, &range)))
             }
             "SIMILARITY" => {
-                // Polymorphic, but dispatched on IRI-ness (NOT mere dictionary
-                // membership): node similarity (neighbour-set cosine overlap) only
-                // when BOTH arguments are IRIs naming graph nodes; otherwise the
-                // original Jaro string similarity. This keeps string similarity
-                // working for literals — a stored literal must never be silently
-                // reinterpreted as a graph node (which would make SIMILARITY on
-                // data-bound strings data-dependent and non-compositional).
+                // Upstream gStore's SIMILARITY (TempResult.cpp:1278-1288):
+                // `doSimilarity(x.term_value, y.term_value)`, its Jaro variant,
+                // over the arguments' *term strings* — `<iri>`, `"lit"`,
+                // `"lit"@en`, `"1"^^<…#integer>` (the dictionary key form that
+                // upstream's `getStringByID` / constant `getText()` yield), so
+                // the quotes and brackets take part in the comparison. The
+                // legacy gstore-rust node/string similarity is `rs:SIMILARITY`.
                 let av = self.eval_value(args.first()?, b, l)?;
                 let cv = self.eval_value(args.get(1)?, b, l)?;
-                if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
-                    if let (Some(a), Some(c)) =
-                        (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
-                    {
-                        if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
-                            return Some(Value::Double(sim));
-                        }
-                    }
-                }
-                Some(Value::Double(jaro_similarity(&av.lexical(), &cv.lexical())))
+                Some(Value::Double(crate::analytics::gfun::metrics::jaro_similarity(
+                    &value_to_term(&av).dict_key(),
+                    &value_to_term(&cv).dict_key(),
+                )))
             }
 
             // ---- numeric -------------------------------------------------
@@ -2336,6 +3389,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 value: gen_uuid(),
                 lang: None,
             }),
+            "CONTAINALL" | "CONTAINANY" => self.eval_contain(name == "CONTAINANY", args, b, l),
             "IF" => {
                 if self.eval_ebv(args.first()?, b, l)? {
                     self.eval_value(args.get(1)?, b, l)
@@ -2564,6 +3618,48 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
+    /// gStore's `CONTAINALL(items, list [, sep])` / `CONTAINANY(items, list
+    /// [, sep])` (upstream `TempResult::doComp`). A *list* is a literal typed
+    /// `xsd:list` (`<http://www.w3.org/2001/XMLSchema#list>`) whose lexical
+    /// form holds items separated by `sep` (default `","`); items are trimmed
+    /// of spaces, and an empty last item is dropped (upstream `Util::split`).
+    /// `items` is such a list, or any other term standing for the one item
+    /// that is its lexical form (an IRI's IRI string). `list` must be a list.
+    ///
+    /// CONTAINALL is true iff every item of `items` occurs in `list`;
+    /// CONTAINANY iff some item of `list` occurs in `items`. Items compare as
+    /// strings. The result is an error (unbound) when `list` is not an
+    /// `xsd:list`, or `sep` is not a non-empty simple string.
+    ///
+    /// Divergences from upstream, whose behaviour here is accidental:
+    /// upstream only honours a one-character separator *literal* (any other
+    /// third argument silently means `","`), and turns a non-list `items`
+    /// term into an item by cutting the first and last character off its
+    /// N-Triples form, which mangles language-tagged and typed literals
+    /// (`"5"^^xsd:integer` becomes `5"^^<…#integer`); here the separator may
+    /// be any non-empty string expression and the item is the lexical form.
+    fn eval_contain(&self, any: bool, args: &[Expr], b: &Binding, l: &VarLayout) -> Option<Value> {
+        let sep = match args.get(2) {
+            None => ",".to_string(),
+            Some(e) => match self.eval_value(e, b, l)? {
+                Value::Str { value, lang: None } if !value.is_empty() => value,
+                _ => return None,
+            },
+        };
+        let first = self.eval_value(args.first()?, b, l)?;
+        let items = match xsd_list_text(&first) {
+            Some(text) => split_xsd_list(text, &sep),
+            None => vec![first.lexical()],
+        };
+        let list_value = self.eval_value(args.get(1)?, b, l)?;
+        let list = split_xsd_list(xsd_list_text(&list_value)?, &sep);
+        Some(Value::Bool(if any {
+            list.iter().any(|y| items.contains(y))
+        } else {
+            items.iter().all(|x| list.contains(x))
+        }))
+    }
+
     /// User-defined function fallback (gStore `pfnQuery`): a name that is not a
     /// SPARQL built-in is looked up in the registry before erroring. Arguments
     /// are evaluated to values first; if any errors/unbound the call yields
@@ -2576,6 +3672,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
     ) -> Option<Value> {
         let f = self.functions.get(name)?;
+        let mut argv = Vec::with_capacity(args.len());
+        for a in args {
+            argv.push(self.eval_value(a, b, l)?);
+        }
+        f(&argv)
+    }
+
+    /// A user function called through its IRI: registered under the full IRI,
+    /// else under the IRI's local name (`ex:double(…)` reaches a function
+    /// registered as `"double"`).
+    fn eval_iri_function(
+        &self,
+        iri: &str,
+        args: &[Expr],
+        b: &Binding,
+        l: &VarLayout,
+    ) -> Option<Value> {
+        let f = self.user_iri_function(iri)?;
         let mut argv = Vec::with_capacity(args.len());
         for a in args {
             argv.push(self.eval_value(a, b, l)?);
@@ -2730,6 +3844,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })
     }
 
+    /// `UCASE` / `LCASE`: map the lexical form, keeping a language tag
+    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`).
     fn str1(
         &self,
         args: &[Expr],
@@ -2737,25 +3853,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let v = self.eval_value(args.first()?, b, l)?;
-        Some(Value::Str {
-            value: f(&v.lexical()),
-            lang: None,
-        })
+        let (s, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
+        Some(Value::Str { value: f(&s), lang })
     }
 
-    fn str2(
-        &self,
-        args: &[Expr],
-        b: &Binding,
-        l: &VarLayout,
-        f: impl Fn(String, String) -> String,
-    ) -> Option<Value> {
-        let a = self.eval_value(args.first()?, b, l)?.lexical();
+    /// `STRBEFORE` / `STRAFTER` (§17.4.3.7-8): the part of the first
+    /// argument before / after the first occurrence of the second, with the
+    /// first argument's language tag; no occurrence gives the empty simple
+    /// literal.
+    fn str_split(&self, args: &[Expr], b: &Binding, l: &VarLayout, before: bool) -> Option<Value> {
+        let (a, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
         let c = self.eval_value(args.get(1)?, b, l)?.lexical();
-        Some(Value::Str {
-            value: f(a, c),
-            lang: None,
+        Some(match a.split_once(&c) {
+            Some((head, tail)) => Value::Str {
+                value: if before { head } else { tail }.to_string(),
+                lang,
+            },
+            None => Value::Str {
+                value: String::new(),
+                lang: None,
+            },
         })
     }
 
@@ -2769,24 +3886,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let a = self.eval_value(args.first()?, b, l)?.lexical();
         let c = self.eval_value(args.get(1)?, b, l)?.lexical();
         Some(Value::Bool(f(a, c)))
-    }
-
-    fn num1(
-        &self,
-        args: &[Expr],
-        b: &Binding,
-        l: &VarLayout,
-        ff: impl Fn(f64) -> f64,
-        fi: impl Fn(i64) -> i64,
-    ) -> Option<Value> {
-        match self.eval_value(args.first()?, b, l)? {
-            Value::Int(i) => Some(Value::Int(fi(i))),
-            Value::Double(d) => Some(Value::Double(ff(d))),
-            // BigInt / Decimal have no i64/f64-native fast path here; evaluate in
-            // f64 (as they were before the numeric tower split) rather than
-            // type-erroring. Non-numeric operands stay a type error (None).
-            v => v.as_f64().map(|x| Value::Double(ff(x))),
-        }
     }
 
     // ---- ordering ---------------------------------------------------------
@@ -2837,6 +3936,7 @@ fn value_to_term(v: &Value) -> Term {
         Value::Int(i) => Term::typed_literal(i.to_string(), xsd::INTEGER),
         Value::BigInt(_) => Term::typed_literal(v.lexical(), xsd::INTEGER),
         Value::Decimal(_) => Term::typed_literal(v.lexical(), xsd::DECIMAL),
+        Value::Float(_) => Term::typed_literal(v.lexical(), XSD_FLOAT),
         Value::Double(_) => Term::typed_literal(v.lexical(), xsd::DOUBLE),
         Value::Bool(bool_v) => Term::typed_literal(bool_v.to_string(), xsd::BOOLEAN),
         Value::Str { value, lang } => Term::Literal {
@@ -2850,6 +3950,231 @@ fn value_to_term(v: &Value) -> Term {
             lang: None,
         },
     }
+}
+
+/// `xsd:date`, produced by the `xsd:date(…)` cast.
+const XSD_DATE: &str = "http://www.w3.org/2001/XMLSchema#date";
+
+/// An integer from an `xsd:integer` lexical (`i64`, else `i128`).
+fn integer_value(lexical: &str) -> Option<Value> {
+    match Value::from_term(&Term::typed_literal(lexical, xsd::INTEGER)) {
+        v @ (Value::Int(_) | Value::BigInt(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// A decimal from an `xsd:decimal` lexical (`None` beyond its `i128` range).
+fn decimal_value(lexical: &str) -> Option<Value> {
+    match Value::from_term(&Term::typed_literal(lexical, xsd::DECIMAL)) {
+        v @ Value::Decimal(_) => Some(v),
+        _ => None,
+    }
+}
+
+/// The integer part of a finite double (`None` for NaN / ±INF or beyond `i128`).
+fn integer_from_f64(x: f64) -> Option<Value> {
+    if !x.is_finite() {
+        return None;
+    }
+    let t = x.trunc();
+    if t.abs() < 9.0e18 {
+        return Some(Value::Int(t as i64));
+    }
+    if t.abs() < 1.7e38 {
+        return Some(Value::BigInt(t as i128));
+    }
+    None
+}
+
+/// What an XSD cast reads its argument as (SPARQL 1.1 §17.5, the rows of the
+/// casting table).
+enum CastSource<'v> {
+    Iri(&'v str),
+    Str(&'v str),
+    Number(&'v Value),
+    Float(f64),
+    Bool(bool),
+    DateTime(&'v str),
+    Date(&'v str),
+    /// A literal of another datatype: castable to `xsd:string` only.
+    Other(&'v str),
+}
+
+/// The SPARQL 1.1 XSD constructor functions (§17.5): `xsd:string(?x)`,
+/// `xsd:integer(?x)`, `xsd:decimal`, `xsd:double`, `xsd:float`,
+/// `xsd:boolean`, `xsd:dateTime`, plus `xsd:date` (XPath casting rules).
+/// `None` (an expression error: FILTER false, BIND/projection unbound) for a
+/// cast the table forbids — blank nodes, language-tagged strings, IRIs to
+/// anything but `xsd:string`, ill-typed literals, NaN/INF to an integer or
+/// decimal, … — and for a string whose lexical form is invalid for the
+/// target type.
+fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
+    // An ill-typed literal ("abc"^^xsd:integer, "300"^^xsd:byte,
+    // "2020-13-01"^^xsd:date) has no value to cast.
+    if v.is_ill_typed() {
+        return None;
+    }
+    let src = match v {
+        Value::Iri(s) => CastSource::Iri(s),
+        Value::Blank(_) => return None,
+        Value::Str { lang: Some(_), .. } => return None,
+        Value::Str { value, lang: None } => CastSource::Str(value),
+        Value::Int(_) | Value::BigInt(_) | Value::Decimal(_) | Value::Double(_) => {
+            CastSource::Number(v)
+        }
+        Value::Float(x) => CastSource::Float(*x),
+        Value::Bool(b) => CastSource::Bool(*b),
+        Value::Typed { value, datatype } => match datatype.as_str() {
+            XSD_DATETIME => CastSource::DateTime(value),
+            XSD_DATE => CastSource::Date(value),
+            _ => CastSource::Other(value),
+        },
+    };
+    let string = |s: String| Value::Str {
+        value: s,
+        lang: None,
+    };
+    match target {
+        XsdCast::String => Some(match src {
+            CastSource::Iri(s) | CastSource::Str(s) | CastSource::Other(s) => string(s.into()),
+            CastSource::DateTime(s) | CastSource::Date(s) => string(s.into()),
+            CastSource::Number(n) => string(n.lexical()),
+            CastSource::Float(x) => string(xsd_float_lexical(x)),
+            CastSource::Bool(b) => string(b.to_string()),
+        }),
+        XsdCast::Integer => match src {
+            CastSource::Str(s) => {
+                let s = s.trim();
+                is_integer_lexical(s).then(|| integer_value(s)).flatten()
+            }
+            CastSource::Number(n @ (Value::Int(_) | Value::BigInt(_))) => Some(n.clone()),
+            CastSource::Number(Value::Decimal(d)) => {
+                // Truncate toward zero: the integer part of the lexical form.
+                let lex = Value::Decimal(*d).lexical();
+                let int = lex.split('.').next().unwrap_or("0");
+                integer_value(if int == "-0" || int == "-" { "0" } else { int })
+            }
+            CastSource::Number(n) => integer_from_f64(n.as_f64()?),
+            CastSource::Float(x) => integer_from_f64(x),
+            CastSource::Bool(b) => Some(Value::Int(b as i64)),
+            _ => None,
+        },
+        XsdCast::Decimal => match src {
+            CastSource::Str(s) => {
+                let s = s.trim();
+                is_decimal_lexical(s).then(|| decimal_value(s)).flatten()
+            }
+            CastSource::Number(Value::Decimal(d)) => Some(Value::Decimal(*d)),
+            CastSource::Number(n @ (Value::Int(_) | Value::BigInt(_))) => {
+                decimal_value(&n.lexical())
+            }
+            CastSource::Number(n) => {
+                let x = n.as_f64()?;
+                // Rust prints a finite f64 positionally (never with an
+                // exponent), the shortest digits that round-trip.
+                x.is_finite()
+                    .then(|| decimal_value(&x.to_string()))
+                    .flatten()
+            }
+            CastSource::Float(x) => {
+                let f = x as f32;
+                f.is_finite()
+                    .then(|| decimal_value(&f.to_string()))
+                    .flatten()
+            }
+            CastSource::Bool(b) => decimal_value(if b { "1.0" } else { "0.0" }),
+            _ => None,
+        },
+        XsdCast::Double | XsdCast::Float => {
+            let x = match src {
+                CastSource::Str(s) => parse_xsd_double(s)?,
+                CastSource::Number(n) => n.as_f64()?,
+                CastSource::Float(x) => x,
+                CastSource::Bool(b) => f64::from(u8::from(b)),
+                _ => return None,
+            };
+            Some(match target {
+                XsdCast::Float => Value::Float(to_f32_precision(x)),
+                _ => Value::Double(x),
+            })
+        }
+        XsdCast::Boolean => match src {
+            CastSource::Str(s) => match s.trim() {
+                "true" | "1" => Some(Value::Bool(true)),
+                "false" | "0" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            CastSource::Number(n) => {
+                let x = n.as_f64()?;
+                Some(Value::Bool(x != 0.0 && !x.is_nan()))
+            }
+            CastSource::Float(x) => Some(Value::Bool(x != 0.0 && !x.is_nan())),
+            CastSource::Bool(b) => Some(Value::Bool(b)),
+            _ => None,
+        },
+        XsdCast::DateTime => {
+            let lexical = match src {
+                CastSource::Str(s) | CastSource::DateTime(s) => {
+                    let s = s.trim();
+                    (s.contains('T') && parse_datetime_parts(s).is_some()).then(|| s.to_string())?
+                }
+                // xs:date → xs:dateTime: midnight, same timezone (XPath).
+                CastSource::Date(s) => {
+                    let s = s.trim();
+                    if s.contains('T') || parse_datetime_parts(s).is_none() {
+                        return None;
+                    }
+                    let (date, tz) = split_date_tz(s);
+                    format!("{date}T00:00:00{tz}")
+                }
+                _ => return None,
+            };
+            Some(Value::Typed {
+                value: lexical,
+                datatype: XSD_DATETIME.into(),
+            })
+        }
+        XsdCast::Date => {
+            let lexical = match src {
+                CastSource::Str(s) | CastSource::Date(s) => {
+                    let s = s.trim();
+                    (!s.contains('T') && parse_datetime_parts(s).is_some())
+                        .then(|| s.to_string())?
+                }
+                // xs:dateTime → xs:date: the date part, same timezone.
+                CastSource::DateTime(s) => {
+                    let s = s.trim();
+                    parse_datetime_parts(s)?;
+                    let (date_time, tz) = split_date_tz(s);
+                    let date = date_time.split('T').next()?;
+                    format!("{date}{tz}")
+                }
+                _ => return None,
+            };
+            Some(Value::Typed {
+                value: lexical,
+                datatype: XSD_DATE.into(),
+            })
+        }
+    }
+}
+
+/// Split a valid `xsd:date` / `xsd:dateTime` lexical into the part before
+/// its timezone and the timezone (`Z`, `±hh:mm`, or empty).
+fn split_date_tz(s: &str) -> (&str, &str) {
+    if let Some(body) = s.strip_suffix('Z') {
+        return (body, "Z");
+    }
+    // A `±hh:mm` zone is the last six characters. Without a zone those end
+    // in `-MM-DD` (a date: `:` missing) or `mm:ss` / fractional digits (a
+    // dateTime: no leading sign), so the shape test cannot misfire.
+    if let Some(at) = s.len().checked_sub(6).filter(|&at| s.is_char_boundary(at)) {
+        let (body, tz) = s.split_at(at);
+        if tz.starts_with(['+', '-']) && tz.as_bytes()[3] == b':' {
+            return (body, tz);
+        }
+    }
+    (s, "")
 }
 
 /// A value's lexical form plus its language tag (preserved by `SUBSTR`/`REPLACE`
@@ -2990,9 +4315,11 @@ fn gen_uuid() -> String {
     )
 }
 
-/// Jaro string similarity in `[0, 1]`, backing the gStore `SIMILARITY` built-in
-/// (ported from `TempResult::doSimilarity`, including its equal/empty/substring
-/// short-cuts so results track the C++ engine).
+/// Jaro string similarity in `[0, 1]` over Unicode scalar values, with
+/// `TempResult::doSimilarity`'s equal/empty/substring short-cuts but textbook
+/// transposition counting, in `f64`: the string mode of the legacy
+/// `rs:SIMILARITY`. The bare `SIMILARITY` uses the exact upstream port,
+/// [`crate::analytics::gfun::metrics::jaro_similarity`].
 fn jaro_similarity(s: &str, t: &str) -> f64 {
     if s == t {
         return 1.0;
@@ -3063,6 +4390,68 @@ fn compare_values(op: CompareOp, a: &Value, b: &Value) -> Option<bool> {
     }
 }
 
+/// gStore's list datatype, used by `CONTAINALL` / `CONTAINANY`.
+const XSD_LIST: &str = "http://www.w3.org/2001/XMLSchema#list";
+
+/// The lexical form of an `xsd:list` literal, if `v` is one.
+fn xsd_list_text(v: &Value) -> Option<&str> {
+    match v {
+        Value::Typed { value, datatype } if datatype == XSD_LIST => Some(value),
+        _ => None,
+    }
+}
+
+/// Split an `xsd:list` lexical form as upstream's `Util::split` does: items
+/// are separated by `sep` and trimmed of spaces; an empty last item (so also
+/// the only item of an empty list) is dropped, empty inner items are kept.
+fn split_xsd_list(text: &str, sep: &str) -> Vec<String> {
+    let mut items: Vec<String> = text
+        .split(sep)
+        .map(|t| t.trim_matches(' ').to_string())
+        .collect();
+    if items.last().is_some_and(String::is_empty) {
+        items.pop();
+    }
+    items
+}
+
+/// `lhs IN (list…)` / `lhs NOT IN (list…)` (SPARQL 1.1 §17.4.1.9-10), with
+/// `eval` evaluating an operand (`None` = error/unbound). The test is `=`
+/// ([`Value::sparql_eq`]: value equality where the operator mapping defines
+/// it, else RDFterm-equal, so `2 IN (<http://ex/iri>, 2.0)` is true and
+/// `2 IN ("2")` a type error) on each list member in turn: IN is true as soon as one member is equal; an
+/// error in some comparison makes the result an error unless a later or
+/// earlier member is equal (`2 IN (1/0, 2)` is true, `2 IN (3, 1/0)` an
+/// error); otherwise it is false. NOT IN is the negation under the same error
+/// rule. An empty list gives false (true for NOT IN) whatever the left-hand
+/// side, as the spec's expansion into a `||`/`&&` chain of zero comparisons
+/// does; otherwise an error in the left-hand side is an error. Members are
+/// evaluated lazily, left to right, stopping at the first equal one.
+fn eval_in(
+    lhs: &Expr,
+    list: &[Expr],
+    negated: bool,
+    eval: impl Fn(&Expr) -> Option<Value>,
+) -> Option<Value> {
+    if list.is_empty() {
+        return Some(Value::Bool(negated));
+    }
+    let x = eval(lhs)?;
+    let mut error = false;
+    for e in list {
+        match eval(e).and_then(|y| x.sparql_eq(&y)) {
+            Some(true) => return Some(Value::Bool(!negated)),
+            Some(false) => {}
+            None => error = true,
+        }
+    }
+    if error {
+        None
+    } else {
+        Some(Value::Bool(negated))
+    }
+}
+
 /// Sum numeric values (integer-preserving until a double appears).
 fn sum_values(vals: &[Value]) -> Value {
     // Accumulate through the numeric tower so decimals and big integers are
@@ -3077,6 +4466,84 @@ fn sum_values(vals: &[Value]) -> Value {
         }
     }
     acc
+}
+
+/// How a variable of a trailing `VALUES` block meets an aggregate query's
+/// group rows ([`Evaluator::eval_aggregation`]).
+#[derive(Debug, Clone, Copy)]
+enum ValuesCol {
+    /// A GROUP BY or projected variable: the VALUES term must equal the
+    /// row's (an unbound column takes it).
+    Match(usize),
+    /// A SELECT expression alias: matched like `Match`, once the expressions
+    /// are computed.
+    Alias(usize),
+    /// Out of scope after grouping: the VALUES term binds the column.
+    Bind(usize),
+}
+
+/// The hidden group-row variable holding the `i`-th lifted aggregate of an
+/// aggregate query (`.` cannot occur in a SPARQL variable name, so it never
+/// clashes with a query variable).
+fn agg_var(i: usize) -> String {
+    format!(".agg{i}")
+}
+
+/// SPARQL 1.1 §18.2.4.1: `e` with every aggregate replaced by the variable
+/// of its group-row column ([`agg_var`]); new aggregates are appended to
+/// `aggs` (an aggregate already there — the same call written twice — reuses
+/// its column). An aggregate's own argument is left as is.
+fn lift_aggregates(e: &Expr, aggs: &mut Vec<Expr>) -> Expr {
+    let mut lift = |x: &Expr| lift_aggregates(x, aggs);
+    match e {
+        Expr::Aggregate { .. } => {
+            let i = match aggs.iter().position(|a| a == e) {
+                Some(i) => i,
+                None => {
+                    aggs.push(e.clone());
+                    aggs.len() - 1
+                }
+            };
+            Expr::Var(agg_var(i))
+        }
+        Expr::Or(a, b) => Expr::Or(Box::new(lift(a)), Box::new(lift(b))),
+        Expr::And(a, b) => Expr::And(Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Compare(op, a, b) => Expr::Compare(*op, Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Arith(op, a, b) => Expr::Arith(*op, Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Not(a) => Expr::Not(Box::new(lift(a))),
+        Expr::Unary(op, a) => Expr::Unary(*op, Box::new(lift(a))),
+        Expr::Builtin(name, args) => Expr::Builtin(name.clone(), args.iter().map(lift).collect()),
+        Expr::IriCall { iri, args } => Expr::IriCall {
+            iri: iri.clone(),
+            args: args.iter().map(lift).collect(),
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(lift(expr)),
+            list: list.iter().map(lift).collect(),
+            negated: *negated,
+        },
+        Expr::Var(_)
+        | Expr::Const(_)
+        | Expr::Exists(_, _)
+        | Expr::GraphFn { .. }
+        | Expr::Pfn { .. } => e.clone(),
+    }
+}
+
+/// The layout of an aggregate query's group rows: the WHERE `layout` plus
+/// one hidden column per lifted aggregate ([`agg_var`]).
+fn group_layout(layout: &VarLayout, n_aggs: usize) -> VarLayout {
+    let mut names = layout.names.clone();
+    let mut is_pred = layout.is_pred.clone();
+    for i in 0..n_aggs {
+        names.push(agg_var(i));
+        is_pred.push(false);
+    }
+    VarLayout::from_vars(names, is_pred)
 }
 
 /// Does a projection contain any aggregate (⇒ grouping evaluation)?
@@ -3096,8 +4563,372 @@ fn expr_has_aggregate(e: &Expr) -> bool {
             expr_has_aggregate(a) || expr_has_aggregate(b)
         }
         Expr::Not(a) | Expr::Unary(_, a) => expr_has_aggregate(a),
-        Expr::Builtin(_, args) => args.iter().any(expr_has_aggregate),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().any(expr_has_aggregate),
+        Expr::In { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// advanced graph functions: projection shape
+// ---------------------------------------------------------------------------
+
+/// A SELECT projection item `(f(…) AS ?alias)` whose expression is an
+/// upstream advanced graph function.
+struct GraphFnItem {
+    call: GCall,
+    alias: String,
+}
+
+/// The advanced graph functions projected by `q`, in projection order.
+fn graph_fn_items(q: &SelectQuery) -> Result<Vec<GraphFnItem>> {
+    let Projection::Items(items) = &q.projection else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .filter_map(|it| match it {
+            SelectItem::Expr(Expr::GraphFn { func, args }, alias) => {
+                Some(GCall::from_ast(*func, args).map(|call| GraphFnItem {
+                    call,
+                    alias: alias.clone(),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The size of upstream's projection list for `q`: the projected items plus
+/// every ORDER BY variable that is not projected (upstream appends those to
+/// `proj`, GE:1418-1437, and the row shape of a graph function depends on
+/// whether `proj` has a single entry).
+fn upstream_projection_len(q: &SelectQuery) -> usize {
+    let projected = q.result_vars();
+    let mut extra: Vec<String> = Vec::new();
+    for o in &q.order_by {
+        let mut vars = Vec::new();
+        expr_vars(&o.expr, &mut vars);
+        for v in vars {
+            if !projected.contains(&v) && !extra.contains(&v) {
+                extra.push(v);
+            }
+        }
+    }
+    projected.len() + extra.len()
+}
+
+/// The variables an expression mentions (not those of nested patterns).
+fn expr_vars(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Var(v) => out.push(v.clone()),
+        Expr::Const(_) | Expr::Exists(_, _) | Expr::Pfn { .. } => {}
+        Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+            expr_vars(a, out);
+            expr_vars(b, out);
+        }
+        Expr::Not(a) | Expr::Unary(_, a) => expr_vars(a, out),
+        Expr::Builtin(_, args) | Expr::IriCall { args, .. } => {
+            args.iter().for_each(|a| expr_vars(a, out))
+        }
+        Expr::In { expr, list, .. } => {
+            expr_vars(expr, out);
+            list.iter().for_each(|a| expr_vars(a, out));
+        }
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                expr_vars(a, out);
+            }
+        }
+        Expr::GraphFn { args, .. } => {
+            for a in args {
+                if let GArg::Node(VarOrIri::Var(v)) = a {
+                    out.push(v.clone());
+                }
+            }
+        }
+    }
+}
+
+/// `WHERE {}`: upstream evaluates it to no rows at all (its result table is
+/// created empty, GE:1390-1394), where SPARQL has one empty solution.
+fn pattern_is_trivially_empty(gp: &GraphPattern) -> bool {
+    match gp {
+        GraphPattern::Empty => true,
+        GraphPattern::Bgp(tps) => tps.is_empty(),
+        _ => false,
+    }
+}
+
+/// Upstream's `singleBGP` (QueryParser.cpp:1033-1034): the WHERE clause is
+/// triple patterns only — no FILTER, OPTIONAL, UNION, BIND, VALUES, MINUS,
+/// property path, … — which enables its LIMIT pushdown. (The parser folds
+/// a bare nested group `{ { … } }` of triple patterns into one BGP, so that
+/// counts here too; upstream would not push its LIMIT down.)
+fn pattern_is_single_bgp(gp: &GraphPattern) -> bool {
+    matches!(gp, GraphPattern::Bgp(tps) if !tps.is_empty())
+}
+
+/// The variables `gp` binds only through `BIND` (no triple, path, VALUES,
+/// sub-SELECT or `GRAPH ?g` binds them too). Upstream always stores a BIND
+/// result in a string column (`TempResult::doBind`, TempResult.cpp:1566),
+/// which a graph function rejects as a vertex, whether or not the value is
+/// a stored term.
+fn bind_only_vars(gp: &GraphPattern) -> HashSet<String> {
+    fn walk(gp: &GraphPattern, binds: &mut Vec<String>, other: &mut Vec<String>) {
+        match gp {
+            GraphPattern::Extend(inner, v, _) => {
+                walk(inner, binds, other);
+                binds.push(v.clone());
+            }
+            GraphPattern::Join(a, b)
+            | GraphPattern::Union(a, b)
+            | GraphPattern::Minus(a, b)
+            | GraphPattern::LeftJoin(a, b, _) => {
+                walk(a, binds, other);
+                walk(b, binds, other);
+            }
+            GraphPattern::Filter(_, inner) | GraphPattern::Service { pattern: inner, .. } => {
+                walk(inner, binds, other)
+            }
+            GraphPattern::Graph(g, inner) => {
+                if let GraphTerm::Var(v) = g {
+                    other.push(v.clone());
+                }
+                walk(inner, binds, other);
+            }
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _)
+            | GraphPattern::SubSelect(_) => gp.collect_vars(other),
+        }
+    }
+    let (mut binds, mut other) = (Vec::new(), Vec::new());
+    walk(gp, &mut binds, &mut other);
+    binds.into_iter().filter(|v| !other.contains(v)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// call validation (before evaluation)
+// ---------------------------------------------------------------------------
+
+/// The `xsd:` namespace of the SPARQL 1.1 constructor (cast) functions.
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// The target of an XSD constructor function call, `xsd:integer(?x)` & co.
+/// (SPARQL 1.1 §17.5, plus `xsd:date`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XsdCast {
+    String,
+    Integer,
+    Decimal,
+    Double,
+    Float,
+    Boolean,
+    DateTime,
+    Date,
+}
+
+impl XsdCast {
+    /// The cast an IRI function call names, if any (XSD local names are
+    /// case-sensitive).
+    fn from_iri(iri: &str) -> Option<XsdCast> {
+        Some(match iri.strip_prefix(XSD_NS)? {
+            "string" => XsdCast::String,
+            "integer" => XsdCast::Integer,
+            "decimal" => XsdCast::Decimal,
+            "double" => XsdCast::Double,
+            "float" => XsdCast::Float,
+            "boolean" => XsdCast::Boolean,
+            "dateTime" => XsdCast::DateTime,
+            "date" => XsdCast::Date,
+            _ => return None,
+        })
+    }
+}
+
+/// The local name of a function IRI (after the last `#`, `/` or `:`), for
+/// looking up user functions registered under a bare name.
+fn iri_local_name(iri: &str) -> &str {
+    iri.rsplit(['#', '/', ':']).next().unwrap_or(iri)
+}
+
+impl<'a, S: TripleSource> Evaluator<'a, S> {
+    /// Reject, before evaluation, the calls this engine cannot evaluate, so
+    /// the query fails with a clear message instead of silently yielding
+    /// unbound values:
+    ///
+    /// * an upstream advanced graph function anywhere but as the whole
+    ///   expression of a SELECT projection (upstream gStore parses
+    ///   `simpleCycleBoolean`/`cycleBoolean`/`shortestPathLen`/`kHopReachable`
+    ///   inside FILTER — QueryParser.cpp:866-930 — but `TempResult::doComp`
+    ///   has no case for them, so they never evaluate there);
+    /// * an advanced function whose arguments do not fit its signature (the
+    ///   parser never produces one, but an AST may be built by hand);
+    /// * `PFN.name({…})` (personalised functions arrive in a later phase);
+    /// * an IRI function call that is neither an XSD cast, nor a legacy `rs:`
+    ///   function, nor a user function registered under its IRI or its local
+    ///   name.
+    fn check_calls(&self, q: &Query) -> Result<()> {
+        match q {
+            Query::Select(s) => self.check_select_calls(s),
+            Query::Ask(a) => self.check_pattern_calls(&a.pattern),
+            Query::Construct(c) => {
+                self.check_pattern_calls(&c.pattern)?;
+                c.order_by
+                    .iter()
+                    .try_for_each(|o| self.check_expr_calls(&o.expr))
+            }
+            Query::Describe(d) => match &d.pattern {
+                Some(p) => self.check_pattern_calls(p),
+                None => Ok(()),
+            },
+            Query::Update(ops) => self.check_update_calls(ops),
+        }
+    }
+
+    /// The same checks for every `WHERE` clause of an UPDATE request. They
+    /// only read the request and the function registry, so
+    /// [`Database`](crate::Database) runs them before the first operation:
+    /// a statically invalid request is rejected as a whole, with nothing
+    /// applied.
+    pub fn check_update_calls(&self, ops: &[UpdateOp]) -> Result<()> {
+        ops.iter().try_for_each(|op| match op {
+            UpdateOp::Modify { pattern, .. } => self.check_pattern_calls(pattern),
+            _ => Ok(()),
+        })
+    }
+
+    fn check_select_calls(&self, s: &SelectQuery) -> Result<()> {
+        if let Projection::Items(items) = &s.projection {
+            for it in items {
+                match it {
+                    // The one place an advanced function evaluates.
+                    SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
+                        GCall::from_ast(*func, args)?;
+                    }
+                    SelectItem::Expr(e, _) => self.check_expr_calls(e)?,
+                    SelectItem::Var(_) => {}
+                }
+            }
+        }
+        self.check_pattern_calls(&s.pattern)?;
+        for e in s.group_by.iter().chain(&s.having) {
+            self.check_expr_calls(e)?;
+        }
+        s.order_by
+            .iter()
+            .try_for_each(|o| self.check_expr_calls(&o.expr))
+    }
+
+    fn check_pattern_calls(&self, gp: &GraphPattern) -> Result<()> {
+        match gp {
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _) => Ok(()),
+            GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
+                self.check_pattern_calls(a)?;
+                self.check_pattern_calls(b)
+            }
+            GraphPattern::LeftJoin(a, b, fs) => {
+                self.check_pattern_calls(a)?;
+                self.check_pattern_calls(b)?;
+                fs.iter().try_for_each(|e| self.check_expr_calls(e))
+            }
+            GraphPattern::Filter(fs, inner) => {
+                fs.iter().try_for_each(|e| self.check_expr_calls(e))?;
+                self.check_pattern_calls(inner)
+            }
+            GraphPattern::Extend(inner, _, e) => {
+                self.check_pattern_calls(inner)?;
+                self.check_expr_calls(e)
+            }
+            GraphPattern::SubSelect(sq) => self.check_select_calls(sq),
+            GraphPattern::Graph(_, inner) => self.check_pattern_calls(inner),
+            GraphPattern::Service { pattern, .. } => self.check_pattern_calls(pattern),
+        }
+    }
+
+    fn check_expr_calls(&self, e: &Expr) -> Result<()> {
+        match e {
+            Expr::GraphFn { func, .. } => {
+                let name = func.name();
+                let mut msg = format!(
+                    "{name}(…) is only evaluated as the whole expression of a SELECT \
+                     projection, e.g. SELECT ({name}(…) AS ?v); upstream gStore parses it \
+                     inside FILTER but never evaluates it there"
+                );
+                if rs_function_name(&format!("{RS_NAMESPACE}{}", func.keyword())).is_some() {
+                    msg.push_str(&format!(
+                        "; the legacy gstore-rust function rs:{}(…) works anywhere",
+                        func.keyword()
+                    ));
+                }
+                Err(GStoreError::Query(msg))
+            }
+            Expr::Pfn { name, .. } => Err(GStoreError::Query(format!(
+                "PFN not supported yet (Phase 4): PFN.{name}(…)"
+            ))),
+            Expr::IriCall { iri, args } => {
+                self.check_iri_call(iri, args.len())?;
+                args.iter().try_for_each(|a| self.check_expr_calls(a))
+            }
+            Expr::Var(_) | Expr::Const(_) => Ok(()),
+            Expr::Or(a, b) | Expr::And(a, b) | Expr::Compare(_, a, b) | Expr::Arith(_, a, b) => {
+                self.check_expr_calls(a)?;
+                self.check_expr_calls(b)
+            }
+            Expr::Not(a) | Expr::Unary(_, a) => self.check_expr_calls(a),
+            Expr::Builtin(_, args) => args.iter().try_for_each(|a| self.check_expr_calls(a)),
+            Expr::In { expr, list, .. } => {
+                self.check_expr_calls(expr)?;
+                list.iter().try_for_each(|a| self.check_expr_calls(a))
+            }
+            Expr::Exists(_, p) => self.check_pattern_calls(p),
+            Expr::Aggregate { arg, .. } => match arg {
+                Some(a) => self.check_expr_calls(a),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// An IRI function call must name an `rs:` legacy function (the parser
+    /// checked name and arity), a one-argument XSD cast, or a registered user
+    /// function (by full IRI, else by local name).
+    fn check_iri_call(&self, iri: &str, nargs: usize) -> Result<()> {
+        if rs_function_name(iri).is_some() {
+            return Ok(());
+        }
+        if XsdCast::from_iri(iri).is_some() {
+            if nargs != 1 {
+                return Err(GStoreError::Query(format!(
+                    "the cast <{iri}>(…) takes exactly one argument, got {nargs}"
+                )));
+            }
+            return Ok(());
+        }
+        if self.user_iri_function(iri).is_some() {
+            return Ok(());
+        }
+        Err(GStoreError::Query(format!(
+            "unknown function <{iri}>: it is not an XSD cast (xsd:string, xsd:integer, \
+             xsd:decimal, xsd:double, xsd:float, xsd:boolean, xsd:dateTime, xsd:date), not a \
+             legacy gstore-rust function (<{RS_NAMESPACE}NAME>, rs:NAME), and no user function \
+             is registered under this IRI or its local name \"{}\"",
+            iri_local_name(iri)
+        )))
+    }
+
+    /// The user function an IRI call reaches: registered under the full IRI,
+    /// else under its local name.
+    fn user_iri_function(&self, iri: &str) -> Option<&super::functions::CustomFn> {
+        self.functions
+            .get(iri)
+            .or_else(|| self.functions.get(iri_local_name(iri)))
     }
 }
 
@@ -3136,23 +4967,77 @@ fn eval_minus(
         return left; // no shared variables ⇒ MINUS removes nothing
     }
     left.into_iter()
-        .filter(|l| {
-            !right.iter().any(|r| {
-                let mut compatible = true;
-                let mut any_shared = false;
-                for &v in &shared {
-                    if let (Some(a), Some(b)) = (l[v], r[v]) {
-                        any_shared = true;
-                        if a != b {
-                            compatible = false;
-                            break;
-                        }
-                    }
-                }
-                compatible && any_shared
-            })
-        })
+        .filter(|l| !minus_removes(l, &right, &shared))
         .collect()
+}
+
+/// Whether MINUS drops `l`: some right solution is compatible with it on the
+/// `shared` variables and they share at least one bound one.
+fn minus_removes(l: &Binding, right: &[Binding], shared: &[usize]) -> bool {
+    right.iter().any(|r| {
+        let mut compatible = true;
+        let mut any_shared = false;
+        for &v in shared {
+            if let (Some(a), Some(b)) = (l[v], r[v]) {
+                any_shared = true;
+                if a != b {
+                    compatible = false;
+                    break;
+                }
+            }
+        }
+        compatible && any_shared
+    })
+}
+
+/// DISTINCT, OFFSET and LIMIT over a SELECT's projected rows, in that order.
+fn apply_row_modifiers(q: &SelectQuery, mut rows: Vec<Vec<Option<u32>>>) -> Vec<Vec<Option<u32>>> {
+    if q.distinct {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|r| seen.insert(r.clone()));
+    }
+    let offset = q.offset.unwrap_or(0);
+    if offset > 0 {
+        rows.drain(0..offset.min(rows.len()));
+    }
+    if let Some(limit) = q.limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+/// The order in which [`Evaluator::eval_join`] joins its conjuncts, given
+/// each one's `(solution count, variables)`: the smallest first, then
+/// repeatedly the smallest one connected to what is joined so far (any
+/// smallest one when none is connected); ties go to the conjunct the
+/// `swap_remove`-based selection meets first. The streaming join (`topk`)
+/// uses the same order, so both produce the solutions in the same order.
+fn greedy_join_order(parts: &[(usize, &[usize])]) -> Vec<usize> {
+    let mut rest: Vec<usize> = (0..parts.len()).collect();
+    let mut order = Vec::with_capacity(parts.len());
+    let Some(start) = (0..rest.len()).min_by_key(|&i| parts[rest[i]].0) else {
+        return order;
+    };
+    let first = rest.swap_remove(start);
+    let mut acc_vars: Vec<usize> = parts[first].1.to_vec();
+    order.push(first);
+    while !rest.is_empty() {
+        let pick = (0..rest.len())
+            .min_by_key(|&i| {
+                let (len, vars) = parts[rest[i]];
+                let connected = vars.iter().any(|v| acc_vars.contains(v));
+                (!connected as u8, len)
+            })
+            .unwrap_or(0);
+        let next = rest.swap_remove(pick);
+        for &v in parts[next].1 {
+            if !acc_vars.contains(&v) {
+                acc_vars.push(v);
+            }
+        }
+        order.push(next);
+    }
+    order
 }
 
 /// Flatten a (possibly nested) `Join` tree into its conjuncts.
@@ -3163,6 +5048,95 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
             flatten_join(b, out);
         }
         other => out.push(other),
+    }
+}
+
+/// Per-BGP translation caches of a mixed pipeline (both directions):
+/// entity-space id → predicate id, predicate id → entity-space id
+/// ([`Evaluator::mixed_enter`] / [`Evaluator::mixed_leave`]).
+#[derive(Default)]
+struct MixedCaches {
+    to_pred: HashMap<u32, Option<u32>>,
+    to_node: HashMap<u32, Option<u32>>,
+}
+
+/// The `(x, hidden)` slot pairs of the mixed variables whose hidden
+/// predicate slot some pattern of a compiled BGP binds
+/// ([`VarLayout::pred_alias`]); non-empty ⇒ the BGP runs as a mixed
+/// pipeline. Sorted, so every executor translates in the same order.
+fn mixed_slots(plans: &[PatPlan], layout: &VarLayout) -> Vec<(usize, usize)> {
+    let mut mixed: Vec<(usize, usize)> = layout
+        .pred_alias
+        .iter()
+        .filter(|&(_, &h)| plans.iter().any(|p| matches!(p.p, Slot::Var(v) if v == h)))
+        .map(|(&x, &h)| (x, h))
+        .collect();
+    mixed.sort_unstable();
+    mixed
+}
+
+/// Clear the hidden predicate slots of a finished mixed-pipeline row, so it
+/// carries each mixed variable in its own (entity-space) slot only.
+fn mixed_clear(b: &mut Binding, mixed: &[(usize, usize)]) {
+    for &(_, h) in mixed {
+        b[h] = None;
+    }
+}
+
+/// The variables `gp` binds other than in a triple's predicate position:
+/// subjects and objects of triple and path patterns, BIND targets, VALUES
+/// columns, sub-SELECT results and GRAPH / SERVICE variables — the ids such
+/// a binding carries are entity/literal (or synthetic) ids. A variable both
+/// here and in predicate position is *mixed* ([`VarLayout::pred_alias`]).
+fn node_bound_vars(gp: &GraphPattern, out: &mut HashSet<String>) {
+    let mut add = |t: &PatternTerm| {
+        if let PatternTerm::Var(v) = t {
+            out.insert(v.clone());
+        }
+    };
+    match gp {
+        GraphPattern::Empty => {}
+        GraphPattern::Bgp(tps) => {
+            for tp in tps {
+                add(&tp.subject);
+                add(&tp.object);
+            }
+        }
+        GraphPattern::Path(p) => {
+            add(&p.subject);
+            add(&p.object);
+        }
+        GraphPattern::Join(a, b)
+        | GraphPattern::Union(a, b)
+        | GraphPattern::Minus(a, b)
+        | GraphPattern::LeftJoin(a, b, _) => {
+            node_bound_vars(a, out);
+            node_bound_vars(b, out);
+        }
+        GraphPattern::Filter(_, inner) => node_bound_vars(inner, out),
+        GraphPattern::Extend(inner, v, _) => {
+            node_bound_vars(inner, out);
+            out.insert(v.clone());
+        }
+        GraphPattern::Values(_, _) | GraphPattern::SubSelect(_) => {
+            let mut vars = Vec::new();
+            gp.collect_vars(&mut vars);
+            out.extend(vars);
+        }
+        GraphPattern::Graph(g, inner) => {
+            if let GraphTerm::Var(v) = g {
+                out.insert(v.clone());
+            }
+            node_bound_vars(inner, out);
+        }
+        GraphPattern::Service {
+            endpoint, pattern, ..
+        } => {
+            if let ServiceRef::Var(v) = endpoint {
+                out.insert(v.clone());
+            }
+            node_bound_vars(pattern, out);
+        }
     }
 }
 
@@ -3409,31 +5383,32 @@ fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
     }
 }
 
-/// Numeric arithmetic with integer fast-path and f64 fallback.
-fn eval_arith(op: ArithOp, a: Value, b: Value) -> Option<Value> {
-    // The numeric tower (Int/BigInt/Decimal/Double promotion, exact where
-    // possible) lives on Value; see [`Value::arith`].
-    a.arith(op, &b)
-}
+/// `rdf:langString`, the datatype of a language-tagged literal.
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
-/// The datatype IRI for `DATATYPE()`.
-fn datatype_iri(v: &Value) -> Option<String> {
-    Some(
-        match v {
-            Value::Int(_) | Value::BigInt(_) => xsd::INTEGER,
-            Value::Decimal(_) => xsd::DECIMAL,
-            Value::Double(_) => xsd::DOUBLE,
-            Value::Bool(_) => xsd::BOOLEAN,
-            Value::Str { lang: None, .. } => xsd::STRING,
-            Value::Str { lang: Some(_), .. } => {
-                return Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString".into())
+/// RDF term equality, for `sameTerm`: a simple literal and the
+/// `xsd:string` literal of the same text are one term (RDF 1.1).
+fn same_term(a: &Term, b: &Term) -> bool {
+    match (a, b) {
+        (
+            Term::Literal {
+                value: va,
+                datatype: da,
+                lang: la,
+            },
+            Term::Literal {
+                value: vb,
+                datatype: db,
+                lang: lb,
+            },
+        ) => {
+            fn dt(d: &Option<String>) -> Option<&str> {
+                d.as_deref().filter(|d| *d != xsd::STRING)
             }
-            Value::Typed { datatype, .. } => return Some(datatype.clone()),
-            // IRIs and blank nodes have no datatype.
-            Value::Iri(_) | Value::Blank(_) => return None,
+            va == vb && la == lb && dt(da) == dt(db)
         }
-        .to_string(),
-    )
+        _ => a == b,
+    }
 }
 
 /// Render a `SERVICE` inner pattern as a remote `SELECT * WHERE { … }` query
@@ -3483,6 +5458,11 @@ fn serialize_pattern_body(gp: &GraphPattern, out: &mut String) -> Option<()> {
 /// (which is itself valid SPARQL for IRIs/literals/blank nodes).
 fn render_pattern_term(pt: &PatternTerm) -> String {
     match pt {
+        // A hidden blank-node variable goes out as a blank node, which the
+        // remote reads as a non-distinguished variable.
+        PatternTerm::Var(v) if is_anon_var(v) => {
+            format!("_:anon{}", &v[ANON_VAR_PREFIX.len()..])
+        }
         PatternTerm::Var(v) => format!("?{v}"),
         PatternTerm::Term(t) => t.to_string(),
     }
@@ -3518,6 +5498,7 @@ mod builtin_tests {
             index: HashMap::from([("s".to_string(), 0usize), ("o".to_string(), 1usize)]),
             names: vec!["s".into(), "o".into()],
             is_pred: vec![false, false],
+            pred_alias: HashMap::new(),
         };
         let lit = |s: &str| Expr::Const(Term::plain_literal(s));
 
@@ -3849,11 +5830,38 @@ mod builtin_tests {
 
     #[test]
     fn similarity_jaro() {
+        // Bare SIMILARITY is upstream's `doSimilarity` over the *term
+        // strings*, so quotes and brackets take part in the comparison.
+        let sim = |e: &str| -> f64 { lit(&scalar(e)).parse().unwrap() };
+        let upstream = crate::analytics::gfun::metrics::jaro_similarity;
         assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
-        assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "xyz")"#)), "0.0");
-        // "abc" is a substring of "abcdef": (3/6 + 2)/3 = 0.8333…
-        let sub: f64 = lit(&scalar(r#"SIMILARITY("abcdef", "abc")"#)).parse().unwrap();
-        assert!((sub - 0.833_333).abs() < 1e-4, "got {sub}");
+        // `"abc"` vs `"xyz"`: only the two quotes match: (2/5 + 2/5 + 2/2)/3.
+        let v = sim(r#"SIMILARITY("abc", "xyz")"#);
+        assert!((v - 0.6).abs() < 1e-6, "got {v}");
+        // `"abc"` is no substring of `"abcdef"` (the closing quote differs):
+        // four matches, no transposition: (4/8 + 4/5 + 4/4)/3.
+        let v = sim(r#"SIMILARITY("abcdef", "abc")"#);
+        assert!((v - 2.3 / 3.0).abs() < 1e-6, "got {v}");
+        // Exactly the upstream port (f32 arithmetic, byte-wise), on term strings.
+        assert_eq!(
+            sim(r#"SIMILARITY("MARTHA", "MARHTA")"#),
+            upstream("\"MARTHA\"", "\"MARHTA\"")
+        );
+        assert_eq!(
+            sim("SIMILARITY(<http://ex/a>, <http://ex/c>)"),
+            upstream("<http://ex/a>", "<http://ex/c>")
+        );
+        assert_eq!(
+            sim(r#"SIMILARITY(?n, "Hello")"#),
+            upstream("\"Hello World\"", "\"Hello\"")
+        );
+        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        // The legacy gstore-rust SIMILARITY (lexical forms, textbook Jaro)
+        // stays reachable as rs:SIMILARITY: "abc" is a substring of "abcdef"
+        // there, (3/6 + 2)/3.
+        let v = sim(r#"rs:SIMILARITY("abcdef", "abc")"#);
+        assert!((v - 2.5 / 3.0).abs() < 1e-9, "got {v}");
+        assert_eq!(lit(&scalar(r#"rs:SIMILARITY("abc", "xyz")"#)), "0.0");
     }
 
     // ---- numeric ----------------------------------------------------------
@@ -3974,24 +5982,24 @@ mod builtin_tests {
 
     #[test]
     fn cycleboolean_detects_directed_cycle() {
-        assert_eq!(lit(&scalar_on(false, "CYCLEBOOLEAN()")), "false");
-        assert_eq!(lit(&scalar_on(true, "CYCLEBOOLEAN()")), "true");
-        assert_eq!(lit(&scalar_on(true, "SIMPLECYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(false, "rs:CYCLEBOOLEAN()")), "false");
+        assert_eq!(lit(&scalar_on(true, "rs:CYCLEBOOLEAN()")), "true");
+        assert_eq!(lit(&scalar_on(true, "rs:SIMPLECYCLEBOOLEAN()")), "true");
     }
 
     #[test]
     fn shortestpathlen_counts_edges() {
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/a>, <http://ex/d>)")),
             "3"
         );
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/a>, <http://ex/a>)")),
             "0"
         );
         // d→a is unreachable in the acyclic graph ⇒ -1 sentinel.
         assert_eq!(
-            lit(&scalar("SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
+            lit(&scalar("rs:SHORTESTPATHLEN(<http://ex/d>, <http://ex/a>)")),
             "-1"
         );
     }
@@ -3999,15 +6007,15 @@ mod builtin_tests {
     #[test]
     fn khopreachable_respects_budget() {
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 3)")),
             "true"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/d>, 2)")),
             "false"
         );
         assert_eq!(
-            lit(&scalar("KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
+            lit(&scalar("rs:KHOPREACHABLE(<http://ex/a>, <http://ex/a>, 0)")),
             "true"
         );
     }
@@ -4017,44 +6025,59 @@ mod builtin_tests {
     #[test]
     fn sssp_serializes_the_path() {
         assert_eq!(
-            lit(&scalar("SSSP(<http://ex/a>, <http://ex/d>)")),
+            lit(&scalar("rs:SSSP(<http://ex/a>, <http://ex/d>)")),
             "<http://ex/a> <http://ex/b> <http://ex/c> <http://ex/d>"
         );
         // Unreachable ⇒ empty (but bound) string.
-        assert_eq!(lit(&scalar("SSSP(<http://ex/d>, <http://ex/a>)")), "");
+        assert_eq!(lit(&scalar("rs:SSSP(<http://ex/d>, <http://ex/a>)")), "");
     }
 
     #[test]
     fn sssplen_aliases_shortestpathlen() {
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/a>, <http://ex/d>)")), "3");
-        assert_eq!(lit(&scalar("SSSPLEN(<http://ex/d>, <http://ex/a>)")), "-1");
+        assert_eq!(
+            lit(&scalar("rs:SSSPLEN(<http://ex/a>, <http://ex/d>)")),
+            "3"
+        );
+        assert_eq!(
+            lit(&scalar("rs:SSSPLEN(<http://ex/d>, <http://ex/a>)")),
+            "-1"
+        );
     }
 
     #[test]
     fn shortestpaths_counts_distinct_paths() {
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")), "1");
-        assert_eq!(lit(&scalar("SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")), "1");
+        assert_eq!(
+            lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/d>)")),
+            "1"
+        );
+        assert_eq!(
+            lit(&scalar("rs:SHORTESTPATHS(<http://ex/a>, <http://ex/a>)")),
+            "1"
+        );
     }
 
     #[test]
     fn khop_count_and_neighbor_and_all() {
         // a's out-edges: b, "Hello World", <dt> ⇒ 3 nodes at exactly 1 hop.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:KHOPCOUNT(<http://ex/a>, 1)")), "3");
         // Exactly 2 hops from a is just {c}.
-        assert_eq!(lit(&scalar("KHOPCOUNT(<http://ex/a>, 2)")), "1");
+        assert_eq!(lit(&scalar("rs:KHOPCOUNT(<http://ex/a>, 2)")), "1");
         assert_eq!(
-            lit(&scalar("KHOPNEIGHBOR(<http://ex/a>, 2)")),
+            lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/a>, 2)")),
             "<http://ex/c>"
         );
-        assert_eq!(lit(&scalar("KHOPNEIGHBOR(<http://ex/b>, 1)")), "<http://ex/c>");
+        assert_eq!(
+            lit(&scalar("rs:KHOPNEIGHBOR(<http://ex/b>, 1)")),
+            "<http://ex/c>"
+        );
     }
 
     #[test]
     fn bfscount_counts_reachable() {
         // All reachable from a (excl. a): b, c, d, "Hello World", <dt> ⇒ 5.
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>)")), "5");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 1)")), "3");
-        assert_eq!(lit(&scalar("BFSCOUNT(<http://ex/a>, 2)")), "4");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>)")), "5");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>, 1)")), "3");
+        assert_eq!(lit(&scalar("rs:BFSCOUNT(<http://ex/a>, 2)")), "4");
     }
 
     #[test]
@@ -4069,23 +6092,26 @@ mod builtin_tests {
     #[test]
     fn wcc_membership_and_size() {
         // Every node hangs off a ⇒ one weakly-connected component of 6 nodes.
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>, <http://ex/d>)")), "true");
-        assert_eq!(lit(&scalar("WCC(<http://ex/a>)")), "6");
+        assert_eq!(lit(&scalar("rs:WCC(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(lit(&scalar("rs:WCC(<http://ex/a>)")), "6");
     }
 
     #[test]
     fn community_builtins_group_the_graph() {
         // The whole graph is one connected blob ⇒ same label-prop community.
-        assert_eq!(lit(&scalar("LABELPROP(<http://ex/a>, <http://ex/d>)")), "true");
+        assert_eq!(
+            lit(&scalar("rs:LABELPROP(<http://ex/a>, <http://ex/d>)")),
+            "true"
+        );
         // Louvain returns a community size (≥ 1) for a known node.
-        let sz: usize = lit(&scalar("LOUVAIN(<http://ex/a>)")).parse().unwrap();
+        let sz: usize = lit(&scalar("rs:LOUVAIN(<http://ex/a>)")).parse().unwrap();
         assert!(sz >= 1);
     }
 
     #[test]
     fn triangle_and_clustering_are_zero_on_a_tree() {
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING()")), "0");
-        assert_eq!(lit(&scalar("TRIANGLECOUNTING(<http://ex/a>)")), "0");
+        assert_eq!(lit(&scalar("rs:TRIANGLECOUNTING()")), "0");
+        assert_eq!(lit(&scalar("rs:TRIANGLECOUNTING(<http://ex/a>)")), "0");
         // Acyclic fan/path ⇒ no closed triples ⇒ transitivity 0.0.
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF()")), "0.0");
         assert_eq!(lit(&scalar("CLUSTERINGCOEFF(<http://ex/a>)")), "0.0");
@@ -4094,12 +6120,18 @@ mod builtin_tests {
     #[test]
     fn centrality_builtins_rank_intermediate_nodes() {
         // A source node is never an intermediary ⇒ betweenness 0.
-        let bc_a: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
-        let bc_b: f64 = lit(&scalar("BETWEENNESSCENTRALITY(<http://ex/b>)")).parse().unwrap();
+        let bc_a: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/a>)"))
+            .parse()
+            .unwrap();
+        let bc_b: f64 = lit(&scalar("rs:BETWEENNESSCENTRALITY(<http://ex/b>)"))
+            .parse()
+            .unwrap();
         assert_eq!(bc_a, 0.0);
         assert!(bc_b > 0.0);
         // a reaches five nodes ⇒ positive closeness.
-        let cc_a: f64 = lit(&scalar("CLOSENESSCENTRALITY(<http://ex/a>)")).parse().unwrap();
+        let cc_a: f64 = lit(&scalar("rs:CLOSENESSCENTRALITY(<http://ex/a>)"))
+            .parse()
+            .unwrap();
         assert!(cc_a > 0.0);
     }
 
@@ -4108,12 +6140,19 @@ mod builtin_tests {
         // JACCARDSIMILARITY is a dedicated graph function (literal-as-node is fine):
         // N(b) = {a, c}, N("Hello World") = {a}: intersection {a}, union {a, c}.
         assert_eq!(
-            lit(&scalar(r#"JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#)),
+            lit(&scalar(
+                r#"rs:JACCARDSIMILARITY(<http://ex/b>, "Hello World")"#
+            )),
             "0.5"
         );
         // Node-mode SIMILARITY requires BOTH args to be IRIs naming graph nodes;
-        // a node vs itself has an identical neighbour set ⇒ 1.0.
-        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        // a node vs itself has an identical neighbour set ⇒ 1.0. (Node mode
+        // is the legacy gstore-rust SIMILARITY, rs:SIMILARITY; upstream's bare
+        // SIMILARITY is string similarity.)
+        assert_eq!(
+            lit(&scalar("rs:SIMILARITY(<http://ex/a>, <http://ex/a>)")),
+            "1.0"
+        );
         // Regression (#3): two STORED LITERALS must use STRING similarity, not
         // node cosine. Both are objects of <a>, so node mode would wrongly report
         // a cosine of 1.0; string (Jaro) similarity of these very different
@@ -4130,16 +6169,20 @@ mod builtin_tests {
 
     #[test]
     fn degree_correlation_and_diameter() {
-        let r: f64 = lit(&scalar("DEGREECORRELATION()")).parse().unwrap();
+        let r: f64 = lit(&scalar("rs:DEGREECORRELATION()")).parse().unwrap();
         assert!(r.is_finite() && (-1.0..=1.0).contains(&r));
         // Undirected longest shortest path: leaf → a → b → c → d = 4.
-        assert_eq!(lit(&scalar("DIAMETERESTIMATION()")), "4");
+        assert_eq!(lit(&scalar("rs:DIAMETERESTIMATION()")), "4");
     }
 
     #[test]
     fn ppr_prefers_the_source() {
-        let self_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/a>)")).parse().unwrap();
-        let far_score: f64 = lit(&scalar("PPR(<http://ex/a>, <http://ex/d>)")).parse().unwrap();
+        let self_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/a>)"))
+            .parse()
+            .unwrap();
+        let far_score: f64 = lit(&scalar("rs:PPR(<http://ex/a>, <http://ex/d>)"))
+            .parse()
+            .unwrap();
         assert!(self_score > far_score);
         assert!(far_score >= 0.0);
     }
@@ -4148,7 +6191,7 @@ mod builtin_tests {
     fn graph_builtin_inside_filter() {
         // Keep only rows where a can reach d within 3 hops (it can).
         assert_eq!(
-            count("<http://ex/a> <http://ex/name> ?n FILTER(SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
+            count("<http://ex/a> <http://ex/name> ?n FILTER(rs:SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
             1
         );
     }
@@ -4493,5 +6536,175 @@ mod pfn_tests {
         // Real ABS(-5)=5, not the custom 999.
         assert!(rs.rows[0][0].as_ref().unwrap().contains('5'));
         assert!(!rs.rows[0][0].as_ref().unwrap().contains("999"));
+    }
+}
+
+/// Advanced graph functions inside the evaluator: CSR sourcing, cancellation
+/// and the cast helpers (end-to-end behaviour: `tests/dt_gfun_e2e.rs`).
+#[cfg(test)]
+mod gfun_engine_tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::parser::sparql::parse;
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+
+    /// `a -p-> b -p-> c`.
+    fn fixture() -> (Dictionary, TripleStore) {
+        let mut d = Dictionary::new();
+        let a = d.intern_term(&Term::iri("http://ex/a"));
+        let b = d.intern_term(&Term::iri("http://ex/b"));
+        let c = d.intern_term(&Term::iri("http://ex/c"));
+        let p = d.intern_predicate(&Term::iri("http://ex/p").dict_key());
+        let mut s = TripleStore::new();
+        s.bulk_load(vec![IdTriple::new(a, p, b), IdTriple::new(b, p, c)]);
+        (d, s)
+    }
+
+    fn cells(r: QueryResult) -> Vec<Vec<Option<String>>> {
+        match r {
+            QueryResult::Select(rs) => rs.rows,
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+
+    const TWO_FNS: &str = "SELECT (kHopCount(<http://ex/a>, true, 2, {}) AS ?k) \
+                           (bfsCount(?x, true, {}) AS ?b) WHERE { ?x <http://ex/p> ?y }";
+
+    #[test]
+    fn without_a_provider_the_evaluator_builds_its_own_csr() {
+        let (d, s) = fixture();
+        let q = parse("SELECT (SSSPLen(<http://ex/a>, true, {}) AS ?r) WHERE {}").unwrap();
+        let rows = cells(Evaluator::new(&d, &s).evaluate(&q).unwrap());
+        assert_eq!(rows.len(), 1);
+        let cell = rows[0][0].clone().unwrap();
+        let Ok(Term::Literal {
+            value,
+            datatype: None,
+            lang: None,
+        }) = parse_term(&cell)
+        else {
+            panic!("not a plain literal: {cell}")
+        };
+        assert_eq!(
+            value,
+            // Upstream's order (an `unordered_map` walk), see gfun::paths.
+            r#"{"paths":[{"src":"<http://ex/a>","dst":"<http://ex/c>","length":2},{"src":"<http://ex/a>","dst":"<http://ex/b>","length":1},{"src":"<http://ex/a>","dst":"<http://ex/a>","length":0}]}"#
+        );
+    }
+
+    #[test]
+    fn the_provider_is_asked_once_per_query_and_only_when_needed() {
+        let (d, s) = fixture();
+        let calls = Cell::new(0);
+        let shared = Arc::new(CsrGraph::build(&s).unwrap());
+        let provider = || {
+            calls.set(calls.get() + 1);
+            Ok(Arc::clone(&shared))
+        };
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&provider);
+        // Two functions (the second over two rows) share one CSR.
+        let rows = cells(ev.evaluate(&parse(TWO_FNS).unwrap()).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(calls.get(), 1);
+        // No graph function, no CSR.
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&provider);
+        ev.evaluate(&parse("SELECT ?x WHERE { ?x <http://ex/p> ?y }").unwrap())
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // A failing provider fails the query.
+        let failing = || Err(GStoreError::Database("no CSR".into()));
+        let ev = Evaluator::new(&d, &s).with_csr_provider(&failing);
+        let e = ev.evaluate(&parse(TWO_FNS).unwrap()).unwrap_err();
+        assert!(e.to_string().contains("no CSR"), "{e}");
+    }
+
+    #[test]
+    fn graph_functions_run_under_the_evaluators_cancel_flag() {
+        let (d, s) = fixture();
+        let flag = Arc::new(AtomicBool::new(true));
+        let ev = Evaluator::new(&d, &s).with_cancel(Arc::clone(&flag));
+        let Query::Select(q) = parse(TWO_FNS).unwrap() else {
+            unreachable!()
+        };
+        let items = graph_fn_items(&q).unwrap();
+        let layout = VarLayout::build(&q.pattern);
+        // `eval_graph_fn` does not check the flag itself: the library does,
+        // through the context the evaluator hands it.
+        let r = ev.eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true);
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(ev
+            .eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn upstream_projection_length_counts_unprojected_order_by_variables() {
+        let len = |q: &str| match parse(q).unwrap() {
+            Query::Select(s) => upstream_projection_len(&s),
+            _ => unreachable!(),
+        };
+        let f = "(WCC({}) AS ?w)";
+        assert_eq!(len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }}")), 1);
+        assert_eq!(
+            len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?w")),
+            1
+        );
+        assert_eq!(
+            len(&format!(
+                "SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?x DESC(?y)"
+            )),
+            3
+        );
+        assert_eq!(
+            len(&format!(
+                "SELECT ?x {f} WHERE {{ ?x ?p ?y }} ORDER BY (STR(?x))"
+            )),
+            2
+        );
+        assert!(pattern_is_trivially_empty(&GraphPattern::Empty));
+        assert!(pattern_is_trivially_empty(&GraphPattern::Bgp(Vec::new())));
+    }
+
+    #[test]
+    fn cast_helpers() {
+        assert_eq!(parse_xsd_double("1e3"), Some(1000.0));
+        assert_eq!(parse_xsd_double(" -.5E-1 "), Some(-0.05));
+        assert_eq!(parse_xsd_double("+INF"), Some(f64::INFINITY));
+        assert!(parse_xsd_double("NaN").unwrap().is_nan());
+        for bad in [
+            "inf", "Infinity", "nan", "1e", "e3", "1.2.3", "", "0x10", "1_000",
+        ] {
+            assert_eq!(parse_xsd_double(bad), None, "{bad}");
+        }
+        assert!(is_integer_lexical("+12"));
+        assert!(!is_integer_lexical("-") && !is_integer_lexical("1.0"));
+        assert!(is_decimal_lexical(".5") && is_decimal_lexical("5."));
+        assert!(!is_decimal_lexical("."));
+        assert_eq!(xsd_float_lexical(0.1), "0.1");
+        assert_eq!(xsd_float_lexical(f64::NEG_INFINITY), "-INF");
+        assert_eq!(xsd_float_lexical(1e40), "INF");
+        assert_eq!(split_date_tz("2020-01-01"), ("2020-01-01", ""));
+        assert_eq!(split_date_tz("-0044-03-15"), ("-0044-03-15", ""));
+        assert_eq!(split_date_tz("2020-01-01Z"), ("2020-01-01", "Z"));
+        assert_eq!(split_date_tz("2020-01-01-05:00"), ("2020-01-01", "-05:00"));
+        assert_eq!(
+            split_date_tz("2020-01-01T10:00:00"),
+            ("2020-01-01T10:00:00", "")
+        );
+        assert_eq!(
+            split_date_tz("2020-01-01T10:00:00.5+01:30"),
+            ("2020-01-01T10:00:00.5", "+01:30")
+        );
+        assert_eq!(iri_local_name("http://ex/fn#double"), "double");
+        assert_eq!(iri_local_name("http://ex/fn/double"), "double");
+        assert_eq!(iri_local_name("urn:x:double"), "double");
+        assert_eq!(
+            XsdCast::from_iri(&format!("{XSD_NS}integer")),
+            Some(XsdCast::Integer)
+        );
+        assert_eq!(XsdCast::from_iri(&format!("{XSD_NS}Integer")), None);
     }
 }
