@@ -1,9 +1,0 @@
-{
-    "paths": [
-        {
-            "src": "<Francis>",
-            "dst": "<Alice>",
-            "value": "true"
-        }
-    ]
-}

@@ -181,8 +181,9 @@ functions) are now evaluated only for the solutions actually consumed.
 
 - **New: `tests/dt_upstream_parser_suite.rs`** runs upstream gStore's
   `scripts/test/parser_test.sh` (50 SPARQL cases, vendored byte-for-byte
-  with upstream's BSD-3 licence under `tests/data/upstream/parser_test/`)
-  in-process: each case imports its Turtle file and checks the triple
+  with upstream's BSD-3 licence under
+  `testdata/upstream/scripts/test/parser_test/`, the copy the `/api` suite
+  `tests/upstream_parser.rs` uses too) in-process: each case imports its Turtle file and checks the triple
   count, the answer count and the rows against upstream's result file.
   **50/50 pass**, each with Top-K / early termination both on and off (the
   two runs must give the same answer). 48 match upstream exactly; cases 15

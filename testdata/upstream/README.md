@@ -19,7 +19,7 @@ The directory layout mirrors upstream's `GSTORE_HOME`, so the scripts' paths
 | `data/num/` | `data/num/` (`num.nt`, 4 `.sql`) | `basic_test.sh`, `bfs_test` |
 | `data/lubm/` | `data/lubm/*.rq` (LUBM queries `lubm_q1`–`lubm_q14`, `lubm_insert`, `lubm_delete`) | `basic_test.sh` |
 | `data/update_test.nt`, `data/all.sql` | same | `update_test.sh` |
-| `scripts/test/parser_test/` | same (50 × data `parser_d<N>.ttl`, query `parser_q<N>.sql`, expected result `parser_r<N>.txt`) | `parser_test.sh`, `tests/upstream_parser.rs` |
+| `scripts/test/parser_test/` | same (50 × data `parser_d<N>.ttl`, query `parser_q<N>.sql`, expected result `parser_r<N>.txt`) | `parser_test.sh`, `tests/upstream_parser.rs` (over `/api`), `tests/dt_upstream_parser_suite.rs` (in-process, row-by-row, Top-K on and off) |
 | `scripts/test/bfs_test/` | same (25 queries `<q>.sql` with expected answers `<q>r.txt`) | `PyTest/auto_test.py BFSTest`, `tests/upstream_bfs.rs` |
 | `LICENSE` | `LICENSE` | — |
 
@@ -44,7 +44,13 @@ The directory layout mirrors upstream's `GSTORE_HOME`, so the scripts' paths
 - `basic_test.sh` records `num_ans=(0 0 0 1)`; the SPARQL answers of
   `num0`–`num2` are 8, 1 and 4 (see `tests/upstream_basic.rs`).
 - `parser_test.sh` records `AnsNum` 0 for cases 15 and 17, whose result files
-  hold 4 and 1 rows (see `tests/upstream_parser.rs`).
+  hold 4 and 1 rows — the W3C answers. Both parser suites follow the result
+  files; the script's numbers and this divergence table (`DIVERGENCES`, with
+  the reasons) live once, in `tests/upstream_scripts/parser_cases.rs`, which
+  both include.
+- These files are the only vendored copy of `parser_test`: the in-process
+  suite (`tests/dt_upstream_parser_suite.rs`, added with Phase 3) reads them
+  here too. Do not edit them; add new cases elsewhere.
 
 ## License
 

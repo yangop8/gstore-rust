@@ -14,26 +14,24 @@
 //! MINUS semantics) give 4 and 1 rows; the script's `get_json_val` reads a
 //! missing `AnsNum` as -1 and counts 0 and -1 as equal, so those entries
 //! record that upstream's `/api` answered no `AnsNum` there. This port
-//! follows the result files.
+//! follows the result files: the expected `AnsNum` is
+//! [`parser_cases::expected_ans_num`], i.e. the script's number except for the
+//! documented divergences ([`parser_cases::DIVERGENCES`], #15 and #17) —
+//! the same table `tests/dt_upstream_parser_suite.rs` uses for its in-process
+//! run of these cases, so the two suites cannot disagree.
 //!
-//! Cases needing a later phase are ignored with the phase and feature, one test
-//! per case so a phase can un-ignore its own.
+//! All 50 cases run, the graph-function cases (33–35), `UCASE`/`LCASE` with
+//! language tags (42) and the variable shared by predicate and subject
+//! positions (50) included.
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
+#[path = "upstream_scripts/parser_cases.rs"]
+mod parser_cases;
 
 use gstore::json::{self, Json};
 use harness::*;
-
-/// `success_expected` of `parser_test.sh` (index = case number).
-const SUCCESS_EXPECTED: [i64; 51] = [
-    0, 5, 3, 3, 3, 3, 4, 4, 4, 6, 4, 4, 6, 6, 6, 10, 1, 1, 6, 6, 4, 4, 3, 3, 4, 4, 4, 4, 3, 3, 2,
-    3, 9, 15, 15, 15, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 9, 9, 9,
-];
-
-fn case_file(kind: &str, n: usize, ext: &str) -> std::path::PathBuf {
-    upstream(&format!("scripts/test/parser_test/parser_{kind}{n}.{ext}"))
-}
+use parser_cases::{case_file, expected_ans_num, SUCCESS_EXPECTED, TOTAL_CASE};
 
 fn run_case(n: usize) {
     let srv = Server::start(&format!("parser{n}"));
@@ -44,7 +42,7 @@ fn run_case(n: usize) {
     ok(&j);
     assert_eq!(
         int(&j, "success_num"),
-        SUCCESS_EXPECTED[n],
+        SUCCESS_EXPECTED[n] as i64,
         "case {n}: build success_num"
     );
     // [2/5] load
@@ -96,6 +94,13 @@ fn run_case(n: usize) {
         expected.rows.len() as i64,
         "case {n}: AnsNum"
     );
+    // The result file's row count is the script's `ans_expected`, but for
+    // the documented divergences (#15, #17), where it is the spec's number.
+    assert_eq!(
+        int(&answer, "AnsNum"),
+        expected_ans_num(n),
+        "case {n}: AnsNum vs parser_test.sh (and parser_cases::DIVERGENCES)"
+    );
     // [4/5] unload, [5/5] drop
     srv.unload(&db);
     srv.drop_db(&db);
@@ -144,11 +149,8 @@ cases! {
     case_30_regex_anchor_case_insensitive => 30;
     case_31_filter_numeric_comparison => 31;
     case_32_order_by_two_keys => 32;
-    #[ignore = "phase 2: graph functions (cyclePath with a predicate set {...}, upstream JSON paths output)"]
     case_33_cycle_path => 33;
-    #[ignore = "phase 2: graph functions (shortestPathLen with a predicate set {...}, upstream JSON paths output)"]
     case_34_shortest_path_len => 34;
-    #[ignore = "phase 2: graph functions (kHopReachable with a predicate set {...}, upstream JSON paths output)"]
     case_35_k_hop_reachable => 35;
     case_36_datatype_lang_string => 36;
     case_37_datatype_not_equal => 37;
@@ -156,7 +158,6 @@ cases! {
     case_39_year => 39;
     case_40_month => 40;
     case_41_day => 41;
-    #[ignore = "phase 3: UCASE/LCASE keep the language tag (ucase(\"Alice\"@en) = \"ALICE\"@en)"]
     case_42_ucase_keeps_language_tag => 42;
     case_43_ucase_str => 43;
     case_44_str_ucase => 44;
@@ -165,6 +166,16 @@ cases! {
     case_47_abs_of_negative_integer => 47;
     case_48_variable_as_object_and_predicate => 48;
     case_49_variable_as_subject_and_predicate => 49;
-    #[ignore = "phase 3: a variable joined across predicate and subject/object positions compares predicate ids with entity ids"]
     case_50_variable_chain_through_predicates => 50;
+}
+
+/// The `cases!` list above covers every case of the script, once.
+#[test]
+fn every_case_has_a_test() {
+    let src = include_str!("upstream_parser.rs");
+    let listed: Vec<usize> = src
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix(';')?.split_once("=> ")?.1.parse().ok())
+        .collect();
+    assert_eq!(listed, (1..=TOTAL_CASE).collect::<Vec<_>>());
 }

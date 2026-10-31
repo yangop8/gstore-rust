@@ -1,10 +1,14 @@
 //! Data test: upstream gStore's `scripts/test/parser_test.sh` suite — 50 SPARQL
 //! cases — run in-process (GAP_PLAN §8, the Phase 3 acceptance gate).
 //!
-//! The 50 cases are vendored verbatim under `tests/data/upstream/parser_test/`
-//! (`parser_d<N>.ttl` data, `parser_q<N>.sql` query, `parser_r<N>.txt`
-//! upstream's printed result). For every case this test does what the
-//! upstream script does over `/api`, but against an in-memory [`Database`]:
+//! The 50 cases are vendored verbatim, once, under upstream's own path
+//! `testdata/upstream/scripts/test/parser_test/` (`parser_d<N>.ttl` data,
+//! `parser_q<N>.sql` query, `parser_r<N>.txt` upstream's printed result; see
+//! `testdata/upstream/README.md`). The script's numbers and the divergence
+//! table live in `tests/upstream_scripts/parser_cases.rs`, shared with
+//! `tests/upstream_parser.rs`, which runs the same cases over the `/api` wire
+//! protocol. For every case this test does what the upstream script does over
+//! `/api`, but against an in-memory [`Database`]:
 //!
 //! 1. **build** — import `parser_d<N>.ttl` with the crate's normal
 //!    format-by-extension loader ([`Database::build_from_files`]) and compare
@@ -22,8 +26,9 @@
 //! W3C SPARQL 1.1 semantics are the oracle. Where the script's `ans_expected`
 //! and the result file disagree, or upstream deviates from W3C, the engine
 //! follows the spec and the case's expectation is overridden in the single
-//! [`DIVERGENCES`] table below, with the reason. Cases that could only fail
-//! because of RDF-import tolerance / Turtle leniency (Phase 5, GAP_PLAN §4.2)
+//! [`DIVERGENCES`] table (`upstream_scripts/parser_cases.rs`), with the
+//! reason. Cases that could only fail because of RDF-import tolerance /
+//! Turtle leniency (Phase 5, GAP_PLAN §4.2)
 //! would be listed in [`DEFERRED_TO_PHASE5`]; the list is currently empty —
 //! every vendored data file imports cleanly.
 //!
@@ -43,70 +48,13 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+#[path = "upstream_scripts/parser_cases.rs"]
+mod parser_cases;
+use parser_cases::*;
+
 use gstore::parser::ntriples::parse_term;
 use gstore::query::{DpbMode, TopKOptions};
 use gstore::{Database, QueryResult, Term};
-
-/// Number of upstream cases (`TOTAL_CASE` of `parser_test.sh`).
-const TOTAL_CASE: usize = 50;
-
-/// `ans_expected` of upstream `parser_test.sh` (index = case number; index 0
-/// unused). Upstream's `AnsNum` of each query.
-const ANS_EXPECTED: [i64; TOTAL_CASE + 1] = [
-    0, //
-    2, 0, 1, 1, 1, 1, 1, 1, 3, 2, // 1..=10
-    2, 4, 4, 2, 0, 1, 0, 1, 2, 1, // 11..=20
-    1, 1, 1, 2, 1, 1, 1, 1, 1, 1, // 21..=30
-    1, 3, 1, 1, 1, 1, 3, 1, 1, 1, // 31..=40
-    1, 1, 1, 1, 1, 1, 1, 8, 8, 7, // 41..=50
-];
-
-/// `success_expected` of upstream `parser_test.sh` (index = case number):
-/// the `success_num` (triples imported) of each `build`.
-const SUCCESS_EXPECTED: [u64; TOTAL_CASE + 1] = [
-    0, //
-    5, 3, 3, 3, 3, 4, 4, 4, 6, 4, // 1..=10
-    4, 6, 6, 6, 10, 1, 1, 6, 6, 4, // 11..=20
-    4, 3, 3, 4, 4, 4, 4, 3, 3, 2, // 21..=30
-    3, 9, 15, 15, 15, 4, 4, 4, 4, 4, // 31..=40
-    4, 4, 4, 4, 4, 4, 4, 9, 9, 9, // 41..=50
-];
-
-/// One documented divergence from upstream: the spec-correct value this
-/// engine produces instead of the script's `ans_expected[case]`.
-struct Divergence {
-    case: usize,
-    /// The answer count W3C SPARQL 1.1 prescribes (replaces `ans_expected`).
-    ans_num: i64,
-    /// Why upstream's recorded number is not followed.
-    reason: &'static str,
-}
-
-/// The single table of documented divergences from upstream's expectations.
-///
-/// In both entries only the script's `ans_expected` differs: upstream's own
-/// result file agrees with W3C. The script's `get_json_val` reads a missing
-/// `AnsNum` as -1 and counts 0 and -1 as equal, so a 0 there means upstream's
-/// `/api` answered 0 rows *or* no `AnsNum` at all; either way it is not the
-/// spec's answer. (Upstream's `TempResult::doMinus` itself keeps every row
-/// when the two sides share no variable, as W3C does.)
-const DIVERGENCES: &[Divergence] = &[
-    Divergence {
-        case: 15,
-        ans_num: 4,
-        reason: "nested MINUS (a variant of the SPARQL 1.1 §8.2 example): the inner \
-                 MINUS keeps only :bob2 (:bob1 is a Jones), the outer one removes :bob2, \
-                 DISTINCT ?s leaves :alice :bob1 :carol :dave = 4 rows, exactly \
-                 parser_r15.txt; the script records 0",
-    },
-    Divergence {
-        case: 17,
-        ans_num: 1,
-        reason: "MINUS { :a :b :c } binds no variable, so no solution shares a variable \
-                 with it and nothing is removed (SPARQL 1.1 §8.3.2, this very example): \
-                 1 row, exactly parser_r17.txt; the script records 0",
-    },
-];
 
 /// Cases whose failure is Phase 5 work (tolerant import / Turtle leniency,
 /// GAP_PLAN §4.2): `(case, reason)`. Such a case still runs and checks the
@@ -117,14 +65,6 @@ const DEFERRED_TO_PHASE5: &[(usize, &str)] = &[];
 // ---------------------------------------------------------------------------
 // files
 // ---------------------------------------------------------------------------
-
-fn case_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/upstream/parser_test")
-}
-
-fn case_file(kind: &str, n: usize, ext: &str) -> PathBuf {
-    case_dir().join(format!("parser_{kind}{n}.{ext}"))
-}
 
 fn read(path: &PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -459,10 +399,6 @@ impl Report {
     }
 }
 
-fn divergence(case: usize) -> Option<&'static Divergence> {
-    DIVERGENCES.iter().find(|d| d.case == case)
-}
-
 fn deferred(case: usize) -> Option<&'static str> {
     DEFERRED_TO_PHASE5
         .iter()
@@ -489,7 +425,7 @@ const MODES: [(&str, TopKOptions); 2] = [
 
 /// Run case `n` with the given Top-K options.
 fn run_case(n: usize, topk: TopKOptions) -> Report {
-    let ans_want = divergence(n).map_or(ANS_EXPECTED[n], |d| d.ans_num);
+    let ans_want = expected_ans_num(n);
     let mut report = Report {
         case: n,
         success_got: None,
