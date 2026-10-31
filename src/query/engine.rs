@@ -183,17 +183,30 @@ struct VarLayout {
     index: HashMap<String, usize>,
     /// Index → name, in first-appearance order (drives `SELECT *`).
     names: Vec<String>,
-    /// Whether each variable ever appears in predicate position (→ resolve its
-    /// id via the predicate dictionary rather than the entity/literal one).
+    /// Whether each variable's ids are *predicate*-dictionary ids (→ resolve
+    /// them via the predicate dictionary rather than the entity/literal one):
+    /// true for a variable that appears only in predicate position.
     is_pred: Vec<bool>,
+    /// Mixed variables: a variable in predicate position that is also bound
+    /// some other way (subject/object, BIND, VALUES, sub-SELECT, GRAPH, …).
+    /// Its own slot holds entity/literal-space ids (`is_pred` false) and its
+    /// predicate-position occurrences bind the hidden predicate-space slot
+    /// it maps to here; [`Evaluator::eval_bgp_constrained`] keeps the two
+    /// in step (same RDF term), so joins never compare a predicate id with
+    /// an entity id.
+    pred_alias: HashMap<usize, usize>,
 }
+
+/// Name prefix of the hidden predicate-space slot of a mixed variable (see
+/// [`VarLayout::pred_alias`]); a SPARQL variable name cannot contain NUL.
+const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
         // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
         let mut names = Vec::new();
         pattern.collect_vars(&mut names);
-        let index: HashMap<String, usize> = names
+        let mut index: HashMap<String, usize> = names
             .iter()
             .enumerate()
             .map(|(i, v)| (v.clone(), i))
@@ -207,10 +220,27 @@ impl VarLayout {
                 is_pred[index[v]] = true;
             }
         }
+        // A predicate variable bound any other way too is mixed: it keeps
+        // entity-space ids and gets a hidden predicate-space slot.
+        let mut node_bound = HashSet::new();
+        node_bound_vars(pattern, &mut node_bound);
+        let mut pred_alias = HashMap::new();
+        for i in 0..names.len() {
+            if is_pred[i] && node_bound.contains(&names[i]) {
+                is_pred[i] = false;
+                let hidden = format!("{PRED_ALIAS_PREFIX}{}", names[i]);
+                let h = names.len();
+                index.insert(hidden.clone(), h);
+                names.push(hidden);
+                is_pred.push(true);
+                pred_alias.insert(i, h);
+            }
+        }
         VarLayout {
             index,
             names,
             is_pred,
+            pred_alias,
         }
     }
 
@@ -225,6 +255,7 @@ impl VarLayout {
             index,
             names,
             is_pred,
+            pred_alias: HashMap::new(),
         }
     }
 
@@ -2019,17 +2050,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (col, id) in r.into_iter().enumerate() {
                     if let Some(idx) = slots[col] {
                         // A predicate-typed inner column carries a *predicate*-
-                        // dictionary id, but the outer layout may not know this
-                        // slot is predicate-typed (`collect_triples` does not
-                        // recurse into sub-SELECTs), so resolving it later via the
-                        // entity/literal dictionary would be wrong. Re-mint such a
-                        // value as a synthetic term, which resolves correctly
-                        // regardless of the outer `is_pred` flag and stays
-                        // join-consistent (the interner is idempotent per term).
+                        // dictionary id, but a variable a sub-SELECT binds is
+                        // never predicate-typed in the outer layout (it is
+                        // entity-space, or mixed, see `VarLayout::build`).
+                        // Re-mint such a value in the entity space with
+                        // `term_to_id`: the term's dictionary id when it has
+                        // one — so it joins with the same IRI bound elsewhere
+                        // — else a synthetic id (idempotent per term).
                         b[idx] = match id {
-                            Some(pid) if is_pred[col] && !is_synth(pid) => self
-                                .id_to_term(pid, true)
-                                .map(|t| self.extras.borrow_mut().intern(&t)),
+                            Some(pid) if is_pred[col] && !is_synth(pid) => {
+                                self.id_to_term(pid, true).map(|t| self.term_to_id(&t))
+                            }
                             other => other,
                         };
                     }
@@ -2127,6 +2158,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
             .clone();
 
+        // A mixed variable in predicate position (see `VarLayout::pred_alias`)
+        // joins across id spaces: run the left-deep order with translation.
+        let mixed: Vec<(usize, usize)> = layout
+            .pred_alias
+            .iter()
+            .filter(|&(_, &h)| plans.iter().any(|p| matches!(p.p, Slot::Var(v) if v == h)))
+            .map(|(&x, &h)| (x, h))
+            .collect();
+        if !mixed.is_empty() {
+            return self.eval_mixed_pipeline(&plans, &plan.order, &candidates, layout, &mixed);
+        }
+
         if let Some(tree) = &plan.tree {
             // Bushy execution: build each side independently, then hash-join.
             let (sols, _vars) = self.eval_join_tree(tree, &plans, &candidates, layout);
@@ -2152,6 +2195,95 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         solutions
+    }
+
+    /// The left-deep pipeline of a BGP in which a *mixed* variable `x` (bound
+    /// in predicate position and some other way, e.g. `?x ?p ?o . ?s ?x ?y`)
+    /// occurs in predicate position; `mixed` lists its `(x, hidden)` slot
+    /// pairs ([`VarLayout::pred_alias`]). Predicate positions bind the hidden
+    /// slot with predicate-dictionary ids, every other position binds `x`
+    /// with entity/literal ids, and the two must name the same RDF term:
+    ///
+    /// * before a pattern binds the hidden slot, a bound `x` is translated
+    ///   into it (no predicate with that IRI ⇒ the row cannot match);
+    /// * after each pattern, a bound hidden slot is translated back into `x`
+    ///   (bound if unbound, else it must agree).
+    ///
+    /// The hidden slots are cleared at the end, so the solutions carry `x`
+    /// only, in the entity space its layout entry says. Joins thus stay
+    /// index-driven instead of a cross product filtered afterwards.
+    fn eval_mixed_pipeline(
+        &self,
+        plans: &[PatPlan],
+        order: &[usize],
+        cands: &Candidates,
+        layout: &VarLayout,
+        mixed: &[(usize, usize)],
+    ) -> Vec<Binding> {
+        // Per-BGP translation caches (both directions).
+        let mut to_pred: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut to_node: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
+        let mut fresh = Vec::new();
+        for &pi in order {
+            if self.cancelled() {
+                return Vec::new();
+            }
+            let plan = &plans[pi];
+            let mut next = Vec::new();
+            'rows: for binding in &solutions {
+                let mut b = binding.clone();
+                for &(x, h) in mixed {
+                    let (Some(id), None, Slot::Var(p)) = (b[x], b[h], plan.p) else {
+                        continue;
+                    };
+                    if p != h {
+                        continue;
+                    }
+                    let pid = *to_pred
+                        .entry(id)
+                        .or_insert_with(|| self.iri_predicate_id(id));
+                    match pid {
+                        Some(pid) => b[h] = Some(pid),
+                        None => continue 'rows,
+                    }
+                }
+                self.extend(&b, plan, cands, &mut fresh);
+                'fresh: for mut nb in fresh.drain(..) {
+                    for &(x, h) in mixed {
+                        let Some(pid) = nb[h] else { continue };
+                        let node = *to_node.entry(pid).or_insert_with(|| {
+                            self.id_to_term(pid, true).map(|t| self.term_to_id(&t))
+                        });
+                        match (node, nb[x]) {
+                            (Some(n), None) => nb[x] = Some(n),
+                            (Some(n), Some(cur)) if n == cur => {}
+                            _ => continue 'fresh,
+                        }
+                    }
+                    next.push(nb);
+                }
+            }
+            solutions = next;
+            if solutions.is_empty() {
+                break;
+            }
+        }
+        for b in &mut solutions {
+            for &(_, h) in mixed {
+                b[h] = None;
+            }
+        }
+        solutions
+    }
+
+    /// The predicate-dictionary id of the IRI an entity-space `id` names, if
+    /// that IRI is a predicate (for [`eval_mixed_pipeline`](Self::eval_mixed_pipeline)).
+    fn iri_predicate_id(&self, id: u32) -> Option<u32> {
+        match self.id_to_term(id, false)? {
+            t @ Term::Iri(_) => self.dict.predicate_id(&t.dict_key()),
+            _ => None,
+        }
     }
 
     /// Execute a binary-join tree: each `Leaf` scans its pattern from scratch and
@@ -2330,7 +2462,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     fn compile_pred_slot(&self, pt: &PatternTerm, layout: &VarLayout) -> Option<Slot> {
         match pt {
-            PatternTerm::Var(v) => Some(Slot::Var(layout.index[v])),
+            // A mixed variable binds its hidden predicate-space slot here.
+            PatternTerm::Var(v) => {
+                let i = layout.index[v];
+                Some(Slot::Var(layout.pred_alias.get(&i).copied().unwrap_or(i)))
+            }
             PatternTerm::Term(Term::Iri(iri)) => self
                 .dict
                 .predicate_id(&Term::iri(iri.clone()).dict_key())
@@ -2834,24 +2970,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "CONTAINS" => self.str2_bool(args, b, l, |a, c| a.contains(&c)),
             "STRSTARTS" => self.str2_bool(args, b, l, |a, c| a.starts_with(&c)),
             "STRENDS" => self.str2_bool(args, b, l, |a, c| a.ends_with(&c)),
-            "STRBEFORE" => self.str2(args, b, l, |a, c| {
-                a.split_once(&c)
-                    .map(|(p, _)| p.to_string())
-                    .unwrap_or_default()
-            }),
-            "STRAFTER" => self.str2(args, b, l, |a, c| {
-                a.split_once(&c)
-                    .map(|(_, s)| s.to_string())
-                    .unwrap_or_default()
-            }),
+            "STRBEFORE" => self.str_split(args, b, l, true),
+            "STRAFTER" => self.str_split(args, b, l, false),
+            // §17.4.3.12: the language tag survives when every argument
+            // carries the same one; otherwise the result is a simple literal.
             "CONCAT" => {
                 let mut out = String::new();
+                let mut common: Option<Option<String>> = None;
                 for a in args {
-                    out.push_str(&self.eval_value(a, b, l)?.lexical());
+                    let (s, lang) = str_and_lang(&self.eval_value(a, b, l)?);
+                    out.push_str(&s);
+                    common = match common {
+                        None => Some(lang),
+                        Some(c) if c == lang => Some(c),
+                        Some(_) => Some(None),
+                    };
                 }
                 Some(Value::Str {
                     value: out,
-                    lang: None,
+                    lang: common.flatten(),
                 })
             }
             "SAMETERM" => {
@@ -3482,6 +3619,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })
     }
 
+    /// `UCASE` / `LCASE`: map the lexical form, keeping a language tag
+    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`).
     fn str1(
         &self,
         args: &[Expr],
@@ -3489,25 +3628,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let v = self.eval_value(args.first()?, b, l)?;
-        Some(Value::Str {
-            value: f(&v.lexical()),
-            lang: None,
-        })
+        let (s, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
+        Some(Value::Str { value: f(&s), lang })
     }
 
-    fn str2(
-        &self,
-        args: &[Expr],
-        b: &Binding,
-        l: &VarLayout,
-        f: impl Fn(String, String) -> String,
-    ) -> Option<Value> {
-        let a = self.eval_value(args.first()?, b, l)?.lexical();
+    /// `STRBEFORE` / `STRAFTER` (§17.4.3.7-8): the part of the first
+    /// argument before / after the first occurrence of the second, with the
+    /// first argument's language tag; no occurrence gives the empty simple
+    /// literal.
+    fn str_split(&self, args: &[Expr], b: &Binding, l: &VarLayout, before: bool) -> Option<Value> {
+        let (a, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
         let c = self.eval_value(args.get(1)?, b, l)?.lexical();
-        Some(Value::Str {
-            value: f(a, c),
-            lang: None,
+        Some(match a.split_once(&c) {
+            Some((head, tail)) => Value::Str {
+                value: if before { head } else { tail }.to_string(),
+                lang,
+            },
+            None => Value::Str {
+                value: String::new(),
+                lang: None,
+            },
         })
     }
 
@@ -4632,6 +4772,63 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
     }
 }
 
+/// The variables `gp` binds other than in a triple's predicate position:
+/// subjects and objects of triple and path patterns, BIND targets, VALUES
+/// columns, sub-SELECT results and GRAPH / SERVICE variables — the ids such
+/// a binding carries are entity/literal (or synthetic) ids. A variable both
+/// here and in predicate position is *mixed* ([`VarLayout::pred_alias`]).
+fn node_bound_vars(gp: &GraphPattern, out: &mut HashSet<String>) {
+    let mut add = |t: &PatternTerm| {
+        if let PatternTerm::Var(v) = t {
+            out.insert(v.clone());
+        }
+    };
+    match gp {
+        GraphPattern::Empty => {}
+        GraphPattern::Bgp(tps) => {
+            for tp in tps {
+                add(&tp.subject);
+                add(&tp.object);
+            }
+        }
+        GraphPattern::Path(p) => {
+            add(&p.subject);
+            add(&p.object);
+        }
+        GraphPattern::Join(a, b)
+        | GraphPattern::Union(a, b)
+        | GraphPattern::Minus(a, b)
+        | GraphPattern::LeftJoin(a, b, _) => {
+            node_bound_vars(a, out);
+            node_bound_vars(b, out);
+        }
+        GraphPattern::Filter(_, inner) => node_bound_vars(inner, out),
+        GraphPattern::Extend(inner, v, _) => {
+            node_bound_vars(inner, out);
+            out.insert(v.clone());
+        }
+        GraphPattern::Values(_, _) | GraphPattern::SubSelect(_) => {
+            let mut vars = Vec::new();
+            gp.collect_vars(&mut vars);
+            out.extend(vars);
+        }
+        GraphPattern::Graph(g, inner) => {
+            if let GraphTerm::Var(v) = g {
+                out.insert(v.clone());
+            }
+            node_bound_vars(inner, out);
+        }
+        GraphPattern::Service {
+            endpoint, pattern, ..
+        } => {
+            if let ServiceRef::Var(v) = endpoint {
+                out.insert(v.clone());
+            }
+            node_bound_vars(pattern, out);
+        }
+    }
+}
+
 /// The variable indices a pattern structurally binds (incl. BIND/VALUES/sub-SELECT).
 fn pattern_vars(gp: &GraphPattern, layout: &VarLayout) -> Vec<usize> {
     let mut names = Vec::new();
@@ -4983,6 +5180,7 @@ mod builtin_tests {
             index: HashMap::from([("s".to_string(), 0usize), ("o".to_string(), 1usize)]),
             names: vec!["s".into(), "o".into()],
             is_pred: vec![false, false],
+            pred_alias: HashMap::new(),
         };
         let lit = |s: &str| Expr::Const(Term::plain_literal(s));
 

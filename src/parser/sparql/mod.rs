@@ -3513,6 +3513,36 @@ mod tests {
     }
 
     #[test]
+    fn select_star_lists_in_scope_vars_only() {
+        let vars = |q: &str| sel(q).result_vars();
+        // §18.2.1: MINUS contributes no in-scope variables (upstream
+        // parser_test case 16).
+        assert_eq!(
+            vars("SELECT * { ?s ?p ?o MINUS { ?x ?y ?z } }"),
+            vec!["s", "p", "o"]
+        );
+        assert_eq!(
+            vars("SELECT * { ?s ?p ?o MINUS { ?s ?y ?z MINUS { ?z ?w ?v } } }"),
+            vec!["s", "p", "o"]
+        );
+        // … but a MINUS-side variable bound on the left is listed once.
+        assert_eq!(
+            vars("SELECT * { ?s <p> ?o MINUS { ?s <q> ?o } }"),
+            vec!["s", "o"]
+        );
+        // OPTIONAL, UNION, BIND, VALUES, GRAPH ?g and sub-SELECT projections
+        // stay in scope; FILTER (NOT) EXISTS patterns do not.
+        assert_eq!(
+            vars(
+                "SELECT * { ?a <p> ?b OPTIONAL { ?b <q> ?c } { ?d <r> ?e } UNION { ?f <s> ?e } \
+                 BIND(1 AS ?g) VALUES ?h { 1 } GRAPH ?i { ?j <t> ?k } \
+                 { SELECT ?l WHERE { ?l <u> ?m } } FILTER NOT EXISTS { ?n <v> ?o } }"
+            ),
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+        );
+    }
+
+    #[test]
     fn service_silent_and_variable_endpoint_and_join() {
         // SILENT flag with a variable endpoint.
         let q = sel("SELECT * WHERE { ?a <p> ?b SERVICE SILENT ?svc { ?b <q> ?c } }");
