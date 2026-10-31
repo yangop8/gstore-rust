@@ -296,6 +296,12 @@ pub trait StatementSink {
     /// drain `quads`; the reader clears it afterwards either way.
     fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()>;
 
+    /// The 1-based line the next [`statement`](Self::statement) was read
+    /// from (where it ends), for reports about its quads that only the sink
+    /// can make (upstream's literal checks). Readers that know it call this
+    /// just before `statement`; the default ignores it.
+    fn at_line(&mut self, _line: usize) {}
+
     /// A statement that failed. `Err` stops the parse with that error
     /// (strict); `Ok` skips the statement and continues (tolerant).
     fn error(&mut self, err: SyntaxError) -> Result<()>;

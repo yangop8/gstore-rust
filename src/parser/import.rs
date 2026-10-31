@@ -469,6 +469,9 @@ struct Pipeline<'a> {
     sink: &'a mut dyn QuadSink,
     batch: Vec<Quad>,
     report: ImportReport,
+    /// The line of the statement being checked (0 = unknown: documents
+    /// parsed whole).
+    line: usize,
 }
 
 impl Pipeline<'_> {
@@ -491,10 +494,14 @@ impl Pipeline<'_> {
 }
 
 impl StatementSink for Pipeline<'_> {
+    fn at_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
     fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
         for mut q in quads.drain(..) {
             if let Some(msg) = invalid_quad(&q, self.opts.upstream_checks) {
-                let err = SyntaxError::new(0, msg)
+                let err = SyntaxError::new(self.line, msg)
                     .with_context(format!("{} {} {}", q.subject, q.predicate, q.object));
                 self.fail(err)?;
                 continue;
@@ -790,6 +797,7 @@ pub fn import_reader<R: BufRead>(
             documents: 1,
             ..ImportReport::default()
         },
+        line: 0,
     };
     parse_into(
         reader,

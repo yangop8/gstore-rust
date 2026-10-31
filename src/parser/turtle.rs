@@ -193,6 +193,7 @@ impl<R: BufRead> Parser<R> {
             match item {
                 Ok(true) => {
                     if !self.out.is_empty() {
+                        sink.at_line(self.src.line());
                         sink.statement(&mut self.out)?;
                         self.out.clear();
                     }
@@ -637,6 +638,13 @@ impl<R: BufRead> Parser<R> {
         self.expect('<')?;
         let mut s = String::new();
         loop {
+            // IRIREF excludes spaces and control characters (upstream's lexer
+            // also stops at a space). Not consuming it keeps a tolerant
+            // import's resync on this line: `<oops .` must not swallow the
+            // statements after it while looking for a '>'.
+            if matches!(self.peek(), Some(c) if c <= ' ') {
+                return Err(self.err("invalid IRI (space or control character before '>')"));
+            }
             match self.bump() {
                 Some('>') => return Ok(self.resolve_iri(&s)),
                 Some('\\') => {
@@ -1390,6 +1398,26 @@ mod tests {
         assert_eq!(sink.quads[0].subject, Term::iri("http://e/e"));
         assert_eq!(sink.errors.len(), 1);
         assert_eq!(sink.errors[0].line, 3);
+    }
+
+    #[test]
+    fn an_iri_stops_at_a_space_so_a_missing_gt_costs_one_line() {
+        // Upstream's lexer ends an IRI at a space too ("invalid URI"); the
+        // next line's statement survives a tolerant import.
+        let doc = "@prefix : <http://e/> .\n\
+                   :a :p <oops .\n\
+                   :b :p :o .\n\
+                   :c :p <http://e/x\ty> .\n\
+                   :d :p :o .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        assert_eq!(subjects, ["<http://e/b>", "<http://e/d>"]);
+        let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [2, 4], "{:?}", sink.errors);
+        assert!(sink.errors[0].message.contains("invalid IRI"));
+        assert!(parse_str("<http://e/a b> <http://e/p> <http://e/o> .").is_err());
+        assert!(parse_str("<http://e/a%20b> <http://e/p> <http://e/o> .").is_ok());
     }
 
     #[test]

@@ -294,8 +294,13 @@ fn tolerant_build_counts_and_logs_like_upstream() {
     );
     assert!(lines[1].starts_with("Line 3 ("), "{text}");
     assert!(lines[1].contains("undefined prefix"), "{text}");
+    // Failures found after parsing (upstream's literal checks, the subject
+    // check) carry the line the statement was read from too.
+    assert!(lines[2].starts_with("Line 5 ("), "{text}");
     assert!(lines[2].contains("Object integer value invalid"), "{text}");
+    assert!(lines[3].starts_with("Line 6 ("), "{text}");
     assert!(lines[3].contains("invalid subject"), "{text}");
+    assert!(lines[4].starts_with("Line 7 ("), "{text}");
     assert!(lines[4].contains("Object double value is NaN"), "{text}");
     assert_eq!(import::count_logged_failures(&log_path), report.failed);
 

@@ -131,6 +131,7 @@ pub(crate) fn stream_lines<R: BufRead>(
             Ok(Some(mut q)) => {
                 relabel_quad(&mut q, labels);
                 out.push(q);
+                sink.at_line(line_no);
                 sink.statement(&mut out)?;
                 out.clear();
             }
