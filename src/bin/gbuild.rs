@@ -28,6 +28,11 @@
 //! with bounded memory; N-Quads / TriG statements keep their named graph;
 //! each file is its own blank-node scope.
 //!
+//! A local `.zip` source (upstream 1.3's `gbuild -f x.zip`; feature `zip`)
+//! is unpacked — under the default zip limits, refusing unsafe entry names —
+//! into a scratch directory beside the database (`<db_name>.db.unzip-tmp-N`,
+//! removed when `gbuild` ends) and read like a directory source.
+//!
 //! Like upstream, a statement that does not parse is skipped, counted and
 //! logged to `<db_name>.db/parse_error.log` (see
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
@@ -38,23 +43,25 @@
 #[path = "common/cli.rs"]
 mod cli;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use gstore::parser::import::{self, ImportOptions, ImportReport, ParseErrorLog, Source};
+use gstore::zipio::{self, ScratchDir, ZipLimits};
 use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gbuild",
-    usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | url> ...]\n\
-            gbuild -db <db_name> [-f <file | dir | url>] [--disk | --rocksdb] [--strict] [--force]",
+    usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
+            gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]",
     help: "build a database from RDF files\n\
            \n\
            Options:\n\
            \t-h,--help\t\tDisplay this message.\n\
            \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
-           \t-f,--file PATH\t\tAn RDF file, a directory of RDF files or an http(s) URL.\n\
+           \t-f,--file PATH\t\tAn RDF file, a directory of RDF files, a zip package of\n\
+           \t\t\t\tRDF files (feature `zip`) or an http(s) URL.\n\
            \t\t\t\tWithout any source an empty database is built.\n\
            \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore.\n\
            \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`).\n\
@@ -113,6 +120,15 @@ fn main() -> ExitCode {
     if paths.is_empty() {
         println!("will build an empty database");
     }
+    // Zip packages are unpacked first and read as directories; the scratch
+    // directories go when `_unpacked` is dropped, whatever the outcome.
+    let _unpacked = match unpack_packages(&dir, &mut paths) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("gbuild: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let sources = match import::sources_from_paths(&paths) {
         Ok(s) => s,
         Err(e) => {
@@ -222,6 +238,33 @@ fn build_rocksdb(
 ) -> ExitCode {
     eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
     ExitCode::FAILURE
+}
+
+/// Unpack every local `.zip` file among `paths` (upstream's `gbuild -f
+/// x.zip`) into a scratch directory beside the database directory `dir`,
+/// replacing the path by that directory; the scratch directories, removed
+/// when dropped. Without the `zip` feature a package is an error naming it.
+fn unpack_packages(dir: &str, paths: &mut [String]) -> Result<Vec<ScratchDir>, String> {
+    let mut unpacked = Vec::new();
+    for (i, p) in paths.iter_mut().enumerate() {
+        let path = Path::new(p.as_str());
+        if import::is_url(p) || !path.is_file() || !zipio::is_zip_name(path) {
+            continue;
+        }
+        if !zipio::AVAILABLE {
+            return Err(format!("cannot read '{p}': {}", zipio::FEATURE_MISSING));
+        }
+        let scratch = ScratchDir::fresh(PathBuf::from(format!("{dir}.unzip-tmp-{i}")))
+            .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
+        // Every entry is accepted (as upstream's gbuild); the directory walk
+        // then reads the RDF files among them.
+        zipio::unpack(path, scratch.path(), &ZipLimits::default(), &|_| true)
+            .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
+        println!("unpacked '{p}'");
+        *p = scratch.path().to_string_lossy().into_owned();
+        unpacked.push(scratch);
+    }
+    Ok(unpacked)
 }
 
 /// Whether `path` exists as anything but an empty directory.

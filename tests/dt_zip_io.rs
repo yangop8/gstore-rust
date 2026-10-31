@@ -282,6 +282,15 @@ fn without_the_feature_every_zip_path_is_a_clean_1003() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("`zip` feature"));
+    fs::write(dir.join("pkg.zip"), b"PK\x03\x04").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+        .args(["fromzip", "pkg.zip"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`zip` feature"));
+    assert!(!dir.join("fromzip.db").exists());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1220,6 +1229,112 @@ mod with_zip {
             &[("operation", "load"), ("db_name", "quad")],
         ));
         assert_eq!(graph_count(&srv.addr, "quad"), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy tools in upstream 1.3's spelling: `gbuild -f x.zip`,
+    /// `gexport -db … -z 1`, `gbackup -db … -z 1`, `grestore -l` / `-db … -p
+    /// x.zip`.
+    #[test]
+    fn cli_upstream_forms_read_and_write_zips() {
+        let dir = tmp_root("cli_upstream");
+        fs::write(
+            dir.join("pkg.zip"),
+            package(&[
+                E::Dir("data/"),
+                E::File("data/b.ttl", TTL.as_bytes()),
+                E::File("data/a.nt", MORE.as_bytes()),
+                E::File("README", b"not RDF, skipped like in a directory"),
+            ]),
+        )
+        .unwrap();
+        // gbuild -db NAME -f x.zip: the package's RDF files, then the
+        // scratch directory is gone.
+        let out = run(
+            env!("CARGO_BIN_EXE_gbuild"),
+            &["-db", "z", "-f", "pkg.zip"],
+            &dir,
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("from 2 source(s)"), "{text}");
+        assert!(!dir.join("z.db.unzip-tmp-0").exists());
+        assert_eq!(gstore::Database::open(dir.join("z.db")).unwrap().triple_num(), 4);
+        // An unsafe package builds nothing.
+        fs::write(
+            dir.join("evil.zip"),
+            package(&[E::File("../evil.nt", MORE.as_bytes())]),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+            .args(["evil", "evil.zip"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(!dir.join("evil.nt").exists() && !dir.join("evil.db").exists());
+
+        // gexport -db NAME -z 1 [-f DIR]: <db>_<timestamp>.zip holding the
+        // .nt file.
+        run(
+            env!("CARGO_BIN_EXE_gexport"),
+            &["-db", "z", "-f", "exports", "-z", "1"],
+            &dir,
+        );
+        let zips: Vec<PathBuf> = fs::read_dir(dir.join("exports"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(zips.len(), 1, "{zips:?}");
+        let name = zips[0].file_name().unwrap().to_string_lossy().into_owned();
+        let stem = name.strip_suffix(".zip").unwrap();
+        assert!(stem.starts_with("z_"), "{name}");
+        assert_eq!(entries(&zips[0]), [format!("{stem}.nt")]);
+        // --format nq: the timestamped name follows the format.
+        run(
+            env!("CARGO_BIN_EXE_gexport"),
+            &["-db", "z", "-f", "nq", "--format", "nq"],
+            &dir,
+        );
+        let nq: Vec<String> = fs::read_dir(dir.join("nq"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(nq.len() == 1 && nq[0].ends_with(".nq"), "{nq:?}");
+
+        // gbackup -db NAME -z 1: ./backups/<db>.db_<timestamp>.zip; grestore
+        // -l lists it and -db/-p restores it.
+        run(env!("CARGO_BIN_EXE_gbackup"), &["-db", "z", "-z", "1"], &dir);
+        let backups: Vec<String> = fs::read_dir(dir.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(
+            backups[0].starts_with("z.db_") && backups[0].ends_with(".zip"),
+            "{backups:?}"
+        );
+        let out = run(env!("CARGO_BIN_EXE_grestore"), &["-l", "z"], &dir);
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&backups[0]));
+        let path = format!("./backups/{}", backups[0]);
+        run(
+            env!("CARGO_BIN_EXE_grestore"),
+            &["-db", "z2", "-p", &path],
+            &dir,
+        );
+        assert_eq!(gstore::Database::open(dir.join("z2.db")).unwrap().triple_num(), 4);
+        // The old order (the archive first) restores nothing and hints at
+        // the order.
+        let out = Command::new(env!("CARGO_BIN_EXE_grestore"))
+            .args([path.as_str(), "z3"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("grestore <db_name> <backup_dir>"));
+        assert!(!dir.join("z3.db").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
