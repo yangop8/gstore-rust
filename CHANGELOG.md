@@ -4,6 +4,51 @@ All notable changes to gstore-rust are recorded here.
 
 ## Unreleased
 
+### SPARQL semantics follow SPARQL 1.1 more closely
+
+- **Fixed: built-ins around aggregates.** `ROUND(AVG(?x))`,
+  `STR(COUNT(*))`, `(SUM(?a)/COUNT(?a) AS ?avg)`, `IF`/`COALESCE` over
+  aggregates and aggregates inside `HAVING` and `ORDER BY` expressions now
+  evaluate (they used to be silently unbound). `HAVING`, or an aggregate in
+  `ORDER BY`, makes a query an aggregate query even without `GROUP BY`; a
+  later SELECT expression may use an earlier alias. `GROUP BY ?v` groups by
+  the bound term itself.
+- **Fixed: SPARQL Update over named graphs.** The WHERE clause of
+  `DELETE/INSERT … WHERE` sees named graphs (`GRAPH <g> { … }`,
+  `GRAPH ?g { … }`); templates accept `GRAPH <g> { … }` / `GRAPH ?g { … }`
+  blocks (also in `DELETE WHERE`); `WITH <g>` names the default graph of
+  the templates and the WHERE clause; `USING` / `USING NAMED` define the
+  WHERE clause's dataset; `LOAD <src> INTO GRAPH <g>` loads into `<g>`
+  (still subject to the `LoadPolicy`). Template triples that would not be
+  RDF (a literal subject, a non-IRI predicate or graph name) are skipped,
+  in `CONSTRUCT` too. **API:** `UpdateOp::Modify` gained `with`, `using`
+  and `using_named`, its templates are `QuadPattern`s, and
+  `UpdateOp::Load` gained `into`.
+- **Changed: typed literals are validated.** Ill-typed literals
+  (`"abc"^^xsd:integer`, `"300"^^xsd:byte`, `"1e3"^^xsd:decimal`, …; all
+  integer-derived types check their range) are stored as they are but are
+  never numbers: comparing them with anything but the same term is a type
+  error, arithmetic on them is unbound, their effective boolean value is
+  false. Valid literals compare by value (`"01"^^xsd:integer = 1`). An IRI
+  compared with `=`/`!=` to a literal is now simply unequal (it used to be
+  an error).
+- **Changed: numbers.** `xsd:float` keeps its datatype through expressions
+  (`float + integer` is a float). Dividing two integers gives an
+  `xsd:decimal` (`7/2` = `3.5`; it used to be an `xsd:double`), and so does
+  `AVG` over integers; dividing a double by zero gives `INF`/`NaN`. `ABS`,
+  `CEIL`, `FLOOR` and `ROUND` keep their argument's type, and `ROUND` rounds
+  halves up (`ROUND(-2.5)` = `-2`).
+- **New: upstream integer division.** `Database::set_integer_division(
+  IntegerDivision::Truncate)` (and `Evaluator::with_integer_division`)
+  switches to gStore's truncating integer division (`7/2` = `3`, also in
+  `AVG`). Proposed `conf.ini` key: `integer_division = decimal | truncate`.
+- **Changed: the query cache is bounded by memory.** It holds about 64 MiB
+  of results by default (`Database::set_query_cache_size(bytes)`, 0 turns it
+  off; `set_query_cache_capacity` is gone) and never caches queries using
+  `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, `SERVICE` or a user
+  function. `Database::query_cache_len()` / `query_cache_bytes()` report its
+  use. Proposed `conf.ini` key: `query_cache_size` (bytes).
+
 ### Breaking: SPARQL graph functions follow gStore 1.4
 
 The advanced graph functions of upstream gStore 1.4 (`docs/en-us/SPARQL_QUERY.md`,

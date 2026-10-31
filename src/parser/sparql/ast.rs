@@ -30,22 +30,41 @@ pub enum Query {
 }
 
 /// One SPARQL UPDATE operation.
+// `Modify` is much larger than the other variants; an update request holds
+// only a handful of operations, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateOp {
     /// `INSERT DATA { … }` — ground triples to add.
     InsertData(Vec<GroundTriple>),
     /// `DELETE DATA { … }` — ground triples to remove.
     DeleteData(Vec<GroundTriple>),
-    /// `[DELETE { … }] [INSERT { … }] WHERE { … }` (and `DELETE WHERE { … }`,
-    /// where `delete` and `pattern` are the same triples). Templates are
-    /// instantiated per WHERE solution; deletes apply before inserts.
+    /// `[WITH <g>] [DELETE { … }] [INSERT { … }] (USING [NAMED] <g>)* WHERE
+    /// { … }` (and `DELETE WHERE { … }`, where `delete` and `pattern` are the
+    /// same quads). Templates are instantiated per WHERE solution; deletes
+    /// apply before inserts.
     Modify {
-        delete: Vec<TriplePattern>,
-        insert: Vec<TriplePattern>,
+        /// `WITH <g>`: the graph that template triples outside `GRAPH { … }`
+        /// write to and — unless `USING`/`USING NAMED` is given — the
+        /// default graph the WHERE clause matches against.
+        with: Option<String>,
+        delete: Vec<QuadPattern>,
+        insert: Vec<QuadPattern>,
+        /// `USING <g>` graphs: when any `USING`/`USING NAMED` clause is
+        /// present, the WHERE clause's default graph is the merge of these
+        /// (empty if there are none) …
+        using: Vec<String>,
+        /// … and `USING NAMED <g>` graphs are its only named graphs.
+        using_named: Vec<String>,
         pattern: GraphPattern,
     },
-    /// `LOAD [SILENT] <iri>` — load an RDF document into the default graph.
-    Load { source: String, silent: bool },
+    /// `LOAD [SILENT] <iri> [INTO GRAPH <g>]` — load an RDF document into the
+    /// default graph, or into named graph `into`.
+    Load {
+        source: String,
+        silent: bool,
+        into: Option<String>,
+    },
     /// `CLEAR [SILENT] (DEFAULT | NAMED | ALL | GRAPH <iri>)`.
     Clear { target: GraphTarget, silent: bool },
     /// `DROP [SILENT] (DEFAULT | NAMED | ALL | GRAPH <iri>)`.
@@ -357,6 +376,26 @@ impl PatternTerm {
         match self {
             PatternTerm::Var(v) => Some(v),
             _ => None,
+        }
+    }
+}
+
+/// A triple template of a DELETE/INSERT clause (SPARQL 1.1 Update
+/// `QuadPattern`): `graph` is the `GRAPH <iri> { … }` / `GRAPH ?g { … }`
+/// block the triple was written in, `None` outside any (the operation's
+/// default graph: the `WITH` graph, else the store's default graph).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuadPattern {
+    pub graph: Option<GraphTerm>,
+    pub triple: TriplePattern,
+}
+
+impl QuadPattern {
+    /// A template triple outside any `GRAPH` block.
+    pub fn default_graph(triple: TriplePattern) -> QuadPattern {
+        QuadPattern {
+            graph: None,
+            triple,
         }
     }
 }

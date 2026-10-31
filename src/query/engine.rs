@@ -85,6 +85,39 @@
 //! forbids or an invalid lexical form is an expression error, i.e. unbound);
 //! or a user function registered on the [`Database`](crate::Database) under
 //! the full IRI or its local name. Any other IRI call is a query error.
+//!
+//! # Aggregate queries
+//!
+//! A SELECT is an aggregate query when it has `GROUP BY`, an aggregate in a
+//! SELECT expression, `HAVING`, or an aggregate in `ORDER BY` (the last two
+//! form one implicit group). As SPARQL 1.1 §18.2.4.1 specifies, every
+//! aggregate in the SELECT expressions, `HAVING` and `ORDER BY` is computed
+//! once per group into a hidden column of the group's row, and the
+//! expressions are then evaluated over that row like any other expression —
+//! so built-ins, casts, arithmetic, `IF` and `COALESCE` wrap aggregates
+//! freely (`ROUND(AVG(?x))`, `(SUM(?a)/COUNT(?a) AS ?avg)`,
+//! `HAVING (STR(COUNT(*)) = "2")`, `ORDER BY DESC(SUM(?x))`). SELECT
+//! expressions are evaluated left to right, so a later one may use an earlier
+//! alias, and `ORDER BY` may use any alias. `GROUP BY ?v` groups by the term
+//! `?v` is bound to (two different terms with equal values, such as
+//! `"1"^^xsd:integer` and `"01"^^xsd:integer`, are different groups). A
+//! variable that is neither grouped nor aggregated reads its value in the
+//! group's first solution (SPARQL would reject the query).
+//!
+//! # Arithmetic
+//!
+//! Numbers follow XPath type promotion (see [`Value`]). Dividing two integers
+//! gives an `xsd:decimal` by default (`7/2` = `3.5`); upstream gStore's
+//! truncating integer division (`7/2` = `3`, also inside `AVG`) is an opt-in
+//! mode, [`Evaluator::with_integer_division`] /
+//! [`Database::set_integer_division`](crate::Database::set_integer_division).
+//!
+//! # SPARQL Update templates
+//!
+//! [`Evaluator::eval_update_modify`] instantiates `DELETE`/`INSERT` quad
+//! templates (`GRAPH <g> { … }` / `GRAPH ?g { … }` blocks included) per WHERE
+//! solution; the [`Database`](crate::Database) chooses the WHERE dataset
+//! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -537,7 +570,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut out = Vec::new();
         for b in &solutions {
             for tp in &c.template {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
+                // A triple with a literal subject or a non-IRI predicate is
+                // not RDF and is left out (§16.2).
+                if let Some(t) = self
+                    .instantiate_template(tp, b, &layout)
+                    .filter(|t| !t.subject.is_literal() && matches!(t.predicate, Term::Iri(_)))
+                {
                     if seen.insert(t.to_string()) {
                         out.push(t);
                     }
@@ -629,43 +667,84 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok(out)
     }
 
-    /// Compute the ground triples a `DELETE … INSERT … WHERE` modify would
-    /// remove and add: evaluate the WHERE pattern, then instantiate each
-    /// template against every solution (skipping template triples with an
-    /// unbound variable), de-duplicated. The caller (Database) applies deletes
-    /// before inserts. Read-only — does not mutate the store. Fails, like
-    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced graph
-    /// function or `PFN` that the engine cannot evaluate yet.
+    /// Compute the ground quads a `DELETE … INSERT … WHERE` modify would
+    /// remove and add: evaluate the WHERE pattern over this evaluator's
+    /// dataset (its store is the default graph, [`with_named`](Self::with_named)
+    /// the named graphs), then instantiate each template against every
+    /// solution, de-duplicated. Each quad comes with its target graph IRI —
+    /// the template's `GRAPH <iri>`, or the IRI `GRAPH ?g` is bound to — or
+    /// `None` for a template outside any `GRAPH` block (the caller's default
+    /// graph, i.e. the `WITH` graph if there is one). A template quad is
+    /// skipped for a solution that leaves one of its variables unbound or
+    /// would make an illegal triple (a literal or blank-node predicate, a
+    /// literal subject, a graph name that is not an IRI) — SPARQL 1.1 Update
+    /// §3.1.3. The caller (Database) applies deletes before inserts.
+    /// Read-only — does not mutate the store. Fails, like
+    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced
+    /// graph function or `PFN` that the engine cannot evaluate yet.
+    #[allow(clippy::type_complexity)]
     pub fn eval_update_modify(
         &self,
-        delete: &[TriplePattern],
-        insert: &[TriplePattern],
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
         pattern: &GraphPattern,
-    ) -> Result<(Vec<Triple>, Vec<Triple>)> {
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
         self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
+        self.check_cancel()?;
         let mut dels = Vec::new();
         let mut ins = Vec::new();
         let mut seen_d = HashSet::new();
         let mut seen_i = HashSet::new();
         for b in &sols {
-            for tp in delete {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
-                    if seen_d.insert(t.to_string()) {
-                        dels.push(t);
-                    }
-                }
-            }
-            for tp in insert {
-                if let Some(t) = self.instantiate_template(tp, b, &layout) {
-                    if seen_i.insert(t.to_string()) {
-                        ins.push(t);
+            for (templates, out, seen) in [
+                (delete, &mut dels, &mut seen_d),
+                (insert, &mut ins, &mut seen_i),
+            ] {
+                for q in templates {
+                    let Some(quad) = self.instantiate_quad(q, b, &layout) else {
+                        continue;
+                    };
+                    if seen.insert((quad.0.clone(), quad.1.to_string())) {
+                        out.push(quad);
                     }
                 }
             }
         }
         Ok((dels, ins))
+    }
+
+    /// Fill a quad template from a solution (see
+    /// [`eval_update_modify`](Self::eval_update_modify)); `None` if a
+    /// variable is unbound or the result is not a legal quad.
+    fn instantiate_quad(
+        &self,
+        q: &QuadPattern,
+        b: &Binding,
+        layout: &VarLayout,
+    ) -> Option<(Option<String>, Triple)> {
+        let graph = match &q.graph {
+            None => None,
+            Some(GraphTerm::Iri(iri)) => Some(iri.clone()),
+            Some(GraphTerm::Var(v)) => match self.binding_term(v, b, layout)? {
+                Term::Iri(iri) => Some(iri),
+                _ => return None,
+            },
+        };
+        let t = self.instantiate_template(&q.triple, b, layout)?;
+        if t.subject.is_literal() || !matches!(t.predicate, Term::Iri(_)) {
+            return None;
+        }
+        Some((graph, t))
+    }
+
+    /// The term variable `v` is bound to in `b`, resolved in the variable's
+    /// own id space (a predicate-position variable holds predicate ids).
+    fn binding_term(&self, v: &str, b: &Binding, layout: &VarLayout) -> Option<Term> {
+        let idx = *layout.index.get(v)?;
+        let s = self.resolve_string(b[idx], layout.is_pred[idx])?;
+        parse_term(&s).ok()
     }
 
     /// Fill a template triple from a solution; `None` if any position is unbound.
@@ -675,20 +754,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         b: &Binding,
         layout: &VarLayout,
     ) -> Option<Triple> {
-        let resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
+        let resolve = |pt: &PatternTerm| -> Option<Term> {
             match pt {
                 PatternTerm::Term(t) => Some(t.clone()),
-                PatternTerm::Var(v) => {
-                    let idx = *layout.index.get(v)?;
-                    let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
-                    parse_term(&s).ok()
-                }
+                PatternTerm::Var(v) => self.binding_term(v, b, layout),
             }
         };
         Some(Triple::new(
-            resolve(&tp.subject, false)?,
-            resolve(&tp.predicate, true)?,
-            resolve(&tp.object, false)?,
+            resolve(&tp.subject)?,
+            resolve(&tp.predicate)?,
+            resolve(&tp.object)?,
         ))
     }
 

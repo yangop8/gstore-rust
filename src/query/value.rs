@@ -243,9 +243,11 @@ impl Value {
         // typed literal).
         if let Some((min, max)) = integer_type_range(dt) {
             if is_integer_lexical(t) {
-                if let Some(v) = t.parse::<i128>().ok().filter(|v| {
-                    min.is_none_or(|m| *v >= m) && max.is_none_or(|m| *v <= m)
-                }) {
+                if let Some(v) = t
+                    .parse::<i128>()
+                    .ok()
+                    .filter(|v| min.is_none_or(|m| *v >= m) && max.is_none_or(|m| *v <= m))
+                {
                     return int_value(v);
                 }
             }
@@ -532,7 +534,13 @@ impl Value {
             _ => 0,
         };
         match floating(self).max(floating(other)) {
-            2 => return Some(Value::Double(apply_f64(op, self.as_f64()?, other.as_f64()?))),
+            2 => {
+                return Some(Value::Double(apply_f64(
+                    op,
+                    self.as_f64()?,
+                    other.as_f64()?,
+                )))
+            }
             1 => {
                 let r = apply_f64(op, self.as_f64()?, other.as_f64()?);
                 return Some(Value::Float(to_f32_precision(r)));
@@ -706,7 +714,11 @@ impl Decimal {
             return None;
         }
         let digits = format!("{int_part}{frac_part}");
-        let mut mant: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+        let mut mant: i128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().ok()?
+        };
         if neg {
             mant = -mant;
         }
@@ -753,7 +765,9 @@ impl Decimal {
     fn add(self, other: Decimal) -> Option<Decimal> {
         let target = self.scale.max(other.scale);
         Some(Decimal {
-            mant: self.rescaled(target)?.checked_add(other.rescaled(target)?)?,
+            mant: self
+                .rescaled(target)?
+                .checked_add(other.rescaled(target)?)?,
             scale: target,
         })
     }
@@ -761,7 +775,9 @@ impl Decimal {
     fn sub(self, other: Decimal) -> Option<Decimal> {
         let target = self.scale.max(other.scale);
         Some(Decimal {
-            mant: self.rescaled(target)?.checked_sub(other.rescaled(target)?)?,
+            mant: self
+                .rescaled(target)?
+                .checked_sub(other.rescaled(target)?)?,
             scale: target,
         })
     }
@@ -797,7 +813,8 @@ impl Decimal {
                 let (q, r) = (num / other.mant, num % other.mant);
                 // Round half away from zero: |2r| ≥ |b| ⇒ one more unit
                 // in the quotient's direction.
-                let q = if r != 0 && r.unsigned_abs().saturating_mul(2) >= other.mant.unsigned_abs() {
+                let q = if r != 0 && r.unsigned_abs().saturating_mul(2) >= other.mant.unsigned_abs()
+                {
                     if (num < 0) != (other.mant < 0) {
                         q.checked_sub(1)?
                     } else {
@@ -1079,8 +1096,8 @@ fn parse_xsd_datetime(s: &str) -> Option<f64> {
     // "999999999999-01-01T00:00:00Z"^^xsd:dateTime would otherwise hit.
     let days = days_from_civil(p.year as i128, p.month as i128, p.day as i128);
     let tz = p.tz_offset_secs.unwrap_or(0) as i128;
-    let secs = days * 86_400 + p.hour as i128 * 3600 + p.minute as i128 * 60 + p.second as i128
-        - tz;
+    let secs =
+        days * 86_400 + p.hour as i128 * 3600 + p.minute as i128 * 60 + p.second as i128 - tz;
     Some(secs as f64 + p.frac)
 }
 
@@ -1228,7 +1245,10 @@ mod tests {
             assert!(matches!(v, Value::Typed { .. }), "{bad:?} → {v:?}");
         }
         // A valid one is still an integer.
-        assert_eq!(Value::from_term(&Term::typed_literal("42", xsd::INTEGER)), Value::Int(42));
+        assert_eq!(
+            Value::from_term(&Term::typed_literal("42", xsd::INTEGER)),
+            Value::Int(42)
+        );
     }
 
     #[test]
@@ -1249,7 +1269,10 @@ mod tests {
         let b = Value::from_term(&Term::typed_literal("0.2", xsd::DECIMAL));
         let sum = a.arith(ArithOp::Add, &b).unwrap();
         // Exactly 0.3, unlike f64's 0.1 + 0.2 == 0.30000000000000004.
-        assert_eq!(sum, Value::from_term(&Term::typed_literal("0.3", xsd::DECIMAL)));
+        assert_eq!(
+            sum,
+            Value::from_term(&Term::typed_literal("0.3", xsd::DECIMAL))
+        );
         assert_eq!(sum.lexical(), "0.3");
     }
 
@@ -1264,7 +1287,9 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_widens_on_overflow() {
-        let sum = Value::Int(i64::MAX).arith(ArithOp::Add, &Value::Int(1)).unwrap();
+        let sum = Value::Int(i64::MAX)
+            .arith(ArithOp::Add, &Value::Int(1))
+            .unwrap();
         assert_eq!(sum, Value::BigInt(i64::MAX as i128 + 1));
         let prod = Value::BigInt(10_000_000_000)
             .arith(ArithOp::Mul, &Value::Int(10_000_000_000))
@@ -1381,7 +1406,10 @@ mod tests {
             ("abc", "integer"),
         ] {
             let v = typed(lex, local);
-            assert!(!v.is_numeric() && v.is_ill_typed(), "{lex}^^xsd:{local} → {v:?}");
+            assert!(
+                !v.is_numeric() && v.is_ill_typed(),
+                "{lex}^^xsd:{local} → {v:?}"
+            );
         }
     }
 
@@ -1411,16 +1439,28 @@ mod tests {
             assert!(typed(lex, local).is_ill_typed(), "{lex}^^xsd:{local}");
         }
         // Value-space equality of valid literals.
-        assert_eq!(typed("01", "integer").sparql_eq(&typed("1", "integer")), Some(true));
-        assert_eq!(typed("1", "byte").sparql_eq(&typed("1.0", "double")), Some(true));
-        assert_eq!(typed("1", "boolean").sparql_eq(&typed("true", "boolean")), Some(true));
+        assert_eq!(
+            typed("01", "integer").sparql_eq(&typed("1", "integer")),
+            Some(true)
+        );
+        assert_eq!(
+            typed("1", "byte").sparql_eq(&typed("1.0", "double")),
+            Some(true)
+        );
+        assert_eq!(
+            typed("1", "boolean").sparql_eq(&typed("true", "boolean")),
+            Some(true)
+        );
     }
 
     #[test]
     fn floats_keep_their_type_through_arithmetic() {
         let f = typed("1.5", "float");
         assert_eq!(f, Value::Float(1.5));
-        assert_eq!(f.arith(ArithOp::Add, &Value::Int(1)), Some(Value::Float(2.5)));
+        assert_eq!(
+            f.arith(ArithOp::Add, &Value::Int(1)),
+            Some(Value::Float(2.5))
+        );
         assert_eq!(
             f.arith(ArithOp::Add, &Value::Double(1.0)),
             Some(Value::Double(2.5))
@@ -1447,8 +1487,14 @@ mod tests {
         let d = |s: &str| typed(s, "decimal");
         let div = |a: i64, b: i64, m| Value::Int(a).arith_with(ArithOp::Div, &Value::Int(b), m);
         assert_eq!(div(7, 2, IntegerDivision::Decimal), Some(d("3.5")));
-        assert_eq!(div(7, 2, IntegerDivision::Decimal).unwrap().lexical(), "3.5");
-        assert_eq!(div(6, 2, IntegerDivision::Decimal).unwrap().lexical(), "3.0");
+        assert_eq!(
+            div(7, 2, IntegerDivision::Decimal).unwrap().lexical(),
+            "3.5"
+        );
+        assert_eq!(
+            div(6, 2, IntegerDivision::Decimal).unwrap().lexical(),
+            "3.0"
+        );
         assert_eq!(
             div(1, 3, IntegerDivision::Decimal).unwrap().lexical(),
             "0.333333333333333333"
@@ -1470,27 +1516,62 @@ mod tests {
             d("7.0").arith_with(ArithOp::Div, &Value::Int(2), IntegerDivision::Truncate),
             Some(d("3.5"))
         );
-        assert_eq!(d("1.5").arith(ArithOp::Div, &d("0.5")).unwrap().lexical(), "3.0");
+        assert_eq!(
+            d("1.5").arith(ArithOp::Div, &d("0.5")).unwrap().lexical(),
+            "3.0"
+        );
         assert_eq!(d("1").arith(ArithOp::Div, &d("0.0")), None);
         // Huge dividends lose fractional digits rather than overflowing.
-        let big = Value::Int(i64::MAX).arith(ArithOp::Div, &Value::Int(2)).unwrap();
+        let big = Value::Int(i64::MAX)
+            .arith(ArithOp::Div, &Value::Int(2))
+            .unwrap();
         assert_eq!(big.lexical(), "4611686018427387903.5");
-        assert_eq!(IntegerDivision::parse("Upstream"), Some(IntegerDivision::Truncate));
-        assert_eq!(IntegerDivision::parse("w3c"), Some(IntegerDivision::Decimal));
+        assert_eq!(
+            IntegerDivision::parse("Upstream"),
+            Some(IntegerDivision::Truncate)
+        );
+        assert_eq!(
+            IntegerDivision::parse("w3c"),
+            Some(IntegerDivision::Decimal)
+        );
         assert_eq!(IntegerDivision::parse("x"), None);
     }
 
     #[test]
     fn numeric_functions_keep_the_type() {
         let d = |s: &str| typed(s, "decimal");
-        assert_eq!(d("2.5").numeric_fn(NumericFn::Round).unwrap().lexical(), "3.0");
-        assert_eq!(d("-2.5").numeric_fn(NumericFn::Round).unwrap().lexical(), "-2.0");
-        assert_eq!(d("-2.4").numeric_fn(NumericFn::Floor).unwrap().lexical(), "-3.0");
-        assert_eq!(d("-2.4").numeric_fn(NumericFn::Ceil).unwrap().lexical(), "-2.0");
-        assert_eq!(d("2.0").numeric_fn(NumericFn::Ceil).unwrap().lexical(), "2.0");
-        assert_eq!(d("-2.4").numeric_fn(NumericFn::Abs).unwrap().lexical(), "2.4");
-        assert_eq!(Value::Int(-3).numeric_fn(NumericFn::Abs), Some(Value::Int(3)));
-        assert_eq!(Value::Int(3).numeric_fn(NumericFn::Round), Some(Value::Int(3)));
+        assert_eq!(
+            d("2.5").numeric_fn(NumericFn::Round).unwrap().lexical(),
+            "3.0"
+        );
+        assert_eq!(
+            d("-2.5").numeric_fn(NumericFn::Round).unwrap().lexical(),
+            "-2.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Floor).unwrap().lexical(),
+            "-3.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Ceil).unwrap().lexical(),
+            "-2.0"
+        );
+        assert_eq!(
+            d("2.0").numeric_fn(NumericFn::Ceil).unwrap().lexical(),
+            "2.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Abs).unwrap().lexical(),
+            "2.4"
+        );
+        assert_eq!(
+            Value::Int(-3).numeric_fn(NumericFn::Abs),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            Value::Int(3).numeric_fn(NumericFn::Round),
+            Some(Value::Int(3))
+        );
         assert_eq!(
             Value::Double(-2.5).numeric_fn(NumericFn::Round),
             Some(Value::Double(-2.0))
@@ -1503,7 +1584,14 @@ mod tests {
             Value::Float(1.5).numeric_fn(NumericFn::Floor),
             Some(Value::Float(1.0))
         );
-        assert_eq!(Value::Str { value: "1".into(), lang: None }.numeric_fn(NumericFn::Abs), None);
+        assert_eq!(
+            Value::Str {
+                value: "1".into(),
+                lang: None
+            }
+            .numeric_fn(NumericFn::Abs),
+            None
+        );
         // |x| < 1 with a scale beyond 10^38.
         let tiny = d(&format!("0.{}1", "0".repeat(45)));
         assert_eq!(tiny.numeric_fn(NumericFn::Floor).unwrap().lexical(), "0.0");
