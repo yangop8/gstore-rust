@@ -102,6 +102,39 @@
 //!   solution.
 //! * gStore's `CONTAINALL` / `CONTAINANY` test `xsd:list` literals (see
 //!   `eval_contain`).
+//!
+//! # Aggregate queries
+//!
+//! A SELECT is an aggregate query when it has `GROUP BY`, an aggregate in a
+//! SELECT expression, `HAVING`, or an aggregate in `ORDER BY` (the last two
+//! form one implicit group). As SPARQL 1.1 §18.2.4.1 specifies, every
+//! aggregate in the SELECT expressions, `HAVING` and `ORDER BY` is computed
+//! once per group into a hidden column of the group's row, and the
+//! expressions are then evaluated over that row like any other expression —
+//! so built-ins, casts, arithmetic, `IF` and `COALESCE` wrap aggregates
+//! freely (`ROUND(AVG(?x))`, `(SUM(?a)/COUNT(?a) AS ?avg)`,
+//! `HAVING (STR(COUNT(*)) = "2")`, `ORDER BY DESC(SUM(?x))`). SELECT
+//! expressions are evaluated left to right, so a later one may use an earlier
+//! alias, and `ORDER BY` may use any alias. `GROUP BY ?v` groups by the term
+//! `?v` is bound to (two different terms with equal values, such as
+//! `"1"^^xsd:integer` and `"01"^^xsd:integer`, are different groups). A
+//! variable that is neither grouped nor aggregated reads its value in the
+//! group's first solution (SPARQL would reject the query).
+//!
+//! # Arithmetic
+//!
+//! Numbers follow XPath type promotion (see [`Value`]). Dividing two integers
+//! gives an `xsd:decimal` by default (`7/2` = `3.5`); upstream gStore's
+//! truncating integer division (`7/2` = `3`, also inside `AVG`) is an opt-in
+//! mode, [`Evaluator::with_integer_division`] /
+//! [`Database::set_integer_division`](crate::Database::set_integer_division).
+//!
+//! # SPARQL Update templates
+//!
+//! [`Evaluator::eval_update_modify`] instantiates `DELETE`/`INSERT` quad
+//! templates (`GRAPH <g> { … }` / `GRAPH ?g { … }` blocks included) per WHERE
+//! solution; the [`Database`](crate::Database) chooses the WHERE dataset
+//! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -130,7 +163,11 @@ use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
 use super::results::{QueryResult, ResultSet};
-use super::value::{format_xsd_datetime_utc, order_key, parse_datetime_parts, DateTimeParts, Value};
+use super::value::{
+    format_xsd_datetime_utc, is_decimal_lexical, is_integer_lexical, order_key,
+    parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
+    IntegerDivision, NumericFn, Value, XSD_FLOAT,
+};
 
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -320,6 +357,8 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// The CSR obtained for this query (from the provider or built), kept so
     /// several graph functions / groups in one query share it.
     gfun_csr: std::cell::RefCell<Option<Arc<CsrGraph>>>,
+    /// How `/` divides two integers ([`with_integer_division`](Self::with_integer_division)).
+    integer_division: IntegerDivision,
 }
 
 /// A source of the per-predicate CSR the advanced graph functions run on
@@ -360,6 +399,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
+            integer_division: IntegerDivision::default(),
         }
     }
 
@@ -384,6 +424,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
+            integer_division: IntegerDivision::default(),
         }
     }
 
@@ -423,6 +464,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// first time a query needs one.
     pub fn with_csr_provider(mut self, provider: &'a CsrProvider<'a>) -> Evaluator<'a, S> {
         self.csr_provider = Some(provider);
+        self
+    }
+
+    /// Choose how `/` divides two integers: SPARQL 1.1's decimal quotient
+    /// ([`IntegerDivision::Decimal`], the default: `7/2` = `3.5`) or upstream
+    /// gStore's truncation ([`IntegerDivision::Truncate`]: `7/2` = `3`, and
+    /// `AVG` over integers truncates too). See [`Value::arith_with`].
+    pub fn with_integer_division(mut self, mode: IntegerDivision) -> Evaluator<'a, S> {
+        self.integer_division = mode;
         self
     }
 
@@ -538,7 +588,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for b in &solutions {
             let mut fresh = HashMap::new();
             for tp in &c.template {
-                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
+                // A triple with a literal subject or a non-IRI predicate is
+                // not RDF and is left out (§16.2).
+                if let Some(t) = self
+                    .instantiate_template(tp, b, &layout, &mut fresh)
+                    .filter(|t| !t.subject.is_literal() && matches!(t.predicate, Term::Iri(_)))
+                {
                     if seen.insert(t.to_string()) {
                         out.push(t);
                     }
@@ -632,44 +687,90 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok(out)
     }
 
-    /// Compute the ground triples a `DELETE … INSERT … WHERE` modify would
-    /// remove and add: evaluate the WHERE pattern, then instantiate each
-    /// template against every solution (skipping template triples with an
-    /// unbound variable), de-duplicated. The caller (Database) applies deletes
-    /// before inserts. Read-only — does not mutate the store. Fails, like
-    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced graph
-    /// function or `PFN` that the engine cannot evaluate yet.
+    /// Compute the ground quads a `DELETE … INSERT … WHERE` modify would
+    /// remove and add: evaluate the WHERE pattern over this evaluator's
+    /// dataset (its store is the default graph, [`with_named`](Self::with_named)
+    /// the named graphs), then instantiate each template against every
+    /// solution, de-duplicated. Each quad comes with its target graph IRI —
+    /// the template's `GRAPH <iri>`, or the IRI `GRAPH ?g` is bound to — or
+    /// `None` for a template outside any `GRAPH` block (the caller's default
+    /// graph, i.e. the `WITH` graph if there is one). A template quad is
+    /// skipped for a solution that leaves one of its variables unbound or
+    /// would make an illegal triple (a literal or blank-node predicate, a
+    /// literal subject, a graph name that is not an IRI) — SPARQL 1.1 Update
+    /// §3.1.3. The caller (Database) applies deletes before inserts.
+    /// Read-only — does not mutate the store. Fails, like
+    /// [`Evaluator::evaluate`], when the WHERE pattern calls an advanced
+    /// graph function or `PFN` that the engine cannot evaluate yet.
+    #[allow(clippy::type_complexity)]
     pub fn eval_update_modify(
         &self,
-        delete: &[TriplePattern],
-        insert: &[TriplePattern],
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
         pattern: &GraphPattern,
-    ) -> Result<(Vec<Triple>, Vec<Triple>)> {
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
         self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
+        self.check_cancel()?;
         let mut dels = Vec::new();
         let mut ins = Vec::new();
         let mut seen_d = HashSet::new();
         let mut seen_i = HashSet::new();
         for b in &sols {
+            // One map per solution: a `[ … ]` / `( … )` node of the
+            // templates is the same fresh blank node across this solution's
+            // quads, and a new one for the next solution.
             let mut fresh = HashMap::new();
-            for tp in delete {
-                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
-                    if seen_d.insert(t.to_string()) {
-                        dels.push(t);
-                    }
-                }
-            }
-            for tp in insert {
-                if let Some(t) = self.instantiate_template(tp, b, &layout, &mut fresh) {
-                    if seen_i.insert(t.to_string()) {
-                        ins.push(t);
+            for (templates, out, seen) in [
+                (delete, &mut dels, &mut seen_d),
+                (insert, &mut ins, &mut seen_i),
+            ] {
+                for q in templates {
+                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh) else {
+                        continue;
+                    };
+                    if seen.insert((quad.0.clone(), quad.1.to_string())) {
+                        out.push(quad);
                     }
                 }
             }
         }
         Ok((dels, ins))
+    }
+
+    /// Fill a quad template from a solution (see
+    /// [`eval_update_modify`](Self::eval_update_modify)); `None` if a
+    /// variable is unbound or the result is not a legal quad. `fresh` is as
+    /// for [`instantiate_template`](Self::instantiate_template).
+    fn instantiate_quad(
+        &self,
+        q: &QuadPattern,
+        b: &Binding,
+        layout: &VarLayout,
+        fresh: &mut HashMap<String, Term>,
+    ) -> Option<(Option<String>, Triple)> {
+        let graph = match &q.graph {
+            None => None,
+            Some(GraphTerm::Iri(iri)) => Some(iri.clone()),
+            Some(GraphTerm::Var(v)) => match self.binding_term(v, b, layout)? {
+                Term::Iri(iri) => Some(iri),
+                _ => return None,
+            },
+        };
+        let t = self.instantiate_template(&q.triple, b, layout, fresh)?;
+        if t.subject.is_literal() || !matches!(t.predicate, Term::Iri(_)) {
+            return None;
+        }
+        Some((graph, t))
+    }
+
+    /// The term variable `v` is bound to in `b`, resolved in the variable's
+    /// own id space (a predicate-position variable holds predicate ids).
+    fn binding_term(&self, v: &str, b: &Binding, layout: &VarLayout) -> Option<Term> {
+        let idx = *layout.index.get(v)?;
+        let s = self.resolve_string(b[idx], layout.is_pred[idx])?;
+        parse_term(&s).ok()
     }
 
     /// Fill a template triple from a solution; `None` if any position is
@@ -685,30 +786,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         fresh: &mut HashMap<String, Term>,
     ) -> Option<Triple> {
-        let mut resolve = |pt: &PatternTerm, is_pred: bool| -> Option<Term> {
+        let mut resolve = |pt: &PatternTerm| -> Option<Term> {
             match pt {
                 PatternTerm::Term(t) => Some(t.clone()),
-                PatternTerm::Var(v) => {
-                    let bound = layout.index.get(v).and_then(|&idx| {
-                        let s = self.resolve_string(b[idx], is_pred && layout.is_pred[idx])?;
-                        parse_term(&s).ok()
-                    });
-                    match bound {
-                        None if is_anon_var(v) => Some(
-                            fresh
-                                .entry(v.clone())
-                                .or_insert_with(|| Term::Blank(fresh_bnode_label()))
-                                .clone(),
-                        ),
-                        other => other,
-                    }
-                }
+                PatternTerm::Var(v) => match self.binding_term(v, b, layout) {
+                    None if is_anon_var(v) => Some(
+                        fresh
+                            .entry(v.clone())
+                            .or_insert_with(|| Term::Blank(fresh_bnode_label()))
+                            .clone(),
+                    ),
+                    other => other,
+                },
             }
         };
         Some(Triple::new(
-            resolve(&tp.subject, false)?,
-            resolve(&tp.predicate, true)?,
-            resolve(&tp.object, false)?,
+            resolve(&tp.subject)?,
+            resolve(&tp.predicate)?,
+            resolve(&tp.object)?,
         ))
     }
 
@@ -737,11 +832,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         &self,
         q: &SelectQuery,
     ) -> Result<(Vec<String>, Vec<bool>, Vec<Vec<Option<u32>>>)> {
-        let has_agg = !q.group_by.is_empty() || projection_has_aggregate(&q.projection);
+        // gStore's advanced graph functions, `(shortestPath(…) AS ?v)`: each is
+        // computed once over the distinct bindings of its vertex arguments
+        // across all solutions (per group with GROUP BY) and placed with
+        // upstream's row shape — see the module docs, "Advanced graph
+        // functions".
+        let gfns = graph_fn_items(q)?;
+        // An aggregate query: GROUP BY, an aggregate in a SELECT expression,
+        // or HAVING / an aggregate in ORDER BY (one implicit group). Next to
+        // a projected graph function, HAVING keeps upstream's row shape
+        // instead (see the module docs).
+        let has_agg = !q.group_by.is_empty()
+            || projection_has_aggregate(&q.projection)
+            || (gfns.is_empty()
+                && (!q.having.is_empty()
+                    || q.order_by.iter().any(|o| expr_has_aggregate(&o.expr))));
         // A trailing `VALUES` block joins the solutions before the SELECT
         // expressions, ORDER BY and projection (§18.2.4.3): without grouping
         // that is a join with the WHERE pattern; after grouping it joins the
-        // aggregated rows (`join_values_rows`, below).
+        // group rows after HAVING (in `eval_aggregation`).
         let with_values;
         let pattern = match &q.values {
             Some((vars, rows)) if !has_agg => {
@@ -768,12 +877,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .map(|v| layout.index.get(v).is_some_and(|&i| layout.is_pred[i]))
             .collect();
 
-        // gStore's advanced graph functions, `(shortestPath(…) AS ?v)`: each is
-        // computed once over the distinct bindings of its vertex arguments
-        // across all solutions (per group with GROUP BY) and placed with
-        // upstream's row shape — see the module docs, "Advanced graph
-        // functions".
-        let gfns = graph_fn_items(q)?;
         // Upstream's LIMIT pushdown: a WHERE clause that is one BGP, with a
         // LIMIT and no ORDER BY, stops its BGP after LIMIT rows (OFFSET is not
         // added), so the functions only see those rows.
@@ -819,17 +922,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             };
             vec![vec![value]]
         } else if has_agg {
-            let mut rows = self.eval_aggregation(&solutions, &layout, &bind_only, q)?;
-            if let Some((vars, vrows)) = &q.values {
-                rows = self.join_values_rows(rows, &result_vars, &is_pred, vars, vrows);
-            }
-            // Aggregated rows are ordered over the projected result layout —
-            // ORDER BY here references group keys / aggregate aliases.
-            if !q.order_by.is_empty() {
-                let result_layout = VarLayout::from_vars(result_vars.clone(), is_pred.clone());
-                self.sort_solutions(&mut rows, &q.order_by, &result_layout);
-            }
-            rows
+            // Grouped, filtered by HAVING, joined with a trailing VALUES and
+            // ordered by ORDER BY there.
+            self.eval_aggregation(&solutions, &layout, &bind_only, q)?
         } else {
             // Graph functions next to other projections: one row per
             // solution, each function's value on the *last* solution only
@@ -914,50 +1009,112 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Ok((result_vars, is_pred, rows))
     }
 
-    /// Join aggregated result rows (columns `result_vars`) with a trailing
-    /// `VALUES` table: a row and a VALUES row are compatible when every
-    /// variable they share has the same term (a VALUES variable that is not a
-    /// result column is shared with nothing, as it would only extend the
-    /// solution before the projection drops it); each compatible pair gives a
-    /// row, its unbound columns filled from the VALUES row.
-    fn join_values_rows(
+    /// Where each variable of an aggregate query's trailing `VALUES` block
+    /// meets the group rows (see [`eval_aggregation`](Self::eval_aggregation)),
+    /// adding a column to `glayout` for a variable it does not have.
+    fn values_columns(
         &self,
-        rows: Vec<Vec<Option<u32>>>,
-        result_vars: &[String],
-        is_pred: &[bool],
         vars: &[String],
-        vrows: &[Vec<Option<Term>>],
-    ) -> Vec<Vec<Option<u32>>> {
-        let cols: Vec<Option<usize>> = vars
-            .iter()
-            .map(|v| result_vars.iter().position(|r| r == v))
-            .collect();
-        let mut out = Vec::new();
-        for row in &rows {
-            'values: for vrow in vrows {
-                let mut merged = row.clone();
-                for (cell, col) in vrow.iter().zip(&cols) {
-                    let (Some(term), Some(c)) = (cell, *col) else {
-                        continue;
-                    };
-                    match row[c] {
-                        Some(id) => {
-                            if self.id_to_term(id, is_pred[c]).as_ref() != Some(term) {
-                                continue 'values;
-                            }
-                        }
-                        // A predicate-typed column resolves its ids through the
-                        // predicate dictionary; a synthetic id resolves anywhere.
-                        None if is_pred[c] => {
-                            merged[c] = Some(self.extras.borrow_mut().intern(term))
-                        }
-                        None => merged[c] = Some(self.term_to_id(term)),
-                    }
+        q: &SelectQuery,
+        items: &[SelectItem],
+        alias_cols: &[Option<usize>],
+        glayout: &mut VarLayout,
+    ) -> Vec<ValuesCol> {
+        vars.iter()
+            .map(|v| {
+                let alias = items.iter().zip(alias_cols).find_map(|(it, col)| match it {
+                    SelectItem::Expr(_, a) if a == v => *col,
+                    _ => None,
+                });
+                if let Some(col) = alias {
+                    return ValuesCol::Alias(col);
                 }
-                out.push(merged);
+                if let Some(&i) = glayout.index.get(v) {
+                    let grouped = q
+                        .group_by
+                        .iter()
+                        .any(|e| matches!(e, Expr::Var(g) if g == v))
+                        || items
+                            .iter()
+                            .any(|it| matches!(it, SelectItem::Var(x) if x == v));
+                    return if grouped {
+                        ValuesCol::Match(i)
+                    } else {
+                        ValuesCol::Bind(i)
+                    };
+                }
+                let i = glayout.names.len();
+                glayout.index.insert(v.clone(), i);
+                glayout.names.push(v.clone());
+                glayout.is_pred.push(false);
+                ValuesCol::Bind(i)
+            })
+            .collect()
+    }
+
+    /// Join one group row with one row of a trailing `VALUES` block over the
+    /// [`ValuesCol::Match`] / [`ValuesCol::Bind`] columns: `None` when a
+    /// matched column holds a different term, else the row with the VALUES
+    /// terms bound (an `UNDEF` cell leaves the column as it is). Alias
+    /// columns are checked later, by [`values_alias_join`](Self::values_alias_join).
+    fn values_join_row(
+        &self,
+        gb: &Binding,
+        vrow: &[Option<Term>],
+        cols: &[ValuesCol],
+        glayout: &VarLayout,
+    ) -> Option<Binding> {
+        let mut merged = gb.clone();
+        for (cell, col) in vrow.iter().zip(cols) {
+            let Some(term) = cell else { continue };
+            match *col {
+                ValuesCol::Match(c) => match gb[c] {
+                    Some(id) if self.id_to_term(id, glayout.is_pred[c]).as_ref() != Some(term) => {
+                        return None
+                    }
+                    Some(_) => {}
+                    None => merged[c] = Some(self.values_cell_id(term, glayout.is_pred[c])),
+                },
+                ValuesCol::Bind(c) => {
+                    merged[c] = Some(self.values_cell_id(term, glayout.is_pred[c]))
+                }
+                ValuesCol::Alias(_) => {}
             }
         }
-        out
+        Some(merged)
+    }
+
+    /// The [`ValuesCol::Alias`] half of the VALUES join, once the SELECT
+    /// expressions are in `gb`: `false` when an alias holds a different term
+    /// than the VALUES row; an unbound alias takes the VALUES term.
+    fn values_alias_join(
+        &self,
+        gb: &mut Binding,
+        vrow: &[Option<Term>],
+        cols: &[ValuesCol],
+    ) -> bool {
+        for (cell, col) in vrow.iter().zip(cols) {
+            let (Some(term), ValuesCol::Alias(c)) = (cell, *col) else {
+                continue;
+            };
+            match gb[c] {
+                Some(id) if self.id_to_term(id, false).as_ref() != Some(term) => return false,
+                Some(_) => {}
+                None => gb[c] = Some(self.term_to_id(term)),
+            }
+        }
+        true
+    }
+
+    /// The id a VALUES term takes in a column: a predicate-typed column
+    /// resolves its ids through the predicate dictionary, so a term goes
+    /// there as a synthetic id (which resolves anywhere).
+    fn values_cell_id(&self, term: &Term, is_pred: bool) -> u32 {
+        if is_pred {
+            self.extras.borrow_mut().intern(term)
+        } else {
+            self.term_to_id(term)
+        }
     }
 
     /// Project a single solution into result-variable order (no aggregation).
@@ -1102,9 +1259,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         out
     }
 
-    /// Group solutions and compute aggregates / projected expressions.
-    /// `bind_only` is [`bind_only_vars`] of the pattern, for the projected
-    /// graph functions.
+    /// Group solutions and compute the projected rows of an aggregate query
+    /// (one per group that passes HAVING, sorted by ORDER BY), following
+    /// SPARQL 1.1 §18.2.4.1: every aggregate in the SELECT expressions,
+    /// HAVING and ORDER BY is computed once per group into a hidden column
+    /// of the group's row, and the expressions — with the aggregates replaced
+    /// by those columns — are then ordinary expressions over the row. So
+    /// builtins wrapping aggregates (`ROUND(AVG(?x))`, `STR(COUNT(*))`,
+    /// `SUM(?a)/COUNT(?a)`, `COALESCE(MIN(?x), 0)`, `IF(COUNT(*) > 1, …)`)
+    /// evaluate like any other expression. SELECT expressions are evaluated
+    /// in order (a later one may use an earlier alias) and ORDER BY sees the
+    /// aliases. A group row binds each GROUP BY variable to the group's key
+    /// and, as before, every other WHERE variable to its value in the group's
+    /// first solution. `bind_only` is [`bind_only_vars`] of the pattern, for
+    /// the projected graph functions.
     fn eval_aggregation(
         &self,
         solutions: &[Binding],
@@ -1112,7 +1280,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         bind_only: &HashSet<String>,
         q: &SelectQuery,
     ) -> Result<Vec<Vec<Option<u32>>>> {
-        // Group key = the GROUP BY expression values (empty ⇒ one group).
+        let items = match &q.projection {
+            Projection::Items(items) => items,
+            Projection::All => {
+                return Err(GStoreError::Query(
+                    "SELECT * with aggregation is not allowed".into(),
+                ))
+            }
+        };
+
+        // Group key = the GROUP BY expression values (empty ⇒ one group). A
+        // plain variable keys by its bound term itself (RDF term identity, in
+        // the variable's own id space); an expression by its computed value.
         use std::collections::hash_map::Entry;
         let mut order: Vec<Vec<Option<u32>>> = Vec::new();
         let mut groups: HashMap<Vec<Option<u32>>, Vec<usize>> = HashMap::new();
@@ -1120,7 +1299,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let key: Vec<Option<u32>> = q
                 .group_by
                 .iter()
-                .map(|e| self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
+                .map(|e| match e {
+                    Expr::Var(v) => layout.index.get(v).and_then(|&vi| b[vi]),
+                    e => self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)),
+                })
                 .collect();
             match groups.entry(key.clone()) {
                 Entry::Occupied(mut o) => o.get_mut().push(i),
@@ -1136,162 +1318,180 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             groups.insert(Vec::new(), Vec::new());
         }
 
-        // Map GROUP BY variables to their key column, for projecting group vars.
-        let mut key_vars: HashMap<String, usize> = HashMap::new();
-        for (ki, e) in q.group_by.iter().enumerate() {
-            if let Expr::Var(v) = e {
-                key_vars.insert(v.clone(), ki);
-            }
+        // §18.2.4.1: lift every aggregate into a hidden group-row column.
+        let mut aggs: Vec<Expr> = Vec::new();
+        let lifted_items: Vec<Option<Expr>> = items
+            .iter()
+            .map(|it| match it {
+                SelectItem::Expr(Expr::GraphFn { .. }, _) | SelectItem::Var(_) => None,
+                SelectItem::Expr(e, _) => Some(lift_aggregates(e, &mut aggs)),
+            })
+            .collect();
+        let having: Vec<Expr> = q
+            .having
+            .iter()
+            .map(|h| lift_aggregates(h, &mut aggs))
+            .collect();
+        let order_by: Vec<OrderCondition> = q
+            .order_by
+            .iter()
+            .map(|o| OrderCondition {
+                expr: lift_aggregates(&o.expr, &mut aggs),
+                descending: o.descending,
+            })
+            .collect();
+        let mut glayout = group_layout(layout, aggs.len());
+        // One column per SELECT expression alias.
+        let mut alias_cols = Vec::with_capacity(items.len());
+        for it in items {
+            alias_cols.push(match it {
+                SelectItem::Var(_) => None,
+                SelectItem::Expr(_, alias) => Some(match glayout.index.get(alias) {
+                    Some(&i) => {
+                        glayout.is_pred[i] = false;
+                        i
+                    }
+                    None => {
+                        let i = glayout.names.len();
+                        glayout.index.insert(alias.clone(), i);
+                        glayout.names.push(alias.clone());
+                        glayout.is_pred.push(false);
+                        i
+                    }
+                }),
+            });
         }
 
-        let items = match &q.projection {
-            Projection::Items(items) => items,
-            Projection::All => {
-                return Err(GStoreError::Query(
-                    "SELECT * with aggregation is not allowed".into(),
-                ))
-            }
+        // A trailing VALUES block (§18.2.4.3) joins the group rows after
+        // HAVING: on the GROUP BY and projected variables, and on the SELECT
+        // aliases once they are computed (as the join of the projected rows
+        // would); any other VALUES variable is not in scope after grouping,
+        // so the VALUES row binds it, visible to the SELECT expressions.
+        let values_cols = match &q.values {
+            Some((vars, _)) => self.values_columns(vars, q, items, &alias_cols, &mut glayout),
+            None => Vec::new(),
         };
 
-        let mut rows = Vec::new();
+        let mut grows: Vec<Binding> = Vec::new();
         for key in &order {
             let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
+            let gb = self.group_row(&sols, layout, &glayout, &aggs);
             // HAVING: drop groups failing any constraint.
-            if !self.group_passes_having(q, &sols, layout, &key_vars, key) {
+            if !having
+                .iter()
+                .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
+            {
                 continue;
             }
-            let mut row = Vec::with_capacity(items.len());
+            // An advanced graph function over the group's solutions
+            // (upstream: once per GROUP BY group, GE:2546-2620).
+            let mut gfn_values: Vec<Option<Option<u32>>> = Vec::with_capacity(items.len());
             for it in items {
-                let val = match it {
-                    SelectItem::Var(v) => key_vars.get(v).and_then(|&ki| key[ki]).or_else(|| {
-                        sols.first()
-                            .and_then(|b| layout.index.get(v).and_then(|&i| b[i]))
-                    }),
-                    // An advanced graph function over the group's solutions
-                    // (upstream: once per GROUP BY group, GE:2546-2620).
+                gfn_values.push(match it {
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         let call = GCall::from_ast(*func, args)?;
-                        self.eval_graph_fn(&call, &sols, layout, bind_only, false)?
+                        Some(self.eval_graph_fn(&call, &sols, layout, bind_only, false)?)
                     }
-                    SelectItem::Expr(e, _) => self
-                        .eval_group_expr(e, &sols, layout, &key_vars, key)
-                        .map(|v| self.value_to_id(&v)),
-                };
-                row.push(val);
+                    _ => None,
+                });
             }
-            rows.push(row);
+            let joined: Vec<(Binding, Option<&Vec<Option<Term>>>)> = match &q.values {
+                None => vec![(gb, None)],
+                Some((_, vrows)) => vrows
+                    .iter()
+                    .filter_map(|vrow| {
+                        self.values_join_row(&gb, vrow, &values_cols, &glayout)
+                            .map(|row| (row, Some(vrow)))
+                    })
+                    .collect(),
+            };
+            for (mut gb, vrow) in joined {
+                for ((lifted, gfn), col) in lifted_items.iter().zip(&gfn_values).zip(&alias_cols) {
+                    let Some(col) = *col else { continue };
+                    gb[col] = match (gfn, lifted) {
+                        (Some(v), _) => *v,
+                        (None, Some(e)) => self
+                            .eval_value(e, &gb, &glayout)
+                            .map(|v| self.value_to_id(&v)),
+                        (None, None) => None,
+                    };
+                }
+                if let Some(vrow) = vrow {
+                    if !self.values_alias_join(&mut gb, vrow, &values_cols) {
+                        continue;
+                    }
+                }
+                grows.push(gb);
+            }
         }
-        Ok(rows)
+        if !order_by.is_empty() {
+            self.sort_solutions(&mut grows, &order_by, &glayout);
+        }
+        Ok(grows
+            .iter()
+            .map(|gb| {
+                items
+                    .iter()
+                    .zip(&alias_cols)
+                    .map(|(it, col)| match (it, col) {
+                        (SelectItem::Var(v), _) => glayout.index.get(v).and_then(|&i| gb[i]),
+                        (_, Some(col)) => gb[*col],
+                        (_, None) => None,
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
-    // ---- aggregate / group-expression evaluation -------------------------
-
-    /// Whether a group's solutions satisfy every HAVING constraint of `q`.
-    fn group_passes_having(
+    /// A group's row (see [`eval_aggregation`](Self::eval_aggregation)) over
+    /// `glayout` (the WHERE `layout` extended by [`group_layout`] and maybe
+    /// alias columns): the group's first solution, then the value of each
+    /// lifted aggregate of `aggs` (an error leaves its column unbound).
+    fn group_row(
         &self,
-        q: &SelectQuery,
         sols: &[&Binding],
         layout: &VarLayout,
-        key_vars: &HashMap<String, usize>,
-        key: &[Option<u32>],
-    ) -> bool {
-        q.having.iter().all(|h| {
-            self.eval_group_expr(h, sols, layout, key_vars, key)
-                .and_then(|v| v.ebv())
-                == Some(true)
-        })
+        glayout: &VarLayout,
+        aggs: &[Expr],
+    ) -> Binding {
+        let mut gb: Binding = match sols.first() {
+            Some(b) => (*b).clone(),
+            None => vec![None; layout.len()],
+        };
+        gb.resize(glayout.len(), None);
+        for (i, a) in aggs.iter().enumerate() {
+            if let Expr::Aggregate {
+                func,
+                distinct,
+                arg,
+                sep,
+            } = a
+            {
+                gb[layout.len() + i] = self
+                    .eval_aggregate(*func, *distinct, arg.as_deref(), sep.as_deref(), sols, layout)
+                    .map(|v| self.value_to_id(&v));
+            }
+        }
+        gb
     }
 
     /// HAVING over all of `sols` as one group (no GROUP BY) — upstream treats
     /// a projected graph function as an aggregate, so its HAVING applies.
     fn having_holds(&self, q: &SelectQuery, sols: &[&Binding], layout: &VarLayout) -> bool {
-        self.group_passes_having(q, sols, layout, &HashMap::new(), &[])
-    }
-
-    /// Evaluate an expression in group context (may contain aggregates).
-    fn eval_group_expr(
-        &self,
-        e: &Expr,
-        sols: &[&Binding],
-        layout: &VarLayout,
-        key_vars: &HashMap<String, usize>,
-        key: &[Option<u32>],
-    ) -> Option<Value> {
-        match e {
-            Expr::Aggregate {
-                func,
-                distinct,
-                arg,
-                sep,
-            } => self.eval_aggregate(
-                *func,
-                *distinct,
-                arg.as_deref(),
-                sep.as_deref(),
-                sols,
-                layout,
-            ),
-            Expr::Var(name) => {
-                if let Some(&ki) = key_vars.get(name) {
-                    self.id_to_value(key[ki]?, false)
-                } else {
-                    // Non-grouped variable inside an expression ⇒ SAMPLE-like.
-                    let idx = *layout.index.get(name)?;
-                    self.resolve_value(idx, sols.first()?, layout)
-                }
-            }
-            Expr::Const(t) => Some(Value::from_term(t)),
-            Expr::Arith(op, a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
-                eval_arith(*op, x, y)
-            }
-            Expr::Unary(op, x) => {
-                let v = self.eval_group_expr(x, sols, layout, key_vars, key)?;
-                match op {
-                    UnaryOp::Plus => Some(v),
-                    UnaryOp::Neg => v.negate(),
-                }
-            }
-            Expr::Compare(op, a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?;
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?;
-                Some(Value::Bool(compare_values(*op, &x, &y)?))
-            }
-            Expr::In {
-                expr,
-                list,
-                negated,
-            } => eval_in(expr, list, *negated, |e| {
-                self.eval_group_expr(e, sols, layout, key_vars, key)
-            }),
-            Expr::And(a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
-                Some(Value::Bool(x? && y?))
-            }
-            Expr::Or(a, b) => {
-                let x = self.eval_group_expr(a, sols, layout, key_vars, key)?.ebv();
-                let y = self.eval_group_expr(b, sols, layout, key_vars, key)?.ebv();
-                Some(Value::Bool(x? || y?))
-            }
-            Expr::Not(x) => Some(Value::Bool(
-                !self
-                    .eval_group_expr(x, sols, layout, key_vars, key)?
-                    .ebv()?,
-            )),
-            // Builtins over aggregate context are not supported.
-            Expr::Builtin(_, _) | Expr::IriCall { .. } => None,
-            // A projected advanced function is evaluated per group by
-            // `eval_aggregation`; nested ones and PFN are rejected before
-            // evaluation starts (`check_calls`).
-            Expr::GraphFn { .. } | Expr::Pfn { .. } => None,
-            // EXISTS in HAVING: test against the group's representative solution.
-            Expr::Exists(neg, pat) => {
-                let rep = *sols.first()?;
-                Some(Value::Bool(self.eval_exists(*neg, pat, rep, layout)))
-            }
+        if q.having.is_empty() {
+            return true;
         }
+        let mut aggs = Vec::new();
+        let having: Vec<Expr> = q
+            .having
+            .iter()
+            .map(|h| lift_aggregates(h, &mut aggs))
+            .collect();
+        let glayout = group_layout(layout, aggs.len());
+        let gb = self.group_row(sols, layout, &glayout, &aggs);
+        having
+            .iter()
+            .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
     }
 
     /// Compute one aggregate over a group's solutions.
@@ -1334,12 +1534,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(match func {
             AggFunc::Count => Value::Int(vals.len() as i64),
             AggFunc::Sum => sum_values(&vals),
+            // Avg(S) = Sum(S) / Count(S) with the query's division (so an
+            // integer average is a decimal, or truncated in upstream mode);
+            // 0 for an empty group (§18.5.1.4).
             AggFunc::Avg => {
                 if vals.is_empty() {
                     Value::Int(0)
                 } else {
-                    let s = sum_values(&vals).as_f64().unwrap_or(0.0);
-                    Value::Double(s / vals.len() as f64)
+                    sum_values(&vals).arith_with(
+                        ArithOp::Div,
+                        &Value::Int(vals.len() as i64),
+                        self.integer_division,
+                    )?
                 }
             }
             AggFunc::Min => vals.into_iter().reduce(|a, b| {
@@ -1704,6 +1910,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // its CSR is built from the sub-evaluator's own store.
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
+            integer_division: self.integer_division,
         }
     }
 
@@ -2276,7 +2483,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
             Expr::Not(x) => self.eval_ebv(x, b, l).map(|v| !v),
-            _ => numeric_view(self.eval_value(e, b, l)?).ebv(),
+            _ => self.eval_value(e, b, l)?.ebv(),
         }
     }
 
@@ -2298,14 +2505,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 negated,
             } => eval_in(expr, list, *negated, |e| self.eval_value(e, b, l)),
             Expr::Arith(op, x, y) => {
-                let a = numeric_view(self.eval_value(x, b, l)?);
-                let c = numeric_view(self.eval_value(y, b, l)?);
-                eval_arith(*op, a, c)
+                let a = self.eval_value(x, b, l)?;
+                let c = self.eval_value(y, b, l)?;
+                a.arith_with(*op, &c, self.integer_division)
             }
             Expr::Unary(op, x) => {
-                let v = numeric_view(self.eval_value(x, b, l)?);
+                let v = self.eval_value(x, b, l)?;
                 match op {
-                    UnaryOp::Plus => Some(v),
+                    // op:numeric-unary-plus: a type error for a non-number.
+                    UnaryOp::Plus => v.is_numeric().then_some(v),
                     UnaryOp::Neg => v.negate(),
                 }
             }
@@ -2548,8 +2756,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         b: &Binding,
         l: &VarLayout,
     ) -> Option<bool> {
-        let a = numeric_view(self.eval_value(x, b, l)?);
-        let c = numeric_view(self.eval_value(y, b, l)?);
+        let a = self.eval_value(x, b, l)?;
+        let c = self.eval_value(y, b, l)?;
         compare_values(op, &a, &c)
     }
 
@@ -2582,20 +2790,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
-            "ABS" => match self.eval_value(args.first()?, b, l)? {
-                // `i64::abs(i64::MIN)` overflows (panics in debug, wraps to a
-                // negative value in release); widen to `BigInt` like `negate`.
-                Value::Int(i) => Some(
-                    i.checked_abs()
-                        .map(Value::Int)
-                        .unwrap_or(Value::BigInt((i as i128).abs())),
-                ),
-                Value::Double(d) => Some(Value::Double(d.abs())),
-                v => v.as_f64().map(|x| Value::Double(x.abs())),
-            },
-            "CEIL" => self.num1(args, b, l, f64::ceil, |i| i),
-            "FLOOR" => self.num1(args, b, l, f64::floor, |i| i),
-            "ROUND" => self.num1(args, b, l, f64::round, |i| i),
+            // Type-preserving (an integer stays an integer, a decimal a
+            // decimal, a float a float); `ROUND` rounds halves upward.
+            "ABS" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Abs),
+            "CEIL" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Ceil),
+            "FLOOR" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Floor),
+            "ROUND" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Round),
             "ISNUMERIC" => Some(Value::Bool(self.eval_value(args.first()?, b, l)?.is_numeric())),
             "ISIRI" | "ISURI" => Some(Value::Bool(matches!(
                 self.eval_value(args.first()?, b, l)?,
@@ -2610,6 +2810,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Value::Int(_)
                     | Value::BigInt(_)
                     | Value::Decimal(_)
+                    | Value::Float(_)
                     | Value::Double(_)
                     | Value::Bool(_)
                     | Value::Str { .. }
@@ -3322,24 +3523,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(Value::Bool(f(a, c)))
     }
 
-    fn num1(
-        &self,
-        args: &[Expr],
-        b: &Binding,
-        l: &VarLayout,
-        ff: impl Fn(f64) -> f64,
-        fi: impl Fn(i64) -> i64,
-    ) -> Option<Value> {
-        match self.eval_value(args.first()?, b, l)? {
-            Value::Int(i) => Some(Value::Int(fi(i))),
-            Value::Double(d) => Some(Value::Double(ff(d))),
-            // BigInt / Decimal have no i64/f64-native fast path here; evaluate in
-            // f64 (as they were before the numeric tower split) rather than
-            // type-erroring. Non-numeric operands stay a type error (None).
-            v => v.as_f64().map(|x| Value::Double(ff(x))),
-        }
-    }
-
     // ---- ordering ---------------------------------------------------------
 
     fn sort_solutions(
@@ -3388,6 +3571,7 @@ fn value_to_term(v: &Value) -> Term {
         Value::Int(i) => Term::typed_literal(i.to_string(), xsd::INTEGER),
         Value::BigInt(_) => Term::typed_literal(v.lexical(), xsd::INTEGER),
         Value::Decimal(_) => Term::typed_literal(v.lexical(), xsd::DECIMAL),
+        Value::Float(_) => Term::typed_literal(v.lexical(), XSD_FLOAT),
         Value::Double(_) => Term::typed_literal(v.lexical(), xsd::DOUBLE),
         Value::Bool(bool_v) => Term::typed_literal(bool_v.to_string(), xsd::BOOLEAN),
         Value::Str { value, lang } => Term::Literal {
@@ -3403,82 +3587,8 @@ fn value_to_term(v: &Value) -> Term {
     }
 }
 
-/// `xsd:float`, produced by the `xsd:float(…)` cast.
-const XSD_FLOAT: &str = "http://www.w3.org/2001/XMLSchema#float";
 /// `xsd:date`, produced by the `xsd:date(…)` cast.
 const XSD_DATE: &str = "http://www.w3.org/2001/XMLSchema#date";
-
-/// [`Value`] has no `xsd:float` variant: a float read from the store is an
-/// `f64` [`Value::Double`], but the `xsd:float(…)` cast keeps its datatype as
-/// a [`Value::Typed`] so it projects as `"…"^^xsd:float`. Arithmetic and
-/// comparisons see such a value as the number it is.
-fn numeric_view(v: Value) -> Value {
-    match &v {
-        Value::Typed { value, datatype } if datatype == XSD_FLOAT => {
-            match parse_xsd_double(value) {
-                Some(x) => Value::Double(x),
-                None => v,
-            }
-        }
-        _ => v,
-    }
-}
-
-/// Whether `s` (already whitespace-trimmed) is an `xsd:integer` lexical.
-fn is_integer_lexical(s: &str) -> bool {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
-}
-
-/// Whether `s` (already trimmed) is an `xsd:decimal` lexical (no exponent).
-fn is_decimal_lexical(s: &str) -> bool {
-    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
-    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    !(int.is_empty() && frac.is_empty())
-        && int.bytes().all(|c| c.is_ascii_digit())
-        && frac.bytes().all(|c| c.is_ascii_digit())
-}
-
-/// Parse an `xsd:double` / `xsd:float` lexical (decimal mantissa with an
-/// optional exponent, `INF`, `+INF`, `-INF`, `NaN`); Rust spellings such as
-/// `inf` or `infinity` are not XSD lexicals and are rejected.
-fn parse_xsd_double(s: &str) -> Option<f64> {
-    let s = s.trim();
-    match s {
-        "INF" | "+INF" => return Some(f64::INFINITY),
-        "-INF" => return Some(f64::NEG_INFINITY),
-        "NaN" => return Some(f64::NAN),
-        _ => {}
-    }
-    let (mantissa, exponent) = match s.find(['e', 'E']) {
-        Some(i) => (&s[..i], Some(&s[i + 1..])),
-        None => (s, None),
-    };
-    if !is_decimal_lexical(mantissa) || !exponent.is_none_or(is_integer_lexical) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-/// The `xsd:float` lexical of `x` rounded to single precision.
-fn xsd_float_lexical(x: f64) -> String {
-    let f = x as f32;
-    if f.is_nan() {
-        "NaN".into()
-    } else if f.is_infinite() {
-        if f > 0.0 { "INF" } else { "-INF" }.into()
-    } else {
-        f.to_string()
-    }
-}
-
-/// A float result of the `xsd:float(…)` cast.
-fn float_value(x: f64) -> Value {
-    Value::Typed {
-        value: xsd_float_lexical(x),
-        datatype: XSD_FLOAT.into(),
-    }
-}
 
 /// An integer from an `xsd:integer` lexical (`i64`, else `i128`).
 fn integer_value(lexical: &str) -> Option<Value> {
@@ -3534,6 +3644,11 @@ enum CastSource<'v> {
 /// decimal, … — and for a string whose lexical form is invalid for the
 /// target type.
 fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
+    // An ill-typed literal ("abc"^^xsd:integer, "300"^^xsd:byte,
+    // "2020-13-01"^^xsd:date) has no value to cast.
+    if v.is_ill_typed() {
+        return None;
+    }
     let src = match v {
         Value::Iri(s) => CastSource::Iri(s),
         Value::Blank(_) => return None,
@@ -3542,17 +3657,11 @@ fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
         Value::Int(_) | Value::BigInt(_) | Value::Decimal(_) | Value::Double(_) => {
             CastSource::Number(v)
         }
+        Value::Float(x) => CastSource::Float(*x),
         Value::Bool(b) => CastSource::Bool(*b),
         Value::Typed { value, datatype } => match datatype.as_str() {
             XSD_DATETIME => CastSource::DateTime(value),
             XSD_DATE => CastSource::Date(value),
-            XSD_FLOAT => CastSource::Float(parse_xsd_double(value)?),
-            // A datatype the value layer reads as a number (its "0" is
-            // numeric) or a boolean, whose literal nevertheless stayed
-            // `Typed`, is an ill-typed literal ("abc"^^xsd:integer): not
-            // castable at all.
-            dt if Value::from_term(&Term::typed_literal("0", dt)).is_numeric() => return None,
-            xsd::BOOLEAN => return None,
             _ => CastSource::Other(value),
         },
     };
@@ -3620,7 +3729,7 @@ fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
                 _ => return None,
             };
             Some(match target {
-                XsdCast::Float => float_value(x),
+                XsdCast::Float => Value::Float(to_f32_precision(x)),
                 _ => Value::Double(x),
             })
         }
@@ -3942,8 +4051,10 @@ fn split_xsd_list(text: &str, sep: &str) -> Vec<String> {
 }
 
 /// `lhs IN (list…)` / `lhs NOT IN (list…)` (SPARQL 1.1 §17.4.1.9-10), with
-/// `eval` evaluating an operand (`None` = error/unbound). The test is `=` on
-/// each list member in turn: IN is true as soon as one member is equal; an
+/// `eval` evaluating an operand (`None` = error/unbound). The test is `=`
+/// ([`Value::sparql_eq`]: value equality where the operator mapping defines
+/// it, else RDFterm-equal, so `2 IN (<http://ex/iri>, 2.0)` is true and
+/// `2 IN ("2")` a type error) on each list member in turn: IN is true as soon as one member is equal; an
 /// error in some comparison makes the result an error unless a later or
 /// earlier member is equal (`2 IN (1/0, 2)` is true, `2 IN (3, 1/0)` an
 /// error); otherwise it is false. NOT IN is the negation under the same error
@@ -3960,10 +4071,10 @@ fn eval_in(
     if list.is_empty() {
         return Some(Value::Bool(negated));
     }
-    let x = numeric_view(eval(lhs)?);
+    let x = eval(lhs)?;
     let mut error = false;
     for e in list {
-        match eval(e).and_then(|y| in_equal(&x, &numeric_view(y))) {
+        match eval(e).and_then(|y| x.sparql_eq(&y)) {
             Some(true) => return Some(Value::Bool(!negated)),
             Some(false) => {}
             None => error = true,
@@ -3974,23 +4085,6 @@ fn eval_in(
     } else {
         Some(Value::Bool(negated))
     }
-}
-
-/// The `=` that IN / NOT IN apply: the value comparison of
-/// [`Value::sparql_eq`] where it is defined, else RDFterm-equal (§17.4.1.7):
-/// two terms that are not both literals cannot be the same term, so they are
-/// unequal (`2 IN (<http://ex/iri>, 2.0)` is true, `<a> NOT IN ("a")` true),
-/// while two literals the operator mapping cannot compare (e.g. `2` and
-/// `"2"`) are a type error.
-fn in_equal(a: &Value, b: &Value) -> Option<bool> {
-    a.sparql_eq(b).or_else(|| {
-        let literal = |v: &Value| !matches!(v, Value::Iri(_) | Value::Blank(_));
-        if literal(a) && literal(b) {
-            None
-        } else {
-            Some(false)
-        }
-    })
 }
 
 /// Sum numeric values (integer-preserving until a double appears).
@@ -4007,6 +4101,84 @@ fn sum_values(vals: &[Value]) -> Value {
         }
     }
     acc
+}
+
+/// How a variable of a trailing `VALUES` block meets an aggregate query's
+/// group rows ([`Evaluator::eval_aggregation`]).
+#[derive(Debug, Clone, Copy)]
+enum ValuesCol {
+    /// A GROUP BY or projected variable: the VALUES term must equal the
+    /// row's (an unbound column takes it).
+    Match(usize),
+    /// A SELECT expression alias: matched like `Match`, once the expressions
+    /// are computed.
+    Alias(usize),
+    /// Out of scope after grouping: the VALUES term binds the column.
+    Bind(usize),
+}
+
+/// The hidden group-row variable holding the `i`-th lifted aggregate of an
+/// aggregate query (`.` cannot occur in a SPARQL variable name, so it never
+/// clashes with a query variable).
+fn agg_var(i: usize) -> String {
+    format!(".agg{i}")
+}
+
+/// SPARQL 1.1 §18.2.4.1: `e` with every aggregate replaced by the variable
+/// of its group-row column ([`agg_var`]); new aggregates are appended to
+/// `aggs` (an aggregate already there — the same call written twice — reuses
+/// its column). An aggregate's own argument is left as is.
+fn lift_aggregates(e: &Expr, aggs: &mut Vec<Expr>) -> Expr {
+    let mut lift = |x: &Expr| lift_aggregates(x, aggs);
+    match e {
+        Expr::Aggregate { .. } => {
+            let i = match aggs.iter().position(|a| a == e) {
+                Some(i) => i,
+                None => {
+                    aggs.push(e.clone());
+                    aggs.len() - 1
+                }
+            };
+            Expr::Var(agg_var(i))
+        }
+        Expr::Or(a, b) => Expr::Or(Box::new(lift(a)), Box::new(lift(b))),
+        Expr::And(a, b) => Expr::And(Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Compare(op, a, b) => Expr::Compare(*op, Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Arith(op, a, b) => Expr::Arith(*op, Box::new(lift(a)), Box::new(lift(b))),
+        Expr::Not(a) => Expr::Not(Box::new(lift(a))),
+        Expr::Unary(op, a) => Expr::Unary(*op, Box::new(lift(a))),
+        Expr::Builtin(name, args) => Expr::Builtin(name.clone(), args.iter().map(lift).collect()),
+        Expr::IriCall { iri, args } => Expr::IriCall {
+            iri: iri.clone(),
+            args: args.iter().map(lift).collect(),
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(lift(expr)),
+            list: list.iter().map(lift).collect(),
+            negated: *negated,
+        },
+        Expr::Var(_)
+        | Expr::Const(_)
+        | Expr::Exists(_, _)
+        | Expr::GraphFn { .. }
+        | Expr::Pfn { .. } => e.clone(),
+    }
+}
+
+/// The layout of an aggregate query's group rows: the WHERE `layout` plus
+/// one hidden column per lifted aggregate ([`agg_var`]).
+fn group_layout(layout: &VarLayout, n_aggs: usize) -> VarLayout {
+    let mut names = layout.names.clone();
+    let mut is_pred = layout.is_pred.clone();
+    for i in 0..n_aggs {
+        names.push(agg_var(i));
+        is_pred.push(false);
+    }
+    VarLayout::from_vars(names, is_pred)
 }
 
 /// Does a projection contain any aggregate (⇒ grouping evaluation)?
@@ -4703,19 +4875,13 @@ fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
     }
 }
 
-/// Numeric arithmetic with integer fast-path and f64 fallback.
-fn eval_arith(op: ArithOp, a: Value, b: Value) -> Option<Value> {
-    // The numeric tower (Int/BigInt/Decimal/Double promotion, exact where
-    // possible) lives on Value; see [`Value::arith`].
-    a.arith(op, &b)
-}
-
 /// The datatype IRI for `DATATYPE()`.
 fn datatype_iri(v: &Value) -> Option<String> {
     Some(
         match v {
             Value::Int(_) | Value::BigInt(_) => xsd::INTEGER,
             Value::Decimal(_) => xsd::DECIMAL,
+            Value::Float(_) => XSD_FLOAT,
             Value::Double(_) => xsd::DOUBLE,
             Value::Bool(_) => xsd::BOOLEAN,
             Value::Str { lang: None, .. } => xsd::STRING,
@@ -6024,8 +6190,5 @@ mod gfun_engine_tests {
             Some(XsdCast::Integer)
         );
         assert_eq!(XsdCast::from_iri(&format!("{XSD_NS}Integer")), None);
-        // Typed floats are numbers to arithmetic.
-        assert_eq!(numeric_view(float_value(1.5)), Value::Double(1.5));
-        assert_eq!(numeric_view(Value::Int(1)), Value::Int(1));
     }
 }

@@ -4,11 +4,88 @@
 //! A [`Value`] is produced from a [`Term`] and carries enough type information to
 //! implement SPARQL's numeric/string/boolean comparison and arithmetic, the
 //! effective-boolean-value (EBV) rule, and a total order for `ORDER BY`.
+//!
+//! # Typed literals and their lexical forms
+//!
+//! A typed literal of a datatype the engine computes with — `xsd:integer`
+//! and every integer type derived from it (`xsd:long`, `xsd:int`,
+//! `xsd:short`, `xsd:byte`, `xsd:nonNegativeInteger`, `xsd:positiveInteger`,
+//! `xsd:nonPositiveInteger`, `xsd:negativeInteger`, `xsd:unsignedLong`,
+//! `xsd:unsignedInt`, `xsd:unsignedShort`, `xsd:unsignedByte`),
+//! `xsd:decimal`, `xsd:double`, `xsd:float`, `xsd:boolean`, `xsd:dateTime`
+//! and `xsd:date` — is read through its datatype's lexical-to-value mapping
+//! (surrounding whitespace is tolerated). A lexical form outside the
+//! datatype's lexical space, or a value outside a derived integer type's
+//! range (`"300"^^xsd:byte`, `"-1"^^xsd:nonNegativeInteger`), makes the
+//! literal **ill-typed** (RDF 1.1 §3.3). An ill-typed literal stays a
+//! [`Value::Typed`] and is never a number, a boolean or a date:
+//!
+//! * `=` / `!=` against it is a type error unless the other side is the very
+//!   same RDF term (SPARQL 1.1 §17.4.1.7 `RDFterm-equal`), so `FILTER` drops
+//!   the solution; `<`, `>`, … and arithmetic are type errors too, so a
+//!   `BIND`/projection of them is unbound;
+//! * its effective boolean value is `false` for the numeric and boolean
+//!   datatypes (§17.2.2), an error otherwise;
+//! * `isNumeric` is `false`, while `STR`, `DATATYPE` and `sameTerm` see the
+//!   literal exactly as written.
+//!
+//! Valid literals compare by value: `"01"^^xsd:integer = "1"^^xsd:integer`,
+//! `"1"^^xsd:byte = 1.0`. The store accepts ill-typed literals as they are —
+//! RDF allows them, and SPARQL Update `INSERT DATA` stores any literal
+//! unchanged — so only expression evaluation treats them specially.
+//!
+//! # Numbers
+//!
+//! The numeric tower follows XPath type promotion: integer ⊂ decimal ⊂
+//! float ⊂ double. Integers are exact (`i64`, widening to `i128`), decimals
+//! are exact within `i128` ([`Decimal`]), an `xsd:float` is a
+//! [`Value::Float`] (a single-precision value held as `f64`) that keeps its
+//! datatype through expressions, an `xsd:double` is a [`Value::Double`].
+//! Doubles and floats print their special values as the XSD lexicals `INF`,
+//! `-INF` and `NaN` everywhere (`STR`, computed values, every result format).
+//!
+//! Dividing two integers gives an `xsd:decimal` (`7/2` is `3.5`), as SPARQL
+//! 1.1 (XPath `op:numeric-divide`) requires; upstream gStore truncates
+//! instead (`7/2` is `3`). [`IntegerDivision::Truncate`] opts into upstream's
+//! behaviour.
 
 use std::cmp::Ordering;
 
 use crate::model::Term;
 use crate::parser::sparql::ast::{xsd, ArithOp};
+
+/// How `/` divides two integers (`xsd:integer` and the types derived from
+/// it). Every other division is the same in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IntegerDivision {
+    /// SPARQL 1.1 / XPath `op:numeric-divide`: the quotient of two integers
+    /// is an `xsd:decimal` (`7/2` = `3.5`); dividing by zero is an error.
+    /// The default.
+    #[default]
+    Decimal,
+    /// Upstream gStore 1.4 compatibility: the quotient of two integers is an
+    /// `xsd:integer` truncated toward zero (`7/2` = `3`, `-7/2` = `-3`), as
+    /// upstream's `EvalMultitypeValue::operator/` computes it with C integer
+    /// division. `AVG` over integers truncates too, since upstream divides
+    /// the integer sum by the integer count with the same operator. Dividing
+    /// by zero is an error (upstream's behaviour there is undefined).
+    Truncate,
+}
+
+impl IntegerDivision {
+    /// Parse a configuration value: `decimal` / `w3c` (the default) or
+    /// `truncate` / `upstream`, case-insensitively.
+    pub fn parse(s: &str) -> Option<IntegerDivision> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "decimal" | "w3c" => Some(IntegerDivision::Decimal),
+            "truncate" | "upstream" => Some(IntegerDivision::Truncate),
+            _ => None,
+        }
+    }
+}
+
+/// `xsd:float`.
+pub(crate) const XSD_FLOAT: &str = "http://www.w3.org/2001/XMLSchema#float";
 
 /// A typed value used during expression evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +98,10 @@ pub enum Value {
     BigInt(i128),
     /// xsd:decimal, held exactly as mantissa × 10⁻ˢᶜᵃˡᵉ.
     Decimal(Decimal),
-    /// xsd:double / xsd:float, held as `f64`.
+    /// xsd:float: a single-precision value (always exactly representable as
+    /// `f32`), held as `f64`.
+    Float(f64),
+    /// xsd:double, held as `f64`.
     Double(f64),
     Bool(bool),
     /// A plain or language-tagged string (and xsd:string).
@@ -29,11 +109,102 @@ pub enum Value {
         value: String,
         lang: Option<String>,
     },
-    /// Any other typed literal we don't special-case.
+    /// Any other typed literal: a datatype the engine does not compute with,
+    /// or an ill-typed literal of one it does (see the module docs).
     Typed {
         value: String,
         datatype: String,
     },
+}
+
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// The value range of `xsd:integer` and of each type derived from it:
+/// `(min, max)`, `None` = unbounded on that side. `None` for any other
+/// datatype.
+#[allow(clippy::type_complexity)]
+fn integer_type_range(dt: &str) -> Option<(Option<i128>, Option<i128>)> {
+    Some(match dt.strip_prefix(XSD_NS)? {
+        "integer" => (None, None),
+        "nonPositiveInteger" => (None, Some(0)),
+        "negativeInteger" => (None, Some(-1)),
+        "long" => (Some(i64::MIN as i128), Some(i64::MAX as i128)),
+        "int" => (Some(i32::MIN as i128), Some(i32::MAX as i128)),
+        "short" => (Some(i16::MIN as i128), Some(i16::MAX as i128)),
+        "byte" => (Some(i8::MIN as i128), Some(i8::MAX as i128)),
+        "nonNegativeInteger" => (Some(0), None),
+        "positiveInteger" => (Some(1), None),
+        "unsignedLong" => (Some(0), Some(u64::MAX as i128)),
+        "unsignedInt" => (Some(0), Some(u32::MAX as i128)),
+        "unsignedShort" => (Some(0), Some(u16::MAX as i128)),
+        "unsignedByte" => (Some(0), Some(u8::MAX as i128)),
+        _ => return None,
+    })
+}
+
+/// Whether `dt` is a datatype whose valid literals the engine reads as
+/// numbers or booleans (so a [`Value::Typed`] of it is ill-typed).
+fn is_numeric_or_boolean_datatype(dt: &str) -> bool {
+    integer_type_range(dt).is_some()
+        || dt == xsd::DECIMAL
+        || dt == xsd::DOUBLE
+        || dt == XSD_FLOAT
+        || dt == xsd::BOOLEAN
+}
+
+/// Round `x` to the nearest single-precision value (the `xsd:float` value
+/// space), keeping it as `f64`.
+pub(crate) fn to_f32_precision(x: f64) -> f64 {
+    x as f32 as f64
+}
+
+/// Whether `s` (already whitespace-trimmed) is an `xsd:integer` lexical.
+pub(crate) fn is_integer_lexical(s: &str) -> bool {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Whether `s` (already trimmed) is an `xsd:decimal` lexical (no exponent).
+pub(crate) fn is_decimal_lexical(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    !(int.is_empty() && frac.is_empty())
+        && int.bytes().all(|c| c.is_ascii_digit())
+        && frac.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Parse an `xsd:double` / `xsd:float` lexical (decimal mantissa with an
+/// optional exponent, `INF`, `+INF`, `-INF`, `NaN`); Rust spellings such as
+/// `inf` or `infinity` are not XSD lexicals and are rejected.
+pub(crate) fn parse_xsd_double(s: &str) -> Option<f64> {
+    let s = s.trim();
+    match s {
+        "INF" | "+INF" => return Some(f64::INFINITY),
+        "-INF" => return Some(f64::NEG_INFINITY),
+        "NaN" => return Some(f64::NAN),
+        _ => {}
+    }
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    if !is_decimal_lexical(mantissa) || !exponent.is_none_or(is_integer_lexical) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// The `xsd:float` lexical of `x` rounded to single precision (`INF`, `-INF`
+/// and `NaN` for the special values).
+pub(crate) fn xsd_float_lexical(x: f64) -> String {
+    let f = x as f32;
+    if f.is_nan() {
+        "NaN".into()
+    } else if f.is_infinite() {
+        if f > 0.0 { "INF" } else { "-INF" }.into()
+    } else {
+        f.to_string()
+    }
 }
 
 impl Value {
@@ -65,53 +236,57 @@ impl Value {
     }
 
     fn from_typed(value: &str, dt: &str) -> Value {
-        // Integer family.
-        const INT_TYPES: &[&str] = &[
-            xsd::INTEGER,
-            "http://www.w3.org/2001/XMLSchema#int",
-            "http://www.w3.org/2001/XMLSchema#long",
-            "http://www.w3.org/2001/XMLSchema#short",
-            "http://www.w3.org/2001/XMLSchema#byte",
-            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-            "http://www.w3.org/2001/XMLSchema#positiveInteger",
-            "http://www.w3.org/2001/XMLSchema#unsignedInt",
-            "http://www.w3.org/2001/XMLSchema#unsignedLong",
-        ];
-        const FLOAT_TYPES: &[&str] = &[xsd::DOUBLE, "http://www.w3.org/2001/XMLSchema#float"];
-        if INT_TYPES.contains(&dt) {
-            let t = value.trim();
-            // Prefer i64; fall back to i128 for integers beyond it (exact big
-            // integers); beyond i128 fall back to f64 (a documented bound).
-            if let Ok(i) = t.parse::<i64>() {
-                return Value::Int(i);
+        let t = value.trim();
+        // The integer family: an `[+-]?[0-9]+` lexical whose value is within
+        // the type's range. Held as i64, or exactly as i128 beyond it; an
+        // integer beyond i128 is a documented bound (kept as a non-numeric
+        // typed literal).
+        if let Some((min, max)) = integer_type_range(dt) {
+            if is_integer_lexical(t) {
+                if let Some(v) = t
+                    .parse::<i128>()
+                    .ok()
+                    .filter(|v| min.is_none_or(|m| *v >= m) && max.is_none_or(|m| *v <= m))
+                {
+                    return int_value(v);
+                }
             }
-            if let Ok(i) = t.parse::<i128>() {
-                return Value::BigInt(i);
-            }
-            // An xsd:integer lexical that is not an integer ("1.5", "1e10",
-            // "NaN", "inf", or one beyond i128) is ill-typed — it is NOT a
-            // double. Fall through to a plain Typed literal (non-numeric).
+            // Ill-typed ("1.5", "1e10", "NaN", "inf", "300"^^xsd:byte, …): NOT
+            // a double — a (non-numeric) typed literal.
+            return Value::typed(value, dt);
         }
         // xsd:decimal is held exactly (mantissa + scale), not as lossy f64.
         if dt == xsd::DECIMAL {
-            if let Some(d) = Decimal::parse(value.trim()) {
+            if let Some(d) = Decimal::parse(t) {
                 return Value::Decimal(d);
             }
-            if let Ok(f) = value.trim().parse::<f64>() {
-                return Value::Double(f);
+            // A valid decimal lexical beyond i128 precision is approximated;
+            // anything else ("1e3", "abc") is ill-typed.
+            if is_decimal_lexical(t) {
+                if let Ok(f) = t.parse::<f64>() {
+                    return Value::Double(f);
+                }
             }
+            return Value::typed(value, dt);
         }
-        if FLOAT_TYPES.contains(&dt) {
-            if let Ok(f) = value.trim().parse::<f64>() {
-                return Value::Double(f);
-            }
+        if dt == xsd::DOUBLE {
+            return match parse_xsd_double(t) {
+                Some(f) => Value::Double(f),
+                None => Value::typed(value, dt),
+            };
+        }
+        if dt == XSD_FLOAT {
+            return match parse_xsd_double(t) {
+                Some(f) => Value::Float(to_f32_precision(f)),
+                None => Value::typed(value, dt),
+            };
         }
         if dt == xsd::BOOLEAN {
-            match value.trim() {
-                "true" | "1" => return Value::Bool(true),
-                "false" | "0" => return Value::Bool(false),
-                _ => {}
-            }
+            return match t {
+                "true" | "1" => Value::Bool(true),
+                "false" | "0" => Value::Bool(false),
+                _ => Value::typed(value, dt),
+            };
         }
         if dt == xsd::STRING {
             return Value::Str {
@@ -119,9 +294,28 @@ impl Value {
                 lang: None,
             };
         }
+        Value::typed(value, dt)
+    }
+
+    fn typed(value: &str, dt: &str) -> Value {
         Value::Typed {
             value: value.to_owned(),
             datatype: dt.to_owned(),
+        }
+    }
+
+    /// Whether this is an ill-typed literal of a datatype the engine reads by
+    /// value: a number, boolean, `xsd:dateTime` or `xsd:date` literal whose
+    /// lexical form (or value range) is invalid for its type. See the module
+    /// docs.
+    pub fn is_ill_typed(&self) -> bool {
+        match self {
+            Value::Typed { value, datatype } => {
+                is_numeric_or_boolean_datatype(datatype)
+                    || ((datatype == XSD_DATETIME || datatype == XSD_DATE)
+                        && parse_xsd_datetime(value).is_none())
+            }
+            _ => false,
         }
     }
 
@@ -133,7 +327,7 @@ impl Value {
             Value::Int(i) => Some(*i as f64),
             Value::BigInt(i) => Some(*i as f64),
             Value::Decimal(d) => Some(d.to_f64()),
-            Value::Double(d) => Some(*d),
+            Value::Float(d) | Value::Double(d) => Some(*d),
             _ => None,
         }
     }
@@ -161,7 +355,11 @@ impl Value {
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Value::Int(_) | Value::BigInt(_) | Value::Decimal(_) | Value::Double(_)
+            Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Decimal(_)
+                | Value::Float(_)
+                | Value::Double(_)
         )
     }
 
@@ -172,6 +370,7 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::BigInt(i) => i.to_string(),
             Value::Decimal(d) => d.lexical(),
+            Value::Float(d) => xsd_float_lexical(*d),
             Value::Double(d) => format_double(*d),
             Value::Bool(b) => b.to_string(),
             Value::Str { value, .. } => value.clone(),
@@ -187,18 +386,30 @@ impl Value {
             Value::Int(i) => Some(*i != 0),
             Value::BigInt(i) => Some(*i != 0),
             Value::Decimal(d) => Some(!d.is_zero()),
-            Value::Double(d) => Some(*d != 0.0 && !d.is_nan()),
+            Value::Float(d) | Value::Double(d) => Some(*d != 0.0 && !d.is_nan()),
             Value::Str { value, .. } => Some(!value.is_empty()),
-            // Numeric strings stored as Typed are uncommon; IRIs/blank have no EBV.
+            // §17.2.2: a numeric or boolean typed literal with an invalid
+            // lexical form has EBV false.
+            Value::Typed { datatype, .. } if is_numeric_or_boolean_datatype(datatype) => {
+                Some(false)
+            }
+            // Other typed literals, IRIs and blank nodes have no EBV.
             _ => None,
         }
     }
 
     /// SPARQL `=` semantics across value types. `None` means "incomparable"
     /// (a type error), which the caller maps to filter exclusion.
+    ///
+    /// Numbers, `xsd:dateTime`/`xsd:date`, booleans and simple / `xsd:string`
+    /// literals compare by value. Everything else is `RDFterm-equal`
+    /// (SPARQL 1.1 §17.4.1.7): `true` for the same RDF term, `false` when an
+    /// IRI or blank node meets a different term, and a type error for two
+    /// different literals (an ill-typed literal against anything but itself,
+    /// two literals of an unknown datatype, a number against a string, …).
     pub fn sparql_eq(&self, other: &Value) -> Option<bool> {
         // Numeric equality, exact where possible: integers via i128, integers
-        // and xsd:decimal via exact decimal, otherwise (any double) via f64.
+        // and xsd:decimal via exact decimal, otherwise (any float/double) via f64.
         if self.is_numeric() && other.is_numeric() {
             if let (Some(a), Some(b)) = (self.as_i128(), other.as_i128()) {
                 return Some(a == b);
@@ -217,10 +428,16 @@ impl Value {
         match (self, other) {
             (Value::Iri(a), Value::Iri(b)) => Some(a == b),
             (Value::Blank(a), Value::Blank(b)) => Some(a == b),
+            // An IRI or blank node is never the same term as anything else.
+            (Value::Iri(_) | Value::Blank(_), _) | (_, Value::Iri(_) | Value::Blank(_)) => {
+                Some(false)
+            }
             (Value::Bool(a), Value::Bool(b)) => Some(a == b),
             (Value::Str { value: a, lang: la }, Value::Str { value: b, lang: lb }) => {
                 Some(a == b && la == lb)
             }
+            // Two literals no value comparison applies to: equal as the same
+            // RDF term, a type error otherwise.
             (
                 Value::Typed {
                     value: a,
@@ -230,7 +447,7 @@ impl Value {
                     value: b,
                     datatype: db,
                 },
-            ) => Some(a == b && da == db),
+            ) if a == b && da == db => Some(true),
             _ => None,
         }
     }
@@ -279,57 +496,97 @@ impl Value {
                     .unwrap_or_else(|| Value::Double(-(*i as f64))),
             ),
             Value::Decimal(d) => Some(Value::Decimal(d.negated())),
+            Value::Float(d) => Some(Value::Float(-d)),
             Value::Double(d) => Some(Value::Double(-d)),
             _ => None,
         }
     }
 
-    /// SPARQL numeric arithmetic with XPath-style type promotion, `None` on a
-    /// non-numeric operand or division by zero.
-    ///
-    /// `+`/`-`/`*` are exact when no `xsd:double`/`float` is involved: integer
-    /// operands compute in `i128` (widening `i64`→`i128`, overflow → `f64`), and
-    /// integer/decimal operands compute in exact decimal (overflow → `f64`).
-    /// `/` is evaluated in `f64` (SPARQL permits implementation-defined decimal
-    /// division precision), as is any operation touching a double.
+    /// SPARQL numeric arithmetic with XPath-style type promotion
+    /// (integer → decimal → float → double), `None` (a type error) on a
+    /// non-numeric operand, on integer/decimal division by zero, or on an
+    /// overflowing truncating division. Integer division is
+    /// [`IntegerDivision::Decimal`]; see [`arith_with`](Self::arith_with).
     pub fn arith(&self, op: ArithOp, other: &Value) -> Option<Value> {
-        if matches!(op, ArithOp::Div) {
-            let (x, y) = (self.as_f64()?, other.as_f64()?);
-            if y == 0.0 {
-                return None;
-            }
-            return Some(Value::Double(x / y));
+        self.arith_with(op, other, IntegerDivision::Decimal)
+    }
+
+    /// [`arith`](Self::arith) with an explicit [`IntegerDivision`] mode.
+    ///
+    /// Exact unless a float or double is involved: integer operands of
+    /// `+`/`-`/`*` compute in `i128` (widening `i64`→`i128`, overflow →
+    /// `f64`); integer/decimal operands compute in exact decimal (overflow →
+    /// `f64`), and their quotient is a decimal rounded to
+    /// [`DECIMAL_DIV_SCALE`] fractional digits (XSD leaves the precision of
+    /// decimal division to the implementation; at least 18 digits are
+    /// required) — unless both are integers and `mode` is
+    /// [`IntegerDivision::Truncate`]. With a float operand (and no double)
+    /// the result is an `xsd:float`, with a double operand an `xsd:double`;
+    /// their division by zero follows IEEE 754 (`INF`, `-INF`, `NaN`), as
+    /// XPath specifies for those types.
+    pub fn arith_with(&self, op: ArithOp, other: &Value, mode: IntegerDivision) -> Option<Value> {
+        if !self.is_numeric() || !other.is_numeric() {
+            return None;
         }
-        // Exact integer path (both integers, no double).
+        let floating = |v: &Value| match v {
+            Value::Double(_) => 2,
+            Value::Float(_) => 1,
+            _ => 0,
+        };
+        match floating(self).max(floating(other)) {
+            2 => {
+                return Some(Value::Double(apply_f64(
+                    op,
+                    self.as_f64()?,
+                    other.as_f64()?,
+                )))
+            }
+            1 => {
+                let r = apply_f64(op, self.as_f64()?, other.as_f64()?);
+                return Some(Value::Float(to_f32_precision(r)));
+            }
+            _ => {}
+        }
+        // Exact integer path (both integers).
         if let (Some(x), Some(y)) = (self.as_i128(), other.as_i128()) {
             let checked = match op {
                 ArithOp::Add => x.checked_add(y),
                 ArithOp::Sub => x.checked_sub(y),
                 ArithOp::Mul => x.checked_mul(y),
-                ArithOp::Div => unreachable!(),
+                // Upstream compatibility: C-style truncation toward zero.
+                ArithOp::Div if mode == IntegerDivision::Truncate => {
+                    return x.checked_div(y).map(int_value);
+                }
+                ArithOp::Div => None, // decimal division, below
             };
-            return Some(match checked {
-                Some(v) => int_value(v),
-                None => Value::Double(apply_f64(op, x as f64, y as f64)),
-            });
-        }
-        // Exact decimal path (integers and/or xsd:decimal, no double).
-        if let (Some(x), Some(y)) = (self.as_decimal(), other.as_decimal()) {
-            let d = match op {
-                ArithOp::Add => x.add(y),
-                ArithOp::Sub => x.sub(y),
-                ArithOp::Mul => x.mul(y),
-                ArithOp::Div => unreachable!(),
-            };
-            if let Some(d) = d {
-                return Some(Value::Decimal(d));
+            if let Some(v) = checked {
+                return Some(int_value(v));
             }
-            // Exact result overflowed i128 — fall through to the f64 path.
+            if !matches!(op, ArithOp::Div) {
+                return Some(Value::Double(apply_f64(op, x as f64, y as f64)));
+            }
         }
-        let (x, y) = (self.as_f64()?, other.as_f64()?);
-        Some(Value::Double(apply_f64(op, x, y)))
+        // Exact decimal path (integers and/or xsd:decimal).
+        let (x, y) = (self.as_decimal()?, other.as_decimal()?);
+        if matches!(op, ArithOp::Div) && y.is_zero() {
+            return None; // op:numeric-divide: decimal division by zero is an error
+        }
+        let d = match op {
+            ArithOp::Add => x.add(y),
+            ArithOp::Sub => x.sub(y),
+            ArithOp::Mul => x.mul(y),
+            ArithOp::Div => x.div(y),
+        };
+        match d {
+            Some(d) => Some(Value::Decimal(d)),
+            // The exact result overflowed i128: approximate in f64.
+            None => Some(Value::Double(apply_f64(op, x.to_f64(), y.to_f64()))),
+        }
     }
 }
+
+/// Fractional digits of a decimal quotient (see [`Value::arith_with`]).
+pub const DECIMAL_DIV_SCALE: u32 = 18;
 
 /// Narrow an exact integer to the smallest fitting [`Value`] representation.
 fn int_value(v: i128) -> Value {
@@ -339,8 +596,7 @@ fn int_value(v: i128) -> Value {
     }
 }
 
-/// `f64` arithmetic for the non-exact / overflow fallback (`Div` handled by the
-/// caller before this is reached).
+/// `f64` arithmetic (IEEE 754: a division by zero is `±INF` or `NaN`).
 fn apply_f64(op: ArithOp, x: f64, y: f64) -> f64 {
     match op {
         ArithOp::Add => x + y,
@@ -366,7 +622,7 @@ pub fn order_key(v: &Option<Value>) -> impl Ord {
         Some(Value::Int(i)) => (3, OrdF64(*i as f64), *i as i128, String::new()),
         Some(Value::BigInt(i)) => (3, OrdF64(*i as f64), *i, String::new()),
         Some(Value::Decimal(d)) => (3, OrdF64(d.to_f64()), 0, String::new()),
-        Some(Value::Double(d)) => (3, OrdF64(*d), 0, String::new()),
+        Some(Value::Float(d) | Value::Double(d)) => (3, OrdF64(*d), 0, String::new()),
         Some(Value::Bool(b)) => (4, OrdF64(0.0), 0, b.to_string()),
         Some(Value::Str { value, .. }) => (5, OrdF64(0.0), 0, value.clone()),
         Some(v @ Value::Typed { value, .. }) => match datetime_instant(v) {
@@ -458,7 +714,11 @@ impl Decimal {
             return None;
         }
         let digits = format!("{int_part}{frac_part}");
-        let mut mant: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+        let mut mant: i128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().ok()?
+        };
         if neg {
             mant = -mant;
         }
@@ -505,7 +765,9 @@ impl Decimal {
     fn add(self, other: Decimal) -> Option<Decimal> {
         let target = self.scale.max(other.scale);
         Some(Decimal {
-            mant: self.rescaled(target)?.checked_add(other.rescaled(target)?)?,
+            mant: self
+                .rescaled(target)?
+                .checked_add(other.rescaled(target)?)?,
             scale: target,
         })
     }
@@ -513,7 +775,9 @@ impl Decimal {
     fn sub(self, other: Decimal) -> Option<Decimal> {
         let target = self.scale.max(other.scale);
         Some(Decimal {
-            mant: self.rescaled(target)?.checked_sub(other.rescaled(target)?)?,
+            mant: self
+                .rescaled(target)?
+                .checked_sub(other.rescaled(target)?)?,
             scale: target,
         })
     }
@@ -526,6 +790,169 @@ impl Decimal {
             scale: self.scale.checked_add(other.scale)?,
         })
     }
+
+    /// The quotient rounded (half away from zero) to [`DECIMAL_DIV_SCALE`]
+    /// fractional digits — fewer when the dividend's digits would overflow
+    /// `i128`, more when the operands' scales need them — with trailing zeros
+    /// dropped down to one fractional digit (`6/2` is `3.0`, `7/2` is `3.5`).
+    /// `None` for a zero divisor, or when not even an integral quotient fits.
+    fn div(self, other: Decimal) -> Option<Decimal> {
+        if other.mant == 0 {
+            return None;
+        }
+        // self / other = (a / b) · 10^(sb − sa); at result scale `s` the
+        // mantissa is a · 10^(s + sb − sa) / b, which needs s ≥ sa − sb.
+        let min_scale = self.scale.saturating_sub(other.scale);
+        let mut scale = DECIMAL_DIV_SCALE.max(min_scale);
+        loop {
+            let exp = scale + other.scale - self.scale;
+            let num = 10i128
+                .checked_pow(exp)
+                .and_then(|f| self.mant.checked_mul(f));
+            if let Some(num) = num {
+                let (q, r) = (num / other.mant, num % other.mant);
+                // Round half away from zero: |2r| ≥ |b| ⇒ one more unit
+                // in the quotient's direction.
+                let q = if r != 0 && r.unsigned_abs().saturating_mul(2) >= other.mant.unsigned_abs()
+                {
+                    if (num < 0) != (other.mant < 0) {
+                        q.checked_sub(1)?
+                    } else {
+                        q.checked_add(1)?
+                    }
+                } else {
+                    q
+                };
+                let mut d = Decimal { mant: q, scale };
+                while d.scale > 1 && d.mant % 10 == 0 {
+                    d.mant /= 10;
+                    d.scale -= 1;
+                }
+                if d.scale == 0 {
+                    d = Decimal {
+                        mant: d.mant.checked_mul(10)?,
+                        scale: 1,
+                    };
+                }
+                return Some(d);
+            }
+            if scale == min_scale {
+                return None;
+            }
+            scale -= 1;
+        }
+    }
+
+    /// The largest integral decimal ≤ `self` (`fn:floor`).
+    fn floor(self) -> Decimal {
+        let mant = match 10i128.checked_pow(self.scale) {
+            Some(f) => self.mant.div_euclid(f),
+            // 10^scale beyond i128 means |self| < 1.
+            None if self.mant < 0 => -1,
+            None => 0,
+        };
+        Decimal { mant, scale: 0 }
+    }
+
+    /// The smallest integral decimal ≥ `self` (`fn:ceiling`).
+    fn ceil(self) -> Decimal {
+        let fl = self.floor();
+        let integral = match 10i128.checked_pow(self.scale) {
+            Some(f) => self.mant % f == 0,
+            None => self.mant == 0,
+        };
+        if integral {
+            fl
+        } else {
+            Decimal {
+                mant: fl.mant.saturating_add(1),
+                scale: 0,
+            }
+        }
+    }
+
+    /// The nearest integral decimal, halves rounding toward positive
+    /// infinity (`fn:round`: `round(2.5)` = 3, `round(-2.5)` = −2).
+    fn round(self) -> Decimal {
+        // floor(x + 0.5), exactly.
+        match self.add(Decimal { mant: 5, scale: 1 }) {
+            Some(x) => x.floor(),
+            None => self.floor(),
+        }
+    }
+
+    fn abs(self) -> Decimal {
+        Decimal {
+            mant: self.mant.saturating_abs(),
+            scale: self.scale,
+        }
+    }
+}
+
+impl Value {
+    /// `fn:abs`, `fn:floor`, `fn:ceiling` and `fn:round` over the numeric
+    /// tower, keeping the argument's type (an integer stays an integer, a
+    /// decimal a decimal, a float a float); `None` for a non-number.
+    /// `round` rounds halves toward positive infinity (`round(-2.5)` = −2).
+    pub fn numeric_fn(&self, f: NumericFn) -> Option<Value> {
+        let float = |x: f64| -> f64 {
+            match f {
+                NumericFn::Abs => x.abs(),
+                NumericFn::Floor => x.floor(),
+                NumericFn::Ceil => x.ceil(),
+                NumericFn::Round => {
+                    let fl = x.floor();
+                    if x - fl >= 0.5 {
+                        fl + 1.0
+                    } else {
+                        fl
+                    }
+                }
+            }
+        };
+        Some(match self {
+            Value::Int(i) => match f {
+                // `i64::abs(i64::MIN)` overflows; widen to `BigInt` like `negate`.
+                NumericFn::Abs => i
+                    .checked_abs()
+                    .map(Value::Int)
+                    .unwrap_or(Value::BigInt((*i as i128).abs())),
+                _ => Value::Int(*i),
+            },
+            Value::BigInt(i) => match f {
+                NumericFn::Abs => i
+                    .checked_abs()
+                    .map(Value::BigInt)
+                    .unwrap_or_else(|| Value::Double((*i as f64).abs())),
+                _ => Value::BigInt(*i),
+            },
+            Value::Decimal(d) => {
+                let r = match f {
+                    NumericFn::Abs => return Some(Value::Decimal(d.abs())),
+                    NumericFn::Floor => d.floor(),
+                    NumericFn::Ceil => d.ceil(),
+                    NumericFn::Round => d.round(),
+                };
+                // An integral decimal keeps one fractional digit ("3.0").
+                Value::Decimal(Decimal {
+                    mant: r.mant.saturating_mul(10),
+                    scale: 1,
+                })
+            }
+            Value::Float(x) => Value::Float(float(*x)),
+            Value::Double(x) => Value::Double(float(*x)),
+            _ => return None,
+        })
+    }
+}
+
+/// The one-argument numeric functions of [`Value::numeric_fn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericFn {
+    Abs,
+    Floor,
+    Ceil,
+    Round,
 }
 
 /// Decimal equality is by numeric value, so `1.0 == 1.00` (and it composes into
@@ -669,8 +1096,8 @@ fn parse_xsd_datetime(s: &str) -> Option<f64> {
     // "999999999999-01-01T00:00:00Z"^^xsd:dateTime would otherwise hit.
     let days = days_from_civil(p.year as i128, p.month as i128, p.day as i128);
     let tz = p.tz_offset_secs.unwrap_or(0) as i128;
-    let secs = days * 86_400 + p.hour as i128 * 3600 + p.minute as i128 * 60 + p.second as i128
-        - tz;
+    let secs =
+        days * 86_400 + p.hour as i128 * 3600 + p.minute as i128 * 60 + p.second as i128 - tz;
     Some(secs as f64 + p.frac)
 }
 
@@ -818,7 +1245,10 @@ mod tests {
             assert!(matches!(v, Value::Typed { .. }), "{bad:?} → {v:?}");
         }
         // A valid one is still an integer.
-        assert_eq!(Value::from_term(&Term::typed_literal("42", xsd::INTEGER)), Value::Int(42));
+        assert_eq!(
+            Value::from_term(&Term::typed_literal("42", xsd::INTEGER)),
+            Value::Int(42)
+        );
     }
 
     #[test]
@@ -839,7 +1269,10 @@ mod tests {
         let b = Value::from_term(&Term::typed_literal("0.2", xsd::DECIMAL));
         let sum = a.arith(ArithOp::Add, &b).unwrap();
         // Exactly 0.3, unlike f64's 0.1 + 0.2 == 0.30000000000000004.
-        assert_eq!(sum, Value::from_term(&Term::typed_literal("0.3", xsd::DECIMAL)));
+        assert_eq!(
+            sum,
+            Value::from_term(&Term::typed_literal("0.3", xsd::DECIMAL))
+        );
         assert_eq!(sum.lexical(), "0.3");
     }
 
@@ -854,7 +1287,9 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_widens_on_overflow() {
-        let sum = Value::Int(i64::MAX).arith(ArithOp::Add, &Value::Int(1)).unwrap();
+        let sum = Value::Int(i64::MAX)
+            .arith(ArithOp::Add, &Value::Int(1))
+            .unwrap();
         assert_eq!(sum, Value::BigInt(i64::MAX as i128 + 1));
         let prod = Value::BigInt(10_000_000_000)
             .arith(ArithOp::Mul, &Value::Int(10_000_000_000))
@@ -924,7 +1359,243 @@ mod tests {
         let a = Value::Iri("x".into());
         let b = Value::Int(1);
         assert_eq!(a.sparql_cmp(&b), None);
-        assert_eq!(a.sparql_eq(&b), None);
+        // RDFterm-equal: an IRI is simply not the same term as a literal
+        // (false, not a type error — only two different literals error).
+        assert_eq!(a.sparql_eq(&b), Some(false));
+    }
+
+    fn typed(lex: &str, local: &str) -> Value {
+        Value::from_term(&Term::typed_literal(lex, format!("{XSD_NS}{local}")))
+    }
+
+    #[test]
+    fn derived_integer_types_check_their_range() {
+        for (lex, local) in [
+            ("127", "byte"),
+            ("-128", "byte"),
+            ("32767", "short"),
+            ("2147483647", "int"),
+            ("9223372036854775807", "long"),
+            ("255", "unsignedByte"),
+            ("65535", "unsignedShort"),
+            ("4294967295", "unsignedInt"),
+            ("18446744073709551615", "unsignedLong"),
+            ("0", "nonNegativeInteger"),
+            ("1", "positiveInteger"),
+            ("0", "nonPositiveInteger"),
+            ("-1", "negativeInteger"),
+            (" +7 ", "integer"),
+        ] {
+            assert!(typed(lex, local).is_numeric(), "{lex}^^xsd:{local}");
+        }
+        for (lex, local) in [
+            ("128", "byte"),
+            ("-129", "byte"),
+            ("32768", "short"),
+            ("2147483648", "int"),
+            ("9223372036854775808", "long"),
+            ("256", "unsignedByte"),
+            ("-1", "unsignedShort"),
+            ("4294967296", "unsignedInt"),
+            ("18446744073709551616", "unsignedLong"),
+            ("-1", "nonNegativeInteger"),
+            ("0", "positiveInteger"),
+            ("1", "nonPositiveInteger"),
+            ("0", "negativeInteger"),
+            ("1.0", "int"),
+            ("abc", "integer"),
+        ] {
+            let v = typed(lex, local);
+            assert!(
+                !v.is_numeric() && v.is_ill_typed(),
+                "{lex}^^xsd:{local} → {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ill_typed_literals_follow_the_spec() {
+        let bad = typed("abc", "integer");
+        // Type error against a different term, true against itself.
+        assert_eq!(bad.sparql_eq(&Value::Int(1)), None);
+        assert_eq!(bad.sparql_eq(&typed("abd", "integer")), None);
+        assert_eq!(bad.sparql_eq(&bad.clone()), Some(true));
+        assert_eq!(bad.sparql_cmp(&Value::Int(1)), None);
+        assert_eq!(bad.arith(ArithOp::Add, &Value::Int(1)), None);
+        // EBV false for ill-typed numerics / booleans, an error otherwise.
+        assert_eq!(bad.ebv(), Some(false));
+        assert_eq!(typed("yes", "boolean").ebv(), Some(false));
+        assert_eq!(typed("2020-13-01", "date").ebv(), None);
+        assert!(typed("2020-13-01", "date").is_ill_typed());
+        assert!(!typed("2020-12-01", "date").is_ill_typed());
+        // The lexical spaces: no exponent in a decimal, no Rust spellings.
+        for (lex, local) in [
+            ("1e3", "decimal"),
+            ("inf", "double"),
+            ("Infinity", "float"),
+            ("nan", "double"),
+            ("TRUE", "boolean"),
+        ] {
+            assert!(typed(lex, local).is_ill_typed(), "{lex}^^xsd:{local}");
+        }
+        // Value-space equality of valid literals.
+        assert_eq!(
+            typed("01", "integer").sparql_eq(&typed("1", "integer")),
+            Some(true)
+        );
+        assert_eq!(
+            typed("1", "byte").sparql_eq(&typed("1.0", "double")),
+            Some(true)
+        );
+        assert_eq!(
+            typed("1", "boolean").sparql_eq(&typed("true", "boolean")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn floats_keep_their_type_through_arithmetic() {
+        let f = typed("1.5", "float");
+        assert_eq!(f, Value::Float(1.5));
+        assert_eq!(
+            f.arith(ArithOp::Add, &Value::Int(1)),
+            Some(Value::Float(2.5))
+        );
+        assert_eq!(
+            f.arith(ArithOp::Add, &Value::Double(1.0)),
+            Some(Value::Double(2.5))
+        );
+        // Single precision: 0.1f32 is not 0.1f64.
+        let tenth = typed("0.1", "float");
+        assert_eq!(tenth, Value::Float(0.1f32 as f64));
+        assert_eq!(tenth.lexical(), "0.1");
+        assert_eq!(Value::Float(f64::INFINITY).lexical(), "INF");
+        assert_eq!(Value::Float(f64::NAN).lexical(), "NaN");
+        // IEEE division by zero for floating types.
+        assert_eq!(
+            Value::Double(1.0).arith(ArithOp::Div, &Value::Int(0)),
+            Some(Value::Double(f64::INFINITY))
+        );
+        assert_eq!(
+            Value::Float(-1.0).arith(ArithOp::Div, &Value::Int(0)),
+            Some(Value::Float(f64::NEG_INFINITY))
+        );
+    }
+
+    #[test]
+    fn integer_division_is_decimal_or_truncating() {
+        let d = |s: &str| typed(s, "decimal");
+        let div = |a: i64, b: i64, m| Value::Int(a).arith_with(ArithOp::Div, &Value::Int(b), m);
+        assert_eq!(div(7, 2, IntegerDivision::Decimal), Some(d("3.5")));
+        assert_eq!(
+            div(7, 2, IntegerDivision::Decimal).unwrap().lexical(),
+            "3.5"
+        );
+        assert_eq!(
+            div(6, 2, IntegerDivision::Decimal).unwrap().lexical(),
+            "3.0"
+        );
+        assert_eq!(
+            div(1, 3, IntegerDivision::Decimal).unwrap().lexical(),
+            "0.333333333333333333"
+        );
+        assert_eq!(
+            div(2, 3, IntegerDivision::Decimal).unwrap().lexical(),
+            "0.666666666666666667"
+        );
+        assert_eq!(
+            div(-2, 3, IntegerDivision::Decimal).unwrap().lexical(),
+            "-0.666666666666666667"
+        );
+        assert_eq!(div(1, 0, IntegerDivision::Decimal), None);
+        assert_eq!(div(7, 2, IntegerDivision::Truncate), Some(Value::Int(3)));
+        assert_eq!(div(-7, 2, IntegerDivision::Truncate), Some(Value::Int(-3)));
+        assert_eq!(div(1, 0, IntegerDivision::Truncate), None);
+        // Only integer ÷ integer truncates.
+        assert_eq!(
+            d("7.0").arith_with(ArithOp::Div, &Value::Int(2), IntegerDivision::Truncate),
+            Some(d("3.5"))
+        );
+        assert_eq!(
+            d("1.5").arith(ArithOp::Div, &d("0.5")).unwrap().lexical(),
+            "3.0"
+        );
+        assert_eq!(d("1").arith(ArithOp::Div, &d("0.0")), None);
+        // Huge dividends lose fractional digits rather than overflowing.
+        let big = Value::Int(i64::MAX)
+            .arith(ArithOp::Div, &Value::Int(2))
+            .unwrap();
+        assert_eq!(big.lexical(), "4611686018427387903.5");
+        assert_eq!(
+            IntegerDivision::parse("Upstream"),
+            Some(IntegerDivision::Truncate)
+        );
+        assert_eq!(
+            IntegerDivision::parse("w3c"),
+            Some(IntegerDivision::Decimal)
+        );
+        assert_eq!(IntegerDivision::parse("x"), None);
+    }
+
+    #[test]
+    fn numeric_functions_keep_the_type() {
+        let d = |s: &str| typed(s, "decimal");
+        assert_eq!(
+            d("2.5").numeric_fn(NumericFn::Round).unwrap().lexical(),
+            "3.0"
+        );
+        assert_eq!(
+            d("-2.5").numeric_fn(NumericFn::Round).unwrap().lexical(),
+            "-2.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Floor).unwrap().lexical(),
+            "-3.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Ceil).unwrap().lexical(),
+            "-2.0"
+        );
+        assert_eq!(
+            d("2.0").numeric_fn(NumericFn::Ceil).unwrap().lexical(),
+            "2.0"
+        );
+        assert_eq!(
+            d("-2.4").numeric_fn(NumericFn::Abs).unwrap().lexical(),
+            "2.4"
+        );
+        assert_eq!(
+            Value::Int(-3).numeric_fn(NumericFn::Abs),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            Value::Int(3).numeric_fn(NumericFn::Round),
+            Some(Value::Int(3))
+        );
+        assert_eq!(
+            Value::Double(-2.5).numeric_fn(NumericFn::Round),
+            Some(Value::Double(-2.0))
+        );
+        assert_eq!(
+            Value::Double(0.49999999999999994).numeric_fn(NumericFn::Round),
+            Some(Value::Double(0.0))
+        );
+        assert_eq!(
+            Value::Float(1.5).numeric_fn(NumericFn::Floor),
+            Some(Value::Float(1.0))
+        );
+        assert_eq!(
+            Value::Str {
+                value: "1".into(),
+                lang: None
+            }
+            .numeric_fn(NumericFn::Abs),
+            None
+        );
+        // |x| < 1 with a scale beyond 10^38.
+        let tiny = d(&format!("0.{}1", "0".repeat(45)));
+        assert_eq!(tiny.numeric_fn(NumericFn::Floor).unwrap().lexical(), "0.0");
+        assert_eq!(tiny.numeric_fn(NumericFn::Ceil).unwrap().lexical(), "1.0");
     }
 
     #[test]

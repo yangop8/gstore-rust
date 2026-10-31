@@ -2391,13 +2391,16 @@ impl<'s> Parser<'s> {
                         self.with_bnode_mode(BnodeMode::Fresh, |p| p.parse_ground_block())?;
                     Ok(UpdateOp::InsertData(data))
                 } else {
-                    let insert = self.parse_triple_template_block()?;
-                    self.skip_using_clauses()?;
+                    let insert = self.parse_quad_template_block()?;
+                    let (using, using_named) = self.parse_using_clauses()?;
                     self.expect_keyword("WHERE")?;
                     let pattern = self.parse_group_graph_pattern()?;
                     Ok(UpdateOp::Modify {
+                        with: None,
                         delete: Vec::new(),
                         insert,
+                        using,
+                        using_named,
                         pattern,
                     })
                 }
@@ -2410,54 +2413,83 @@ impl<'s> Parser<'s> {
                     })?;
                     Ok(UpdateOp::DeleteData(data))
                 } else if self.eat_keyword("WHERE") {
-                    // DELETE WHERE { triples }: the triples are both the match
+                    // DELETE WHERE { quads }: the quads are both the match
                     // pattern and the delete template.
-                    let triples = self
+                    let quads = self
                         .with_bnode_mode(BnodeMode::Forbidden("DELETE WHERE"), |p| {
-                            p.parse_triple_template_block()
+                            p.parse_quad_template_block()
                         })?;
-                    let pattern = GraphPattern::Bgp(triples.clone());
+                    let pattern = quads_as_pattern(&quads);
                     Ok(UpdateOp::Modify {
-                        delete: triples,
+                        with: None,
+                        delete: quads,
                         insert: Vec::new(),
+                        using: Vec::new(),
+                        using_named: Vec::new(),
                         pattern,
                     })
                 } else {
                     let delete = self
                         .with_bnode_mode(BnodeMode::Forbidden("a DELETE template"), |p| {
-                            p.parse_triple_template_block()
+                            p.parse_quad_template_block()
                         })?;
                     let insert = if self.eat_keyword("INSERT") {
-                        self.parse_triple_template_block()?
+                        self.parse_quad_template_block()?
                     } else {
                         Vec::new()
                     };
-                    self.skip_using_clauses()?;
+                    let (using, using_named) = self.parse_using_clauses()?;
                     self.expect_keyword("WHERE")?;
                     let pattern = self.parse_group_graph_pattern()?;
                     Ok(UpdateOp::Modify {
+                        with: None,
                         delete,
                         insert,
+                        using,
+                        using_named,
                         pattern,
                     })
                 }
             }
             Some("WITH") => {
-                // `WITH <iri>` sets the default graph for the modify; with a
-                // single graph it has no effect, so consume and recurse.
+                // `WITH <iri>` names the default graph of the DELETE/INSERT
+                // … WHERE that follows (also accepted before DELETE WHERE).
                 self.bump();
-                self.expect_graph_iri()?;
-                self.parse_update_op()
+                let graph = self.expect_graph_iri()?;
+                match self.parse_update_op()? {
+                    UpdateOp::Modify {
+                        with: None,
+                        delete,
+                        insert,
+                        using,
+                        using_named,
+                        pattern,
+                    } => Ok(UpdateOp::Modify {
+                        with: Some(graph),
+                        delete,
+                        insert,
+                        using,
+                        using_named,
+                        pattern,
+                    }),
+                    _ => Err(self.err("WITH <iri> must be followed by DELETE/INSERT … WHERE")),
+                }
             }
             Some("LOAD") => {
                 self.bump();
                 let silent = self.eat_keyword("SILENT");
                 let source = self.expect_graph_iri()?;
-                if self.eat_keyword("INTO") {
+                let into = if self.eat_keyword("INTO") {
                     self.expect_keyword("GRAPH")?;
-                    self.expect_graph_iri()?;
-                }
-                Ok(UpdateOp::Load { source, silent })
+                    Some(self.expect_graph_iri()?)
+                } else {
+                    None
+                };
+                Ok(UpdateOp::Load {
+                    source,
+                    silent,
+                    into,
+                })
             }
             Some("CLEAR") => {
                 self.bump();
@@ -2575,13 +2607,60 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// Skip `USING [NAMED] <iri>` clauses (dataset selection; not modeled).
-    fn skip_using_clauses(&mut self) -> Result<()> {
+    /// `( USING [NAMED] <iri> )*`: the `USING` graphs and the `USING NAMED`
+    /// graphs, each in source order.
+    fn parse_using_clauses(&mut self) -> Result<(Vec<String>, Vec<String>)> {
+        let (mut using, mut using_named) = (Vec::new(), Vec::new());
         while self.eat_keyword("USING") {
-            self.eat_keyword("NAMED");
-            self.expect_graph_iri()?;
+            if self.eat_keyword("NAMED") {
+                using_named.push(self.expect_graph_iri()?);
+            } else {
+                using.push(self.expect_graph_iri()?);
+            }
         }
-        Ok(())
+        Ok((using, using_named))
+    }
+
+    /// A DELETE/INSERT template `{ … }` (SPARQL 1.1 Update `QuadPattern`):
+    /// triple templates, and `GRAPH (<iri> | ?g) { … }` blocks whose triples
+    /// target that graph.
+    fn parse_quad_template_block(&mut self) -> Result<Vec<QuadPattern>> {
+        self.expect(&Token::LBrace, "'{'")?;
+        let mut out = Vec::new();
+        loop {
+            match self.peek() {
+                Token::RBrace => {
+                    self.bump();
+                    break;
+                }
+                Token::Dot => {
+                    self.bump();
+                }
+                Token::Word(w) if w.eq_ignore_ascii_case("GRAPH") => {
+                    self.bump();
+                    let graph = self.parse_graph_term()?;
+                    for triple in self.parse_triple_template_block()? {
+                        out.push(QuadPattern {
+                            graph: Some(graph.clone()),
+                            triple,
+                        });
+                    }
+                }
+                Token::Eof => return Err(self.err("unexpected end of template block")),
+                _ => {
+                    let mut patterns = Vec::new();
+                    let mut paths = Vec::new();
+                    self.parse_triples_same_subject(&mut patterns, &mut paths)?;
+                    if !paths.is_empty() {
+                        return Err(
+                            self.err("property paths are not allowed in an INSERT/DELETE template")
+                        );
+                    }
+                    out.extend(patterns.into_iter().map(QuadPattern::default_graph));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The graph reference of a `GRAPH` pattern: a variable or constant IRI.
@@ -2779,6 +2858,37 @@ fn join_opt(left: GraphPattern, right: GraphPattern) -> GraphPattern {
         GraphPattern::Empty => right,
         _ => GraphPattern::Join(Box::new(left), Box::new(right)),
     }
+}
+
+/// The match pattern of `DELETE WHERE { quads }`: the default-graph triples
+/// as one BGP, joined with a `GRAPH g { … }` BGP per run of consecutive
+/// quads in the same graph.
+fn quads_as_pattern(quads: &[QuadPattern]) -> GraphPattern {
+    let default: Vec<TriplePattern> = quads
+        .iter()
+        .filter(|q| q.graph.is_none())
+        .map(|q| q.triple.clone())
+        .collect();
+    let mut pattern = if default.is_empty() && quads.iter().any(|q| q.graph.is_some()) {
+        GraphPattern::Empty
+    } else {
+        GraphPattern::Bgp(default)
+    };
+    let mut i = 0;
+    while i < quads.len() {
+        let Some(g) = &quads[i].graph else {
+            i += 1;
+            continue;
+        };
+        let mut triples = Vec::new();
+        while i < quads.len() && quads[i].graph.as_ref() == Some(g) {
+            triples.push(quads[i].triple.clone());
+            i += 1;
+        }
+        let block = GraphPattern::Graph(g.clone(), Box::new(GraphPattern::Bgp(triples)));
+        pattern = join_opt(pattern, block);
+    }
+    pattern
 }
 
 /// A token as the user would have written it, for error messages.
@@ -3097,6 +3207,7 @@ mod tests {
                 delete,
                 insert,
                 pattern,
+                ..
             } => {
                 assert_eq!(delete.len(), 1);
                 assert!(insert.is_empty());
@@ -3104,6 +3215,85 @@ mod tests {
             }
             other => panic!("expected Modify, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_quad_templates_with_and_using() {
+        let q = "PREFIX : <http://ex/> WITH :w DELETE { ?s :p ?o . GRAPH ?g { ?s :q ?o } } \
+                 INSERT { GRAPH :h { ?s :r ?o } ?s :t ?o } USING :u1 USING NAMED :n USING :u2 \
+                 WHERE { GRAPH ?g { ?s :p ?o } }";
+        match one_op(q) {
+            UpdateOp::Modify {
+                with,
+                delete,
+                insert,
+                using,
+                using_named,
+                pattern,
+            } => {
+                assert_eq!(with.as_deref(), Some("http://ex/w"));
+                let graphs =
+                    |qs: &[QuadPattern]| qs.iter().map(|q| q.graph.clone()).collect::<Vec<_>>();
+                assert_eq!(
+                    graphs(&delete),
+                    vec![None, Some(GraphTerm::Var("g".into()))]
+                );
+                assert_eq!(
+                    graphs(&insert),
+                    vec![Some(GraphTerm::Iri("http://ex/h".into())), None]
+                );
+                assert_eq!(using, vec!["http://ex/u1", "http://ex/u2"]);
+                assert_eq!(using_named, vec!["http://ex/n"]);
+                assert!(matches!(pattern, GraphPattern::Graph(..)));
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+        // DELETE WHERE with GRAPH blocks: the quads are also the pattern.
+        match one_op("DELETE WHERE { <a> <p> ?o . GRAPH <g> { ?s <p> ?o } }") {
+            UpdateOp::Modify {
+                delete, pattern, ..
+            } => {
+                assert_eq!(delete.len(), 2);
+                assert_eq!(delete[1].graph, Some(GraphTerm::Iri("g".into())));
+                match pattern {
+                    GraphPattern::Join(a, b) => {
+                        assert!(matches!(*a, GraphPattern::Bgp(ref t) if t.len() == 1));
+                        assert!(matches!(*b, GraphPattern::Graph(GraphTerm::Iri(_), _)));
+                    }
+                    other => panic!("expected a join, got {other:?}"),
+                }
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+        match one_op("DELETE WHERE { GRAPH <g> { ?s <p> ?o } }") {
+            UpdateOp::Modify { pattern, .. } => {
+                assert!(matches!(pattern, GraphPattern::Graph(GraphTerm::Iri(_), _)))
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+        // WITH only qualifies a DELETE/INSERT … WHERE.
+        assert!(parse("WITH <g> INSERT DATA { <a> <b> <c> }").is_err());
+        assert!(parse("INSERT { <a> <b> <c> } USING NAMED WHERE {}").is_err());
+    }
+
+    #[test]
+    fn parses_load_into_graph() {
+        match one_op("LOAD SILENT <file:///tmp/x.ttl> INTO GRAPH <http://ex/g>") {
+            UpdateOp::Load {
+                source,
+                silent,
+                into,
+            } => {
+                assert_eq!(source, "file:///tmp/x.ttl");
+                assert!(silent);
+                assert_eq!(into.as_deref(), Some("http://ex/g"));
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+        assert!(matches!(
+            one_op("LOAD <file:///tmp/x.ttl>"),
+            UpdateOp::Load { into: None, .. }
+        ));
     }
 
     #[test]

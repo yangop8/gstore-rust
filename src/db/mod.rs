@@ -12,7 +12,7 @@
 //! [`Database::open`] detects the layout.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,9 +25,11 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
-use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
+use crate::parser::sparql::ast::{
+    GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
+};
 use crate::parser::{sparql, turtle};
-use crate::query::{Evaluator, FunctionRegistry, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
@@ -42,6 +44,9 @@ mod hardening_tests;
 mod review_tests;
 mod load_policy;
 pub use load_policy::{LoadPolicy, LoadSource};
+mod query_cache;
+use query_cache::QueryCache;
+pub use query_cache::DEFAULT_QUERY_CACHE_BYTES;
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -69,8 +74,6 @@ const INCREMENTAL_LOG_FILE: &str = "incr.log";
 /// every *committed* mutation so it can be re-applied on recovery (the redo half
 /// of gStore's WAL; the undo half is the per-transaction [`UndoOp`] log).
 const REDO_LOG_FILE: &str = "redo.log";
-/// Default upper bound on cached read-query results before LRU eviction kicks in.
-const DEFAULT_QUERY_CACHE_CAP: usize = 256;
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
 /// The on-disk (out-of-core) VS-tree node file inside a disk database directory.
@@ -123,72 +126,6 @@ struct Meta {
     predicate_num: u64,
 }
 
-/// A bounded LRU cache of read-query results, keyed by the SPARQL string
-/// (gStore's `QueryCache`, but with a capacity bound). Each entry carries a
-/// monotonically-increasing access tick; when the cache is full, the entry with
-/// the smallest tick (least-recently used) is evicted to make room. The whole
-/// cache is still cleared on any store mutation (writes invalidate reads).
-#[derive(Debug)]
-struct LruCache {
-    map: HashMap<String, (QueryResult, u64)>,
-    cap: usize,
-    tick: u64,
-}
-
-impl LruCache {
-    fn new(cap: usize) -> LruCache {
-        LruCache {
-            map: HashMap::new(),
-            cap,
-            tick: 0,
-        }
-    }
-
-    /// Look up `key`, refreshing its recency and returning a clone on hit.
-    fn get(&mut self, key: &str) -> Option<QueryResult> {
-        self.tick += 1;
-        let tk = self.tick;
-        let entry = self.map.get_mut(key)?;
-        entry.1 = tk;
-        Some(entry.0.clone())
-    }
-
-    /// Insert `key → value`, evicting the least-recently-used entry if inserting
-    /// a new key would exceed the capacity. A zero capacity disables caching.
-    fn put(&mut self, key: String, value: QueryResult) {
-        if self.cap == 0 {
-            return;
-        }
-        self.tick += 1;
-        let tk = self.tick;
-        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
-            if let Some(lru) = self
-                .map
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&lru);
-            }
-        }
-        self.map.insert(key, (value, tk));
-    }
-
-    fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    #[cfg(test)]
-    fn contains(&self, key: &str) -> bool {
-        self.map.contains_key(key)
-    }
-}
-
 /// One pending/serialized redo-log record: an applied mutation in surface form.
 /// `op` is `b'I'` (insert) or `b'D'` (delete); `graph` is the named-graph IRI
 /// (`None` ⇒ default graph); `triple` is the N-Triples `s p o .` text.
@@ -222,10 +159,14 @@ pub struct Database {
     /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
     /// the inverse of a triple mutation, applied in reverse on rollback.
     txn: Option<Vec<UndoOp>>,
-    /// Bounded LRU cache of read-query results keyed by the SPARQL string
-    /// (gStore `QueryCache`), cleared on any store mutation. Interior mutability
-    /// so a `&self`/`&mut self` query path can read and populate it.
-    query_cache: RefCell<LruCache>,
+    /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
+    /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
+    /// any store mutation. Interior mutability so a `&self`/`&mut self` query
+    /// path can read and populate it.
+    query_cache: RefCell<QueryCache>,
+    /// How `/` divides two integers in this database's queries (see
+    /// [`set_integer_division`](Self::set_integer_division)).
+    integer_division: IntegerDivision,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
@@ -358,7 +299,8 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
+            query_cache: RefCell::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
+            integer_division: IntegerDivision::default(),
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
@@ -1043,9 +985,15 @@ impl Database {
         match q {
             Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
                 // Serve from the query cache when the same request was already
-                // answered against the current (unchanged) store.
-                if let Some(cached) = self.query_cache.borrow_mut().get(sparql) {
-                    return Ok(cached);
+                // answered against the current (unchanged) store. Only
+                // deterministic queries are cached (no NOW()/RAND()/UUID()/
+                // STRUUID()/BNODE(), SERVICE or user functions).
+                let cacheable = query_cache::is_cacheable(&q);
+                if cacheable {
+                    if let Some(cached) = self.query_cache.borrow_mut().get(sparql, self.mutations)
+                    {
+                        return Ok(cached);
+                    }
                 }
                 // The advanced graph functions run on this database's cached
                 // CSR (see `csr`), built only when a query needs it.
@@ -1067,11 +1015,17 @@ impl Database {
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
                 }
-                eval = eval.with_csr_provider(&csr);
+                eval = eval
+                    .with_csr_provider(&csr)
+                    .with_integer_division(self.integer_division);
                 let result = eval.evaluate(&q)?;
-                self.query_cache
-                    .borrow_mut()
-                    .put(sparql.to_string(), result.clone());
+                if cacheable {
+                    self.query_cache.borrow_mut().put(
+                        sparql.to_string(),
+                        result.clone(),
+                        self.mutations,
+                    );
+                }
                 Ok(result)
             }
             Query::Update(ops) => {
@@ -1133,36 +1087,44 @@ impl Database {
             UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
             UpdateOp::Modify {
+                with,
                 delete,
                 insert,
+                using,
+                using_named,
                 pattern,
             } => {
-                // Compute the ground delete/insert sets against the *current*
+                // Compute the ground delete/insert quads against the *current*
                 // data, then apply deletes before inserts (SPARQL semantics).
-                let (dels, ins) = {
-                    let csr = || self.csr();
-                    let mut eval = Evaluator::new(&self.dict, &self.store).with_csr_provider(&csr);
-                    // IRI function calls in the WHERE clause reach the
-                    // user-defined functions, as in read queries.
-                    if !self.functions.is_empty() {
-                        eval = eval.with_functions(self.functions.clone());
-                    }
-                    eval.eval_update_modify(&delete, &insert, &pattern)?
-                };
+                let (dels, ins) = self.modify_changes(
+                    &delete,
+                    &insert,
+                    &pattern,
+                    with.as_deref(),
+                    &using,
+                    &using_named,
+                )?;
+                // A template triple outside `GRAPH { … }` targets the WITH
+                // graph, else the default graph.
+                let target = |g: &Option<String>| g.clone().or_else(|| with.clone());
                 let mut changed = 0;
-                for t in &dels {
-                    if self.remove_triple(t) {
+                for (g, t) in &dels {
+                    if self.delete_quad(t, target(g).as_deref()) {
                         changed += 1;
                     }
                 }
-                for t in &ins {
-                    if self.try_insert_triple(t)? {
+                for (g, t) in &ins {
+                    if self.insert_quad(t, target(g).as_deref())? {
                         changed += 1;
                     }
                 }
                 Ok(changed)
             }
-            UpdateOp::Load { source, silent } => match self.load_rdf_source(&source) {
+            UpdateOp::Load {
+                source,
+                silent,
+                into,
+            } => match self.load_rdf_source(&source, into.as_deref()) {
                 Ok(n) => Ok(n),
                 Err(e) => {
                     if silent {
@@ -1369,11 +1331,77 @@ impl Database {
         }
     }
 
-    /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
-    /// graph, subject to the [`LoadPolicy`]. Only local sources are fetched — a
-    /// `file:` IRI or a bare path; remote (`http(s)://`, …) sources are never
-    /// retrieved (no network) and error.
-    fn load_rdf_source(&mut self, source: &str) -> Result<usize> {
+    /// The ground quads a `DELETE … INSERT … WHERE` removes and adds (see
+    /// [`Evaluator::eval_update_modify`]; `None` = the operation's default
+    /// graph). The WHERE clause matches against the request's dataset
+    /// (SPARQL 1.1 Update §3.1.3):
+    ///
+    /// * with `USING`/`USING NAMED` clauses: the default graph is the merge
+    ///   of the `USING` graphs (empty when there are none) and the named
+    ///   graphs are exactly the `USING NAMED` ones;
+    /// * otherwise with `WITH <g>`: the default graph is `<g>` (empty if it
+    ///   does not exist) and every named graph is visible to `GRAPH`;
+    /// * otherwise the store's default graph and all named graphs.
+    #[allow(clippy::type_complexity)]
+    fn modify_changes(
+        &self,
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
+        pattern: &GraphPattern,
+        with: Option<&str>,
+        using: &[String],
+        using_named: &[String],
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        let graph = |iri: &str| {
+            self.dict
+                .entity_id(&Term::iri(iri).dict_key())
+                .and_then(|gid| self.named.get(&gid).map(|s| (gid, s)))
+        };
+        fn prepare<'e, S: TripleSource>(db: &Database, eval: Evaluator<'e, S>) -> Evaluator<'e, S> {
+            // IRI function calls in the WHERE clause reach the user-defined
+            // functions, as in read queries.
+            let eval = eval.with_integer_division(db.integer_division);
+            if db.functions.is_empty() {
+                eval
+            } else {
+                eval.with_functions(db.functions.clone())
+            }
+        }
+        if !using.is_empty() || !using_named.is_empty() {
+            let mut merged = TripleStore::new();
+            for iri in using {
+                if let Some((_, s)) = graph(iri) {
+                    for t in s.iter_all() {
+                        merged.insert(t);
+                    }
+                }
+            }
+            let named: BTreeMap<u32, TripleStore> = using_named
+                .iter()
+                .filter_map(|iri| graph(iri).map(|(gid, s)| (gid, s.clone())))
+                .collect();
+            let eval = prepare(self, Evaluator::new(&self.dict, &merged)).with_named(&named);
+            return eval.eval_update_modify(delete, insert, pattern);
+        }
+        if let Some(w) = with {
+            let empty = TripleStore::new();
+            let store = graph(w).map_or(&empty, |(_, s)| s);
+            let eval = prepare(self, Evaluator::new(&self.dict, store)).with_named(&self.named);
+            return eval.eval_update_modify(delete, insert, pattern);
+        }
+        let csr = || self.csr();
+        let eval = prepare(self, Evaluator::new(&self.dict, &self.store))
+            .with_named(&self.named)
+            .with_csr_provider(&csr);
+        eval.eval_update_modify(delete, insert, pattern)
+    }
+
+    /// `LOAD <iri> [INTO GRAPH <g>]`: read an RDF (Turtle/N-Triples) document
+    /// into the default graph, or into named graph `into`, subject to the
+    /// [`LoadPolicy`]. Only local sources are fetched — a `file:` IRI or a
+    /// bare path; remote (`http(s)://`, …) sources are never retrieved (no
+    /// network) and error.
+    fn load_rdf_source(&mut self, source: &str, into: Option<&str>) -> Result<usize> {
         let path = match self.load_policy.resolve(source)? {
             LoadSource::Local(path) => path,
             LoadSource::Remote(_) => {
@@ -1386,7 +1414,7 @@ impl Database {
         let triples = turtle::parse_file(&path)?;
         let mut n = 0;
         for t in &triples {
-            if self.try_insert_triple(t)? {
+            if self.insert_quad(t, into)? {
                 n += 1;
             }
         }
@@ -1875,18 +1903,55 @@ impl Database {
         self.record_inferred(added)
     }
 
-    // ---- query-cache capacity --------------------------------------------
+    // ---- query cache / evaluation options ---------------------------------
 
-    /// Resize the read-query LRU cache, clearing it. A capacity of 0 disables
-    /// caching entirely.
-    pub fn set_query_cache_capacity(&mut self, cap: usize) {
-        *self.query_cache.get_mut() = LruCache::new(cap);
+    /// Set the read-query cache's memory budget in (approximate) bytes,
+    /// clearing it; 0 disables caching. The default is
+    /// [`DEFAULT_QUERY_CACHE_BYTES`] (64 MiB). A single result larger than
+    /// an eighth of the budget is never cached; least-recently-used results
+    /// are evicted to make room. Only deterministic read queries are cached
+    /// (none calling `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, a
+    /// user function, or using `SERVICE`), and every data change empties the
+    /// cache. Upstream gStore hard-codes its budget; the proposed `conf.ini`
+    /// key for this setting is `query_cache_size` (bytes).
+    pub fn set_query_cache_size(&mut self, bytes: usize) {
+        *self.query_cache.get_mut() = QueryCache::new(bytes);
     }
 
-    /// Number of entries currently in the read-query cache (tests).
-    #[cfg(test)]
-    fn query_cache_len(&self) -> usize {
+    /// The read-query cache's budget in bytes (see
+    /// [`set_query_cache_size`](Self::set_query_cache_size)).
+    pub fn query_cache_size(&self) -> usize {
+        self.query_cache.borrow().budget()
+    }
+
+    /// Number of results currently in the read-query cache.
+    pub fn query_cache_len(&self) -> usize {
         self.query_cache.borrow().len()
+    }
+
+    /// Approximate bytes the read-query cache currently holds.
+    pub fn query_cache_bytes(&self) -> usize {
+        self.query_cache.borrow().bytes()
+    }
+
+    /// Choose how `/` divides two integers in this database's queries and
+    /// updates: [`IntegerDivision::Decimal`] (the default, SPARQL 1.1:
+    /// `7/2` = `3.5`) or [`IntegerDivision::Truncate`] (upstream gStore
+    /// compatibility: `7/2` = `3`, and `AVG` over integers truncates).
+    /// Clears the query cache. The proposed `conf.ini` key is
+    /// `integer_division` (`decimal` | `truncate`, see
+    /// [`IntegerDivision::parse`]).
+    pub fn set_integer_division(&mut self, mode: IntegerDivision) {
+        if self.integer_division != mode {
+            self.integer_division = mode;
+            self.query_cache.get_mut().clear();
+        }
+    }
+
+    /// The current integer-division mode (see
+    /// [`set_integer_division`](Self::set_integer_division)).
+    pub fn integer_division(&self) -> IntegerDivision {
+        self.integer_division
     }
 
     /// Whether a given SPARQL string is currently cached (tests).
@@ -2682,22 +2747,29 @@ mod tests {
     #[test]
     fn query_cache_lru_evicts_least_recently_used() {
         let mut db = Database::build_from_str("lru", SMALL).unwrap();
-        db.set_query_cache_capacity(2);
-        let q1 = "SELECT ?o WHERE { <root> <contain> ?o }";
-        let q2 = "SELECT ?n WHERE { <root> <name> ?n }";
-        let q3 = "SELECT ?o WHERE { <node1> <own> ?o }";
-
-        db.query(q1).unwrap();
-        db.query(q2).unwrap();
-        assert_eq!(db.query_cache_len(), 2);
-        // Touch q1 so q2 is now the least-recently used.
-        db.query(q1).unwrap();
-        // Inserting q3 evicts q2.
-        db.query(q3).unwrap();
-        assert_eq!(db.query_cache_len(), 2, "cache stays at capacity");
-        assert!(db.query_cache_contains(q1));
-        assert!(db.query_cache_contains(q3));
-        assert!(!db.query_cache_contains(q2), "q2 was least-recently used");
+        // Queries q(10)..q(19) have results of exactly the same size.
+        let q = |i: usize| format!("SELECT ?o{i} WHERE {{ <root> <contain> ?o{i} }}");
+        db.query(&q(10)).unwrap();
+        let one = db.query_cache_bytes();
+        // The cache is bounded by memory: room for exactly eight results.
+        db.set_query_cache_size(8 * one);
+        assert_eq!(db.query_cache_len(), 0, "resizing clears the cache");
+        for i in 10..18 {
+            db.query(&q(i)).unwrap();
+        }
+        assert_eq!(db.query_cache_len(), 8);
+        // Touch q(10) so q(11) is now the least-recently used.
+        db.query(&q(10)).unwrap();
+        // Inserting q(18) evicts q(11).
+        db.query(&q(18)).unwrap();
+        assert_eq!(db.query_cache_len(), 8, "cache stays within its budget");
+        assert!(db.query_cache_bytes() <= db.query_cache_size());
+        assert!(db.query_cache_contains(&q(10)));
+        assert!(db.query_cache_contains(&q(18)));
+        assert!(
+            !db.query_cache_contains(&q(11)),
+            "q(11) was least-recently used"
+        );
     }
 
     #[test]
