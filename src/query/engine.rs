@@ -718,7 +718,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // (a variable is looked up as an IRI and is missing); next to
             // other projections there is no row at all.
             if only_gfn {
-                vec![vec![self.eval_graph_fn(&gfns[0].call, &[], &layout, true)?]]
+                vec![vec![self.eval_graph_fn(
+                    &gfns[0].call,
+                    &[],
+                    &layout,
+                    true,
+                )?]]
             } else {
                 Vec::new()
             }
@@ -726,7 +731,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // A lone graph function over the solutions: exactly one row
             // (upstream reserves `resultSz = 1`, GE:2041-2050).
             let all: Vec<&Binding> = solutions.iter().collect();
-            vec![vec![self.eval_graph_fn(&gfns[0].call, &all, &layout, false)?]]
+            vec![vec![self.eval_graph_fn(
+                &gfns[0].call,
+                &all,
+                &layout,
+                false,
+            )?]]
         } else if has_agg {
             let mut rows = self.eval_aggregation(&solutions, &layout, q)?;
             // Aggregated rows are ordered over the projected result layout —
@@ -3358,11 +3368,15 @@ fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
                 let x = n.as_f64()?;
                 // Rust prints a finite f64 positionally (never with an
                 // exponent), the shortest digits that round-trip.
-                x.is_finite().then(|| decimal_value(&x.to_string())).flatten()
+                x.is_finite()
+                    .then(|| decimal_value(&x.to_string()))
+                    .flatten()
             }
             CastSource::Float(x) => {
                 let f = x as f32;
-                f.is_finite().then(|| decimal_value(&f.to_string())).flatten()
+                f.is_finite()
+                    .then(|| decimal_value(&f.to_string()))
+                    .flatten()
             }
             CastSource::Bool(b) => decimal_value(if b { "1.0" } else { "0.0" }),
             _ => None,
@@ -3420,7 +3434,8 @@ fn xsd_cast(target: XsdCast, v: &Value) -> Option<Value> {
             let lexical = match src {
                 CastSource::Str(s) | CastSource::Date(s) => {
                     let s = s.trim();
-                    (!s.contains('T') && parse_datetime_parts(s).is_some()).then(|| s.to_string())?
+                    (!s.contains('T') && parse_datetime_parts(s).is_some())
+                        .then(|| s.to_string())?
                 }
                 // xs:dateTime → xs:date: the date part, same timezone.
                 CastSource::DateTime(s) => {
@@ -3728,12 +3743,12 @@ fn graph_fn_items(q: &SelectQuery) -> Result<Vec<GraphFnItem>> {
     items
         .iter()
         .filter_map(|it| match it {
-            SelectItem::Expr(Expr::GraphFn { func, args }, alias) => Some(
-                GCall::from_ast(*func, args).map(|call| GraphFnItem {
+            SelectItem::Expr(Expr::GraphFn { func, args }, alias) => {
+                Some(GCall::from_ast(*func, args).map(|call| GraphFnItem {
                     call,
                     alias: alias.clone(),
-                }),
-            ),
+                }))
+            }
             _ => None,
         })
         .collect()
@@ -5567,13 +5582,20 @@ mod gfun_engine_tests {
         };
         let f = "(WCC({}) AS ?w)";
         assert_eq!(len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }}")), 1);
-        assert_eq!(len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?w")), 1);
         assert_eq!(
-            len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?x DESC(?y)")),
+            len(&format!("SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?w")),
+            1
+        );
+        assert_eq!(
+            len(&format!(
+                "SELECT {f} WHERE {{ ?x ?p ?y }} ORDER BY ?x DESC(?y)"
+            )),
             3
         );
         assert_eq!(
-            len(&format!("SELECT ?x {f} WHERE {{ ?x ?p ?y }} ORDER BY (STR(?x))")),
+            len(&format!(
+                "SELECT ?x {f} WHERE {{ ?x ?p ?y }} ORDER BY (STR(?x))"
+            )),
             2
         );
         assert!(pattern_is_trivially_empty(&GraphPattern::Empty));
@@ -5586,7 +5608,9 @@ mod gfun_engine_tests {
         assert_eq!(parse_xsd_double(" -.5E-1 "), Some(-0.05));
         assert_eq!(parse_xsd_double("+INF"), Some(f64::INFINITY));
         assert!(parse_xsd_double("NaN").unwrap().is_nan());
-        for bad in ["inf", "Infinity", "nan", "1e", "e3", "1.2.3", "", "0x10", "1_000"] {
+        for bad in [
+            "inf", "Infinity", "nan", "1e", "e3", "1.2.3", "", "0x10", "1_000",
+        ] {
             assert_eq!(parse_xsd_double(bad), None, "{bad}");
         }
         assert!(is_integer_lexical("+12"));

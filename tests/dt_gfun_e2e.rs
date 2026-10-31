@@ -126,7 +126,12 @@ fn plain(cell: &Option<String>) -> String {
 fn only_cell(db: &mut Database, q: &str) -> Option<String> {
     let rs = select(db, q);
     assert_eq!(rs.vars.len(), 1, "{q}");
-    assert_eq!(rs.rows.len(), 1, "`{q}` should yield one row: {:?}", rs.rows);
+    assert_eq!(
+        rs.rows.len(),
+        1,
+        "`{q}` should yield one row: {:?}",
+        rs.rows
+    );
     rs.rows[0][0].clone()
 }
 
@@ -143,9 +148,12 @@ fn bindings(db: &mut Database, where_clause: &str) -> Vec<GNode> {
     let mut out: Vec<GNode> = Vec::new();
     for row in &rs.rows {
         let key = row[0].clone().unwrap();
-        let n = GNode::resolve(&csr, db.dict().entity_id(&key).or(db.dict().term_id(
-            &parse_term(&key).unwrap(),
-        )));
+        let n = GNode::resolve(
+            &csr,
+            db.dict()
+                .entity_id(&key)
+                .or(db.dict().term_id(&parse_term(&key).unwrap())),
+        );
         if !out.iter().any(|m| m.entity == n.entity) {
             out.push(n);
         }
@@ -448,10 +456,7 @@ fn doc_diameter_estimation() {
         r#"{"paths":[0]}"#
     );
     assert_eq!(
-        json(
-            &mut db,
-            "SELECT (diameterEstimation({}) AS ?y) WHERE {}"
-        ),
+        json(&mut db, "SELECT (diameterEstimation({}) AS ?y) WHERE {}"),
         r#"{"paths":[4]}"#
     );
 }
@@ -467,7 +472,10 @@ fn sssp_and_sssp_len_and_shortest_paths() {
         ..args(lib.preds(&["<like>"]))
     };
     assert_eq!(
-        json(&mut db, "SELECT (SSSP(<Alice>, true, {<like>}) AS ?y) WHERE {}"),
+        json(
+            &mut db,
+            "SELECT (SSSP(<Alice>, true, {<like>}) AS ?y) WHERE {}"
+        ),
         lib.json(GFnKind::Sssp, &a)
     );
     let len = json(
@@ -587,7 +595,10 @@ fn doc_personalized_pagerank() {
         ..args(lib.all())
     };
     assert_eq!(got, lib.json(GFnKind::Ppr, &a));
-    assert!(got.contains(r#""src":"<Alice>""#) && got.contains(r#""src":"<Eve>""#), "{got}");
+    assert!(
+        got.contains(r#""src":"<Alice>""#) && got.contains(r#""src":"<Eve>""#),
+        "{got}"
+    );
 }
 
 #[test]
@@ -1094,7 +1105,10 @@ fn unbound_vertex_variables_give_no_entries() {
     );
     assert_eq!(term(&cell), Some(Term::typed_literal("false", XSD_BOOLEAN)));
     // With the vertex omitted, clusterCoeff is the global coefficient.
-    let global = json(&mut db, &format!("SELECT (clusterCoeff(false, {{}}) AS ?c) {where_clause}"));
+    let global = json(
+        &mut db,
+        &format!("SELECT (clusterCoeff(false, {{}}) AS ?c) {where_clause}"),
+    );
     assert!(global.starts_with(r#"{"paths":[0."#), "{global}");
 }
 
@@ -1153,8 +1167,9 @@ fn filter_forms_are_a_clean_error() {
     ] {
         let e = query_err(&mut db, q);
         assert!(
-            e.contains(&format!("{name}(…) is only evaluated as the whole expression"))
-                && e.contains(legacy),
+            e.contains(&format!(
+                "{name}(…) is only evaluated as the whole expression"
+            )) && e.contains(legacy),
             "{q}: {e}"
         );
     }
@@ -1196,7 +1211,10 @@ fn rs_legacy_functions_work_anywhere() {
     );
     // The legacy function keeps its semantics: every predicate, so Alice
     // -dislike-> Eve -like-> Carol is 2 hops.
-    assert_eq!(term(&cell).unwrap(), Term::typed_literal("2", format!("{XSD}integer")));
+    assert_eq!(
+        term(&cell).unwrap(),
+        Term::typed_literal("2", format!("{XSD}integer"))
+    );
     let rs = select(
         &mut db,
         "SELECT ?x WHERE { <Alice> <like> ?x FILTER(<urn:gstore-rust:fn:shortestPathLen>(?x, <Carol>) = 2) }",
@@ -1237,9 +1255,8 @@ fn rs_legacy_functions_work_anywhere() {
 
 /// Evaluate one expression; `None` when it is unbound (an expression error).
 fn eval1(db: &mut Database, expr: &str) -> Option<Term> {
-    let q = format!(
-        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ({expr} AS ?v) WHERE {{}}"
-    );
+    let q =
+        format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ({expr} AS ?v) WHERE {{}}");
     term(&only_cell(db, &q))
 }
 
@@ -1256,7 +1273,10 @@ fn xsd_constructor_casts() {
     assert_eq!(e("xsd:integer(\"-007\")"), typed("-7", "integer"));
     assert_eq!(e("xsd:integer(3.99)"), typed("3", "integer"));
     assert_eq!(e("xsd:integer(-3.99)"), typed("-3", "integer"));
-    assert_eq!(e("xsd:integer(\"2.5e1\"^^xsd:double)"), typed("25", "integer"));
+    assert_eq!(
+        e("xsd:integer(\"2.5e1\"^^xsd:double)"),
+        typed("25", "integer")
+    );
     assert_eq!(e("xsd:integer(true)"), typed("1", "integer"));
     assert_eq!(e("xsd:integer(\"4.5\")"), None);
     assert_eq!(e("xsd:integer(\"abc\")"), None);
@@ -1266,14 +1286,20 @@ fn xsd_constructor_casts() {
     // xsd:decimal
     assert_eq!(e("xsd:decimal(\"1.50\")"), typed("1.50", "decimal"));
     assert_eq!(e("xsd:decimal(2)"), typed("2", "decimal"));
-    assert_eq!(e("xsd:decimal(\"0.1\"^^xsd:double)"), typed("0.1", "decimal"));
+    assert_eq!(
+        e("xsd:decimal(\"0.1\"^^xsd:double)"),
+        typed("0.1", "decimal")
+    );
     assert_eq!(e("xsd:decimal(\"1e3\")"), None);
     assert_eq!(e("xsd:decimal(\"INF\"^^xsd:double)"), None);
     // xsd:double / xsd:float
     assert_eq!(e("xsd:double(\"1e3\")"), typed("1000.0", "double"));
     assert_eq!(e("xsd:double(2)"), typed("2.0", "double"));
     assert_eq!(e("xsd:double(\"inf\")"), None);
-    assert_eq!(e("(xsd:double(\"-INF\") < -1e308)"), typed("true", "boolean"));
+    assert_eq!(
+        e("(xsd:double(\"-INF\") < -1e308)"),
+        typed("true", "boolean")
+    );
     assert_eq!(e("xsd:float(\"0.1\")"), typed("0.1", "float"));
     assert_eq!(e("xsd:float(\"NaN\")"), typed("NaN", "float"));
     assert_eq!(e("xsd:float(1)"), typed("1", "float"));
@@ -1352,10 +1378,8 @@ fn iri_functions_reach_user_functions_or_fail_cleanly() {
         int("15")
     );
     // In an UPDATE's WHERE as well.
-    db.query(
-        "INSERT { <Alice> <score> ?s } WHERE { BIND(<http://ex/fn/double>(4) AS ?s) }",
-    )
-    .unwrap();
+    db.query("INSERT { <Alice> <score> ?s } WHERE { BIND(<http://ex/fn/double>(4) AS ?s) }")
+        .unwrap();
     let rs = select(&mut db, "SELECT ?s WHERE { <Alice> <score> ?s }");
     assert_eq!(term(&rs.rows[0][0]), int("8"));
     // Unknown IRI functions are a query error, wherever they appear.
@@ -1365,7 +1389,10 @@ fn iri_functions_reach_user_functions_or_fail_cleanly() {
         "ASK { BIND(<http://ex/fn/none>() AS ?v) }",
     ] {
         let e = query_err(&mut db, q);
-        assert!(e.contains("unknown function <http://ex/fn/none>"), "{q}: {e}");
+        assert!(
+            e.contains("unknown function <http://ex/fn/none>"),
+            "{q}: {e}"
+        );
     }
     // Including unknown xsd: local names (not a cast).
     let e = query_err(
@@ -1397,7 +1424,10 @@ fn the_csr_is_cached_per_database_and_rebuilt_after_updates() {
     // A query without graph functions does not build it.
     select(&mut db, "SELECT ?x WHERE { <Alice> <like> ?x }");
     assert!(!db.csr_is_cached());
-    let before = json(&mut db, "SELECT (kHopCount(<Alice>, true, 1, {}) AS ?y) WHERE {}");
+    let before = json(
+        &mut db,
+        "SELECT (kHopCount(<Alice>, true, 1, {}) AS ?y) WHERE {}",
+    );
     assert!(db.csr_is_cached());
     let csr = db.csr().unwrap();
     // Another graph-function query reuses the same CSR.
@@ -1411,7 +1441,10 @@ fn the_csr_is_cached_per_database_and_rebuilt_after_updates() {
     db.query("INSERT DATA { <Alice> <like> <Dave> . }").unwrap();
     assert!(!db.csr_is_cached());
     assert_eq!(
-        json(&mut db, "SELECT (kHopCount(<Alice>, true, 1, {}) AS ?y) WHERE {}"),
+        json(
+            &mut db,
+            "SELECT (kHopCount(<Alice>, true, 1, {}) AS ?y) WHERE {}"
+        ),
         r#"{"paths":[{"src":"<Alice>","depth":1, "count":3}]}"#
     );
     assert!(!Arc::ptr_eq(&csr, &db.csr().unwrap()));
