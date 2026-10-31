@@ -1,0 +1,8 @@
+# gStore diagnostic log configuration for the console only -- example shipped
+# with gstore-rust, mirroring upstream gStore's conf/slog.stdout.properties
+# (point conf.ini's log_mode at a copy of it). See slog.properties.example.
+log4cplus.rootLogger=TRACE, STDOUT
+
+log4cplus.appender.STDOUT=log4cplus::ConsoleAppender
+log4cplus.appender.STDOUT.layout=log4cplus::PatternLayout
+log4cplus.appender.STDOUT.layout.ConversionPattern =[%D{%Y-%m-%d %H:%M:%S.%q}] [%5p] [%22.30b:%-4L]-%m%n

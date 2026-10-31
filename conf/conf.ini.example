@@ -93,6 +93,23 @@ accesslog_mode=1
 accesslog_path="logs/ipaccess/"
 accesslog_days=30
 
+# ---- gstore-rust extensions (not in upstream conf.ini) ----
+# The diagnostic log (gserver's errors, warnings and lifecycle events) is
+# configured like upstream's: log_mode names a log4cplus properties file (see
+# conf/slog.properties.example: root level, a console appender and a
+# DailyRollingFileAppender with File and MaxBackupIndex); when that file does
+# not exist the log goes to standard error at level info. These keys override
+# the properties file; the GSTORE_LOG environment variable (a level) overrides
+# log_level.
+# level: trace, debug, info, warn, error or off
+# log_level=info
+# log file, rolled daily into <file>.YYYY-MM-DD; off for none
+# log_file=logs/all.log
+# days of rolled log files to keep, 0 keeps them all (default 30)
+# log_days=30
+# also write the log to standard error, values: on or off (default on)
+# log_stderr=on
+
 [backup]
 # backup database path. The HTTP API's /backup and /restore only write and read
 # backups inside it (when this key is not set: <db_home>/backups).
