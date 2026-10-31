@@ -32,9 +32,15 @@
   `gzip` feature.
 - **Turtle leniency.** Upstream's local-name characters are accepted (loader
   only). An IRI ends at a space or control character, as in upstream's lexer,
-  so a missing `>` costs only its own line.
-- **RDF/XML.** Internal DTD entities, with expansion budgets; external
-  entities are refused. `rdf:parseType="Collection"` is supported.
+  so a missing `>` costs only its own line; so does a short string missing
+  its closing quote (it ends at the line break). After a bad statement in a
+  TriG file, a `{` or `}` on the rest of its line still opens or closes the
+  block, so no statement is filed under the wrong graph.
+- **RDF/XML.** Internal DTD entities, with expansion budgets (every expanded
+  entity value counts); a value may refer to an entity declared after it;
+  external entities are refused. `rdf:parseType="Collection"` is supported.
+- **Exports load back.** `gexport` / `/api export` write IRIs holding a
+  space or another character IRIREF excludes as `\uXXXX` escapes.
 
 ### gconsole
 
@@ -49,8 +55,13 @@
   Other options: `--host`, `--port` (falls back to `conf.ini`, then 9000),
   `-c`, `-e`, `-i`.
 - Interactive features: multi-line statements, `#` comments, `>` / `>>`
-  redirection, and a persistent history. Ctrl-C cancels the server's query
-  task.
+  redirection, and a persistent history (created mode `0600`). Ctrl-C
+  cancels the server's query task.
+- `drop <name>` always drops a database and `clear …` clears the screen, as
+  upstream; SPARQL's `DROP` / `CLEAR` / `CREATE` are recognised only in
+  forms the commands cannot have (`DROP GRAPH <g>`, `DROP SILENT ALL`, …).
+  `sparql <file>` sends a run of update operations (`op ; op`) as one
+  request. `use system;` is refused for root too (it cannot be queried).
 - The optional `readline` feature adds line editing and tab completion.
 - `gconsole --local <db>` keeps the embedded REPL; the legacy `gconsole <db>`
   still works. Its `import` command now accepts any RDF format, a directory
@@ -76,9 +87,11 @@
   *Behaviour change:* without `format`, a database with named graphs is
   exported as N-Quads (`.nq`) instead of N-Triples that dropped them.
 - CLI: `gexport --format nt|nq` and `-z` / `out.zip`; `gbackup -z` /
-  `x.zip`; `grestore` of a `.zip`; `gbuild` of a `.zip` package (upstream
-  1.3's `gbuild -f x.zip`). `gconsole`'s `restore` passes a zip path to the
-  server like a directory.
+  `x.zip`; `grestore` of a `.zip`; `gbuild`, `gadd` and `gsub` of a `.zip`
+  package (upstream 1.3's `-f x.zip`). `--unzip-max-size` /
+  `--unzip-max-entries` change the CLI's limits (`0` = none); `grestore`
+  has none by default, so any `gbackup -z` archive restores. `gconsole`'s
+  `restore` passes a zip path to the server like a directory.
 - Without the feature every zip path answers `1003` (the CLI exits 1),
   naming the feature.
 
@@ -89,7 +102,9 @@
   retention in days. Configured as upstream through `conf.ini`'s `log_mode`
   (a log4cplus properties file; upstream's two are shipped as
   `conf/slog*.properties.example`), plus the keys `log_level`, `log_file`,
-  `log_days`, `log_stderr` and the `GSTORE_LOG` variable.
+  `log_days`, `log_stderr` and the `GSTORE_LOG` variable. As log4cplus,
+  `MaxBackupIndex` deletes no daily file (`MaxHistory` / `log_days` set a
+  retention), and the file only ever rolls forward.
 - `gserver`'s diagnostics go through it (handler panics, accept failures,
   failed saves; each request at `debug`); its startup lines on standard
   output are also recorded in the file.
@@ -110,7 +125,8 @@
 - `gshow` with no argument lists every database (upstream's
   database/creator/built_time table); `gshow NAME` still shows its counts.
 - `gbuild` without a source builds an empty database, and refuses to
-  overwrite an existing one unless `--force`.
+  overwrite an existing one unless `--force`. A failed build removes the
+  database directory it created, as upstream.
 - `gexport -db NAME [-f DIR]` writes `<db>_<timestamp>.nt` (`.nq` / `.zip`
   as chosen); `gbackup -db NAME [-p DIR]` creates
   `DIR/<db>.db_<timestamp>` (default `./backups/`).
@@ -126,6 +142,10 @@
   cargo-deb / cargo-generate-rpm metadata with maintainer scripts.
 - `docs/DEPLOY.md` covers the container, the service, the packages, the
   configuration and logs, and the tools.
+- `gserver` refuses to listen beyond loopback while `root` still has the
+  default password `123456`; `--password-file FILE` /
+  `$GSTORE_ROOT_PASSWORD_FILE` set root's initial password without putting it
+  on the command line (the container's way).
 
 ### CI
 

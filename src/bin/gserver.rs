@@ -54,6 +54,14 @@
 //! - `--addr HOST`: bind address (`listen_addr`, default 127.0.0.1).
 //! - `--password PW`: root's password when the user store is first created
 //!   (`root_password`).
+//! - `--password-file FILE`: the same, read from the first line of `FILE`
+//!   (also `$GSTORE_ROOT_PASSWORD_FILE`, e.g. a Docker secret), so it shows
+//!   in neither `ps` nor `docker inspect`.
+//!
+//! While `root` still has the default password `123456` (whatever
+//! `conf.ini` says now: it only seeds a new user store), the multi-database
+//! server refuses to listen on anything but a loopback address; on loopback
+//! it warns.
 //! - `--db-home DIR`: where the multi-database server keeps its databases
 //!   (`db_home`, default `./dbhome/`).
 //! - `--thread-num N`: the worker-pool size (`thread_num`, default 30).
@@ -101,7 +109,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gstore::config::GStoreConfig;
+use gstore::config::{GStoreConfig, DEFAULT_ROOT_PASSWORD};
 use gstore::http_api::ApiServer;
 use gstore::logging::{self, LogConfig};
 use gstore::{gs_announce, gs_error, gs_info, gs_warn};
@@ -114,6 +122,9 @@ const ENV_BACKGROUND: &str = "GSTORE_GSERVER_BACKGROUND";
 /// Set by the `deamon=on` supervisor in its server child's environment: the
 /// supervisor's pid.
 const ENV_SUPERVISOR: &str = "GSTORE_GSERVER_SUPERVISOR";
+/// A file holding root's initial password (Docker secrets' convention), read
+/// when neither `--password` nor `--password-file` is given.
+const ENV_PASSWORD_FILE: &str = "GSTORE_ROOT_PASSWORD_FILE";
 
 const DOCS: &str = "https://www.gstore.cn";
 
@@ -171,6 +182,8 @@ fn print_help() {
          \t-p,--port N\t\tPort (default: conf.ini port, 9000).\n\
          \t--addr HOST\t\tBind address (default: conf.ini listen_addr, 127.0.0.1).\n\
          \t--password PW\t\tInitial root password (default: conf.ini root_password).\n\
+         \t--password-file FILE\tRead the initial root password from FILE's first line\n\
+         \t\t\t\t(or from $GSTORE_ROOT_PASSWORD_FILE).\n\
          \t--db-home DIR\t\tDatabase directory (default: conf.ini db_home, ./dbhome/).\n\
          \t--thread-num N\t\tWorker threads (default: conf.ini thread_num, 30).\n\
          \t--no-checkpoint\t\tDo not save every write before acknowledging it.\n\
@@ -209,6 +222,9 @@ struct Cli {
     port: Option<u16>,
     addr: Option<String>,
     password: Option<String>,
+    /// `--password-file FILE`: root's initial password, from a file (kept
+    /// out of the command line, `ps` and `docker inspect`).
+    password_file: Option<PathBuf>,
     /// `--db-home DIR`: conf.ini's `db_home`.
     db_home: Option<String>,
     /// `--thread-num N`: conf.ini's `thread_num` (validated when parsed).
@@ -274,6 +290,7 @@ impl Cli {
                 "--password" => {
                     cli.password = Some(value(&mut i, &arg)?.to_string_lossy().into_owned())
                 }
+                "--password-file" => cli.password_file = Some(value(&mut i, &arg)?.into()),
                 "--db-home" => {
                     let v = value(&mut i, &arg)?.to_string_lossy().into_owned();
                     if v.trim().is_empty() {
@@ -381,8 +398,24 @@ fn load_config(cli: &Cli) -> GStoreConfig {
     if let Some(a) = &cli.addr {
         cfg.listen_addr = a.clone();
     }
+    let password_file = cli.password_file.clone().or_else(|| {
+        std::env::var_os(ENV_PASSWORD_FILE)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
     if let Some(pw) = &cli.password {
         cfg.root_password = pw.clone();
+    } else if let Some(file) = password_file {
+        match read_password_file(&file) {
+            Ok(pw) => cfg.root_password = pw,
+            Err(e) => {
+                eprintln!(
+                    "gserver: cannot read root's password from '{}': {e}",
+                    file.display()
+                );
+                std::process::exit(1);
+            }
+        }
     }
     // Both were validated by `Cli::parse`; `set` also marks them as given, so
     // `--api` without a DIR roots at `--db-home`.
@@ -398,6 +431,19 @@ fn load_config(cli: &Cli) -> GStoreConfig {
         cfg.check_point = false;
     }
     cfg
+}
+
+/// Root's password from `file`: its first line (an empty one is an error).
+fn read_password_file(file: &Path) -> io::Result<String> {
+    let text = fs::read_to_string(file)?;
+    let pw = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    if pw.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the file holds no password",
+        ));
+    }
+    Ok(pw.to_string())
 }
 
 /// Say where the configuration came from and log its warnings.
@@ -988,12 +1034,6 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             if cli.rocksdb {
                 gs_warn!("--rocksdb is ignored in API mode (the API manages its own databases)");
             }
-            if cfg.root_password == "123456" {
-                gs_warn!(
-                    "root is using the default password '123456'; \
-                     pass --password (or set root_password) before exposing this server"
-                );
-            }
             // The served root becomes the configuration's db_home, so request
             // handlers reading the config see where the databases really are.
             let mut served = cfg.clone();
@@ -1005,6 +1045,28 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                     return 1;
                 }
             };
+            // Every gStore install shares the default root password: never
+            // serve it beyond this machine.
+            if server.root_has_default_password() {
+                let local = server.local_addr().ok();
+                if local.is_some_and(|a| !a.ip().is_loopback()) {
+                    gs_error!(
+                        "root still has the default password '{DEFAULT_ROOT_PASSWORD}' and the \
+                         server would listen on {}: refusing to start. Set root's password \
+                         first: for a new user store with --password-file FILE (or the \
+                         {ENV_PASSWORD_FILE} environment variable, or conf.ini's root_password); \
+                         for an existing one, start on 127.0.0.1 and change it with gconsole's \
+                         setpswd or the /api userPassword operation.",
+                        cfg.listen_addr
+                    );
+                    return 1;
+                }
+                gs_warn!(
+                    "root is using the default password '{DEFAULT_ROOT_PASSWORD}'; change it \
+                     before exposing this server (gserver refuses to listen beyond loopback \
+                     with it)"
+                );
+            }
             let root_s = root.display();
             if cfg.check_point {
                 gs_announce!("gserver: databases are stored under '{root_s}' (check_point on: every write is saved)");

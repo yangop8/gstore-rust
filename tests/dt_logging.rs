@@ -160,6 +160,38 @@ fn the_log_file_rolls_over_at_midnight_of_the_injected_clock() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A record stamped before midnight that is written after one stamped after
+/// it (threads racing for the file, or a clock stepped back) goes into the
+/// current file: the log never rolls backwards, nor splits a day.
+#[test]
+fn a_late_record_from_the_previous_day_does_not_roll_the_file_back() {
+    let dir = tmp_dir("late");
+    let path = dir.join("all.log");
+    let clock = Arc::new(ManualClock::at_unix(at(2026, 10, 30, 23, 59, 59)));
+    let log = file_logger(&path, Level::Info, 0, &clock);
+    log.log(Level::Info, "t", format_args!("D record"));
+    clock.set_unix(at(2026, 10, 31, 0, 0, 1));
+    log.log(Level::Info, "t", format_args!("D+1 record A"));
+    clock.set_unix(at(2026, 10, 30, 23, 59, 59));
+    log.log(Level::Info, "t", format_args!("D record (late)"));
+    clock.set_unix(at(2026, 10, 31, 0, 0, 2));
+    log.log(Level::Info, "t", format_args!("D+1 record B"));
+    assert_eq!(names(&dir), ["all.log", "all.log.2026-10-30"]);
+    assert_eq!(read(&dir.join("all.log.2026-10-30")).lines().count(), 1);
+    let current = read(&path);
+    assert_eq!(current.lines().count(), 3, "{current}");
+    assert!(current.contains("(late)") && current.contains("record B"));
+    // The next day rolls the whole of D+1 into one file.
+    clock.set_unix(at(2026, 11, 1, 0, 0, 5));
+    log.log(Level::Info, "t", format_args!("D+2"));
+    assert_eq!(
+        names(&dir),
+        ["all.log", "all.log.2026-10-30", "all.log.2026-10-31"]
+    );
+    assert_eq!(read(&dir.join("all.log.2026-10-31")).lines().count(), 3);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_file_left_by_an_earlier_run_on_an_earlier_day_is_rolled_when_opened() {
     let dir = tmp_dir("stale");
@@ -321,11 +353,21 @@ fn configuration_comes_from_the_properties_file_and_the_log_keys() {
     assert_eq!(lc.stderr, None, "no console appender listed");
     let file = lc.file.clone().unwrap();
     assert_eq!(file.path, dir.join("logs/all.log"));
-    assert_eq!(file.days, 12);
+    // log4cplus' MaxBackupIndex limits one day's `.N` backups and deletes
+    // no daily file: the rolled files are kept, as upstream keeps them.
+    assert_eq!(file.days, 0);
     assert!(
         warnings.len() == 1 && warnings[0].contains("only DAILY"),
         "{warnings:?}"
     );
+    // MaxHistory (log4cplus' age-based retention) sets one.
+    let (lc, _) = LogConfig::from_properties(
+        "log4cplus.rootLogger=INFO, FILE\n\
+         log4cplus.appender.FILE=log4cplus::TimeBasedRollingFileAppender\n\
+         log4cplus.appender.FILE.FilenamePattern=x.log\n\
+         log4cplus.appender.FILE.MaxHistory=12\n",
+    );
+    assert_eq!(lc.file.unwrap().days, 12);
 
     // The extension keys override the properties file.
     for (k, v) in [

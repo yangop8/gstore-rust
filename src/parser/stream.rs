@@ -145,9 +145,15 @@ impl<R: BufRead> CharSource<R> {
             }
             return true;
         }
-        // The character straddles the end of the buffer: gather it.
+        // The character straddles the end of the buffer: gather it, one
+        // continuation byte at a time. A byte that is not one (an invalid
+        // lead byte followed by ASCII, say) is left for the next character,
+        // as the path above leaves it — so what is decoded never depends on
+        // where the read window happens to end.
         let mut tmp = [0u8; 4];
-        let mut have = 0usize;
+        tmp[0] = b0;
+        self.inner.consume(1);
+        let mut have = 1usize;
         while have < n {
             let buf = loop {
                 match self.inner.fill_buf() {
@@ -160,13 +166,14 @@ impl<R: BufRead> CharSource<R> {
                     }
                 }
             };
-            if buf.is_empty() {
-                break;
+            match buf.first() {
+                Some(&b) if b & 0xC0 == 0x80 => {
+                    tmp[have] = b;
+                    have += 1;
+                    self.inner.consume(1);
+                }
+                _ => break,
             }
-            let take = (n - have).min(buf.len());
-            tmp[have..have + take].copy_from_slice(&buf[..take]);
-            have += take;
-            self.inner.consume(take);
         }
         match std::str::from_utf8(&tmp[..have])
             .ok()
@@ -515,6 +522,19 @@ mod tests {
         let (out, bad) = decode_all(b"a\xffb\xe6\x97", 2);
         assert_eq!(out, "a\u{FFFD}b\u{FFFD}");
         assert!(bad);
+    }
+
+    #[test]
+    fn an_invalid_lead_byte_at_a_window_boundary_swallows_nothing_after_it() {
+        // Latin-1 'é' (0xE6) in a literal: the bytes after it are ASCII, so
+        // they must survive whatever the window size.
+        let data = b"<s> <p> \"ab\xe6\" .\n<s1> <p> <o1> .\n";
+        let want = "<s> <p> \"ab\" .\n<s1> <p> <o1> .\n";
+        for chunk in 1..data.len() + 1 {
+            let (out, bad) = decode_all(data, chunk);
+            assert!(bad, "chunk {chunk}");
+            assert_eq!(out.replace('\u{FFFD}', ""), want, "chunk {chunk}");
+        }
     }
 
     #[test]

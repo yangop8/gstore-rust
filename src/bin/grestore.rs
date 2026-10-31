@@ -20,8 +20,11 @@
 //!
 //! A zipped backup (`….zip`, as `gbackup -z` and the `/api` `backup
 //! compress=true` write; upstream `grestore` accepts one too) is unpacked
-//! beside the target first, under the default zip limits (feature `zip`;
-//! see [`Database::restore_from_zip`]).
+//! beside the target first (feature `zip`; see
+//! [`Database::restore_from_zip`]). Unsafe entry names are refused; its size
+//! is not limited — a backup is the operator's own, and `gbackup -z` packs
+//! one of any size — unless `--unzip-max-size BYTES` / `--unzip-max-entries
+//! N` set a limit.
 //!
 //! `-l`/`--list <db_name>` prints the backups `gbackup -db <db_name>` made in
 //! the default backup directory `./backups/` (upstream's `-l`), zipped ones
@@ -42,7 +45,8 @@ const TOOL: cli::Tool = cli::Tool {
     name: "grestore",
     usage: "grestore <db_name> <backup_dir | backup.zip>\n\
             grestore -db <db_name> -p <backup_dir | backup.zip>\n\
-            grestore -l <db_name>",
+            grestore -l <db_name>\n\
+            \t[--unzip-max-size BYTES] [--unzip-max-entries N]",
     help: "restore a database from a backup\n\
            \n\
            Options:\n\
@@ -51,7 +55,9 @@ const TOOL: cli::Tool = cli::Tool {
            \t-p,--path PATH\t\tThe backup to restore (e.g. ./backups/<db_name>.db_<timestamp>),\n\
            \t\t\t\ta directory or a zip archive (the latter needs the `zip`\n\
            \t\t\t\tcargo feature).\n\
-           \t-l,--list NAME\t\tList the backups of NAME in the default path ./backups/.",
+           \t-l,--list NAME\t\tList the backups of NAME in the default path ./backups/.\n\
+           \t--unzip-max-size BYTES\tThe most a zipped backup may unpack to (default: no limit).\n\
+           \t--unzip-max-entries N\tThe most entries a zipped backup may hold (default: no limit).",
 };
 
 const PATH: cli::Opt = cli::Opt {
@@ -72,7 +78,16 @@ fn is_zip_file(path: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    let mut args = match cli::parse(&cli::argv(), &[cli::DB, PATH, LIST]) {
+    let mut args = match cli::parse(
+        &cli::argv(),
+        &[
+            cli::DB,
+            PATH,
+            LIST,
+            cli::UNZIP_MAX_SIZE,
+            cli::UNZIP_MAX_ENTRIES,
+        ],
+    ) {
         Ok(cli::Parsed::Help) => {
             TOOL.print_help();
             return ExitCode::SUCCESS;
@@ -81,7 +96,7 @@ fn main() -> ExitCode {
         Err(e) => return TOOL.usage_error(&e),
     };
     if let Some(name) = args.value(2) {
-        if args.value(0).is_some() || args.value(1).is_some() || !args.rest.is_empty() {
+        if args.values.iter().filter(|v| v.is_some()).count() > 1 || !args.rest.is_empty() {
             return TOOL.usage_error("-l takes only the database name");
         }
         return list_backups(name);
@@ -89,6 +104,10 @@ fn main() -> ExitCode {
     if let Some(o) = args.unknown_option() {
         return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
+    let limits = match cli::zip_limits(&args, 3, 4, ZipLimits::NONE) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     // Upstream's order: the database, then the backup.
     let mut positional = std::mem::take(&mut args.rest).into_iter();
     let name = match args.value(0) {
@@ -121,9 +140,9 @@ fn main() -> ExitCode {
     }
 
     let restored = if zipped {
-        Database::restore_from_zip(backup, &dir, &ZipLimits::default())
+        Database::restore_from_zip(backup, &dir, &limits).map_err(cli::zip_error)
     } else {
-        Database::restore_into(backup, &dir)
+        Database::restore_into(backup, &dir).map_err(|e| e.to_string())
     };
     if let Err(e) = restored {
         eprintln!("restore of '{backup}' into '{dir}' failed: {e}");

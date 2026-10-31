@@ -53,6 +53,7 @@ use crate::parser::nquads::Quad;
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 use crate::parser::stream::{
     BlankLabeler, CharSource, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
+    MAX_LOOKAHEAD,
 };
 
 /// Parse a Turtle document into triples.
@@ -125,6 +126,7 @@ fn run<R: BufRead>(
         out: Vec::new(),
         graph: None,
         in_block: false,
+        skip_block: false,
         trig,
         labels,
         depth: 0,
@@ -143,6 +145,10 @@ struct Parser<R> {
     graph: Option<Term>,
     /// TriG: inside a `{ … }` block.
     in_block: bool,
+    /// TriG: inside a block whose label could not be read (an error on the
+    /// line that opened it). Its statements are reported as errors rather
+    /// than filed under a graph the document does not name.
+    skip_block: bool,
     trig: bool,
     labels: BlankLabeler,
     /// Current `[ … ]` / `( … )` nesting depth, bounded by `MAX_NESTING_DEPTH` so
@@ -173,6 +179,11 @@ fn is_lenient_local_char(c: char) -> bool {
     is_std_local_char(c) || matches!(c, '/' | '#' | '?' | '=' | '&' | '~' | '!' | '$' | '*' | '+' | '@')
 }
 
+/// A character a blank node label may contain besides `.`.
+fn is_blank_label_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
 /// Characters a `\`-escape may produce in a local name (`PN_LOCAL_ESC`).
 const LOCAL_ESCAPES: &str = "_~.-!$&'()*+,;=/?#@%";
 
@@ -191,6 +202,11 @@ impl<R: BufRead> Parser<R> {
                 other => other,
             };
             match item {
+                Ok(true) if self.skip_block && !self.out.is_empty() => {
+                    self.out.clear();
+                    let e = self.err("statement in a graph block whose label could not be read");
+                    sink.error(SyntaxError::from_error(&e).with_context(self.context()))?;
+                }
                 Ok(true) => {
                     if !self.out.is_empty() {
                         sink.at_line(self.src.line());
@@ -202,14 +218,7 @@ impl<R: BufRead> Parser<R> {
                 Err(e) => {
                     self.out.clear();
                     self.depth = 0;
-                    let context = self
-                        .ctx
-                        .iter()
-                        .flatten()
-                        .map(Term::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    sink.error(SyntaxError::from_error(&e).with_context(context))?;
+                    sink.error(SyntaxError::from_error(&e).with_context(self.context()))?;
                     // Tolerant: resynchronise at the next line.
                     self.resync();
                     self.src.take_bad_utf8();
@@ -218,23 +227,57 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// The current statement's subject / predicate / object, for the log.
+    fn context(&self) -> String {
+        self.ctx
+            .iter()
+            .flatten()
+            .map(Term::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Leave a TriG block.
+    fn close_block(&mut self) {
+        self.in_block = false;
+        self.skip_block = false;
+        self.graph = None;
+    }
+
     /// After a failed statement: skip the rest of the line (upstream's
-    /// `discardLine`). Inside a TriG block a `}` on that line (outside a
-    /// string, IRI or comment) still closes the block, and parsing resumes
-    /// right after it — otherwise one bad statement on a block's last line
-    /// would pull everything after the block into it.
+    /// `discardLine`). The parser stops outside any string or IRI when it
+    /// fails (see [`Parser::skip_rest_of_literal`]), so in TriG the skipped
+    /// text can be scanned for block boundaries (outside strings, IRIs and
+    /// comments):
+    ///
+    /// * inside a block, a `}` still closes it, and parsing resumes right
+    ///   after it — otherwise one bad statement on a block's last line would
+    ///   pull everything after the block into it;
+    /// * outside one, a `{` still opens one, under the label written before
+    ///   it — otherwise the block's statements would land in the default
+    ///   graph. A label that cannot be read makes the block's statements
+    ///   errors (see [`Parser::skip_block`]).
     fn resync(&mut self) {
-        if !(self.trig && self.in_block) {
+        if !self.trig {
             self.src.discard_line();
             return;
         }
+        let in_block = self.in_block;
         let mut quote: Option<char> = None;
         let mut in_iri = false;
+        // The token being scanned and the one before it (outside strings),
+        // for the label of a block opened on this line.
+        let mut token = String::new();
+        let mut prev = String::new();
         while let Some(c) = self.src.bump() {
+            let outside = quote.is_none() && !in_iri;
             match c {
                 '\n' => return,
                 '\\' if quote.is_some() => {
-                    self.src.bump();
+                    if self.src.peek() != Some('\n') {
+                        self.src.bump();
+                    }
+                    continue;
                 }
                 '"' | '\'' if !in_iri => match quote {
                     Some(q) if q == c => quote = None,
@@ -243,18 +286,68 @@ impl<R: BufRead> Parser<R> {
                 },
                 '<' if quote.is_none() => in_iri = true,
                 '>' if in_iri => in_iri = false,
-                '#' if quote.is_none() && !in_iri => {
+                '#' if outside => {
                     self.src.discard_line();
                     return;
                 }
-                '}' if quote.is_none() && !in_iri => {
-                    self.in_block = false;
-                    self.graph = None;
+                '}' if outside && in_block => {
+                    self.close_block();
+                    return;
+                }
+                '{' if outside && !in_block => {
+                    let label = if token.is_empty() { prev } else { token };
+                    self.in_block = true;
+                    match self.block_label(&label) {
+                        Some(graph) => self.graph = graph,
+                        None => self.skip_block = true,
+                    }
                     return;
                 }
                 _ => {}
             }
+            if outside && c.is_whitespace() {
+                if !token.is_empty() {
+                    prev = std::mem::take(&mut token);
+                }
+            } else if token.len() < 4096 {
+                token.push(c);
+            }
         }
+    }
+
+    /// The graph of a block opened by `{` after `text` (found while skipping
+    /// a bad line): `Some(None)` for the default graph (`… . {`), `None` when
+    /// `text` is not a graph label.
+    fn block_label(&mut self, text: &str) -> Option<Option<Term>> {
+        if text == "." {
+            return Some(None);
+        }
+        if text == "[]" {
+            return Some(Some(self.fresh_blank()));
+        }
+        if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+            if iri
+                .chars()
+                .any(|c| c <= ' ' || matches!(c, '<' | '>' | '\\'))
+            {
+                return None;
+            }
+            return Some(Some(Term::Iri(self.resolve_iri(iri))));
+        }
+        if let Some(label) = text.strip_prefix("_:") {
+            let ok = !label.is_empty()
+                && !label.ends_with('.')
+                && label
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'));
+            return ok.then(|| Some(Term::Blank(self.labels.explicit(label))));
+        }
+        let (prefix, local) = text.split_once(':')?;
+        if local.ends_with('.') || !local.chars().all(is_lenient_local_char) {
+            return None;
+        }
+        let ns = self.prefixes.get(prefix)?;
+        Some(Some(Term::Iri(format!("{ns}{local}"))))
     }
 
     /// Mint a fresh blank node for an anonymous construct.
@@ -325,8 +418,7 @@ impl<R: BufRead> Parser<R> {
         self.skip_ws();
         if self.eof() {
             if self.in_block {
-                self.in_block = false;
-                self.graph = None;
+                self.close_block();
                 return Err(self.err("unterminated graph block (missing '}')"));
             }
             return Ok(false);
@@ -334,8 +426,7 @@ impl<R: BufRead> Parser<R> {
         if self.in_block {
             if self.peek() == Some('}') {
                 self.bump();
-                self.in_block = false;
-                self.graph = None;
+                self.close_block();
                 // An optional `.` may follow a graph block (lenient).
                 self.skip_ws();
                 if self.peek() == Some('.') {
@@ -649,10 +740,29 @@ impl<R: BufRead> Parser<R> {
                 Some('>') => return Ok(self.resolve_iri(&s)),
                 Some('\\') => {
                     // \uXXXX / \UXXXXXXXX
-                    match self.bump() {
-                        Some('u') => self.read_hex(&mut s, 4)?,
-                        Some('U') => self.read_hex(&mut s, 8)?,
-                        other => return Err(self.err(format!("invalid IRI escape '\\{other:?}'"))),
+                    let escaped = match self.peek() {
+                        Some('u') => {
+                            self.bump();
+                            self.read_hex(&mut s, 4)
+                        }
+                        Some('U') => {
+                            self.bump();
+                            self.read_hex(&mut s, 8)
+                        }
+                        other => Err(self.err(format!("invalid IRI escape '\\{other:?}'"))),
+                    };
+                    if let Err(e) = escaped {
+                        // Stop after the IRI, not inside it (see `resync`).
+                        while let Some(c) = self.peek() {
+                            if c <= ' ' {
+                                break;
+                            }
+                            self.bump();
+                            if c == '>' {
+                                break;
+                            }
+                        }
+                        return Err(e);
                     }
                 }
                 Some(c) => s.push(c),
@@ -666,11 +776,21 @@ impl<R: BufRead> Parser<R> {
         self.expect(':')?;
         let mut label = String::new();
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                // Don't absorb a '.' that terminates the statement.
-                if c == '.' && self.peek2().is_none_or(|n| n.is_whitespace()) {
+            if c == '.' {
+                // A label never ends with '.' (BLANK_NODE_LABEL): the dots
+                // are part of it only if a label character follows them —
+                // `_:b.}` / `_:b.# note` / `_:b.<s2> …` end the statement.
+                let dots = (0..MAX_LOOKAHEAD - 1)
+                    .take_while(|&k| self.src.peek_at(k) == Some('.'))
+                    .count();
+                if !self.src.peek_at(dots).is_some_and(is_blank_label_char) {
                     break;
                 }
+                for _ in 0..dots {
+                    label.push('.');
+                    self.bump();
+                }
+            } else if is_blank_label_char(c) {
                 label.push(c);
                 self.bump();
             } else {
@@ -762,9 +882,21 @@ impl<R: BufRead> Parser<R> {
         loop {
             match self.peek() {
                 None => return Err(self.err("unterminated literal")),
+                // A short string never spans lines (STRING_LITERAL_QUOTE):
+                // stopping here, the newline unread, keeps a tolerant
+                // import's resync on this line — one stray quote must not
+                // swallow the rest of the file into one value.
+                Some('\n' | '\r') if !triple => {
+                    return Err(
+                        self.err("unterminated literal (line break before the closing quote)")
+                    )
+                }
                 Some('\\') => {
                     self.bump();
-                    self.read_string_escape(&mut value)?;
+                    if let Err(e) = self.read_string_escape(&mut value) {
+                        self.skip_rest_of_literal(quote, triple);
+                        return Err(e);
+                    }
                 }
                 Some(c) if c == quote => {
                     if triple {
@@ -829,6 +961,39 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// After a bad escape: move past the literal's closing quote(s), so that
+    /// a failed statement leaves the parser outside the string (`resync`
+    /// relies on it). A short string still stops before a line break.
+    fn skip_rest_of_literal(&mut self, quote: char, triple: bool) {
+        while let Some(c) = self.peek() {
+            match c {
+                '\n' | '\r' if !triple => return,
+                '\\' => {
+                    self.bump();
+                    if triple || !matches!(self.peek(), Some('\n' | '\r')) {
+                        self.bump();
+                    }
+                }
+                c if c == quote => {
+                    if !triple {
+                        self.bump();
+                        return;
+                    }
+                    if self.peek2() == Some(quote) && self.src.peek_at(2) == Some(quote) {
+                        self.bump();
+                        self.bump();
+                        self.bump();
+                        return;
+                    }
+                    self.bump();
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
     fn parse_numeric(&mut self) -> Result<Term> {
         let mut s = String::new();
         let mut is_decimal = false;
@@ -869,6 +1034,9 @@ impl<R: BufRead> Parser<R> {
     }
 
     fn read_string_escape(&mut self, out: &mut String) -> Result<()> {
+        if matches!(self.peek(), Some('\n' | '\r')) {
+            return Err(self.err("invalid escape: '\\' at the end of a line"));
+        }
         match self.bump() {
             Some('t') => out.push('\t'),
             Some('n') => out.push('\n'),
@@ -889,12 +1057,14 @@ impl<R: BufRead> Parser<R> {
     fn read_hex(&mut self, out: &mut String, n: usize) -> Result<()> {
         let mut code = 0u32;
         for _ in 0..n {
+            // Peeked, not consumed: a bad digit may be a closing quote.
             let c = self
-                .bump()
+                .peek()
                 .ok_or_else(|| self.err("truncated \\u escape"))?;
             let d = c
                 .to_digit(16)
                 .ok_or_else(|| self.err(format!("bad hex digit '{c}'")))?;
+            self.bump();
             code = code * 16 + d;
         }
         out.push(char::from_u32(code).ok_or_else(|| self.err("invalid code point"))?);
@@ -1475,6 +1645,121 @@ mod tests {
             ]
         );
         assert_eq!(sink.errors.len(), 2);
+    }
+
+    /// `(subject, graph)` of each quad a tolerant TriG parse keeps, and its
+    /// error count.
+    fn tolerant_trig(doc: &str) -> (Vec<(String, Option<Term>)>, usize) {
+        let mut sink = Tolerant::default();
+        parse_reader_trig(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let got = sink
+            .quads
+            .iter()
+            .map(|q| (q.subject.to_string(), q.graph.clone()))
+            .collect();
+        (got, sink.errors.len())
+    }
+
+    #[test]
+    fn an_unterminated_short_literal_fails_only_its_line() {
+        let mut doc = String::from("<s0> <p> <o0> .\n<s1> <p> \"unterminated .\n");
+        for i in 0..100 {
+            doc.push_str(&format!("<s{}> <p> <o> .\n", i + 2));
+        }
+        // An escaped closing quote, and a backslash ending the line.
+        doc.push_str("<x> <p> \"C:\\\\dir\\\" .\n<y> <p> <o> .\n<z> <p> \"a\\\n<w> <p> <o> .\n");
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.quads.len(), 103, "{:?}", sink.errors);
+        let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [2, 103, 105], "{:?}", sink.errors);
+        assert!(sink.errors[0].message.contains("unterminated literal"));
+        // A long string may still span lines.
+        let ts = parse_str("<s> <p> \"\"\"a\nb\"\"\" .").unwrap();
+        assert_eq!(ts[0].object, Term::plain_literal("a\nb"));
+    }
+
+    #[test]
+    fn a_bad_escape_leaves_the_parser_after_the_literal() {
+        // A bad `\u` digit that is the closing quote, and a bad escape in a
+        // long string whose text looks like statements.
+        let doc = "<a> <p> \"\\u12\" . <x> <p> <o> .\n<b> <p> <o> .\n\
+                   <c> <p> \"\"\"\\q\n<inside> <p> <o> .\n\"\"\" .\n<d> <p> <o> .\n\
+                   <e> <p> <http://x/\\q\"> .\n<f> <p> <o> .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        assert_eq!(subjects, ["<b>", "<d>", "<f>"]);
+        assert_eq!(sink.errors.len(), 3);
+    }
+
+    #[test]
+    fn tolerant_trig_recovery_follows_blocks_after_an_error_in_a_literal() {
+        // A bad escape inside a literal on a block's last line: its `}`
+        // still closes the block.
+        let (got, errors) = tolerant_trig(
+            "<g1> {\n<s1> <p> <o1> .\n<s2> <p> \"C:\\path\" }\n<s3> <p> <o3> .\n\
+             <g2> { <s4> <p> <o4> . }\n<s5> <p> <o5> .\n",
+        );
+        let (g1, g2) = (Some(Term::iri("g1")), Some(Term::iri("g2")));
+        assert_eq!(
+            got,
+            [
+                ("<s1>".to_string(), g1),
+                ("<s3>".to_string(), None),
+                ("<s4>".to_string(), g2.clone()),
+                ("<s5>".to_string(), None),
+            ]
+        );
+        assert_eq!(errors, 1);
+        // A block opened on the line of a bad statement is still opened.
+        let (got, errors) = tolerant_trig(
+            "@prefix ex: <http://e/> .\n\
+             <s0> <p> \"bad\\q\" . <g2> {\n<a> <b> <c> .\n}\n\
+             <s1> <p> \"bad\\q\" . ex:g {\n<d> <b> <c> .\n}\n\
+             <s2> <p> \"bad\\q\" . GRAPH _:x { <e> <b> <c> . }\n\
+             <s3> <p> \"bad\\q\" . { <f> <b> <c> . }\n\
+             <z> <p> <o> .\n",
+        );
+        assert_eq!(
+            got,
+            [
+                ("<a>".to_string(), g2),
+                ("<d>".to_string(), Some(Term::iri("http://e/g"))),
+                ("<e>".to_string(), Some(Term::Blank("x".into()))),
+                ("<f>".to_string(), None),
+                ("<z>".to_string(), None),
+            ]
+        );
+        assert_eq!(errors, 4);
+        // A block whose label cannot be read: its statements are errors,
+        // not default-graph triples.
+        let (got, errors) =
+            tolerant_trig("\"lit\" {\n<a> <b> <c> .\n<d> <b> <c> .\n}\n<z> <p> <o> .\n");
+        assert_eq!(got, [("<z>".to_string(), None)]);
+        assert_eq!(errors, 3);
+    }
+
+    #[test]
+    fn a_blank_node_label_does_not_end_with_a_dot() {
+        let (got, errors) = tolerant_trig("<g> { <s> <p> _:b.}\n<g> { _:b <p> <o> . }\n");
+        assert_eq!(errors, 0);
+        assert_eq!(got.len(), 2);
+        let mut sink = CollectQuads::default();
+        parse_reader_trig(
+            "<g> { <s> <p> _:b.}\n<g> { _:b <p> <o> . }\n".as_bytes(),
+            BlankLabeler::keep(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.quads[0].object, Term::Blank("b".into()));
+        assert_eq!(sink.quads[1].subject, Term::Blank("b".into()));
+        let ts = parse_str("<s> <p> _:b.# note\n<s> <p> _:c.<s2> <p> _:a.b , _:a..b .").unwrap();
+        let objects: Vec<Term> = ts.into_iter().map(|t| t.object).collect();
+        assert_eq!(
+            objects,
+            ["b", "c", "a.b", "a..b"].map(|l| Term::Blank(l.into()))
+        );
     }
 
     #[test]

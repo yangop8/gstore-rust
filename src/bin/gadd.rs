@@ -16,6 +16,13 @@
 //! named graphs; every file is its own blank-node scope (a `_:b` of this call
 //! never merges with one already stored).
 //!
+//! A local `.zip` source (upstream 1.3's `gadd -f x.zip`; feature `zip`) is
+//! unpacked — refusing unsafe entry names, under the default zip limits
+//! (`--unzip-max-size BYTES` / `--unzip-max-entries N` change them, `0` = no
+//! limit) — into a scratch directory beside the database, removed when
+//! `gadd` ends, and read like a directory source. Without the feature it is
+//! an error, never parsed as RDF.
+//!
 //! Like upstream's batch insert, a statement that does not parse is skipped,
 //! counted and logged to `<db_name>.db/parse_error.log`; `--strict` stops at
 //! the first one instead (what was inserted before it is kept and saved).
@@ -32,20 +39,26 @@ mod cli;
 use std::process::ExitCode;
 
 use gstore::parser::import::{self, ImportOptions, ParseErrorLog};
+use gstore::zipio::ZipLimits;
 use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gadd",
     usage: "gadd [--strict] <db_name> <file | dir | url> [more ...]\n\
-            gadd -db <db_name> (-f <file> | -dir <directory>) [--strict]",
+            gadd -db <db_name> (-f <file | zip> | -dir <directory>) [--strict]",
     help: "insert the triples of RDF files into a database\n\
            \n\
            Options:\n\
            \t-h,--help\t\tDisplay this message.\n\
            \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
-           \t-f,--file PATH\t\tThe RDF file (or directory, or http(s) URL) to insert.\n\
+           \t-f,--file PATH\t\tThe RDF file (or directory, zip package or http(s) URL)\n\
+           \t\t\t\tto insert.\n\
            \t-dir,--directory DIR\tA directory of RDF files to insert.\n\
-           \t--strict\t\tStop at the first statement that does not parse.",
+           \t--strict\t\tStop at the first statement that does not parse.\n\
+           \t--unzip-max-size BYTES\tThe most a zip package may unpack to (default\n\
+           \t\t\t\t10737418240; 0 = no limit).\n\
+           \t--unzip-max-entries N\tThe most entries a zip package may hold (default\n\
+           \t\t\t\t10000; 0 = no limit).",
 };
 
 const FILE: cli::Opt = cli::Opt {
@@ -58,7 +71,16 @@ const DIRECTORY: cli::Opt = cli::Opt {
 };
 
 fn main() -> ExitCode {
-    let mut args = match cli::parse(&cli::argv(), &[cli::DB, FILE, DIRECTORY]) {
+    let mut args = match cli::parse(
+        &cli::argv(),
+        &[
+            cli::DB,
+            FILE,
+            DIRECTORY,
+            cli::UNZIP_MAX_SIZE,
+            cli::UNZIP_MAX_ENTRIES,
+        ],
+    ) {
         Ok(cli::Parsed::Help) => {
             TOOL.print_help();
             return ExitCode::SUCCESS;
@@ -70,6 +92,10 @@ fn main() -> ExitCode {
     if let Some(o) = args.unknown_option() {
         return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
+    let limits = match cli::zip_limits(&args, 3, 4, ZipLimits::default()) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     let (name, mut paths) = match args.value(0) {
         Some(db) => (db.to_string(), args.rest.clone()),
         None => match args.rest.split_first() {
@@ -89,6 +115,15 @@ fn main() -> ExitCode {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Zip packages (upstream 1.3's `-f x.zip`) are unpacked first and read
+    // as directories; the scratch directories go when `_unpacked` drops.
+    let _unpacked = match cli::unpack_packages(&dir, &mut paths, &limits) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };

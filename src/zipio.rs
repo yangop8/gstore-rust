@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use crate::config::GStoreConfig;
 use crate::db::Database;
 use crate::error::{GStoreError, Result};
+use crate::model::term::export_key;
 use crate::store::TripleSource;
 
 /// Whether this build handles zip packages (feature `zip`).
@@ -88,6 +89,13 @@ impl Default for ZipLimits {
 }
 
 impl ZipLimits {
+    /// No limit at all: for a package the local operator vouches for, such as
+    /// a backup `grestore` restores (upstream's `grestore` has no limit).
+    pub const NONE: ZipLimits = ZipLimits {
+        max_entries: usize::MAX,
+        max_size: u64::MAX,
+    };
+
     /// The limits `conf.ini` sets (`[upload] unzip_max_entries`,
     /// `unzip_max_size`).
     pub fn from_config(cfg: &GStoreConfig) -> ZipLimits {
@@ -749,6 +757,7 @@ impl ExportFormat {
 /// .`), and for N-Quads then each named graph's (`<s> <p> <o> <g> .`, graphs
 /// in id order). Returns the number of statements written. A statement whose
 /// terms the dictionary cannot resolve is skipped (as `export_ntriples`).
+/// IRIs are written through [`export_key`], so the export loads back.
 pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) -> Result<u64> {
     let dict = db.dict();
     let mut count = 0u64;
@@ -760,6 +769,7 @@ pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
         ) else {
             continue;
         };
+        let (s, p, o) = (export_key(s), export_key(p), export_key(o));
         writeln!(out, "{s} {p} {o} .")?;
         count += 1;
     }
@@ -768,6 +778,7 @@ pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
             let Some(g) = dict.id_to_string(gid) else {
                 continue;
             };
+            let g = export_key(g);
             for t in graph.iter_all() {
                 let (Some(s), Some(p), Some(o)) = (
                     dict.id_to_string(t.sub),
@@ -776,6 +787,7 @@ pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
                 ) else {
                     continue;
                 };
+                let (s, p, o) = (export_key(s), export_key(p), export_key(o));
                 writeln!(out, "{s} {p} {o} {g} .")?;
                 count += 1;
             }
@@ -810,6 +822,55 @@ mod tests {
         ] {
             assert_eq!(safe_entry_path(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn exported_iris_load_back_even_with_characters_iriref_excludes() {
+        use crate::model::{Term, Triple};
+        let triples = vec![
+            Triple::new(
+                Term::iri("http://ex/a b"),
+                Term::iri("http://ex/p"),
+                Term::iri("http://ex/o\t{x}|\"<>`^\\"),
+            ),
+            Triple::new(
+                Term::iri("http://ex/c"),
+                Term::iri("http://ex/p"),
+                Term::typed_literal("v \"q\"^^<x y>", "http://ex/dt z"),
+            ),
+            Triple::new(
+                Term::iri("http://ex/c"),
+                Term::iri("http://ex/p"),
+                Term::plain_literal("a b <c>"),
+            ),
+        ];
+        let db = Database::build_from_triples("x", triples.clone()).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            write_export(&db, ExportFormat::NTriples, &mut out).unwrap(),
+            3
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("<http://ex/a\\u0020b>"), "{text}");
+        let mut want = triples.clone();
+        want.sort_by_key(|t| t.to_string());
+        // `.nt` files load through the Turtle reader, `.nq` through N-Quads.
+        for mut back in [
+            crate::parser::turtle::parse_str(&text).unwrap(),
+            crate::parser::nquads::parse_str_triples(&text).unwrap(),
+        ] {
+            back.sort_by_key(|t| t.to_string());
+            assert_eq!(back, want);
+        }
+        let mut out = Vec::new();
+        db.export_ntriples(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), text);
+        assert_eq!(export_key("_:b"), "_:b");
+        assert_eq!(export_key("\"x\"@en"), "\"x\"@en");
+        assert!(matches!(
+            export_key("<http://ok>"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

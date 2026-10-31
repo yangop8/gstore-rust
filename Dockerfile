@@ -92,7 +92,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # gserver in the foreground (-s); SIGTERM (docker stop) shuts it down
 # gracefully: in-flight requests finish, open transactions roll back,
 # unsaved changes are saved. The listener binds every interface inside the
-# container (conf.ini's listen_addr defaults to 127.0.0.1). Its diagnostic log
+# container (conf.ini's listen_addr defaults to 127.0.0.1), so gserver will not
+# start while root has the default password 123456: give the first start one
+# with GSTORE_ROOT_PASSWORD_FILE (a mounted file or Docker secret; see
+# docs/DEPLOY.md) or conf.ini's root_password. Its diagnostic log
 # goes to standard error (docker logs) unless conf.ini / slog.properties say
 # otherwise.
 STOPSIGNAL SIGTERM

@@ -435,6 +435,30 @@ fn exec_mode_and_exit_codes() {
     let r = run(cmd, "");
     assert_eq!(r.code, 1, "{r:?}");
     assert!(r.out.contains("Load database nothere failed: "), "{r:?}");
+    // Root cannot select the system database (nothing could query it).
+    let mut cmd = gconsole(&srv.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD, "-e", "use system;"]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.out.contains("system database can NOT be queried"),
+        "{r:?}"
+    );
+    // `clear <arg>` clears the screen, as upstream — never SPARQL `CLEAR`
+    // of the current database.
+    let mut cmd = gconsole(&srv.addr, &cwd);
+    cmd.args([
+        "-u",
+        "root",
+        "-p",
+        PASSWORD,
+        "-e",
+        "use small; clear all; clear default; select * where { ?s ?p ?o };",
+    ]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.out.contains("Update ans num"), "{r:?}");
+    assert!(r.out.contains("Query ans num 25, use "), "{r:?}");
     // `quit;` ends a script: later statements do not run.
     let r = script(&srv, &cwd, "pwd;\nquit;\nuse small;\n");
     assert_eq!(r.code, 0, "{r:?}");

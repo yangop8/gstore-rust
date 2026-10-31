@@ -292,11 +292,13 @@ fn dechunk(mut b: &[u8]) -> io::Result<Vec<u8>> {
         if size == 0 {
             return Ok(out);
         }
-        if b.len() < size + 2 {
-            return Err(bad());
-        }
+        // A size near `usize::MAX` (from a hostile server) must not wrap.
+        let end = size
+            .checked_add(2)
+            .filter(|&end| end <= b.len())
+            .ok_or_else(bad)?;
         out.extend_from_slice(&b[..size]);
-        b = &b[size + 2..];
+        b = &b[end..];
     }
 }
 
@@ -909,6 +911,22 @@ impl JsonParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dechunk_refuses_sizes_that_would_overflow() {
+        assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n\r\n").unwrap(), b"abc");
+        for body in [
+            &b"fffffffffffffffe\r\nabc\r\n0\r\n\r\n"[..],
+            b"ffffffffffffffff\r\nabc\r\n0\r\n\r\n",
+            b"4\r\nabc\r\n0\r\n\r\n",
+        ] {
+            assert_eq!(
+                dechunk(body).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{body:?}"
+            );
+        }
+    }
     use std::net::TcpListener;
 
     /// Serve one connection: read the request, then run `respond` on it.

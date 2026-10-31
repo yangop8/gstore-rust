@@ -22,9 +22,10 @@ directory, as upstream's are to its install root.
 
 **Before exposing a server**: the `root` user's password is `conf.ini`'s
 `root_password` (default `123456`) when the user store is first created —
-set it before the first start (or pass `--password`), or change it later
-with the `/api` `userpassword` operation or `gconsole`. `gserver` warns while
-the default is in use.
+set it before the first start (or pass `--password-file FILE`, or
+`--password`), or change it later with the `/api` `userpassword` operation or
+`gconsole`. While root still has the default password, `gserver` refuses to
+listen on anything but a loopback address (and warns on loopback).
 
 ## Docker
 
@@ -40,9 +41,15 @@ docker build -t gstore-rust .
 # builder install clang for bindgen
 docker build --build-arg FEATURES="gzip tls zip" -t gstore-rust .
 
+# root's password, read once when the user store is created (the server
+# refuses to listen on 0.0.0.0 while root has the default 123456); the file
+# must be readable by the container's uid 10001
+printf '%s\n' 'a-long-random-password' > gstore_root
 docker run -d --name gstore -p 9000:9000 \
     -v gstore-data:/var/lib/gstore \
     -v gstore-conf:/etc/gstore \
+    -v "$PWD/gstore_root:/run/secrets/gstore_root:ro" \
+    -e GSTORE_ROOT_PASSWORD_FILE=/run/secrets/gstore_root \
     --stop-timeout 120 \
     gstore-rust
 
@@ -56,7 +63,11 @@ docker exec -it gstore gconsole -u root                    # the console
   in the foreground, reading `/etc/gstore/conf.ini`, listening on every
   interface of the container (`conf.ini`'s `listen_addr` defaults to
   `127.0.0.1`). Arguments given to `docker run … gstore-rust ARGS` replace
-  the `CMD`, e.g. `-s -c /etc/gstore/conf.ini --addr 0.0.0.0 --password s3cret`.
+  the `CMD`. Because it listens beyond loopback, the server will not start
+  while `root` has the default password: give the first start one through
+  `GSTORE_ROOT_PASSWORD_FILE` (a Docker secret or a mounted file, as above),
+  `--password-file FILE`, or `root_password` in the `/etc/gstore` volume's
+  `conf.ini` — not `--password`, which `docker inspect` and `ps` show.
 * **Volumes.** `/var/lib/gstore` holds the databases, backups, uploads and
   the query/access/transaction logs; `/etc/gstore` holds `conf.ini` (and,
   if you add them, `slog.properties`, `ipDeny.config`, `ipAllow.config`).
@@ -173,7 +184,7 @@ purge.
 
 `conf.ini` is upstream's file key for key (`conf/conf.ini.example`
 documents every key and the gstore-rust extensions). Command-line flags win
-over it: `-c FILE`, `-p/--port`, `--addr`, `--password`, `--db-home`,
+over it: `-c FILE`, `-p/--port`, `--addr`, `--password`, `--password-file`, `--db-home`,
 `--thread-num`, `--no-checkpoint`, `--load-dir`, … (`gserver -h`).
 
 **Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
@@ -194,12 +205,15 @@ analogue of upstream's log4cplus `SLOG_*` log):
   (`conf/slog.properties.example` is upstream's: level `INFO`, the console
   and `./logs/all.log`). Honoured: the root level, `ConsoleAppender`
   (standard error) and one `DailyRollingFileAppender` (`File`,
-  `MaxBackupIndex` — days kept —, `Schedule=DAILY`) with an optional
-  `Threshold`. When the file does not exist, the log goes to standard error
+  `Schedule=DAILY`) with an optional `Threshold`. As upstream's log4cplus
+  (whose `MaxBackupIndex` only limits one day's `.1`, `.2` … backups), the
+  rolled daily files are all kept unless `MaxHistory` (days) or `log_days`
+  sets a retention. When the file does not exist, the log goes to standard error
   at level `info`.
 * gstore-rust extension keys override it: `log_level`
   (`trace`/`debug`/`info`/`warn`/`error`/`off`), `log_file` (a path, or
-  `off`), `log_days` (rolled files kept, `0` = all) and `log_stderr`
+  `off`), `log_days` (days of rolled files kept, `0` = all; `30` when
+  `log_file` sets the file) and `log_stderr`
   (`on`/`off`); the `GSTORE_LOG` environment variable (a level) overrides
   the level once more, e.g. `GSTORE_LOG=debug` logs every request.
 * The file rolls over at local midnight into `<file>.YYYY-MM-DD`; rolled

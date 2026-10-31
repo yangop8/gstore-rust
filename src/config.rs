@@ -238,6 +238,10 @@ fn section_of(key: &str) -> Option<&'static str> {
     KNOWN_KEYS.iter().find(|(_, k)| *k == key).map(|(s, _)| *s)
 }
 
+/// Upstream's default `root_password` (`conf.ini`), which every gStore
+/// install shares: `gserver` refuses to expose a root that still uses it.
+pub const DEFAULT_ROOT_PASSWORD: &str = "123456";
+
 /// gStore's server configuration: every key of upstream's `conf/conf.ini`
 /// (plus a few Rust-only HTTP knobs), typed, with upstream's defaults.
 ///
@@ -345,7 +349,8 @@ pub struct GStoreConfig {
     /// `DailyRollingFileAppender`, else no file).
     pub log_file: String,
     /// *(Rust extension)* Days of rolled diagnostic log files kept, `0` for
-    /// all (default `30`, upstream's `MaxBackupIndex`; applies when set).
+    /// all (applies when set; otherwise a properties file's log keeps them
+    /// all, as upstream's log4cplus, and one `log_file` sets keeps `30`).
     pub log_days: u32,
     /// *(Rust extension)* Write the diagnostic log to standard error too
     /// (default on; applies when set, overriding the properties file).
@@ -406,7 +411,7 @@ impl Default for GStoreConfig {
             db_home: PathBuf::from("./dbhome/"),
             db_suffix: ".db".to_string(),
             root_username: "root".to_string(),
-            root_password: "123456".to_string(),
+            root_password: DEFAULT_ROOT_PASSWORD.to_string(),
             system_username: "system".to_string(),
             pfn_base_path: PathBuf::from("./pfn/"),
             licensetype: "opensource".to_string(),

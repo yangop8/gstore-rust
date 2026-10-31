@@ -18,12 +18,15 @@
 //!   `rdf:first`/`rdf:rest` list ending in `rdf:nil`)
 //! * internal DTD entities: `<!DOCTYPE rdf:RDF [ <!ENTITY xsd "http://…#"> ]>`
 //!   and `&xsd;` references in attribute values and text (the OWL idiom
-//!   `rdf:resource="&xsd;string"`). A replacement text may use entities
-//!   declared before it; it is inserted as text (not re-parsed as markup).
-//!   External entities (`SYSTEM` / `PUBLIC`) are never fetched — a reference
-//!   to one is an error — and expansion is bounded
+//!   `rdf:resource="&xsd;string"`). A replacement text may refer to other
+//!   entities, declared before or after it (XML 1.0 §4.4.7: they are
+//!   expanded when the entity is first used); it is inserted as text (not
+//!   re-parsed as markup). External entities (`SYSTEM` / `PUBLIC`) are never
+//!   fetched — a reference to one is an error — and expansion is bounded
 //!   ([`MAX_ENTITY_VALUE`] per entity, [`MAX_ENTITY_EXPANSION`] per
-//!   document), so an "entity bomb" (billion laughs) is refused, not expanded.
+//!   document, which every expanded entity value and every reference in the
+//!   content is charged to), so an "entity bomb" (billion laughs, or many
+//!   declarations copying one big entity) is refused, not expanded.
 //!
 //! It is deliberately lenient and does not validate; constructs outside the
 //! supported subset are either ignored or surfaced as a parse error.
@@ -51,8 +54,32 @@ const MAX_NESTING_DEPTH: usize = 256;
 /// Longest replacement text one DTD entity may expand to (characters).
 pub const MAX_ENTITY_VALUE: usize = 64 * 1024;
 
-/// Most characters entity references may add to one document in total.
+/// Most characters entity references may add to one document in total:
+/// the expanded replacement texts of the entities used, plus every reference
+/// in attribute values and text.
 pub const MAX_ENTITY_EXPANSION: usize = 4 << 20;
+
+/// One internal DTD entity.
+enum Entity {
+    /// `SYSTEM` / `PUBLIC`: never fetched.
+    External,
+    /// A literal value as declared (character references already decoded),
+    /// expanded when the entity is first used. Holding it unexpanded keeps the
+    /// table as small as the DTD, however many declarations copy one entity,
+    /// and lets a value refer to an entity declared after it.
+    Declared(Vec<Piece>),
+    /// Being expanded: a reference back to it is a loop.
+    Expanding,
+    /// The replacement text (charged to the document's expansion budget).
+    Expanded(String),
+}
+
+/// Part of an entity's literal value.
+enum Piece {
+    Text(String),
+    /// `&name;`: a reference to another general entity.
+    Ref(String),
+}
 
 /// Parse an RDF/XML document into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
@@ -126,10 +153,10 @@ struct XmlParser {
     pos: usize,
     /// Elements currently open, bounded by [`MAX_NESTING_DEPTH`].
     depth: usize,
-    /// Internal DTD entities: name → replacement text (`None` = an external
-    /// entity, which is never fetched).
-    entities: HashMap<String, Option<String>>,
-    /// Characters entity references have added so far.
+    /// Internal DTD entities by name.
+    entities: HashMap<String, Entity>,
+    /// Characters entity expansion has added so far (entity values expanded
+    /// plus references in the content), bounded by [`MAX_ENTITY_EXPANSION`].
     expanded: usize,
 }
 
@@ -304,9 +331,10 @@ impl XmlParser {
         }
     }
 
-    /// `<!ENTITY name "value">` (recorded, its references expanded now),
-    /// `<!ENTITY name SYSTEM "uri">` (recorded as external, never fetched) or
-    /// `<!ENTITY % name …>` (a parameter entity: ignored).
+    /// `<!ENTITY name "value">` (recorded; its entity references are expanded
+    /// when it is first used), `<!ENTITY name SYSTEM "uri">` (recorded as
+    /// external, never fetched) or `<!ENTITY % name …>` (a parameter entity:
+    /// ignored).
     fn parse_entity_decl(&mut self) -> Result<()> {
         self.pos += 8; // "<!ENTITY"
         self.skip_ws();
@@ -338,9 +366,9 @@ impl XmlParser {
                         None => return Err(self.err("unterminated entity value")),
                     }
                 }
-                Some(self.expand_entity_value(&name, &raw)?)
+                Entity::Declared(self.entity_value_pieces(&name, &raw)?)
             }
-            _ => None,
+            _ => Entity::External,
         };
         self.skip_decl()?;
         // The first declaration of a name is binding (XML 1.0 §4.2).
@@ -350,48 +378,126 @@ impl XmlParser {
         Ok(())
     }
 
-    /// Expand the character and entity references of an entity's literal
-    /// value, bounded by [`MAX_ENTITY_VALUE`].
-    fn expand_entity_value(&self, name: &str, raw: &str) -> Result<String> {
-        let mut out = String::new();
+    /// Split an entity's literal value into text (character and predefined
+    /// references decoded now) and references to other entities (expanded on
+    /// first use, by [`XmlParser::expand_entity`]).
+    fn entity_value_pieces(&self, name: &str, raw: &str) -> Result<Vec<Piece>> {
+        let mut pieces = Vec::new();
+        let mut text = String::new();
         let mut rest = raw;
         while let Some(i) = rest.find('&') {
-            out.push_str(&rest[..i]);
+            text.push_str(&rest[..i]);
             let after = &rest[i + 1..];
             let end = after
                 .find(';')
                 .ok_or_else(|| self.err(format!("unterminated reference in entity '{name}'")))?;
             let reference = &after[..end];
             match self.decode_reference(reference)? {
-                Some(c) => out.push(c),
-                None => match self.entities.get(reference) {
-                    Some(Some(text)) => out.push_str(text),
-                    Some(None) => {
-                        return Err(self.err(format!(
-                            "external entity '&{reference};' is not supported"
-                        )))
+                Some(c) => text.push(c),
+                None => {
+                    if !text.is_empty() {
+                        pieces.push(Piece::Text(std::mem::take(&mut text)));
                     }
-                    None => {
-                        return Err(self.err(format!(
-                            "entity '{name}' refers to undeclared entity '&{reference};'"
-                        )))
-                    }
-                },
-            }
-            if out.len() > MAX_ENTITY_VALUE {
-                break;
+                    pieces.push(Piece::Ref(reference.to_string()));
+                }
             }
             rest = &after[end + 1..];
         }
-        if out.len() <= MAX_ENTITY_VALUE {
-            out.push_str(rest);
+        text.push_str(rest);
+        if !text.is_empty() {
+            pieces.push(Piece::Text(text));
         }
-        if out.len() > MAX_ENTITY_VALUE {
-            return Err(self.err(format!(
-                "entity '{name}' expands beyond {MAX_ENTITY_VALUE} characters (entity expansion limit)"
-            )));
+        Ok(pieces)
+    }
+
+    /// Expand entity `name` (and, first, every entity its value refers to)
+    /// unless that was done already. Each expanded value is bounded by
+    /// [`MAX_ENTITY_VALUE`] and charged once to the document's
+    /// [`MAX_ENTITY_EXPANSION`] budget; a loop of references is an error.
+    /// Iterative, so a long chain of entities cannot overflow the stack.
+    fn expand_entity(&mut self, name: &str) -> Result<()> {
+        struct Frame {
+            name: String,
+            pieces: Vec<Piece>,
+            next: usize,
+            out: String,
         }
-        Ok(out)
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut want = Some(name.to_string());
+        loop {
+            if let Some(n) = want.take() {
+                match self.entities.get_mut(&n) {
+                    Some(Entity::Expanded(_)) => {}
+                    Some(slot @ Entity::Declared(_)) => {
+                        let Entity::Declared(pieces) = std::mem::replace(slot, Entity::Expanding)
+                        else {
+                            unreachable!()
+                        };
+                        stack.push(Frame {
+                            name: n,
+                            pieces,
+                            next: 0,
+                            out: String::new(),
+                        });
+                    }
+                    Some(Entity::Expanding) => {
+                        return Err(self.err(format!(
+                            "entity '&{n};' refers to itself (recursive entity reference)"
+                        )))
+                    }
+                    Some(Entity::External) => {
+                        return Err(self.err(format!("external entity '&{n};' is not supported")))
+                    }
+                    None => {
+                        return Err(match stack.last() {
+                            Some(f) => self.err(format!(
+                                "entity '{}' refers to undeclared entity '&{n};'",
+                                f.name
+                            )),
+                            None => self.err(format!("unknown entity '&{n};'")),
+                        })
+                    }
+                }
+            }
+            let Some(top) = stack.last_mut() else {
+                return Ok(());
+            };
+            match top.pieces.get(top.next) {
+                Some(Piece::Text(t)) => {
+                    top.out.push_str(t);
+                    top.next += 1;
+                }
+                Some(Piece::Ref(r)) => match self.entities.get(r) {
+                    Some(Entity::Expanded(t)) => {
+                        top.out.push_str(t);
+                        top.next += 1;
+                    }
+                    // Expand it first; this piece is read again afterwards.
+                    _ => {
+                        want = Some(r.clone());
+                        continue;
+                    }
+                },
+                None => {
+                    let done = stack.pop().expect("a frame is open");
+                    self.expanded += done.out.len();
+                    if self.expanded > MAX_ENTITY_EXPANSION {
+                        return Err(self.err(format!(
+                            "entity references expand beyond {MAX_ENTITY_EXPANSION} characters \
+                             (entity expansion limit)"
+                        )));
+                    }
+                    self.entities.insert(done.name, Entity::Expanded(done.out));
+                    continue;
+                }
+            }
+            if top.out.len() > MAX_ENTITY_VALUE {
+                return Err(self.err(format!(
+                    "entity '{}' expands beyond {MAX_ENTITY_VALUE} characters (entity expansion limit)",
+                    top.name
+                )));
+            }
+        }
     }
 
     /// A predefined entity or character reference (`lt`, `#x41`, …) as a
@@ -605,23 +711,19 @@ impl XmlParser {
             out.push(c);
             return Ok(());
         }
-        match self.entities.get(&name) {
-            Some(Some(text)) => {
-                self.expanded += text.len();
-                if self.expanded > MAX_ENTITY_EXPANSION {
-                    return Err(self.err(format!(
-                        "entity references expand beyond {MAX_ENTITY_EXPANSION} characters \
-                         (entity expansion limit)"
-                    )));
-                }
-                out.push_str(text);
-                Ok(())
-            }
-            Some(None) => Err(self.err(format!(
-                "external entity '&{name};' is not supported"
-            ))),
-            None => Err(self.err(format!("unknown entity '&{name};'"))),
+        self.expand_entity(&name)?;
+        let Some(Entity::Expanded(text)) = self.entities.get(&name) else {
+            unreachable!("expand_entity leaves the entity expanded")
+        };
+        self.expanded += text.len();
+        if self.expanded > MAX_ENTITY_EXPANSION {
+            return Err(self.err(format!(
+                "entity references expand beyond {MAX_ENTITY_EXPANSION} characters \
+                 (entity expansion limit)"
+            )));
         }
+        out.push_str(text);
+        Ok(())
     }
 }
 
@@ -1285,6 +1387,87 @@ mod tests {
             "<rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\"><rdf:Description rdf:about=\"&nope;\"/></rdf:RDF>"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn many_declarations_copying_a_big_entity_stay_within_the_budget() {
+        // Each `<!ENTITY eN "&big;">` costs ~20 input bytes; storing a copy of
+        // `big` for each would multiply a small DTD into gigabytes.
+        let big = "a".repeat(60_000);
+        let decls: String = (0..200)
+            .map(|i| format!("<!ENTITY e{i} \"&big;\">"))
+            .collect();
+        let doc = |body: &str| {
+            format!(
+                "<!DOCTYPE r [<!ENTITY big \"{big}\">{decls}]><rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\">\
+                 <rdf:Description rdf:about=\"http://ex/a\"><ex:p>{body}</ex:p></rdf:Description></rdf:RDF>"
+            )
+        };
+        let unused = doc("v");
+        let mut p = XmlParser::new(&unused);
+        p.parse_document().unwrap();
+        let stored: usize = p
+            .entities
+            .values()
+            .map(|e| match e {
+                Entity::Declared(pieces) => pieces
+                    .iter()
+                    .map(|p| match p {
+                        Piece::Text(t) | Piece::Ref(t) => t.len(),
+                    })
+                    .sum(),
+                Entity::Expanded(t) => t.len(),
+                Entity::External | Entity::Expanding => 0,
+            })
+            .sum();
+        assert!(
+            stored < 2 * unused.len(),
+            "the entity table holds {stored} characters"
+        );
+        assert_eq!(parse_str(&unused).unwrap().len(), 1);
+        // Using them is charged to the document budget.
+        let used: String = (0..200).map(|i| format!("&e{i};")).collect();
+        let err = parse_str(&doc(&used)).unwrap_err().to_string();
+        assert!(err.contains("entity expansion limit"), "{err}");
+    }
+
+    #[test]
+    fn entity_values_may_refer_to_entities_declared_after_them() {
+        let doc = |dtd: &str, about: &str| {
+            format!(
+                "<!DOCTYPE r [{dtd}]><rdf:RDF xmlns:rdf=\"{RDF_NS}\" xmlns:ex=\"http://ex/\">\
+                 <rdf:Description rdf:about=\"{about}\"><ex:p>v</ex:p></rdf:Description></rdf:RDF>"
+            )
+        };
+        let ts = parse_str(&doc(
+            "<!ENTITY a \"&b;x\"><!ENTITY b \"http://ex/\">",
+            "&a;",
+        ))
+        .unwrap();
+        assert_eq!(ts[0].subject, Term::iri("http://ex/x"));
+        // An unused entity that refers to an undeclared one is harmless …
+        let ts = parse_str(&doc(
+            "<!ENTITY a \"&nope;\"><!ENTITY b \"http://ex/\">",
+            "&b;s",
+        ))
+        .unwrap();
+        assert_eq!(ts[0].subject, Term::iri("http://ex/s"));
+        // … using it is an error, and so is a loop of references.
+        let err = parse_str(&doc("<!ENTITY a \"&nope;\">", "&a;"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("undeclared entity '&nope;'"), "{err}");
+        let err = parse_str(&doc("<!ENTITY a \"&b;\"><!ENTITY b \"x&a;\">", "&a;"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recursive entity reference"), "{err}");
+        // A long chain expands without recursing once per link.
+        let mut dtd = String::from("<!ENTITY c0 \"http://ex/\">");
+        for i in 1..5000 {
+            dtd.push_str(&format!("<!ENTITY c{i} \"&c{};\">", i - 1));
+        }
+        let ts = parse_str(&doc(&dtd, "&c4999;z")).unwrap();
+        assert_eq!(ts[0].subject, Term::iri("http://ex/z"));
     }
 
     #[test]

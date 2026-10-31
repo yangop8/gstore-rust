@@ -29,14 +29,20 @@
 //! each file is its own blank-node scope.
 //!
 //! A local `.zip` source (upstream 1.3's `gbuild -f x.zip`; feature `zip`)
-//! is unpacked — under the default zip limits, refusing unsafe entry names —
-//! into a scratch directory beside the database (`<db_name>.db.unzip-tmp-N`,
-//! removed when `gbuild` ends) and read like a directory source.
+//! is unpacked — refusing unsafe entry names, under the default zip limits
+//! (10 GiB, 10000 entries; `--unzip-max-size BYTES` / `--unzip-max-entries
+//! N` change them, `0` = no limit) — into a scratch directory beside the
+//! database (`<db_name>.db.unzip-tmp-N`, removed when `gbuild` ends) and
+//! read like a directory source.
 //!
 //! Like upstream, a statement that does not parse is skipped, counted and
 //! logged to `<db_name>.db/parse_error.log` (see
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
 //! first such statement instead (exit status 1, nothing built).
+//!
+//! A build that fails removes the database directory it created (upstream's
+//! `Util::remove_path` of a failed build), so the same `gbuild` can simply be
+//! run again; a failed `--force` rebuild leaves the directory as it was.
 //!
 //! Exit status: 0 built, 1 failed, 2 invalid arguments; `-h`/`--help`.
 
@@ -48,13 +54,14 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use gstore::parser::import::{self, ImportOptions, ImportReport, ParseErrorLog, Source};
-use gstore::zipio::{self, ScratchDir, ZipLimits};
+use gstore::zipio::ZipLimits;
 use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gbuild",
     usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
-            gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]",
+            gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]\n\
+            \t[--unzip-max-size BYTES] [--unzip-max-entries N]",
     help: "build a database from RDF files\n\
            \n\
            Options:\n\
@@ -66,7 +73,11 @@ const TOOL: cli::Tool = cli::Tool {
            \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore.\n\
            \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`).\n\
            \t--strict\t\tStop at the first statement that does not parse.\n\
-           \t--force\t\t\tReplace an existing database (else gbuild refuses).",
+           \t--force\t\t\tReplace an existing database (else gbuild refuses).\n\
+           \t--unzip-max-size BYTES\tThe most a zip package may unpack to (default\n\
+           \t\t\t\t10737418240; 0 = no limit).\n\
+           \t--unzip-max-entries N\tThe most entries a zip package may hold (default\n\
+           \t\t\t\t10000; 0 = no limit).",
 };
 
 /// `-f` / `--file`.
@@ -76,7 +87,10 @@ const FILE: cli::Opt = cli::Opt {
 };
 
 fn main() -> ExitCode {
-    let mut args = match cli::parse(&cli::argv(), &[cli::DB, FILE]) {
+    let mut args = match cli::parse(
+        &cli::argv(),
+        &[cli::DB, FILE, cli::UNZIP_MAX_SIZE, cli::UNZIP_MAX_ENTRIES],
+    ) {
         Ok(cli::Parsed::Help) => {
             TOOL.print_help();
             return ExitCode::SUCCESS;
@@ -95,6 +109,10 @@ fn main() -> ExitCode {
     if let Some(o) = args.unknown_option() {
         return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
+    let limits = match cli::zip_limits(&args, 2, 3, ZipLimits::default()) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     let (name, mut paths) = match args.value(0) {
         Some(db) => (db.to_string(), args.rest.clone()),
         None => match args.rest.split_first() {
@@ -110,19 +128,25 @@ fn main() -> ExitCode {
     }
     let name = &name;
     let dir = db_dir_for(name);
-    if !force && holds_data(Path::new(&dir)) {
+    let existed = holds_data(Path::new(&dir));
+    if !force && existed {
         eprintln!(
             "gbuild: the database path '{dir}' already exists. Please check database {name}, \
              or use gdrop to remove it at first (or rebuild it with --force)."
         );
         return ExitCode::FAILURE;
     }
+    // A failed build removes what it created; one over an existing
+    // database (`--force`) leaves the directory as it is.
+    let mut created = CreatedDir {
+        path: (!existed).then(|| PathBuf::from(&dir)),
+    };
     if paths.is_empty() {
         println!("will build an empty database");
     }
     // Zip packages are unpacked first and read as directories; the scratch
     // directories go when `_unpacked` is dropped, whatever the outcome.
-    let _unpacked = match unpack_packages(&dir, &mut paths) {
+    let _unpacked = match cli::unpack_packages(&dir, &mut paths, &limits) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("gbuild: {e}");
@@ -154,7 +178,11 @@ fn main() -> ExitCode {
         }
     };
     if rocksdb {
-        return build_rocksdb(name, &dir, &sources, &opts, &mut log, started);
+        let code = build_rocksdb(name, &dir, &sources, &opts, &mut log, started);
+        if code == ExitCode::SUCCESS {
+            created.keep();
+        }
+        return code;
     }
     let report = if disk {
         let report = match Database::build_disk_from_sources(&dir, &sources, &opts, &mut log) {
@@ -190,7 +218,28 @@ fn main() -> ExitCode {
         report
     };
     print_report(&report, &log_path);
+    created.keep();
     ExitCode::SUCCESS
+}
+
+/// The database directory a build created, removed when dropped unless the
+/// build succeeded ([`CreatedDir::keep`]).
+struct CreatedDir {
+    path: Option<PathBuf>,
+}
+
+impl CreatedDir {
+    fn keep(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for CreatedDir {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
 }
 
 /// Build a RocksDB-backed database (each file parsed by its extension). Gated on
@@ -238,33 +287,6 @@ fn build_rocksdb(
 ) -> ExitCode {
     eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
     ExitCode::FAILURE
-}
-
-/// Unpack every local `.zip` file among `paths` (upstream's `gbuild -f
-/// x.zip`) into a scratch directory beside the database directory `dir`,
-/// replacing the path by that directory; the scratch directories, removed
-/// when dropped. Without the `zip` feature a package is an error naming it.
-fn unpack_packages(dir: &str, paths: &mut [String]) -> Result<Vec<ScratchDir>, String> {
-    let mut unpacked = Vec::new();
-    for (i, p) in paths.iter_mut().enumerate() {
-        let path = Path::new(p.as_str());
-        if import::is_url(p) || !path.is_file() || !zipio::is_zip_name(path) {
-            continue;
-        }
-        if !zipio::AVAILABLE {
-            return Err(format!("cannot read '{p}': {}", zipio::FEATURE_MISSING));
-        }
-        let scratch = ScratchDir::fresh(PathBuf::from(format!("{dir}.unzip-tmp-{i}")))
-            .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
-        // Every entry is accepted (as upstream's gbuild); the directory walk
-        // then reads the RDF files among them.
-        zipio::unpack(path, scratch.path(), &ZipLimits::default(), &|_| true)
-            .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
-        println!("unpacked '{p}'");
-        *p = scratch.path().to_string_lossy().into_owned();
-        unpacked.push(scratch);
-    }
-    Ok(unpacked)
 }
 
 /// Whether `path` exists as anything but an empty directory.

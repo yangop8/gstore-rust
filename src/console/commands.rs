@@ -279,7 +279,13 @@ impl History {
         }
         self.entries.push(entry.to_string());
         if let Some(p) = &self.path {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
+            let mut opts = OpenOptions::new();
+            opts.create(true).append(true);
+            // Statements carry data and server paths: readable by the user
+            // only, like a shell's history (an existing file keeps its mode).
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            if let Ok(mut f) = opts.open(p) {
                 let _ = writeln!(f, "{entry}");
             }
         }
@@ -902,7 +908,10 @@ fn h_sparql(c: &mut Console, args: &[String]) -> CmdResult {
         bail!(c, "File open failed: {}", args[0]);
     };
     let mut result = Ok(());
-    for stmt in syntax::split_statements(&text) {
+    // Consecutive update operations go as one request (a SPARQL 1.1 Update
+    // `op ; op` shares its prologue and is applied together, as upstream
+    // sends the whole file); queries go one by one.
+    for stmt in syntax::group_updates(syntax::split_statements(&text)) {
         match raw_sparql(c, &stmt) {
             Err(Fail::Cancelled) => return Err(Fail::Cancelled),
             Err(f) => result = Err(f),
@@ -1000,9 +1009,16 @@ fn h_use(c: &mut Console, args: &[String]) -> CmdResult {
     c.argc(args, &[1], "use")?;
     let db = args[0].clone();
     if db == SYSTEM_DB {
+        // Upstream lets root query the system database through its
+        // `/sys/query` route; here the users and database records are not
+        // an RDF database and the server refuses every operation on
+        // `system`, so selecting it would only make every query fail.
         if c.is_root() {
-            c.current_db = db;
-            return Ok(());
+            bail!(
+                c,
+                "The system database can NOT be queried here (gstore-rust keeps users and \
+                 databases outside RDF); use showusrs / showdbs instead."
+            );
         }
         bail!(c, "You can NOT use system database. ");
     }
@@ -2275,6 +2291,13 @@ mod tests {
         h.add("  ");
         h.add("pdb;");
         assert_eq!(h.entries(), ["use lubm;", "pdb;"]);
+        // Created readable by the user only, whatever the umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
         let lines: Vec<String> = (0..History::MAX + 10).map(|i| format!("s{i};")).collect();
         std::fs::write(&dir, lines.join("\n")).unwrap();
         let h = History::open(Some(dir.clone()));

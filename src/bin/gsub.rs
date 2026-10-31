@@ -8,8 +8,9 @@
 //! ```
 //!
 //! Sources and formats exactly as `gadd` (files by extension, directories,
-//! `http(s)://` URLs); N-Quads / TriG statements are removed from their named
-//! graphs. Blank-node labels are read verbatim, so a file naming stored blank
+//! `http(s)://` URLs, zip packages — upstream 1.3's `gsub -f x.zip`, feature
+//! `zip`, under the same `--unzip-max-size` / `--unzip-max-entries` limits);
+//! N-Quads / TriG statements are removed from their named graphs. Blank-node labels are read verbatim, so a file naming stored blank
 //! nodes (e.g. one written by `gexport`) removes them; anonymous `[]` nodes
 //! match nothing.
 //!
@@ -29,19 +30,25 @@ mod cli;
 use std::process::ExitCode;
 
 use gstore::parser::import::{self, ImportOptions, ParseErrorLog};
+use gstore::zipio::ZipLimits;
 use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gsub",
     usage: "gsub [--strict] <db_name> <file | dir | url> [more ...]\n\
-            gsub -db <db_name> -f <file> [--strict]",
+            gsub -db <db_name> -f <file | zip> [--strict]",
     help: "remove the triples of RDF files from a database\n\
            \n\
            Options:\n\
            \t-h,--help\t\tDisplay this message.\n\
            \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
-           \t-f,--file PATH\t\tThe RDF file (or directory, or http(s) URL) to remove.\n\
-           \t--strict\t\tStop at the first statement that does not parse.",
+           \t-f,--file PATH\t\tThe RDF file (or directory, zip package or http(s) URL)\n\
+           \t\t\t\tto remove.\n\
+           \t--strict\t\tStop at the first statement that does not parse.\n\
+           \t--unzip-max-size BYTES\tThe most a zip package may unpack to (default\n\
+           \t\t\t\t10737418240; 0 = no limit).\n\
+           \t--unzip-max-entries N\tThe most entries a zip package may hold (default\n\
+           \t\t\t\t10000; 0 = no limit).",
 };
 
 const FILE: cli::Opt = cli::Opt {
@@ -50,7 +57,10 @@ const FILE: cli::Opt = cli::Opt {
 };
 
 fn main() -> ExitCode {
-    let mut args = match cli::parse(&cli::argv(), &[cli::DB, FILE]) {
+    let mut args = match cli::parse(
+        &cli::argv(),
+        &[cli::DB, FILE, cli::UNZIP_MAX_SIZE, cli::UNZIP_MAX_ENTRIES],
+    ) {
         Ok(cli::Parsed::Help) => {
             TOOL.print_help();
             return ExitCode::SUCCESS;
@@ -62,6 +72,10 @@ fn main() -> ExitCode {
     if let Some(o) = args.unknown_option() {
         return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
+    let limits = match cli::zip_limits(&args, 2, 3, ZipLimits::default()) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     let (name, mut paths) = match args.value(0) {
         Some(db) => (db.to_string(), args.rest.clone()),
         None => match args.rest.split_first() {
@@ -81,6 +95,15 @@ fn main() -> ExitCode {
         Ok(db) => db,
         Err(e) => {
             eprintln!("cannot load database '{dir}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Zip packages (upstream 1.3's `-f x.zip`) are unpacked first and read
+    // as directories; the scratch directories go when `_unpacked` drops.
+    let _unpacked = match cli::unpack_packages(&dir, &mut paths, &limits) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };

@@ -570,8 +570,14 @@ fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<In
                 &format!("{stem}_{}", clock::now().date_compact()),
                 &ext,
             )?;
-            std::io::Write::write_all(&mut f, &body)?;
-            Ok(dir.join(file))
+            let path = dir.join(file);
+            // A failed write (a full disk, say) leaves no partial file behind.
+            if let Err(e) = std::io::Write::write_all(&mut f, &body) {
+                drop(f);
+                let _ = fs::remove_file(&path);
+                return Err(e);
+            }
+            Ok(path)
         });
         let local = saved.map_err(|_| failed())?;
         out.temp.push(local.clone());
@@ -585,7 +591,9 @@ fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<In
 }
 
 /// The RDF files directly inside directory `requested` (a `batchInsert`
-/// `dir`), sorted by name: those with an allowed RDF extension.
+/// `dir`), sorted by name: those with an allowed RDF extension. Each must
+/// lie inside the source roots itself, as a `file` must: a symlink in the
+/// directory that leads outside them refuses the request.
 fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
     let roots = ops_file::source_roots(ctx);
     let bases = [ops_file::upload_dir(ctx)];
@@ -601,7 +609,7 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
             return Err(refusal.answer("dir", requested, roots.as_deref().unwrap_or_default()))
         }
     };
-    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
         .map_err(|e| {
             GResp::error(
                 Status::OperationFailed,
@@ -618,7 +626,18 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
                     .is_some_and(|e| ops_file::is_rdf_ext(ctx, e))
         })
         .collect();
-    files.sort();
+    entries.sort();
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // `is_file` followed a symlink: where it leads is confined too.
+        let shown = entry.to_string_lossy();
+        match ops_file::resolve_existing(&shown, roots.as_deref(), &[]) {
+            Ok(file) => files.push(file),
+            Err(refusal) => {
+                return Err(refusal.answer("file", &shown, roots.as_deref().unwrap_or_default()))
+            }
+        }
+    }
     Ok(Inputs {
         sources: files.into_iter().map(import::Source::File).collect(),
         temp: Vec::new(),

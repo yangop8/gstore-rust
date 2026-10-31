@@ -8,7 +8,10 @@
 #   log4cplus.appender.X=log4cplus::ConsoleAppender           -> standard error
 #   log4cplus.appender.X=log4cplus::DailyRollingFileAppender  -> the log file
 #     .File            the active log file; it is rolled into <File>.YYYY-MM-DD
-#     .MaxBackupIndex  days of rolled files kept (0 keeps them all)
+#     .MaxBackupIndex  accepted; as in log4cplus (where it limits one day's
+#                      .1, .2 ... backups) no daily file is ever deleted
+#     .MaxHistory      days of rolled files kept (default: all, as upstream;
+#                      conf.ini's log_days sets it too)
 #     .Schedule        DAILY (the only schedule supported)
 #     .Threshold       the most verbose level this appender records
 # Layouts and filters are accepted and ignored: every record is written as

@@ -291,6 +291,23 @@ fn without_the_feature_every_zip_path_is_a_clean_1003() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("`zip` feature"));
     assert!(!dir.join("fromzip.db").exists());
+    // gadd / gsub refuse the package too, rather than parse it as Turtle.
+    fs::write(dir.join("a.nt"), LUBM).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+        .args(["nz", "a.nt"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    for bin in [env!("CARGO_BIN_EXE_gadd"), env!("CARGO_BIN_EXE_gsub")] {
+        let out = Command::new(bin)
+            .args(["-db", "nz", "-f", "pkg.zip"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{bin}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("`zip` feature"));
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1229,6 +1246,95 @@ mod with_zip {
             &[("operation", "load"), ("db_name", "quad")],
         ));
         assert_eq!(graph_count(&srv.addr, "quad"), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `gadd` / `gsub -f x.zip` unpack the package (upstream 1.3), and the
+    /// CLI's zip limits can be changed: `--unzip-max-size` /
+    /// `--unzip-max-entries` (`0` = none); `grestore` has none by default.
+    #[test]
+    fn cli_gadd_gsub_read_zips_and_zip_limits_are_options() {
+        let dir = tmp_root("cli_gadd_zip");
+        fs::write(
+            dir.join("pkg.zip"),
+            package(&[E::File("a.nt", MORE.as_bytes())]),
+        )
+        .unwrap();
+        fs::write(dir.join("t.ttl"), TTL).unwrap();
+        run(env!("CARGO_BIN_EXE_gbuild"), &["zdb", "t.ttl"], &dir);
+        let out = run(
+            env!("CARGO_BIN_EXE_gadd"),
+            &["-db", "zdb", "-f", "pkg.zip"],
+            &dir,
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("Added 2 new triple(s)"), "{text}");
+        assert!(!text.contains("Skipped"), "{text}");
+        assert!(!dir.join("zdb.db.unzip-tmp-0").exists());
+        let out = run(env!("CARGO_BIN_EXE_gsub"), &["zdb", "pkg.zip"], &dir);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("Removed 2 triple(s)"), "{text}");
+        assert_eq!(
+            gstore::Database::open(dir.join("zdb.db"))
+                .unwrap()
+                .triple_num(),
+            2
+        );
+        // A limit refuses the package, and the message names the options.
+        for (bin, args) in [
+            (
+                env!("CARGO_BIN_EXE_gadd"),
+                vec!["--unzip-max-size", "10", "zdb", "pkg.zip"],
+            ),
+            (
+                env!("CARGO_BIN_EXE_gbuild"),
+                vec![
+                    "--unzip-max-entries",
+                    "0",
+                    "--unzip-max-size",
+                    "10",
+                    "z9",
+                    "pkg.zip",
+                ],
+            ),
+        ] {
+            let out = Command::new(bin)
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains("--unzip-max-size"), "{err}");
+        }
+        assert!(!dir.join("z9.db").exists());
+        let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+            .args(["--unzip-max-size", "lots", "z9", "pkg.zip"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        run(
+            env!("CARGO_BIN_EXE_gbuild"),
+            &["--unzip-max-size", "0", "z9", "pkg.zip"],
+            &dir,
+        );
+        // grestore: no limit unless one is given.
+        run(env!("CARGO_BIN_EXE_gbackup"), &["--zip", "zdb", "bk"], &dir);
+        let out = Command::new(env!("CARGO_BIN_EXE_grestore"))
+            .args(["--unzip-max-size", "10", "r", "bk.zip"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--unzip-max-size"));
+        run(env!("CARGO_BIN_EXE_grestore"), &["r", "bk.zip"], &dir);
+        assert_eq!(
+            gstore::Database::open(dir.join("r.db"))
+                .unwrap()
+                .triple_num(),
+            2
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

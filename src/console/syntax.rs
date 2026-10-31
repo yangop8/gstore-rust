@@ -143,9 +143,14 @@ fn leading_keyword(text: &str) -> String {
 
 /// Whether `text` (a statement, or the start of one) is SPARQL typed at the
 /// prompt rather than a console command. Besides the query and update
-/// keywords, `drop` / `create` are SPARQL when followed by `GRAPH` or
-/// `SILENT` (and `drop` by `DEFAULT`, `NAMED`, `ALL`), and `clear` when it
-/// has an argument (the console's `clear` takes none).
+/// keywords, `drop` / `clear` / `create` are SPARQL only in a form the
+/// console command cannot have — as upstream, `drop <name>` drops a database
+/// and `clear …` clears the screen, whatever the name or argument (a
+/// database may be called `default` or `all`):
+///
+/// * `drop` / `clear` `GRAPH <iri>`, or `SILENT` and more
+///   (`DROP SILENT ALL`, `CLEAR SILENT DEFAULT`, …);
+/// * `create GRAPH <iri>` (an IRI, not a file) or `create SILENT GRAPH …`.
 pub fn is_sparql(text: &str) -> bool {
     let kw = leading_keyword(text);
     if kw.is_empty() {
@@ -163,22 +168,84 @@ pub fn is_sparql(text: &str) -> bool {
     if SPARQL_KEYWORDS.contains(&kw.as_str()) {
         return true;
     }
-    let second = leading_keyword(after);
-    let second_ends = after
-        .trim_start()
-        .get(second.len()..)
-        .and_then(|s| s.chars().next())
-        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-    let second = if second_ends { second } else { String::new() };
-    match kw.as_str() {
-        "drop" => matches!(
-            second.as_str(),
-            "graph" | "silent" | "default" | "named" | "all"
-        ),
-        "create" => matches!(second.as_str(), "graph" | "silent"),
-        "clear" => !second.is_empty(),
+    let (second, after2) = next_word(after);
+    // What follows `second` in this statement (it ends at a `;`).
+    let next_char = after2.trim_start().chars().next().filter(|&c| c != ';');
+    match (kw.as_str(), second.as_str()) {
+        ("drop" | "clear", "graph" | "silent") => next_char.is_some(),
+        ("create", "graph") => next_char == Some('<'),
+        ("create", "silent") => next_word(after2).0 == "graph",
         _ => false,
     }
+}
+
+/// The SPARQL 1.1 Update operations' keywords.
+const UPDATE_KEYWORDS: &[&str] = &[
+    "insert", "delete", "load", "clear", "drop", "create", "add", "move", "copy", "with",
+];
+
+/// Whether the SPARQL statement `text` is an update operation (after its
+/// `PREFIX` / `BASE` prologue and comments) — one that may share a request,
+/// and its prologue, with the operations around it (`op ; op`).
+pub fn is_update(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('#') {
+            rest = rest.find('\n').map_or("", |i| &rest[i..]);
+            continue;
+        }
+        let (kw, after) = next_word(rest);
+        match kw.as_str() {
+            // `PREFIX p: <iri>` / `BASE <iri>`.
+            "prefix" | "base" => {
+                let Some(iri) = after.find('<') else {
+                    return false;
+                };
+                let Some(len) = after[iri..].find('>') else {
+                    return false;
+                };
+                rest = &after[iri + len + 1..];
+            }
+            kw => return UPDATE_KEYWORDS.contains(&kw),
+        }
+    }
+}
+
+/// The requests a SPARQL file's statements make: each query alone, and each
+/// run of consecutive update operations as one request (`op ;\n op`), as
+/// SPARQL 1.1 Update reads them — the prologue of the first applies to the
+/// rest, and the server applies them together.
+pub fn group_updates(statements: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut joinable = false;
+    for stmt in statements {
+        let update = is_update(&stmt);
+        match out.last_mut() {
+            Some(last) if update && joinable => {
+                last.push_str(" ;\n");
+                last.push_str(&stmt);
+            }
+            _ => out.push(stmt),
+        }
+        joinable = update;
+    }
+    out
+}
+
+/// The keyword at the start of `text` (lowercased; empty unless a whole word
+/// of letters) and the text after it.
+fn next_word(text: &str) -> (String, &str) {
+    let word = leading_keyword(text);
+    let rest = &text.trim_start()[word.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return (String::new(), rest);
+    }
+    (word, rest)
 }
 
 /// The length of an `<IRI>` starting at `bytes[i]` (`'<'`), if one does:
@@ -515,12 +582,13 @@ mod tests {
             "PREFIX ex: <http://e/> SELECT * {?s ?p ?o}",
             "BASE <http://e/> SELECT * {?s ?p ?o}",
             "LOAD <file:///x.nt>",
-            "CLEAR DEFAULT",
+            "CLEAR SILENT DEFAULT",
             "clear graph <g>",
             "DROP GRAPH <g>",
             "drop silent graph <g>",
-            "DROP ALL",
+            "DROP SILENT ALL",
             "CREATE GRAPH <g>",
+            "create silent graph <g>",
             "WITH <g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
             "ADD <a> TO <b>",
         ] {
@@ -536,6 +604,23 @@ mod tests {
             "drop graphs",
             "create lubm data.nt",
             "clear",
+            // A database called `default` / `all` / … is dropped as upstream
+            // does, never the current database's graphs; `clear …` clears
+            // the screen.
+            "drop default",
+            "DROP ALL",
+            "drop named",
+            "drop graph",
+            "drop silent",
+            "drop default;\nselect * where {?s ?p ?o};",
+            "drop graph;\nshow;",
+            "clear all",
+            "CLEAR DEFAULT",
+            "clear graph",
+            "create default d.nt",
+            "create all d.nt",
+            "create graph data.nt",
+            "create silent x.nt",
             "show",
             "selection",
             "addusr bob",
@@ -544,6 +629,27 @@ mod tests {
         ] {
             assert!(!is_sparql(s), "{s}");
         }
+    }
+
+    #[test]
+    fn a_files_update_operations_stay_one_request() {
+        let file = "PREFIX ex: <http://ex/>\nINSERT DATA { ex:a ex:b ex:c } ;\n\
+                    # the second operation\nINSERT DATA { ex:d ex:e ex:f } ;\n\
+                    SELECT * WHERE { ?s ?p ?o } ;\n\
+                    BASE <http://b/> DELETE WHERE { <x> ?p ?o } ;\n\
+                    PREFIX ex: <http://ex/> ASK { ex:a ?p ?o }";
+        let requests = group_updates(split_statements(file));
+        assert_eq!(requests.len(), 4, "{requests:#?}");
+        assert!(requests[0].starts_with("PREFIX ex:"), "{requests:#?}");
+        assert!(requests[0].contains("ex:d ex:e ex:f"), "{requests:#?}");
+        assert!(requests[1].starts_with("SELECT"));
+        assert!(requests[2].starts_with("BASE"));
+        assert!(requests[3].contains("ASK"));
+        assert!(is_update(
+            "prefix p: <x> # c\nwith <g> delete { ?s ?p ?o } where {}"
+        ));
+        assert!(!is_update("PREFIX p: <x> SELECT * {}"));
+        assert!(!is_update("show"));
     }
 
     #[test]

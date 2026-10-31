@@ -963,6 +963,46 @@ fn run(bin: &str, args: &[&str], cwd: &Path) -> std::process::Output {
         .unwrap()
 }
 
+/// A failed `gbuild` leaves nothing behind, so the corrected command simply
+/// runs (upstream removes the database path of a failed build); a failed
+/// `--force` rebuild keeps the database it was to replace.
+#[test]
+fn a_failed_gbuild_removes_the_database_it_created() {
+    let dir = tmp("cli_failed_build");
+    write(
+        &dir.join("good.nt"),
+        "<http://e/s> <http://e/p> <http://e/o> .\n",
+    );
+    write(
+        &dir.join("bad.nt"),
+        "<http://e/s> <http://e/p> <http://e/o> .\nnot rdf\n",
+    );
+    let gbuild = env!("CARGO_BIN_EXE_gbuild");
+    for (db, args) in [
+        ("typo", vec!["-db", "typo", "-f", "missing.nt"]),
+        ("sdb", vec!["--strict", "sdb", "bad.nt"]),
+        ("ddb", vec!["--disk", "ddb", "missing.nt"]),
+    ] {
+        let out = run(gbuild, &args, &dir);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(!dir.join(format!("{db}.db")).exists(), "{args:?}");
+        let mut again = args.clone();
+        *again.last_mut().unwrap() = "good.nt";
+        let out = run(gbuild, &again, &dir);
+        assert!(out.status.success(), "{again:?}: {out:?}");
+        assert_eq!(
+            Database::open(dir.join(format!("{db}.db")))
+                .unwrap()
+                .triple_num(),
+            1
+        );
+    }
+    let out = run(gbuild, &["--force", "--strict", "typo", "bad.nt"], &dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(Database::open(dir.join("typo.db")).unwrap().triple_num(), 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cli_tools_take_directories_are_tolerant_and_have_strict() {
     let dir = tmp("cli");

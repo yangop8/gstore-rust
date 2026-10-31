@@ -1571,6 +1571,62 @@ fn batch_insert_and_remove_read_server_files_and_dirs() {
     ok(&j);
     assert_eq!(int(&j, "success_num"), 3);
     assert_eq!(count(a, "lubm"), 9);
+    // A symlink in the directory leading outside the source roots is
+    // refused, as the same file named by `file` is.
+    #[cfg(unix)]
+    {
+        let outside = srv.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("secret.nt"),
+            "<http://ex/SECRET> <http://ex/p> \"top secret\" .\n",
+        )
+        .unwrap();
+        let linked = srv.upload_dir().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(linked.join("a.nt"), MORE).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.nt"), linked.join("leak.nt")).unwrap();
+        for op in ["batchInsert", "batchRemove"] {
+            let j = api(
+                a,
+                &[
+                    ("operation", op),
+                    ("db_name", "lubm"),
+                    ("dir", linked.to_str().unwrap()),
+                ],
+            );
+            assert_eq!(code(&j), 1003, "{j}");
+            assert!(msg(&j).contains("leak.nt"), "{j}");
+        }
+        assert_eq!(count(a, "lubm"), 9);
+        // A symlink that stays inside a root is read.
+        fs::remove_file(linked.join("leak.nt")).unwrap();
+        let inside = srv.data_file(
+            "inside.nt",
+            "<http://ex/in> <http://ex/p> <http://ex/o> .\n",
+        );
+        std::os::unix::fs::symlink(inside, linked.join("b.nt")).unwrap();
+        let j = api(
+            a,
+            &[
+                ("operation", "batchInsert"),
+                ("db_name", "lubm"),
+                ("dir", linked.to_str().unwrap()),
+            ],
+        );
+        ok(&j);
+        assert_eq!(count(a, "lubm"), 10);
+        let j = api(
+            a,
+            &[
+                ("operation", "batchRemove"),
+                ("db_name", "lubm"),
+                ("file", srv.upload_dir().join("inside.nt").to_str().unwrap()),
+            ],
+        );
+        ok(&j);
+        assert_eq!(count(a, "lubm"), 9);
+    }
     // Refusals.
     let j = api(a, &[("operation", "batchInsert"), ("db_name", "lubm")]);
     assert_eq!(

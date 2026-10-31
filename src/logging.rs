@@ -17,8 +17,10 @@
 //!    shipped files use is honoured (see [`LogConfig::from_properties`]):
 //!    `log4cplus.rootLogger=LEVEL, APPENDER…`, `ConsoleAppender`s (standard
 //!    error here) and one `DailyRollingFileAppender` (`File`,
-//!    `MaxBackupIndex` — the days kept —, `Schedule=DAILY`), plus a per
-//!    appender `Threshold`. When it does not exist, upstream falls back to
+//!    `Schedule=DAILY`), plus a per appender `Threshold`. As in log4cplus,
+//!    whose `MaxBackupIndex` only limits the `.1`, `.2` … backups of one
+//!    day, the daily files are kept for good — unless `MaxHistory` (days)
+//!    or `log_days` below sets a retention. When it does not exist, upstream falls back to
 //!    log4cplus' basic configuration — console only; here: standard error at
 //!    `info`.
 //! 2. The gstore-rust extension keys of `[log]` then override it: `log_level`
@@ -299,8 +301,9 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Days of rolled log files kept by default (upstream's shipped
-/// `slog.properties`: `MaxBackupIndex=30`).
+/// Days of rolled log files kept when the gstore-rust `log_file` key
+/// configures the log file (a properties file's `DailyRollingFileAppender`
+/// keeps them all, as log4cplus does, unless it sets `MaxHistory`).
 pub const DEFAULT_LOG_DAYS: u32 = 30;
 
 /// The environment variable overriding the level ([`LogConfig::apply_env`]).
@@ -351,9 +354,12 @@ impl LogConfig {
     /// `log4cplus.appender.A=log4cplus::ConsoleAppender` (standard error);
     /// one `log4cplus::DailyRollingFileAppender` (or `FileAppender`,
     /// `RollingFileAppender`, `TimeBasedRollingFileAppender`, all rolled
-    /// daily here) with `.File`, `.MaxBackupIndex` (days kept) and
-    /// `.Schedule` (`DAILY`); `.Threshold` on either. Layouts, filters and
-    /// non-root loggers are ignored (the record format is fixed).
+    /// daily here) with `.File`, `.MaxHistory` (days of rolled files kept;
+    /// without it they are all kept — log4cplus' `MaxBackupIndex` never
+    /// deletes a day's file, it only limits one day's `.N` backups, so it
+    /// is accepted and does not set a retention) and `.Schedule` (`DAILY`);
+    /// `.Threshold` on either. Layouts, filters and non-root loggers are
+    /// ignored (the record format is fixed).
     pub fn from_properties(text: &str) -> (LogConfig, Vec<String>) {
         let mut warnings = Vec::new();
         let mut props: Vec<(String, String)> = Vec::new();
@@ -427,13 +433,11 @@ impl LogConfig {
                         warnings.push(format!("appender '{name}' has no File; ignored"));
                         continue;
                     };
-                    let days = match get(&format!("{key}.MaxBackupIndex"))
-                        .or_else(|| get(&format!("{key}.MaxHistory")))
-                    {
-                        None => DEFAULT_LOG_DAYS,
+                    let days = match get(&format!("{key}.MaxHistory")) {
+                        None => 0,
                         Some(v) => v.parse().unwrap_or_else(|_| {
-                            warnings.push(format!("{key}.MaxBackupIndex: not a number '{v}'"));
-                            DEFAULT_LOG_DAYS
+                            warnings.push(format!("{key}.MaxHistory: not a number '{v}'"));
+                            0
                         }),
                     };
                     if let Some(s) = get(&format!("{key}.Schedule")) {
@@ -603,10 +607,13 @@ impl FileSink {
     }
 
     /// Append `line` (already newline-terminated) for a record of day
-    /// `today`, rolling the file first when the day changed.
+    /// `today`, rolling the file first when a new day began. Only forward,
+    /// as log4cplus: a record stamped before midnight that reaches the lock
+    /// after one stamped after it (or a clock stepped back) goes into the
+    /// current file, rather than rolling the new day's file away.
     fn write(&self, today: Date, line: &[u8]) {
         let mut st = self.state();
-        if st.date != Some(today) {
+        if st.date.is_none_or(|d| d < today) {
             if let Some(old) = st.date {
                 // Roll only the file this process has open: another process
                 // sharing the file may have rolled it (and started a new one)
@@ -1014,7 +1021,8 @@ mod tests {
         assert_eq!(c.stderr, Some(Level::Trace));
         let f = c.file.unwrap();
         assert_eq!(f.path, PathBuf::from("./logs/all.log"));
-        assert_eq!(f.days, 30);
+        // `MaxBackupIndex=30` deletes no daily file in log4cplus: all kept.
+        assert_eq!(f.days, 0);
         let (c, w) =
             LogConfig::from_properties(include_str!("../conf/slog.stdout.properties.example"));
         assert!(w.is_empty(), "{w:?}");

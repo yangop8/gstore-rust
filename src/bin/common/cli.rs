@@ -223,3 +223,86 @@ pub fn file_in_dir_or_file(path: &str, file_name: &str) -> PathBuf {
         PathBuf::from(path)
     }
 }
+
+/// `--unzip-max-size BYTES`: the most a zip package named on the command
+/// line may unpack to (`0`: no limit).
+pub const UNZIP_MAX_SIZE: Opt = Opt {
+    short: "",
+    long: "unzip-max-size",
+};
+
+/// `--unzip-max-entries N`: the most entries such a package may hold (`0`:
+/// no limit).
+pub const UNZIP_MAX_ENTRIES: Opt = Opt {
+    short: "",
+    long: "unzip-max-entries",
+};
+
+/// `base` with the values of the [`UNZIP_MAX_SIZE`] / [`UNZIP_MAX_ENTRIES`]
+/// options (options `size` and `entries` of `args`) in place of its own; `0`
+/// lifts a limit. An invalid number is the message to report.
+pub fn zip_limits(
+    args: &Args,
+    size: usize,
+    entries: usize,
+    base: gstore::zipio::ZipLimits,
+) -> Result<gstore::zipio::ZipLimits, String> {
+    let mut limits = base;
+    if let Some(v) = args.value(size) {
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("--unzip-max-size takes a number of bytes, not '{v}'"))?;
+        limits.max_size = if n == 0 { u64::MAX } else { n };
+    }
+    if let Some(v) = args.value(entries) {
+        let n: usize = v
+            .parse()
+            .map_err(|_| format!("--unzip-max-entries takes a number, not '{v}'"))?;
+        limits.max_entries = if n == 0 { usize::MAX } else { n };
+    }
+    Ok(limits)
+}
+
+/// A zip error, with a hint at the options when it is a limit that refused
+/// the package.
+pub fn zip_error(e: impl std::fmt::Display) -> String {
+    let e = e.to_string();
+    if e.contains("unzip_max_") {
+        format!("{e}; raise the limit with --unzip-max-size BYTES / --unzip-max-entries N (0 = no limit)")
+    } else {
+        e
+    }
+}
+
+/// Unpack every local `.zip` file among `paths` (upstream 1.3's `-f x.zip`
+/// of `gbuild` / `gadd` / `gsub`) under `limits` into a scratch directory
+/// beside the database directory `dir`, replacing the path by that
+/// directory, which is then read like any directory source; the scratch
+/// directories, removed when dropped. Every entry is accepted (as upstream);
+/// the directory walk reads the RDF files among them. Without the `zip`
+/// feature a package is an error naming it — never parsed as RDF.
+pub fn unpack_packages(
+    dir: &str,
+    paths: &mut [String],
+    limits: &gstore::zipio::ZipLimits,
+) -> Result<Vec<gstore::zipio::ScratchDir>, String> {
+    use gstore::zipio::{self, ScratchDir};
+    let mut unpacked = Vec::new();
+    for (i, p) in paths.iter_mut().enumerate() {
+        let path = Path::new(p.as_str());
+        if gstore::parser::import::is_url(p) || !path.is_file() || !zipio::is_zip_name(path) {
+            continue;
+        }
+        if !zipio::AVAILABLE {
+            return Err(format!("cannot read '{p}': {}", zipio::FEATURE_MISSING));
+        }
+        let scratch = ScratchDir::fresh(PathBuf::from(format!("{dir}.unzip-tmp-{i}")))
+            .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
+        zipio::unpack(path, scratch.path(), limits, &|_| true)
+            .map_err(|e| format!("cannot unpack '{p}': {}", zip_error(e)))?;
+        println!("unpacked '{p}'");
+        *p = scratch.path().to_string_lossy().into_owned();
+        unpacked.push(scratch);
+    }
+    Ok(unpacked)
+}

@@ -1253,6 +1253,15 @@ impl ApiServer {
         self
     }
 
+    /// Whether `root` still has upstream's default password
+    /// ([`DEFAULT_ROOT_PASSWORD`](crate::config::DEFAULT_ROOT_PASSWORD)) —
+    /// as stored, whatever `conf.ini` says now (it seeds a new store only).
+    pub fn root_has_default_password(&self) -> bool {
+        locked(&self.inner.state)
+            .users
+            .verify(ROOT_USER, crate::config::DEFAULT_ROOT_PASSWORD)
+    }
+
     /// The password the `system` user (`conf.ini`'s `system_username`) must
     /// present to `/shutdown` or `/restart`. Upstream writes it to the second
     /// line of the pid file; `gserver` does the same.

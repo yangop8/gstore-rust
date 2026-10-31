@@ -155,7 +155,8 @@ gconsole -u root             # upstream's console, a client of a running gserver
 gconsole --local mydb        # the embedded REPL on mydb.db (no server)
 gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
 gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
-                             # tasks, backup/restore); default login root / 123456
+                             # tasks, backup/restore); default login root / 123456,
+                             # served on loopback only (set a password to expose it)
 gserver                      # the same API server rooted at db_home (./dbhome/)
                              # on port 9000, settings from ./conf/conf.ini
 gserver -b                   # … started in the background (-s: foreground)
@@ -281,7 +282,8 @@ gStore[lubm]> quit;
   names; the default build reads plain lines.
 * Differences from upstream: privileges are checked by the server (a
   non-root user's `pusr <db>` needs `showuser`, which only root may call);
-  `sparql <file>` runs each `;`-separated statement of the file; results are
+  `sparql <file>` runs each `;`-separated query of the file on its own (a
+  run of update operations, `op ; op`, is still one request); results are
   fetched as JSON (an unbound cell is shown empty); a local file given to
   `create` / `batchinsert` is sent as an absolute path when the server runs
   on the same machine — the server still only reads files under its
