@@ -312,8 +312,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .collect();
                 let mut right: Option<Probe> = None;
                 self.stream_pattern(a, layout, &mut |l| {
-                    let probe =
-                        right.get_or_insert_with(|| Probe::new(self.eval_pattern(b, layout), &hint));
+                    let probe = right
+                        .get_or_insert_with(|| Probe::new(self.eval_pattern(b, layout), &hint));
                     let mut matched = false;
                     probe.for_each_compatible(&l, &mut |m| {
                         if filters
@@ -431,7 +431,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let order = {
             let meta: Vec<(usize, &[usize])> = parts
                 .iter()
-                .map(|p| p.as_ref().map(|(b, v)| (b.len(), v.as_slice())).unwrap_or_default())
+                .map(|p| {
+                    p.as_ref()
+                        .map(|(b, v)| (b.len(), v.as_slice()))
+                        .unwrap_or_default()
+                })
                 .collect();
             greedy_join_order(&meta)
         };
@@ -500,7 +504,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 continue;
             }
             let mut nb = binding.clone();
-            if unify(&mut nb, &plan.s, s) && unify(&mut nb, &plan.p, pr) && unify(&mut nb, &plan.o, o)
+            if unify(&mut nb, &plan.s, s)
+                && unify(&mut nb, &plan.p, pr)
+                && unify(&mut nb, &plan.o, o)
             {
                 self.note_bindings(1);
                 self.stream_left_deep(p, depth + 1, nb, sink)?;
@@ -549,7 +555,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut right: Option<Probe> = None;
                 self.stream_join_tree(l, p, layout, &mut |lb| {
                     let probe = right.get_or_insert_with(|| {
-                        Probe::new(self.eval_join_tree(r, &p.plans, &p.cands, layout).0, &shared)
+                        Probe::new(
+                            self.eval_join_tree(r, &p.plans, &p.cands, layout).0,
+                            &shared,
+                        )
                     });
                     probe.for_each_compatible(&lb, &mut |m| {
                         self.note_bindings(1);
@@ -589,22 +598,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let mut seen = HashSet::new();
             let mut failed = None;
             if k > 0 {
-                let _ = self.stream_pattern(pattern, layout, &mut |b| {
-                    match self.project_items(&b, layout, q, result_vars) {
-                        Ok(row) => {
-                            if !q.distinct || seen.insert(row.clone()) {
-                                rows.push(row);
-                            }
-                            if rows.len() >= k {
-                                STOP
-                            } else {
-                                GO
-                            }
+                let _ = self.stream_pattern(pattern, layout, &mut |b| match self.project_items(
+                    &b,
+                    layout,
+                    q,
+                    result_vars,
+                ) {
+                    Ok(row) => {
+                        if !q.distinct || seen.insert(row.clone()) {
+                            rows.push(row);
                         }
-                        Err(e) => {
-                            failed = Some(e);
+                        if rows.len() >= k {
                             STOP
+                        } else {
+                            GO
                         }
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        STOP
                     }
                 });
             }
@@ -966,8 +978,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             Slot::Var(v) => b[*v],
         };
         // Which triples each candidate list must place.
-        let mut needs: HashMap<Lookup, HashMap<(u32, u32, u32), u32>> = HashMap::new();
-        let mut per_sol: Vec<Vec<(Lookup, (u32, u32, u32))>> = Vec::with_capacity(sols.len());
+        let mut needs: HashMap<Lookup, HashMap<IdTriple3, u32>> = HashMap::new();
+        let mut per_sol: Vec<Vec<(Lookup, IdTriple3)>> = Vec::with_capacity(sols.len());
         for b in sols {
             let mut keys = Vec::with_capacity(steps.len());
             for (t, (pi, bound)) in steps.iter().enumerate() {
@@ -1084,14 +1096,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut root_vals: Vec<u32> = match unary.get(&root) {
             Some(vals) => vals.clone(),
             None => {
-                let (pi, subject) = shape.incident(root, plans).min_by_key(|&(pi, subject)| {
-                    match plans[pi].p {
-                        Slot::Const(p) if subject => self.store.pred_distinct_subj(p),
-                        Slot::Const(p) => self.store.pred_distinct_obj(p),
-                        Slot::Var(_) if subject => self.store.distinct_subjects(),
-                        Slot::Var(_) => self.store.distinct_objects(),
-                    }
-                })?;
+                let (pi, subject) =
+                    shape
+                        .incident(root, plans)
+                        .min_by_key(|&(pi, subject)| match plans[pi].p {
+                            Slot::Const(p) if subject => self.store.pred_distinct_subj(p),
+                            Slot::Const(p) => self.store.pred_distinct_obj(p),
+                            Slot::Var(_) if subject => self.store.distinct_subjects(),
+                            Slot::Var(_) => self.store.distinct_objects(),
+                        })?;
                 match plans[pi].p {
                     Slot::Const(p) if subject => self.store.subs_by_p(p),
                     Slot::Const(p) => self.store.objs_by_p(p),
@@ -1142,12 +1155,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // Top down: each parent value's children along each tree edge.
         let mut cand: HashMap<usize, Vec<u32>> = HashMap::from([(root, root_vals)]);
-        let mut lists: Vec<HashMap<u32, Vec<(u32, Vec<u32>)>>> = vec![HashMap::new(); width];
+        let mut lists: EdgeLists = vec![HashMap::new(); width];
         for &p in &bfs {
             for &c in &children[p] {
                 let mut child_vals = BTreeSet::new();
                 let mut list = HashMap::new();
-                for (n, &u) in cand.get(&p).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                for (n, &u) in cand
+                    .get(&p)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                {
                     if n % 1024 == 0 && self.cancelled() {
                         return None;
                     }
@@ -1233,7 +1252,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         pats: &[(usize, bool)],
         plans: &[PatPlan],
         unary: Option<&Vec<u32>>,
-    ) -> Vec<(u32, Vec<u32>)> {
+    ) -> Vec<EdgeEntry> {
         let mut base: Option<Vec<u32>> = None;
         let mut var_pats = Vec::new();
         for &(pi, fwd) in pats {
@@ -1484,6 +1503,14 @@ impl<K: Ord, T> Ord for Ranked<K, T> {
 
 // ---- DP-B ----------------------------------------------------------------
 
+/// An `(s, p, o)` triple of ids.
+type IdTriple3 = (u32, u32, u32);
+/// A tree-edge entry: a child value and the values of the edge's predicate
+/// variables.
+type EdgeEntry = (u32, Vec<u32>);
+/// Child variable → parent value → its entries along the tree edge.
+type EdgeLists = Vec<HashMap<u32, Vec<EdgeEntry>>>;
+
 /// Largest `Σ|cᵢ|` of a linear key (and of each of its subexpressions):
 /// with `i64` values every intermediate result stays far inside `i128`, so
 /// SPARQL's exact integer arithmetic and the scores agree.
@@ -1667,7 +1694,7 @@ struct DpbTree {
     children: Vec<Vec<usize>>,
     /// Child variable → parent value → (child value, predicate-variable
     /// values) entries, reduced to valid children.
-    lists: Vec<HashMap<u32, Vec<(u32, Vec<u32>)>>>,
+    lists: EdgeLists,
     /// Child variable → the predicate variables of its tree edge.
     edge_pred_vars: Vec<Vec<usize>>,
     /// Variable → value → its share of the score (absent: 0).
@@ -1874,7 +1901,9 @@ impl<'t> DpbEnum<'t> {
             if let Some(next) = self.fr_get(fr, idx[j] as usize + 1) {
                 let mut succ = idx.clone();
                 succ[j] += 1;
-                self.fqs[id].heap.push(Reverse((cost - cur + next, succ, j)));
+                self.fqs[id]
+                    .heap
+                    .push(Reverse((cost - cur + next, succ, j)));
             }
         }
         self.fqs[id].pool.push((cost, idx));
@@ -1905,5 +1934,285 @@ impl<'t> DpbEnum<'t> {
         for (j, &fr) in fq.children.iter().enumerate() {
             self.fill_fr(fr, idx[j] as usize, b);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::IdTriple;
+    use crate::parser::sparql::parse;
+
+    /// SplitMix64.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Random `:p0`..`:p2` edges over `n` entities.
+    fn graph(n: usize, edges: usize, seed: u64) -> (Dictionary, TripleStore) {
+        let mut rng = Rng(seed);
+        let mut d = Dictionary::new();
+        let ents: Vec<u32> = (0..n)
+            .map(|i| d.intern_term(&Term::iri(format!("http://ex/e{i}"))))
+            .collect();
+        let preds: Vec<u32> = (0..3)
+            .map(|i| d.intern_predicate(&Term::iri(format!("http://ex/p{i}")).dict_key()))
+            .collect();
+        let mut triples = Vec::new();
+        for _ in 0..edges {
+            triples.push(IdTriple::new(
+                ents[rng.below(n)],
+                preds[rng.below(3)],
+                ents[rng.below(n)],
+            ));
+        }
+        for &p in &preds {
+            triples.push(IdTriple::new(ents[0], p, ents[1]));
+        }
+        let mut s = TripleStore::new();
+        s.bulk_load(triples);
+        (d, s)
+    }
+
+    fn bgp(body: &str) -> GraphPattern {
+        let q = parse(&format!(
+            "PREFIX : <http://ex/> SELECT * WHERE {{ {body} }}"
+        ))
+        .unwrap();
+        match q {
+            Query::Select(s) => s.pattern,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn compiled<S: TripleSource>(
+        ev: &Evaluator<'_, S>,
+        gp: &GraphPattern,
+        layout: &VarLayout,
+    ) -> (Vec<PatPlan>, Candidates) {
+        let GraphPattern::Bgp(tps) = gp else {
+            panic!("not a BGP")
+        };
+        let plans: Vec<PatPlan> = tps
+            .iter()
+            .map(|tp| ev.compile_pattern(tp, layout).unwrap())
+            .collect();
+        let cands = candidates::generate(&plans, ev.store);
+        (plans, cands)
+    }
+
+    fn leaf(i: usize) -> JoinTree {
+        JoinTree::Leaf(i)
+    }
+    fn join(l: JoinTree, r: JoinTree) -> JoinTree {
+        JoinTree::Join(Box::new(l), Box::new(r))
+    }
+
+    fn copy_plans(plans: &[PatPlan]) -> Vec<PatPlan> {
+        plans
+            .iter()
+            .map(|p| PatPlan {
+                s: p.s,
+                p: p.p,
+                o: p.o,
+            })
+            .collect()
+    }
+
+    fn collect(f: impl FnOnce(&mut Sink<'_>) -> Flow) -> Vec<Binding> {
+        let mut out = Vec::new();
+        let _ = f(&mut |b| {
+            out.push(b);
+            GO
+        });
+        out
+    }
+
+    #[test]
+    fn plans_stream_in_the_materialized_order_and_positions_agree() {
+        let gp = bgp("?a :p0 ?b . ?b :p1 ?c . ?c :p2 ?d . ?d :p0 ?e");
+        for seed in 0..6 {
+            let (d, s) = graph(9, 40, seed);
+            let ev = Evaluator::new(&d, &s);
+            let layout = VarLayout::build(&gp);
+            let (plans, cands) = compiled(&ev, &gp, &layout);
+            let trees = [
+                join(join(leaf(0), leaf(1)), join(leaf(2), leaf(3))),
+                join(leaf(2), join(leaf(0), join(leaf(3), leaf(1)))),
+                join(join(leaf(3), leaf(2)), join(leaf(1), leaf(0))),
+            ];
+            for tree in trees {
+                let full = ev.eval_join_tree(&tree, &plans, &cands, &layout).0;
+                let p = BgpPlan {
+                    plans: copy_plans(&plans),
+                    cands: cands.clone(),
+                    exec: ExecPlan {
+                        order: vec![0, 1, 2, 3],
+                        tree: Some(tree.clone()),
+                    },
+                };
+                let streamed = collect(|sink| ev.stream_join_tree(&tree, &p, &layout, sink));
+                assert_eq!(streamed, full, "{tree:?}");
+                let pos = ev.solution_positions(&p, &full, layout.len()).unwrap();
+                assert!(pos.windows(2).all(|w| w[0] < w[1]), "{tree:?}");
+            }
+            for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]] {
+                let mut full = vec![vec![None; layout.len()]];
+                for &pi in &order {
+                    let mut next = Vec::new();
+                    for b in &full {
+                        ev.extend(b, &plans[pi], &cands, &mut next);
+                    }
+                    full = next;
+                }
+                let p = BgpPlan {
+                    plans: copy_plans(&plans),
+                    cands: cands.clone(),
+                    exec: ExecPlan {
+                        order: order.to_vec(),
+                        tree: None,
+                    },
+                };
+                let streamed =
+                    collect(|sink| ev.stream_left_deep(&p, 0, vec![None; layout.len()], sink));
+                assert_eq!(streamed, full, "{order:?}");
+                let pos = ev.solution_positions(&p, &full, layout.len()).unwrap();
+                assert!(pos.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+            }
+        }
+    }
+
+    /// The join order `eval_join` used before it was factored out.
+    fn original_join_order(parts: &[(usize, Vec<usize>)]) -> Vec<usize> {
+        let mut parts: Vec<(usize, Vec<usize>, usize)> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, (n, v))| (*n, v.clone(), i))
+            .collect();
+        let start = (0..parts.len()).min_by_key(|&i| parts[i].0).unwrap_or(0);
+        let (_, mut acc_vars, first) = parts.swap_remove(start);
+        let mut order = vec![first];
+        while !parts.is_empty() {
+            let pick = (0..parts.len())
+                .min_by_key(|&i| {
+                    let connected = parts[i].1.iter().any(|v| acc_vars.contains(v));
+                    (!connected as u8, parts[i].0)
+                })
+                .unwrap();
+            let (_, rv, idx) = parts.swap_remove(pick);
+            for v in rv {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+            order.push(idx);
+        }
+        order
+    }
+
+    #[test]
+    fn greedy_join_order_is_the_original_order() {
+        let mut rng = Rng(5);
+        for _ in 0..2000 {
+            let n = 1 + rng.below(7);
+            let parts: Vec<(usize, Vec<usize>)> = (0..n)
+                .map(|_| {
+                    let vars = (0..rng.below(3)).map(|_| rng.below(6)).collect();
+                    (rng.below(4), vars)
+                })
+                .collect();
+            let meta: Vec<(usize, &[usize])> =
+                parts.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+            assert_eq!(
+                greedy_join_order(&meta),
+                original_join_order(&parts),
+                "{parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_pairs_like_join_sets() {
+        let mut rng = Rng(9);
+        let width = 5;
+        let rows = |vars: &[usize], rng: &mut Rng| -> Vec<Binding> {
+            (0..rng.below(8))
+                .map(|_| {
+                    let mut b = vec![None; width];
+                    for &v in vars {
+                        if rng.below(5) != 0 {
+                            b[v] = Some(rng.below(3) as u32);
+                        }
+                    }
+                    b
+                })
+                .collect()
+        };
+        for _ in 0..500 {
+            let lvars: Vec<usize> = (0..width).filter(|_| rng.below(2) == 0).collect();
+            let rvars: Vec<usize> = (0..width).filter(|_| rng.below(2) == 0).collect();
+            let left = rows(&lvars, &mut rng);
+            let right = rows(&rvars, &mut rng);
+            let shared: Vec<usize> = lvars
+                .iter()
+                .copied()
+                .filter(|v| rvars.contains(v))
+                .collect();
+            let expected = join_sets(&left, &lvars, &right, &rvars);
+            let probe = Probe::new(right.clone(), &shared);
+            let mut got = Vec::new();
+            for l in &left {
+                let _ = probe.for_each_compatible(l, &mut |m| {
+                    got.push(m);
+                    GO
+                });
+            }
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn linear_keys() {
+        let order = |e: &str| {
+            let q = parse(&format!(
+                "SELECT * WHERE {{ ?x ?p ?y . ?y ?q ?z }} ORDER BY ({e})"
+            ))
+            .unwrap();
+            let Query::Select(s) = q else { panic!() };
+            let layout = VarLayout::build(&s.pattern);
+            let key = linear_key(&s.order_by[0].expr, &layout);
+            key.map(|k| {
+                let coef: Vec<(String, i128)> = k
+                    .coef
+                    .iter()
+                    .map(|(&v, &c)| (layout.names[v].clone(), c))
+                    .collect();
+                (coef, k.vars.len(), k.constant)
+            })
+        };
+        let x = |c| ("x".to_string(), c);
+        let y = |c| ("y".to_string(), c);
+        let z = |c| ("z".to_string(), c);
+        assert_eq!(order("?x"), Some((vec![x(1)], 1, 0)));
+        assert_eq!(order("2*?x - 3*?y + 5"), Some((vec![x(2), y(-3)], 2, 5)));
+        assert_eq!(order("(?x - ?y) * -2"), Some((vec![x(-2), y(2)], 2, 0)));
+        assert_eq!(order("-(?x + ?z) + +?x"), Some((vec![x(0), z(-1)], 2, 0)));
+        assert_eq!(order("0 * ?y"), Some((vec![y(0)], 1, 0)));
+        assert_eq!(order("?x * ?y"), None);
+        assert_eq!(order("?x + 0.5"), None);
+        assert_eq!(order("?x / 2"), None);
+        assert_eq!(order("ABS(?x)"), None);
+        assert_eq!(order("?nope + 1"), None);
+        assert_eq!(order("?x * 4294967297"), None, "coefficient bound");
     }
 }

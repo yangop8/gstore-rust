@@ -63,6 +63,9 @@ fn int(i: i64) -> Term {
     Term::typed_literal(i.to_string(), format!("{XSD}integer"))
 }
 
+/// A triple of terms.
+type T3 = (Term, Term, Term);
+
 /// A dataset: default graph plus named graphs, in id space.
 struct Data {
     dict: Dictionary,
@@ -71,9 +74,9 @@ struct Data {
 }
 
 impl Data {
-    fn new(default: &[(Term, Term, Term)], named: &[(Term, Vec<(Term, Term, Term)>)]) -> Data {
+    fn new(default: &[T3], named: &[(Term, Vec<T3>)]) -> Data {
         let mut dict = Dictionary::new();
-        let ids = |dict: &mut Dictionary, triples: &[(Term, Term, Term)]| -> Vec<IdTriple> {
+        let ids = |dict: &mut Dictionary, triples: &[T3]| -> Vec<IdTriple> {
             triples
                 .iter()
                 .map(|(s, p, o)| {
@@ -117,8 +120,14 @@ impl Data {
         let (full, _) = self.run(q, TopKOptions::NONE);
         let (heap, _) = self.run(q, HEAP_ONLY);
         let (all, stats) = self.run(q, TopKOptions::ALL);
-        assert_eq!(heap, full, "bounded heap / streaming differ from full evaluation:\n{q}");
-        assert_eq!(all, full, "optimized evaluation differs from full evaluation:\n{q}");
+        assert_eq!(
+            heap, full,
+            "bounded heap / streaming differ from full evaluation:\n{q}"
+        );
+        assert_eq!(
+            all, full,
+            "optimized evaluation differs from full evaluation:\n{q}"
+        );
         stats
     }
 }
@@ -146,7 +155,10 @@ fn value(rng: &mut Rng, kind: Values) -> Term {
         0 => Term::plain_literal(format!("s{}", rng.below(4))),
         1 => Term::typed_literal(format!("{i}.5"), format!("{XSD}decimal")),
         2 => Term::typed_literal(format!("{i}.25e0"), format!("{XSD}double")),
-        3 => Term::typed_literal(if rng.chance(50) { "true" } else { "false" }, format!("{XSD}boolean")),
+        3 => Term::typed_literal(
+            if rng.chance(50) { "true" } else { "false" },
+            format!("{XSD}boolean"),
+        ),
         4 => iri(&format!("v{}", rng.below(3))),
         5 => Term::blank(format!("b{}", rng.below(3))),
         6 => Term::Literal {
@@ -164,7 +176,7 @@ fn value(rng: &mut Rng, kind: Values) -> Term {
 
 /// A random graph over `n` entities: types, values, and `:p0`..`:p2` links
 /// (self-loops included); every predicate occurs at least once.
-fn random_triples(rng: &mut Rng, n: usize, kind: Values) -> Vec<(Term, Term, Term)> {
+fn random_triples(rng: &mut Rng, n: usize, kind: Values) -> Vec<T3> {
     let e = |i: usize| iri(&format!("e{i}"));
     let mut t = Vec::new();
     for i in 0..n {
@@ -320,7 +332,10 @@ fn random_query(rng: &mut Rng) -> String {
     } else {
         ""
     };
-    format!("{PREFIX}SELECT {distinct}{proj} WHERE {w}{order}{}{values}", slice(rng))
+    format!(
+        "{PREFIX}SELECT {distinct}{proj} WHERE {w}{order}{}{values}",
+        slice(rng)
+    )
 }
 
 // ---- equivalence ---------------------------------------------------------
@@ -462,7 +477,10 @@ fn dpb_falls_back_when_values_are_not_integers() {
         }
     }
     assert!(heap > 50, "heap fallback used {heap} times");
-    assert!(dpb > 0, "DP-B still used where the reachable values are integers");
+    assert!(
+        dpb > 0,
+        "DP-B still used where the reachable values are integers"
+    );
 }
 
 #[test]
@@ -519,8 +537,21 @@ fn order_by_ties_unbound_and_mixed_types_keep_the_full_sort_order() {
     t.push((iri("e20"), iri("type"), iri("T"))); // no :val → unbound key
     t.push((iri("e21"), iri("type"), iri("T")));
     let data = Data::new(&t, &[]);
-    for order in ["?v", "DESC(?v)", "?v DESC(?e)", "DESC(?v) ?e", "STR(?v)", "(?v + 1)"] {
-        for slice in ["LIMIT 1", "LIMIT 3", "LIMIT 4 OFFSET 2", "LIMIT 100", "OFFSET 11 LIMIT 5"] {
+    for order in [
+        "?v",
+        "DESC(?v)",
+        "?v DESC(?e)",
+        "DESC(?v) ?e",
+        "STR(?v)",
+        "(?v + 1)",
+    ] {
+        for slice in [
+            "LIMIT 1",
+            "LIMIT 3",
+            "LIMIT 4 OFFSET 2",
+            "LIMIT 100",
+            "OFFSET 11 LIMIT 5",
+        ] {
             for distinct in ["", "DISTINCT "] {
                 data.check(&format!(
                     "{PREFIX}SELECT {distinct}?v WHERE {{ ?e :type :T OPTIONAL {{ ?e :val ?v }} }} \
@@ -567,12 +598,18 @@ fn limit_stops_the_join_early() {
     assert!(opt.bgp_bindings <= 10, "{opt:?}");
     assert_eq!(opt.streamed, 1);
 
-    let (full, opt) = compare(&data, "SELECT * WHERE { ?s :p ?o . ?o :q ?v } LIMIT 2 OFFSET 7");
+    let (full, opt) = compare(
+        &data,
+        "SELECT * WHERE { ?s :p ?o . ?o :q ?v } LIMIT 2 OFFSET 7",
+    );
     assert!(full.bgp_bindings >= 10_000);
     assert!(opt.bgp_bindings <= 30, "{opt:?}");
 
     // DISTINCT counts distinct rows: one ?s per two solutions.
-    let (_, opt) = compare(&data, "SELECT DISTINCT ?s WHERE { ?s :p ?o . ?o :q ?v } LIMIT 4");
+    let (_, opt) = compare(
+        &data,
+        "SELECT DISTINCT ?s WHERE { ?s :p ?o . ?o :q ?v } LIMIT 4",
+    );
     assert!(opt.bgp_bindings <= 20, "{opt:?}");
 }
 
@@ -583,14 +620,19 @@ fn ask_stops_at_the_first_solution() {
     assert!(full.bgp_bindings >= 10_000);
     assert!(opt.bgp_bindings <= 4, "{opt:?}");
     let (_, opt) = compare(&data, "ASK { ?s :p ?o . ?o :q ?v . FILTER(?v < 0) }");
-    assert!(opt.bgp_bindings >= 10_000, "no solution: everything is tried");
+    assert!(
+        opt.bgp_bindings >= 10_000,
+        "no solution: everything is tried"
+    );
 }
 
 #[test]
 fn exists_stops_at_the_first_solution() {
     let data = chains(300, 40);
-    let (full, opt) =
-        compare(&data, "SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { ?o :q ?v } }");
+    let (full, opt) = compare(
+        &data,
+        "SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { ?o :q ?v } }",
+    );
     // Full: every EXISTS enumerates all 40 values; optimized: one each.
     assert!(full.bgp_bindings >= 300 * 40, "{full:?}");
     assert!(opt.bgp_bindings <= 300 * 3, "{opt:?}");
@@ -600,27 +642,48 @@ fn exists_stops_at_the_first_solution() {
 fn filter_bind_union_optional_minus_stream() {
     let data = chains(4000, 2);
     for (q, max) in [
-        ("SELECT * WHERE { ?s :p ?o . ?o :q ?v FILTER(?v > 100) } LIMIT 2", 400),
-        ("SELECT * WHERE { ?s :p ?o . ?o :q ?v BIND(?v + 1 AS ?w) } LIMIT 2", 10),
-        ("SELECT * WHERE { { ?s :p ?o } UNION { ?o :q ?v } } LIMIT 3", 10),
+        (
+            "SELECT * WHERE { ?s :p ?o . ?o :q ?v FILTER(?v > 100) } LIMIT 2",
+            400,
+        ),
+        (
+            "SELECT * WHERE { ?s :p ?o . ?o :q ?v BIND(?v + 1 AS ?w) } LIMIT 2",
+            10,
+        ),
+        (
+            "SELECT * WHERE { { ?s :p ?o } UNION { ?o :q ?v } } LIMIT 3",
+            10,
+        ),
         ("SELECT * WHERE { ?o :q ?v } LIMIT 2 OFFSET 2", 10),
         ("SELECT ?s WHERE { GRAPH ?g { ?s :p ?o } } LIMIT 1", 10),
         // the OPTIONAL side is evaluated once, in full (8000 values)
-        ("SELECT * WHERE { ?s :p ?o OPTIONAL { ?o :q ?v } } LIMIT 2", 8000 + 10),
+        (
+            "SELECT * WHERE { ?s :p ?o OPTIONAL { ?o :q ?v } } LIMIT 2",
+            8000 + 10,
+        ),
         // the MINUS side too (4000 types)
-        ("SELECT * WHERE { ?s :p ?o MINUS { ?s :type :Nothing } } LIMIT 2", 10),
+        (
+            "SELECT * WHERE { ?s :p ?o MINUS { ?s :type :Nothing } } LIMIT 2",
+            10,
+        ),
         ("SELECT * WHERE { ?s :p ?o MINUS { ?o :q 5 } } LIMIT 2", 10),
     ] {
         let (full, opt) = compare(&data, q);
         assert!(opt.bgp_bindings <= max, "{q}: {opt:?} (full: {full:?})");
-        assert!(full.bgp_bindings > opt.bgp_bindings || full.bgp_bindings <= 10, "{q}");
+        assert!(
+            full.bgp_bindings > opt.bgp_bindings || full.bgp_bindings <= 10,
+            "{q}"
+        );
     }
 }
 
 #[test]
 fn construct_with_limit_streams_and_ranks() {
     let data = chains(3000, 2);
-    let (full, opt) = compare(&data, "CONSTRUCT { ?s :r ?v } WHERE { ?s :p ?o . ?o :q ?v } LIMIT 3");
+    let (full, opt) = compare(
+        &data,
+        "CONSTRUCT { ?s :r ?v } WHERE { ?s :p ?o . ?o :q ?v } LIMIT 3",
+    );
     assert!(full.bgp_bindings >= 6000);
     assert!(opt.bgp_bindings <= 10, "{opt:?}");
     let (_, opt) = compare(

@@ -129,6 +129,18 @@
 //! mode, [`Evaluator::with_integer_division`] /
 //! [`Database::set_integer_division`](crate::Database::set_integer_division).
 //!
+//! # LIMIT, ORDER BY … LIMIT, ASK and EXISTS
+//!
+//! Step 5 above does not always materialize everything (module `topk`,
+//! source `src/query/topk.rs`): a SELECT or CONSTRUCT with `LIMIT` and no
+//! `ORDER BY`, `ASK` and `EXISTS` stream their solutions and stop early;
+//! `ORDER BY … LIMIT k` keeps the best `OFFSET + k` solutions in a bounded
+//! heap; and `ORDER BY` of an integer linear expression over a tree-shaped
+//! BGP enumerates matches in key order (upstream's DP-B). Each returns the
+//! exact rows, in the exact order, of the full evaluation — ties keep their
+//! WHERE order — and [`TopKOptions`] switches them off
+//! ([`Evaluator::with_topk_options`]); [`EvalStats`] counts the work.
+//!
 //! # SPARQL Update templates
 //!
 //! [`Evaluator::eval_update_modify`] instantiates `DELETE`/`INSERT` quad
@@ -174,8 +186,8 @@ use super::value::{
 // BGP/join machinery below.
 #[path = "topk.rs"]
 mod topk;
-pub use topk::{EvalStats, TopKOptions};
 use topk::PreparedBgp;
+pub use topk::{EvalStats, TopKOptions};
 
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -2083,7 +2095,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // smallest-first order (a lightweight join optimizer).
         let meta: Vec<(usize, &[usize])> = parts
             .iter()
-            .map(|p| p.as_ref().map(|(b, v)| (b.len(), v.as_slice())).unwrap_or_default())
+            .map(|p| {
+                p.as_ref()
+                    .map(|(b, v)| (b.len(), v.as_slice()))
+                    .unwrap_or_default()
+            })
             .collect();
         let order = greedy_join_order(&meta);
         let mut order = order.into_iter();
