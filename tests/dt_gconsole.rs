@@ -1186,6 +1186,67 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     assert_eq!(code, 1, "{out}\n{err}");
 }
 
+/// A query that runs for a long time unless cancelled (a REGEX FILTER over
+/// a cross product, checked for cancellation per row; as in
+/// `dt_gapi_tasks`).
+const SLOW: &str = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?p1 ?b . ?c ?p2 ?d \
+                    FILTER(REGEX(CONCAT(STR(?a), STR(?d), STR(?b), STR(?c)), \"(x+x+)+y\")) }";
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_cancels_the_servers_query_task() {
+    let dir = scratch("gc_ctrl_c_real_data");
+    let _dir = DirGuard(dir.clone());
+    let mut ttl = String::from("@prefix : <http://ex/> .\n");
+    for i in 0..1200 {
+        ttl.push_str(&format!(":s{i} :p :o{i} .\n"));
+    }
+    fs::write(dir.join("chain.ttl"), ttl).unwrap();
+    let srv = Server::start_with_dir("gc_ctrl_c_real", Some(&dir));
+    ok(&srv.build("slow", &dir.join("chain.ttl")));
+    let mut cmd = gconsole(&srv.addr, &dir);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (out, err) = collect(&mut child);
+    stdin
+        .write_all(format!("use slow;\n{SLOW};\n").as_bytes())
+        .unwrap();
+    let tasks = |status: &str| {
+        let j = srv.op(
+            "operationTaskList",
+            &[("status", status), ("pageSize", "100")],
+        );
+        ok(&j);
+        j.get("list").and_then(Json::as_array).unwrap().to_vec()
+    };
+    wait_for("the running query", || {
+        tasks("0")
+            .iter()
+            .any(|t| field(t, "operation") == "query" && field(t, "sparql") == SLOW)
+    });
+    sigint(&child);
+    // The task is cancelled (not merely abandoned by the client).
+    wait_for("the cancelled task", || {
+        tasks("-1")
+            .iter()
+            .any(|t| field(t, "operation") == "query" && field(t, "sparql") == SLOW)
+    });
+    stdin.write_all(b"pdb;\n").unwrap();
+    drop(stdin);
+    let code = wait(&mut child);
+    let (out, err) = (out.join().unwrap(), err.join().unwrap());
+    assert!(out.contains("Query cancelled.\n"), "{out}\n{err}");
+    assert!(out.ends_with("slow\n\n"), "{out}\n{err}");
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(tasks("0").is_empty(), "nothing left running");
+}
+
 // ---- the README flow: gserver + conf.ini + gconsole -u root ---------------------
 
 #[cfg(unix)]

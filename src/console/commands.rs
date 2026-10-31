@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use super::client::{ApiClient, CallError};
 use super::syntax;
 use super::table;
-use super::term::{EchoOff, LineReader, ReadOutcome};
+use super::term::{self, EchoOff, LineReader, ReadOutcome};
 use crate::json::{self, Json};
 
 /// Upstream's product name, version and site (`GlobalTypedef`).
@@ -414,20 +414,19 @@ impl Console {
     /// `hidden`. `None` at the end of input or on Ctrl-C.
     pub fn prompt_line(&mut self, prompt: &str, hidden: bool) -> Option<String> {
         if self.show_prompts {
-            print!("{prompt}");
-            let _ = io::stdout().flush();
+            term::show(prompt);
         }
         let line = {
             let _echo = hidden.then(EchoOff::new);
             self.reader.read_line()
         };
         if hidden && self.show_prompts {
-            println!();
+            term::show("\n");
         }
         match line {
             ReadOutcome::Line(l) => Some(l),
             ReadOutcome::Eof => {
-                println!("End of stdin!");
+                term::show("End of stdin!\n");
                 None
             }
             ReadOutcome::Interrupted => None,
@@ -471,13 +470,13 @@ impl Console {
                     Some((db, sparql)) => {
                         let n = self.cancel_query(db, sparql);
                         if n > 0 {
-                            println!("Query cancelled.");
+                            term::show("Query cancelled.\n");
                         } else {
-                            println!("Query cancelled (the connection was dropped).");
+                            term::show("Query cancelled (the connection was dropped).\n");
                         }
                     }
-                    None => println!(
-                        "Cancelled: the connection was dropped; the server may still complete the operation."
+                    None => term::show(
+                        "Cancelled: the connection was dropped; the server may still complete the operation.\n",
                     ),
                 }
                 Err(Fail::Cancelled)
@@ -513,9 +512,13 @@ impl Console {
                 .iter()
                 .filter(|t| {
                     let field = |k: &str| t.get(k).map(text_of).unwrap_or_default();
+                    let listed = field("sparql");
+                    // A server may list a long statement clipped.
+                    let same = listed == sparql
+                        || (listed.chars().count() >= 1024 && sparql.starts_with(&listed));
                     field("operation") == "query"
                         && field("database") == db
-                        && field("sparql") == sparql
+                        && same
                         && field("async") != "1"
                         && t.get("user")
                             .is_none_or(|u| text_of(u) == self.client.username)
@@ -632,7 +635,7 @@ impl Console {
     pub fn execute(&mut self, stmt: &str) {
         let (body, redirect) = syntax::split_redirect(stmt);
         if let Some(r) = &redirect {
-            println!("Redirect output to file: {}", r.path);
+            term::show(&format!("Redirect output to file: {}\n", r.path));
             let file = if r.append {
                 OpenOptions::new().create(true).append(true).open(&r.path)
             } else {
@@ -641,7 +644,7 @@ impl Console {
             match file {
                 Ok(f) => self.out = Out::File(BufWriter::new(f)),
                 Err(_) => {
-                    println!("Failed to open file: {}", r.path);
+                    term::show(&format!("Failed to open file: {}\n", r.path));
                     self.failures += 1;
                     return;
                 }

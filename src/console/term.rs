@@ -11,7 +11,7 @@
 //! [`ReadOutcome::Interrupted`]. Code waiting on something else (a request
 //! to the server) polls [`interrupts`].
 
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +25,14 @@ pub fn interrupts() -> u64 {
 /// key themselves).
 pub fn note_interrupt() {
     INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Write `text` to stdout and flush it, ignoring errors: a closed pipe
+/// (`gconsole … | head`) must not end the console with a panic.
+pub fn show(text: &str) {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
 }
 
 /// Whether stdin is a terminal.

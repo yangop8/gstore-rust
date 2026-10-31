@@ -44,7 +44,6 @@ pub mod syntax;
 pub mod table;
 pub mod term;
 
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use client::{ApiClient, CallError};
@@ -211,17 +210,17 @@ pub fn main(args: &[String]) -> i32 {
     let opts = match parse_args(args) {
         Ok(Invocation::Run(o)) => o,
         Ok(Invocation::Help) => {
-            print!("{}", help_text());
+            term::show(&help_text());
             return 0;
         }
         Ok(Invocation::Version) => {
-            print!("{}", commands::version_text());
+            term::show(&commands::version_text());
             return 0;
         }
         Err(e) => {
-            println!("Wrong usage.");
-            println!("gconsole: {e}");
-            print!("{}", help_text());
+            term::show("Wrong usage.\n");
+            term::show(&format!("gconsole: {e}\n"));
+            term::show(&help_text());
             return 2;
         }
     };
@@ -282,11 +281,11 @@ fn login(console: &mut Console, opts: &Options) -> Result<(), i32> {
                     .get("StatusMsg")
                     .and_then(crate::json::Json::as_str)
                     .unwrap_or_default();
-                println!("login failed: {msg}");
+                term::show(&format!("login failed: {msg}\n"));
             }
             Err(CallError::Interrupted) => return Err(1),
             Err(e) => {
-                println!("Could not connect to server. Please check server status");
+                term::show("Could not connect to server. Please check server status\n");
                 eprintln!("gconsole: {e} ({})", console.client.url());
                 return Err(1);
             }
@@ -297,10 +296,10 @@ fn login(console: &mut Console, opts: &Options) -> Result<(), i32> {
         }
         wrong += 1;
         if wrong >= MAX_WRONG_PSWD_TIMES {
-            println!("Please check your remember list for your usrname and password.");
+            term::show("Please check your remember list for your usrname and password.\n");
             return Err(1);
         }
-        println!("Username or password wrong! Please try again.");
+        term::show("Username or password wrong! Please try again.\n");
     }
 }
 
@@ -320,12 +319,11 @@ impl Source {
         match self {
             Source::Plain { prompts } => {
                 if *prompts {
-                    print!("{prompt}");
-                    let _ = io::stdout().flush();
+                    term::show(prompt);
                 }
                 let line = console.reader.read_line();
                 if *prompts && line == ReadOutcome::Interrupted {
-                    println!();
+                    term::show("\n");
                 }
                 line
             }
@@ -361,7 +359,7 @@ fn run_client(opts: &Options, client: ApiClient) -> i32 {
         None => plain_or_editor(&mut console, interactive),
     };
     if interactive {
-        print!("{}", banner());
+        term::show(&banner());
         console.history = History::open(history_path());
         for e in console.history.entries().to_vec() {
             source.add_history(&e);
@@ -443,8 +441,8 @@ fn repl(console: &mut Console, source: &mut Source, interactive: bool) {
                         console.execute(&text);
                     }
                 } else {
-                    println!();
-                    println!();
+                    term::show("\n");
+                    term::show("\n");
                 }
                 console.current_db.clear();
                 return;
