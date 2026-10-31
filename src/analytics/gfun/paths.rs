@@ -1718,28 +1718,23 @@ pub fn k_hop_reachable_path(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 // ---------------------------------------------------------------------------
 
 /// A DFS frame's neighbour cursor: for each predicate, out-neighbours, then
-/// (undirected) in-neighbours.
+/// (undirected) in-neighbours. `groups == None` is a frame that is not
+/// expanded (its hop budget is used up).
 struct NbrCursor<'g> {
-    groups: PredGroups<'g>,
+    groups: Option<PredGroups<'g>>,
     cur: Option<(PredId, &'g [Node], &'g [Node])>,
     pos: usize,
     in_phase: bool,
 }
 
 impl<'g> NbrCursor<'g> {
-    fn new(groups: PredGroups<'g>) -> Self {
+    fn new(groups: Option<PredGroups<'g>>) -> Self {
         NbrCursor {
             groups,
             cur: None,
             pos: 0,
             in_phase: false,
         }
-    }
-
-    fn exhausted(g: &'g CsrGraph, preds: &'g PredFilter) -> Self {
-        let mut gr = groups(g, 0, preds, false, false);
-        gr.ascending = true;
-        NbrCursor::new(gr)
     }
 
     fn next(&mut self) -> Option<(Node, PathEdge)> {
@@ -1757,7 +1752,7 @@ impl<'g> NbrCursor<'g> {
                     continue;
                 }
             }
-            self.cur = Some(self.groups.next()?);
+            self.cur = Some(self.groups.as_mut()?.next()?);
             self.pos = 0;
             self.in_phase = false;
         }
@@ -1770,7 +1765,7 @@ impl<'g> NbrCursor<'g> {
 fn k_hop_enumerate_nodes(
     g: &CsrGraph,
     bar: &mut Dense<u32>,
-    on_stack: &mut NodeMarks,
+    on_stack: &mut [bool],
     poll: &mut Poll<'_, '_>,
     u: Node,
     v: Node,
@@ -1783,7 +1778,6 @@ fn k_hop_enumerate_nodes(
 ) -> Result<()> {
     // Reverse k-BFS from v: bar[x] = hop distance x → v (0 when unreached).
     bar.reset();
-    on_stack.clear();
     let bar_of = |bar: &Dense<u32>, x: Node| i64::from(bar.get_or_zero(x));
     let mut q = VecDeque::from([v]);
     while let Some(cur) = q.pop_front() {
@@ -1803,28 +1797,28 @@ fn k_hop_enumerate_nodes(
     }
 
     // bc_dfs with an explicit stack: (vertex, edge into it, neighbour cursor).
+    // `s.size() - 1 < k` (kHopEnumeratePath.cpp:31) decides whether a frame
+    // is expanded at all; `on_stack` replaces the linear `stacked` scan.
     let mut budget = ret_num;
     let mut stack: Vec<(Node, Option<PathEdge>, NbrCursor<'_>)> = Vec::new();
     let expand = |depth_edges: i64, x: Node| {
-        if depth_edges < k {
-            NbrCursor::new(groups(g, x, preds, true, !directed))
-        } else {
-            NbrCursor::exhausted(g, preds)
-        }
+        NbrCursor::new((depth_edges < k).then(|| groups(g, x, preds, true, !directed)))
     };
-    on_stack.mark(u);
+    on_stack[u as usize] = true;
     stack.push((u, None, expand(0, u)));
-    while let Some(top) = stack.last_mut() {
+    // Once the budget is spent no further path can be recorded (upstream
+    // keeps looping without recursing), so stop right away.
+    while budget != 0 {
+        let Some(top) = stack.last_mut() else {
+            break;
+        };
         poll.tick()?;
         let Some((to, e)) = top.2.next() else {
             let (x, _, _) = stack.pop().expect("non-empty stack");
-            on_stack.unmark(x);
+            on_stack[x as usize] = false;
             continue;
         };
-        if on_stack.is_marked(to) {
-            continue;
-        }
-        if stack.len() as i64 + bar_of(bar, to) > k || budget == 0 {
+        if on_stack[to as usize] || stack.len() as i64 + bar_of(bar, to) > k {
             continue;
         }
         if to == v {
@@ -1846,8 +1840,11 @@ fn k_hop_enumerate_nodes(
             continue;
         }
         let depth_edges = stack.len() as i64; // edges once `to` is pushed
-        on_stack.mark(to);
+        on_stack[to as usize] = true;
         stack.push((to, Some(e), expand(depth_edges, to)));
+    }
+    for (x, _, _) in stack.drain(..) {
+        on_stack[x as usize] = false;
     }
     *total += out.len();
     Ok(())
@@ -1896,7 +1893,8 @@ pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
     let ret_num = a.ret_num.unwrap_or(-1);
     let mut bar = Dense::new(g.num_nodes());
-    let mut on_stack = NodeMarks::new(g.num_nodes());
+    // all clear between pairs: the DFS unmarks what it marks
+    let mut on_stack = vec![false; g.num_nodes()];
     let mut poll = Poll::new(ctx);
     let mut list = JsonList::new();
     let mut total = 0usize;
@@ -2520,9 +2518,15 @@ mod tests {
         // Undirected push uses out-degree only: u = 3 has out-degree 1 →
         // pushes to 2 (l1[2] = 1); v = 2: l2[2] = 0 → 1 + 0 <= 1 → true.
         assert!(k_hop_reachable_nodes(&g, 3, 2, false, 1, &f, Some(1e-4)));
-        // A zero divisor (upstream SIGFPE) reads as 0: undirected push from
-        // u = 1 (out-degree 1) reaches 2, whose out-degree is 0 → residue 0 /
-        // 0 → 0; v = 0 has in-degree 0 in the backward push → 0 as well.
-        assert!(!k_hop_reachable_nodes(&g, 1, 0, false, 1, &f, Some(1e-4)));
+        // A zero divisor (upstream: SIGFPE) reads as 0 and the search goes
+        // on. u = 1, v = 3, undirected, k = 1: the forward push from 1
+        // (out-degree 1) sets l1[2] = 1, residue1[2] = int(0.8) = 0 and then
+        // divides by out-degree(2) = 0; the backward push divides by
+        // in-degree(3) = 0. BFS: f1[2] = 1; backward from 3 over its real
+        // out-edge: f2[2] = 1, and l1[2] + 1 = f1[2] + 1 = 2 > 1 → false.
+        assert!(!k_hop_reachable_nodes(&g, 1, 3, false, 1, &f, Some(1e-4)));
+        // u = 1, v = 0: same zero divisors, but the backward BFS from 0 finds
+        // its out-neighbour 1 = u with l1[1] = 0 → 0 + 1 <= 1 → true.
+        assert!(k_hop_reachable_nodes(&g, 1, 0, false, 1, &f, Some(1e-4)));
     }
 }
