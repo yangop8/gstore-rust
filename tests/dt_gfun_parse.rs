@@ -711,8 +711,8 @@ fn pred_sets_empty_negated_mixed_and_prefixed() {
     assert_eq!(args, vec![preds(&["http://base/p"], &["http://base/q"])]);
 
     // Malformed sets.
-    let e = call_err("WCC({nope:p})");
-    assert!(e.contains("undefined prefix 'nope:'"), "{e}");
+    let e = call_err("maximumKplex({nope:p})");
+    assert!(e.ends_with("argument 1 (pred_set): undefined prefix 'nope:'"), "{e}");
     let e = call_err("WCC({<p> <q>})");
     assert!(
         e.contains("argument 1 (pred_set)") && e.contains("found <q>"),
@@ -892,7 +892,7 @@ fn missing_extra_and_misplaced_arguments_have_helpful_messages() {
         );
     }
     let e = call_err("SSSP(nope:x, true, {})");
-    assert!(e.contains("undefined prefix 'nope:'"), "{e}");
+    assert!(e.contains("argument 1 (u): undefined prefix 'nope:'"), "{e}");
     // `$var` works like `?var`.
     assert_eq!(call("SSSP($s, true, {})").1[0], var("s"));
 }

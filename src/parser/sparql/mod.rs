@@ -1177,8 +1177,11 @@ impl<'s> Parser<'s> {
                 let d = format!("missing argument {argno} ({label})");
                 return Err(self.gfn_err(written, func, d));
             }
-            let arg = self.parse_gfn_slot(spec.slot).map_err(|what| {
-                let d = format!("argument {argno} ({label}) must be {what}");
+            let arg = self.parse_gfn_slot(spec.slot).map_err(|e| {
+                let d = match e {
+                    SlotErr::Expected(what) => format!("argument {argno} ({label}) must be {what}"),
+                    SlotErr::Other(msg) => format!("argument {argno} ({label}): {msg}"),
+                };
                 self.gfn_err(written, func, d)
             })?;
             args.push(arg);
@@ -1204,9 +1207,8 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// One advanced-function argument. The error is the "must be …" part of
-    /// the message (what was expected and what was found).
-    fn parse_gfn_slot(&mut self, slot: GSlot) -> std::result::Result<GArg, String> {
+    /// One advanced-function argument.
+    fn parse_gfn_slot(&mut self, slot: GSlot) -> std::result::Result<GArg, SlotErr> {
         let found = |p: &Self| format!("found {}", describe_token(p.peek()));
         match slot {
             GSlot::Node(_) => match self.peek().clone() {
@@ -1218,7 +1220,10 @@ impl<'s> Parser<'s> {
                     let iri = self.parse_gfn_iri()?;
                     Ok(GArg::Node(VarOrIri::Iri(iri)))
                 }
-                _ => Err(format!("a ?variable or an IRI, {}", found(self))),
+                _ => Err(SlotErr::Expected(format!(
+                    "a ?variable or an IRI, {}",
+                    found(self)
+                ))),
             },
             GSlot::Bool => match self.peek() {
                 Token::Word(w) if w.eq_ignore_ascii_case("true") => {
@@ -1229,31 +1234,49 @@ impl<'s> Parser<'s> {
                     self.bump();
                     Ok(GArg::Bool(false))
                 }
-                _ => Err(format!("true or false, {}", found(self))),
+                _ => Err(SlotErr::Expected(format!("true or false, {}", found(self)))),
             },
-            GSlot::Int(_) => self.parse_gfn_int(true, true).map(GArg::Int),
-            GSlot::UInt(_) => self.parse_gfn_int(false, true).map(GArg::Int),
-            GSlot::Num(_) => self.parse_gfn_num().map(GArg::Num),
+            GSlot::Int(_) => self
+                .parse_gfn_int(true, true)
+                .map(GArg::Int)
+                .map_err(SlotErr::Expected),
+            GSlot::UInt(_) => self
+                .parse_gfn_int(false, true)
+                .map(GArg::Int)
+                .map_err(SlotErr::Expected),
+            GSlot::Num(_) => self
+                .parse_gfn_num()
+                .map(GArg::Num)
+                .map_err(SlotErr::Expected),
             GSlot::Preds => self.parse_pred_set(),
             GSlot::Named(key, kind) => {
                 match self.peek() {
                     Token::Word(w) if w.eq_ignore_ascii_case(key) => {
                         self.bump();
                     }
-                    _ => return Err(format!("the named argument {key}=…, {}", found(self))),
+                    _ => {
+                        return Err(SlotErr::Expected(format!(
+                            "the named argument {key}=…, {}",
+                            found(self)
+                        )))
+                    }
                 }
                 if !matches!(self.peek(), Token::Eq) {
-                    return Err(format!("{key}=…, but '=' is missing ({})", found(self)));
+                    return Err(SlotErr::Expected(format!(
+                        "{key}=…, but '=' is missing ({})",
+                        found(self)
+                    )));
                 }
                 self.bump();
                 let value = match kind {
-                    GNamedKind::UInt => GNum::Int(
-                        self.parse_gfn_int(false, false)
-                            .map_err(|e| format!("{key}=<unsigned integer>: {e}"))?,
-                    ),
+                    GNamedKind::UInt => {
+                        GNum::Int(self.parse_gfn_int(false, false).map_err(|e| {
+                            SlotErr::Expected(format!("{key}=<unsigned integer>: {e}"))
+                        })?)
+                    }
                     GNamedKind::Num => GNum::Num(
                         self.parse_gfn_num()
-                            .map_err(|e| format!("{key}=<number>: {e}"))?,
+                            .map_err(|e| SlotErr::Expected(format!("{key}=<number>: {e}")))?,
                     ),
                 };
                 Ok(GArg::Named {
@@ -1266,18 +1289,23 @@ impl<'s> Parser<'s> {
 
     /// An IRI (`<…>` or a prefixed name) inside an advanced-function call,
     /// fully expanded.
-    fn parse_gfn_iri(&mut self) -> std::result::Result<String, String> {
+    fn parse_gfn_iri(&mut self) -> std::result::Result<String, SlotErr> {
         match self.peek().clone() {
             Token::Iri(s) => {
                 self.bump();
                 Ok(self.resolve_iri(&s))
             }
             Token::PName(p, l) => {
-                let iri = self.expand_pname(&p, &l).map_err(sparql_msg)?;
+                let iri = self
+                    .expand_pname(&p, &l)
+                    .map_err(|e| SlotErr::Other(sparql_msg(e)))?;
                 self.bump();
                 Ok(iri)
             }
-            other => Err(format!("an IRI, found {}", describe_token(&other))),
+            other => Err(SlotErr::Expected(format!(
+                "an IRI, found {}",
+                describe_token(&other)
+            ))),
         }
     }
 
@@ -1353,12 +1381,12 @@ impl<'s> Parser<'s> {
 
     /// `predSet`: `{}` or `{ iriOrNegIri ( , iriOrNegIri )* }`, where an entry
     /// is an IRI, or `!` IRI to exclude it.
-    fn parse_pred_set(&mut self) -> std::result::Result<GArg, String> {
+    fn parse_pred_set(&mut self) -> std::result::Result<GArg, SlotErr> {
         if !matches!(self.peek(), Token::LBrace) {
-            return Err(format!(
+            return Err(SlotErr::Expected(format!(
                 "a predicate set like {{}} or {{<p>, !<q>}}, found {}",
                 describe_token(self.peek())
-            ));
+            )));
         }
         self.bump();
         let mut include = Vec::new();
@@ -1372,9 +1400,13 @@ impl<'s> Parser<'s> {
             if negated {
                 self.bump();
             }
-            let iri = self.parse_gfn_iri().map_err(|e| {
-                format!("a predicate set of IRIs, optionally negated with '!': expected {e}")
-            })?;
+            if !matches!(self.peek(), Token::Iri(_) | Token::PName(_, _)) {
+                return Err(SlotErr::Expected(format!(
+                    "a predicate set of IRIs, each optionally negated with '!', but it holds {}",
+                    describe_token(self.peek())
+                )));
+            }
+            let iri = self.parse_gfn_iri()?;
             if negated {
                 exclude.push(iri);
             } else {
@@ -1389,10 +1421,10 @@ impl<'s> Parser<'s> {
                     return Ok(GArg::PredSet { include, exclude });
                 }
                 other => {
-                    return Err(format!(
+                    return Err(SlotErr::Expected(format!(
                         "a predicate set closed by '}}' (entries separated by ','), found {}",
                         describe_token(other)
-                    ))
+                    )))
                 }
             }
         }
@@ -2077,6 +2109,15 @@ impl GSlot {
             GSlot::Named(k, _) => k,
         }
     }
+}
+
+/// Why an advanced-function argument failed to parse.
+enum SlotErr {
+    /// Rendered as "argument N (label) must be …": what was expected (and
+    /// what was found instead).
+    Expected(String),
+    /// Rendered as "argument N (label): …" (e.g. an undefined prefix).
+    Other(String),
 }
 
 /// The value kind of a named argument.
