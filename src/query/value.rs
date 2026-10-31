@@ -41,6 +41,8 @@
 //! are exact within `i128` ([`Decimal`]), an `xsd:float` is a
 //! [`Value::Float`] (a single-precision value held as `f64`) that keeps its
 //! datatype through expressions, an `xsd:double` is a [`Value::Double`].
+//! A float meets an integer or decimal at single precision (the other
+//! operand is promoted to `xsd:float`), so `"0.1"^^xsd:float = 0.1`.
 //! Doubles and floats print their special values as the XSD lexicals `INF`,
 //! `-INF` and `NaN` everywhere (`STR`, computed values, every result format).
 //!
@@ -352,6 +354,25 @@ impl Value {
         }
     }
 
+    /// Both operands promoted to `xsd:float` when that is their common type
+    /// (XPath numeric type promotion): one is a float and the other a float,
+    /// a decimal or an integer, which is rounded to single precision as
+    /// `xsd:float(…)` would. `None` otherwise (a double involved, no float,
+    /// or a non-number).
+    fn float_operands(&self, other: &Value) -> Option<(f64, f64)> {
+        let promote = |v: &Value| match v {
+            Value::Float(f) => Some(*f),
+            Value::Int(_) | Value::BigInt(_) | Value::Decimal(_) => {
+                Some(to_f32_precision(v.as_f64()?))
+            }
+            _ => None,
+        };
+        if !matches!(self, Value::Float(_)) && !matches!(other, Value::Float(_)) {
+            return None;
+        }
+        Some((promote(self)?, promote(other)?))
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
@@ -409,12 +430,16 @@ impl Value {
     /// two literals of an unknown datatype, a number against a string, …).
     pub fn sparql_eq(&self, other: &Value) -> Option<bool> {
         // Numeric equality, exact where possible: integers via i128, integers
-        // and xsd:decimal via exact decimal, otherwise (any float/double) via f64.
+        // and xsd:decimal via exact decimal, a float against a float, decimal
+        // or integer at single precision, otherwise (a double) via f64.
         if self.is_numeric() && other.is_numeric() {
             if let (Some(a), Some(b)) = (self.as_i128(), other.as_i128()) {
                 return Some(a == b);
             }
             if let (Some(a), Some(b)) = (self.as_decimal(), other.as_decimal()) {
+                return Some(a == b);
+            }
+            if let Some((a, b)) = self.float_operands(other) {
                 return Some(a == b);
             }
             if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
@@ -455,7 +480,8 @@ impl Value {
     /// SPARQL ordering relation for `<`, `>`, `<=`, `>=`. `None` = incomparable.
     pub fn sparql_cmp(&self, other: &Value) -> Option<Ordering> {
         // Numeric ordering, exact where possible: integers via i128, integers and
-        // xsd:decimal via exact decimal, otherwise (any double) via f64.
+        // xsd:decimal via exact decimal, a float against a float, decimal or
+        // integer at single precision, otherwise (a double) via f64.
         if self.is_numeric() && other.is_numeric() {
             if let (Some(a), Some(b)) = (self.as_i128(), other.as_i128()) {
                 return Some(a.cmp(&b));
@@ -464,6 +490,9 @@ impl Value {
                 if let Some(o) = a.cmp_exact(b) {
                     return Some(o);
                 }
+            }
+            if let Some((a, b)) = self.float_operands(other) {
+                return a.partial_cmp(&b);
             }
             if let (Some(a), Some(b)) = (self.as_f64(), other.as_f64()) {
                 return a.partial_cmp(&b);
@@ -521,7 +550,8 @@ impl Value {
     /// decimal division to the implementation; at least 18 digits are
     /// required) — unless both are integers and `mode` is
     /// [`IntegerDivision::Truncate`]. With a float operand (and no double)
-    /// the result is an `xsd:float`, with a double operand an `xsd:double`;
+    /// the other operand is promoted to `xsd:float` and the result is an
+    /// `xsd:float`, with a double operand an `xsd:double`;
     /// their division by zero follows IEEE 754 (`INF`, `-INF`, `NaN`), as
     /// XPath specifies for those types.
     pub fn arith_with(&self, op: ArithOp, other: &Value, mode: IntegerDivision) -> Option<Value> {
@@ -542,8 +572,10 @@ impl Value {
                 )))
             }
             1 => {
-                let r = apply_f64(op, self.as_f64()?, other.as_f64()?);
-                return Some(Value::Float(to_f32_precision(r)));
+                // Both operands at single precision; computing on them in f64
+                // and rounding once gives the correctly rounded f32 result.
+                let (x, y) = self.float_operands(other)?;
+                return Some(Value::Float(to_f32_precision(apply_f64(op, x, y))));
             }
             _ => {}
         }
@@ -795,7 +827,8 @@ impl Decimal {
     /// fractional digits — fewer when the dividend's digits would overflow
     /// `i128`, more when the operands' scales need them — with trailing zeros
     /// dropped down to one fractional digit (`6/2` is `3.0`, `7/2` is `3.5`).
-    /// `None` for a zero divisor, or when not even an integral quotient fits.
+    /// `None` for a zero divisor, or when not even an integral quotient fits
+    /// (`i128::MIN / -1` included).
     fn div(self, other: Decimal) -> Option<Decimal> {
         if other.mant == 0 {
             return None;
@@ -810,7 +843,9 @@ impl Decimal {
                 .checked_pow(exp)
                 .and_then(|f| self.mant.checked_mul(f));
             if let Some(num) = num {
-                let (q, r) = (num / other.mant, num % other.mant);
+                // Checked: i128::MIN / -1 (exp 0, so already the smallest
+                // scale) overflows, and the caller falls back to f64.
+                let (q, r) = (num.checked_div(other.mant)?, num.checked_rem(other.mant)?);
                 // Round half away from zero: |2r| ≥ |b| ⇒ one more unit
                 // in the quotient's direction.
                 let q = if r != 0 && r.unsigned_abs().saturating_mul(2) >= other.mant.unsigned_abs()
@@ -1479,6 +1514,61 @@ mod tests {
         assert_eq!(
             Value::Float(-1.0).arith(ArithOp::Div, &Value::Int(0)),
             Some(Value::Float(f64::NEG_INFINITY))
+        );
+    }
+
+    #[test]
+    fn float_meets_decimal_and_integer_at_single_precision() {
+        // XPath promotes the integer / decimal operand to xs:float.
+        let tenth = typed("0.1", "float");
+        let d = typed("0.1", "decimal");
+        assert_eq!(tenth.sparql_eq(&d), Some(true));
+        assert_eq!(d.sparql_eq(&tenth), Some(true));
+        assert_eq!(tenth.sparql_cmp(&d), Some(Ordering::Equal));
+        assert_eq!(d.sparql_cmp(&tenth), Some(Ordering::Equal));
+        assert_eq!(tenth.arith(ArithOp::Sub, &d), Some(Value::Float(0.0)));
+        assert_eq!(d.arith(ArithOp::Sub, &tenth), Some(Value::Float(0.0)));
+        let big = typed("16777217", "float");
+        assert_eq!(big.sparql_eq(&Value::Int(16_777_217)), Some(true));
+        assert_eq!(
+            big.sparql_cmp(&Value::BigInt(16_777_217)),
+            Some(Ordering::Equal)
+        );
+        // A double is never narrowed: 0.1f32 is not 0.1e0.
+        assert_eq!(tenth.sparql_eq(&Value::Double(0.1)), Some(false));
+        assert_eq!(
+            tenth.sparql_cmp(&Value::Double(0.1)),
+            Some(Ordering::Greater)
+        );
+        // Two decimals whose scales cannot be aligned in i128 still compare
+        // in f64, not at single precision.
+        let tiny = Value::Decimal(Decimal { mant: 1, scale: 40 });
+        let huge = Value::Decimal(Decimal {
+            mant: i128::MAX,
+            scale: 0,
+        });
+        assert_eq!(tiny.sparql_cmp(&huge), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn decimal_division_overflow_falls_back_instead_of_panicking() {
+        let two_127 = Value::Double(2f64.powi(127));
+        // i128::MIN / -1 = 2^127 does not fit i128.
+        assert_eq!(
+            Value::BigInt(i128::MIN).arith(ArithOp::Div, &Value::Int(-1)),
+            Some(two_127.clone())
+        );
+        // The same mantissas at a common scale.
+        let dec = |mant| Value::Decimal(Decimal { mant, scale: 1 });
+        assert_eq!(dec(i128::MIN).arith(ArithOp::Div, &dec(-1)), Some(two_127));
+        // Truncating integer division reports the overflow as an error.
+        assert_eq!(
+            Value::BigInt(i128::MIN).arith_with(
+                ArithOp::Div,
+                &Value::Int(-1),
+                IntegerDivision::Truncate
+            ),
+            None
         );
     }
 

@@ -1063,9 +1063,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                                 layout.names.push(alias.clone());
                                 layout.is_pred.push(false);
                                 for b in solutions.iter_mut() {
-                                    let v =
-                                        self.eval_value(e, b, &layout).map(|v| self.value_to_id(&v));
-                                    b.push(v);
+                                    // The column exists (unbound) while its
+                                    // expression is evaluated, so a reference
+                                    // to the alias itself reads unbound
+                                    // instead of indexing past the end — as
+                                    // the Top-K path (`order_extend`) does.
+                                    b.push(None);
+                                    b[idx] = self.eval_id(e, b, &layout);
                                 }
                             }
                         }
@@ -1214,9 +1218,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Expr(Expr::GraphFn { .. }, alias) => {
                         Ok(layout.index.get(alias).and_then(|&i| b[i]))
                     }
-                    SelectItem::Expr(e, _) => {
-                        Ok(self.eval_value(e, b, layout).map(|v| self.value_to_id(&v)))
-                    }
+                    SelectItem::Expr(e, _) => Ok(self.eval_id(e, b, layout)),
                 })
                 .collect(),
         }
@@ -1485,9 +1487,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     let Some(col) = *col else { continue };
                     gb[col] = match (gfn, lifted) {
                         (Some(v), _) => *v,
-                        (None, Some(e)) => self
-                            .eval_value(e, &gb, &glayout)
-                            .map(|v| self.value_to_id(&v)),
+                        (None, Some(e)) => self.eval_id(e, &gb, &glayout),
                         (None, None) => None,
                     };
                 }
@@ -1580,12 +1580,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
     ) -> Option<Value> {
         // COUNT(*) counts solutions; COUNT(DISTINCT *) counts the distinct
-        // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup whole bindings
-        // before counting when the DISTINCT modifier is present.
+        // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup bindings before
+        // counting when the DISTINCT modifier is present. A mapping holds
+        // only the query's own variables: the hidden variables of `[]` /
+        // `( … )` (existential blank nodes, which `SELECT DISTINCT *` leaves
+        // out too) and a mixed predicate variable's predicate-space twin are
+        // not part of it.
         if func == AggFunc::Count && arg.is_none() {
             if distinct {
-                let mut seen: HashSet<&Binding> = HashSet::new();
-                let n = sols.iter().filter(|&&b| seen.insert(b)).count();
+                let visible: Vec<usize> = (0..layout.len())
+                    .filter(|&i| {
+                        let name = &layout.names[i];
+                        !is_anon_var(name) && !name.starts_with(PRED_ALIAS_PREFIX)
+                    })
+                    .collect();
+                let mut seen: HashSet<Vec<Option<u32>>> = HashSet::new();
+                let n = sols
+                    .iter()
+                    .filter(|b| {
+                        seen.insert(
+                            visible
+                                .iter()
+                                .map(|&i| b.get(i).copied().flatten())
+                                .collect(),
+                        )
+                    })
+                    .count();
                 return Some(Value::Int(n as i64));
             }
             return Some(Value::Int(sols.len() as i64));
@@ -1877,8 +1897,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let vi = layout.index[var];
                 for b in &mut sols {
                     // BIND error/unbound leaves the variable unbound (no row drop).
-                    if let Some(v) = self.eval_value(expr, b, layout) {
-                        b[vi] = Some(self.value_to_id(&v));
+                    if let Some(id) = self.eval_id(expr, b, layout) {
+                        b[vi] = Some(id);
                     }
                 }
                 sols
@@ -2695,6 +2715,50 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(Value::from_term(&term))
     }
 
+    /// Evaluate an expression to the RDF term it denotes, for what sees
+    /// terms rather than values — `STR`, `DATATYPE`, `sameTerm` and the copy
+    /// `BIND(… AS ?v)` / `(… AS ?v)` binds. A variable denotes the term it is
+    /// bound to and a constant itself (so `"05"^^xsd:unsignedByte` keeps its
+    /// lexical form and datatype, which its [`Value`], an integer, does
+    /// not), as does the `COALESCE` / `IF` argument chosen; anything else
+    /// the term of its computed value.
+    fn eval_term(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<Term> {
+        match e {
+            Expr::Var(name) => {
+                let idx = *l.index.get(name)?;
+                self.id_to_term((*b.get(idx)?)?, l.is_pred[idx])
+            }
+            Expr::Const(t) => Some(t.clone()),
+            Expr::Builtin(name, args) if name == "COALESCE" => {
+                args.iter().find_map(|a| self.eval_term(a, b, l))
+            }
+            Expr::Builtin(name, args) if name == "IF" => match args.as_slice() {
+                [c, then, other] => {
+                    if self.eval_ebv(c, b, l)? {
+                        self.eval_term(then, b, l)
+                    } else {
+                        self.eval_term(other, b, l)
+                    }
+                }
+                _ => None,
+            },
+            _ => self.eval_value(e, b, l).map(|v| value_to_term(&v)),
+        }
+    }
+
+    /// The id of the term [`eval_term`](Self::eval_term) gives, for a column
+    /// that holds entity/literal-space ids: a variable's own id when it is
+    /// in that space (so a copy is the very same term), else the term's.
+    fn eval_id(&self, e: &Expr, b: &Binding, l: &VarLayout) -> Option<u32> {
+        if let Expr::Var(name) = e {
+            let idx = *l.index.get(name)?;
+            if !l.is_pred[idx] {
+                return *b.get(idx)?;
+            }
+        }
+        self.eval_term(e, b, l).map(|t| self.term_to_id(&t))
+    }
+
     // ---- expression evaluation -------------------------------------------
 
     /// Effective boolean value of an expression (error-tolerant for AND/OR).
@@ -2822,8 +2886,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// An id resolved back to its RDF term (synthetic, predicate, or
     /// entity/literal — routed by `is_pred` exactly as [`resolve_string`]).
     fn id_to_term(&self, id: u32, is_pred: bool) -> Option<Term> {
-        let s = self.resolve_string(Some(id), is_pred)?;
-        parse_term(&s).ok()
+        if is_synth(id) {
+            return self.extras.borrow().term(id).cloned();
+        }
+        let s = if is_pred {
+            self.dict.predicate_to_string(id)?
+        } else {
+            self.dict.id_to_string(id)?
+        };
+        parse_term(s).ok()
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term
@@ -3020,8 +3091,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return None;
         }
         match name {
+            // The term's own lexical form ("05"^^xsd:unsignedByte is "05").
             "STR" => Some(Value::Str {
-                value: self.eval_value(args.first()?, b, l)?.lexical(),
+                value: match self.eval_term(args.first()?, b, l)? {
+                    Term::Literal { value, .. } => value,
+                    Term::Iri(s) | Term::Blank(s) => s,
+                },
                 lang: None,
             }),
             "STRLEN" => {
@@ -3067,10 +3142,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 })
             }
-            "DATATYPE" => {
-                let v = self.eval_value(args.first()?, b, l)?;
-                Some(Value::Iri(datatype_iri(&v)?))
-            }
+            // The term's own datatype ("5"^^xsd:unsignedByte is
+            // xsd:unsignedByte); IRIs and blank nodes have none.
+            "DATATYPE" => match self.eval_term(args.first()?, b, l)? {
+                Term::Literal { lang: Some(_), .. } => Some(Value::Iri(RDF_LANG_STRING.into())),
+                Term::Literal { datatype, .. } => Some(Value::Iri(
+                    datatype.unwrap_or_else(|| xsd::STRING.to_owned()),
+                )),
+                Term::Iri(_) | Term::Blank(_) => None,
+            },
             "CONTAINS" => self.str2_bool(args, b, l, |a, c| a.contains(&c)),
             "STRSTARTS" => self.str2_bool(args, b, l, |a, c| a.starts_with(&c)),
             "STRENDS" => self.str2_bool(args, b, l, |a, c| a.ends_with(&c)),
@@ -3096,9 +3176,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 })
             }
             "SAMETERM" => {
-                let a = self.eval_value(args.first()?, b, l)?;
-                let c = self.eval_value(args.get(1)?, b, l)?;
-                Some(Value::Bool(a == c))
+                let a = self.eval_term(args.first()?, b, l)?;
+                let c = self.eval_term(args.get(1)?, b, l)?;
+                Some(Value::Bool(same_term(&a, &c)))
             }
             "COALESCE" => args.iter().find_map(|a| self.eval_value(a, b, l)),
             "REGEX" => {
@@ -5262,25 +5342,32 @@ fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
     }
 }
 
-/// The datatype IRI for `DATATYPE()`.
-fn datatype_iri(v: &Value) -> Option<String> {
-    Some(
-        match v {
-            Value::Int(_) | Value::BigInt(_) => xsd::INTEGER,
-            Value::Decimal(_) => xsd::DECIMAL,
-            Value::Float(_) => XSD_FLOAT,
-            Value::Double(_) => xsd::DOUBLE,
-            Value::Bool(_) => xsd::BOOLEAN,
-            Value::Str { lang: None, .. } => xsd::STRING,
-            Value::Str { lang: Some(_), .. } => {
-                return Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString".into())
+/// `rdf:langString`, the datatype of a language-tagged literal.
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+
+/// RDF term equality, for `sameTerm`: a simple literal and the
+/// `xsd:string` literal of the same text are one term (RDF 1.1).
+fn same_term(a: &Term, b: &Term) -> bool {
+    match (a, b) {
+        (
+            Term::Literal {
+                value: va,
+                datatype: da,
+                lang: la,
+            },
+            Term::Literal {
+                value: vb,
+                datatype: db,
+                lang: lb,
+            },
+        ) => {
+            fn dt(d: &Option<String>) -> Option<&str> {
+                d.as_deref().filter(|d| *d != xsd::STRING)
             }
-            Value::Typed { datatype, .. } => return Some(datatype.clone()),
-            // IRIs and blank nodes have no datatype.
-            Value::Iri(_) | Value::Blank(_) => return None,
+            va == vb && la == lb && dt(da) == dt(db)
         }
-        .to_string(),
-    )
+        _ => a == b,
+    }
 }
 
 /// Render a `SERVICE` inner pattern as a remote `SELECT * WHERE { … }` query

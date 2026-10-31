@@ -32,7 +32,8 @@
 //!   `?var`, bare calls, `( expr )` and `( expr AS ?v )`, which binds `?v`.
 //!   `HAVING` takes one or more constraints (`HAVING (c1) (c2)`).
 //! * `CONSTRUCT WHERE { triples }`, the short form whose template is its
-//!   basic graph pattern (anything but triple patterns is an error).
+//!   basic graph pattern (anything but triple patterns is an error); as in
+//!   any template, its `[ … ]` / `( … )` blank nodes are fresh per solution.
 //! * A trailing `VALUES` block after any query form (and inside a
 //!   sub-SELECT): kept on [`SelectQuery::values`] for SELECT, joined onto the
 //!   WHERE pattern for ASK/CONSTRUCT/DESCRIBE. `VALUES () { () }` and row
@@ -892,12 +893,39 @@ impl<'s> Parser<'s> {
                 "the CONSTRUCT WHERE { … } short form",
                 "; write CONSTRUCT { template } WHERE { … } for anything but triple patterns",
             )?;
+            // The template is the pattern, except that a blank node of `[]` /
+            // `( … )` is a fresh one per solution in a template (§16.2.1)
+            // but existential in the pattern: the template gets its own
+            // hidden variables, which no solution binds — as in the long
+            // form `CONSTRUCT { T } WHERE { T }`.
+            let mut renamed: HashMap<String, String> = HashMap::new();
+            let mut fresh = |pt: &PatternTerm| match pt {
+                PatternTerm::Var(v) if is_anon_var(v) => PatternTerm::Var(
+                    renamed
+                        .entry(v.clone())
+                        .or_insert_with(|| {
+                            let name = format!("{ANON_VAR_PREFIX}{}", self.anon);
+                            self.anon += 1;
+                            name
+                        })
+                        .clone(),
+                ),
+                other => other.clone(),
+            };
+            let template = triples
+                .iter()
+                .map(|tp| TriplePattern {
+                    subject: fresh(&tp.subject),
+                    predicate: fresh(&tp.predicate),
+                    object: fresh(&tp.object),
+                })
+                .collect();
             let pattern = if triples.is_empty() {
                 GraphPattern::Empty
             } else {
-                GraphPattern::Bgp(triples.clone())
+                GraphPattern::Bgp(triples)
             };
-            (triples, pattern)
+            (template, pattern)
         };
         let (order_by, limit, offset) = self.parse_solution_modifiers()?;
         let values = self.parse_trailing_values()?;

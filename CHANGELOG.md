@@ -42,7 +42,8 @@ calls `RAND()` (`tests/dt_sparql_phase3_combo.rs`).
   the destination first; `MOVE` drops the source. A named source graph with
   no triples is missing (an error unless `SILENT`). They roll back with a
   transaction and invalidate the query cache.
-- **`CONSTRUCT WHERE { triples }`** short form.
+- **`CONSTRUCT WHERE { triples }`** short form. Its template's `[ … ]` /
+  `( … )` blank nodes are fresh per solution, as in the long form.
 - **`ORDER BY` keys** may be bare calls (`ORDER BY STRLEN(?x) COUNT(*)
   xsd:integer(?z)`) as well as `ASC/DESC(…)`, `?var` and `(expr)`.
 - **`HAVING` with several constraints** (`HAVING (c1) (c2)`, bare calls
@@ -91,9 +92,13 @@ calls `RAND()` (`tests/dt_sparql_phase3_combo.rs`).
   error, arithmetic on them is unbound, their effective boolean value is
   false. Valid literals compare by value (`"01"^^xsd:integer = 1`). An IRI
   compared with `=`/`!=` to a literal is now simply unequal (it used to be
-  an error).
+  an error). `STR`, `DATATYPE`, `sameTerm` and the copy `BIND(?v AS ?w)` /
+  `(?v AS ?w)` binds see a variable's or constant's term as written
+  (`"05"^^xsd:unsignedByte` stays that term, with `STR` `"05"`), so
+  `sameTerm("01"^^xsd:integer, 1)` is false.
 - **Changed: numbers.** `xsd:float` keeps its datatype through expressions
-  (`float + integer` is a float). Dividing two integers gives an
+  (`float + integer` is a float), and an integer or decimal meeting a float
+  is promoted to single precision (`"0.1"^^xsd:float = 0.1`). Dividing two integers gives an
   `xsd:decimal` (`7/2` = `3.5`; it used to be an `xsd:double`), and so does
   `AVG` over integers; dividing a double by zero gives `INF`/`NaN`. `ABS`,
   `CEIL`, `FLOOR` and `ROUND` keep their argument's type, and `ROUND` rounds
@@ -197,8 +202,8 @@ functions) are now evaluated only for the solutions actually consumed.
   resolution is concatenation, not RFC 3986.
 - `SELECT (expr AS ?v)` / `BIND(… AS ?v)` with `?v` already in scope is not
   rejected at parse time.
-- `sameTerm` and `COUNT(DISTINCT …)` compare values, so
-  `"01"^^xsd:integer` and `"1"^^xsd:integer` count as one there; `SUM` /
+- `COUNT(DISTINCT …)` compares values, so `"01"^^xsd:integer` and
+  `"1"^^xsd:integer` count as one there; `SUM` /
   `AVG` skip non-numeric values instead of failing.
 - The proposed `conf.ini` keys (`integer_division`, `query_cache_size`)
   are not read yet: there is no `conf.ini` loader in this crate.

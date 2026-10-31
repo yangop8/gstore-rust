@@ -483,17 +483,24 @@ fn construct_where_short_form_returns_the_matched_triples() {
         format!("{} {} {} .", ex("carol"), ex("age"), int("35")),
     ];
     assert_eq!(got, want);
-    // Solution modifiers and a blank node property list, whose hidden
-    // variable is bound to the matched node.
+    // Solution modifiers and a blank node property list. As in the long
+    // form `CONSTRUCT { T } WHERE { T }`, the template's blank node is a
+    // fresh one per solution (§16.2.1), not the node the pattern matched.
     let got = construct(
         &mut db,
         &format!("{P} CONSTRUCT WHERE {{ :alice :knows [ :name ?n ] }} LIMIT 5"),
     );
+    assert_eq!(got.len(), 2, "{got:?}");
+    let bnode = got[0]
+        .split(' ')
+        .nth(2)
+        .filter(|t| t.starts_with("_:"))
+        .unwrap_or_else(|| panic!("{got:?}"));
     assert_eq!(
         got,
         vec![
-            format!("{} {} {} .", ex("alice"), ex("knows"), ex("bob")),
-            format!("{} {} \"Bob\" .", ex("bob"), ex("name")),
+            format!("{} {} {bnode} .", ex("alice"), ex("knows")),
+            format!("{bnode} {} \"Bob\" .", ex("name")),
         ]
     );
     // Empty short form: no triples.

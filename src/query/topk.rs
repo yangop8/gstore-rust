@@ -401,8 +401,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let vi = layout.index[var];
                 self.stream_pattern(inner, layout, &mut |mut b| {
                     // BIND error/unbound leaves the variable unbound (no row drop).
-                    if let Some(v) = self.eval_value(expr, &b, layout) {
-                        b[vi] = Some(self.value_to_id(&v));
+                    if let Some(id) = self.eval_id(expr, &b, layout) {
+                        b[vi] = Some(id);
                     }
                     sink(b)
                 })
@@ -781,7 +781,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // exists; an unbound column reads the same (and a reference to
             // the alias itself cannot index past the end).
             b.push(None);
-            let v = self.eval_value(e, b, lay).map(|v| self.value_to_id(&v));
+            let v = self.eval_id(e, b, lay);
             if let Some(slot) = b.last_mut() {
                 *slot = v;
             }
