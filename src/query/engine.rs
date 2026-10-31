@@ -1423,6 +1423,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             return Err(GStoreError::Query(msg));
         };
+        // Looked up once (upstream `getPfnSoFile`, before any call — so a
+        // missing or uncompiled function fails even when nothing would run).
+        let func = caller.resolve(name).map_err(|e| {
+            if constant {
+                e
+            } else {
+                crate::pfn::call::by_var_error(e)
+            }
+        })?;
         let csr = self.gfun_csr()?;
         let graph = crate::pfn::CsrGraphCtx::new(&csr, self.dict);
         let var_values = |var: &str| -> Option<Vec<String>> {
@@ -1445,8 +1454,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         };
         let run = |params: &str| -> Result<String> {
             self.check_cancel()?;
-            caller.call(
-                name,
+            caller.run(
+                &func,
                 params,
                 &graph,
                 self.cancel.as_deref(),

@@ -69,6 +69,34 @@ impl std::fmt::Debug for PfnRegistry {
     }
 }
 
+/// A function looked up for calling ([`PfnRegistry::resolve`]): its loaded
+/// module. Without the `pfn-wasm` runtime no function resolves.
+#[derive(Clone)]
+pub struct ResolvedFn {
+    #[cfg(feature = "pfn-wasm")]
+    name: String,
+    #[cfg(feature = "pfn-wasm")]
+    module: super::wasm::LoadedModule,
+    #[cfg(not(feature = "pfn-wasm"))]
+    _never: std::convert::Infallible,
+}
+
+impl std::fmt::Debug for ResolvedFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "pfn-wasm")]
+        {
+            f.debug_struct("ResolvedFn")
+                .field("name", &self.name)
+                .finish()
+        }
+        #[cfg(not(feature = "pfn-wasm"))]
+        {
+            let _ = f;
+            match self._never {}
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -428,6 +456,15 @@ impl PfnRegistry {
         graph: &dyn GraphCtx,
         opts: &CallOptions<'_>,
     ) -> Result<String> {
+        let f = self.resolve(user, name)?;
+        self.run(&f, params, graph, opts)
+    }
+
+    /// Look function `name` of `user` up for calling (upstream
+    /// `getPfnSoFile`): it must exist and be compiled; its module is loaded
+    /// (or taken from the cache). A query resolves a function once and runs
+    /// it for every argument combination ([`run`](Self::run)).
+    pub fn resolve(&self, user: &str, name: &str) -> Result<ResolvedFn> {
         let missing = || query_err(format!("abort function '{name}' is not exist"));
         if !valid_user(user) || !valid_name(name) {
             return Err(missing());
@@ -444,7 +481,7 @@ impl PfnRegistry {
         };
         #[cfg(not(feature = "pfn-wasm"))]
         {
-            let _ = (info, params, graph, opts);
+            let _ = info;
             Err(query_err(super::FEATURE_HINT))
         }
         #[cfg(feature = "pfn-wasm")]
@@ -454,8 +491,30 @@ impl PfnRegistry {
                     "abort function '{name}' not compile yet"
                 )));
             }
-            let module = self.module(user, name, &info.last_time)?;
-            self.runtime.run(&module, name, params, graph, opts)
+            Ok(ResolvedFn {
+                name: name.to_string(),
+                module: self.module(user, name, &info.last_time)?,
+            })
+        }
+    }
+
+    /// Run a [resolved](Self::resolve) function once with argument text
+    /// `params` (upstream `excutePfnSoFile`).
+    pub fn run(
+        &self,
+        f: &ResolvedFn,
+        params: &str,
+        graph: &dyn GraphCtx,
+        opts: &CallOptions<'_>,
+    ) -> Result<String> {
+        #[cfg(not(feature = "pfn-wasm"))]
+        {
+            let _ = (f, params, graph, opts);
+            Err(query_err(super::FEATURE_HINT))
+        }
+        #[cfg(feature = "pfn-wasm")]
+        {
+            self.runtime.run(&f.module, &f.name, params, graph, opts)
         }
     }
 

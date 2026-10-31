@@ -1279,4 +1279,28 @@ upload_allow_compress_packages = "zip"
         assert!(GStoreConfig::load(dir.join("missing.ini")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `[pfn]`: the PFN sandbox limits reach the query settings; bad values
+    /// warn and keep the default.
+    #[test]
+    fn pfn_limits_are_read_and_validated() {
+        let c = GStoreConfig::from_ini_str(
+            "[pfn]\npfn_max_memory_pages=0\npfn_fuel_per_call=-1\npfn_max_module_bytes=12\n\
+             pfn_max_functions=2\n",
+        );
+        let w = c.warnings().join("\n");
+        assert!(w.contains("'pfn_max_memory_pages'"), "{w}");
+        assert!(w.contains("'pfn_fuel_per_call'"), "{w}");
+        let pfn = c.query_settings().pfn;
+        assert_eq!(pfn.max_memory_pages, crate::pfn::DEFAULT_MAX_MEMORY_PAGES);
+        assert_eq!(pfn.fuel_per_call, crate::pfn::DEFAULT_FUEL_PER_CALL);
+        assert_eq!((pfn.max_module_bytes, pfn.max_functions), (12, 2));
+        assert_eq!(c.value("pfn_max_module_bytes").unwrap(), "12");
+        let mut c = GStoreConfig::default();
+        assert_eq!(c.query_settings().pfn, crate::pfn::PfnLimits::default());
+        c.set("pfn_max_memory_pages", "65536").unwrap();
+        assert!(c.set("pfn_max_memory_pages", "65537").is_err());
+        c.set("pfn_fuel_per_call", "0").unwrap();
+        assert_eq!(c.query_settings().pfn.fuel_per_call, 0, "0 = unlimited");
+    }
 }

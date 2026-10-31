@@ -1635,3 +1635,36 @@ fn modules_may_be_complete_or_binary_but_only_import_the_host() {
     let e = reg.compile("root", "wasi").unwrap().unwrap_err();
     assert!(e.contains("is not available"), "{e}");
 }
+
+/// `conf.ini`: upstream's `[system] pfn_base_path` places the functions,
+/// and the `[pfn]` limits are what create checks.
+#[test]
+fn conf_ini_places_and_limits_the_functions() {
+    let root = tmp_root("conf");
+    let base = root.join("custom_pfn");
+    let config = gstore::config::GStoreConfig::from_ini_str(&format!(
+        "[system]\npfn_base_path={}\n[pfn]\npfn_max_functions=1\npfn_max_module_bytes=200000\n",
+        base.display()
+    ));
+    assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    let server = ApiServer::bind(&root, "root", "127.0.0.1:0")
+        .unwrap()
+        .with_config(config);
+    assert_eq!(server.pfn_registry().base_dir(), base.as_path());
+    assert_eq!(server.pfn_registry().limits().max_functions, 1);
+    let server = Arc::new(server);
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    thread::spawn(move || {
+        s2.serve_forever();
+    });
+    let body = "(i32.const 1)";
+    let j = funcudb(&addr, "root", "1", fun_info("first", "", body, ""));
+    assert_eq!(code(&j), 0, "{j}");
+    assert!(base.join("src/root/first.wat").is_file());
+    assert!(!root.join("pfn").exists(), "not under the server root");
+    let j = funcudb(&addr, "root", "1", fun_info("second", "", body, ""));
+    assert_eq!(code(&j), 1005);
+    assert!(msg(&j).contains("pfn_max_functions = 1"), "{j}");
+    server.shutdown();
+}

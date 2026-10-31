@@ -107,6 +107,15 @@ pub fn output_value(text: &str) -> Json {
     crate::json::parse(text).unwrap_or_else(|_| Json::Str(text.to_string()))
 }
 
+/// An error of the variable form, worded as upstream's `pfnQueryByVar`
+/// words it (`run dynamic function fail: …`); a cancellation stays one.
+pub fn by_var_error(e: GStoreError) -> GStoreError {
+    match e {
+        GStoreError::Query(m) => GStoreError::Query(format!("run dynamic function fail: {m}")),
+        other => other,
+    }
+}
+
 /// Evaluate one projected PFN call (see the module docs). `var_values(v)`
 /// gives the distinct usable bindings of WHERE variable `v` across the
 /// solutions (`None` when `v` is not a WHERE variable); `run(args)` calls
@@ -123,10 +132,7 @@ pub fn evaluate(
     if constant {
         return run(&canonical(args));
     }
-    let wrap = |e: GStoreError| match e {
-        GStoreError::Query(m) => GStoreError::Query(format!("run dynamic function fail: {m}")),
-        other => other,
-    };
+    let wrap = by_var_error;
     let mut var_keys = Vec::new();
     for (key, var) in variable_keys(args, |_| true) {
         if let Some(values) = var_values(&var) {

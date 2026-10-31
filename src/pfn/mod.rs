@@ -48,7 +48,7 @@ mod wasm;
 use std::sync::Arc;
 
 pub use graph::{CsrGraphCtx, GraphCtx};
-pub use registry::PfnRegistry;
+pub use registry::{PfnRegistry, ResolvedFn};
 
 /// `funStatus` of a function created or updated but not compiled since
 /// (upstream "1-待编译").
@@ -267,9 +267,28 @@ impl PfnCaller {
         cancel: Option<&std::sync::atomic::AtomicBool>,
         max_output: usize,
     ) -> crate::Result<String> {
-        self.registry.call(
-            &self.user,
-            name,
+        let f = self.resolve(name)?;
+        self.run(&f, params, graph, cancel, max_output)
+    }
+
+    /// Look the caller's function `name` up (it must exist and be compiled),
+    /// to [`run`](Self::run) it any number of times.
+    pub fn resolve(&self, name: &str) -> crate::Result<ResolvedFn> {
+        self.registry.resolve(&self.user, name)
+    }
+
+    /// Run a [resolved](Self::resolve) function once (see
+    /// [`call`](Self::call)).
+    pub fn run(
+        &self,
+        f: &ResolvedFn,
+        params: &str,
+        graph: &dyn GraphCtx,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        max_output: usize,
+    ) -> crate::Result<String> {
+        self.registry.run(
+            f,
             params,
             graph,
             &CallOptions {
