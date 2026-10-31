@@ -800,9 +800,10 @@ fn cli_backup_restore_of_a_disk_database() {
         &[name.to_str().unwrap(), bak.to_str().unwrap()],
     );
     let restored = base.join("restored");
+    // grestore <db_name> <backup_dir> (upstream's order).
     ok(
         env!("CARGO_BIN_EXE_grestore"),
-        &[bak.to_str().unwrap(), restored.to_str().unwrap()],
+        &[restored.to_str().unwrap(), bak.to_str().unwrap()],
     );
     let mut db = Database::open(base.join("restored.db")).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);

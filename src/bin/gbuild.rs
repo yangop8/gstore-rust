@@ -3,14 +3,21 @@
 //! Mirrors gStore's `gbuild`:
 //!
 //! ```text
-//! gbuild [--disk | --rocksdb] [--strict] <db_name> <source> [more sources ...]
+//! gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<source> ...]
+//! gbuild -db <db_name> [-f <source>] [--disk | --rocksdb] [--strict] [--force]
 //! ```
+//!
+//! (the second form is upstream 1.3's: `-db`/`--database`, `-f`/`--file`;
+//! further positional sources may follow it).
 //!
 //! Produces a `<db_name>.db` directory holding the dictionary and indexes.
 //! `--disk` selects the on-disk B+ tree KVstore; `--rocksdb` (requires building
-//! with `--features rocksdb`) selects the persistent RocksDB backend. Building
-//! replaces any database previously stored in the directory, whatever its
-//! backend.
+//! with `--features rocksdb`) selects the persistent RocksDB backend. Without
+//! a source an empty database is built (upstream: "will build an empty
+//! database"). Like upstream, `gbuild` refuses to build over an existing
+//! database directory (exit status 1; remove it with `gdrop` first) unless
+//! `--force` is given — then the build replaces the database previously
+//! stored there, whatever its backend.
 //!
 //! A source is a file, a directory (every RDF file below it, recursively,
 //! sorted by path; hidden entries skipped) or an `http://` / `https://` URL
@@ -25,6 +32,11 @@
 //! logged to `<db_name>.db/parse_error.log` (see
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
 //! first such statement instead (exit status 1, nothing built).
+//!
+//! Exit status: 0 built, 1 failed, 2 invalid arguments; `-h`/`--help`.
+
+#[path = "common/cli.rs"]
+mod cli;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -33,27 +45,75 @@ use std::time::Instant;
 use gstore::parser::import::{self, ImportOptions, ImportReport, ParseErrorLog, Source};
 use gstore::{db_dir_for, Database};
 
+const TOOL: cli::Tool = cli::Tool {
+    name: "gbuild",
+    usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | url> ...]\n\
+            gbuild -db <db_name> [-f <file | dir | url>] [--disk | --rocksdb] [--strict] [--force]",
+    help: "build a database from RDF files\n\
+           \n\
+           Options:\n\
+           \t-h,--help\t\tDisplay this message.\n\
+           \t-db,--database NAME\tThe database name (or give it as the first argument).\n\
+           \t-f,--file PATH\t\tAn RDF file, a directory of RDF files or an http(s) URL.\n\
+           \t\t\t\tWithout any source an empty database is built.\n\
+           \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore.\n\
+           \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`).\n\
+           \t--strict\t\tStop at the first statement that does not parse.\n\
+           \t--force\t\t\tReplace an existing database (else gbuild refuses).",
+};
+
+/// `-f` / `--file`.
+const FILE: cli::Opt = cli::Opt {
+    short: "f",
+    long: "file",
+};
+
 fn main() -> ExitCode {
-    let mut args: Vec<String> = std::env::args().collect();
+    let mut args = match cli::parse(&cli::argv(), &[cli::DB, FILE]) {
+        Ok(cli::Parsed::Help) => {
+            TOOL.print_help();
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Args(a)) => a,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     // Optional flags select an alternative storage backend / strict parsing.
-    let disk = args.iter().any(|a| a == "--disk");
-    let rocksdb = args.iter().any(|a| a == "--rocksdb");
-    let strict = args.iter().any(|a| a == "--strict");
-    args.retain(|a| a != "--disk" && a != "--rocksdb" && a != "--strict");
+    let disk = args.take_flag(&["--disk"]);
+    let rocksdb = args.take_flag(&["--rocksdb"]);
+    let strict = args.take_flag(&["--strict"]);
+    let force = args.take_flag(&["--force"]);
     if disk && rocksdb {
-        eprintln!("gbuild: choose at most one of --disk / --rocksdb");
-        return ExitCode::FAILURE;
+        return TOOL.usage_error("choose at most one of --disk / --rocksdb");
     }
-    if args.len() < 3 {
+    if let Some(o) = args.unknown_option() {
+        return TOOL.usage_error(&format!("unknown option '{o}'"));
+    }
+    let (name, mut paths) = match args.value(0) {
+        Some(db) => (db.to_string(), args.rest.clone()),
+        None => match args.rest.split_first() {
+            Some((db, more)) => (db.clone(), more.to_vec()),
+            None => return TOOL.usage_error("missing the database name"),
+        },
+    };
+    if let Some(f) = args.value(1) {
+        paths.insert(0, f.to_string());
+    }
+    if name.trim().is_empty() {
+        return TOOL.usage_error("the database name is empty");
+    }
+    let name = &name;
+    let dir = db_dir_for(name);
+    if !force && holds_data(Path::new(&dir)) {
         eprintln!(
-            "usage: {} [--disk | --rocksdb] [--strict] <db_name> <file | dir | url> [more ...]",
-            args[0]
+            "gbuild: the database path '{dir}' already exists. Please check database {name}, \
+             or use gdrop to remove it at first (or rebuild it with --force)."
         );
         return ExitCode::FAILURE;
     }
-    let name = &args[1];
-    let dir = db_dir_for(name);
-    let sources = match import::sources_from_paths(&args[2..]) {
+    if paths.is_empty() {
+        println!("will build an empty database");
+    }
+    let sources = match import::sources_from_paths(&paths) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("gbuild: cannot read the sources: {e}");
@@ -162,6 +222,14 @@ fn build_rocksdb(
 ) -> ExitCode {
     eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
     ExitCode::FAILURE
+}
+
+/// Whether `path` exists as anything but an empty directory.
+fn holds_data(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => path.exists(),
+    }
 }
 
 fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: &str) {

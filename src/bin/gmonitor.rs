@@ -5,20 +5,49 @@
 //!
 //! ```text
 //! gmonitor <db_name>
+//! gmonitor -db <db_name>     # upstream 1.3
 //! ```
+//!
+//! Exit status: 0 shown, 1 failed, 2 invalid arguments; `-h`/`--help`.
+
+#[path = "common/cli.rs"]
+mod cli;
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use gstore::{db_dir_for, Database, TripleSource};
 
+const TOOL: cli::Tool = cli::Tool {
+    name: "gmonitor",
+    usage: "gmonitor <db_name>\n\
+            gmonitor -db <db_name>",
+    help: "print statistics about a database\n\
+           \n\
+           Options:\n\
+           \t-h,--help\t\tDisplay this message.\n\
+           \t-db,--database NAME\tThe database name (or give it as the argument).",
+};
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: {} <db_name>", args[0]);
-        return ExitCode::FAILURE;
+    let args = match cli::parse(&cli::argv(), &[cli::DB]) {
+        Ok(cli::Parsed::Help) => {
+            TOOL.print_help();
+            return ExitCode::SUCCESS;
+        }
+        Ok(cli::Parsed::Args(a)) => a,
+        Err(e) => return TOOL.usage_error(&e),
+    };
+    if let Some(o) = args.unknown_option() {
+        return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
-    let dir = db_dir_for(&args[1]);
+    let name = match (args.value(0), args.rest.as_slice()) {
+        (Some(db), []) => db.to_string(),
+        (None, [db]) => db.clone(),
+        (None, []) => return TOOL.usage_error("missing the database name"),
+        _ => return TOOL.usage_error("too many arguments"),
+    };
+    let dir = db_dir_for(&name);
 
     let db = match Database::open(&dir) {
         Ok(db) => db,
