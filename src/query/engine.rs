@@ -139,7 +139,9 @@
 //! BGP enumerates matches in key order (upstream's DP-B). Each returns the
 //! exact rows, in the exact order, of the full evaluation — ties keep their
 //! WHERE order — and [`TopKOptions`] switches them off
-//! ([`Evaluator::with_topk_options`]); [`EvalStats`] counts the work.
+//! ([`Evaluator::with_topk_options`] /
+//! [`Database::set_topk_options`](crate::Database::set_topk_options));
+//! [`EvalStats`] counts the work.
 //!
 //! # SPARQL Update templates
 //!
@@ -2177,12 +2179,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // A mixed variable in predicate position (see `VarLayout::pred_alias`)
         // joins across id spaces: run the left-deep order with translation.
-        let mixed: Vec<(usize, usize)> = layout
-            .pred_alias
-            .iter()
-            .filter(|&(_, &h)| plans.iter().any(|p| matches!(p.p, Slot::Var(v) if v == h)))
-            .map(|(&x, &h)| (x, h))
-            .collect();
+        // (The streaming executor in `topk` does the same, depth first.)
+        let mixed = mixed_slots(&plans, layout);
         if !mixed.is_empty() {
             return self.eval_mixed_pipeline(&plans, &plan.order, &candidates, layout, &mixed);
         }
@@ -2289,9 +2287,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         mixed: &[(usize, usize)],
     ) -> Vec<Binding> {
-        // Per-BGP translation caches (both directions).
-        let mut to_pred: HashMap<u32, Option<u32>> = HashMap::new();
-        let mut to_node: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut caches = MixedCaches::default();
         let mut solutions: Vec<Binding> = vec![vec![None; layout.len()]];
         let mut fresh = Vec::new();
         for &pi in order {
@@ -2300,37 +2296,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             let plan = &plans[pi];
             let mut next = Vec::new();
-            'rows: for binding in &solutions {
+            for binding in &solutions {
                 let mut b = binding.clone();
-                for &(x, h) in mixed {
-                    let (Some(id), None, Slot::Var(p)) = (b[x], b[h], plan.p) else {
-                        continue;
-                    };
-                    if p != h {
-                        continue;
-                    }
-                    let pid = *to_pred
-                        .entry(id)
-                        .or_insert_with(|| self.iri_predicate_id(id));
-                    match pid {
-                        Some(pid) => b[h] = Some(pid),
-                        None => continue 'rows,
-                    }
+                if !self.mixed_enter(&mut b, plan, mixed, &mut caches) {
+                    continue;
                 }
                 self.extend(&b, plan, cands, &mut fresh);
-                'fresh: for mut nb in fresh.drain(..) {
-                    for &(x, h) in mixed {
-                        let Some(pid) = nb[h] else { continue };
-                        let node = *to_node.entry(pid).or_insert_with(|| {
-                            self.id_to_term(pid, true).map(|t| self.term_to_id(&t))
-                        });
-                        match (node, nb[x]) {
-                            (Some(n), None) => nb[x] = Some(n),
-                            (Some(n), Some(cur)) if n == cur => {}
-                            _ => continue 'fresh,
-                        }
+                for mut nb in fresh.drain(..) {
+                    if self.mixed_leave(&mut nb, mixed, &mut caches) {
+                        next.push(nb);
                     }
-                    next.push(nb);
                 }
             }
             solutions = next;
@@ -2339,11 +2314,63 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         for b in &mut solutions {
-            for &(_, h) in mixed {
-                b[h] = None;
-            }
+            mixed_clear(b, mixed);
         }
         solutions
+    }
+
+    /// Before `plan` extends `b` in a mixed pipeline
+    /// ([`eval_mixed_pipeline`](Self::eval_mixed_pipeline)): translate each
+    /// bound mixed variable whose hidden slot `plan` binds into that slot.
+    /// `false` when its IRI names no predicate (the row cannot match).
+    fn mixed_enter(
+        &self,
+        b: &mut Binding,
+        plan: &PatPlan,
+        mixed: &[(usize, usize)],
+        caches: &mut MixedCaches,
+    ) -> bool {
+        for &(x, h) in mixed {
+            let (Some(id), None, Slot::Var(p)) = (b[x], b[h], plan.p) else {
+                continue;
+            };
+            if p != h {
+                continue;
+            }
+            let pid = *caches
+                .to_pred
+                .entry(id)
+                .or_insert_with(|| self.iri_predicate_id(id));
+            match pid {
+                Some(pid) => b[h] = Some(pid),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// After a pattern extended a row of a mixed pipeline: translate each
+    /// bound hidden slot back into its mixed variable (bound if unbound,
+    /// else it must agree). `false` when they disagree (drop the row).
+    fn mixed_leave(
+        &self,
+        nb: &mut Binding,
+        mixed: &[(usize, usize)],
+        caches: &mut MixedCaches,
+    ) -> bool {
+        for &(x, h) in mixed {
+            let Some(pid) = nb[h] else { continue };
+            let node = *caches
+                .to_node
+                .entry(pid)
+                .or_insert_with(|| self.id_to_term(pid, true).map(|t| self.term_to_id(&t)));
+            match (node, nb[x]) {
+                (Some(n), None) => nb[x] = Some(n),
+                (Some(n), Some(cur)) if n == cur => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// The predicate-dictionary id of the IRI an entity-space `id` names, if
@@ -4900,6 +4927,38 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
             flatten_join(b, out);
         }
         other => out.push(other),
+    }
+}
+
+/// Per-BGP translation caches of a mixed pipeline (both directions):
+/// entity-space id → predicate id, predicate id → entity-space id
+/// ([`Evaluator::mixed_enter`] / [`Evaluator::mixed_leave`]).
+#[derive(Default)]
+struct MixedCaches {
+    to_pred: HashMap<u32, Option<u32>>,
+    to_node: HashMap<u32, Option<u32>>,
+}
+
+/// The `(x, hidden)` slot pairs of the mixed variables whose hidden
+/// predicate slot some pattern of a compiled BGP binds
+/// ([`VarLayout::pred_alias`]); non-empty ⇒ the BGP runs as a mixed
+/// pipeline. Sorted, so every executor translates in the same order.
+fn mixed_slots(plans: &[PatPlan], layout: &VarLayout) -> Vec<(usize, usize)> {
+    let mut mixed: Vec<(usize, usize)> = layout
+        .pred_alias
+        .iter()
+        .filter(|&(_, &h)| plans.iter().any(|p| matches!(p.p, Slot::Var(v) if v == h)))
+        .map(|(&x, &h)| (x, h))
+        .collect();
+    mixed.sort_unstable();
+    mixed
+}
+
+/// Clear the hidden predicate slots of a finished mixed-pipeline row, so it
+/// carries each mixed variable in its own (entity-space) slot only.
+fn mixed_clear(b: &mut Binding, mixed: &[(usize, usize)]) {
+    for &(_, h) in mixed {
+        b[h] = None;
     }
 }
 

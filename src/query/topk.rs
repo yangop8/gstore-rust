@@ -22,6 +22,9 @@
 //!   list per partial solution, no intermediate result), a bushy plan streams
 //!   its left operand and probes the materialized right one. Both use the
 //!   plan the full evaluation would use (same candidates, same plan cache).
+//!   A BGP with a *mixed* variable (a predicate variable also bound as a
+//!   subject/object, see `VarLayout::pred_alias`) runs its left-deep order
+//!   depth first with the same id translation as `eval_mixed_pipeline`.
 //! * **FILTER, BIND, UNION, `GRAPH`** — fully (`UNION` streams its left
 //!   branch, then its right one; `GRAPH ?g` each named graph in turn).
 //! * **OPTIONAL, MINUS** — the left side streams; the right side is
@@ -65,7 +68,8 @@
 //!   them form a tree (several patterns between the same two variables are
 //!   one tree edge); a pattern with one variable (and constants), or the
 //!   same variable twice, restricts that variable; a predicate variable
-//!   must occur in exactly one pattern, between two different variables;
+//!   must occur in exactly one pattern, between two different variables,
+//!   and not also as a subject or object (a mixed variable);
 //! * the first `ORDER BY` key is `Σ cᵢ·?vᵢ + c₀` built from variables,
 //!   integer constants, `+`, `-`, unary `-`/`+` and `*` by a constant (the
 //!   later keys, if any, may be anything);
@@ -514,11 +518,54 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         match self.prepare_bgp(tps, layout, str_constraints) {
             PreparedBgp::Empty => GO,
             PreparedBgp::Identity => sink(vec![None; layout.len()]),
-            PreparedBgp::Plan(p) => match &p.exec.tree {
-                Some(tree) => self.stream_join_tree(tree, &p, layout, sink),
-                None => self.stream_left_deep(&p, 0, vec![None; layout.len()], sink),
-            },
+            PreparedBgp::Plan(p) => {
+                // A mixed variable in predicate position: the left-deep order
+                // with id translation, as `eval_bgp_constrained` runs it.
+                let mixed = mixed_slots(&p.plans, layout);
+                if !mixed.is_empty() {
+                    let mut caches = MixedCaches::default();
+                    let start = vec![None; layout.len()];
+                    return self.stream_mixed(&p, &mixed, &mut caches, 0, start, sink);
+                }
+                match &p.exec.tree {
+                    Some(tree) => self.stream_join_tree(tree, &p, layout, sink),
+                    None => self.stream_left_deep(&p, 0, vec![None; layout.len()], sink),
+                }
+            }
         }
+    }
+
+    /// [`eval_mixed_pipeline`](Self::eval_mixed_pipeline), depth first:
+    /// extend `binding` by the `depth`-th pattern of the left-deep order,
+    /// translating the mixed variables' ids between the two dictionaries.
+    fn stream_mixed(
+        &self,
+        p: &BgpPlan,
+        mixed: &[(usize, usize)],
+        caches: &mut MixedCaches,
+        depth: usize,
+        mut binding: Binding,
+        sink: &mut Sink<'_>,
+    ) -> Flow {
+        let Some(&pi) = p.exec.order.get(depth) else {
+            mixed_clear(&mut binding, mixed);
+            return sink(binding);
+        };
+        if self.cancelled() {
+            return STOP;
+        }
+        let plan = &p.plans[pi];
+        if !self.mixed_enter(&mut binding, plan, mixed, caches) {
+            return GO;
+        }
+        let mut fresh = Vec::new();
+        self.extend(&binding, plan, &p.cands, &mut fresh);
+        for mut nb in fresh {
+            if self.mixed_leave(&mut nb, mixed, caches) {
+                self.stream_mixed(p, mixed, caches, depth + 1, nb, sink)?;
+            }
+        }
+        GO
     }
 
     /// The left-deep pipeline, depth first: extend `binding` by the
@@ -895,6 +942,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(p) => plans.push(p),
                 None => return Ok(None),
             }
+        }
+        // A mixed variable (predicate and subject/object, see
+        // `VarLayout::pred_alias`) links two slots in different id spaces,
+        // which the DP-B tree cannot express: take the heap path.
+        if !mixed_slots(&plans, layout).is_empty() {
+            return Ok(None);
         }
         let Some(shape) = DpbShape::analyze(&plans, &lin) else {
             return Ok(None);

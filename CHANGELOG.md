@@ -114,6 +114,77 @@ calls `RAND()` (`tests/dt_sparql_phase3_combo.rs`).
   `ConcurrentDb` snapshots (`query`, transactions, version views) and the
   HTTP API's transaction read snapshot now divide integers in the
   database's mode instead of always using the default.
+- **Fixed: `SELECT *` leaves out variables that only a `MINUS` mentions**
+  (§18.2.1: MINUS adds no in-scope variables).
+- **Fixed: a variable used as a predicate and bound some other way.**
+  Predicates and entities are numbered by separate dictionaries, so a
+  variable both in predicate position and as a subject/object, or bound by
+  `UNION`, `VALUES`, `BIND`, a sub-SELECT or `MINUS`
+  (`?s ?p ?o . ?p rdfs:label ?l`), compared ids from the two numberings and
+  matched the wrong terms. Such a variable now always holds the term's
+  entity id, its predicate positions bind a hidden predicate-id slot, and
+  the join translates between the two (still index-driven). A sub-SELECT's
+  predicate column joins with the same IRI bound elsewhere.
+- **Fixed: string functions keep the language tag** (§17.4.3): `UCASE`,
+  `LCASE`, `STRBEFORE` / `STRAFTER` (an empty simple literal when there is
+  no match) and `CONCAT` when every argument has the same tag.
+
+#### Top-K and early termination (GAP_PLAN §3.4)
+
+Every optimization below returns exactly the rows of the full evaluation,
+in the same order, ties included (`tests/dt_topk.rs` checks each query with
+the optimizations off, heap-only, default and DP-B forced, over randomized
+data). Side-effecting expressions (`RAND()`, `BNODE()`, `STRUUID()`, user
+functions) are now evaluated only for the solutions actually consumed.
+
+- **New: early termination.** A SELECT or CONSTRUCT with `LIMIT` and no
+  `ORDER BY` streams its WHERE solutions and stops after OFFSET+LIMIT rows
+  (distinct rows for `SELECT DISTINCT`); `ASK` and `EXISTS` / `NOT EXISTS`
+  stop at the first solution; the graph-function `LIMIT` pushdown streams
+  its first LIMIT solutions. BGPs (left-deep and bushy plans, and the
+  mixed-variable pipeline above), `FILTER`, `BIND`, `UNION` and `GRAPH`
+  stream fully; the left side of `OPTIONAL` / `MINUS` streams; a group of
+  several conjuncts evaluates each conjunct, then streams the join;
+  `VALUES`, sub-SELECTs, property paths and `SERVICE` are evaluated in full.
+- **New: bounded-heap `ORDER BY … LIMIT`** (also for CONSTRUCT and with
+  `DISTINCT`): O(n log k) time and O(k) memory instead of a full sort.
+- **New: DP-B Top-K**, a port of upstream's DPB / FR / FQ / OW lists, for
+  `ORDER BY` of an integer linear expression (`?a`, `2*?a - ?b + 3`, …)
+  over a tree-shaped BGP (optionally under `FILTER`). It enumerates matches
+  in key order and stops after the k-th and its ties. By default it runs
+  only when the store's per-predicate statistics predict at least twice as
+  many matches as values it must read (a star or one-to-many edge); cycles,
+  non-integer values, a predicate variable that is also a subject/object,
+  and other shapes take the heap. Upstream's quirks are not copied: it drops
+  non-numeric values (SPARQL sorts them first / last), emits ties in its
+  internal order, and misranks matches when a scored variable has children.
+- **New API:** `TopKOptions { early_termination, bounded_heap, dpb:
+  DpbMode::{Off, Auto, Always} }` (`ALL`, the default, and `NONE`),
+  `Evaluator::with_topk_options`, `Evaluator::stats` / `reset_stats`
+  (`EvalStats` work counters), and `Database::set_topk_options` /
+  `topk_options` (clears the query cache; carried into `ConcurrentDb` and
+  HTTP transaction snapshots). All are re-exported from `gstore::query`.
+- **Benchmark:** `cargo run --release --example topk_bench` compares full,
+  heap-only, default and forced-DP-B evaluation and checks the rows agree.
+  Measured at opt-level 1 on 100k–200k solutions: `LIMIT 10` 65 ms → 1 ms,
+  `ASK` 115 ms → 0.8 ms, `ORDER BY … LIMIT 10` on a fan-out-20 star 469 ms
+  → 3.3 ms.
+- Cancellation is polled per BGP step, per filtered solution and per DP-B
+  match; a cancelled query still reports `Cancelled` on every path.
+
+#### Upstream parser test suite
+
+- **New: `tests/dt_upstream_parser_suite.rs`** runs upstream gStore's
+  `scripts/test/parser_test.sh` (50 SPARQL cases, vendored byte-for-byte
+  with upstream's BSD-3 licence under `tests/data/upstream/parser_test/`)
+  in-process: each case imports its Turtle file and checks the triple
+  count, the answer count and the rows against upstream's result file.
+  **50/50 pass**, each with Top-K / early termination both on and off (the
+  two runs must give the same answer). 48 match upstream exactly; cases 15
+  and 17 follow W3C and upstream's own result files where the script's
+  expected count does not (listed with the reason in one `DIVERGENCES`
+  table). No case is deferred to Phase 5. Run it with the per-case table:
+  `cargo test --test dt_upstream_parser_suite -- --nocapture`.
 
 #### Known gaps
 
@@ -131,6 +202,17 @@ calls `RAND()` (`tests/dt_sparql_phase3_combo.rs`).
   `AVG` skip non-numeric values instead of failing.
 - The proposed `conf.ini` keys (`integer_division`, `query_cache_size`)
   are not read yet: there is no `conf.ini` loader in this crate.
+- String functions do not apply SPARQL's argument-compatibility rules
+  (`STRBEFORE("abc"@en, "b"@cy)` should be an error; `CONTAINS`,
+  `STRSTARTS`, `STRENDS` do not check either), and `UCASE` / `LCASE` on an
+  IRI or a number return a string instead of an error.
+- DP-B handles tree-shaped BGPs and integer keys only (upstream also cuts
+  one cycle); other `ORDER BY … LIMIT` queries use the bounded heap. The
+  join-order cost model does not yet know that a mixed predicate variable's
+  hidden slot and the variable are linked.
+- Property-path solutions come out of hash sets, so
+  `{ ?a :p+ ?b } LIMIT n` without a total `ORDER BY` can return different
+  rows on different runs (with or without the Top-K optimizations).
 
 ### Breaking: SPARQL graph functions follow gStore 1.4
 

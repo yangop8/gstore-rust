@@ -89,7 +89,7 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
-use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::store::{TripleSource, TripleStore};
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
@@ -196,6 +196,9 @@ pub struct Snapshot {
     functions: FunctionRegistry,
     /// The database's integer-division mode when the snapshot was published.
     integer_division: IntegerDivision,
+    /// The database's Top-K / early-termination options when the snapshot
+    /// was published.
+    topk: TopKOptions,
     csr: CsrCache,
 }
 
@@ -220,6 +223,7 @@ impl Snapshot {
             version,
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
+            topk: db.topk_options(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
@@ -251,7 +255,8 @@ impl Snapshot {
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
         let mut eval = Evaluator::new(&self.dict, &self.store)
             .with_csr_provider(&csr)
-            .with_integer_division(self.integer_division);
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
@@ -991,7 +996,9 @@ impl VersionView<'_> {
         let q = sparql::parse(sparql)?;
         let latest = self.db.snapshot();
         let functions = latest.functions.clone();
-        let mut eval = Evaluator::new(&dict, &store).with_integer_division(latest.integer_division);
+        let mut eval = Evaluator::new(&dict, &store)
+            .with_integer_division(latest.integer_division)
+            .with_topk_options(latest.topk);
         if !self.db.base.named.is_empty() {
             eval = eval.with_named(&self.db.base.named);
         }

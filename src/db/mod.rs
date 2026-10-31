@@ -29,7 +29,7 @@ use crate::parser::sparql::ast::{
     GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
 };
 use crate::parser::{sparql, turtle};
-use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
@@ -167,6 +167,10 @@ pub struct Database {
     /// How `/` divides two integers in this database's queries (see
     /// [`set_integer_division`](Self::set_integer_division)).
     integer_division: IntegerDivision,
+    /// Which `LIMIT` / `ORDER BY` / `ASK` optimizations (Top-K, early
+    /// termination, DP-B) this database's queries may use (see
+    /// [`set_topk_options`](Self::set_topk_options)); all on by default.
+    topk: TopKOptions,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
@@ -301,6 +305,7 @@ impl Database {
             txn: None,
             query_cache: RefCell::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
             integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
@@ -1017,7 +1022,8 @@ impl Database {
                 }
                 eval = eval
                     .with_csr_provider(&csr)
-                    .with_integer_division(self.integer_division);
+                    .with_integer_division(self.integer_division)
+                    .with_topk_options(self.topk);
                 let result = eval.evaluate(&q)?;
                 if cacheable {
                     self.query_cache.borrow_mut().put(
@@ -1360,7 +1366,9 @@ impl Database {
         fn prepare<'e, S: TripleSource>(db: &Database, eval: Evaluator<'e, S>) -> Evaluator<'e, S> {
             // IRI function calls in the WHERE clause reach the user-defined
             // functions, as in read queries.
-            let eval = eval.with_integer_division(db.integer_division);
+            let eval = eval
+                .with_integer_division(db.integer_division)
+                .with_topk_options(db.topk);
             if db.functions.is_empty() {
                 eval
             } else {
@@ -1952,6 +1960,27 @@ impl Database {
     /// [`set_integer_division`](Self::set_integer_division)).
     pub fn integer_division(&self) -> IntegerDivision {
         self.integer_division
+    }
+
+    /// Choose which `LIMIT` / `ORDER BY` / `ASK` / `EXISTS` optimizations
+    /// this database's queries may use: early termination, the bounded-heap
+    /// Top-K and DP-B (see [`TopKOptions`]; all on by default). Every one
+    /// returns exactly the rows the full evaluation returns, so this only
+    /// changes how much work a query does — it exists for testing and
+    /// benchmarking ([`TopKOptions::NONE`] evaluates every query in full).
+    /// Clears the query cache, so the next query really runs with the new
+    /// options.
+    pub fn set_topk_options(&mut self, options: TopKOptions) {
+        if self.topk != options {
+            self.topk = options;
+            self.query_cache.get_mut().clear();
+        }
+    }
+
+    /// The current Top-K / early-termination options (see
+    /// [`set_topk_options`](Self::set_topk_options)).
+    pub fn topk_options(&self) -> TopKOptions {
+        self.topk
     }
 
     /// Whether a given SPARQL string is currently cached (tests).

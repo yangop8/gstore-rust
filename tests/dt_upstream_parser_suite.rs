@@ -27,6 +27,11 @@
 //! would be listed in [`DEFERRED_TO_PHASE5`]; the list is currently empty —
 //! every vendored data file imports cleanly.
 //!
+//! Every case runs twice: with the `LIMIT` / `ORDER BY` / `ASK`
+//! optimizations on (the default, [`TopKOptions::ALL`]) and off
+//! ([`TopKOptions::NONE`], full evaluation), and both runs must pass and
+//! return the same answer, in the same order.
+//!
 //! Run it with the per-case table printed (the in-process counterpart of
 //! upstream's `bash scripts/test/parser_test.sh`):
 //!
@@ -39,6 +44,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use gstore::parser::ntriples::parse_term;
+use gstore::query::{DpbMode, TopKOptions};
 use gstore::{Database, QueryResult, Term};
 
 /// Number of upstream cases (`TOTAL_CASE` of `parser_test.sh`).
@@ -442,6 +448,9 @@ struct Report {
     note: &'static str,
     /// Failure details (empty when the case passes).
     problems: Vec<String>,
+    /// The whole query result, in order (`Debug` form), to compare the runs
+    /// with the Top-K optimizations on and off.
+    answer: Option<String>,
 }
 
 impl Report {
@@ -472,7 +481,14 @@ fn has_order_by(sparql: &str) -> bool {
     false
 }
 
-fn run_case(n: usize) -> Report {
+/// The two settings every case runs with: optimizations on, then off.
+const MODES: [(&str, TopKOptions); 2] = [
+    ("Top-K / early termination ON", TopKOptions::ALL),
+    ("Top-K / early termination OFF", TopKOptions::NONE),
+];
+
+/// Run case `n` with the given Top-K options.
+fn run_case(n: usize, topk: TopKOptions) -> Report {
     let ans_want = divergence(n).map_or(ANS_EXPECTED[n], |d| d.ans_num);
     let mut report = Report {
         case: n,
@@ -489,6 +505,7 @@ fn run_case(n: usize) -> Report {
             ""
         },
         problems: Vec::new(),
+        answer: None,
     };
 
     // [1] build
@@ -500,6 +517,7 @@ fn run_case(n: usize) -> Report {
                 return report;
             }
         };
+    db.set_topk_options(topk);
     let success = db.triple_num();
     report.success_got = Some(success);
     if success != report.success_want && deferred(n).is_none() {
@@ -519,6 +537,7 @@ fn run_case(n: usize) -> Report {
             return report;
         }
     };
+    report.answer = Some(format!("{result:?}"));
 
     // [3] answer count + rows
     let (ans, rows_ok) = match (&result, &expected) {
@@ -651,9 +670,20 @@ fn render_table(reports: &[Report]) -> String {
 /// The whole suite with upstream's per-case summary (see the module docs).
 #[test]
 fn upstream_parser_suite_all_cases() {
-    let reports: Vec<Report> = (1..=TOTAL_CASE).map(run_case).collect();
-    let table = render_table(&reports);
-    println!("{table}");
+    let mut runs = Vec::new();
+    for (label, topk) in MODES {
+        let reports: Vec<Report> = (1..=TOTAL_CASE).map(|n| run_case(n, topk)).collect();
+        println!("== {label}\n{}", render_table(&reports));
+        runs.push((label, reports));
+    }
+    let (on, off) = (&runs[0].1, &runs[1].1);
+    for (a, b) in on.iter().zip(off) {
+        assert_eq!(
+            a.answer, b.answer,
+            "case {}: the answer depends on the Top-K options",
+            a.case
+        );
+    }
     for d in DIVERGENCES {
         println!(
             "divergence #{}: AnsNum {} (upstream script: {}) — {}",
@@ -663,17 +693,20 @@ fn upstream_parser_suite_all_cases() {
     for (c, why) in DEFERRED_TO_PHASE5 {
         println!("deferred to Phase 5 #{c}: {why}");
     }
-    let failures: Vec<String> = reports
-        .iter()
-        .filter(|r| !r.passed())
-        .map(|r| format!("case {}:\n  {}", r.case, r.problems.join("\n  ")))
-        .collect();
-    assert!(
-        failures.is_empty(),
-        "{table}\n{} failing case(s):\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    for (label, reports) in &runs {
+        let failures: Vec<String> = reports
+            .iter()
+            .filter(|r| !r.passed())
+            .map(|r| format!("case {}:\n  {}", r.case, r.problems.join("\n  ")))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{label}\n{}\n{} failing case(s):\n{}",
+            render_table(reports),
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }
 
 /// The divergence / deferral tables only name real cases, once each, and a
@@ -916,6 +949,89 @@ fn predicate_variable_bound_elsewhere_resolves_and_joins() {
     );
 }
 
+/// A mixed variable (predicate and subject/object, case 50's fix) through
+/// the Top-K paths: early termination streams its BGP with the same id
+/// translation as the full evaluation, and DP-B, whose tree cannot link the
+/// predicate slot to the variable's other occurrences, declines it. Every
+/// query must return the same rows, in the same order, with the
+/// optimizations off, on (default) and with DP-B forced.
+#[test]
+fn predicate_variable_queries_agree_with_topk_on_and_off() {
+    const DATA: &str = r#"
+@prefix : <http://ex/> .
+:a :knows :b .
+:c :likes :b .
+:b :rel :likes .
+:b :rel :knows .
+:likes :w 1 .
+:knows :w 2 .
+:knows :knows :likes .
+:d :likes :a .
+:a :rel :likes .
+"#;
+    let modes = [
+        TopKOptions::NONE,
+        TopKOptions::ALL,
+        TopKOptions {
+            dpb: DpbMode::Always,
+            ..TopKOptions::ALL
+        },
+    ];
+    let queries = [
+        // SELECT … LIMIT: streamed.
+        "SELECT ?s ?p ?o ?n { ?s ?p ?o . ?p <http://ex/w> ?n } LIMIT 2",
+        "SELECT DISTINCT ?p { ?s ?p ?o . ?p ?q ?r } LIMIT 1",
+        "SELECT ?x ?o { ?x ?x ?o } LIMIT 1",
+        "SELECT ?s ?p { ?s ?p ?o . ?o <http://ex/rel> ?p } OFFSET 1 LIMIT 2",
+        // ORDER BY … LIMIT: heap, or DP-B (a tree once ?p is ignored as a
+        // predicate, so DP-B must decline it).
+        "SELECT ?s ?p ?o ?n { ?s ?p ?o . ?o <http://ex/rel> ?p . ?p <http://ex/w> ?n } ORDER BY ?n LIMIT 1",
+        "SELECT ?s ?p ?o ?n { ?s ?p ?o . ?o <http://ex/rel> ?p . ?p <http://ex/w> ?n } ORDER BY DESC(?n) LIMIT 2",
+        "SELECT ?s ?p ?n { ?s ?p ?o . ?p <http://ex/w> ?n } ORDER BY ?n ?s LIMIT 3",
+        // ASK / EXISTS: stop at the first solution.
+        "ASK { ?s ?p ?o . ?p <http://ex/w> 2 }",
+        "ASK { ?s ?p ?o . ?p <http://ex/w> 3 }",
+        "SELECT ?s { ?s <http://ex/rel> ?o FILTER EXISTS { ?x ?p ?s . ?p <http://ex/w> ?n } }",
+        "SELECT ?s { ?s <http://ex/rel> ?o FILTER NOT EXISTS { ?x ?p ?s . ?p <http://ex/w> 1 } }",
+        // CONSTRUCT … LIMIT.
+        "CONSTRUCT { ?p <http://ex/used> ?s } WHERE { ?s ?p ?o . ?p <http://ex/w> ?n } LIMIT 2",
+    ];
+    for q in queries {
+        let answers: Vec<String> = modes
+            .iter()
+            .map(|&topk| {
+                let mut db = Database::build_from_str("mixed-topk", DATA).expect("build");
+                db.set_topk_options(topk);
+                format!("{:?}", db.query(q).unwrap_or_else(|e| panic!("`{q}`: {e}")))
+            })
+            .collect();
+        assert_eq!(
+            answers[0], answers[1],
+            "`{q}`: default options differ from full evaluation"
+        );
+        assert_eq!(
+            answers[0], answers[2],
+            "`{q}`: forced DP-B differs from full evaluation"
+        );
+    }
+    // The answer itself: `?o :rel ?p` must name the predicate of the same
+    // triple, so `:a :knows :b` only pairs with `:b :rel :knows` (weight 2),
+    // never with `:b :rel :likes` (weight 1).
+    let mut db = Database::build_from_str("mixed-topk", DATA).expect("build");
+    let int = |n: u8| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT ?s ?p ?o ?n { ?s ?p ?o . ?o <http://ex/rel> ?p . ?p <http://ex/w> ?n } ORDER BY ?n ?s LIMIT 3"
+        ),
+        vec![
+            format!(":a|:knows|:b|{}", int(2)),
+            format!(":c|:likes|:b|{}", int(1)),
+            format!(":d|:likes|:a|{}", int(1)),
+        ]
+    );
+}
+
 /// Case 42's root cause: UCASE/LCASE (and STRBEFORE/STRAFTER/CONCAT)
 /// dropped the language tag (SPARQL 1.1 §17.4.3).
 #[test]
@@ -956,8 +1072,13 @@ macro_rules! cases {
     ($($name:ident => $n:expr;)*) => {$(
         #[test]
         fn $name() {
-            let r = run_case($n);
-            assert!(r.passed(), "case {}:\n  {}", $n, r.problems.join("\n  "));
+            let mut answers = Vec::new();
+            for (label, topk) in MODES {
+                let r = run_case($n, topk);
+                assert!(r.passed(), "case {} ({label}):\n  {}", $n, r.problems.join("\n  "));
+                answers.push(r.answer);
+            }
+            assert_eq!(answers[0], answers[1], "case {}: the answer depends on the Top-K options", $n);
         }
     )*};
 }

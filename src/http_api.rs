@@ -92,7 +92,7 @@ use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::http_users::{Privilege, UserStore, ROOT_USER};
 use crate::model::{Term, Triple};
-use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult};
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::server::{
     err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, spawn_worker,
     write_response_ext, write_response_maybe_gzip, Lifecycle, Request, ShutdownHandle,
@@ -344,6 +344,8 @@ struct ReadSnapshot {
     functions: FunctionRegistry,
     /// The database's integer-division mode at `/begin`.
     integer_division: IntegerDivision,
+    /// The database's Top-K / early-termination options at `/begin`.
+    topk: TopKOptions,
     csr: CsrCache,
 }
 
@@ -364,6 +366,7 @@ impl ReadSnapshot {
             named: db.named_graphs().clone(),
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
+            topk: db.topk_options(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
@@ -384,7 +387,8 @@ impl ReadSnapshot {
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
         let mut eval = Evaluator::new(&self.dict, &self.store)
             .with_csr_provider(&csr)
-            .with_integer_division(self.integer_division);
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }

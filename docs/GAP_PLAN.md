@@ -124,6 +124,8 @@
 - `LIMIT` 不带 `ORDER BY` 时提前终止;`ASK` 拿到首个解即停。
 - 目前三者都是全量求值后再排序、截断。
 
+**状态(Phase 3 已完成)**:`src/query/topk.rs`。SELECT/CONSTRUCT 带 `LIMIT` 无 `ORDER BY`、`ASK`、`EXISTS` 流式求值并提前终止;`ORDER BY … LIMIT` 用有界堆(O(k) 内存);整数线性表达式 + 树形 BGP 走 DP-B(按统计信息估算,收益不足 2 倍时退回有界堆)。所有路径与全量求值结果逐行一致(含并列顺序),由 `tests/dt_topk.rs` 随机化验证;`TopKOptions` / `Database::set_topk_options` 可关闭。尚未覆盖:带环 BGP 的 DP-B(上游会切断一条环边)、非整数排序键。parser_test 50 组在优化开/关两种设置下均通过(`tests/dt_upstream_parser_suite.rs`)。
+
 ## 4. P2 · SPARQL 细节与导入导出
 
 ### 4.1 SPARQL 语法与语义

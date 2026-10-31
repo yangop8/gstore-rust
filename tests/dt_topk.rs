@@ -828,3 +828,27 @@ fn cancellation_is_reported_on_every_path() {
         }
     }
 }
+
+/// The database-level switch ([`gstore::Database::set_topk_options`]): it
+/// reaches the database's queries (same rows either way) and clears the
+/// query cache, so the next query really runs with the new options.
+#[test]
+fn database_switch_reaches_queries_and_clears_the_cache() {
+    let mut db = gstore::Database::build_from_str(
+        "topk-switch",
+        "<http://ex/a> <http://ex/v> 3 . <http://ex/b> <http://ex/v> 1 . <http://ex/c> <http://ex/v> 2 .",
+    )
+    .unwrap();
+    assert_eq!(db.topk_options(), TopKOptions::ALL);
+    let q = "SELECT ?s ?v WHERE { ?s <http://ex/v> ?v } ORDER BY ?v LIMIT 2";
+    let on = format!("{:?}", db.query(q).unwrap());
+    assert_eq!(db.query_cache_len(), 1);
+    db.set_topk_options(TopKOptions::NONE);
+    assert_eq!(db.topk_options(), TopKOptions::NONE);
+    assert_eq!(db.query_cache_len(), 0);
+    let off = format!("{:?}", db.query(q).unwrap());
+    assert_eq!(on, off);
+    // Setting the same options again keeps the cache.
+    db.set_topk_options(TopKOptions::NONE);
+    assert_eq!(db.query_cache_len(), 1);
+}
