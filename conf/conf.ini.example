@@ -1,0 +1,112 @@
+# gStore server configuration (gserver).
+#
+# Copy to conf/conf.ini (the default location, relative to the directory
+# gserver is started from) or pass it explicitly: `gserver -c path/to/conf.ini`.
+# This mirrors upstream gStore 1.4's conf/conf.ini key for key; keys marked
+# "Rust-only" are extensions of this implementation.
+#
+# Syntax: [section] headers and key=value lines. Keys and values are trimmed;
+# a value in "double" or 'single' quotes loses the quotes. Lines starting with
+# '#' or ';' are comments (there are no inline comments). An empty value
+# (`key=`) leaves the key at its built-in default. Unknown keys and bad values
+# are reported as warnings at start-up and ignored; they never stop the server.
+#
+# Precedence: command-line flag > this file > built-in default.
+# Relative paths are relative to gserver's working directory.
+
+[server]
+# the http api port (gserver -p/--port overrides it)
+port=9000
+# upstream's socket api port; accepted for compatibility, unused
+tcp_port=9100
+# request worker threads: the size of the bounded worker pool serving HTTP
+# connections (connections beyond it wait in a queue)
+thread_num=30
+max_database_num=100
+max_user_num=1000
+# run under a supervisor that restarts the server after an abnormal exit
+# (crash, SIGKILL); values: on or off
+deamon=off
+# the maximum output result, default 100000
+# max_output_size=100000
+# ip_allow_path first if both path are configured
+ip_allow_path=
+ip_deny_path="./conf/ipDeny.config"
+
+# Rust-only: the address to listen on (gserver --addr overrides it). Upstream
+# listens on every interface; the default here is loopback only — set 0.0.0.0
+# to accept remote clients.
+# bind_addr=127.0.0.1
+# Rust-only: HTTP/1.1 keep-alive. Seconds an idle connection is kept open
+# (0 disables keep-alive) and requests served per connection.
+# keep_alive_timeout=15
+# keep_alive_max_requests=100
+# Rust-only: the largest accepted request body in bytes. Default:
+# upload_max_body_size + 1 MiB (room for multipart framing).
+# max_body_size=1074790400
+# Rust-only: send `Access-Control-Allow-Origin: <value>` on every response and
+# answer CORS preflights on every path. Unset (the default): only upstream's
+# /file/* preflights answer CORS.
+# cors_allow_origin=*
+# Rust-only: seconds a graceful shutdown waits for in-flight requests.
+# shutdown_grace=10
+
+[system]
+# unit MB
+min_memory=1024
+min_million_disk=200
+min_million_memory=200
+resource_check=off
+# the directory do you want to place your database in: databases, the user
+# store and logs live here, and gserver keeps its pid file (gstore.pid) and
+# background log (gserver.log) here too
+# db_home="./dbhome/"
+
+# only ".db" is supported
+# db_suffix=".db"
+
+# root username
+root_username="root"
+# root default password (seeds the user store the first time; gserver
+# --password overrides it)
+root_password="123456"
+# system username for shutdown; its password is generated at every start and
+# written to the pid file (line 2)
+system_username="system"
+# auto check point, default on: save every write before acknowledging it
+# (gserver --no-checkpoint overrides it)
+check_point=on
+# build use multi thread increase efficiency
+build_multi_thread=off
+# personalized function base directory
+# pfn_base_path="./pfn/"
+# licensetype="opensource"
+
+[log]
+# upstream's log4cplus configuration; accepted for compatibility
+log_mode="./conf/slog.properties"
+# save the query log
+# 0: not save
+# 1: save the log
+querylog_mode=1
+querylog_path="logs/endpoint/"
+querylog_days=30
+# whether to record the access (operation) log
+accesslog_mode=1
+accesslog_path="logs/ipaccess/"
+accesslog_days=30
+
+[backup]
+# backup database path
+backup_path="./backups/"
+# max backups kept per database; older backups are removed
+max_backups=3
+
+[upload]
+upload_path = "./upload/"
+# max body size, 1 GB = 1024 MB = 1048576 KB(1M=1024KB) = 1073741824 B(1KB=1024B)
+upload_max_body_size = 1073741824
+# allow extensions
+upload_allow_extensions = "nt|ttl|n3|rdf|txt"
+# allow compress package
+upload_allow_compress_packages = "zip"
