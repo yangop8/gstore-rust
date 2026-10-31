@@ -167,6 +167,7 @@ fn hand_built_wrong_arity_ast_does_not_panic_the_evaluator() {
                 order_by: vec![],
                 limit: None,
                 offset: None,
+                values: None,
             });
             let r = catch_unwind(AssertUnwindSafe(|| Evaluator::new(&d, &store).evaluate(&q)));
             match r {

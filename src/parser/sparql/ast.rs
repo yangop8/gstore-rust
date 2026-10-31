@@ -18,6 +18,54 @@ pub mod xsd {
 /// rdf:type, the IRI that `a` abbreviates.
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
+/// The RDF collection vocabulary that `( … )` expands to.
+pub mod rdf {
+    pub const FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
+    pub const REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
+    pub const NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
+}
+
+/// Name prefix of the hidden variables that stand for the anonymous blank
+/// nodes of a query (`[]`, `[ :p :o ]` and the cells of a collection
+/// `( … )`). A SPARQL variable name cannot contain `:`, so a hidden variable
+/// never collides with a variable the query names.
+///
+/// In a WHERE pattern a hidden variable matches like any other variable, but
+/// it is not a query variable: `SELECT *` / `DESCRIBE *` leave it out. In a
+/// CONSTRUCT or INSERT template, a hidden variable the WHERE clause does not
+/// bind is instantiated as a fresh blank node per solution.
+pub const ANON_VAR_PREFIX: &str = "_:";
+
+/// Whether `name` is a hidden blank-node variable (see [`ANON_VAR_PREFIX`]).
+pub fn is_anon_var(name: &str) -> bool {
+    name.starts_with(ANON_VAR_PREFIX)
+}
+
+/// A fresh blank-node label, unique within this process and — through a
+/// per-process random component — practically unique across processes, so a
+/// minted node never merges with a blank node already in a store. Used for
+/// the anonymous blank nodes of `INSERT DATA` and for template blank nodes.
+pub fn fresh_bnode_label() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Mix in the pid so two processes started in the same instant differ.
+        (nanos ^ (u64::from(std::process::id()) << 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    });
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("genid-{nonce:016x}-{n}")
+}
+
+/// An inline data table, `VALUES (?a ?b) { (…) (…) }`: the variables, then
+/// one row per solution with a cell per variable (`None` = `UNDEF`).
+pub type ValuesTable = (Vec<String>, Vec<Vec<Option<Term>>>);
+
 /// A complete parsed request: a query or an update.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
@@ -52,6 +100,28 @@ pub enum UpdateOp {
     Drop { target: GraphTarget, silent: bool },
     /// `CREATE [SILENT] GRAPH <iri>`.
     Create { name: String, silent: bool },
+    /// `ADD [SILENT] from TO to` (SPARQL 1.1 Update §3.2.5): insert every
+    /// triple of graph `from` into graph `to`, keeping `to`'s data. A graph
+    /// is `None` for `DEFAULT`, else the named graph's IRI.
+    Add {
+        from: Option<String>,
+        to: Option<String>,
+        silent: bool,
+    },
+    /// `MOVE [SILENT] from TO to` (§3.2.4): clear `to`, copy `from` into it,
+    /// then drop `from`.
+    Move {
+        from: Option<String>,
+        to: Option<String>,
+        silent: bool,
+    },
+    /// `COPY [SILENT] from TO to` (§3.2.3): clear `to`, then copy `from` into
+    /// it.
+    Copy {
+        from: Option<String>,
+        to: Option<String>,
+        silent: bool,
+    },
 }
 
 /// The target of a `CLEAR`/`DROP` operation.
@@ -74,7 +144,11 @@ pub struct DescribeQuery {
 }
 
 /// `SELECT [DISTINCT] (…|*) WHERE { … } [GROUP BY …] [HAVING …]
-/// [ORDER BY …] [LIMIT/OFFSET]`.
+/// [ORDER BY …] [LIMIT/OFFSET] [VALUES …]`.
+///
+/// A `GROUP BY (expr AS ?v)` condition is stored as `Expr::Var(v)` in
+/// `group_by`, with `pattern` extended by `BIND(expr AS ?v)` (SPARQL 1.1
+/// §18.2.4.1 evaluates it exactly so).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectQuery {
     pub distinct: bool,
@@ -85,15 +159,29 @@ pub struct SelectQuery {
     pub order_by: Vec<OrderCondition>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// The trailing `VALUES` block (`ValuesClause` after the solution
+    /// modifiers). It is joined with the solutions after grouping/HAVING and
+    /// before the SELECT expressions, ORDER BY and projection (§18.2.4.3).
+    pub values: Option<ValuesTable>,
 }
 
 impl SelectQuery {
-    /// The output variable names, in column order.
+    /// The output variable names, in column order. `SELECT *` lists the
+    /// variables of the WHERE pattern, then those only the trailing `VALUES`
+    /// binds; hidden blank-node variables ([`is_anon_var`]) are not listed.
     pub fn result_vars(&self) -> Vec<String> {
         match &self.projection {
             Projection::All => {
                 let mut v = Vec::new();
                 self.pattern.collect_vars(&mut v);
+                if let Some((vars, _)) = &self.values {
+                    for x in vars {
+                        if !v.contains(x) {
+                            v.push(x.clone());
+                        }
+                    }
+                }
+                v.retain(|x| !is_anon_var(x));
                 v
             }
             Projection::Items(items) => items
@@ -391,6 +479,13 @@ pub enum Expr {
     /// Unary minus / plus.
     Unary(UnaryOp, Box<Expr>),
     Compare(CompareOp, Box<Expr>, Box<Expr>),
+    /// `expr IN (e1, …)` / `expr NOT IN (e1, …)` (SPARQL 1.1 §17.4.1.9-10;
+    /// `negated` for NOT IN). `list` may be empty: `x IN ()` is false.
+    In {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
     Arith(ArithOp, Box<Expr>, Box<Expr>),
     /// A builtin function call, e.g. `ABS`, `STR`, `REGEX`, `BOUND`.
     Builtin(String, Vec<Expr>),
