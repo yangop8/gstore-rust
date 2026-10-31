@@ -21,9 +21,7 @@ use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::model::Term;
-use gstore::parser::import::{
-    self, BlankNodes, ImportOptions, ParseErrorLog, RdfFormat, Source,
-};
+use gstore::parser::import::{self, BlankNodes, ImportOptions, ParseErrorLog, RdfFormat, Source};
 use gstore::parser::nquads::Quad;
 use gstore::parser::stream::{BlankLabeler, StatementSink, SyntaxError};
 use gstore::parser::{nquads, ntriples, trig, turtle};
@@ -90,8 +88,11 @@ struct Gen {
     post_done: bool,
 }
 
+/// Shared with the sink: bytes pulled so far, and where each statement ends.
+type Probes = (Rc<Cell<u64>>, Rc<RefCell<Vec<u64>>>);
+
 impl Gen {
-    fn new(pre: &str, post: &str, n: u64, stmt: fn(u64) -> String) -> (Gen, Rc<Cell<u64>>, Rc<RefCell<Vec<u64>>>) {
+    fn new(pre: &str, post: &str, n: u64, stmt: fn(u64) -> String) -> (Gen, Probes) {
         let pulled = Rc::new(Cell::new(0));
         let ends = Rc::new(RefCell::new(Vec::new()));
         let g = Gen {
@@ -107,7 +108,7 @@ impl Gen {
             ends: Rc::clone(&ends),
             post_done: false,
         };
-        (g, pulled, ends)
+        (g, (pulled, ends))
     }
 }
 
@@ -175,14 +176,8 @@ impl StatementSink for BoundCheck {
 
 const WINDOW: usize = 8 * 1024;
 
-fn check_bound(
-    format: &str,
-    pre: &str,
-    post: &str,
-    n: u64,
-    stmt: fn(u64) -> String,
-) -> (u64, u64) {
-    let (g, pulled, ends) = Gen::new(pre, post, n, stmt);
+fn check_bound(format: &str, pre: &str, post: &str, n: u64, stmt: fn(u64) -> String) -> (u64, u64) {
+    let (g, (pulled, ends)) = Gen::new(pre, post, n, stmt);
     let reader = BufReader::with_capacity(WINDOW, g);
     let mut sink = BoundCheck {
         pulled: Rc::clone(&pulled),
@@ -220,18 +215,26 @@ fn ntriples_and_nquads_stream_within_the_window() {
     let (q, _) = check_bound("nt", "# header\n", "", 20_000, nt_stmt);
     assert_eq!(q, 20_000);
     let (q, _) = check_bound("nq", "", "", 20_000, |i| {
-        format!("<http://ex.org/s{i}> <http://ex.org/p> \"v{i}\" <http://g/{}> .\n", i % 3)
+        format!(
+            "<http://ex.org/s{i}> <http://ex.org/p> \"v{i}\" <http://g/{}> .\n",
+            i % 3
+        )
     });
     assert_eq!(q, 20_000);
 }
 
 #[test]
 fn turtle_streams_within_the_window() {
-    let pre = "@prefix ex: <http://ex.org/> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
+    let pre =
+        "@prefix ex: <http://ex.org/> .\n@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
     let (q, _) = check_bound("ttl", pre, "", 15_000, |i| {
         // Multi-line statements, nested lists, long literals (some bigger
         // than the window itself), comments.
-        let long = if i % 500 == 0 { "L".repeat(3 * WINDOW) } else { String::new() };
+        let long = if i % 500 == 0 {
+            "L".repeat(3 * WINDOW)
+        } else {
+            String::new()
+        };
         format!(
             "ex:s{i} a ex:T ;\n  ex:name \"\"\"name {i}\nline 2 {long}\"\"\"@en ,\n    'other' ;\n  ex:list ( {i} ex:a [ ex:p ex:o ] ) . # c\n"
         )
@@ -459,16 +462,35 @@ fn library_parsers_keep_labels_and_mint_round_trippable_ones() {
 fn directory_sources_load_every_rdf_file_sorted_and_recursively() {
     let dir = tmp("dirsrc");
     let data = dir.join("data");
-    write(&data.join("b/2.ttl"), "@prefix e: <http://e/> . e:s e:p e:two .\n");
-    write(&data.join("a.nt"), "<http://e/s> <http://e/p> <http://e/one> .\n");
-    write(&data.join("b/sub/3.nq"), "<http://e/s> <http://e/p> <http://e/three> <http://e/g> .\n");
+    write(
+        &data.join("b/2.ttl"),
+        "@prefix e: <http://e/> . e:s e:p e:two .\n",
+    );
+    write(
+        &data.join("a.nt"),
+        "<http://e/s> <http://e/p> <http://e/one> .\n",
+    );
+    write(
+        &data.join("b/sub/3.nq"),
+        "<http://e/s> <http://e/p> <http://e/three> <http://e/g> .\n",
+    );
     write(&data.join("README.md"), "not data");
-    write(&data.join(".hidden/x.nt"), "<http://e/s> <http://e/p> <http://e/hidden> .\n");
-    write(&data.join("c.rdf"), "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"/>");
+    write(
+        &data.join(".hidden/x.nt"),
+        "<http://e/s> <http://e/p> <http://e/hidden> .\n",
+    );
+    write(
+        &data.join("c.rdf"),
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"/>",
+    );
     let sources = import::sources_from_paths(&[&data]).unwrap();
     let names: Vec<String> = sources
         .iter()
-        .map(|s| s.name().trim_start_matches(&data.display().to_string()).to_string())
+        .map(|s| {
+            s.name()
+                .trim_start_matches(&data.display().to_string())
+                .to_string()
+        })
         .collect();
     assert_eq!(names, ["/a.nt", "/b/2.ttl", "/b/sub/3.nq", "/c.rdf"]);
     let mut db = Database::build_from_files("d", &[&data]).unwrap();
@@ -477,7 +499,10 @@ fn directory_sources_load_every_rdf_file_sorted_and_recursively() {
         ["<http://e/one>", "<http://e/two>"]
     );
     assert_eq!(
-        col0(&mut db, "SELECT ?o WHERE { GRAPH <http://e/g> { ?s ?p ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { GRAPH <http://e/g> { ?s ?p ?o } }"
+        ),
         ["<http://e/three>"]
     );
     // The load policy governs directories too.
@@ -537,9 +562,18 @@ fn http_server(files: Vec<(&'static str, String)>) -> SocketAddr {
 #[test]
 fn url_sources_download_through_the_http_client() {
     let addr = http_server(vec![
-        ("/data.ttl", "@prefix e: <http://e/> . e:u e:p e:o1 , e:o2 .\n".to_string()),
-        ("/q.nq", "<http://e/u> <http://e/p> <http://e/o3> <http://e/g> .\n".to_string()),
-        ("/chunked.nt", "<http://e/u> <http://e/p> <http://e/o4> .\n".to_string()),
+        (
+            "/data.ttl",
+            "@prefix e: <http://e/> . e:u e:p e:o1 , e:o2 .\n".to_string(),
+        ),
+        (
+            "/q.nq",
+            "<http://e/u> <http://e/p> <http://e/o3> <http://e/g> .\n".to_string(),
+        ),
+        (
+            "/chunked.nt",
+            "<http://e/u> <http://e/p> <http://e/o4> .\n".to_string(),
+        ),
     ]);
     let urls = [
         format!("http://{addr}/data.ttl"),
@@ -564,8 +598,12 @@ fn gzip_files_are_decompressed_by_extension() {
     use flate2::write::GzEncoder;
     let dir = tmp("gz");
     let path = dir.join("d.nt.gz");
-    let mut enc = GzEncoder::new(fs::File::create(&path).unwrap(), flate2::Compression::default());
-    enc.write_all(b"<http://e/s> <http://e/p> <http://e/o> .\n").unwrap();
+    let mut enc = GzEncoder::new(
+        fs::File::create(&path).unwrap(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"<http://e/s> <http://e/p> <http://e/o> .\n")
+        .unwrap();
     enc.finish().unwrap();
     let db = Database::build_from_files("gz", &[&dir]).unwrap();
     assert_eq!(db.triple_num(), 1);
@@ -639,8 +677,10 @@ fn named_graphs_survive_every_build_path() {
     assert_eq!(n, 7);
     check(&mut db);
     let mut db = Database::new("l");
-    db.query(&format!("LOAD <file://{}>", tg.display())).unwrap();
-    db.query(&format!("LOAD <file://{}>", nq.display())).unwrap();
+    db.query(&format!("LOAD <file://{}>", tg.display()))
+        .unwrap();
+    db.query(&format!("LOAD <file://{}>", nq.display()))
+        .unwrap();
     check(&mut db);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -671,7 +711,10 @@ fn rdfxml_entities_and_collections_load() {
     );
     let mut db = Database::build_from_files("x", &[&owl]).unwrap();
     assert_eq!(
-        col0(&mut db, "SELECT ?a WHERE { <http://e/x> <http://e/age> ?a }"),
+        col0(
+            &mut db,
+            "SELECT ?a WHERE { <http://e/x> <http://e/age> ?a }"
+        ),
         ["\"3\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
     );
     assert_eq!(
@@ -723,7 +766,10 @@ fn start(tag: &str, policy: Option<LoadPolicy>) -> Srv {
 }
 
 fn api(addr: &SocketAddr, body: Json) -> Json {
-    let body = body.with("username", "root").with("password", "root").to_string();
+    let body = body
+        .with("username", "root")
+        .with("password", "root")
+        .to_string();
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
     let req = format!(
@@ -758,12 +804,21 @@ fn api_build_and_batches_report_upstream_counts_and_log() {
     let a = &srv.addr;
     let up = srv.root.join("upload");
     let mixed = write(&up.join("mixed.ttl"), MIXED_TTL);
-    let j = api(a, op("build", "imp").with("db_path", mixed.to_string_lossy().as_ref()));
+    let j = api(
+        a,
+        op("build", "imp").with("db_path", mixed.to_string_lossy().as_ref()),
+    );
     assert_eq!(code(&j), 0, "{j}");
     assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (4, 4));
     let log = srv.root.join("imp.db").join("parse_error.log");
     let text = fs::read_to_string(&log).unwrap();
-    assert!(text.lines().next().unwrap().contains("build parser info, file path"), "{text}");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .contains("build parser info, file path"),
+        "{text}"
+    );
     assert_eq!(import::count_logged_failures(&log), 4);
 
     assert_eq!(code(&api(a, op("load", "imp"))), 0);
@@ -774,16 +829,25 @@ fn api_build_and_batches_report_upstream_counts_and_log() {
         "@prefix e: <http://e/> .\ne:g { _:b e:p \"x\" . e:bad e:p }\n_:b e:q \"y\" .\n",
     );
     let insert = || {
-        api(a, op("batchInsert", "imp").with("file", more.to_string_lossy().as_ref()))
+        api(
+            a,
+            op("batchInsert", "imp").with("file", more.to_string_lossy().as_ref()),
+        )
     };
     let j = insert();
     assert_eq!(code(&j), 0, "{j}");
     assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (2, 1));
     let j = insert();
-    assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (2, 1), "no merge: {j}");
+    assert_eq!(
+        (int(&j, "success_num"), int(&j, "failed_num")),
+        (2, 1),
+        "no merge: {j}"
+    );
     let text = fs::read_to_string(&log).unwrap();
     assert_eq!(
-        text.lines().filter(|l| l.contains("batch insert parser info")).count(),
+        text.lines()
+            .filter(|l| l.contains("batch insert parser info"))
+            .count(),
         2,
         "{text}"
     );
@@ -801,8 +865,15 @@ fn api_build_and_batches_report_upstream_counts_and_log() {
         &up.join("rm.nt"),
         "<http://ex.org/a> <http://ex.org/p> <http://ex.org/o1> .\nbroken line\n",
     );
-    let j = api(a, op("batchRemove", "imp").with("file", rm.to_string_lossy().as_ref()));
-    assert_eq!((int(&j, "success_num"), int(&j, "failed_num")), (1, 1), "{j}");
+    let j = api(
+        a,
+        op("batchRemove", "imp").with("file", rm.to_string_lossy().as_ref()),
+    );
+    assert_eq!(
+        (int(&j, "success_num"), int(&j, "failed_num")),
+        (1, 1),
+        "{j}"
+    );
     let text = fs::read_to_string(&log).unwrap();
     assert!(text.contains("batch remove parser info"), "{text}");
 }
@@ -818,7 +889,9 @@ fn api_remote_sources_follow_the_load_policy() {
     let srv = start("remote_denied", None);
     let j = api(
         &srv.addr,
-        op("build", "rem").with("db_path", url.as_str()).with("remote", true),
+        op("build", "rem")
+            .with("db_path", url.as_str())
+            .with("remote", true),
     );
     assert_eq!(code(&j), 1003, "{j}");
     assert!(j.to_string().contains("load policy"), "{j}");
@@ -829,7 +902,9 @@ fn api_remote_sources_follow_the_load_policy() {
     let srv = start("remote_allowed", Some(policy));
     let j = api(
         &srv.addr,
-        op("build", "rem").with("db_path", url.as_str()).with("remote", true),
+        op("build", "rem")
+            .with("db_path", url.as_str())
+            .with("remote", true),
     );
     assert_eq!(code(&j), 0, "{j}");
     assert_eq!(int(&j, "success_num"), 1);
@@ -852,7 +927,11 @@ fn api_remote_sources_follow_the_load_policy() {
 // ---------------------------------------------------------------------------
 
 fn run(bin: &str, args: &[&str], cwd: &Path) -> std::process::Output {
-    Command::new(bin).args(args).current_dir(cwd).output().unwrap()
+    Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
 }
 
 #[test]
@@ -860,20 +939,33 @@ fn cli_tools_take_directories_are_tolerant_and_have_strict() {
     let dir = tmp("cli");
     let src = dir.join("src");
     write(&src.join("a.ttl"), MIXED_TTL);
-    write(&src.join("nested/b.nq"), "<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n");
+    write(
+        &src.join("nested/b.nq"),
+        "<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n",
+    );
     let s = src.to_string_lossy().into_owned();
     let out = run(env!("CARGO_BIN_EXE_gbuild"), &["cli", &s], &dir);
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("RDF parse error num 4"), "{stdout}");
     assert!(stdout.contains("named-graph quads=1"), "{stdout}");
-    assert_eq!(import::count_logged_failures(&dir.join("cli.db/parse_error.log")), 4);
+    assert_eq!(
+        import::count_logged_failures(&dir.join("cli.db/parse_error.log")),
+        4
+    );
     // --strict: the first bad statement fails the build.
-    let out = run(env!("CARGO_BIN_EXE_gbuild"), &["--strict", "strict", &s], &dir);
+    let out = run(
+        env!("CARGO_BIN_EXE_gbuild"),
+        &["--strict", "strict", &s],
+        &dir,
+    );
     assert!(!out.status.success(), "{out:?}");
     // gadd: a directory of files, tolerant, logged.
     let add = dir.join("add");
-    write(&add.join("x.nt"), "<http://e/n> <http://e/p> \"new\" .\nnot rdf\n");
+    write(
+        &add.join("x.nt"),
+        "<http://e/n> <http://e/p> \"new\" .\nnot rdf\n",
+    );
     let out = run(
         env!("CARGO_BIN_EXE_gadd"),
         &["cli", &add.to_string_lossy()],
@@ -892,7 +984,11 @@ fn cli_tools_take_directories_are_tolerant_and_have_strict() {
     // gsub removes, from the default and the named graph.
     let out = run(
         env!("CARGO_BIN_EXE_gsub"),
-        &["cli", &add.join("x.nt").to_string_lossy(), &src.join("nested/b.nq").to_string_lossy()],
+        &[
+            "cli",
+            &add.join("x.nt").to_string_lossy(),
+            &src.join("nested/b.nq").to_string_lossy(),
+        ],
         &dir,
     );
     assert!(out.status.success(), "{out:?}");

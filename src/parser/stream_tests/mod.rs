@@ -207,8 +207,27 @@ fn blank(r: &mut Rng) -> String {
 /// multi-byte characters and sometimes thousands of characters.
 fn literal(r: &mut Rng) -> String {
     const PIECES: &[&str] = &[
-        "abc", "a b", "é", "漢字", "😀", "\\\"", "\\\\", "\\n", "\\t", "\\r", "\\u00E9",
-        "\\U0001F600", "#notcomment", ".", "{", "}", ";", ",", "\\'", "<x>", "_:no",
+        "abc",
+        "a b",
+        "é",
+        "漢字",
+        "😀",
+        "\\\"",
+        "\\\\",
+        "\\n",
+        "\\t",
+        "\\r",
+        "\\u00E9",
+        "\\U0001F600",
+        "#notcomment",
+        ".",
+        "{",
+        "}",
+        ";",
+        ",",
+        "\\'",
+        "<x>",
+        "_:no",
     ];
     let mut body = String::new();
     let parts = if r.chance(5) { 400 } else { r.below(6) };
@@ -261,10 +280,18 @@ fn pol(r: &mut Rng, depth: usize, trailing: bool) -> String {
     let preds = 1 + r.below(3);
     let mut parts = Vec::new();
     for _ in 0..preds {
-        let verb = if r.chance(15) { "a".to_string() } else { iri(r) };
+        let verb = if r.chance(15) {
+            "a".to_string()
+        } else {
+            iri(r)
+        };
         let objs = 1 + r.below(3);
         let os: Vec<String> = (0..objs).map(|_| object(r, depth)).collect();
-        parts.push(format!("{verb}{}{}", sep(r), os.join(&format!("{},{}", sep(r), sep(r)))));
+        parts.push(format!(
+            "{verb}{}{}",
+            sep(r),
+            os.join(&format!("{},{}", sep(r), sep(r)))
+        ));
     }
     let mut s = parts.join(&format!("{};{}", sep(r), sep(r)));
     if trailing && r.chance(15) {
@@ -286,7 +313,13 @@ fn statement(r: &mut Rng) -> String {
             sep(r),
             pol(r, 0, true)
         ),
-        2 => format!("( {} {} ){}{}{dot}", iri(r), literal(r), sep(r), pol(r, 0, true)),
+        2 => format!(
+            "( {} {} ){}{}{dot}",
+            iri(r),
+            literal(r),
+            sep(r),
+            pol(r, 0, true)
+        ),
         3 => format!("{}{}{}{dot}", blank(r), sep(r), pol(r, 0, true)),
         _ => format!("{}{}{}{dot}", iri(r), sep(r), pol(r, 0, true)),
     }
@@ -356,7 +389,10 @@ fn nt_term(r: &mut Rng, literal_ok: bool) -> String {
         1 => format!("<http://ex.org/é{n}\\u00E9>"),
         2 => format!("_:n{n}"),
         3 => "\"plain é 漢 😀 \\\"q\\\" \\\\ \\n \\t \\u00E9 \\U0001F600\"".to_string(),
-        4 => format!("\"{}\"@en-GB", "x".repeat(if r.chance(5) { 3000 } else { 3 })),
+        4 => format!(
+            "\"{}\"@en-GB",
+            "x".repeat(if r.chance(5) { 3000 } else { 3 })
+        ),
         5 => "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string(),
         _ => "\"tab\tand space\"".to_string(),
     }
@@ -417,7 +453,11 @@ fn streaming_trig_equals_the_old_reader_on_random_documents() {
         for chunking in 0..3 {
             let new = stream_trig(&doc, seed * 17 + chunking)
                 .unwrap_or_else(|e| panic!("streaming reader: {e}\n{doc}"));
-            assert_eq!(canon_by_graph(&new), canon_by_graph(&old), "seed {seed}\n{doc}");
+            assert_eq!(
+                canon_by_graph(&new),
+                canon_by_graph(&old),
+                "seed {seed}\n{doc}"
+            );
         }
     }
 }
@@ -486,7 +526,11 @@ fn existing_parser_corpus_agrees_with_the_old_reader() {
     for doc in docs {
         let old = old_turtle(doc).unwrap();
         for chunking in 0..4 {
-            assert_eq!(canon(&stream_turtle(doc, chunking).unwrap()), canon(&old), "{doc}");
+            assert_eq!(
+                canon(&stream_turtle(doc, chunking).unwrap()),
+                canon(&old),
+                "{doc}"
+            );
         }
     }
 }

@@ -47,9 +47,12 @@ pub struct LoadPolicy {
     /// of `dirs` (an empty list therefore denies every local path).
     pub allowed_dirs: Option<Vec<PathBuf>>,
     /// Whether a remote (`http://`, `https://`, … scheme) source may be named.
-    /// This crate never fetches remote documents, so an allowed remote `LOAD`
-    /// still fails with "not supported"; a disallowed one is refused by policy
-    /// before anything else happens. It also governs federated `SERVICE`
+    /// SPARQL `LOAD` never fetches remote documents, so an allowed remote
+    /// `LOAD` still fails with "not supported"; a disallowed one is refused by
+    /// policy before anything else happens. The bulk loaders do download
+    /// `http(s)://` sources (`/api` `build` / `batchInsert` / `batchRemove`
+    /// with `remote=true`, [`crate::parser::import::expand_sources`]) — only
+    /// when this is set. It also governs federated `SERVICE`
     /// patterns, which do make outbound HTTP requests: a database whose policy
     /// disallows remote sources refuses any query using `SERVICE` — so a
     /// server on [`restricted`](Self::restricted) cannot be made to contact

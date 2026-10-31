@@ -26,10 +26,10 @@
 
 use std::path::Path;
 
+use super::legacy_turtle as turtle;
 use crate::error::{GStoreError, Result};
 use crate::model::Term;
 use crate::parser::nquads::Quad;
-use super::legacy_turtle as turtle;
 
 /// Parse a TriG document into quads.
 pub fn parse_str(content: &str) -> Result<Vec<Quad>> {
@@ -203,9 +203,10 @@ impl Splitter {
                     while j < self.len() {
                         match self.at(j) {
                             Some('\\') => j += 2,
-                            Some(c) if c == q
-                                && self.at(j + 1) == Some(q)
-                                && self.at(j + 2) == Some(q) =>
+                            Some(c)
+                                if c == q
+                                    && self.at(j + 1) == Some(q)
+                                    && self.at(j + 2) == Some(q) =>
                             {
                                 return Some(j + 3);
                             }
@@ -425,7 +426,10 @@ fn ensure_terminated(body: &str) -> String {
 /// Strip a leading `GRAPH` keyword (case-insensitive) from a label region,
 /// leaving just the label token (possibly empty for the default graph).
 fn strip_graph_keyword(before: &str) -> &str {
-    if before.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("graph")) {
+    if before
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("graph"))
+    {
         let rest = &before[5..];
         if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
             return rest.trim();
@@ -433,4 +437,3 @@ fn strip_graph_keyword(before: &str) -> &str {
     }
     before
 }
-

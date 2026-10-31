@@ -369,8 +369,10 @@ impl Source {
 /// Whether `s` is an `http://` / `https://` URL.
 pub fn is_url(s: &str) -> bool {
     let l = s.trim_start();
-    l.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-        || l.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    l.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || l.get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Expand inputs into sources, checking each against `policy`: an
@@ -485,10 +487,8 @@ impl StatementSink for Pipeline<'_> {
     fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
         for mut q in quads.drain(..) {
             if let Some(msg) = invalid_quad(&q, self.opts.upstream_checks) {
-                let err = SyntaxError::new(0, msg).with_context(format!(
-                    "{} {} {}",
-                    q.subject, q.predicate, q.object
-                ));
+                let err = SyntaxError::new(0, msg)
+                    .with_context(format!("{} {} {}", q.subject, q.predicate, q.object));
                 self.fail(err)?;
                 continue;
             }
@@ -685,13 +685,14 @@ fn c_strtod_ok(s: &str, float: bool) -> bool {
 /// Read a whole document of at most `max` bytes.
 fn read_bounded<R: Read>(mut reader: R, max: u64, what: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    reader.by_ref().take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    reader
+        .by_ref()
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)?;
     if buf.len() as u64 > max {
         return Err(GStoreError::RdfParse {
             line: 0,
-            msg: format!(
-                "{what} is larger than {max} bytes, the limit for documents parsed whole"
-            ),
+            msg: format!("{what} is larger than {max} bytes, the limit for documents parsed whole"),
         });
     }
     Ok(buf)
@@ -783,7 +784,13 @@ pub fn import_reader<R: BufRead>(
             ..ImportReport::default()
         },
     };
-    parse_into(reader, format, opts.labeler(), opts.max_document_bytes, &mut pipe)?;
+    parse_into(
+        reader,
+        format,
+        opts.labeler(),
+        opts.max_document_bytes,
+        &mut pipe,
+    )?;
     pipe.flush()?;
     Ok(pipe.report)
 }
@@ -818,7 +825,9 @@ pub fn open_file(path: &Path, opts: &ImportOptions) -> Result<(Box<dyn BufRead>,
 pub fn fetch_url(url: &str, max: u64) -> Result<Vec<u8>> {
     let opts = crate::http_client::PostOptions {
         limits: crate::http_client::Limits {
-            max_response: usize::try_from(max).unwrap_or(usize::MAX).saturating_add(64 << 10),
+            max_response: usize::try_from(max)
+                .unwrap_or(usize::MAX)
+                .saturating_add(64 << 10),
             ..crate::http_client::Limits::default()
         },
         ..crate::http_client::PostOptions::default()
@@ -916,11 +925,20 @@ mod tests {
 
     #[test]
     fn formats_by_extension() {
-        assert_eq!(RdfFormat::detect("a/b.NT"), (Some(RdfFormat::Turtle), false));
+        assert_eq!(
+            RdfFormat::detect("a/b.NT"),
+            (Some(RdfFormat::Turtle), false)
+        );
         assert_eq!(RdfFormat::detect("x.nq"), (Some(RdfFormat::NQuads), false));
-        assert_eq!(RdfFormat::detect("x.trig.gz"), (Some(RdfFormat::TriG), true));
+        assert_eq!(
+            RdfFormat::detect("x.trig.gz"),
+            (Some(RdfFormat::TriG), true)
+        );
         assert_eq!(RdfFormat::detect("x.owl"), (Some(RdfFormat::RdfXml), false));
-        assert_eq!(RdfFormat::detect("x.jsonld"), (Some(RdfFormat::JsonLd), false));
+        assert_eq!(
+            RdfFormat::detect("x.jsonld"),
+            (Some(RdfFormat::JsonLd), false)
+        );
         assert_eq!(RdfFormat::detect("x.html"), (Some(RdfFormat::Rdfa), false));
         assert_eq!(RdfFormat::detect("README"), (None, false));
         assert_eq!(RdfFormat::detect("x.gz"), (None, true));
@@ -932,7 +950,9 @@ mod tests {
 
     #[test]
     fn upstream_literal_checks_follow_stoll_and_stod() {
-        let lit = |v: &str, dt: &str| Term::typed_literal(v, format!("http://www.w3.org/2001/XMLSchema#{dt}"));
+        let lit = |v: &str, dt: &str| {
+            Term::typed_literal(v, format!("http://www.w3.org/2001/XMLSchema#{dt}"))
+        };
         assert_eq!(upstream_literal_check(&lit("42", "integer")), None);
         assert_eq!(upstream_literal_check(&lit(" 12abc", "integer")), None);
         assert_eq!(
