@@ -94,16 +94,38 @@ fn target(ctx: &Ctx<'_>, db: &str) -> (Option<DbHandle>, PathBuf) {
 }
 
 /// The rule store of `db` for an operation that only touches rule files:
-/// the database must exist (loaded, or on disk).
+/// the database must exist (loaded, or on disk). It does not wait for the
+/// database's lock (a long query may hold it): the rule directory's own lock
+/// orders it with execute / disable / check.
 fn file_store(ctx: &Ctx<'_>, db: &str) -> Result<RuleStore<'static>, GResp> {
     let (handle, dir) = target(ctx, db);
-    if handle.is_none() && !dir.is_dir() {
-        return Err(GResp::error(
-            Status::OperationFailed,
-            format!("database[{db}] does not exist"),
-        ));
+    match handle {
+        Some(h) => {
+            // Best effort: tell a loaded database where its rules are, so
+            // that its own backups carry them (see `note_rule_dir`).
+            if let Ok(mut slot) = h.try_lock() {
+                note_rule_dir(&mut slot);
+            }
+        }
+        None if !dir.is_dir() => {
+            return Err(GResp::error(
+                Status::OperationFailed,
+                format!("database[{db}] does not exist"),
+            ))
+        }
+        None => {}
     }
     Ok(RuleStore::dir(dir))
+}
+
+/// Make a loaded database keep its rules in the directory the server serves
+/// it from — a database built in memory and saved there does not know that
+/// directory as its home, and `Database::backup` copies the rules from it.
+fn note_rule_dir(slot: &mut crate::http_api::DbSlot) {
+    if !slot.retired && slot.db.reason_db_dir().as_deref() != Some(slot.dir.as_path()) {
+        let dir = slot.dir.clone();
+        slot.db.set_reason_db_dir(dir);
+    }
 }
 
 /// `type` 1.
@@ -240,6 +262,7 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
         return not_loaded(db, dir.is_dir());
     }
     ctx.inner.sync_query_settings(&mut slot);
+    note_rule_dir(&mut slot);
     let mut store = RuleStore::dir(slot.dir.clone());
     let resp = match op {
         DataOp::Check => {
@@ -277,13 +300,14 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
             let before = slot.db.mutation_count();
             let outcome = match op {
                 DataOp::Execute => {
-                    manage::execute(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel)))
-                        .map(|x| {
+                    manage::execute(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel))).map(
+                        |x| {
                             GResp::success("ok")
                                 .with("insert_sparql", x.insert_sparql)
                                 .with("select_sparql", x.select_sparql)
                                 .with("AnsNum", x.inserted)
-                        })
+                        },
+                    )
                 }
                 _ => manage::disable(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel)))
                     .map(|x| {

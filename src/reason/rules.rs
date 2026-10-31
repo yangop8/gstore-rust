@@ -246,7 +246,11 @@ impl RuleDef {
             RuleType::Relation => (str_field(ret, "target"), String::new()),
         };
         let mut uses = Vec::new();
-        uses.push(check_term(&source, Pos::Source, "the source of the return information")?);
+        uses.push(check_term(
+            &source,
+            Pos::Source,
+            "the source of the return information",
+        )?);
         match rule_type {
             RuleType::Property => uses.push(check_term(
                 &value,
@@ -368,8 +372,9 @@ fn tokens_covering(
             .chars()
             .all(|c| allowed_ws.contains(&c))
         {
-            return Err("contains a comment or a character that is not part of a SPARQL token"
-                .to_string());
+            return Err(
+                "contains a comment or a character that is not part of a SPARQL token".to_string(),
+            );
         }
         covered = span.end;
         if tok != Token::Eof {
@@ -377,7 +382,9 @@ fn tokens_covering(
         }
     }
     if !text[covered..].chars().all(|c| allowed_ws.contains(&c)) {
-        return Err("contains a comment or a character that is not part of a SPARQL token".to_string());
+        return Err(
+            "contains a comment or a character that is not part of a SPARQL token".to_string(),
+        );
     }
     Ok(out)
 }
@@ -401,36 +408,41 @@ fn check_term(raw: &str, pos: Pos, what: &str) -> Result<CheckedTerm, String> {
     };
     let numeric = |t: &Token| matches!(t, Token::Integer(_) | Token::Decimal(_) | Token::Double(_));
     let literal_ok = matches!(pos, Pos::Object | Pos::Target | Pos::Value);
-    let kind = match toks.as_slice() {
-        [(Token::Var(v), _)] => return Ok(CheckedTerm { var: Some(v.clone()) }),
-        [(Token::Iri(_), _)] => return Ok(CheckedTerm { var: None }),
-        [(Token::Blank(_), _)] if matches!(pos, Pos::Subject | Pos::Object) => "blank",
-        [(Token::Word(w), _)] if w == "a" && pos == Pos::Predicate => "a",
-        [(Token::Word(w), _)] if (w == "true" || w == "false") && literal_ok => "boolean",
-        [(Token::Str { datatype, .. }, _)] if literal_ok => match datatype.as_deref() {
-            None | Some(Token::Iri(_)) => "literal",
-            Some(_) => {
-                return fail(
+    let kind =
+        match toks.as_slice() {
+            [(Token::Var(v), _)] => {
+                return Ok(CheckedTerm {
+                    var: Some(v.clone()),
+                })
+            }
+            [(Token::Iri(_), _)] => return Ok(CheckedTerm { var: None }),
+            [(Token::Blank(_), _)] if matches!(pos, Pos::Subject | Pos::Object) => "blank",
+            [(Token::Word(w), _)] if w == "a" && pos == Pos::Predicate => "a",
+            [(Token::Word(w), _)] if (w == "true" || w == "false") && literal_ok => "boolean",
+            [(Token::Str { datatype, .. }, _)] if literal_ok => match datatype.as_deref() {
+                None | Some(Token::Iri(_)) => "literal",
+                Some(_) => return fail(
                     "uses a prefixed datatype name; a rule has no PREFIX declarations, write the \
                      full <IRI>"
                         .to_string(),
+                ),
+            },
+            [(t, _)] if numeric(t) && literal_ok => "number",
+            [(Token::Plus | Token::Minus, a), (t, b)]
+                if numeric(t) && literal_ok && a.end == b.start =>
+            {
+                "number"
+            }
+            [(Token::PName(..), _)] => {
+                return fail(
+                    "is a prefixed name; a rule has no PREFIX declarations, write the full <IRI>"
+                        .to_string(),
                 )
             }
-        },
-        [(t, _)] if numeric(t) && literal_ok => "number",
-        [(Token::Plus | Token::Minus, a), (t, b)] if numeric(t) && literal_ok && a.end == b.start => {
-            "number"
-        }
-        [(Token::PName(..), _)] => {
-            return fail(
-                "is a prefixed name; a rule has no PREFIX declarations, write the full <IRI>"
-                    .to_string(),
-            )
-        }
-        [] => return Err(format!("{what} is empty")),
-        [_] => "",
-        _ => return fail("is not a single SPARQL term".to_string()),
-    };
+            [] => return Err(format!("{what} is empty")),
+            [_] => "",
+            _ => return fail("is not a single SPARQL term".to_string()),
+        };
     if kind.is_empty() {
         let allowed = match pos {
             Pos::Subject => "a variable, an <IRI> or a _:blank node",
@@ -497,7 +509,9 @@ fn check_filter(f: &str) -> Result<(), String> {
         return Err("the filter is empty".to_string());
     }
     if f.len() > MAX_FILTER_BYTES {
-        return Err(format!("the filter is longer than {MAX_FILTER_BYTES} bytes"));
+        return Err(format!(
+            "the filter is longer than {MAX_FILTER_BYTES} bytes"
+        ));
     }
     if f.chars()
         .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
@@ -631,7 +645,15 @@ mod tests {
             assert!(err.contains("pattern 1"), "{err}");
         }
         // Literals, numbers and booleans are objects.
-        for o in ["\"v\"", "\"v\"@en", "\"1\"^^<http://www.w3.org/2001/XMLSchema#int>", "12", "-1.5", "true", "_:b"] {
+        for o in [
+            "\"v\"",
+            "\"v\"@en",
+            "\"1\"^^<http://www.w3.org/2001/XMLSchema#int>",
+            "12",
+            "-1.5",
+            "true",
+            "_:b",
+        ] {
             let r = rule(&with_pattern("?x", "<p>", o));
             assert!(r.is_ok(), "{o}: {r:?}");
         }
@@ -649,8 +671,14 @@ mod tests {
         let unbound = rule(&base(r#"{"source":"?x","target":"?zz","label":"L"}"#)).unwrap_err();
         assert!(unbound.contains("?zz"), "{unbound}");
         assert!(rule(&base(r#"{"source":"","target":"?y","label":"L"}"#)).is_err());
-        assert!(rule(&base(r#"{"source":"?x","label":"L"}"#)).is_err(), "no target");
-        assert!(rule(&base(r#"{"source":"?x","target":"?y"}"#)).is_err(), "no label");
+        assert!(
+            rule(&base(r#"{"source":"?x","label":"L"}"#)).is_err(),
+            "no target"
+        );
+        assert!(
+            rule(&base(r#"{"source":"?x","target":"?y"}"#)).is_err(),
+            "no label"
+        );
         for label in ["a b", "a>b", "a>  <x", "x}", "\"", "a\nb"] {
             let ret = format!(
                 r#"{{"source":"?x","target":"?y","label":{}}}"#,

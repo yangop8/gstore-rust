@@ -213,13 +213,19 @@ mod tests {
         let w = format!(
             "{{ ?x  <母亲> ?y. ?y  <父亲> ?z. ?k <父亲> ?z. ?k <性别> \"男\"^^<{XSD_STRING}>.}}"
         );
-        assert_eq!(c.insert_sparql, format!("insert {{ ?x <Rule:舅舅> ?k. }} where {w}"));
+        assert_eq!(
+            c.insert_sparql,
+            format!("insert {{ ?x <Rule:舅舅> ?k. }} where {w}")
+        );
         assert_eq!(c.delete_sparql, "delete where {?x <Rule:舅舅> ?y.}");
         assert_eq!(
             c.select_sparql,
             "select ?s ?p ?o where { bind(<Rule:舅舅> as ?p). ?s <Rule:舅舅> ?o. }"
         );
-        assert_eq!(c.check_sparql, format!("select (count(*) as ?result) where {w}"));
+        assert_eq!(
+            c.check_sparql,
+            format!("select (count(*) as ?result) where {w}")
+        );
     }
 
     /// Upstream `API_USAGE.md`'s property example.
@@ -237,15 +243,24 @@ mod tests {
         let v = format!("\"孤儿\"^^<{XSD_STRING}>");
         let d = format!("\"去世\"^^<{XSD_STRING}>");
         let w = format!("{{ ?x  <父亲> ?y. ?x <母亲> ?z. ?y <状态> {d}. ?z <状态> {d}.}}");
-        assert_eq!(c.insert_sparql, format!("insert {{?x <Rule:状态> {v}. }} where {w}"));
-        assert_eq!(c.delete_sparql, format!("delete where {{?x <Rule:状态> {v}.}}"));
+        assert_eq!(
+            c.insert_sparql,
+            format!("insert {{?x <Rule:状态> {v}. }} where {w}")
+        );
+        assert_eq!(
+            c.delete_sparql,
+            format!("delete where {{?x <Rule:状态> {v}.}}")
+        );
         assert_eq!(
             c.select_sparql,
             format!(
                 "select ?s ?p ?o where {{ bind(<Rule:状态> as ?p). bind({v} as ?o). ?s <Rule:状态> {v}. }}"
             )
         );
-        assert_eq!(c.check_sparql, format!("select (count(*) as ?result) where {w}"));
+        assert_eq!(
+            c.check_sparql,
+            format!("select (count(*) as ?result) where {w}")
+        );
     }
 
     #[test]

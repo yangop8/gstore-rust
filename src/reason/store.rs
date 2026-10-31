@@ -168,7 +168,9 @@ impl<'a> RuleStore<'a> {
     }
 
     fn ledger_file(db_dir: &Path, name: &str) -> PathBuf {
-        Self::rule_dir(db_dir).join(LEDGER_DIR).join(format!("{name}.nt"))
+        Self::rule_dir(db_dir)
+            .join(LEDGER_DIR)
+            .join(format!("{name}.nt"))
     }
 
     /// The path a rule's file is shown as in messages (upstream prints
@@ -401,7 +403,10 @@ impl<'a> RuleStore<'a> {
 /// which carry a database's rules like upstream's whole-directory copies do.
 pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> {
     let (src, dst) = (src_db_dir.join(RULE_DIR), dst_db_dir.join(RULE_DIR));
-    if fs::canonicalize(&src).ok().is_some_and(|s| fs::canonicalize(&dst).ok() == Some(s)) {
+    if fs::canonicalize(&src)
+        .ok()
+        .is_some_and(|s| fs::canonicalize(&dst).ok() == Some(s))
+    {
         return Ok(());
     }
     fsutil::remove_dir_if_exists(&dst)?;
@@ -446,7 +451,10 @@ pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<(
             text.push_str(l);
             text.push('\n');
         }
-        fsutil::atomic_write(&dir.join(LEDGER_DIR).join(format!("{name}.nt")), text.as_bytes())?;
+        fsutil::atomic_write(
+            &dir.join(LEDGER_DIR).join(format!("{name}.nt")),
+            text.as_bytes(),
+        )?;
     }
     Ok(())
 }

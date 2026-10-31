@@ -309,7 +309,11 @@ pub fn compiled_statement(
 /// `createtime`. The rule is validated (and compiled, to be sure it can be)
 /// first; client-supplied compiled fields are dropped. Refused when the name
 /// exists or the database holds [`MAX_RULES_PER_DB`] rules.
-pub fn add(store: &mut RuleStore<'_>, ruleinfo: &Json, createtime: &str) -> Result<Added, ReasonError> {
+pub fn add(
+    store: &mut RuleStore<'_>,
+    ruleinfo: &Json,
+    createtime: &str,
+) -> Result<Added, ReasonError> {
     let fail = |m: String| failed(format!("Add Reason Rule Fail. {m}"));
     if ruleinfo.as_object().is_none() {
         return Err(fail("the rule information must be a JSON object".into()));
@@ -555,7 +559,12 @@ pub fn check(
         return Err(failed(STALE));
     }
     let effect_num = match read(&compiled.check_sparql).map_err(|e| failed(e.to_string()))? {
-        QueryResult::Select(rs) => count_of(rs.rows.first().and_then(|r| r.first()).and_then(|c| c.as_deref())),
+        QueryResult::Select(rs) => count_of(
+            rs.rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|c| c.as_deref()),
+        ),
         _ => 0,
     };
     let executed = is_executed(&doc, store.ledger(name)?.as_ref());

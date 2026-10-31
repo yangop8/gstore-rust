@@ -349,7 +349,10 @@ fn relation_rule_full_lifecycle() {
     assert_eq!(msg(&j), "ok");
     let insert = format!("insert {{ ?x <Rule:舅舅> ?k. }} where {}", uncle_where());
     assert_eq!(string(&j, "insert_sparql"), insert);
-    assert_eq!(string(&j, "delete_sparql"), "delete where {?x <Rule:舅舅> ?y.}");
+    assert_eq!(
+        string(&j, "delete_sparql"),
+        "delete where {?x <Rule:舅舅> ?y.}"
+    );
     assert_eq!(
         string(&j, "check_sparql"),
         format!("select (count(*) as ?result) where {}", uncle_where())
@@ -399,8 +402,16 @@ fn relation_rule_full_lifecycle() {
     assert_eq!(int(&j, "AnsNum"), 0);
 
     // An executed rule can be neither deleted nor recompiled.
-    fails(&reason(a, "fam", "7", "舅舅"), 1005, "该规则已经执行，请先让该规则失效后再执行");
-    fails(&reason(a, "fam", "3", "舅舅"), 1005, "该规则已经执行，请先让该规则失效后再执行");
+    fails(
+        &reason(a, "fam", "7", "舅舅"),
+        1005,
+        "该规则已经执行，请先让该规则失效后再执行",
+    );
+    fails(
+        &reason(a, "fam", "3", "舅舅"),
+        1005,
+        "该规则已经执行，请先让该规则失效后再执行",
+    );
     // A check keeps it executed.
     ok(&reason(a, "fam", "8", "舅舅"));
     let info = reason(a, "fam", "6", "舅舅");
@@ -410,7 +421,10 @@ fn relation_rule_full_lifecycle() {
     let j = reason(a, "fam", "5", "舅舅");
     ok(&j);
     assert_eq!(int(&j, "AnsNum"), 1);
-    assert_eq!(string(&j, "delete_sparql"), "delete where {?x <Rule:舅舅> ?y.}");
+    assert_eq!(
+        string(&j, "delete_sparql"),
+        "delete where {?x <Rule:舅舅> ?y.}"
+    );
     assert!(!ask(a, "fam", "<张三> <Rule:舅舅> <李四>"));
     let info = reason(a, "fam", "6", "舅舅");
     assert_eq!(string(info.get("ruleinfo").unwrap(), "status"), "已失效");
@@ -433,7 +447,10 @@ fn relation_rule_full_lifecycle() {
     let j = reason(a, "fam", "2", "");
     ok(&j);
     assert_eq!(int(&j, "num"), 0);
-    assert_eq!(j.get("list").and_then(Json::as_array).map(<[Json]>::len), Some(0));
+    assert_eq!(
+        j.get("list").and_then(Json::as_array).map(<[Json]>::len),
+        Some(0)
+    );
 }
 
 #[test]
@@ -570,7 +587,11 @@ fn disable_retracts_exactly_the_inferred_triples() {
     assert_eq!(int(&j, "effectNum"), 2);
     let j = reason(a, "fam", "4", "舅舅");
     ok(&j);
-    assert_eq!(int(&j, "AnsNum"), 1, "王五 <Rule:舅舅> 某人 existed already");
+    assert_eq!(
+        int(&j, "AnsNum"),
+        1,
+        "王五 <Rule:舅舅> 某人 existed already"
+    );
     assert_eq!(triple_count(a, "fam"), before + 1);
     let j = reason(a, "fam", "5", "舅舅");
     ok(&j);
@@ -647,18 +668,42 @@ fn parameters_and_lifecycle_refusals() {
         1003,
         "the value of type can not be empty!",
     );
-    fails(&reason(a, "fam", "9", "x"), 1003, "The operation is not support.");
-    fails(&reason(a, "fam", "0", "x"), 1003, "The operation is not support.");
+    fails(
+        &reason(a, "fam", "9", "x"),
+        1003,
+        "The operation is not support.",
+    );
+    fails(
+        &reason(a, "fam", "0", "x"),
+        1003,
+        "The operation is not support.",
+    );
     // db_name
-    fails(&reason(a, "", "2", ""), 1003, "the value of db_name can not be empty!");
+    fails(
+        &reason(a, "", "2", ""),
+        1003,
+        "the value of db_name can not be empty!",
+    );
     fails(&reason(a, "system", "2", ""), 1003, "system database");
-    fails(&reason(a, "nodb", "2", ""), 1005, "database[nodb] does not exist");
-    fails(&reason(a, "nodb", "4", "x"), 1005, "the reason file is not exist");
+    fails(
+        &reason(a, "nodb", "2", ""),
+        1005,
+        "database[nodb] does not exist",
+    );
+    fails(
+        &reason(a, "nodb", "4", "x"),
+        1005,
+        "the reason file is not exist",
+    );
     // add
     fails(
         &api(
             a,
-            &[("operation", "reasonManage"), ("db_name", "fam"), ("type", "1")],
+            &[
+                ("operation", "reasonManage"),
+                ("db_name", "fam"),
+                ("type", "1"),
+            ],
         ),
         1003,
         "the data has not the rule information",
@@ -690,12 +735,24 @@ fn parameters_and_lifecycle_refusals() {
     );
     // Missing rules.
     for ty in ["3", "4", "5", "8"] {
-        fails(&reason(a, "fam", ty, "nope"), 1005, "the reason file is not exist");
+        fails(
+            &reason(a, "fam", ty, "nope"),
+            1005,
+            "the reason file is not exist",
+        );
     }
     for ty in ["6", "7"] {
-        fails(&reason(a, "fam", ty, "nope"), 1005, "the reason file is not exists");
+        fails(
+            &reason(a, "fam", ty, "nope"),
+            1005,
+            "the reason file is not exists",
+        );
     }
-    fails(&reason(a, "fam", "3", ""), 1003, "the value of rulename can not be empty!");
+    fails(
+        &reason(a, "fam", "3", ""),
+        1003,
+        "the value of rulename can not be empty!",
+    );
     // Not compiled yet.
     for ty in ["4", "5", "8"] {
         fails(
@@ -708,7 +765,10 @@ fn parameters_and_lifecycle_refusals() {
     // Edited after compiling: refused until compiled again.
     let path = srv.rule_file("fam", "舅舅");
     let mut doc = json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
-    doc.set("return", json::parse(r#"{"source":"?k","target":"?x","label":"外甥"}"#).unwrap());
+    doc.set(
+        "return",
+        json::parse(r#"{"source":"?k","target":"?x","label":"外甥"}"#).unwrap(),
+    );
     fs::write(&path, doc.sorted().to_string()).unwrap();
     fails(&reason(a, "fam", "4", "舅舅"), 1005, "compile it again");
     ok(&reason(a, "fam", "3", "舅舅"));
@@ -718,8 +778,16 @@ fn parameters_and_lifecycle_refusals() {
     ok(&reason(a, "fam", "5", "舅舅"));
     // A rule file that is not JSON.
     fs::write(srv.rule_file("fam", "broken"), "{not json").unwrap();
-    fails(&reason(a, "fam", "3", "broken"), 1005, "the reason file is not fit the json format");
-    fails(&reason(a, "fam", "6", "broken"), 1005, "pasrse ruleinfo error:{not json");
+    fails(
+        &reason(a, "fam", "3", "broken"),
+        1005,
+        "the reason file is not fit the json format",
+    );
+    fails(
+        &reason(a, "fam", "6", "broken"),
+        1005,
+        "pasrse ruleinfo error:{not json",
+    );
     fails(&reason(a, "fam", "2", ""), 1005, "pasrse rulefiles error:[");
     // A broken rule that is not executed can be deleted.
     ok(&reason(a, "fam", "7", "broken"));
@@ -728,7 +796,11 @@ fn parameters_and_lifecycle_refusals() {
     // Execute / disable / check need the database loaded.
     ok(&api(a, &[("operation", "unload"), ("db_name", "fam")]));
     for ty in ["4", "5", "8"] {
-        fails(&reason(a, "fam", ty, "舅舅"), 1005, "database[fam] is not loaded yet");
+        fails(
+            &reason(a, "fam", ty, "舅舅"),
+            1005,
+            "database[fam] is not loaded yet",
+        );
     }
     // The file operations do not.
     ok(&reason(a, "fam", "2", ""));
@@ -789,7 +861,11 @@ fn lenient_parameter_forms() {
     let info = info.get("ruleinfo").unwrap();
     assert!(info.get("insert_sparql").is_none(), "{info}");
     assert_eq!(string(info, "status"), "新建");
-    fails(&reason(a, "fam", "4", "spoof"), 1005, "The sparql of the reason rule is not exist!");
+    fails(
+        &reason(a, "fam", "4", "spoof"),
+        1005,
+        "The sparql of the reason rule is not exist!",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -802,8 +878,20 @@ fn rule_names_cannot_escape_the_rule_directory() {
     let a = &srv.addr;
     family_db(&srv, "fam");
     let long = "x".repeat(200);
-    for name in ["../evil", "a/b", "a\\b", "..", ".hidden", "a\u{0}b", "a\nb", long.as_str()] {
-        let rule = UNCLE.replace("\"rulename\": \"舅舅\"", &format!("\"rulename\": {}", json::quote(name)));
+    for name in [
+        "../evil",
+        "a/b",
+        "a\\b",
+        "..",
+        ".hidden",
+        "a\u{0}b",
+        "a\nb",
+        long.as_str(),
+    ] {
+        let rule = UNCLE.replace(
+            "\"rulename\": \"舅舅\"",
+            &format!("\"rulename\": {}", json::quote(name)),
+        );
         fails(&add_rule(a, "fam", &rule), 1003, "rule");
         for ty in ["3", "4", "6", "7"] {
             fails(&reason(a, "fam", ty, name), 1003, "rule");
@@ -1041,6 +1129,47 @@ fn drop_removes_the_rules_and_backup_restore_carries_them() {
     assert_eq!(int(&j, "num"), 0);
 }
 
+/// A database the REST layer created in memory (`POST /upload` into a new
+/// name: it has no home directory of its own) keeps its rules in the
+/// directory it is served from, and its backups carry them.
+#[test]
+fn a_database_created_by_rest_upload_keeps_rules_in_its_directory() {
+    let srv = start("restup");
+    let a = &srv.addr;
+    let body = "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n";
+    let mut s = TcpStream::connect(a).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let req = format!(
+        "POST /upload?db_name=updb&format=ntriples HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Authorization: Basic cm9vdDpyb290\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let rule = r#"{"rulename":"next2","type":1,"logic":1,"conditions":[{"patterns":[
+        {"subject":"?x","predicate":"<http://ex/p>","object":"?y"},
+        {"subject":"?y","predicate":"<http://ex/p>","object":"?z"}]}],
+        "return":{"source":"?x","target":"?z","label":"next2"}}"#;
+    ok(&add_rule(a, "updb", rule));
+    ok(&reason(a, "updb", "3", "next2"));
+    assert_eq!(int(&reason(a, "updb", "4", "next2"), "AnsNum"), 1);
+    assert!(srv.rule_file("updb", "next2").is_file());
+    assert!(ask(a, "updb", "<http://ex/a> <Rule:next2> <http://ex/c>"));
+    let j = api(a, &[("operation", "backup"), ("db_name", "updb")]);
+    ok(&j);
+    let backup = fs::read_dir(srv.root.join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .expect("the backup directory");
+    assert!(backup
+        .join("reason_rule_files")
+        .join("next2.json")
+        .is_file());
+}
+
 // ---------------------------------------------------------------------------
 // Query cache
 // ---------------------------------------------------------------------------
@@ -1124,10 +1253,7 @@ fn a_database_without_a_directory_keeps_its_rules_in_memory() {
         .unwrap()
         .rows
         .is_empty());
-    assert_eq!(
-        string(&db.reason_show("舅舅").unwrap(), "status"),
-        "已失效"
-    );
+    assert_eq!(string(&db.reason_show("舅舅").unwrap(), "status"), "已失效");
     // A backup writes the in-memory rules out.
     let dir = tmp_root("membk");
     let bk = dir.join("bk");
