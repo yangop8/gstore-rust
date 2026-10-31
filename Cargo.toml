@@ -124,7 +124,7 @@ systemd service), the gconsole client and the command-line tools gbuild, \
 gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor and gnode."""
 section = "database"
 priority = "optional"
-depends = "$auto"
+depends = "$auto, adduser"
 conf-files = ["/etc/gstore/conf.ini"]
 maintainer-scripts = "packaging/debian/"
 assets = [
