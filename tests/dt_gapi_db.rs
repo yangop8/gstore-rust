@@ -1774,11 +1774,10 @@ fn a_loaded_database_is_locked_against_other_processes() {
         .unwrap();
     let stdin = child.stdin.take().unwrap();
     let mut first = String::new();
-    std::io::BufRead::read_line(
-        &mut std::io::BufReader::new(child.stdout.take().unwrap()),
-        &mut first,
-    )
-    .unwrap();
+    // Kept open until the end: a closed pipe would make the console's next
+    // write (its prompt) fail and the child exit, releasing the lock early.
+    let mut child_out = std::io::BufReader::new(child.stdout.take().unwrap());
+    std::io::BufRead::read_line(&mut child_out, &mut first).unwrap();
     assert!(first.starts_with("Loaded database 'lubm'"), "{first}");
     let j = api(a, &[("operation", "load"), ("db_name", "lubm")]);
     assert_eq!(code(&j), 1005, "{j}");
