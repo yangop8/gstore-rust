@@ -85,6 +85,23 @@
 //! forbids or an invalid lexical form is an expression error, i.e. unbound);
 //! or a user function registered on the [`Database`](crate::Database) under
 //! the full IRI or its local name. Any other IRI call is a query error.
+//!
+//! # SPARQL 1.1 details
+//!
+//! * `IN` / `NOT IN` follow §17.4.1.9-10: `=` on each member, where two
+//!   terms that are not both literals are simply unequal (RDFterm-equal) and
+//!   two incomparable literals are a type error; an error only counts when
+//!   no member is equal (see `eval_in`).
+//! * A trailing `VALUES` block ([`SelectQuery::values`]) joins the WHERE
+//!   solutions of a query without grouping; after GROUP BY / aggregation it
+//!   joins the aggregated rows on their projected names (a VALUES variable
+//!   that is not a result column only multiplies the rows), before ORDER BY.
+//! * A hidden blank-node variable ([`ANON_VAR_PREFIX`], from `[ … ]` /
+//!   `( … )`) never shows in `SELECT *` / `DESCRIBE *`; in a CONSTRUCT or
+//!   INSERT template, one the solution does not bind is a fresh blank node per
+//!   solution.
+//! * gStore's `CONTAINALL` / `CONTAINANY` test `xsd:list` literals (see
+//!   `eval_contain`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -3066,11 +3083,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 _ => return None,
             },
         };
-        let items = match self.eval_value(args.first()?, b, l)? {
-            v @ Value::Typed { .. } if xsd_list_text(&v).is_some() => {
-                split_xsd_list(xsd_list_text(&v)?, &sep)
-            }
-            v => vec![v.lexical()],
+        let first = self.eval_value(args.first()?, b, l)?;
+        let items = match xsd_list_text(&first) {
+            Some(text) => split_xsd_list(text, &sep),
+            None => vec![first.lexical()],
         };
         let list_value = self.eval_value(args.get(1)?, b, l)?;
         let list = split_xsd_list(xsd_list_text(&list_value)?, &sep);
@@ -3915,7 +3931,10 @@ fn xsd_list_text(v: &Value) -> Option<&str> {
 /// are separated by `sep` and trimmed of spaces; an empty last item (so also
 /// the only item of an empty list) is dropped, empty inner items are kept.
 fn split_xsd_list(text: &str, sep: &str) -> Vec<String> {
-    let mut items: Vec<String> = text.split(sep).map(|t| t.trim_matches(' ').to_string()).collect();
+    let mut items: Vec<String> = text
+        .split(sep)
+        .map(|t| t.trim_matches(' ').to_string())
+        .collect();
     if items.last().is_some_and(String::is_empty) {
         items.pop();
     }

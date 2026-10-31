@@ -445,11 +445,19 @@ impl Lexer {
                 } else {
                     break;
                 }
-            } else if c == 'e' || c == 'E' {
+            } else if (c == 'e' || c == 'E') && !is_double {
+                // EXPONENT ::= [eE] [+-]? [0-9]+ — the digits are required.
+                let signed = matches!(self.peek2(), Some('+') | Some('-'));
+                let digit_at = self.pos + 1 + usize::from(signed);
+                if !self.chars.get(digit_at).is_some_and(|d| d.is_ascii_digit()) {
+                    return Err(self.err(format!(
+                        "malformed number '{s}{c}…': an exponent needs digits, e.g. {s}e3"
+                    )));
+                }
                 is_double = true;
                 s.push(c);
                 self.pos += 1;
-                if matches!(self.peek(), Some('+') | Some('-')) {
+                if signed {
                     s.push(self.bump().unwrap());
                 }
             } else {
@@ -619,6 +627,39 @@ mod tests {
         let t = lex("foaf:knows .");
         assert_eq!(t[0], Token::PName("foaf".into(), "knows".into()));
         assert_eq!(t[1], Token::Dot);
+    }
+
+    #[test]
+    fn pname_local_escapes_colons_and_percent() {
+        let pn = |p: &str, l: &str| Token::PName(p.into(), l.into());
+        assert_eq!(lex("ex:a\\-b\\~c")[0], pn("ex", "a-b~c"));
+        assert_eq!(lex("ex:a:b:")[0], pn("ex", "a:b:"));
+        assert_eq!(lex("ex:x%20y")[0], pn("ex", "x%20y"));
+        // An escaped trailing '.' stays; an unescaped one is the next token.
+        assert_eq!(lex("ex:o\\.")[0], pn("ex", "o."));
+        let t = lex("ex:a.b.");
+        assert_eq!(t[0], pn("ex", "a.b"));
+        assert_eq!(t[1], Token::Dot);
+        // '-' and '.' inside a prefix, only when ':' follows.
+        assert_eq!(lex("my-ns.v2:x")[0], pn("my-ns.v2", "x"));
+        let t = lex("true.");
+        assert_eq!(t[0], Token::Word("true".into()));
+        assert_eq!(t[1], Token::Dot);
+        assert!(tokenize("ex:a%2").is_err());
+        assert!(tokenize("ex:a\\q").is_err());
+    }
+
+    #[test]
+    fn exponent_needs_digits_and_blank_labels_drop_a_trailing_dot() {
+        assert_eq!(lex("1e-3")[0], Token::Double("1e-3".into()));
+        assert_eq!(lex(".5E+2")[0], Token::Double(".5E+2".into()));
+        let e = tokenize("1e").unwrap_err().to_string();
+        assert!(e.contains("exponent needs digits"), "{e}");
+        assert!(tokenize("2e+x").is_err());
+        let t = lex("_:b1.");
+        assert_eq!(t[0], Token::Blank("b1".into()));
+        assert_eq!(t[1], Token::Dot);
+        assert_eq!(lex("_:a.b")[0], Token::Blank("a.b".into()));
     }
 
     #[test]

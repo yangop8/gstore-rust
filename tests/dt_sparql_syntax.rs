@@ -174,9 +174,7 @@ fn in_works_in_having_and_projection_and_binds_tighter_than_and() {
     );
     assert_eq!(rows(&mut db, &q), vec![vec![ex("d1"), int("2")]]);
     // `a IN (…) && b` parses as `(a IN (…)) && b`.
-    let q = format!(
-        "{P} SELECT ?p WHERE {{ ?p :age ?a FILTER(?a IN (25, 30) && ?a > 26) }}"
-    );
+    let q = format!("{P} SELECT ?p WHERE {{ ?p :age ?a FILTER(?a IN (25, 30) && ?a > 26) }}");
     assert_eq!(col0(&mut db, &q), vec![ex("alice")]);
     match parse("SELECT * WHERE { ?s ?p ?o FILTER(?o NOT IN (1)) }").unwrap() {
         Query::Select(s) => match &s.pattern {
@@ -206,26 +204,53 @@ fn in_syntax_errors_are_explained() {
 #[test]
 fn signed_numbers_and_booleans_match_in_triple_patterns() {
     let mut db = db();
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -5 }}")), vec![ex("alice")]);
     assert_eq!(
-        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -1.5e3 }}")),
+        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -5 }}")),
+        vec![ex("alice")]
+    );
+    assert_eq!(
+        col0(
+            &mut db,
+            &format!("{P} SELECT ?p WHERE {{ ?p :temp -1.5e3 }}")
+        ),
         vec![ex("carol")]
     );
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :ok true }}")), vec![ex("alice")]);
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :ok FALSE }}")), vec![ex("bob")]);
+    assert_eq!(
+        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :ok true }}")),
+        vec![ex("alice")]
+    );
+    assert_eq!(
+        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :ok FALSE }}")),
+        vec![ex("bob")]
+    );
     // A term in subject position too (no match, but it parses and evaluates).
     assert!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ -5 ?p ?o }}")).is_empty());
     // Graph matching is by term: `+7` is not the stored `7`.
     assert!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp +7 }}")).is_empty());
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp 7 }}")), vec![ex("bob")]);
+    assert_eq!(
+        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp 7 }}")),
+        vec![ex("bob")]
+    );
     match parse("SELECT * WHERE { ?s ?p -1.5e3, +2, -.5, true }").unwrap() {
         Query::Select(s) => match &s.pattern {
             GraphPattern::Bgp(tps) => {
                 let objs: Vec<String> = tps.iter().map(|t| format!("{:?}", t.object)).collect();
-                assert!(objs[0].contains("\"-1.5e3\"") && objs[0].contains("double"), "{objs:?}");
-                assert!(objs[1].contains("\"+2\"") && objs[1].contains("integer"), "{objs:?}");
-                assert!(objs[2].contains("\"-.5\"") && objs[2].contains("decimal"), "{objs:?}");
-                assert!(objs[3].contains("\"true\"") && objs[3].contains("boolean"), "{objs:?}");
+                assert!(
+                    objs[0].contains("\"-1.5e3\"") && objs[0].contains("double"),
+                    "{objs:?}"
+                );
+                assert!(
+                    objs[1].contains("\"+2\"") && objs[1].contains("integer"),
+                    "{objs:?}"
+                );
+                assert!(
+                    objs[2].contains("\"-.5\"") && objs[2].contains("decimal"),
+                    "{objs:?}"
+                );
+                assert!(
+                    objs[3].contains("\"true\"") && objs[3].contains("boolean"),
+                    "{objs:?}"
+                );
             }
             other => panic!("{other:?}"),
         },
@@ -251,17 +276,39 @@ fn signed_numbers_and_booleans_in_values_blocks() {
 #[test]
 fn signed_numbers_and_booleans_in_data_blocks() {
     let mut db = db();
-    let n = update(&mut db, &format!("{P} INSERT DATA {{ :dave :temp -40 ; :ok true ; :d -0.5 }}"));
+    let n = update(
+        &mut db,
+        &format!("{P} INSERT DATA {{ :dave :temp -40 ; :ok true ; :d -0.5 }}"),
+    );
     assert_eq!(n, 3);
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -40 }}")), vec![ex("dave")]);
+    assert_eq!(
+        col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -40 }}")),
+        vec![ex("dave")]
+    );
     let got = rows(&mut db, &format!("{P} SELECT ?o WHERE {{ :dave :d ?o }}"));
     assert_eq!(got, vec![vec![format!("\"-0.5\"^^<{XSD}decimal>")]]);
     // Arithmetic sees the sign.
     let q = format!("{P} SELECT ?p WHERE {{ ?p :temp ?t FILTER(?t < -10) }}");
     assert_eq!(col0(&mut db, &q), vec![ex("carol"), ex("dave")]);
-    let n = update(&mut db, &format!("{P} DELETE DATA {{ :dave :temp -40 . :dave :ok true }}"));
+    let n = update(
+        &mut db,
+        &format!("{P} DELETE DATA {{ :dave :temp -40 . :dave :ok true }}"),
+    );
     assert_eq!(n, 2);
     assert!(col0(&mut db, &format!("{P} SELECT ?p WHERE {{ ?p :temp -40 }}")).is_empty());
+}
+
+#[test]
+fn plus_after_a_predicate_is_a_path_modifier_only_when_not_a_signed_number() {
+    let is_path = |q: &str| match parse(q).unwrap() {
+        Query::Select(s) => matches!(s.pattern, GraphPattern::Path(_)),
+        other => panic!("{other:?}"),
+    };
+    assert!(is_path("SELECT * WHERE { ?s <http://p>+ ?o }"));
+    assert!(is_path("SELECT * WHERE { ?s <http://p>+?o }"));
+    assert!(!is_path("SELECT * WHERE { ?s <http://p> +7 }"));
+    assert!(!is_path("SELECT * WHERE { ?s <http://p>+7 }"));
+    assert!(is_path("SELECT * WHERE { ?s <http://p>+ 7 }"));
 }
 
 #[test]
@@ -307,12 +354,15 @@ fn containall_and_containany_follow_upstream() {
     let q = format!("{P} SELECT ?s WHERE {{ ?s :tags ?t ; :need ?n FILTER(CONTAINANY(?n, ?t)) }}");
     assert_eq!(col0(&mut db, &q), vec![ex("a")]);
     // A custom separator (third argument).
-    let q = format!(
-        "{P} SELECT ?s WHERE {{ ?s :tags ?t FILTER(CONTAINANY(\"yellow\", ?t, \";\")) }}"
-    );
+    let q =
+        format!("{P} SELECT ?s WHERE {{ ?s :tags ?t FILTER(CONTAINANY(\"yellow\", ?t, \";\")) }}");
     assert_eq!(col0(&mut db, &q), vec![ex("b")]);
     let q = format!("{P} SELECT ?s WHERE {{ ?s :tags ?t FILTER(containall(\"red\", ?t)) }}");
-    assert_eq!(col0(&mut db, &q), vec![ex("a")], "',' does not split :b's ';' list");
+    assert_eq!(
+        col0(&mut db, &q),
+        vec![ex("a")],
+        "',' does not split :b's ';' list"
+    );
     // An IRI item is its IRI string; an empty list contains nothing.
     let cases = [
         ("CONTAINALL(<http://x>, \"http://x,y\"^^xsd:list)", "true"),
@@ -353,7 +403,11 @@ fn order_by_bare_builtin_and_function_calls() {
     let q = format!("{P} SELECT ?n WHERE {{ ?p :name ?n }} ORDER BY STRLEN(?n) DESC(?n)");
     assert_eq!(
         ordered(&mut db, &q),
-        vec![vec!["\"Bob\"".to_string()], vec!["\"Carol\"".into()], vec!["\"Alice\"".into()]]
+        vec![
+            vec!["\"Bob\"".to_string()],
+            vec!["\"Carol\"".into()],
+            vec!["\"Alice\"".into()]
+        ]
     );
     let q = format!(
         "{P} SELECT ?p WHERE {{ ?p :age ?a ; :name ?n }} ORDER BY xsd:string(?a) STRLEN(?n)"
@@ -366,11 +420,12 @@ fn order_by_bare_builtin_and_function_calls() {
     let q = format!(
         "{P} SELECT ?p WHERE {{ ?p :age ?a ; :temp ?t }} ORDER BY ABS(?t) ?p DESC(?a) LIMIT 2"
     );
-    assert_eq!(ordered(&mut db, &q), vec![vec![ex("alice")], vec![ex("bob")]]);
-    // A bare aggregate as the key of a grouped query.
-    let q = format!(
-        "{P} SELECT ?d WHERE {{ ?p :dept ?d }} GROUP BY ?d ORDER BY DESC(COUNT(?p))"
+    assert_eq!(
+        ordered(&mut db, &q),
+        vec![vec![ex("alice")], vec![ex("bob")]]
     );
+    // A bare aggregate as the key of a grouped query.
+    let q = format!("{P} SELECT ?d WHERE {{ ?p :dept ?d }} GROUP BY ?d ORDER BY DESC(COUNT(?p))");
     assert_eq!(ordered(&mut db, &q), vec![vec![ex("d1")], vec![ex("d2")]]);
 }
 
@@ -389,7 +444,10 @@ fn order_by_errors() {
 #[test]
 fn construct_where_short_form_returns_the_matched_triples() {
     let mut db = db();
-    let got = construct(&mut db, &format!("{P} CONSTRUCT WHERE {{ ?p :knows ?k . ?k :age ?a }}"));
+    let got = construct(
+        &mut db,
+        &format!("{P} CONSTRUCT WHERE {{ ?p :knows ?k . ?k :age ?a }}"),
+    );
     let want = vec![
         format!("{} {} {} .", ex("alice"), ex("knows"), ex("bob")),
         format!("{} {} {} .", ex("bob"), ex("age"), int("25")),
@@ -417,7 +475,15 @@ fn construct_where_short_form_returns_the_matched_triples() {
 #[test]
 fn construct_where_short_form_rejects_non_bgp_patterns() {
     let m = parse_err("CONSTRUCT WHERE { ?s ?p ?o FILTER(?o > 1) }");
-    assert_contains(&m, &["CONSTRUCT WHERE", "only triple patterns", "FILTER", "CONSTRUCT { template }"]);
+    assert_contains(
+        &m,
+        &[
+            "CONSTRUCT WHERE",
+            "only triple patterns",
+            "FILTER",
+            "CONSTRUCT { template }",
+        ],
+    );
     let m = parse_err("CONSTRUCT WHERE { ?s ?p ?o OPTIONAL { ?o ?q ?r } }");
     assert_contains(&m, &["only triple patterns", "OPTIONAL"]);
     let m = parse_err("CONSTRUCT WHERE { { ?s ?p ?o } }");
@@ -435,7 +501,8 @@ fn construct_where_short_form_rejects_non_bgp_patterns() {
 #[test]
 fn having_with_several_constraints_requires_all() {
     let mut db = db();
-    let base = format!("{P} SELECT ?d (SUM(?s) AS ?t) WHERE {{ ?p :dept ?d ; :salary ?s }} GROUP BY ?d");
+    let base =
+        format!("{P} SELECT ?d (SUM(?s) AS ?t) WHERE {{ ?p :dept ?d ; :salary ?s }} GROUP BY ?d");
     // d1: 2 people, 300; d2: 1 person, 50.
     let q = format!("{base} HAVING (COUNT(?p) > 1) (SUM(?s) < 1000)");
     assert_eq!(rows(&mut db, &q), vec![vec![ex("d1"), int("300")]]);
@@ -464,14 +531,21 @@ fn having_with_several_constraints_requires_all() {
 #[test]
 fn trailing_values_joins_select_results() {
     let mut db = db();
-    let q = format!("{P} SELECT ?p ?a WHERE {{ ?p :age ?a }} VALUES ?p {{ :alice :carol :nobody }}");
-    assert_eq!(rows(&mut db, &q), vec![vec![ex("alice"), int("30")], vec![ex("carol"), int("35")]]);
+    let q =
+        format!("{P} SELECT ?p ?a WHERE {{ ?p :age ?a }} VALUES ?p {{ :alice :carol :nobody }}");
+    assert_eq!(
+        rows(&mut db, &q),
+        vec![vec![ex("alice"), int("30")], vec![ex("carol"), int("35")]]
+    );
     // UNDEF matches anything; ORDER BY / LIMIT apply after the join.
     let q = format!(
         "{P} SELECT ?p WHERE {{ ?p :age ?a }} ORDER BY DESC(?a) LIMIT 2 \
          VALUES (?p ?a) {{ (:alice UNDEF) (UNDEF 25) (:bob 30) }}"
     );
-    assert_eq!(ordered(&mut db, &q), vec![vec![ex("alice")], vec![ex("bob")]]);
+    assert_eq!(
+        ordered(&mut db, &q),
+        vec![vec![ex("alice")], vec![ex("bob")]]
+    );
     // SELECT * includes the VALUES-only variables.
     let q = format!("{P} SELECT * WHERE {{ ?p :age 25 }} VALUES ?x {{ 1 2 }}");
     let rs = db.select(&q).unwrap();
@@ -509,13 +583,26 @@ fn trailing_values_after_grouping_joins_the_groups() {
 #[test]
 fn trailing_values_on_ask_construct_describe_and_subselect() {
     let mut db = db();
-    assert!(ask(&mut db, &format!("{P} ASK {{ ?p :age ?a }} VALUES ?a {{ 25 }}")));
-    assert!(!ask(&mut db, &format!("{P} ASK {{ ?p :age ?a }} VALUES ?a {{ 26 }}")));
+    assert!(ask(
+        &mut db,
+        &format!("{P} ASK {{ ?p :age ?a }} VALUES ?a {{ 25 }}")
+    ));
+    assert!(!ask(
+        &mut db,
+        &format!("{P} ASK {{ ?p :age ?a }} VALUES ?a {{ 26 }}")
+    ));
     let got = construct(
         &mut db,
         &format!("{P} CONSTRUCT {{ ?p :young true }} WHERE {{ ?p :age ?a }} VALUES ?a {{ 25 }}"),
     );
-    assert_eq!(got, vec![format!("{} {} \"true\"^^<{XSD}boolean> .", ex("bob"), ex("young"))]);
+    assert_eq!(
+        got,
+        vec![format!(
+            "{} {} \"true\"^^<{XSD}boolean> .",
+            ex("bob"),
+            ex("young")
+        )]
+    );
     let got = construct(&mut db, &format!("{P} DESCRIBE ?p VALUES ?p {{ :carol }}"));
     assert_eq!(got.len(), 5, "{got:?}");
     // A sub-SELECT's own VALUES clause.
@@ -553,7 +640,10 @@ fn blank_node_property_lists_in_patterns() {
     assert_eq!(col0(&mut db, &q), vec![ex("alice")]);
     // Subject position with `;` and `,`, plus a trailing property list.
     let q = format!("{P} SELECT ?n WHERE {{ [ :dept :d1 ; :name ?n ] :knows ?k . }}");
-    assert_eq!(col0(&mut db, &q), vec!["\"Alice\"".to_string(), "\"Bob\"".into()]);
+    assert_eq!(
+        col0(&mut db, &q),
+        vec!["\"Alice\"".to_string(), "\"Bob\"".into()]
+    );
     // Nested, and a property list as the whole statement.
     let q = format!("{P} SELECT ?n WHERE {{ [ :knows [ :knows [ :name ?n ] ] ] . }}");
     assert_eq!(col0(&mut db, &q), vec!["\"Carol\"".to_string()]);
@@ -568,13 +658,11 @@ fn blank_node_property_lists_in_patterns() {
 }
 
 fn list_data_db() -> Database {
-    let mut db = Database::build_from_str(
+    Database::build_from_str(
         "coll",
         "@prefix : <http://ex/> . :x :p ( 1 2 :z ) . :y :p () .",
     )
-    .expect("build");
-    let _ = &mut db;
-    db
+    .expect("build")
 }
 
 #[test]
@@ -583,9 +671,16 @@ fn collections_in_patterns() {
     // A collection pattern matches the rdf:first/rdf:rest chain.
     let q = format!("{P} SELECT ?s ?last WHERE {{ ?s :p ( 1 2 ?last ) }}");
     assert_eq!(rows(&mut db, &q), vec![vec![ex("x"), ex("z")]]);
-    assert!(col0(&mut db, &format!("{P} SELECT ?s WHERE {{ ?s :p ( 1 ?b ) }}")).is_empty());
+    assert!(col0(
+        &mut db,
+        &format!("{P} SELECT ?s WHERE {{ ?s :p ( 1 ?b ) }}")
+    )
+    .is_empty());
     // `()` is rdf:nil.
-    assert_eq!(col0(&mut db, &format!("{P} SELECT ?s WHERE {{ ?s :p () }}")), vec![ex("y")]);
+    assert_eq!(
+        col0(&mut db, &format!("{P} SELECT ?s WHERE {{ ?s :p () }}")),
+        vec![ex("y")]
+    );
     // A collection as the subject, standing alone.
     assert!(ask(&mut db, &format!("{P} ASK {{ ( 1 2 :z ) . }}")));
     assert!(!ask(&mut db, &format!("{P} ASK {{ ( 2 1 :z ) . }}")));
@@ -615,11 +710,20 @@ fn blank_nodes_and_collections_in_insert_data_are_fresh() {
     assert_eq!(n, 9);
     let q = format!("{P} SELECT ?c WHERE {{ :e :addr [ :city ?c ] }}");
     assert_eq!(col0(&mut db, &q), vec!["\"Paris\"".to_string()]);
-    assert!(ask(&mut db, &format!("{P} ASK {{ :e :list ( 1 [ :v 2 ] ) }}")));
+    assert!(ask(
+        &mut db,
+        &format!("{P} ASK {{ :e :list ( 1 [ :v 2 ] ) }}")
+    ));
     // Each INSERT DATA mints new blank nodes: the same text inserts again.
-    let n = update(&mut db, &format!("{P} INSERT DATA {{ :e :addr [ :city \"Paris\" ] }}"));
+    let n = update(
+        &mut db,
+        &format!("{P} INSERT DATA {{ :e :addr [ :city \"Paris\" ] }}"),
+    );
     assert_eq!(n, 2);
-    assert_eq!(rows(&mut db, &format!("{P} SELECT ?b WHERE {{ :e :addr ?b }}")).len(), 2);
+    assert_eq!(
+        rows(&mut db, &format!("{P} SELECT ?b WHERE {{ :e :addr ?b }}")).len(),
+        2
+    );
 }
 
 #[test]
@@ -639,13 +743,18 @@ fn blank_nodes_in_templates_are_fresh_per_solution() {
     // INSERT … WHERE with a template node and collection.
     let n = update(
         &mut db,
-        &format!("{P} INSERT {{ ?p :tags ( ?n ) }} WHERE {{ ?p :age ?a ; :name ?n FILTER(?a > 26) }}"),
+        &format!(
+            "{P} INSERT {{ ?p :tags ( ?n ) }} WHERE {{ ?p :age ?a ; :name ?n FILTER(?a > 26) }}"
+        ),
     );
     assert_eq!(n, 6);
     let q = format!("{P} SELECT ?p ?n WHERE {{ ?p :tags ( ?n ) }}");
     assert_eq!(
         rows(&mut db, &q),
-        vec![vec![ex("alice"), "\"Alice\"".into()], vec![ex("carol"), "\"Carol\"".into()]]
+        vec![
+            vec![ex("alice"), "\"Alice\"".into()],
+            vec![ex("carol"), "\"Carol\"".into()]
+        ]
     );
 }
 
@@ -665,10 +774,17 @@ fn blank_node_syntax_is_rejected_where_update_forbids_it() {
     let m = parse_err("SELECT * WHERE { ?s <p> [ ?o ] }");
     assert_contains(&m, &["expected an RDF term", "found ']'"]);
     let m = parse_err("SELECT * WHERE { ?s <p> [ \"x\" ] }");
-    assert_contains(&m, &["expected a predicate in the blank node property list"]);
+    assert_contains(
+        &m,
+        &["expected a predicate in the blank node property list"],
+    );
     let m = parse_err("SELECT * WHERE { ?s <p> ( 1 2 }");
     assert_contains(&m, &["expected an RDF term", "'}'"]);
-    let deep = format!("SELECT * WHERE {{ ?s <p> {}1{} }}", "( ".repeat(300), " )".repeat(300));
+    let deep = format!(
+        "SELECT * WHERE {{ ?s <p> {}1{} }}",
+        "( ".repeat(300),
+        " )".repeat(300)
+    );
     assert_contains(&parse_err(&deep), &["nested more than 256 deep"]);
 }
 
@@ -692,7 +808,9 @@ fn graph_db() -> Database {
 fn objects(db: &mut Database, graph: Option<&str>) -> Vec<String> {
     let q = match graph {
         None => "SELECT ?o WHERE { <http://ex/s> <http://ex/p> ?o }".to_string(),
-        Some(g) => format!("SELECT ?o WHERE {{ GRAPH <{g}> {{ <http://ex/s> <http://ex/p> ?o }} }}"),
+        Some(g) => {
+            format!("SELECT ?o WHERE {{ GRAPH <{g}> {{ <http://ex/s> <http://ex/p> ?o }} }}")
+        }
     };
     col0(db, &q)
 }
@@ -701,15 +819,24 @@ fn objects(db: &mut Database, graph: Option<&str>) -> Vec<String> {
 fn add_inserts_and_keeps_both_graphs() {
     let mut db = graph_db();
     assert_eq!(update(&mut db, "ADD <http://ex/g1> TO <http://ex/g2>"), 2);
-    assert_eq!(objects(&mut db, Some("http://ex/g2")), vec![ex("o1"), ex("o2"), ex("old")]);
-    assert_eq!(objects(&mut db, Some("http://ex/g1")), vec![ex("o1"), ex("o2")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g2")),
+        vec![ex("o1"), ex("o2"), ex("old")]
+    );
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g1")),
+        vec![ex("o1"), ex("o2")]
+    );
     // GRAPH keyword and DEFAULT on either side; already-present triples don't count.
     assert_eq!(update(&mut db, "ADD GRAPH <http://ex/g1> TO DEFAULT"), 2);
     assert_eq!(update(&mut db, "ADD GRAPH <http://ex/g1> TO DEFAULT"), 0);
     assert_eq!(objects(&mut db, None), vec![ex("o0"), ex("o1"), ex("o2")]);
     // Into a new graph.
     assert_eq!(update(&mut db, "ADD DEFAULT TO <http://ex/g3>"), 3);
-    assert_eq!(objects(&mut db, Some("http://ex/g3")), vec![ex("o0"), ex("o1"), ex("o2")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g3")),
+        vec![ex("o0"), ex("o1"), ex("o2")]
+    );
 }
 
 #[test]
@@ -717,8 +844,14 @@ fn copy_replaces_the_destination() {
     let mut db = graph_db();
     // Clears g2's one triple, adds g1's two.
     assert_eq!(update(&mut db, "COPY <http://ex/g1> TO <http://ex/g2>"), 3);
-    assert_eq!(objects(&mut db, Some("http://ex/g2")), vec![ex("o1"), ex("o2")]);
-    assert_eq!(objects(&mut db, Some("http://ex/g1")), vec![ex("o1"), ex("o2")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g2")),
+        vec![ex("o1"), ex("o2")]
+    );
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g1")),
+        vec![ex("o1"), ex("o2")]
+    );
     assert_eq!(update(&mut db, "COPY DEFAULT TO GRAPH <http://ex/g1>"), 3);
     assert_eq!(objects(&mut db, Some("http://ex/g1")), vec![ex("o0")]);
     assert_eq!(update(&mut db, "COPY <http://ex/g2> TO DEFAULT"), 3);
@@ -729,13 +862,19 @@ fn copy_replaces_the_destination() {
 fn move_replaces_the_destination_and_drops_the_source() {
     let mut db = graph_db();
     assert_eq!(update(&mut db, "MOVE <http://ex/g1> TO <http://ex/g2>"), 5);
-    assert_eq!(objects(&mut db, Some("http://ex/g2")), vec![ex("o1"), ex("o2")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g2")),
+        vec![ex("o1"), ex("o2")]
+    );
     assert!(objects(&mut db, Some("http://ex/g1")).is_empty());
     assert_eq!(update(&mut db, "MOVE DEFAULT TO <http://ex/g1>"), 2);
     assert!(objects(&mut db, None).is_empty());
     assert_eq!(objects(&mut db, Some("http://ex/g1")), vec![ex("o0")]);
     // Inside an update sequence.
-    let n = update(&mut db, "MOVE <http://ex/g1> TO DEFAULT ; COPY DEFAULT TO <http://ex/g4>");
+    let n = update(
+        &mut db,
+        "MOVE <http://ex/g1> TO DEFAULT ; COPY DEFAULT TO <http://ex/g4>",
+    );
     assert_eq!(n, 3);
     assert_eq!(objects(&mut db, Some("http://ex/g4")), vec![ex("o0")]);
 }
@@ -744,12 +883,27 @@ fn move_replaces_the_destination_and_drops_the_source() {
 fn same_graph_transfers_are_no_ops() {
     let mut db = graph_db();
     for op in ["ADD", "MOVE", "COPY"] {
-        assert_eq!(update(&mut db, &format!("{op} <http://ex/g1> TO GRAPH <http://ex/g1>")), 0);
+        assert_eq!(
+            update(
+                &mut db,
+                &format!("{op} <http://ex/g1> TO GRAPH <http://ex/g1>")
+            ),
+            0
+        );
         assert_eq!(update(&mut db, &format!("{op} DEFAULT TO DEFAULT")), 0);
         // Even for a graph that does not exist.
-        assert_eq!(update(&mut db, &format!("{op} <http://ex/none> TO <http://ex/none>")), 0);
+        assert_eq!(
+            update(
+                &mut db,
+                &format!("{op} <http://ex/none> TO <http://ex/none>")
+            ),
+            0
+        );
     }
-    assert_eq!(objects(&mut db, Some("http://ex/g1")), vec![ex("o1"), ex("o2")]);
+    assert_eq!(
+        objects(&mut db, Some("http://ex/g1")),
+        vec![ex("o1"), ex("o2")]
+    );
     assert_eq!(objects(&mut db, None), vec![ex("o0")]);
 }
 
@@ -757,10 +911,21 @@ fn same_graph_transfers_are_no_ops() {
 fn missing_source_graph_fails_unless_silent() {
     let mut db = graph_db();
     for op in ["ADD", "MOVE", "COPY"] {
-        let e = db.query(&format!("{op} <http://ex/none> TO <http://ex/g2>")).unwrap_err();
+        let e = db
+            .query(&format!("{op} <http://ex/none> TO <http://ex/g2>"))
+            .unwrap_err();
         let m = e.to_string();
-        assert_contains(&m, &[op, "source graph <http://ex/none> does not exist", "SILENT"]);
-        assert_eq!(update(&mut db, &format!("{op} SILENT <http://ex/none> TO <http://ex/g2>")), 0);
+        assert_contains(
+            &m,
+            &[op, "source graph <http://ex/none> does not exist", "SILENT"],
+        );
+        assert_eq!(
+            update(
+                &mut db,
+                &format!("{op} SILENT <http://ex/none> TO <http://ex/g2>")
+            ),
+            0
+        );
         // The destination was not touched.
         assert_eq!(objects(&mut db, Some("http://ex/g2")), vec![ex("old")]);
     }
@@ -857,7 +1022,10 @@ fn group_by_expression_as_variable_binds_the_key() {
     let q = format!(
         "{P} SELECT ?k WHERE {{ ?p :dept ?d }} GROUP BY (STR(?d) AS ?k) HAVING (COUNT(*) > 1) ORDER BY ?k"
     );
-    assert_eq!(ordered(&mut db, &q), vec![vec!["\"http://ex/d1\"".to_string()]]);
+    assert_eq!(
+        ordered(&mut db, &q),
+        vec![vec!["\"http://ex/d1\"".to_string()]]
+    );
     let m = parse_err("SELECT ?a WHERE { ?s ?p ?a } GROUP BY (STR(?s) AS ?a)");
     assert_contains(&m, &["?a is already bound by the WHERE clause"]);
 }

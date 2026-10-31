@@ -11,6 +11,46 @@
 //! `;`-separated sequences); named graphs (`GRAPH`); and federated query
 //! (`SERVICE [SILENT] (<iri> | ?var) { … }`).
 //!
+//! ## SPARQL 1.1 grammar details
+//!
+//! * `expr IN (…)` / `expr NOT IN (…)` ([`Expr::In`]).
+//! * Signed numeric literals (`-5`, `+1.5`, `-1.5e3`; the sign must touch the
+//!   digits, as in the `INTEGER_NEGATIVE` & co. terminals, so `:p +7` is the
+//!   object `+7` while `:p+ 7` is a path) and `true`/`false` as terms in
+//!   triple patterns, `VALUES` cells and DATA blocks.
+//! * Blank node property lists `[ :p :o ; :q :r ]` and collections
+//!   `( 1 2 ?x )` (expanded to `rdf:first`/`rdf:rest`/`rdf:nil`) in subject
+//!   and object position, nested, also as a statement of their own. In WHERE
+//!   patterns and CONSTRUCT/INSERT templates their blank nodes are hidden
+//!   variables ([`ANON_VAR_PREFIX`]; the engine instantiates an unbound one
+//!   in a template as a fresh blank node per solution); in `INSERT DATA`
+//!   they are fresh blank nodes; in `DELETE DATA`, `DELETE WHERE` and DELETE
+//!   templates they are an error, as SPARQL 1.1 Update forbids blank nodes
+//!   there. `[]` and `()` (`rdf:nil`) are plain terms.
+//! * `ORDER BY` keys: `ASC(…)`/`DESC(…)`, `?var`, `( expr )` and bare calls
+//!   (`STRLEN(?x)`, `COUNT(?x)`, `xsd:integer(?z)`). `GROUP BY` conditions:
+//!   `?var`, bare calls, `( expr )` and `( expr AS ?v )`, which binds `?v`.
+//!   `HAVING` takes one or more constraints (`HAVING (c1) (c2)`).
+//! * `CONSTRUCT WHERE { triples }`, the short form whose template is its
+//!   basic graph pattern (anything but triple patterns is an error).
+//! * A trailing `VALUES` block after any query form (and inside a
+//!   sub-SELECT): kept on [`SelectQuery::values`] for SELECT, joined onto the
+//!   WHERE pattern for ASK/CONSTRUCT/DESCRIBE. `VALUES () { () }` and row
+//!   width checks are supported.
+//! * `ADD` / `MOVE` / `COPY [SILENT] (DEFAULT | [GRAPH] <g>) TO …`.
+//! * Prefixed names: `PN_LOCAL` escapes (`ex:a\-b` is `ex:` + `a-b`), `%XX`
+//!   kept verbatim, `:` inside local names (`ex:a:b`), `-`/`.` inside
+//!   prefixes (`my-ns.v2:x`); an unescaped trailing `.` (also after a blank
+//!   node label) ends the statement.
+//! * gStore's `CONTAINALL(items, list [, sep])` / `CONTAINANY(…)` built-ins
+//!   (`SPARQL.g4`), evaluated by the query engine.
+//!
+//! Known deviations: a labelled blank node `_:b` in a WHERE pattern is a
+//! constant (as in upstream gStore, which reads it as the IRI `<_:b>`), not
+//! a variable, and in a template or `INSERT DATA` it names the same node for
+//! every solution / request; `FROM`/`FROM NAMED` are skipped; CONSTRUCT, ASK
+//! and DESCRIBE accept no GROUP BY / HAVING.
+//!
 //! ## gStore advanced functions
 //!
 //! Every path/analytics alternative of upstream gStore 1.4's `builtInCall`
@@ -261,9 +301,7 @@ impl<'s> Parser<'s> {
             "CONSTRUCT" => Query::Construct(self.parse_construct()?),
             "DESCRIBE" => Query::Describe(self.parse_describe()?),
             "INSERT" | "DELETE" | "LOAD" | "CLEAR" | "DROP" | "CREATE" | "WITH" | "ADD"
-            | "MOVE" | "COPY" => {
-                Query::Update(self.parse_update_sequence()?)
-            }
+            | "MOVE" | "COPY" => Query::Update(self.parse_update_sequence()?),
             other => return Err(self.err(format!("unsupported query form '{other}'"))),
         };
         // A well-formed request consumes all of its input. Reject trailing
@@ -445,20 +483,15 @@ impl<'s> Parser<'s> {
             }
         }
         let mut having = Vec::new();
-        if self.keyword().as_deref() == Some("HAVING") {
-            self.bump();
+        while self.eat_keyword("HAVING") {
             if !self.at_constraint() {
                 return Err(self.err(format!(
                     "HAVING needs a constraint, e.g. HAVING (COUNT(?x) > 1), found {}",
                     describe_token(self.peek())
                 )));
             }
-            loop {
-                if self.at_constraint() {
-                    having.push(self.parse_constraint()?);
-                } else if !self.eat_keyword("HAVING") {
-                    break;
-                }
+            while self.at_constraint() {
+                having.push(self.parse_constraint()?);
             }
         }
         Ok((group_by, having))
@@ -899,7 +932,9 @@ impl<'s> Parser<'s> {
                         "{what} allows only triple patterns, found a nested group '{{'{hint}"
                     )))
                 }
-                Token::Word(w) if GROUP_PATTERN_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()) => {
+                Token::Word(w)
+                    if GROUP_PATTERN_KEYWORDS.contains(&w.to_ascii_uppercase().as_str()) =>
+                {
                     return Err(self.err(format!(
                         "{what} allows only triple patterns, found {}{hint}",
                         w.to_ascii_uppercase()
@@ -1301,7 +1336,11 @@ impl<'s> Parser<'s> {
     fn parse_term_token(&mut self) -> Result<Term> {
         match self.peek().clone() {
             Token::Plus | Token::Minus => {
-                let sign = if matches!(self.peek(), Token::Plus) { "+" } else { "-" };
+                let sign = if matches!(self.peek(), Token::Plus) {
+                    "+"
+                } else {
+                    "-"
+                };
                 let adjacent = self.spans[self.pos].end == self.spans[self.pos + 1].start;
                 let (digits, datatype) = match self.peek_at(1) {
                     Token::Integer(d) => (d.clone(), xsd::INTEGER),
@@ -2373,9 +2412,10 @@ impl<'s> Parser<'s> {
                 } else if self.eat_keyword("WHERE") {
                     // DELETE WHERE { triples }: the triples are both the match
                     // pattern and the delete template.
-                    let triples = self.with_bnode_mode(BnodeMode::Forbidden("DELETE WHERE"), |p| {
-                        p.parse_triple_template_block()
-                    })?;
+                    let triples = self
+                        .with_bnode_mode(BnodeMode::Forbidden("DELETE WHERE"), |p| {
+                            p.parse_triple_template_block()
+                        })?;
                     let pattern = GraphPattern::Bgp(triples.clone());
                     Ok(UpdateOp::Modify {
                         delete: triples,
