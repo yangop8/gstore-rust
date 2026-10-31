@@ -140,7 +140,8 @@ A database is a `<name>.db` directory. Main tools (there are more — `gadd`,
 ```bash
 gbuild mydb data.nt          # build a DB from RDF (add --disk for the on-disk B+ tree)
 gquery mydb query.rq         # run a SPARQL query (or -e "…" inline)
-gconsole mydb                # interactive REPL (end a query with ';')
+gconsole -u root             # upstream's console, a client of a running gserver
+gconsole --local mydb        # the embedded REPL on mydb.db (no server)
 gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
 gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
                              # tasks, backup/restore); default login root / 123456
@@ -178,12 +179,79 @@ backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
 A database directory is open in **one process at a time**: opening it takes an
 operating-system lock on `<name>.db/LOCK` (snapshot and `--disk` layouts;
 RocksDB locks itself), held for as long as the database is open. So while a
-`gserver` has a database loaded, `gquery`, `gadd`, `gconsole`, `gbackup`, … on
+`gserver` has a database loaded, `gquery`, `gadd`, `gconsole --local`, `gbackup`, … on
 the same directory fail with "… is locked by another process (pid N)" instead
 of racing it — unload it there (or use the server's API) first. The server's
 `drop`, `rename`, `restore` and rebuilding `/build` refuse a directory another
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
+
+### gconsole
+
+`gconsole` is upstream gStore 1.4's console: an interactive client of a
+running `gserver`'s `/api` at `127.0.0.1:<port>`, the port read from
+`./conf/conf.ini` like the server's (or `--port N`, `--host H`, `-c FILE`).
+Every request carries the logged-in user's credentials, so the server checks
+that user's privileges.
+
+```text
+$ gserver -b --load-dir data          # let `create` read the data sets in ./data
+$ gconsole -u root
+Enter password:                       # (not echoed; -p PW or $GSTORE_PASSWORD for scripts)
+...
+gStore[no database]> create lubm data/lubm/lubm.nt;
+Build RDF database lubm successfully! use 1043 ms.
+
+gStore[no database]> use lubm;
+Current database switch to lubm successfully.
+
+gStore[lubm]> SELECT ?x WHERE {
+     ->   ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?t .
+     -> } LIMIT 2;
+...
+Query ans num 2, use 3 ms.
+
+gStore[lubm]> showdbs > dbs.txt;      # redirect a command's output (>> appends)
+gStore[lubm]> quit;
+```
+
+* Statements end with `;` and may span lines; `#` starts a comment; several
+  statements may share a line. SPARQL typed directly (`SELECT`, `ASK`,
+  `CONSTRUCT`, `DESCRIBE`, `INSERT`, `DELETE`, `PREFIX`, `BASE`, `LOAD`,
+  `CLEAR`, `WITH`, …) runs on the current database.
+* Commands (`help;` lists them, `help <command>;` shows one): `create <db>
+  [<file|dir|url>]`, `use`, `show [<db>]`, `showdbs`, `pdb`, `unload`, `drop`,
+  `backup [<path>]`, `restore <db> <path>`, `export [<path>]`, `batchinsert` /
+  `batchremove <file>`, `sparql <file>`, `init <db>[,…]`, `refreshconf`; users
+  and privileges: `addusr`, `delusr`, `setpswd`, `setpriv <user> <db>`,
+  `clearpriv`, `pusr`, `showusrs`, `flushpriv`; reasoning rules (`addreason`,
+  `listreason`, `compilereason`, `executereason`, `disablereason`,
+  `showreason`, `deletereason`) and custom functions (`showpfn`, `addpfn`,
+  `mdfpfn`, `delpfn`, `buildpfn`) — the server answers these with "The
+  operation is not defined" until it implements them; `version`, `pwd`,
+  `clear`, `quit` / `exit` (or Ctrl-D), and `history [<n>]`.
+* Ctrl-C abandons the statement being typed, or the request in flight: the
+  connection is dropped and, for SPARQL, the server's task is cancelled
+  (`operationTaskCancel`); the console stays open.
+* Scripts: `gconsole -u root -p PW -e "use lubm; select * where {?s ?p ?o} limit 5"`,
+  or commands on stdin (`gconsole -u root -p PW < script.txt`) run without
+  banner or prompts, and the exit code is 1 if any command failed. A command
+  that prompts (`addusr`, `setpriv`, `setpswd`, …) reads its answers from the
+  following lines.
+* History: statements typed at a terminal are kept in `~/.gstore_history`
+  (`$GSTORE_HISTFILE`). Build with `--features readline` for line editing,
+  history recall (arrow keys) and tab completion of command and database
+  names; the default build reads plain lines.
+* Differences from upstream: privileges are checked by the server (a
+  non-root user's `pusr <db>` needs `showuser`, which only root may call);
+  `sparql <file>` runs each `;`-separated statement of the file; results are
+  fetched as JSON (an unbound cell is shown empty); a local file given to
+  `create` / `batchinsert` is sent as an absolute path when the server runs
+  on the same machine — the server still only reads files under its
+  `--load-dir` directories and its upload / export directories.
+* `gconsole --local <db>` (gstore-rust extension; also the older `gconsole
+  <db>`) is the embedded REPL that opens `<db>.db` directly, without a
+  server.
 
 ### Library API
 

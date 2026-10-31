@@ -513,7 +513,11 @@ mod tests {
         ] {
             assert!(is_sparql(s), "{s}");
         }
+        // `clear;` followed by more input is still the console's command.
+        assert_eq!(stmt("clear;\nshow;\n").as_deref(), Some("clear"));
         for s in [
+            "clear;\nshow;",
+            "clear > out.txt",
             "use lubm",
             "drop lubm",
             "drop graphs",

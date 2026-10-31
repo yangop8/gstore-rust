@@ -860,17 +860,27 @@ fn h_sparql(c: &mut Console, args: &[String]) -> CmdResult {
 }
 
 /// The files a `create` from directory `dir` reads (upstream
-/// `FileUtil::dir_filepaths`: the regular files in it), sorted.
+/// `FileUtil::dir_filepaths`: the regular files in it and, recursively, in
+/// its subdirectories), sorted.
 fn dir_files(dir: &Path) -> Vec<String> {
-    let mut files: Vec<String> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 32 {
+                walk(&path, depth + 1, out);
+            } else if path.is_file() {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, 0, &mut files);
     files.sort();
     files
 }

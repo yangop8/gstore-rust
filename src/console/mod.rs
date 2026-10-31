@@ -173,7 +173,7 @@ pub fn banner() -> String {
          Commands end with ;. Cross line input is allowed.\n\
          Comment start with #. Redirect (> and >>) is supported.\n\
          CTRL+C to quit current command. CTRL+D to exit this console.\n\
-         Type 'help;' for help. \n",
+         Type 'help;' for help. \n\n",
         version = commands::version_text(),
     )
 }
