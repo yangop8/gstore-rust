@@ -73,7 +73,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::fsutil::{self, SnapshotWriter};
 use super::{
-    build_vstree, memory_vstree_entries, vstree_entries, Database, Meta, BACKUP_OFFSET_FILE,
+    build_vstree, disk_vstree_entries, memory_vstree_entries, Database, Meta, BACKUP_OFFSET_FILE,
     DICT_FILE, DISK_CACHE_PAGES, KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR,
     STORE_FILE, UPDATE_LOG_FILE, VSTREE_FILE, VSTREE_KV_FILE,
 };
@@ -798,7 +798,7 @@ impl Database {
         // `load_disk` filters through it on disk instead of materializing it.
         let vskv = dir.join(VSTREE_KV_FILE);
         super::remove_file_and_wal(&vskv);
-        drop(write_vstree_kv(&vskv, vstree_entries(&ds))?);
+        drop(write_vstree_kv(&vskv, disk_vstree_entries(&ds)?)?);
         ds.mark_vstree_fresh();
         ds.flush()?;
         Ok(report)

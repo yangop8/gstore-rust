@@ -142,6 +142,28 @@ fn memory_vstree_entries(store: &TripleStore) -> Vec<(EntityLiteralId, Signature
     out
 }
 
+/// [`vstree_entries`] for the on-disk store, from one streaming pass over its
+/// SPO and OSP trees ([`DiskStore::for_each_entity_adjacency`]) instead of
+/// two range reads and copies per entity. Equal to the generic version; a
+/// read error fails the build instead of signing an entity with missing edges.
+///
+/// [`DiskStore::for_each_entity_adjacency`]: crate::kvstore::DiskStore::for_each_entity_adjacency
+fn disk_vstree_entries(store: &crate::kvstore::DiskStore) -> Result<Vec<(EntityLiteralId, Signature)>> {
+    let mut out = Vec::new();
+    store.for_each_entity_adjacency(|e, outgoing, incoming| {
+        let mut sig = Signature::new();
+        for &(p, o) in outgoing {
+            sig.encode_edge(p, o, EdgeDir::Out);
+        }
+        for &(p, s) in incoming {
+            sig.encode_edge(p, s, EdgeDir::In);
+        }
+        out.push((e, sig));
+        std::ops::ControlFlow::Continue(())
+    })?;
+    Ok(out)
+}
+
 /// [`vstree_entries`] of a [`Backend`], through the in-memory fast path when
 /// it holds a [`TripleStore`].
 fn backend_vstree_entries(store: &Backend) -> Vec<(EntityLiteralId, Signature)> {
@@ -3806,6 +3828,47 @@ mod tests {
             check(&mut db, step);
         }
         assert!(db.vs_shrink_debt() > 0);
+    }
+
+    /// The disk build signs entities from one streaming SPO+OSP pass; the
+    /// entries (and so the `vstree.kv` written from them) equal the generic
+    /// per-entity signing over the same store — with literal objects, ids
+    /// that are both subject and object, entities that are only objects,
+    /// and deleted triples.
+    #[test]
+    fn disk_vstree_entries_equal_the_generic_signing() {
+        let dir = temp_dir("disk_vstree_entries");
+        fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0xD15C_u64;
+        let mut next = move |n: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        let mut lines = Vec::new();
+        for _ in 0..1200 {
+            let (s, p, o) = (next(200), next(5), next(320));
+            let line = if next(4) == 0 {
+                (format!("<http://ex/e{s}>"), format!("<http://ex/p{p}>"), format!("\"v{o}\""), true)
+            } else {
+                (format!("<http://ex/e{s}>"), format!("<http://ex/p{p}>"), format!("<http://ex/e{o}>"), false)
+            };
+            lines.push(line);
+        }
+        let text: String = lines
+            .iter()
+            .map(|(s, p, o, _)| format!("{s} {p} {o} .\n"))
+            .collect();
+        let mut ds = crate::kvstore::DiskStore::build_str(dir.join(KV_FILE), 64, &text).unwrap();
+        for (s, p, o, lit) in lines.iter().step_by(4) {
+            ds.delete_keys(s, p, o, *lit).unwrap();
+        }
+        let truth = vstree_entries(&ds);
+        assert!(truth.len() > 200, "subjects plus object-only entities");
+        assert_eq!(disk_vstree_entries(&ds).unwrap(), truth);
+        drop(ds);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- redo log --------------------------------------------------------
