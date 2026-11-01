@@ -216,10 +216,13 @@ predicates the queries scan: geomean 8.275 ms against 8.180 ms without
 (1.012×).
 
 Stress test timings (`snapshot_readers_never_see_a_torn_state_and_commits_cancel_them`,
-test profile, 8 readers): every commit, drain included, 0.14–0.21 ms; 96
-reader runs expired by commits, 16 completed. `cargo test -p gstore --test
-dt_overlay`: 10 passed, 1 ignored (the soak), 13.8 s (the LUBM build
-dominates).
+test profile, 8 readers, 12 commits): every commit, drain included, took
+0.28–0.65 ms with readers that sleep 200 µs between query steps (the final
+test), and 0.14–0.21 ms with readers that only yield (an earlier version);
+96 reader runs were expired by commits, 16 completed, all on whole committed
+states. `cargo test -p gstore --test dt_overlay`: 10 passed, 1 ignored, 13.8 s
+(the LUBM build dominates); with `--include-ignored` the one-minute soak (30
+commits against readers running 10-second queries) passes too (60.4 s).
 
 ### Acceptance (R2-DISKLIB)
 

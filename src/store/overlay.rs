@@ -92,9 +92,16 @@ const FILTER_BITS_LOG2: u32 = 16;
 /// undone). It is what makes a read of an untouched key cost one bit test:
 /// the view answers from the base when the key's bit is clear. Allocated at
 /// the first insertion; only cleared with the whole overlay.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct KeyFilter {
     bits: Vec<u64>,
+}
+
+impl std::fmt::Debug for KeyFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set: u32 = self.bits.iter().map(|w| w.count_ones()).sum();
+        write!(f, "KeyFilter({set} bits set)")
+    }
 }
 
 impl KeyFilter {

@@ -812,7 +812,9 @@ fn stress(
                     {
                         break;
                     }
-                    std::thread::yield_now();
+                    // A "long query" that leaves the CPU to the others now
+                    // and then; it still checks its cancel flag every step.
+                    std::thread::sleep(Duration::from_micros(200));
                 }
                 seen.unwrap()
             });
