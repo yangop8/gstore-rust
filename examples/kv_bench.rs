@@ -534,10 +534,12 @@ fn contains(o: &Opts) {
     let second_ms = later[0];
     println!(
         "contains_rows={} contains_first_ms={first_ms:.1} contains_second_ms={second_ms:.1} \
-         contains_warm_median_ms={:.1} contains_ratio={:.3} contains_rss_after_kib={}",
+         contains_warm_median_ms={:.1} contains_ratio={:.3} contains_rss_after_kib={} \
+         contains_index_bytes={}",
         first.0,
         median(later.clone()),
         second_ms / first_ms,
-        rss_kib()
+        rss_kib(),
+        db.cached_string_index().map_or(0, |i| i.heap_bytes())
     );
 }
