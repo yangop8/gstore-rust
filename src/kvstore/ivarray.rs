@@ -36,10 +36,13 @@
 //! than silently misbehaving. That covers the test/working sets here; a deeper
 //! table (or a wider page) would raise the bound and is left as future work.
 
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
 use crate::error::{GStoreError, Result};
 
 use super::overflow;
-use super::pager::{PageId, Pager, PAGE_SIZE};
+use super::pager::{Page, PageId, Pager, PAGE_SIZE};
 
 /// A handle to one integer-keyed array, rooted at a [`Pager`] header slot. Like
 /// [`BTree`](super::bptree::BTree) the structure lives in pager pages, so the
@@ -52,13 +55,15 @@ pub struct IvArray {
 
 /// Bytes per directory slot. Sized so typical dictionary strings (IRIs/literals)
 /// fit inline; longer values spill to an overflow chain.
-const SLOT_SIZE: usize = 128;
+pub(crate) const SLOT_SIZE: usize = 128;
 /// Slots per directory page.
-const SLOTS_PER_DIR: usize = PAGE_SIZE / SLOT_SIZE; // 32
+pub(crate) const SLOTS_PER_DIR: usize = PAGE_SIZE / SLOT_SIZE; // 32
 /// Page-table entries (u32 page ids) per page-table page.
-const PT_FANOUT: usize = PAGE_SIZE / 4; // 1024
+pub(crate) const PT_FANOUT: usize = PAGE_SIZE / 4; // 1024
 /// Max value bytes stored inline in a slot: `SLOT_SIZE - tag(1) - len(4)`.
-const INLINE_CAP: usize = SLOT_SIZE - 5; // 123
+pub(crate) const INLINE_CAP: usize = SLOT_SIZE - 5; // 123
+/// Number of addressable keys (`0 .. CAPACITY`): `PT_FANOUT² × SLOTS_PER_DIR`.
+pub(crate) const CAPACITY: usize = PT_FANOUT * PT_FANOUT * SLOTS_PER_DIR; // 33_554_432
 
 /// Slot is empty (no value for this key).
 const TAG_EMPTY: u8 = 0;
@@ -95,43 +100,138 @@ impl IvArray {
         if l0 == 0 {
             return Ok(None);
         }
-        let l0buf = pager.read_page(l0)?;
-        let l1 = read_u32(&l0buf, l0i * 4);
+        let l0buf = pager.read_page_shared(l0)?;
+        let l1 = read_u32(&l0buf[..], l0i * 4);
         if l1 == 0 {
             return Ok(None);
         }
-        let l1buf = pager.read_page(l1)?;
-        let dir = read_u32(&l1buf, l1i * 4);
+        let l1buf = pager.read_page_shared(l1)?;
+        let dir = read_u32(&l1buf[..], l1i * 4);
         if dir == 0 {
             return Ok(None);
         }
         Ok(Some(dir))
     }
 
-    /// Look up the value for integer `key`. Read-only (`&Pager`), so it runs
-    /// under a shared read guard concurrently with other readers.
-    pub fn get(&self, pager: &Pager, key: u32) -> Result<Option<Vec<u8>>> {
-        let (l0i, l1i, si) = Self::locate(key)?;
-        let Some(dir) = self.dir_page(pager, l0i, l1i)? else {
-            return Ok(None);
-        };
-        let dbuf = pager.read_page(dir)?;
+    /// Hand slot `si` of directory page `dbuf` to `f`: an inline value is
+    /// passed in place, an overflow value is read from its chain first.
+    fn with_slot<R>(
+        pager: &Pager,
+        dbuf: &[u8],
+        si: usize,
+        key: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>> {
         let off = si * SLOT_SIZE;
         match dbuf[off] {
             TAG_EMPTY => Ok(None),
             TAG_INLINE => {
-                let len = read_u32(&dbuf, off + 1) as usize;
-                Ok(Some(dbuf[off + 5..off + 5 + len].to_vec()))
+                let len = read_u32(dbuf, off + 1) as usize;
+                if len > INLINE_CAP {
+                    return Err(GStoreError::Database(format!(
+                        "IvArray: corrupt inline length {len} for key {key}"
+                    )));
+                }
+                Ok(Some(f(&dbuf[off + 5..off + 5 + len])))
             }
             TAG_OVERFLOW => {
-                let len = read_u32(&dbuf, off + 1) as usize;
-                let head = read_u32(&dbuf, off + 5);
-                Ok(Some(overflow::read_chain(pager, head, len)?))
+                let len = read_u32(dbuf, off + 1) as usize;
+                let head = read_u32(dbuf, off + 5);
+                let bytes = overflow::read_chain(pager, head, len)?;
+                if bytes.len() != len {
+                    return Err(GStoreError::Database(format!(
+                        "IvArray: truncated overflow chain for key {key}"
+                    )));
+                }
+                Ok(Some(f(&bytes)))
             }
             other => Err(GStoreError::Database(format!(
                 "IvArray: corrupt slot tag {other} for key {key}"
             ))),
         }
+    }
+
+    /// Look up integer `key` and hand its value to `f` — in place, with no
+    /// allocation, for an inline value (an overflow value is assembled from its
+    /// chain first). Read-only (`&Pager`), so it runs under a shared read guard
+    /// concurrently with other readers.
+    pub fn get_with<R>(
+        &self,
+        pager: &Pager,
+        key: u32,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>> {
+        let (l0i, l1i, si) = Self::locate(key)?;
+        let Some(dir) = self.dir_page(pager, l0i, l1i)? else {
+            return Ok(None);
+        };
+        let dbuf = pager.read_page_shared(dir)?;
+        Self::with_slot(pager, &dbuf[..], si, key as usize, f)
+    }
+
+    /// Look up the value for integer `key` (an owned copy; see
+    /// [`get_with`](Self::get_with)). Read-only.
+    pub fn get(&self, pager: &Pager, key: u32) -> Result<Option<Vec<u8>>> {
+        self.get_with(pager, key, <[u8]>::to_vec)
+    }
+
+    /// Visit every key in `from..to` that has a value, in ascending key order:
+    /// `f(key, value)`, which may stop the walk with [`ControlFlow::Break`].
+    /// Sequential: one directory page serves [`SLOTS_PER_DIR`] consecutive
+    /// keys, page-table pages are read once per span they cover, unallocated
+    /// spans are skipped whole, and overflow values are read from their chains.
+    /// Keys at or past [`CAPACITY`] hold nothing. Read-only.
+    pub fn for_each_range(
+        &self,
+        pager: &Pager,
+        from: u32,
+        to: u32,
+        mut f: impl FnMut(u32, &[u8]) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let l0 = pager.root(self.root_slot) as PageId;
+        let end = (to as usize).min(CAPACITY);
+        let mut key = from as usize;
+        if l0 == 0 || key >= end {
+            return Ok(());
+        }
+        let l0buf = pager.read_page_shared(l0)?;
+        let mut l1buf: Option<(usize, Arc<Page>)> = None;
+        while key < end {
+            let dir_idx = key / SLOTS_PER_DIR;
+            let (l0i, l1i) = (dir_idx / PT_FANOUT, dir_idx % PT_FANOUT);
+            let l1 = read_u32(&l0buf[..], l0i * 4);
+            if l1 == 0 {
+                // No directory below this L0 entry: skip its whole span.
+                key = (l0i + 1) * PT_FANOUT * SLOTS_PER_DIR;
+                continue;
+            }
+            let l1page = match &l1buf {
+                Some((i, page)) if *i == l0i => Arc::clone(page),
+                _ => {
+                    let page = pager.read_page_shared(l1)?;
+                    l1buf = Some((l0i, Arc::clone(&page)));
+                    page
+                }
+            };
+            let dir = read_u32(&l1page[..], l1i * 4);
+            let dir_end = (dir_idx + 1) * SLOTS_PER_DIR;
+            if dir == 0 {
+                key = dir_end;
+                continue;
+            }
+            let dbuf = pager.read_page_shared(dir)?;
+            while key < end.min(dir_end) {
+                let k = key;
+                let flow = Self::with_slot(pager, &dbuf[..], k % SLOTS_PER_DIR, k, |v| {
+                    f(k as u32, v)
+                })?;
+                if let Some(ControlFlow::Break(())) = flow {
+                    return Ok(());
+                }
+                key += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Insert or replace `key → val`. Allocates page-table / directory pages on
@@ -242,7 +342,7 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_ivarray_{tag}.kv"));
+        let p = std::env::temp_dir().join(format!("gstore_ivarray_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
@@ -381,6 +481,109 @@ mod tests {
         id2pred.insert(&mut pg, 1, b"<pred1>").unwrap();
         assert_eq!(id2ent.get(&pg, 1).unwrap().as_deref(), Some(&b"<entity1>"[..]));
         assert_eq!(id2pred.get(&pg, 1).unwrap().as_deref(), Some(&b"<pred1>"[..]));
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- Phase 6 R1-KV: get_with / for_each_range -------------------------
+
+    /// Collect `for_each_range(from, to)`.
+    fn range(a: &IvArray, pg: &Pager, from: u32, to: u32) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        a.for_each_range(pg, from, to, |k, v| {
+            out.push((k, v.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// `get` for every key in `from..to`, as `for_each_range` reports it.
+    fn by_get(a: &IvArray, pg: &Pager, from: u32, to: u32) -> Vec<(u32, Vec<u8>)> {
+        (from..to)
+            .filter_map(|k| a.get(pg, k).unwrap().map(|v| (k, v)))
+            .collect()
+    }
+
+    #[test]
+    fn for_each_range_equals_get_including_overflow_chains() {
+        let path = tmp("range");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let a = IvArray::new(0);
+        let mut seed = 0x9E37_79B9u64;
+        let mut keys = Vec::new();
+        // Dense keys across several directories, gaps, and every few keys a
+        // value long enough to need an overflow chain (some span 2+ pages).
+        for k in 0..3000u32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if (seed >> 33).is_multiple_of(5) {
+                continue; // a hole
+            }
+            let len = match (seed >> 40) % 7 {
+                0 => INLINE_CAP + 1 + (seed >> 20) as usize % (2 * PAGE_SIZE),
+                1 => INLINE_CAP,
+                2 => 0,
+                _ => (seed >> 45) as usize % 60,
+            };
+            let v: Vec<u8> = (0..len).map(|i| (i as u32 ^ k) as u8).collect();
+            a.insert(&mut pg, k, &v).unwrap();
+            keys.push(k);
+        }
+        // Sparse keys in far-away page-table spans.
+        for &k in &[70_000u32, 1_000_000, 5_000_000, (CAPACITY - 1) as u32] {
+            a.insert(&mut pg, k, format!("far{k}").as_bytes()).unwrap();
+        }
+        a.delete(&mut pg, keys[10]).unwrap();
+        for (from, to) in [
+            (0, 3000),
+            (0, 32),
+            (31, 33),
+            (5, 5),
+            (100, 90),
+            (2990, 70_001),
+            (999_999, 5_000_001),
+        ] {
+            assert_eq!(range(&a, &pg, from, to), by_get(&a, &pg, from, to), "{from}..{to}");
+        }
+        let all = range(&a, &pg, 0, u32::MAX);
+        assert_eq!(all.len(), keys.len() - 1 + 4);
+        assert_eq!(all.last().unwrap().0, (CAPACITY - 1) as u32);
+        assert!(range(&a, &pg, CAPACITY as u32, u32::MAX).is_empty());
+        // get_with sees the same bytes as get, inline or chained.
+        for &k in keys.iter().take(400) {
+            assert_eq!(a.get_with(&pg, k, |v| v.to_vec()).unwrap(), a.get(&pg, k).unwrap());
+        }
+        // Early stop.
+        let mut n = 0;
+        a.for_each_range(&pg, 0, 3000, |_, _| {
+            n += 1;
+            if n == 7 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 7);
+        // An empty array visits nothing.
+        assert!(range(&IvArray::new(1), &pg, 0, 100).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn corrupt_slot_lengths_are_errors() {
+        let path = tmp("corrupt_slot");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let a = IvArray::new(0);
+        a.insert(&mut pg, 3, b"abc").unwrap();
+        let (l0i, l1i, si) = IvArray::locate(3).unwrap();
+        let dir = a.dir_page(&pg, l0i, l1i).unwrap().unwrap();
+        let mut page = pg.read_page(dir).unwrap();
+        write_u32(&mut page, si * SLOT_SIZE + 1, 4000); // inline length > slot
+        pg.write_page(dir, &page).unwrap();
+        assert!(a.get(&pg, 3).is_err());
+        assert!(a
+            .for_each_range(&pg, 0, 10, |_, _| ControlFlow::Continue(()))
+            .is_err());
         std::fs::remove_file(&path).ok();
     }
 }

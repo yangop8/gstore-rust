@@ -194,7 +194,7 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_isarray_{tag}.kv"));
+        let p = std::env::temp_dir().join(format!("gstore_isarray_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
