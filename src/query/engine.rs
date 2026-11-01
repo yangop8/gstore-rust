@@ -244,6 +244,12 @@ struct VarLayout {
 /// [`VarLayout::pred_alias`]); a SPARQL variable name cannot contain NUL.
 const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 
+/// A variable's exact candidate set is refined by probing the in-memory
+/// VS-tree entry by entry, instead of walking the tree, when it holds at most
+/// `max(PROBE_MIN_CANDIDATES, indexed entities / 32)` ids (see
+/// `refine_candidates_with_vstree`).
+const PROBE_MIN_CANDIDATES: usize = 1024;
+
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
         // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
@@ -2771,6 +2777,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             if sig.is_empty() {
                 continue;
+            }
+            // Probe refinement: when the variable already has a small exact
+            // candidate set and the tree is in memory, test each candidate's
+            // stored signature (O(1) each through the tree's locator) instead
+            // of walking the tree. The result is exactly walk ∩ existing: a
+            // walk reports precisely the entries whose signature contains the
+            // query (every ancestor contains its descendants' signatures).
+            let probe_limit = PROBE_MIN_CANDIDATES.max(vstree.entity_count() / 32);
+            if let Some(existing) = candidates.get_mut(&vidx) {
+                if vstree.can_probe() && existing.len() <= probe_limit {
+                    if !vstree.is_empty() {
+                        existing.retain(|&x| vstree.probe(x, &sig));
+                    }
+                    continue;
+                }
             }
             if let Some(mut vs) = vstree.candidates(&sig) {
                 vs.sort_unstable();

@@ -532,6 +532,7 @@ impl Database {
     pub fn rebuild_index(&mut self) {
         self.vstree = build_vstree(&self.store);
         self.index_valid = true;
+        self.vs_shrink_debt = 0;
     }
 
     /// Opt this database into an **out-of-core** (streaming) VS-tree, even while
@@ -562,6 +563,7 @@ impl Database {
         remove_file_and_wal(path);
         self.vstree = VsTree::build_disk(path, vstree_entries(&self.store))?;
         self.index_valid = true;
+        self.vs_shrink_debt = 0;
         self.query_cache_mut().clear();
         Ok(())
     }
@@ -979,15 +981,18 @@ impl Database {
     fn remove_default_id(&mut self, id: IdTriple) -> bool {
         let changed = self.store.remove(id);
         if changed {
-            // Deletes deliberately invalidate (full rebuild on next save / query)
-            // rather than updating incrementally. A removed edge *shrinks* the
-            // subject/object signatures, and while `VsTree::update` stays sound
-            // under a shrink, a delete can also leave an entity with no edges at
-            // all (a phantom tree entry) and can be followed by `reclaim_unused`,
-            // which reuses freed dictionary ids for unrelated terms. Cleanly
-            // handling those would need entry removal + rebalancing the bulk-built
-            // tree, so we keep the simple, always-correct rebuild for deletes.
-            self.index_valid = false;
+            // A delete leaves the VS-tree alone, valid: the removed edge only
+            // *shrinks* the subject/object signatures, so their stored entries
+            // stay sound supersets (an entity left with no edge at all is a
+            // harmless phantom — the joins check every candidate against the
+            // store). A freed id that `reclaim_unused` later reuses is either
+            // re-signed exactly by the insert that uses it, or has no
+            // default-graph edge, so its entry is a superset too. This holds
+            // for the read-only out-of-core tree as well. The cost is some
+            // pruning power, counted in `vs_shrink_debt`.
+            if self.index_valid {
+                self.vs_shrink_debt += 1;
+            }
             self.touched();
             if let Some(log) = self.txn.as_mut() {
                 log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
@@ -1053,16 +1058,21 @@ impl Database {
         // also covers the named-graph quads in RocksDB); only the in-memory
         // named-graph map is undone here.
         let journaled = self.rocks_journaling();
+        // Default-graph triples the rollback puts back: their entities are
+        // re-signed once the store holds them again (below).
+        let mut readded: Vec<IdTriple> = Vec::new();
         for op in log.into_iter().rev() {
             match op {
                 UndoOp::Add(None, id) => {
-                    if !journaled {
-                        self.store.insert(id);
+                    if journaled || self.store.insert(id) {
+                        readded.push(id);
                     }
                 }
                 UndoOp::Del(None, id) => {
-                    if !journaled {
-                        self.store.remove(id);
+                    // Removing the transaction's insert shrinks signatures:
+                    // the tree stays a sound superset (see `remove_default_id`).
+                    if (journaled || self.store.remove(id)) && self.index_valid {
+                        self.vs_shrink_debt += 1;
                     }
                 }
                 UndoOp::Add(Some(gid), id) => {
@@ -1079,7 +1089,19 @@ impl Database {
             }
         }
         let replayed = self.rocks_rollback_journal();
-        self.index_valid = false;
+        if replayed.is_err() {
+            // The store's state is not known: never filter through the tree.
+            self.index_valid = false;
+        } else if self.index_valid && !readded.is_empty() {
+            if self.vstree.is_disk_backed() {
+                // A read-only tree cannot take the grown signatures.
+                self.index_valid = false;
+            } else {
+                for id in readded {
+                    self.vstree_index_insert(id);
+                }
+            }
+        }
         self.touched();
         replayed
     }
@@ -3639,11 +3661,12 @@ mod tests {
         }
     }
 
-    /// A delete invalidates the index (documented behaviour); a subsequent query
-    /// still returns correct results (it evaluates without the stale tree, or
-    /// after a rebuild on save), and inserts after the delete leave it stale.
+    /// A delete leaves the index valid (its entries stay sound supersets) and
+    /// counts one unit of shrink debt; queries return the correct results
+    /// through the tree, and a rebuild clears the debt. (Before Phase 6 a
+    /// delete invalidated the index.)
     #[test]
-    fn delete_invalidates_then_results_stay_correct() {
+    fn delete_keeps_the_index_valid_and_results_correct() {
         let mut db = Database::build_from_str("d", SMALL).unwrap();
         assert!(db.stats().index_valid);
         assert!(db.remove_triple(&Triple::new(
@@ -3651,17 +3674,110 @@ mod tests {
             Term::iri("own"),
             Term::iri("point0")
         )));
-        assert!(!db.stats().index_valid, "a delete invalidates the index");
+        assert!(db.stats().index_valid, "a delete keeps the index valid");
+        assert_eq!(db.vs_shrink_debt(), 1);
 
         let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
         let got: Vec<_> = rs.rows.iter().map(|r| r[0].clone().unwrap()).collect();
         assert_eq!(got, vec!["<point1>".to_string()], "point0 was deleted");
 
-        // Rebuilding restores a valid index and the same answer.
+        // Rebuilding clears the debt and gives the same answer.
         db.rebuild_index();
         assert!(db.stats().index_valid);
+        assert_eq!(db.vs_shrink_debt(), 0);
         let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
         assert_eq!(rs.row_count(), 1);
+    }
+
+    /// Deletes (and a rollback's removal of inserts) leave the VS-tree valid
+    /// as a sound superset, and a rollback that re-adds deleted triples
+    /// re-signs their entities: after every step, each entity whose current
+    /// signature contains a query is among the tree's candidates, and the
+    /// answers equal those of a fresh build.
+    #[test]
+    fn vstree_stays_a_sound_superset_under_deletes_and_rollbacks() {
+        let mut seed = 0x5EED_u64;
+        let mut next = move |n: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        let triple = |s: u32, p: u32, o: u32| {
+            Triple::new(
+                Term::iri(format!("http://ex/e{s}")),
+                Term::iri(format!("http://ex/p{p}")),
+                Term::iri(format!("http://ex/e{o}")),
+            )
+        };
+        let mut text = String::new();
+        for _ in 0..1500 {
+            let (s, p, o) = (next(300), next(6), next(300));
+            text.push_str(&format!("<http://ex/e{s}> <http://ex/p{p}> <http://ex/e{o}> .\n"));
+        }
+        let mut db = Database::build_from_str("vs", &text).unwrap();
+        let check = |db: &mut Database, step: usize| {
+            assert!(db.stats().index_valid, "step {step}: the index stays valid");
+            let truth = vstree_entries(&db.store);
+            for &(e, sig) in truth.iter().step_by(7) {
+                // A query made of each real edge of `e` must find `e`.
+                for &(p, o) in &db.store.po_by_s(e) {
+                    let mut q = Signature::new();
+                    q.encode_query_edge(Some(p), Some(o), EdgeDir::Out);
+                    assert!(sig.contains(&q));
+                    let cands = db.vstree.candidates(&q).unwrap();
+                    assert!(cands.contains(&e), "step {step}: entity {e} pruned");
+                    assert!(db.vstree.probe(e, &q), "step {step}: probe misses {e}");
+                }
+            }
+            let q = "SELECT ?s ?o WHERE { ?s <http://ex/p1> ?o . ?o <http://ex/p2> ?x }";
+            let mut a = db.select(q).unwrap().rows;
+            let saved = db.index_valid;
+            db.index_valid = false;
+            let mut b = db.select(q).unwrap().rows;
+            db.index_valid = saved;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "step {step}: the tree changed an answer");
+        };
+        for step in 0..60 {
+            match step % 4 {
+                // Plain deletes and inserts.
+                0 | 1 => {
+                    for _ in 0..40 {
+                        db.remove_triple(&triple(next(300), next(6), next(300)));
+                    }
+                    for (s, p, o) in db.store.iter_all().into_iter().take(30).map(|t| (t.sub, t.pred, t.obj)) {
+                        db.remove_default_id(IdTriple::new(s, p, o));
+                    }
+                    for _ in 0..20 {
+                        db.insert_triple(&triple(next(300), next(6), next(300)));
+                    }
+                }
+                // A transaction deleting edges of an entity, then growing it
+                // (its entry is re-signed without the deleted edges), rolled
+                // back: the deleted edges come back and must be re-signed.
+                _ => {
+                    db.begin().unwrap();
+                    let victims: Vec<IdTriple> = db.store.iter_all().into_iter().step_by(17).take(25).collect();
+                    for t in &victims {
+                        assert!(db.remove_default_id(*t));
+                    }
+                    for t in &victims {
+                        let subject = db.dict.id_to_string(t.sub).unwrap().to_owned();
+                        let grown = Triple::new(
+                            Term::from_dict_key(&subject).unwrap(),
+                            Term::iri(format!("http://ex/p{}", next(6))),
+                            Term::iri(format!("http://ex/e{}", next(300))),
+                        );
+                        db.insert_triple(&grown);
+                    }
+                    db.rollback().unwrap();
+                }
+            }
+            check(&mut db, step);
+        }
+        assert!(db.vs_shrink_debt() > 0);
     }
 
     // ---- redo log --------------------------------------------------------
