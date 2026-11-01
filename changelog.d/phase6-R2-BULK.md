@@ -260,6 +260,15 @@ tests ~16 s, `tests/dt_bulk_import.rs` 3 tests ~1 s,
 `tests/dt_bulk_crash.rs` 5 tests ~8 s (the SIGKILL loop stops after 25 s
 at most), `bulk::` unit tests 17 tests ~9 s.
 
+Verification at the final commit: `cargo fmt --all -- --check`; `cargo
+clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`
+(all pass); `cargo clippy -p gstore --features rocksdb --all-targets -- -D
+warnings` and `cargo test -p gstore --features rocksdb` (all pass; the crash
+matrix then builds a real RocksDB prior layout). No other feature-gated
+code was touched. No existing test was changed: `config.rs`'s
+`every_key_is_read_from_its_section` gained the four new keys (it requires
+every known key to be set).
+
 ## Requests/Not yet
 
 Requests (outside R2-BULK's files):

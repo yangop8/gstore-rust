@@ -183,11 +183,13 @@ fn killed_gbuild_leaves_the_old_or_the_new_database() {
     // 1. Abort at every step.
     for (k, point) in CRASH_POINTS.iter().enumerate() {
         rebuild_old();
+        // In the scratch directory: an aborted process may leave a core file.
         let out = Command::new(gbuild)
             .args(["--disk", "--force", "--threads", "2"])
             .arg(&name)
             .arg(&new_nt)
             .env(CRASH_ENV, point)
+            .current_dir(&base)
             .output()
             .unwrap();
         assert!(!out.status.success(), "{point}: {out:?}");
