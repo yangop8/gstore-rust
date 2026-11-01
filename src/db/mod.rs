@@ -1135,7 +1135,8 @@ impl Database {
                 }
                 Ok(result)
             }
-            Query::Update(ops) => self.run_update(sparql, ops, cancel),
+            // An UPDATE's WHERE clause calls the same caller's functions.
+            Query::Update(ops) => self.run_update(sparql, ops, cancel, pfn),
         }
     }
 
@@ -1143,12 +1144,15 @@ impl Database {
     /// text the update log records): the write path of
     /// [`query`](Self::query), shared with the reasoning rules
     /// ([`reason_execute`](Self::reason_execute) /
-    /// [`reason_disable`](Self::reason_disable)).
+    /// [`reason_disable`](Self::reason_disable)). A `PFN.name({…})` call in a
+    /// WHERE clause reaches `pfn`'s functions, else the
+    /// [installed caller](Self::set_pfn_caller)'s.
     fn run_update(
         &mut self,
         sparql: &str,
         ops: Vec<UpdateOp>,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<QueryResult> {
         // Reject a statically invalid request (an unknown IRI
         // function, a graph function in FILTER/BIND, …) before any of
@@ -1163,7 +1167,7 @@ impl Database {
         let before = self.mutations;
         let mut changed = 0;
         for op in ops {
-            match self.exec_update_op(op, cancel.as_ref()) {
+            match self.exec_update_op(op, cancel.as_ref(), pfn) {
                 Ok(n) => changed += n,
                 Err(e) => return Err(self.failed_update(e, before)),
             }
@@ -1206,6 +1210,7 @@ impl Database {
         &mut self,
         op: UpdateOp,
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<usize> {
         match op {
             UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
@@ -1232,6 +1237,7 @@ impl Database {
                     &using,
                     &using_named,
                     cancel,
+                    pfn,
                 )?;
                 // A template triple outside `GRAPH { … }` targets the WITH
                 // graph, else the default graph.
@@ -1484,6 +1490,7 @@ impl Database {
         using: &[String],
         using_named: &[String],
         cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
         let graph = |iri: &str| {
             self.dict
@@ -1494,6 +1501,7 @@ impl Database {
             db: &Database,
             eval: Evaluator<'e, S>,
             cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+            pfn: Option<&crate::pfn::PfnCaller>,
         ) -> Evaluator<'e, S> {
             // IRI function calls in the WHERE clause reach the user-defined
             // functions, as in read queries; `SERVICE` follows the load
@@ -1508,7 +1516,13 @@ impl Database {
             if let Some(c) = cancel {
                 eval = eval.with_cancel(std::sync::Arc::clone(c));
             }
-            if let Some(caller) = db.pfn_caller() {
+            // PFN calls: the request's caller (a server passes the
+            // authenticated user), else the installed one — under this
+            // database's limits, as in reads.
+            let caller = pfn
+                .map(|c| c.clone().with_limits(db.pfn_limits))
+                .or_else(|| db.pfn_caller());
+            if let Some(caller) = caller {
                 eval = eval.with_pfn(caller);
             }
             if db.functions.is_empty() {
@@ -1531,18 +1545,18 @@ impl Database {
                 .filter_map(|iri| graph(iri).map(|(gid, s)| (gid, s.clone())))
                 .collect();
             let eval =
-                prepare(self, Evaluator::new(&self.dict, &merged), cancel).with_named(&named);
+                prepare(self, Evaluator::new(&self.dict, &merged), cancel, pfn).with_named(&named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         if let Some(w) = with {
             let empty = TripleStore::new();
             let store = graph(w).map_or(&empty, |(_, s)| s);
-            let eval =
-                prepare(self, Evaluator::new(&self.dict, store), cancel).with_named(&self.named);
+            let eval = prepare(self, Evaluator::new(&self.dict, store), cancel, pfn)
+                .with_named(&self.named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         let csr = || self.csr();
-        let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel)
+        let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
             .with_named(&self.named)
             .with_csr_provider(&csr);
         eval.eval_update_modify(delete, insert, pattern)
@@ -1705,7 +1719,9 @@ impl Database {
     /// onto it. Deltas are checked for contiguity: each must begin exactly where
     /// the previous one ended (starting from the base's recorded checkpoint), so
     /// an out-of-order or gapped chain is rejected rather than silently
-    /// misapplied. Persist the result with [`save`](Self::save).
+    /// misapplied. The base's reasoning rules (and ledgers) come with it, held
+    /// in memory (see [`into_memory`](Self::into_memory)). Persist the result
+    /// with [`save`](Self::save), which writes those rules too.
     pub fn restore_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
         base_dir: P,
         incr_dirs: &[Q],
@@ -2070,8 +2086,10 @@ impl Database {
     /// [`set_reason_db_dir`](Self::set_reason_db_dir), else the database's
     /// [`home`](Self::home). `None`: the rules are kept in memory and live as
     /// long as this value — [`backup`](Self::backup) writes them into the
-    /// backup, [`save`](Self::save) does not (open the saved directory, or
-    /// [`set_reason_db_dir`](Self::set_reason_db_dir), to keep rules there).
+    /// backup, and [`save`](Self::save) into the saved directory when there
+    /// are any (open the saved directory, or
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), to keep managing them
+    /// there).
     pub fn reason_db_dir(&self) -> Option<PathBuf> {
         self.reason_home.dir.clone().or_else(|| self.home.clone())
     }
@@ -2191,9 +2209,13 @@ impl Database {
 
     /// Run a rule's compiled `INSERT … WHERE` (one operation, default graph)
     /// through the update path, reporting which triples it derived, which
-    /// of them existed before, and which it added. An error before anything
+    /// of them existed before, and which it added. The WHERE clause is
+    /// evaluated **once** and exactly the triples that evaluation derived are
+    /// inserted (as `INSERT DATA`; the update log records `sparql`), so a
+    /// filter that is not deterministic (`RAND()`, `NOW()`, …) can never
+    /// insert a triple the ledger does not record. An error before anything
     /// was applied (parse, WHERE evaluation, cancellation) is `Err`; the
-    /// update's own outcome is the report's `result`.
+    /// insert's own outcome is the report's `result`.
     pub(crate) fn reason_infer(
         &mut self,
         sparql: &str,
@@ -2218,6 +2240,14 @@ impl Database {
                 "a reasoning rule must compile to one INSERT … WHERE".into(),
             ));
         };
+        // The static checks the update path runs before applying anything.
+        {
+            let mut eval = Evaluator::new(&self.dict, &self.store);
+            if !self.functions.is_empty() {
+                eval = eval.with_functions(self.functions.clone());
+            }
+            eval.check_update_calls(&ops)?;
+        }
         let (_, ins) = self.modify_changes(
             delete,
             insert,
@@ -2226,20 +2256,31 @@ impl Database {
             using,
             using_named,
             cancel.as_ref(),
+            None,
         )?;
         let mut seen = HashSet::new();
         let mut derived: Vec<(String, bool, Triple)> = Vec::new();
-        for (g, t) in ins {
+        for (g, t) in &ins {
             if g.is_some() {
                 continue;
             }
-            let line = ledger_line(&t);
+            let line = ledger_line(t);
             if seen.insert(line.clone()) {
-                let existed = self.contains_triple(&t);
-                derived.push((line, existed, t));
+                let existed = self.contains_triple(t);
+                derived.push((line, existed, t.clone()));
             }
         }
-        let result = match self.run_update(sparql, ops, cancel) {
+        let ground = ins
+            .into_iter()
+            .map(|(graph, t)| GroundTriple {
+                subject: t.subject,
+                predicate: t.predicate,
+                object: t.object,
+                graph,
+            })
+            .collect();
+        let result = match self.run_update(sparql, vec![UpdateOp::InsertData(ground)], cancel, None)
+        {
             Ok(QueryResult::Update { changed }) => Ok(changed),
             Ok(_) => Ok(0),
             Err(e) => Err(e.to_string()),
@@ -2286,7 +2327,7 @@ impl Database {
         if ground.is_empty() {
             return Ok(0);
         }
-        match self.run_update(&text, vec![UpdateOp::DeleteData(ground)], cancel)? {
+        match self.run_update(&text, vec![UpdateOp::DeleteData(ground)], cancel, None)? {
             QueryResult::Update { changed } => Ok(changed),
             _ => Ok(0),
         }
@@ -2302,7 +2343,7 @@ impl Database {
         let Query::Update(ops) = sparql::parse(sparql)? else {
             return Err(GStoreError::Query("not an update".into()));
         };
-        match self.run_update(sparql, ops, cancel)? {
+        match self.run_update(sparql, ops, cancel, None)? {
             QueryResult::Update { changed } => Ok(changed),
             _ => Ok(0),
         }

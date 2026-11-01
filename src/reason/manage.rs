@@ -15,8 +15,8 @@
 //! | 7 delete | any but executed | — (file removed) | **executed** (`该规则已经执行，请先让该规则失效后再执行`) |
 //! | 2 list, 6 show | — | — | — |
 //!
-//! A rule is *executed* while its status is `已执行` or it has a ledger (see
-//! below).
+//! A rule is *executed* while its status is `已执行` or its ledger (see
+//! below) holds a triple.
 //!
 //! # Inferred triples, and retraction
 //!
@@ -29,8 +29,9 @@
 //! Upstream retracts with `delete where {?x <Rule:label> ?y.}` — every
 //! triple with the predicate, including those another rule with the same
 //! label inferred, and any a user inserted with that predicate himself.
-//! Here each execution records a **ledger** of the triples the rule owns
-//! (`reason_rule_files/inferred/<rulename>.nt`):
+//! Here each rule has a **ledger** of the triples it owns
+//! (`reason_rule_files/inferred/<rulename>.nt`; add creates it empty, each
+//! execution records into it):
 //!
 //! * a triple the rule derived that did not exist before is inserted and
 //!   recorded;
@@ -39,16 +40,30 @@
 //!   was **asserted** (inserted by a user / loaded) and the rule does not own
 //!   it.
 //!
+//! The rule's WHERE clause is evaluated once per execution and exactly the
+//! triples that evaluation derived are inserted, so a filter that is not
+//! deterministic (`RAND()`, `NOW()`) cannot insert a triple the ledger
+//! misses. An execution that fails having inserted nothing leaves the rule
+//! as it was.
+//!
 //! Disabling a rule deletes exactly the triples of its ledger that no other
 //! rule's ledger holds, through the same update path (`DELETE DATA`), and
-//! drops the ledger. So: a fact asserted before the rule ran survives its
+//! empties the ledger. So: a fact asserted before the rule ran survives its
 //! retraction; a fact two rules inferred survives until both are disabled.
 //! A fact asserted *after* the rule inferred it (re-inserting an existing
 //! triple changes nothing in an RDF store) is indistinguishable from the
-//! inferred one and is retracted with it. A rule marked executed without a
-//! ledger (executed by upstream gStore before the database was moved here)
-//! is retracted with upstream's `delete_sparql`; executing it again records
-//! the triples it derives that are already there as its own.
+//! inferred one and is retracted with it.
+//!
+//! A rule file **without a ledger** was written by upstream gStore (the
+//! database was moved here): whatever its status — upstream's check and
+//! compile overwrite `已执行` without retracting anything — it may have
+//! inferred triples nobody recorded. Disabling it retracts upstream's way,
+//! with its `delete_sparql` (built from the validated label and value only,
+//! so a rule whose conditions this implementation refuses can still be
+//! disabled); executing it records the triples it derives that are already
+//! there as its own. Either gives it a ledger. Names of existing rule files
+//! are only checked to stay inside the rule directory (upstream accepts any
+//! name; add applies the stricter [`validate_rule_name`]).
 //!
 //! The `delete_sparql` reported by compile / disable is upstream's text.
 //!
@@ -62,8 +77,11 @@ use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use super::compile::{compile as compile_rule, CompiledRule};
-use super::rules::{status, validate_rule_name, RuleDef, MAX_RULES_PER_DB, MAX_RULE_FILE_BYTES};
+use super::compile::{compile as compile_rule, retraction_statement, CompiledRule};
+use super::rules::{
+    status, validate_existing_rule_name, validate_rule_name, RuleDef, MAX_RULES_PER_DB,
+    MAX_RULE_FILE_BYTES,
+};
 use super::store::{RuleStore, StoreError, NO_DB_DIR};
 use crate::json::{self, Json};
 use crate::query::QueryResult;
@@ -211,9 +229,11 @@ pub struct Checked {
     pub effect_num: i64,
 }
 
-/// The name check of every operation but add (`1003` when it fails).
+/// The name check of every operation but add (`1003` when it fails): the
+/// name must name a file inside the rule directory (see
+/// [`validate_existing_rule_name`]).
 fn check_name(name: &str) -> Result<(), ReasonError> {
-    validate_rule_name(name).map_err(param)
+    validate_existing_rule_name(name).map_err(param)
 }
 
 /// Read and parse rule `name`'s file; `missing` is the message when it does
@@ -244,9 +264,10 @@ fn status_of(doc: &Json) -> &str {
     doc.get("status").and_then(Json::as_str).unwrap_or_default()
 }
 
-/// Whether the rule currently owns inferred triples.
+/// Whether the rule currently owns inferred triples (an empty ledger owns
+/// none).
 fn is_executed(doc: &Json, ledger: Option<&BTreeSet<String>>) -> bool {
-    ledger.is_some() || status_of(doc) == status::EXECUTED
+    ledger.is_some_and(|l| !l.is_empty()) || status_of(doc) == status::EXECUTED
 }
 
 /// The rule definition and its compiled statements.
@@ -324,7 +345,7 @@ pub fn add(
         .and_then(Json::as_str)
         .unwrap_or_default()
         .to_string();
-    check_name(&name)?;
+    validate_rule_name(&name).map_err(param)?;
     let _lock = store.lock();
     if !store.db_exists() {
         return Err(fail(NO_DB_DIR.into()));
@@ -354,6 +375,12 @@ pub fn add(
         return Err(fail(
             "The rule file has been exist, please remove it before!".into(),
         ));
+    }
+    // Its (empty) ledger marks the rule as one whose inferred triples are
+    // recorded here (see the module docs).
+    if let Err(e) = store.set_ledger(&name, Some(&BTreeSet::new())) {
+        let _ = store.remove(&name);
+        return Err(e.into());
     }
     Ok(Added {
         path: store.shown_path(&name),
@@ -426,10 +453,10 @@ pub fn execute(
     }
     refuse_in_transaction(db)?;
     let recorded = store.ledger(name)?;
-    // Executed by upstream gStore (no ledger): the triples it derives that
-    // are already there are taken as its own, as upstream's retraction
-    // would treat them.
-    let legacy = recorded.is_none() && status_of(&doc) == status::EXECUTED;
+    // A rule file of upstream gStore (no ledger), possibly executed there:
+    // the triples it derives that are already there are taken as its own,
+    // as upstream's retraction would treat them.
+    let legacy = recorded.is_none();
     let mut ledger = recorded.unwrap_or_default();
     let report = db
         .reason_infer(&compiled.insert_sparql, cancel)
@@ -446,11 +473,15 @@ pub fn execute(
         ledger.extend(held_by_others(store, name, &existing)?);
     }
     ledger.extend(report.inserted.iter().cloned());
-    // Recorded even when the update failed part-way: what it added is owned.
-    store.set_ledger(name, Some(&ledger))?;
+    // Recorded even when the insert failed part-way — what it added is
+    // owned, and the rule is then executed. A failure that added nothing
+    // leaves the rule as it was.
+    if report.result.is_ok() || !report.inserted.is_empty() {
+        store.set_ledger(name, Some(&ledger))?;
+        doc.set("status", status::EXECUTED);
+        write_doc(store, name, &doc)?;
+    }
     let inserted = report.result.map_err(failed)?;
-    doc.set("status", status::EXECUTED);
-    write_doc(store, name, &doc)?;
     Ok(Executed {
         insert_sparql: compiled.insert_sparql,
         select_sparql: compiled.select_sparql,
@@ -475,7 +506,6 @@ pub fn disable(
     };
     let stored = stored.to_string();
     refuse_in_transaction(db)?;
-    let compiled = recompile(&doc);
     let removed = match store.ledger(name)? {
         Some(lines) => {
             let shared = held_by_others(store, name, &lines)?;
@@ -483,22 +513,24 @@ pub fn disable(
             db.reason_retract(&retract, cancel)
                 .map_err(|e| failed(e.to_string()))?
         }
-        // Executed by an earlier gStore (no ledger): upstream's retraction,
-        // compiled from the validated definition.
-        None if status_of(&doc) == status::EXECUTED => {
-            let c = compiled.clone()?;
-            match db.reason_update(&c.delete_sparql, cancel) {
-                Ok(n) => n,
-                Err(e) => return Err(failed(e.to_string())),
-            }
+        // A rule file of upstream gStore (no ledger), whatever its status:
+        // upstream's retraction, built from the validated label (and value)
+        // only — never the stored text.
+        None => {
+            let delete = retraction_statement(&doc).map_err(failed)?;
+            db.reason_update(&delete, cancel)
+                .map_err(|e| failed(e.to_string()))?
         }
-        None => 0,
     };
-    store.set_ledger(name, None)?;
+    store.set_ledger(name, Some(&BTreeSet::new()))?;
     doc.set("status", status::DISABLED);
     write_doc(store, name, &doc)?;
+    let delete_sparql = recompile(&doc)
+        .map(|c| c.delete_sparql)
+        .or_else(|_| retraction_statement(&doc))
+        .unwrap_or(stored);
     Ok(Disabled {
-        delete_sparql: compiled.map_or(stored, |c| c.delete_sparql),
+        delete_sparql,
         removed,
     })
 }

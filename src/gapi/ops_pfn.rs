@@ -173,8 +173,9 @@ fn funcudb(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     }
 }
 
-/// `funreview` — the module text `funInfo` compiles from, URL-encoded.
-fn funreview(_ctx: &mut Ctx<'_>, p: &Params) -> GResp {
+/// `funreview` — the module text `funInfo` compiles from, URL-encoded
+/// (bounded like a stored definition).
+fn funreview(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let info = match fun_info(p) {
         Ok(i) => i,
         Err(r) => return r,
@@ -182,7 +183,15 @@ fn funreview(_ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if info.is_empty() {
         return GResp::error(Status::ParamIsIllegal, EMPTY_INFO);
     }
-    let source = crate::pfn::generate_source(&info);
+    let source = match ctx.inner.pfn.check_definition(&info) {
+        Ok(s) => s,
+        Err(e) => {
+            return GResp::error(
+                Status::OperationFailed,
+                format!("Function review fail: {}", reason(e)),
+            )
+        }
+    };
     GResp::json(
         Json::obj()
             .with("StatusCode", 0)
@@ -196,8 +205,8 @@ fn funreview(_ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 /// value replaces the whole JSON document with `{"results": <value>}` —
 /// the value parsed as JSON when it is JSON, else the text. With several
 /// rows, the last shown row's first PFN cell wins (upstream overwrites as it
-/// goes); when no shown row has one, the usual `head` / `results` document
-/// stays.
+/// goes); when no shown row has one, or that cell's output is empty (upstream
+/// tests `pfn_data.empty()`), the usual `head` / `results` document stays.
 pub(super) struct PfnShape {
     /// The result columns holding PFN values.
     cols: Vec<String>,
@@ -251,6 +260,9 @@ impl PfnShape {
             .and_then(Json::as_str)
             .unwrap_or(cell)
             .to_string();
+        if text.is_empty() {
+            return None;
+        }
         Some(Json::obj().with("results", crate::pfn::call::output_value(&text)))
     }
 }
@@ -296,6 +308,14 @@ mod tests {
             s.results_json(&rs, None).unwrap().to_string(),
             r#"{"results":"plain text"}"#
         );
+        // An empty output: the usual document (upstream's
+        // `pfn_data.empty()`), also when an earlier row had a value.
+        let rs = ResultSet {
+            vars: vec!["v".into()],
+            rows: vec![vec![Some(r#""x""#.into())], vec![Some("\"\"".into())]],
+        };
+        assert!(s.results_json(&rs, None).is_none());
+        assert!(s.results_json(&rs, Some(1)).is_some());
     }
 
     #[test]

@@ -96,8 +96,20 @@ fn target(ctx: &Ctx<'_>, db: &str) -> (Option<DbHandle>, PathBuf) {
 /// The rule store of `db` for an operation that only touches rule files:
 /// the database must exist (loaded, or on disk). It does not wait for the
 /// database's lock (a long query may hold it): the rule directory's own lock
-/// orders it with execute / disable / check.
+/// orders it with execute / disable / check, and with backups (which copy
+/// the directory under it) and drop / restore (which remove or replace it
+/// under it). Refused (`1007`) while a build / drop / rename / backup /
+/// restore of the database is in progress.
 fn file_store(ctx: &Ctx<'_>, db: &str) -> Result<RuleStore<'static>, GResp> {
+    if ctx.state().busy.contains(db) {
+        return Err(GResp::error(
+            Status::LossOfLock,
+            format!(
+                "database[{db}] try write lock fail: another build/load/unload/drop/rename/\
+                 backup/restore of it is in progress"
+            ),
+        ));
+    }
     // A loaded database already keeps its rules in the directory it is
     // served from (`DbSlot::handle` tells it so), whose rules are these.
     let (handle, dir) = target(ctx, db);

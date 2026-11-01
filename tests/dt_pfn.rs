@@ -552,7 +552,11 @@ fn lifecycle_over_the_api() {
         assert_eq!(field(&list_of(&one)[0], "funStatus"), "1", "unchanged");
     }
     let j = funcudb(&addr, "root", "4", Json::obj().with("funName", "nope"));
-    assert_eq!(msg(&j), "Function build fail: function nope not exists");
+    // Upstream looks for the source file first (its text, sic).
+    assert_eq!(
+        msg(&j),
+        "Function build fail: Function source file dose not exist"
+    );
 
     // Delete.
     let j = funcudb(&addr, "root", "3", Json::obj().with("funName", "seven"));
@@ -662,6 +666,27 @@ fn functions_belong_to_their_user() {
     );
     let j = json::parse(&r.body).unwrap();
     assert_eq!(code(&j), 1001, "{j}");
+    // Deleting a user deletes their functions: an account created later
+    // under the name inherits none of them (usermanage and REST alike).
+    let manage = |kind: &str, name: &str| {
+        api(
+            &addr,
+            Json::obj()
+                .with("operation", "usermanage")
+                .with("type", kind)
+                .with("op_username", name)
+                .with("op_password", "pw"),
+        )
+    };
+    assert_eq!(code(&manage("2", "alice")), 0);
+    assert!(!root.join("pfn/src/alice").exists());
+    assert_eq!(code(&manage("1", "alice")), 0);
+    assert!(names("alice").is_empty(), "{:?}", names("alice"));
+    let r = rest(&addr, "POST", "/user/drop?op_username=bob", "");
+    assert_eq!(r.status, 200, "{}", r.body);
+    add_user(&addr, "bob", "");
+    assert!(names("bob").is_empty());
+    assert_eq!(names("root").len(), 1);
     srv.shutdown();
 }
 
@@ -734,15 +759,24 @@ fn define(reg: &PfnRegistry, user: &str, name: &str, subs: &str, body: &str) {
     assert!(r.is_ok(), "compile {name}: {r:?}");
 }
 
-/// The lexical value of the only cell of a one-row SELECT.
+/// The lexical value of a lone PFN projection: on the only row, or — over
+/// solutions, one row each (upstream's shape) — on the last row, the others
+/// holding none.
 #[cfg(feature = "pfn-wasm")]
 fn value_of(r: gstore::Result<QueryResult>) -> String {
     let rs = match r.unwrap() {
         QueryResult::Select(rs) => rs,
         other => panic!("not a SELECT result: {other:?}"),
     };
-    assert_eq!(rs.rows.len(), 1, "{rs:?}");
-    let cell = rs.rows[0].iter().flatten().next().expect("a value").clone();
+    let (last, others) = rs
+        .rows
+        .split_last()
+        .unwrap_or_else(|| panic!("no row: {rs:?}"));
+    assert!(
+        others.iter().all(|r| r.iter().all(Option::is_none)),
+        "{rs:?}"
+    );
+    let cell = last.iter().flatten().next().expect("a value").clone();
     gstore::sparql_results::upstream_binding(&cell)
         .get("value")
         .and_then(Json::as_str)
@@ -985,7 +1019,9 @@ fn api_query_answers_upstreams_results_document_as_the_caller() {
         ),
     );
     assert_eq!(code(&j), 0, "{j}");
-    assert_eq!(j.get("AnsNum").and_then(Json::as_i64), Some(1));
+    // One row per solution, the value on the last (upstream's shape for a
+    // PFN call, unlike a lone graph function's one row).
+    assert_eq!(j.get("AnsNum").and_then(Json::as_i64), Some(6));
     assert!(j.get("OutputLimit").is_some());
     let arr = j.get("results").and_then(Json::as_array).expect("array");
     assert_eq!(arr.len(), 6, "{j}");

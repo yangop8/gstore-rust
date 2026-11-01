@@ -198,10 +198,6 @@ impl Default for PfnLimits {
     }
 }
 
-/// The user whose functions a query run without a caller calls (the
-/// embedded API, the command-line tools): upstream's root user.
-pub const DEFAULT_CALLER: &str = crate::http_users::ROOT_USER;
-
 /// Who calls PFN functions, from which registry, under which limits — what a
 /// query evaluator needs to evaluate `PFN.name({…})`
 /// ([`Evaluator::with_pfn`](crate::query::engine::Evaluator::with_pfn)).

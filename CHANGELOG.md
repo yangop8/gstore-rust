@@ -34,7 +34,8 @@ end.
   Rules live in `<db>.db/reason_rule_files/<rulename>.json` (upstream's
   layout; compact JSON, sorted keys), survive unload / load and restarts, and
   are carried by `backup` / `restore` (also the library's `Database::backup`,
-  `backup_dir` and `restore_into`) and removed by `drop`.
+  `backup_dir`, `restore_into` and `restore_incremental`) and removed by
+  `drop`.
 - **Compiler** (`reason::compile`): upstream's `insert`, `delete`, `check`
   and `select` statements byte for byte, relation (`type` 1) and property
   (`type` 0) rules, `logic` 0 (`UNION`) and 1 (join), filters. Inferred
@@ -43,21 +44,30 @@ end.
   CSR, write-through, update / redo logs, commit point, check_point save,
   query log, task registry and cancellation); refused (`1004`) while a
   transaction is open on the database.
-- **Exact retraction**: each execution records the triples the rule owns
-  (`reason_rule_files/inferred/<rulename>.nt`); disabling deletes exactly
-  those no other rule owns. A rule executed by upstream gStore (no record)
-  is retracted upstream's way.
+- **Exact retraction**: each rule records the triples it owns
+  (`reason_rule_files/inferred/<rulename>.nt`, created empty by add); the
+  conditions are evaluated once per execution and exactly what that
+  evaluation derived is inserted; disabling deletes exactly those no other
+  rule owns. A rule file without a record (written by upstream gStore, in
+  any status) is retracted upstream's way from its validated label alone,
+  and re-executing it takes its existing triples over. An execution that
+  fails having inserted nothing leaves the rule as it was.
 - **Hardening**: every pattern / `return` term must be one SPARQL term, every
   filter one bracket-balanced expression, the label part of one IRI, and
   `return` variables must be bound — validated with the crate's own lexer and
   parser, and the compiled statements are parsed again and shape-checked.
   Execute only ever runs the statement compiled from the definition. Rule
-  names must be safe file names; at most 1000 rules per database, 1 MiB per
-  rule file (fixed limits: there are no `conf.ini` keys).
+  names must be safe file names (an existing rule file's name only has to
+  stay inside the rule directory); at most 1000 rules per database, 1 MiB
+  per rule file (fixed limits: there are no `conf.ini` keys). Backups copy
+  the rule directory under its lock; `drop` / `restore` replace it under it,
+  and the file operations are refused (`1007`) while a lifecycle operation
+  holds the database.
 - **Library API**: `Database::reason_add`, `reason_list`, `reason_compile`,
   `reason_execute`, `reason_disable`, `reason_show`, `reason_delete`,
   `reason_check`, `reason_db_dir`, `set_reason_db_dir`; a database without a
-  directory keeps its rules in memory (and writes them into its backups).
+  directory keeps its rules in memory (and writes them into its backups and
+  saves); `into_memory` reads a database's rules into memory with it.
 - **Fix: RDFS range** no longer infers `"lit" rdf:type C` — a triple with a
   literal subject — from `p rdfs:range C` and `x p "lit"`.
 

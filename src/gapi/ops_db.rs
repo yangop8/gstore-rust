@@ -53,6 +53,7 @@ use crate::http_api::{
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
 use crate::model::{Term, Triple};
+use crate::reason::store::RuleStore;
 use crate::server::locked;
 use crate::sysdb::{clock, DbRecord, DbStatus};
 use crate::{Database, DB_SUFFIX};
@@ -1107,6 +1108,9 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         }
     }
     if dir.is_dir() {
+        // A `reasonManage` file operation (which does not wait for the
+        // database) is never half-way through its rule directory meanwhile.
+        let _rules = RuleStore::dir(&dir).lock();
         let moved = if is_backup {
             fs::rename(&dir, bak_path(&dir))
         } else {
@@ -1595,7 +1599,12 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             st.dbs.remove(&db);
         }
     }
-    let installed = Database::install_restore(&staged, &dir);
+    let installed = {
+        // As in drop: no `reasonManage` file operation is half-way through
+        // the rule directory swapped out.
+        let _rules = RuleStore::dir(&dir).lock();
+        Database::install_restore(&staged, &dir)
+    };
     // Release the probe before reopening: the directory at this path is a
     // new one now.
     drop(probe);

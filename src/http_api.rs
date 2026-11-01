@@ -3715,7 +3715,14 @@ impl ApiInner {
             return Resp::fail(400, "missing op_username");
         };
         match st.users.drop_user(&name) {
-            Ok(()) => Resp::ok(&format!("user '{name}' dropped")),
+            // Its PFN functions go with it (see `PfnRegistry::drop_user`).
+            Ok(()) => match self.pfn.drop_user(&name) {
+                Ok(()) => Resp::ok(&format!("user '{name}' dropped")),
+                Err(e) => Resp::fail(
+                    500,
+                    &format!("user '{name}' dropped, but removing its PFN functions failed: {e}"),
+                ),
+            },
             Err(e) => Resp::fail(400, &e),
         }
     }

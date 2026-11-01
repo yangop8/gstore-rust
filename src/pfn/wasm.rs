@@ -14,15 +14,26 @@
 //!   [`MAX_TABLE_ELEMENTS`], and wasmi *fuel* metering: the call runs in
 //!   slices of [`FUEL_SLICE`] instructions; between slices the query's
 //!   cancel flag is checked and the [`PfnLimits::fuel_per_call`] budget
-//!   enforced. Traps (`unreachable`, an out-of-bounds access, a stack
-//!   overflow, a host function refusing a bad pointer, an output past
+//!   enforced. A host function is charged fuel for the guest bytes it reads
+//!   or writes (one unit per [`HOST_BYTES_PER_FUEL`]) and checks the cancel
+//!   flag itself, so a call into the host costs what its work costs. Traps
+//!   (`unreachable`, an out-of-bounds access, a stack overflow, a host
+//!   function refusing a bad pointer, an output past
 //!   `gfun_max_output_bytes`) become query errors.
+//! * **Engines.** wasmi keeps what a module registers in its engine until the
+//!   engine itself is dropped. Compiling validates in a throw-away engine;
+//!   modules are loaded into a shared engine that is replaced by a fresh one
+//!   once [`ENGINE_RECYCLE_BYTES`] of modules were loaded into it (the
+//!   registry then drops its cached modules, freeing the old engine when the
+//!   last running call ends). wasmi's strict [`EnforcedLimits`] bound what one
+//!   module may declare (10 000 functions, …).
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use wasmi::{
-    Caller, Config, Engine, Error as WasmError, Extern, ExternType, Linker, Memory, Module, Store,
-    StoreLimits, StoreLimitsBuilder, TypedResumableCall, ValType as WasmVal,
+    Caller, Config, EnforcedLimits, Engine, Error as WasmError, Extern, ExternType, Linker, Memory,
+    Module, Store, StoreLimits, StoreLimitsBuilder, TypedResumableCall, ValType as WasmVal,
 };
 
 use super::abi::{self, ValType};
@@ -38,12 +49,27 @@ pub const FUEL_SLICE: u64 = 1 << 20;
 /// The most table elements a module may have.
 pub const MAX_TABLE_ELEMENTS: usize = 10_000;
 
+/// Guest bytes a host function may read or write per unit of fuel it is
+/// charged (about the cost of an instruction).
+pub const HOST_BYTES_PER_FUEL: u64 = 8;
+
+/// The bytes of modules loaded into one engine before loads move to a fresh
+/// one (see the module docs).
+pub const ENGINE_RECYCLE_BYTES: usize = 16 << 20;
+
 /// A compiled, validated module.
 pub(crate) type LoadedModule = Module;
 
-/// The PFN WebAssembly engine (one per registry; modules are tied to it).
+/// The PFN WebAssembly runtime (one per registry; see the module docs).
 pub(crate) struct Runtime {
+    config: Config,
+    current: Mutex<EngineSlot>,
+}
+
+/// The engine modules are loaded into, and how many module bytes were.
+struct EngineSlot {
     engine: Engine,
+    loaded: usize,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -54,10 +80,15 @@ impl std::fmt::Debug for Runtime {
 
 impl Runtime {
     pub(crate) fn new() -> Runtime {
-        let mut cfg = Config::default();
-        cfg.consume_fuel(true).allow_start_fn(false);
+        let mut config = Config::default();
+        config
+            .consume_fuel(true)
+            .allow_start_fn(false)
+            .enforced_limits(EnforcedLimits::strict());
+        let engine = Engine::new(&config);
         Runtime {
-            engine: Engine::new(&cfg),
+            config,
+            current: Mutex::new(EngineSlot { engine, loaded: 0 }),
         }
     }
 
@@ -90,16 +121,36 @@ impl Runtime {
                 limits.max_module_bytes
             ));
         }
-        self.load(name, &bytes)?;
+        // Validated in an engine of its own, dropped (with everything the
+        // module registered in it) right after.
+        validate(&Engine::new(&self.config), name, &bytes)?;
         Ok(bytes)
     }
 
-    /// Validate `bytes` and check the PFN interface; the module to run.
-    pub(crate) fn load(&self, name: &str, bytes: &[u8]) -> std::result::Result<Module, String> {
-        let module =
-            Module::new(&self.engine, bytes).map_err(|e| format!("invalid module: {e}"))?;
-        check_interface(&module, name)?;
-        Ok(module)
+    /// Validate `bytes` and check the PFN interface; the module to run,
+    /// loaded into the shared engine — a fresh one when the current one had
+    /// [`ENGINE_RECYCLE_BYTES`] loaded into it (`true` then: drop the
+    /// modules loaded before, so the old engine is freed).
+    pub(crate) fn load(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<(Module, bool), String> {
+        let mut slot = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh =
+            slot.loaded > 0 && slot.loaded.saturating_add(bytes.len()) > ENGINE_RECYCLE_BYTES;
+        if fresh {
+            *slot = EngineSlot {
+                engine: Engine::new(&self.config),
+                loaded: 0,
+            };
+        }
+        // A module that fails validation registers in the engine too.
+        slot.loaded = slot.loaded.saturating_add(bytes.len());
+        Ok((validate(&slot.engine, name, bytes)?, fresh))
     }
 
     /// Call function `name` of `module` once with argument text `params`.
@@ -121,6 +172,9 @@ impl Runtime {
             args,
             out: Vec::new(),
             max_output: opts.max_output,
+            cancel: opts.cancel,
+            cancelled: false,
+            debt: 0,
             limits: StoreLimitsBuilder::new()
                 .memory_size(max_memory)
                 .memories(1)
@@ -129,9 +183,12 @@ impl Runtime {
                 .instances(1)
                 .build(),
         };
-        let mut store = Store::new(&self.engine, host);
+        // The store and linker belong to the module's engine (an older one
+        // when the shared engine was replaced since the module was loaded).
+        let engine = module.engine();
+        let mut store = Store::new(engine, host);
         store.limiter(|h| &mut h.limits);
-        let linker = linker(&self.engine).map_err(|e| fail(e.to_string()))?;
+        let linker = linker(engine).map_err(|e| fail(e.to_string()))?;
         let budget = opts.limits.fuel_per_call;
         let remaining = |used: u64| {
             if budget == 0 {
@@ -160,6 +217,14 @@ impl Runtime {
         loop {
             match call {
                 TypedResumableCall::Finished(ret) => {
+                    // Host work charged past the last slice counts too.
+                    let left = store.get_fuel().unwrap_or(0);
+                    let total = used
+                        .saturating_add(granted.saturating_sub(left))
+                        .saturating_add(store.data().debt);
+                    if budget != 0 && total > budget {
+                        return Err(exhausted());
+                    }
                     let host = store.into_data();
                     let out = String::from_utf8(host.out)
                         .map_err(|_| fail("the output is not valid UTF-8".into()))?;
@@ -175,7 +240,11 @@ impl Runtime {
                 }
                 TypedResumableCall::OutOfFuel(invocation) => {
                     let left = store.get_fuel().unwrap_or(0);
-                    used = used.saturating_add(granted.saturating_sub(left));
+                    // What host functions were charged past the slice too.
+                    let debt = std::mem::take(&mut store.data_mut().debt);
+                    used = used
+                        .saturating_add(granted.saturating_sub(left))
+                        .saturating_add(debt);
                     if opts.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                         return Err(GStoreError::Cancelled);
                     }
@@ -191,11 +260,21 @@ impl Runtime {
                         .map_err(|e| fail(e.to_string()))?;
                 }
                 TypedResumableCall::HostTrap(trap) => {
+                    if store.data().cancelled {
+                        return Err(GStoreError::Cancelled);
+                    }
                     return Err(fail(trap.host_error().to_string()));
                 }
             }
         }
     }
+}
+
+/// Validate `bytes` in `engine` and check the PFN interface.
+fn validate(engine: &Engine, name: &str, bytes: &[u8]) -> std::result::Result<Module, String> {
+    let module = Module::new(engine, bytes).map_err(|e| format!("invalid module: {e}"))?;
+    check_interface(&module, name)?;
+    Ok(module)
 }
 
 /// Check what `module` imports and exports against the PFN interface.
@@ -259,10 +338,44 @@ struct Host<'a> {
     args: Json,
     out: Vec<u8>,
     max_output: usize,
+    /// The query's cancel flag, checked by the host functions too.
+    cancel: Option<&'a AtomicBool>,
+    /// Set when a host function stopped the call because of `cancel`.
+    cancelled: bool,
+    /// Fuel host functions were charged beyond what the slice had left
+    /// (added to the budget's count when the slice runs out).
+    debt: u64,
     limits: StoreLimits,
 }
 
 type Cx<'c, 'a> = Caller<'c, Host<'a>>;
+
+/// Charge the call for host work touching `bytes` guest bytes (see
+/// [`HOST_BYTES_PER_FUEL`]), and stop it when its query was cancelled. The
+/// charge empties the current slice at most; the rest is owed (`debt`), so
+/// the next instruction runs out of fuel and the budget and the cancel flag
+/// are checked.
+fn charge(c: &mut Cx<'_, '_>, bytes: usize) -> std::result::Result<(), WasmError> {
+    if c.data().cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        c.data_mut().cancelled = true;
+        return Err(err("query cancelled"));
+    }
+    let cost = 1 + bytes as u64 / HOST_BYTES_PER_FUEL;
+    let left = c.get_fuel()?;
+    if cost <= left {
+        c.set_fuel(left - cost)?;
+    } else {
+        c.set_fuel(0)?;
+        let h = c.data_mut();
+        h.debt = h.debt.saturating_add(cost - left);
+    }
+    Ok(())
+}
+
+/// The length a guest passed (`u32`, as [`abi::guest_range`] reads it).
+fn guest_len(len: i32) -> usize {
+    len as u32 as usize
+}
 
 fn err(msg: impl Into<String>) -> WasmError {
     WasmError::new(msg.into())
@@ -377,6 +490,7 @@ fn lookup(
     len: i32,
     f: impl FnOnce(&dyn GraphCtx, &str) -> Option<u64>,
 ) -> std::result::Result<i64, WasmError> {
+    charge(&mut c, guest_len(len))?;
     let mem = memory(&c)?;
     let (data, host) = mem.data_and_store_mut(&mut c);
     let s = abi::read_guest_str(data, ptr, len).map_err(err)?;
@@ -414,72 +528,92 @@ fn h_term_vertex(c: Cx<'_, '_>, t: i64) -> i64 {
 }
 
 /// Write a host string into the guest's `(buf, cap)` (`-1` when `f` has
-/// none; the buffer is checked either way).
-fn give(
-    mut c: Cx<'_, '_>,
+/// none; the buffer is checked either way). `key` is the guest's key string
+/// `(ptr, len)` `f` is given (empty when `None`), read in place. Charged for
+/// the key and the bytes written.
+fn give<'h>(
+    mut c: Cx<'_, 'h>,
+    key: Option<(i32, i32)>,
     buf: i32,
     cap: i32,
-    f: impl FnOnce(&Host<'_>) -> Option<String>,
+    f: impl for<'x> FnOnce(&'x Host<'h>, &str) -> Option<std::borrow::Cow<'x, str>>,
 ) -> std::result::Result<i32, WasmError> {
+    let klen = key.map_or(0, |(_, l)| guest_len(l));
+    charge(&mut c, klen)?;
     let mem = memory(&c)?;
     let (data, host) = mem.data_and_store_mut(&mut c);
     abi::guest_range(data.len(), buf, cap).map_err(err)?;
-    match f(host) {
-        Some(s) => abi::write_guest(data, buf, cap, s.as_bytes()).map_err(err),
-        None => Ok(-1),
-    }
+    let value = match key {
+        Some((p, l)) => f(host, abi::read_guest_str(data, p, l).map_err(err)?),
+        None => f(host, ""),
+    };
+    let Some(s) = value else {
+        return Ok(-1);
+    };
+    let written = s.len().min(guest_len(cap));
+    let n = abi::write_guest(data, buf, cap, s.as_bytes()).map_err(err)?;
+    drop(s);
+    charge(&mut c, written)?;
+    Ok(n)
 }
 
 fn h_term_str(c: Cx<'_, '_>, t: i64, buf: i32, cap: i32) -> std::result::Result<i32, WasmError> {
-    give(c, buf, cap, |h| {
+    give(c, None, buf, cap, |h, _| {
         u64::try_from(t)
             .ok()
             .and_then(|t| h.graph.term_str(t))
-            .map(str::to_owned)
+            .map(Into::into)
     })
 }
 
 fn h_vertex_str(c: Cx<'_, '_>, v: i64, buf: i32, cap: i32) -> std::result::Result<i32, WasmError> {
-    give(c, buf, cap, |h| {
+    give(c, None, buf, cap, |h, _| {
         u64::try_from(v)
             .ok()
             .and_then(|v| h.graph.vertex_term(v))
             .and_then(|t| h.graph.term_str(t))
-            .map(str::to_owned)
+            .map(Into::into)
     })
 }
 
 fn h_pred_str(c: Cx<'_, '_>, p: i64, buf: i32, cap: i32) -> std::result::Result<i32, WasmError> {
-    give(c, buf, cap, |h| {
+    give(c, None, buf, cap, |h, _| {
         PredId::try_from(p)
             .ok()
             .and_then(|p| h.graph.pred_str(p))
-            .map(str::to_owned)
+            .map(Into::into)
     })
 }
 
 fn h_args(c: Cx<'_, '_>, buf: i32, cap: i32) -> std::result::Result<i32, WasmError> {
-    give(c, buf, cap, |h| Some(h.args_text.to_owned()))
+    give(c, None, buf, cap, |h, _| Some(h.args_text.into()))
 }
 
-/// The guest's key string `(key, klen)`, copied.
-fn key_of(c: &mut Cx<'_, '_>, key: i32, klen: i32) -> std::result::Result<String, WasmError> {
+/// Run `f` with the guest's key string `(key, klen)`, read in place (no
+/// copy) and charged for.
+fn with_key<R>(
+    c: &mut Cx<'_, '_>,
+    key: i32,
+    klen: i32,
+    f: impl FnOnce(&Host<'_>, &str) -> R,
+) -> std::result::Result<R, WasmError> {
+    charge(c, guest_len(klen))?;
     let mem = memory(c)?;
-    let data = mem.data(&*c);
-    abi::read_guest_str(data, key, klen)
-        .map(str::to_owned)
-        .map_err(err)
+    let (data, host) = mem.data_and_store_mut(&mut *c);
+    let k = abi::read_guest_str(data, key, klen).map_err(err)?;
+    Ok(f(host, k))
 }
 
 fn h_arg_str(
-    mut c: Cx<'_, '_>,
+    c: Cx<'_, '_>,
     key: i32,
     klen: i32,
     buf: i32,
     cap: i32,
 ) -> std::result::Result<i32, WasmError> {
-    let k = key_of(&mut c, key, klen)?;
-    give(c, buf, cap, |h| abi::arg_str(&h.args, &k))
+    give(c, Some((key, klen)), buf, cap, |h, k| {
+        abi::arg_str(&h.args, k).map(Into::into)
+    })
 }
 
 fn h_arg_int(
@@ -488,8 +622,9 @@ fn h_arg_int(
     klen: i32,
     default: i64,
 ) -> std::result::Result<i64, WasmError> {
-    let k = key_of(&mut c, key, klen)?;
-    Ok(abi::arg_int(&c.data().args, &k).unwrap_or(default))
+    with_key(&mut c, key, klen, |h, k| {
+        abi::arg_int(&h.args, k).unwrap_or(default)
+    })
 }
 
 fn h_arg_bool(
@@ -498,32 +633,34 @@ fn h_arg_bool(
     klen: i32,
     default: i32,
 ) -> std::result::Result<i32, WasmError> {
-    let k = key_of(&mut c, key, klen)?;
-    Ok(abi::arg_bool(&c.data().args, &k).map_or(default, i32::from))
+    with_key(&mut c, key, klen, |h, k| {
+        abi::arg_bool(&h.args, k).map_or(default, i32::from)
+    })
 }
 
 fn h_arg_len(mut c: Cx<'_, '_>, key: i32, klen: i32) -> std::result::Result<i32, WasmError> {
-    let k = key_of(&mut c, key, klen)?;
-    Ok(abi::arg_array(&c.data().args, &k)
-        .and_then(|a| i32::try_from(a.len()).ok())
-        .unwrap_or(-1))
+    with_key(&mut c, key, klen, |h, k| {
+        abi::arg_array(&h.args, k)
+            .and_then(|a| i32::try_from(a.len()).ok())
+            .unwrap_or(-1)
+    })
 }
 
 fn h_arg_item(
-    mut c: Cx<'_, '_>,
+    c: Cx<'_, '_>,
     key: i32,
     klen: i32,
     i: i32,
     buf: i32,
     cap: i32,
 ) -> std::result::Result<i32, WasmError> {
-    let k = key_of(&mut c, key, klen)?;
-    give(c, buf, cap, |h| {
-        let items = abi::arg_array(&h.args, &k)?;
+    give(c, Some((key, klen)), buf, cap, |h, k| {
+        let items = abi::arg_array(&h.args, k)?;
         usize::try_from(i)
             .ok()
             .and_then(|i| items.get(i))
             .and_then(abi::scalar_text)
+            .map(Into::into)
     })
 }
 
@@ -540,17 +677,60 @@ fn push_out(host: &mut Host<'_>, bytes: &[u8]) -> std::result::Result<(), WasmEr
 }
 
 fn h_emit(mut c: Cx<'_, '_>, ptr: i32, len: i32) -> std::result::Result<(), WasmError> {
+    charge(&mut c, guest_len(len))?;
     let mem = memory(&c)?;
     let (data, host) = mem.data_and_store_mut(&mut c);
     let bytes = abi::read_guest(data, ptr, len).map_err(err)?;
     push_out(host, bytes)
 }
 
+/// `emit_json_str`: the guest's string as a quoted JSON string, escaped
+/// straight into the output — the bound is checked as it grows (an escape
+/// is at most 6 bytes per input byte), never on a copy built first.
 fn h_emit_json_str(mut c: Cx<'_, '_>, ptr: i32, len: i32) -> std::result::Result<(), WasmError> {
+    charge(&mut c, guest_len(len))?;
     let mem = memory(&c)?;
     let (data, host) = mem.data_and_store_mut(&mut c);
-    let s = abi::read_guest_str(data, ptr, len).map_err(err)?;
-    push_out(host, crate::json::quote(s).as_bytes())
+    let bytes = abi::read_guest(data, ptr, len).map_err(err)?;
+    let s = std::str::from_utf8(bytes).map_err(|e| {
+        err(format!(
+            "the string at {} is not valid UTF-8 ({e})",
+            ptr as u32
+        ))
+    })?;
+    let exceeds = |host: &Host<'_>| {
+        err(format!(
+            "the output exceeds {} bytes (gfun_max_output_bytes)",
+            host.max_output
+        ))
+    };
+    // At least the quotes and the text itself, before anything is written.
+    if host.out.len().saturating_add(s.len()).saturating_add(2) > host.max_output {
+        return Err(exceeds(host));
+    }
+    let start = host.out.len();
+    let mut chunk = String::new();
+    host.out.push(b'"');
+    // Escaped a piece at a time (whole characters), each checked.
+    let mut from = 0;
+    while from < s.len() {
+        let mut to = (from + 64 * 1024).min(s.len());
+        while !s.is_char_boundary(to) {
+            to += 1;
+        }
+        chunk.clear();
+        crate::json::write_str(&s[from..to], &mut chunk);
+        // Without the quotes `write_str` adds around each piece.
+        let inner = &chunk.as_bytes()[1..chunk.len() - 1];
+        if host.out.len().saturating_add(inner.len()).saturating_add(1) > host.max_output {
+            host.out.truncate(start);
+            return Err(exceeds(host));
+        }
+        host.out.extend_from_slice(inner);
+        from = to;
+    }
+    host.out.push(b'"');
+    Ok(())
 }
 
 fn h_emit_i64(mut c: Cx<'_, '_>, x: i64) -> std::result::Result<(), WasmError> {
@@ -610,7 +790,7 @@ mod tests {
             ..PfnInfo::default()
         });
         let bytes = rt.compile(name, &src, &PfnLimits::default()).unwrap();
-        rt.load(name, &bytes).unwrap()
+        rt.load(name, &bytes).unwrap().0
     }
 
     fn opts(limits: PfnLimits) -> CallOptions<'static> {
@@ -635,6 +815,46 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    /// Loads move to a fresh engine once `ENGINE_RECYCLE_BYTES` were loaded
+    /// into one (wasmi never frees what a module registered in its engine);
+    /// a module of the replaced engine still runs.
+    #[test]
+    fn the_shared_engine_is_replaced_and_old_modules_still_run() {
+        let rt = Runtime::new();
+        let wat = format!(
+            "(module (import \"gstore\" \"emit_i64\" (func $e (param i64))) \
+             (memory (export \"memory\") 8) (data (i32.const 0) \"{}\") \
+             (func (export \"f\") (result i32) (call $e (i64.const 5)) (i32.const 1)))",
+            "a".repeat(300 * 1024)
+        );
+        let bytes = rt.compile("f", &wat, &PfnLimits::default()).unwrap();
+        let (first, fresh) = rt.load("f", &bytes).unwrap();
+        assert!(!fresh);
+        let mut loads = 1;
+        loop {
+            let (_, fresh) = rt.load("f", &bytes).unwrap();
+            loads += 1;
+            if fresh {
+                break;
+            }
+            assert!(loads * bytes.len() <= ENGINE_RECYCLE_BYTES + bytes.len(), "{loads}");
+        }
+        assert!(!rt.load("f", &bytes).unwrap().1);
+        let db =
+            Database::build_from_str("pfn_wasm_e", "<http://a> <http://p> <http://b> .\n").unwrap();
+        let csr = db.csr().unwrap();
+        let g = CsrGraphCtx::new(&csr, db.dict());
+        assert_eq!(
+            rt.run(&first, "f", "{}", &g, &opts(PfnLimits::default()))
+                .unwrap(),
+            "5"
+        );
+        // Validation never touches the shared engine.
+        let before = rt.current.lock().unwrap().loaded;
+        rt.compile("f", &wat, &PfnLimits::default()).unwrap();
+        assert_eq!(rt.current.lock().unwrap().loaded, before);
     }
 
     #[test]

@@ -3,17 +3,21 @@
 //! * A database with a directory keeps them, as upstream, in
 //!   `<db dir>/reason_rule_files/`: one `<rulename>.json` per rule (the rule
 //!   JSON, compact with sorted keys like upstream's `nlohmann::json::dump()`).
-//!   This implementation adds one file per executed rule,
-//!   `reason_rule_files/inferred/<rulename>.nt`: the N-Triples ledger of the
-//!   triples the rule inferred (see [`super::manage`]). Upstream's listing
-//!   only reads names containing `.json`, so it ignores the ledgers.
+//!   This implementation adds one file per rule it added (or disabled or
+//!   executed), `reason_rule_files/inferred/<rulename>.nt`: the N-Triples
+//!   ledger of the triples the rule inferred, empty when it owns none (see
+//!   [`super::manage`]; a rule file without one was written by upstream
+//!   gStore). Upstream's listing only reads names containing `.json`, so it
+//!   ignores the ledgers.
 //! * A database without a directory (built in memory, never opened from or
 //!   saved to a directory) keeps them in memory ([`MemoryRules`]); they live
 //!   as long as the [`Database`](crate::Database) value.
 //!
 //! Every read-modify-write of a rule directory happens under a process-wide
 //! lock for that directory ([`RuleStore::lock`]), so concurrent
-//! `reasonManage` requests on one database never interleave. Rule files are
+//! `reasonManage` requests on one database never interleave; copying a rule
+//! directory ([`copy_rule_dir`], for backups and restores) holds it too, and
+//! so does a server removing or replacing a database directory. Rule files are
 //! created with `create_new` (two concurrent adds of a name cannot both
 //! succeed) and replaced atomically (temp file + rename). The database
 //! directory itself is never created here: a rule cannot resurrect a dropped
@@ -144,17 +148,7 @@ impl<'a> RuleStore<'a> {
     /// the whole of an operation.
     pub fn lock(&self) -> StoreLock {
         match self {
-            RuleStore::Dir { db_dir } => {
-                let state = dir_lock(db_dir);
-                {
-                    let mut held = state.held.lock().unwrap_or_else(|p| p.into_inner());
-                    while *held {
-                        held = state.freed.wait(held).unwrap_or_else(|p| p.into_inner());
-                    }
-                    *held = true;
-                }
-                StoreLock { state: Some(state) }
-            }
+            RuleStore::Dir { db_dir } => lock_dir(db_dir),
             RuleStore::Memory(_) => StoreLock { state: None },
         }
     }
@@ -398,11 +392,38 @@ impl<'a> RuleStore<'a> {
     }
 }
 
+/// Take the process-wide rule lock of the database in directory `db_dir`
+/// (see [`RuleStore::lock`]).
+fn lock_dir(db_dir: &Path) -> StoreLock {
+    let state = dir_lock(db_dir);
+    {
+        let mut held = state.held.lock().unwrap_or_else(|p| p.into_inner());
+        while *held {
+            held = state.freed.wait(held).unwrap_or_else(|p| p.into_inner());
+        }
+        *held = true;
+    }
+    StoreLock { state: Some(state) }
+}
+
 /// Make `dst_db_dir/reason_rule_files` a copy of `src_db_dir`'s (removing
 /// the destination's when the source has none) — for backups and restores,
 /// which carry a database's rules like upstream's whole-directory copies do.
+/// Both directories' rule locks are held throughout (taken in a fixed order),
+/// so a concurrent `reasonManage` operation is never copied half-done.
 pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> {
     let (src, dst) = (src_db_dir.join(RULE_DIR), dst_db_dir.join(RULE_DIR));
+    let key = |d: &Path| fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+    let (src_key, dst_key) = (key(src_db_dir), key(dst_db_dir));
+    if src_key == dst_key {
+        return Ok(());
+    }
+    let _locks = if src_key < dst_key {
+        (lock_dir(src_db_dir), lock_dir(dst_db_dir))
+    } else {
+        let d = lock_dir(dst_db_dir);
+        (lock_dir(src_db_dir), d)
+    };
     if fs::canonicalize(&src)
         .ok()
         .is_some_and(|s| fs::canonicalize(&dst).ok() == Some(s))
@@ -431,6 +452,29 @@ fn copy_tree(src: &Path, dst: &Path) -> crate::Result<()> {
         }
     }
     fsutil::sync_dir(dst)
+}
+
+/// The rules (and ledgers) of the database in directory `db_dir`, read into
+/// memory under its rule lock — for a database detached from its directory
+/// ([`Database::into_memory`](crate::Database::into_memory)), which keeps
+/// them in memory from then on. A rule file that cannot be read (larger
+/// than [`MAX_RULE_FILE_BYTES`], not UTF-8) is left out, as no operation
+/// could use it.
+pub fn read_rule_dir(db_dir: &Path) -> crate::Result<MemoryRules> {
+    let store = RuleStore::dir(db_dir);
+    let _lock = store.lock();
+    let mut m = MemoryRules::default();
+    let err = |e: StoreError| crate::GStoreError::Database(e.0);
+    for name in store.names().map_err(err)? {
+        let Ok(Some(text)) = store.read(&name) else {
+            continue;
+        };
+        if let Some(ledger) = store.ledger(&name).map_err(err)? {
+            m.ledgers.insert(name.clone(), ledger);
+        }
+        m.rules.insert(name, text);
+    }
+    Ok(m)
 }
 
 /// Write the in-memory rules `m` into `dst_db_dir/reason_rule_files` (the

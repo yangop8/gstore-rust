@@ -402,9 +402,16 @@ owned triples no other rule also owns. So a fact asserted with an ordinary
 predicate is never touched; a `<Rule:…>` triple that was already in the
 database before the rule ran (asserted by a user) survives; a triple two rules
 infer survives until both are disabled. A triple a user inserts *after* the
-rule inferred it is the same RDF triple and is retracted with the rule. A rule
-that upstream gStore executed (no ownership record) is retracted with
-upstream's `delete where {?x <Rule:label> ?y.}`.
+rule inferred it is the same RDF triple and is retracted with the rule. A
+rule's conditions are evaluated once per execution and exactly the triples
+that evaluation derived are inserted, so a random filter cannot leave a triple
+unrecorded. A rule file without an ownership record was written by upstream
+gStore: whatever its status (upstream's check and compile overwrite `已执行`),
+disabling it retracts with upstream's `delete where {?x <Rule:label> ?y.}`
+(built from the validated label alone, so a rule whose conditions this
+implementation refuses can still be disabled, and its name only has to stay
+inside the rule directory), and executing it takes over the triples it derives
+that are already there.
 
 **Differences from upstream**, deliberate:
 
@@ -448,7 +455,11 @@ compiles a C++ body with `g++` and `dlopen()`s it, gstore-rust compiles a
 can only call the gStore host interface (vertices, edges, per-predicate
 neighbours, id ↔ string, its arguments, an output buffer), under an
 instruction budget, a memory cap, the output bound and the query's cancel
-flag. Every user reaches only their own functions.
+flag. Every user reaches only their own functions. PFN calls are evaluated
+by the multi-database `gserver` (API mode) and by embedded databases with a
+caller installed (`Database::set_pfn_caller`); the single-database
+`gserver <db dir>` and the command-line tools answer a PFN call with an
+error.
 
 The runtime is the cargo feature `pfn-wasm` (`wasmi` + `wat`, off by
 default): without it, function management works but compiling and calling

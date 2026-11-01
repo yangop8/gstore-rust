@@ -128,9 +128,15 @@ a call may only be the whole expression of a SELECT projection.
   string otherwise. A variable bound only by `BIND` (or to a computed value)
   has no usable binding, as for the graph functions. When no variable has a
   binding, nothing runs and the value is `[]`.
-* The row shape is the graph functions': the lone projection gives one row;
-  next to other projections the value is on the last row; with `GROUP BY` it
-  is computed per group.
+* The row shape is upstream's: over solutions there is one row per
+  solution and the value is on the last row, whether the call is the lone
+  projection or next to others (unlike a lone graph function, which gives one
+  row — upstream reserves one row for it but not for PFN); with no solution
+  the lone projection gives one row; with `GROUP BY` it is computed per
+  group. So `AnsNum` counts the solutions, `OFFSET` keeps the value as long
+  as the last row is shown, and `DISTINCT` leaves the value row and one
+  empty row. An empty output gives the usual result document (no
+  `{"results": …}`), as upstream.
 * **Whose functions**: the caller's. The `/api` and REST endpoints run every
   statement for the authenticated user, so `PFN.f` is *that user's* `f`
   (upstream looks the module up under the query's user name); a user cannot
@@ -449,21 +455,32 @@ extensions) and applied to every served database like the `[query]` keys
 |-----|---------|---------|
 | `pfn_fuel_per_call` | `1000000000` | the most WebAssembly instructions one call may run (`0` = unlimited); past it: `run f fail: the instruction budget … is exhausted` |
 | `pfn_max_memory_pages` | `1024` (64 MiB) | the most 64 KiB pages the memory may grow to; `memory.grow` past it returns `-1`, as WebAssembly specifies |
-| `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts |
+| `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts — also `funBody` and `funSubs` together as sent (URL-decoded, whitespace included); `funDesc` may have at most 64 KiB, and `funSubs` must be empty next to a complete module, when the function is created or updated |
 | `pfn_max_functions` | `100` | the most functions one user may own |
 | `[query] gfun_max_output_bytes` | `67108864` | the most bytes one call may emit (and the most a call's result array may hold) |
 
 The call runs in slices of about a million instructions; between slices the
 query's cancel flag is checked, so `operationTaskCancel` (`/api`) and
 `POST /cancel` (REST) stop a looping function, and the instruction budget is
-enforced. A trap (`unreachable`, an out-of-bounds memory access, a stack
+enforced. A host function is charged one instruction per 8 bytes of guest
+memory it reads or writes (a string lookup, an argument key, `emit`, …) and
+checks the cancel flag itself, so a loop of host calls on large strings is
+bounded and stopped like any other. `emit_json_str` escapes straight into the
+output, checking the bound as it goes. Modules may declare at most 10 000
+functions (wasmi's strict limits); compiling validates in a throw-away
+engine, and the engine modules are loaded into is replaced after 16 MiB of
+modules, so neither leaks memory however often functions are compiled, and
+a compilation does not hold up other users' calls. Calls of one statement
+are made one argument combination at a time (never all prepared at once),
+and the combinations are counted before any call is made. A trap (`unreachable`, an out-of-bounds memory access, a stack
 overflow, a division by zero, a host function refusing a bad pointer or too
 much output) fails the query with a clean error; the server is unaffected.
 
 PFN results are never served from the query cache: they depend on the calling
 user and on the function's current version, which the cache key does not
 contain. A recompiled, updated or deleted function takes effect on the next
-query.
+query. Deleting a user deletes their functions (`usermanage` type 2, and the
+REST user drop): an account later created under the name starts with none.
 
 ## Storage
 
@@ -506,11 +523,15 @@ usable as is: its bodies are C++).
   upstream defaults to `./pfn/` relative to its working directory. The key
   is read at startup (as upstream reads it once); `refreshconf` re-applies
   the `[pfn]` limits only.
-* **Where PFN runs**: the `/api` and REST endpoints of `gserver` (and an
-  embedded `Database` / `ConcurrentDb` with a caller installed). A function
-  called from the `WHERE` clause of an UPDATE (inside a sub-SELECT) uses the
-  database's installed caller only, which a server does not set — upstream
-  does not evaluate PFN in updates at all.
+* **Where PFN runs**: the `/api` and REST endpoints of the multi-database
+  `gserver` (API mode, which manages the functions with `funcudb`), and an
+  embedded `Database` / `ConcurrentDb` with a caller installed
+  (`Database::set_pfn_caller`). The single-database `gserver <db dir>` and
+  the command-line tools (`gquery`, `gconsole`) install no caller: a PFN
+  call there is a query error. A function called from the `WHERE` clause of
+  an UPDATE (inside a sub-SELECT) is the requesting user's, as in reads —
+  upstream does not evaluate PFN in updates at all. A failing call inside a
+  sub-SELECT fails the statement (it never reads as "no solution").
 * **Upstream's extra `funInfo` fields** `funArgs` and `funReturn` (listed in
   its docs, dropped by its code) are not stored, as upstream.
 * A PFN value is a plain literal everywhere but the `/api` `query`

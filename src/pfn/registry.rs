@@ -24,8 +24,15 @@
 //!   it is compiled again.
 //! * **delete** — removes the entry, the source and the module.
 //! * **compile** — compiles the source file; status `"2"` and the module
-//!   file on success, `"3"` and the compiler's message on failure.
+//!   file on success, `"3"` and the compiler's message on failure. The
+//!   compilation runs without the registry's lock (a function changed
+//!   meanwhile is not stamped).
 //! * **list** — the entries, filtered by exact `funName` and `funStatus`.
+//! * **drop_user** — every function of a deleted user.
+//!
+//! Every stored field is bounded ([`PfnRegistry::check_definition`]), so a
+//! user's `data.json` is at most about `pfn_max_functions` ×
+//! (`pfn_max_module_bytes` + [`MAX_DESC_BYTES`]).
 //!
 //! `lastTime` is stamped on create, update and compile (upstream stamps it
 //! on compile only and keeps whatever the client sent otherwise).
@@ -104,6 +111,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn query_err(msg: impl Into<String>) -> GStoreError {
     GStoreError::Query(msg.into())
 }
+
+/// The longest `funDesc` stored, in bytes.
+pub const MAX_DESC_BYTES: usize = 64 * 1024;
+
+const SUBS_WITH_MODULE: &str = "funSubs must be empty when funBody is a complete module";
 
 impl PfnRegistry {
     /// A registry rooted at `base` (created on first write), with the default
@@ -237,9 +249,33 @@ impl PfnRegistry {
         lock(&self.cache).remove(&(user.to_string(), name.to_string()));
     }
 
-    fn check_source_size(&self, info: &PfnInfo) -> Result<String> {
-        let src = generate_source(info);
+    /// Check the definition `info` a client sends (create, update,
+    /// `funreview`) and return its generated source: `funDesc` at most
+    /// [`MAX_DESC_BYTES`]; `funBody` and `funSubs` together, URL-decoded and
+    /// as sent (whitespace included), and the generated source each at most
+    /// `pfn_max_module_bytes`; no `funSubs` next to a complete module. So
+    /// every field stored in `data.json` is bounded.
+    pub fn check_definition(&self, info: &PfnInfo) -> Result<String> {
+        if info.desc.len() > MAX_DESC_BYTES {
+            return Err(query_err(format!(
+                "funDesc is {} bytes, more than the {MAX_DESC_BYTES} bytes allowed",
+                info.desc.len()
+            )));
+        }
         let max = self.limits().max_module_bytes;
+        let body = url_decode(&info.body);
+        let subs = url_decode(&info.subs);
+        let given = body.len().saturating_add(subs.len());
+        if given > max {
+            return Err(query_err(format!(
+                "funBody and funSubs are {given} bytes, more than the {max} bytes allowed \
+                 (pfn_max_module_bytes)"
+            )));
+        }
+        if source_kind(body.trim()) != SourceKind::Body && !subs.trim().is_empty() {
+            return Err(query_err(SUBS_WITH_MODULE));
+        }
+        let src = generate_source(info);
         if src.len() > max {
             return Err(query_err(format!(
                 "the function's source is {} bytes, more than the {max} bytes allowed \
@@ -248,6 +284,28 @@ impl PfnRegistry {
             )));
         }
         Ok(src)
+    }
+
+    /// Remove every function of `user` — entries, sources, modules and
+    /// cached modules — when the user is deleted, so that an account later
+    /// created under the name starts with none.
+    pub fn drop_user(&self, user: &str) -> Result<()> {
+        if !valid_user(user) {
+            return Ok(());
+        }
+        let _g = self
+            .data_lock
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        for dir in [self.src_dir(user), self.lib_dir(user)] {
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        lock(&self.cache).retain(|(u, _), _| u != user);
+        Ok(())
     }
 
     /// `user`'s functions, filtered by exact `name` and `status` when given
@@ -283,7 +341,7 @@ impl PfnRegistry {
     pub fn create(&self, user: &str, mut info: PfnInfo) -> Result<PfnInfo> {
         Self::check_user(user)?;
         Self::check_name(&info.name)?;
-        let src = self.check_source_size(&info)?;
+        let src = self.check_definition(&info)?;
         let _g = self
             .data_lock
             .write()
@@ -319,7 +377,7 @@ impl PfnRegistry {
     pub fn update(&self, user: &str, mut info: PfnInfo) -> Result<PfnInfo> {
         Self::check_user(user)?;
         Self::check_name(&info.name)?;
-        let src = self.check_source_size(&info)?;
+        let src = self.check_definition(&info)?;
         let _g = self
             .data_lock
             .write()
@@ -369,10 +427,38 @@ impl PfnRegistry {
     /// Compile function `name` of `user` (upstream `fun_build`). `Ok(Ok(info))`
     /// on success; `Ok(Err(message))` when the source does not compile (the
     /// function's status is then `"3"`); `Err` when the function does not
-    /// exist, or this build has no runtime (status unchanged).
+    /// exist (upstream's messages: its source file is looked for first), was
+    /// changed while it compiled, or this build has no runtime (status
+    /// unchanged). The compilation itself runs without the registry's lock,
+    /// so other users' lookups never wait for it.
     pub fn compile(&self, user: &str, name: &str) -> Result<std::result::Result<PfnInfo, String>> {
         Self::check_user(user)?;
         Self::check_name(name)?;
+        let (compiled, source) = {
+            let _g = self
+                .data_lock
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let source = match fs::read_to_string(self.source_file(user, name)) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Upstream's text (sic).
+                    return Err(query_err("Function source file dose not exist"));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let Some(info) = self.read_all(user)?.into_iter().find(|i| i.name == name) else {
+                return Err(query_err(format!("function {name} not exists")));
+            };
+            (info, source)
+        };
+        let outcome = self.compile_source(&compiled, &source);
+        #[cfg(not(feature = "pfn-wasm"))]
+        if let Err(GStoreError::Query(m)) = &outcome {
+            if m.as_str() == super::FEATURE_HINT {
+                return Err(query_err(super::FEATURE_HINT));
+            }
+        }
         let _g = self
             .data_lock
             .write()
@@ -381,19 +467,10 @@ impl PfnRegistry {
         let Some(idx) = all.iter().position(|i| i.name == name) else {
             return Err(query_err(format!("function {name} not exists")));
         };
-        let source = match fs::read_to_string(self.source_file(user, name)) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(query_err("Function source file does not exist"))
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let outcome = self.compile_source(&all[idx], &source);
-        #[cfg(not(feature = "pfn-wasm"))]
-        if let Err(GStoreError::Query(m)) = &outcome {
-            if m.as_str() == super::FEATURE_HINT {
-                return Err(query_err(super::FEATURE_HINT));
-            }
+        if all[idx] != compiled {
+            return Err(query_err(format!(
+                "function {name} was changed while it was being compiled; compile it again"
+            )));
         }
         let info = &mut all[idx];
         info.last_time = super::now();
@@ -429,9 +506,7 @@ impl PfnRegistry {
         let body = url_decode(&info.body);
         if source_kind(body.trim()) != SourceKind::Body && !url_decode(&info.subs).trim().is_empty()
         {
-            return Err(query_err(
-                "funSubs must be empty when funBody is a complete module",
-            ));
+            return Err(query_err(SUBS_WITH_MODULE));
         }
         #[cfg(feature = "pfn-wasm")]
         {
@@ -535,11 +610,18 @@ impl PfnRegistry {
                 file.display()
             ))
         })?;
-        let module = self
+        let (module, fresh_engine) = self
             .runtime
             .load(name, &bytes)
             .map_err(|e| query_err(format!("abort load module file error: {e}")))?;
-        lock(&self.cache).insert(key, (file, module.clone()));
+        let mut cache = lock(&self.cache);
+        if fresh_engine {
+            // The modules of the replaced engine: dropped so it is freed (a
+            // call still running keeps its module, and so the engine, until
+            // it ends); they load into the new engine when called again.
+            cache.clear();
+        }
+        cache.insert(key, (file, module.clone()));
         Ok(module)
     }
 
@@ -659,6 +741,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("pfn_max_module_bytes"), "{e}");
+        // Every stored field is bounded, not only the generated source
+        // (which leaves funDesc out, trims, and drops funSubs next to a
+        // complete module).
+        let mut big_desc = info("d", "(i32.const 1)");
+        big_desc.desc = "x".repeat(MAX_DESC_BYTES + 1);
+        let e = r.create("u", big_desc).unwrap_err().to_string();
+        assert!(e.contains("funDesc"), "{e}");
+        let padded = info("p", &format!("(i32.const 1){}", " ".repeat(5000)));
+        let e = r.create("u", padded).unwrap_err().to_string();
+        assert!(e.contains("pfn_max_module_bytes"), "{e}");
+        let mut subs = info("s", "(module)");
+        subs.subs = "x".repeat(5000);
+        assert!(r.create("u", subs).is_err());
+        r.create("u", info("ok", "(i32.const 1)")).unwrap();
+        let mut grown = info("ok", "(i32.const 1)");
+        grown.desc = "x".repeat(MAX_DESC_BYTES + 1);
+        assert!(r.update("u", grown).is_err());
+        let text = fs::read_to_string(base.join("src/u/data.json")).unwrap();
+        assert!(text.len() < 1000, "{}", text.len());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dropping_a_user_removes_their_functions() {
+        let base = tmp("dropuser");
+        let r = PfnRegistry::new(&base);
+        r.create("alice", info("f", "(i32.const 1)")).unwrap();
+        r.create("bob", info("f", "(i32.const 1)")).unwrap();
+        r.drop_user("alice").unwrap();
+        assert!(r.list("alice", None, None).unwrap().is_empty());
+        assert!(!base.join("src/alice").exists());
+        assert_eq!(r.list("bob", None, None).unwrap().len(), 1);
+        // Idempotent, and never outside the base directory.
+        r.drop_user("alice").unwrap();
+        r.drop_user("../bob").unwrap();
+        assert_eq!(r.list("bob", None, None).unwrap().len(), 1);
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -733,12 +851,11 @@ mod tests {
         .unwrap();
         r.compile("u", "f").unwrap().unwrap();
         assert_eq!(r.call("u", "f", "{}", &g, &opts).unwrap(), "8");
-        // A complete module with funSubs is refused.
+        // A complete module with funSubs is refused (when it is stored).
         let mut m = info("m", "(module)");
         m.subs = "(global i32 (i32.const 0))".into();
-        r.create("u", m).unwrap();
-        let msg = r.compile("u", "m").unwrap().unwrap_err();
-        assert!(msg.contains("funSubs must be empty"), "{msg}");
+        let e = r.create("u", m).unwrap_err().to_string();
+        assert!(e.contains("funSubs must be empty"), "{e}");
         r.delete("u", "f").unwrap();
         assert!(r.module_files("u", "f").is_empty());
         let _ = fs::remove_dir_all(&base);

@@ -49,6 +49,12 @@ impl Srv {
             .join("reason_rule_files")
             .join(format!("{rule}.json"))
     }
+    fn ledger_file(&self, db: &str, rule: &str) -> PathBuf {
+        self.db_dir(db)
+            .join("reason_rule_files")
+            .join("inferred")
+            .join(format!("{rule}.nt"))
+    }
 }
 
 impl Drop for Srv {
@@ -640,6 +646,7 @@ fn a_rule_executed_elsewhere_is_retracted_upstream_style() {
     let mut doc = json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
     doc.set("status", "已执行");
     fs::write(&path, doc.sorted().to_string()).unwrap();
+    fs::remove_file(srv.ledger_file("fam", "舅舅")).unwrap();
     update(
         a,
         "fam",
@@ -665,6 +672,7 @@ fn re_executing_a_rule_executed_elsewhere_takes_over_its_triples() {
     let mut doc = json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
     doc.set("status", "已执行");
     fs::write(&path, doc.sorted().to_string()).unwrap();
+    fs::remove_file(srv.ledger_file("fam", "舅舅")).unwrap();
     update(a, "fam", "INSERT DATA { <张三> <Rule:舅舅> <李四> . }");
     let j = reason(a, "fam", "4", "舅舅");
     ok(&j);
@@ -901,6 +909,7 @@ fn rule_names_cannot_escape_the_rule_directory() {
     let a = &srv.addr;
     family_db(&srv, "fam");
     let long = "x".repeat(200);
+    let too_long = "x".repeat(251);
     for name in [
         "../evil",
         "a/b",
@@ -916,8 +925,25 @@ fn rule_names_cannot_escape_the_rule_directory() {
             &format!("\"rulename\": {}", json::quote(name)),
         );
         fails(&add_rule(a, "fam", &rule), 1003, "rule");
+    }
+    // The other operations only keep the name inside the rule directory (a
+    // rule file upstream gStore wrote may have any name): `..`, a leading
+    // `.` or a long name just name no rule here.
+    for name in [
+        "../evil",
+        "a/b",
+        "a\\b",
+        "a\u{0}b",
+        "a\nb",
+        too_long.as_str(),
+    ] {
         for ty in ["3", "4", "6", "7"] {
             fails(&reason(a, "fam", ty, name), 1003, "rule");
+        }
+    }
+    for name in ["..", ".hidden", long.as_str()] {
+        for ty in ["3", "4", "6", "7"] {
+            fails(&reason(a, "fam", ty, name), 1005, "not exist");
         }
     }
     assert!(!srv.db_dir("fam").join("evil.json").exists());
@@ -992,9 +1018,19 @@ fn rules_cannot_inject_sparql() {
         doc.set("check_sparql", "DROP ALL");
         doc.set("status", "已执行");
         fs::write(dir.join("evil.json"), doc.sorted().to_string()).unwrap();
-        for ty in ["4", "5", "8"] {
+        for ty in ["4", "8"] {
             assert_eq!(code(&reason(a, "fam", ty, "evil")), 1005, "type {ty}");
         }
+        // Disable retracts a planted (upstream-style) rule with the
+        // statement built from its validated label alone, or refuses.
+        let j = reason(a, "fam", "5", "evil");
+        if code(&j) == 0 {
+            assert_eq!(int(&j, "AnsNum"), 0, "{j}");
+            assert!(string(&j, "delete_sparql").starts_with("delete where {?x <Rule:"));
+        } else {
+            assert_eq!(code(&j), 1005, "{j}");
+        }
+        let _ = fs::remove_file(dir.join("inferred").join("evil.nt"));
     }
     assert_eq!(triple_count(a, "fam"), before, "nothing changed");
 }

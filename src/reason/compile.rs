@@ -144,6 +144,45 @@ pub fn compile(def: &RuleDef) -> Result<CompiledRule, String> {
     Ok(compiled)
 }
 
+/// Upstream's retraction statement (`delete_sparql`) of rule file `doc`,
+/// built from its validated type, label and value alone (see
+/// [`super::rules::retraction_target`]) — the same text [`compile`] produces
+/// — and its shape checked. Used to retract a rule that upstream gStore
+/// executed, whose conditions this implementation may refuse.
+pub fn retraction_statement(doc: &crate::json::Json) -> Result<String, String> {
+    let (rule_type, label, value) = super::rules::retraction_target(doc)?;
+    let text = match rule_type {
+        RuleType::Property => format!("delete where {{?x <Rule:{label}> {value}.}}"),
+        RuleType::Relation => format!("delete where {{?x <Rule:{label}> ?y.}}"),
+    };
+    verify_delete(&text)?;
+    Ok(text)
+}
+
+/// Check that `text` is one `DELETE WHERE` of a single triple.
+fn verify_delete(text: &str) -> Result<(), String> {
+    match sparql::parse(text).map_err(|e| format!("{e} (in: {text})"))? {
+        Query::Update(ops) => match ops.as_slice() {
+            [UpdateOp::Modify {
+                with: None,
+                delete,
+                insert,
+                using,
+                using_named,
+                ..
+            }] if insert.is_empty()
+                && delete.len() == 1
+                && using.is_empty()
+                && using_named.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err("the compiled delete_sparql is not a single DELETE WHERE".into()),
+        },
+        _ => Err("the compiled delete_sparql is not an update".into()),
+    }
+}
+
 /// Parse the compiled statements and check their shape.
 fn verify(c: &CompiledRule) -> Result<(), String> {
     let parse = |s: &str| sparql::parse(s).map_err(|e| format!("{e} (in: {s})"));
@@ -165,18 +204,7 @@ fn verify(c: &CompiledRule) -> Result<(), String> {
         },
         _ => return Err("the compiled insert_sparql is not an update".into()),
     }
-    match parse(&c.delete_sparql)? {
-        Query::Update(ops) => match ops.as_slice() {
-            [UpdateOp::Modify {
-                with: None,
-                delete,
-                insert,
-                ..
-            }] if insert.is_empty() && delete.len() == 1 => {}
-            _ => return Err("the compiled delete_sparql is not a single DELETE WHERE".into()),
-        },
-        _ => return Err("the compiled delete_sparql is not an update".into()),
-    }
+    verify_delete(&c.delete_sparql)?;
     for s in [&c.check_sparql, &c.select_sparql] {
         if !matches!(parse(s)?, Query::Select(_)) {
             return Err(format!("the compiled statement is not a SELECT: {s}"));

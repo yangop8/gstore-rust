@@ -148,8 +148,18 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     "Username not exist, delete user failed.",
                 );
             }
-            match st.users.drop_user(&op_username) {
-                Ok(()) => GResp::success("Delete user done."),
+            let dropped = st.users.drop_user(&op_username);
+            drop(st);
+            match dropped {
+                // Its PFN functions go with it: an account created later
+                // under the name must not inherit them.
+                Ok(()) => match ctx.inner.pfn.drop_user(&op_username) {
+                    Ok(()) => GResp::success("Delete user done."),
+                    Err(e) => GResp::error(
+                        Status::OperationFailed,
+                        format!("delete user done, but removing its PFN functions failed: {e}"),
+                    ),
+                },
                 Err(e) => GResp::error(Status::OperationFailed, format!("delete user failed: {e}")),
             }
         }

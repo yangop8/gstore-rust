@@ -23,7 +23,7 @@
 //!   solutions, runs once (a one-element array); upstream's loop never runs
 //!   then either and answers `[]`, which only makes the call useless.
 
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use crate::error::{GStoreError, Result};
 use crate::json::Json;
@@ -63,41 +63,145 @@ pub fn variable_keys(args: &Json, is_var: impl Fn(&str) -> bool) -> Vec<(String,
 }
 
 /// Upstream's `pfnConvertVar`: every combination of `bindings` (key → its
-/// values) substituted into `args`, as canonical texts — sorted, distinct.
-/// Fails beyond `limit` combinations.
-pub fn expand(
+/// values) substituted into `args`, as canonical texts — distinct, in byte
+/// order (upstream collects them in a `std::set<std::string>`). They are
+/// produced one at a time ([`Combinations`]), never all held at once, and
+/// without recursion, so neither a wide argument object nor a large constant
+/// in it can exhaust memory or the stack. Fails before producing any when
+/// there would be more than `limit`.
+pub fn combinations(
+    args: &Json,
+    bindings: &[(&str, &[String])],
+    limit: usize,
+) -> std::result::Result<Combinations, String> {
+    let mut out = Combinations {
+        slots: Vec::new(),
+        idx: Vec::new(),
+        done: bindings.is_empty(),
+        len: 0,
+    };
+    if out.done {
+        return Ok(out);
+    }
+    let by_key: HashMap<&str, &[String]> = bindings.iter().copied().collect();
+    // The canonical text is "{" + the sorted entries joined by "," + "}".
+    // Where combinations first differ, the order of the whole texts is that
+    // of one entry's quoted value (everything before it is the same, and an
+    // escaped JSON string never holds a raw `"`): so with each variable
+    // entry's quoted values sorted, an odometer over the entries (the first
+    // one most significant) yields the texts in byte order, each once.
+    let sorted = args.sorted();
+    let entries = sorted.as_object().unwrap_or_default();
+    let mut count: usize = 1;
+    for (k, _) in entries {
+        if let Some(values) = by_key.get(k.as_str()) {
+            count = count.saturating_mul(values.len());
+        }
+    }
+    if count > limit {
+        return Err(format!(
+            "the variables expand to more than {limit} argument combinations"
+        ));
+    }
+    let mut constant = String::new();
+    for (k, v) in entries {
+        if !constant.is_empty() || !out.slots.is_empty() {
+            constant.push(',');
+        }
+        crate::json::write_str(k, &mut constant);
+        constant.push(':');
+        match by_key.get(k.as_str()) {
+            Some(values) => {
+                let mut quoted: Vec<String> =
+                    values.iter().map(|v| crate::json::quote(v)).collect();
+                quoted.sort_unstable();
+                quoted.dedup();
+                out.slots.push(Slot {
+                    prefix: std::mem::take(&mut constant),
+                    values: quoted,
+                });
+            }
+            None => v.write_to(&mut constant),
+        }
+    }
+    out.len = out.slots.iter().map(|s| s.prefix.len()).sum::<usize>() + constant.len() + 2;
+    out.slots.push(Slot {
+        prefix: constant,
+        values: Vec::new(),
+    });
+    out.idx = vec![0; out.slots.len()];
+    // A variable without values: no combination at all.
+    out.done = count == 0;
+    Ok(out)
+}
+
+/// One run of an argument text: the constant text before a variable entry's
+/// value, and that entry's quoted values, sorted (the last slot holds the
+/// constant tail only).
+#[derive(Debug)]
+struct Slot {
+    prefix: String,
+    values: Vec<String>,
+}
+
+/// The argument texts of [`combinations`], in byte order.
+#[derive(Debug)]
+pub struct Combinations {
+    slots: Vec<Slot>,
+    /// The odometer: each variable slot's current value.
+    idx: Vec<usize>,
+    done: bool,
+    /// The length of the constant parts (a capacity hint).
+    len: usize,
+}
+
+impl Iterator for Combinations {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if self.done {
+            return None;
+        }
+        let mut text = String::with_capacity(self.len + 64);
+        text.push('{');
+        for (slot, &i) in self.slots.iter().zip(&self.idx) {
+            text.push_str(&slot.prefix);
+            if let Some(v) = slot.values.get(i) {
+                text.push_str(v);
+            }
+        }
+        text.push('}');
+        // Advance: the last variable slot fastest.
+        let vars = self.slots.len() - 1;
+        let mut j = vars;
+        loop {
+            if j == 0 {
+                self.done = true;
+                break;
+            }
+            j -= 1;
+            self.idx[j] += 1;
+            if self.idx[j] < self.slots[j].values.len() {
+                break;
+            }
+            self.idx[j] = 0;
+        }
+        Some(text)
+    }
+}
+
+/// [`combinations`], collected (tests).
+#[cfg(test)]
+fn expand(
     args: &Json,
     bindings: &[(String, Vec<String>)],
     limit: usize,
-) -> std::result::Result<BTreeSet<String>, String> {
-    fn go(
-        cur: &mut Json,
-        bindings: &[(String, Vec<String>)],
-        out: &mut BTreeSet<String>,
-        limit: usize,
-    ) -> std::result::Result<(), String> {
-        let Some(((key, values), rest)) = bindings.split_first() else {
-            out.insert(canonical(cur));
-            if out.len() > limit {
-                return Err(format!(
-                    "the variables expand to more than {limit} argument combinations"
-                ));
-            }
-            return Ok(());
-        };
-        for v in values {
-            cur.set(key.clone(), v.as_str());
-            go(cur, rest, out, limit)?;
-        }
-        Ok(())
-    }
-    let mut out = BTreeSet::new();
-    if bindings.is_empty() {
-        return Ok(out);
-    }
-    let mut cur = args.clone();
-    go(&mut cur, bindings, &mut out, limit)?;
-    Ok(out)
+) -> std::result::Result<Vec<String>, String> {
+    let b: Vec<(&str, &[String])> = bindings
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_slice()))
+        .collect();
+    Ok(combinations(args, &b, limit)?.collect())
 }
 
 /// One output as an array element: its JSON value when it parses, else the
@@ -133,27 +237,33 @@ pub fn evaluate(
         return run(&canonical(args));
     }
     let wrap = by_var_error;
-    let mut var_keys = Vec::new();
-    for (key, var) in variable_keys(args, |_| true) {
-        if let Some(values) = var_values(&var) {
-            var_keys.push((key, values));
+    // Each variable's bindings are looked up once, however many keys name it.
+    let keys = variable_keys(args, |_| true);
+    let mut values: HashMap<&str, Option<Vec<String>>> = HashMap::new();
+    for (_, var) in &keys {
+        if !values.contains_key(var.as_str()) {
+            values.insert(var, var_values(var));
         }
     }
-    let combos: Vec<String> = if var_keys.is_empty() {
-        vec![canonical(args)]
+    let var_keys: Vec<(&str, &[String])> = keys
+        .iter()
+        .filter_map(|(key, var)| Some((key.as_str(), values.get(var.as_str())?.as_deref()?)))
+        .collect();
+    let combos: Box<dyn Iterator<Item = String>> = if var_keys.is_empty() {
+        Box::new(std::iter::once(canonical(args)))
     } else {
-        let bound: Vec<(String, Vec<String>)> = var_keys
+        let bound: Vec<(&str, &[String])> = var_keys
             .into_iter()
             .filter(|(_, v)| !v.is_empty())
             .collect();
-        expand(args, &bound, MAX_COMBINATIONS)
-            .map_err(|m| wrap(GStoreError::Query(format!("PFN.{name}: {m}"))))?
-            .into_iter()
-            .collect()
+        Box::new(
+            combinations(args, &bound, MAX_COMBINATIONS)
+                .map_err(|m| wrap(GStoreError::Query(format!("PFN.{name}: {m}"))))?,
+        )
     };
     let mut out = String::from("[");
-    for (i, combo) in combos.iter().enumerate() {
-        let text = run(combo).map_err(wrap)?;
+    for (i, combo) in combos.enumerate() {
+        let text = run(&combo).map_err(wrap)?;
         if i > 0 {
             out.push(',');
         }

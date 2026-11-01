@@ -505,9 +505,17 @@ impl Database {
     /// Detach this database from its on-disk storage, returning a purely
     /// in-memory database with the same content (pending write-through is
     /// committed first). Later updates and saves no longer touch the original
-    /// directory.
+    /// directory. The reasoning rules it kept there (and their ledgers) are
+    /// read into memory with it (unless they live in a directory set with
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), which is kept), so
+    /// they stay manageable and [`backup`](Self::backup) carries them.
     pub fn into_memory(mut self) -> Result<Database> {
         self.commit_point()?;
+        if self.reason_home.dir.is_none() {
+            if let Some(home) = &self.home {
+                self.reason_home.mem = crate::reason::store::read_rule_dir(home)?;
+            }
+        }
         #[cfg(feature = "rocksdb")]
         if self.store.as_rocks().is_some() {
             let mut mem = TripleStore::new();
@@ -532,7 +540,9 @@ impl Database {
     /// * In-memory database: writes the bincode snapshot as one crash-atomic set
     ///   (temp files + a commit record, renamed into place) and removes any
     ///   other layout's files
-    ///   from `dir`.
+    ///   from `dir`. Reasoning rules it holds in memory (see
+    ///   [`reason_db_dir`](Self::reason_db_dir)) replace `dir`'s; holding
+    ///   none, it leaves `dir`'s rules alone.
     /// * On-disk database: at its home directory, commits the write-through to
     ///   `kvstore.kv` — no shadow `store.bin` is written. Into another
     ///   directory, it commits and then copies the store files there.
@@ -570,7 +580,13 @@ impl Database {
             fsutil::install_staged_dir(&staged, &target)?;
             return remove_other_layouts(dir, StorageKind::RocksDb);
         }
-        self.save_snapshot(dir)
+        self.save_snapshot(dir)?;
+        // Reasoning rules held in memory (see `reason_db_dir`) go with the
+        // snapshot; with none, the directory's own are left alone.
+        if self.reason_db_dir().is_none() && !self.reason_home.mem.is_empty() {
+            crate::reason::store::write_memory_rules(&self.reason_home.mem, dir)?;
+        }
+        Ok(())
     }
 
     /// Write the bincode snapshot set into `dir` (crash-atomic as a set).

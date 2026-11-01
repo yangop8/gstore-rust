@@ -76,10 +76,11 @@
 //! # PFN calls
 //!
 //! `PFN.name({…})` — a user's personalized function ([`crate::pfn`]) — is
-//! evaluated with the same projection shape as a graph function (whole
-//! SELECT projection only; one row over all solutions when it is the lone
-//! projection, the last row next to other projections, per group with GROUP
-//! BY, once with its argument as written when there is no solution). Its
+//! evaluated with upstream's projection shape (whole SELECT projection only;
+//! over solutions one row per solution with the value on the last — also
+//! when it is the lone projection, where a graph function gives one row —
+//! per group with GROUP BY, once with its argument as written when there is
+//! no solution). A failing call inside a sub-SELECT fails the query. Its
 //! arguments follow upstream's `pfnQueryByVar` (see [`crate::pfn::call`]);
 //! the value is a plain literal with the function's output (no solutions) or
 //! the JSON array of its outputs. The function comes from the caller set
@@ -420,6 +421,12 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Set when a `SERVICE` was refused; like a cancel, it cuts evaluation
     /// short and is reported as an error. Shared with `GRAPH` sub-evaluators.
     service_denied: Rc<std::cell::Cell<bool>>,
+    /// The first error of a sub-`SELECT` (a failing `PFN` or graph-function
+    /// call, …): a pattern has no way to return one, so — like a refused
+    /// `SERVICE` — it cuts evaluation short and is reported as the query's
+    /// error instead of reading as "no solution". Shared with `GRAPH`
+    /// sub-evaluators.
+    failed: Rc<std::cell::RefCell<Option<GStoreError>>>,
     /// Where gStore's advanced graph functions get their per-predicate CSR
     /// ([`with_csr_provider`](Self::with_csr_provider)): the
     /// [`Database`](crate::Database)'s cached [`Database::csr`](crate::Database::csr),
@@ -483,6 +490,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            failed: Rc::default(),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
@@ -514,6 +522,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            failed: Rc::default(),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
@@ -619,9 +628,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Whether evaluation must stop early: cancellation was requested, or a
-    /// refused `SERVICE` already doomed the query.
+    /// refused `SERVICE` or a failed sub-`SELECT` already doomed the query.
     fn cancelled(&self) -> bool {
         self.service_denied.get()
+            || self.failed.borrow().is_some()
             || self
                 .cancel
                 .as_ref()
@@ -629,8 +639,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `Err` if evaluation was cut short — [`GStoreError::Cancelled`] when
-    /// cancellation was requested, a query error when a `SERVICE` was refused —
-    /// else `Ok(())`.
+    /// cancellation was requested, a query error when a `SERVICE` was refused,
+    /// a sub-`SELECT`'s error when one failed — else `Ok(())`.
     pub(crate) fn check_cancel(&self) -> Result<()> {
         if self.service_denied.get() {
             Err(GStoreError::Query(
@@ -638,6 +648,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                  client's behalf (its load policy does not allow remote sources)"
                     .into(),
             ))
+        } else if let Some(e) = self.failed.borrow().as_ref() {
+            Err(e.duplicate())
         } else if self.cancelled() {
             Err(GStoreError::Cancelled)
         } else {
@@ -1062,6 +1074,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             bind_only_vars(pattern)
         };
         let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
+        // Upstream reserves one row for a lone graph function but not for a
+        // lone PFN call (GE:2043-2050 excludes `PFN_type`): over solutions
+        // that one keeps a row per solution, its value on the last, as next
+        // to other projections (GE:2526-2530).
+        let one_row = only_gfn && !matches!(gfns[0].call, ProjCall::Pfn { .. });
         let rows = if !gfns.is_empty()
             && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
         {
@@ -1080,7 +1097,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             } else {
                 Vec::new()
             }
-        } else if only_gfn && !has_agg {
+        } else if one_row && !has_agg {
             // A lone graph function over the solutions: exactly one row
             // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
             // form one group: a failing HAVING leaves the value unset
@@ -2200,6 +2217,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: self.allow_service,
             service_denied: Rc::clone(&self.service_denied),
+            failed: Rc::clone(&self.failed),
             // Graph functions inside a GRAPH block run over that named graph:
             // its CSR is built from the sub-evaluator's own store.
             csr_provider: None,
@@ -2307,7 +2325,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn eval_subselect(&self, sq: &SelectQuery, layout: &VarLayout) -> Vec<Binding> {
         let (vars, is_pred, rows) = match self.eval_select_solutions(sq) {
             Ok(t) => t,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                // Reported as the query's error (see `failed`), never as
+                // "no solution" — which would invert a `NOT EXISTS`.
+                let mut failed = self.failed.borrow_mut();
+                if failed.is_none() {
+                    *failed = Some(e);
+                }
+                return Vec::new();
+            }
         };
         // Map each sub-query result column to an outer layout slot (by name).
         let slots: Vec<Option<usize>> = vars.iter().map(|v| layout.index.get(v).copied()).collect();

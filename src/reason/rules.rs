@@ -116,6 +116,68 @@ pub fn validate_rule_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest rule name an existing rule file may have, in bytes:
+/// `<name>.json` must stay within the usual 255-byte file-name limit.
+pub const MAX_FILE_RULE_NAME_BYTES: usize = 255 - ".json".len();
+
+/// Validate the name of a rule an operation other than add names: it must
+/// name a file inside the rule directory — non-empty, no path separator
+/// (`/`, `\`), no control character (NUL included), at most
+/// [`MAX_FILE_RULE_NAME_BYTES`] bytes. Upstream gStore accepts any rule
+/// name, so a rule file it created may have a name [`validate_rule_name`]
+/// refuses (`..`, a leading `.`, a long one); such a rule must still be
+/// manageable (disabled, deleted). `<name>.json` is never `.` or `..`, so a
+/// name without a separator cannot leave the directory.
+pub fn validate_existing_rule_name(name: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("the rule name {name:?} is not allowed: {why}"));
+    if name.is_empty() {
+        return Err("the value of rulename can not be empty!".to_string());
+    }
+    if name.len() > MAX_FILE_RULE_NAME_BYTES {
+        return bad(&format!(
+            "it is longer than {MAX_FILE_RULE_NAME_BYTES} bytes"
+        ));
+    }
+    if name.contains(['/', '\\']) {
+        return bad("it contains a path separator");
+    }
+    if name.chars().any(char::is_control) {
+        return bad("it contains a control character");
+    }
+    Ok(())
+}
+
+/// What upstream's retraction statement of a rule file deletes: the rule
+/// type, its `return` label and (a property rule) value — each validated
+/// like [`RuleDef::from_json`] does, without the rest of the definition
+/// (the conditions), which a rule upstream gStore compiled may have in a
+/// form this implementation refuses.
+pub(crate) fn retraction_target(doc: &Json) -> Result<(RuleType, String, String), String> {
+    let rule_type = if int_field(doc, "type")? == 0 {
+        RuleType::Property
+    } else {
+        RuleType::Relation
+    };
+    let Some(ret) = doc.get("return").filter(|r| r.as_object().is_some()) else {
+        return Err("the reason file has not the return information".to_string());
+    };
+    let label = str_field(ret, "label");
+    check_label(&label)?;
+    let value = match rule_type {
+        RuleType::Property => {
+            let value = str_field(ret, "value");
+            check_term(
+                &value,
+                Pos::Value,
+                "the value of the return information (a property rule, type 0)",
+            )?;
+            value
+        }
+        RuleType::Relation => String::new(),
+    };
+    Ok((rule_type, label, value))
+}
+
 /// One triple pattern of a condition, as the raw texts the rule gives (kept
 /// verbatim — whitespace included — for the compiled SPARQL).
 #[derive(Debug, Clone, PartialEq, Eq)]
