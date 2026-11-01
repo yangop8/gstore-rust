@@ -31,10 +31,13 @@ on:
     # Weekly, Monday 03:23 UTC.
     - cron: "23 3 * * 1"
 
-# A newer push to the same branch / PR supersedes an in-flight run.
+# A newer push to the same branch / PR supersedes an in-flight run. The
+# event is part of the group, so a push to main never cancels the scheduled
+# or dispatched reference run (nor the other way round), and those queue
+# instead of cancelling each other.
 concurrency:
-  group: bench-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: bench-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -63,10 +66,12 @@ jobs:
           --baseline bench/baselines/smoke.json
           --summary "$GITHUB_STEP_SUMMARY"
           --out target/gstore-bench/smoke.json
+      # The result against itself, so the canary tests the gates, not how far
+      # the tree has moved from the blessed baseline.
       - name: canary (the same result slowed down 3x must fail with exit 1)
         run: |
           set +e
-          target/release/gstore-bench check --baseline bench/baselines/smoke.json \
+          target/release/gstore-bench check --baseline target/gstore-bench/smoke.json \
             --from target/gstore-bench/smoke.json --self-test-slowdown 3 \
             > target/gstore-bench/canary.md
           code=$?

@@ -21,6 +21,12 @@
 //! ```
 //! A leaf's `link` is the next leaf (0 = none); an internal node's `link` is
 //! its leftmost child, for keys below its first separator.
+//!
+//! An overflowing node splits by **bytes**: at the middle entry when both
+//! halves fit a page (so trees of small entries are laid out as they always
+//! were), else where the halves fit. A key is at most [`MAX_KEY_LEN`] bytes
+//! (half a node), so an internal node always splits in two; a leaf entry may
+//! fill a page, so a leaf splits in up to three.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -33,6 +39,19 @@ use super::pager::{Page, PageId, Pager, PAGE_SIZE};
 /// of child pointers would otherwise loop forever). A 4 KiB-page tree of
 /// 12-byte keys is 5 levels deep at a billion entries.
 const MAX_DEPTH: usize = 64;
+
+/// Bytes of a node's header: `is_leaf` (1) + `link` (4) + entry count (2).
+const NODE_HEADER: usize = 7;
+/// Bytes of entries a node holds in one page.
+const NODE_ROOM: usize = PAGE_SIZE - NODE_HEADER;
+
+/// The longest key a tree accepts: 2038 bytes. Any key may become a separator
+/// in an internal node (`2 + len + 4` bytes); keeping a separator within half
+/// a node's room means an overflowing internal node — which received at most
+/// two new separators, from a leaf split — always has a separator to move up
+/// that leaves both halves non-empty and within a page. A longer key is
+/// refused with an error (the reserved `LONG_KEYS` feature would lift this).
+pub const MAX_KEY_LEN: usize = NODE_ROOM / 2 - 2 - 4;
 
 fn corrupt(what: &str) -> GStoreError {
     GStoreError::Database(format!("corrupt B+ tree page: {what}"))
@@ -638,8 +657,10 @@ impl Node {
     }
 }
 
-/// The outcome of inserting into a subtree: a split that must propagate up.
-type Split = Option<(Vec<u8>, PageId)>;
+/// The outcome of inserting into a subtree: the new right siblings a split
+/// produced, in key order, each with the separator that routes to it (empty:
+/// no split). The parent inserts them all.
+type Split = Vec<(Vec<u8>, PageId)>;
 
 /// A non-root node holding fewer than this many serialized bytes is "underfull"
 /// after a delete and triggers rebalancing (borrow from a sibling, else merge).
@@ -687,16 +708,23 @@ impl BTree {
 
     /// Insert or replace `key → val`.
     pub fn insert(&self, pager: &mut Pager, key: &[u8], val: &[u8]) -> Result<()> {
-        // A single entry must fit within one page. A leaf node reserves 7 bytes
+        // A single entry must fit within one page: a leaf node reserves 7 bytes
         // of header (is_leaf + link + count) plus a 2-byte length prefix for the
-        // key and another for the value. Reject an oversized entry up front:
-        // otherwise `split_leaf` would try to serialise a lone entry that cannot
-        // fit and write past the fixed-size page buffer (a panic).
-        if 7 + 2 + key.len() + 2 + val.len() > PAGE_SIZE {
+        // key and another for the value. And a key must fit half a node, so the
+        // separators it may become never block an internal split (see
+        // MAX_KEY_LEN). Reject an oversized entry up front, before any page
+        // changes.
+        if NODE_HEADER + 2 + key.len() + 2 + val.len() > PAGE_SIZE {
             return Err(GStoreError::Serialize(format!(
                 "B+ tree entry ({}-byte key + {}-byte value) too large for a {PAGE_SIZE}-byte page",
                 key.len(),
                 val.len()
+            )));
+        }
+        if key.len() > MAX_KEY_LEN {
+            return Err(GStoreError::Serialize(format!(
+                "B+ tree key of {} bytes exceeds the {MAX_KEY_LEN}-byte key limit",
+                key.len()
             )));
         }
         if let Some(shape) = self.shape {
@@ -717,20 +745,22 @@ impl BTree {
             let mut leaf = Node::leaf();
             leaf.keys.push(key.to_vec());
             leaf.vals.push(val.to_vec());
-            pager.write_page(id, &leaf.serialize())?;
+            write_node(pager, id, &leaf)?;
             self.set_root(pager, id);
             return Ok(());
         }
-        if let Some((sep, right)) = self.insert_rec(pager, root, key, val)? {
+        let splits = self.insert_rec(pager, root, key, val)?;
+        if !splits.is_empty() {
             let new_root = pager.alloc()?;
+            let (keys, children) = splits.into_iter().unzip();
             let node = Node {
                 is_leaf: false,
                 link: root,
-                keys: vec![sep],
+                keys,
                 vals: Vec::new(),
-                children: vec![right],
+                children,
             };
-            pager.write_page(new_root, &node.serialize())?;
+            write_node(pager, new_root, &node)?;
             self.set_root(pager, new_root);
         }
         Ok(())
@@ -746,62 +776,92 @@ impl BTree {
                     node.vals.insert(i, val.to_vec());
                 }
             }
+            // Sized just now: write it directly (the per-insert hot path).
             if node.size() <= PAGE_SIZE {
                 pager.write_page(page, &node.serialize())?;
-                Ok(None)
+                Ok(Vec::new())
             } else {
                 self.split_leaf(pager, page, node)
             }
         } else {
             let child = node.child_for(key);
             let pos = node.keys.partition_point(|k| k.as_slice() <= key);
-            if let Some((sep, right)) = self.insert_rec(pager, child, key, val)? {
-                node.keys.insert(pos, sep);
-                node.children.insert(pos, right);
-                if node.size() <= PAGE_SIZE {
-                    pager.write_page(page, &node.serialize())?;
-                    Ok(None)
-                } else {
-                    self.split_internal(pager, page, node)
-                }
+            let splits = self.insert_rec(pager, child, key, val)?;
+            if splits.is_empty() {
+                return Ok(splits);
+            }
+            for (j, (sep, right)) in splits.into_iter().enumerate() {
+                node.keys.insert(pos + j, sep);
+                node.children.insert(pos + j, right);
+            }
+            if node.size() <= PAGE_SIZE {
+                pager.write_page(page, &node.serialize())?;
+                Ok(Vec::new())
             } else {
-                Ok(None)
+                self.split_internal(pager, page, node)
             }
         }
     }
 
+    /// Split an overflowing leaf into two leaves — or three, when an entry
+    /// that nearly fills a page landed between two that together fill one —
+    /// each within a page (see [`leaf_cuts`]).
     fn split_leaf(&self, pager: &mut Pager, page: PageId, mut node: Node) -> Result<Split> {
-        let mid = node.keys.len() / 2;
-        let right_keys = node.keys.split_off(mid);
-        let right_vals = node.vals.split_off(mid);
-        let sep = right_keys[0].clone();
-        let right_id = pager.alloc()?;
-        let right = Node {
-            is_leaf: true,
-            link: node.link,
-            keys: right_keys,
-            vals: right_vals,
-            children: Vec::new(),
-        };
-        node.link = right_id;
-        pager.write_page(right_id, &right.serialize())?;
-        pager.write_page(page, &node.serialize())?;
-        Ok(Some((sep, right_id)))
+        let sizes: Vec<usize> = (0..node.keys.len())
+            .map(|i| boundary_bytes(&node, i))
+            .collect();
+        let cuts = leaf_cuts(&sizes).ok_or_else(|| {
+            GStoreError::Serialize(format!(
+                "B+ tree leaf entry too large for a {PAGE_SIZE}-byte page"
+            ))
+        })?;
+        // Detach the new right siblings (last first, so the cut indexes hold).
+        let mut rights = Vec::with_capacity(cuts.len());
+        for &cut in cuts.iter().rev() {
+            rights.push(Node {
+                is_leaf: true,
+                link: 0,
+                keys: node.keys.split_off(cut),
+                vals: node.vals.split_off(cut),
+                children: Vec::new(),
+            });
+        }
+        rights.reverse();
+        let ids = rights
+            .iter()
+            .map(|_| pager.alloc())
+            .collect::<Result<Vec<PageId>>>()?;
+        // Chain the leaves: node → rights… → the node's old next leaf.
+        let mut next = node.link;
+        for (right, &id) in rights.iter_mut().zip(&ids).rev() {
+            right.link = next;
+            next = id;
+        }
+        node.link = next;
+        for (right, &id) in rights.iter().zip(&ids) {
+            write_node(pager, id, right)?;
+        }
+        write_node(pager, page, &node)?;
+        Ok(rights
+            .into_iter()
+            .zip(ids)
+            .map(|(right, id)| (right.keys[0].clone(), id))
+            .collect())
     }
 
+    /// Split an overflowing internal node in two around one separator, which
+    /// moves up (see [`internal_cut`]). A node that cannot be split that way
+    /// (separators longer than [`MAX_KEY_LEN`], from an older file) is an
+    /// error, never a node past its page or one without separators.
     fn split_internal(&self, pager: &mut Pager, page: PageId, mut node: Node) -> Result<Split> {
-        // An internal split pushes exactly one separator up, so a node with a
-        // single separator can't be split into two key-bearing internal nodes:
-        // pushing the lone key up leaves both halves with zero keys (a
-        // degenerate node that no longer routes between children). We only reach
-        // here when the node already overflows a page, so a single separator
-        // means that one key plus its child link is too large to ever fit.
-        if node.keys.len() < 2 {
-            return Err(GStoreError::Serialize(format!(
-                "B+ tree separator key too large to fit in a {PAGE_SIZE}-byte page"
-            )));
-        }
-        let mid = node.keys.len() / 2;
+        let sizes: Vec<usize> = (0..node.keys.len())
+            .map(|i| boundary_bytes(&node, i))
+            .collect();
+        let mid = internal_cut(&sizes).ok_or_else(|| {
+            GStoreError::Serialize(format!(
+                "B+ tree separator keys too large to split a node into {PAGE_SIZE}-byte pages"
+            ))
+        })?;
         let sep = node.keys[mid].clone();
         let right_keys = node.keys.split_off(mid + 1);
         let right_children = node.children.split_off(mid + 1);
@@ -815,9 +875,9 @@ impl BTree {
             vals: Vec::new(),
             children: right_children,
         };
-        pager.write_page(right_id, &right.serialize())?;
-        pager.write_page(page, &node.serialize())?;
-        Ok(Some((sep, right_id)))
+        write_node(pager, right_id, &right)?;
+        write_node(pager, page, &node)?;
+        Ok(vec![(sep, right_id)])
     }
 
     /// Descend from the root to the leaf whose key range holds `key`. `None`
@@ -1096,7 +1156,7 @@ impl BTree {
                 Ok(i) => {
                     node.keys.remove(i);
                     node.vals.remove(i);
-                    pager.write_page(page, &node.serialize())?;
+                    write_node(pager, page, &node)?;
                     Ok(true)
                 }
                 Err(_) => Ok(false),
@@ -1136,11 +1196,14 @@ impl BTree {
                 let entry = boundary_bytes(&left, left.keys.len() - 1);
                 let sep_len = parent.keys[ci - 1].len();
                 let child_gain = if child.is_leaf { entry } else { 6 + sep_len };
+                // Either way the left sibling's last key becomes the separator.
+                let new_sep = left.keys[left.keys.len() - 1].len();
                 if left.size() - entry >= UNDERFLOW_BYTES
                     && child.size() + child_gain <= PAGE_SIZE
+                    && parent.size() - sep_len + new_sep <= PAGE_SIZE
                 {
                     self.borrow_from_left(pager, parent, ci)?;
-                    pager.write_page(parent_page, &parent.serialize())?;
+                    write_node(pager, parent_page, parent)?;
                     return Ok(());
                 }
             }
@@ -1152,11 +1215,15 @@ impl BTree {
                 let entry = boundary_bytes(&right, 0);
                 let sep_len = parent.keys[ci].len();
                 let child_gain = if child.is_leaf { entry } else { 6 + sep_len };
+                // A leaf's new separator is the right sibling's second key, an
+                // internal node's its first (which moves up).
+                let new_sep = right.keys[usize::from(child.is_leaf)].len();
                 if right.size() - entry >= UNDERFLOW_BYTES
                     && child.size() + child_gain <= PAGE_SIZE
+                    && parent.size() - sep_len + new_sep <= PAGE_SIZE
                 {
                     self.borrow_from_right(pager, parent, ci)?;
-                    pager.write_page(parent_page, &parent.serialize())?;
+                    write_node(pager, parent_page, parent)?;
                     return Ok(());
                 }
             }
@@ -1171,7 +1238,7 @@ impl BTree {
             };
             if merged <= PAGE_SIZE {
                 self.merge_into_left(pager, parent, ci)?;
-                pager.write_page(parent_page, &parent.serialize())?;
+                write_node(pager, parent_page, parent)?;
                 return Ok(());
             }
         }
@@ -1185,7 +1252,7 @@ impl BTree {
             };
             if merged <= PAGE_SIZE {
                 self.merge_right_into(pager, parent, ci)?;
-                pager.write_page(parent_page, &parent.serialize())?;
+                write_node(pager, parent_page, parent)?;
                 return Ok(());
             }
         }
@@ -1218,8 +1285,8 @@ impl BTree {
             child.set_children_vec(child_all);
             parent.keys[ci - 1] = lk;
         }
-        pager.write_page(lp, &left.serialize())?;
-        pager.write_page(cp, &child.serialize())?;
+        write_node(pager, lp, &left)?;
+        write_node(pager, cp, &child)?;
         Ok(())
     }
 
@@ -1247,8 +1314,8 @@ impl BTree {
             child.set_children_vec(child_all);
             parent.keys[ci] = rk;
         }
-        pager.write_page(cp, &child.serialize())?;
-        pager.write_page(rp, &right.serialize())?;
+        write_node(pager, cp, &child)?;
+        write_node(pager, rp, &right)?;
         Ok(())
     }
 
@@ -1272,7 +1339,7 @@ impl BTree {
         }
         parent.keys.remove(ci - 1);
         parent.children.remove(ci - 1);
-        pager.write_page(lp, &left.serialize())?;
+        write_node(pager, lp, &left)?;
         pager.free(cp)?;
         Ok(())
     }
@@ -1297,10 +1364,94 @@ impl BTree {
         }
         parent.keys.remove(ci);
         parent.children.remove(ci);
-        pager.write_page(cp, &child.serialize())?;
+        write_node(pager, cp, &child)?;
         pager.free(rp)?;
         Ok(())
     }
+}
+
+/// Write `node` to page `id`. A node larger than a page is an error, never a
+/// write past the page buffer (the splits and rebalances size every node they
+/// write, so this is a backstop).
+fn write_node(pager: &mut Pager, id: PageId, node: &Node) -> Result<()> {
+    let size = node.size();
+    if size > PAGE_SIZE {
+        return Err(GStoreError::Serialize(format!(
+            "B+ tree node of {size} bytes does not fit a {PAGE_SIZE}-byte page"
+        )));
+    }
+    pager.write_page(id, &node.serialize())
+}
+
+/// `[0, s0, s0+s1, …]`: the running byte totals of `sizes`.
+fn prefix_sums(sizes: &[usize]) -> Vec<usize> {
+    let mut sums = Vec::with_capacity(sizes.len() + 1);
+    sums.push(0);
+    for s in sizes {
+        sums.push(sums[sums.len() - 1] + s);
+    }
+    sums
+}
+
+/// Where to cut an overflowing leaf whose entries take `sizes` bytes: the
+/// index of each new right sibling's first entry. The middle entry when both
+/// halves fit a page (the classic split, so trees of small entries are laid
+/// out as before); else the two-way cut with the most even halves; else the
+/// fewest pages, packed greedily from the left. A leaf that fitted a page
+/// before one entry was added or grown always splits in at most three (its
+/// old entries before and after that entry, and the entry itself). `None`
+/// only if a single entry exceeds a page.
+fn leaf_cuts(sizes: &[usize]) -> Option<Vec<usize>> {
+    let n = sizes.len();
+    let sums = prefix_sums(sizes);
+    let fits = |a: usize, b: usize| sums[b] - sums[a] <= NODE_ROOM;
+    if n >= 2 && fits(0, n / 2) && fits(n / 2, n) {
+        return Some(vec![n / 2]);
+    }
+    let even = (1..n)
+        .filter(|&j| fits(0, j) && fits(j, n))
+        .min_by_key(|&j| sums[j].abs_diff(sums[n] - sums[j]));
+    if let Some(j) = even {
+        return Some(vec![j]);
+    }
+    let mut cuts = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let mut end = start;
+        while end < n && fits(start, end + 1) {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        if end < n {
+            cuts.push(end);
+        }
+        start = end;
+    }
+    Some(cuts)
+}
+
+/// Which separator of an overflowing internal node (entries of `sizes` bytes)
+/// moves up in a split, leaving both halves non-empty and within a page: the
+/// middle one when that works (the classic split), else the one with the most
+/// even halves. With every separator within half a node ([`MAX_KEY_LEN`]) one
+/// always exists: the node fitted a page before at most two new separators
+/// arrived, so the entries total at most two pages, and the separator at the
+/// byte midpoint (or its neighbour, when the midpoint falls on the first or
+/// last) leaves at most one page on each side. `None` otherwise.
+fn internal_cut(sizes: &[usize]) -> Option<usize> {
+    let n = sizes.len();
+    let sums = prefix_sums(sizes);
+    let ok = |m: usize| {
+        m >= 1 && m + 1 < n && sums[m] <= NODE_ROOM && sums[n] - sums[m + 1] <= NODE_ROOM
+    };
+    if ok(n / 2) {
+        return Some(n / 2);
+    }
+    (1..n.saturating_sub(1))
+        .filter(|&m| ok(m))
+        .min_by_key(|&m| sums[m].abs_diff(sums[n] - sums[m + 1]))
 }
 
 /// Serialized byte size of the entry at index `i` (a key+value for a leaf, or a
@@ -1936,6 +2087,151 @@ mod tests {
         };
         pg.write_page(root, &node.serialize()).unwrap();
         assert!(t.get(&pg, &be32(1)).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- Phase 6 R1 review: nodes split by bytes, never past a page ----------
+
+    type Model = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+
+    /// `t` holds exactly `model`: every key reads back and a full scan is the
+    /// model in key order.
+    fn assert_matches_model(t: &BTree, pg: &Pager, model: &Model) {
+        for (k, v) in model {
+            assert_eq!(
+                t.get(pg, k).unwrap().as_ref(),
+                Some(v),
+                "{}-byte key",
+                k.len()
+            );
+        }
+        let all = t.iter_all(pg).unwrap();
+        assert_eq!(all.len(), model.len());
+        assert!(
+            all.iter()
+                .zip(model)
+                .all(|((k, v), (mk, mv))| k == mk && v == mv),
+            "the scan differs from the model"
+        );
+    }
+
+    #[test]
+    fn large_keys_split_by_bytes_not_by_count() {
+        // Three small keys, then three of 1.4 KB: splitting at the middle
+        // *entry* put all three large keys in one half, past the page, and
+        // `serialize` panicked (the reviewer's DiskStore repro).
+        let path = tmp("large_keys");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        let mut model = Model::new();
+        let mut keys: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        keys.extend((b'd'..=b'f').map(|c| vec![c; 1400]));
+        for (i, k) in keys.iter().enumerate() {
+            t.insert(&mut pg, k, &be32(i as u32)).unwrap();
+            model.insert(k.clone(), be32(i as u32).to_vec());
+        }
+        assert_matches_model(&t, &pg, &model);
+        // Keys of every size up to the limit, in an order that lands large
+        // keys next to each other in leaves and in internal nodes.
+        for i in 0..400u32 {
+            let len = [4, 7, 300, 1000, 1400, 1800, MAX_KEY_LEN][i as usize % 7];
+            let mut k = vec![b'k'; len];
+            k[..4].copy_from_slice(&be32(i.wrapping_mul(2_654_435_761)));
+            t.insert(&mut pg, &k, &be32(i)).unwrap();
+            model.insert(k, be32(i).to_vec());
+        }
+        assert_matches_model(&t, &pg, &model);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn random_large_entries_never_overflow_a_page() {
+        // Random inserts, replacements and deletes of keys up to MAX_KEY_LEN and
+        // values up to what fits a page: every split and every rebalance must
+        // leave each node within its page (no panic) and the tree exact.
+        let path = tmp("random_large");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let mut rng = Rng(0x000B_16E7_7EE5);
+        let t = BTree::new(0);
+        let mut model = Model::new();
+        let mut live: Vec<Vec<u8>> = Vec::new();
+        for step in 0..2500 {
+            if rng.below(10) < 7 || live.is_empty() {
+                let klen = match rng.below(4) {
+                    0 => 1 + rng.below(24),
+                    1 => 100 + rng.below(700),
+                    _ => 1000 + rng.below(MAX_KEY_LEN - 999),
+                };
+                let k = if !live.is_empty() && rng.below(5) == 0 {
+                    live[rng.below(live.len())].clone() // replace a value
+                } else {
+                    rng.bytes(klen)
+                };
+                let room = PAGE_SIZE - 7 - 2 - k.len() - 2;
+                let vlen = match rng.below(3) {
+                    0 => rng.below(8),
+                    1 => rng.below(room + 1),
+                    _ => room - rng.below(room.min(40) + 1),
+                };
+                let v = rng.bytes(vlen);
+                t.insert(&mut pg, &k, &v).unwrap();
+                if model.insert(k.clone(), v).is_none() {
+                    live.push(k);
+                }
+            } else {
+                let k = live.swap_remove(rng.below(live.len()));
+                assert!(t.delete(&mut pg, &k).unwrap());
+                model.remove(&k);
+            }
+            if step % 250 == 0 {
+                assert_matches_model(&t, &pg, &model);
+            }
+        }
+        assert_matches_model(&t, &pg, &model);
+        while let Some(k) = live.pop() {
+            assert!(t.delete(&mut pg, &k).unwrap());
+            model.remove(&k);
+        }
+        assert_matches_model(&t, &pg, &model);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn page_sized_values_split_three_ways() {
+        // A value that nearly fills a page, inserted between two that together
+        // fill one: no two-way split fits, the leaf splits in three.
+        let path = tmp("three_way");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        let mut model = Model::new();
+        let half = (PAGE_SIZE - 7) / 2 - 2 - 8 - 2;
+        let full = PAGE_SIZE - 7 - 2 - 8 - 2;
+        for (k, vlen) in [(1u64, half), (3, half), (2, full)] {
+            let v = vec![k as u8; vlen];
+            t.insert(&mut pg, &k.to_be_bytes(), &v).unwrap();
+            model.insert(k.to_be_bytes().to_vec(), v);
+        }
+        assert_matches_model(&t, &pg, &model);
+        // Ascending page-sized values (the VList index's compact pattern).
+        for k in 10u64..60 {
+            let v = vec![k as u8; if k % 3 == 0 { full } else { half + 9 }];
+            t.insert(&mut pg, &k.to_be_bytes(), &v).unwrap();
+            model.insert(k.to_be_bytes().to_vec(), v);
+        }
+        assert_matches_model(&t, &pg, &model);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_key_longer_than_the_limit_is_an_error() {
+        let path = tmp("key_limit");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::new(0);
+        t.insert(&mut pg, &vec![b'k'; MAX_KEY_LEN], b"v").unwrap();
+        assert!(t
+            .insert(&mut pg, &vec![b'l'; MAX_KEY_LEN + 1], b"v")
+            .is_err());
+        assert_eq!(t.iter_all(&pg).unwrap().len(), 1);
         std::fs::remove_file(&path).ok();
     }
 }

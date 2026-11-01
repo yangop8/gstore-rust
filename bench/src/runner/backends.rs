@@ -137,12 +137,23 @@ fn build_cli(
     let log = fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let status = Command::new(&exe)
-        .args(&args)
+    let mut cmd = Command::new(&exe);
+    cmd.args(&args)
         .current_dir(work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2))
+        .stderr(Stdio::from(log2));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // gbuild ends with this phase child, which ends with the harness.
+        let parent = std::process::id();
+        // SAFETY: the hook only makes async-signal-safe syscalls.
+        unsafe {
+            cmd.pre_exec(move || sys::die_with_parent(parent));
+        }
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
     let wall_ms = started.elapsed().as_secs_f64() * 1e3;

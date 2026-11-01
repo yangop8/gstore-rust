@@ -166,9 +166,12 @@ A baseline is the same document with `"kind": "baseline"`;
 * Concurrency throughput and update times are report-only.
 
 A failing timing or memory gate re-runs only the failing phases of that
-backend, up to `retries` (2) times, keeping the minimum of the medians.
+backend, up to `retries` (2) times, keeping the minimum of the medians. The
+gates run after the update phase, so a retried open or query phase first
+rebuilds the database that phase changed (and a retried open must see the
+first attempt's term counts).
 `--self-test-slowdown X` multiplies every measured time by X: CI checks that
-3× fails (exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
+the run's own result, slowed 3× and checked against itself, fails (exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
 ≥ 20 ms slowed 4× fails, and a row-hash change fails without a retry
 (`tests/gates.rs`).
 

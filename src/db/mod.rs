@@ -173,6 +173,13 @@ fn backend_vstree_entries(store: &Backend) -> Vec<(EntityLiteralId, Signature)> 
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Edges read to re-sign entities from the store on this thread (tests
+    /// bound the incremental maintenance's work with it).
+    static RESIGNED_EDGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Build an in-memory VS-tree over every entity (see [`vstree_entries`]).
 fn build_vstree(store: &Backend) -> VsTree {
     VsTree::build(backend_vstree_entries(store))
@@ -985,16 +992,27 @@ impl Database {
 
     /// Fold a just-inserted default-graph triple into the VS-tree incrementally
     /// (called only while the index is valid). The subject — and the object when
-    /// it is an entity — gained an incident edge, so each is re-signed from the
-    /// current store and its tree entry updated (or inserted, if new to the
-    /// tree). Mirrors [`build_vstree`]'s per-entity signing, so the
-    /// incrementally-maintained tree stays equivalent to a freshly-rebuilt one
-    /// and the candidate filter remains a sound superset.
+    /// it is an entity — gained an incident edge. That edge only adds bits, so
+    /// its signature is ORed into the entity's tree entry and up its path
+    /// ([`VsTree::union_into`], O(height)): the entry becomes what re-signing
+    /// the entity would give (a superset of it after deletes), without reading
+    /// the entity's other edges — a class with a million members costs no
+    /// more than a leaf entity. An entity new to the tree is signed from the
+    /// store and inserted. Mirrors [`build_vstree`]'s per-entity signing, so
+    /// the candidate filter remains a sound superset.
     fn vstree_index_insert(&mut self, id: IdTriple) {
-        self.upsert_entity_signature(id.sub);
+        let mut out = Signature::new();
+        out.encode_edge(id.pred, id.obj, EdgeDir::Out);
+        if !self.vstree.union_into(id.sub, &out) {
+            self.upsert_entity_signature(id.sub);
+        }
         // Literal objects are not VS-tree entities (see `build_vstree`).
         if is_entity_id(id.obj) {
-            self.upsert_entity_signature(id.obj);
+            let mut inc = Signature::new();
+            inc.encode_edge(id.pred, id.sub, EdgeDir::In);
+            if !self.vstree.union_into(id.obj, &inc) {
+                self.upsert_entity_signature(id.obj);
+            }
         }
     }
 
@@ -1002,12 +1020,15 @@ impl Database {
     /// update its VS-tree entry in place, inserting it if it is not yet indexed.
     fn upsert_entity_signature(&mut self, e: u32) {
         let mut sig = Signature::new();
-        for &(p, o) in &self.store.po_by_s(e) {
+        let (out, inc) = (self.store.po_by_s(e), self.store.ps_by_o(e));
+        for &(p, o) in &out {
             sig.encode_edge(p, o, EdgeDir::Out);
         }
-        for &(p, s) in &self.store.ps_by_o(e) {
+        for &(p, s) in &inc {
             sig.encode_edge(p, s, EdgeDir::In);
         }
+        #[cfg(test)]
+        RESIGNED_EDGES.with(|c| c.set(c.get() + (out.len() + inc.len()) as u64));
         if !self.vstree.update(e, sig) {
             self.vstree.insert(e, sig);
         }
@@ -1107,8 +1128,9 @@ impl Database {
         // also covers the named-graph quads in RocksDB); only the in-memory
         // named-graph map is undone here.
         let journaled = self.rocks_journaling();
-        // Default-graph triples the rollback puts back: their entities are
-        // re-signed once the store holds them again (below).
+        // Default-graph triples the rollback puts back: their edges are folded
+        // into the tree once the store holds them again (below), O(height)
+        // each.
         let mut readded: Vec<IdTriple> = Vec::new();
         for op in log.into_iter().rev() {
             match op {
@@ -3828,6 +3850,86 @@ mod tests {
             check(&mut db, step);
         }
         assert!(db.vs_shrink_debt() > 0);
+    }
+
+    /// Phase 6 R1 review: an insert into a valid index re-signed its subject
+    /// and object from every edge they have, so after a delete (which keeps
+    /// the index valid) each insert typing an entity into a large class read
+    /// the whole class, and a rollback re-adding a deleted class did so once
+    /// per triple — quadratic. An added edge only adds bits: it is ORed into
+    /// the entries in O(height), and only a new entity is signed from the
+    /// store. The answers stay those of an index-free evaluation.
+    #[test]
+    fn incremental_vstree_maintenance_does_not_rescan_hubs() {
+        let n = 3000;
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!(
+                "<http://ex/e{i}> <http://ex/type> <http://ex/Class> .\n"
+            ));
+        }
+        text.push_str("<http://ex/e0> <http://ex/knows> <http://ex/e1> .\n");
+        let mut db = Database::build_from_str("hub", &text).unwrap();
+        let resigned = || RESIGNED_EDGES.with(|c| c.replace(0));
+        let agree = |db: &mut Database, q: &str| {
+            let mut a = db.select(q).unwrap().rows;
+            let saved = db.index_valid;
+            db.index_valid = false;
+            let mut b = db.select(q).unwrap().rows;
+            db.index_valid = saved;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "the tree changed the answer of {q}");
+            a.len()
+        };
+        resigned();
+        // A delete keeps the index valid; then 200 typings into the class.
+        db.query("DELETE DATA { <http://ex/e5> <http://ex/type> <http://ex/Class> }")
+            .unwrap();
+        let mut ins = String::from("INSERT DATA {\n");
+        for i in 0..200 {
+            ins.push_str(&format!(
+                "<http://ex/new{i}> <http://ex/type> <http://ex/Class> .\n"
+            ));
+        }
+        ins.push('}');
+        db.query(&ins).unwrap();
+        assert!(db.stats().index_valid);
+        let work = resigned();
+        assert!(
+            work <= 2 * 200,
+            "inserts re-read {work} edges (the class has {n})"
+        );
+        let q = "SELECT ?s WHERE { ?s <http://ex/type> <http://ex/Class> }";
+        assert_eq!(agree(&mut db, q), n - 1 + 200);
+        // Delete the whole class in a transaction and roll it back.
+        db.begin().unwrap();
+        db.query("DELETE WHERE { ?s <http://ex/type> <http://ex/Class> }")
+            .unwrap();
+        assert_eq!(agree(&mut db, q), 0);
+        db.rollback().unwrap();
+        assert!(db.stats().index_valid);
+        let work = resigned();
+        assert!(work <= 2 * n as u64, "the rollback re-read {work} edges");
+        assert_eq!(agree(&mut db, q), n - 1 + 200);
+        // A retyping (DELETE … INSERT … WHERE) moves the class wholesale.
+        db.query(
+            "DELETE { ?s <http://ex/type> <http://ex/Class> } \
+             INSERT { ?s <http://ex/type> <http://ex/Other> } \
+             WHERE { ?s <http://ex/type> <http://ex/Class> }",
+        )
+        .unwrap();
+        let work = resigned();
+        assert!(work <= 2 * n as u64, "the retyping re-read {work} edges");
+        let other = "SELECT ?s WHERE { ?s <http://ex/type> <http://ex/Other> }";
+        assert_eq!(agree(&mut db, other), n - 1 + 200);
+        assert_eq!(
+            agree(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/e0> <http://ex/knows> ?o }"
+            ),
+            1
+        );
     }
 
     /// The disk build signs entities from one streaming SPO+OSP pass; the

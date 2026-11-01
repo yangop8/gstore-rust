@@ -13,8 +13,8 @@ pub mod cli;
 pub mod conc;
 pub mod phases;
 
-use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -348,6 +348,9 @@ pub struct Session {
     work_root: PathBuf,
     calib_score: Option<f64>,
     seq: Cell<u32>,
+    /// Backends whose database the update phase has changed since it was
+    /// built (see [`rerun`](Self::rerun)).
+    updated: RefCell<BTreeSet<String>>,
 }
 
 impl Session {
@@ -389,6 +392,7 @@ impl Session {
             work_root,
             calib_score: None,
             seq: Cell::new(0),
+            updated: RefCell::new(BTreeSet::new()),
         };
         if let Some(ms) = s.data.gen_ms {
             s.say(&format!(
@@ -620,6 +624,7 @@ impl Session {
         }
 
         if p.update {
+            self.updated.borrow_mut().insert(backend.to_string());
             let mut req = self.request("update", backend, dir.clone());
             req.expected = run
                 .queries
@@ -639,7 +644,12 @@ impl Session {
     }
 
     /// Re-run `phase` of `run`'s backend and keep the minimum of the
-    /// medians (`check`'s targeted retries). Answers must not change.
+    /// medians (`check`'s targeted retries). Answers must not change. The
+    /// update phase has already run (gates are evaluated after the whole
+    /// run) and its inserts and deletes leave the database larger (ids are
+    /// not reclaimed), so a retried open or query phase first rebuilds it:
+    /// a retry measures the database the first attempt and the baseline
+    /// measured.
     pub fn rerun(&self, run: &mut BackendRun, phase: Phase) -> Result<(), String> {
         let backend = run.backend.clone();
         let key = match phase {
@@ -647,6 +657,16 @@ impl Session {
             Phase::Open => "open",
             Phase::Query => "query",
         };
+        if matches!(phase, Phase::Open | Phase::Query) && self.updated.borrow().contains(&backend) {
+            self.say(&format!(
+                "{backend}: rebuilding the database the update phase changed"
+            ));
+            let dir = self.backend_dir(&backend);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            self.child::<crate::schema::BuildResult>(&self.request("build", &backend, dir))?;
+            self.updated.borrow_mut().remove(&backend);
+        }
         *run.attempts.entry(key.into()).or_insert(1) += 1;
         self.say(&format!("{backend}: retrying the {key} phase"));
         match phase {
@@ -673,6 +693,16 @@ impl Session {
                 let samples = self.opens(&backend, self.opts.profile.open_reps.max(1))?;
                 let ms: Vec<f64> = samples.iter().map(|s| s.open_ms).collect();
                 if let Some(o) = run.open.as_mut() {
+                    let same = |s: &OpenSample| {
+                        (s.triple_num, s.entity_num, s.literal_num, s.predicate_num)
+                            == (o.triple_num, o.entity_num, o.literal_num, o.predicate_num)
+                    };
+                    if !samples.iter().all(same) {
+                        return Err(format!(
+                            "{backend}: the retried open phase saw a different database \
+                             than the first attempt"
+                        ));
+                    }
                     o.warm_ms = o.warm_ms.min(median(&ms));
                     o.warm_samples_ms.extend(ms);
                     if let Some(rss) = samples.iter().filter_map(|s| s.rss_mib).reduce(f64::min) {
@@ -777,6 +807,13 @@ pub fn run_child(
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        // Its own group is out of reach of Ctrl-C and timeout(1): end it
+        // with this process instead (it ends its gbuild the same way).
+        let parent = std::process::id();
+        // SAFETY: the hook only makes async-signal-safe syscalls.
+        unsafe {
+            cmd.pre_exec(move || crate::sys::die_with_parent(parent));
+        }
     }
     let mut child = cmd
         .spawn()

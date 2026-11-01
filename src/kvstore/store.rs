@@ -64,7 +64,7 @@ use super::format::{
     ROOT_LITERAL_COUNT, ROOT_PRED_COUNT, ROOT_QUAD_COUNT, ROOT_TRIPLE_COUNT, ROOT_VSTREE_STALE,
     SP2O_VLIST, SPO,
 };
-use super::ivarray::IvArray;
+use super::ivarray::{self, IvArray};
 use super::overflow;
 use super::pager::{Pager, PagerOp, PAGE_SIZE};
 use super::vlist;
@@ -309,10 +309,28 @@ impl DiskStore {
     /// a read-only view catching up with its writer.
     pub fn refresh(&mut self) -> Result<()> {
         let pager = self.pager.read().unwrap();
+        // The term counts are dense ids into the `id2*` arrays, so a count
+        // past their capacity is a damaged header: fail here, before anything
+        // is sized from it.
+        let dense = |slot: usize, what: &str| -> Result<u32> {
+            let n = pager.root(slot);
+            if n > ivarray::CAPACITY as u64 {
+                return Err(GStoreError::Database(format!(
+                    "corrupt kvstore header: {what} count {n} exceeds the id capacity {}",
+                    ivarray::CAPACITY
+                )));
+            }
+            Ok(n as u32)
+        };
+        let (entity_count, literal_count, pred_count) = (
+            dense(ROOT_ENTITY_COUNT, "entity")?,
+            dense(ROOT_LITERAL_COUNT, "literal")?,
+            dense(ROOT_PRED_COUNT, "predicate")?,
+        );
         self.triple_count = pager.root(ROOT_TRIPLE_COUNT);
-        self.entity_count = pager.root(ROOT_ENTITY_COUNT) as u32;
-        self.literal_count = pager.root(ROOT_LITERAL_COUNT) as u32;
-        self.pred_count = pager.root(ROOT_PRED_COUNT) as u32;
+        self.entity_count = entity_count;
+        self.literal_count = literal_count;
+        self.pred_count = pred_count;
         self.compacted = pager.root(ROOT_COMPACTED) != 0;
         self.distinct_subj = pager.root(ROOT_DISTINCT_SUBJ) as u32;
         self.distinct_obj = pager.root(ROOT_DISTINCT_OBJ) as u32;
@@ -470,7 +488,10 @@ impl DiskStore {
 
     /// Run one logical write as a single pager operation under the pager write
     /// lock (see the module docs): it commits as a whole or, on error, leaves
-    /// no trace in the pages, the header or this struct's counters.
+    /// no trace in the pages, the header or this struct's counters. A panic
+    /// inside the operation (a bug) is rolled back and returned as an error
+    /// the same way, instead of unwinding through the write guard: that would
+    /// poison the pager for every reader and writer sharing it.
     fn write_op<R>(&mut self, f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>) -> Result<R> {
         self.check_writable()?;
         let before = self.counters();
@@ -478,7 +499,18 @@ impl DiskStore {
         let pager = Arc::clone(&self.pager);
         let mut guard = pager.write().unwrap();
         let mut op = PagerOp::begin(&mut guard);
-        match f(self, &mut op) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, &mut op)))
+            .unwrap_or_else(|panic| {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|m| m.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                Err(GStoreError::Database(format!(
+                    "a disk write panicked and was rolled back: {what}"
+                )))
+            });
+        match outcome {
             Ok(r) => {
                 self.stats_undo.clear();
                 op.commit()?;
@@ -719,7 +751,7 @@ impl DiskStore {
     /// sorted by graph then `(s, p, o)`.
     pub fn quads(&self) -> Result<Vec<(EntityLiteralId, IdTriple)>> {
         let pager = self.pager.read().unwrap();
-        let mut out = Vec::with_capacity(self.quad_count as usize);
+        let mut out = with_hint(self.quad_count);
         scan_keys(&self.gspo, &pager, &[], 16, |k| {
             out.push((
                 id_at(k, 0),
@@ -1136,7 +1168,10 @@ impl DiskStore {
     /// to the SPO scan for any group not present in the index.
     pub fn try_o_by_sp(&self, s: EntityLiteralId, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
         let pager = self.read_pager();
-        if self.compacted {
+        // The flag in the shared header, not this struct's copy: a read-only
+        // view must see the writer's invalidation at once, as its other reads
+        // see the writer's pages.
+        if pager.root(ROOT_COMPACTED) != 0 {
             if let Some(rec) = io(self.sp2o_vlist.get(&pager, &cat(s, p)))? {
                 let bytes = io(materialize_vlist(&pager, &rec))?;
                 return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
@@ -1182,7 +1217,7 @@ impl DiskStore {
     /// `? p ?` → `(sub, obj)` pairs, sorted.
     pub fn try_so_by_p(&self, p: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
         // POS key = (p, o, s): the scan yields (o, s) order; sort to (s, o).
-        let mut out = Vec::with_capacity(self.stat(p).0 as usize);
+        let mut out = with_hint(self.stat(p).0.into());
         io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
             out.push((id_at(k, 8), id_at(k, 4)));
         }))?;
@@ -1192,7 +1227,7 @@ impl DiskStore {
 
     /// Distinct subjects of predicate `p`, ascending.
     pub fn try_subs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
-        let mut out = Vec::with_capacity(self.stat(p).1 as usize);
+        let mut out = with_hint(self.stat(p).1.into());
         io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
             out.push(id_at(k, 8));
         }))?;
@@ -1203,7 +1238,7 @@ impl DiskStore {
 
     /// Distinct objects of predicate `p`, ascending (POS order needs no sort).
     pub fn try_objs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
-        let mut out: Vec<u32> = Vec::with_capacity(self.stat(p).2 as usize);
+        let mut out: Vec<u32> = with_hint(self.stat(p).2.into());
         io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
             let o = id_at(k, 4);
             if out.last() != Some(&o) {
@@ -1215,7 +1250,7 @@ impl DiskStore {
 
     /// Every id used as a subject, ascending: one streaming pass over SPO.
     pub fn try_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
-        let mut out: Vec<u32> = Vec::with_capacity(self.distinct_subj as usize);
+        let mut out: Vec<u32> = with_hint(self.distinct_subj.into());
         io(scan_keys(&self.spo, &self.read_pager(), &[], 12, |k| {
             let s = id_at(k, 0);
             if out.last() != Some(&s) {
@@ -1227,7 +1262,7 @@ impl DiskStore {
 
     /// Every id used as an object, ascending: one streaming pass over OSP.
     pub fn try_object_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
-        let mut out: Vec<u32> = Vec::with_capacity(self.distinct_obj as usize);
+        let mut out: Vec<u32> = with_hint(self.distinct_obj.into());
         io(scan_keys(&self.osp, &self.read_pager(), &[], 12, |k| {
             let o = id_at(k, 0);
             if out.last() != Some(&o) {
@@ -1239,7 +1274,7 @@ impl DiskStore {
 
     /// Every triple in SPO order (the cheapest full scan).
     pub fn try_iter_spo(&self) -> io::Result<Vec<IdTriple>> {
-        let mut out = Vec::with_capacity(self.triple_count as usize);
+        let mut out = with_hint(self.triple_count);
         io(scan_keys(&self.spo, &self.read_pager(), &[], 12, |k| {
             out.push(IdTriple::new(id_at(k, 0), id_at(k, 4), id_at(k, 8)));
         }))?;
@@ -1570,9 +1605,10 @@ impl DiskStore {
     }
 
     /// Whether the VList-compressed index is currently valid (set by
-    /// [`compact`](Self::compact), cleared by any write).
+    /// [`compact`](Self::compact), cleared by any write). Read from the shared
+    /// header, so a read-only view sees its writer's changes at once.
     pub fn is_compacted(&self) -> bool {
-        self.compacted
+        self.read_pager().root(ROOT_COMPACTED) != 0
     }
 
     /// Total allocated page count (for tests asserting no page leaks).
@@ -1863,6 +1899,19 @@ fn overflow_head(rec: &[u8]) -> Option<super::pager::PageId> {
 
 /// Intern every string of `arr` in `0..n`, in id order (an absent id is
 /// skipped, as the per-id loop this replaces did).
+/// An empty `Vec` with room for `hint` elements when the allocator can give
+/// it. Hints come from counters in the file (header roots, statistics
+/// records), which a damaged file can make arbitrarily large: a reservation
+/// that fails is skipped, and the vector grows as it fills, instead of the
+/// allocation failure aborting the process.
+fn with_hint<T>(hint: u64) -> Vec<T> {
+    let mut v = Vec::new();
+    if let Ok(n) = usize::try_from(hint) {
+        let _ = v.try_reserve_exact(n);
+    }
+    v
+}
+
 fn load_terms(
     arr: &IvArray,
     pager: &Pager,
@@ -3102,6 +3151,72 @@ mod tests {
     }
 
     #[test]
+    fn large_terms_split_pages_by_bytes_and_keep_the_store_usable() {
+        // Phase 6 R1 review: three small literals, then three of 1.4 KB, used
+        // to split a literal2id leaf at its middle entry, past the page: a
+        // panic that also poisoned the shared pager. Subjects of 2 KB did the
+        // same in entity2id.
+        let path = tmp("large_terms");
+        let mut ds = DiskStore::open(&path, 64).unwrap();
+        let mut lits: Vec<String> = ["\"a\"", "\"b\"", "\"c\""].map(String::from).to_vec();
+        lits.extend((b'x'..=b'z').map(|c| format!("\"{}\"", (c as char).to_string().repeat(1400))));
+        for (i, lit) in lits.iter().enumerate() {
+            assert!(ds
+                .insert_keys(&format!("<s{}>", i % 3), "<p>", lit, true)
+                .unwrap());
+        }
+        let long = |c: char| {
+            format!(
+                "<{}>",
+                c.to_string().repeat(super::super::bptree::MAX_KEY_LEN - 2)
+            )
+        };
+        for s in ["<a>".to_string(), "<b>".to_string(), long('y'), long('z')] {
+            assert!(ds.insert_keys(&s, "<q>", "<o>", false).unwrap());
+        }
+        // A key over the limit is refused cleanly, and nothing is poisoned.
+        let too_long = format!("<{}>", "w".repeat(super::super::bptree::MAX_KEY_LEN));
+        assert!(ds.insert_keys(&too_long, "<q>", "<o>", false).is_err());
+        assert_eq!(ds.try_iter_spo().unwrap().len(), 10);
+        ds.flush().unwrap();
+        drop(ds);
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.triple_count(), 10);
+        let (dict, mem) = ds.to_memory().unwrap();
+        assert_eq!(mem.triple_count(), 10);
+        for lit in &lits {
+            assert!(dict.literal_id(lit).is_some(), "{} bytes", lit.len());
+        }
+        assert!(dict.entity_id(&long('z')).is_some());
+        assert!(dict.entity_id(&too_long).is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_panicking_write_is_rolled_back_without_poisoning_the_pager() {
+        let path = tmp("write_panic");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+        let (ents, pages) = (ds.entity_num(), ds.page_count_for_test());
+        let r: Result<()> = ds.write_op(|st, pg| {
+            st.intern_entity_in(pg, "<half-done>")?;
+            panic!("a bug inside a write");
+        });
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("a bug inside a write"), "{err}");
+        assert_eq!(ds.entity_num(), ents);
+        assert_eq!(ds.page_count_for_test(), pages);
+        assert_eq!(ds.term_id(&Term::iri("half-done")).unwrap(), None);
+        // Readers and writers sharing the pager carry on.
+        assert_eq!(view.try_iter_spo().unwrap().len(), 5);
+        assert!(ds
+            .insert_keys("<after>", "<own>", "<point0>", false)
+            .unwrap());
+        assert_eq!(ds.try_iter_spo().unwrap().len(), 6);
+        cleanup(&path);
+    }
+
+    #[test]
     fn a_logical_insert_is_one_commit_unit_even_with_a_tiny_cache() {
         // With an 8-page cache, a single insert touches more pages than fit;
         // the operation must still never be committed in part, so the file only
@@ -3155,6 +3270,92 @@ mod tests {
         assert_eq!(view.triple_count(), 6);
         assert_eq!(TripleSource::num_predicates(&view), 4);
         ds.commit().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_view_reads_the_vlist_index_only_while_it_is_current() {
+        // Phase 6 R1 review: a view built after `compact` kept its own copy of
+        // the compacted flag, so once the writer changed a group its `o_by_sp`
+        // answered from the outdated VList while its other reads were live.
+        let path = tmp("view_compacted");
+        let mut ds =
+            DiskStore::build_str(&path, 64, "<a> <p> <b> .\n<a> <p> <c> .\n<a> <q> <d> .\n")
+                .unwrap();
+        ds.compact().unwrap();
+        let view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+        assert!(view.is_compacted());
+        let a = ds.term_id(&Term::iri("a")).unwrap().unwrap();
+        let p = ds.predicate_id("<p>").unwrap().unwrap();
+        assert_eq!(
+            view.try_o_by_sp(a, p).unwrap(),
+            ds.try_o_by_sp(a, p).unwrap()
+        );
+        assert!(ds.insert_keys("<a>", "<p>", "<e>", false).unwrap());
+        assert!(!view.is_compacted());
+        let live = ds.try_o_by_sp(a, p).unwrap();
+        assert_eq!(live.len(), 3);
+        assert_eq!(view.try_o_by_sp(a, p).unwrap(), live);
+        assert!(ds.delete_keys("<a>", "<p>", "<b>", false).unwrap());
+        assert_eq!(
+            view.try_o_by_sp(a, p).unwrap(),
+            ds.try_o_by_sp(a, p).unwrap()
+        );
+        // Compacted again: the view uses the new index at once.
+        ds.compact().unwrap();
+        assert!(view.is_compacted());
+        assert_eq!(
+            view.try_o_by_sp(a, p).unwrap(),
+            ds.try_o_by_sp(a, p).unwrap()
+        );
+        cleanup(&path);
+    }
+
+    /// Overwrite header root slot `slot` of the file at `path` with `v`.
+    fn poke_root(path: &std::path::Path, slot: usize, v: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(16 + 8 * slot as u64)).unwrap();
+        f.write_all(&v.to_le_bytes()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_header_counters_are_errors_not_aborts() {
+        // Phase 6 R1 review: `open` sized allocations from header counters, so
+        // a damaged count aborted the process (allocation failure) instead of
+        // failing the open.
+        let path = tmp("corrupt_counts");
+        DiskStore::build_str(&path, 64, SMALL)
+            .unwrap()
+            .flush()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        for slot in [ROOT_PRED_COUNT, ROOT_ENTITY_COUNT, ROOT_LITERAL_COUNT] {
+            for v in [u64::from(u32::MAX), 1 << 40] {
+                std::fs::write(&path, &bytes).unwrap();
+                poke_root(&path, slot, v);
+                let err = DiskStore::open(&path, 64).err().expect("a corrupt count");
+                assert!(err.to_string().contains("corrupt"), "{err}");
+            }
+        }
+        // Counters that only size a buffer: the open and the reads still work
+        // (the count itself is what the file says).
+        for slot in [
+            ROOT_TRIPLE_COUNT,
+            ROOT_QUAD_COUNT,
+            ROOT_DISTINCT_SUBJ,
+            ROOT_DISTINCT_OBJ,
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            poke_root(&path, slot, 1 << 44);
+            let ds = DiskStore::open(&path, 64).unwrap();
+            assert_eq!(ds.try_iter_spo().unwrap().len(), 5);
+            assert_eq!(ds.try_subject_keys().unwrap().len(), 2);
+            assert_eq!(ds.try_object_keys().unwrap().len(), 5);
+            assert!(ds.quads().unwrap().is_empty());
+            let (_, mem) = ds.to_memory().unwrap();
+            assert_eq!(mem.triple_count(), 5);
+        }
         cleanup(&path);
     }
 

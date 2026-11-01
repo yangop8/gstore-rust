@@ -525,6 +525,38 @@ impl VsTree {
         true
     }
 
+    /// OR `bits` — the signature of one edge just added to entity `id` —
+    /// into `id`'s stored signature and every ancestor's, in O(height)
+    /// through the locator. An added edge only adds bits, so this leaves the
+    /// entry exactly what re-signing the entity from all its edges and
+    /// [`update`](Self::update)-ing it would (or a superset of that, where a
+    /// delete left bits behind), without reading the entity's other edges.
+    /// Returns `false`, changing nothing, if `id` is not in the tree (the
+    /// caller then signs and [`insert`](Self::insert)s it) or the tree is
+    /// out-of-core.
+    pub fn union_into(&mut self, id: EntityLiteralId, bits: &Signature) -> bool {
+        if self.disk.is_some() {
+            return false;
+        }
+        let Some(leaf) = self.locator.get(id) else {
+            return false;
+        };
+        let Kind::Leaf(entries) = &mut self.nodes[leaf as usize].kind else {
+            return false;
+        };
+        let Some(entry) = entries.iter_mut().find(|(eid, _)| *eid == id) else {
+            return false;
+        };
+        entry.1.union_with(bits);
+        let mut n = leaf;
+        while n != NONE {
+            let node = &mut self.nodes[n as usize];
+            node.sig.union_with(bits);
+            n = node.parent;
+        }
+        true
+    }
+
     /// Whether `probe` is available: the tree is in memory (an out-of-core
     /// tree is only walked).
     pub fn can_probe(&self) -> bool {
@@ -1549,6 +1581,24 @@ mod arena_tests {
             b.sort_unstable();
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn union_into_equals_updating_to_the_grown_signature() {
+        let mut rng = Rng(77);
+        let entries = random_entries(&mut rng, 1800, 8);
+        let mut current = entries.clone();
+        let mut by_union = VsTree::build(entries.clone());
+        let mut by_update = VsTree::build(entries);
+        for _ in 0..4000 {
+            let id = rng.below(1800);
+            let edge = random_sig(&mut rng, 8);
+            current[id as usize].1.union_with(&edge);
+            assert!(by_union.union_into(id, &edge));
+            assert!(by_update.update(id, current[id as usize].1));
+        }
+        assert_eq!(bytes(&by_union), bytes(&by_update));
+        assert!(!by_union.union_into(1800, &Signature::new()), "absent id");
     }
 
     #[test]

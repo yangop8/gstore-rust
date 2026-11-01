@@ -208,6 +208,41 @@ fn micro_bless_check_compare_report_and_canary() {
     );
     assert_eq!(m.workload.data_fnv64, bl.workload.data_fnv64);
 
+    // Targeted retries re-measure the database the first attempt measured,
+    // not the one the update phase (which runs before the gates) changed: a
+    // baseline whose open time no machine can match fails the open gate,
+    // both retries run, and the run ends as a performance failure (exit 1),
+    // its retried opens seeing the original term counts.
+    let mut fast = bl.clone();
+    fast.runs[0].open.as_mut().unwrap().warm_ms = 1e-6;
+    let fast_path = t.path("fast-open.json");
+    fast.save(Path::new(&fast_path)).unwrap();
+    let strict_open = t.path("strict-open.json");
+    std::fs::write(
+        &strict_open,
+        RELAXED.replace(
+            r#""open": { "floor_ms": 20.0, "max_ratio": 50.0 }"#,
+            r#""open": { "floor_ms": 0.0, "max_ratio": 2.0 }"#,
+        ),
+    )
+    .unwrap();
+    let retried = t.path("retried.json");
+    let mut a = args(&[
+        "check",
+        "--baseline",
+        &fast_path,
+        "--thresholds",
+        &strict_open,
+        "--out",
+        &retried,
+    ]);
+    a.extend(c.clone());
+    let r = bench(&a);
+    assert_eq!(r.0, 1, "retries: {}{}", r.1, r.2);
+    assert!(r.1.contains("time.open"), "{}", r.1);
+    let rr = BenchResult::load(Path::new(&retried)).unwrap();
+    assert_eq!(rr.runs[0].attempts.get("open"), Some(&3));
+
     // The canary: the baseline against itself, every time tripled.
     let r = bench(&args(&[
         "check",
@@ -482,4 +517,108 @@ fn a_relative_bin_dir_works() {
     );
     let r = BenchResult::load(Path::new(&t.path("r.json"))).unwrap();
     assert_eq!(r.runs[0].open.as_ref().unwrap().triple_num, 285);
+}
+
+/// The parent pid of `pid` (from `/proc/<pid>/stat`).
+#[cfg(target_os = "linux")]
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` has ended (gone, or a zombie nobody reaped yet).
+#[cfg(target_os = "linux")]
+fn ended(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Killing the harness (Ctrl-C, `timeout`, a cancelled CI job) ends its
+/// phase child and the child's `gbuild` too: each runs in its own process
+/// group (so a phase timeout can kill it whole), out of reach of the
+/// terminal's or `timeout`'s signal, and they used to run on, writing into
+/// the work directory and holding an inherited `flock`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_killed_harness_leaves_no_phase_child_or_gbuild_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    let t = Tmp::new("orphans");
+    let bin = t.path("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pidfile = t.path("gbuild.pid");
+    let fake = Path::new(&bin).join("gbuild");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\necho $$ > {pidfile}.tmp\nmv {pidfile}.tmp {pidfile}\nexec sleep 120\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut harness = Command::new(exe())
+        .args([
+            "run",
+            "--profile",
+            "micro",
+            "--workload",
+            "tiny",
+            "--backends",
+            "disk",
+            "--no-calibrate",
+            "--no-conc",
+            "--bin-dir",
+            &bin,
+            "--builder",
+            "cli",
+            "--data-dir",
+            &t.path("data"),
+            "--work-dir",
+            &t.path("work"),
+            "--quiet",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let gbuild = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            let _ = harness.kill();
+            panic!("the fake gbuild never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let child = ppid_of(gbuild).expect("the phase child");
+    assert_eq!(ppid_of(child), Some(harness.id()));
+    // SIGTERM, as timeout(1) sends: the harness ends without cleaning up.
+    let st = Command::new("kill")
+        .args(["-TERM", &harness.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let _ = harness.wait();
+    let started = Instant::now();
+    while !(ended(child) && ended(gbuild)) {
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &child.to_string(), &gbuild.to_string()])
+                .status();
+            panic!("the phase child or gbuild outlived the harness");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

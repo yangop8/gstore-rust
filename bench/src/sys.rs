@@ -39,11 +39,16 @@ mod linux {
     }
 
     pub const RUSAGE_CHILDREN: i32 = -1;
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+    pub const SIGKILL: u64 = 9;
+    pub const ESRCH: i32 = 3;
 
     extern "C" {
         pub fn getrusage(who: i32, usage: *mut RUsage) -> i32;
         pub fn sync();
         pub fn kill(pid: i32, sig: i32) -> i32;
+        pub fn prctl(option: i32, ...) -> i32;
+        pub fn getppid() -> i32;
     }
 }
 
@@ -86,6 +91,35 @@ pub fn kill_process_group(pgid: u32) -> bool {
         let _ = pgid;
         false
     }
+}
+
+/// For a [`std::os::unix::process::CommandExt::pre_exec`] hook: have the
+/// process about to run be killed (SIGKILL) when `parent` — the process
+/// spawning it — dies. Phase children and `gbuild` run in their own process
+/// group, so neither a terminal's Ctrl-C nor `timeout(1)` reaches them; this
+/// keeps them from outliving an interrupted harness (and the `flock` it may
+/// have handed down). A parent that died before the hook ran fails the spawn.
+/// Only async-signal-safe calls (it runs between fork and exec). A no-op off
+/// 64-bit Linux.
+pub fn die_with_parent(parent: u32) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        // SAFETY: prctl(PR_SET_PDEATHSIG) and getppid are plain syscall
+        // wrappers that touch no memory of ours.
+        unsafe {
+            if linux::prctl(linux::PR_SET_PDEATHSIG, linux::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if linux::getppid() as u32 != parent {
+                return Err(io::Error::from_raw_os_error(linux::ESRCH));
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        let _ = parent;
+    }
+    Ok(())
 }
 
 /// Flush dirty pages and drop the page cache (needs root on Linux). Returns
