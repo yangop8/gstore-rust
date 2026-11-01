@@ -170,15 +170,15 @@ impl DiskOp {
         id: IdTriple,
     ) -> Option<DiskOp> {
         let graph = match graph {
-            Some(g) => Some(dict.id_to_string(g)?.to_owned()),
+            Some(g) => Some(dict.term(g)?.into_string()),
             None => None,
         };
         Some(DiskOp {
             insert,
             graph,
-            s: dict.id_to_string(id.sub)?.to_owned(),
-            p: dict.predicate_to_string(id.pred)?.to_owned(),
-            o: dict.id_to_string(id.obj)?.to_owned(),
+            s: dict.term(id.sub)?.into_string(),
+            p: dict.pred(id.pred)?.into_string(),
+            o: dict.term(id.obj)?.into_string(),
             o_is_literal: is_literal_id(id.obj),
         })
     }
@@ -309,9 +309,9 @@ type KeyQuad = (String, String, String, String, bool);
 
 fn key_triple(dict: &Dictionary, t: IdTriple) -> Option<KeyTriple> {
     Some((
-        dict.id_to_string(t.sub)?.to_owned(),
-        dict.predicate_to_string(t.pred)?.to_owned(),
-        dict.id_to_string(t.obj)?.to_owned(),
+        dict.term(t.sub)?.into_string(),
+        dict.pred(t.pred)?.into_string(),
+        dict.term(t.obj)?.into_string(),
         is_literal_id(t.obj),
     ))
 }
@@ -1477,11 +1477,11 @@ impl Database {
                         .chain(&retried)
                         .any(|(sp, i, _)| (*sp, *i) == (space, id));
                 let key = match space {
-                    TermSpace::Predicate => self.dict.predicate_to_string(id),
-                    _ => self.dict.id_to_string(id),
+                    TermSpace::Predicate => self.dict.pred(id),
+                    _ => self.dict.term(id),
                 };
                 if let (true, Some(key)) = (pending, key) {
-                    retried.push((space, id, key.to_owned()));
+                    retried.push((space, id, key.into_string()));
                 }
             }
         }
@@ -1683,7 +1683,7 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
 
     let quad = |dict: &Dictionary, g: u32, t: IdTriple| -> Option<KeyQuad> {
         let (s, p, o, lit) = key_triple(dict, t)?;
-        Some((dict.id_to_string(g)?.to_owned(), s, p, o, lit))
+        Some((dict.term(g)?.into_string(), s, p, o, lit))
     };
     let disk_quads: HashSet<KeyQuad> = ds
         .quads()?
@@ -1714,7 +1714,7 @@ mod rocks_layout {
 
     use super::{fsutil, Meta, DICT_FILE, LEGACY_SUFFIX, META_FILE, NAMED_FILE};
     use crate::backend::rocks::{RocksStore, TermSpace};
-    use crate::dict::Dictionary;
+    use crate::dict::{Dictionary, Space};
     use crate::error::{GStoreError, Result};
     use crate::model::id::{is_literal_id, LITERAL_FIRST_ID};
     use crate::model::IdTriple;
@@ -1760,25 +1760,22 @@ mod rocks_layout {
         }
     }
 
-    /// Every live dictionary term as `(space, id, key)`.
+    /// Every live dictionary term as `(space, id, key)` (entities, literals,
+    /// then predicates, each in id order). The dictionary of a RocksDB
+    /// database is in memory (plan D4).
     pub(super) fn dict_entries(dict: &Dictionary) -> Vec<(TermSpace, u32, &str)> {
-        let mut out: Vec<(TermSpace, u32, &str)> = dict
-            .entity_literal_entries()
-            .into_iter()
-            .map(|(id, k)| (space_of(id), id, k))
-            .collect();
-        // Predicates have no entry iterator; walk ids until every live one is
-        // found (freed ids leave holes).
-        let mut found = 0usize;
-        let mut id = 0u32;
-        while found < dict.predicate_num() && id < u32::MAX {
-            if let Some(k) = dict.predicate_to_string(id) {
-                out.push((TermSpace::Predicate, id, k));
-                found += 1;
-            }
-            id += 1;
-        }
-        out
+        [
+            (Space::Entity, TermSpace::Entity),
+            (Space::Literal, TermSpace::Literal),
+            (Space::Predicate, TermSpace::Predicate),
+        ]
+        .into_iter()
+        .flat_map(|(space, ts)| {
+            dict.entries_in(space)
+                .into_iter()
+                .map(move |(id, k)| (ts, id, k))
+        })
+        .collect()
     }
 
     /// The terms `(space, id, key)` the triples in `added` use, de-duplicated.
@@ -1795,11 +1792,11 @@ mod rocks_layout {
                     continue;
                 }
                 let key = match space {
-                    TermSpace::Predicate => dict.predicate_to_string(id),
-                    _ => dict.id_to_string(id),
+                    TermSpace::Predicate => dict.pred(id),
+                    _ => dict.term(id),
                 };
                 if let Some(k) = key {
-                    out.push((space, id, k.to_owned()));
+                    out.push((space, id, k.into_string()));
                 }
             }
         }
@@ -1902,9 +1899,9 @@ mod rocks_layout {
                 .iter_all()
                 .into_iter()
                 .filter(|t| {
-                    dict.id_to_string(t.sub).is_none()
-                        || dict.predicate_to_string(t.pred).is_none()
-                        || dict.id_to_string(t.obj).is_none()
+                    dict.term(t.sub).is_none()
+                        || dict.pred(t.pred).is_none()
+                        || dict.term(t.obj).is_none()
                 })
                 .count();
             if dangling > 0 {

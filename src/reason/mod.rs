@@ -49,7 +49,7 @@ pub use manage::{ReasonError, ReasonErrorKind};
 
 use std::collections::HashMap;
 
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, PredId};
 use crate::model::{IdTriple, Term, Triple};
@@ -113,7 +113,7 @@ where
             .collect();
         let keys: Vec<String> = prop_ents
             .iter()
-            .filter_map(|&e| dict.id_to_string(e).map(str::to_owned))
+            .filter_map(|&e| dict.term(e).map(TermStr::into_string))
             .collect();
         for k in keys {
             // Best effort: a property that cannot get a predicate id (id space
@@ -244,8 +244,8 @@ fn gather<S: TripleSource>(
 /// predicate id, via the shared dictionary key. `None` if that IRI is never used
 /// as a predicate in the data.
 fn ent_to_pred(dict: &Dictionary, ent: u32) -> Option<PredId> {
-    let key = dict.id_to_string(ent)?;
-    dict.predicate_id(key)
+    let key = dict.term(ent)?;
+    dict.predicate_id(&key)
 }
 
 // ===========================================================================
@@ -379,11 +379,10 @@ impl Rule {
                 let req_s = pat.subject.required(b);
                 let req_o = pat.object.required(b);
                 for &(s_id, o_id) in &pairs {
-                    let (Some(s_str), Some(o_str)) =
-                        (dict.id_to_string(s_id), dict.id_to_string(o_id))
-                    else {
+                    let (Some(s_str), Some(o_str)) = (dict.term(s_id), dict.term(o_id)) else {
                         continue;
                     };
+                    let (s_str, o_str) = (s_str.as_str(), o_str.as_str());
                     if req_s.as_deref().is_some_and(|r| r != s_str) {
                         continue;
                     }

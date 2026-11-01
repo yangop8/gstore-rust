@@ -70,6 +70,13 @@ impl StringIndex {
             idx.ordered.push(id);
         }
         idx.sort_ordered();
+        // A built index is kept (a database caches it per dictionary
+        // generation): give back the growth slack of every list.
+        for list in idx.trigrams.values_mut() {
+            list.shrink_to_fit();
+        }
+        idx.trigrams.shrink_to_fit();
+        idx.by_id.shrink_to_fit();
         idx
     }
 
@@ -98,6 +105,21 @@ impl StringIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// An estimate of the heap bytes the index holds (map buckets at their
+    /// capacity, strings and posting lists at theirs).
+    pub fn heap_bytes(&self) -> usize {
+        let bucket = |entry: usize| entry + 1; // one control byte per bucket
+        self.by_id.capacity() * bucket(std::mem::size_of::<(u32, String)>())
+            + self.by_id.values().map(String::capacity).sum::<usize>()
+            + self.trigrams.capacity() * bucket(std::mem::size_of::<(u32, Vec<u32>)>())
+            + self
+                .trigrams
+                .values()
+                .map(|v| v.capacity() * 4)
+                .sum::<usize>()
+            + self.ordered.capacity() * 4
     }
 
     /// The string for `id`, if indexed.

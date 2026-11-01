@@ -60,10 +60,11 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, Space};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId, INVALID_PRED_ID};
 use crate::model::IdTriple;
+use crate::store::read_scope::note_read_error;
 use crate::store::TripleSource;
 
 /// A dense CSR vertex index in `0..CsrGraph::num_nodes()`.
@@ -256,18 +257,16 @@ fn predicate_key(iri: &str) -> String {
     }
 }
 
-/// Every live predicate id of `dict`, ascending. Freed (reclaimed) ids leave
-/// holes, so the id space is scanned until all `predicate_num()` live ids
-/// were found.
+/// Every live predicate id of `dict`, ascending (freed ids are skipped). A
+/// backend's read error is noted in the running statement's read scope (C2).
 fn dictionary_predicate_ids(dict: &Dictionary) -> Vec<PredId> {
-    let want = dict.predicate_num();
-    let mut out = Vec::with_capacity(want);
-    let mut id: PredId = 0;
-    while out.len() < want && id < INVALID_PRED_ID {
-        if dict.predicate_to_string(id).is_some() {
-            out.push(id);
-        }
-        id += 1;
+    let mut out = Vec::with_capacity(dict.predicate_num());
+    let walked = dict.for_each_term(Space::Predicate, 0, |id, _| {
+        out.push(id);
+        ControlFlow::Continue(())
+    });
+    if let Err(e) = walked {
+        note_read_error(format_args!("listing the dictionary's predicates: {e}"));
     }
     out
 }

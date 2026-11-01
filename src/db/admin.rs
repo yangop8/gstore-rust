@@ -107,7 +107,7 @@ impl Database {
         }
         let mut out: Vec<(String, u64)> = counts
             .into_iter()
-            .filter_map(|(o, n)| self.dict.id_to_string(o).map(|s| (s.to_string(), n)))
+            .filter_map(|(o, n)| self.dict.term(o).map(|s| (s.into_string(), n)))
             .collect();
         out.sort();
         out
@@ -128,7 +128,7 @@ impl Database {
         }
         let mut classes: Vec<(String, EntityLiteralId)> = instances
             .keys()
-            .filter_map(|&c| self.dict.id_to_string(c).map(|s| (s.to_string(), c)))
+            .filter_map(|&c| self.dict.term(c).map(|s| (s.into_string(), c)))
             .collect();
         classes.sort();
         let class_ids: HashMap<EntityLiteralId, u32> = classes
@@ -149,7 +149,7 @@ impl Database {
             let mut rels: BTreeMap<(String, String), u32> = BTreeMap::new();
             for &s in &instances[class] {
                 for (p, o) in self.store.po_by_s(s) {
-                    let Some(pname) = self.dict.predicate_to_string(p) else {
+                    let Some(pname) = self.dict.pred(p) else {
                         continue;
                     };
                     if is_literal_id(o) {
@@ -157,7 +157,7 @@ impl Database {
                     } else if p != tp {
                         for c2 in self.store.o_by_sp(o, tp) {
                             if let (Some(&target), Some(cname)) =
-                                (class_ids.get(&c2), self.dict.id_to_string(c2))
+                                (class_ids.get(&c2), self.dict.term(c2))
                             {
                                 rels.insert((pname.to_string(), cname.to_string()), target);
                             }
