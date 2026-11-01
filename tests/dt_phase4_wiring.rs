@@ -1,6 +1,6 @@
 //! Phase 4 cross-package wiring: the reasoning rules (`reasonManage`, GAP_PLAN
 //! §3.2) meet the PFN user functions (§3.3), the advanced graph functions,
-//! the caches and `conf.ini`.
+//! the caches, `conf.ini` and the privilege model.
 //!
 //! * **Caches.** Executing a rule adds `<Rule:label>` edges and disabling it
 //!   retracts them through the database's update path, so the query cache
@@ -12,6 +12,10 @@
 //! * **conf.ini.** `refreshconf` re-reads the `[pfn]` section: the registry's
 //!   limits (`pfn_max_functions`) and — on a database already loaded — the
 //!   sandbox limits a query runs under (`pfn_fuel_per_call`).
+//! * **Privileges.** A user created over `/api` holds no privilege yet may
+//!   manage their own PFN functions (upstream grants `funquery` / `funcudb`
+//!   / `funreview` to everyone) but no reasoning rule (`reasonManage` is
+//!   root's); `showuser` lists upstream's seven privileges, nothing new.
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
@@ -221,7 +225,6 @@ fn doc_block(tag: &str) -> String {
 }
 
 /// `funcudb` `kind` as `user` with `info`: the answer.
-#[cfg(feature = "pfn-wasm")]
 fn funcudb(srv: &Server, user: &str, kind: &str, info: Json) -> Json {
     api_as(
         srv,
@@ -442,4 +445,120 @@ fn refreshconf_applies_the_pfn_section() {
         ok(&run());
     }
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Privileges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_fresh_api_user_manages_pfn_functions_but_not_rules() {
+    let srv = family_server("p4w_priv", "fam");
+    ok(&srv.op(
+        "usermanage",
+        &[("type", "1"), ("op_username", "bob"), ("op_password", "pw")],
+    ));
+    ok(&funcudb(
+        &srv,
+        USERNAME,
+        "1",
+        fun_info("roots", "(i32.const 1)", ""),
+    ));
+    // No privilege on any database, yet the PFN operations are bob's — on
+    // his own functions only.
+    ok(&funcudb(
+        &srv,
+        "bob",
+        "1",
+        fun_info("mine", "(i32.const 1)", ""),
+    ));
+    let names = |user: &str| -> Vec<String> {
+        let j = api_as(&srv, user, vec![("operation", "funquery".into())]);
+        ok(&j);
+        j.get("list")
+            .and_then(Json::as_array)
+            .unwrap_or_else(|| panic!("no list in {j}"))
+            .iter()
+            .map(|f| string(f, "funName"))
+            .collect()
+    };
+    assert_eq!(names("bob"), ["mine"]);
+    assert_eq!(names(USERNAME), ["roots"]);
+    let j = api_as(
+        &srv,
+        "bob",
+        vec![
+            ("operation", "funreview".into()),
+            ("funInfo", fun_info("mine", "(i32.const 1)", "")),
+        ],
+    );
+    ok(&j);
+    assert!(string(&j, "result").contains("i32.const"), "{j}");
+    ok(&funcudb(
+        &srv,
+        "bob",
+        "3",
+        Json::obj().with("funName", "mine"),
+    ));
+    // … but no reasoning rule: reasonManage is root's (upstream's
+    // check_privilege grants it to nobody else), whatever the type.
+    ok(&reason(&srv, "fam", "1"));
+    for ty in ["1", "2", "3", "4", "5", "6", "7", "8"] {
+        let j = api_as(
+            &srv,
+            "bob",
+            vec![
+                ("operation", "reasonManage".into()),
+                ("db_name", "fam".into()),
+                ("type", ty.into()),
+                ("rulename", "uncle".into()),
+                ("ruleinfo", json::parse(UNCLE).unwrap()),
+            ],
+        );
+        assert_eq!(code(&j), 1004, "{j}");
+        assert_eq!(
+            string(&j, "StatusMsg"),
+            "You have no reasonManage privilege"
+        );
+    }
+    assert!(names("bob").is_empty());
+    // showuser lists upstream's seven privileges: Phase 4 adds none.
+    let j = srv.op("showuser", &[]);
+    ok(&j);
+    let bob = j
+        .get("ResponseBody")
+        .and_then(Json::as_array)
+        .and_then(|users| {
+            users
+                .iter()
+                .find(|u| u.get("username").and_then(Json::as_str) == Some("bob"))
+        })
+        .unwrap_or_else(|| panic!("bob in {j}"))
+        .clone();
+    let mut keys: Vec<String> = bob
+        .as_object()
+        .expect("an object")
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "backup_privilege",
+            "export_privilege",
+            "load_privilege",
+            "password",
+            "query_privilege",
+            "restore_privilege",
+            "unload_privilege",
+            "update_privilege",
+            "username",
+        ]
+    );
+    for (k, v) in bob.as_object().unwrap() {
+        if k.ends_with("_privilege") {
+            assert_eq!(v.as_str(), Some(""), "{k} of a fresh user");
+        }
+    }
 }
