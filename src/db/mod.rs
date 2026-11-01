@@ -11,11 +11,12 @@
 //! write-through), or a RocksDB store (`rocksdb/`, feature `rocksdb`).
 //! [`Database::open`] detects the layout.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -34,12 +35,18 @@ use crate::parser::sparql::ast::{
 };
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
+use crate::store::read_scope::ReadScope;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
 pub(crate) mod fsutil;
 mod admin;
 pub mod dirlock;
-mod persist;
+pub(crate) mod persist;
+mod statement;
+pub use statement::Statement;
+
+#[cfg(test)]
+mod concurrency_tests;
 
 pub use admin::{SchemaEdge, SchemaGraph, SchemaNode};
 pub use persist::StorageKind;
@@ -167,9 +174,10 @@ pub struct Database {
     txn: Option<Vec<UndoOp>>,
     /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
     /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
-    /// any store mutation. Interior mutability so a `&self`/`&mut self` query
-    /// path can read and populate it.
-    query_cache: RefCell<QueryCache>,
+    /// any store mutation. Behind a lock so concurrent `&self` reads
+    /// ([`read_as`](Self::read_as)) can look up and populate it; its entries
+    /// are shared (`Arc`), so a hit is copied out after the lock is released.
+    query_cache: Mutex<QueryCache>,
     /// How `/` divides two integers in this database's queries (see
     /// [`set_integer_division`](Self::set_integer_division)).
     integer_division: IntegerDivision,
@@ -202,9 +210,9 @@ pub struct Database {
     /// full ([`backup`](Self::backup)) or incremental
     /// ([`backup_incremental`](Self::backup_incremental)) backup ended at. The
     /// next incremental captures update-log records from here onward, so
-    /// successive incrementals chain contiguously. Interior-mutable because both
-    /// backup methods take `&self`.
-    backup_offset: Cell<u64>,
+    /// successive incrementals chain contiguously. Atomic because both backup
+    /// methods take `&self` (they run under [`persist_lock`](Self::persist_lock)).
+    backup_offset: AtomicU64,
     /// User-defined forward-chaining reasoning rules (the crate's textual
     /// `body => head` rules, see [`crate::reason::RuleSet`]).
     rules: crate::reason::RuleSet,
@@ -222,18 +230,29 @@ pub struct Database {
     home: Option<PathBuf>,
     /// Write-through state of an on-disk (`kvstore.kv`) database: every
     /// committed mutation of the in-memory working set is mirrored to the
-    /// [`DiskStore`](crate::kvstore::DiskStore). A `RefCell` so `save(&self)`
-    /// can commit it.
-    disk: RefCell<Option<persist::DiskSink>>,
+    /// [`DiskStore`](crate::kvstore::DiskStore). Behind a lock so
+    /// `save(&self)` / `sync(&self)` can commit it.
+    disk: Mutex<Option<persist::DiskSink>>,
     /// The first persistence failure (RocksDB dictionary / named-graph write)
     /// since the last commit point, reported by the next one.
-    persist_error: RefCell<Option<String>>,
+    persist_error: Mutex<Option<String>>,
+    /// Serializes the `&self` persistence entry points — [`save`](Self::save),
+    /// [`checkpoint`](Self::checkpoint), [`sync`](Self::sync),
+    /// [`backup`](Self::backup) and
+    /// [`backup_incremental`](Self::backup_incremental) — which may now run
+    /// concurrently with each other and with reads. Lock order (C8):
+    /// `persist_lock` → `disk` → `persist_error` → the pager. Each entry point
+    /// takes it once and delegates to internals that never take it again.
+    persist_lock: Mutex<()>,
     /// Which sources SPARQL `LOAD` may read (see [`LoadPolicy`]). Permissive by
     /// default; network-facing servers install [`LoadPolicy::restricted`].
     load_policy: LoadPolicy,
     /// Advances on every applied data mutation (see
     /// [`mutation_count`](Self::mutation_count)).
     mutations: u64,
+    /// Default-graph deletes applied since the VS-tree was last built, while
+    /// it stayed valid (see [`vs_shrink_debt`](Self::vs_shrink_debt)).
+    vs_shrink_debt: u64,
     /// The per-predicate CSR of the default graph used by the advanced graph
     /// functions (upstream `GeneralEvaluation::csr`), built lazily and keyed
     /// by [`mutations`](Self::mutations) so any data change invalidates it
@@ -366,7 +385,7 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
-            query_cache: RefCell::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
+            query_cache: Mutex::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
@@ -375,15 +394,17 @@ impl Database {
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
+            backup_offset: AtomicU64::new(0),
             rules: crate::reason::RuleSet::new(),
             reason_home: crate::reason::store::RuleHome::default(),
             functions: FunctionRegistry::new(),
             home: None,
-            disk: RefCell::new(None),
-            persist_error: RefCell::new(None),
+            disk: Mutex::new(None),
+            persist_error: Mutex::new(None),
+            persist_lock: Mutex::new(()),
             load_policy: LoadPolicy::default(),
             mutations: 0,
+            vs_shrink_debt: 0,
             csr_cache: CsrCache::new(),
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
@@ -414,8 +435,15 @@ impl Database {
     /// mutation also advances the counter and so triggers a (redundant but
     /// harmless) rebuild. Thread-safe: concurrent callers share one build.
     pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
-        self.csr_cache
-            .get_or_build(self.mutations, || CsrGraph::build(&self.store))
+        self.csr_cache.get_or_build(self.mutations, || {
+            // A read error while building fails the build (nothing is cached).
+            let scope = ReadScope::enter();
+            let graph = CsrGraph::build(&self.store);
+            match scope.take_error() {
+                Some(e) => Err(read_failure("building the CSR", e)),
+                None => graph,
+            }
+        })
     }
 
     /// Build the CSR now instead of on the first graph-function query —
@@ -447,9 +475,57 @@ impl Database {
     /// drop the now stale CSR (so it is not kept alive until the next graph
     /// function query) and advance [`mutation_count`](Self::mutation_count).
     fn touched(&mut self) {
-        self.query_cache.get_mut().clear();
+        self.query_cache_mut().clear();
         self.csr_cache.clear();
         self.mutations += 1;
+    }
+
+    /// The query cache, through its lock. A lock poisoned by a panic is
+    /// recovered with the cache emptied (it only holds copies of answers).
+    fn query_cache(&self) -> MutexGuard<'_, QueryCache> {
+        match self.query_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                self.query_cache.clear_poison();
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                cache
+            }
+        }
+    }
+
+    /// The query cache, exclusively (no locking needed).
+    fn query_cache_mut(&mut self) -> &mut QueryCache {
+        let poisoned = self.query_cache.is_poisoned();
+        self.query_cache.clear_poison();
+        let cache = self
+            .query_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        if poisoned {
+            cache.clear();
+        }
+        cache
+    }
+
+    /// Serialize a `&self` persistence entry point (see
+    /// [`persist_lock`](Self::persist_lock)); it guards no data, so a poisoned
+    /// lock is simply taken over.
+    fn persist_guard(&self) -> MutexGuard<'_, ()> {
+        self.persist_lock.lock().unwrap_or_else(|e| {
+            self.persist_lock.clear_poison();
+            e.into_inner()
+        })
+    }
+
+    /// How many default-graph deletes (including a rollback's removal of the
+    /// transaction's inserts) were applied while the VS-tree stayed valid
+    /// since it was last built. Deletes leave the tree in place — an entity's
+    /// signature only loses bits, so its stored signature stays a sound
+    /// superset — at the price of some pruning power; this counts that debt.
+    /// [`rebuild_index`](Self::rebuild_index) clears it.
+    pub fn vs_shrink_debt(&self) -> u64 {
+        self.vs_shrink_debt
     }
 
     /// Rebuild the VS-tree from the current store and mark the index valid.
@@ -486,7 +562,7 @@ impl Database {
         remove_file_and_wal(path);
         self.vstree = VsTree::build_disk(path, vstree_entries(&self.store))?;
         self.index_valid = true;
-        self.query_cache.get_mut().clear();
+        self.query_cache_mut().clear();
         Ok(())
     }
 
@@ -500,7 +576,7 @@ impl Database {
         F: Fn(&[crate::query::Value]) -> Option<crate::query::Value> + Send + Sync + 'static,
     {
         self.functions.register(name, f);
-        self.query_cache.get_mut().clear();
+        self.query_cache_mut().clear();
         self
     }
 
@@ -1218,66 +1294,138 @@ impl Database {
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<QueryResult> {
-        let q = sparql::parse(sparql)?;
-        match q {
-            Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
-                // Serve from the query cache when the same request was already
-                // answered against the current (unchanged) store. Only
-                // deterministic queries are cached (no NOW()/RAND()/UUID()/
-                // STRUUID()/BNODE(), SERVICE or user functions).
-                let cacheable = query_cache::is_cacheable(&q);
-                if cacheable {
-                    if let Some(cached) = self.query_cache.borrow_mut().get(sparql, self.mutations)
-                    {
-                        return Ok(cached);
-                    }
-                }
-                // The advanced graph functions run on this database's cached
-                // CSR (see `csr`), built only when a query needs it.
-                let csr = || self.csr();
-                // Use the VS-tree as a candidate filter only while it is
-                // consistent with the store; otherwise evaluate without it.
-                let mut eval = if self.index_valid {
-                    Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
-                } else {
-                    Evaluator::new(&self.dict, &self.store)
-                };
-                if !self.named.is_empty() {
-                    eval = eval.with_named(&self.named);
-                }
-                // Make user-defined functions (PFN) visible to this query.
-                if !self.functions.is_empty() {
-                    eval = eval.with_functions(self.functions.clone());
-                }
-                // gStore's PFN functions: the caller's, under this database's
-                // limits (never cached, see `query_cache::is_cacheable`).
-                if let Some(caller) = pfn.or(self.pfn.as_ref()) {
-                    eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
-                }
-                if let Some(c) = cancel {
-                    eval = eval.with_cancel(c);
-                }
-                // `SERVICE` makes outbound requests: only where remote sources
-                // are allowed (not on a server's restricted policy).
-                eval = eval
-                    .with_service_allowed(self.load_policy.allow_remote)
-                    .with_csr_provider(&csr)
-                    .with_integer_division(self.integer_division)
-                    .with_topk_options(self.topk)
-                    .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
-                let result = eval.evaluate(&q)?;
-                if cacheable {
-                    self.query_cache.borrow_mut().put(
-                        sparql.to_string(),
-                        result.clone(),
-                        self.mutations,
-                    );
-                }
-                Ok(result)
-            }
-            // An UPDATE's WHERE clause calls the same caller's functions.
-            Query::Update(ops) => self.run_update(sparql, ops, cancel, pfn),
+        let stmt = Statement::parse(sparql)?;
+        self.execute_as(stmt, cancel, pfn)
+    }
+
+    /// Run a parsed [`Statement`]: a read through [`read_as`](Self::read_as),
+    /// an UPDATE through the write path (the update log records its text).
+    /// What [`query_as`](Self::query_as) does after parsing — a server that
+    /// parsed the request to route it (shared reads, exclusive writes) runs
+    /// it with this without parsing it again.
+    pub fn execute_as(
+        &mut self,
+        stmt: Statement,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        if !stmt.is_update() {
+            return self.read_as(&stmt, cancel, pfn);
         }
+        let (text, query) = stmt.into_parts();
+        match query {
+            // An UPDATE's WHERE clause calls the same caller's functions.
+            Query::Update(ops) => self.run_update(&text, ops, cancel, pfn),
+            _ => Err(GStoreError::Query("not an update".into())),
+        }
+    }
+
+    /// Parse and run a **read** request — SELECT, ASK, CONSTRUCT or DESCRIBE —
+    /// on a shared `&Database`, so several threads may query one database at
+    /// once (`Database` is `Send + Sync`). An UPDATE is refused with an error
+    /// before anything happens; run it through [`query`](Self::query) /
+    /// [`execute_as`](Self::execute_as). Otherwise exactly
+    /// [`query_as`](Self::query_as): the same cache, VS-tree, named graphs,
+    /// functions, PFN caller and limits, `SERVICE` policy and cancellation.
+    pub fn query_read(
+        &self,
+        sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        let stmt = Statement::parse(sparql)?;
+        self.read_as(&stmt, cancel, pfn)
+    }
+
+    /// Run the parsed read request `stmt` on a shared `&Database` (see
+    /// [`query_read`](Self::query_read)); an UPDATE is refused with no side
+    /// effect. The evaluation runs inside a [`ReadScope`]: a read error a
+    /// backend reports fails the query (and its result is not cached).
+    pub fn read_as(
+        &self,
+        stmt: &Statement,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        if stmt.is_update() {
+            return Err(GStoreError::Query(
+                "an UPDATE cannot run on the shared read path; run it through query / \
+                 execute_as"
+                    .into(),
+            ));
+        }
+        let (sparql, q) = (stmt.text(), stmt.query());
+        // Serve from the query cache when the same request was already
+        // answered against the current (unchanged) store. Only
+        // deterministic queries are cached (no NOW()/RAND()/UUID()/
+        // STRUUID()/BNODE(), SERVICE or user functions).
+        let cacheable = query_cache::is_cacheable(q);
+        if cacheable {
+            // The guard is released at the end of this statement; the hit is
+            // copied out of its `Arc` after that.
+            let hit = self.query_cache().get(sparql, self.mutations);
+            if let Some(cached) = hit {
+                return Ok(Arc::unwrap_or_clone(cached));
+            }
+        }
+        // The advanced graph functions run on this database's cached
+        // CSR (see `csr`), built only when a query needs it.
+        let csr = || self.csr();
+        // Use the VS-tree as a candidate filter only while it is
+        // consistent with the store; otherwise evaluate without it.
+        let mut eval = if self.index_valid {
+            Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
+        } else {
+            Evaluator::new(&self.dict, &self.store)
+        };
+        if !self.named.is_empty() {
+            eval = eval.with_named(&self.named);
+        }
+        // Make user-defined functions (PFN) visible to this query.
+        if !self.functions.is_empty() {
+            eval = eval.with_functions(self.functions.clone());
+        }
+        // gStore's PFN functions: the caller's, under this database's
+        // limits (never cached, see `query_cache::is_cacheable`).
+        if let Some(caller) = pfn.or(self.pfn.as_ref()) {
+            eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
+        }
+        if let Some(c) = cancel {
+            eval = eval.with_cancel(c);
+        }
+        // `SERVICE` makes outbound requests: only where remote sources
+        // are allowed (not on a server's restricted policy).
+        eval = eval
+            .with_service_allowed(self.load_policy.allow_remote)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk)
+            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
+        // A read error a backend reports fails the query (C2).
+        let scope = ReadScope::enter();
+        let evaluated = eval.evaluate(q);
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("evaluating the query", e));
+        }
+        drop(scope);
+        let result = evaluated?;
+        if cacheable && self.query_cache().budget() > 0 {
+            // Size the entry before taking the lock; the cache shares the
+            // result, so it is copied (once) only if it was cached.
+            let bytes = query_cache::entry_cost(sparql, &result);
+            if !self.query_cache().admits(bytes) {
+                return Ok(result);
+            }
+            let shared = Arc::new(result);
+            self.query_cache().put_sized(
+                sparql.to_string(),
+                Arc::clone(&shared),
+                self.mutations,
+                bytes,
+            );
+            return Ok(Arc::unwrap_or_clone(shared));
+        }
+        Ok(result)
     }
 
     /// Apply the parsed operations `ops` of UPDATE request `sparql` (the
@@ -1616,9 +1764,40 @@ impl Database {
     /// * otherwise the store's default graph and all named graphs.
     ///
     /// The WHERE clause runs under `cancel` (the request's cancel flag), as
-    /// a read query does.
+    /// a read query does, and inside a [`ReadScope`]: a read error a backend
+    /// reports fails the operation before anything is applied.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn modify_changes(
+        &self,
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
+        pattern: &GraphPattern,
+        with: Option<&str>,
+        using: &[String],
+        using_named: &[String],
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        let scope = ReadScope::enter();
+        let changes = self.eval_modify_changes(
+            delete,
+            insert,
+            pattern,
+            with,
+            using,
+            using_named,
+            cancel,
+            pfn,
+        );
+        match scope.take_error() {
+            Some(e) => Err(read_failure("evaluating the update's WHERE clause", e)),
+            None => changes,
+        }
+    }
+
+    /// [`modify_changes`](Self::modify_changes) without the read scope.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn eval_modify_changes(
         &self,
         delete: &[QuadPattern],
         insert: &[QuadPattern],
@@ -1851,10 +2030,11 @@ impl Database {
     /// increments. See [`enable_redo_log_in`](Self::enable_redo_log_in).)
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
-        self.save(backup_dir)?;
+        let _persist = self.persist_guard();
+        self.save_locked(backup_dir)?;
         self.backup_reason_rules(backup_dir)?;
         let off = self.redo_log_len();
-        self.backup_offset.set(off);
+        self.backup_offset.store(off, Ordering::SeqCst);
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
         Ok(())
     }
@@ -1874,7 +2054,7 @@ impl Database {
     /// The current incremental-backup checkpoint: the redo-log byte offset that
     /// the most recent full/incremental backup ended at (0 before any backup).
     pub fn backup_checkpoint(&self) -> u64 {
-        self.backup_offset.get()
+        self.backup_offset.load(Ordering::SeqCst)
     }
 
     /// Byte length of the redo log, or 0 when logging is disabled or the file
@@ -1917,6 +2097,7 @@ impl Database {
     ///   rules the replayed inferred triples belong to.
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
+        let _persist = self.persist_guard();
         let Some(log_path) = self.redo_log.clone() else {
             return Err(GStoreError::Database(
                 "backup_incremental requires redo logging to be enabled \
@@ -1924,7 +2105,7 @@ impl Database {
                     .into(),
             ));
         };
-        let base = self.backup_offset.get();
+        let base = self.backup_offset.load(Ordering::SeqCst);
         // Missing log ⇒ no records yet (treat as empty), so an incremental taken
         // before any logged mutation is simply an empty (but valid) delta.
         let data = fs::read(&log_path).unwrap_or_default();
@@ -1943,7 +2124,7 @@ impl Database {
         self.backup_reason_rules(out_dir)?;
         fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
-        self.backup_offset.set(end);
+        self.backup_offset.store(end, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2010,7 +2191,7 @@ impl Database {
             Ok(())
         })();
         db.redo_log = saved;
-        db.backup_offset.set(expected);
+        db.backup_offset.store(expected, Ordering::SeqCst);
         outcome.map(|()| db)
     }
 
@@ -2666,23 +2847,23 @@ impl Database {
     /// this from `conf.ini`'s `[query] query_cache_size` (bytes, see
     /// [`QuerySettings`]).
     pub fn set_query_cache_size(&mut self, bytes: usize) {
-        *self.query_cache.get_mut() = QueryCache::new(bytes);
+        *self.query_cache_mut() = QueryCache::new(bytes);
     }
 
     /// The read-query cache's budget in bytes (see
     /// [`set_query_cache_size`](Self::set_query_cache_size)).
     pub fn query_cache_size(&self) -> usize {
-        self.query_cache.borrow().budget()
+        self.query_cache().budget()
     }
 
     /// Number of results currently in the read-query cache.
     pub fn query_cache_len(&self) -> usize {
-        self.query_cache.borrow().len()
+        self.query_cache().len()
     }
 
     /// Approximate bytes the read-query cache currently holds.
     pub fn query_cache_bytes(&self) -> usize {
-        self.query_cache.borrow().bytes()
+        self.query_cache().bytes()
     }
 
     /// Choose how `/` divides two integers in this database's queries and
@@ -2695,7 +2876,7 @@ impl Database {
     pub fn set_integer_division(&mut self, mode: IntegerDivision) {
         if self.integer_division != mode {
             self.integer_division = mode;
-            self.query_cache.get_mut().clear();
+            self.query_cache_mut().clear();
         }
     }
 
@@ -2718,7 +2899,7 @@ impl Database {
     pub fn set_topk_options(&mut self, options: TopKOptions) {
         if self.topk != options {
             self.topk = options;
-            self.query_cache.get_mut().clear();
+            self.query_cache_mut().clear();
         }
     }
 
@@ -2739,7 +2920,7 @@ impl Database {
     pub fn set_gfun_max_output_bytes(&mut self, bytes: usize) {
         if self.gfun_max_output_bytes != bytes {
             self.gfun_max_output_bytes = bytes;
-            self.query_cache.get_mut().clear();
+            self.query_cache_mut().clear();
         }
     }
 
@@ -2809,7 +2990,7 @@ impl Database {
     /// Whether a given SPARQL string is currently cached (tests).
     #[cfg(test)]
     fn query_cache_contains(&self, sparql: &str) -> bool {
-        self.query_cache.borrow().contains(sparql)
+        self.query_cache().contains(sparql)
     }
 
     // ---- bulk / parallel loaders -----------------------------------------
@@ -2951,6 +3132,19 @@ impl Database {
         db.rebuild_index();
         Ok(db)
     }
+}
+
+/// `Database` may be shared by reference across threads: its `&self` methods
+/// (reads, `save`, `sync`, backups) may run concurrently, its `&mut self`
+/// methods need exclusive access (contract C8).
+#[allow(dead_code)]
+fn assert_send_sync<T: Send + Sync>() {}
+const _: fn() = || assert_send_sync::<Database>();
+
+/// The error a statement fails with when a read inside it reported `msg`
+/// through [`note_read_error`](crate::store::read_scope::note_read_error).
+fn read_failure(what: &str, msg: String) -> GStoreError {
+    GStoreError::Database(format!("a read from the store failed while {what}: {msg}"))
 }
 
 /// The named-graph IRI of an imported quad (`None` = the default graph). The
@@ -3998,7 +4192,7 @@ mod tests {
 
     #[test]
     fn build_reports_progress_stages() {
-        let stages = RefCell::new(Vec::new());
+        let stages = std::cell::RefCell::new(Vec::new());
         let db = Database::build_from_str_with_progress("p", SMALL, |s| {
             stages.borrow_mut().push(s)
         })

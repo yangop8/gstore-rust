@@ -271,18 +271,19 @@ fn plans_are_identical_through_the_default_methods() {
     // Shapes whose cost model uses the distinct-predicate and per-key counts.
     let ub = "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#";
     let d0 = "http://www.Department0.University0.edu/";
+    let dept = "http://www.Department0.University0.edu";
     queries.extend([
         format!("SELECT ?s ?p WHERE {{ ?s ?p <{d0}GraduateCourse0> . ?s <{ub}advisor> ?a }}"),
         format!("SELECT ?p ?o WHERE {{ <{d0}GraduateStudent44> ?p ?o . ?o ?q ?r }} LIMIT 50"),
         format!(
-            "SELECT ?x ?p WHERE {{ ?x <{ub}memberOf> <{d0}> . <{d0}GraduateStudent44> ?p ?x }}"
+            "SELECT ?x ?p WHERE {{ ?x <{ub}memberOf> <{dept}> . <{d0}GraduateStudent44> ?p ?x }}"
         ),
         format!(
             "SELECT ?x ?y ?z WHERE {{ ?x <{ub}advisor> ?y . ?y <{ub}teacherOf> ?z . \
-             ?x <{ub}takesCourse> ?z . ?x ?p <{d0}> }}"
+             ?x <{ub}takesCourse> ?z . ?x ?p <{dept}> }}"
         ),
-        format!("SELECT ?p WHERE {{ <{d0}GraduateStudent44> ?p <{d0}> }}"),
-        format!("ASK {{ ?s ?p ?o . ?o ?q <{d0}> }}"),
+        format!("SELECT ?p WHERE {{ <{d0}GraduateStudent44> ?p <{dept}> }}"),
+        format!("ASK {{ ?s ?p ?o . ?o ?q <{dept}> }}"),
     ]);
     let store = db.store();
     for q in &queries {

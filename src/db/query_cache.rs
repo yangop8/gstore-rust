@@ -34,6 +34,7 @@
 //!   advanced graph functions (deterministic for given data) are cacheable.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::model::Term;
 use crate::parser::sparql::ast::{
@@ -61,7 +62,9 @@ const XSD_CASTS: [&str; 8] = [
 
 #[derive(Debug)]
 struct Entry {
-    result: QueryResult,
+    /// Shared, so a hit is handed out without copying the result under the
+    /// cache's lock (the caller clones it after unlocking).
+    result: Arc<QueryResult>,
     tick: u64,
     bytes: usize,
 }
@@ -103,8 +106,9 @@ impl QueryCache {
     }
 
     /// Look up `key` among the results computed at data generation
-    /// `generation`, refreshing its recency and returning a clone on hit.
-    pub(crate) fn get(&mut self, key: &str, generation: u64) -> Option<QueryResult> {
+    /// `generation`, refreshing its recency and returning the shared result
+    /// on hit.
+    pub(crate) fn get(&mut self, key: &str, generation: u64) -> Option<Arc<QueryResult>> {
         self.sync(generation);
         self.tick += 1;
         let tick = self.tick;
@@ -112,18 +116,38 @@ impl QueryCache {
         self.lru.remove(&entry.tick);
         entry.tick = tick;
         self.lru.insert(tick, key.to_string());
-        Some(entry.result.clone())
+        Some(Arc::clone(&entry.result))
     }
 
     /// Cache `key → value`, computed at data generation `generation`,
     /// evicting least-recently-used entries until it fits the budget. A
     /// result above the per-entry limit (or any result, with a zero budget)
     /// is not cached.
+    #[cfg(test)]
     pub(crate) fn put(&mut self, key: String, value: QueryResult, generation: u64) {
+        let bytes = entry_cost(&key, &value);
+        self.put_sized(key, Arc::new(value), generation, bytes);
+    }
+
+    /// Whether an entry of `bytes` (see [`entry_cost`]) can be cached at all
+    /// under the current budget.
+    pub(crate) fn admits(&self, bytes: usize) -> bool {
+        self.budget != 0 && bytes <= self.budget / MAX_ENTRY_FRACTION
+    }
+
+    /// [`put`](Self::put) with the entry's cost computed beforehand by
+    /// [`entry_cost`] (outside any lock the cache sits behind). Returns
+    /// whether the result was cached.
+    pub(crate) fn put_sized(
+        &mut self,
+        key: String,
+        value: Arc<QueryResult>,
+        generation: u64,
+        bytes: usize,
+    ) -> bool {
         self.sync(generation);
-        let bytes = key.len() + result_bytes(&value) + ENTRY_OVERHEAD;
-        if self.budget == 0 || bytes > self.budget / MAX_ENTRY_FRACTION {
-            return;
+        if !self.admits(bytes) {
+            return false;
         }
         self.remove(&key);
         while self.used + bytes > self.budget {
@@ -145,6 +169,7 @@ impl QueryCache {
                 bytes,
             },
         );
+        true
     }
 
     fn remove(&mut self, key: &str) {
@@ -179,6 +204,11 @@ impl QueryCache {
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.map.contains_key(key)
     }
+}
+
+/// The approximate bytes an entry `key → value` takes (what the budget counts).
+pub(crate) fn entry_cost(key: &str, value: &QueryResult) -> usize {
+    key.len() + result_bytes(value) + ENTRY_OVERHEAD
 }
 
 /// Approximate heap + inline size of a result.
