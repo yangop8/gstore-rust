@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 
+mod backend;
+pub mod read_scope;
+
+pub use backend::Backend;
+
 /// A sorted, de-duplicated adjacency map `key → Vec<(a, b)>`.
 type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 
@@ -30,6 +35,33 @@ type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 /// optimizer + executor can run either fully in memory or *streaming* from disk
 /// (reading only the index ranges a query touches). Owned `Vec`s keep the disk
 /// implementation simple; the in-memory one clones its (small per-key) slices.
+///
+/// ## Ordering contract
+///
+/// Every implementor returns its lists in this order, so that plans and the
+/// order of solutions never depend on the backend:
+///
+/// * [`po_by_s`](Self::po_by_s) returns `(p, o)` pairs, [`ps_by_o`](Self::ps_by_o)
+///   returns `(p, s)` pairs and [`so_by_p`](Self::so_by_p) returns `(s, o)`
+///   pairs — each list sorted ascending by the pair, without duplicates;
+/// * [`o_by_sp`](Self::o_by_sp), [`s_by_po`](Self::s_by_po),
+///   [`p_by_so`](Self::p_by_so), [`subs_by_p`](Self::subs_by_p),
+///   [`objs_by_p`](Self::objs_by_p) and the key lists
+///   ([`subject_keys`](Self::subject_keys), [`object_keys`](Self::object_keys))
+///   are ascending and duplicate-free;
+/// * [`iter_all`](Self::iter_all) returns triples in `(p, s, o)` order.
+///
+/// ## Count methods (provided)
+///
+/// The `count_*`, `distinct_p_of_*` and `has_*` methods have defaults that are
+/// correct for every implementor (they are defined through the list methods).
+/// A backend may override them to answer without materializing the list —
+/// [`TripleStore`] does with slice arithmetic, an on-disk store can count a key
+/// prefix — but an override must return **exactly** what the default returns,
+/// so that the cost model, and with it every plan and solution order, never
+/// changes. On a read error (reported through
+/// [`read_scope::note_read_error`]) the `has_*` methods answer `true`: an id is
+/// never treated as unused when in doubt.
 pub trait TripleSource {
     /// `s p o` — does this exact triple exist?
     fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool;
@@ -69,6 +101,72 @@ pub trait TripleSource {
     fn pred_distinct_obj(&self, pred: PredId) -> usize;
     /// Every triple (for the all-variable `? ? ?` scan).
     fn iter_all(&self) -> Vec<IdTriple>;
+
+    // ---- provided counts (contract C1) -------------------------------------
+
+    /// `s ? ?` — `po_by_s(sub).len()`.
+    fn count_po_by_s(&self, sub: EntityLiteralId) -> u64 {
+        self.po_by_s(sub).len() as u64
+    }
+    /// `s p ?` — `o_by_sp(sub, pred).len()`.
+    fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
+        self.o_by_sp(sub, pred).len() as u64
+    }
+    /// `s ? o` — `p_by_so(sub, obj).len()`.
+    fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
+        self.p_by_so(sub, obj).len() as u64
+    }
+    /// `? ? o` — `ps_by_o(obj).len()`.
+    fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
+        self.ps_by_o(obj).len() as u64
+    }
+    /// `? p o` — `s_by_po(pred, obj).len()`.
+    fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
+        self.s_by_po(pred, obj).len() as u64
+    }
+    /// `? p ?` — `so_by_p(pred).len()`.
+    fn count_so_by_p(&self, pred: PredId) -> u64 {
+        self.so_by_p(pred).len() as u64
+    }
+    /// The number of distinct predicates of subject `sub`: the runs of equal
+    /// first components in [`po_by_s`](Self::po_by_s) (sorted by the ordering
+    /// contract).
+    fn distinct_p_of_s(&self, sub: EntityLiteralId) -> u64 {
+        distinct_first(&self.po_by_s(sub))
+    }
+    /// The number of distinct predicates of object `obj`: the runs of equal
+    /// first components in [`ps_by_o`](Self::ps_by_o).
+    fn distinct_p_of_o(&self, obj: EntityLiteralId) -> u64 {
+        distinct_first(&self.ps_by_o(obj))
+    }
+    /// Whether `sub` is the subject of some triple. `true` when the read
+    /// failed (see the trait docs).
+    fn has_subject(&self, sub: EntityLiteralId) -> bool {
+        read_scope::true_on_read_error(|| !self.po_by_s(sub).is_empty())
+    }
+    /// Whether `obj` is the object of some triple. `true` when the read
+    /// failed.
+    fn has_object(&self, obj: EntityLiteralId) -> bool {
+        read_scope::true_on_read_error(|| !self.ps_by_o(obj).is_empty())
+    }
+    /// Whether some triple has predicate `pred`. `true` when the read failed.
+    fn has_predicate(&self, pred: PredId) -> bool {
+        read_scope::true_on_read_error(|| !self.so_by_p(pred).is_empty())
+    }
+}
+
+/// The number of runs of equal first components in `pairs` — the number of
+/// distinct first components of a list sorted by them.
+pub(crate) fn distinct_first(pairs: &[(u32, u32)]) -> u64 {
+    let mut count = 0u64;
+    let mut last: Option<u32> = None;
+    for &(a, _) in pairs {
+        if last != Some(a) {
+            count += 1;
+            last = Some(a);
+        }
+    }
+    count
 }
 
 /// The triple-*mutation* interface — the write counterpart of [`TripleSource`].
@@ -95,170 +193,6 @@ pub trait MutableStore {
 /// algorithms, decoupled from where triples physically live.)
 pub trait StorageBackend: TripleSource + MutableStore {}
 impl<T: TripleSource + MutableStore> StorageBackend for T {}
-
-/// The runtime-selectable storage backend the [`Database`](crate::Database)
-/// holds (DESIGN §"Phase 2", route A). It is a [`StorageBackend`] in its own
-/// right: it implements [`TripleSource`] + [`MutableStore`] by **statically**
-/// dispatching to the active variant (a branch, not a vtable), so the query
-/// engine / optimizer / VS-tree / analytics run over it unchanged while the
-/// physical store is chosen at construction time.
-///
-/// The default is `Memory` — every existing constructor wraps a fresh
-/// [`TripleStore`], so behaviour with the `rocksdb` feature *off* is identical.
-/// An on-disk (`kvstore.kv`) database also evaluates over a `Memory` working
-/// set: the `Database` facade writes every committed mutation through to its
-/// [`DiskStore`](crate::kvstore::DiskStore), which stays the source of truth.
-#[derive(Debug)]
-pub enum Backend {
-    /// In-memory triple store (the default; three sorted adjacency maps).
-    Memory(TripleStore),
-    /// Persistent RocksDB triple store (feature `rocksdb`).
-    #[cfg(feature = "rocksdb")]
-    Rocks(crate::backend::rocks::RocksStore),
-}
-
-/// Run `$body` against the inner store of whichever [`Backend`] variant is
-/// active, binding it to `$inner`. Pure static dispatch — no trait object.
-macro_rules! backend_dispatch {
-    ($self:expr, $inner:ident, $body:expr) => {
-        match $self {
-            Backend::Memory($inner) => $body,
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks($inner) => $body,
-        }
-    };
-}
-
-impl Backend {
-    /// The in-memory store, if this is the `Memory` variant. Lets components
-    /// that are intrinsically in-memory (snapshot MVCC, named-graph clones)
-    /// borrow the concrete store without a downcast.
-    pub fn as_memory(&self) -> Option<&TripleStore> {
-        match self {
-            Backend::Memory(s) => Some(s),
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(_) => None,
-        }
-    }
-
-    /// The RocksDB store, if this is the `Rocks` variant.
-    #[cfg(feature = "rocksdb")]
-    pub fn as_rocks(&self) -> Option<&crate::backend::rocks::RocksStore> {
-        match self {
-            Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
-        }
-    }
-
-    /// Mutable access to the RocksDB store, if this is the `Rocks` variant.
-    #[cfg(feature = "rocksdb")]
-    pub fn as_rocks_mut(&mut self) -> Option<&mut crate::backend::rocks::RocksStore> {
-        match self {
-            Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
-        }
-    }
-
-    /// Collect (and clear) a write error a persistent variant recorded because
-    /// [`MutableStore`]'s `bool` results cannot carry one. Always `None` for the
-    /// in-memory store, whose writes cannot fail.
-    pub fn take_write_error(&self) -> Option<String> {
-        match self {
-            Backend::Memory(_) => None,
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(r) => r.take_error(),
-        }
-    }
-
-    /// All predicate ids present in the store (sorted). Not part of
-    /// [`TripleSource`] (the engine never needs it), but the schema extractor
-    /// does, so it is dispatched here rather than special-cased on the caller.
-    pub fn predicates(&self) -> Vec<PredId> {
-        match self {
-            Backend::Memory(s) => s.predicates().collect(),
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(r) => r.predicates(),
-        }
-    }
-}
-
-impl TripleSource for Backend {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        backend_dispatch!(self, s, TripleSource::exists(s, sub, pred, obj))
-    }
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::po_by_s(s, sub))
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::o_by_sp(s, sub, pred))
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        backend_dispatch!(self, s, TripleSource::p_by_so(s, sub, obj))
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::ps_by_o(s, obj))
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::s_by_po(s, pred, obj))
-    }
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::so_by_p(s, pred))
-    }
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::subs_by_p(s, pred))
-    }
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::objs_by_p(s, pred))
-    }
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::subject_keys(s))
-    }
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::object_keys(s))
-    }
-    fn triple_count(&self) -> u64 {
-        backend_dispatch!(self, s, TripleSource::triple_count(s))
-    }
-    fn distinct_subjects(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::distinct_subjects(s))
-    }
-    fn distinct_objects(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::distinct_objects(s))
-    }
-    fn num_predicates(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::num_predicates(s))
-    }
-    fn pred_card(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_card(s, pred))
-    }
-    fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_distinct_subj(s, pred))
-    }
-    fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_distinct_obj(s, pred))
-    }
-    fn iter_all(&self) -> Vec<IdTriple> {
-        backend_dispatch!(self, s, TripleSource::iter_all(s))
-    }
-}
-
-impl MutableStore for Backend {
-    fn insert(&mut self, t: IdTriple) -> bool {
-        backend_dispatch!(self, s, MutableStore::insert(s, t))
-    }
-    fn remove(&mut self, t: IdTriple) -> bool {
-        backend_dispatch!(self, s, MutableStore::remove(s, t))
-    }
-    fn bulk_load(&mut self, triples: Vec<IdTriple>) {
-        backend_dispatch!(self, s, MutableStore::bulk_load(s, triples))
-    }
-}
-
-impl Default for Backend {
-    fn default() -> Backend {
-        Backend::Memory(TripleStore::new())
-    }
-}
 
 impl MutableStore for TripleStore {
     fn insert(&mut self, t: IdTriple) -> bool {
@@ -329,6 +263,50 @@ impl TripleSource for TripleStore {
     }
     fn iter_all(&self) -> Vec<IdTriple> {
         TripleStore::iter_all(self).collect()
+    }
+
+    // C1: slice arithmetic, no list is materialized. Each equals the default.
+
+    fn count_po_by_s(&self, sub: EntityLiteralId) -> u64 {
+        TripleStore::po_by_s(self, sub).len() as u64
+    }
+    fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
+        self.s2po
+            .get(&sub)
+            .map_or(0, |v| range_by_first(v, pred).len()) as u64
+    }
+    fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
+        // `(p, o)` pairs are unique per subject, so with `o` fixed every
+        // matching pair has its own predicate (the default's `dedup` is a no-op).
+        self.s2po
+            .get(&sub)
+            .map_or(0, |v| v.iter().filter(|&&(_, o)| o == obj).count()) as u64
+    }
+    fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
+        TripleStore::ps_by_o(self, obj).len() as u64
+    }
+    fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
+        self.o2ps
+            .get(&obj)
+            .map_or(0, |v| range_by_first(v, pred).len()) as u64
+    }
+    fn count_so_by_p(&self, pred: PredId) -> u64 {
+        TripleStore::so_by_p(self, pred).len() as u64
+    }
+    fn distinct_p_of_s(&self, sub: EntityLiteralId) -> u64 {
+        distinct_first(TripleStore::po_by_s(self, sub))
+    }
+    fn distinct_p_of_o(&self, obj: EntityLiteralId) -> u64 {
+        distinct_first(TripleStore::ps_by_o(self, obj))
+    }
+    fn has_subject(&self, sub: EntityLiteralId) -> bool {
+        !TripleStore::po_by_s(self, sub).is_empty()
+    }
+    fn has_object(&self, obj: EntityLiteralId) -> bool {
+        !TripleStore::ps_by_o(self, obj).is_empty()
+    }
+    fn has_predicate(&self, pred: PredId) -> bool {
+        !TripleStore::so_by_p(self, pred).is_empty()
     }
 }
 
