@@ -1705,6 +1705,24 @@ impl Dictionary {
         v
     }
 
+    /// Live `(id, key)` pairs of one space in id order, borrowed — in-memory
+    /// dictionaries only (empty for a disk-backed one; see
+    /// [`for_each_term`](Self::for_each_term)).
+    pub fn entries_in(&self, space: Space) -> Vec<(u32, &str)> {
+        if self.backing.is_some() {
+            return Vec::new();
+        }
+        let first = space.first_id();
+        let it = self.interner(space).entries();
+        let mut v = Vec::with_capacity(self.interner(space).len());
+        v.extend(it.filter_map(|(i, s)| {
+            i.checked_add(first)
+                .filter(|&id| id != INVALID_ENTITY_LITERAL_ID)
+                .map(|id| (id, s))
+        }));
+        v
+    }
+
     // ---- prefix-compressed (front-coded) export --------------------------
 
     /// Every dictionary string — entities, literals, and predicates — merged,

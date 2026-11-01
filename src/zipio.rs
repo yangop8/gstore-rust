@@ -781,32 +781,27 @@ fn write_statements(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
     let dict = db.dict();
     let mut count = 0u64;
     for t in db.backend().iter_all() {
-        let (Some(s), Some(p), Some(o)) = (
-            dict.id_to_string(t.sub),
-            dict.predicate_to_string(t.pred),
-            dict.id_to_string(t.obj),
-        ) else {
+        let (Some(s), Some(p), Some(o)) = (dict.term(t.sub), dict.pred(t.pred), dict.term(t.obj))
+        else {
             continue;
         };
-        let (s, p, o) = (export_key(s), export_key(p), export_key(o));
+        let (s, p, o) = (export_key(&s), export_key(&p), export_key(&o));
         writeln!(out, "{s} {p} {o} .")?;
         count += 1;
     }
     if format == ExportFormat::NQuads {
         for (&gid, graph) in db.named_graphs() {
-            let Some(g) = dict.id_to_string(gid) else {
+            let Some(g) = dict.term(gid) else {
                 continue;
             };
-            let g = export_key(g);
+            let g = export_key(&g);
             for t in graph.iter_all() {
-                let (Some(s), Some(p), Some(o)) = (
-                    dict.id_to_string(t.sub),
-                    dict.predicate_to_string(t.pred),
-                    dict.id_to_string(t.obj),
-                ) else {
+                let (Some(s), Some(p), Some(o)) =
+                    (dict.term(t.sub), dict.pred(t.pred), dict.term(t.obj))
+                else {
                     continue;
                 };
-                let (s, p, o) = (export_key(s), export_key(p), export_key(o));
+                let (s, p, o) = (export_key(&s), export_key(&p), export_key(&o));
                 writeln!(out, "{s} {p} {o} {g} .")?;
                 count += 1;
             }

@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::csr::{CsrCache, CsrGraph};
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::term::export_key;
@@ -898,7 +898,7 @@ impl Database {
         }
         let mut classes: Vec<String> = class_ids
             .iter()
-            .filter_map(|&id| self.dict.id_to_string(id).map(str::to_owned))
+            .filter_map(|&id| self.dict.term(id).map(TermStr::into_string))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -909,13 +909,13 @@ impl Database {
             .store
             .predicates()
             .into_iter()
-            .filter_map(|p| self.dict.predicate_to_string(p).map(str::to_owned))
+            .filter_map(|p| self.dict.pred(p).map(TermStr::into_string))
             .collect();
         for iri in [RDFS_SUBPROP, RDFS_DOMAIN, RDFS_RANGE] {
             if let Some(p) = pid(iri) {
                 for &(s, _o) in &self.store.so_by_p(p) {
-                    if let Some(name) = self.dict.id_to_string(s) {
-                        props.insert(name.to_owned());
+                    if let Some(name) = self.dict.term(s) {
+                        props.insert(name.into_string());
                     }
                 }
             }
@@ -1738,14 +1738,14 @@ impl Database {
                 ids
             }
         };
-        let term = |s: Option<&str>| s.and_then(Term::from_dict_key);
+        let term = |s: Option<TermStr<'_>>| s.and_then(|s| Term::from_dict_key(&s));
         Some(
             ids.into_iter()
                 .filter_map(|id| {
                     Some(Triple::new(
-                        term(self.dict.id_to_string(id.sub))?,
-                        term(self.dict.predicate_to_string(id.pred))?,
-                        term(self.dict.id_to_string(id.obj))?,
+                        term(self.dict.term(id.sub))?,
+                        term(self.dict.pred(id.pred))?,
+                        term(self.dict.term(id.obj))?,
                     ))
                 })
                 .collect(),
@@ -2412,18 +2412,18 @@ impl Database {
             return;
         }
         let (Some(s), Some(p), Some(o)) = (
-            self.dict.id_to_string(id.sub),
-            self.dict.predicate_to_string(id.pred),
-            self.dict.id_to_string(id.obj),
+            self.dict.term(id.sub),
+            self.dict.pred(id.pred),
+            self.dict.term(id.obj),
         ) else {
             return;
         };
         // Each term as the N-Triples reader reads it back: an IRI the
         // lenient readers let in (holding `>`, `\`, a space…) is escaped.
-        let triple = format!("{} {} {} .", export_key(s), export_key(p), export_key(o));
+        let triple = format!("{} {} {} .", export_key(&s), export_key(&p), export_key(&o));
         let graph = graph
-            .and_then(|g| self.dict.id_to_string(g))
-            .map(|g| strip_angle(g).to_owned());
+            .and_then(|g| self.dict.term(g))
+            .map(|g| strip_angle(&g).to_owned());
         self.redo_pending.push(RedoRec { op, graph, triple });
         if self.txn.is_none() {
             // Auto-commit: the mutation is already durable, so flush now.
