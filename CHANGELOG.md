@@ -12,7 +12,86 @@ gconsole, zip, logging and packaging) was developed from the Phase 1 head
 and merged after them; Phase 4 (reasoning rules and PFN functions) was
 developed from the Phases 0–3 head and merged last. The integration
 sections record what joining them changed, newest first; the following
-ones each phase, newest first.
+ones each phase, newest first (Phase 5, then Phase 4, …).
+
+### Integrating Phase 4 with Phases 0–3 and 5
+
+Phase 4 (reasoning rules and PFN functions) was developed from the
+Phases 0–3 head while Phase 5 (import, gconsole, zip, logging, packaging)
+landed; this records what joining them changed.
+
+- **Merge.** Both dependency and feature sets (`readline`, `zip`;
+  `pfn-wasm`); `Cargo.lock` is main's plus the optional `wasmi` / `wat`
+  packages at the versions Phase 4 locked — its package set is exactly the
+  union of both parents' locks. Phase 5's SPARQL `LOAD` runs inside Phase
+  4's refactored `run_update` (with the request's PFN caller), its
+  `insert_sources` / `remove_sources` use the same insert / delete paths
+  as rule execution and retraction, and every served database — built,
+  uploaded, restored from a zip — goes through `DbSlot::handle`, which sets
+  its rule directory.
+- **gconsole and Phase 4.** The console's `addreason` … `deletereason` and
+  `showpfn` / `addpfn` / `mdfpfn` / `delpfn` / `buildpfn` commands, written
+  against a server that did not implement them, were compared with
+  upstream's `gconsole.cpp` handlers and now run whole lifecycles against
+  `gserver`. **Fixed:** SPARQL typed at the prompt that projects
+  `PFN.name({…})` printed the `{"results": …}` answer as `Update ans num
+  0`; it prints the value and `pfn query use <ms> ms.`, as upstream prints
+  its `pfn_type` cells. `addpfn` / `mdfpfn` accept a file holding the
+  `PFNInfo` object as a JSON string too (upstream's `PFNInfo(json)`); the
+  body is WebAssembly text, sent unchanged and URL-decoded by the server as
+  upstream does (documented). `showpfn`'s third column names the
+  WebAssembly source the server keeps (`src/<user>/<name>.wat`) where
+  upstream shows `./pfn/<name>.cpp`.
+- **Backups.** A database's rules and ownership ledgers travel with it
+  through every Phase 5 backup path — `gbackup` / `grestore` (directory and
+  `-z` zip), `/api` `backup compress=true` / zip `restore`, `drop`'s `.bak`
+  — and a restored executed rule still retracts exactly its triples.
+  `export` writes data only, as upstream's. PFN functions belong to users:
+  `docs/DEPLOY.md` gains a *Backups* section on backing up
+  `pfn_base_path`, which the packaged and container layouts keep in
+  `/var/lib/gstore/dbhome/pfn` (the data volume; the unit's
+  `ReadWritePaths`).
+- **Logging.** Reasoning and PFN events reach Phase 5's diagnostic log
+  through the `gs_*` macros, as upstream's `SLOG_*` record them: rule
+  execute / disable (info), compiled statements (debug), PFN compile
+  (info), calls (debug) and failed calls (warn), stale PFN files that cannot
+  be removed and unreadable `data.json` lines. Tested: `reasonManage` and
+  the PFN operations are in the `/api` access log, the statement a rule
+  executes and PFN queries (`/api` `query`, REST `/sparql`) in the query
+  log.
+- **Import × reasoning.** Rules over the blank nodes Phase 5's per-load
+  scopes mint (explicit and anonymous) execute and retract exactly — every
+  ledger line parses back to the stored triple — and `batchInsert` / `LOAD`
+  after an execution leave the ledger as it was. Imported `<Rule:…>`
+  triples (a tolerant import included) are asserted: no rule owns them.
+- **Configuration.** A test reads `conf/conf.ini.example` like an operator:
+  every key the code reads is documented in its section and every example
+  value parses (the `[query]` / `[pfn]` examples are the defaults); it found
+  `[system] licensetype` undocumented, now added. One `refreshconf`
+  re-applies `[query]`, `[pfn]` and the `[log]` configuration together;
+  `pfn_base_path`, like `db_home`, is read at startup.
+- **CI and Docker.** One feature matrix builds (`--locked`), lints and
+  tests `gzip`, `tls`, `zip`, `readline`, `pfn-wasm` and `zip pfn-wasm
+  readline` together (the separate `pfn-wasm` clippy job is folded in);
+  `rocksdb` and the conformance job are unchanged. The Docker image builds
+  with `FEATURES="pfn-wasm"` by default (pure Rust, within its 1.89
+  toolchain), so its server compiles and runs PFN functions; the default
+  `cargo build` stays lean.
+- **Docs.** README (features, cargo features, Reasoning, PFN, gconsole,
+  configuration, test count), `docs/DEPLOY.md`, `docs/PFN.md`,
+  `docs/GAP_PLAN.md` (status notes for Phases 0–5; Phase 6 pending) and
+  `docs/CPP_PARITY.md` agree.
+- **Tests.** `tests/dt_merge4_wiring.rs`; new cases in `dt_gconsole` (a
+  rule's and a PFN function's lifecycle through the console, the PFN call
+  part with `pfn-wasm`), `config` and `console::commands`. One expectation
+  changed intentionally: the fake-server test's `showpfn` third column.
+  The default workspace runs 1,942 tests; the features add their own.
+
+#### Not yet
+
+- The Docker image with `pfn-wasm` was not built in this environment (no
+  Docker daemon); `cargo build --locked -p gstore --bins --features
+  pfn-wasm`, what its builder runs, was.
 
 ### Integrating Phase 5 with Phases 0–3
 

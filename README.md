@@ -25,7 +25,7 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 1,860 tests pass** across the workspace (incl. 159 for gNLQA), among them
+* **About 1,940 tests pass** across the workspace (incl. 159 for gNLQA), among them
   ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`, `gzip`,
   `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
   --workspace --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
@@ -48,12 +48,14 @@ scripts/conformance.sh
 ```
 
 The default build is dependency-light. Optional cargo features (all off by
-default): `zip` (zip packages, zipped backups and exports), `gzip` (HTTP
-response compression, `.gz` sources), `tls` (HTTPS listeners), `readline`
-(`gconsole` line editing) — all pure Rust — and `rocksdb` (the RocksDB
-backend; needs clang). For example `cargo build --release -p gstore
---features "zip gzip"`. To run `gserver` in a container or as a systemd
-service, or from `.deb` / `.rpm` packages, see
+default): `pfn-wasm` (the sandboxed WebAssembly runtime that compiles and
+runs [PFN user functions](#pfn-user-graph-functions)), `zip` (zip packages,
+zipped backups and exports), `gzip` (HTTP response compression, `.gz`
+sources), `tls` (HTTPS listeners), `readline` (`gconsole` line editing) —
+all pure Rust — and `rocksdb` (the RocksDB backend; needs clang). For
+example `cargo build --release -p gstore --features "pfn-wasm zip gzip"`.
+To run `gserver` in a container (the image enables `pfn-wasm`) or as a
+systemd service, or from `.deb` / `.rpm` packages, see
 [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ### A) Use gStore directly (SPARQL)
@@ -157,6 +159,16 @@ optimizer and a VS-tree signature filter.
   asynchronous operations with callbacks, file upload/download, a built-in web
   console (`GET /`), task cancellation, and upstream's `conf.ini` and
   `gserver` lifecycle (`server` / `http_api` / `gapi` / `sysdb` / `config`).
+* **gconsole** — upstream gStore 1.4's console as a client of a running
+  server's `/api`: all 43 commands of upstream's table (databases, users and
+  privileges, backups, reasoning rules, PFN functions) and SPARQL typed at
+  the prompt, printed as upstream prints them (see [gconsole](#gconsole)).
+* **Operations** — upstream's `conf.ini` (plus `[query]`, `[pfn]`, `[log]`
+  and zip-limit extension keys, re-read by `refreshconf`), a daily-rolling
+  diagnostic log configured like upstream's log4cplus, JSON query / access
+  logs, zip packages and zipped backups (feature `zip`), upstream 1.3's
+  command-line spellings, and a container image, a systemd unit and deb /
+  rpm packages ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
 * **Transactions** — commit/rollback, per-key MVCC + snapshot isolation, four
   named isolation levels, and full + **incremental** backup/restore.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
@@ -267,7 +279,8 @@ SPARQL `LOAD` — reads RDF through one streaming pipeline
 The multi-DB server speaks upstream gStore 1.4's `/api` protocol (`GET|POST
 /api` or `POST /` with `operation=…`, per-request `username`/`password`,
 `encryption=1`, the `StatusCode` JSON envelope): the database, user, privilege,
-transaction, log and task operations with upstream's parameters, fields, codes
+transaction, log and task operations, `reasonManage` and the PFN operations
+(`funquery`, `funcudb`, `funreview`) with upstream's parameters, fields, codes
 and messages, so the upstream SDKs such as `GstoreConnector.py` work against
 it unchanged, plus upstream's `/shutdown` and `/restart` routes. Its graph
 functions answer as upstream's (see below), and `loadcsr` / `load` with

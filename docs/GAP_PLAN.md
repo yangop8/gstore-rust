@@ -13,6 +13,8 @@
 3. **gStore 标志性能力只做到"同名"**:24 个图分析函数在上游语法下**无一能解析**,语义和输出也不同;推理引擎和 PFN 自定义函数没有对外入口(§3)。
 4. **规模与运维**:没有真正的磁盘原生查询路径,导入不流式、不容错,没有 conf.ini、日志体系、打包和 CI(§4、§5)。
 
+**进度(截至 Phase 4 与 Phase 5 合并)**:Phase 0–5 已完成并合入主线(各阶段状态见下文各节的"状态"段与 §8 表格,逐项变更见 `CHANGELOG.md`);Phase 6(规模与性能,§8 第 6 行)尚未开始。
+
 ---
 
 ## 1. P0 · 数据安全与正确性(先止血)
@@ -30,6 +32,8 @@
 | 1.9 | **实体 ID 无上限检查** | 第 2,000,000,000 个实体会拿到字面量区间的 ID(`src/dict/mod.rs:182`) | 分配 ID 时检查上限并报错 | S |
 | 1.10 | **CI 缺失,测试不稳定** | 没有 `.github/`;Raft 网络用例在"刚选出 leader 就 propose"时存在竞态;`.DS_Store` 被提交进了仓库 | 加 GitHub Actions(fmt、clippy、test,覆盖 default/gzip/tls/rocksdb 四种 feature);propose 遇到 NotLeader 时重试;删除 `.DS_Store` | S |
 | 1.11 | **文档自评失真** | `CPP_PARITY.md` 中至少 20 处表述与代码不符(如 HTTP ✅、图函数"已对齐"、流式磁盘查询 ✅、四级隔离、PFN 等价……) | 按本复核重写差距矩阵 | S |
+
+**状态(Phase 0 已完成)**:1.1–1.10 全部修复——磁盘库与 RocksDB 库的写入逐次落到各自存储(WAL 提交点、RocksDB 列族 + 撤销日志),快照保存按组原子化,`Database::open` 自动识别布局;restore 先暂存校验再整体替换;服务端按 `check_point` 落盘、优雅退出时保存,`/batchInsert` 只应用解析后的三元组,`LOAD` 受 `LoadPolicy` 约束;字典 ID 空间有界,内建函数参数个数在解析期校验;密码改为带版本的 PBKDF2-HMAC-SHA256;HTTP 事务对非持有者提供开始时快照;GitHub Actions CI。1.11:`CPP_PARITY.md` 保留原矩阵,各阶段的更正与补齐以"更新"段落记在其中。
 
 ## 2. P1 · 上游兼容层(让 SDK / Workbench / 上游测试脚本直接可用)
 
@@ -80,6 +84,8 @@
 - **第一步**:先把期望结果移植成 Rust 集成测试,最快能形成 CI 闸门。
 - **第二步**:兼容层完成后,原样运行上游 shell 脚本。
 
+**状态(Phase 1 已完成)**:`src/gapi` 实现 `/api` 线协议(`GET|POST /api`、`/grpc/api`、HTTP 200 + `StatusCode` 信封、上游字段与消息)与 §2.2 的全部操作(`reasonManage`、PFN 三个操作见 Phase 4);按库授权与系统库、异步任务(`opt_id`、回调、取消)、`conf.ini`(`src/config.rs`)、`gserver` 生命周期(`-s/-b/-t/-r/-k/-S`、pid 文件、`deamon` 守护)。上游 `scripts/test` 脚本与 Python SDK 原样跑通(`scripts/conformance.sh`,CI 的 conformance 任务)。
+
 ## 3. P1 · gStore 标志性能力对齐
 
 ### 3.1 高级图函数(按"上游语义为准"重做)
@@ -103,6 +109,8 @@
 **④ 测试**
 - 以上游 `SPARQL_QUERY.md` 中的全部示例和 `scripts/test/bfs_test` 作为黄金用例。
 
+**状态(Phase 2 已完成)**:上游 1.4 的 32 个高级图函数按上游语法、语义与 JSON 输出重做,运行在按库缓存的 CSR 上(`loadcsr` / `load csr=1` 预建);旧的 Rust 语义保留在 `rs:` 命名空间下(§7 第 2 项按推荐执行);`SPARQL_QUERY.md` 示例与 bfs_test 输出与上游一致。
+
 ### 3.2 推理引擎(`reasonManage`)
 
 - **规则格式**:兼容上游 JSON(`rulename/type/logic/conditions[].patterns|filters/return{source,target,label,value}`),支持 UNION(`logic=0`)和 FILTER。
@@ -112,7 +120,7 @@
 - **接入**:HTTP 接口加 gconsole 命令。
 - **修 bug**:RDFS range 规则会生成以字面量为主语的三元组(`src/reason/mod.rs:182-190`)。
 
-**状态(Phase 4 已完成)**:`src/reason/{rules,compile,store,manage}.rs` + `src/gapi/ops_reason.rs`。`reasonManage` type 1–8(新增/列表/编译/执行/失效/查看/删除/校验)沿用上游的参数、字段、状态字符串(`新建`/`已编译`/`已执行`/`已失效`/`已校验`)与消息;编译结果与上游 1.4 `Reason.cpp` 逐字节一致;规则按库存于 `<db>.db/reason_rule_files/`,随 unload/load、重启、`backup`/`restore` 保留,`drop` 时删除;仅 root(及 admin)可调用。执行/失效走数据库正常更新路径(查询缓存、CSR、持久化、日志、可取消),事务打开时拒绝。刻意偏离:按 `reason_rule_files/inferred/<rule>.nt` 账本**精确撤回**(上游 `delete where` 会误删用户断言或其他规则推出的同谓词三元组);规则逐项校验以杜绝 SPARQL 注入;已执行规则不可重新编译。RDFS range 字面量 bug 已修。gconsole 的 reason 系列命令属 Phase 5。测试:`tests/dt_reason_manage.rs`、`tests/dt_phase4_wiring.rs`。
+**状态(Phase 4 已完成)**:`src/reason/{rules,compile,store,manage}.rs` + `src/gapi/ops_reason.rs`。`reasonManage` type 1–8(新增/列表/编译/执行/失效/查看/删除/校验)沿用上游的参数、字段、状态字符串(`新建`/`已编译`/`已执行`/`已失效`/`已校验`)与消息;编译结果与上游 1.4 `Reason.cpp` 逐字节一致;规则按库存于 `<db>.db/reason_rule_files/`,随 unload/load、重启、`backup`/`restore` 保留,`drop` 时删除;仅 root(及 admin)可调用。执行/失效走数据库正常更新路径(查询缓存、CSR、持久化、日志、可取消),事务打开时拒绝。刻意偏离:按 `reason_rule_files/inferred/<rule>.nt` 账本**精确撤回**(上游 `delete where` 会误删用户断言或其他规则推出的同谓词三元组);规则逐项校验以杜绝 SPARQL 注入;已执行规则不可重新编译。RDFS range 字面量 bug 已修。测试:`tests/dt_reason_manage.rs`、`tests/dt_phase4_wiring.rs`。与 Phase 5 合并后:gconsole 的 reason 系列命令对真实服务端走完全生命周期(`tests/dt_gconsole.rs`);规则与账本随 zip 备份、`gbackup`/`grestore`、`drop` 的 `.bak` 一起保留,`export` 只导出数据(与上游一致);导入流水线按每次加载分域的空节点上推出的三元组可精确撤回(`tests/dt_merge4_wiring.rs`)。
 
 ### 3.3 PFN 自定义图函数
 
@@ -122,7 +130,7 @@
 - **调用与输出**:`pfn.` 调用语法,结果形如 `{"results":…}`。
 - **现有问题**:`ConcurrentDb` 的快照没有带上函数注册表(`src/concurrent.rs:221-228`)。
 
-**状态(Phase 4 已完成,见 [`docs/PFN.md`](PFN.md))**:运行时选定 **WASM**——用 `wasmi` 解释器(feature `pfn-wasm`,默认关闭,默认构建不引入依赖)运行 WebAssembly 文本写的函数体,而非 wasmtime;沙箱只开放 gStore 宿主接口(`GraphCtx`:点/边/谓词计数、按谓词出入度与邻居、id↔string、参数、输出),带指令预算、内存上限、输出上限,并响应查询取消。`funquery`/`funcudb`/`funreview` 按用户存储与隔离,沿用上游消息与状态;`PFN.name({…})` 按上游 `pfnQuery`/`pfnQueryByVar` 求值,`/api` `query` 返回 `{"results": …}`。`ConcurrentDb` 快照、版本视图、事务与 HTTP 事务快照都带上调用者。`conf.ini` 新增 `[pfn]` 段(`refreshconf` 重新生效),`[system] pfn_base_path` 决定存放位置。刻意偏离见 `docs/PFN.md`(上游 C++ 函数体需改写为 WAT)。测试:`tests/dt_pfn.rs`、`tests/dt_phase4_wiring.rs`。
+**状态(Phase 4 已完成,见 [`docs/PFN.md`](PFN.md))**:运行时选定 **WASM**——用 `wasmi` 解释器(feature `pfn-wasm`,默认关闭,默认构建不引入依赖)运行 WebAssembly 文本写的函数体,而非 wasmtime;沙箱只开放 gStore 宿主接口(`GraphCtx`:点/边/谓词计数、按谓词出入度与邻居、id↔string、参数、输出),带指令预算、内存上限、输出上限,并响应查询取消。`funquery`/`funcudb`/`funreview` 按用户存储与隔离,沿用上游消息与状态;`PFN.name({…})` 按上游 `pfnQuery`/`pfnQueryByVar` 求值,`/api` `query` 返回 `{"results": …}`。`ConcurrentDb` 快照、版本视图、事务与 HTTP 事务快照都带上调用者。`conf.ini` 新增 `[pfn]` 段(`refreshconf` 重新生效),`[system] pfn_base_path` 决定存放位置。刻意偏离见 `docs/PFN.md`(上游 C++ 函数体需改写为 WAT)。测试:`tests/dt_pfn.rs`、`tests/dt_phase4_wiring.rs`。与 Phase 5 合并后:gconsole 的 pfn 系列命令(`showpfn`/`addpfn`/`mdfpfn`/`delpfn`/`buildpfn`)与 PFN 查询结果打印对齐上游;函数按用户存于 `pfn_base_path`(打包与容器布局:`/var/lib/gstore/dbhome/pfn`),备份方法见 `docs/DEPLOY.md`;Docker 镜像默认开启 `pfn-wasm`,默认 `cargo build` 仍不含。§7 第 3 项据此定为 WASM。
 
 ### 3.4 Top-K 与查询提前终止
 
@@ -159,6 +167,8 @@
 - **查询缓存**:跳过含 NOW/RAND/UUID/SERVICE 的查询;按内存而非条数设上限。
 - **与 W3C 冲突的上游行为**:整数除法上游截断取整,W3C 结果是 decimal。默认保持 W3C 行为,另加兼容开关。
 
+**状态(Phase 3 已完成)**:上述语法与语义缺口全部补齐(`IN`/`NOT IN`、`[ … ]`/`( … )`、尾部 `VALUES`、`GROUP BY (expr AS ?v)`、`CONSTRUCT WHERE`、`WITH`/`USING`、`ADD`/`MOVE`/`COPY` 等),整数除法默认 W3C,`conf.ini` `[query]` 的 `integer_division=truncate` 切到上游行为;上游 parser_test 50 组通过。
+
 ### 4.2 RDF 导入导出
 
 - **流式解析**:目前整个文件读成 `Vec<char>`(`src/parser/turtle.rs:41`),改为基于 BufRead 的流式解析加分批 flush。
@@ -169,6 +179,8 @@
 - **Turtle 宽松度**:与上游对齐,接受 `ex:a/b`、`ex:a#b` 这类本地名。
 - **命名图**:TriG/N-Quads 导入时保留命名图;导出支持命名图(N-Quads)和 zip。
 - **RDF/XML**:支持 DTD 实体和 `parseType="Collection"`。
+
+**状态(Phase 5 已完成)**:Turtle/TriG/N-Triples/N-Quads 流式读取,所有批量加载走同一条导入流水线(`src/parser/import.rs`),上游式容错导入(`parse_error.log`、`success_num`/`failed_num`);目录、URL、zip(feature `zip`)来源;按扩展名分派格式;空节点按每次加载分域;本地名宽松度对齐;TriG/N-Quads 保留命名图,导出支持 N-Quads 与 zip;RDF/XML 支持 DTD 实体与 `parseType="Collection"`;SPARQL `LOAD` 经同一流水线且原子。
 
 ## 5. P2 · CLI / gconsole / 运维
 
@@ -186,6 +198,8 @@
   - 修正 `grestore` 的参数顺序(目前与上游相反)。
   - `gshow` 改为列出全部库(上游语义)。
   - `gbuild` 支持建空库,并加防覆盖保护。
+
+**状态(Phase 5 已完成)**:`gconsole` 重写为 `/api` 客户端,实现上游 43 条命令(reason 与 pfn 系列在与 Phase 4 合并后对真实服务端可用)及交互体验(feature `readline` 提供行编辑与补全);`src/logging.rs` 按上游 `log_mode` 属性文件配置诊断日志,按天滚动与保留,查询日志为 JSON 并带 IP、结果数与耗时;Dockerfile、systemd unit、deb/rpm 元数据与 `docs/DEPLOY.md`;老工具兼容项全部完成。
 
 ## 6. 不需要补 / 本仓已领先
 
@@ -208,18 +222,18 @@
 
 1. **兼容目标**:是否以"与 gStore 1.4 `/api` 线协议兼容"为目标?推荐是。这是让 SDK、Workbench 和上游测试脚本直接可用的前提。
 2. **图函数语义冲突**:以上游语义为准重做,还是把现有 Rust 语义的这批函数挪到 `rs:` 命名空间下保留?推荐以上游为准,另设兼容命名空间。
-3. **PFN 运行时**:WASM、Rhai 二选一,或者暂不做?
+3. **PFN 运行时**:WASM、Rhai 二选一,或者暂不做?(已定:WASM,`wasmi` 解释器,feature `pfn-wasm`,见 §3.3。)
 4. **Rust 集群**:接入 gserver(需要复制字典、Raft 状态持久化、分片读失败时报错而不是返回空结果),还是标为实验特性、冻结?推荐冻结,因为上游开源版本里并没有这项能力。
 5. **依赖策略**:zip、日志、readline、wasm 都会引入依赖,建议一律走 feature 门控,保持默认构建精简。
 
 ## 8. 排期建议(粗估,1 人)
 
-| 阶段 | 内容 | 估时 | 验收 |
-|------|------|------|------|
-| 0 | §1 全部 P0 + CI + 修正文档 | 1.5–2 周 | 新增回归用例(磁盘库 gadd→gquery、RocksDB 更新后重开、batch 注入、`STR()`),CI 全绿 |
-| 1 | §2 兼容层 + conf.ini + gserver 生命周期 + 移植上游测试 | 3–4 周 | 上游 `basic/update/transaction/api_test` 对 Rust 版 gserver 全部通过 |
-| 2 | §3.1 图函数 + CSR | 3 周 | `SPARQL_QUERY.md` 中的全部示例和 bfs_test 输出与上游一致 |
-| 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 2–3 周 | parser_test 50 组通过 |
-| 4 | §3.2 推理 + §3.3 PFN | 3 周 | reasonManage 走完全生命周期,PFN 示例可跑 |
-| 5 | §4.2 导入导出 + §5 gconsole/日志/打包 | 3 周 | README 中 `gconsole -u root` 的流程能照做;Docker 镜像可用 |
-| 6 | 规模与性能(长期):`Backend::Disk` 流式查询直接穿透 `Database`、字典与 VS-tree 留在磁盘、持久化 StringIndex、批量建索引(B+ 树 bulk load / RocksDB SST ingest)、读写锁或廉价快照替代 `Mutex<Database>`、删除时即时回收 ID | 持续 | LUBM/WatDiv 的规模和延迟与上游同量级 |
+| 阶段 | 内容 | 估时 | 验收 | 状态 |
+|------|------|------|------|------|
+| 0 | §1 全部 P0 + CI + 修正文档 | 1.5–2 周 | 新增回归用例(磁盘库 gadd→gquery、RocksDB 更新后重开、batch 注入、`STR()`),CI 全绿 | 已完成 |
+| 1 | §2 兼容层 + conf.ini + gserver 生命周期 + 移植上游测试 | 3–4 周 | 上游 `basic/update/transaction/api_test` 对 Rust 版 gserver 全部通过 | 已完成 |
+| 2 | §3.1 图函数 + CSR | 3 周 | `SPARQL_QUERY.md` 中的全部示例和 bfs_test 输出与上游一致 | 已完成 |
+| 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 2–3 周 | parser_test 50 组通过 | 已完成 |
+| 4 | §3.2 推理 + §3.3 PFN | 3 周 | reasonManage 走完全生命周期,PFN 示例可跑 | 已完成(含 gconsole 对接,见 §3.2/§3.3) |
+| 5 | §4.2 导入导出 + §5 gconsole/日志/打包 | 3 周 | README 中 `gconsole -u root` 的流程能照做;Docker 镜像可用 | 已完成 |
+| 6 | 规模与性能(长期):`Backend::Disk` 流式查询直接穿透 `Database`、字典与 VS-tree 留在磁盘、持久化 StringIndex、批量建索引(B+ 树 bulk load / RocksDB SST ingest)、读写锁或廉价快照替代 `Mutex<Database>`、删除时即时回收 ID | 持续 | LUBM/WatDiv 的规模和延迟与上游同量级 | 待开始 |
