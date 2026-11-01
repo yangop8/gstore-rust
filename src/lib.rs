@@ -23,6 +23,8 @@ pub mod analytics;
 /// [`backend::rocks::RocksStore`]; compiled only with `--features rocksdb`.
 #[cfg(feature = "rocksdb")]
 pub mod backend;
+/// Bulk index build (sorted, bottom-up, bounded memory, crash-safe install).
+pub mod bulk;
 pub mod cluster;
 pub mod concurrent;
 pub mod config;

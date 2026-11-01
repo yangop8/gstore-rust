@@ -76,6 +76,20 @@ system_username="system"
 check_point=on
 # build use multi thread increase efficiency
 build_multi_thread=off
+# gbuild --disk builds the indexes in bulk (sorted, bottom-up). Its sort
+# buffers stay within this many MiB, spilling sorted runs to disk beyond it;
+# the dictionary under construction (about 26 bytes plus the term per term)
+# comes on top (Rust extension)
+# build_memory_mb=1024
+# threads of that bulk build, 0 = every core; build_multi_thread=off means 1
+# (Rust extension)
+# build_threads=0
+# where it spills sorted runs (default: inside the database directory)
+# (Rust extension)
+# build_tmp_dir="/tmp"
+# how full it packs B+ tree nodes, 50-100 percent; the slack takes later
+# inserts without splitting nodes (Rust extension)
+# build_fill_factor=90
 # the license type login / testConnect / getCoreVersion report: an upstream
 # key upstream's default conf.ini leaves out (default "opensource")
 # licensetype="opensource"

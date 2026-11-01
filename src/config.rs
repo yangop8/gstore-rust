@@ -249,6 +249,10 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     // Rust-only extensions.
     ("upload", "unzip_max_entries"),
     ("upload", "unzip_max_size"),
+    ("system", "build_memory_mb"),
+    ("system", "build_threads"),
+    ("system", "build_tmp_dir"),
+    ("system", "build_fill_factor"),
     ("server", "listen_addr"),
     ("server", "keep_alive_timeout"),
     ("server", "keep_alive_max"),
@@ -365,8 +369,22 @@ pub struct GStoreConfig {
     pub licensetype: String,
     /// Save every write before it is acknowledged (default on).
     pub check_point: bool,
-    /// Build with multiple threads (default on).
+    /// Build with multiple threads (default on). `off` makes `gbuild`'s
+    /// bulk build use one thread.
     pub build_multi_thread: bool,
+    /// *(Rust extension)* Memory budget of `gbuild --disk`'s bulk build in
+    /// MiB: its sort buffers stay within it (spilling sorted runs to disk);
+    /// the dictionary under construction is extra (default `1024`).
+    pub build_memory_mb: u64,
+    /// *(Rust extension)* Threads of the bulk build; `0` = the available
+    /// parallelism (default `0`).
+    pub build_threads: usize,
+    /// *(Rust extension)* Directory for the bulk build's spilled runs
+    /// (default unset: inside the database directory's staging area).
+    pub build_tmp_dir: Option<PathBuf>,
+    /// *(Rust extension)* B+ tree node fill of the bulk build in percent,
+    /// 50–100 (default `90`; the slack takes later inserts without splits).
+    pub build_fill_factor: u8,
 
     // ---- [log] ----------------------------------------------------------
     /// Upstream's log4cplus properties file (default `conf/slog.properties`).
@@ -504,6 +522,10 @@ impl Default for GStoreConfig {
             licensetype: "opensource".to_string(),
             check_point: true,
             build_multi_thread: true,
+            build_memory_mb: crate::bulk::DEFAULT_MEMORY_BUDGET as u64 >> 20,
+            build_threads: 0,
+            build_tmp_dir: None,
+            build_fill_factor: crate::bulk::DEFAULT_FILL_PERCENT,
             log_mode: "conf/slog.properties".to_string(),
             querylog_mode: true,
             querylog_path: PathBuf::from("logs/endpoint/"),
@@ -737,6 +759,29 @@ impl GStoreConfig {
             "build_multi_thread" => {
                 self.build_multi_thread = parse_switch(v).ok_or_else(|| bad("on or off"))?
             }
+            "build_memory_mb" => {
+                self.build_memory_mb = v
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| (1..=(1 << 30)).contains(n))
+                    .ok_or_else(|| bad("a positive number of MiB"))?
+            }
+            "build_threads" => {
+                self.build_threads = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n <= 1024)
+                    .ok_or_else(|| bad("a number of threads (0 = all cores)"))?
+            }
+            "build_tmp_dir" => self.build_tmp_dir = parse_opt_path(v),
+            "build_fill_factor" => {
+                self.build_fill_factor = v
+                    .trim_end_matches('%')
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|n| (50..=100).contains(n))
+                    .ok_or_else(|| bad("a percentage from 50 to 100"))?
+            }
             "log_mode" => self.log_mode = v.to_string(),
             "querylog_mode" => self.querylog_mode = parse_switch(v).ok_or_else(|| bad("0 or 1"))?,
             "querylog_path" => {
@@ -860,6 +905,10 @@ impl GStoreConfig {
             "licensetype" => self.licensetype.clone(),
             "check_point" => switch(self.check_point),
             "build_multi_thread" => switch(self.build_multi_thread),
+            "build_memory_mb" => self.build_memory_mb.to_string(),
+            "build_threads" => self.build_threads.to_string(),
+            "build_tmp_dir" => opt_path(&self.build_tmp_dir),
+            "build_fill_factor" => self.build_fill_factor.to_string(),
             "log_mode" => self.log_mode.clone(),
             "querylog_mode" => digit(self.querylog_mode),
             "querylog_path" => path(&self.querylog_path),
@@ -964,6 +1013,22 @@ impl GStoreConfig {
                 max_module_bytes: self.pfn_max_module_bytes,
                 max_functions: self.pfn_max_functions,
             },
+        }
+    }
+
+    /// The bulk-build options of the `[system]` `build_*` keys (`gbuild
+    /// --disk`): `build_multi_thread=off` means one thread.
+    pub fn bulk_options(&self) -> crate::bulk::BulkOptions {
+        crate::bulk::BulkOptions {
+            memory_budget: usize::try_from(self.build_memory_mb.saturating_mul(1 << 20))
+                .unwrap_or(usize::MAX),
+            threads: if self.build_multi_thread {
+                self.build_threads
+            } else {
+                1
+            },
+            temp_dir: self.build_tmp_dir.clone(),
+            fill_percent: self.build_fill_factor,
         }
     }
 
@@ -1222,6 +1287,21 @@ upload_allow_compress_packages = "zip"
     }
 
     #[test]
+    fn bulk_build_defaults_and_bad_values() {
+        let c = GStoreConfig::default();
+        let bulk = c.bulk_options();
+        assert_eq!(bulk, crate::bulk::BulkOptions::default());
+        let mut d = GStoreConfig::default();
+        assert!(d.set("build_fill_factor", "40").is_err());
+        assert!(d.set("build_fill_factor", "101").is_err());
+        assert!(d.set("build_memory_mb", "0").is_err());
+        d.set("build_fill_factor", "100%").unwrap();
+        d.set("build_tmp_dir", "off").unwrap();
+        assert_eq!(d.build_fill_factor, 100);
+        assert_eq!(d.build_tmp_dir, None);
+    }
+
+    #[test]
     fn upstream_conf_ini_parses_without_warnings() {
         let c = GStoreConfig::from_ini_str(UPSTREAM_CONF);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
@@ -1326,7 +1406,8 @@ upload_allow_compress_packages = "zip"
                     [system]\nmin_memory=1\nmin_million_disk=2\nmin_million_memory=3\n\
                     resource_check=on\ndb_home=/data/gs\ndb_suffix=.gdb\nroot_username=admin\n\
                     root_password=s3cret\nsystem_username=sys\npfn_base_path=/p\nlicensetype=x\n\
-                    check_point=off\nbuild_multi_thread=off\n\
+                    check_point=off\nbuild_multi_thread=off\nbuild_memory_mb=128\n\
+                    build_threads=3\nbuild_tmp_dir=/scratch\nbuild_fill_factor=75\n\
                     [log]\nlog_mode=l.properties\nquerylog_mode=0\nquerylog_path=q/\n\
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
                     log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
@@ -1364,6 +1445,16 @@ upload_allow_compress_packages = "zip"
             (1, 2, 3)
         );
         assert!(c.resource_check && !c.check_point && !c.build_multi_thread);
+        assert_eq!(
+            (c.build_memory_mb, c.build_threads, c.build_fill_factor),
+            (128, 3, 75)
+        );
+        assert_eq!(c.build_tmp_dir, Some(PathBuf::from("/scratch")));
+        let bulk = c.bulk_options();
+        assert_eq!(bulk.memory_budget, 128 << 20);
+        assert_eq!(bulk.threads, 1, "build_multi_thread=off means one thread");
+        assert_eq!(bulk.fill_percent, 75);
+        assert_eq!(bulk.temp_dir, Some(PathBuf::from("/scratch")));
         assert_eq!(c.db_home, PathBuf::from("/data/gs"));
         assert_eq!(c.db_suffix, ".gdb");
         assert_eq!(c.db_path("lubm"), PathBuf::from("/data/gs/lubm.gdb"));
