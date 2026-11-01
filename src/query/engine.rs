@@ -72,7 +72,21 @@
 //!   graph-function query after a data change and shared by later queries.
 //! * **Cancellation.** The library polls the evaluator's cancel flag.
 //!
-//! `PFN.name({…})` parses but is not evaluated yet (a query error).
+//!
+//! # PFN calls
+//!
+//! `PFN.name({…})` — a user's personalized function ([`crate::pfn`]) — is
+//! evaluated with upstream's projection shape (whole SELECT projection only;
+//! over solutions one row per solution with the value on the last — also
+//! when it is the lone projection, where a graph function gives one row —
+//! per group with GROUP BY, once with its argument as written when there is
+//! no solution). A failing call inside a sub-SELECT fails the query. Its
+//! arguments follow upstream's `pfnQueryByVar` (see [`crate::pfn::call`]);
+//! the value is a plain literal with the function's output (no solutions) or
+//! the JSON array of its outputs. The function comes from the caller set
+//! with [`Evaluator::with_pfn`] — a query reaches only its own user's
+//! functions — and runs over the shared CSR under the cancel flag and the
+//! graph-function output bound.
 //!
 //! # IRI function calls
 //!
@@ -414,6 +428,12 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Set when a `SERVICE` was refused; like a cancel, it cuts evaluation
     /// short and is reported as an error. Shared with `GRAPH` sub-evaluators.
     service_denied: Rc<std::cell::Cell<bool>>,
+    /// The first error of a sub-`SELECT` (a failing `PFN` or graph-function
+    /// call, …): a pattern has no way to return one, so — like a refused
+    /// `SERVICE` — it cuts evaluation short and is reported as the query's
+    /// error instead of reading as "no solution". Shared with `GRAPH`
+    /// sub-evaluators.
+    failed: Rc<std::cell::RefCell<Option<GStoreError>>>,
     /// Where gStore's advanced graph functions get their per-predicate CSR
     /// ([`with_csr_provider`](Self::with_csr_provider)): the
     /// [`Database`](crate::Database)'s cached [`Database::csr`](crate::Database::csr),
@@ -434,6 +454,9 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// The most bytes of JSON one graph-function call may produce
     /// ([`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
     gfun_max_output: usize,
+    /// Who calls `PFN.name(…)` functions, from which registry
+    /// ([`with_pfn`](Self::with_pfn)); `None` = PFN calls fail.
+    pfn: Option<crate::pfn::PfnCaller>,
 }
 
 /// A source of the per-predicate CSR the advanced graph functions run on
@@ -474,12 +497,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            failed: Rc::default(),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: None,
         }
     }
 
@@ -504,12 +529,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
+            failed: Rc::default(),
             csr_provider: None,
             gfun_csr: std::cell::RefCell::new(None),
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: None,
         }
     }
 
@@ -582,6 +609,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self
     }
 
+    /// Let `PFN.name({…})` projections call `caller`'s functions (gStore's
+    /// personalized functions, see [`crate::pfn`]). They run over this
+    /// query's CSR (see [`with_csr_provider`](Self::with_csr_provider)),
+    /// under the caller's limits, this evaluator's cancel flag and
+    /// [`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)
+    /// bound. Without a caller a PFN call is a query error.
+    pub fn with_pfn(mut self, caller: crate::pfn::PfnCaller) -> Evaluator<'a, S> {
+        self.pfn = Some(caller);
+        self
+    }
+
     /// The CSR for the advanced graph functions of this query (see
     /// [`with_csr_provider`](Self::with_csr_provider)).
     fn gfun_csr(&self) -> Result<Arc<CsrGraph>> {
@@ -597,9 +635,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Whether evaluation must stop early: cancellation was requested, or a
-    /// refused `SERVICE` already doomed the query.
+    /// refused `SERVICE` or a failed sub-`SELECT` already doomed the query.
     fn cancelled(&self) -> bool {
         self.service_denied.get()
+            || self.failed.borrow().is_some()
             || self
                 .cancel
                 .as_ref()
@@ -607,8 +646,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `Err` if evaluation was cut short — [`GStoreError::Cancelled`] when
-    /// cancellation was requested, a query error when a `SERVICE` was refused —
-    /// else `Ok(())`.
+    /// cancellation was requested, a query error when a `SERVICE` was refused,
+    /// a sub-`SELECT`'s error when one failed — else `Ok(())`.
     pub(crate) fn check_cancel(&self) -> Result<()> {
         if self.service_denied.get() {
             Err(GStoreError::Query(
@@ -616,6 +655,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                  client's behalf (its load policy does not allow remote sources)"
                     .into(),
             ))
+        } else if let Some(e) = self.failed.borrow().as_ref() {
+            Err(e.duplicate())
         } else if self.cancelled() {
             Err(GStoreError::Cancelled)
         } else {
@@ -1040,6 +1081,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             bind_only_vars(pattern)
         };
         let only_gfn = !gfns.is_empty() && upstream_projection_len(q) == 1;
+        // Upstream reserves one row for a lone graph function but not for a
+        // lone PFN call (GE:2043-2050 excludes `PFN_type`): over solutions
+        // that one keeps a row per solution, its value on the last, as next
+        // to other projections (GE:2526-2530).
+        let one_row = only_gfn && !matches!(gfns[0].call, ProjCall::Pfn { .. });
         let rows = if !gfns.is_empty()
             && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
         {
@@ -1048,7 +1094,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // (a variable is looked up as an IRI and is missing); next to
             // other projections there is no row at all.
             if only_gfn {
-                vec![vec![self.eval_graph_fn(
+                vec![vec![self.eval_proj_call(
                     &gfns[0].call,
                     &[],
                     &layout,
@@ -1058,14 +1104,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             } else {
                 Vec::new()
             }
-        } else if only_gfn && !has_agg {
+        } else if one_row && !has_agg {
             // A lone graph function over the solutions: exactly one row
             // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
             // form one group: a failing HAVING leaves the value unset
             // (GE:2071-2075).
             let all: Vec<&Binding> = solutions.iter().collect();
             let value = if self.having_holds(q, &all, &layout) {
-                self.eval_graph_fn(&gfns[0].call, &all, &layout, &bind_only, false)?
+                self.eval_proj_call(&gfns[0].call, &all, &layout, &bind_only, false)?
             } else {
                 None
             };
@@ -1087,7 +1133,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut values = Vec::with_capacity(gfns.len());
                 for g in &gfns {
                     values.push(if keep {
-                        self.eval_graph_fn(&g.call, &all, &layout, &bind_only, false)?
+                        self.eval_proj_call(&g.call, &all, &layout, &bind_only, false)?
                     } else {
                         None
                     });
@@ -1098,7 +1144,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                             "?{} is already bound by the WHERE clause; ({}(…) AS ?v) needs a \
                              fresh variable",
                             g.alias,
-                            g.call.kind.name()
+                            g.call.label()
                         )));
                     }
                     layout.index.insert(g.alias.clone(), layout.names.len());
@@ -1277,7 +1323,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Var(v) => Ok(layout.index.get(v).and_then(|&i| b[i])),
                     // Computed up front into the alias column (see
                     // `eval_select_solutions`).
-                    SelectItem::Expr(Expr::GraphFn { .. }, alias) => {
+                    SelectItem::Expr(Expr::GraphFn { .. } | Expr::Pfn { .. }, alias) => {
                         Ok(layout.index.get(alias).and_then(|&i| b[i]))
                     }
                     SelectItem::Expr(e, _) => Ok(self.eval_id(e, b, layout)),
@@ -1350,6 +1396,108 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GFunValue::Num(v) => Value::Double(v),
         };
         Ok(Some(self.value_to_id(&value)))
+    }
+
+    /// Evaluate a projected graph function or PFN call (see
+    /// [`eval_graph_fn`](Self::eval_graph_fn) / [`eval_pfn`](Self::eval_pfn)).
+    fn eval_proj_call(
+        &self,
+        call: &ProjCall,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        bind_only: &HashSet<String>,
+        constant: bool,
+    ) -> Result<Option<u32>> {
+        match call {
+            ProjCall::Graph(c) => self.eval_graph_fn(c, sols, layout, bind_only, constant),
+            ProjCall::Pfn { name, json } => {
+                self.eval_pfn(name, json, sols, layout, bind_only, constant)
+            }
+        }
+    }
+
+    /// Evaluate a projected `PFN.name({…})` over `sols` as upstream's
+    /// `pfnQuery` / `pfnQueryByVar` do ([`crate::pfn::call`]): with
+    /// `constant` (no solutions) the function runs once on the argument as
+    /// written and its output is the value; otherwise every `"?v"` argument
+    /// value takes each distinct term `?v` is bound to across `sols` (a
+    /// variable bound only by BIND, or to a computed value, has no usable
+    /// binding, as for graph functions) and the value is the JSON array of
+    /// the outputs. The value is a plain literal holding that text; the
+    /// `/api` layer answers it as upstream's `{"results": …}`. The calls run
+    /// with [`with_pfn`](Self::with_pfn)'s caller over this query's CSR.
+    fn eval_pfn(
+        &self,
+        name: &str,
+        json: &str,
+        sols: &[&Binding],
+        layout: &VarLayout,
+        bind_only: &HashSet<String>,
+        constant: bool,
+    ) -> Result<Option<u32>> {
+        let args = crate::pfn::call::parse_args(name, json)?;
+        let Some(caller) = &self.pfn else {
+            let mut msg = format!(
+                "PFN.{name}(…): no PFN function registry is attached to this query (functions \
+                 are managed per user with the server's funcudb / funquery operations; an \
+                 embedded database attaches one with Database::set_pfn_caller)"
+            );
+            if !crate::pfn::RUNTIME_AVAILABLE {
+                msg.push_str(&format!("; besides, {}", crate::pfn::FEATURE_HINT));
+            }
+            return Err(GStoreError::Query(msg));
+        };
+        // Looked up once (upstream `getPfnSoFile`, before any call — so a
+        // missing or uncompiled function fails even when nothing would run).
+        let func = caller.resolve(name).map_err(|e| {
+            if constant {
+                e
+            } else {
+                crate::pfn::call::by_var_error(e)
+            }
+        })?;
+        let csr = self.gfun_csr()?;
+        let graph = crate::pfn::CsrGraphCtx::new(&csr, self.dict);
+        let var_values = |var: &str| -> Option<Vec<String>> {
+            let &idx = layout.index.get(var)?;
+            if bind_only.contains(var) {
+                return Some(Vec::new());
+            }
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for b in sols {
+                let Some(id) = b[idx] else { continue };
+                if is_synth(id) || !seen.insert(id) {
+                    continue;
+                }
+                if let Some(s) = self.resolve_string(Some(id), layout.is_pred[idx]) {
+                    out.push(s);
+                }
+            }
+            Some(out)
+        };
+        let run = |params: &str| -> Result<String> {
+            self.check_cancel()?;
+            caller.run(
+                &func,
+                params,
+                &graph,
+                self.cancel.as_deref(),
+                self.gfun_max_output,
+            )
+        };
+        let text = crate::pfn::call::evaluate(
+            name,
+            &args,
+            constant,
+            var_values,
+            run,
+            self.gfun_max_output,
+        )?;
+        Ok(Some(self.value_to_id(&Value::Str {
+            value: text,
+            lang: None,
+        })))
     }
 
     /// The distinct vertices a graph-function variable is bound to across
@@ -1462,7 +1610,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let lifted_items: Vec<Option<Expr>> = items
             .iter()
             .map(|it| match it {
-                SelectItem::Expr(Expr::GraphFn { .. }, _) | SelectItem::Var(_) => None,
+                SelectItem::Expr(Expr::GraphFn { .. } | Expr::Pfn { .. }, _)
+                | SelectItem::Var(_) => None,
                 SelectItem::Expr(e, _) => Some(lift_aggregates(e, &mut aggs)),
             })
             .collect();
@@ -1530,6 +1679,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         let call = GCall::from_ast(*func, args)?;
                         Some(self.eval_graph_fn(&call, &sols, layout, bind_only, false)?)
+                    }
+                    SelectItem::Expr(Expr::Pfn { name, json }, _) => {
+                        Some(self.eval_pfn(name, json, &sols, layout, bind_only, false)?)
                     }
                     _ => None,
                 });
@@ -2072,6 +2224,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             allow_service: self.allow_service,
             service_denied: Rc::clone(&self.service_denied),
+            failed: Rc::clone(&self.failed),
             // Graph functions inside a GRAPH block run over that named graph:
             // its CSR is built from the sub-evaluator's own store.
             csr_provider: None,
@@ -2080,6 +2233,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: self.topk,
             stats: Rc::clone(&self.stats),
             gfun_max_output: self.gfun_max_output,
+            pfn: self.pfn.clone(),
         }
     }
 
@@ -2178,7 +2332,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn eval_subselect(&self, sq: &SelectQuery, layout: &VarLayout) -> Vec<Binding> {
         let (vars, is_pred, rows) = match self.eval_select_solutions(sq) {
             Ok(t) => t,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                // Reported as the query's error (see `failed`), never as
+                // "no solution" — which would invert a `NOT EXISTS`.
+                let mut failed = self.failed.borrow_mut();
+                if failed.is_none() {
+                    *failed = Some(e);
+                }
+                return Vec::new();
+            }
         };
         // Map each sub-query result column to an outer layout slot (by name).
         let slots: Vec<Option<usize>> = vars.iter().map(|v| layout.index.get(v).copied()).collect();
@@ -4605,14 +4767,34 @@ fn expr_has_aggregate(e: &Expr) -> bool {
 // advanced graph functions: projection shape
 // ---------------------------------------------------------------------------
 
+/// A function only evaluated as a whole SELECT projection: an upstream
+/// advanced graph function, or a `PFN.name({…})` call, which upstream
+/// evaluates the same way (one row per the shape rules, its arguments
+/// gathered over all solutions — see the module docs).
+enum ProjCall {
+    Graph(GCall),
+    Pfn { name: String, json: String },
+}
+
+impl ProjCall {
+    /// The call's name, for messages.
+    fn label(&self) -> String {
+        match self {
+            ProjCall::Graph(c) => c.kind.name().to_string(),
+            ProjCall::Pfn { name, .. } => format!("PFN.{name}"),
+        }
+    }
+}
+
 /// A SELECT projection item `(f(…) AS ?alias)` whose expression is an
-/// upstream advanced graph function.
+/// upstream advanced graph function or a PFN call.
 struct GraphFnItem {
-    call: GCall,
+    call: ProjCall,
     alias: String,
 }
 
-/// The advanced graph functions projected by `q`, in projection order.
+/// The advanced graph functions and PFN calls projected by `q`, in
+/// projection order.
 fn graph_fn_items(q: &SelectQuery) -> Result<Vec<GraphFnItem>> {
     let Projection::Items(items) = &q.projection else {
         return Ok(Vec::new());
@@ -4622,10 +4804,17 @@ fn graph_fn_items(q: &SelectQuery) -> Result<Vec<GraphFnItem>> {
         .filter_map(|it| match it {
             SelectItem::Expr(Expr::GraphFn { func, args }, alias) => {
                 Some(GCall::from_ast(*func, args).map(|call| GraphFnItem {
-                    call,
+                    call: ProjCall::Graph(call),
                     alias: alias.clone(),
                 }))
             }
+            SelectItem::Expr(Expr::Pfn { name, json }, alias) => Some(Ok(GraphFnItem {
+                call: ProjCall::Pfn {
+                    name: name.clone(),
+                    json: json.clone(),
+                },
+                alias: alias.clone(),
+            })),
             _ => None,
         })
         .collect()
@@ -4840,6 +5029,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         GCall::from_ast(*func, args)?;
                     }
+                    // So does a PFN call; its argument must be a JSON object.
+                    SelectItem::Expr(Expr::Pfn { name, json }, _) => {
+                        crate::pfn::call::parse_args(name, json)?;
+                    }
                     SelectItem::Expr(e, _) => self.check_expr_calls(e)?,
                     SelectItem::Var(_) => {}
                 }
@@ -4901,7 +5094,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Err(GStoreError::Query(msg))
             }
             Expr::Pfn { name, .. } => Err(GStoreError::Query(format!(
-                "PFN not supported yet (Phase 4): PFN.{name}(…)"
+                "PFN.{name}(…) is only evaluated as the whole expression of a SELECT \
+                 projection, e.g. SELECT (PFN.{name}({{…}}) AS ?v)"
             ))),
             Expr::IriCall { iri, args } => {
                 self.check_iri_call(iri, args.len())?;
@@ -6659,13 +6853,13 @@ mod gfun_engine_tests {
         };
         let items = graph_fn_items(&q).unwrap();
         let layout = VarLayout::build(&q.pattern);
-        // `eval_graph_fn` does not check the flag itself: the library does,
-        // through the context the evaluator hands it.
-        let r = ev.eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true);
+        // `eval_graph_fn` (behind `eval_proj_call`) does not check the flag
+        // itself: the library does, through the context the evaluator hands it.
+        let r = ev.eval_proj_call(&items[0].call, &[], &layout, &HashSet::new(), true);
         assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
         flag.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(ev
-            .eval_graph_fn(&items[0].call, &[], &layout, &HashSet::new(), true)
+            .eval_proj_call(&items[0].call, &[], &layout, &HashSet::new(), true)
             .unwrap()
             .is_some());
     }

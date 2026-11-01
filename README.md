@@ -26,8 +26,9 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
 * **About 1,860 tests pass** across the workspace (incl. 159 for gNLQA), among them
-  ports of upstream gStore's own test scripts; `cargo clippy --workspace
-  --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
+  ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`, `gzip`,
+  `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
+  --workspace --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
   planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
   [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -142,6 +143,11 @@ optimizer and a VS-tree signature filter.
   `coreTruss`, … with upstream's syntax, semantics and JSON output; the older
   gstore-rust graph functions remain available as `rs:NAME(…)` (see
   [Graph functions in SPARQL](#graph-functions-in-sparql)).
+* **PFN user graph functions** (`pfn`) — upstream's `funquery` / `funcudb` /
+  `funreview` and `SELECT (PFN.name({…}) AS ?v)`: each user's own graph
+  functions, written in WebAssembly text and run sandboxed over the graph
+  (feature `pfn-wasm`; see [PFN](#pfn-user-graph-functions) and
+  [`docs/PFN.md`](docs/PFN.md)).
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
   — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
@@ -156,7 +162,11 @@ optimizer and a VS-tree signature filter.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
-* **RDFS/rule reasoning** (`reason`), an **RPC cluster** (`rpc` / `cluster`), and
+* **Reasoning** (`reason`) — upstream's JSON inference rules over `/api`
+  (`reasonManage`: add, compile, execute, disable, … with exact retraction;
+  see [Reasoning](#reasoning-reasonmanage)) and RDFS materialization; the
+  inferred `<Rule:…>` edges are ordinary data to SPARQL, the graph functions
+  and PFN functions. Also an **RPC cluster** (`rpc` / `cluster`), and
   **concurrency/MVCC** (`concurrent`).
 
 Remaining large-refactor items are tracked in
@@ -318,7 +328,7 @@ Other gstore-rust keys: `[server]` `listen_addr`, `keep_alive_timeout`,
 (default 10000) and `unzip_max_size` (default 10 GiB), the limits a zip
 package must stay within; `[log]` `log_level`, `log_file`, `log_days`,
 `log_stderr` (below). `refreshconf` re-reads the file: the `[query]`
-settings, the log configuration (as upstream re-runs log4cplus; a log file
+and `[pfn]` settings, the log configuration (as upstream re-runs log4cplus; a log file
 that could not be opened is tried again), the IP lists, the database and
 user limits and the upload, backup and query / access-log settings take
 effect at once; the address, the worker pool, `check_point`, `db_home` and
@@ -326,6 +336,22 @@ the cap `upload_max_body_size` puts on every HTTP request body need a
 restart (the upload operation's own size check follows the new value).
 A relative `querylog_path` / `accesslog_path` is taken relative to
 `db_home`.
+
+A `[pfn]` section (gstore-rust only) sets the sandbox limits of
+[PFN user functions](#pfn-user-graph-functions), applied the same way (to
+every served database, and re-applied by `refreshconf` to the loaded ones and
+to the function registry): `pfn_fuel_per_call` (instructions per call,
+default 10^9, `0` = unlimited), `pfn_max_memory_pages` (default 1024 =
+64 MiB), `pfn_max_module_bytes` (default 1 MiB) and `pfn_max_functions` (per
+user, default 100). Upstream's `[system] pfn_base_path` (default here:
+`<db_home>/pfn`) is where the functions are stored; it is read at startup.
+
+[Reasoning rules](#reasoning-reasonmanage) have no `conf.ini` keys: their
+limits are fixed (1000 rules per database, 1 MiB per rule file, 64
+conditions per rule, 256 patterns and 64 filters per condition, rule names of
+at most 128 characters and 240 bytes), and executing or disabling a rule is
+an ordinary update (`check_point`, the `[query]` cache and the CSR behave as
+for any other write).
 
 **Logs.** `gserver` writes a diagnostic log (errors, warnings, lifecycle
 events) configured like upstream's: `conf.ini`'s `log_mode` names a log4cplus
@@ -373,8 +399,8 @@ eagerly, as the server's `loadcsr` and `load` with `csr=1` do). A call is
 cancelled like any query (`/cancel`, `operationTaskCancel`, shutdown) and its
 JSON is bounded (`[query] gfun_max_output_bytes`, 64 MiB on a server). Upstream parses `cycleBoolean`,
 `simpleCycleBoolean`, `shortestPathLen` and `kHopReachable` inside `FILTER` but
-never evaluates them there; here that is a clear error. `PFN.name({…})` parses
-but is not evaluated yet.
+never evaluates them there; here that is a clear error. `PFN.name({…})` calls a
+user's own function (see [PFN](#pfn-user-graph-functions) below).
 
 **The `rs:` namespace (breaking change).** The functions gstore-rust offered
 before — bare names such as `SSSP(?a, ?b)`, usable in `FILTER`/`BIND` and
@@ -403,6 +429,139 @@ naming its `rs:` replacement. Other IRI function calls are SPARQL 1.1 casts
 `xsd:string`, `xsd:dateTime`, `xsd:date`) or functions registered with
 `Database::register_function` under the IRI or its local name; anything else is
 an error.
+
+### Reasoning (`reasonManage`)
+
+Upstream gStore 1.4's inference rules (`src/Reason`, `/api` operation
+`reasonManage`): a rule is a JSON object whose conditions are triple patterns
+and filters, compiled to a SPARQL `INSERT … WHERE`; executing it adds the
+inferred triples under the predicate `<Rule:label>`, disabling it retracts
+them.
+
+```json
+{"rulename": "舅舅", "description": "母亲的男性同胞是舅舅", "isenable": 1,
+ "type": 1, "logic": 1,
+ "conditions": [{"patterns": [
+     {"subject": "?x", "predicate": "<母亲>", "object": "?y"},
+     {"subject": "?y", "predicate": "<父亲>", "object": "?z"},
+     {"subject": "?k", "predicate": "<父亲>", "object": "?z"},
+     {"subject": "?k", "predicate": "<性别>", "object": "\"男\"^^<http://www.w3.org/2001/XMLSchema#string>"}],
+   "filters": []}],
+ "return": {"source": "?x", "target": "?k", "label": "舅舅"}}
+```
+
+`type` `1` infers a relation (`source <Rule:label> target`), `0` a property
+(`source <Rule:label> value`); `logic` `0` makes the conditions alternatives
+(`UNION`), `1` requires them all; a condition's `filters` are SPARQL
+expressions that must all hold. The rule above compiles — byte for byte as
+upstream 1.4 — to
+
+```sparql
+insert { ?x <Rule:舅舅> ?k. } where { ?x <母亲> ?y. ?y <父亲> ?z. ?k <父亲> ?z. ?k <性别> "男"^^<http://www.w3.org/2001/XMLSchema#string>.}
+```
+
+| `type` | operation | answer | rule `status` |
+|---|---|---|---|
+| `1` | add (`ruleinfo`) | `StatusMsg` names the rule file | `新建` |
+| `2` | list | `list`, `num` | — |
+| `3` | compile (`rulename`) | `insert_sparql`, `delete_sparql`, `check_sparql` | `已编译` |
+| `4` | execute | `insert_sparql`, `select_sparql`, `AnsNum` (triples added) | `已执行` |
+| `5` | disable | `delete_sparql`, `AnsNum` (triples retracted) | `已失效` |
+| `6` | show | `ruleinfo` | — |
+| `7` | delete | — | (file removed) |
+| `8` | check | `check_sparql`, `effectNum` (matches) | `已校验` |
+
+Only `root` (and `admin` users) may call it, as upstream. Rules are stored per
+database in `<db>.db/reason_rule_files/<rulename>.json` (upstream's layout and
+format), so they survive unload / load and restarts, move with `rename`, are
+carried by `backup` / `restore` and removed by `drop`; a database without a
+directory (built in memory through the library) keeps them in memory. The
+library offers the same lifecycle: `Database::reason_add`, `reason_list`,
+`reason_compile`, `reason_execute`, `reason_disable`, `reason_show`,
+`reason_delete`, `reason_check`.
+
+Execution is an ordinary autocommit update (query cache, CSR, write-through,
+durability and the query log behave as for a `query` update, and it can be
+cancelled); execute and disable are refused (`1004`) while a transaction is
+open on the database, and execute / disable / check need it loaded.
+
+**Retraction is exact.** Each execution records which triples the rule owns
+(`reason_rule_files/inferred/<rulename>.nt`): those it added, and those it
+derived that another executed rule already owns. Disabling deletes exactly the
+owned triples no other rule also owns. So a fact asserted with an ordinary
+predicate is never touched; a `<Rule:…>` triple that was already in the
+database before the rule ran (asserted by a user) survives; a triple two rules
+infer survives until both are disabled. A triple a user inserts *after* the
+rule inferred it is the same RDF triple and is retracted with the rule. A
+rule's conditions are evaluated once per execution and exactly the triples
+that evaluation derived are inserted, so a random filter cannot leave a triple
+unrecorded. A rule file without an ownership record was written by upstream
+gStore: whatever its status (upstream's check and compile overwrite `已执行`),
+disabling it retracts with upstream's `delete where {?x <Rule:label> ?y.}`
+(built from the validated label alone, so a rule whose conditions this
+implementation refuses can still be disabled, and its name only has to stay
+inside the rule directory), and executing it takes over the triples it derives
+that are already there.
+
+**Differences from upstream**, deliberate:
+
+- Every rule is validated when it is added and compiled: each pattern or
+  `return` term must be exactly one SPARQL term (variable, full `<IRI>`,
+  literal, number, boolean, `a`), a filter one complete expression whose
+  brackets balance, the label part of one IRI, and a `return` variable must
+  occur in the patterns. Upstream splices the strings into SPARQL verbatim,
+  so a rule could inject SPARQL; here such a rule is refused (`1005 "Add
+  Reason Rule Fail. …"`). Prefixed names are refused (a rule has no
+  `PREFIX`es).
+- Rule names must be safe file names (no `/`, `\`, `..`, leading `.`, control
+  characters; at most 128 characters and 240 bytes of UTF-8), at most 1000
+  rules per database and 1 MiB per rule file.
+- Execute runs the statement compiled from the rule's definition, never text
+  stored in the file: a rule edited after compiling must be compiled again;
+  compiled fields a client sends with `add` are dropped.
+- An executed rule cannot be recompiled (upstream allows it, resets the
+  status to `已编译` and thereby lets the rule be deleted while its triples
+  stay); checking an executed rule keeps it `已执行`.
+- When a condition has several filters and one has a top-level `||`, that
+  filter is parenthesized (upstream's plain `&&` join would change its
+  meaning).
+- Upstream's documentation shows the compiled text with extra spaces
+  (`where {  ?x … . }`); the text here is what upstream 1.4's code produces.
+- `type` may be a JSON number and `ruleinfo` a string holding the object;
+  `list` is sorted by rule name; operations on a database that does not exist
+  answer `1005 "database[<db>] does not exist"` (upstream creates its
+  directory).
+
+### PFN: user graph functions
+
+gStore 1.4's personalized functions — each user's own graph functions,
+managed with the `/api` operations `funquery`, `funcudb` (create / update /
+delete / compile) and `funreview`, and called as
+`SELECT (PFN.name({"src":"<…>", …}) AS ?v) WHERE {…}` — are supported with
+upstream's requests, messages, statuses, storage layout and answers (a
+`query` answers `{"results": …}`). The difference is the runtime: upstream
+compiles a C++ body with `g++` and `dlopen()`s it, gstore-rust compiles a
+**WebAssembly text** body and runs it **sandboxed** in an interpreter — it
+can only call the gStore host interface (vertices, edges, per-predicate
+neighbours, id ↔ string, its arguments, an output buffer), under an
+instruction budget, a memory cap, the output bound and the query's cancel
+flag. Every user reaches only their own functions. PFN calls are evaluated
+by the multi-database `gserver` (API mode) and by embedded databases with a
+caller installed (`Database::set_pfn_caller`); the single-database
+`gserver <db dir>` and the command-line tools answer a PFN call with an
+error.
+
+The runtime is the cargo feature `pfn-wasm` (`wasmi` + `wat`, off by
+default): without it, function management works but compiling and calling
+fail with an error naming the feature.
+
+```sh
+cargo build --release --features pfn-wasm
+```
+
+[`docs/PFN.md`](docs/PFN.md) is the guide: the host interface, two complete
+examples (out-degree; k-hop count along a predicate set), the limits and every
+difference from upstream.
 
 ### gconsole
 
@@ -455,8 +614,8 @@ gStore[lubm]> quit;
   `clearpriv`, `pusr`, `showusrs`, `flushpriv`; reasoning rules (`addreason`,
   `listreason`, `compilereason`, `executereason`, `disablereason`,
   `showreason`, `deletereason`) and custom functions (`showpfn`, `addpfn`,
-  `mdfpfn`, `delpfn`, `buildpfn`) — the server answers these with "The
-  operation is not defined" until it implements them; `version`, `pwd`,
+  `mdfpfn`, `delpfn`, `buildpfn`; see [Reasoning](#reasoning-reasonmanage)
+  and [PFN](#pfn-user-graph-functions) above); `version`, `pwd`,
   `clear`, `quit` / `exit` (or Ctrl-D), and `history [<n>]`.
 * Ctrl-C abandons the statement being typed, or the request in flight: the
   connection is dropped and, for SPARQL, the server's task is cancelled
@@ -546,7 +705,8 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `logging`     | diagnostic log: levels, daily rolling file, retention   |
 | `zipio`       | zip packages, zipped backups / exports (feature `zip`) |
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
-| `reason`      | RDFS / rule reasoning                                   |
+| `reason`      | upstream inference rules (`reasonManage`), RDFS, textual rules |
+| `pfn`         | PFN user graph functions: per-user registry, `GraphCtx`, sandboxed WebAssembly runtime (`pfn-wasm`) |
 | `db`          | `Database` facade + persistence (mem & disk)           |
 | `gnlqa/`      | LLM natural-language QA layer (separate crate)          |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`, `gserver`, …            |

@@ -359,7 +359,14 @@ pub fn write_str(s: &str, out: &mut String) {
         out.push_str(&s[start..i]);
         match esc {
             Some(e) => out.push_str(e),
-            None => out.push_str(&format!("\\u{:04x}", c as u32)),
+            None => {
+                // `\u00XX` (c < 0x20), without a temporary String.
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let b = c as u32 as usize;
+                out.push_str("\\u00");
+                out.push(char::from(HEX[b >> 4]));
+                out.push(char::from(HEX[b & 0xf]));
+            }
         }
         start = i + c.len_utf8();
     }

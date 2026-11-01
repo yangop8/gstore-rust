@@ -76,6 +76,11 @@ system_username="system"
 check_point=on
 # build use multi thread increase efficiency
 build_multi_thread=off
+# where PFN user functions (funcudb / funquery / funreview) are stored: an
+# upstream key upstream's default conf.ini leaves out (upstream default
+# "./pfn/"; gstore-rust's: <db_home>/pfn). Read when gserver starts:
+# refreshconf does not move the functions. See [pfn] below and docs/PFN.md.
+# pfn_base_path="./pfn/"
 [log]
 # choose the system core log output model
 # config/slog.stdout.properties for console
@@ -169,3 +174,32 @@ unzip_max_size = 10737418240
 # PR, ...) may produce before the query fails with an error (default 64 MiB;
 # an embedded Database allows 256 MiB)
 # gfun_max_output_bytes=67108864
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# Sandbox limits of PFN user functions (funcudb / funquery / funreview, and
+# SELECT (PFN.name({...}) AS ?v) in queries). gstore-rust runs PFN functions as
+# WebAssembly in an interpreter (cargo feature pfn-wasm) instead of compiling
+# C++ with g++ and dlopen()ing it like upstream; see docs/PFN.md. They live
+# under [system]'s pfn_base_path (upstream's key; when it is not set:
+# <db_home>/pfn). The output of one call is bounded by [query]'s
+# gfun_max_output_bytes. Like [query], these apply to every database the
+# server serves and /api refreshconf re-applies them (to the loaded databases
+# and to the function registry). The values shown are the defaults.
+[pfn]
+# the most WebAssembly instructions one function call may run (0 = unlimited;
+# a call is also stopped when its query is cancelled)
+# pfn_fuel_per_call=1000000000
+# the most 64 KiB pages a function's memory may grow to (1024 = 64 MiB)
+# pfn_max_memory_pages=1024
+# the largest function module, source text and compiled binary, in bytes
+# pfn_max_module_bytes=1048576
+# the most functions one user may own
+# pfn_max_functions=100
+
+# Reasoning rules (/api reasonManage, stored per database in
+# <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --
+# at most 1000 rules per database, 1 MiB per rule file, 64 conditions per rule,
+# 256 patterns and 64 filters per condition, 4 KiB per term and 16 KiB per
+# filter, rule names of at most 128 characters (240 bytes). Executing a rule
+# is an update like any other: it obeys check_point and empties the [query]
+# cache.

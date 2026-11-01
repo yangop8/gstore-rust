@@ -96,6 +96,11 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     // runner, and the statement's task is that operation's (`tasks`).
     let parsed = crate::parser::sparql::parse(&sparql);
     let is_update = matches!(parsed, Ok(Query::Update(_)));
+    // A projected `PFN.name(…)` answers upstream's `{"results": …}` shape.
+    let pfn = parsed
+        .as_ref()
+        .ok()
+        .and_then(|q| super::ops_pfn::PfnShape::of(q, &sparql));
     let limit = match &parsed {
         Ok(Query::Select(q)) => q.limit,
         Ok(Query::Construct(q)) => q.limit,
@@ -132,6 +137,7 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             sparql,
             is_update,
             fmt: ResultFormat::Json,
+            user: ctx.user().to_string(),
         }
     };
     let started = Instant::now();
@@ -151,7 +157,8 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 return GResp::error(Status::OperationFailed, "Unknown result format.");
             };
             let rs = result_table(result);
-            match read_response(ctx, &db, &rs, format, limit, &query_time, &thread_id) {
+            let pfn = pfn.as_ref();
+            match read_response(ctx, &db, &rs, format, limit, &query_time, &thread_id, pfn) {
                 Ok(r) => r,
                 Err(r) => return r,
             }
@@ -208,6 +215,7 @@ fn output_limit(ans_num: usize, limit: Option<usize>, max: usize) -> i64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_response(
     ctx: &Ctx<'_>,
     db: &str,
@@ -216,16 +224,22 @@ fn read_response(
     limit: Option<usize>,
     query_time: &str,
     thread_id: &str,
+    pfn: Option<&super::ops_pfn::PfnShape>,
 ) -> Result<GResp, GResp> {
     let ans_num = rs.rows.len();
     let out_limit = output_limit(ans_num, limit, ctx.config.max_output_size);
     let shown = usize::try_from(out_limit).ok();
+    // A PFN result replaces the JSON document (upstream `ResultSet::to_JSON`).
+    let json = |shown| match pfn.and_then(|p| p.results_json(rs, shown)) {
+        Some(body) => body,
+        None => upstream_select_json(rs, shown),
+    };
     let (mut body, file_name) = match format {
-        OutFormat::Json => (upstream_select_json(rs, shown), None),
+        OutFormat::Json => (json(shown), None),
         OutFormat::NTriple => (upstream_ntriple_json(rs, shown), None),
         // File outputs are not capped (upstream resets the output limit).
         OutFormat::File => {
-            let text = upstream_select_json(rs, None).into_sorted().to_string();
+            let text = json(None).into_sorted().to_string();
             (
                 Json::obj(),
                 Some(write_result_file(ctx, db, thread_id, "json", &text)?),
@@ -241,10 +255,14 @@ fn read_response(
     };
     body.set("StatusCode", 0);
     body.set("StatusMsg", "success");
-    body.set("AnsNum", ans_num);
-    body.set("OutputLimit", out_limit);
-    body.set("ThreadId", thread_id);
     body.set("QueryTime", query_time);
+    // Upstream drops these for a query that starts with `select (pfn.`
+    // (`MessageQueryResponse::is_pfn`).
+    if !pfn.is_some_and(|p| p.bare) {
+        body.set("AnsNum", ans_num);
+        body.set("OutputLimit", out_limit);
+        body.set("ThreadId", thread_id);
+    }
     if let Some(name) = file_name {
         body.set("FileName", name);
     }

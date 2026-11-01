@@ -1392,11 +1392,16 @@ fn filter_forms_are_a_clean_error() {
     assert_eq!(db.triple_num(), before);
 }
 
+/// PFN calls are evaluated since Phase 4 (`tests/dt_pfn.rs`); a database
+/// with no PFN caller attached answers a clean error.
 #[test]
-fn pfn_is_a_clean_not_supported_yet_error() {
+fn pfn_without_a_registry_is_a_clean_error() {
     let mut db = social();
     let e = query_err(&mut db, "SELECT (PFN.f({\"k\":\"v\"}) AS ?z) WHERE {}");
-    assert!(e.contains("PFN not supported yet (Phase 4): PFN.f"), "{e}");
+    assert!(
+        e.contains("PFN.f(…): no PFN function registry is attached"),
+        "{e}"
+    );
 }
 
 #[test]

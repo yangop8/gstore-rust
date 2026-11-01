@@ -1,6 +1,26 @@
-//! RDFS entailment by forward-chaining materialization.
+//! Reasoning: upstream gStore's rule management (`reasonManage`), RDFS
+//! entailment, and the crate's own textual rules.
 //!
-//! Corresponds to gStore's `src/Reason`. Given a store that mixes data and an
+//! # Upstream rules (`reasonManage`)
+//!
+//! The JSON rules of upstream gStore's `src/Reason` (`ReasonHelper`) and its
+//! `/api` operation `reasonManage` (types 1-8):
+//!
+//! * [`rules`] — the rule JSON model and its validation (no rule can inject
+//!   SPARQL);
+//! * [`compile`] — rule → upstream's `INSERT … WHERE`, `DELETE WHERE`,
+//!   count and select statements, byte for byte;
+//! * [`store`] — where rules live (`<db>/reason_rule_files/`, or memory);
+//! * [`manage`] — the lifecycle (add, list, compile, execute, disable, show,
+//!   delete, check), with exact retraction of inferred triples.
+//!
+//! The [`Database`](crate::Database) methods `reason_add` … `reason_check`
+//! expose it to embedders; the `/api` server answers `reasonManage` with it
+//! (`crate::gapi`).
+//!
+//! # RDFS entailment
+//!
+//! Given a store that mixes data and an
 //! RDFS schema, [`materialize`] computes the RDFS closure and inserts every
 //! entailed triple, iterating to a fixpoint. It implements the core
 //! schema-driven rules (the ones that actually change query answers):
@@ -12,18 +32,26 @@
 //! | subproperty transitivity | `p ⊑ₚ q`, `q ⊑ₚ r` | `p ⊑ₚ r` |
 //! | subproperty propagation  | `p ⊑ₚ q`, `x p y` | `x q y` |
 //! | domain | `p domain c`, `x p y` | `x a c` |
-//! | range  | `p range c`,  `x p y` | `y a c` |
+//! | range  | `p range c`,  `x p y` | `y a c` (only for an entity `y`: a literal is never typed) |
 //!
 //! Note the id-space subtlety: a property used as the *subject* of a schema
 //! triple (`p rdfs:subPropertyOf q`) is interned as an **entity**, while the same
 //! property in data (`x p y`) is a **predicate** — two different id spaces sharing
 //! the dictionary key. [`ent_to_pred`] bridges them through the dictionary.
 
+pub mod compile;
+pub mod manage;
+pub mod rules;
+pub mod store;
+
+pub use compile::CompiledRule;
+pub use manage::{ReasonError, ReasonErrorKind};
+
 use std::collections::HashMap;
 
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
-use crate::model::id::PredId;
+use crate::model::id::{is_entity_id, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
 use crate::store::{MutableStore, TripleSource};
@@ -196,11 +224,17 @@ fn gather<S: TripleSource>(
     }
 
     // --- range: (p range c), (x p y) ⇒ (y a c) ---
+    // Only for an entity `y`: a literal object (`x p "lit"`) cannot be the
+    // subject of a triple, so `"lit" a c` is never inferred (RDFS leaves that
+    // entailment to a generalized-RDF reasoner; an RDF store has no such
+    // triple).
     if let (Some(rng), Some(tp)) = (rng_p, type_p) {
         for (p_ent, c) in store.so_by_p(rng) {
             if let Some(p_pred) = ent_to_pred(dict, p_ent) {
                 for (_x, y) in store.so_by_p(p_pred) {
-                    new.push(IdTriple::new(y, tp, c));
+                    if is_entity_id(y) {
+                        new.push(IdTriple::new(y, tp, c));
+                    }
                 }
             }
         }
@@ -802,6 +836,35 @@ mod tests {
         let added = materialize(&mut d, &mut s);
         assert!(!added.is_empty());
         assert!(s.exists(alice, parent_p, bob)); // mother ⊑ₚ parent
+    }
+
+    /// Regression: `p range c` with `x p "lit"` used to infer `"lit" a c` — a
+    /// triple whose subject is a literal. Only entity objects are typed.
+    #[test]
+    fn range_never_types_a_literal_object() {
+        let mut d = Dictionary::new();
+        let typ = pred(&mut d, RDF_TYPE);
+        let rng = pred(&mut d, RDFS_RANGE);
+        let name_p = pred(&mut d, "name");
+        let name_e = ent(&mut d, "name");
+        let label = ent(&mut d, "Label");
+        let alice = ent(&mut d, "alice");
+        let bob = ent(&mut d, "bob");
+        let lit = d.intern_literal(&Term::plain_literal("Alice").dict_key());
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(name_e, rng, label));
+        s.insert(IdTriple::new(alice, name_p, lit));
+        s.insert(IdTriple::new(alice, name_p, bob));
+
+        let added = materialize(&mut d, &mut s);
+        assert!(!s.exists(lit, typ, label), "a literal was typed");
+        assert!(
+            added.iter().all(|t| is_entity_id(t.sub)),
+            "inferred a literal subject: {added:?}"
+        );
+        // The entity object is still typed.
+        assert!(s.exists(bob, typ, label));
+        assert_eq!(added.len(), 1);
     }
 
     #[test]

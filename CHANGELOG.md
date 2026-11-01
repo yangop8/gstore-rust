@@ -9,8 +9,10 @@ phases. Phases 0 and 1 (durability and hardening; the upstream `/api`
 server) and Phases 2 and 3 (graph functions; SPARQL 1.1 and Top-K) were
 developed in parallel from the same base and merged; Phase 5 (RDF import,
 gconsole, zip, logging and packaging) was developed from the Phase 1 head
-and merged after them. The integration sections record what joining them
-changed; the following ones each phase, newest first.
+and merged after them; Phase 4 (reasoning rules and PFN functions) was
+developed from the Phases 0–3 head and merged last. The integration
+sections record what joining them changed, newest first; the following
+ones each phase, newest first.
 
 ### Integrating Phase 5 with Phases 0–3
 
@@ -402,6 +404,208 @@ changed; the following ones each phase, newest first.
 - The legacy REST payload endpoints (`/upload`, the `/batchInsert` body)
   still parse whole and drop graph labels.
 - JSON-LD `@graph` with an `@id` is flattened into the default graph.
+
+### Phase 4: reasoning rules and PFN functions (GAP_PLAN §3.2, §3.3)
+
+Upstream gStore 1.4's two user-programmable features reach the `/api`
+server: inference rules (`reasonManage`) and personalized graph functions
+(PFN: `funquery` / `funcudb` / `funreview`, `PFN.name({…})` in queries).
+They were built in parallel and merged; *Joining them* records what the
+merge changed. Every deliberate difference from upstream is listed at the
+end.
+
+#### Reasoning rules (`reasonManage`)
+
+- **`reasonManage` (types 1-8)** on the `/api` server — add, list, compile,
+  execute, disable, show, delete, check upstream gStore 1.4's JSON inference
+  rules, with upstream's parameters (`db_name`, `type`, `ruleinfo`,
+  `rulename`), response fields (`list`/`num`; `insert_sparql`,
+  `delete_sparql`, `check_sparql`; `insert_sparql`, `select_sparql`,
+  `AnsNum`; `delete_sparql`, `AnsNum`; `ruleinfo`; `check_sparql`,
+  `effectNum`), status strings (`新建`, `已编译`, `已执行`, `已失效`,
+  `已校验`), codes and messages. Root (and `admin` users) only, as upstream.
+  Rules live in `<db>.db/reason_rule_files/<rulename>.json` (upstream's
+  layout; compact JSON, sorted keys), survive unload / load and restarts, and
+  are carried by `backup` / `restore` (also the library's `Database::backup`,
+  `backup_dir`, `restore_into` and `restore_incremental`) and removed by
+  `drop`.
+- **Compiler** (`reason::compile`): upstream's `insert`, `delete`, `check`
+  and `select` statements byte for byte, relation (`type` 1) and property
+  (`type` 0) rules, `logic` 0 (`UNION`) and 1 (join), filters. Inferred
+  triples use upstream's `<Rule:label>` predicates.
+- **Execution** goes through the database's normal update path (query cache,
+  CSR, write-through, update / redo logs, commit point, check_point save,
+  query log, task registry and cancellation); refused (`1004`) while a
+  transaction is open on the database.
+- **Exact retraction**: each rule records the triples it owns
+  (`reason_rule_files/inferred/<rulename>.nt`, created empty by add); the
+  conditions are evaluated once per execution and exactly what that
+  evaluation derived is inserted; disabling deletes exactly those no other
+  rule owns. A rule file without a record (written by upstream gStore, in
+  any status) is retracted upstream's way from its validated label alone,
+  and re-executing it takes its existing triples over. An execution that
+  fails having inserted nothing leaves the rule as it was.
+- **Hardening**: every pattern / `return` term must be one SPARQL term, every
+  filter one bracket-balanced expression, the label part of one IRI, and
+  `return` variables must be bound — validated with the crate's own lexer and
+  parser, and the compiled statements are parsed again and shape-checked.
+  Execute only ever runs the statement compiled from the definition. Rule
+  names must be safe file names (an existing rule file's name only has to
+  stay inside the rule directory); at most 1000 rules per database, 1 MiB
+  per rule file (fixed limits: there are no `conf.ini` keys). Backups copy
+  the rule directory under its lock; `drop` / `restore` replace it under it,
+  and the file operations are refused (`1007`) while a lifecycle operation
+  holds the database.
+- **Library API**: `Database::reason_add`, `reason_list`, `reason_compile`,
+  `reason_execute`, `reason_disable`, `reason_show`, `reason_delete`,
+  `reason_check`, `reason_db_dir`, `set_reason_db_dir`; a database without a
+  directory keeps its rules in memory (and writes them into its backups and
+  saves); `into_memory` reads a database's rules into memory with it.
+- **Fix: RDFS range** no longer infers `"lit" rdf:type C` — a triple with a
+  literal subject — from `p rdfs:range C` and `x p "lit"`.
+
+#### PFN personalized functions (`docs/PFN.md`)
+
+- **New: `funquery`, `funcudb`, `funreview` on `/api`** (upstream
+  `ApiPFNOperation.cpp`), open to every user (as upstream grants them) and
+  acting on the caller's own functions only. `funcudb` `type` `1`/`2`/`3`/`4`
+  creates, updates, deletes and compiles, with upstream's messages
+  (`"Function create success."`, `"Function build fail: …"`, a compilation
+  error answered as the compiler's message, the `1003` parameter errors);
+  `funquery` lists upstream's six `funInfo` fields filtered by `funName` /
+  `funStatus`; `funreview` returns the generated module text, URL-encoded.
+  Statuses `"1"` (not compiled), `"2"` (compiled), `"3"` (failed);
+  `funBody` / `funSubs` are URL-decoded as upstream does. Functions are
+  stored as upstream stores them, per user: `<pfn_base_path>/src/<user>/
+  data.json` (+ the generated source) and `lib/<user>/lib<name><md5>.wasm`.
+- **New: `SELECT (PFN.name({…}) AS ?v)` is evaluated** (it was a query
+  error): with upstream's projection shape and argument handling
+  (`pfnQuery` / `pfnQueryByVar`: the argument canonicalized, `"?x"` values
+  replaced by every distinct binding, one call per combination in sorted
+  order, the outputs as a JSON array; one call with the argument as written
+  when there is no solution). The `/api` `query` operation answers upstream's
+  `{"results": …}` document (without `AnsNum` / `OutputLimit` / `ThreadId`
+  for a statement starting `select (pfn.`); elsewhere the value is a plain
+  literal. A query calls the functions of the user it runs for.
+- **Runtime: sandboxed WebAssembly, new optional feature `pfn-wasm`**
+  (`wasmi` 2.0.0 with `std`, `validate`, `auto-dispatch` only; `wat` 1.263.0
+  without the component model). The default build gains no dependency.
+  A body is WebAssembly text wrapped into a module that imports the
+  `"gstore"` host interface (`GraphCtx`: vertex / edge / predicate counts,
+  per-predicate out- / in-degrees and neighbours, id ↔ string, the
+  arguments, `emit*` output); a complete `(module …)` or a
+  `wasm-base64:` binary module is accepted too. Compilation validates the
+  module and its imports / exports and refuses WASI, other imports and
+  start functions. Each call runs in a fresh instance under an instruction
+  budget (fuel, checked with the query's cancel flag between slices, so
+  `operationTaskCancel` and `/cancel` stop a looping function), a memory cap,
+  the `gfun_max_output_bytes` output bound and bounds-checked guest
+  pointers; traps are query errors. Without the feature, management works and
+  compiling / calling fail with an error naming `pfn-wasm`. CI builds,
+  lints and tests the feature.
+- **New `conf.ini` `[pfn]` section** (Rust extension): `pfn_fuel_per_call`
+  (10^9), `pfn_max_memory_pages` (1024), `pfn_max_module_bytes` (1 MiB),
+  `pfn_max_functions` (100), applied with the `[query]` settings (and by
+  `refreshconf`); upstream's `[system] pfn_base_path` now places the
+  functions (default `<db_home>/pfn`, read at startup).
+- **API:** `gstore::pfn` (`PfnRegistry`, `PfnCaller`, `PfnInfo`,
+  `PfnLimits`, `GraphCtx` / `CsrGraphCtx`, `ResolvedFn`),
+  `Evaluator::with_pfn`, `Database::set_pfn_caller` / `pfn_caller` /
+  `set_pfn_limits` / `pfn_limits` / `query_as`, `QuerySettings::pfn`,
+  `ApiServer::pfn_registry`. `ConcurrentDb` snapshots, version views and
+  transactions, and HTTP transaction snapshots carry the caller.
+- **Query cache:** PFN queries are never cached (their result depends on
+  the caller and on the function's version) — now documented and tested.
+- **Changed tests:** `config::every_key_is_read_from_its_section` reads a
+  `[pfn]` section too (it requires every known key), and the
+  `QuerySettings` literals of two existing tests gained the `pfn` field;
+  an engine test calls graph functions through the new projection-call
+  dispatcher; the two tests that expected "PFN not supported yet" expect
+  the new "no PFN function registry is attached" error. No assertion was
+  weakened.
+
+#### Joining them
+
+- **Rules, graph functions and PFN functions share the caches.** Executing
+  or disabling a rule changes the data through the update path, so the
+  query cache and the CSR the graph functions and PFN functions run on are
+  rebuilt: a cached SELECT, `kHopCount` / `shortestPathLen` and a PFN
+  function see the inferred `<Rule:label>` edges after execute and lose
+  them after disable, on a CSR preloaded with `loadcsr` too
+  (`tests/dt_phase4_wiring.rs`, the PFN part with `pfn-wasm`).
+- **Fixed: rules of a database the REST layer built.** A database built or
+  created in memory by REST has no home directory, so its rules followed
+  the served directory only once a `reasonManage` call had reached it, and
+  REST `/backup` until then wrote none. Every served database now keeps its
+  rules in the directory it is served from (`DbSlot::handle`); the
+  per-call fix-up in `reasonManage` and the extra rule copy in `/api`
+  `backup` are gone.
+- **Configuration.** `conf/conf.ini.example` documents `[system]
+  pfn_base_path` (an upstream key its shipped file leaves out), says that
+  `refreshconf` re-applies `[pfn]`, and lists the reasoning rules' fixed
+  limits; tested: `refreshconf` changes `pfn_max_functions` for the
+  registry and `pfn_fuel_per_call` for a database loaded before it.
+- **Privileges.** As upstream's `check_privilege`: a user created with
+  `usermanage` holds no privilege and still manages their own PFN
+  functions, `reasonManage` stays root's (`1004 "You have no reasonManage
+  privilege"`), and `showuser` lists upstream's seven privileges — Phase 4
+  adds none. Tested.
+- **Docs.** `docs/GAP_PLAN.md` records §3.2 and §3.3 as done (the PFN
+  runtime decision: WebAssembly in `wasmi`); `docs/CPP_PARITY.md` gains
+  rows for both.
+
+#### Deliberate divergences from upstream
+
+Reasoning rules (also in the README's *Reasoning* section):
+
+- Retraction is exact (see above). Upstream's `delete where {?x
+  <Rule:label> ?y.}` also deletes triples asserted with that predicate
+  before the rule ran and triples another rule with the same label
+  inferred; a triple a user inserts *after* the rule inferred it is the
+  same RDF triple and is retracted with the rule here too. Disabling a
+  compiled rule that was never executed deletes nothing.
+- Rules are validated (see *Hardening*); upstream splices the strings into
+  SPARQL verbatim, so a rule could inject SPARQL. Prefixed names are
+  refused (a rule has no `PREFIX`es). Rule names must be safe file names
+  (no `/`, `\`, `..`, leading `.` or control characters, at most 128
+  characters and 240 bytes), and the number and size of rules are bounded.
+- Execute runs the statement compiled from the rule's definition, never
+  text stored in the file: a rule edited after compiling must be compiled
+  again, and compiled fields a client sends with `add` are dropped.
+- An executed rule cannot be recompiled (upstream allows it, resets the
+  status to `已编译` and so lets the rule be deleted with its triples left
+  behind); checking an executed rule keeps it `已执行`.
+- A top-level `||` filter among several is parenthesized (upstream's plain
+  `&&` join would change its meaning).
+- `type` may be a JSON number and `ruleinfo` a string holding the object;
+  `list` is sorted by name; a missing `rulename` answers `1003`; a database
+  that does not exist answers `1005 "database[<db>] does not exist"`
+  (upstream creates its directory).
+- Execute and disable are refused (`1004`) while a transaction is open;
+  check reads the transaction's snapshot. Execute, disable and check write
+  a query-log record and register a cancellable task.
+- Upstream's documentation shows the compiled text with extra spaces; the
+  text here is what its 1.4 code produces.
+
+PFN functions (all in `docs/PFN.md`):
+
+- WebAssembly text run in a sandbox instead of C++ compiled with `g++` and
+  `dlopen()`ed: upstream function bodies must be rewritten; the management
+  API, the call syntax and the answers are upstream's.
+- Limits where upstream has none: instruction budget, memory cap, module
+  size, functions per user, output bounded by `gfun_max_output_bytes`.
+- A function returning `0` fails the query (upstream ignores the `bool`).
+- A call whose argument names no variable runs once next to WHERE
+  solutions (upstream answers `[]`).
+- `lastTime` is stamped on create / update / compile (upstream: compile
+  only); names are SPARQL words of at most 64 characters; sources live
+  under `src/` instead of `cpp/`, modules are `.wasm` instead of `.so`, and
+  update deletes the old module (upstream leaves the stale `.so`).
+- `funquery` paging (`pageNo` / `pageSize`) is an extension; without
+  `pfn_base_path` the functions live under `<db_home>/pfn` (upstream:
+  `./pfn/` relative to its working directory).
+- Outside the `/api` `query` JSON / file answers a PFN value is a plain
+  literal (upstream replaces the result document in every JSON form).
 
 ### Phase 3: SPARQL 1.1 grammar and semantics
 

@@ -439,6 +439,12 @@ pub(crate) struct ReadSnapshot {
     allow_service: bool,
     /// The database's graph-function output bound at `/begin`.
     gfun_max_output_bytes: usize,
+    /// The database's PFN limits at `/begin`.
+    pfn_limits: crate::pfn::PfnLimits,
+    /// The database's own PFN caller ([`Database::set_pfn_caller`]; a served
+    /// database has none — the server passes the user per read, see
+    /// [`query_as`](Self::query_as)).
+    pfn: Option<crate::pfn::PfnCaller>,
 }
 
 impl ReadSnapshot {
@@ -464,12 +470,26 @@ impl ReadSnapshot {
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
             allow_service: db.load_policy().allow_remote,
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
+            pfn_limits: db.pfn_limits(),
+            pfn: db.pfn_caller(),
         }
     }
 
     /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE). Updates are refused:
     /// the snapshot is read-only by construction.
     fn query(&self, sparql: &str, cancel: Option<Arc<AtomicBool>>) -> crate::Result<QueryResult> {
+        self.query_as(sparql, cancel, None)
+    }
+
+    /// [`query`](Self::query) on behalf of `pfn` (the requesting user's PFN
+    /// functions, under the snapshot's PFN limits); `None` falls back to the
+    /// database's own caller, if any.
+    fn query_as(
+        &self,
+        sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> crate::Result<QueryResult> {
         let q = crate::parser::sparql::parse(sparql)?;
         if matches!(q, crate::parser::sparql::ast::Query::Update(_)) {
             return Err(GStoreError::Query(
@@ -490,6 +510,9 @@ impl ReadSnapshot {
         }
         if !self.functions.is_empty() {
             eval = eval.with_functions(self.functions.clone());
+        }
+        if let Some(caller) = pfn.or(self.pfn.as_ref()) {
+            eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
         }
         if let Some(c) = cancel {
             eval = eval.with_cancel(c);
@@ -580,6 +603,13 @@ impl DbSlot {
     ) -> DbHandle {
         db.set_load_policy(policy.clone());
         db.apply_query_settings(query);
+        // Its reasoning rules (`reasonManage`) are those of the directory it
+        // is served from — also for a database built or created in memory,
+        // which has no home directory — so that its own backups (REST
+        // `/backup`, `Database::backup`) carry them.
+        if db.reason_db_dir().as_deref() != Some(dir.as_path()) {
+            db.set_reason_db_dir(dir.clone());
+        }
         // Hold `dir`'s inter-process lock while serving it (`crate::db::dirlock`):
         // a database opened from `dir` already does; one built in memory and
         // saved there takes it now. Best effort — a database not on disk yet
@@ -1045,6 +1075,11 @@ pub(crate) struct ApiInner {
     /// the log (an embedded server; `gserver` opts in with
     /// [`ApiServer::with_log_refresh`]).
     log_refresh: Mutex<Option<crate::logging::LogConfig>>,
+    /// Every user's PFN functions (`funquery` / `funcudb` / `funreview`,
+    /// `PFN.name(…)` in queries): under `conf.ini`'s `pfn_base_path` when it
+    /// is set, else `<root>/pfn`. A query calls the functions of the user it
+    /// runs for ([`pfn_caller`](Self::pfn_caller)).
+    pub(crate) pfn: Arc<crate::pfn::PfnRegistry>,
 }
 
 impl ApiInner {
@@ -1153,6 +1188,8 @@ impl ApiInner {
     /// database busy with a statement, a CSR build or a batch takes them
     /// the next time it is used ([`sync_query_settings`](Self::sync_query_settings)).
     pub(crate) fn apply_query_settings(&self, settings: QuerySettings) {
+        // The PFN registry checks the compile-time limits itself.
+        self.pfn.set_limits(settings.pfn);
         let loaded: Vec<DbHandle> = {
             let mut st = locked(&self.state);
             st.query_settings = settings;
@@ -1167,6 +1204,12 @@ impl ApiInner {
             };
             self.sync_query_settings(&mut slot);
         }
+    }
+
+    /// `user` calling the server's PFN functions (under the registry's
+    /// limits; a database replaces them with its own when the query runs).
+    pub(crate) fn pfn_caller(&self, user: &str) -> crate::pfn::PfnCaller {
+        crate::pfn::PfnCaller::new(Arc::clone(&self.pfn), user)
     }
 
     /// Bring a locked database's `[query]` settings up to date, if new ones
@@ -1290,6 +1333,9 @@ pub(crate) struct QueryJob {
     /// Whether `sparql` is an UPDATE (classified by the parser at dispatch).
     pub(crate) is_update: bool,
     pub(crate) fmt: ResultFormat,
+    /// The user the statement runs for: its `PFN.name(…)` calls reach this
+    /// user's functions (see [`ApiInner::pfn_caller`]).
+    pub(crate) user: String,
 }
 
 /// Ends a task when dropped — also when the query panics (then as failed) —
@@ -1340,6 +1386,10 @@ impl ApiServer {
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         let life = Lifecycle::new(addr);
+        let pfn = Arc::new(
+            crate::pfn::PfnRegistry::new(root.join("pfn"))
+                .with_limits(GStoreConfig::default().query_settings().pfn),
+        );
         Ok(ApiServer {
             inner: Arc::new(ApiInner {
                 state: Mutex::new(ApiState {
@@ -1370,6 +1420,7 @@ impl ApiServer {
                 self_ref: OnceLock::new(),
                 settings_gen: AtomicU64::new(0),
                 log_refresh: Mutex::new(None),
+                pfn,
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -1412,6 +1463,12 @@ impl ApiServer {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.check_point = config.check_point;
             inner.ipfilter = IpFilter::from_config(&config);
+            if config.is_set("pfn_base_path") {
+                inner.pfn = Arc::new(
+                    crate::pfn::PfnRegistry::new(config.pfn_base_path.clone())
+                        .with_limits(config.query_settings().pfn),
+                );
+            }
             *inner.config.get_mut().unwrap_or_else(PoisonError::into_inner) = Arc::new(config);
         }
         self
@@ -1522,6 +1579,11 @@ impl ApiServer {
     /// [`with_query_settings`](Self::with_query_settings)).
     pub fn query_settings(&self) -> QuerySettings {
         locked(&self.inner.state).query_settings
+    }
+
+    /// The registry of every user's PFN functions (see [`crate::pfn`]).
+    pub fn pfn_registry(&self) -> Arc<crate::pfn::PfnRegistry> {
+        Arc::clone(&self.inner.pfn)
     }
 
     /// Bound the time a graceful shutdown waits for in-flight requests before
@@ -1927,12 +1989,15 @@ impl ApiInner {
             let snapshot = Arc::clone(&open.snapshot);
             drop(slot);
             return snapshot
-                .query(&job.sparql, Some(job.cancel))
+                .query_as(&job.sparql, Some(job.cancel), Some(&self.pfn_caller(&job.user)))
                 .map(JobOutput::Read)
                 .map_err(|e| OpError::new(OpErrorKind::Query, e.to_string()));
         }
         let before = slot.db.mutation_count();
-        let result = slot.db.query_cancellable(&job.sparql, job.cancel);
+        let caller = self.pfn_caller(&job.user);
+        let result = slot
+            .db
+            .query_as(&job.sparql, Some(job.cancel), Some(&caller));
         // Whether data changed — also by an UPDATE that failed part-way: the
         // operations before the failing one stay applied, so the database is
         // dirty and (under check_point) saved like after any other write.
@@ -2334,6 +2399,7 @@ impl ApiInner {
             sparql,
             is_update,
             fmt,
+            user: user.to_string(),
         })
     }
 
@@ -3096,7 +3162,7 @@ impl ApiInner {
             self.register_task(&mut st, name, sparql, user)
         };
         let mut task = TaskGuard::new(self, task_id);
-        let out = self.run_in_txn(dbh, name, tid, sparql, Some(cancel));
+        let out = self.run_in_txn(dbh, name, tid, sparql, Some(cancel), user);
         task.set_ok(out.is_ok());
         out
     }
@@ -3114,6 +3180,7 @@ impl ApiInner {
         tid: u64,
         sparql: &str,
         cancel: Option<Arc<AtomicBool>>,
+        user: &str,
     ) -> Result<QueryResult, OpError> {
         let mut slot = locked(dbh);
         if slot.retired || slot.txn.as_ref().map(|t| t.tid) != Some(tid) {
@@ -3124,10 +3191,9 @@ impl ApiInner {
         }
         self.sync_query_settings(&mut slot);
         let before = slot.db.mutation_count();
-        let result = match cancel {
-            Some(cancel) => slot.db.query_cancellable(sparql, cancel),
-            None => slot.db.query(sparql),
-        };
+        let result = slot
+            .db
+            .query_as(sparql, cancel, Some(&self.pfn_caller(user)));
         // Also a failing UPDATE may have applied part of its operations.
         if slot.db.mutation_count() != before {
             if let Some(open) = slot.txn.as_mut() {
@@ -3776,7 +3842,14 @@ impl ApiInner {
             return Resp::fail(400, "missing op_username");
         };
         match st.users.drop_user(&name) {
-            Ok(()) => Resp::ok(&format!("user '{name}' dropped")),
+            // Its PFN functions go with it (see `PfnRegistry::drop_user`).
+            Ok(()) => match self.pfn.drop_user(&name) {
+                Ok(()) => Resp::ok(&format!("user '{name}' dropped")),
+                Err(e) => Resp::fail(
+                    500,
+                    &format!("user '{name}' dropped, but removing its PFN functions failed: {e}"),
+                ),
+            },
             Err(e) => Resp::fail(400, &e),
         }
     }
@@ -5581,6 +5654,10 @@ mod tests {
                 dpb: DpbMode::Off,
             },
             gfun_max_output_bytes: 777,
+            pfn: crate::pfn::PfnLimits {
+                fuel_per_call: 4242,
+                ..crate::pfn::PfnLimits::default()
+            },
         };
         let root = tmp_root("qsettings");
         let server = Arc::new(
@@ -5589,6 +5666,8 @@ mod tests {
                 .with_query_settings(custom),
         );
         assert_eq!(server.query_settings(), custom);
+        // The PFN registry checks the same [pfn] limits.
+        assert_eq!(server.pfn_registry().limits(), custom.pfn);
         let addr = server.local_addr().expect("addr");
         let s2 = Arc::clone(&server);
         std::thread::spawn(move || s2.serve_forever());
