@@ -18,13 +18,17 @@ use gstore::Database;
 
 const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n";
 
-/// A unique temp directory for one server's databases + logs + user store.
+/// A unique, empty temp directory for one server's databases + logs + user
+/// store. A directory left at the same path by an earlier run whose process
+/// had the same id (pids are reused) is removed, so its users and databases
+/// never leak into this run.
 fn tmp_root(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let mut p = std::env::temp_dir();
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     p.push(format!("gstore_api_{tag}_{pid}_{n}"));
+    let _ = std::fs::remove_dir_all(&p);
     p
 }
 

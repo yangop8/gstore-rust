@@ -28,10 +28,14 @@ const DATA: &str = "@prefix : <http://ex/> .\n\
 :a :knows _:x .\n\
 _:x :name \"Bob\" .\n";
 
+/// A unique, empty server root (a leftover of an earlier run with the same
+/// pid is removed first: pids are reused).
 fn tmp_root(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("gstore_gapi_{tag}_{}_{n}", std::process::id()))
+    let p = std::env::temp_dir().join(format!("gstore_gapi_{tag}_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    p
 }
 
 fn serve(server: ApiServer) -> (Arc<ApiServer>, SocketAddr) {
