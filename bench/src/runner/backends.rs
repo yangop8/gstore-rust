@@ -89,7 +89,8 @@ pub fn build(
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     }
-    fs::create_dir_all(work_dir).map_err(|e| format!("cannot create {}: {e}", work_dir.display()))?;
+    fs::create_dir_all(work_dir)
+        .map_err(|e| format!("cannot create {}: {e}", work_dir.display()))?;
     let mut res = match builder {
         "cli" => build_cli(backend, bin_dir, gbuild_args, work_dir, data, w)?,
         "lib" => build_lib(backend, &dir, data, w)?,
@@ -141,8 +142,19 @@ fn build_cli(
     let peak_rss_mib = sys::children_peak_rss_mib();
     if !status.success() {
         let text = fs::read_to_string(&log_path).unwrap_or_default();
-        let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-        return Err(format!("{} {} failed ({status}):\n{tail}", exe.display(), args.join(" ")));
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return Err(format!(
+            "{} {} failed ({status}):\n{tail}",
+            exe.display(),
+            args.join(" ")
+        ));
     }
     let mut command = vec![exe.to_string_lossy().into_owned()];
     command.extend(args);
@@ -154,7 +166,12 @@ fn build_cli(
     })
 }
 
-fn build_lib(backend: &str, dir: &Path, data: &Path, w: &dyn Workload) -> Result<BuildResult, String> {
+fn build_lib(
+    backend: &str,
+    dir: &Path,
+    data: &Path,
+    w: &dyn Workload,
+) -> Result<BuildResult, String> {
     use gstore::Database;
     let started = Instant::now();
     let files = [data];

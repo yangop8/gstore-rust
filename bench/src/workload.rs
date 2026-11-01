@@ -141,11 +141,7 @@ impl WorkloadSpec {
 
 /// Generate a workload's data set (or chunk) into `out` through a 1 MiB
 /// buffer, hashing what is written.
-pub fn generate_to(
-    w: &dyn Workload,
-    out: &mut dyn Write,
-    chunk: bool,
-) -> io::Result<GenStats> {
+pub fn generate_to(w: &dyn Workload, out: &mut dyn Write, chunk: bool) -> io::Result<GenStats> {
     let mut hw = HashingWriter::new(out);
     let mut stats = {
         let mut buf = BufWriter::with_capacity(1 << 20, &mut hw);
@@ -188,14 +184,21 @@ fn tiny_triples(n: u64, base: &str, out: &mut dyn Write) -> io::Result<u64> {
     for i in 0..n {
         let s = format!("<{base}p{i}>");
         let kind = if i % 3 == 0 { "Student" } else { "Teacher" };
-        writeln!(out, "{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{TINY}{kind}> .")?;
+        writeln!(
+            out,
+            "{s} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{TINY}{kind}> ."
+        )?;
         writeln!(out, "{s} <{TINY}name> \"person {i}\" .")?;
         writeln!(out, "{s} <{TINY}knows> <{base}p{}> .", (i * 7 + 3) % n)?;
         writeln!(out, "{s} <{TINY}knows> <{base}p{}> .", (i + 1) % n)?;
         lines += 4;
         if i % 4 != 0 {
             // Some people have no age: OPTIONAL then leaves ?a unbound.
-            writeln!(out, "{s} <{TINY}age> \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer> .", 18 + i % 50)?;
+            writeln!(
+                out,
+                "{s} <{TINY}age> \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
+                18 + i % 50
+            )?;
             lines += 1;
         }
         writeln!(out, "{s} <{TINY}memberOf> <{TINY}group{}> .", i % 5)?;
@@ -252,11 +255,26 @@ impl Workload for Tiny {
             text: format!("PREFIX t: <{TINY}>\n{body}\n"),
         };
         vec![
-            q("t1", "SELECT ?x WHERE { ?x a t:Student . ?x t:memberOf t:group1 . }"),
-            q("t2", "SELECT ?x ?y WHERE { ?x t:knows ?y . ?y a t:Student . ?x a t:Student . }"),
-            q("t3", "SELECT ?x ?a WHERE { ?x a t:Teacher . OPTIONAL { ?x t:age ?a } }"),
-            q("t4", "SELECT ?x WHERE { { ?x t:memberOf t:group2 } UNION { ?x t:memberOf t:group3 } }"),
-            q("t5", "SELECT ?x ?n WHERE { ?x t:name ?n . ?x t:age ?a . FILTER(?a > 40) }"),
+            q(
+                "t1",
+                "SELECT ?x WHERE { ?x a t:Student . ?x t:memberOf t:group1 . }",
+            ),
+            q(
+                "t2",
+                "SELECT ?x ?y WHERE { ?x t:knows ?y . ?y a t:Student . ?x a t:Student . }",
+            ),
+            q(
+                "t3",
+                "SELECT ?x ?a WHERE { ?x a t:Teacher . OPTIONAL { ?x t:age ?a } }",
+            ),
+            q(
+                "t4",
+                "SELECT ?x WHERE { { ?x t:memberOf t:group2 } UNION { ?x t:memberOf t:group3 } }",
+            ),
+            q(
+                "t5",
+                "SELECT ?x ?n WHERE { ?x t:name ?n . ?x t:age ?a . FILTER(?a > 40) }",
+            ),
         ]
     }
 

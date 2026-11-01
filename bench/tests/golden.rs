@@ -37,7 +37,12 @@ fn splitmix_golden_sequences() {
     let v: Vec<u64> = (0..4).map(|_| r.next_u64()).collect();
     assert_eq!(
         v,
-        [0xe220a8397b1dcdaf, 0x6e789e6aa1b965f4, 0x06c45d188009454f, 0xf88bb8a8724c81ec]
+        [
+            0xe220a8397b1dcdaf,
+            0x6e789e6aa1b965f4,
+            0x06c45d188009454f,
+            0xf88bb8a8724c81ec
+        ]
     );
     let mut r = SplitMix64::new(42);
     let below: Vec<u64> = (0..8).map(|_| r.below(10)).collect();
@@ -87,7 +92,10 @@ fn lubm_univ1_seed0_is_pinned_and_deterministic() {
     assert_eq!(s1, s2, "deterministic");
     assert_eq!(sink.0.finish(), s1.fnv64);
     assert_eq!(hex(s1.fnv64), "b45d2e4d786f1a33");
-    assert_eq!((s1.lines, s1.unique_triples, s1.bytes), (143_930, 139_905, 25_325_755));
+    assert_eq!(
+        (s1.lines, s1.unique_triples, s1.bytes),
+        (143_930, 139_905, 25_325_755)
+    );
     // unique_triples counts exactly the distinct lines.
     let text = std::str::from_utf8(&data).unwrap();
     let distinct: HashSet<&str> = text.lines().collect();
@@ -95,7 +103,10 @@ fn lubm_univ1_seed0_is_pinned_and_deterministic() {
     // Within ±5% of the prototype's 143K triples at univ 1.
     assert!((136_000..=150_600).contains(&s1.unique_triples));
     // Another seed gives other data.
-    let other = Lubm { seed: 1, ..w.clone() };
+    let other = Lubm {
+        seed: 1,
+        ..w.clone()
+    };
     assert_ne!(gen(&other, false).0.fnv64, s1.fnv64);
 }
 
@@ -127,14 +138,23 @@ fn micro_data_and_chunk_are_pinned_and_disjoint() {
     assert_eq!(hex(s.fnv64), "d5f50a8e697fc892");
     assert_eq!((s.lines, s.unique_triples), (7_521, 7_491));
     let (c, chunk) = gen(&w, true);
-    assert_eq!(c.lines, c.unique_triples, "the chunk has no duplicate lines");
+    assert_eq!(
+        c.lines, c.unique_triples,
+        "the chunk has no duplicate lines"
+    );
     let data: HashSet<&str> = std::str::from_utf8(&data).unwrap().lines().collect();
     let chunk_text = std::str::from_utf8(&chunk).unwrap();
     let chunk_lines: HashSet<&str> = chunk_text.lines().collect();
     assert_eq!(chunk_lines.len() as u64, c.unique_triples);
-    assert!(chunk_lines.is_disjoint(&data), "the chunk is disjoint from the data");
+    assert!(
+        chunk_lines.is_disjoint(&data),
+        "the chunk is disjoint from the data"
+    );
     for l in &chunk_lines {
-        assert!(l.starts_with("<http://www.Department0.University1.edu"), "{l}");
+        assert!(
+            l.starts_with("<http://www.Department0.University1.edu"),
+            "{l}"
+        );
     }
 }
 
@@ -143,7 +163,11 @@ fn query_texts_are_pinned() {
     assert_eq!(QUERIES.len(), 14);
     for ((name, text), (pname, h)) in QUERIES.iter().zip(QUERY_TEXT_FNV64.iter()) {
         assert_eq!(name, pname);
-        assert_eq!(fnv64(text.as_bytes()), *h, "{name}: testdata/lubm/lubm_{name}.rq changed");
+        assert_eq!(
+            fnv64(text.as_bytes()),
+            *h,
+            "{name}: testdata/lubm/lubm_{name}.rq changed"
+        );
     }
 }
 
@@ -156,7 +180,11 @@ fn rows(db: &mut Database, text: &str) -> usize {
 
 fn build(w: &dyn Workload) -> Database {
     let (_, data) = gen(w, false);
-    let dir = std::env::temp_dir().join(format!("gsb-golden-{}-{}", w.file_stem(), std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "gsb-golden-{}-{}",
+        w.file_stem(),
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let f = dir.join("data.nt");
     std::fs::write(&f, &data).unwrap();
@@ -184,7 +212,10 @@ fn all_queries_answer_at_univ1_and_micro_counts_are_pinned() {
     let mut db = build(&micro);
     assert_eq!(db.triple_num(), 7_491);
     let counts: Vec<usize> = QUERIES.iter().map(|(_, t)| rows(&mut db, t)).collect();
-    assert_eq!(counts, [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]);
+    assert_eq!(
+        counts,
+        [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]
+    );
 }
 
 #[test]

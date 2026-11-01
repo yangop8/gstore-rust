@@ -166,7 +166,11 @@ mod tests {
         let h1 = rows_fnv64(&[a.clone(), b.clone()]);
         let h2 = rows_fnv64(&[b.clone(), a.clone()]);
         assert_eq!(h1, h2, "order does not matter");
-        assert_ne!(h1, rows_fnv64(&[a.clone(), b.clone(), a.clone()]), "duplicates count");
+        assert_ne!(
+            h1,
+            rows_fnv64(&[a.clone(), b.clone(), a.clone()]),
+            "duplicates count"
+        );
         assert_ne!(h1, rows_fnv64(std::slice::from_ref(&a)));
         // Unbound differs from the empty string.
         let unbound = vec![None];

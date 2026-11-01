@@ -500,7 +500,11 @@ impl Lubm {
         }
         if u == 0 && d == 0 && !gc0_taken {
             // Q1/Q10
-            out.t(&e("GraduateStudent0"), &v.takes_course, &e("GraduateCourse0"))?;
+            out.t(
+                &e("GraduateStudent0"),
+                &v.takes_course,
+                &e("GraduateCourse0"),
+            )?;
         }
 
         for (k, &(fi, p)) in publications.iter().enumerate() {
@@ -510,7 +514,11 @@ impl Lubm {
             out.t(&s, &v.name, &lit(&format!("Publication{p}")))?;
             out.t(&s, &v.publication_author, &e(author))?;
             for g in &coauthors[k] {
-                out.t(&s, &v.publication_author, &e(&format!("GraduateStudent{g}")))?;
+                out.t(
+                    &s,
+                    &v.publication_author,
+                    &e(&format!("GraduateStudent{g}")),
+                )?;
             }
         }
 

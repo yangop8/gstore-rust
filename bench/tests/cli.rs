@@ -58,7 +58,10 @@ fn builder(tmp: &Path, rocksdb: bool) -> String {
         return "lib".into();
     }
     if rocksdb && !gbuild_has_rocksdb(tmp) {
-        eprintln!("note: {} lacks --features rocksdb; using the library builder", gbuild().display());
+        eprintln!(
+            "note: {} lacks --features rocksdb; using the library builder",
+            gbuild().display()
+        );
         return "lib".into();
     }
     "cli".into()
@@ -131,7 +134,11 @@ const RELAXED: &str = r#"{
 }"#;
 
 fn ok(r: &(i32, String, String), what: &str) {
-    assert_eq!(r.0, 0, "{what}: exit {}\nstdout:\n{}\nstderr:\n{}", r.0, r.1, r.2);
+    assert_eq!(
+        r.0, 0,
+        "{what}: exit {}\nstdout:\n{}\nstderr:\n{}",
+        r.0, r.1, r.2
+    );
 }
 
 #[test]
@@ -144,7 +151,16 @@ fn micro_bless_check_compare_report_and_canary() {
     let relaxed = t.path("relaxed.json");
     std::fs::write(&relaxed, RELAXED).unwrap();
 
-    let mut a = args(&["bless", "--profile", "micro", "--to", &base, "--provisional", "--note", "test"]);
+    let mut a = args(&[
+        "bless",
+        "--profile",
+        "micro",
+        "--to",
+        &base,
+        "--provisional",
+        "--note",
+        "test",
+    ]);
     a.extend(c.clone());
     ok(&bench(&a), "bless");
     let bl = BenchResult::load(Path::new(&base)).unwrap();
@@ -154,30 +170,65 @@ fn micro_bless_check_compare_report_and_canary() {
     let run = &bl.runs[0];
     assert_eq!(run.config.builder, b);
     let rows: Vec<u64> = run.queries.iter().map(|q| q.rows).collect();
-    assert_eq!(rows, [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]);
+    assert_eq!(
+        rows,
+        [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]
+    );
     assert_eq!(run.open.as_ref().unwrap().triple_num, 7_491);
     assert!(run.update.as_ref().unwrap().round_trip_ok());
     let conc = run.conc.as_ref().unwrap();
     assert!(conc.bodies_equal);
-    assert!(conc.points.iter().any(|p| p.endpoint == "sparql" && p.ok > 0));
+    assert!(conc
+        .points
+        .iter()
+        .any(|p| p.endpoint == "sparql" && p.ok > 0));
     assert!(conc.points.iter().any(|p| p.endpoint == "api" && p.ok > 0));
-    assert!(bl.workload.gen_ms.is_some(), "the first run generated the data");
+    assert!(
+        bl.workload.gen_ms.is_some(),
+        "the first run generated the data"
+    );
 
-    let mut a = args(&["check", "--baseline", &base, "--thresholds", &relaxed, "--out", &res]);
+    let mut a = args(&[
+        "check",
+        "--baseline",
+        &base,
+        "--thresholds",
+        &relaxed,
+        "--out",
+        &res,
+    ]);
     a.extend(c.clone());
     let r = bench(&a);
     ok(&r, "check");
     assert!(r.1.contains("### Gates: PASS"), "{}", r.1);
     let m = BenchResult::load(Path::new(&res)).unwrap();
-    assert!(m.workload.gen_ms.is_none(), "the second run reused the cached data");
+    assert!(
+        m.workload.gen_ms.is_none(),
+        "the second run reused the cached data"
+    );
     assert_eq!(m.workload.data_fnv64, bl.workload.data_fnv64);
 
     // The canary: the baseline against itself, every time tripled.
-    let r = bench(&args(&["check", "--baseline", &base, "--from", &base, "--self-test-slowdown", "3"]));
+    let r = bench(&args(&[
+        "check",
+        "--baseline",
+        &base,
+        "--from",
+        &base,
+        "--self-test-slowdown",
+        "3",
+    ]));
     assert_eq!(r.0, 1, "canary: {}{}", r.1, r.2);
     assert!(r.1.contains("FAIL (performance)"));
 
-    let r = bench(&args(&["compare", &base, &res, "--thresholds", &relaxed, "--markdown"]));
+    let r = bench(&args(&[
+        "compare",
+        &base,
+        &res,
+        "--thresholds",
+        &relaxed,
+        "--markdown",
+    ]));
     ok(&r, "compare");
     let r = bench(&args(&["report", &res, "--markdown", "--compare", &base]));
     ok(&r, "report");
@@ -190,7 +241,11 @@ fn micro_bless_check_compare_report_and_canary() {
     tampered.save(Path::new(&tp)).unwrap();
     let r = bench(&args(&["compare", &base, &tp, "--thresholds", &relaxed]));
     assert_eq!(r.0, 1);
-    assert!(r.1.contains("exact.rows") && r.1.contains("FAIL (exact)"), "{}", r.1);
+    assert!(
+        r.1.contains("exact.rows") && r.1.contains("FAIL (exact)"),
+        "{}",
+        r.1
+    );
     // The databases are gone.
     let left: Vec<_> = std::fs::read_dir(t.path("work")).unwrap().collect();
     assert!(left.is_empty(), "work directory not cleaned: {left:?}");
@@ -200,19 +255,43 @@ fn micro_bless_check_compare_report_and_canary() {
 fn injected_crash_and_timeout_exit_2() {
     let t = Tmp::new("inject");
     let c = common(&t, &builder(&t.0, false));
-    let base = ["run", "--profile", "micro", "--workload", "tiny", "--no-calibrate", "--no-conc", "--no-update"];
+    let base = [
+        "run",
+        "--profile",
+        "micro",
+        "--workload",
+        "tiny",
+        "--no-calibrate",
+        "--no-conc",
+        "--no-update",
+    ];
 
     let mut a = args(&base);
     a.extend(c.clone());
-    a.extend(args(&["--inject", "crash:query", "--out", &t.path("crash.json")]));
+    a.extend(args(&[
+        "--inject",
+        "crash:query",
+        "--out",
+        &t.path("crash.json"),
+    ]));
     let r = bench(&a);
     assert_eq!(r.0, 2, "crash: {}{}", r.1, r.2);
     assert!(r.2.contains("crashed"), "{}", r.2);
-    assert!(!Path::new(&t.path("crash.json")).exists(), "no result for a crashed run");
+    assert!(
+        !Path::new(&t.path("crash.json")).exists(),
+        "no result for a crashed run"
+    );
 
     let mut a = args(&base);
     a.extend(c.clone());
-    a.extend(args(&["--inject", "timeout:open", "--timeout-s", "4", "--out", &t.path("timeout.json")]));
+    a.extend(args(&[
+        "--inject",
+        "timeout:open",
+        "--timeout-s",
+        "4",
+        "--out",
+        &t.path("timeout.json"),
+    ]));
     let started = Instant::now();
     let r = bench(&a);
     assert_eq!(r.0, 2, "timeout: {}{}", r.1, r.2);
@@ -227,7 +306,18 @@ fn tiny_backends_agree_and_the_data_cache_regenerates() {
     let b = builder(&t.0, rocks);
     let c = common(&t, &b);
     let run = |backends: &str, out: &str| {
-        let mut a = args(&["run", "--profile", "micro", "--workload", "tiny", "--no-calibrate", "--backends", backends, "--out", out]);
+        let mut a = args(&[
+            "run",
+            "--profile",
+            "micro",
+            "--workload",
+            "tiny",
+            "--no-calibrate",
+            "--backends",
+            backends,
+            "--out",
+            out,
+        ]);
         a.extend(c.clone());
         bench(&a)
     };
@@ -242,16 +332,26 @@ fn tiny_backends_agree_and_the_data_cache_regenerates() {
     let others = if rocks { "disk,rocksdb" } else { "disk" };
     ok(&run(others, &b_json), "disk run");
     let rb = BenchResult::load(Path::new(&b_json)).unwrap();
-    assert!(rb.workload.gen_ms.is_some(), "regenerated after the sidecar was removed");
+    assert!(
+        rb.workload.gen_ms.is_some(),
+        "regenerated after the sidecar was removed"
+    );
     assert_eq!(rb.workload.data_fnv64, ra.workload.data_fnv64);
     for run in &rb.runs {
-        assert!(run.update.as_ref().unwrap().round_trip_ok(), "{}", run.backend);
+        assert!(
+            run.update.as_ref().unwrap().round_trip_ok(),
+            "{}",
+            run.backend
+        );
         assert!(run.conc.as_ref().unwrap().bodies_equal, "{}", run.backend);
     }
 
     // Merged, every backend answers alike (the self-check's cross-backend gate).
     let m = t.path("m.json");
-    ok(&bench(&args(&["merge", "--out", &m, &a_json, &b_json])), "merge");
+    ok(
+        &bench(&args(&["merge", "--out", &m, &a_json, &b_json])),
+        "merge",
+    );
     let merged = BenchResult::load(Path::new(&m)).unwrap();
     assert_eq!(merged.runs.len(), if rocks { 3 } else { 2 });
     let outcomes = self_check(&merged);
@@ -265,13 +365,34 @@ fn tiny_backends_agree_and_the_data_cache_regenerates() {
 fn gen_usage_and_calibrate() {
     let t = Tmp::new("gen");
     let out = t.path("micro.nt");
-    let r = bench(&args(&["gen", "--scale", "1", "--departments", "1", "--out", &out]));
+    let r = bench(&args(&[
+        "gen",
+        "--scale",
+        "1",
+        "--departments",
+        "1",
+        "--out",
+        &out,
+    ]));
     ok(&r, "gen");
     assert!(r.2.contains("unique_triples=7491"), "{}", r.2);
-    assert_eq!(hex(file_fnv64(Path::new(&out)).unwrap().0), "d5f50a8e697fc892");
+    assert_eq!(
+        hex(file_fnv64(Path::new(&out)).unwrap().0),
+        "d5f50a8e697fc892"
+    );
 
     assert_eq!(bench(&args(&["bogus"])).0, 2);
-    assert_eq!(bench(&args(&["run", "--backends", "nope", "--data-dir", &t.path("d")])).0, 2);
+    assert_eq!(
+        bench(&args(&[
+            "run",
+            "--backends",
+            "nope",
+            "--data-dir",
+            &t.path("d")
+        ]))
+        .0,
+        2
+    );
     assert_eq!(bench(&args(&["run", "--no-such-option"])).0, 2);
     assert_eq!(bench(&args(&["compare", "only-one.json"])).0, 2);
     let r = bench(&args(&["calibrate", "--quick"]));
@@ -284,10 +405,21 @@ fn gen_usage_and_calibrate() {
 #[ignore]
 fn micro_on_disk() {
     let t = Tmp::new("microdisk");
-    let mut a = args(&["run", "--profile", "micro", "--backends", "disk", "--out", &t.path("d.json")]);
+    let mut a = args(&[
+        "run",
+        "--profile",
+        "micro",
+        "--backends",
+        "disk",
+        "--out",
+        &t.path("d.json"),
+    ]);
     a.extend(common(&t, &builder(&t.0, false)));
     ok(&bench(&a), "micro disk");
     let r = BenchResult::load(Path::new(&t.path("d.json"))).unwrap();
     let rows: Vec<u64> = r.runs[0].queries.iter().map(|q| q.rows).collect();
-    assert_eq!(rows, [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]);
+    assert_eq!(
+        rows,
+        [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]
+    );
 }

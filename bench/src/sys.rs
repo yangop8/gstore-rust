@@ -141,7 +141,11 @@ pub fn mem_total_mib() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     s.lines().find_map(|l| {
         let rest = l.strip_prefix("MemTotal:")?;
-        rest.split_whitespace().next()?.parse::<u64>().ok().map(|k| k / 1024)
+        rest.split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|k| k / 1024)
     })
 }
 

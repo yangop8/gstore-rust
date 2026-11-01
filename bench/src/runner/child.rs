@@ -109,7 +109,9 @@ fn run(req: &ChildRequest) -> Result<serde_json::Value, String> {
     let db_dir = backends::db_dir(&req.work_dir, w.as_ref());
     match req.phase.as_str() {
         "calibrate" => to_value(crate::calib::calibrate(
-            Some(&req.work_dir).filter(|p| !p.as_os_str().is_empty()).map(|p| p.as_path()),
+            Some(&req.work_dir)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.as_path()),
             req.quick,
         )),
         "build" => to_value(backends::build(
@@ -128,7 +130,10 @@ fn run(req: &ChildRequest) -> Result<serde_json::Value, String> {
             to_value(conc::conc_phase(&db_dir, w.as_ref(), s)?)
         }
         "update" => {
-            let chunk = req.chunk_file.as_ref().ok_or("the update phase needs the chunk")?;
+            let chunk = req
+                .chunk_file
+                .as_ref()
+                .ok_or("the update phase needs the chunk")?;
             to_value(phases::update_phase(
                 &db_dir,
                 w.as_ref(),

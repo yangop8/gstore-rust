@@ -36,7 +36,11 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
         w.unique_triples
     );
     if r.provisional {
-        let _ = writeln!(s, "> **Provisional** baseline: {}\n", r.note.clone().unwrap_or_default());
+        let _ = writeln!(
+            s,
+            "> **Provisional** baseline: {}\n",
+            r.note.clone().unwrap_or_default()
+        );
     }
     let _ = writeln!(
         s,
@@ -50,11 +54,18 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
         s,
         "- commit `{}`{}, {} {} × {} CPUs{}, {}",
         r.env.git_commit.clone().unwrap_or_else(|| "?".into()),
-        if r.env.git_dirty == Some(true) { " (dirty)" } else { "" },
+        if r.env.git_dirty == Some(true) {
+            " (dirty)"
+        } else {
+            ""
+        },
         r.env.os,
         r.env.arch,
         r.env.nproc,
-        r.env.mem_total_mib.map(|m| format!(", {m} MiB")).unwrap_or_default(),
+        r.env
+            .mem_total_mib
+            .map(|m| format!(", {m} MiB"))
+            .unwrap_or_default(),
         r.env
             .loadavg
             .map(|l| format!("load {:.2} {:.2} {:.2}", l[0], l[1], l[2]))
@@ -105,7 +116,11 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
             opt(run.build.as_ref().and_then(|x| x.peak_rss_mib), f1),
             opt(run.build.as_ref().map(|x| x.dir_bytes as f64 / 1e6), f1),
             opt(run.open.as_ref().map(|x| x.first_ms), f1),
-            if run.open.as_ref().is_some_and(|o| o.cold) { " (cold)" } else { "" },
+            if run.open.as_ref().is_some_and(|o| o.cold) {
+                " (cold)"
+            } else {
+                ""
+            },
             opt(run.open.as_ref().map(|x| x.warm_ms), f1),
             opt(run.open.as_ref().and_then(|x| x.rss_after_open_mib), f1),
             opt(run.query_mem.as_ref().and_then(|x| x.hwm_mib), f1),
@@ -139,7 +154,11 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
         }
         s.push('\n');
         for n in names {
-            let rows = r.runs.iter().find_map(|x| x.query(n)).map(|q| q.rows.to_string());
+            let rows = r
+                .runs
+                .iter()
+                .find_map(|x| x.query(n))
+                .map(|q| q.rows.to_string());
             let _ = write!(s, "| {n} | {} |", rows.unwrap_or_else(|| "–".into()));
             for run in &r.runs {
                 let q = run.query(n);
@@ -150,11 +169,15 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
                     opt(q.map(|q| q.median_ms), f2)
                 );
                 if let Some(b) = base {
-                    let bq = b.run(&run.backend).and_then(|x| x.query(n)).map(|q| q.median_ms);
+                    let bq = b
+                        .run(&run.backend)
+                        .and_then(|x| x.query(n))
+                        .map(|q| q.median_ms);
                     let _ = write!(
                         s,
                         " {} |",
-                        q.map(|q| ratio_cell(q.median_ms, bq)).unwrap_or_else(|| "–".into())
+                        q.map(|q| ratio_cell(q.median_ms, bq))
+                            .unwrap_or_else(|| "–".into())
                     );
                 }
             }
@@ -187,7 +210,11 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
                     f1(u.reopen_ms),
                     u.entities_before,
                     u.entities_after,
-                    if u.round_trip_ok() { "ok" } else { "**FAILED**" }
+                    if u.round_trip_ok() {
+                        "ok"
+                    } else {
+                        "**FAILED**"
+                    }
                 );
             }
         }
@@ -213,9 +240,11 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
                         .and_then(|b| b.run(&run.backend))
                         .and_then(|x| x.conc.as_ref())
                         .and_then(|bc| {
-                            bc.points
-                                .iter()
-                                .find(|x| x.endpoint == p.endpoint && x.query == p.query && x.clients == p.clients)
+                            bc.points.iter().find(|x| {
+                                x.endpoint == p.endpoint
+                                    && x.query == p.query
+                                    && x.clients == p.clients
+                            })
                         })
                         .map(|x| x.qps);
                     let _ = writeln!(
@@ -229,8 +258,16 @@ pub fn markdown(r: &BenchResult, base: Option<&BenchResult>) -> String {
                         f2(p.mean_ms),
                         f2(p.p95_ms),
                         p.http_errors,
-                        if p.distinct_bodies == 1 { "identical" } else { "**differ**" },
-                        if base.is_some() { format!(" {} |", ratio_cell(p.qps, bq)) } else { String::new() }
+                        if p.distinct_bodies == 1 {
+                            "identical"
+                        } else {
+                            "**differ**"
+                        },
+                        if base.is_some() {
+                            format!(" {} |", ratio_cell(p.qps, bq))
+                        } else {
+                            String::new()
+                        }
                     );
                 }
             }
@@ -274,7 +311,10 @@ pub fn gates_markdown(outcomes: &[GateOutcome], failures_only: bool) -> String {
     if rows.is_empty() {
         return s;
     }
-    let _ = writeln!(s, "| result | gate | subject | base | measured | ratio | limit | detail |");
+    let _ = writeln!(
+        s,
+        "| result | gate | subject | base | measured | ratio | limit | detail |"
+    );
     let _ = writeln!(s, "|---|---|---|---:|---:|---:|---:|---|");
     for o in rows {
         let _ = writeln!(

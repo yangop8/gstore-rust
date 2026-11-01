@@ -86,7 +86,10 @@ impl Thresholds {
         let t: Thresholds =
             serde_json::from_str(text).map_err(|e| format!("invalid thresholds: {e}"))?;
         if t.schema != GATES_SCHEMA {
-            return Err(format!("thresholds schema '{}' is not {GATES_SCHEMA}", t.schema));
+            return Err(format!(
+                "thresholds schema '{}' is not {GATES_SCHEMA}",
+                t.schema
+            ));
         }
         Ok(t)
     }
@@ -144,7 +147,12 @@ pub struct GateOutcome {
 }
 
 impl GateOutcome {
-    fn exact(gate: &str, subject: impl Into<String>, pass: bool, detail: impl Into<String>) -> Self {
+    fn exact(
+        gate: &str,
+        subject: impl Into<String>,
+        pass: bool,
+        detail: impl Into<String>,
+    ) -> Self {
         GateOutcome {
             gate: gate.into(),
             subject: subject.into(),
@@ -171,7 +179,10 @@ pub enum Verdict {
 }
 
 pub fn verdict(outcomes: &[GateOutcome]) -> Verdict {
-    if outcomes.iter().any(|o| !o.pass && o.class == GateClass::Exact) {
+    if outcomes
+        .iter()
+        .any(|o| !o.pass && o.class == GateClass::Exact)
+    {
         Verdict::ExactFail
     } else if outcomes.iter().any(|o| !o.pass) {
         Verdict::PerfFail
@@ -212,7 +223,11 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
                 "exact.query_text",
                 format!("workload/{}", q.name),
                 pinned.as_deref() == Some(q.text_fnv64.as_str()),
-                format!("text fnv {} (pinned {})", q.text_fnv64, pinned.unwrap_or_default()),
+                format!(
+                    "text fnv {} (pinned {})",
+                    q.text_fnv64,
+                    pinned.unwrap_or_default()
+                ),
             ));
         }
     }
@@ -266,7 +281,11 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
                 "exact.update_round_trip",
                 b,
                 u.round_trip_ok(),
-                if why.is_empty() { "ok".into() } else { why.join("; ") },
+                if why.is_empty() {
+                    "ok".into()
+                } else {
+                    why.join("; ")
+                },
             ));
         }
         if let Some(c) = &run.conc {
@@ -297,7 +316,13 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
 
 /// The calibration factor (measured machine time / baseline machine time,
 /// clamped) dividing measured times.
-fn calib_factor(t: &Thresholds, base: &BenchResult, b: &BackendRun, m: &BenchResult, r: &BackendRun) -> f64 {
+fn calib_factor(
+    t: &Thresholds,
+    base: &BenchResult,
+    b: &BackendRun,
+    m: &BenchResult,
+    r: &BackendRun,
+) -> f64 {
     if !t.normalize_by_calibration {
         return 1.0;
     }
@@ -335,7 +360,12 @@ fn ratio_gate(
 
 /// Evaluate `m` against baseline `base`. `slowdown` multiplies every measured
 /// time (the `--self-test-slowdown` canary; 1.0 normally).
-pub fn evaluate(base: &BenchResult, m: &BenchResult, t: &Thresholds, slowdown: f64) -> Vec<GateOutcome> {
+pub fn evaluate(
+    base: &BenchResult,
+    m: &BenchResult,
+    t: &Thresholds,
+    slowdown: f64,
+) -> Vec<GateOutcome> {
     let mut out = self_check(m);
     // Workload identity.
     let wb = &base.workload;
@@ -344,7 +374,13 @@ pub fn evaluate(base: &BenchResult, m: &BenchResult, t: &Thresholds, slowdown: f
         "exact.workload",
         "workload",
         wb.spec == wm.spec && wb.version == wm.version,
-        format!("{} {} vs baseline {} {}", wm.version, wm.spec.label(), wb.version, wb.spec.label()),
+        format!(
+            "{} {} vs baseline {} {}",
+            wm.version,
+            wm.spec.label(),
+            wb.version,
+            wb.spec.label()
+        ),
     ));
     out.push(GateOutcome::exact(
         "exact.data_hash",
@@ -555,11 +591,9 @@ pub fn evaluate(base: &BenchResult, m: &BenchResult, t: &Thresholds, slowdown: f
         // Report-only: concurrency throughput.
         if let (Some(cb), Some(cm)) = (&b.conc, &r.conc) {
             for pb in &cb.points {
-                if let Some(pm) = cm
-                    .points
-                    .iter()
-                    .find(|p| p.endpoint == pb.endpoint && p.query == pb.query && p.clients == pb.clients)
-                {
+                if let Some(pm) = cm.points.iter().find(|p| {
+                    p.endpoint == pb.endpoint && p.query == pb.query && p.clients == pb.clients
+                }) {
                     out.push(GateOutcome {
                         gate: "info.conc_qps".into(),
                         subject: format!("{be}/{}/{}/c{}", pb.endpoint, pb.query, pb.clients),

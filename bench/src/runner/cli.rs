@@ -125,9 +125,17 @@ fn fail(msg: &str) -> ExitCode {
 /// Apply the workload options to `spec`.
 fn workload_options(a: &mut Args, spec: &mut WorkloadSpec) -> Result<(), String> {
     if let Some(w) = a.value("--workload")? {
-        let w = if w == "lubm-like" { "lubm".to_string() } else { w };
+        let w = if w == "lubm-like" {
+            "lubm".to_string()
+        } else {
+            w
+        };
         if w != spec.kind {
-            *spec = if w == "tiny" { WorkloadSpec::tiny() } else { WorkloadSpec::lubm(1, 0) };
+            *spec = if w == "tiny" {
+                WorkloadSpec::tiny()
+            } else {
+                WorkloadSpec::lubm(1, 0)
+            };
             spec.kind = w;
         }
     }
@@ -145,8 +153,11 @@ fn workload_options(a: &mut Args, spec: &mut WorkloadSpec) -> Result<(), String>
 
 /// Parse the run options on top of `base` (a built-in profile).
 fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String> {
-    let pname = a.value("--profile")?.unwrap_or_else(|| default_profile.to_string());
-    let mut p = profile(&pname).ok_or_else(|| format!("unknown profile '{pname}' (micro, smoke, reference)"))?;
+    let pname = a
+        .value("--profile")?
+        .unwrap_or_else(|| default_profile.to_string());
+    let mut p = profile(&pname)
+        .ok_or_else(|| format!("unknown profile '{pname}' (micro, smoke, reference)"))?;
     workload_options(a, &mut p.spec)?;
     if let Some(b) = a.list("--backends")? {
         p.backends = b;
@@ -180,7 +191,10 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         if let Some(cl) = clients {
             c.clients = cl
                 .iter()
-                .map(|x| x.parse().map_err(|_| format!("--conc-clients: invalid '{x}'")))
+                .map(|x| {
+                    x.parse()
+                        .map_err(|_| format!("--conc-clients: invalid '{x}'"))
+                })
                 .collect::<Result<_, _>>()?;
         }
         if let Some(s) = secs {
@@ -237,12 +251,19 @@ fn default_out(o: &RunOptions) -> PathBuf {
         .instantiate()
         .map(|w| w.file_stem())
         .unwrap_or_else(|_| "result".into());
-    PathBuf::from(format!("target/gstore-bench/{}-{stem}.json", o.profile.name))
+    PathBuf::from(format!(
+        "target/gstore-bench/{}-{stem}.json",
+        o.profile.name
+    ))
 }
 
 fn append_summary(path: Option<&Path>, text: &str) {
     if let Some(p) = path {
-        match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
             Ok(mut f) => {
                 let _ = f.write_all(text.as_bytes());
             }
@@ -353,14 +374,14 @@ fn print_self_check(result: &BenchResult) -> Verdict {
 
 fn cmd_run(a: &mut Args) -> CmdResult {
     let o = usage(run_options(a, "smoke"))?;
-    let out = usage(a.value("--out"))?.map(PathBuf::from).unwrap_or_else(|| default_out(&o));
+    let out = usage(a.value("--out"))?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_out(&o));
     let note = usage(a.value("--note"))?;
     usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
     let mut s = failed(Session::prepare(o))?;
     let r = s.run_all(false);
-    if !s.opts.keep_db {
-        s.cleanup();
-    }
+    finish_session(&s, r.is_ok());
     let mut result = failed(r)?;
     result.note = note;
     failed(result.save(&out))?;
@@ -369,6 +390,19 @@ fn cmd_run(a: &mut Args) -> CmdResult {
     }
     eprintln!("[gstore-bench] wrote {}", out.display());
     Ok(exit_for(print_self_check(&result)))
+}
+
+/// Remove the work directory after a run (keeping the phase logs when it
+/// failed, and everything with `--keep-db`).
+fn finish_session(s: &Session, ok: bool) {
+    if s.opts.keep_db {
+        return;
+    }
+    if ok {
+        s.cleanup();
+    } else {
+        s.cleanup_keep_logs();
+    }
 }
 
 fn thresholds(a: &mut Args) -> Result<Thresholds, Error> {
@@ -386,14 +420,20 @@ fn thresholds(a: &mut Args) -> Result<Thresholds, Error> {
 }
 
 fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
-    let baseline_path = usage(a.value("--baseline"))?
-        .unwrap_or_else(|| "bench/baselines/smoke.json".into());
+    let baseline_path =
+        usage(a.value("--baseline"))?.unwrap_or_else(|| "bench/baselines/smoke.json".into());
     let baseline = failed(BenchResult::load(Path::new(&baseline_path)))?;
     let t = thresholds(a)?;
     let slowdown: f64 = usage(a.parsed("--self-test-slowdown"))?.unwrap_or(1.0);
     let from = usage(a.value("--from"))?;
     let summary = usage(a.value("--summary"))?
-        .or_else(|| if ci { std::env::var("GITHUB_STEP_SUMMARY").ok() } else { None })
+        .or_else(|| {
+            if ci {
+                std::env::var("GITHUB_STEP_SUMMARY").ok()
+            } else {
+                None
+            }
+        })
         .map(PathBuf::from);
     let out_arg = usage(a.value("--out"))?;
 
@@ -404,20 +444,25 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         (r, o)
     } else {
         // Measure what the baseline measured, unless options say otherwise.
-        let has_profile = a.items.iter().any(|x| x == "--profile" || x.starts_with("--profile="));
+        let given = |keys: &[&str]| {
+            a.items.iter().any(|x| {
+                keys.iter()
+                    .any(|k| x == k || x.starts_with(&format!("{k}=")))
+            })
+        };
+        let has_profile = given(&["--profile"]);
+        let explicit_spec = given(&["--workload", "--scale", "--seed", "--departments"]);
+        let explicit_backends = given(&["--backends"]);
         let default_profile = if profile(&baseline.profile).is_some() {
             baseline.profile.clone()
         } else {
             "smoke".into()
         };
         let mut o = usage(run_options(a, &default_profile))?;
-        if !has_profile {
-            let explicit_spec = ["--workload", "--scale", "--seed", "--departments"]
-                .iter()
-                .any(|k| a.items.iter().any(|x| x == k));
-            if !explicit_spec {
-                o.profile.spec = baseline.workload.spec.clone();
-            }
+        if !has_profile && !explicit_spec {
+            o.profile.spec = baseline.workload.spec.clone();
+        }
+        if !has_profile && !explicit_backends {
             o.profile.backends = baseline.runs.iter().map(|r| r.backend.clone()).collect();
         }
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
@@ -425,7 +470,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         let mut result = match s.run_all(true) {
             Ok(r) => r,
             Err(e) => {
-                s.cleanup();
+                finish_session(&s, false);
                 return Err(Error::Failed(e));
             }
         };
@@ -434,20 +479,20 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         while verdict(&outcomes) == Verdict::PerfFail && attempt < t.retries {
             attempt += 1;
             for (backend, phase) in retry_targets(&outcomes) {
-                let Some(run) = result.run_mut(&backend) else { continue };
-                let mut run2 = run.clone();
-                if let Err(e) = s.rerun(&mut run2, phase) {
-                    s.cleanup();
-                    return Err(Error::Failed(e));
+                if let Some(run) = result.run_mut(&backend) {
+                    if let Err(e) = s.rerun(run, phase) {
+                        finish_session(&s, false);
+                        return Err(Error::Failed(e));
+                    }
                 }
-                *result.run_mut(&backend).expect("present") = run2;
             }
             outcomes = evaluate(&baseline, &result, &t, slowdown);
         }
-        if !s.opts.keep_db {
-            s.cleanup();
-        }
-        let out = out_arg.clone().map(PathBuf::from).unwrap_or_else(|| default_out(&s.opts));
+        finish_session(&s, true);
+        let out = out_arg
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_out(&s.opts));
         failed(result.save(&out))?;
         eprintln!("[gstore-bench] wrote {}", out.display());
         (result, outcomes)
@@ -456,7 +501,9 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
     let mut text = report::markdown(&result, Some(&baseline));
     text.push_str(&report::gates_markdown(&outcomes, false));
     if slowdown != 1.0 {
-        text.push_str(&format!("_Self-test: every measured time multiplied by {slowdown}._\n\n"));
+        text.push_str(&format!(
+            "_Self-test: every measured time multiplied by {slowdown}._\n\n"
+        ));
     }
     print!("{text}");
     append_summary(summary.as_deref(), &text);
@@ -524,9 +571,7 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
         let mut s = failed(Session::prepare(o))?;
         let r = s.run_all(false);
-        if !s.opts.keep_db {
-            s.cleanup();
-        }
+        finish_session(&s, r.is_ok());
         failed(r)?
     };
     let outcomes = self_check(&result);
@@ -541,12 +586,16 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
         result.note = note;
     }
     failed(result.save(Path::new(&to)))?;
-    eprintln!("[gstore-bench] blessed {to}{}", if provisional { " (provisional)" } else { "" });
+    eprintln!(
+        "[gstore-bench] blessed {to}{}",
+        if provisional { " (provisional)" } else { "" }
+    );
     Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_merge(a: &mut Args) -> CmdResult {
-    let out = usage(a.value("--out"))?.ok_or_else(|| Error::Usage("merge needs --out FILE".into()))?;
+    let out =
+        usage(a.value("--out"))?.ok_or_else(|| Error::Usage("merge needs --out FILE".into()))?;
     let pos = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
     if pos.len() < 2 {
         return Err(Error::Usage("merge needs at least two results".into()));
@@ -565,12 +614,19 @@ fn cmd_merge(a: &mut Args) -> CmdResult {
             None => merged = Some(r),
             Some(m) => {
                 let (wa, wb) = (&m.workload, &r.workload);
-                if wa.spec != wb.spec || wa.version != wb.version || wa.data_fnv64 != wb.data_fnv64 {
-                    return Err(Error::Failed(format!("{p}: a different workload than {}", pos[0])));
+                if wa.spec != wb.spec || wa.version != wb.version || wa.data_fnv64 != wb.data_fnv64
+                {
+                    return Err(Error::Failed(format!(
+                        "{p}: a different workload than {}",
+                        pos[0]
+                    )));
                 }
                 for run in r.runs {
                     if m.run(&run.backend).is_some() {
-                        return Err(Error::Failed(format!("{p}: backend {} appears twice", run.backend)));
+                        return Err(Error::Failed(format!(
+                            "{p}: backend {} appears twice",
+                            run.backend
+                        )));
                     }
                     m.runs.push(run);
                 }
@@ -613,7 +669,12 @@ fn cmd_calibrate(a: &mut Args) -> CmdResult {
         quick,
     };
     let log = dir.join(format!("gstore-bench-calibrate-{}.log", std::process::id()));
-    let v = failed(run_child(&req, &[], &log, std::time::Duration::from_secs(600)));
+    let v = failed(run_child(
+        &req,
+        &[],
+        &log,
+        std::time::Duration::from_secs(600),
+    ));
     let _ = std::fs::remove_file(&log);
     let v = v?;
     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -627,7 +688,10 @@ mod tests {
     #[test]
     fn args_scanner() {
         let mut a = Args {
-            items: ["--x", "1", "--y=2", "pos", "--f", "--x", "3"].iter().map(|s| s.to_string()).collect(),
+            items: ["--x", "1", "--y=2", "pos", "--f", "--x", "3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
         assert!(a.flag("--f"));
         assert_eq!(a.values("--x").unwrap(), vec!["1", "3"]);
@@ -642,10 +706,11 @@ mod tests {
     #[test]
     fn run_options_apply_overrides() {
         let mut a = Args {
-            items: "--profile reference --scale 38 --backends snapshot --reps 2 --no-conc --env A=b"
-                .split(' ')
-                .map(String::from)
-                .collect(),
+            items:
+                "--profile reference --scale 38 --backends snapshot --reps 2 --no-conc --env A=b"
+                    .split(' ')
+                    .map(String::from)
+                    .collect(),
         };
         let o = run_options(&mut a, "smoke").unwrap();
         assert_eq!(o.profile.name, "reference");

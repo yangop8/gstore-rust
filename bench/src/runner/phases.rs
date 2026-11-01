@@ -152,7 +152,11 @@ pub fn query_phase(dir: &Path, w: &dyn Workload, reps: usize) -> Result<QueryPha
             rows: first.1,
             rows_fnv64: hex(first.2),
             first_ms: first.0,
-            median_ms: if runs.is_empty() { first.0 } else { median(&runs) },
+            median_ms: if runs.is_empty() {
+                first.0
+            } else {
+                median(&runs)
+            },
             runs_ms: runs,
             stable,
         });
@@ -199,7 +203,9 @@ pub fn update_phase(
     for i in 0..singles {
         let before = db.triple_num();
         let t = Instant::now();
-        let r = db.query(&w.single_insert(i)).map_err(|e| format!("single insert {i}: {e}"))?;
+        let r = db
+            .query(&w.single_insert(i))
+            .map_err(|e| format!("single insert {i}: {e}"))?;
         ins.push(ms(t));
         update_ok(r)?;
         singles_ok &= db.triple_num() == before + 1;
@@ -208,7 +214,9 @@ pub fn update_phase(
     for i in 0..singles {
         let before = db.triple_num();
         let t = Instant::now();
-        let r = db.query(&w.single_delete(i)).map_err(|e| format!("single delete {i}: {e}"))?;
+        let r = db
+            .query(&w.single_delete(i))
+            .map_err(|e| format!("single delete {i}: {e}"))?;
         del.push(ms(t));
         update_ok(r)?;
         singles_ok &= db.triple_num() + 1 == before;

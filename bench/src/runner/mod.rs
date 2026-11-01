@@ -207,10 +207,22 @@ pub fn ensure_data(
         .ok()
         .and_then(|t| serde_json::from_str::<Sidecar>(&t).ok())
         .filter(|s| {
-            s.schema == SIDECAR_SCHEMA && s.version == w.version() && s.spec == *spec && s.chunk == chunk
+            s.schema == SIDECAR_SCHEMA
+                && s.version == w.version()
+                && s.spec == *spec
+                && s.chunk == chunk
         })
-        .filter(|s| fs::metadata(&path).map(|m| m.len() == s.stats.bytes).unwrap_or(false))
-        .filter(|s| !verify || file_fnv64(&path).map(|(h, _)| h == s.stats.fnv64).unwrap_or(false));
+        .filter(|s| {
+            fs::metadata(&path)
+                .map(|m| m.len() == s.stats.bytes)
+                .unwrap_or(false)
+        })
+        .filter(|s| {
+            !verify
+                || file_fnv64(&path)
+                    .map(|(h, _)| h == s.stats.fnv64)
+                    .unwrap_or(false)
+        });
     if let Some(s) = cached {
         return Ok(DataFile {
             path,
@@ -218,11 +230,16 @@ pub fn ensure_data(
             gen_ms: None,
         });
     }
-    let tmp = dir.join(format!(".{}.tmp{}", path.file_name().unwrap().to_string_lossy(), std::process::id()));
+    let tmp = dir.join(format!(
+        ".{}.tmp{}",
+        path.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    ));
     let started = Instant::now();
     let stats = {
         let mut f = fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        let s = generate_to(w, &mut f, chunk).map_err(|e| format!("generating {}: {e}", path.display()))?;
+        let s = generate_to(w, &mut f, chunk)
+            .map_err(|e| format!("generating {}: {e}", path.display()))?;
         f.sync_all().map_err(|e| e.to_string())?;
         s
     };
@@ -236,8 +253,11 @@ pub fn ensure_data(
         stats,
     };
     let tmp = sidecar_path(&tmp);
-    fs::write(&tmp, serde_json::to_string_pretty(&sc).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&sc).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::rename(&tmp, &side).map_err(|e| format!("{}: {e}", side.display()))?;
     Ok(DataFile {
         path,
@@ -254,7 +274,11 @@ fn now_unix() -> u64 {
 }
 
 fn git(args: &[&str]) -> Option<String> {
-    let o = Command::new("git").args(args).stderr(Stdio::null()).output().ok()?;
+    let o = Command::new("git")
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -279,7 +303,9 @@ pub fn env_info() -> EnvInfo {
         hostname: crate::sys::hostname(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
-        nproc: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        nproc: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         cpu_model: crate::sys::cpu_model(),
         mem_total_mib: crate::sys::mem_total_mib(),
         loadavg: crate::sys::loadavg(),
@@ -320,11 +346,26 @@ impl Session {
         for b in &opts.profile.backends {
             backends::validate(b)?;
         }
-        let data = ensure_data(&opts.profile.spec, workload.as_ref(), &opts.data_dir, false, opts.verify_data)?;
-        let chunk = ensure_data(&opts.profile.spec, workload.as_ref(), &opts.data_dir, true, opts.verify_data)?;
-        let work_root = opts
-            .work_dir
-            .join(format!("{}-{}-{}", workload.file_stem(), std::process::id(), now_unix()));
+        let data = ensure_data(
+            &opts.profile.spec,
+            workload.as_ref(),
+            &opts.data_dir,
+            false,
+            opts.verify_data,
+        )?;
+        let chunk = ensure_data(
+            &opts.profile.spec,
+            workload.as_ref(),
+            &opts.data_dir,
+            true,
+            opts.verify_data,
+        )?;
+        let work_root = opts.work_dir.join(format!(
+            "{}-{}-{}",
+            workload.file_stem(),
+            std::process::id(),
+            now_unix()
+        ));
         fs::create_dir_all(work_root.join("logs"))
             .map_err(|e| format!("cannot create {}: {e}", work_root.display()))?;
         let s = Session {
@@ -371,7 +412,9 @@ impl Session {
             workload: self.opts.profile.spec.clone(),
             work_dir,
             data_file: fs::canonicalize(&self.data.path).unwrap_or_else(|_| self.data.path.clone()),
-            chunk_file: Some(fs::canonicalize(&self.chunk.path).unwrap_or_else(|_| self.chunk.path.clone())),
+            chunk_file: Some(
+                fs::canonicalize(&self.chunk.path).unwrap_or_else(|_| self.chunk.path.clone()),
+            ),
             chunk_triples: self.chunk.stats.unique_triples,
             bin_dir: self.opts.bin_dir.clone(),
             builder: self.opts.builder.clone(),
@@ -390,17 +433,23 @@ impl Session {
     pub fn child<T: DeserializeOwned>(&self, req: &ChildRequest) -> Result<T, String> {
         let n = self.seq.get() + 1;
         self.seq.set(n);
-        let log = self
-            .work_root
-            .join("logs")
-            .join(format!("{n:03}-{}-{}.log", if req.backend.is_empty() { "all" } else { &req.backend }, req.phase));
+        let log = self.work_root.join("logs").join(format!(
+            "{n:03}-{}-{}.log",
+            if req.backend.is_empty() {
+                "all"
+            } else {
+                &req.backend
+            },
+            req.phase
+        ));
         let timeout = Duration::from_secs(if req.phase == "build" {
             self.opts.profile.timeout_build_s
         } else {
             self.opts.profile.timeout_s
         });
         let v = run_child(req, &self.opts.env, &log, timeout)?;
-        serde_json::from_value(v).map_err(|e| format!("{} phase: unexpected result: {e}", req.phase))
+        serde_json::from_value(v)
+            .map_err(|e| format!("{} phase: unexpected result: {e}", req.phase))
     }
 
     /// Calibrate this machine (in a child).
@@ -480,11 +529,15 @@ impl Session {
         let mut run = BackendRun::new(backend);
         run.config = self.run_config();
 
-        let build = self.child::<crate::schema::BuildResult>(&self.request("build", backend, dir.clone()))?;
+        let build =
+            self.child::<crate::schema::BuildResult>(&self.request("build", backend, dir.clone()))?;
         self.say(&format!(
             "{backend}: build {:.2} s, peak RSS {}, {:.1} MB on disk",
             build.wall_ms / 1e3,
-            build.peak_rss_mib.map(|m| format!("{m:.0} MiB")).unwrap_or_else(|| "n/a".into()),
+            build
+                .peak_rss_mib
+                .map(|m| format!("{m:.0} MiB"))
+                .unwrap_or_else(|| "n/a".into()),
             build.dir_bytes as f64 / 1e6
         ));
         run.build = Some(build);
@@ -496,7 +549,11 @@ impl Session {
         let warm_ms: Vec<f64> = warm.iter().map(|s| s.open_ms).collect();
         run.open = Some(OpenResult {
             first_ms: first.open_ms,
-            warm_ms: if warm_ms.is_empty() { first.open_ms } else { median(&warm_ms) },
+            warm_ms: if warm_ms.is_empty() {
+                first.open_ms
+            } else {
+                median(&warm_ms)
+            },
             warm_samples_ms: warm_ms,
             cold: first.cold,
             rss_after_open_mib: first.rss_mib,
@@ -522,10 +579,14 @@ impl Session {
             .iter()
             .map(|q| format!("{} {:.1}", q.name, q.median_ms))
             .collect();
-        self.say(&format!("{backend}: query medians (ms): {}", meds.join(", ")));
+        self.say(&format!(
+            "{backend}: query medians (ms): {}",
+            meds.join(", ")
+        ));
 
         if p.conc.is_some() {
-            let c: crate::schema::ConcResult = self.child(&self.request("conc", backend, dir.clone()))?;
+            let c: crate::schema::ConcResult =
+                self.child(&self.request("conc", backend, dir.clone()))?;
             let pts: Vec<String> = c
                 .points
                 .iter()
@@ -570,7 +631,11 @@ impl Session {
                 let dir = self.work_root.join(format!("{backend}-retry"));
                 let _ = fs::remove_dir_all(&dir);
                 fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let r = self.child::<crate::schema::BuildResult>(&self.request("build", &backend, dir.clone()));
+                let r = self.child::<crate::schema::BuildResult>(&self.request(
+                    "build",
+                    &backend,
+                    dir.clone(),
+                ));
                 let _ = fs::remove_dir_all(&dir);
                 let b = r?;
                 if let Some(old) = run.build.as_mut() {
@@ -588,15 +653,18 @@ impl Session {
                     o.warm_ms = o.warm_ms.min(median(&ms));
                     o.warm_samples_ms.extend(ms);
                     if let Some(rss) = samples.iter().filter_map(|s| s.rss_mib).reduce(f64::min) {
-                        o.rss_after_open_mib = Some(o.rss_after_open_mib.map_or(rss, |x| x.min(rss)));
+                        o.rss_after_open_mib =
+                            Some(o.rss_after_open_mib.map_or(rss, |x| x.min(rss)));
                     }
                 }
             }
             Phase::Query => {
-                let qp: QueryPhase = self.child(&self.request("query", &backend, self.backend_dir(&backend)))?;
+                let qp: QueryPhase =
+                    self.child(&self.request("query", &backend, self.backend_dir(&backend)))?;
                 for q in qp.queries {
                     if let Some(old) = run.queries.iter_mut().find(|o| o.name == q.name) {
-                        old.stable &= q.stable && q.rows == old.rows && q.rows_fnv64 == old.rows_fnv64;
+                        old.stable &=
+                            q.stable && q.rows == old.rows && q.rows_fnv64 == old.rows_fnv64;
                         old.median_ms = old.median_ms.min(q.median_ms);
                         old.first_ms = old.first_ms.min(q.first_ms);
                         old.runs_ms.extend(q.runs_ms);
@@ -618,6 +686,22 @@ impl Session {
     /// Delete the whole work directory (databases and logs).
     pub fn cleanup(&self) {
         let _ = fs::remove_dir_all(&self.work_root);
+    }
+
+    /// After a failure: delete the databases but keep the phase logs, and
+    /// say where they are.
+    pub fn cleanup_keep_logs(&self) {
+        if let Ok(rd) = fs::read_dir(&self.work_root) {
+            for e in rd.flatten() {
+                if e.file_name() != "logs" {
+                    let _ = fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        eprintln!(
+            "[gstore-bench] phase logs kept in {}",
+            self.work_root.join("logs").display()
+        );
     }
 
     /// Calibrate, then measure every backend of the profile. Databases are
@@ -671,7 +755,9 @@ pub fn run_child(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("cannot start a child: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start a child: {e}"))?;
     let pid = child.id();
     let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
     {
@@ -704,7 +790,11 @@ pub fn run_child(
             return Err(format!(
                 "the {} phase{} timed out after {} s (log {}):\n{}",
                 req.phase,
-                if req.backend.is_empty() { String::new() } else { format!(" of {}", req.backend) },
+                if req.backend.is_empty() {
+                    String::new()
+                } else {
+                    format!(" of {}", req.backend)
+                },
                 timeout.as_secs(),
                 log.display(),
                 tail(log, 20)
@@ -713,11 +803,18 @@ pub fn run_child(
         std::thread::sleep(Duration::from_millis(20));
     };
     let lines = reader.join().unwrap_or_default();
-    let results: Vec<&String> = lines.iter().filter(|l| l.starts_with(RESULT_MARKER)).collect();
+    let results: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with(RESULT_MARKER))
+        .collect();
     let what = format!(
         "the {} phase{}",
         req.phase,
-        if req.backend.is_empty() { String::new() } else { format!(" of {}", req.backend) }
+        if req.backend.is_empty() {
+            String::new()
+        } else {
+            format!(" of {}", req.backend)
+        }
     );
     if results.len() != 1 {
         return Err(format!(
@@ -730,11 +827,16 @@ pub fn run_child(
     let v: serde_json::Value = serde_json::from_str(&results[0][RESULT_MARKER.len()..])
         .map_err(|e| format!("{what}: malformed result line: {e}"))?;
     if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
-        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("unknown error");
+        let err = v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown error");
         return Err(format!("{what} failed: {err}\n{}", tail(log, 20)));
     }
     if !status.success() {
-        return Err(format!("{what} exited with {status} after reporting success"));
+        return Err(format!(
+            "{what} exited with {status} after reporting success"
+        ));
     }
     Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
 }

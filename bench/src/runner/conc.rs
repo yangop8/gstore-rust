@@ -75,7 +75,12 @@ pub fn read_response(r: &mut BufReader<TcpStream>) -> io::Result<Option<Response
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("bad status line {line:?}")))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad status line {line:?}"),
+            )
+        })?;
     let mut len: Option<usize> = None;
     let mut chunked = false;
     let mut close = false;
@@ -153,7 +158,9 @@ pub fn get_once(addr: SocketAddr, path: &str, accept: &str) -> io::Result<(u16, 
 /// The body hash an endpoint's response is compared by.
 fn body_hash(endpoint: &str, body: &[u8]) -> u64 {
     if endpoint == "api" {
-        if let Ok(serde_json::Value::Object(mut m)) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Ok(serde_json::Value::Object(mut m)) =
+            serde_json::from_slice::<serde_json::Value>(body)
+        {
             m.remove("QueryTime");
             m.remove("ThreadId");
             let canon = serde_json::to_vec(&serde_json::Value::Object(m)).unwrap_or_default();
@@ -172,7 +179,14 @@ struct Load {
 }
 
 /// Drive `path` with `clients` closed-loop keep-alive clients for `secs`.
-fn drive(addr: SocketAddr, endpoint: &str, path: &str, accept: &str, clients: usize, secs: f64) -> Result<(Load, f64), String> {
+fn drive(
+    addr: SocketAddr,
+    endpoint: &str,
+    path: &str,
+    accept: &str,
+    clients: usize,
+    secs: f64,
+) -> Result<(Load, f64), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(Mutex::new(Load {
         ok: 0,
@@ -184,7 +198,12 @@ fn drive(addr: SocketAddr, endpoint: &str, path: &str, accept: &str, clients: us
     let req = request(path, accept);
     let mut handles = Vec::new();
     for _ in 0..clients {
-        let (stop, total, req, endpoint) = (stop.clone(), total.clone(), req.clone(), endpoint.to_string());
+        let (stop, total, req, endpoint) = (
+            stop.clone(),
+            total.clone(),
+            req.clone(),
+            endpoint.to_string(),
+        );
         handles.push(std::thread::spawn(move || -> Result<(), String> {
             let mut mine = Load {
                 ok: 0,
@@ -268,11 +287,19 @@ fn drive(addr: SocketAddr, endpoint: &str, path: &str, accept: &str, clients: us
 
 /// Measure every query and client count on one endpoint; returns whether all
 /// bodies per query were identical.
-fn measure(addr: SocketAddr, endpoint: &str, paths: &[(String, String)], accept: &str, s: &ConcSettings, points: &mut Vec<ConcPoint>) -> Result<bool, String> {
+fn measure(
+    addr: SocketAddr,
+    endpoint: &str,
+    paths: &[(String, String)],
+    accept: &str,
+    s: &ConcSettings,
+    points: &mut Vec<ConcPoint>,
+) -> Result<bool, String> {
     let mut equal = true;
     for (name, path) in paths {
         // The reference body.
-        let (st, body) = get_once(addr, path, accept).map_err(|e| format!("{endpoint} {name}: {e}"))?;
+        let (st, body) =
+            get_once(addr, path, accept).map_err(|e| format!("{endpoint} {name}: {e}"))?;
         if st != 200 {
             return Err(format!(
                 "{endpoint} {name}: HTTP {st}: {}",
@@ -310,7 +337,11 @@ fn measure(addr: SocketAddr, endpoint: &str, paths: &[(String, String)], accept:
 
 /// Run the concurrency phase on the database in `dir`.
 pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<ConcResult, String> {
-    let names = if s.queries.is_empty() { w.conc_queries() } else { s.queries.clone() };
+    let names = if s.queries.is_empty() {
+        w.conc_queries()
+    } else {
+        s.queries.clone()
+    };
     let all = w.queries();
     let queries: Vec<QuerySpec> = names
         .iter()
@@ -326,7 +357,8 @@ pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<Conc
     for endpoint in &s.endpoints {
         match endpoint.as_str() {
             "sparql" => {
-                let mut db = Database::open(dir).map_err(|e| format!("open {}: {e}", dir.display()))?;
+                let mut db =
+                    Database::open(dir).map_err(|e| format!("open {}: {e}", dir.display()))?;
                 db.set_query_cache_size(0);
                 let server = Server::bind(db, "127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
                 let addr = server.local_addr().map_err(|e| e.to_string())?;
@@ -336,9 +368,21 @@ pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<Conc
                 });
                 let paths: Vec<(String, String)> = queries
                     .iter()
-                    .map(|q| (q.name.clone(), format!("/sparql?query={}", urlencode(&q.text))))
+                    .map(|q| {
+                        (
+                            q.name.clone(),
+                            format!("/sparql?query={}", urlencode(&q.text)),
+                        )
+                    })
                     .collect();
-                let r = measure(addr, "sparql", &paths, "text/tab-separated-values", s, &mut points);
+                let r = measure(
+                    addr,
+                    "sparql",
+                    &paths,
+                    "text/tab-separated-values",
+                    s,
+                    &mut points,
+                );
                 handle.shutdown();
                 let _ = t.join();
                 equal &= r?;
@@ -363,10 +407,17 @@ pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<Conc
                 let t = std::thread::spawn(move || {
                     api.serve_forever();
                 });
-                let cred = format!("username={API_USER}&password={API_PASSWORD}&db_name={}", urlencode(&name));
+                let cred = format!(
+                    "username={API_USER}&password={API_PASSWORD}&db_name={}",
+                    urlencode(&name)
+                );
                 let r = (|| {
-                    let (st, body) = get_once(addr, &format!("/api?operation=load&{cred}"), "application/json")
-                        .map_err(|e| format!("api load: {e}"))?;
+                    let (st, body) = get_once(
+                        addr,
+                        &format!("/api?operation=load&{cred}"),
+                        "application/json",
+                    )
+                    .map_err(|e| format!("api load: {e}"))?;
                     let text = String::from_utf8_lossy(&body);
                     if st != 200 || !text.contains("\"StatusCode\":0") {
                         return Err(format!("api load failed: HTTP {st}: {text}"));
@@ -376,7 +427,10 @@ pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<Conc
                         .map(|q| {
                             (
                                 q.name.clone(),
-                                format!("/api?operation=query&{cred}&format=json&sparql={}", urlencode(&q.text)),
+                                format!(
+                                    "/api?operation=query&{cred}&format=json&sparql={}",
+                                    urlencode(&q.text)
+                                ),
                             )
                         })
                         .collect();

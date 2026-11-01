@@ -16,9 +16,23 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# No rustfmt check yet: the tree is not rustfmt-clean. A later change formats
-# the code base and adds a `cargo fmt --all -- --check` job.
+# Benchmarks (gstore-bench smoke gate, RocksDB correctness through the
+# harness, the weekly reference run) are in bench.yml.
 jobs:
+  # rustfmt.toml pins style_edition 2021. The one-time `cargo fmt --all`
+  # commit that made the tree rustfmt-clean is listed in
+  # .git-blame-ignore-revs.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   clippy:
     name: clippy (workspace, all targets)
     runs-on: ubuntu-latest
@@ -117,9 +131,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # One cache for every job that compiles librocksdb-sys (this one and
+      # bench.yml's rocksdb-correctness): the C++ build dominates both.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: rocksdb
+          shared-key: rocksdb
       - name: clippy
         run: cargo clippy -p gstore --all-targets --features rocksdb -- -D warnings
       - name: test

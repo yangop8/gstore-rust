@@ -4,7 +4,9 @@
 //! memory, size and coverage gates.
 
 use gstore_bench::calib::Calibration;
-use gstore_bench::gates::{evaluate, retry_targets, self_check, verdict, Phase, Thresholds, Verdict};
+use gstore_bench::gates::{
+    evaluate, retry_targets, self_check, verdict, Phase, Thresholds, Verdict,
+};
 use gstore_bench::schema::*;
 use gstore_bench::workload::WorkloadSpec;
 
@@ -111,7 +113,11 @@ fn result(scale: f64) -> BenchResult {
     }
 }
 
-fn check(base: &BenchResult, m: &BenchResult, slowdown: f64) -> (Verdict, Vec<gstore_bench::gates::GateOutcome>) {
+fn check(
+    base: &BenchResult,
+    m: &BenchResult,
+    slowdown: f64,
+) -> (Verdict, Vec<gstore_bench::gates::GateOutcome>) {
     let o = evaluate(base, m, &Thresholds::default(), slowdown);
     (verdict(&o), o)
 }
@@ -143,7 +149,10 @@ fn the_canary_slowdown_fails() {
     assert_eq!(v, Verdict::PerfFail);
     let targets = retry_targets(&o);
     assert!(targets.contains(&("snapshot".to_string(), Phase::Query)));
-    assert!(targets.contains(&("disk".to_string(), Phase::Build)) || targets.contains(&("disk".to_string(), Phase::Open)));
+    assert!(
+        targets.contains(&("disk".to_string(), Phase::Build))
+            || targets.contains(&("disk".to_string(), Phase::Open))
+    );
 }
 
 #[test]
@@ -157,9 +166,20 @@ fn one_slow_query_of_20ms_or_more_fails() {
         r.runs[0].queries[i].median_ms *= 4.0;
         let (v, o) = check(&b, &r, 1.0);
         assert_eq!(v, Verdict::PerfFail, "q{} at {m} ms slowed 4×", i + 1);
-        let failing: Vec<&str> = o.iter().filter(|g| !g.pass).map(|g| g.gate.as_str()).collect();
-        assert_eq!(failing, ["time.query"], "only the per-query gate: {failing:?}");
-        assert_eq!(retry_targets(&o), vec![("snapshot".to_string(), Phase::Query)]);
+        let failing: Vec<&str> = o
+            .iter()
+            .filter(|g| !g.pass)
+            .map(|g| g.gate.as_str())
+            .collect();
+        assert_eq!(
+            failing,
+            ["time.query"],
+            "only the per-query gate: {failing:?}"
+        );
+        assert_eq!(
+            retry_targets(&o),
+            vec![("snapshot".to_string(), Phase::Query)]
+        );
     }
     // A sub-millisecond query slowed 4× stays under the 2 ms floor.
     let mut r = result(1.0);
@@ -175,9 +195,14 @@ fn a_row_hash_change_fails_exactly_without_retry() {
     let (v, o) = check(&b, &r, 1.0);
     assert_eq!(v, Verdict::ExactFail);
     let failing: Vec<&gstore_bench::gates::GateOutcome> = o.iter().filter(|g| !g.pass).collect();
-    assert!(failing.iter().any(|g| g.gate == "exact.rows" && g.subject == "disk/q4"));
+    assert!(failing
+        .iter()
+        .any(|g| g.gate == "exact.rows" && g.subject == "disk/q4"));
     assert!(failing.iter().any(|g| g.gate == "exact.cross_backend"));
-    assert!(retry_targets(&o).is_empty(), "exact failures are never retried");
+    assert!(
+        retry_targets(&o).is_empty(),
+        "exact failures are never retried"
+    );
     // self_check alone sees the cross-backend difference.
     assert_eq!(verdict(&self_check(&r)), Verdict::ExactFail);
 }
@@ -212,18 +237,27 @@ fn memory_and_size_gates() {
     let b = result(1.0);
     let mut r = result(1.0);
     r.runs[0].open.as_mut().unwrap().rss_after_open_mib = Some(127.0 * 1.4);
-    assert_eq!(check(&b, &r, 1.0).0, Verdict::Pass, "(178+32)/(127+32) = 1.32");
+    assert_eq!(
+        check(&b, &r, 1.0).0,
+        Verdict::Pass,
+        "(178+32)/(127+32) = 1.32"
+    );
     r.runs[0].open.as_mut().unwrap().rss_after_open_mib = Some(260.0);
     let (v, o) = check(&b, &r, 1.0);
     assert_eq!(v, Verdict::PerfFail);
     assert!(o.iter().any(|g| !g.pass && g.gate == "rss.after_open"));
-    assert_eq!(retry_targets(&o), vec![("snapshot".to_string(), Phase::Open)]);
+    assert_eq!(
+        retry_targets(&o),
+        vec![("snapshot".to_string(), Phase::Open)]
+    );
 
     let mut r = result(1.0);
     r.runs[1].build.as_mut().unwrap().dir_bytes = 87_000_000 * 13 / 10;
     let (v, o) = check(&b, &r, 1.0);
     assert_eq!(v, Verdict::PerfFail);
-    assert!(o.iter().any(|g| !g.pass && g.gate == "bytes.dir" && g.subject == "disk"));
+    assert!(o
+        .iter()
+        .any(|g| !g.pass && g.gate == "bytes.dir" && g.subject == "disk"));
 }
 
 #[test]
@@ -234,7 +268,11 @@ fn build_gate_is_looser_for_disk() {
     assert_eq!(check(&b, &r, 1.0).0, Verdict::Pass, "disk allows 2.5×");
     let mut r = result(1.0);
     r.runs[0].build.as_mut().unwrap().wall_ms = 12_000.0 * 2.3;
-    assert_eq!(check(&b, &r, 1.0).0, Verdict::PerfFail, "snapshot allows 2.0×");
+    assert_eq!(
+        check(&b, &r, 1.0).0,
+        Verdict::PerfFail,
+        "snapshot allows 2.0×"
+    );
 }
 
 #[test]
@@ -259,7 +297,8 @@ fn coverage_and_identity_gates() {
     // A failed update round trip, unequal concurrent bodies, an empty or
     // unstable answer.
     for f in [
-        (|r: &mut BenchResult| r.runs[0].update.as_mut().unwrap().reopen_ok = false) as fn(&mut BenchResult),
+        (|r: &mut BenchResult| r.runs[0].update.as_mut().unwrap().reopen_ok = false)
+            as fn(&mut BenchResult),
         |r| r.runs[0].conc.as_mut().unwrap().bodies_equal = false,
         |r| r.runs[0].queries[0].stable = false,
         |r| {
@@ -293,11 +332,17 @@ fn results_round_trip_through_json() {
     for (a, b) in back.runs.iter().zip(&r.runs) {
         assert_eq!(a.backend, b.backend);
         for (x, y) in a.queries.iter().zip(&b.queries) {
-            assert_eq!((&x.name, x.rows, &x.rows_fnv64), (&y.name, y.rows, &y.rows_fnv64));
+            assert_eq!(
+                (&x.name, x.rows, &x.rows_fnv64),
+                (&y.name, y.rows, &y.rows_fnv64)
+            );
             assert!((x.median_ms - y.median_ms).abs() < 1e-9);
         }
     }
-    assert_eq!(verdict(&evaluate(&r, &back, &Thresholds::default(), 1.0)), Verdict::Pass);
+    assert_eq!(
+        verdict(&evaluate(&r, &back, &Thresholds::default(), 1.0)),
+        Verdict::Pass
+    );
     std::fs::write(&p, r#"{"schema":"other"}"#).unwrap();
     assert!(BenchResult::load(&p).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
