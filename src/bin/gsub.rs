@@ -141,13 +141,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!(
+    gstore::outln!(
         "Removed {removed} triple(s) from '{dir}' ({} read; {} now total)",
         report.statements,
         db.triple_num()
     );
     if report.failed > 0 {
-        println!(
+        gstore::outln!(
             "Skipped {} statement(s) that could not be read; see {}",
             report.failed,
             log.path().display()

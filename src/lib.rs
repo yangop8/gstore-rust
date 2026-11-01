@@ -51,6 +51,9 @@ pub mod rpc;
 pub mod server;
 pub mod signature;
 pub mod sparql_results;
+/// Standard output for the command-line tools that a closed pipe ends
+/// quietly (`outln!` / `out!` instead of `println!` / `print!`).
+pub mod stdout;
 pub mod store;
 /// The system store: users, per-database privileges, the database registry.
 pub mod sysdb;

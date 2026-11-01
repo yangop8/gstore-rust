@@ -180,6 +180,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let shown = archive.map_or_else(|| backup.clone(), |a| a.display().to_string());
-    println!("Backed up '{dir}' to '{shown}'");
+    gstore::outln!("Backed up '{dir}' to '{shown}'");
     ExitCode::SUCCESS
 }

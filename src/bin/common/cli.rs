@@ -52,19 +52,19 @@ pub struct Tool {
 impl Tool {
     /// Print the help to standard output.
     pub fn print_help(&self) {
-        println!("\ngStore {} — {}\n", self.name, first_line(self.help));
+        gstore::outln!("\ngStore {} — {}\n", self.name, first_line(self.help));
         let mut lines = self.usage.lines();
         if let Some(first) = lines.next() {
-            println!("Usage:\t{first}");
+            gstore::outln!("Usage:\t{first}");
         }
         for l in lines {
-            println!("\t{l}");
+            gstore::outln!("\t{l}");
         }
         let rest: Vec<&str> = self.help.lines().skip(1).collect();
         if !rest.is_empty() {
-            println!("{}", rest.join("\n"));
+            gstore::outln!("{}", rest.join("\n"));
         }
-        println!();
+        gstore::outln!();
     }
 
     /// Report invalid arguments (`msg`, then the usage) on standard error
@@ -300,7 +300,7 @@ pub fn unpack_packages(
             .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
         zipio::unpack(path, scratch.path(), limits, &|_| true)
             .map_err(|e| format!("cannot unpack '{p}': {}", zip_error(e)))?;
-        println!("unpacked '{p}'");
+        gstore::outln!("unpacked '{p}'");
         *p = scratch.path().to_string_lossy().into_owned();
         unpacked.push(scratch);
     }

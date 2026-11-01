@@ -165,13 +165,13 @@ fn main() -> ExitCode {
         eprintln!("inserted {added} triple(s) but saving failed: {e}");
         return ExitCode::FAILURE;
     }
-    println!(
+    gstore::outln!(
         "Added {added} new triple(s) to '{dir}' ({} read; {} now total)",
         report.statements,
         db.triple_num()
     );
     if report.failed > 0 {
-        println!(
+        gstore::outln!(
             "Skipped {} statement(s) that could not be read; see {}",
             report.failed,
             log.path().display()

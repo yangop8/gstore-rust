@@ -180,7 +180,7 @@ fn main() -> ExitCode {
 }
 
 fn print_help() {
-    println!(
+    gstore::outln!(
         "\ngStore API Server(gserver)\n\n\
          Usage:\tgserver [option] [DIR]\n\n\
          Options:\n\
@@ -213,8 +213,8 @@ fn print_help() {
          \t--rocksdb\t\tWith a single DIR: insist it is a RocksDB database."
     );
     #[cfg(feature = "tls")]
-    println!("\t--tls-cert FILE --tls-key FILE\tServe HTTPS.");
-    println!("\nDocs: {DOCS}\n");
+    gstore::outln!("\t--tls-cert FILE --tls-key FILE\tServe HTTPS.");
+    gstore::outln!("\nDocs: {DOCS}\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +697,7 @@ fn start_foreground(cli: &Cli, cfg: &GStoreConfig, target: &Target) -> u8 {
 
 fn start_background(cli: &Cli, target: &Target) -> u8 {
     if let Some(info) = live_server(target) {
-        println!("the server already running (pid {}).", info.pid);
+        gstore::outln!("the server already running (pid {}).", info.pid);
         return 1;
     }
     #[cfg(not(unix))]
@@ -767,11 +767,11 @@ fn start_background(cli: &Cli, target: &Target) -> u8 {
             if let Some(info) = read_pid_file(&target.pid_file) {
                 if (info.pid == child_pid || info.supervisor == child_pid) && info.answers() {
                     let addr = info.addr.map(|a| a.to_string()).unwrap_or_default();
-                    println!(
+                    gstore::outln!(
                         "gserver started in the background (pid {}), listening on http://{addr}",
                         info.pid
                     );
-                    println!("gserver: log file '{}', pid file '{}'", log.display(), target.pid_file.display());
+                    gstore::outln!("gserver: log file '{}', pid file '{}'", log.display(), target.pid_file.display());
                     return 0;
                 }
             }
@@ -807,7 +807,7 @@ fn stop(target: &Target) -> u8 {
         // the supervisor is what stops the service (it exits during its
         // backoff, or stops the server it has just started).
         if let Some(sup) = live_supervisor(target) {
-            println!("stopping gserver supervisor (pid {sup})...");
+            gstore::outln!("stopping gserver supervisor (pid {sup})...");
             if let Err(e) = proc_util::signal(sup, proc_util::SIGTERM) {
                 eprintln!("gserver: cannot signal pid {sup}: {e}");
                 return 1;
@@ -826,10 +826,10 @@ fn stop(target: &Target) -> u8 {
                     let _ = fs::remove_file(&target.pid_file);
                 }
             }
-            println!("the Server supervisor [{sup}] stop successfully.");
+            gstore::outln!("the Server supervisor [{sup}] stop successfully.");
             return 0;
         }
-        println!("server is inactive (dead).");
+        gstore::outln!("server is inactive (dead).");
         if let Some(stale) = read_pid_file(&target.pid_file) {
             if stale.pid != std::process::id() {
                 let _ = fs::remove_file(&target.pid_file);
@@ -837,7 +837,7 @@ fn stop(target: &Target) -> u8 {
         }
         return 0;
     };
-    println!("stopping gserver (pid {})...", info.pid);
+    gstore::outln!("stopping gserver (pid {})...", info.pid);
     if let Err(e) = proc_util::signal(info.pid, proc_util::SIGTERM) {
         eprintln!("gserver: cannot signal pid {}: {e}", info.pid);
         return 1;
@@ -855,7 +855,7 @@ fn stop(target: &Target) -> u8 {
         eprintln!("gserver: supervisor pid {} is still running", info.supervisor);
     }
     remove_pid_file_of(&target.pid_file, info.pid);
-    println!("the Server [{}] stop successfully.", info.pid);
+    gstore::outln!("the Server [{}] stop successfully.", info.pid);
     0
 }
 
@@ -863,14 +863,14 @@ fn restart(cli: &Cli, cfg: &GStoreConfig, target: &Target) -> u8 {
     let mut background = false;
     if let Some(info) = live_server(target) {
         background = info.background;
-        println!("server is active (running).");
-        println!("stop server...");
+        gstore::outln!("server is active (running).");
+        gstore::outln!("stop server...");
         let code = stop(target);
         if code != 0 {
             return code;
         }
     }
-    println!("start server...");
+    gstore::outln!("start server...");
     if background {
         report_config(cfg);
         start_background(cli, target)
@@ -880,9 +880,9 @@ fn restart(cli: &Cli, cfg: &GStoreConfig, target: &Target) -> u8 {
 }
 
 fn kill(target: &Target) -> u8 {
-    println!("The service will be forcibly stopped!");
+    gstore::outln!("The service will be forcibly stopped!");
     let Some(info) = read_pid_file(&target.pid_file) else {
-        println!("server is inactive (dead).");
+        gstore::outln!("server is inactive (dead).");
         return 0;
     };
     let me = std::process::id();
@@ -892,7 +892,7 @@ fn kill(target: &Target) -> u8 {
             match proc_util::signal(pid, proc_util::SIGKILL) {
                 Ok(()) => {
                     proc_util::wait_exit(pid, Duration::from_secs(10));
-                    println!("killed pid {pid}");
+                    gstore::outln!("killed pid {pid}");
                 }
                 Err(e) => eprintln!("gserver: cannot kill pid {pid}: {e}"),
             }
@@ -905,33 +905,33 @@ fn kill(target: &Target) -> u8 {
 }
 
 fn status(target: &Target) -> u8 {
-    println!("gStore API Server(gserver)");
+    gstore::outln!("gStore API Server(gserver)");
     match live_server(target) {
         Some(info) => {
-            println!("\tActive: active (running)");
-            println!("\tMain PID: {}", info.pid);
+            gstore::outln!("\tActive: active (running)");
+            gstore::outln!("\tMain PID: {}", info.pid);
             if let Some(a) = info.addr {
                 let answering = if info.answers() { "" } else { " (not answering)" };
-                println!("\tAddress: http://{a}{answering}");
+                gstore::outln!("\tAddress: http://{a}{answering}");
             }
-            println!(
+            gstore::outln!(
                 "\tStarted: {}",
                 if info.background { "in the background (-b)" } else { "in the foreground" }
             );
             if info.supervisor != 0 {
-                println!("\tSupervisor PID: {} (deamon=on)", info.supervisor);
+                gstore::outln!("\tSupervisor PID: {} (deamon=on)", info.supervisor);
             }
         }
         None => match live_supervisor(target) {
             Some(sup) => {
-                println!("\tActive: activating (the server stopped; its supervisor restarts it)");
-                println!("\tSupervisor PID: {sup} (deamon=on)");
+                gstore::outln!("\tActive: activating (the server stopped; its supervisor restarts it)");
+                gstore::outln!("\tSupervisor PID: {sup} (deamon=on)");
             }
-            None => println!("\tActive: inactive (dead)"),
+            None => gstore::outln!("\tActive: inactive (dead)"),
         },
     }
-    println!("\tPID file: {}", target.pid_file.display());
-    println!("\tDocs: {DOCS}");
+    gstore::outln!("\tPID file: {}", target.pid_file.display());
+    gstore::outln!("\tDocs: {DOCS}");
     0
 }
 

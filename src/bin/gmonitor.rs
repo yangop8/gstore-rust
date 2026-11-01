@@ -81,7 +81,7 @@ fn main() -> ExitCode {
     ];
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (k, v) in &rows {
-        println!("{k:<width$} : {v}");
+        gstore::outln!("{k:<width$} : {v}");
     }
     ExitCode::SUCCESS
 }

@@ -135,7 +135,8 @@ fn main() -> ExitCode {
         QueryResult::Construct(triples) => triples.iter().try_for_each(|t| writeln!(out, "{t}")),
         QueryResult::Update { .. } => Ok(()),
     };
-    if let Err(e) = written.and_then(|()| out.flush()) {
+    // A reader that stopped early (`gquery … | head`) is not an error.
+    if let Err(e) = gstore::stdout::quiet_broken_pipe(written.and_then(|()| out.flush())) {
         eprintln!("cannot write the result: {e}");
         return ExitCode::FAILURE;
     }

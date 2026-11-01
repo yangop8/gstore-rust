@@ -143,7 +143,7 @@ fn main() -> ExitCode {
         path: (!existed).then(|| PathBuf::from(&dir)),
     };
     if paths.is_empty() {
-        println!("will build an empty database");
+        gstore::outln!("will build an empty database");
     }
     // Zip packages are unpacked first and read as directories; the scratch
     // directories go when `_unpacked` is dropped, whatever the outcome.
@@ -324,8 +324,8 @@ fn holds_data(path: &Path) -> bool {
 }
 
 fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: &str) {
-    println!("Built database '{name}' in {dir} ({backend})");
-    println!(
+    gstore::outln!("Built database '{name}' in {dir} ({backend})");
+    gstore::outln!(
         "  triples={}  entities={}  literals={}  predicates={}",
         db.triple_num(),
         db.entity_num(),
@@ -334,21 +334,21 @@ fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: 
     );
     let quads: u64 = db.named_graphs().values().map(|g| g.triple_count()).sum();
     if quads > 0 {
-        println!(
+        gstore::outln!(
             "  named graphs={}  named-graph quads={quads}",
             db.named_graphs().len()
         );
     }
-    println!("  took {:.3}s", started.elapsed().as_secs_f64());
+    gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
 }
 
 fn print_report(report: &ImportReport, log: &Path) {
-    println!(
+    gstore::outln!(
         "  read {} statement(s) from {} source(s)",
         report.statements, report.documents
     );
     if report.failed > 0 {
-        println!(
+        gstore::outln!(
             "  RDF parse error num {}; see {}",
             report.failed,
             log.display()

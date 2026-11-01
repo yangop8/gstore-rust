@@ -288,7 +288,7 @@ fn main() -> ExitCode {
         ExportFormat::NTriples => "triple(s)",
         ExportFormat::NQuads => "statement(s)",
     };
-    println!(
+    gstore::outln!(
         "Exported {count} {what} from '{dir}' to '{}'",
         written.display()
     );

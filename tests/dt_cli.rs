@@ -81,3 +81,103 @@ fn gquery_update_persists_to_disk() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run `cmd` with its standard output a pipe whose reader is already gone
+/// (what a tool sees after `| head -1` exited), returning its status and
+/// standard error.
+fn run_with_closed_stdout(cmd: &mut Command) -> (std::process::ExitStatus, String) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = cmd
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run the tool");
+    (out.status, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A tool whose standard output is a closed pipe (`gserver -S | head -1`,
+/// `gquery … | head`) stops writing and exits with its usual status — no
+/// "failed printing to stdout: Broken pipe" panic, no error message.
+#[test]
+fn a_closed_stdout_pipe_ends_the_output_quietly() {
+    let work = std::env::temp_dir().join(format!("gstore_dt_cli_epipe_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let name = work.join("epipe");
+    let build = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+        .arg(&name)
+        .arg(small_nt())
+        .output()
+        .expect("run gbuild");
+    assert!(build.status.success(), "gbuild failed: {build:?}");
+    let db = format!("{}.db", name.display());
+
+    let quiet = |what: &str, (status, stderr): (std::process::ExitStatus, String)| {
+        assert!(!stderr.contains("panicked"), "{what} panicked: {stderr}");
+        assert!(!stderr.contains("Broken pipe"), "{what} reported the pipe: {stderr}");
+        assert!(status.success(), "{what} exited with {status}: {stderr}");
+    };
+    // Every tool's help.
+    for exe in [
+        env!("CARGO_BIN_EXE_gbuild"),
+        env!("CARGO_BIN_EXE_gquery"),
+        env!("CARGO_BIN_EXE_gadd"),
+        env!("CARGO_BIN_EXE_gsub"),
+        env!("CARGO_BIN_EXE_gdrop"),
+        env!("CARGO_BIN_EXE_gexport"),
+        env!("CARGO_BIN_EXE_gbackup"),
+        env!("CARGO_BIN_EXE_grestore"),
+        env!("CARGO_BIN_EXE_gshow"),
+        env!("CARGO_BIN_EXE_gmonitor"),
+        env!("CARGO_BIN_EXE_gserver"),
+        env!("CARGO_BIN_EXE_gconsole"),
+    ] {
+        quiet(exe, run_with_closed_stdout(Command::new(exe).arg("--help")));
+    }
+    // Status and listing output.
+    quiet(
+        "gserver -S",
+        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gserver")).arg("-S").current_dir(&work)),
+    );
+    quiet(
+        "gshow",
+        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gshow")).current_dir(&work)),
+    );
+    quiet(
+        "gshow <db>",
+        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gshow")).arg(&name)),
+    );
+    quiet(
+        "gmonitor <db>",
+        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gmonitor")).arg(&name)),
+    );
+    // A query result streamed to the closed pipe.
+    quiet(
+        "gquery -e",
+        run_with_closed_stdout(
+            Command::new(env!("CARGO_BIN_EXE_gquery"))
+                .arg(&name)
+                .arg("-e")
+                .arg("SELECT ?s ?p ?o WHERE { ?s ?p ?o }"),
+        ),
+    );
+    // The embedded console reading its commands from standard input.
+    let script = work.join("script.txt");
+    std::fs::write(&script, "SELECT ?s WHERE { ?s ?p ?o };\nquit\n").unwrap();
+    quiet(
+        "gconsole --local",
+        run_with_closed_stdout(
+            Command::new(env!("CARGO_BIN_EXE_gconsole"))
+                .arg("--local")
+                .arg(&db)
+                .stdin(std::fs::File::open(&script).unwrap()),
+        ),
+    );
+    // The output is gone, but the work was done: a mutating tool finished.
+    quiet(
+        "gadd",
+        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gadd")).arg(&name).arg(small_nt())),
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}

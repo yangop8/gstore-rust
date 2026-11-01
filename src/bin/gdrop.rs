@@ -70,6 +70,6 @@ fn main() -> ExitCode {
         eprintln!("failed to drop '{dir}': {e}");
         return ExitCode::FAILURE;
     }
-    println!("Dropped database '{dir}'");
+    gstore::outln!("Dropped database '{dir}'");
     ExitCode::SUCCESS
 }

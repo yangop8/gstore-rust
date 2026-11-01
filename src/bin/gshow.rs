@@ -153,13 +153,13 @@ fn print_table(headers: &[&str], rows: &[[String; 3]]) {
             .collect::<String>()
             + "|"
     };
-    println!("{rule}");
-    println!("{}", line(headers.to_vec()));
-    println!("{rule}");
+    gstore::outln!("{rule}");
+    gstore::outln!("{}", line(headers.to_vec()));
+    gstore::outln!("{rule}");
     for row in rows {
-        println!("{}", line(row.iter().map(String::as_str).collect()));
+        gstore::outln!("{}", line(row.iter().map(String::as_str).collect()));
     }
-    println!("{rule}");
+    gstore::outln!("{rule}");
 }
 
 /// One database's counts and status.
@@ -175,18 +175,18 @@ fn show_one(name: &str) -> ExitCode {
     };
 
     let s = db.stats();
-    println!("database  : {}", s.name);
-    println!("directory : {dir}");
-    println!("storage   : {}", db.storage());
-    println!("triples   : {}", s.triple_num);
-    println!("entities  : {}", s.entity_num);
-    println!("literals  : {}", s.literal_num);
-    println!("predicates: {}", s.predicate_num);
-    println!("named_graphs: {}", db.named_graphs().len());
-    println!(
+    gstore::outln!("database  : {}", s.name);
+    gstore::outln!("directory : {dir}");
+    gstore::outln!("storage   : {}", db.storage());
+    gstore::outln!("triples   : {}", s.triple_num);
+    gstore::outln!("entities  : {}", s.entity_num);
+    gstore::outln!("literals  : {}", s.literal_num);
+    gstore::outln!("predicates: {}", s.predicate_num);
+    gstore::outln!("named_graphs: {}", db.named_graphs().len());
+    gstore::outln!(
         "index     : {}",
         if s.index_valid { "valid" } else { "stale" }
     );
-    println!("in_txn    : {}", s.in_transaction);
+    gstore::outln!("in_txn    : {}", s.in_transaction);
     ExitCode::SUCCESS
 }

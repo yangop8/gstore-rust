@@ -87,8 +87,8 @@ fn main() -> ExitCode {
         }
     };
     match node.local_addr() {
-        Ok(a) => println!("gnode shard listening on {a} (length-prefixed binary RPC)"),
-        Err(_) => println!("gnode shard listening on {bind_addr}"),
+        Ok(a) => gstore::outln!("gnode shard listening on {a} (length-prefixed binary RPC)"),
+        Err(_) => gstore::outln!("gnode shard listening on {bind_addr}"),
     }
     node.serve_forever();
     ExitCode::SUCCESS
@@ -152,11 +152,11 @@ fn run_cluster(args: &[&str]) -> ExitCode {
         node.set_peer_addr(*pid, *addr);
     }
     match node.local_addr() {
-        Ok(a) => println!(
+        Ok(a) => gstore::outln!(
             "gnode cluster node {id} listening on {a} with {} peer(s) (Raft replication)",
             peers.len()
         ),
-        Err(_) => println!("gnode cluster node {id} listening on {bind_addr}"),
+        Err(_) => gstore::outln!("gnode cluster node {id} listening on {bind_addr}"),
     }
     let handles = node.start();
     for h in handles {

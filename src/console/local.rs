@@ -35,7 +35,7 @@ pub fn run(target: &str) -> i32 {
     let mut db = if Path::new(&dir).is_dir() {
         match Database::open(&dir) {
             Ok(db) => {
-                println!(
+                crate::outln!(
                     "Loaded database '{}' ({} triples, {}).",
                     db.name(),
                     db.triple_num(),
@@ -49,11 +49,11 @@ pub fn run(target: &str) -> i32 {
             }
         }
     } else {
-        println!("No database at '{dir}'. Started a new in-memory database '{target}'.");
+        crate::outln!("No database at '{dir}'. Started a new in-memory database '{target}'.");
         Database::new(target.to_string())
     };
 
-    println!("gStore-rust local console. End a query with ';'. Type 'help' for commands.");
+    crate::outln!("gStore-rust local console. End a query with ';'. Type 'help' for commands.");
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();
     let mut failures = 0usize;
@@ -79,7 +79,7 @@ pub fn run(target: &str) -> i32 {
                     continue;
                 }
                 "stats" => {
-                    println!(
+                    crate::outln!(
                         "name={} triples={} entities={} literals={} predicates={}",
                         db.name(),
                         db.triple_num(),
@@ -98,7 +98,7 @@ pub fn run(target: &str) -> i32 {
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(db_dir_for(db.name())));
                     match db.save(&dir) {
-                        Ok(()) => println!("saved to {}", dir.display()),
+                        Ok(()) => crate::outln!("saved to {}", dir.display()),
                         Err(e) => {
                             failures += 1;
                             eprintln!("save failed: {e}");
@@ -120,7 +120,7 @@ pub fn run(target: &str) -> i32 {
                     match Database::open(db_dir_for(other)) {
                         Ok(loaded) => {
                             db = loaded;
-                            println!("loaded '{}' ({} triples)", db.name(), db.triple_num());
+                            crate::outln!("loaded '{}' ({} triples)", db.name(), db.triple_num());
                         }
                         Err(e) => {
                             failures += 1;
@@ -147,7 +147,7 @@ pub fn run(target: &str) -> i32 {
         }
         print_prompt(&buffer);
     }
-    println!("bye.");
+    crate::outln!("bye.");
     if !interactive && failures > 0 {
         1
     } else {
@@ -174,17 +174,17 @@ fn run_query(db: &mut Database, query: &str) -> bool {
     }
     match db.query(query) {
         Ok(QueryResult::Select(rs)) => {
-            print!("{}", rs.to_table_string());
-            println!("[{} row(s)]", rs.row_count());
+            crate::out!("{}", rs.to_table_string());
+            crate::outln!("[{} row(s)]", rs.row_count());
         }
-        Ok(QueryResult::Ask(b)) => println!("{b}"),
+        Ok(QueryResult::Ask(b)) => crate::outln!("{b}"),
         Ok(QueryResult::Construct(triples)) => {
             for t in &triples {
-                println!("{t}");
+                crate::outln!("{t}");
             }
-            println!("[{} triple(s)]", triples.len());
+            crate::outln!("[{} triple(s)]", triples.len());
         }
-        Ok(QueryResult::Update { changed }) => println!("[updated {changed} triple(s)]"),
+        Ok(QueryResult::Update { changed }) => crate::outln!("[updated {changed} triple(s)]"),
         Err(e) => {
             eprintln!("error: {e}");
             return false;
@@ -202,7 +202,7 @@ fn import_file(db: &mut Database, path: &str) -> bool {
         db.insert_sources(&sources, &ImportOptions::strict(), &mut (), &mut count)
     });
     match res {
-        Ok(_) => println!("imported {count} new triple(s) from {path}"),
+        Ok(_) => crate::outln!("imported {count} new triple(s) from {path}"),
         Err(e) => {
             eprintln!("import failed after {count} new triple(s): {e}");
             return false;
@@ -212,7 +212,7 @@ fn import_file(db: &mut Database, path: &str) -> bool {
 }
 
 fn print_help() {
-    println!(
+    crate::outln!(
         "commands:\n  \
          help              show this help\n  \
          stats             show database statistics\n  \
@@ -231,6 +231,6 @@ fn print_prompt(buffer: &str) {
     } else {
         "  ..> "
     };
-    print!("{p}");
+    crate::out!("{p}");
     let _ = io::stdout().flush();
 }

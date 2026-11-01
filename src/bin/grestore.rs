@@ -148,7 +148,7 @@ fn main() -> ExitCode {
         eprintln!("restore of '{backup}' into '{dir}' failed: {e}");
         return ExitCode::FAILURE;
     }
-    println!("Restored '{backup}' into '{dir}'");
+    gstore::outln!("Restored '{backup}' into '{dir}'");
     ExitCode::SUCCESS
 }
 
@@ -166,9 +166,9 @@ fn list_backups(name: &str) -> ExitCode {
         Err(_) => Vec::new(),
     };
     found.sort();
-    println!("Backup Path");
+    gstore::outln!("Backup Path");
     for f in &found {
-        println!("{}", Path::new(DEFAULT_BACKUP_PATH).join(f).display());
+        gstore::outln!("{}", Path::new(DEFAULT_BACKUP_PATH).join(f).display());
     }
     if found.is_empty() {
         eprintln!("no backup of '{name}' in '{DEFAULT_BACKUP_PATH}'");
