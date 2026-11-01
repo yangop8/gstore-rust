@@ -1,0 +1,2 @@
+# rustfmt settings of the workspace (`cargo fmt --all`; CI checks it).
+style_edition = "2021"

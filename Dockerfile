@@ -34,11 +34,12 @@ RUN if echo " ${FEATURES} " | grep -q " rocksdb "; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# The workspace (gstore + the gnlqa member, which cargo needs to resolve the
-# workspace even though only gstore is built). .dockerignore keeps target/,
-# tests and test data out of the context.
+# The workspace (gstore + the gnlqa and bench members, which cargo needs to
+# resolve the workspace even though only gstore is built). .dockerignore keeps
+# target/, tests and test data out of the context.
 COPY Cargo.toml Cargo.lock ./
 COPY gnlqa ./gnlqa
+COPY bench ./bench
 COPY src ./src
 COPY conf ./conf
 
