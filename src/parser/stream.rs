@@ -37,14 +37,48 @@ pub const MAX_LOOKAHEAD: usize = 8;
 /// wrapped around a file, i.e. how much undecoded input is held at once.
 pub const DEFAULT_WINDOW: usize = 64 * 1024;
 
+/// How much input a [recording](CharSource::record_from) may hold: the bytes
+/// a Turtle short string literal may run on after its first raw line break
+/// (and the rest of its statement after it), so that a failed statement can
+/// be [replayed](CharSource::replay) from that line break.
+pub const MAX_LITERAL_SPAN: usize = 256 * 1024;
+
+/// Marks a lookahead entry decoded from an invalid UTF-8 sequence (the low
+/// bits hold its byte length).
+const BAD: u8 = 0x80;
+/// The byte-length bits of a lookahead entry.
+const LEN: u8 = 0x7F;
+
+/// What a [`CharSource`] recorded for a replay (see
+/// [`record_from`](CharSource::record_from)).
+#[derive(Debug)]
+struct Recording {
+    /// The characters consumed since the recording started, with their
+    /// lookahead entries' length bits.
+    chars: Vec<(char, u8)>,
+    /// Their encoded size.
+    bytes: usize,
+    /// The line the recording started on.
+    line: usize,
+    /// Inside the literal that started it: running past
+    /// [`MAX_LITERAL_SPAN`] then ends the input (see
+    /// [`CharSource::replay`]); past it, the recording is dropped.
+    in_literal: bool,
+    /// The literal ran past [`MAX_LITERAL_SPAN`].
+    overflow: bool,
+}
+
 /// A bounded-memory UTF-8 character stream over a [`BufRead`].
 ///
 /// Memory held: the reader's own buffer (the window), at most
 /// [`MAX_LOOKAHEAD`] decoded characters and a 4-byte carry for a character
-/// split across refills. Nothing else of the input is retained.
+/// split across refills — and, while a reader [records](Self::record_from)
+/// for a replay, at most [`MAX_LITERAL_SPAN`] bytes of input. Nothing else
+/// of the input is retained.
 pub struct CharSource<R> {
     inner: R,
-    /// Decoded lookahead: `(char, encoded byte length)`.
+    /// Decoded lookahead: `(char, encoded byte length | BAD)`; after a
+    /// [`replay`](Self::replay) it may hold more than [`MAX_LOOKAHEAD`].
     look: VecDeque<(char, u8)>,
     /// 1-based line of the next character [`bump`](Self::bump) returns.
     line: usize,
@@ -53,6 +87,8 @@ pub struct CharSource<R> {
     bad_utf8: bool,
     /// Bytes of the characters consumed so far.
     consumed: u64,
+    /// The input consumed since [`record_from`](Self::record_from).
+    record: Option<Recording>,
 }
 
 impl<R: BufRead> CharSource<R> {
@@ -65,6 +101,7 @@ impl<R: BufRead> CharSource<R> {
             io_error: None,
             bad_utf8: false,
             consumed: 0,
+            record: None,
         }
     }
 
@@ -125,7 +162,7 @@ impl<R: BufRead> CharSource<R> {
         if n == 0 {
             self.inner.consume(1);
             self.bad_utf8 = true;
-            self.look.push_back(('\u{FFFD}', 1));
+            self.look.push_back(('\u{FFFD}', 1 | BAD));
             return true;
         }
         if buf.len() >= n {
@@ -140,7 +177,7 @@ impl<R: BufRead> CharSource<R> {
                 None => {
                     self.inner.consume(1);
                     self.bad_utf8 = true;
-                    self.look.push_back(('\u{FFFD}', 1));
+                    self.look.push_back(('\u{FFFD}', 1 | BAD));
                 }
             }
             return true;
@@ -183,7 +220,7 @@ impl<R: BufRead> CharSource<R> {
             Some(c) => self.look.push_back((c, n as u8)),
             None => {
                 self.bad_utf8 = true;
-                self.look.push_back(('\u{FFFD}', have.max(1) as u8));
+                self.look.push_back(('\u{FFFD}', have.max(1) as u8 | BAD));
             }
         }
         true
@@ -192,6 +229,9 @@ impl<R: BufRead> CharSource<R> {
     /// The character `k` positions ahead (`0` = the next one).
     pub fn peek_at(&mut self, k: usize) -> Option<char> {
         debug_assert!(k < MAX_LOOKAHEAD);
+        if self.record.as_ref().is_some_and(|r| r.overflow) {
+            return None;
+        }
         while self.look.len() <= k {
             if !self.decode_one() {
                 return None;
@@ -210,12 +250,92 @@ impl<R: BufRead> CharSource<R> {
         if self.look.is_empty() && !self.decode_one() {
             return None;
         }
+        if let Some(r) = &mut self.record {
+            let n = usize::from(self.look.front()?.1 & LEN);
+            if r.overflow {
+                return None;
+            }
+            if r.bytes + n > MAX_LITERAL_SPAN {
+                if r.in_literal {
+                    // The literal ran too far: the input "ends" here until
+                    // the reader replays (its parse fails meanwhile).
+                    r.overflow = true;
+                    return None;
+                }
+                // Past the literal: too far back to replay; carry on.
+                self.record = None;
+            }
+        }
         let (c, n) = self.look.pop_front()?;
-        self.consumed += u64::from(n);
+        self.consumed += u64::from(n & LEN);
+        if n & BAD != 0 {
+            // (Set again for a replayed character, whose decoding set it the
+            // first time.)
+            self.bad_utf8 = true;
+        }
         if c == '\n' {
             self.line += 1;
         }
+        if let Some(r) = &mut self.record {
+            r.chars.push((c, n));
+            r.bytes += usize::from(n & LEN);
+        }
         Some(c)
+    }
+
+    /// Start recording the input consumed from here on (unless a recording
+    /// is under way), for a [`replay`](Self::replay), and mark the reader as
+    /// inside the literal that asked for it ([`end_literal`](Self::end_literal)
+    /// marks its end). The Turtle reader records from a short string's
+    /// first raw line break, which upstream's lexer accepts: if the
+    /// statement then fails, the literal was probably missing its closing
+    /// quote, and the statement is replayed from that line break so the
+    /// lines after it are read again rather than swallowed. At most
+    /// [`MAX_LITERAL_SPAN`] bytes are held: a literal running further makes
+    /// the input end (the statement fails and is replayed); a statement
+    /// running further after its literal is not replayable any more.
+    pub fn record_from(&mut self, line: usize) {
+        match &mut self.record {
+            Some(r) => r.in_literal = true,
+            None => {
+                self.record = Some(Recording {
+                    chars: Vec::new(),
+                    bytes: 0,
+                    line,
+                    in_literal: true,
+                    overflow: false,
+                })
+            }
+        }
+    }
+
+    /// The literal that started (or continued) the recording has ended.
+    pub fn end_literal(&mut self) {
+        if let Some(r) = &mut self.record {
+            r.in_literal = false;
+        }
+    }
+
+    /// Drop the recording (its statement parsed).
+    pub fn drop_recording(&mut self) {
+        self.record = None;
+    }
+
+    /// Put the recorded input back in front of the lookahead, as if it had
+    /// never been consumed (lines and byte counts included), and end the
+    /// recording. Returns the line the recording started on and whether the
+    /// literal ran past [`MAX_LITERAL_SPAN`]; `None` when nothing was
+    /// recorded.
+    pub fn replay(&mut self) -> Option<(usize, bool)> {
+        let r = self.record.take()?;
+        for &(c, n) in r.chars.iter().rev() {
+            self.look.push_front((c, n));
+            self.consumed -= u64::from(n & LEN);
+            if c == '\n' {
+                self.line -= 1;
+            }
+        }
+        Some((r.line, r.overflow))
     }
 
     /// Whether the input is exhausted.

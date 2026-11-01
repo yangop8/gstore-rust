@@ -33,6 +33,20 @@
 //! of the line the error was detected on is skipped, and parsing resumes at
 //! the next line (still inside the current TriG block, if any).
 //!
+//! # Extension: line breaks in short strings
+//!
+//! Like upstream's lexer (`TurtleParser::Lexer::lexString`), a `"…"` /
+//! `'…'` string may contain a raw line break (W3C Turtle allows them only in
+//! `"""…"""` strings). The exporters never write one (they escape `\n` /
+//! `\r`). Recovery stays per line: a statement whose short string ran
+//! across a line break and that then fails — a missing closing quote,
+//! usually — is reported on the literal's line and read again from its line
+//! break, so the next lines are not swallowed (upstream loses them). A short
+//! string may run on for at most
+//! [`MAX_LITERAL_SPAN`](crate::parser::stream::MAX_LITERAL_SPAN) (256 KiB)
+//! after its first line break; one that reaches the end of the input or
+//! runs further is an error of its statement too.
+//!
 //! # Extension: lenient local names
 //!
 //! Like upstream's lexer, which ends a prefixed name only at whitespace or
@@ -192,6 +206,9 @@ impl<R: BufRead> Parser<R> {
     fn run(&mut self, sink: &mut dyn StatementSink) -> Result<()> {
         loop {
             self.ctx = [None, None, None];
+            // The previous statement parsed (or was replayed): nothing of it
+            // is needed any more.
+            self.src.drop_recording();
             let item = self.next_item();
             if let Some(e) = self.src.take_io_error() {
                 return Err(e.into());
@@ -218,6 +235,14 @@ impl<R: BufRead> Parser<R> {
                 Err(e) => {
                     self.out.clear();
                     self.depth = 0;
+                    // A short string ran across a line break and the
+                    // statement then failed: its closing quote was probably
+                    // missing. Read the input again from that line break, so
+                    // the error costs the literal's line only.
+                    let e = match self.src.replay() {
+                        Some((line, overflow)) => literal_span_error(&e, line, overflow),
+                        None => e,
+                    };
                     sink.error(SyntaxError::from_error(&e).with_context(self.context()))?;
                     // Tolerant: resynchronise at the next line.
                     self.resync();
@@ -882,14 +907,18 @@ impl<R: BufRead> Parser<R> {
         loop {
             match self.peek() {
                 None => return Err(self.err("unterminated literal")),
-                // A short string never spans lines (STRING_LITERAL_QUOTE):
-                // stopping here, the newline unread, keeps a tolerant
-                // import's resync on this line — one stray quote must not
-                // swallow the rest of the file into one value.
-                Some('\n' | '\r') if !triple => {
-                    return Err(
-                        self.err("unterminated literal (line break before the closing quote)")
-                    )
+                // A raw line break in a short string: W3C Turtle forbids it
+                // (STRING_LITERAL_QUOTE), upstream's lexer (`lexString`)
+                // reads it into the value, and so does this reader — while
+                // recording from here, so that a statement that then fails
+                // (a closing quote was missing, most likely) is read again
+                // from this line break instead of swallowing the lines
+                // after it (see `CharSource::record_from`).
+                Some(c @ ('\n' | '\r')) if !triple => {
+                    let line = self.src.line();
+                    self.src.record_from(line);
+                    value.push(c);
+                    self.bump();
                 }
                 Some('\\') => {
                     self.bump();
@@ -910,6 +939,7 @@ impl<R: BufRead> Parser<R> {
                         self.bump();
                     } else {
                         self.bump();
+                        self.src.end_literal();
                         break;
                     }
                 }
@@ -1107,6 +1137,30 @@ impl<R: BufRead> Parser<R> {
     }
 }
 
+
+/// The error of a statement replayed from the first raw line break of one
+/// of its short string literals (opened on `line`): reported on that line,
+/// the literal's closing quote being the likely culprit.
+fn literal_span_error(e: &GStoreError, line: usize, overflow: bool) -> GStoreError {
+    let detail = if overflow {
+        format!(
+            "a string literal runs across line breaks for more than {} KiB",
+            crate::parser::stream::MAX_LITERAL_SPAN / 1024
+        )
+    } else {
+        match e {
+            GStoreError::RdfParse { msg, .. } => msg.clone(),
+            other => other.to_string(),
+        }
+    };
+    GStoreError::RdfParse {
+        line,
+        msg: format!(
+            "{detail} (a string literal opened on this line runs across a line break: is its \
+             closing quote missing?)"
+        ),
+    }
+}
 
 fn is_absolute_iri(s: &str) -> bool {
     match s.find(':') {
@@ -1673,10 +1727,117 @@ mod tests {
         assert_eq!(sink.quads.len(), 103, "{:?}", sink.errors);
         let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
         assert_eq!(lines, [2, 103, 105], "{:?}", sink.errors);
-        assert!(sink.errors[0].message.contains("unterminated literal"));
+        // Line 2's string ran on to line 103's quote, then the statement
+        // failed: replayed from its line break, reported on its line.
+        assert!(
+            sink.errors[0].message.contains("closing quote missing"),
+            "{:?}",
+            sink.errors
+        );
         // A long string may still span lines.
         let ts = parse_str("<s> <p> \"\"\"a\nb\"\"\" .").unwrap();
         assert_eq!(ts[0].object, Term::plain_literal("a\nb"));
+    }
+
+    #[test]
+    fn short_strings_may_hold_raw_line_breaks_like_upstream() {
+        // Upstream's `lexString` reads a raw line break into the value.
+        let ts = parse_str("<s> <p> \"a\nb\" .\n<s> <q> 'c\r\nd'@en .\n<t> <p> <o> .\n").unwrap();
+        assert_eq!(ts.len(), 3);
+        assert_eq!(ts[0].object, Term::plain_literal("a\nb"));
+        assert_eq!(
+            ts[1].object,
+            Term::Literal {
+                value: "c\r\nd".into(),
+                datatype: None,
+                lang: Some("en".into())
+            }
+        );
+        // Several lines, an escape and a predicate-object list after it.
+        let doc = "<s> <p> \"line 1\nline \\\"2\\\"\n\nline 4\" ; <q> 1 .\n<u> <p> <o> .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        assert!(sink.errors.is_empty(), "{:?}", sink.errors);
+        assert_eq!(sink.quads.len(), 3);
+        assert_eq!(
+            sink.quads[0].object,
+            Term::plain_literal("line 1\nline \"2\"\n\nline 4")
+        );
+        // In a TriG block too, and the block still closes.
+        let (got, errors) =
+            tolerant_trig("<g> { <s> <p> \"x\ny\" .\n<t> <p> <o> . }\n<d> <p> <o> .\n");
+        assert_eq!(errors, 0);
+        let g = Some(Term::iri("g"));
+        assert_eq!(
+            got,
+            [
+                ("<s>".to_string(), g.clone()),
+                ("<t>".to_string(), g),
+                ("<d>".to_string(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_string_reaching_the_end_or_the_cap_costs_only_its_line() {
+        use crate::parser::stream::MAX_LITERAL_SPAN;
+        // No closing quote before the end of the input.
+        let doc = "<a> <p> <o> .\n<s> <p> \"no end .\n<b> <p> <o> .\n<c> <p> <o> .\n";
+        let mut sink = Tolerant::default();
+        parse_reader(doc.as_bytes(), BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        assert_eq!(subjects, ["<a>", "<b>", "<c>"], "{:?}", sink.errors);
+        assert_eq!(sink.errors.len(), 1);
+        assert_eq!(sink.errors[0].line, 2);
+        assert!(sink.errors[0].message.contains("unterminated literal"));
+        let err = parse_str(doc).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::RdfParse { line: 2, .. }),
+            "{err}"
+        );
+
+        // A quote far away: the string would run past the cap.
+        let mut doc = String::from("<s> <p> \"far .\n");
+        let filler = "<f> <p> <o> .\n";
+        let n = MAX_LITERAL_SPAN / filler.len() + 10;
+        for _ in 0..n {
+            doc.push_str(filler);
+        }
+        doc.push_str("<z> <p> \"closed\" .\n");
+        // A small read window: the replay crosses many refills.
+        let reader = BufReader::with_capacity(7, doc.as_bytes());
+        let mut sink = Tolerant::default();
+        parse_reader(reader, BlankLabeler::keep(), &mut sink).unwrap();
+        assert_eq!(sink.errors.len(), 1, "{:?}", sink.errors);
+        assert_eq!(sink.errors[0].line, 1);
+        assert!(
+            sink.errors[0].message.contains("more than 256 KiB"),
+            "{:?}",
+            sink.errors
+        );
+        assert_eq!(sink.quads.len(), n + 1);
+        assert_eq!(sink.quads[n].object, Term::plain_literal("closed"));
+    }
+
+    #[test]
+    fn replays_keep_lines_bytes_and_bad_utf8_exact() {
+        // The statement after a replayed one is reported on its own line,
+        // and invalid UTF-8 inside the replayed text still fails its
+        // statement.
+        let mut doc =
+            b"<s> <p> \"open .\n<a> <p> \"x\xff\" .\n<b> <p> <o> .\n<c> ?bad .\n".to_vec();
+        doc.extend_from_slice(b"<d> <p> <o> .\n");
+        let mut sink = Tolerant::default();
+        parse_reader(&doc[..], BlankLabeler::keep(), &mut sink).unwrap();
+        let subjects: Vec<String> = sink.quads.iter().map(|q| q.subject.to_string()).collect();
+        assert_eq!(subjects, ["<b>", "<d>"], "{:?}", sink.errors);
+        let lines: Vec<usize> = sink.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [1, 2, 4], "{:?}", sink.errors);
+        assert!(
+            sink.errors[1].message.contains("UTF-8"),
+            "{:?}",
+            sink.errors
+        );
     }
 
     #[test]

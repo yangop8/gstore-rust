@@ -1068,3 +1068,60 @@ fn cli_tools_take_directories_are_tolerant_and_have_strict() {
     assert!(log.contains("batch remove parser info"), "{log}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Upstream's Turtle lexer reads a raw line break inside a `"…"` string and
+/// its exporter (`NodeUtil::node2string`) escapes one; so do the loaders and
+/// exporters here: such a file builds, its export holds `\n` / `\r` escapes
+/// (never a raw line break inside a literal) and loads back to the same
+/// values; a tolerant build loses only the line of an unclosed string.
+#[test]
+fn raw_line_breaks_in_short_strings_load_like_upstream_and_export_escaped() {
+    let dir = tmp("raw_newlines");
+    let file = write(
+        &dir.join("multi.ttl"),
+        "@prefix ex: <http://ex/> .\n\
+         ex:a ex:note \"first line\nsecond line\" .\n\
+         ex:b ex:note \"crlf\r\nend\"@en ; ex:n 1 .\n\
+         ex:c ex:note \"unclosed .\n\
+         ex:d ex:note \"fine\" .\n",
+    );
+    // Strict: the unclosed string fails the build, on its line.
+    let err = Database::build_from_files("strict", &[&file]).unwrap_err();
+    assert!(err.to_string().contains("line 6"), "{err}");
+    // Tolerant (upstream's build): only that statement is lost.
+    let sources = import::sources_from_paths(&[&file]).unwrap();
+    let (mut db, report) =
+        Database::build_from_sources("raw", &sources, &ImportOptions::tolerant(), &mut ()).unwrap();
+    assert_eq!((report.failed, db.triple_num()), (1, 4), "{report:?}");
+    let notes = col0(
+        &mut db,
+        "SELECT ?n WHERE { ?s <http://ex/note> ?n } ORDER BY ?s",
+    );
+    assert_eq!(
+        notes,
+        [
+            "\"crlf\\r\\nend\"@en",
+            "\"fine\"",
+            "\"first line\\nsecond line\""
+        ]
+    );
+    // The export escapes the line breaks: one statement per line.
+    let mut out = Vec::new();
+    let n =
+        gstore::zipio::write_export(&db, gstore::zipio::ExportFormat::NTriples, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!((n, text.lines().count()), (4, 4), "{text}");
+    assert!(text.contains("\"first line\\nsecond line\""), "{text}");
+    assert!(text.contains("\"crlf\\r\\nend\"@en"), "{text}");
+    // And loads back to the same values (strictly).
+    let back = write(&dir.join("export.nt"), &text);
+    let mut again = Database::build_from_files("again", &[&back]).unwrap();
+    assert_eq!(
+        col0(
+            &mut again,
+            "SELECT ?n WHERE { ?s <http://ex/note> ?n } ORDER BY ?s"
+        ),
+        notes
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
