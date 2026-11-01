@@ -249,12 +249,20 @@ In code: `GStoreConfig::query_settings()`, `ApiServer::with_query_settings`,
 `Server::with_query_settings`, `Database::apply_query_settings`.
 
 A `[pfn]` section (gstore-rust only) sets the sandbox limits of
-[PFN user functions](#pfn-user-graph-functions), applied the same way:
-`pfn_fuel_per_call` (instructions per call, default 10^9, `0` = unlimited),
-`pfn_max_memory_pages` (default 1024 = 64 MiB), `pfn_max_module_bytes`
-(default 1 MiB) and `pfn_max_functions` (per user, default 100). Upstream's
-`[system] pfn_base_path` (default here: `<db_home>/pfn`) is where the
-functions are stored.
+[PFN user functions](#pfn-user-graph-functions), applied the same way (to
+every served database, and re-applied by `refreshconf` to the loaded ones and
+to the function registry): `pfn_fuel_per_call` (instructions per call,
+default 10^9, `0` = unlimited), `pfn_max_memory_pages` (default 1024 =
+64 MiB), `pfn_max_module_bytes` (default 1 MiB) and `pfn_max_functions` (per
+user, default 100). Upstream's `[system] pfn_base_path` (default here:
+`<db_home>/pfn`) is where the functions are stored; it is read at startup.
+
+[Reasoning rules](#reasoning-reasonmanage) have no `conf.ini` keys: their
+limits are fixed (1000 rules per database, 1 MiB per rule file, 64
+conditions per rule, 256 patterns and 64 filters per condition, rule names of
+at most 128 characters), and executing or disabling a rule is an ordinary
+update (`check_point`, the `[query]` cache and the CSR behave as for any
+other write).
 
 ### Graph functions in SPARQL
 

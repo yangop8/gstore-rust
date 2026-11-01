@@ -1,6 +1,6 @@
 //! Phase 4 cross-package wiring: the reasoning rules (`reasonManage`, GAP_PLAN
-//! §3.2) meet the PFN user functions (§3.3), the advanced graph functions
-//! and the caches.
+//! §3.2) meet the PFN user functions (§3.3), the advanced graph functions,
+//! the caches and `conf.ini`.
 //!
 //! * **Caches.** Executing a rule adds `<Rule:label>` edges and disabling it
 //!   retracts them through the database's update path, so the query cache
@@ -9,12 +9,19 @@
 //!   the `pfn-wasm` runtime — a PFN function computed before see the new
 //!   edges after, and stop seeing them once the rule is disabled, each
 //!   answered twice (the second time from the caches).
+//! * **conf.ini.** `refreshconf` re-reads the `[pfn]` section: the registry's
+//!   limits (`pfn_max_functions`) and — on a database already loaded — the
+//!   sandbox limits a query runs under (`pfn_fuel_per_call`).
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
 use std::fs;
+use std::sync::Arc;
+use std::thread;
 
+use gstore::config::GStoreConfig;
+use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::{Database, QueryResult};
 use harness::*;
@@ -228,7 +235,6 @@ fn funcudb(srv: &Server, user: &str, kind: &str, info: Json) -> Json {
 }
 
 /// A `funInfo` object.
-#[cfg(feature = "pfn-wasm")]
 fn fun_info(name: &str, body: &str, subs: &str) -> Json {
     Json::obj()
         .with("funName", name)
@@ -333,4 +339,107 @@ fn executing_a_rule_changes_what_a_pfn_function_sees() {
     // Executed again: the same edge again (the rule re-infers it).
     assert_eq!(int(&reason(&srv, "fam", "4"), "AnsNum"), 1);
     assert_eq!(degrees("alice"), (1, 2));
+}
+
+// ---------------------------------------------------------------------------
+// conf.ini [pfn] and refreshconf
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refreshconf_applies_the_pfn_section() {
+    let dir = scratch("p4w_refresh");
+    let conf = dir.join("conf.ini");
+    let home = dir.join("home");
+    let write_conf = |pfn: &str| {
+        fs::write(
+            &conf,
+            format!(
+                "[server]\nport=0\nip_deny_path=off\n[system]\ndb_home={}\n[pfn]\n{pfn}\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+    };
+    write_conf("pfn_max_functions=1");
+    let mut cfg = GStoreConfig::load(&conf).unwrap();
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+    cfg.listen_addr = "127.0.0.1".to_string();
+    cfg.root_password = PASSWORD.to_string();
+    let server = Arc::new(ApiServer::bind_with_config(cfg).unwrap());
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    thread::spawn(move || s2.serve_forever());
+    let api = |fields: Vec<(&str, Json)>| {
+        let mut body = Json::obj()
+            .with("username", USERNAME)
+            .with("password", PASSWORD);
+        for (k, v) in fields {
+            body.set(k, v);
+        }
+        let (status, text) = http(&addr, "POST", "/api", body.to_string().as_bytes());
+        assert_eq!(status, 200, "{text}");
+        json::parse(&text).unwrap()
+    };
+    let create = |name: &str, body: &str| {
+        api(vec![
+            ("operation", "funcudb".into()),
+            ("type", "1".into()),
+            ("funInfo", fun_info(name, body, "")),
+        ])
+    };
+    let refresh = || ok(&api(vec![("operation", "refreshconf".into())]));
+    ok(&create("first", "(i32.const 1)"));
+    let j = create("second", "(i32.const 1)");
+    assert_eq!(code(&j), 1005, "{j}");
+    assert!(
+        string(&j, "StatusMsg").contains("pfn_max_functions = 1"),
+        "{j}"
+    );
+    // A loop of 100 000 iterations — well inside the default instruction
+    // budget, far beyond 1 000 instructions.
+    let spin = "(local $i i32) (local.set $i (i32.const 100000)) \
+                (loop $l (local.set $i (i32.sub (local.get $i) (i32.const 1))) \
+                (br_if $l (local.get $i))) (i32.const 1)";
+    write_conf("pfn_max_functions=2\npfn_fuel_per_call=1000");
+    refresh();
+    assert_eq!(server.pfn_registry().limits().max_functions, 2);
+    assert_eq!(server.pfn_registry().limits().fuel_per_call, 1000);
+    ok(&create("spin", spin));
+    assert_eq!(code(&create("third", "(i32.const 1)")), 1005);
+
+    // A database loaded before refreshconf runs its queries under the new
+    // sandbox limits.
+    if cfg!(feature = "pfn-wasm") {
+        // REST /build takes the data in its body.
+        let (status, text) = http_with(
+            &addr,
+            "POST",
+            "/build?db_name=fuel",
+            &[("Authorization", "Basic cm9vdDoxMjM0NTY=")],
+            FAMILY.as_bytes(),
+        );
+        assert_eq!(status, 200, "{text}");
+        ok(&api(vec![
+            ("operation", "funcudb".into()),
+            ("type", "4".into()),
+            ("funInfo", Json::obj().with("funName", "spin")),
+        ]));
+        let run = || {
+            api(vec![
+                ("operation", "query".into()),
+                ("db_name", "fuel".into()),
+                ("sparql", "SELECT (PFN.spin({}) AS ?v) WHERE {}".into()),
+            ])
+        };
+        let j = run();
+        assert_eq!(code(&j), 1005, "{j}");
+        assert!(
+            string(&j, "StatusMsg").contains("instruction budget of 1000"),
+            "{j}"
+        );
+        write_conf("pfn_max_functions=2\npfn_fuel_per_call=0");
+        refresh();
+        ok(&run());
+    }
+    server.shutdown();
 }
