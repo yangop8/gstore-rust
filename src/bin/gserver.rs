@@ -1057,6 +1057,18 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             // handlers reading the config see where the databases really are.
             let mut served = cfg.clone();
             served.db_home = root.clone();
+            // A new user store would seed root with the default password:
+            // refuse before `bind` creates it. Otherwise the refused start
+            // leaves that store behind, and the next start — given a password
+            // file, as the refusal advises — finds an existing store with the
+            // default password and is refused again.
+            if cfg.root_password == DEFAULT_ROOT_PASSWORD
+                && !root.join(gstore::sysdb::USERS_FILE).exists()
+                && !binds_loopback_only(addr)
+            {
+                refuse_default_password(&cfg.listen_addr);
+                return 1;
+            }
             let server = match ApiServer::bind_with_config(served) {
                 // gserver owns the diagnostic log: refreshconf re-reads it.
                 Ok(s) => s.with_load_policy(load_policy).with_log_refresh(),
@@ -1070,15 +1082,7 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             if server.root_has_default_password() {
                 let local = server.local_addr().ok();
                 if local.is_some_and(|a| !a.ip().is_loopback()) {
-                    gs_error!(
-                        "root still has the default password '{DEFAULT_ROOT_PASSWORD}' and the \
-                         server would listen on {}: refusing to start. Set root's password \
-                         first: for a new user store with --password-file FILE (or the \
-                         {ENV_PASSWORD_FILE} environment variable, or conf.ini's root_password); \
-                         for an existing one, start on 127.0.0.1 and change it with gconsole's \
-                         setpswd or the /api userPassword operation.",
-                        cfg.listen_addr
-                    );
+                    refuse_default_password(&cfg.listen_addr);
                     return 1;
                 }
                 gs_warn!(
@@ -1172,6 +1176,28 @@ fn install_signals(handle: &ShutdownHandle) {
     if shutdown_on_signals(handle.clone()) {
         gs_announce!("gserver: Ctrl-C / SIGTERM shuts down gracefully (saving unsaved changes)");
     }
+}
+
+/// Whether every address `addr` resolves to is a loopback address (an
+/// address that does not resolve counts as loopback: `bind` reports it).
+fn binds_loopback_only(addr: (&str, u16)) -> bool {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()
+        .map(|mut addrs| addrs.all(|a| a.ip().is_loopback()))
+        .unwrap_or(true)
+}
+
+/// Log why the API server will not serve root's default password on
+/// `listen_addr`.
+fn refuse_default_password(listen_addr: &str) {
+    gs_error!(
+        "root still has the default password '{DEFAULT_ROOT_PASSWORD}' and the \
+         server would listen on {listen_addr}: refusing to start. Set root's password \
+         first: for a new user store with --password-file FILE (or the \
+         {ENV_PASSWORD_FILE} environment variable, or conf.ini's root_password); \
+         for an existing one, start on 127.0.0.1 and change it with gconsole's \
+         setpswd or the /api userPassword operation."
+    );
 }
 
 /// Record this server in the pid file (warn, but keep serving, on failure).

@@ -4,8 +4,11 @@
 # 1.4's /api protocol on port 9000) plus the command-line tools.
 #
 #   docker build -t gstore-rust .
+#   printf '%s\n' 'a-long-random-password' > gstore_root   # root's password
 #   docker run -d --name gstore -p 9000:9000 \
 #       -v gstore-data:/var/lib/gstore -v gstore-conf:/etc/gstore \
+#       -v "$PWD/gstore_root:/run/secrets/gstore_root:ro" \
+#       -e GSTORE_ROOT_PASSWORD_FILE=/run/secrets/gstore_root \
 #       --stop-timeout 120 gstore-rust
 #   curl 'http://127.0.0.1:9000/api?operation=check'
 #

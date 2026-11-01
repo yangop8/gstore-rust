@@ -152,6 +152,15 @@ changed; the following ones each phase, newest first.
 - **Tests.** `tests/dt_merge5_review.rs`, and new cases in
   `dt_gserver_lifecycle`, `dt_zip_io`, `dt_settings_phase5`, `dt_logging`,
   `dt_gconsole` and the unit tests of `console::table` and `model::term`.
+- **Fixed: a refused start no longer blocks the next one.** `gserver`
+  refused to serve root's default password beyond loopback only after it
+  had created the user store, so a container started without a password
+  (as the `Dockerfile`'s own example did) left a store with root at
+  `123456` in its volume, and the next start — given
+  `GSTORE_ROOT_PASSWORD_FILE`, as the refusal advises — found that store
+  and was refused again. It now refuses before creating the store
+  (`dt_gserver_lifecycle`); the `Dockerfile`'s example passes a password
+  file, as `docs/DEPLOY.md`'s does.
 
 ### Integrating Phases 2 and 3 with the Phase 1 server
 

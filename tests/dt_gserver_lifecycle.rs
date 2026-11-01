@@ -532,6 +532,35 @@ mod binary {
         assert_eq!(code, 1, "stdout:{out}\nstderr:{err}");
         assert!(err.contains("refusing to start"), "{err}");
         assert!(!pid_file.exists());
+        // The refused start created no user store: the next start, given a
+        // password file as the refusal advises (and as docs/DEPLOY.md's
+        // `docker run` does), seeds a new one from it instead of finding root
+        // with the default password and refusing again.
+        assert!(!home.join("users.db").exists(), "a refused start left a user store");
+        let pw0 = dir.join("root_pw0");
+        std::fs::write(&pw0, "set-after-refusal\n").unwrap();
+        let pw0_s = pw0.to_string_lossy().into_owned();
+        let (code, out, err) = gserver(
+            &dir,
+            &[
+                "-b",
+                "--api",
+                &home_s,
+                "-p",
+                "0",
+                "--addr",
+                "0.0.0.0",
+                "--password-file",
+                &pw0_s,
+            ],
+        );
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let port = addr_of(&pid_file).port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let (s, body) = request(&addr, "POST", "/login", "username=root&password=set-after-refusal");
+        assert_eq!(s, 200, "{body}");
+        let (code, _, _) = gserver(&dir, &["-t", "--api", &home_s]);
+        assert_eq!(code, 0);
 
         // An unreadable password file is an error.
         let (code, _, err) = gserver(
