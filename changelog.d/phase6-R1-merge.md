@@ -66,6 +66,11 @@ identical). The query geomean improved by more than 1.5×, so plan §5.6(d)
   2, left to the owners of that file). Today their store is always an
   in-memory `TripleStore`, so no read error can occur there; `Snapshot::capture`
   over a non-memory backend reads the whole store unscoped as well.
-- **rustfmt:** the one-time `cargo fmt --all` commit and its
-  `.git-blame-ignore-revs` entry (plan §5.6e) are a separate stage; until it
-  lands the new `fmt` CI job fails.
+- **rustfmt:** done after the merge (plan §5.6e). The one-time
+  `cargo fmt --all` commit is `fe5de76` (exactly `cargo fmt --all` of its
+  parent, no other change). `05be7e3` lists its SHA in
+  `.git-blame-ignore-revs`. `cargo fmt --all -- --check`, the new `fmt` CI
+  job, passes from `fe5de76` on.
+- **Measure stage:** it ran the §5.6(c) reference re-run
+  (`bench/results/phase6-r1-lubm{8,38}.json`). It did not re-bless
+  `smoke.json`; the R1-BENCH fragment gives the reason.
