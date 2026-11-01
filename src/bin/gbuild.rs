@@ -5,6 +5,7 @@
 //! ```text
 //! gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<source> ...]
 //! gbuild -db <db_name> [-f <source>] [--disk | --rocksdb] [--strict] [--force]
+//! gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] …
 //! ```
 //!
 //! (the second form is upstream 1.3's: `-db`/`--database`, `-f`/`--file`;
@@ -36,6 +37,21 @@
 //! database (`<db_name>.db.unzip-tmp-N`, removed when `gbuild` ends) and
 //! read like a directory source.
 //!
+//! `--disk` builds the indexes **in bulk** ([`gstore::bulk`]): the input is
+//! encoded, sorted (spilling sorted runs to disk beyond the memory budget)
+//! and the B+ trees, dictionary arrays and VS-tree are written bottom-up,
+//! then installed crash-safely over whatever the directory held. Its knobs:
+//! `--memory MB` (the sort budget, default `build_memory_mb` of
+//! `conf/conf.ini`, else 1024; the dictionary under construction comes on
+//! top), `--threads N` (`build_threads`, `0` = every core;
+//! `build_multi_thread=off` means 1), `--tmp-dir DIR` (`build_tmp_dir`,
+//! where runs spill; default inside the database directory) and `--fill
+//! PCT` (`build_fill_factor`, 50–100, default 90). Instead of reopening the
+//! database it prints the counts and a phase / memory / spill summary.
+//! `--incremental` selects the previous path (one B+ tree insert per index
+//! and term), for comparisons. The `[system]` keys are read from
+//! `./conf/conf.ini` when it exists.
+//!
 //! Like upstream, a statement that does not parse is skipped, counted and
 //! logged to `<db_name>.db/parse_error.log` (see
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
@@ -54,6 +70,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use gstore::bulk::{BulkInput, BulkOptions, BulkReport, BulkTarget};
+use gstore::config::GStoreConfig;
 use gstore::parser::import::{self, ImportOptions, ImportReport, ParseErrorLog, Source};
 use gstore::zipio::ZipLimits;
 use gstore::{db_dir_for, Database};
@@ -62,7 +80,8 @@ const TOOL: cli::Tool = cli::Tool {
     name: "gbuild",
     usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
             gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]\n\
-            \t[--unzip-max-size BYTES] [--unzip-max-entries N]",
+            \t[--unzip-max-size BYTES] [--unzip-max-entries N]\n\
+            gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] ...",
     help: "build a database from RDF files\n\
            \n\
            Options:\n\
@@ -71,7 +90,16 @@ const TOOL: cli::Tool = cli::Tool {
            \t-f,--file PATH\t\tAn RDF file, a directory of RDF files, a zip package of\n\
            \t\t\t\tRDF files (feature `zip`) or an http(s) URL.\n\
            \t\t\t\tWithout any source an empty database is built.\n\
-           \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore.\n\
+           \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore (built in\n\
+           \t\t\t\tbulk: sorted, bottom-up, installed crash-safely).\n\
+           \t--memory MB\t\tSort memory of the --disk build (default: conf.ini\n\
+           \t\t\t\tbuild_memory_mb, else 1024); the dictionary comes on top.\n\
+           \t--threads N\t\tThreads of the --disk build (default: conf.ini\n\
+           \t\t\t\tbuild_threads; 0 = every core).\n\
+           \t--tmp-dir DIR\t\tWhere the --disk build spills sorted runs (default:\n\
+           \t\t\t\tinside the database directory).\n\
+           \t--fill PCT\t\tB+ tree node fill of the --disk build, 50-100 (default 90).\n\
+           \t--incremental\t\tBuild --disk the previous way, one insert at a time.\n\
            \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`).\n\
            \t--strict\t\tStop at the first statement that does not parse.\n\
            \t--force\t\t\tReplace an existing database (else gbuild refuses).\n\
@@ -86,11 +114,82 @@ const FILE: cli::Opt = cli::Opt {
     short: "f",
     long: "file",
 };
+/// `--memory MB`: the bulk build's memory budget.
+const MEMORY: cli::Opt = cli::Opt {
+    short: "",
+    long: "memory",
+};
+/// `--threads N`: the bulk build's threads.
+const THREADS: cli::Opt = cli::Opt {
+    short: "",
+    long: "threads",
+};
+/// `--tmp-dir DIR`: where the bulk build spills.
+const TMP_DIR: cli::Opt = cli::Opt {
+    short: "",
+    long: "tmp-dir",
+};
+/// `--fill PCT`: the bulk build's B+ tree fill factor.
+const FILL: cli::Opt = cli::Opt {
+    short: "",
+    long: "fill",
+};
+
+/// The `[system]` configuration: `./conf/conf.ini` when it exists.
+fn load_config() -> GStoreConfig {
+    let path = Path::new("conf/conf.ini");
+    if path.is_file() {
+        if let Ok(c) = GStoreConfig::load(path) {
+            return c;
+        }
+    }
+    GStoreConfig::default()
+}
+
+/// The bulk options: `conf.ini`'s `build_*` keys, then the command line
+/// (options 4–7 of `args`).
+fn bulk_options(args: &cli::Args) -> Result<BulkOptions, String> {
+    let mut bulk = load_config().bulk_options();
+    if let Some(v) = args.value(4) {
+        let mb: u64 = v
+            .parse()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| format!("--memory takes a number of MiB, not '{v}'"))?;
+        bulk.memory_budget = usize::try_from(mb.saturating_mul(1 << 20)).unwrap_or(usize::MAX);
+    }
+    if let Some(v) = args.value(5) {
+        bulk.threads = v
+            .parse()
+            .map_err(|_| format!("--threads takes a number of threads, not '{v}'"))?;
+    }
+    if let Some(v) = args.value(6) {
+        bulk.temp_dir = Some(PathBuf::from(v));
+    }
+    if let Some(v) = args.value(7) {
+        bulk.fill_percent = v
+            .trim_end_matches('%')
+            .parse()
+            .ok()
+            .filter(|n| (50..=100).contains(n))
+            .ok_or_else(|| format!("--fill takes a percentage from 50 to 100, not '{v}'"))?;
+    }
+    Ok(bulk)
+}
 
 fn main() -> ExitCode {
     let mut args = match cli::parse(
         &cli::argv(),
-        &[cli::DB, FILE, cli::UNZIP_MAX_SIZE, cli::UNZIP_MAX_ENTRIES],
+        &[
+            cli::DB,
+            FILE,
+            cli::UNZIP_MAX_SIZE,
+            cli::UNZIP_MAX_ENTRIES,
+            MEMORY,
+            THREADS,
+            TMP_DIR,
+            FILL,
+        ],
     ) {
         Ok(cli::Parsed::Help) => {
             TOOL.print_help();
@@ -104,9 +203,20 @@ fn main() -> ExitCode {
     let rocksdb = args.take_flag(&["--rocksdb"]);
     let strict = args.take_flag(&["--strict"]);
     let force = args.take_flag(&["--force"]);
+    let incremental = args.take_flag(&["--incremental"]);
     if disk && rocksdb {
         return TOOL.usage_error("choose at most one of --disk / --rocksdb");
     }
+    let bulk_flags = (4..8).any(|i| args.value(i).is_some()) || incremental;
+    if bulk_flags && !disk {
+        return TOOL.usage_error(
+            "--memory, --threads, --tmp-dir, --fill and --incremental apply to --disk builds",
+        );
+    }
+    let bulk = match bulk_options(&args) {
+        Ok(b) => b,
+        Err(e) => return TOOL.usage_error(&e),
+    };
     if let Some(o) = args.unknown_option() {
         return TOOL.usage_error(&format!("unknown option '{o}'"));
     }
@@ -188,7 +298,27 @@ fn main() -> ExitCode {
         }
         return code;
     }
-    let report = if disk {
+    let report = if disk && !incremental {
+        let built = gstore::bulk::build(
+            Path::new(&dir),
+            name,
+            BulkInput::Sources(&sources),
+            &opts,
+            &mut log,
+            BulkTarget::Disk,
+            &bulk,
+        );
+        match built {
+            Ok(r) => {
+                print_bulk(name, &dir, &r, started);
+                r.import
+            }
+            Err(e) => {
+                eprintln!("disk build failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if disk {
         let report = match Database::build_disk_from_sources(&dir, &sources, &opts, &mut log) {
             Ok(r) => r,
             Err(e) => {
@@ -339,6 +469,12 @@ fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: 
             db.named_graphs().len()
         );
     }
+    gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
+}
+
+fn print_bulk(name: &str, dir: &str, r: &BulkReport, started: Instant) {
+    gstore::outln!("Built database '{name}' in {dir} (on-disk B+ tree, bulk build)");
+    gstore::outln!("{}", r.summary());
     gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
 }
 
