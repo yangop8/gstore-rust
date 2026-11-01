@@ -23,9 +23,11 @@ use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 
 mod backend;
+pub mod overlay;
 pub mod read_scope;
 
 pub use backend::Backend;
+pub use overlay::{Overlay, OverlayChanges, OverlayView};
 
 /// A sorted, de-duplicated adjacency map `key → Vec<(a, b)>`.
 type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;

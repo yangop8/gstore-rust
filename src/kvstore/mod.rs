@@ -16,6 +16,12 @@
 //! writes its committed updates through to this store by dictionary key (see
 //! `DiskStore::insert_keys`).
 //!
+//! [`disk_triples::DiskTriples`] wraps a writable `DiskStore` for Stream-mode
+//! evaluation (contract C5): reads that report errors to the statement's read
+//! scope, a transaction overlay (no triple reaches the pager before commit),
+//! a drain-and-cancel writer gate with epochs for [`DiskReadView`] snapshot
+//! readers, and a broken state after any write or flush error.
+//!
 //! Space/compaction features layered on top:
 //! * [`disk_dict::DiskDict`] backs an *out-of-core* dictionary: a disk query
 //!   resolves str↔id from the B+trees on demand instead of loading every string
@@ -55,6 +61,7 @@
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod disk_triples;
 pub mod format;
 pub mod isarray;
 pub mod ivarray;
@@ -65,6 +72,7 @@ pub mod string_index;
 pub mod vlist;
 
 pub use disk_dict::DiskDict;
+pub use disk_triples::{DiskReadView, DiskSource, DiskTriples, ViewError};
 pub use isarray::IsArray;
 pub use ivarray::IvArray;
 pub use pager::{PageId, Pager, PagerOp, PAGE_SIZE};

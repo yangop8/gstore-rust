@@ -1483,6 +1483,29 @@ impl DiskStore {
         self.try_distinct_p_of_o(o).unwrap_or(0)
     }
 
+    /// Whether `id` is the subject of some triple; a read error is returned
+    /// (for callers that report it, such as `DiskTriples`).
+    pub fn try_has_subject(&self, id: EntityLiteralId) -> io::Result<bool> {
+        io(self.spo.prefix_exists(&self.read_pager(), &be32(id)))
+    }
+
+    /// Whether `id` is the object of some triple; a read error is returned.
+    pub fn try_has_object(&self, id: EntityLiteralId) -> io::Result<bool> {
+        io(self.osp.prefix_exists(&self.read_pager(), &be32(id)))
+    }
+
+    /// Whether predicate `p` has some triple; a read error is returned.
+    pub fn try_has_predicate(&self, p: PredId) -> io::Result<bool> {
+        io(self.pos.prefix_exists(&self.read_pager(), &be32(p)))
+    }
+
+    /// Whether the quad `(g, t)` is stored in the named-graph index.
+    pub fn try_quad_exists(&self, g: EntityLiteralId, t: IdTriple) -> io::Result<bool> {
+        io(self
+            .gspo
+            .contains(&self.read_pager(), &key4(g, t.sub, t.pred, t.obj)))
+    }
+
     /// Whether `id` is the subject of some triple. `true` on a read error:
     /// never free an id when in doubt.
     pub fn has_subject(&self, id: EntityLiteralId) -> bool {
