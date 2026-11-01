@@ -6,7 +6,9 @@
 #   systemctl enable --now gserver
 #   journalctl -u gserver          # gserver's diagnostic log (standard error)
 #
-# Configuration: /etc/gstore/conf.ini. Data (dbhome/, backups/, logs/,
+# Configuration: /etc/gstore/conf.ini. Data (dbhome/ with the databases and
+# their reasoning rules, dbhome/pfn/ with the users' PFN functions --
+# conf.ini's pfn_base_path, by default <db_home>/pfn --, backups/, logs/,
 # upload/): /var/lib/gstore, the working directory, against which every
 # relative conf.ini path is resolved (but querylog_path / accesslog_path,
 # relative to db_home: dbhome/logs/); /var/lib/gstore/conf -> /etc/gstore
@@ -42,7 +44,9 @@ LimitNOFILE=65535
 
 # Hardening: gserver writes only below its working directory. (/etc/gstore is
 # read-only to it: to let operation=ipmanage edit the IP lists, point
-# ip_deny_path / ip_allow_path at files below /var/lib/gstore.)
+# ip_deny_path / ip_allow_path at files below /var/lib/gstore. A
+# pfn_base_path outside /var/lib/gstore needs its own ReadWritePaths= line in
+# a drop-in: systemctl edit gserver.)
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes

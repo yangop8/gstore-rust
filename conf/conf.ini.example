@@ -79,7 +79,9 @@ build_multi_thread=off
 # where PFN user functions (funcudb / funquery / funreview) are stored: an
 # upstream key upstream's default conf.ini leaves out (upstream default
 # "./pfn/"; gstore-rust's: <db_home>/pfn). Read when gserver starts:
-# refreshconf does not move the functions. See [pfn] below and docs/PFN.md.
+# refreshconf does not move the functions. They belong to users, not to
+# databases, so no database backup holds them: back up this directory
+# (docs/DEPLOY.md, "Backups"). See [pfn] below and docs/PFN.md.
 # pfn_base_path="./pfn/"
 [log]
 # choose the system core log output model

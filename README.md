@@ -474,7 +474,9 @@ insert { ?x <Rule:舅舅> ?k. } where { ?x <母亲> ?y. ?y <父亲> ?z. ?k <父�
 Only `root` (and `admin` users) may call it, as upstream. Rules are stored per
 database in `<db>.db/reason_rule_files/<rulename>.json` (upstream's layout and
 format), so they survive unload / load and restarts, move with `rename`, are
-carried by `backup` / `restore` and removed by `drop`; a database without a
+carried by `backup` / `restore` (zipped backups and `gbackup` / `grestore`
+too; `export` writes data only, as upstream's), kept in `<db>.db.bak` by
+`drop` and removed by `drop` with `is_backup=false`; a database without a
 directory (built in memory through the library) keeps them in memory. The
 library offers the same lifecycle: `Database::reason_add`, `reason_list`,
 `reason_compile`, `reason_execute`, `reason_disable`, `reason_show`,

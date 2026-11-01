@@ -72,7 +72,9 @@ COPY --from=builder /out/ /usr/local/bin/
 # Configuration in /etc/gstore (conf.ini from the shipped example, the log4cplus
 # properties examples); data in /var/lib/gstore, the working directory: every
 # relative conf.ini path (dbhome/, backups/, logs/, upload/, ./conf/...) lives
-# below it, as upstream's install root. /var/lib/gstore/conf points at
+# below it, as upstream's install root -- the users' PFN functions too
+# (pfn_base_path, by default <db_home>/pfn = /var/lib/gstore/dbhome/pfn), so
+# the data volume keeps them. /var/lib/gstore/conf points at
 # /etc/gstore so conf.ini's ./conf/... paths (log_mode, ip_deny_path) resolve.
 COPY conf/conf.ini.example /etc/gstore/conf.ini
 COPY conf/slog.properties.example conf/slog.stdout.properties.example /etc/gstore/

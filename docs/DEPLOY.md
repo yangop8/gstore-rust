@@ -11,6 +11,7 @@ command-line tools.
 | binaries | `/usr/bin/g*` | `/usr/local/bin/g*` |
 | configuration | `/etc/gstore/conf.ini` | `/etc/gstore/conf.ini` (volume) |
 | working directory: databases (`dbhome/`), `backups/`, `logs/`, `upload/` | `/var/lib/gstore` | `/var/lib/gstore` (volume) |
+| PFN functions (`pfn_base_path`; default `<db_home>/pfn`) | `/var/lib/gstore/dbhome/pfn` | `/var/lib/gstore/dbhome/pfn` (in the volume) |
 | `./conf` (for `conf.ini`'s `./conf/...` paths) | `/var/lib/gstore/conf → /etc/gstore` | same |
 | port | 9000 (`conf.ini` `[server] port`) | 9000 |
 | runs as | user `gstore` | user `gstore` (uid 10001) |
@@ -84,8 +85,10 @@ docker exec -it gstore gconsole -u root                    # the console
   `GSTORE_ROOT_PASSWORD_FILE` (a Docker secret or a mounted file, as above),
   `--password-file FILE`, or `root_password` in the `/etc/gstore` volume's
   `conf.ini` — not `--password`, which `docker inspect` and `ps` show.
-* **Volumes.** `/var/lib/gstore` holds the databases, backups, uploads and
-  the query/access/transaction logs; `/etc/gstore` holds `conf.ini` (and,
+* **Volumes.** `/var/lib/gstore` holds the databases (with their
+  reasoning rules), backups, uploads, the users' PFN functions
+  (`dbhome/pfn/`) and the query/access/transaction logs; `/etc/gstore`
+  holds `conf.ini` (and,
   if you add them, `slog.properties`, `ipDeny.config`, `ipAllow.config`).
   Named volumes are initialised from the image (including the
   `/var/lib/gstore/conf` link). With a **bind mount** for `/var/lib/gstore`,
@@ -148,7 +151,10 @@ sudo systemctl restart gserver
   `deamon=off` (its supervisor would duplicate what systemd does).
 * `LimitNOFILE=65535`, as upstream raises it.
 * Hardening (`ProtectSystem=strict`, `ReadWritePaths=/var/lib/gstore`, …):
-  the server writes only below `/var/lib/gstore`. `/etc/gstore` is read-only
+  the server writes only below `/var/lib/gstore` — the PFN functions too
+  (`pfn_base_path`, by default `<db_home>/pfn`, i.e.
+  `/var/lib/gstore/dbhome/pfn`; set it elsewhere and add that directory to
+  `ReadWritePaths` with a drop-in). `/etc/gstore` is read-only
   to it — to manage the IP lists with the `ipmanage` operation, point
   `ip_deny_path` / `ip_allow_path` at files below `/var/lib/gstore`.
 * `gserver -S -c /etc/gstore/conf.ini` (run as `gstore`, in
@@ -194,8 +200,39 @@ The packages install:
 The service is not enabled or started on install; an upgrade restarts a
 running server (`try-restart`). Removing the package stops and disables
 the service first (a graceful stop: unsaved changes are saved). The
-databases in `/var/lib/gstore` are never removed by the package, not even on
-purge.
+databases, their reasoning rules and the PFN functions in `/var/lib/gstore`
+are never removed by the package, not even on purge.
+
+## Backups
+
+**Databases.** `/api` `backup` (and `compress=true` for a zip), `gconsole`'s
+`backup` and `gbackup` (`-z 1` for a zip) copy a database's whole
+directory, as upstream does — its data and its **reasoning rules** with
+their ownership records (`reason_rule_files/`, see the README's
+Reasoning section). `restore` / `grestore` (a backup directory or a zip)
+bring both back, so a restored executed rule still retracts exactly the
+triples it inferred. `drop` with `is_backup=true` (the default) keeps the
+directory, rules included, as `<db>.db.bak`. `export` / `gexport` write the
+data only, as upstream's export: the inferred `<Rule:…>` triples are in it
+as ordinary triples, the rules are not (a database rebuilt from an export
+holds those triples as asserted ones, owned by no rule).
+
+**PFN functions** belong to users, not to databases: they live under
+`pfn_base_path` (by default `<db_home>/pfn` — `/var/lib/gstore/dbhome/pfn`
+in the packaged and container layouts), one directory per user:
+
+```text
+<pfn_base_path>/src/<user>/data.json     every function's definition (one JSON object per line)
+<pfn_base_path>/src/<user>/<name>.wat    the generated WebAssembly text
+<pfn_base_path>/lib/<user>/lib<name><hash>.wasm   the compiled modules
+```
+
+No database backup includes them. Back them up by archiving
+`pfn_base_path` (e.g. `tar -C /var/lib/gstore/dbhome -czf pfn.tgz pfn`,
+while no `funcudb` is running); `src/` is enough — `buildpfn` / `funcudb`
+type `4` recompiles a function from it. To restore, stop `gserver`, unpack
+the archive in place and start it again. Deleting a user (`/api`
+`usermanage` type `2`) deletes that user's functions.
 
 ## Configuration and logs
 

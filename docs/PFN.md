@@ -50,6 +50,13 @@ before it builds the module, because upstream clients send them encoded.
 Plain WAT works unchanged as long as it contains no `+` and no `%`; otherwise
 encode it (Python: `urllib.parse.quote_plus(body)`).
 
+From `gconsole`, as upstream's console: `showpfn` lists the functions,
+`addpfn <file>` / `mdfpfn <file>` create / update one from a file holding
+the `funInfo` JSON (its `funBody` / `funSubs` in WebAssembly text, URL-decoded
+by the server as above), `buildpfn <name>` compiles and `delpfn <name>`
+deletes it; a `SELECT (PFN.name({…}) AS ?v) …` typed at the prompt prints
+the value and `pfn query use <ms> ms.`.
+
 ### `funcudb` — create, update, delete, compile
 
 `type` is `"1"` create, `"2"` update, `"3"` delete, `"4"` compile:
@@ -499,6 +506,12 @@ Upstream keeps its C++ sources under `cpp/`; the WebAssembly sources are
 under `src/` so the two never mix (an upstream `pfn/` directory is not
 usable as is: its bodies are C++).
 
+The functions belong to users, not to databases: a database backup
+(`backup`, `gbackup`, zipped or not) does not hold them. Back up
+`pfn_base_path` itself — `src/` is enough, a compile rebuilds `lib/` — see
+[`docs/DEPLOY.md`](DEPLOY.md#backups); the packaged and container layouts
+keep it in `/var/lib/gstore/dbhome/pfn`, with the databases.
+
 ## Differences from upstream
 
 * **Runtime**: WebAssembly text in a sandboxed interpreter instead of C++
@@ -528,9 +541,10 @@ usable as is: its bodies are C++).
 * **Where PFN runs**: the `/api` and REST endpoints of the multi-database
   `gserver` (API mode, which manages the functions with `funcudb`), and an
   embedded `Database` / `ConcurrentDb` with a caller installed
-  (`Database::set_pfn_caller`). The single-database `gserver <db dir>` and
-  the command-line tools (`gquery`, `gconsole`) install no caller: a PFN
-  call there is a query error. A function called from the `WHERE` clause of
+  (`Database::set_pfn_caller`) — and so `gconsole`, a client of the `/api`
+  (see below). The single-database `gserver <db dir>` and the command-line
+  tools that open a database themselves (`gquery`, `gconsole --local`)
+  install no caller: a PFN call there is a query error. A function called from the `WHERE` clause of
   an UPDATE (inside a sub-SELECT) is the requesting user's, as in reads —
   upstream does not evaluate PFN in updates at all. A failing call inside a
   sub-SELECT fails the statement (it never reads as "no solution").
