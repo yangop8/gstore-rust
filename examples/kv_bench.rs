@@ -1,11 +1,13 @@
 //! `kv_bench` — micro-benchmarks for the on-disk kvstore read path (Phase 6,
-//! package R1-KV).
+//! packages R1-KV and R2-DICT).
 //!
 //! ```text
 //! cargo run --release --example kv_bench -- <db_dir> [options]
 //!
-//!   <db_dir>             a database built by `gbuild --disk` (holds kvstore.kv)
-//!   --mode M[,M...]      lookup | scan | open | query | all      (default all)
+//!   <db_dir>             a database built by `gbuild --disk` (holds kvstore.kv);
+//!                        for `contains`, any database (e.g. a snapshot)
+//!   --mode M[,M...]      lookup | scan | open | query | dict-ooc | contains | all
+//!                        (default all = every mode but contains)
 //!   --reps N             timed repetitions per measurement         (default 5)
 //!   --qreps N            warm repetitions per query                (default 3)
 //!   --lookups N          random lookups per repetition             (default 20000)
@@ -13,7 +15,11 @@
 //!   --queries DIR        directory holding lubm_q1.rq .. lubm_q14.rq
 //!                        (default <crate>/testdata/lubm)
 //!   --cache-pages N      page cache of the hot lookup/scan store
-//!                        (default: the whole kvstore.kv file)
+//!                        (default: the whole kvstore.kv file; dict-ooc: 4096)
+//!   --dict-cache-mb N    dict-ooc: the out-of-core dictionary's id → string
+//!                        cache budget in MiB (default 64; key → id: N / 4)
+//!   --contains NEEDLE    contains: the substring of the CONTAINS filter
+//!                        (default "Course1")
 //! ```
 //!
 //! The database the R1-KV numbers use is the univ 8 LUBM-like data built once
@@ -40,6 +46,17 @@
 //!   LUBM Q1–Q14: first run, warm median, rows and an order-independent row
 //!   hash, checked against the memory answer of `Database::load_disk` (`match`).
 //!   `query_geomean_warm_ms` is the geometric mean of the warm medians.
+//! * `dict-ooc` (R2-DICT): Q1–Q14 through the evaluator over the on-disk
+//!   triples twice — with the out-of-core dictionary (`DiskDict` with a
+//!   bounded cache, as `DiskStore::query` uses) and with the dictionary
+//!   loaded into memory — `qreps` runs each, the out-of-core ones three times
+//!   over (`dictooc_qN_ms` / `dictooc_qN_memdict_ms`, rows compared in
+//!   order); the dictionary bytes resident after Q1–Q14 × 3
+//!   (`dictooc_resident_bytes`) and the process RSS.
+//! * `contains` (R2-DICT): `Database::open` of the directory (query cache
+//!   off), then the same `CONTAINS` query `1 + qreps` times — the first
+//!   builds the dictionary substring index, later ones reuse the database's
+//!   cached one (`contains_first_ms`, `contains_second_ms`, `contains_ratio`).
 //!
 //! The database directory is only read (the memory comparison opens it through
 //! `Database::load_disk`, which writes nothing to a database whose VS-tree is
@@ -92,12 +109,15 @@ struct Opts {
     seed: u64,
     queries: PathBuf,
     cache_pages: Option<usize>,
+    dict_cache_mb: usize,
+    needle: String,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: kv_bench <db_dir> [--mode lookup,scan,open,query|all] [--reps N] [--qreps N] \
-         [--lookups N] [--seed S] [--queries DIR] [--cache-pages N]"
+        "usage: kv_bench <db_dir> [--mode lookup,scan,open,query,dict-ooc,contains|all] \
+         [--reps N] [--qreps N] [--lookups N] [--seed S] [--queries DIR] [--cache-pages N] \
+         [--dict-cache-mb N] [--contains NEEDLE]"
     );
     std::process::exit(2)
 }
@@ -113,6 +133,8 @@ fn parse_args() -> Opts {
         seed: 42,
         queries: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/lubm"),
         cache_pages: None,
+        dict_cache_mb: 64,
+        needle: "Course1".into(),
     };
     let mut dir = None;
     while let Some(a) = args.next() {
@@ -125,6 +147,8 @@ fn parse_args() -> Opts {
             "--seed" => o.seed = val().parse().unwrap_or_else(|_| usage()),
             "--queries" => o.queries = PathBuf::from(val()),
             "--cache-pages" => o.cache_pages = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--dict-cache-mb" => o.dict_cache_mb = val().parse().unwrap_or_else(|_| usage()),
+            "--contains" => o.needle = val(),
             "-h" | "--help" => usage(),
             _ if dir.is_none() && !a.starts_with("--") => dir = Some(PathBuf::from(a)),
             _ => usage(),
@@ -177,10 +201,16 @@ fn timed<R>(reps: usize, mut f: impl FnMut() -> R) -> f64 {
 fn main() {
     let o = parse_args();
     let kv = o.dir.join("kvstore.kv");
-    assert!(kv.is_file(), "no kvstore.kv in {}", o.dir.display());
     let all = o.modes.iter().any(|m| m == "all");
     let want = |m: &str| all || o.modes.iter().any(|x| x == m);
     println!("build={}", api::NAME);
+    if o.modes.iter().any(|x| x == "contains") {
+        contains(&o);
+        if !all && o.modes.iter().all(|x| x == "contains") {
+            return;
+        }
+    }
+    assert!(kv.is_file(), "no kvstore.kv in {}", o.dir.display());
     if want("lookup") || want("scan") {
         lookup_and_scan(&o, &kv, want("lookup"), want("scan"));
     }
@@ -189,6 +219,9 @@ fn main() {
     }
     if want("query") {
         query(&o, &kv);
+    }
+    if want("dict-ooc") {
+        dict_ooc(&o, &kv);
     }
 }
 
@@ -342,4 +375,164 @@ fn query(o: &Opts, kv: &Path) {
     }
     let gm = (logs.iter().sum::<f64>() / logs.len() as f64).exp();
     println!("query_geomean_warm_ms={gm:.2} query_all_match={all_match}");
+}
+
+fn read_queries(o: &Opts) -> Vec<(usize, String)> {
+    (1..=14)
+        .map(|i| {
+            let p = o.queries.join(format!("lubm_q{i}.rq"));
+            (
+                i,
+                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+            )
+        })
+        .collect()
+}
+
+/// Rows of a result, in order.
+fn result_rows(r: QueryResult) -> Vec<Vec<Option<String>>> {
+    match r {
+        QueryResult::Select(rs) => rs.rows,
+        QueryResult::Ask(b) => vec![vec![Some(b.to_string())]],
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+/// The process's resident set (`VmRSS`) in KiB.
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// R2-DICT: Q1–Q14 over the on-disk triples with the out-of-core dictionary
+/// vs the same queries with the dictionary in memory.
+fn dict_ooc(o: &Opts, kv: &Path) {
+    use gstore::dict::Dictionary;
+    use gstore::kvstore::DiskDict;
+    use gstore::parser::sparql;
+    use gstore::query::Evaluator;
+    use std::sync::Arc;
+
+    let texts = read_queries(o);
+    let parsed: Vec<_> = texts
+        .iter()
+        .map(|(_, q)| sparql::parse(q).expect("parse"))
+        .collect();
+    let ds = DiskStore::open(kv, o.cache_pages.unwrap_or(4096)).expect("open");
+    let rss_open = rss_kib();
+    let budget = o.dict_cache_mb << 20;
+    let dd = Arc::new(
+        DiskDict::open_shared(ds.shared_pager())
+            .expect("dictionary")
+            .with_cache_budgets(budget, budget / 4),
+    );
+    let lazy = Dictionary::from_backing(dd);
+    let run = |dict: &Dictionary, q| Evaluator::new(dict, &ds).evaluate(q).expect("query");
+    // Three passes of Q1–Q14 through the out-of-core dictionary first (the
+    // resident-bytes figure is taken after them), then the in-memory one.
+    let mut ooc: Vec<Vec<f64>> = vec![Vec::new(); texts.len()];
+    let mut ooc_rows = Vec::new();
+    for pass in 0..3 {
+        for (k, q) in parsed.iter().enumerate() {
+            let t = Instant::now();
+            let r = run(&lazy, q);
+            ooc[k].push(ms(t));
+            if pass == 0 {
+                ooc_rows.push(result_rows(r));
+            }
+            for _ in 1..o.qreps {
+                let t = Instant::now();
+                black_box(run(&lazy, q));
+                ooc[k].push(ms(t));
+            }
+        }
+    }
+    let st = lazy.cache_stats();
+    println!(
+        "dictooc_resident_bytes={} dictooc_term_entries={} dictooc_key_entries={} \
+         dictooc_budget_bytes={} dictooc_hits={} dictooc_misses={} dictooc_evictions={} \
+         dictooc_rss_open_kib={rss_open} dictooc_rss_after_kib={}",
+        st.resident_bytes(),
+        st.term_entries,
+        st.key_entries,
+        st.term_budget + st.key_budget,
+        st.hits,
+        st.misses,
+        st.evictions,
+        rss_kib()
+    );
+    let mem = ds.dictionary().expect("dictionary");
+    let mut all_match = true;
+    let (mut lo, mut lm) = (Vec::new(), Vec::new());
+    for (k, (i, _)) in texts.iter().enumerate() {
+        let want = result_rows(run(&mem, &parsed[k]));
+        let warm_mem = median(
+            (0..o.qreps.max(3))
+                .map(|_| {
+                    let t = Instant::now();
+                    black_box(run(&mem, &parsed[k]));
+                    ms(t)
+                })
+                .collect(),
+        );
+        // The first out-of-core run filled the cache: warm = the later ones.
+        let warm_ooc = median(ooc[k][1..].to_vec());
+        let ok = want == ooc_rows[k];
+        all_match &= ok;
+        lo.push(warm_ooc.max(1e-3).ln());
+        lm.push(warm_mem.max(1e-3).ln());
+        println!(
+            "dictooc_q{i}_first_ms={:.2} dictooc_q{i}_ms={warm_ooc:.2} \
+             dictooc_q{i}_memdict_ms={warm_mem:.2} dictooc_q{i}_ratio={:.2} \
+             dictooc_q{i}_rows={} dictooc_q{i}_match={ok}",
+            ooc[k][0],
+            warm_ooc / warm_mem.max(1e-6),
+            want.len()
+        );
+    }
+    let gm = |v: &[f64]| (v.iter().sum::<f64>() / v.len() as f64).exp();
+    println!(
+        "dictooc_geomean_ms={:.2} dictooc_memdict_geomean_ms={:.2} dictooc_all_match={all_match}",
+        gm(&lo),
+        gm(&lm)
+    );
+}
+
+/// R2-DICT: the same CONTAINS query `1 + qreps` times on one open database
+/// (query cache off): the first builds the dictionary substring index, the
+/// later ones reuse the database's cached one.
+fn contains(o: &Opts) {
+    let q = format!(
+        "PREFIX ub: <http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#>\n\
+         SELECT ?x ?n WHERE {{ ?x ub:name ?n . FILTER(CONTAINS(?n, \"{}\")) }}",
+        o.needle
+    );
+    let t = Instant::now();
+    let mut db = Database::open(&o.dir).expect("open");
+    db.set_query_cache_size(0);
+    println!("contains_open_ms={:.1}", ms(t));
+    let t = Instant::now();
+    let first = rows_hash(&db.query(&q).expect("query"));
+    let first_ms = ms(t);
+    let mut later = Vec::new();
+    for _ in 0..o.qreps {
+        let t = Instant::now();
+        let again = rows_hash(&db.query(&q).expect("query"));
+        later.push(ms(t));
+        assert_eq!(again, first, "same answer");
+    }
+    let second_ms = later[0];
+    println!(
+        "contains_rows={} contains_first_ms={first_ms:.1} contains_second_ms={second_ms:.1} \
+         contains_warm_median_ms={:.1} contains_ratio={:.3}",
+        first.0,
+        median(later.clone()),
+        second_ms / first_ms
+    );
 }
