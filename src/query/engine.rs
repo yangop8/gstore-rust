@@ -165,6 +165,7 @@
 //! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -175,7 +176,7 @@ use regex::Regex;
 use crate::analytics::csr::CsrGraph;
 use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
-use crate::dict::{Dictionary, TermStr};
+use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
 use crate::model::id::PredId;
@@ -426,8 +427,18 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// disk-backed dictionary (no in-memory strings) or a dictionary too small
     /// for indexing to beat a scan; [`string_index_tried`](Self::string_index)
     /// guards against rebuilding.
-    string_index: std::cell::RefCell<Option<Rc<StringIndex>>>,
+    string_index: std::cell::RefCell<Option<Arc<StringIndex>>>,
     string_index_tried: std::cell::Cell<bool>,
+    /// Where the substring index comes from when the caller keeps one across
+    /// queries ([`with_string_index_provider`](Self::with_string_index_provider));
+    /// without one the evaluator builds its own on first use.
+    string_index_provider: Option<&'a StringIndexProvider<'a>>,
+    /// Per-query memo of dictionary id → parsed term and → value (bounded by
+    /// [`MEMO_MAX_ENTRIES`]): FILTER, BIND and ORDER BY see the same ids on
+    /// many rows, and each look-up of an out-of-core dictionary costs a
+    /// cache probe or a page read.
+    term_memo: std::cell::RefCell<HashMap<(u32, bool), Option<Term>, FxBuildHasher>>,
+    value_memo: std::cell::RefCell<HashMap<(u32, bool), Option<Value>, FxBuildHasher>>,
     /// Whether `SERVICE` may contact remote endpoints (see
     /// [`with_service_allowed`](Self::with_service_allowed)).
     allow_service: bool,
@@ -469,6 +480,11 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
 /// (see [`Evaluator::with_csr_provider`]).
 pub type CsrProvider<'a> = dyn Fn() -> Result<Arc<CsrGraph>> + 'a;
 
+/// A source of the dictionary substring index (see
+/// [`Evaluator::with_string_index_provider`]): `None` when there is none
+/// (an out-of-core dictionary, or one too small to index).
+pub type StringIndexProvider<'a> = dyn Fn() -> Option<Arc<StringIndex>> + 'a;
+
 /// Per-query memoization of whole-graph analytics results (see
 /// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
 /// ([`EntityLiteralId`](crate::model::id::EntityLiteralId) = `u32`).
@@ -501,6 +517,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            string_index_provider: None,
+            term_memo: std::cell::RefCell::default(),
+            value_memo: std::cell::RefCell::default(),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
@@ -529,6 +548,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             algo_cache: std::cell::RefCell::new(AlgoCache::default()),
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
+            string_index_provider: None,
+            term_memo: std::cell::RefCell::default(),
+            value_memo: std::cell::RefCell::default(),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
@@ -592,6 +614,27 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// first time a query needs one.
     pub fn with_csr_provider(mut self, provider: &'a CsrProvider<'a>) -> Evaluator<'a, S> {
         self.csr_provider = Some(provider);
+        self
+    }
+
+    /// Use `index` as the dictionary substring index for `CONTAINS` /
+    /// `STRSTARTS` / `STRENDS` / plain `REGEX` candidate pruning instead of
+    /// building one for this query. It must have been built from this
+    /// evaluator's dictionary as it is now ([`dictionary_string_index`]).
+    pub fn with_string_index(self, index: Arc<StringIndex>) -> Evaluator<'a, S> {
+        *self.string_index.borrow_mut() = Some(index);
+        self.string_index_tried.set(true);
+        self
+    }
+
+    /// Ask `provider` for the substring index on first use (e.g. a database
+    /// that caches it per dictionary generation) instead of building one per
+    /// query. Its index must come from this evaluator's dictionary as it is now.
+    pub fn with_string_index_provider(
+        mut self,
+        provider: &'a StringIndexProvider<'a>,
+    ) -> Evaluator<'a, S> {
+        self.string_index_provider = Some(provider);
         self
     }
 
@@ -986,19 +1029,47 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     fn eval_select(&self, q: &SelectQuery) -> Result<ResultSet> {
         let (vars, is_pred, rows) = self.eval_select_solutions(q)?;
-        let str_rows: Vec<Vec<Option<String>>> = rows
-            .iter()
-            .map(|r| {
+        // Materialize in chunks, each prepared by one sorted dictionary
+        // prefetch (an out-of-core dictionary then reads its pages in id
+        // order; an in-memory one has nothing to prepare).
+        let mut str_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(MATERIALIZE_CHUNK_ROWS) {
+            self.prefetch_rows(chunk, &is_pred);
+            str_rows.extend(chunk.iter().map(|r| {
                 r.iter()
                     .enumerate()
                     .map(|(i, &id)| self.resolve_string(id, is_pred[i]))
-                    .collect()
-            })
-            .collect();
+                    .collect::<Vec<_>>()
+            }));
+        }
         Ok(ResultSet {
             vars,
             rows: str_rows,
         })
+    }
+
+    /// One sorted prefetch of every dictionary id in `rows` (columns flagged
+    /// by `is_pred` hold predicate ids). Nothing to do in memory.
+    fn prefetch_rows(&self, rows: &[Vec<Option<u32>>], is_pred: &[bool]) {
+        if !self.dict.is_disk_backed() {
+            return;
+        }
+        let (mut ids, mut pids) = (Vec::new(), Vec::new());
+        for r in rows {
+            for (i, id) in r.iter().enumerate() {
+                match *id {
+                    Some(id) if !is_synth(id) => {
+                        if is_pred.get(i).copied().unwrap_or(false) {
+                            pids.push(id);
+                        } else {
+                            ids.push(id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.dict.prefetch(&ids, &pids);
     }
 
     /// Evaluate a SELECT into id-space result rows over its result variables.
@@ -2236,8 +2307,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             functions: Rc::clone(&self.functions),
             cancel: self.cancel.clone(), // cancellation propagates into GRAPH blocks
             algo_cache: std::cell::RefCell::new(AlgoCache::default()), // per-graph, not shared
-            string_index: std::cell::RefCell::new(None), // per-graph store, own index
-            string_index_tried: std::cell::Cell::new(false),
+            // The index covers the dictionary, which the named graphs share.
+            string_index: std::cell::RefCell::new(self.string_index.borrow().clone()),
+            string_index_tried: std::cell::Cell::new(self.string_index_tried.get()),
+            string_index_provider: self.string_index_provider,
+            term_memo: std::cell::RefCell::default(),
+            value_memo: std::cell::RefCell::default(),
             allow_service: self.allow_service,
             service_denied: Rc::clone(&self.service_denied),
             failed: Rc::clone(&self.failed),
@@ -2689,35 +2764,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
-    /// The dictionary substring index, built once per query on first use (see the
-    /// [`string_index`](Self#structfield.string_index) field). `None` when it
-    /// would not help: a disk-backed dictionary (no in-memory strings ⇒ empty
-    /// entries) or one too small for indexing to beat a linear scan.
-    ///
-    /// The index is keyed by each term's **`STR()`/lexical value** — the exact
-    /// string a substring `FILTER` compares against — NOT the raw N-Triples dict
-    /// key. This keeps candidate pruning sound: indexing the escaped/quoted dict
-    /// form would miss a needle containing an escaped character (`"`, `\`, a
-    /// newline) or a numeric whose canonical lexical differs from its stored form,
-    /// silently dropping true matches. A term whose dict string somehow fails to
-    /// re-parse falls back to its raw form (a term the dictionary stored always
-    /// re-parses, so this is only a safety net).
-    fn string_index(&self) -> Option<Rc<StringIndex>> {
+    /// The dictionary substring index, looked up once per query on first use
+    /// (see the [`string_index`](Self#structfield.string_index) field): the
+    /// caller's ([`with_string_index`](Self::with_string_index) /
+    /// [`with_string_index_provider`](Self::with_string_index_provider)), else
+    /// built here by [`dictionary_string_index`]. `None` when it would not
+    /// help (see there).
+    fn string_index(&self) -> Option<Arc<StringIndex>> {
         if !self.string_index_tried.get() {
             self.string_index_tried.set(true);
-            let raw = self.dict.entity_literal_entries();
-            if raw.len() >= STRING_INDEX_MIN_ENTRIES {
-                let lexical: Vec<(u32, String)> = raw
-                    .iter()
-                    .map(|(id, s)| {
-                        let key = key_term(s)
-                            .map(|t| Value::from_term(&t).lexical())
-                            .unwrap_or_else(|| (*s).to_string());
-                        (*id, key)
-                    })
-                    .collect();
-                *self.string_index.borrow_mut() = Some(Rc::new(StringIndex::build(lexical)));
-            }
+            let idx = match self.string_index_provider {
+                Some(provider) => provider(),
+                None => dictionary_string_index(self.dict),
+            };
+            *self.string_index.borrow_mut() = idx;
         }
         self.string_index.borrow().clone()
     }
@@ -3014,17 +3074,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Resolve any id (dictionary or synthetic) to a runtime [`Value`].
+    /// Dictionary ids are memoized for the query (see `value_memo`).
     fn id_to_value(&self, id: u32, is_pred: bool) -> Option<Value> {
         if is_synth(id) {
             return self.extras.borrow().term(id).map(Value::from_term);
         }
-        let s = if is_pred {
-            self.dict.pred(id)?
-        } else {
-            self.dict.term(id)?
-        };
-        let term = key_term(&s)?;
-        Some(Value::from_term(&term))
+        if let Some(v) = self.value_memo.borrow().get(&(id, is_pred)) {
+            return v.clone();
+        }
+        let v = self.id_to_term(id, is_pred).map(|t| Value::from_term(&t));
+        let mut memo = self.value_memo.borrow_mut();
+        if memo.len() < MEMO_MAX_ENTRIES {
+            memo.insert((id, is_pred), v.clone());
+        }
+        v
     }
 
     /// Evaluate an expression to the RDF term it denotes, for what sees
@@ -3204,16 +3267,25 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// An id resolved back to its RDF term (synthetic, predicate, or
     /// entity/literal — routed by `is_pred` exactly as [`resolve_string`]).
+    /// Dictionary ids are memoized for the query (see `term_memo`).
     fn id_to_term(&self, id: u32, is_pred: bool) -> Option<Term> {
         if is_synth(id) {
             return self.extras.borrow().term(id).cloned();
         }
+        if let Some(t) = self.term_memo.borrow().get(&(id, is_pred)) {
+            return t.clone();
+        }
         let s = if is_pred {
-            self.dict.pred(id)?
+            self.dict.pred(id)
         } else {
-            self.dict.term(id)?
+            self.dict.term(id)
         };
-        key_term(&s)
+        let t = s.and_then(|s| key_term(&s));
+        let mut memo = self.term_memo.borrow_mut();
+        if memo.len() < MEMO_MAX_ENTRIES {
+            memo.insert((id, is_pred), t.clone());
+        }
+        t
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term
@@ -5747,6 +5819,13 @@ fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
 /// number less than `1 / CANDIDATE_LOOKUP_FACTOR` of the predicate's triples.
 const CANDIDATE_LOOKUP_FACTOR: usize = 8;
 
+/// Result rows materialized per dictionary prefetch (see `eval_select`).
+const MATERIALIZE_CHUNK_ROWS: usize = 4096;
+
+/// At most this many ids are memoized per query in each of the id → term and
+/// id → value memos; later ids are resolved without memoizing.
+const MEMO_MAX_ENTRIES: usize = 1 << 16;
+
 /// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
 /// Constants and variables without a candidate set are always allowed. The
 /// executor uses [`slot_candidates`] + [`in_candidates`]; this per-triple
@@ -5765,6 +5844,40 @@ fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
 /// Minimum dictionary size (entities + literals) below which the substring index
 /// is not built — a linear scan beats indexing for a tiny dictionary.
 const STRING_INDEX_MIN_ENTRIES: usize = 64;
+
+/// The substring index of `dict`'s entity and literal strings that the
+/// evaluator prunes `CONTAINS` / `STRSTARTS` / `STRENDS` / plain `REGEX`
+/// candidates with — what [`Evaluator::with_string_index`] expects. `None`
+/// when it would not help: an out-of-core dictionary (substring filters then
+/// run without the prefilter, which is still exact) or one too small for
+/// indexing to beat a linear scan.
+///
+/// The index is keyed by each term's **`STR()`/lexical value** — the exact
+/// string a substring `FILTER` compares against — NOT the raw N-Triples dict
+/// key. This keeps candidate pruning sound: indexing the escaped/quoted dict
+/// form would miss a needle containing an escaped character (`"`, `\`, a
+/// newline) or a numeric whose canonical lexical differs from its stored form,
+/// silently dropping true matches. A term whose dict string somehow fails to
+/// re-parse falls back to its raw form (a term the dictionary stored always
+/// re-parses, so this is only a safety net).
+pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
+    if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
+        return None;
+    }
+    let mut lexical: Vec<(u32, String)> =
+        Vec::with_capacity(dict.entity_num() + dict.literal_num());
+    for space in [Space::Entity, Space::Literal] {
+        // In memory: cannot fail.
+        let _ = dict.for_each_term(space, space.first_id(), |id, s| {
+            let key = key_term(s)
+                .map(|t| Value::from_term(&t).lexical())
+                .unwrap_or_else(|| s.to_string());
+            lexical.push((id, key));
+            ControlFlow::Continue(())
+        });
+    }
+    Some(Arc::new(StringIndex::build(lexical)))
+}
 
 /// Walk a `FILTER` expression collecting mandatory-substring constraints for
 /// StringIndex pruning (see [`Evaluator::filter_string_constraints`]). Recurses
