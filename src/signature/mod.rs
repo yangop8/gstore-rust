@@ -164,8 +164,9 @@ impl Signature {
     /// (the order of the limb vectors the builds once materialized per
     /// comparison).
     pub(crate) fn cmp_limbs(&self, other: &Signature) -> std::cmp::Ordering {
-        for i in 0..LIMBS {
-            let (a, b) = (self.bits[i] & LIMB_MASK[i], other.bits[i] & LIMB_MASK[i]);
+        let limbs = self.bits.iter().zip(&other.bits).zip(&LIMB_MASK);
+        for ((&a, &b), &mask) in limbs {
+            let (a, b) = (a & mask, b & mask);
             if a != b {
                 return a.cmp(&b);
             }

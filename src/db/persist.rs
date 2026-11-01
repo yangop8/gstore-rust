@@ -73,9 +73,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::fsutil::{self, SnapshotWriter};
 use super::{
-    build_vstree, memory_vstree_entries, vstree_entries, Database, Meta, BACKUP_OFFSET_FILE, DICT_FILE, DISK_CACHE_PAGES,
-    KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR, STORE_FILE, UPDATE_LOG_FILE,
-    VSTREE_FILE, VSTREE_KV_FILE,
+    build_vstree, memory_vstree_entries, vstree_entries, Database, Meta, BACKUP_OFFSET_FILE,
+    DICT_FILE, DISK_CACHE_PAGES, KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR,
+    STORE_FILE, UPDATE_LOG_FILE, VSTREE_FILE, VSTREE_KV_FILE,
 };
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
@@ -748,9 +748,8 @@ impl Database {
             )));
         }
         // The VS-tree is rebuilt from the store if absent or unreadable.
-        let vstree =
-            fsutil::read_bincode(&dir.join(VSTREE_FILE))
-                .unwrap_or_else(|_| VsTree::build(memory_vstree_entries(&store)));
+        let vstree = fsutil::read_bincode(&dir.join(VSTREE_FILE))
+            .unwrap_or_else(|_| VsTree::build(memory_vstree_entries(&store)));
         let mut db = Database::new(meta.name);
         db.dict = dict;
         db.store = Backend::Memory(store);
