@@ -83,6 +83,17 @@ pub const ENTITY_SIG_LENGTH: usize = STR_SIG_LENGTH + EDGE_SIG_LENGTH + STR_AND_
 /// Number of 64-bit limbs backing a signature (⌈944/64⌉ = 15 → 960 bits).
 const LIMBS: usize = ENTITY_SIG_LENGTH.div_ceil(64);
 
+/// Per-limb masks of the bits that belong to the signature (the last limb is
+/// padded past [`ENTITY_SIG_LENGTH`]).
+const LIMB_MASK: [u64; LIMBS] = {
+    let mut m = [u64::MAX; LIMBS];
+    let used = ENTITY_SIG_LENGTH - (LIMBS - 1) * 64;
+    if used < 64 {
+        m[LIMBS - 1] = (1u64 << used) - 1;
+    }
+    m
+};
+
 /// Raw byte width of a signature's limbs (`LIMBS × 8` = 120). Used by the
 /// out-of-core VS-tree ([`vstree`]/[`disk_vstree`]) to (de)serialize a signature
 /// into a fixed slot inside a paged node.
@@ -145,6 +156,22 @@ impl Signature {
 
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|&w| w == 0)
+    }
+
+    /// Compare the raw limbs, low limb first (each limb as a number, so bit
+    /// 63 of a limb weighs most within it), ignoring the padding bits past
+    /// [`ENTITY_SIG_LENGTH`] — the clustering order of the VS-tree bulk builds
+    /// (the order of the limb vectors the builds once materialized per
+    /// comparison).
+    pub(crate) fn cmp_limbs(&self, other: &Signature) -> std::cmp::Ordering {
+        let limbs = self.bits.iter().zip(&other.bits).zip(&LIMB_MASK);
+        for ((&a, &b), &mask) in limbs {
+            let (a, b) = (a & mask, b & mask);
+            if a != b {
+                return a.cmp(&b);
+            }
+        }
+        std::cmp::Ordering::Equal
     }
 
     pub fn popcount(&self) -> u32 {

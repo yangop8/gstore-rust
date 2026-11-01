@@ -117,3 +117,60 @@ fn save_load_preserves_lubm_query() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn vstree_stays_sound_after_deletes() {
+    // Deletes leave the VS-tree valid (stored signatures are supersets of the
+    // shrunk ones): every query still agrees with an evaluation without the
+    // tree, through both the exclusive and the shared read path.
+    use gstore::query::{Evaluator, QueryResult};
+
+    let mut db = build();
+    let ub = "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#";
+    // Delete the advisor and takesCourse edges of a third of the students.
+    let victims = db
+        .select(&format!(
+            "SELECT ?s ?a ?c WHERE {{ ?s <{ub}advisor> ?a . ?s <{ub}takesCourse> ?c }}"
+        ))
+        .unwrap();
+    let mut deleted = 0;
+    for (i, row) in victims.rows.iter().enumerate() {
+        if i % 3 != 0 {
+            continue;
+        }
+        let (s, a, c) = (
+            row[0].clone().unwrap(),
+            row[1].clone().unwrap(),
+            row[2].clone().unwrap(),
+        );
+        let u = format!("DELETE DATA {{ {s} <{ub}advisor> {a} . {s} <{ub}takesCourse> {c} }}");
+        if let QueryResult::Update { changed } = db.query(&u).unwrap() {
+            deleted += changed;
+        }
+    }
+    assert!(deleted > 100, "deleted {deleted}");
+    assert!(db.stats().index_valid, "deletes keep the VS-tree valid");
+    assert!(db.vs_shrink_debt() > 0);
+    db.set_query_cache_size(0);
+    for i in 1..=14 {
+        let q = std::fs::read_to_string(lubm_dir().join(format!("lubm_q{i}.rq"))).unwrap();
+        let sorted = |r: QueryResult| match r {
+            QueryResult::Select(rs) => {
+                let mut rows = rs.rows;
+                rows.sort();
+                rows
+            }
+            other => panic!("q{i}: expected SELECT, got {other:?}"),
+        };
+        let with = sorted(db.query(&q).unwrap());
+        let shared = sorted(db.query_read(&q, None, None).unwrap());
+        let parsed = gstore::parser::sparql::parse(&q).unwrap();
+        let without = sorted(
+            Evaluator::new(db.dict(), db.store())
+                .evaluate(&parsed)
+                .unwrap(),
+        );
+        assert_eq!(with, without, "q{i}: the VS-tree changed the answer after deletes");
+        assert_eq!(shared, without, "q{i}: the shared read path differs");
+    }
+}

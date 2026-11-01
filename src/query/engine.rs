@@ -244,6 +244,12 @@ struct VarLayout {
 /// [`VarLayout::pred_alias`]); a SPARQL variable name cannot contain NUL.
 const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 
+/// A variable's exact candidate set is refined by probing the in-memory
+/// VS-tree entry by entry, instead of walking the tree, when it holds at most
+/// `max(PROBE_MIN_CANDIDATES, indexed entities / 32)` ids (see
+/// `refine_candidates_with_vstree`).
+const PROBE_MIN_CANDIDATES: usize = 1024;
+
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
         // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
@@ -2772,6 +2778,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             if sig.is_empty() {
                 continue;
             }
+            // Probe refinement: when the variable already has a small exact
+            // candidate set and the tree is in memory, test each candidate's
+            // stored signature (O(1) each through the tree's locator) instead
+            // of walking the tree. The result is exactly walk ∩ existing: a
+            // walk reports precisely the entries whose signature contains the
+            // query (every ancestor contains its descendants' signatures).
+            let probe_limit = PROBE_MIN_CANDIDATES.max(vstree.entity_count() / 32);
+            if let Some(existing) = candidates.get_mut(&vidx) {
+                if vstree.can_probe() && existing.len() <= probe_limit {
+                    if !vstree.is_empty() {
+                        existing.retain(|&x| vstree.probe(x, &sig));
+                    }
+                    continue;
+                }
+            }
             if let Some(mut vs) = vstree.candidates(&sig) {
                 vs.sort_unstable();
                 vs.dedup();
@@ -2845,9 +2866,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         out: &mut Vec<Binding>,
     ) {
         let before = out.len();
-        for (s, p, o) in self.candidate_triples(binding, plan) {
+        // The subject's / object's candidate sets, looked up once per call.
+        let s_cands = slot_candidates(&plan.s, cands);
+        let o_cands = slot_candidates(&plan.o, cands);
+        for (s, p, o) in self.candidate_triples_in(binding, plan, s_cands, o_cands) {
             // VS-tree filter: an entity variable's value must be a candidate.
-            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
+            if !in_candidates(s_cands, s) || !in_candidates(o_cands, o) {
                 continue;
             }
             let mut nb = binding.clone();
@@ -2859,6 +2883,51 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         self.note_bindings(out.len() - before);
+    }
+
+    /// [`candidate_triples`](Self::candidate_triples) for a caller that keeps
+    /// only triples whose subject is in `s_cands` and object in `o_cands`
+    /// (`None` = unconstrained): a predicate scan (`? p ?`) whose subject or
+    /// object variable has a candidate set much smaller than the predicate is
+    /// answered by looking each candidate up instead of scanning the
+    /// predicate. Exactly the scanned triples that pass the candidate filter
+    /// are returned (possibly with others the caller then drops), in the same
+    /// `(s, o)` order, so solutions and their order are unchanged.
+    fn candidate_triples_in(
+        &self,
+        binding: &Binding,
+        plan: &PatPlan,
+        s_cands: Option<&[u32]>,
+        o_cands: Option<&[u32]>,
+    ) -> Vec<(u32, PredId, u32)> {
+        let known = (
+            slot_known(&plan.s, binding),
+            slot_known(&plan.p, binding),
+            slot_known(&plan.o, binding),
+        );
+        if let (None, Some(p), None) = known {
+            let card = self.store.pred_card(p);
+            let small = |c: &[u32]| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < card;
+            if let Some(subjects) = s_cands.filter(|c| small(c)) {
+                // Ascending subjects, each with its ascending objects: the
+                // `(s, o)` order of `so_by_p`.
+                let mut out = Vec::new();
+                for &s in subjects {
+                    out.extend(self.store.o_by_sp(s, p).into_iter().map(|o| (s, p, o)));
+                }
+                return out;
+            }
+            if let Some(objects) = o_cands.filter(|c| small(c)) {
+                let mut out = Vec::new();
+                for &o in objects {
+                    out.extend(self.store.s_by_po(p, o).into_iter().map(|s| (s, p, o)));
+                }
+                // Back into `so_by_p`'s `(s, o)` order.
+                out.sort_unstable_by_key(|&(s, _, o)| (s, o));
+                return out;
+            }
+        }
+        self.candidate_triples(binding, plan)
     }
 
     /// The `(s, p, o)` triples that may extend `binding` by `plan`, in the
@@ -5450,17 +5519,92 @@ fn join_sets(
     }
 }
 
+/// A fast, deterministic, std-only hasher for the hash join's key table: the
+/// FxHash mixing step (rotate, xor, multiply) over each written word. The
+/// join keys are small tuples of ids, for which SipHash's per-call setup and
+/// rounds dominate. Not DoS-resistant, which is fine for keys made of the
+/// database's own ids. The join's output order never depends on the hasher
+/// (see [`join_sets_hash`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FxHasher {
+    hash: u64,
+}
+
+/// The FxHash multiplier.
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// The [`BuildHasher`](std::hash::BuildHasher) of [`FxHasher`].
+pub(crate) type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+
 /// Hash join on the shared-variable key (gStore `multi_join`): build a hash
 /// table on the right side, then probe it once per left row.
+///
+/// The output is left-major, right-minor — each left row in order, joined with
+/// its matching right rows in their original order — whatever the hasher.
 fn join_sets_hash(left: &[Binding], right: &[Binding], shared: &[usize]) -> Vec<Binding> {
+    join_sets_hash_with::<FxBuildHasher>(left, right, shared)
+}
+
+/// [`join_sets_hash`] with the key table hashed by `H`.
+fn join_sets_hash_with<H: std::hash::BuildHasher + Default>(
+    left: &[Binding],
+    right: &[Binding],
+    shared: &[usize],
+) -> Vec<Binding> {
     let key_of = |b: &Binding| -> Vec<Option<u32>> { shared.iter().map(|&i| b[i]).collect() };
-    let mut index: HashMap<Vec<Option<u32>>, Vec<&Binding>> = HashMap::new();
+    let mut index: HashMap<Vec<Option<u32>>, Vec<&Binding>, H> = HashMap::default();
     for r in right {
         index.entry(key_of(r)).or_default().push(r);
     }
     let mut out = Vec::new();
+    // One probe key buffer, reused for every left row.
+    let mut key: Vec<Option<u32>> = Vec::with_capacity(shared.len());
     for l in left {
-        if let Some(matches) = index.get(&key_of(l)) {
+        key.clear();
+        key.extend(shared.iter().map(|&i| l[i]));
+        if let Some(matches) = index.get(key.as_slice()) {
             for r in matches {
                 if let Some(m) = merge_bindings(l, r) {
                     out.push(m);
@@ -5525,6 +5669,24 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
 
 /// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
 /// Constants and variables without a candidate set are always allowed.
+/// The candidate set of a variable slot, if it has one.
+fn slot_candidates<'c>(slot: &Slot, cands: &'c Candidates) -> Option<&'c [u32]> {
+    match slot {
+        Slot::Var(v) => cands.get(v).map(Vec::as_slice),
+        Slot::Const(_) => None,
+    }
+}
+
+/// Whether `value` passes a (sorted) candidate set; `None` admits anything.
+/// [`cand_ok`] with the set looked up beforehand.
+fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
+    set.is_none_or(|list| list.binary_search(&value).is_ok())
+}
+
+/// A predicate scan is replaced by candidate lookups when the candidates
+/// number less than `1 / CANDIDATE_LOOKUP_FACTOR` of the predicate's triples.
+const CANDIDATE_LOOKUP_FACTOR: usize = 8;
+
 fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
     match slot {
         // Candidate lists are sorted; membership is a binary search.
@@ -6458,6 +6620,101 @@ mod join_method_tests {
             row[i] = Some(v);
         }
         row
+    }
+
+    /// The hash join's output order does not depend on the hasher: the fast
+    /// deterministic one, randomly keyed SipHash and the nested loop agree
+    /// row for row, with repeated keys on both sides and unbound slots.
+    #[test]
+    fn candidate_lookups_equal_the_filtered_predicate_scan() {
+        // `extend` answers a `?s p ?o` scan from small candidate sets by
+        // lookups: the same solutions, in the same order, as scanning the
+        // predicate and filtering by the candidates.
+        let mut state = 0xC0FFEE_u64;
+        let mut next = move |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(n)) as u32
+        };
+        let mut store = TripleStore::new();
+        store.bulk_load((0..6000).map(|_| IdTriple::new(next(400), next(3), next(500))));
+        let dict = Dictionary::new();
+        let ev = Evaluator::new(&dict, &store);
+        for round in 0..60 {
+            let p = next(3);
+            let plan = PatPlan {
+                s: Slot::Var(0),
+                p: Slot::Const(p),
+                o: Slot::Var(if round % 7 == 0 { 0 } else { 1 }),
+            };
+            let mut set = |n: u32, range: u32| -> Vec<u32> {
+                let mut v: Vec<u32> = (0..n).map(|_| next(range)).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let mut cands = Candidates::default();
+            match round % 3 {
+                0 => {
+                    cands.insert(0, set(20, 400));
+                }
+                1 => {
+                    cands.insert(1, set(15, 500));
+                }
+                _ => {
+                    cands.insert(0, set(30, 400));
+                    cands.insert(1, set(200, 500));
+                }
+            }
+            let binding: Binding = vec![None; 2];
+            let mut fast = Vec::new();
+            ev.extend(&binding, &plan, &cands, &mut fast);
+            let mut slow = Vec::new();
+            for (s, pr, o) in ev.candidate_triples(&binding, &plan) {
+                if !cand_ok(&plan.s, s, &cands) || !cand_ok(&plan.o, o, &cands) {
+                    continue;
+                }
+                let mut nb = binding.clone();
+                if unify(&mut nb, &plan.s, s)
+                    && unify(&mut nb, &plan.p, pr)
+                    && unify(&mut nb, &plan.o, o)
+                {
+                    slow.push(nb);
+                }
+            }
+            assert_eq!(fast, slow, "round {round}");
+        }
+    }
+
+    #[test]
+    fn hash_join_order_does_not_depend_on_the_hasher() {
+        let mut state = 0x1234_5678_u64;
+        let mut next = move |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(n)) as u32
+        };
+        for shared in [vec![0usize], vec![0, 1]] {
+            let mut row = |n: u32| -> Binding {
+                let mut r = vec![None; 4];
+                r[0] = Some(next(n));
+                r[1] = (next(4) != 0).then(|| next(3));
+                r[2 + next(2) as usize] = Some(next(1000));
+                r
+            };
+            let left: Vec<Binding> = (0..400).map(|_| row(25)).collect();
+            let right: Vec<Binding> = (0..300).map(|_| row(25)).collect();
+            let fx = join_sets_hash(&left, &right, &shared);
+            let sip = join_sets_hash_with::<std::collections::hash_map::RandomState>(
+                &left, &right, &shared,
+            );
+            let nested = join_sets_nested(&left, &right, &shared);
+            assert!(!fx.is_empty());
+            assert_eq!(fx, sip);
+            assert_eq!(fx, nested);
+        }
     }
 
     /// Both physical methods produce byte-for-byte identical output on the same

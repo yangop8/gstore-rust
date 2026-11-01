@@ -39,7 +39,7 @@ use crate::error::Result;
 use crate::kvstore::pager::{PageId, Pager, PAGE_SIZE};
 use crate::model::id::EntityLiteralId;
 
-use super::vstree::sig_key;
+use super::vstree::sort_entries;
 use super::{SigFilter, Signature, SIG_BYTES};
 
 /// Pager header slot holding the root node's page id (`0` = empty tree).
@@ -93,11 +93,21 @@ impl std::fmt::Debug for DiskTree {
 impl DiskTree {
     /// Bulk-build a fresh out-of-core VS-tree at `path` from `(id, signature)`
     /// pairs, writing every node as a page and returning a read-ready handle.
-    /// Entities are clustered by [`sig_key`] (as the in-memory bulk build does)
-    /// so similar signatures share leaves and pruning stays effective.
+    /// Entities are clustered by [`sort_entries`] (as the in-memory bulk build
+    /// does) so similar signatures share leaves and pruning stays effective.
     pub(super) fn build(
         path: &Path,
         mut entries: Vec<(EntityLiteralId, Signature)>,
+    ) -> Result<DiskTree> {
+        // Cluster signature-similar entities so leaf unions stay tight.
+        sort_entries(&mut entries);
+        DiskTree::build_sorted(path, entries)
+    }
+
+    /// [`build`](Self::build) from entries already in clustering order.
+    pub(super) fn build_sorted(
+        path: &Path,
+        entries: Vec<(EntityLiteralId, Signature)>,
     ) -> Result<DiskTree> {
         let entity_count = entries.len();
         let mut pager = Pager::open(path, CACHE_PAGES)?;
@@ -113,9 +123,6 @@ impl DiskTree {
                 reads: AtomicU64::new(0),
             });
         }
-
-        // Cluster signature-similar entities so leaf unions stay tight.
-        entries.sort_by_key(|(_, s)| sig_key(s));
 
         // Build leaves: each chunk of DISK_FANOUT entities becomes one leaf page.
         let mut level: Vec<(Signature, PageId)> = Vec::new();
@@ -363,5 +370,38 @@ mod tests {
             "candidate scan read {read} of {total_pages} pages (should be a fraction)"
         );
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod sort_fix_tests {
+    use super::*;
+    use crate::signature::vstree::legacy;
+    use crate::signature::EdgeDir;
+
+    /// The sort fix leaves `vstree.kv` byte-identical: a build from entries in
+    /// the legacy clustering order writes the same file as the new build.
+    #[test]
+    fn vstree_kv_bytes_are_unchanged_by_the_sort_fix() {
+        let dir =
+            std::env::temp_dir().join(format!("gstore_diskvs_sortfix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..3000u32 {
+            let mut s = Signature::new();
+            s.encode_edge(i % 5, i % 13, EdgeDir::Out);
+            if i % 3 == 0 {
+                s.encode_edge(i % 7, i % 4, EdgeDir::In);
+            }
+            entries.push((i, s));
+        }
+        let mut legacy_order = entries.clone();
+        legacy_order.sort_by_key(|(_, s)| legacy::sig_key(s));
+        let (a, b) = (dir.join("legacy.kv"), dir.join("new.kv"));
+        drop(DiskTree::build_sorted(&a, legacy_order).unwrap());
+        drop(DiskTree::build(&b, entries).unwrap());
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

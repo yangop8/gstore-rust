@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 
+mod backend;
+pub mod read_scope;
+
+pub use backend::Backend;
+
 /// A sorted, de-duplicated adjacency map `key → Vec<(a, b)>`.
 type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 
@@ -30,6 +35,33 @@ type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 /// optimizer + executor can run either fully in memory or *streaming* from disk
 /// (reading only the index ranges a query touches). Owned `Vec`s keep the disk
 /// implementation simple; the in-memory one clones its (small per-key) slices.
+///
+/// ## Ordering contract
+///
+/// Every implementor returns its lists in this order, so that plans and the
+/// order of solutions never depend on the backend:
+///
+/// * [`po_by_s`](Self::po_by_s) returns `(p, o)` pairs, [`ps_by_o`](Self::ps_by_o)
+///   returns `(p, s)` pairs and [`so_by_p`](Self::so_by_p) returns `(s, o)`
+///   pairs — each list sorted ascending by the pair, without duplicates;
+/// * [`o_by_sp`](Self::o_by_sp), [`s_by_po`](Self::s_by_po),
+///   [`p_by_so`](Self::p_by_so), [`subs_by_p`](Self::subs_by_p),
+///   [`objs_by_p`](Self::objs_by_p) and the key lists
+///   ([`subject_keys`](Self::subject_keys), [`object_keys`](Self::object_keys))
+///   are ascending and duplicate-free;
+/// * [`iter_all`](Self::iter_all) returns triples in `(p, s, o)` order.
+///
+/// ## Count methods (provided)
+///
+/// The `count_*`, `distinct_p_of_*` and `has_*` methods have defaults that are
+/// correct for every implementor (they are defined through the list methods).
+/// A backend may override them to answer without materializing the list —
+/// [`TripleStore`] does with slice arithmetic, an on-disk store can count a key
+/// prefix — but an override must return **exactly** what the default returns,
+/// so that the cost model, and with it every plan and solution order, never
+/// changes. On a read error (reported through
+/// [`read_scope::note_read_error`]) the `has_*` methods answer `true`: an id is
+/// never treated as unused when in doubt.
 pub trait TripleSource {
     /// `s p o` — does this exact triple exist?
     fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool;
@@ -69,6 +101,72 @@ pub trait TripleSource {
     fn pred_distinct_obj(&self, pred: PredId) -> usize;
     /// Every triple (for the all-variable `? ? ?` scan).
     fn iter_all(&self) -> Vec<IdTriple>;
+
+    // ---- provided counts (contract C1) -------------------------------------
+
+    /// `s ? ?` — `po_by_s(sub).len()`.
+    fn count_po_by_s(&self, sub: EntityLiteralId) -> u64 {
+        self.po_by_s(sub).len() as u64
+    }
+    /// `s p ?` — `o_by_sp(sub, pred).len()`.
+    fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
+        self.o_by_sp(sub, pred).len() as u64
+    }
+    /// `s ? o` — `p_by_so(sub, obj).len()`.
+    fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
+        self.p_by_so(sub, obj).len() as u64
+    }
+    /// `? ? o` — `ps_by_o(obj).len()`.
+    fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
+        self.ps_by_o(obj).len() as u64
+    }
+    /// `? p o` — `s_by_po(pred, obj).len()`.
+    fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
+        self.s_by_po(pred, obj).len() as u64
+    }
+    /// `? p ?` — `so_by_p(pred).len()`.
+    fn count_so_by_p(&self, pred: PredId) -> u64 {
+        self.so_by_p(pred).len() as u64
+    }
+    /// The number of distinct predicates of subject `sub`: the runs of equal
+    /// first components in [`po_by_s`](Self::po_by_s) (sorted by the ordering
+    /// contract).
+    fn distinct_p_of_s(&self, sub: EntityLiteralId) -> u64 {
+        distinct_first(&self.po_by_s(sub))
+    }
+    /// The number of distinct predicates of object `obj`: the runs of equal
+    /// first components in [`ps_by_o`](Self::ps_by_o).
+    fn distinct_p_of_o(&self, obj: EntityLiteralId) -> u64 {
+        distinct_first(&self.ps_by_o(obj))
+    }
+    /// Whether `sub` is the subject of some triple. `true` when the read
+    /// failed (see the trait docs).
+    fn has_subject(&self, sub: EntityLiteralId) -> bool {
+        read_scope::true_on_read_error(|| !self.po_by_s(sub).is_empty())
+    }
+    /// Whether `obj` is the object of some triple. `true` when the read
+    /// failed.
+    fn has_object(&self, obj: EntityLiteralId) -> bool {
+        read_scope::true_on_read_error(|| !self.ps_by_o(obj).is_empty())
+    }
+    /// Whether some triple has predicate `pred`. `true` when the read failed.
+    fn has_predicate(&self, pred: PredId) -> bool {
+        read_scope::true_on_read_error(|| !self.so_by_p(pred).is_empty())
+    }
+}
+
+/// The number of runs of equal first components in `pairs` — the number of
+/// distinct first components of a list sorted by them.
+pub(crate) fn distinct_first(pairs: &[(u32, u32)]) -> u64 {
+    let mut count = 0u64;
+    let mut last: Option<u32> = None;
+    for &(a, _) in pairs {
+        if last != Some(a) {
+            count += 1;
+            last = Some(a);
+        }
+    }
+    count
 }
 
 /// The triple-*mutation* interface — the write counterpart of [`TripleSource`].
@@ -95,170 +193,6 @@ pub trait MutableStore {
 /// algorithms, decoupled from where triples physically live.)
 pub trait StorageBackend: TripleSource + MutableStore {}
 impl<T: TripleSource + MutableStore> StorageBackend for T {}
-
-/// The runtime-selectable storage backend the [`Database`](crate::Database)
-/// holds (DESIGN §"Phase 2", route A). It is a [`StorageBackend`] in its own
-/// right: it implements [`TripleSource`] + [`MutableStore`] by **statically**
-/// dispatching to the active variant (a branch, not a vtable), so the query
-/// engine / optimizer / VS-tree / analytics run over it unchanged while the
-/// physical store is chosen at construction time.
-///
-/// The default is `Memory` — every existing constructor wraps a fresh
-/// [`TripleStore`], so behaviour with the `rocksdb` feature *off* is identical.
-/// An on-disk (`kvstore.kv`) database also evaluates over a `Memory` working
-/// set: the `Database` facade writes every committed mutation through to its
-/// [`DiskStore`](crate::kvstore::DiskStore), which stays the source of truth.
-#[derive(Debug)]
-pub enum Backend {
-    /// In-memory triple store (the default; three sorted adjacency maps).
-    Memory(TripleStore),
-    /// Persistent RocksDB triple store (feature `rocksdb`).
-    #[cfg(feature = "rocksdb")]
-    Rocks(crate::backend::rocks::RocksStore),
-}
-
-/// Run `$body` against the inner store of whichever [`Backend`] variant is
-/// active, binding it to `$inner`. Pure static dispatch — no trait object.
-macro_rules! backend_dispatch {
-    ($self:expr, $inner:ident, $body:expr) => {
-        match $self {
-            Backend::Memory($inner) => $body,
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks($inner) => $body,
-        }
-    };
-}
-
-impl Backend {
-    /// The in-memory store, if this is the `Memory` variant. Lets components
-    /// that are intrinsically in-memory (snapshot MVCC, named-graph clones)
-    /// borrow the concrete store without a downcast.
-    pub fn as_memory(&self) -> Option<&TripleStore> {
-        match self {
-            Backend::Memory(s) => Some(s),
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(_) => None,
-        }
-    }
-
-    /// The RocksDB store, if this is the `Rocks` variant.
-    #[cfg(feature = "rocksdb")]
-    pub fn as_rocks(&self) -> Option<&crate::backend::rocks::RocksStore> {
-        match self {
-            Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
-        }
-    }
-
-    /// Mutable access to the RocksDB store, if this is the `Rocks` variant.
-    #[cfg(feature = "rocksdb")]
-    pub fn as_rocks_mut(&mut self) -> Option<&mut crate::backend::rocks::RocksStore> {
-        match self {
-            Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
-        }
-    }
-
-    /// Collect (and clear) a write error a persistent variant recorded because
-    /// [`MutableStore`]'s `bool` results cannot carry one. Always `None` for the
-    /// in-memory store, whose writes cannot fail.
-    pub fn take_write_error(&self) -> Option<String> {
-        match self {
-            Backend::Memory(_) => None,
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(r) => r.take_error(),
-        }
-    }
-
-    /// All predicate ids present in the store (sorted). Not part of
-    /// [`TripleSource`] (the engine never needs it), but the schema extractor
-    /// does, so it is dispatched here rather than special-cased on the caller.
-    pub fn predicates(&self) -> Vec<PredId> {
-        match self {
-            Backend::Memory(s) => s.predicates().collect(),
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(r) => r.predicates(),
-        }
-    }
-}
-
-impl TripleSource for Backend {
-    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        backend_dispatch!(self, s, TripleSource::exists(s, sub, pred, obj))
-    }
-    fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::po_by_s(s, sub))
-    }
-    fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::o_by_sp(s, sub, pred))
-    }
-    fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        backend_dispatch!(self, s, TripleSource::p_by_so(s, sub, obj))
-    }
-    fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::ps_by_o(s, obj))
-    }
-    fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::s_by_po(s, pred, obj))
-    }
-    fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        backend_dispatch!(self, s, TripleSource::so_by_p(s, pred))
-    }
-    fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::subs_by_p(s, pred))
-    }
-    fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::objs_by_p(s, pred))
-    }
-    fn subject_keys(&self) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::subject_keys(s))
-    }
-    fn object_keys(&self) -> Vec<EntityLiteralId> {
-        backend_dispatch!(self, s, TripleSource::object_keys(s))
-    }
-    fn triple_count(&self) -> u64 {
-        backend_dispatch!(self, s, TripleSource::triple_count(s))
-    }
-    fn distinct_subjects(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::distinct_subjects(s))
-    }
-    fn distinct_objects(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::distinct_objects(s))
-    }
-    fn num_predicates(&self) -> usize {
-        backend_dispatch!(self, s, TripleSource::num_predicates(s))
-    }
-    fn pred_card(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_card(s, pred))
-    }
-    fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_distinct_subj(s, pred))
-    }
-    fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        backend_dispatch!(self, s, TripleSource::pred_distinct_obj(s, pred))
-    }
-    fn iter_all(&self) -> Vec<IdTriple> {
-        backend_dispatch!(self, s, TripleSource::iter_all(s))
-    }
-}
-
-impl MutableStore for Backend {
-    fn insert(&mut self, t: IdTriple) -> bool {
-        backend_dispatch!(self, s, MutableStore::insert(s, t))
-    }
-    fn remove(&mut self, t: IdTriple) -> bool {
-        backend_dispatch!(self, s, MutableStore::remove(s, t))
-    }
-    fn bulk_load(&mut self, triples: Vec<IdTriple>) {
-        backend_dispatch!(self, s, MutableStore::bulk_load(s, triples))
-    }
-}
-
-impl Default for Backend {
-    fn default() -> Backend {
-        Backend::Memory(TripleStore::new())
-    }
-}
 
 impl MutableStore for TripleStore {
     fn insert(&mut self, t: IdTriple) -> bool {
@@ -330,10 +264,61 @@ impl TripleSource for TripleStore {
     fn iter_all(&self) -> Vec<IdTriple> {
         TripleStore::iter_all(self).collect()
     }
+
+    // C1: slice arithmetic, no list is materialized. Each equals the default.
+
+    fn count_po_by_s(&self, sub: EntityLiteralId) -> u64 {
+        TripleStore::po_by_s(self, sub).len() as u64
+    }
+    fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
+        self.s2po
+            .get(&sub)
+            .map_or(0, |v| range_by_first(v, pred).len()) as u64
+    }
+    fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
+        // `(p, o)` pairs are unique per subject, so with `o` fixed every
+        // matching pair has its own predicate (the default's `dedup` is a no-op).
+        self.s2po
+            .get(&sub)
+            .map_or(0, |v| v.iter().filter(|&&(_, o)| o == obj).count()) as u64
+    }
+    fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
+        TripleStore::ps_by_o(self, obj).len() as u64
+    }
+    fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
+        self.o2ps
+            .get(&obj)
+            .map_or(0, |v| range_by_first(v, pred).len()) as u64
+    }
+    fn count_so_by_p(&self, pred: PredId) -> u64 {
+        TripleStore::so_by_p(self, pred).len() as u64
+    }
+    fn distinct_p_of_s(&self, sub: EntityLiteralId) -> u64 {
+        distinct_first(TripleStore::po_by_s(self, sub))
+    }
+    fn distinct_p_of_o(&self, obj: EntityLiteralId) -> u64 {
+        distinct_first(TripleStore::ps_by_o(self, obj))
+    }
+    fn has_subject(&self, sub: EntityLiteralId) -> bool {
+        !TripleStore::po_by_s(self, sub).is_empty()
+    }
+    fn has_object(&self, obj: EntityLiteralId) -> bool {
+        !TripleStore::ps_by_o(self, obj).is_empty()
+    }
+    fn has_predicate(&self, pred: PredId) -> bool {
+        !TripleStore::so_by_p(self, pred).is_empty()
+    }
 }
 
 /// The triple store. Holds three redundant sorted indexes plus a triple count.
+///
+/// It also keeps, per predicate, its number of distinct subjects and objects
+/// (gStore's `pre2sub` / `pre2obj`), maintained exactly by every mutation, so
+/// the cost model reads them in O(log P) instead of scanning the predicate's
+/// triples on every query. They are derived data: not serialized (`store.bin`
+/// holds exactly the four index fields) and recomputed when a store is read.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(from = "TripleStoreData")]
 pub struct TripleStore {
     /// sub → sorted [(pred, obj)]
     s2po: AdjMap<EntityLiteralId>,
@@ -342,6 +327,36 @@ pub struct TripleStore {
     /// pred → sorted [(sub, obj)]
     p2so: AdjMap<PredId>,
     triple_count: u64,
+    /// pred → (distinct subjects, distinct objects); an entry per predicate
+    /// that has triples.
+    #[serde(skip)]
+    pred_stats: BTreeMap<PredId, (usize, usize)>,
+}
+
+/// The serialized form of a [`TripleStore`] (its four index fields, as
+/// derived before the statistics existed); read back through `From`, which
+/// recomputes the statistics.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "TripleStore")]
+struct TripleStoreData {
+    s2po: AdjMap<EntityLiteralId>,
+    o2ps: AdjMap<EntityLiteralId>,
+    p2so: AdjMap<PredId>,
+    triple_count: u64,
+}
+
+impl From<TripleStoreData> for TripleStore {
+    fn from(d: TripleStoreData) -> TripleStore {
+        let mut store = TripleStore {
+            s2po: d.s2po,
+            o2ps: d.o2ps,
+            p2so: d.p2so,
+            triple_count: d.triple_count,
+            pred_stats: BTreeMap::new(),
+        };
+        store.recompute_pred_stats();
+        store
+    }
 }
 
 /// Insert `value` into a sorted vector if absent. Returns `true` if inserted.
@@ -364,6 +379,22 @@ fn sorted_remove(vec: &mut Vec<(u32, u32)>, value: (u32, u32)) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// An adjacency map from `(key, value)` pairs sorted by key, then value, and
+/// free of duplicates: one exactly sized list per run of equal keys.
+fn group_sorted(pairs: impl Iterator<Item = (u32, (u32, u32))> + Clone) -> AdjMap<u32> {
+    let mut runs: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
+    let mut it = pairs.peekable();
+    while let Some(&(key, _)) = it.peek() {
+        // Count the run first, so its list is allocated once, at its size.
+        let len = it.clone().take_while(|&(k, _)| k == key).count();
+        let mut list = Vec::with_capacity(len);
+        list.extend(it.by_ref().take(len).map(|(_, v)| v));
+        runs.push((key, list));
+    }
+    // Sorted, unique keys: the map is built in one pass.
+    runs.into_iter().collect()
 }
 
 /// Return the slice of `vec` whose first component equals `first`.
@@ -393,12 +424,21 @@ impl TripleStore {
     /// exists. Maintains all three indexes in sorted order.
     pub fn insert(&mut self, t: IdTriple) -> bool {
         let IdTriple { sub, pred, obj } = t;
-        let inserted = sorted_insert(self.s2po.entry(sub).or_default(), (pred, obj));
+        let po = self.s2po.entry(sub).or_default();
+        let inserted = sorted_insert(po, (pred, obj));
         if !inserted {
             return false;
         }
-        sorted_insert(self.o2ps.entry(obj).or_default(), (pred, sub));
+        // The first `(sub, pred, _)` / `(_, pred, obj)` adds a distinct
+        // subject / object to `pred`.
+        let new_subject = range_by_first(po, pred).len() == 1;
+        let ps = self.o2ps.entry(obj).or_default();
+        sorted_insert(ps, (pred, sub));
+        let new_object = range_by_first(ps, pred).len() == 1;
         sorted_insert(self.p2so.entry(pred).or_default(), (sub, obj));
+        let stat = self.pred_stats.entry(pred).or_default();
+        stat.0 += usize::from(new_subject);
+        stat.1 += usize::from(new_object);
         self.triple_count += 1;
         true
     }
@@ -406,18 +446,27 @@ impl TripleStore {
     /// Remove a triple. Returns `false` if it was not present.
     pub fn remove(&mut self, t: IdTriple) -> bool {
         let IdTriple { sub, pred, obj } = t;
-        let existed = match self.s2po.get_mut(&sub) {
-            Some(v) => sorted_remove(v, (pred, obj)),
-            None => false,
+        let (existed, last_subject) = match self.s2po.get_mut(&sub) {
+            Some(v) => {
+                let removed = sorted_remove(v, (pred, obj));
+                (removed, removed && range_by_first(v, pred).is_empty())
+            }
+            None => (false, false),
         };
         if !existed {
             return false;
         }
+        let mut last_object = false;
         if let Some(v) = self.o2ps.get_mut(&obj) {
             sorted_remove(v, (pred, sub));
+            last_object = range_by_first(v, pred).is_empty();
         }
         if let Some(v) = self.p2so.get_mut(&pred) {
             sorted_remove(v, (sub, obj));
+        }
+        if let Some(stat) = self.pred_stats.get_mut(&pred) {
+            stat.0 -= usize::from(last_subject);
+            stat.1 -= usize::from(last_object);
         }
         self.prune_empty(sub, pred, obj);
         self.triple_count -= 1;
@@ -434,13 +483,43 @@ impl TripleStore {
         }
         if self.p2so.get(&pred).is_some_and(Vec::is_empty) {
             self.p2so.remove(&pred);
+            self.pred_stats.remove(&pred);
         }
+    }
+
+    /// Recompute every predicate's distinct subject / object counts from the
+    /// indexes (after a bulk load or a read).
+    fn recompute_pred_stats(&mut self) {
+        let mut stats: BTreeMap<PredId, (usize, usize)> = BTreeMap::new();
+        for (&pred, pairs) in &self.p2so {
+            if pairs.is_empty() {
+                continue;
+            }
+            stats.insert(pred, (distinct_first(pairs) as usize, 0));
+        }
+        // Each object's list is sorted by predicate: one run per predicate.
+        for ps in self.o2ps.values() {
+            let mut last: Option<PredId> = None;
+            for &(pred, _) in ps {
+                if last != Some(pred) {
+                    last = Some(pred);
+                    if let Some(stat) = stats.get_mut(&pred) {
+                        stat.1 += 1;
+                    }
+                }
+            }
+        }
+        self.pred_stats = stats;
     }
 
     /// Bulk-load triples efficiently: push everything, then sort + de-dup each
     /// adjacency list once. Use this for initial build; ~O(n log n) vs the
     /// O(n²)-ish cost of repeated [`insert`](Self::insert).
     pub fn bulk_load(&mut self, triples: impl IntoIterator<Item = IdTriple>) {
+        if self.s2po.is_empty() && self.o2ps.is_empty() && self.p2so.is_empty() {
+            self.bulk_load_into_empty(triples.into_iter().collect());
+            return;
+        }
         for t in triples {
             let IdTriple { sub, pred, obj } = t;
             self.s2po.entry(sub).or_default().push((pred, obj));
@@ -463,6 +542,23 @@ impl TripleStore {
         }
         // `total` counts distinct triples (s2po dedup removes exact repeats).
         self.triple_count = total;
+        self.recompute_pred_stats();
+    }
+
+    /// [`bulk_load`](Self::bulk_load) into an empty store: sort the triples
+    /// once per index order and build each map from its sorted runs (exactly
+    /// sized lists, maps built from sorted input) instead of a map lookup per
+    /// triple and index. The result equals the general path's.
+    fn bulk_load_into_empty(&mut self, mut triples: Vec<IdTriple>) {
+        triples.sort_unstable_by_key(|t| (t.sub, t.pred, t.obj));
+        triples.dedup();
+        self.triple_count = triples.len() as u64;
+        self.s2po = group_sorted(triples.iter().map(|t| (t.sub, (t.pred, t.obj))));
+        triples.sort_unstable_by_key(|t| (t.obj, t.pred, t.sub));
+        self.o2ps = group_sorted(triples.iter().map(|t| (t.obj, (t.pred, t.sub))));
+        triples.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
+        self.p2so = group_sorted(triples.iter().map(|t| (t.pred, (t.sub, t.obj))));
+        self.recompute_pred_stats();
     }
 
     // ---- access patterns --------------------------------------------------
@@ -558,6 +654,51 @@ impl TripleStore {
         })
     }
 
+    /// Visit every entity — each subject, and each object that is an entity
+    /// (not a literal) — in ascending id order, with its outgoing `(p, o)` and
+    /// incoming `(p, s)` lists (either may be empty). The VS-tree signs
+    /// entities from exactly these lists; this walks both maps once, without
+    /// a lookup or a copy per entity.
+    pub fn for_each_entity_adjacency(
+        &self,
+        mut f: impl FnMut(EntityLiteralId, &[(PredId, EntityLiteralId)], &[(PredId, EntityLiteralId)]),
+    ) {
+        let mut outs = self.s2po.iter().peekable();
+        let mut ins = self
+            .o2ps
+            .iter()
+            .filter(|(&o, _)| crate::model::id::is_entity_id(o))
+            .peekable();
+        loop {
+            match (outs.peek(), ins.peek()) {
+                (None, None) => break,
+                (Some(&(&s, out)), None) => {
+                    f(s, out, &[]);
+                    outs.next();
+                }
+                (None, Some(&(&o, inn))) => {
+                    f(o, &[], inn);
+                    ins.next();
+                }
+                (Some(&(&s, out)), Some(&(&o, inn))) => match s.cmp(&o) {
+                    std::cmp::Ordering::Less => {
+                        f(s, out, &[]);
+                        outs.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        f(o, &[], inn);
+                        ins.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        f(s, out, inn);
+                        outs.next();
+                        ins.next();
+                    }
+                },
+            }
+        }
+    }
+
     /// All predicate ids that occur in the store (sorted).
     pub fn predicates(&self) -> impl Iterator<Item = PredId> + '_ {
         self.p2so.keys().copied()
@@ -595,30 +736,16 @@ impl TripleStore {
         self.so_by_p(pred).len()
     }
 
-    /// Distinct subjects appearing with predicate `p` (gStore: `pre2sub`).
-    /// O(card) but allocation-free: `so_by_p` is sorted by `(sub, obj)`, so
-    /// distinct subjects are the count of first-component transitions.
+    /// Distinct subjects appearing with predicate `p` (gStore: `pre2sub`),
+    /// from the maintained statistics: O(log P).
     pub fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        let pairs = self.so_by_p(pred);
-        let mut count = 0usize;
-        let mut last: Option<u32> = None;
-        for &(s, _) in pairs {
-            if last != Some(s) {
-                count += 1;
-                last = Some(s);
-            }
-        }
-        count
+        self.pred_stats.get(&pred).map_or(0, |&(subjects, _)| subjects)
     }
 
-    /// Distinct objects appearing with predicate `p` (gStore: `pre2obj`).
+    /// Distinct objects appearing with predicate `p` (gStore: `pre2obj`),
+    /// from the maintained statistics: O(log P).
     pub fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        // Not sorted by object, so collect distinct via a set.
-        let pairs = self.so_by_p(pred);
-        let mut objs: Vec<u32> = pairs.iter().map(|&(_, o)| o).collect();
-        objs.sort_unstable();
-        objs.dedup();
-        objs.len()
+        self.pred_stats.get(&pred).map_or(0, |&(_, objects)| objects)
     }
 }
 
@@ -761,6 +888,93 @@ mod tests {
         assert_eq!(all.len(), 7);
         assert!(all.contains(&IdTriple::new(0, 1, 1)));
         assert!(all.contains(&IdTriple::new(3, 2, 12)));
+    }
+
+    /// The statistics and bulk-load paths the store keeps are exact: for
+    /// random data under inserts, removes and bulk loads, the maintained
+    /// per-predicate counts equal a brute-force count, the fast bulk load into
+    /// an empty store equals the general path, and `store.bin` holds exactly
+    /// the four index fields (the form derived before the statistics).
+    #[test]
+    fn statistics_bulk_load_and_bytes_stay_exact() {
+        #[derive(Serialize)]
+        struct Mirror<'a> {
+            s2po: &'a AdjMap<EntityLiteralId>,
+            o2ps: &'a AdjMap<EntityLiteralId>,
+            p2so: &'a AdjMap<PredId>,
+            triple_count: u64,
+        }
+        fn brute(s: &TripleStore, p: PredId) -> (usize, usize) {
+            let pairs = s.so_by_p(p);
+            let mut subs: Vec<u32> = pairs.iter().map(|&(a, _)| a).collect();
+            let mut objs: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
+            subs.sort_unstable();
+            subs.dedup();
+            objs.sort_unstable();
+            objs.dedup();
+            (subs.len(), objs.len())
+        }
+        fn check(s: &TripleStore) {
+            for p in 0..9u32 {
+                assert_eq!((s.pred_distinct_subj(p), s.pred_distinct_obj(p)), brute(s, p));
+            }
+            let mut fresh = s.clone();
+            fresh.recompute_pred_stats();
+            assert_eq!(fresh.pred_stats, s.pred_stats);
+            let bytes = bincode::serialize(s).unwrap();
+            let mirror = Mirror {
+                s2po: &s.s2po,
+                o2ps: &s.o2ps,
+                p2so: &s.p2so,
+                triple_count: s.triple_count,
+            };
+            assert_eq!(bytes, bincode::serialize(&mirror).unwrap());
+            let back: TripleStore = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back.pred_stats, s.pred_stats);
+            assert_eq!(bincode::serialize(&back).unwrap(), bytes);
+        }
+        let mut seed = 99u64;
+        let mut next = move |n: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        let mut batch = || -> Vec<IdTriple> {
+            (0..600)
+                .map(|_| IdTriple::new(next(50), next(8), next(70)))
+                .collect()
+        };
+        let first = batch();
+        let mut fast = TripleStore::new();
+        fast.bulk_load(first.clone());
+        let mut general = TripleStore::new();
+        general.insert(first[0]); // non-empty: the general path
+        general.bulk_load(first.clone());
+        assert_eq!(
+            bincode::serialize(&fast).unwrap(),
+            bincode::serialize(&general).unwrap()
+        );
+        assert_eq!(fast.pred_stats, general.pred_stats);
+        check(&fast);
+        let mut store = fast;
+        for round in 0..5 {
+            for t in batch() {
+                if round % 2 == 0 {
+                    store.insert(t);
+                } else {
+                    store.remove(t);
+                }
+            }
+            check(&store);
+            store.bulk_load(batch());
+            check(&store);
+        }
+        for t in store.iter_all().collect::<Vec<_>>() {
+            store.remove(t);
+        }
+        assert!(store.pred_stats.is_empty());
+        check(&store);
     }
 
     #[test]

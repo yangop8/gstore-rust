@@ -277,3 +277,63 @@ fn gbuild_cli_rocksdb_builds_reopenable_db() {
     assert_eq!(rs.row_count(), 2);
     cleanup(&base);
 }
+
+/// Opening a RocksDB database no longer rebuilds the VS-tree (it walked every
+/// entity's edges in RocksDB): the index starts stale and queries evaluate
+/// without it, with the same answers (as multisets) as the in-memory build
+/// and as after an explicit `rebuild_index()`.
+#[test]
+fn reopen_skips_the_vstree_rebuild_with_equal_answers() {
+    let dir = tmp("no_rebuild");
+    let mut data = String::from(SMALL);
+    for i in 0..300 {
+        data.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p{}> <http://ex/o{}> .\n<http://ex/s{i}> <http://ex/v> \"{}\" .\n",
+            i % 7,
+            i % 23,
+            i % 11
+        ));
+    }
+    drop(Database::build_rocksdb_from_str("nr", &dir, &data).unwrap());
+    let mut mem = Database::build_from_str("mem", &data).unwrap();
+    let mut db = Database::open_rocksdb(&dir).unwrap();
+    assert!(!db.stats().index_valid, "open must not build a VS-tree");
+
+    let queries = [
+        "SELECT ?o WHERE { <root> <contain> ?o }",
+        "SELECT ?s ?o WHERE { ?s <http://ex/p3> ?o . ?s <http://ex/v> \"3\" }",
+        "SELECT ?s WHERE { ?s <http://ex/p1> <http://ex/o9> }",
+        "SELECT ?s ?p WHERE { ?s ?p <http://ex/o4> }",
+        "SELECT ?a ?b WHERE { ?a <contain> ?mid . ?mid <own> ?b }",
+        "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+    ];
+    let sorted = |r: QueryResult| match r {
+        QueryResult::Select(rs) => {
+            let mut rows = rs.rows;
+            rows.sort();
+            rows
+        }
+        other => panic!("SELECT expected, got {other:?}"),
+    };
+    let expected: Vec<_> = queries.iter().map(|q| sorted(mem.query(q).unwrap())).collect();
+    for (q, want) in queries.iter().zip(&expected) {
+        assert_eq!(&sorted(db.query(q).unwrap()), want, "without a tree: {q}");
+    }
+    // Inserts while the index is stale leave it stale and stay visible.
+    db.query("INSERT DATA { <http://ex/s1> <http://ex/p1> <http://ex/o9> }")
+        .unwrap();
+    mem.query("INSERT DATA { <http://ex/s1> <http://ex/p1> <http://ex/o9> }")
+        .unwrap();
+    assert!(!db.stats().index_valid);
+    db.rebuild_index();
+    assert!(db.stats().index_valid);
+    for q in queries {
+        assert_eq!(
+            sorted(db.query(q).unwrap()),
+            sorted(mem.query(q).unwrap()),
+            "with a rebuilt tree: {q}"
+        );
+    }
+    drop(db);
+    cleanup(&dir);
+}

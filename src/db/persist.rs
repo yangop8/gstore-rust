@@ -69,12 +69,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use super::fsutil::{self, SnapshotWriter};
 use super::{
-    build_vstree, vstree_entries, Database, Meta, BACKUP_OFFSET_FILE, DICT_FILE, DISK_CACHE_PAGES,
-    KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR, STORE_FILE, UPDATE_LOG_FILE,
-    VSTREE_FILE, VSTREE_KV_FILE,
+    build_vstree, memory_vstree_entries, vstree_entries, Database, Meta, BACKUP_OFFSET_FILE,
+    DICT_FILE, DISK_CACHE_PAGES, KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR,
+    STORE_FILE, UPDATE_LOG_FILE, VSTREE_FILE, VSTREE_KV_FILE,
 };
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
@@ -142,7 +143,7 @@ impl fmt::Display for StorageKind {
 }
 
 /// `<path>.wal`, the pager write-ahead log beside a paged file.
-fn wal_of(path: &Path) -> PathBuf {
+pub(crate) fn wal_of(path: &Path) -> PathBuf {
     fsutil::with_suffix(path, ".wal")
 }
 
@@ -275,6 +276,21 @@ impl DiskSink {
     }
 }
 
+/// The write-through sink behind `disk`, exclusively (no locking needed). A
+/// lock poisoned by a panic in the middle of a store operation leaves the
+/// sink broken: the store may no longer match the working set.
+fn sink_mut(disk: &mut Mutex<Option<DiskSink>>) -> &mut Option<DiskSink> {
+    let poisoned = disk.is_poisoned();
+    disk.clear_poison();
+    let sink = disk.get_mut().unwrap_or_else(|e| e.into_inner());
+    if poisoned {
+        if let Some(s) = sink.as_mut() {
+            s.fail("a panic interrupted an operation on the on-disk store");
+        }
+    }
+    sink
+}
+
 impl Drop for DiskSink {
     /// Best-effort: commit mutations applied since the last commit point, so a
     /// tool that inserts through the API and exits without `save()` loses
@@ -301,7 +317,7 @@ fn key_triple(dict: &Dictionary, t: IdTriple) -> Option<KeyTriple> {
 }
 
 /// Remove the artifacts of every layout other than `keep` from `dir`.
-fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
+pub(crate) fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
     if keep != StorageKind::Snapshot {
         for name in SNAPSHOT_FILES {
             let path = dir.join(name);
@@ -467,7 +483,7 @@ impl Database {
 
     /// The layout this live database persists as.
     pub fn storage(&self) -> StorageKind {
-        if self.disk.borrow().is_some() {
+        if self.is_disk_backed() {
             return StorageKind::Disk;
         }
         #[cfg(feature = "rocksdb")]
@@ -489,7 +505,8 @@ impl Database {
                 self.name
             )));
         };
-        self.save(home)
+        let _persist = self.persist_guard();
+        self.save_locked(&home)
     }
 
     /// A commit point without a full save: make every mutation applied so far
@@ -500,6 +517,7 @@ impl Database {
     /// the direct API ([`insert_triple`](Self::insert_triple), …). A no-op for an
     /// in-memory database — persist that with [`save`](Self::save).
     pub fn sync(&self) -> Result<()> {
+        let _persist = self.persist_guard();
         self.commit_point()
     }
 
@@ -524,7 +542,7 @@ impl Database {
             self.store = Backend::Memory(mem);
         }
         // Dropping the sink closes the disk store (nothing left to flush).
-        *self.disk.get_mut() = None;
+        *sink_mut(&mut self.disk) = None;
         self.home = None;
         self.dir_lock = None;
         if self.vstree.is_disk_backed() {
@@ -554,13 +572,18 @@ impl Database {
     /// Inside an open transaction, the persistent layouts save only what has
     /// been committed; an in-memory snapshot captures the live state.
     pub fn save<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
-        let dir = dir.as_ref();
+        let _persist = self.persist_guard();
+        self.save_locked(dir.as_ref())
+    }
+
+    /// [`save`](Self::save), with `persist_lock` held by the caller.
+    pub(super) fn save_locked(&self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
         let at_home = self
             .home
             .as_deref()
             .is_some_and(|h| fsutil::same_dir(h, dir));
-        if self.disk.borrow().is_some() {
+        if self.is_disk_backed() {
             self.commit_point()?;
             return if at_home {
                 Ok(())
@@ -630,8 +653,7 @@ impl Database {
             ));
         };
         let stale = self
-            .disk
-            .borrow()
+            .disk_guard()
             .as_ref()
             .is_none_or(|s| s.store.vstree_stale());
         let kv_dst = dir.join(KV_FILE);
@@ -726,8 +748,8 @@ impl Database {
             )));
         }
         // The VS-tree is rebuilt from the store if absent or unreadable.
-        let vstree =
-            fsutil::read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
+        let vstree = fsutil::read_bincode(&dir.join(VSTREE_FILE))
+            .unwrap_or_else(|_| VsTree::build(memory_vstree_entries(&store)));
         let mut db = Database::new(meta.name);
         db.dict = dict;
         db.store = Backend::Memory(store);
@@ -817,7 +839,7 @@ impl Database {
         let vstree = if vskv.is_file() && !ds.vstree_stale() {
             VsTree::open_disk(&vskv)?
         } else {
-            let tree = write_vstree_kv(&vskv, vstree_entries(&store))?;
+            let tree = write_vstree_kv(&vskv, memory_vstree_entries(&store))?;
             ds.mark_vstree_fresh();
             ds.flush()?;
             tree
@@ -831,7 +853,7 @@ impl Database {
         // the query path may use it as a candidate filter.
         db.index_valid = true;
         db.home = Some(dir.to_path_buf());
-        *db.disk.get_mut() = Some(DiskSink::new(ds));
+        *sink_mut(&mut db.disk) = Some(DiskSink::new(ds));
         Ok(db)
     }
 
@@ -994,7 +1016,13 @@ impl Database {
         db.store = Backend::Rocks(rocks);
         db.named = named;
         db.home = Some(dir.to_path_buf());
-        db.rebuild_index();
+        // The VS-tree is not rebuilt at open (it walks every entity's edges
+        // in RocksDB): queries evaluate without it until `rebuild_index()`.
+        // `GSTORE_VSTREE_ON_OPEN=1` restores the rebuild at open.
+        db.index_valid = false;
+        if vstree_on_open() {
+            db.rebuild_index();
+        }
         Ok(db)
     }
 
@@ -1211,7 +1239,7 @@ impl Database {
     /// Record a persistence failure to report at the next commit point.
     #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     pub(super) fn note_persist_error(&self, e: impl fmt::Display) {
-        let mut slot = self.persist_error.borrow_mut();
+        let mut slot = self.persist_error_slot();
         if slot.is_none() {
             *slot = Some(e.to_string());
         }
@@ -1225,7 +1253,7 @@ impl Database {
     /// in-memory graph is changed. In-memory: nothing to do.
     pub(super) fn persist_mutation(&mut self, insert: bool, graph: Option<u32>, id: IdTriple) {
         let in_txn = self.txn.is_some();
-        if let Some(sink) = self.disk.get_mut() {
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
             match DiskOp::resolve(&self.dict, insert, graph, id) {
                 Some(op) => sink.record(op, in_txn),
                 None => sink.fail("a mutated triple references an id missing from the dictionary"),
@@ -1300,21 +1328,46 @@ impl Database {
 
     /// Apply the queued write-through of a committing transaction.
     pub(super) fn disk_commit_pending(&mut self) {
-        if let Some(sink) = self.disk.get_mut() {
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
             sink.commit_pending();
         }
     }
 
     /// Drop the queued write-through of a rolled-back transaction.
     pub(super) fn disk_discard_pending(&mut self) {
-        if let Some(sink) = self.disk.get_mut() {
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
             sink.discard_pending();
         }
     }
 
     /// Whether mutations are written through to an on-disk store.
     pub(super) fn is_disk_backed(&self) -> bool {
-        self.disk.borrow().is_some()
+        self.disk_guard().is_some()
+    }
+
+    /// The write-through sink, through its lock (see [`sink_mut`] for a
+    /// poisoned lock).
+    pub(super) fn disk_guard(&self) -> MutexGuard<'_, Option<DiskSink>> {
+        match self.disk.lock() {
+            Ok(sink) => sink,
+            Err(poisoned) => {
+                self.disk.clear_poison();
+                let mut sink = poisoned.into_inner();
+                if let Some(s) = sink.as_mut() {
+                    s.fail("a panic interrupted an operation on the on-disk store");
+                }
+                sink
+            }
+        }
+    }
+
+    /// The pending persistence failure, through its lock (a plain value: a
+    /// poisoned lock is taken over).
+    fn persist_error_slot(&self) -> MutexGuard<'_, Option<String>> {
+        self.persist_error.lock().unwrap_or_else(|e| {
+            self.persist_error.clear_poison();
+            e.into_inner()
+        })
     }
 
     /// A commit point: make every mutation applied so far durable (commit the
@@ -1322,9 +1375,12 @@ impl Database {
     /// persistence failure recorded since the previous commit point.
     pub(super) fn commit_point(&self) -> Result<()> {
         let mut failure: Option<GStoreError> = None;
-        if let Some(sink) = self.disk.borrow_mut().as_mut() {
-            if let Err(e) = sink.flush() {
-                failure = Some(e);
+        {
+            let mut disk = self.disk_guard();
+            if let Some(sink) = disk.as_mut() {
+                if let Err(e) = sink.flush() {
+                    failure = Some(e);
+                }
             }
         }
         #[cfg(feature = "rocksdb")]
@@ -1339,8 +1395,7 @@ impl Database {
             }
         }
         let recorded = self
-            .persist_error
-            .borrow_mut()
+            .persist_error_slot()
             .take()
             .or_else(|| self.store.take_write_error());
         if let Some(msg) = recorded {
@@ -1537,6 +1592,15 @@ impl Database {
             }
         }
     }
+}
+
+/// Whether the environment asks for the pre-Phase-6 VS-tree rebuild when a
+/// RocksDB database is opened (`GSTORE_VSTREE_ON_OPEN=1`).
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
+fn vstree_on_open() -> bool {
+    std::env::var("GSTORE_VSTREE_ON_OPEN").is_ok_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
 }
 
 /// Check that a restored on-disk / RocksDB copy in `dir` opens as a database.

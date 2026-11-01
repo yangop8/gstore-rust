@@ -481,18 +481,19 @@ pub(crate) fn plan_vars(plan: &PatPlan) -> Vec<usize> {
 }
 
 /// Estimated number of triples matching a pattern's constants — the size of the
-/// index range the executor would scan for it.
+/// index range the executor would scan for it (counted, not materialized:
+/// contract C1).
 fn pattern_card(plan: &PatPlan, store: &impl TripleSource) -> f64 {
     use Slot::{Const, Var};
     let c = match (plan.s, plan.p, plan.o) {
-        (Const(_), Const(_), Const(_)) => 1usize,
-        (Const(s), Const(p), Var(_)) => store.o_by_sp(s, p).len(),
-        (Var(_), Const(p), Const(o)) => store.s_by_po(p, o).len(),
-        (Const(s), Var(_), Const(o)) => store.p_by_so(s, o).len(),
-        (Const(s), Var(_), Var(_)) => store.po_by_s(s).len(),
-        (Var(_), Const(p), Var(_)) => store.so_by_p(p).len(),
-        (Var(_), Var(_), Const(o)) => store.ps_by_o(o).len(),
-        (Var(_), Var(_), Var(_)) => store.triple_count() as usize,
+        (Const(_), Const(_), Const(_)) => 1u64,
+        (Const(s), Const(p), Var(_)) => store.count_o_by_sp(s, p),
+        (Var(_), Const(p), Const(o)) => store.count_s_by_po(p, o),
+        (Const(s), Var(_), Const(o)) => store.count_p_by_so(s, o),
+        (Const(s), Var(_), Var(_)) => store.count_po_by_s(s),
+        (Var(_), Const(p), Var(_)) => store.count_so_by_p(p),
+        (Var(_), Var(_), Const(o)) => store.count_ps_by_o(o),
+        (Var(_), Var(_), Var(_)) => store.triple_count(),
     };
     (c as f64).max(1.0)
 }
@@ -513,47 +514,39 @@ fn build_ndv(plan: &PatPlan, store: &impl TripleSource, cand: &Candidates) -> Ha
         }
     };
 
+    // Counted, not materialized (contract C1); every value is the one the
+    // list-based estimate gave, so plans are unchanged.
     if let Var(v) = plan.s {
         let d = match (plan.p, plan.o) {
-            (Const(p), Const(o)) => store.s_by_po(p, o).len(),
+            (Const(p), Const(o)) => store.count_s_by_po(p, o) as usize,
             (Const(p), Var(_)) => store.pred_distinct_subj(p),
-            (Var(_), Const(o)) => distinct_first(&store.ps_by_o(o)), // distinct subjects of o
+            // FIXME: meant as the distinct subjects of `o`, but this counts the
+            // distinct *predicates* of `o` (the first components of `ps_by_o`).
+            // Kept as is: changing it would change plans.
+            (Var(_), Const(o)) => store.distinct_p_of_o(o) as usize,
             (Var(_), Var(_)) => store.distinct_subjects(),
         };
         put(v, d);
     }
     if let Var(v) = plan.o {
         let d = match (plan.s, plan.p) {
-            (Const(s), Const(p)) => store.o_by_sp(s, p).len(),
+            (Const(s), Const(p)) => store.count_o_by_sp(s, p) as usize,
             (Var(_), Const(p)) => store.pred_distinct_obj(p),
-            (Const(s), Var(_)) => store.po_by_s(s).len(), // objects of s (upper bound)
+            (Const(s), Var(_)) => store.count_po_by_s(s) as usize, // objects of s (upper bound)
             (Var(_), Var(_)) => store.distinct_objects(),
         };
         put(v, d);
     }
     if let Var(v) = plan.p {
         let d = match (plan.s, plan.o) {
-            (Const(s), Const(o)) => store.p_by_so(s, o).len(),
-            (Const(s), Var(_)) => distinct_first(&store.po_by_s(s)), // distinct preds of s
-            (Var(_), Const(o)) => distinct_first(&store.ps_by_o(o)), // distinct preds of o
+            (Const(s), Const(o)) => store.count_p_by_so(s, o) as usize,
+            (Const(s), Var(_)) => store.distinct_p_of_s(s) as usize, // distinct preds of s
+            (Var(_), Const(o)) => store.distinct_p_of_o(o) as usize, // distinct preds of o
             (Var(_), Var(_)) => store.num_predicates(),
         };
         put(v, d);
     }
     m
-}
-
-/// Count distinct first components of `(a, b)` pairs sorted by `(a, b)`.
-fn distinct_first(pairs: &[(u32, u32)]) -> usize {
-    let mut count = 0usize;
-    let mut last: Option<u32> = None;
-    for &(a, _) in pairs {
-        if last != Some(a) {
-            count += 1;
-            last = Some(a);
-        }
-    }
-    count
 }
 
 #[cfg(test)]

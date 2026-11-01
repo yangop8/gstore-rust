@@ -16,14 +16,16 @@ use std::collections::{HashMap, HashSet};
 use crate::kvstore::StringIndex;
 use crate::store::TripleSource;
 
-use super::engine::{PatPlan, Slot};
+use super::engine::{FxBuildHasher, PatPlan, Slot};
 
-/// Candidate id sets per variable index (sorted, de-duplicated).
-pub(crate) type Candidates = HashMap<usize, Vec<u32>>;
+/// Candidate id sets per variable index (sorted, de-duplicated). Keyed with
+/// the engine's fast deterministic hasher: the executor looks a variable's set
+/// up for every triple it tests.
+pub(crate) type Candidates = HashMap<usize, Vec<u32>, FxBuildHasher>;
 
 /// Generate candidate id sets for the BGP's variables.
 pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidates {
-    let mut cand: Candidates = HashMap::new();
+    let mut cand = Candidates::default();
 
     // Pass 1 — constant-neighbour edges give an exact list per variable.
     for plan in plans {
@@ -249,18 +251,18 @@ mod tests {
 
         // Seeds ?o (had no candidates) with the "MARK" superset {10,12}.
         let cons = HashMap::from([(2usize, vec!["MARK".to_string()])]);
-        let mut cand: Candidates = HashMap::new();
+        let mut cand = Candidates::default();
         refine_with_substrings(&mut cand, &cons, &idx, &plans);
         assert_eq!(cand.get(&2), Some(&vec![10, 12]));
 
         // A predicate-position variable is skipped (separate id space).
         let cons_p = HashMap::from([(1usize, vec!["MARK".to_string()])]);
-        let mut cand_p: Candidates = HashMap::new();
+        let mut cand_p = Candidates::default();
         refine_with_substrings(&mut cand_p, &cons_p, &idx, &plans);
         assert!(!cand_p.contains_key(&1));
 
         // Tightens an existing candidate set: {10,11} ∩ {10,12} = {10}.
-        let mut cand_t: Candidates = HashMap::from([(2usize, vec![10, 11])]);
+        let mut cand_t: Candidates = [(2usize, vec![10, 11])].into_iter().collect();
         refine_with_substrings(&mut cand_t, &cons, &idx, &plans);
         assert_eq!(cand_t.get(&2), Some(&vec![10]));
     }
