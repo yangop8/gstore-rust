@@ -146,8 +146,14 @@ pub enum UpdateOp {
 /// The target of a `CLEAR`/`DROP` operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphTarget {
+    /// `DEFAULT`.
     Default,
+    /// `GRAPH <iri>` — any IRI, the empty one (`<>` without a `BASE`)
+    /// included.
     Named(String),
+    /// `NAMED`: every named graph.
+    AllNamed,
+    /// `ALL`: the default graph and every named graph.
     All,
 }
 

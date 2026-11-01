@@ -71,6 +71,68 @@ impl Term {
     pub fn dict_key(&self) -> String {
         self.to_string()
     }
+
+    /// The term a dictionary key names — the exact inverse of
+    /// [`dict_key`](Self::dict_key), for every term a reader may have let
+    /// in. Unlike the N-Triples reader it takes an IRI's text verbatim (one
+    /// holding `>`, `\` or a space, which the lenient readers accept, reads
+    /// back as itself; `\u` is not an escape there) and an empty language
+    /// tag. `None` for a string that is not a key.
+    pub fn from_dict_key(key: &str) -> Option<Term> {
+        if let Some(iri) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) {
+            return Some(Term::Iri(iri.to_string()));
+        }
+        if let Some(label) = key.strip_prefix("_:") {
+            return Some(Term::Blank(label.to_string()));
+        }
+        let body = key.strip_prefix('"')?;
+        // The lexical form, escaped as `escape_literal` escapes it.
+        let mut value = String::with_capacity(body.len());
+        let mut chars = body.char_indices();
+        let rest = loop {
+            match chars.next()? {
+                (i, '"') => break &body[i + 1..],
+                (_, '\\') => value.push(match chars.next()?.1 {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => return None,
+                }),
+                (_, c) => value.push(c),
+            }
+        };
+        let (datatype, lang) = if rest.is_empty() {
+            (None, None)
+        } else if let Some(dt) = rest.strip_prefix("^^<").and_then(|r| r.strip_suffix('>')) {
+            (Some(dt.to_string()), None)
+        } else {
+            (None, Some(rest.strip_prefix('@')?.to_string()))
+        };
+        Some(Term::Literal {
+            value,
+            datatype,
+            lang,
+        })
+    }
+
+    /// The bytes this term's strings hold (what a parsed statement costs in
+    /// memory, short of the fixed size of the term itself).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Term::Iri(s) | Term::Blank(s) => s.len(),
+            Term::Literal {
+                value,
+                datatype,
+                lang,
+            } => {
+                value.len()
+                    + datatype.as_ref().map_or(0, String::len)
+                    + lang.as_ref().map_or(0, String::len)
+            }
+        }
+    }
 }
 
 impl fmt::Display for Term {
@@ -199,6 +261,35 @@ impl fmt::Display for Triple {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_keys_read_back_as_the_terms_they_name() {
+        for t in [
+            Term::iri("http://ex/a"),
+            Term::iri("http://ex/a>b c\\u0041\\d"),
+            Term::iri(""),
+            Term::blank("b1_x-y"),
+            Term::plain_literal("a \"q\"\nb\\c\t\r\\u0041"),
+            Term::typed_literal("1", "http://www.w3.org/2001/XMLSchema#integer"),
+            Term::typed_literal("x", "http://ex/dt>odd"),
+            Term::Literal {
+                value: "x".into(),
+                datatype: None,
+                lang: Some("en-GB".into()),
+            },
+            Term::Literal {
+                value: "x".into(),
+                datatype: None,
+                lang: Some(String::new()),
+            },
+            Term::plain_literal(""),
+        ] {
+            assert_eq!(Term::from_dict_key(&t.dict_key()), Some(t.clone()), "{t}");
+        }
+        for not_a_key in ["", "x", "\"open", "\"x\"junk", "\"\\q\""] {
+            assert_eq!(Term::from_dict_key(not_a_key), None, "{not_a_key}");
+        }
+    }
 
     #[test]
     fn iri_roundtrips_through_display() {

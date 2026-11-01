@@ -16,9 +16,12 @@ command-line tools.
 | runs as | user `gstore` | user `gstore` (uid 10001) |
 
 Every relative path in `conf.ini` (`db_home="./dbhome/"`,
-`backup_path="./backups/"`, `querylog_path="logs/endpoint/"`,
+`backup_path="./backups/"`, `upload_path="./upload/"`,
 `log_mode="./conf/slog.properties"`, …) is relative to the working
-directory, as upstream's are to its install root.
+directory, as upstream's are to its install root — except `querylog_path`
+and `accesslog_path`, which are relative to `db_home`: with the shipped
+`conf.ini` the query and access logs are in
+`/var/lib/gstore/dbhome/logs/endpoint/` and `…/dbhome/logs/ipaccess/`.
 
 **Before exposing a server**: the `root` user's password is `conf.ini`'s
 `root_password` (default `123456`) when the user store is first created —
@@ -26,6 +29,19 @@ set it before the first start (or pass `--password-file FILE`, or
 `--password`), or change it later with the `/api` `userpassword` operation or
 `gconsole`. While root still has the default password, `gserver` refuses to
 listen on anything but a loopback address (and warns on loopback).
+
+The legacy **single-database mode** (`gserver DIR`, without `--api`) has no
+authentication and no IP lists at all: anyone who reaches it may update the
+database. It refuses to listen beyond loopback unless started with
+`--allow-unauthenticated`; serve a database to the network through the
+multi-database API instead.
+
+**`--allow-service`** lets SPARQL `SERVICE` contact remote endpoints, and
+lets users with the update privilege make the server download
+`http(s)://` sources (`/api` `build` / `batchInsert` / `batchRemove` with
+`remote=true`) and keep what they hold in a database — never from a
+loopback, link-local or other host-local address, but from any other host
+the server can reach, internal ones included.
 
 ## Docker
 
@@ -87,7 +103,8 @@ docker exec -it gstore gconsole -u root                    # the console
   `./conf/slog.properties`, which does not exist: the diagnostic log goes to
   standard error (`docker logs`). Copy `slog.properties.example` to
   `/etc/gstore/slog.properties` to also write `logs/all.log` (rolled daily).
-  The query and access logs are files below `/var/lib/gstore/logs/`.
+  The query and access logs are files below `/var/lib/gstore/dbhome/logs/`
+  (`querylog_path` / `accesslog_path` are relative to `db_home`).
 
 A Compose service:
 
@@ -202,14 +219,15 @@ run on a per-database CSR built on the first such query after a change;
 
 **Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
 and `batchRemove` read a `.zip` of RDF files (each entry needs an extension
-from `upload_allow_extensions`, which by default omits `nq`), `backup
+from `upload_allow_extensions`), `backup
 compress=true` writes `<db>.db_<timestamp>.zip`, `restore` takes such an
 archive, and `export compress=true` zips the export file. A package is
 checked in full before anything is unpacked: unsafe entry names (absolute,
 `..`) are refused, and `[upload] unzip_max_entries` (default 10000) and
 `unzip_max_size` (default 10 GiB, counted on the bytes actually written)
-bound what it may unpack to. Without the feature these requests answer
-`1003`, naming it.
+bound what it may unpack to — all the packages of one request together; a
+package named twice in a request is unpacked once. Without the feature
+these requests answer `1003`, naming it.
 
 **Diagnostic log** (errors, warnings, startup and shutdown events — the
 analogue of upstream's log4cplus `SLOG_*` log):
@@ -250,6 +268,13 @@ analogue of upstream's log4cplus `SLOG_*` log):
   per `/api` operation with the client IP. Every HTTP request (REST and
   `/api`) is also appended to `<db_home>/access.log` — time, method, path,
   user, status and client IP, tab-separated (`GET /accesslog`).
+* The statements are also appended, as text, to `<db_home>/query.log` —
+  time, database, user, statement, tab-separated (`GET /querylog`).
+  `query.log` follows `querylog_mode` and `access.log` `accesslog_mode`;
+  both roll over daily into `<file>.YYYY-MM-DD`, keeping `querylog_days` /
+  `accesslog_days` days (`GET /querylog` / `/accesslog` read today's file).
+* A relative `querylog_path` / `accesslog_path` is taken relative to
+  `db_home` (upstream: to its working directory).
 
 ## Command-line tools
 

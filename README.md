@@ -25,7 +25,7 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 1,840 tests pass** across the workspace (incl. 159 for gNLQA), among them
+* **About 1,860 tests pass** across the workspace (incl. 159 for gNLQA), among them
   ports of upstream gStore's own test scripts; `cargo clippy --workspace
   --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
   planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
@@ -176,6 +176,8 @@ gquery mydb query.rq         # run a SPARQL query (or -e "…" inline)
 gconsole -u root             # upstream's console, a client of a running gserver
 gconsole --local mydb        # the embedded REPL on mydb.db (no server)
 gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
+                             # (no authentication: loopback only, unless
+                             # --allow-unauthenticated)
 gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
                              # tasks, backup/restore); default login root / 123456,
                              # served on loopback only (set a password to expose it)
@@ -204,7 +206,10 @@ saving to `/checkpoint`, `/unload` and the graceful shutdown on Ctrl-C/SIGTERM).
 SPARQL `LOAD` (and `/build?db_path=`) sent to a server reads nothing unless
 `--load-dir DIR` allows it, `/backup` and `/restore` stay inside the server's
 backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
-`SERVICE` contacts no remote endpoint unless `--allow-service` is given.
+`SERVICE` contacts no remote endpoint unless `--allow-service` is given —
+which also lets `/api` `build` / `batchInsert` / `batchRemove` with
+`remote=true` download `http(s)://` sources (never from a loopback,
+link-local or other host-local address).
 
 A database directory is open in **one process at a time**: opening it takes an
 operating-system lock on `<name>.db/LOCK` (snapshot and `--disk` layouts;
@@ -313,10 +318,14 @@ Other gstore-rust keys: `[server]` `listen_addr`, `keep_alive_timeout`,
 (default 10000) and `unzip_max_size` (default 10 GiB), the limits a zip
 package must stay within; `[log]` `log_level`, `log_file`, `log_days`,
 `log_stderr` (below). `refreshconf` re-reads the file: the `[query]`
-settings, the log configuration (as upstream re-runs log4cplus), the IP
-lists, the database and user limits and the upload, backup and query /
-access-log settings take effect at once; the address, the worker pool,
-`check_point` and `db_home` need a restart.
+settings, the log configuration (as upstream re-runs log4cplus; a log file
+that could not be opened is tried again), the IP lists, the database and
+user limits and the upload, backup and query / access-log settings take
+effect at once; the address, the worker pool, `check_point`, `db_home` and
+the cap `upload_max_body_size` puts on every HTTP request body need a
+restart (the upload operation's own size check follows the new value).
+A relative `querylog_path` / `accesslog_path` is taken relative to
+`db_home`.
 
 **Logs.** `gserver` writes a diagnostic log (errors, warnings, lifecycle
 events) configured like upstream's: `conf.ini`'s `log_mode` names a log4cplus

@@ -796,7 +796,7 @@ fn the_rest_query_log_follows_querylog_mode_and_path() {
         !root.join("logs").join("endpoint").exists(),
         "query log off"
     );
-    // The plain-text REST access log is unconditional.
+    // The plain-text REST access log follows accesslog_mode (on here).
     assert!(read(&root.join("access.log")).contains("\t/sparql\t"));
 
     let root2 = tmp_dir("rest_querylog_path");
@@ -813,4 +813,78 @@ fn the_rest_query_log_follows_querylog_mode_and_path() {
     assert_eq!(dates.len(), 1, "query log under the configured path");
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&root2);
+}
+
+/// The plain-text `query.log` and `access.log` under the server root follow
+/// `querylog_mode` / `accesslog_mode` like the JSON logs, and roll over by
+/// day, keeping `querylog_days` / `accesslog_days` days of rolled files.
+#[test]
+fn the_plain_text_logs_follow_the_log_switches_and_roll_by_day() {
+    // Off: neither the statements nor the requests are written anywhere.
+    let root = tmp_dir("plain_logs_off");
+    let mut cfg = GStoreConfig::default();
+    cfg.querylog_mode = false;
+    cfg.accesslog_mode = false;
+    cfg.ip_deny_path = None;
+    let (srv, addr) = start(&root, Some(cfg));
+    assert_eq!(request(&addr, "POST", "/build?db_name=q", DATA).0, 200);
+    assert_eq!(
+        request(
+            &addr,
+            "POST",
+            "/update?db_name=q",
+            "INSERT DATA { <http://ex/secret> <http://ex/ssn> \"123-45-6789\" }"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        request(&addr, "POST", "/sparql?db_name=q", "ASK { ?s ?p ?o }").0,
+        200
+    );
+    assert!(!root.join("query.log").exists(), "query log off");
+    assert!(!root.join("access.log").exists(), "access log off");
+    srv.shutdown();
+    let _ = fs::remove_dir_all(&root);
+
+    // On: a file an earlier day left is rolled to `<file>.<day>`, and
+    // rolled files past the retention are deleted.
+    let root = tmp_dir("plain_logs_roll");
+    let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 86_400);
+    for f in ["query.log", "access.log"] {
+        fs::write(root.join(f), "old line\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(f))
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        fs::write(root.join(format!("{f}.2001-01-01")), "ancient\n").unwrap();
+    }
+    let mut cfg = GStoreConfig::default();
+    cfg.querylog_days = 30;
+    cfg.accesslog_days = 30;
+    cfg.ip_deny_path = None;
+    let (srv, addr) = start(&root, Some(cfg));
+    assert_eq!(request(&addr, "POST", "/build?db_name=q", DATA).0, 200);
+    assert_eq!(
+        request(&addr, "POST", "/sparql?db_name=q", "ASK { ?s ?p ?o }").0,
+        200
+    );
+    for f in ["query.log", "access.log"] {
+        let now = read(&root.join(f));
+        assert!(!now.contains("old line"), "{f}: {now}");
+        assert!(!now.is_empty(), "{f}");
+        let rolled: Vec<String> = names(&root)
+            .into_iter()
+            .filter(|n| n.starts_with(&format!("{f}.")))
+            .collect();
+        assert_eq!(rolled.len(), 1, "{f}: {rolled:?}");
+        assert!(
+            read(&root.join(&rolled[0])).contains("old line"),
+            "{rolled:?}"
+        );
+    }
+    srv.shutdown();
+    let _ = fs::remove_dir_all(&root);
 }

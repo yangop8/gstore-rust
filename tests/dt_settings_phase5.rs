@@ -44,6 +44,8 @@ fn start(tag: &str, conf: &Path, data: &Path, log_refresh: bool) -> Srv {
     let config = GStoreConfig::load(conf).unwrap();
     let mut policy = LoadPolicy::restricted().with_allowed_dir(data);
     policy.allow_remote = true;
+    // The test's HTTP server is on loopback.
+    policy.allow_local_hosts = true;
     let mut server = ApiServer::bind(&root, PASSWORD, "127.0.0.1:0")
         .unwrap()
         .with_config(config)
@@ -314,12 +316,44 @@ fn refreshconf_reconfigures_the_diagnostic_log_like_upstream() {
     assert!(b_text.contains("second record"), "{b_text}");
     assert!(b_text.contains("diagnostic log reconfigured"), "{b_text}");
 
+    // A log file that cannot be opened is tried again by the next
+    // refreshconf, though the configuration did not change.
+    let blocked = data.join("blocked.log");
+    fs::create_dir_all(&blocked).unwrap();
+    write(&blocked, "info");
+    ok(&srv.op("refreshconf", &[]));
+    assert_eq!(logging::current().unwrap().file_path(), None);
+    fs::remove_dir_all(&blocked).unwrap();
+    ok(&srv.op("refreshconf", &[]));
+    assert_eq!(
+        logging::current().unwrap().file_path(),
+        Some(blocked.as_path()),
+        "the file is opened once it can be"
+    );
+    write(&b, "debug");
+    ok(&srv.op("refreshconf", &[]));
+
     // A server that does not own the log (the default) leaves it alone.
     drop(srv);
     let srv = start("set5_log2", &conf, &data, false);
     write(&a, "info");
     ok(&srv.op("refreshconf", &[]));
     assert_eq!(logging::current().unwrap().file_path(), Some(b.as_path()));
+    drop(srv);
+
+    // The same when the file could not be opened at startup.
+    let blocked = data.join("blocked2.log");
+    fs::create_dir_all(&blocked).unwrap();
+    write(&blocked, "info");
+    let (cfg, _) = LogConfig::from_gstore_config(&GStoreConfig::load(&conf).unwrap());
+    assert!(logging::init(&cfg).is_err());
+    let srv = start("set5_log3", &conf, &data, true);
+    fs::remove_dir_all(&blocked).unwrap();
+    ok(&srv.op("refreshconf", &[]));
+    assert_eq!(
+        logging::current().unwrap().file_path(),
+        Some(blocked.as_path())
+    );
     drop(srv);
     logging::reset();
     let _ = fs::remove_dir_all(&data);

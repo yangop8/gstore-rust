@@ -84,6 +84,10 @@ log_mode="./conf/slog.properties"
 # save the query log
 # 0: not save
 # 1: save the log
+# (gstore-rust: a relative querylog_path / accesslog_path is taken relative to
+# db_home, not to the working directory; the plain-text <db_home>/query.log
+# and access.log follow the *_mode switches too and roll over daily, keeping
+# *_days days)
 querylog_mode=1
 querylog_path="logs/endpoint/"
 querylog_days=30
@@ -124,10 +128,14 @@ max_backups=3
 [upload]
 upload_path = "./upload/"
 # max body size, 1 GB = 1024 MB = 1048576 KB(1M=1024KB) = 1073741824 B(1KB=1024B)
-# (gstore-rust also caps every HTTP request body at this size)
+# (gstore-rust also caps every HTTP request body at this size; refreshconf
+# applies a new value to the upload operation, the HTTP cap needs a restart)
 upload_max_body_size = 1073741824
-# allow extensions
-upload_allow_extensions = "nt|ttl|n3|rdf|txt"
+# allow extensions (also of build / batchInsert / batchRemove sources; with
+# the `gzip` feature `x.nt.gz` counts as `nt`). gstore-rust adds the quad
+# formats to upstream's "nt|ttl|n3|rdf|txt": export writes N-Quads (.nq) for
+# a database with named graphs, and must be able to build it again.
+upload_allow_extensions = "nt|ttl|n3|rdf|txt|nq|trig"
 # allow compress package
 upload_allow_compress_packages = "zip"
 # (gstore-rust extension, feature `zip`) limits a zip package must stay within

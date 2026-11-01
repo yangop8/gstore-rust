@@ -636,36 +636,68 @@ impl FileSink {
     /// Rename the active file to `<file>.<day>` (or `<file>.<day>.<n>` when
     /// that exists already).
     fn roll_to(&self, day: Date) -> io::Result<()> {
-        let base = self.rolled_name(day);
-        let mut target = base.clone();
-        let mut n = 1u32;
-        while target.exists() {
-            target = PathBuf::from(format!("{}.{n}", base.display()));
-            n += 1;
-        }
-        fs::rename(&self.path, &target)
-    }
-
-    fn rolled_name(&self, day: Date) -> PathBuf {
-        let mut name = self
-            .path
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_default();
-        name.push(format!(".{}", day.iso()));
-        self.path.with_file_name(name)
+        roll_file_to(&self.path, day)
     }
 
     /// Delete the rolled files more than `days` days older than `today`.
     fn prune(&self, today: Date) {
-        if self.days == 0 {
-            return;
+        prune_rolled(&self.path, self.days, today);
+    }
+}
+
+/// Rename log file `path` to `<file>.<day>` (or `<file>.<day>.<n>` when
+/// that exists already).
+fn roll_file_to(path: &Path, day: Date) -> io::Result<()> {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}", day.iso()));
+    let base = path.with_file_name(name);
+    let mut target = base.clone();
+    let mut n = 1u32;
+    while target.exists() {
+        target = PathBuf::from(format!("{}.{n}", base.display()));
+        n += 1;
+    }
+    fs::rename(path, &target)
+}
+
+/// Delete the rolled siblings of `path` more than `days` days older than
+/// `today` (`days == 0` keeps them all).
+fn prune_rolled(path: &Path, days: u32, today: Date) {
+    if days == 0 {
+        return;
+    }
+    for (rolled, day) in rolled_files(path) {
+        if today.days() - day.days() > i64::from(days) {
+            let _ = fs::remove_file(rolled);
         }
-        for (path, day) in rolled_files(&self.path) {
-            if today.days() - day.days() > i64::from(self.days) {
-                let _ = fs::remove_file(path);
-            }
-        }
+    }
+}
+
+/// Roll a log that is appended to by opening it for each line (the
+/// servers' plain-text `query.log` and `access.log`) over by day, as a
+/// [`Logger`]'s file is: when `path` was last written on an earlier (local)
+/// day, rename it to `<file>.<day>` and delete the rolled files more than
+/// `days` days old (`0` keeps them all). Call before appending a line.
+pub fn roll_daily(path: &Path, days: u32) {
+    static ROLLING: Mutex<()> = Mutex::new(());
+    let clock = SystemClock;
+    let stale = || -> Option<(Date, Date)> {
+        let meta = fs::metadata(path).ok()?;
+        let day = Date::of(&clock.local(meta.modified().ok()?));
+        let today = Date::of(&clock.local(clock.now()));
+        (meta.len() > 0 && day < today).then_some((day, today))
+    };
+    if stale().is_none() {
+        return;
+    }
+    let _rolling = ROLLING.lock().unwrap_or_else(|e| e.into_inner());
+    // Again under the lock: another thread may have rolled it meanwhile.
+    if let Some((day, today)) = stale() {
+        let _ = roll_file_to(path, day);
+        prune_rolled(path, days, today);
     }
 }
 

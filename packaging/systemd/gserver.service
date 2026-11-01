@@ -8,7 +8,8 @@
 #
 # Configuration: /etc/gstore/conf.ini. Data (dbhome/, backups/, logs/,
 # upload/): /var/lib/gstore, the working directory, against which every
-# relative conf.ini path is resolved; /var/lib/gstore/conf -> /etc/gstore
+# relative conf.ini path is resolved (but querylog_path / accesslog_path,
+# relative to db_home: dbhome/logs/); /var/lib/gstore/conf -> /etc/gstore
 # (created by tmpfiles.d) so conf.ini's ./conf/... paths resolve too.
 # Leave conf.ini's `deamon` off: systemd restarts the server itself.
 

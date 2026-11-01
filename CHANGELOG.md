@@ -87,6 +87,72 @@ changed; the following ones each phase, newest first.
   `tests/dt_settings_phase5.rs`, and new cases in `dt_gconsole`,
   `dt_logging`, `dt_rdf_import` and the Turtle reader's unit tests.
 
+#### Review of the Phase 5 integration
+
+- **A failed `LOAD` is no change.** Once a failed or cancelled `LOAD` has
+  undone its inserts, `Database::mutation_count` (and a CSR built for the
+  data before it) is put back: the servers no longer answer "(operations
+  before the failing one were applied)", save the database, or drop its
+  CSR and caches for a `LOAD` that applied nothing. Nor is an empty named
+  graph left behind: **changed**, a named graph whose last statement is
+  deleted (by `DELETE`, an undo or a rollback) is gone at once — `GRAPH ?g
+  {}` no longer finds it, as it never did after a reopen.
+- **Fixed: `DROP` / `CLEAR GRAPH <>`** (an empty IRI, `<>` without a
+  `BASE`) cleared every named graph, as if it were `NAMED`; it now names the
+  graph `<>`. The redo log marks named-graph records (`REDO <op> <glen>
+  <tlen> G`), so such a graph is no longer replayed into the default graph
+  (logs without the flag read as before).
+- **Fixed: terms a lenient reader lets in are no longer lost.** An IRI
+  holding `>`, `\` or a space (written `\u003E`, …) survives `MOVE` / `COPY`
+  / `ADD`, `DELETE` / `INSERT … WHERE`, `DESCRIBE` and redo replay
+  (`Term::from_dict_key` reads a dictionary key back verbatim; redo records
+  escape such IRIs as the exporters do). **Changed:** an empty language tag
+  (`"x"@`) is a syntax error in Turtle / TriG / `.nt` files, as in N-Triples.
+- **Fixed: a blank-node graph name co-refers with the same blank node.** In
+  an N-Quads / TriG document, `_:g` as a subject or object is now the
+  graph's `urn:gstore:bnode:` IRI too, so `GRAPH ?g { … } ?g <p> ?o` joins —
+  unless `_:g` was used as a subject or object before it named a graph:
+  then it stays a blank node throughout (a warning says so; nothing read is
+  rewritten and no node is split in two).
+- **Bounded import memory.** Each quad holds its own copy of every IRI a
+  prefix, namespace or base expanded, so a small file with a long prefix
+  could take gigabytes. An import batch is now handed over at
+  `ImportOptions::batch_bytes` (**new**, default 64 MiB) of terms as well as
+  at `batch_size` quads, and one Turtle / TriG statement or one RDF/XML /
+  JSON-LD / RDFa document fails when it expands past 64 MiB or 64 times its
+  size (`parser::stream::expansion_budget`).
+- **Bounded `parse_error.log`.** A failed statement's context is cut to 200
+  characters and its message to 512 (`SyntaxError`), so a long prefix no
+  longer turns a small file into a log hundreds of times its size.
+- **Security.** The single-database mode (`gserver DIR`), which has no
+  authentication, refuses to listen beyond loopback unless started with
+  **`--allow-unauthenticated`** (new). `remote=true` downloads never reach a
+  loopback, link-local or other host-local address unless the load policy
+  allows it (`LoadPolicy::allow_local_hosts`, **new**; gserver never sets it;
+  `--allow-service` documents that it enables these downloads). A zip
+  package named twice in one request is unpacked once, and the packages of
+  one request share `unzip_max_entries` / `unzip_max_size`; a URL named twice
+  is downloaded once. gconsole escapes control characters (C0, DEL, C1) in
+  everything it prints from an answer — table cells, IRIs, headers,
+  indented JSON, `pfn_type` text — as `\uXXXX`.
+- **Logs.** `refreshconf` tries a log file that could not be opened (at
+  startup or by an earlier `refreshconf`) again. **Changed:** the plain-text
+  `<db_home>/query.log` and `access.log` follow `querylog_mode` /
+  `accesslog_mode` and roll over daily, keeping `querylog_days` /
+  `accesslog_days` days. The docs now say that `querylog_path` /
+  `accesslog_path` are relative to `db_home` and that the HTTP body cap
+  (`upload_max_body_size`) needs a restart.
+- **Changed: `upload_allow_extensions` defaults to
+  `nt|ttl|n3|rdf|txt|nq|trig`**, so the server's own export of a database
+  with named graphs (N-Quads) builds again; with the `gzip` feature
+  `x.nt.gz` passes the check as `nt`.
+- **`gconsole --local`:** `load <iri> …` / `load silent …` in lower case is
+  SPARQL's `LOAD`, not the console's `load <name>`; a non-interactive run
+  exits 1 when a statement or command failed.
+- **Tests.** `tests/dt_merge5_review.rs`, and new cases in
+  `dt_gserver_lifecycle`, `dt_zip_io`, `dt_settings_phase5`, `dt_logging`,
+  `dt_gconsole` and the unit tests of `console::table` and `model::term`.
+
 ### Integrating Phases 2 and 3 with the Phase 1 server
 
 - **Security limits cover the new grammar.** The SPARQL parser's nesting

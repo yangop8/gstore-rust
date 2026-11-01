@@ -59,7 +59,20 @@
 //!
 //! N-Quads and TriG statements keep their graph. A blank-node graph label is
 //! stored as the IRI [`BNODE_GRAPH_PREFIX`]`<label>` (named graphs are keyed
-//! by IRI).
+//! by IRI), and so is the same blank node as a subject or object of that
+//! document — unless it was used as one before it named a graph: it then
+//! stays a blank node throughout, apart from its graph (a warning says so).
+//!
+//! # Memory
+//!
+//! A batch is handed over at [`ImportOptions::batch_size`] quads or
+//! [`ImportOptions::batch_bytes`] bytes of RDF terms, whichever comes first;
+//! one Turtle / TriG statement, or one document parsed whole, may expand to
+//! at most its [`expansion_budget`](crate::parser::stream::expansion_budget)
+//! (64 MiB, or 64 times its size) — each quad holds its own copy of every
+//! IRI a prefix or base expanded. A failed statement's context in the error
+//! log is cut to [`MAX_CONTEXT_CHARS`](crate::parser::stream::MAX_CONTEXT_CHARS)
+//! characters.
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -81,6 +94,10 @@ pub const DEFAULT_MAX_DOCUMENT_BYTES: u64 = 256 << 20;
 
 /// Default number of quads handed to a [`QuadSink`] at once.
 pub const DEFAULT_BATCH_SIZE: usize = 64 * 1024;
+
+/// Default bytes of RDF terms a batch may hold before it is handed to the
+/// [`QuadSink`], whatever its number of quads: 64 MiB.
+pub const DEFAULT_BATCH_BYTES: usize = 64 << 20;
 
 /// An RDF serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +198,10 @@ pub struct ImportOptions {
     pub max_document_bytes: u64,
     /// Quads per [`QuadSink`] call.
     pub batch_size: usize,
+    /// The most bytes of RDF terms (the strings of its quads) a batch holds:
+    /// it is handed over earlier when its quads reach this size (long IRIs,
+    /// say from a long prefix, make every quad large).
+    pub batch_bytes: usize,
     /// The read window: the buffer size of the reader over a file.
     pub window: usize,
 }
@@ -200,6 +221,7 @@ impl ImportOptions {
             upstream_checks: false,
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             batch_size: DEFAULT_BATCH_SIZE,
+            batch_bytes: DEFAULT_BATCH_BYTES,
             window: DEFAULT_WINDOW,
         }
     }
@@ -468,10 +490,99 @@ struct Pipeline<'a> {
     log: &'a mut dyn ErrorLog,
     sink: &'a mut dyn QuadSink,
     batch: Vec<Quad>,
+    /// Bytes of RDF terms `batch` holds.
+    batch_bytes: usize,
     report: ImportReport,
     /// The line of the statement being checked (0 = unknown: documents
     /// parsed whole).
     line: usize,
+    /// The document's blank-node graph labels (see [`BlankGraphs`]); `None`
+    /// for a format without graphs.
+    blank_graphs: Option<BlankGraphs>,
+}
+
+/// How the blank-node graph labels of one N-Quads / TriG document become
+/// IRIs ([`BNODE_GRAPH_PREFIX`]`<label>`: named graphs are keyed by IRI)
+/// while the same blank node used as a subject or object keeps naming the
+/// same node.
+///
+/// A label first met as a graph label is that IRI everywhere in the
+/// document — the statements describing the graph (`_:g prov:… .`) join its
+/// `GRAPH ?g`. A label already used as a subject or object stays a blank node
+/// there, all through the document (its graph is apart from it, and a
+/// warning says so): what was read is not rewritten, and one node never
+/// splits in two. Whether a label was used earlier is tracked in a Bloom
+/// filter of [`BlankGraphs::FILTER_BITS`] bits, so memory stays bounded; a
+/// false positive only keeps a graph apart.
+#[derive(Default)]
+struct BlankGraphs {
+    /// Graph labels: `true` = an IRI everywhere, `false` = kept apart.
+    graphs: std::collections::HashMap<String, bool>,
+    /// The Bloom filter of the labels used as a subject or object
+    /// (allocated on first use).
+    seen: Vec<u64>,
+}
+
+impl BlankGraphs {
+    /// Bits of the filter (1 MiB).
+    const FILTER_BITS: usize = 1 << 23;
+
+    fn bits(label: &str) -> [usize; 2] {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        label.hash(&mut h);
+        let v = h.finish();
+        let mask = (Self::FILTER_BITS - 1) as u64;
+        [(v & mask) as usize, ((v >> 32) & mask) as usize]
+    }
+
+    fn mark(&mut self, label: &str) {
+        if self.seen.is_empty() {
+            self.seen = vec![0; Self::FILTER_BITS / 64];
+        }
+        for b in Self::bits(label) {
+            self.seen[b / 64] |= 1 << (b % 64);
+        }
+    }
+
+    fn maybe_seen(&self, label: &str) -> bool {
+        !self.seen.is_empty()
+            && Self::bits(label)
+                .iter()
+                .all(|&b| self.seen[b / 64] & (1 << (b % 64)) != 0)
+    }
+
+    fn iri(label: &str) -> Term {
+        Term::Iri(format!("{BNODE_GRAPH_PREFIX}{label}"))
+    }
+
+    /// Rewrite `q`'s blank graph label, and its blank subject / object
+    /// standing for a graph, to the graph's IRI.
+    fn apply(&mut self, q: &mut Quad, source: &str) {
+        if let Some(Term::Blank(l)) = &q.graph {
+            if !self.graphs.contains_key(l) {
+                let joined = !self.maybe_seen(l);
+                if !joined {
+                    crate::gs_warn!(
+                        "{source}: the blank node _:{l} names a graph after it was used as a \
+                         subject or object; the graph is stored as <{BNODE_GRAPH_PREFIX}{l}>, \
+                         apart from that node"
+                    );
+                }
+                self.graphs.insert(l.clone(), joined);
+            }
+            q.graph = Some(Self::iri(l));
+        }
+        for t in [&mut q.subject, &mut q.object] {
+            if let Term::Blank(l) = t {
+                match self.graphs.get(l.as_str()) {
+                    Some(true) => *t = Self::iri(l),
+                    Some(false) => {}
+                    None => self.mark(l),
+                }
+            }
+        }
+    }
 }
 
 impl Pipeline<'_> {
@@ -489,6 +600,7 @@ impl Pipeline<'_> {
             self.sink.quads(&mut self.batch)?;
             self.batch.clear();
         }
+        self.batch_bytes = 0;
         Ok(())
     }
 }
@@ -506,15 +618,23 @@ impl StatementSink for Pipeline<'_> {
                 self.fail(err)?;
                 continue;
             }
-            if let Some(Term::Blank(l)) = &q.graph {
-                q.graph = Some(Term::Iri(format!("{BNODE_GRAPH_PREFIX}{l}")));
+            match self.blank_graphs.as_mut() {
+                Some(bg) => bg.apply(&mut q, self.source),
+                None => {
+                    if let Some(Term::Blank(l)) = &q.graph {
+                        q.graph = Some(BlankGraphs::iri(l));
+                    }
+                }
             }
             if q.graph.is_some() {
                 self.report.named += 1;
             }
             self.report.statements += 1;
+            self.batch_bytes = self.batch_bytes.saturating_add(q.heap_bytes());
             self.batch.push(q);
-            if self.batch.len() >= self.opts.batch_size.max(1) {
+            if self.batch.len() >= self.opts.batch_size.max(1)
+                || self.batch_bytes >= self.opts.batch_bytes.max(1)
+            {
                 self.flush()?;
             }
         }
@@ -793,11 +913,13 @@ pub fn import_reader<R: BufRead>(
         log,
         sink,
         batch: Vec::with_capacity(opts.batch_size.clamp(1, DEFAULT_BATCH_SIZE)),
+        batch_bytes: 0,
         report: ImportReport {
             documents: 1,
             ..ImportReport::default()
         },
         line: 0,
+        blank_graphs: format.has_graphs().then(BlankGraphs::default),
     };
     parse_into(
         reader,
@@ -838,6 +960,13 @@ pub fn open_file(path: &Path, opts: &ImportOptions) -> Result<(Box<dyn BufRead>,
 /// [`crate::http_client`]). Errors on a transport failure or a non-2xx
 /// status.
 pub fn fetch_url(url: &str, max: u64) -> Result<Vec<u8>> {
+    fetch_url_with(url, max, false)
+}
+
+/// [`fetch_url`], refusing a host-local address
+/// ([`crate::http_client::is_local_addr`]) when `refuse_local` — for a
+/// download a server makes on a client's behalf.
+pub fn fetch_url_with(url: &str, max: u64, refuse_local: bool) -> Result<Vec<u8>> {
     let opts = crate::http_client::PostOptions {
         limits: crate::http_client::Limits {
             max_response: usize::try_from(max)
@@ -845,6 +974,7 @@ pub fn fetch_url(url: &str, max: u64) -> Result<Vec<u8>> {
                 .saturating_add(64 << 10),
             ..crate::http_client::Limits::default()
         },
+        refuse_local,
         ..crate::http_client::PostOptions::default()
     };
     // The response cap covers the headers too; the body is checked below.

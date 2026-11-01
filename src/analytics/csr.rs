@@ -860,6 +860,15 @@ impl CsrCache {
         self.lock().as_ref().map(|(gen, _)| *gen)
     }
 
+    /// Cache `graph` for `generation` again — a graph built for data an
+    /// operation changed and then changed back (a failed `LOAD` that undid
+    /// its inserts), whose generation was restored with it.
+    pub fn restore(&self, generation: u64, graph: Arc<CsrGraph>) {
+        let mut slot = self.lock();
+        *slot = Some((generation, graph));
+        self.built.set(true);
+    }
+
     /// Drop the cached graph.
     pub fn clear(&self) {
         let mut slot = self.lock();

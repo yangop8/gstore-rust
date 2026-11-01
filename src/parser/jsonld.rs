@@ -45,7 +45,7 @@ use crate::error::{GStoreError, Result};
 use crate::json::Json;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
-use crate::parser::stream::BlankLabeler;
+use crate::parser::stream::{BlankLabeler, TermBudget};
 
 /// The `rdf:` namespace (for `rdf:first`/`rdf:rest`/`rdf:nil` list chains).
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -66,10 +66,12 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
     let mut proc = Processor {
         triples: Vec::new(),
         labels: std::mem::take(labels),
+        budget: TermBudget::for_input(content.len()),
     };
     let done = proc.process_top(&json, &Context::default());
     *labels = proc.labels;
     done?;
+    proc.budget.check()?;
     Ok(proc.triples)
 }
 
@@ -113,6 +115,8 @@ struct Processor {
     /// Names author-written `_:` labels and minted nodes (see
     /// [`BlankLabeler`]: a minted label never equals an author label).
     labels: BlankLabeler,
+    /// Bounds what `triples` holds.
+    budget: TermBudget,
 }
 
 impl Processor {
@@ -131,7 +135,11 @@ impl Processor {
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
-        self.triples.push(Triple::new(s, p, o));
+        if self.budget.admit([&s, &p, &o]) {
+            self.triples.push(Triple::new(s, p, o));
+        } else {
+            self.triples = Vec::new();
+        }
     }
 
     /// Entry point: a document is a node object, an array of them, or an object

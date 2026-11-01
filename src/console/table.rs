@@ -2,6 +2,8 @@
 //! `Util::printConsole` (upstream `src/Util/PrettyPrint.h`), result cells as
 //! N-Triples terms, and indented JSON (`nlohmann::json::dump(4)`).
 
+use std::borrow::Cow;
+
 use crate::json::Json;
 
 /// Upstream's `_max_column_size`: a longer cell widens its column no further
@@ -54,14 +56,50 @@ fn pad(s: &str, width: usize) -> String {
     out
 }
 
+/// Whether a terminal acts on `c` rather than showing it: C0 controls, DEL
+/// and C1 controls (escape sequences retitle the window, move the cursor,
+/// write the clipboard …).
+fn is_control(c: char) -> bool {
+    let u = c as u32;
+    u < 0x20 || (0x7f..0xa0).contains(&u)
+}
+
+/// `s` as text to print: every control character ([`is_control`]) written
+/// as an escape — `\n` / `\r` / `\t`, else `\uXXXX` — so what a query
+/// answer holds cannot drive the operator's terminal. With `keep_layout`, a
+/// line break and a tab stay as they are (multi-line text).
+pub fn printable(s: &str, keep_layout: bool) -> Cow<'_, str> {
+    let escaped = |c: char| is_control(c) && !(keep_layout && matches!(c, '\n' | '\t'));
+    if !s.chars().any(escaped) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            c if !escaped(c) => out.push(c),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push_str(&format!("\\u{:04X}", c as u32)),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// The table upstream's `Util::printConsole(headers, rows)` prints: a rule
 /// of dashes, the centred headers, a rule, one line per row, a rule —
 /// columns separated by `|` with one space of padding. A row shorter than
-/// the headers prints only its cells.
+/// the headers prints only its cells. Control characters in a header or a
+/// cell are escaped ([`printable`]).
 pub fn render(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let headers: Vec<Cow<'_, str>> = headers.iter().map(|h| printable(h, false)).collect();
+    let rows: Vec<Vec<Cow<'_, str>>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| printable(c, false)).collect())
+        .collect();
     let n = headers.len();
     let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
-    for row in rows {
+    for row in &rows {
         for (i, cell) in row.iter().take(n).enumerate() {
             widths[i] = widths[i].max(display_width(cell).min(MAX_COLUMN_WIDTH));
         }
@@ -84,7 +122,7 @@ pub fn render(headers: &[&str], rows: &[Vec<String>]) -> String {
     out.push('\n');
     out.push_str(&rule);
     out.push('\n');
-    for row in rows {
+    for row in &rows {
         out.push('|');
         for (cell, w) in row.iter().take(n).zip(&widths) {
             out.push(' ');
@@ -108,18 +146,10 @@ pub fn render_owned(headers: &[String], rows: &[Vec<String>]) -> String {
 /// unescaped, as upstream keeps it in a result set and `format=n-triple`
 /// sends it (so a graph function's JSON value reads as JSON, `"{"paths":
 /// …}"`), except that a line break or tab is written `\n` / `\r` / `\t`
-/// — upstream would print it raw and break the table's lines.
-fn cell_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    for c in value.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out
+/// — upstream would print it raw and break the table's lines — and any
+/// other control character `\uXXXX` ([`printable`]).
+fn cell_literal(value: &str) -> Cow<'_, str> {
+    printable(value, false)
 }
 
 /// A SPARQL-JSON binding (`{"type","value"[,"datatype"][,"xml:lang"|"lang"]}`)
@@ -130,16 +160,20 @@ pub fn binding_term(b: &Json) -> String {
     let value = b.get("value").and_then(Json::as_str).unwrap_or_default();
     let kind = b.get("type").and_then(Json::as_str).unwrap_or_default();
     match kind {
-        "uri" => format!("<{value}>"),
-        "bnode" if value.starts_with("_:") => value.to_string(),
-        "bnode" => format!("_:{value}"),
+        "uri" => format!("<{}>", printable(value, false)),
+        "bnode" if value.starts_with("_:") => printable(value, false).into_owned(),
+        "bnode" => format!("_:{}", printable(value, false)),
         _ => {
             let lang = b
                 .get("xml:lang")
                 .or_else(|| b.get("lang"))
                 .and_then(Json::as_str)
-                .filter(|l| !l.is_empty());
-            let datatype = b.get("datatype").and_then(Json::as_str);
+                .filter(|l| !l.is_empty())
+                .map(|l| printable(l, false));
+            let datatype = b
+                .get("datatype")
+                .and_then(Json::as_str)
+                .map(|d| printable(d, false));
             let lex = cell_literal(value);
             match (lang, datatype) {
                 (Some(l), _) => format!("\"{lex}\"@{l}"),
@@ -153,11 +187,11 @@ pub fn binding_term(b: &Json) -> String {
 /// `j` indented like `nlohmann::json::dump(4)`: four spaces per level,
 /// `"key": value`, one array element or object entry per line, `[]` / `{}`
 /// for empty ones. Object keys keep their order (sort first for upstream's
-/// key order).
+/// key order). No control character is printed raw ([`printable`]).
 pub fn pretty_json(j: &Json) -> String {
     let mut out = String::new();
     write_pretty(j, 0, &mut out);
-    out
+    printable(&out, true).into_owned()
 }
 
 fn write_pretty(j: &Json, level: usize, out: &mut String) {
@@ -233,6 +267,32 @@ mod tests {
         let t = render(&["c"], &[vec![long.clone()]]);
         assert!(t.starts_with(&format!("{}\n", "-".repeat(104))));
         assert!(t.contains(&format!("| {long} |")));
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_terminal() {
+        let b = |s: &str| crate::json::parse(s).unwrap();
+        // OSC (retitle the window), BEL, CSI (colours) and a C1 CSI.
+        let cell = binding_term(&b(
+            r#"{"type":"literal","value":"pre\u001b]0;PWNED\u0007\u001b[31mRED\u009b"}"#,
+        ));
+        assert_eq!(cell, "\"pre\\u001B]0;PWNED\\u0007\\u001B[31mRED\\u009B\"");
+        assert_eq!(
+            binding_term(&b(r#"{"type":"uri","value":"http://e/\u001b[2J"}"#)),
+            "<http://e/\\u001B[2J>"
+        );
+        assert_eq!(
+            binding_term(&b(r#"{"type":"bnode","value":"_:b\u007f"}"#)),
+            "_:b\\u007F"
+        );
+        // Whatever reaches a table (the n-triple format's cells, headers).
+        let t = render(&["?x\u{1b}"], &[vec!["a\u{1b}[2Jb\u{9b}".into()]]);
+        assert!(!t.contains(['\u{1b}', '\u{9b}']), "{t:?}");
+        assert!(t.contains("a\\u001B[2Jb\\u009B"), "{t:?}");
+        // Multi-line text keeps its line breaks and tabs, nothing else.
+        assert_eq!(printable("a\nb\tc\r\u{7f}", true), "a\nb\tc\\r\\u007F");
+        assert_eq!(printable("plain", false), "plain");
+        assert!(!pretty_json(&b(r#"{"k":"x\u0085y"}"#)).contains('\u{85}'));
     }
 
     #[test]

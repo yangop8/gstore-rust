@@ -40,6 +40,14 @@ pub struct Quad {
 }
 
 impl Quad {
+    /// The bytes the strings of this quad's terms hold.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.subject.heap_bytes()
+            + self.predicate.heap_bytes()
+            + self.object.heap_bytes()
+            + self.graph.as_ref().map_or(0, Term::heap_bytes)
+    }
+
     /// Build a quad in the default graph.
     pub fn new(subject: Term, predicate: Term, object: Term, graph: Option<Term>) -> Quad {
         Quad {

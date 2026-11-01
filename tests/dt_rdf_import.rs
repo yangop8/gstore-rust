@@ -928,6 +928,8 @@ fn api_remote_sources_follow_the_load_policy() {
     // A policy allowing remote sources: downloaded, built, cleaned up.
     let mut policy = LoadPolicy::restricted();
     policy.allow_remote = true;
+    // The test's HTTP server is on loopback.
+    policy.allow_local_hosts = true;
     let srv = start("remote_allowed", Some(policy));
     let j = api(
         &srv.addr,

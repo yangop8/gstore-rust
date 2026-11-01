@@ -24,6 +24,7 @@ use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
+use crate::model::term::export_key;
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::import;
 use crate::parser::nquads::Quad;
@@ -977,6 +978,7 @@ impl Database {
                     if self.named.get_mut(&gid).is_some_and(|s| s.remove(id)) && !journaled {
                         self.persist_named_quad(false, gid, id);
                     }
+                    self.drop_if_empty(gid);
                 }
             }
         }
@@ -1064,6 +1066,7 @@ impl Database {
         if let Some(s) = self.named.get_mut(&gid) {
             s.remove(id);
         }
+        self.drop_if_empty(gid);
         self.touched();
         if let Some(log) = self.txn.as_mut() {
             log.push(UndoOp::Add(Some(gid), id));
@@ -1071,6 +1074,15 @@ impl Database {
         self.record_redo(b'D', Some(gid), id);
         self.persist_mutation(false, Some(gid), id);
         true
+    }
+
+    /// Forget named graph `gid` once it holds no statement: this store keeps
+    /// no empty named graphs (`GRAPH ?g` never finds one, and none survives
+    /// a reopen).
+    fn drop_if_empty(&mut self, gid: u32) {
+        if self.named.get(&gid).is_some_and(|s| s.triple_count() == 0) {
+            self.named.remove(&gid);
+        }
     }
 
     /// Apply `INSERT DATA`. Returns the number of triples newly added. A triple
@@ -1340,8 +1352,7 @@ impl Database {
             UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
                 GraphTarget::Default => Ok(self.clear_default()),
                 GraphTarget::All => Ok(self.clear_default() + self.clear_all_named()),
-                // NAMED keyword (an empty name) ⇒ all named graphs.
-                GraphTarget::Named(g) if g.is_empty() => Ok(self.clear_all_named()),
+                GraphTarget::AllNamed => Ok(self.clear_all_named()),
                 GraphTarget::Named(g) => Ok(self.clear_named(&g)),
             },
             // CREATE GRAPH only declares an (empty) graph; data ops create it.
@@ -1426,7 +1437,7 @@ impl Database {
                 ids
             }
         };
-        let term = |s: Option<&str>| s.and_then(|s| crate::parser::ntriples::parse_term(s).ok());
+        let term = |s: Option<&str>| s.and_then(Term::from_dict_key);
         Some(
             ids.into_iter()
                 .filter_map(|id| {
@@ -1640,8 +1651,11 @@ impl Database {
     /// Strict and atomic: a statement that does not parse, a cancel (checked
     /// between batches) or any other failure fails the `LOAD` and undoes what
     /// it had inserted, so a failed `LOAD` — `SILENT` or not — changes no
-    /// graph. The undo list holds 16 bytes per inserted statement. Returns
-    /// the number of statements inserted.
+    /// graph. The undo list holds 16 bytes per inserted statement. Once the
+    /// undo is complete the data is what it was, so the `LOAD` is no change
+    /// at all: [`mutation_count`](Self::mutation_count) is put back (servers
+    /// neither report a partial update nor save) and so is a CSR built for
+    /// the data before it. Returns the number of statements inserted.
     fn load_rdf_source(
         &mut self,
         source: &str,
@@ -1657,6 +1671,8 @@ impl Database {
                 )))
             }
         };
+        let mutations = self.mutations;
+        let csr = self.csr_cache.peek(mutations);
         let mut applied: Vec<(Option<u32>, IdTriple)> = Vec::new();
         let mut skipped = 0u64;
         let result = import::import_sources(
@@ -1685,9 +1701,31 @@ impl Database {
             },
         );
         if let Err(e) = result {
-            self.undo_inserts(applied);
+            let inserted = !applied.is_empty();
+            if !self.undo_inserts(applied) {
+                // Not all of it could be undone (a persistence failure): the
+                // data did change.
+                return Err(e);
+            }
+            // Nothing changed. No cached answer can be keyed by the counts
+            // the inserts and their undo went through: the database was not
+            // readable in between.
+            self.mutations = mutations;
+            if let Some(g) = csr {
+                self.csr_cache.restore(mutations, g);
+            }
+            // The inserts and their undo reached a persistent store: make
+            // both durable together, as at any commit point.
+            if inserted && self.txn.is_none() {
+                if let Err(pe) = self.commit_point() {
+                    return Err(GStoreError::Database(format!(
+                        "{e}; in addition, undoing the failed LOAD could not be persisted: {pe}"
+                    )));
+                }
+            }
             return Err(e);
         }
+        drop(csr);
         if skipped > 0 {
             crate::gs_warn!(
                 "LOAD <{source}> INTO GRAPH <{}>: {skipped} statement(s) of the document's own \
@@ -1700,14 +1738,17 @@ impl Database {
 
     /// Undo inserts reported by [`insert_quad_id`](Self::insert_quad_id), in
     /// reverse order, through the ordinary delete paths (so the transaction
-    /// undo log, the redo log and a persistent store see them too).
-    fn undo_inserts(&mut self, applied: Vec<(Option<u32>, IdTriple)>) {
+    /// undo log, the redo log and a persistent store see them too). `false`
+    /// when a statement could not be removed (a persistence failure).
+    fn undo_inserts(&mut self, applied: Vec<(Option<u32>, IdTriple)>) -> bool {
+        let mut all = true;
         for (graph, id) in applied.into_iter().rev() {
-            match graph {
+            all &= match graph {
                 None => self.remove_default_id(id),
                 Some(gid) => self.remove_named_id(gid, id),
             };
         }
+        all
     }
 
     /// Convenience: parse + ensure a SELECT result.
@@ -2010,7 +2051,9 @@ impl Database {
         ) else {
             return;
         };
-        let triple = format!("{s} {p} {o} .");
+        // Each term as the N-Triples reader reads it back: an IRI the
+        // lenient readers let in (holding `>`, `\`, a space…) is escaped.
+        let triple = format!("{} {} {} .", export_key(s), export_key(p), export_key(o));
         let graph = graph
             .and_then(|g| self.dict.id_to_string(g))
             .map(|g| strip_angle(g).to_owned());
@@ -2076,6 +2119,7 @@ impl Database {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| GStoreError::Database("missing triple length in redo.log".into()))?;
+            let named = it.next() == Some("G");
             let gstart = nl + 1;
             let gend = gstart + glen;
             let tend = gend + tlen;
@@ -2086,7 +2130,13 @@ impl Database {
                 .map_err(|_| GStoreError::Database("non-UTF-8 redo.log graph".into()))?;
             let triple_str = std::str::from_utf8(&bytes[gend..tend])
                 .map_err(|_| GStoreError::Database("non-UTF-8 redo.log triple".into()))?;
-            let graph_opt = if graph.is_empty() { None } else { Some(graph) };
+            // A named-graph record is flagged `G`; without the flag (a log
+            // written before it existed) a non-empty graph is named.
+            let graph_opt = if named || !graph.is_empty() {
+                Some(graph)
+            } else {
+                None
+            };
             // N-Triples (verbatim blank labels: the record names stored nodes).
             for t in crate::parser::ntriples::parse_str(triple_str)? {
                 match op {
@@ -2523,13 +2573,22 @@ fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
 }
 
 /// Append redo records to the redo log. Each record is length-prefixed:
-/// `REDO <op> <graph_len> <triple_len>\n<graph bytes><triple bytes>\n`. The
-/// lengths make the graph/triple bodies opaque, so they may hold any bytes.
+/// `REDO <op> <graph_len> <triple_len>[ G]\n<graph bytes><triple bytes>\n`,
+/// `G` marking a named-graph record (so a graph whose IRI is empty is not
+/// taken for the default graph). The lengths make the graph/triple bodies
+/// opaque, so they may hold any bytes.
 fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
     for r in recs {
         let g = r.graph.as_deref().unwrap_or("");
-        writeln!(f, "REDO {} {} {}", r.op as char, g.len(), r.triple.len())?;
+        let flag = if r.graph.is_some() { " G" } else { "" };
+        writeln!(
+            f,
+            "REDO {} {} {}{flag}",
+            r.op as char,
+            g.len(),
+            r.triple.len()
+        )?;
         f.write_all(g.as_bytes())?;
         f.write_all(r.triple.as_bytes())?;
         f.write_all(b"\n")?;

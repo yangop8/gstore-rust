@@ -12,8 +12,13 @@
 //! without a final `;`): `help`, `stats`, `save`, `load <name>`,
 //! `import <file|dir|url>` (any RDF format the loaders read, chosen by the
 //! extension; N-Quads / TriG keep their named graphs), `quit` / `exit`.
+//! `load <iri> …` / `load silent …`, in any case, is SPARQL's `LOAD`, not
+//! the command (a database name holds no `<`).
+//!
+//! Run non-interactively (stdin not a terminal), the exit code is 1 when a
+//! statement or command failed.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::parser::import::{self, ImportOptions};
@@ -50,6 +55,8 @@ pub fn run(target: &str) -> i32 {
 
     println!("gStore-rust local console. End a query with ';'. Type 'help' for commands.");
     let stdin = io::stdin();
+    let interactive = stdin.is_terminal();
+    let mut failures = 0usize;
     let mut buffer = String::new();
     print_prompt(&buffer);
 
@@ -92,25 +99,33 @@ pub fn run(target: &str) -> i32 {
                         .unwrap_or_else(|| PathBuf::from(db_dir_for(db.name())));
                     match db.save(&dir) {
                         Ok(()) => println!("saved to {}", dir.display()),
-                        Err(e) => eprintln!("save failed: {e}"),
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("save failed: {e}");
+                        }
                     }
                     print_prompt(&buffer);
                     continue;
                 }
                 cmd if cmd.starts_with("import ") => {
                     let path = cmd["import ".len()..].trim();
-                    import_file(&mut db, path);
+                    if !import_file(&mut db, path) {
+                        failures += 1;
+                    }
                     print_prompt(&buffer);
                     continue;
                 }
-                cmd if cmd.starts_with("load ") => {
+                cmd if cmd.starts_with("load ") && !is_sparql_load(&cmd["load ".len()..]) => {
                     let other = cmd["load ".len()..].trim();
                     match Database::open(db_dir_for(other)) {
                         Ok(loaded) => {
                             db = loaded;
                             println!("loaded '{}' ({} triples)", db.name(), db.triple_num());
                         }
-                        Err(e) => eprintln!("load failed: {e}"),
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("load failed: {e}");
+                        }
                     }
                     print_prompt(&buffer);
                     continue;
@@ -126,17 +141,36 @@ pub fn run(target: &str) -> i32 {
         if trimmed.ends_with(';') {
             let query = buffer.trim().trim_end_matches(';').to_string();
             buffer.clear();
-            run_query(&mut db, &query);
+            if !run_query(&mut db, &query) {
+                failures += 1;
+            }
         }
         print_prompt(&buffer);
     }
     println!("bye.");
-    0
+    if !interactive && failures > 0 {
+        1
+    } else {
+        0
+    }
 }
 
-fn run_query(db: &mut Database, query: &str) {
+/// Whether the text after `load ` is SPARQL's `LOAD [SILENT] <iri> …`
+/// rather than the name of a database to open.
+fn is_sparql_load(arg: &str) -> bool {
+    let arg = arg.trim_start();
+    let after_silent = arg
+        .get(..6)
+        .filter(|w| w.eq_ignore_ascii_case("silent"))
+        .and_then(|_| arg.get(6..))
+        .filter(|rest| rest.starts_with(char::is_whitespace));
+    arg.starts_with('<') || after_silent.is_some()
+}
+
+/// Run one statement, printing its answer; `false` when it failed.
+fn run_query(db: &mut Database, query: &str) -> bool {
     if query.trim().is_empty() {
-        return;
+        return true;
     }
     match db.query(query) {
         Ok(QueryResult::Select(rs)) => {
@@ -151,22 +185,30 @@ fn run_query(db: &mut Database, query: &str) {
             println!("[{} triple(s)]", triples.len());
         }
         Ok(QueryResult::Update { changed }) => println!("[updated {changed} triple(s)]"),
-        Err(e) => eprintln!("error: {e}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return false;
+        }
     }
+    true
 }
 
 /// `import <path>`: stream an RDF file (or every RDF file below a directory,
 /// or a URL) into the database through the bulk-load pipeline — strictly, so
-/// the first bad statement stops it.
-fn import_file(db: &mut Database, path: &str) {
+/// the first bad statement stops it. `false` when it failed.
+fn import_file(db: &mut Database, path: &str) -> bool {
     let mut count = 0u64;
     let res = import::sources_from_paths(&[path]).and_then(|sources| {
         db.insert_sources(&sources, &ImportOptions::strict(), &mut (), &mut count)
     });
     match res {
         Ok(_) => println!("imported {count} new triple(s) from {path}"),
-        Err(e) => eprintln!("import failed after {count} new triple(s): {e}"),
+        Err(e) => {
+            eprintln!("import failed after {count} new triple(s): {e}");
+            return false;
+        }
     }
+    true
 }
 
 fn print_help() {
@@ -176,6 +218,7 @@ fn print_help() {
          stats             show database statistics\n  \
          save              save the current database to <name>.db\n  \
          load <name>       load a database directory <name>.db\n  \
+         \x20                 (LOAD <iri> … is SPARQL's LOAD)\n  \
          import <path>     import an RDF file (format by extension), a directory or a URL\n  \
          quit | exit       leave the console\n\
          otherwise: type a SPARQL query ending in ';'"

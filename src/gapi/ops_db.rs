@@ -350,11 +350,13 @@ fn schema_json(g: &SchemaGraph) -> Json {
 //
 // `remote=true` (upstream's parameter) makes each `db_path` / `file` value an
 // `http(s)://` URL: refused unless the server's load policy allows remote
-// sources (`gserver --allow-service`); the URL's file name must carry an
-// allowed extension; the body (at most 256 MiB) is downloaded into the upload
-// directory, read like a local file, and removed when the operation ends —
-// a download that fails answers upstream's `1005 "Download file '<url>'
-// failed."`.
+// sources (`gserver --allow-service`); a URL whose host is a host-local
+// address (loopback, link-local, …) is not downloaded unless the policy
+// allows that too (`LoadPolicy::allow_local_hosts`; gserver never does); the
+// URL's file name must carry an allowed extension; the body (at most 256 MiB)
+// is downloaded into the upload directory, read like a local file, and
+// removed when the operation ends — a download that fails answers upstream's
+// `1005 "Download file '<url>' failed."`.
 //
 // A source with a package extension (`upload_allow_compress_packages`,
 // `zip`) is a zip of RDF files (feature `zip`; without it `1003` naming the
@@ -366,7 +368,8 @@ fn schema_json(g: &SchemaGraph) -> Json {
 // their `conf.ini` limits) — then unpacked into
 // `<upload dir>/<package name>_<YYYYmmddHHMMSS>`, its files read in path
 // order like any other source, and that directory removed when the
-// operation ends, whatever its outcome.
+// operation ends, whatever its outcome. A package named twice is unpacked
+// once, and the packages of one request share the zip limits.
 
 /// The import options of `build` / `batchInsert` (upstream: tolerant).
 fn load_options() -> import::ImportOptions {
@@ -381,6 +384,13 @@ struct Inputs {
     temp: Vec<PathBuf>,
     /// Unpacked zip packages (removed when dropped).
     unpacked: Vec<ScratchDir>,
+    /// The packages unpacked so far (canonical paths): one named again is
+    /// not unpacked again.
+    packages: Vec<PathBuf>,
+    /// What is left of the zip limits for this request's packages: they
+    /// share `unzip_max_entries` / `unzip_max_size` (`None` before the
+    /// first package).
+    zip_left: Option<ZipLimits>,
 }
 
 impl Drop for Inputs {
@@ -404,8 +414,17 @@ enum SourceKind {
 /// compressed package (`upload_allow_compress_packages`: a zip, see the
 /// section comment; without the `zip` feature `1003` naming it), `Ok(false)`
 /// for an allowed RDF extension, else `1003 "The file suffix '<ext>' is not
-/// allowed."`.
+/// allowed."`. With the `gzip` feature a gzip-compressed RDF file is
+/// checked by the extension before `.gz` (`x.nt.gz`: `nt`), as the loaders
+/// read it.
 fn check_suffix(ctx: &Ctx<'_>, r: &str, name: &str) -> Result<bool, GResp> {
+    let name = match name
+        .strip_suffix(".gz")
+        .or_else(|| name.strip_suffix(".GZ"))
+    {
+        Some(inner) if cfg!(feature = "gzip") && ops_file::suffix_of(inner).is_some() => inner,
+        _ => name,
+    };
     let ext = ops_file::suffix_of(name).unwrap_or_default();
     if ops_file::is_package(ctx, ext) {
         if !zipio::AVAILABLE {
@@ -443,10 +462,18 @@ fn zip_answer(e: &ZipError) -> GResp {
 }
 
 /// Unpack the zip package `zip` (see the section comment) into a fresh
-/// directory of the upload directory, adding its RDF files to `out`.
+/// directory of the upload directory, adding its RDF files to `out` — once
+/// per request, within what is left of the request's zip limits.
 fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GResp> {
+    let canonical = fs::canonicalize(zip).unwrap_or_else(|_| zip.to_path_buf());
+    if out.packages.contains(&canonical) {
+        return Ok(());
+    }
     let cfg = ctx.inner.config();
-    let limits = ZipLimits::from_config(&cfg);
+    let shared = out.zip_left.is_some();
+    let limits = *out
+        .zip_left
+        .get_or_insert_with(|| ZipLimits::from_config(&cfg));
     let name = zip
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -483,7 +510,23 @@ fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GRe
                 .any(|a| a.eq_ignore_ascii_case(e))
         })
     };
-    let files = zipio::unpack(zip, scratch.path(), &limits, &accept).map_err(|e| zip_answer(&e))?;
+    let files = zipio::unpack(zip, scratch.path(), &limits, &accept).map_err(|e| match e {
+        ZipError::Unzip { code, detail } if shared => zip_answer(&ZipError::Unzip {
+            code,
+            detail: Some(format!(
+                "{}; the packages of one request share these limits",
+                detail.unwrap_or_default()
+            )),
+        }),
+        e => zip_answer(&e),
+    })?;
+    if let Some(left) = out.zip_left.as_mut() {
+        left.max_entries = left.max_entries.saturating_sub(files.len());
+        left.max_size = left
+            .max_size
+            .saturating_sub(files.iter().map(|f| f.size).sum());
+    }
+    out.packages.push(canonical);
     out.sources
         .extend(files.into_iter().map(|f| import::Source::File(f.path)));
     out.unpacked.push(scratch);
@@ -493,7 +536,8 @@ fn unpack_package(ctx: &Ctx<'_>, zip: &Path, out: &mut Inputs) -> Result<(), GRe
 /// Resolve the RDF sources `requested` (named `param`): server-side files
 /// inside the server's source roots, checked like upstream — each must exist
 /// (`1005`) and carry an allowed RDF extension (see [`check_suffix`]) — or,
-/// with `remote`, URLs (see the section comment). Duplicates are read once.
+/// with `remote`, URLs (see the section comment). Duplicates — files,
+/// packages, URLs — are read once.
 fn source_files(
     ctx: &Ctx<'_>,
     requested: &[String],
@@ -534,11 +578,23 @@ fn source_files(
     Ok(out)
 }
 
-/// `remote=true`: download each URL into the upload directory.
+/// `remote=true`: download each URL (once) into the upload directory —
+/// never from a host-local address unless the load policy allows it
+/// ([`LoadPolicy::allow_local_hosts`](crate::LoadPolicy::allow_local_hosts)).
 fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<Inputs, GResp> {
-    let allowed = ctx.state().load_policy.allow_remote;
+    let (allowed, refuse_local) = {
+        let st = ctx.state();
+        (
+            st.load_policy.allow_remote,
+            !st.load_policy.allow_local_hosts,
+        )
+    };
     let mut out = Inputs::default();
+    let mut seen: HashSet<&str> = HashSet::new();
     for r in requested {
+        if !seen.insert(r.as_str()) {
+            continue;
+        }
         let failed = || GResp::error(Status::OperationFailed, format!("Download file '{r}' failed."));
         if !import::is_url(r) {
             return Err(failed());
@@ -562,7 +618,8 @@ fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<In
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
             .collect();
-        let body = import::fetch_url(r, import::DEFAULT_MAX_DOCUMENT_BYTES).map_err(|_| failed())?;
+        let body = import::fetch_url_with(r, import::DEFAULT_MAX_DOCUMENT_BYTES, refuse_local)
+            .map_err(|_| failed())?;
         let dir = ops_file::upload_dir(ctx);
         let saved = fs::create_dir_all(&dir).and_then(|()| {
             let (mut f, file) = ops_file::create_unique(
@@ -638,11 +695,9 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
             }
         }
     }
-    Ok(Inputs {
-        sources: files.into_iter().map(import::Source::File).collect(),
-        temp: Vec::new(),
-        unpacked: Vec::new(),
-    })
+    let mut out = Inputs::default();
+    out.sources = files.into_iter().map(import::Source::File).collect();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

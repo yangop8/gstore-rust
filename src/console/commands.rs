@@ -759,7 +759,7 @@ fn raw_sparql(c: &mut Console, sparql: &str) -> CmdResult {
             }
         }
         if let Some(rest) = value.strip_prefix("pfn_type") {
-            say!(c, "{rest}");
+            say!(c, "{}", table::printable(rest, true));
             say!(c, "pfn query use {time} ms.");
             return Ok(());
         }

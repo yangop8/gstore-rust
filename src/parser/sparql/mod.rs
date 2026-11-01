@@ -2755,11 +2755,9 @@ impl<'s> Parser<'s> {
                 self.bump();
                 Ok(GraphTarget::All)
             }
-            // NAMED targets all named graphs; we keep only a default graph, so
-            // an empty-named target stands for "the (empty) set of named graphs".
             Some("NAMED") => {
                 self.bump();
-                Ok(GraphTarget::Named(String::new()))
+                Ok(GraphTarget::AllNamed)
             }
             Some("GRAPH") => {
                 self.bump();

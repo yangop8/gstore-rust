@@ -1009,7 +1009,8 @@ fn the_local_mode_still_opens_databases_directly() {
          select (count(*) as ?n) where { <http://ex.org/a> ?p ?o };\n\
          quit;\n",
     );
-    assert_eq!(r.code, 0, "{r:?}");
+    // `import missing.ttl` failed: a non-interactive run says so.
+    assert_eq!(r.code, 1, "{r:?}");
     assert!(
         r.out.contains("imported 2 new triple(s) from extra.ttl"),
         "{r:?}"
@@ -1024,6 +1025,37 @@ fn the_local_mode_still_opens_databases_directly() {
         r.err.contains("import failed after 0 new triple(s)"),
         "{r:?}"
     );
+}
+
+/// `gconsole --local`: a SPARQL `LOAD` typed in lower case is SPARQL, not
+/// the console's `load <name>`; a non-interactive run in which a statement
+/// failed exits non-zero.
+#[test]
+fn the_local_mode_runs_a_lowercase_sparql_load_and_reports_failures() {
+    let cwd = scratch("gc_local_load");
+    let _cwd = DirGuard(cwd.clone());
+    let file = cwd.join("d.ttl");
+    fs::write(&file, "<http://ex/s> <http://ex/p> <http://ex/o> .\n").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "mem"]);
+    let r = run(
+        cmd,
+        &format!(
+            "load <file://{}> into graph <http://ex/z>;\n\
+             select ?o where {{ graph <http://ex/z> {{ ?s ?p ?o }} }};\n\
+             quit;\n",
+            path_str(&file)
+        ),
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("[updated 1 triple(s)]"), "{r:?}");
+    assert!(r.out.contains("<http://ex/o>"), "{r:?}");
+    for script in ["select garbage;\nquit;\n", "load missing\nquit;\n"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+        cmd.current_dir(&cwd).args(["--local", "mem"]);
+        let r = run(cmd, script);
+        assert_eq!(r.code, 1, "{script}: {r:?}");
+    }
 }
 
 /// `create` / `batchinsert` / `batchremove` against a real server whose

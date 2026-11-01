@@ -412,7 +412,13 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(None) => return not_loaded(&db, true),
         Err(e) => return txn_error("Transaction query fail", e),
     };
-    log_query(ctx.root_dir(), &db, ctx.user(), &sparql);
+    log_query(
+        &ctx.inner.config(),
+        ctx.root_dir(),
+        &db,
+        ctx.user(),
+        &sparql,
+    );
     match ctx.inner.run_in_txn_task(&dbh, &db, tid, &sparql, ctx.user()) {
         Ok(QueryResult::Update { changed }) => {
             GResp::success("Transaction query success").with("AnsNum", changed)

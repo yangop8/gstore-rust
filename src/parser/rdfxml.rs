@@ -40,7 +40,7 @@ use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
-use crate::parser::stream::BlankLabeler;
+use crate::parser::stream::{BlankLabeler, TermBudget};
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -93,10 +93,12 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
     let mut ex = Extractor {
         triples: Vec::new(),
         labels: std::mem::take(labels),
+        budget: TermBudget::for_input(content.len()),
     };
     let ran = ex.run(&root);
     *labels = ex.labels;
     ran?;
+    ex.budget.check()?;
     Ok(ex.triples)
 }
 
@@ -733,6 +735,8 @@ struct Extractor {
     triples: Vec<Triple>,
     /// Names `rdf:nodeID` values and anonymous nodes.
     labels: BlankLabeler,
+    /// Bounds what `triples` holds.
+    budget: TermBudget,
 }
 
 /// The inherited XML context threaded through the walk.
@@ -986,7 +990,11 @@ impl Extractor {
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
-        self.triples.push(Triple::new(s, p, o));
+        if self.budget.admit([&s, &p, &o]) {
+            self.triples.push(Triple::new(s, p, o));
+        } else {
+            self.triples = Vec::new();
+        }
     }
 }
 

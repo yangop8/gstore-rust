@@ -58,6 +58,13 @@ pub struct LoadPolicy {
     /// server on [`restricted`](Self::restricted) cannot be made to contact
     /// internal hosts on a client's behalf.
     pub allow_remote: bool,
+    /// Whether a download the bulk loaders make on a client's behalf (`/api`
+    /// `build` / `batchInsert` / `batchRemove` with `remote=true`) may reach
+    /// a host-local address — loopback, link-local (cloud metadata), …, see
+    /// [`crate::http_client::is_local_addr`] — as asynchronous callbacks may
+    /// not either. Allowed on [`permissive`](Self::permissive), refused on
+    /// [`restricted`](Self::restricted), whatever `allow_remote` says.
+    pub allow_local_hosts: bool,
 }
 
 impl Default for LoadPolicy {
@@ -84,6 +91,7 @@ impl LoadPolicy {
             allow_local_files: true,
             allowed_dirs: None,
             allow_remote: true,
+            allow_local_hosts: true,
         }
     }
 
@@ -95,6 +103,7 @@ impl LoadPolicy {
             allow_local_files: false,
             allowed_dirs: Some(Vec::new()),
             allow_remote: false,
+            allow_local_hosts: false,
         }
     }
 

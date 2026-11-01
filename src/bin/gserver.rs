@@ -45,7 +45,9 @@
 //!   updates are persisted back to it. A `DIR` that does not exist yet (or is an
 //!   empty directory) starts empty; one holding a database that cannot be opened
 //!   is an error. `--rocksdb` insists `DIR` holds a RocksDB database.
-//!   `conf.ini`'s `[query]` section applies to it as well.
+//!   `conf.ini`'s `[query]` section applies to it as well. This mode has no
+//!   authentication (anyone reaching it may update the database), so it
+//!   listens on loopback only, unless `--allow-unauthenticated`.
 //!
 //! **Options** (precedence: flag > `conf.ini` > built-in default):
 //!
@@ -75,7 +77,13 @@
 //!   `/build?db_path=` and `/restore`) read files inside `DIR`.
 //! - `--allow-service`: let federated SPARQL `SERVICE` patterns contact remote
 //!   endpoints (off by default: a client could otherwise make the server send
-//!   requests to internal hosts).
+//!   requests to internal hosts). It also lets `/api` `build` / `batchInsert`
+//!   / `batchRemove` with `remote=true` (update privilege) download
+//!   `http(s)://` sources — never from a loopback, link-local or other
+//!   host-local address.
+//! - `--allow-unauthenticated`: let the single-database mode (`DIR` without
+//!   `--api`), which has no authentication, listen beyond loopback; without
+//!   it, that mode refuses to start on any other address.
 //! - `--pid-file FILE`, `--log-file FILE`: override the derived locations.
 //! - `--tls-cert FILE --tls-key FILE` (feature `tls`): serve HTTPS.
 //!
@@ -191,7 +199,11 @@ fn print_help() {
          \t--thread-num N\t\tWorker threads (default: conf.ini thread_num, 30).\n\
          \t--no-checkpoint\t\tDo not save every write before acknowledging it.\n\
          \t--load-dir DIR\t\tLet LOAD, /build, /restore read files under DIR (repeatable).\n\
-         \t--allow-service\t\tLet SPARQL SERVICE contact remote endpoints.\n\
+         \t--allow-service\t\tLet SPARQL SERVICE contact remote endpoints, and\n\
+         \t\t\t\t/api build/batchInsert/batchRemove with remote=true download\n\
+         \t\t\t\thttp(s) sources (never from loopback or link-local hosts).\n\
+         \t--allow-unauthenticated\tLet the single-database mode (no authentication) listen\n\
+         \t\t\t\tbeyond loopback.\n\
          \t--pid-file FILE\t\tPid file (default <db_home>/gserver.pid).\n\
          \t--log-file FILE\t\tLog of a background start (default <db_home>/gserver.log).\n\
          \t--api [DIR]\t\tServe the multi-database API rooted at DIR (the default mode).\n\
@@ -237,6 +249,9 @@ struct Cli {
     no_checkpoint: bool,
     load_dirs: Vec<String>,
     allow_service: bool,
+    /// `--allow-unauthenticated`: the single-database mode, which has no
+    /// authentication, may listen beyond loopback.
+    allow_unauthenticated: bool,
     pid_file: Option<PathBuf>,
     log_file: Option<PathBuf>,
     dir: Option<PathBuf>,
@@ -315,6 +330,7 @@ impl Cli {
                     .load_dirs
                     .push(value(&mut i, &arg)?.to_string_lossy().into_owned()),
                 "--allow-service" => cli.allow_service = true,
+                "--allow-unauthenticated" => cli.allow_unauthenticated = true,
                 "--pid-file" => cli.pid_file = Some(value(&mut i, &arg)?.into()),
                 "--log-file" => cli.log_file = Some(value(&mut i, &arg)?.into()),
                 "--tls-cert" => cli.tls_cert = Some(value(&mut i, &arg)?.to_string_lossy().into_owned()),
@@ -1107,6 +1123,23 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                     return 1;
                 }
             };
+            // This mode has no authentication (nor ipAllow / ipDeny): anyone
+            // who reaches it may update the database.
+            if let Some(a) = server.local_addr().ok().filter(|a| !a.ip().is_loopback()) {
+                if !cli.allow_unauthenticated {
+                    gs_error!(
+                        "the single-database mode has no authentication: anyone reaching {a} \
+                         could update '{dir_s}'. Refusing to start beyond loopback; listen on \
+                         127.0.0.1, serve the database with the multi-database API (gserver \
+                         --api), or pass --allow-unauthenticated to serve it anyway."
+                    );
+                    return 1;
+                }
+                gs_warn!(
+                    "serving '{dir_s}' on {a} with no authentication (--allow-unauthenticated): \
+                     anyone reaching it may update the database"
+                );
+            }
             if cfg.check_point {
                 gs_announce!("gserver: database directory '{dir_s}' (check_point on: every update is saved there)");
             } else {

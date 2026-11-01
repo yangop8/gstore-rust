@@ -1010,6 +1010,43 @@ mod binary {
         );
     }
 
+    /// The single-database mode has no authentication: it refuses to listen
+    /// beyond loopback unless told it may (`--allow-unauthenticated`).
+    #[test]
+    fn the_unauthenticated_single_database_mode_stays_on_loopback() {
+        let dir = tmp_dir("bin_single_public");
+        let db_dir = dir.join("pub.db");
+        let db_s = db_dir.to_string_lossy().into_owned();
+        let pid_file = dir.join("pub.db.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let (code, out, err) = gserver(&dir, &["-b", &db_s, "-p", "0", "--addr", "0.0.0.0"]);
+        assert_eq!(code, 1, "stdout:{out}\nstderr:{err}");
+        assert!(
+            format!("{out}{err}").contains("no authentication"),
+            "stdout:{out}\nstderr:{err}"
+        );
+        assert!(!db_dir.exists(), "nothing was served");
+        // The operator's explicit opt-in.
+        let (code, out, err) = gserver(
+            &dir,
+            &[
+                "-b",
+                &db_s,
+                "-p",
+                "0",
+                "--addr",
+                "0.0.0.0",
+                "--allow-unauthenticated",
+            ],
+        );
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let (code, out, err) = gserver(&dir, &["-t", &db_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+    }
+
     #[test]
     fn the_legacy_single_database_invocation_works_with_the_lifecycle() {
         let dir = tmp_dir("bin_single");

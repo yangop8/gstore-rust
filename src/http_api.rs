@@ -1105,7 +1105,9 @@ impl ApiInner {
 
     /// `refreshconf`'s part for the diagnostic log (see
     /// [`ApiServer::with_log_refresh`]): re-install it when the re-read
-    /// configuration describes another log.
+    /// configuration describes another log than the one installed — which
+    /// lacks the file when it could not be opened, so the next `refreshconf`
+    /// tries the file again.
     fn refresh_log(&self, fresh: &GStoreConfig) {
         let mut last = locked(&self.log_refresh);
         let Some(current) = last.as_mut() else {
@@ -1120,22 +1122,28 @@ impl ApiInner {
             return;
         }
         match crate::logging::init(&cfg) {
-            Ok(_) => crate::gs_info!(
-                "refreshconf: diagnostic log reconfigured (level {}, file {})",
-                crate::logging::filter_name(cfg.level),
-                cfg.file
-                    .as_ref()
-                    .map_or_else(|| "none".to_string(), |f| format!("'{}'", f.path.display()))
-            ),
-            Err(e) => crate::gs_error!(
-                "refreshconf: cannot open the log file '{}': {e}; logging to standard error only",
-                cfg.file
-                    .as_ref()
-                    .map(|f| f.path.display().to_string())
-                    .unwrap_or_default()
-            ),
+            Ok(_) => {
+                crate::gs_info!(
+                    "refreshconf: diagnostic log reconfigured (level {}, file {})",
+                    crate::logging::filter_name(cfg.level),
+                    cfg.file
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), |f| format!("'{}'", f.path.display()))
+                );
+                *current = cfg;
+            }
+            Err(e) => {
+                crate::gs_error!(
+                    "refreshconf: cannot open the log file '{}': {e}; logging to standard error only",
+                    cfg.file
+                        .as_ref()
+                        .map(|f| f.path.display().to_string())
+                        .unwrap_or_default()
+                );
+                // What `init` installed instead.
+                *current = crate::logging::LogConfig { file: None, ..cfg };
+            }
         }
-        *current = cfg;
     }
 
     /// Install `settings` as the query-evaluation settings of every database
@@ -1487,6 +1495,13 @@ impl ApiServer {
     pub fn with_log_refresh(self) -> ApiServer {
         let (mut current, _) = crate::logging::LogConfig::from_gstore_config(&self.inner.config());
         let _ = current.apply_env();
+        // The configured file could not be opened at startup (`logging::init`
+        // then installs the rest without it): the next refreshconf tries it.
+        let installed_file =
+            crate::logging::current().and_then(|l| l.file_path().map(Path::to_path_buf));
+        if current.file.as_ref().map(|f| &f.path) != installed_file.as_ref() {
+            current.file = None;
+        }
         *locked(&self.inner.log_refresh) = Some(current);
         self
     }
@@ -1766,18 +1781,22 @@ impl ApiInner {
         // concurrently. The client's IP closes the line (after the fields
         // earlier versions wrote, so readers of those keep working).
         let ip = peer_ip(peer);
-        append_log(
-            &self.root,
-            "access.log",
-            &format!(
-                "{ts}\t{method}\t{path}\t{user}\t{status}\t{ip}",
-                ts = now_millis(),
-                method = req.method,
-                path = req.path,
-                user = user_disp,
-                status = resp.status,
-            ),
-        );
+        let cfg = self.config();
+        if cfg.accesslog_mode {
+            append_daily_log(
+                &self.root,
+                "access.log",
+                &format!(
+                    "{ts}\t{method}\t{path}\t{user}\t{status}\t{ip}",
+                    ts = now_millis(),
+                    method = req.method,
+                    path = req.path,
+                    user = user_disp,
+                    status = resp.status,
+                ),
+                cfg.accesslog_days,
+            );
+        }
         crate::gs_debug!(
             "{ip} {} {} -> {} ({} ms, user {user_disp})",
             req.method,
@@ -2237,7 +2256,7 @@ impl ApiInner {
                 }
                 name
             };
-            log_query(&inner.root, &name, &user, &sparql);
+            log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let prepared = {
                 let mut st = locked(&inner.state);
@@ -2272,7 +2291,7 @@ impl ApiInner {
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let is_update = is_update_sparql(&sparql);
-            log_query(&inner.root, &name, &user, &sparql);
+            log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let prepared = {
                 let mut st = locked(&inner.state);
@@ -3049,7 +3068,7 @@ impl ApiInner {
             if !crate::sysdb::allowed(&locked(&inner.state).users, &user, op, Some(&name)) {
                 return inner.forbidden();
             }
-            log_query(&inner.root, &name, &user, &sparql);
+            log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let out = inner.run_in_txn_task(&dbh, &name, tid, &sparql, &user);
             qlog.finish(inner, out.as_ref().map(answer_count));
@@ -3574,17 +3593,21 @@ impl ApiInner {
                 Err(e) => return Resp::fail(400, &format!("{op} payload is not valid RDF {e}")),
             };
             drop(payload);
-            append_log(
-                &inner.root,
-                "query.log",
-                &format!(
-                    "{}\t{}\t{}\t{op} {} triple(s) ({format})",
-                    now_millis(),
-                    name,
-                    user,
-                    triples.len()
-                ),
-            );
+            let cfg = inner.config();
+            if cfg.querylog_mode {
+                append_daily_log(
+                    &inner.root,
+                    "query.log",
+                    &format!(
+                        "{}\t{}\t{}\t{op} {} triple(s) ({format})",
+                        now_millis(),
+                        name,
+                        user,
+                        triples.len()
+                    ),
+                    cfg.querylog_days,
+                );
+            }
             let Some(dbh) = dbh else {
                 return Resp::fail(404, &format!("database '{name}' is not loaded"));
             };
@@ -4078,12 +4101,18 @@ fn restore_source(
 }
 
 /// Append a statement to `query.log` (no lock needed: `O_APPEND` keeps each
-/// line whole, and the text may be large, so callers do it off the state lock).
-pub(crate) fn log_query(root: &Path, db: &str, user: &str, sparql: &str) {
-    append_log(
+/// line whole, and the text may be large, so callers do it off the state
+/// lock) — when `cfg`'s `querylog_mode` is on; the file rolls over by day,
+/// keeping `querylog_days` days ([`append_daily_log`]).
+pub(crate) fn log_query(cfg: &GStoreConfig, root: &Path, db: &str, user: &str, sparql: &str) {
+    if !cfg.querylog_mode {
+        return;
+    }
+    append_daily_log(
         root,
         "query.log",
         &format!("{}\t{}\t{}\t{}", now_millis(), db, user, sparql.replace('\n', " ")),
+        cfg.querylog_days,
     );
 }
 
@@ -4410,6 +4439,13 @@ pub(crate) fn peer_ip(peer: Option<SocketAddr>) -> String {
 /// The rule [`valid_db_name`] checks, for error messages.
 pub(crate) const DB_NAME_RULE: &str = "the database name may only contain letters, digits, '_', \
                                        '-' and inner '.'s (at most 64 characters)";
+
+/// [`append_log`] to a plain-text log that rolls over by day, keeping
+/// `days` days of rolled files ([`crate::logging::roll_daily`]).
+pub(crate) fn append_daily_log(root: &Path, file: &str, line: &str, days: u32) {
+    crate::logging::roll_daily(&root.join(file), days);
+    append_log(root, file, line);
+}
 
 /// Append one line (with a trailing newline) to `root/file`, best effort.
 pub(crate) fn append_log(root: &Path, file: &str, line: &str) {

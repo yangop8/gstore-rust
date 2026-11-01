@@ -40,7 +40,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
-use crate::parser::stream::BlankLabeler;
+use crate::parser::stream::{BlankLabeler, TermBudget};
 
 /// Parse an (X)HTML document containing RDFa into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
@@ -57,11 +57,16 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
     let mut ex = Extractor {
         triples: Vec::new(),
         labels: std::mem::take(labels),
+        budget: TermBudget::for_input(content.len()),
     };
     let base = find_base(&root).unwrap_or_default();
     let ctx = EvalContext::root(base);
     for child in root.element_children() {
         ex.process(child, &ctx, true);
+    }
+    if let Err(e) = ex.budget.check() {
+        *labels = ex.labels;
+        return Err(e);
     }
     // Author labels go through the labeler now; minted ones carry a marker
     // no `_:` CURIE can contain, so the two never meet.
@@ -547,6 +552,8 @@ impl EvalContext {
 struct Extractor {
     triples: Vec<Triple>,
     labels: BlankLabeler,
+    /// Bounds what `triples` holds.
+    budget: TermBudget,
 }
 
 impl Extractor {
@@ -559,7 +566,11 @@ impl Extractor {
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
-        self.triples.push(Triple::new(s, p, o));
+        if self.budget.admit([&s, &p, &o]) {
+            self.triples.push(Triple::new(s, p, o));
+        } else {
+            self.triples = Vec::new();
+        }
     }
 
     /// The RDFa Core processing sequence for one element (subset).

@@ -27,6 +27,7 @@ use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{GStoreError, Result};
+use crate::model::Term;
 use crate::parser::nquads::Quad;
 
 /// Characters of lookahead a reader may ask for ([`CharSource::peek_at`]).
@@ -377,17 +378,27 @@ pub struct SyntaxError {
     pub context: String,
 }
 
+/// The most characters of a [`SyntaxError`]'s context kept (the rest is
+/// cut, `...` marking the cut): a statement's terms, expanded from prefixes
+/// or a base, can be far longer than its text, and every failed statement
+/// writes its context to the parse error log.
+pub const MAX_CONTEXT_CHARS: usize = 200;
+
+/// The most characters of a [`SyntaxError`]'s message kept.
+pub const MAX_MESSAGE_CHARS: usize = 512;
+
 impl SyntaxError {
     pub fn new(line: usize, message: impl Into<String>) -> SyntaxError {
         SyntaxError {
             line,
-            message: one_line(&message.into()),
+            message: one_line(&message.into(), MAX_MESSAGE_CHARS),
             context: String::new(),
         }
     }
 
+    /// Set the context, cut to [`MAX_CONTEXT_CHARS`].
     pub fn with_context(mut self, context: impl Into<String>) -> SyntaxError {
-        self.context = one_line(&context.into());
+        self.context = one_line(&context.into(), MAX_CONTEXT_CHARS);
         self
     }
 
@@ -408,12 +419,97 @@ impl SyntaxError {
     }
 }
 
-/// Collapse a message onto one line (the error log counts lines).
-fn one_line(s: &str) -> String {
+/// Collapse a message onto one line (the error log counts lines) of at
+/// most `max` characters (`...` marks a cut).
+fn one_line(s: &str, max: usize) -> String {
+    let s = match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_string(),
+    };
     if s.contains(['\n', '\r']) {
         s.replace(['\n', '\r'], " ")
     } else {
-        s.to_string()
+        s
+    }
+}
+
+/// The least bytes of RDF terms a statement or a document parsed whole may
+/// expand to, whatever its size (see [`expansion_budget`]).
+pub const MIN_EXPANSION_BYTES: usize = 64 << 20;
+
+/// How many times its own size a statement or a document parsed whole may
+/// expand to beyond [`MIN_EXPANSION_BYTES`] (see [`expansion_budget`]).
+pub const EXPANSION_FACTOR: usize = 64;
+
+/// The most bytes of RDF terms (the strings of the statements' quads) the
+/// readers hold for `input_bytes` of input at once: one Turtle / TriG
+/// statement, or a whole RDF/XML, JSON-LD or RDFa document. Each quad holds
+/// its own copy of every expanded IRI, so a long prefix, namespace or base
+/// IRI repeated by short prefixed names would otherwise make a small input
+/// take memory without bound. Past the budget the statement (document)
+/// fails.
+pub fn expansion_budget(input_bytes: usize) -> usize {
+    MIN_EXPANSION_BYTES.max(input_bytes.saturating_mul(EXPANSION_FACTOR))
+}
+
+/// Bounds the bytes of RDF terms a reader of whole documents (RDF/XML,
+/// JSON-LD, RDFa) collects to the document's [`expansion_budget`].
+#[derive(Debug)]
+pub(crate) struct TermBudget {
+    held: usize,
+    budget: usize,
+    over: bool,
+}
+
+impl Default for TermBudget {
+    /// No bound.
+    fn default() -> TermBudget {
+        TermBudget {
+            held: 0,
+            budget: usize::MAX,
+            over: false,
+        }
+    }
+}
+
+impl TermBudget {
+    /// The budget of a document of `input_bytes`.
+    pub(crate) fn for_input(input_bytes: usize) -> TermBudget {
+        TermBudget {
+            budget: expansion_budget(input_bytes),
+            ..TermBudget::default()
+        }
+    }
+
+    /// Count the terms of one more statement: `false` once the document is
+    /// past its budget (the reader then keeps nothing more, and
+    /// [`check`](Self::check) fails).
+    pub(crate) fn admit(&mut self, terms: [&Term; 3]) -> bool {
+        if !self.over {
+            let bytes: usize = terms.iter().map(|t| t.heap_bytes()).sum();
+            self.held = self.held.saturating_add(bytes);
+            self.over = self.held > self.budget;
+        }
+        !self.over
+    }
+
+    /// `Err` when the document went past its budget.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.over {
+            return Err(expansion_error(0, "the document", self.budget));
+        }
+        Ok(())
+    }
+}
+
+/// The error of a statement or document past its [`expansion_budget`].
+pub fn expansion_error(line: usize, what: &str, budget: usize) -> GStoreError {
+    GStoreError::RdfParse {
+        line,
+        msg: format!(
+            "{what} expands to more than {budget} bytes of RDF terms (long prefix, namespace \
+             or base IRIs repeated by short names)"
+        ),
     }
 }
 

@@ -394,7 +394,10 @@ pub struct GStoreConfig {
     pub upload_path: PathBuf,
     /// Maximum upload / request body size in bytes (default 1 GiB).
     pub upload_max_body_size: u64,
-    /// Allowed upload extensions (default `nt|ttl|n3|rdf|txt`).
+    /// Allowed upload extensions, and the extensions `build` / `batchInsert`
+    /// / `batchRemove` sources may carry (default `nt|ttl|n3|rdf|txt|nq|trig`:
+    /// upstream's, plus the quad formats — so a database's own export, N-Quads
+    /// once it has named graphs, can be built again).
     pub upload_allow_extensions: Vec<String>,
     /// Allowed compressed upload package types (default `zip`).
     pub upload_allow_compress_packages: Vec<String>,
@@ -484,7 +487,7 @@ impl Default for GStoreConfig {
             max_backups: 3,
             upload_path: PathBuf::from("./upload/"),
             upload_max_body_size: 1_073_741_824,
-            upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt"),
+            upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt|nq|trig"),
             upload_allow_compress_packages: split_list("zip"),
             unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
             unzip_max_size: crate::zipio::DEFAULT_MAX_SIZE,
@@ -1089,7 +1092,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.max_backups, 3);
         assert_eq!(c.upload_path, PathBuf::from("./upload/"));
         assert_eq!(c.upload_max_body_size, 1_073_741_824);
-        assert_eq!(c.upload_allow_extensions, ["nt", "ttl", "n3", "rdf", "txt"]);
+        assert_eq!(
+            c.upload_allow_extensions,
+            ["nt", "ttl", "n3", "rdf", "txt", "nq", "trig"]
+        );
         assert_eq!(c.upload_allow_compress_packages, ["zip"]);
         // [query]: an embedded database's defaults, except the servers'
         // smaller graph-function output bound.
@@ -1144,8 +1150,18 @@ upload_allow_compress_packages = "zip"
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         let upstream = GStoreConfig::from_ini_str(UPSTREAM_CONF);
         for (_, key) in KNOWN_KEYS {
+            if *key == "upload_allow_extensions" {
+                continue;
+            }
             assert_eq!(c.value(key), upstream.value(key), "{key}");
         }
+        // The one deliberate difference: the quad formats are allowed too,
+        // so an export of a database with named graphs (N-Quads) builds
+        // again.
+        assert_eq!(
+            c.upload_allow_extensions,
+            [upstream.upload_allow_extensions.clone(), vec!["nq".into(), "trig".into()]].concat()
+        );
     }
 
     #[test]

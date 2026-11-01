@@ -66,8 +66,8 @@ use crate::model::{Term, Triple};
 use crate::parser::nquads::Quad;
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 use crate::parser::stream::{
-    BlankLabeler, CharSource, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
-    MAX_LOOKAHEAD,
+    expansion_budget, expansion_error, BlankLabeler, CharSource, CollectQuads, StatementSink,
+    SyntaxError, DEFAULT_WINDOW, MAX_LOOKAHEAD,
 };
 
 /// Parse a Turtle document into triples.
@@ -145,6 +145,8 @@ fn run<R: BufRead>(
         labels,
         depth: 0,
         ctx: [None, None, None],
+        stmt_start: 0,
+        held: 0,
     };
     p.run(sink)
 }
@@ -171,6 +173,11 @@ struct Parser<R> {
     /// Subject / predicate / object of the current statement, for the error
     /// log context.
     ctx: [Option<Term>; 3],
+    /// Where the current statement began ([`CharSource::consumed_bytes`]).
+    stmt_start: u64,
+    /// Bytes of RDF terms the current statement holds (its quads, the items
+    /// of its collections), bounded by [`expansion_budget`].
+    held: usize,
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
@@ -206,6 +213,8 @@ impl<R: BufRead> Parser<R> {
     fn run(&mut self, sink: &mut dyn StatementSink) -> Result<()> {
         loop {
             self.ctx = [None, None, None];
+            self.stmt_start = self.src.consumed_bytes();
+            self.held = 0;
             // The previous statement parsed (or was replayed): nothing of it
             // is needed any more.
             self.src.drop_recording();
@@ -421,8 +430,24 @@ impl<R: BufRead> Parser<R> {
     }
 
     /// Emit one triple of the current statement (in the current graph).
-    fn emit(&mut self, s: Term, p: Term, o: Term) {
-        self.out.push(Quad::new(s, p, o, self.graph.clone()));
+    fn emit(&mut self, s: Term, p: Term, o: Term) -> Result<()> {
+        let q = Quad::new(s, p, o, self.graph.clone());
+        self.charge(q.heap_bytes())?;
+        self.out.push(q);
+        Ok(())
+    }
+
+    /// Count `bytes` more of RDF terms held for the current statement: an
+    /// error past its [`expansion_budget`] (so a long prefix repeated by a
+    /// long object list cannot take memory without bound).
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.held = self.held.saturating_add(bytes);
+        let read = self.src.consumed_bytes().saturating_sub(self.stmt_start);
+        let budget = expansion_budget(usize::try_from(read).unwrap_or(usize::MAX));
+        if self.held > budget {
+            return Err(expansion_error(self.src.line(), "the statement", budget));
+        }
+        Ok(())
     }
 
     /// Whether the next characters spell `word` (ASCII, case-insensitive)
@@ -623,7 +648,7 @@ impl<R: BufRead> Parser<R> {
             loop {
                 let object = self.parse_term(false)?;
                 self.ctx[2] = Some(object.clone());
-                self.emit(subject.clone(), predicate.clone(), object);
+                self.emit(subject.clone(), predicate.clone(), object)?;
                 self.skip_ws();
                 if self.peek() == Some(',') {
                     self.bump();
@@ -726,7 +751,11 @@ impl<R: BufRead> Parser<R> {
                     break;
                 }
                 None => return Err(self.err("unterminated collection '('")),
-                _ => items.push(self.parse_term(false)?),
+                _ => {
+                    let item = self.parse_term(false)?;
+                    self.charge(item.heap_bytes())?;
+                    items.push(item);
+                }
             }
         }
         if items.is_empty() {
@@ -738,13 +767,13 @@ impl<R: BufRead> Parser<R> {
         let mut current = head.clone();
         let n = items.len();
         for (i, item) in items.into_iter().enumerate() {
-            self.emit(current.clone(), first.clone(), item);
+            self.emit(current.clone(), first.clone(), item)?;
             let next = if i + 1 < n {
                 self.fresh_blank()
             } else {
                 nil.clone()
             };
-            self.emit(current.clone(), rest.clone(), next.clone());
+            self.emit(current.clone(), rest.clone(), next.clone())?;
             current = next;
         }
         Ok(head)
@@ -961,6 +990,11 @@ impl<R: BufRead> Parser<R> {
                     } else {
                         break;
                     }
+                }
+                // LANGTAG needs a letter (as the N-Triples reader, and the
+                // dictionary's readers, require).
+                if lang.is_empty() {
+                    return Err(self.err("empty language tag after '@'"));
                 }
                 Ok(Term::Literal {
                     value,

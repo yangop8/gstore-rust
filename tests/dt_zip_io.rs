@@ -681,11 +681,80 @@ mod with_zip {
         addr
     }
 
+    /// The zip limits bound a request, not each package of it: a package
+    /// listed again is unpacked and read once, and the packages of one
+    /// request share one `unzip_max_size` budget.
+    #[test]
+    fn zip_limits_bound_a_request_not_each_package() {
+        let srv = start_with(
+            "pkgbudget",
+            |c| c.set("unzip_max_size", "2048").unwrap(),
+            |s| s,
+        );
+        let a = &srv.addr;
+        // About 1.5 KB each, and one bad statement (counted in failed_num:
+        // how often the package was read).
+        let text = |tag: &str| {
+            let mut t: String = (0..40)
+                .map(|i| format!("<http://ex/{tag}{i}> <http://ex/p> \"v{i}\" .\n"))
+                .collect();
+            t.push_str("<http://ex/bad> .\n");
+            t
+        };
+        let (t1, t2) = (text("a"), text("b"));
+        assert!(t1.len() < 2048 && t1.len() + t2.len() > 2048);
+        let p1 = srv.data_file("p1.zip", &package(&[E::File("a.nt", t1.as_bytes())]));
+        let p2 = srv.data_file("p2.zip", &package(&[E::File("b.nt", t2.as_bytes())]));
+        ok(&api(a, &[("operation", "build"), ("db_name", "budget")]));
+        ok(&api(a, &[("operation", "load"), ("db_name", "budget")]));
+        let batch = |files: &[&str]| {
+            let mut body = Json::obj()
+                .with("username", "root")
+                .with("password", "root")
+                .with("operation", "batchInsert")
+                .with("db_name", "budget");
+            body.set(
+                "file",
+                Json::Arr(files.iter().map(|f| Json::from(*f)).collect()),
+            );
+            let (status, bytes) = send(
+                a,
+                "POST",
+                "/api",
+                "application/json",
+                body.to_string().as_bytes(),
+            );
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            assert_eq!(status, 200, "{text}");
+            json::parse(&text).unwrap()
+        };
+        let j = batch(&[&p1, &p1, &p1, &p1, &p1]);
+        ok(&j);
+        assert_eq!(int(&j, "failed_num"), 1, "read once: {j}");
+        assert_eq!(count(a, "budget"), 40);
+        let j = batch(&[&p1, &p2]);
+        assert_eq!(code(&j), 3, "{j}");
+        assert!(msg(&j).contains("unzip_max_size"), "{j}");
+        assert_eq!(
+            count(a, "budget"),
+            40,
+            "the refused request inserted nothing"
+        );
+        let leftovers: Vec<String> = srv
+            .uploads()
+            .into_iter()
+            .filter(|n| !n.ends_with(".zip"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     fn remote_packages_are_downloaded_and_unpacked() {
         let http = serve_bytes("/data.zip", package(&[E::File("lubm.nt", LUBM.as_bytes())]));
         let mut policy = LoadPolicy::restricted();
         policy.allow_remote = true;
+        // The test's HTTP server is on loopback.
+        policy.allow_local_hosts = true;
         let srv = start_with("remotepkg", |_| {}, move |s| s.with_load_policy(policy));
         let url = format!("http://{http}/data.zip");
         let j = api(

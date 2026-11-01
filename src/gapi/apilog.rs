@@ -647,7 +647,7 @@ impl QueryLog {
     /// Begin logging a query of `db`: also appends it to the REST layer's
     /// `query.log` (read by `GET /querylog`), as before.
     pub(crate) fn start(ctx: &Ctx<'_>, db: &str, sparql: &str, format: Option<&str>) -> QueryLog {
-        crate::http_api::log_query(ctx.root_dir(), db, ctx.user(), sparql);
+        crate::http_api::log_query(&ctx.inner.config(), ctx.root_dir(), db, ctx.user(), sparql);
         let on = ctx.inner.config().querylog_mode;
         QueryLog {
             db: db.to_string(),

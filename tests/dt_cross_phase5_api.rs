@@ -56,6 +56,8 @@ fn start(tag: &str, data: &Path) -> Srv {
     config.thread_num = 4;
     let mut policy = LoadPolicy::restricted().with_allowed_dir(data);
     policy.allow_remote = true;
+    // The test's HTTP server is on loopback.
+    policy.allow_local_hosts = true;
     let server = ApiServer::bind(&root, PASSWORD, "127.0.0.1:0")
         .unwrap()
         .with_config(config)

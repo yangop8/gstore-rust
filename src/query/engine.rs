@@ -183,6 +183,13 @@ use super::value::{
     IntegerDivision, NumericFn, Value, XSD_FLOAT,
 };
 
+/// The term a dictionary key names ([`Term::from_dict_key`]: verbatim, so a
+/// term a lenient reader let in — an IRI holding `>` — is never lost on its
+/// way out of the store), else the N-Triples reading of `s`.
+fn key_term(s: &str) -> Option<Term> {
+    Term::from_dict_key(s).or_else(|| parse_term(s).ok())
+}
+
 // Top-K, bounded-heap ORDER BY and early termination for LIMIT / ASK /
 // EXISTS (docs/GAP_PLAN.md §3.4). A child module so it can drive the private
 // BGP/join machinery below.
@@ -789,16 +796,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for id in ids {
             let Some(subj) = self
                 .resolve_string(Some(id), false)
-                .and_then(|s| parse_term(&s).ok())
+                .and_then(|s| key_term(&s))
             else {
                 continue;
             };
             for (p, o) in self.store.po_by_s(id) {
                 let (Some(pred), Some(obj)) = (
                     self.resolve_string(Some(p), true)
-                        .and_then(|s| parse_term(&s).ok()),
+                        .and_then(|s| key_term(&s)),
                     self.resolve_string(Some(o), false)
-                        .and_then(|s| parse_term(&s).ok()),
+                        .and_then(|s| key_term(&s)),
                 ) else {
                     continue;
                 };
@@ -894,7 +901,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn binding_term(&self, v: &str, b: &Binding, layout: &VarLayout) -> Option<Term> {
         let idx = *layout.index.get(v)?;
         let s = self.resolve_string(b[idx], layout.is_pred[idx])?;
-        parse_term(&s).ok()
+        key_term(&s)
     }
 
     /// Fill a template triple from a solution; `None` if any position is
@@ -2525,8 +2532,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let lexical: Vec<(u32, String)> = raw
                     .iter()
                     .map(|(id, s)| {
-                        let key = parse_term(s)
-                            .ok()
+                        let key = key_term(s)
                             .map(|t| Value::from_term(&t).lexical())
                             .unwrap_or_else(|| (*s).to_string());
                         (*id, key)
@@ -2776,7 +2782,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         } else {
             self.dict.id_to_string(id)?
         };
-        let term = parse_term(s).ok()?;
+        let term = key_term(s)?;
         Some(Value::from_term(&term))
     }
 
@@ -2959,7 +2965,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         } else {
             self.dict.id_to_string(id)?
         };
-        parse_term(s).ok()
+        key_term(s)
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term
