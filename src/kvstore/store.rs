@@ -2358,12 +2358,21 @@ mod tests {
         );
 
         // id → str materializes exactly the looked-up strings.
-        assert_eq!(dict.id_to_string(node1), Some("<node1>"));
-        assert_eq!(dict.predicate_to_string(own), Some("<own>"));
+        assert_eq!(dict.term(node1).as_deref(), Some("<node1>"));
+        assert_eq!(dict.pred(own).as_deref(), Some("<own>"));
         assert_eq!(ds.resident_string_count(), 2);
 
         // Re-resolving an already-seen id is free (no extra residency).
-        assert_eq!(dict.id_to_string(node1), Some("<node1>"));
+        assert_eq!(dict.term(node1).as_deref(), Some("<node1>"));
+        assert_eq!(ds.resident_string_count(), 2);
+
+        // The legacy `&str` forms are for in-memory dictionaries: here they
+        // fail closed (contract C4), `None` plus a read error, and read nothing.
+        let scope = crate::store::read_scope::ReadScope::enter();
+        assert_eq!(dict.id_to_string(node1), None);
+        assert_eq!(dict.predicate_to_string(own), None);
+        assert_eq!(scope.error_count(), 2);
+        drop(scope);
         assert_eq!(ds.resident_string_count(), 2);
 
         // Unknown terms/ids resolve to None without panicking.

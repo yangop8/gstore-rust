@@ -388,7 +388,6 @@ impl DiskTermSource for DiskDict {
             misses: tm + km,
             evictions: te + ke,
             invalidations: ti.max(ki),
-            legacy_pinned: 0,
         }
     }
 }

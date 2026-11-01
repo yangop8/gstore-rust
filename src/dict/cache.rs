@@ -62,9 +62,6 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Times a generation change emptied the caches.
     pub invalidations: u64,
-    /// Strings pinned by the legacy `&str` API (see
-    /// [`Dictionary::id_to_string`](super::Dictionary::id_to_string)).
-    pub legacy_pinned: usize,
 }
 
 impl CacheStats {

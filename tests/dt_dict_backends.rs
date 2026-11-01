@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use gstore::dict::{CacheStats, Dictionary, DiskTermSource, Space, TermStr};
 use gstore::kvstore::{DiskDict, DiskStore};
-use gstore::model::id::LITERAL_FIRST_ID;
+use gstore::model::id::{INVALID_ENTITY_LITERAL_ID, INVALID_PRED_ID, LITERAL_FIRST_ID};
 use gstore::parser::sparql;
 use gstore::query::Evaluator;
 use gstore::store::read_scope::ReadScope;
@@ -209,7 +209,9 @@ fn backed_dictionary_routes_lookups_resolves_and_interns() {
     assert_eq!(m.term(1).as_deref(), Some("<http://ex/b>"));
     assert_eq!(m.term(LITERAL_FIRST_ID).as_deref(), Some("\"hello\""));
     assert_eq!(m.pred(0).as_deref(), Some("<http://ex/p>"));
-    assert_eq!(m.cache_stats().legacy_pinned, 0);
+    // ... and serves the legacy `&str` API, which is for in-memory dictionaries.
+    assert_eq!(m.id_to_string(1), Some("<http://ex/b>"));
+    assert_eq!(m.predicate_to_string(0), Some("<http://ex/p>"));
     let _: CacheStats = d.cache_stats();
 }
 
@@ -251,29 +253,34 @@ fn legacy_str_api_on_a_backed_dictionary_fails_closed() {
     }
     let mock = Arc::new(Mock::with(&terms));
     let dict = Dictionary::from_backing(mock.clone());
-    // A read error makes the legacy form `None` and is recorded.
-    mock.fail.store(true, Ordering::SeqCst);
-    let scope = ReadScope::enter();
-    assert_eq!(dict.id_to_string(3), None);
-    assert!(scope.take_error().is_some());
-    drop(scope);
-    mock.fail.store(false, Ordering::SeqCst);
-    // Served strings are pinned in a bounded per-dictionary table (freed
-    // with the dictionary, never leaked) ...
-    let scope = ReadScope::enter();
-    for i in 0..4096u32 {
-        assert_eq!(dict.id_to_string(i), Some(names[i as usize].as_str()));
+    // Contract C4: on a backed dictionary the legacy `&str` forms answer
+    // `None` and record a read error (C2), for every id, whether or not the
+    // backend could resolve it: never a leaked or wrong string.
+    for id in [0u32, 3, 4095, 4500] {
+        let scope = ReadScope::enter();
+        assert_eq!(dict.id_to_string(id), None, "entity {id}");
+        let err = scope.take_error().expect("recorded");
+        assert!(err.contains("term"), "{err}");
     }
-    assert_eq!(dict.id_to_string(5), Some("<http://ex/e5>"), "pinned once");
-    assert_eq!(dict.cache_stats().legacy_pinned, 4096);
+    let scope = ReadScope::enter();
+    assert_eq!(dict.predicate_to_string(0), None);
+    assert!(scope.take_error().is_some());
+    // The invalid ids stay plain `None`, with nothing recorded.
+    assert_eq!(dict.id_to_string(INVALID_ENTITY_LITERAL_ID), None);
+    assert_eq!(dict.predicate_to_string(INVALID_PRED_ID), None);
     assert_eq!(scope.take_error(), None);
-    // ... and once it is full, the legacy form fails closed: `None` plus a
-    // read error, never a wrong or leaked string.
-    assert_eq!(dict.id_to_string(4500), None);
-    let err = scope.take_error().expect("recorded");
-    assert!(err.contains("term"), "{err}");
-    // The C4 API is unaffected.
+    // The legacy forms never reach the backend; the C4 API is unaffected.
+    let before = mock.resolves.load(Ordering::SeqCst);
+    let _ = dict.id_to_string(7);
+    let _ = scope.take_error();
+    assert_eq!(mock.resolves.load(Ordering::SeqCst), before);
     assert_eq!(dict.term(4500).as_deref(), Some("<http://ex/e4500>"));
+    assert_eq!(dict.pred(0).as_deref(), Some("<http://ex/p>"));
+    assert_eq!(scope.take_error(), None);
+    // A read error on the C4 path is recorded the same way.
+    mock.fail.store(true, Ordering::SeqCst);
+    assert_eq!(dict.term(3), None);
+    assert!(scope.take_error().is_some());
 }
 
 // ---- DiskDict over a LUBM-1 kvstore.kv -----------------------------------------

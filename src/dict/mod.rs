@@ -74,7 +74,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::{ControlFlow, Deref};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
@@ -1037,7 +1037,7 @@ impl<'de> Deserialize<'de> for Interner {
     }
 }
 
-// ---- generations and legacy pins -----------------------------------------------
+// ---- generations ----------------------------------------------------------------
 
 /// Process-wide source of dictionary generations: every mutation of an
 /// in-memory dictionary takes a fresh value, so equal generations mean equal
@@ -1046,74 +1046,6 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Slots of the legacy pin table (see [`Dictionary::id_to_string`]).
-const LEGACY_PIN_SLOTS: usize = 4096;
-
-/// The bounded table behind the legacy `&str` API on an out-of-core
-/// dictionary: strings it handed out stay pinned until the dictionary (and
-/// every clone of it) is dropped — freed then, never leaked. Insert-only
-/// linear probing over `OnceLock` slots, so a pinned `&str` lives as long as
-/// `&self`, without `unsafe` and without a lock.
-#[derive(Default)]
-struct LegacyPins {
-    slots: OnceLock<Box<[PinSlot]>>,
-}
-
-/// One legacy pin: `(space << 32 | id, string)`, set once.
-type PinSlot = OnceLock<(u64, Arc<str>)>;
-
-impl LegacyPins {
-    /// The pinned string for `key`, loading and pinning it on first use.
-    /// `Ok(None)` when `load` finds nothing; `Err` when the table is full.
-    fn get_or_pin(
-        &self,
-        key: u64,
-        load: impl FnOnce() -> Option<Arc<str>>,
-    ) -> std::result::Result<Option<&str>, ()> {
-        let slots = self
-            .slots
-            .get_or_init(|| (0..LEGACY_PIN_SLOTS).map(|_| OnceLock::new()).collect());
-        let start = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % LEGACY_PIN_SLOTS;
-        let mut load = Some(load);
-        let mut value: Option<Arc<str>> = None;
-        for step in 0..LEGACY_PIN_SLOTS {
-            let slot = &slots[(start + step) % LEGACY_PIN_SLOTS];
-            if let Some((k, s)) = slot.get() {
-                if *k == key {
-                    return Ok(Some(s));
-                }
-                continue;
-            }
-            if value.is_none() {
-                match load.take().and_then(|f| f()) {
-                    Some(v) => value = Some(v),
-                    None => return Ok(None),
-                }
-            }
-            let v = value.take().expect("loaded above");
-            match slot.set((key, v)) {
-                Ok(()) => return Ok(slot.get().map(|(_, s)| &**s)),
-                Err((_, v)) => {
-                    // Another thread filled this slot first: it may be ours.
-                    value = Some(v);
-                    if let Some((k, s)) = slot.get() {
-                        if *k == key {
-                            return Ok(Some(s));
-                        }
-                    }
-                }
-            }
-        }
-        Err(())
-    }
-
-    fn len(&self) -> usize {
-        self.slots
-            .get()
-            .map_or(0, |s| s.iter().filter(|x| x.get().is_some()).count())
-    }
 }
 
 // ---- the dictionary --------------------------------------------------------------
@@ -1142,9 +1074,6 @@ pub struct Dictionary {
     /// Content generation (see [`generation`](Self::generation)); not persisted.
     #[serde(skip, default = "next_generation")]
     generation: u64,
-    /// Strings handed out by the legacy `&str` API of an out-of-core dictionary.
-    #[serde(skip)]
-    pins: Arc<LegacyPins>,
 }
 
 impl fmt::Debug for Dictionary {
@@ -1428,12 +1357,12 @@ impl Dictionary {
 
     /// The legacy `&str` form of [`term`](Self::term).
     ///
-    /// For an in-memory dictionary it borrows the string (no copy). On an
-    /// out-of-core dictionary no `&str` can outlive the backend's cache, so the
-    /// string is pinned in a small table owned by this dictionary (and its
-    /// clones) and freed with it — never leaked; once that table is full
-    /// (4096 strings) the call fails closed: `None` plus a read error (C2).
-    /// Production code uses [`term`](Self::term) / [`pred`](Self::pred).
+    /// For an in-memory dictionary it borrows the string (no copy). An
+    /// out-of-core dictionary has no string a `&str` could borrow for as long
+    /// as `&self` (the backend's cache may evict it), so there the call fails
+    /// closed (contract C4): `None` plus a read error (C2), never a leaked or
+    /// wrong string. Production code uses [`term`](Self::term) /
+    /// [`pred`](Self::pred), which serve both kinds.
     pub fn id_to_string(&self, id: EntityLiteralId) -> Option<&str> {
         if id == INVALID_ENTITY_LITERAL_ID {
             return None;
@@ -1441,7 +1370,7 @@ impl Dictionary {
         if self.backing.is_none() {
             return self.mem_resolve(Space::of_id(id), id);
         }
-        self.legacy_pinned(Space::of_id(id), id)
+        Self::legacy_on_backed(Space::of_id(id), id)
     }
 
     /// The legacy `&str` form of [`pred`](Self::pred); see
@@ -1453,27 +1382,19 @@ impl Dictionary {
         if self.backing.is_none() {
             return self.predicates.resolve(id);
         }
-        self.legacy_pinned(Space::Predicate, id)
+        Self::legacy_on_backed(Space::Predicate, id)
     }
 
-    fn legacy_pinned(&self, space: Space, id: u32) -> Option<&str> {
-        let key = (space as u64) << 32 | u64::from(id);
-        let pinned = self
-            .pins
-            .get_or_pin(key, || match self.try_resolve(space, id) {
-                Ok(t) => t.map(TermStr::into_shared),
-                Err(e) => {
-                    note_read_error(format_args!("dictionary {} id {id}: {e}", space.name()));
-                    None
-                }
-            });
-        pinned.unwrap_or_else(|()| {
-            note_read_error(format_args!(
-                "the legacy &str dictionary API pinned {LEGACY_PIN_SLOTS} strings of an \
-                 out-of-core dictionary; use Dictionary::term / pred"
-            ));
-            None
-        })
+    /// The legacy `&str` API on an out-of-core dictionary: `None` plus a
+    /// read error (C4 fails closed; C2 makes the statement fail).
+    #[cold]
+    fn legacy_on_backed<'a>(space: Space, id: u32) -> Option<&'a str> {
+        note_read_error(format_args!(
+            "dictionary {} id {id}: the legacy &str dictionary API cannot serve an \
+             out-of-core dictionary; use Dictionary::term / pred",
+            space.name()
+        ));
+        None
     }
 
     // ---- batches ------------------------------------------------------------------
@@ -1658,11 +1579,7 @@ impl Dictionary {
     /// string bytes (everything is resident).
     pub fn cache_stats(&self) -> CacheStats {
         match &self.backing {
-            Some(b) => {
-                let mut st = b.cache_stats();
-                st.legacy_pinned = self.pins.len();
-                st
-            }
+            Some(b) => b.cache_stats(),
             None => CacheStats {
                 term_entries: self.resident_string_count(),
                 term_bytes: self.heap_bytes(),
