@@ -54,9 +54,10 @@ user `gstore`.
 
 ```bash
 docker build -t gstore-rust .
-# optional features: gzip / tls / zip / readline are pure Rust; rocksdb
-# makes the builder install clang for bindgen
-docker build --build-arg FEATURES="gzip tls zip" -t gstore-rust .
+# FEATURES defaults to "pfn-wasm" (PFN functions compile and run); add
+# others — gzip / tls / zip / readline are pure Rust; rocksdb makes the
+# builder install clang for bindgen — or pass FEATURES="" for the lean set
+docker build --build-arg FEATURES="pfn-wasm gzip tls zip" -t gstore-rust .
 
 # root's password, read once when the user store is created (the server
 # refuses to listen on 0.0.0.0 while root has the default 123456); the file
@@ -75,6 +76,10 @@ docker logs gstore                                         # the diagnostic log
 docker exec -it gstore gconsole -u root                    # the console
 ```
 
+* **Features.** The image is built with `--locked` and the `pfn-wasm`
+  feature (the `FEATURES` build argument, default `"pfn-wasm"`): users'
+  PFN functions compile and run in the server's WebAssembly sandbox. A
+  plain `cargo build` leaves it out, as it does every optional feature.
 * **Entry point.** `ENTRYPOINT ["/usr/local/bin/gserver"]` with
   `CMD ["-s", "-c", "/etc/gstore/conf.ini", "--addr", "0.0.0.0"]`: the server
   in the foreground, reading `/etc/gstore/conf.ini`, listening on every

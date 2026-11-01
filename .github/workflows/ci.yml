@@ -33,21 +33,6 @@ jobs:
           key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # The PFN runtime is mostly feature-gated code: lint that configuration too.
-  clippy-pfn-wasm:
-    name: clippy (gstore, all targets, --features pfn-wasm)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: clippy-pfn-wasm
-      - run: cargo clippy -p gstore --all-targets --features pfn-wasm -- -D warnings
-
   test:
     name: test (workspace, default features)
     runs-on: ubuntu-latest
@@ -60,9 +45,11 @@ jobs:
           key: test
       - run: cargo test --workspace
 
-  # One job per optional feature of the gstore crate: build, clippy and test
-  # with it. (rocksdb has its own job below: its bundled C++ build needs
-  # clang and a longer timeout.)
+  # The feature matrix: one job per optional feature of the gstore crate,
+  # plus the console / zip / PFN features together (gconsole driving the PFN
+  # and backup paths of one server): build, clippy and test with it.
+  # (rocksdb has its own job below: its bundled C++ build needs clang and a
+  # longer timeout.)
   features:
     name: test (gstore, --features ${{ matrix.feature }})
     runs-on: ubuntu-latest
@@ -70,9 +57,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pfn-wasm: the sandboxed WebAssembly runtime of PFN user functions
-        # (its tests run the docs/PFN.md examples; see also clippy-pfn-wasm).
-        feature: [gzip, tls, zip, readline, pfn-wasm]
+        # zip: zip packages, zipped backups and exports; readline: gconsole
+        # line editing; pfn-wasm: the sandboxed WebAssembly runtime of PFN
+        # user functions (its tests run the docs/PFN.md examples).
+        feature: [gzip, tls, zip, readline, pfn-wasm, "zip pfn-wasm readline"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -80,13 +68,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: feature-${{ matrix.feature }}
+          key: feature-${{ strategy.job-index }}
       - name: build
-        run: cargo build -p gstore --all-targets --features ${{ matrix.feature }}
+        # --locked, as the Dockerfile builds: Cargo.lock covers every feature.
+        run: cargo build --locked -p gstore --all-targets --features "${{ matrix.feature }}"
       - name: clippy
-        run: cargo clippy -p gstore --all-targets --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy -p gstore --all-targets --features "${{ matrix.feature }}" -- -D warnings
       - name: test
-        run: cargo test -p gstore --features ${{ matrix.feature }}
+        run: cargo test -p gstore --features "${{ matrix.feature }}"
 
   # Upstream gStore 1.4's own test scripts (scripts/test/*.sh) and Python SDK,
   # run unmodified against the Rust gserver (see scripts/conformance.sh).

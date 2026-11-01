@@ -12,9 +12,12 @@
 #       --stop-timeout 120 gstore-rust
 #   curl 'http://127.0.0.1:9000/api?operation=check'
 #
-# Optional cargo features: --build-arg FEATURES="gzip tls zip readline" (pure
-# Rust; readline only changes gconsole); "rocksdb" also works (the builder
-# then installs clang for bindgen).
+# Cargo features: FEATURES defaults to "pfn-wasm" -- the sandboxed
+# WebAssembly runtime of PFN user functions (pure Rust: wasmi + wat), so the
+# image compiles and calls them; the default `cargo build` stays without it.
+# Add others with --build-arg FEATURES="pfn-wasm gzip tls zip readline" (all
+# pure Rust; readline only changes gconsole); "rocksdb" also works (the
+# builder then installs clang for bindgen). FEATURES="" builds the lean set.
 # See docs/DEPLOY.md.
 
 # ---- builder ------------------------------------------------------------------
@@ -22,7 +25,7 @@
 ARG RUST_VERSION=1.89
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
-ARG FEATURES=""
+ARG FEATURES="pfn-wasm"
 WORKDIR /src
 
 RUN if echo " ${FEATURES} " | grep -q " rocksdb "; then \
