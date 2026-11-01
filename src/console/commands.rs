@@ -351,7 +351,10 @@ impl Resp {
             .get("StatusCode")
             .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
             .unwrap_or(-1);
+        // Printable: a message may quote data (a failing PFN function's
+        // output, a term), which must not drive the terminal.
         let msg = json.get("StatusMsg").map(text_of).unwrap_or_default();
+        let msg = table::printable(&msg, true).into_owned();
         Resp { code, msg, json }
     }
 
@@ -779,15 +782,16 @@ fn raw_sparql(c: &mut Console, sparql: &str) -> CmdResult {
 
 /// The value of a PFN answer — the `/api` `query` document a projected
 /// `PFN.name({…})` gives, `{"results": <value>}` with no `head` (upstream
-/// `ResultSet::to_JSON`) — as upstream's console prints it: a string as
-/// is, any other JSON value as compact JSON with sorted keys (the
-/// `nlohmann::json::dump()` text its server puts after `pfn_type`).
+/// `ResultSet::to_JSON`; every other read answer has a `head`, so a value
+/// that is itself an object with `bindings` is still one) — as upstream's
+/// console prints it: a string as is, any other JSON value as compact JSON
+/// with sorted keys (the `nlohmann::json::dump()` text its server puts
+/// after `pfn_type`).
 pub fn pfn_value(j: &Json) -> Option<String> {
     if j.get("head").is_some() {
         return None;
     }
     match j.get("results")? {
-        Json::Obj(_) if j.get("results")?.get("bindings").is_some() => None,
         Json::Str(s) => Some(s.clone()),
         other => Some(other.clone().into_sorted().to_string()),
     }
@@ -1443,17 +1447,45 @@ fn h_showreason(c: &mut Console, args: &[String]) -> CmdResult {
         .get("ruleinfo")
         .map(json_value)
         .unwrap_or_else(Json::obj);
+    let (conditions, rows) = show_reason_rows(&info);
+    say!(c, "{conditions}");
+    let _ = write!(
+        c.out,
+        "{}",
+        table::render(&["rulename", "description", "patterns", "filters"], &rows)
+    );
+    say!(c, "show reason {rule} successfully!");
+    Ok(())
+}
+
+/// What `showreason` prints of rule `info`: its number of conditions, and a
+/// row per pattern (`rulename`, `description`, `<s,p,o>`, the condition's
+/// filters each followed by `;`). The conditions are read as the server
+/// compiles them: the `conditions` list (else a `condition` list), each
+/// entry's own `patterns` / `filters`, or those of the `{"condition": {…}}`
+/// it wraps.
+pub fn show_reason_rows(info: &Json) -> (usize, Vec<Vec<String>>) {
     let field = |k: &str| info.get(k).map(text_of).unwrap_or_default();
     let (name, desc) = (field("rulename"), field("description"));
-    let conditions: Vec<Json> = info
-        .get("condition")
-        .or_else(|| info.get("conditions"))
-        .and_then(Json::as_array)
+    let list = |k: &str| {
+        info.get(k)
+            .map(json_value)
+            .and_then(|v| v.as_array().map(<[Json]>::to_vec))
+    };
+    let conditions: Vec<Json> = list("conditions")
+        .or_else(|| list("condition"))
         .unwrap_or_default()
         .iter()
-        .map(json_value)
+        .map(|c| {
+            let c = json_value(c);
+            match c.get("condition") {
+                Some(inner) if c.get("patterns").is_none() && c.get("filters").is_none() => {
+                    json_value(inner)
+                }
+                _ => c,
+            }
+        })
         .collect();
-    say!(c, "{}", conditions.len());
     let mut rows = Vec::new();
     for cond in &conditions {
         let filters: String = cond
@@ -1479,13 +1511,7 @@ fn h_showreason(c: &mut Console, args: &[String]) -> CmdResult {
             rows.push(vec![name.clone(), desc.clone(), pattern, filters.clone()]);
         }
     }
-    let _ = write!(
-        c.out,
-        "{}",
-        table::render(&["rulename", "description", "patterns", "filters"], &rows)
-    );
-    say!(c, "show reason {rule} successfully!");
-    Ok(())
+    (conditions.len(), rows)
 }
 
 fn h_deletereason(c: &mut Console, args: &[String]) -> CmdResult {
@@ -2340,9 +2366,57 @@ mod tests {
         assert_eq!(v(r#"{"results":[]}"#).as_deref(), Some("[]"));
         assert_eq!(v(r#"{"results":7}"#).as_deref(), Some("7"));
         assert!(v(r#"{"head":{"vars":["v"]},"results":{"bindings":[]}}"#).is_none());
-        assert!(v(r#"{"results":{"bindings":[]}}"#).is_none());
+        // A function's value that happens to be an object with `bindings`
+        // (the server's answer has no `head`).
+        assert_eq!(
+            v(r#"{"results":{"bindings":[1,2]},"StatusCode":0,"StatusMsg":"success","QueryTime":"1"}"#)
+                .as_deref(),
+            Some(r#"{"bindings":[1,2]}"#)
+        );
         assert!(v(r#"{"head":["v"],"results":[["x"]]}"#).is_none());
         assert!(v(r#"{"StatusCode":0,"AnsNum":3}"#).is_none());
+    }
+
+    /// `showreason` lists the patterns of every rule shape the server
+    /// accepts — `conditions` (preferred over any other `condition` field)
+    /// whose entries may wrap their patterns in `{"condition": {…}}`.
+    #[test]
+    fn showreason_reads_every_condition_shape() {
+        let rows = |s: &str| show_reason_rows(&json::parse(s).unwrap());
+        let plain = r#"{"rulename":"r","description":"d","conditions":[{"patterns":[
+            {"subject":"?x","predicate":"<p>","object":"?y"}],"filters":["?x != ?y"]}]}"#;
+        let want = (
+            1,
+            vec![vec![
+                "r".to_string(),
+                "d".to_string(),
+                "<?x,<p>,?y>".to_string(),
+                "?x != ?y;".to_string(),
+            ]],
+        );
+        assert_eq!(rows(plain), want);
+        let wrapped = r#"{"rulename":"r","description":"d","conditions":[{"condition":{"patterns":[
+            {"subject":"?x","predicate":"<p>","object":"?y"}],"filters":["?x != ?y"]},"logic":1}]}"#;
+        assert_eq!(rows(wrapped), want);
+        let extra = r#"{"rulename":"r","description":"d","condition":"note","conditions":[{"patterns":[
+            {"subject":"?x","predicate":"<p>","object":"?y"}],"filters":["?x != ?y"]}]}"#;
+        assert_eq!(rows(extra), want);
+        // Only a `condition` list (upstream's console examples): read too.
+        let old = r#"{"rulename":"r","description":"d","condition":[{"patterns":[
+            {"subject":"?x","predicate":"<p>","object":"?y"}],"filters":["?x != ?y"]}]}"#;
+        assert_eq!(rows(old), want);
+    }
+
+    /// A server's message (which may quote data, e.g. a failing PFN's
+    /// output) never reaches the terminal with its control characters.
+    #[test]
+    fn server_messages_are_printable() {
+        let r = Resp::from_json(
+            json::parse(r#"{"StatusCode":1005,"StatusMsg":"failed: \u001b[31mRED\u001b[0m\u0007 x"}"#)
+                .unwrap(),
+        );
+        assert!(!r.msg.contains(['\u{1b}', '\u{7}']), "{:?}", r.msg);
+        assert!(r.msg.contains("RED"), "{:?}", r.msg);
     }
 
     #[test]

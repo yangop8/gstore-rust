@@ -356,9 +356,15 @@ fn gbuild_builds_empty_databases_and_never_overwrites_silently() {
     let r = run(GBUILD, &["-db", "e", "-f", nt], &dir);
     assert_eq!(r.code, 1, "{r:?}");
     assert_eq!(triples("e", &dir), 25);
-    // … unless --force; then the build replaces it, whatever its layout.
+    // … unless --force; then the build replaces it, whatever its layout —
+    // and the old database's reasoning rules go with it.
+    let rules = dir.join("e2.db/reason_rule_files");
+    fs::create_dir_all(rules.join("inferred")).unwrap();
+    fs::write(rules.join("r.json"), "{}").unwrap();
+    fs::write(rules.join("inferred/r.nt"), "<a>\t<Rule:r>\t<b>\t.\n").unwrap();
     let r = ok(GBUILD, &["--force", "e2", nt], &dir);
     assert!(r.out.contains("triples=25"), "{r:?}");
+    assert!(!rules.exists(), "{r:?}");
     let r = ok(GSHOW, &["e2"], &dir);
     assert!(
         r.out.contains("in-memory") || r.out.contains("snapshot"),

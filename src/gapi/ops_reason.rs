@@ -301,6 +301,7 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                 );
             }
             let before = slot.db.mutation_count();
+            let mut saved = false;
             let outcome = match op {
                 DataOp::Execute => {
                     manage::execute(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel))).map(
@@ -319,7 +320,24 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                         },
                     )
                 }
-                _ => manage::disable(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel)))
+                _ => {
+                    // The retraction is saved before the ledger is emptied
+                    // (whatever the check_point policy; upstream saves here
+                    // too): a crash never leaves inferred triples on disk
+                    // that no ledger records.
+                    let dir = slot.dir.clone();
+                    let persist = |db: &mut crate::Database| {
+                        crate::http_api::DbSlot::save_db(db, &dir)?;
+                        saved = true;
+                        Ok(())
+                    };
+                    manage::disable(
+                        &mut slot.db,
+                        &mut store,
+                        name,
+                        Some(Arc::clone(&cancel)),
+                        persist,
+                    )
                     .map(|x| {
                         crate::gs_info!(
                             "reasonManage: rule '{name}' of database '{db}' disabled by '{}': \
@@ -330,11 +348,15 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                         GResp::success("ok")
                             .with("delete_sparql", x.delete_sparql)
                             .with("AnsNum", x.removed)
-                    }),
+                    })
+                }
             };
             // Data that changed (also by an update that failed part-way) is
-            // saved like any other write.
-            let warning = if slot.db.mutation_count() != before {
+            // saved like any other write — unless the disable just saved it.
+            let warning = if saved {
+                slot.dirty = false;
+                None
+            } else if slot.db.mutation_count() != before {
                 slot.wrote(ctx.inner.save_writes())
             } else {
                 None

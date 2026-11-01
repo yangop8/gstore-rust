@@ -54,6 +54,14 @@
 //! triple changes nothing in an RDF store) is indistinguishable from the
 //! inferred one and is retracted with it.
 //!
+//! The ledger stays true across failures and crashes: execute records the
+//! triples it is about to insert before inserting them (a ledger line for a
+//! triple that is not there is harmless; a triple no ledger names would be
+//! orphaned), disable makes the retraction durable (`persist`) before it
+//! empties the ledger, and a rule's ledger is created before its file and
+//! removed after it ([`RuleStore::remove`]). Each line reads back exactly
+//! ([`ledger_line`]); one that does not fails the disable.
+//!
 //! A rule file **without a ledger** was written by upstream gStore (the
 //! database was moved here): whatever its status — upstream's check and
 //! compile overwrite `已执行` without retracting anything — it may have
@@ -179,19 +187,156 @@ pub(crate) struct InferReport {
     pub result: Result<usize, String>,
 }
 
-/// A triple's ledger line: N-Triples with tab separators (a term's
-/// N-Triples form never holds a raw tab, so the line splits back into its
-/// three terms exactly).
+/// A triple's ledger line: its three terms in N-Triples form, each followed
+/// by a tab, then `.`. Every term reads back exactly ([`parse_ledger_line`])
+/// — whatever a reader let into the database — and holds no tab or line
+/// break, so the line splits back into its terms:
+///
+/// * an IRI (or a literal's datatype IRI) has every character IRIREF
+///   excludes (`>`, `\`, a space, a tab, a newline…) as a `\uXXXX` escape,
+///   as the exporters write it;
+/// * a literal's value is escaped as in N-Triples (`\\`, `\"`, `\n`, `\r`,
+///   `\t`);
+/// * a blank node's label and a language tag have `\`, a space and every
+///   control character as `\uXXXX`.
+///
+/// For the terms N-Triples can write (most), this is their N-Triples form.
 pub fn ledger_line(t: &crate::model::Triple) -> String {
-    format!("{}\t{}\t{}\t.", t.subject, t.predicate, t.object)
+    let mut line = String::new();
+    for term in [&t.subject, &t.predicate, &t.object] {
+        push_ledger_term(&mut line, term);
+        line.push('\t');
+    }
+    line.push('.');
+    line
 }
 
-/// The triple of a ledger line (`None` for a malformed one).
+/// Append `term`'s ledger form (see [`ledger_line`]) to `out`.
+fn push_ledger_term(out: &mut String, term: &crate::model::Term) {
+    use crate::model::term::{escape_iriref, escape_literal};
+    use crate::model::Term;
+    match term {
+        Term::Iri(iri) => {
+            out.push('<');
+            escape_iriref(iri, out);
+            out.push('>');
+        }
+        Term::Blank(label) => {
+            out.push_str("_:");
+            push_escaped_name(out, label);
+        }
+        Term::Literal {
+            value,
+            datatype,
+            lang,
+        } => {
+            out.push('"');
+            out.push_str(&escape_literal(value));
+            out.push('"');
+            if let Some(dt) = datatype {
+                out.push_str("^^<");
+                escape_iriref(dt, out);
+                out.push('>');
+            } else if let Some(lang) = lang {
+                out.push('@');
+                push_escaped_name(out, lang);
+            }
+        }
+    }
+}
+
+/// A blank node label or language tag: `\`, a space and control characters
+/// as `\uXXXX`.
+fn push_escaped_name(out: &mut String, name: &str) {
+    use std::fmt::Write as _;
+    for c in name.chars() {
+        if c == '\\' || c <= ' ' || c.is_control() {
+            let _ = write!(out, "\\u{:04X}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// The triple of a ledger line ([`ledger_line`]; one written before its
+/// escapes were added reads back too, unless one of its terms held a
+/// character they escape now) — `None` for a malformed line: anything but
+/// three terms and `.`, separated by tabs.
 pub fn parse_ledger_line(line: &str) -> Option<crate::model::Triple> {
     let mut parts = line.split('\t');
-    let mut term = || crate::parser::ntriples::parse_term(parts.next()?).ok();
+    let mut term = || parse_ledger_term(parts.next()?);
     let (s, p, o) = (term()?, term()?, term()?);
+    if parts.next()? != "." || parts.next().is_some() {
+        return None;
+    }
     Some(crate::model::Triple::new(s, p, o))
+}
+
+/// One term of a ledger line (see [`ledger_line`]).
+fn parse_ledger_term(text: &str) -> Option<crate::model::Term> {
+    use crate::model::Term;
+    if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+        return Some(Term::Iri(unescape_u(iri)?));
+    }
+    if let Some(label) = text.strip_prefix("_:") {
+        return Some(Term::Blank(unescape_u(label)?));
+    }
+    let body = text.strip_prefix('"')?;
+    let mut value = String::with_capacity(body.len());
+    let mut chars = body.char_indices();
+    let rest = loop {
+        match chars.next()? {
+            (i, '"') => break &body[i + 1..],
+            (_, '\\') => match chars.next()?.1 {
+                '\\' => value.push('\\'),
+                '"' => value.push('"'),
+                'n' => value.push('\n'),
+                'r' => value.push('\r'),
+                't' => value.push('\t'),
+                _ => return None,
+            },
+            (_, c) => value.push(c),
+        }
+    };
+    let (datatype, lang) = if rest.is_empty() {
+        (None, None)
+    } else if let Some(dt) = rest.strip_prefix("^^<").and_then(|r| r.strip_suffix('>')) {
+        (Some(unescape_u(dt)?), None)
+    } else {
+        (None, Some(unescape_u(rest.strip_prefix('@')?)?))
+    };
+    Some(Term::Literal {
+        value,
+        datatype,
+        lang,
+    })
+}
+
+/// `text` with its `\uXXXX` / `\UXXXXXXXX` escapes decoded; `None` for any
+/// other `\`, or an escape that names no character.
+fn unescape_u(text: &str) -> Option<String> {
+    if !text.contains('\\') {
+        return Some(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits = match chars.next()? {
+            'u' => 4,
+            'U' => 8,
+            _ => return None,
+        };
+        let hex: String = chars.by_ref().take(digits).collect();
+        if hex.len() != digits || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+    }
+    Some(out)
 }
 
 /// The answer of `type` 1.
@@ -371,16 +516,24 @@ pub fn add(
             "the database already holds {MAX_RULES_PER_DB} reasoning rules, the most allowed"
         )));
     }
-    if !store.create(&name, &text)? {
-        return Err(fail(
-            "The rule file has been exist, please remove it before!".into(),
-        ));
+    let exists = || fail("The rule file has been exist, please remove it before!".into());
+    if store.exists(&name)? {
+        return Err(exists());
     }
     // Its (empty) ledger marks the rule as one whose inferred triples are
-    // recorded here (see the module docs).
-    if let Err(e) = store.set_ledger(&name, Some(&BTreeSet::new())) {
-        let _ = store.remove(&name);
-        return Err(e.into());
+    // recorded here (see the module docs). It is written before the rule
+    // file, so that a crash in between never leaves a rule file without a
+    // ledger — which would be taken for an upstream rule, retracted
+    // upstream's way (every `<Rule:label>` triple). A ledger without its
+    // rule file is ignored, and replaced when the name is added again.
+    store.set_ledger(&name, Some(&BTreeSet::new()))?;
+    match store.create(&name, &text) {
+        Ok(true) => {}
+        Ok(false) => return Err(exists()),
+        Err(e) => {
+            let _ = store.set_ledger(&name, None);
+            return Err(e.into());
+        }
     }
     Ok(Added {
         path: store.shown_path(&name),
@@ -457,9 +610,31 @@ pub fn execute(
     // the triples it derives that are already there are taken as its own,
     // as upstream's retraction would treat them.
     let legacy = recorded.is_none();
-    let mut ledger = recorded.unwrap_or_default();
+    let mut ledger = recorded.clone().unwrap_or_default();
+    // Before anything is inserted (an insert is durable at once on the
+    // persistent layouts), the ledger records every triple the insert may
+    // add (and, for an upstream rule, those it takes as its own): a crash or
+    // a failed ledger write afterwards never leaves an inferred triple no
+    // rule owns. A recorded triple the insert did not add is dropped from
+    // the ledger below; one left there (the final write failed) names a
+    // triple that is not there, which a retraction skips.
+    let mut intended = false;
     let report = db
-        .reason_infer(&compiled.insert_sparql, cancel)
+        .reason_infer(&compiled.insert_sparql, cancel, |derived| {
+            let mut intent = ledger.clone();
+            intent.extend(
+                derived
+                    .iter()
+                    .filter(|(_, existed)| legacy || !existed)
+                    .map(|(line, _)| line.clone()),
+            );
+            if intent.len() == ledger.len() {
+                return Ok(());
+            }
+            store.set_ledger(name, Some(&intent)).map_err(|e| e.0)?;
+            intended = true;
+            Ok(())
+        })
         .map_err(|e| failed(e.to_string()))?;
     let existing: BTreeSet<String> = report
         .derived
@@ -480,6 +655,10 @@ pub fn execute(
         store.set_ledger(name, Some(&ledger))?;
         doc.set("status", status::EXECUTED);
         write_doc(store, name, &doc)?;
+    } else if intended {
+        // Nothing was inserted: the ledger as it was (none, for an upstream
+        // rule file).
+        store.set_ledger(name, recorded.as_ref())?;
     }
     let inserted = report.result.map_err(failed)?;
     Ok(Executed {
@@ -492,11 +671,18 @@ pub fn execute(
 
 /// `type` 5 — disable a compiled rule: retract the triples it owns (see the
 /// module docs) and set it `已失效`.
+///
+/// `persist` makes the retraction durable before the ledger is emptied (a
+/// snapshot database is saved — upstream saves the database at this point
+/// too); the persistent layouts already are at their commit point. When it
+/// fails, the rule keeps its ledger and status, so disabling it again
+/// retracts (and saves) what remains.
 pub fn disable(
     db: &mut Database,
     store: &mut RuleStore<'_>,
     name: &str,
     cancel: Option<Arc<AtomicBool>>,
+    persist: impl FnOnce(&mut Database) -> crate::Result<()>,
 ) -> Result<Disabled, ReasonError> {
     check_name(name)?;
     let _lock = store.lock();
@@ -522,6 +708,12 @@ pub fn disable(
                 .map_err(|e| failed(e.to_string()))?
         }
     };
+    persist(db).map_err(|e| {
+        failed(format!(
+            "the retraction could not be saved ({e}); the rule keeps its inferred triples \
+             recorded: disable it again"
+        ))
+    })?;
     store.set_ledger(name, Some(&BTreeSet::new()))?;
     doc.set("status", status::DISABLED);
     write_doc(store, name, &doc)?;
@@ -637,6 +829,58 @@ mod tests {
         assert_eq!(count_of(None), 0);
     }
 
+    /// Finding: add wrote the rule file before its ledger, and delete
+    /// removed the ledger first, so a crash in between left a rule file
+    /// without a ledger — an "upstream" rule whose disable deletes every
+    /// `<Rule:label>` triple.
+    #[test]
+    fn a_crash_never_leaves_a_rule_file_without_its_ledger() {
+        use super::super::store::crash;
+        let rule = json::parse(
+            r#"{"rulename":"u","type":1,"logic":1,
+            "conditions":[{"patterns":[{"subject":"?x","predicate":"<p>","object":"?y"}]}],
+            "return":{"source":"?x","target":"?y","label":"u"}}"#,
+        )
+        .unwrap();
+        let consistent = |store: &RuleStore<'_>| {
+            for name in store.names().unwrap() {
+                assert!(
+                    store.ledger(&name).unwrap().is_some(),
+                    "rule {name} has no ledger"
+                );
+            }
+        };
+        // (Each simulated crash prints its panic message.)
+        for n in 0..4 {
+            let dir = std::env::temp_dir().join(format!(
+                "gstore_manage_crash_{}_{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut store = RuleStore::dir(&dir);
+            // A crash during add …
+            crash::arm(n);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                add(&mut store, &rule, "t")
+            }));
+            crash::disarm();
+            consistent(&store);
+            // … and, the rule added, during delete.
+            if store.exists("u").unwrap() {
+                let _ = store.remove("u");
+            }
+            add(&mut store, &rule, "t").unwrap();
+            crash::arm(n);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                delete(&mut store, "u")
+            }));
+            crash::disarm();
+            consistent(&store);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn ledger_lines_round_trip() {
         use crate::model::{Term, Triple};
@@ -662,5 +906,51 @@ mod tests {
             assert_eq!(parse_ledger_line(&line), Some(t));
         }
         assert_eq!(parse_ledger_line("garbage"), None);
+    }
+
+    /// Every term any reader may let into a database reads back exactly,
+    /// on one line, and only a well-formed line reads at all.
+    #[test]
+    fn ledger_lines_hold_any_term_exactly() {
+        use crate::model::{Term, Triple};
+        let weird = [
+            "a>b", "c\\d", "t\tab", "n\newline", "r\rcr", "s p", "x\\u0041", "<>\"{}|^`",
+            "",
+        ];
+        let lit = |v: &str, dt: Option<&str>, lang: Option<&str>| Term::Literal {
+            value: v.into(),
+            datatype: dt.map(Into::into),
+            lang: lang.map(Into::into),
+        };
+        let mut terms = Vec::new();
+        for w in weird {
+            terms.push(Term::iri(w));
+            terms.push(Term::blank(w));
+            terms.push(lit(w, None, None));
+            terms.push(lit("v", Some(w), None));
+            terms.push(lit(w, None, Some(w)));
+        }
+        for s in &terms {
+            for o in &terms {
+                let t = Triple::new(s.clone(), Term::iri("Rule:x"), o.clone());
+                let line = ledger_line(&t);
+                assert_eq!(line.matches('\t').count(), 3, "{line:?}");
+                assert!(!line.contains(['\n', '\r']), "{line:?}");
+                assert_eq!(parse_ledger_line(&line), Some(t), "{line:?}");
+            }
+        }
+        // An ordinary triple is written as N-Triples (as before).
+        let t = Triple::new(Term::iri("http://ex/a"), Term::iri("Rule:x"), lit("v", None, Some("en")));
+        assert_eq!(ledger_line(&t), "<http://ex/a>\t<Rule:x>\t\"v\"@en\t.");
+        for bad in [
+            "<a>\t<b>\t<c>",
+            "<a>\t<b>\t<c>\t.\t<d>",
+            "<a>\t<b>\t<c>\tx",
+            "<a\\q>\t<b>\t<c>\t.",
+            "<a\\u00>\t<b>\t<c>\t.",
+            "\"v\\q\"\t<b>\t<c>\t.",
+        ] {
+            assert_eq!(parse_ledger_line(bad), None, "{bad:?}");
+        }
     }
 }

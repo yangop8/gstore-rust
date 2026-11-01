@@ -46,7 +46,9 @@
 //! twice.
 //!
 //! Every record is one line: `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [target]
-//! message` (the target is the Rust module, or the binary's name).
+//! message` (the target is the Rust module, or the binary's name); a line
+//! break or other control character in the message is escaped
+//! ([`format_line`]).
 //!
 //! # Process-wide logger
 //!
@@ -855,13 +857,34 @@ impl Logger {
 }
 
 /// One record as a line: `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [target] message\n`.
+/// A message may quote text a client controls (a SPARQL statement, a PFN
+/// function's output or compiler message): its line breaks are written as
+/// `\n` / `\r` and its other control characters (but tabs) as `\uXXXX`, so
+/// it can never add a record of its own, nor drive a terminal showing the
+/// log.
 pub fn format_line(
     now: &LocalTime,
     level: Level,
     target: &str,
     args: fmt::Arguments<'_>,
 ) -> String {
-    let mut line = format!("{} [{:>5}] [{target}] {args}", now.datetime_ms(), level);
+    use fmt::Write as _;
+    let mut line = format!("{} [{:>5}] [{target}] ", now.datetime_ms(), level);
+    let start = line.len();
+    let _ = write!(line, "{args}");
+    if line[start..].chars().any(|c| c.is_control() && c != '\t') {
+        let msg = line.split_off(start);
+        for c in msg.chars() {
+            match c {
+                '\n' => line.push_str("\\n"),
+                '\r' => line.push_str("\\r"),
+                c if c.is_control() && c != '\t' => {
+                    let _ = write!(line, "\\u{:04X}", u32::from(c));
+                }
+                c => line.push(c),
+            }
+        }
+    }
     line.push('\n');
     line
 }
@@ -1043,6 +1066,29 @@ mod tests {
         assert_eq!(Date::of(&clock.local(clock.now())).iso(), "2026-10-31");
         clock.advance(Duration::from_secs(86_400));
         assert_eq!(Date::of(&clock.local(clock.now())).iso(), "2026-11-01");
+    }
+
+    /// Finding: a message holding a line break (a PFN compile error naming
+    /// an import, a failing function's output — text a user controls) wrote
+    /// whole forged records into the log.
+    #[test]
+    fn every_record_is_one_line() {
+        let now = clock::from_unix(0, 0);
+        let forged = "evil\n2026-11-01 00:00:00.000 [ERROR] [gserver] FORGED\r\n\u{1b}[31mx\ttab";
+        let line = format_line(&now, Level::Info, "t", format_args!("msg: {forged}"));
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with('\n'), "{line:?}");
+        assert!(!line.contains(['\r', '\u{1b}']), "{line:?}");
+        assert!(
+            line.contains("evil\\n2026-11-01 00:00:00.000 [ERROR] [gserver] FORGED\\r\\n"),
+            "{line:?}"
+        );
+        // A tab is kept, an ordinary message untouched.
+        assert!(line.contains("x\ttab"), "{line:?}");
+        assert_eq!(
+            format_line(&now, Level::Warn, "t", format_args!("plain")),
+            "1970-01-01 00:00:00.000 [ WARN] [t] plain\n"
+        );
     }
 
     #[test]

@@ -228,8 +228,8 @@ in the packaged and container layouts), one directory per user:
 
 ```text
 <pfn_base_path>/src/<user>/data.json     every function's definition (one JSON object per line)
-<pfn_base_path>/src/<user>/<name>.wat    the generated WebAssembly text
-<pfn_base_path>/lib/<user>/lib<name><hash>.wasm   the compiled modules
+<pfn_base_path>/src/<user>/<name lower-cased>.wat    the generated WebAssembly text
+<pfn_base_path>/lib/<user>/lib<name lower-cased><md5(lastTime)>.wasm   the compiled module
 ```
 
 No database backup includes them. Back them up by archiving
@@ -322,8 +322,11 @@ analogue of upstream's log4cplus `SLOG_*` log):
 
 * `querylog_mode` / `querylog_path` / `querylog_days`: one JSON record per
   SPARQL statement — `/api` `query` and the REST endpoints `/sparql`,
-  `/update`, `/tquery` alike, PFN calls included, and the statement a
-  `reasonManage` execute / disable / check runs — with the client IP
+  `/update`, `/tquery` alike, PFN calls included, and for a
+  `reasonManage` execute / disable / check the rule's compiled statement
+  as upstream logs it (for a disable, upstream's nominal `delete where`:
+  a rule with a ledger retracts exactly its ledger's triples, whose number
+  is the record's `ansNum`) — with the client IP
   (`remoteIP`), the number of answers (`ansNum`), the latency in ms
   (`queryTime`), the status, the format and the database, in a daily file
   `<querylog_path>/YYYYMMDD.log`. The `/api` `query` operation records the

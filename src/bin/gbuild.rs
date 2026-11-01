@@ -17,7 +17,8 @@
 //! database"). Like upstream, `gbuild` refuses to build over an existing
 //! database directory (exit status 1; remove it with `gdrop` first) unless
 //! `--force` is given — then the build replaces the database previously
-//! stored there, whatever its backend.
+//! stored there, whatever its backend, and its reasoning rules go with it
+//! (as when it is dropped and built).
 //!
 //! A source is a file, a directory (every RDF file below it, recursively,
 //! sorted by path; hidden entries skipped) or an `http://` / `https://` URL
@@ -181,6 +182,9 @@ fn main() -> ExitCode {
         let code = build_rocksdb(name, &dir, &sources, &opts, &mut log, started);
         if code == ExitCode::SUCCESS {
             created.keep();
+            if existed {
+                return drop_old_rules(&dir);
+            }
         }
         return code;
     }
@@ -219,7 +223,29 @@ fn main() -> ExitCode {
     };
     print_report(&report, &log_path);
     created.keep();
+    if existed {
+        return drop_old_rules(&dir);
+    }
     ExitCode::SUCCESS
+}
+
+/// After a `--force` rebuild: remove the replaced database's reasoning rules
+/// (`reason_rule_files/`), as dropping it would — executed, their ledgers
+/// would name triples the new data holds as asserted ones.
+fn drop_old_rules(dir: &str) -> ExitCode {
+    let rules = Path::new(dir).join(gstore::reason::rules::RULE_DIR);
+    match std::fs::remove_dir_all(&rules) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "gbuild: built, but the replaced database's reasoning rules could not be \
+                 removed ({}): {e}",
+                rules.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The database directory a build created, removed when dropped unless the

@@ -161,6 +161,8 @@ use crate::http_users::{
 };
 use crate::model::{Term, Triple};
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
+use crate::reason::rules::RULE_DIR;
+use crate::reason::store::RuleStore;
 use crate::server::{
     err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
     write_response_ext, write_response_maybe_gzip, BadRequest, ConnMeta, HttpOptions, Lifecycle,
@@ -659,16 +661,23 @@ impl DbSlot {
                 "refusing to save: a transaction is open (its writes are uncommitted)".into(),
             ));
         }
+        Self::save_db(&mut self.db, &self.dir)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Save served database `db` to its directory `dir` (what
+    /// [`save`](Self::save) does once it has checked the slot), for a caller
+    /// that holds the slot's database borrowed.
+    pub(crate) fn save_db(db: &mut Database, dir: &Path) -> crate::Result<()> {
         // Never write a directory another process holds (`crate::db::dirlock`):
         // a database created in memory (`/upload` into a new name) takes the
         // lock before its first save, and keeps it while it is served.
-        if !self.db.holds_dir_lock() && self.db.storage() != crate::StorageKind::RocksDb {
-            fs::create_dir_all(&self.dir)?;
-            self.db.hold_dir_lock(&self.dir)?;
+        if !db.holds_dir_lock() && db.storage() != crate::StorageKind::RocksDb {
+            fs::create_dir_all(dir)?;
+            db.hold_dir_lock(dir)?;
         }
-        self.db.save(&self.dir)?;
-        self.dirty = false;
-        Ok(())
+        db.save(dir)
     }
 
     /// Record that a committed write changed data: mark dirty and, under the
@@ -2556,8 +2565,18 @@ impl ApiInner {
             // A rebuilt database replaces the loaded one: retire it (closing
             // its files) before its directory is rewritten.
             inner.retire_loaded(&name);
-            if let Err(e) = db.save(&dir) {
-                return Resp::fail(500, &format!("save failed: {e}"));
+            {
+                // No `reasonManage` file operation is half-way through the
+                // rule directory meanwhile. A rebuild replaces the database,
+                // as a drop and a build do: the old one's rules (executed,
+                // with ledgers naming triples the new data asserts) go.
+                let _rules = RuleStore::dir(&dir).lock();
+                if let Err(e) = crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR)) {
+                    return Resp::fail(500, &format!("build failed: {e}"));
+                }
+                if let Err(e) = db.save(&dir) {
+                    return Resp::fail(500, &format!("save failed: {e}"));
+                }
             }
             let triples = db.triple_num();
             let mut st = locked(&inner.state);
@@ -2838,6 +2857,10 @@ impl ApiInner {
             let was_loaded = inner.retire_loaded(&name);
             let existed_on_disk = dir.is_dir();
             if existed_on_disk {
+                // A `reasonManage` file operation (which does not wait for
+                // the database) is never half-way through its rule directory
+                // meanwhile, as for the `/api` drop.
+                let _rules = RuleStore::dir(&dir).lock();
                 if let Err(e) = fs::remove_dir_all(&dir) {
                     return Resp::fail(500, &format!("drop failed: {e}"));
                 }
@@ -3542,7 +3565,12 @@ impl ApiInner {
                     st.dbs.remove(&name);
                 }
             }
-            let installed = Database::install_restore(&staged, &dir);
+            let installed = {
+                // As in the `/api` restore: no `reasonManage` file operation
+                // is half-way through the rule directory swapped out.
+                let _rules = RuleStore::dir(&dir).lock();
+                Database::install_restore(&staged, &dir)
+            };
             // Release the probe before reopening: the directory at this path
             // is a new one now, which the reopened database locks itself.
             drop(probe);

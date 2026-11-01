@@ -489,9 +489,13 @@ database in `<db>.db/reason_rule_files/<rulename>.json` (upstream's layout and
 format), so they survive unload / load and restarts, move with `rename`, are
 carried by `backup` / `restore` (zipped backups and `gbackup` / `grestore`
 too; `export` writes data only, as upstream's), kept in `<db>.db.bak` by
-`drop` and removed by `drop` with `is_backup=false`; a database without a
-directory (built in memory through the library) keeps them in memory. The
-library offers the same lifecycle: `Database::reason_add`, `reason_list`,
+`drop` and removed by `drop` with `is_backup=false` — and by a rebuild in
+place (REST `/build` over an existing database, `gbuild --force`), which
+replaces the database as a drop and a build would; incremental backups
+(`Database::backup_incremental`) carry the rules and ledgers of their time,
+which `restore_incremental` restores with the replayed triples; a database
+without a directory (built in memory through the library) keeps them in
+memory. The library offers the same lifecycle: `Database::reason_add`, `reason_list`,
 `reason_compile`, `reason_execute`, `reason_disable`, `reason_show`,
 `reason_delete`, `reason_check`.
 
@@ -503,7 +507,14 @@ open on the database, and execute / disable / check need it loaded.
 **Retraction is exact.** Each execution records which triples the rule owns
 (`reason_rule_files/inferred/<rulename>.nt`): those it added, and those it
 derived that another executed rule already owns. Disabling deletes exactly the
-owned triples no other rule also owns. So a fact asserted with an ordinary
+owned triples no other rule also owns. The record holds each term in a form
+that reads back exactly — an IRI as N-Triples escapes it (`\u003E` for a
+`>`, `\u0009` for a tab…), whatever a loader let into the database — and is
+written *before* the triples are inserted, so a crash or a failed write never
+leaves an inferred triple no rule owns; a record line that cannot be read
+back fails the disable (nothing is retracted) instead of being skipped.
+Disabling a rule of a snapshot database saves the database before its record
+is emptied (whatever `check_point` says; upstream saves there too). So a fact asserted with an ordinary
 predicate is never touched; a `<Rule:…>` triple that was already in the
 database before the rule ran (asserted by a user) survives; a triple two rules
 infer survives until both are disabled. A triple a user inserts *after* the
@@ -632,18 +643,24 @@ gStore[lubm]> quit;
   the rule JSON in the file (the `reasonManage` `ruleinfo`) and prints the
   server's message; `listreason` prints `ruleid | rulename | description`;
   `compilereason` / `executereason` / `disablereason <rule>` print the
-  statements compiled, run or used for the retraction; `showreason <rule>`
+  statements the server answers, upstream's: the compiled `insert_sparql` /
+  `delete_sparql` / `check_sparql`, the `insert_sparql` executed — and, for
+  `disablereason`, upstream's nominal `delete where {?x <Rule:label> ?y.}`,
+  which is **not** what ran for a rule with a ledger: such a rule retracts
+  exactly the triples of its ledger (a `DELETE DATA`; see Reasoning), and
+  the answer's `AnsNum` counts them; `showreason <rule>`
   prints the number of conditions and one `rulename | description |
   patterns | filters` row per pattern (upstream prints the subject twice and
-  no predicate: `<s,o,s>`; here `<s,p,o>`). `addpfn` / `mdfpfn <file>`
+  no predicate: `<s,o,s>`; here `<s,p,o>`), for every condition shape the
+  server accepts (also `{"condition": {…}}`-wrapped ones). `addpfn` / `mdfpfn <file>`
   send upstream's `PFNInfo` JSON from the file — `funName`, `funDesc`,
   `funBody`, `funSubs` — unchanged; the body is WebAssembly text (upstream:
   C++; see [`docs/PFN.md`](docs/PFN.md)), which the server URL-decodes as
   upstream does, so write a literal `+` / `%` as `%2B` / `%25`. `showpfn`
   prints `name | desc | returnType | status | lastBuildTime` — upstream's
-  headers — with the function's source file `src/<user>/<name>.wat` (under
-  the server's `pfn_base_path`) in the third column, where upstream shows
-  `./pfn/<name>.cpp`. `delpfn` / `buildpfn <name>` delete / compile it.
+  headers — with the function's source file `src/<user>/<name
+  lower-cased>.wat` (under the server's `pfn_base_path`) in the third
+  column, where upstream shows `./pfn/<name>.cpp`. `delpfn` / `buildpfn <name>` delete / compile it.
 * Commands (`help;` lists them, `help <command>;` shows one): `create <db>
   [<file|dir|url>]`, `use`, `show [<db>]`, `showdbs`, `pdb`, `unload`, `drop`,
   `backup [<path>]`, `restore <db> <path>`, `export [<path>]`, `batchinsert` /

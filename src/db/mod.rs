@@ -1912,6 +1912,9 @@ impl Database {
     ///   length-prefixed `REDO <op> <graph_len> <triple_len>\n…` record format, so
     ///   it replays through the ordinary redo-log machinery.
     /// * `INCREMENTAL` — a UTF-8 marker: `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
+    /// * `reason_rule_files/` — the database's reasoning rules and their
+    ///   ledgers at the time of the increment (empty when it has none): the
+    ///   rules the replayed inferred triples belong to.
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
         let Some(log_path) = self.redo_log.clone() else {
@@ -1935,6 +1938,10 @@ impl Database {
         fs::create_dir_all(out_dir)?;
         let slice = &data[base as usize..end as usize];
         fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        // The reasoning rules and ledgers as they are now, which the replayed
+        // triples go with (an empty rule directory: none).
+        self.backup_reason_rules(out_dir)?;
+        fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
         self.backup_offset.set(end);
         Ok(())
@@ -1952,9 +1959,11 @@ impl Database {
     /// onto it. Deltas are checked for contiguity: each must begin exactly where
     /// the previous one ended (starting from the base's recorded checkpoint), so
     /// an out-of-order or gapped chain is rejected rather than silently
-    /// misapplied. The base's reasoning rules (and ledgers) come with it, held
-    /// in memory (see [`into_memory`](Self::into_memory)). Persist the result
-    /// with [`save`](Self::save), which writes those rules too.
+    /// misapplied. The reasoning rules (and ledgers) of the last increment
+    /// that carries them (one taken by an earlier version does not) — else
+    /// the base's — come with it, held in memory (see
+    /// [`into_memory`](Self::into_memory)). Persist the result with
+    /// [`save`](Self::save), which writes those rules too.
     pub fn restore_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
         base_dir: P,
         incr_dirs: &[Q],
@@ -1988,6 +1997,15 @@ impl Database {
                 let bytes = fs::read(dir.join(INCREMENTAL_LOG_FILE))?;
                 db.apply_redo_records(&bytes)?;
                 expected = end;
+            }
+            // The rules the last increment carries replace the base's.
+            if let Some(dir) = incr_dirs
+                .iter()
+                .map(AsRef::as_ref)
+                .rev()
+                .find(|d| d.join(crate::reason::rules::RULE_DIR).is_dir())
+            {
+                db.reason_home.mem = crate::reason::store::read_rule_dir(dir)?;
             }
             Ok(())
         })();
@@ -2407,7 +2425,9 @@ impl Database {
         &mut self,
         name: &str,
     ) -> std::result::Result<crate::reason::manage::Disabled, crate::reason::ReasonError> {
-        self.with_rule_store(|db, store| crate::reason::manage::disable(db, store, name, None))
+        self.with_rule_store(|db, store| {
+            crate::reason::manage::disable(db, store, name, None, |db| db.persist_for_rules())
+        })
     }
 
     /// A rule's JSON (type 6).
@@ -2438,6 +2458,21 @@ impl Database {
         })
     }
 
+    /// Make the data durable where this database's rules (and their
+    /// ledgers) live, before a disable empties a ledger: a snapshot database
+    /// whose rules are kept in its [`home`](Self::home) is saved there; the
+    /// persistent layouts are at a commit point already ([`sync`](Self::sync)).
+    fn persist_for_rules(&self) -> Result<()> {
+        if self.storage() == crate::StorageKind::Snapshot {
+            if let Some(home) = self.home.clone() {
+                if self.reason_db_dir().is_some_and(|d| fsutil::same_dir(&d, &home)) {
+                    return self.save(&home);
+                }
+            }
+        }
+        self.sync()
+    }
+
     /// Whether the default graph holds `t` (no interning).
     pub(crate) fn contains_triple(&self, t: &Triple) -> bool {
         let (Some(sub), Some(pred), Some(obj)) = (
@@ -2459,10 +2494,17 @@ impl Database {
     /// insert a triple the ledger does not record. An error before anything
     /// was applied (parse, WHERE evaluation, cancellation) is `Err`; the
     /// insert's own outcome is the report's `result`.
+    ///
+    /// `record` is called with every derived triple's ledger line and
+    /// whether it exists, after the evaluation and before anything is
+    /// inserted (the rule records what it is about to insert — see
+    /// [`crate::reason::manage::execute`]); when it fails nothing is
+    /// inserted and its message is the error.
     pub(crate) fn reason_infer(
         &mut self,
         sparql: &str,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        record: impl FnOnce(&[(String, bool)]) -> std::result::Result<(), String>,
     ) -> Result<crate::reason::manage::InferReport> {
         use crate::reason::manage::{ledger_line, InferReport};
         let Query::Update(ops) = sparql::parse(sparql)? else {
@@ -2513,6 +2555,8 @@ impl Database {
                 derived.push((line, existed, t.clone()));
             }
         }
+        let lines: Vec<(String, bool)> = derived.iter().map(|(l, e, _)| (l.clone(), *e)).collect();
+        record(&lines).map_err(GStoreError::Database)?;
         let ground = ins
             .into_iter()
             .map(|(graph, t)| GroundTriple {
@@ -2534,7 +2578,7 @@ impl Database {
             .map(|(line, _, _)| line.clone())
             .collect();
         Ok(InferReport {
-            derived: derived.into_iter().map(|(l, e, _)| (l, e)).collect(),
+            derived: lines,
             inserted,
             result,
         })
@@ -2542,7 +2586,8 @@ impl Database {
 
     /// Retract the triples of ledger `lines` (see
     /// [`crate::reason::manage`]) as one `DELETE DATA` through the update
-    /// path. Returns how many were removed. The opt-in statement log
+    /// path. Returns how many were removed; fails, removing nothing, when a
+    /// line cannot be read back. The opt-in statement log
     /// (`update.log`) records that `DELETE DATA` text; a blank node in it is
     /// written as its stored label, which SPARQL does not accept in `DELETE
     /// DATA`, so replaying such a record fails (the triple-level redo log is
@@ -2555,8 +2600,15 @@ impl Database {
         let mut ground = Vec::with_capacity(lines.len());
         let mut text = String::from("DELETE DATA {");
         for line in lines {
+            // A line that cannot be read back fails the whole retraction
+            // (nothing is deleted, the ledger stays): skipping it would
+            // leave its triple behind with no rule owning it.
             let Some(t) = crate::reason::manage::parse_ledger_line(line) else {
-                continue;
+                let shown: String = line.escape_debug().take(200).collect();
+                return Err(GStoreError::Database(format!(
+                    "the rule's ledger holds a line that cannot be read back (\"{shown}\"); \
+                     nothing was retracted"
+                )));
             };
             text.push_str(&format!(" {} {} {} .", t.subject, t.predicate, t.object));
             ground.push(GroundTriple {

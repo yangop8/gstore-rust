@@ -30,9 +30,15 @@
 //! * **list** — the entries, filtered by exact `funName` and `funStatus`.
 //! * **drop_user** — every function of a deleted user.
 //!
-//! Every stored field is bounded ([`PfnRegistry::check_definition`]), so a
-//! user's `data.json` is at most about `pfn_max_functions` ×
-//! (`pfn_max_module_bytes` + [`MAX_DESC_BYTES`]).
+//! Every stored field is bounded as it is stored, JSON-escaped
+//! ([`PfnRegistry::check_definition`]), so a user's `data.json` is at most
+//! about `pfn_max_functions` × (3 × `pfn_max_module_bytes` +
+//! [`MAX_DESC_BYTES`]) — the 3 lets a definition within the limit be sent
+//! URL-encoded.
+//!
+//! `data.json` is the record: a source or module file it does not name is
+//! ignored (a write that failed half-way, or a crash, never blocks a name),
+//! and the files it names are replaced only once it names their successors.
 //!
 //! `lastTime` is stamped on create, update and compile (upstream stamps it
 //! on compile only and keeps whatever the client sent otherwise).
@@ -43,6 +49,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, RwLock};
 
 use super::{
@@ -63,9 +70,21 @@ pub struct PfnRegistry {
     /// Loaded modules by `(user, name)`, with the module file they came from.
     #[cfg(feature = "pfn-wasm")]
     cache: Mutex<HashMap<(String, String), (PathBuf, super::wasm::LoadedModule)>>,
+    /// Bumped (under the cache's lock) whenever cached modules are dropped:
+    /// a module loaded across a drop is not cached — its file may have been
+    /// rewritten meanwhile under the same name (a recompilation stamped
+    /// within the same second).
+    generation: AtomicU64,
     #[cfg(not(feature = "pfn-wasm"))]
     cache: Mutex<HashMap<(String, String), ()>>,
+    /// Tests: run once between loading a module and caching it.
+    #[cfg(all(test, feature = "pfn-wasm"))]
+    before_cache: Mutex<Option<BeforeCache>>,
 }
+
+/// A test hook of [`PfnRegistry`] (`before_cache`).
+#[cfg(all(test, feature = "pfn-wasm"))]
+type BeforeCache = Box<dyn FnOnce(&PfnRegistry) + Send>;
 
 impl std::fmt::Debug for PfnRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -123,8 +142,20 @@ fn remove_stale(f: &Path) {
     }
 }
 
-/// The longest `funDesc` stored, in bytes.
+/// The longest `funDesc` stored, in bytes (as stored, JSON-escaped).
 pub const MAX_DESC_BYTES: usize = 64 * 1024;
+
+/// The bytes `s` takes in `data.json`: JSON-escaped (a control character
+/// takes up to 6), without its quotes.
+fn stored_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0C => 2,
+            b if b < 0x20 => 6,
+            _ => 1,
+        })
+        .sum()
+}
 
 const SUBS_WITH_MODULE: &str = "funSubs must be empty when funBody is a complete module";
 
@@ -139,6 +170,9 @@ impl PfnRegistry {
             #[cfg(feature = "pfn-wasm")]
             runtime: super::wasm::Runtime::new(),
             cache: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            #[cfg(all(test, feature = "pfn-wasm"))]
+            before_cache: Mutex::new(None),
         }
     }
 
@@ -269,20 +303,31 @@ impl PfnRegistry {
 
     /// Drop the cached module of `(user, name)`.
     fn forget(&self, user: &str, name: &str) {
-        lock(&self.cache).remove(&(user.to_string(), name.to_string()));
+        let mut cache = lock(&self.cache);
+        cache.remove(&(user.to_string(), name.to_string()));
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Check the definition `info` a client sends (create, update,
     /// `funreview`) and return its generated source: `funDesc` at most
-    /// [`MAX_DESC_BYTES`]; `funBody` and `funSubs` together, URL-decoded and
-    /// as sent (whitespace included), and the generated source each at most
-    /// `pfn_max_module_bytes`; no `funSubs` next to a complete module. So
-    /// every field stored in `data.json` is bounded.
+    /// [`MAX_DESC_BYTES`], also as stored (JSON-escaped); `funBody` and
+    /// `funSubs` together, URL-decoded and as sent (whitespace included), and
+    /// the generated source each at most `pfn_max_module_bytes`, and
+    /// `funBody` and `funSubs` as stored at most 3 × `pfn_max_module_bytes`;
+    /// no `funSubs` next to a complete module. So every field stored in
+    /// `data.json` is bounded.
     pub fn check_definition(&self, info: &PfnInfo) -> Result<String> {
         if info.desc.len() > MAX_DESC_BYTES {
             return Err(query_err(format!(
                 "funDesc is {} bytes, more than the {MAX_DESC_BYTES} bytes allowed",
                 info.desc.len()
+            )));
+        }
+        let desc = stored_len(&info.desc);
+        if desc > MAX_DESC_BYTES {
+            return Err(query_err(format!(
+                "funDesc takes {desc} bytes as stored (JSON-escaped), more than the \
+                 {MAX_DESC_BYTES} bytes allowed"
             )));
         }
         let max = self.limits().max_module_bytes;
@@ -293,6 +338,14 @@ impl PfnRegistry {
             return Err(query_err(format!(
                 "funBody and funSubs are {given} bytes, more than the {max} bytes allowed \
                  (pfn_max_module_bytes)"
+            )));
+        }
+        let stored = stored_len(&info.body).saturating_add(stored_len(&info.subs));
+        if stored > max.saturating_mul(3) {
+            return Err(query_err(format!(
+                "funBody and funSubs take {stored} bytes as stored (JSON-escaped), more than \
+                 the {} bytes allowed (3 × pfn_max_module_bytes)",
+                max.saturating_mul(3)
             )));
         }
         if source_kind(body.trim()) != SourceKind::Body && !subs.trim().is_empty() {
@@ -327,7 +380,9 @@ impl PfnRegistry {
                 Err(e) => return Err(e.into()),
             }
         }
-        lock(&self.cache).retain(|(u, _), _| u != user);
+        let mut cache = lock(&self.cache);
+        cache.retain(|(u, _), _| u != user);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -371,9 +426,9 @@ impl PfnRegistry {
             .unwrap_or_else(PoisonError::into_inner);
         let mut all = self.read_all(user)?;
         let lower = info.name.to_lowercase();
-        if self.source_file(user, &info.name).exists()
-            || all.iter().any(|i| i.name.to_lowercase() == lower)
-        {
+        // `data.json` decides (upstream also refuses a name whose source
+        // file exists; here such a file, which no entry names, is replaced).
+        if all.iter().any(|i| i.name.to_lowercase() == lower) {
             return Err(query_err(format!(
                 "function name {} already exists",
                 info.name
@@ -387,11 +442,15 @@ impl PfnRegistry {
             )));
         }
         fs::create_dir_all(self.src_dir(user))?;
-        crate::db::fsutil::atomic_write(&self.source_file(user, &info.name), src.as_bytes())?;
+        let source = self.source_file(user, &info.name);
+        crate::db::fsutil::atomic_write(&source, src.as_bytes())?;
         info.status = STATUS_PENDING.to_string();
         info.last_time = super::now();
         all.push(info.clone());
-        self.write_all(user, &all)?;
+        if let Err(e) = self.write_all(user, &all) {
+            remove_stale(&source);
+            return Err(e);
+        }
         self.forget(user, &info.name);
         Ok(info)
     }
@@ -412,11 +471,18 @@ impl PfnRegistry {
                 info.name
             )));
         };
-        crate::db::fsutil::atomic_write(&self.source_file(user, &info.name), src.as_bytes())?;
+        let previous = generate_source(slot);
+        let source = self.source_file(user, &info.name);
+        crate::db::fsutil::atomic_write(&source, src.as_bytes())?;
         info.status = STATUS_PENDING.to_string();
         info.last_time = super::now();
         *slot = info.clone();
-        self.write_all(user, &all)?;
+        if let Err(e) = self.write_all(user, &all) {
+            // The entry is unchanged: so is its source (which a compilation
+            // would build).
+            let _ = crate::db::fsutil::atomic_write(&source, previous.as_bytes());
+            return Err(e);
+        }
         for f in self.module_files(user, &info.name) {
             remove_stale(&f);
         }
@@ -495,18 +561,16 @@ impl PfnRegistry {
                 "function {name} was changed while it was being compiled; compile it again"
             )));
         }
+        let previous = self.module_file(user, name, &all[idx].last_time);
         let info = &mut all[idx];
         info.last_time = super::now();
+        let mut written = None;
         let result = match outcome {
             Ok(bytes) => {
                 fs::create_dir_all(self.lib_dir(user))?;
                 let target = self.module_file(user, name, &info.last_time);
                 crate::db::fsutil::atomic_write(&target, &bytes)?;
-                for f in self.module_files(user, name) {
-                    if f != target {
-                        remove_stale(&f);
-                    }
-                }
+                written = Some(target);
                 info.status = STATUS_COMPILED.to_string();
                 Ok(info.clone())
             }
@@ -518,7 +582,21 @@ impl PfnRegistry {
                 })
             }
         };
-        self.write_all(user, &all)?;
+        if let Err(e) = self.write_all(user, &all) {
+            // `data.json` still names the previous module: it stays.
+            if let Some(target) = written.filter(|t| *t != previous) {
+                remove_stale(&target);
+            }
+            return Err(e);
+        }
+        // Only now that `data.json` names the new module do the others go.
+        if let Some(target) = &written {
+            for f in self.module_files(user, name) {
+                if f != *target {
+                    remove_stale(&f);
+                }
+            }
+        }
         self.forget(user, name);
         Ok(result)
     }
@@ -622,11 +700,15 @@ impl PfnRegistry {
     fn module(&self, user: &str, name: &str, last_time: &str) -> Result<super::wasm::LoadedModule> {
         let file = self.module_file(user, name, last_time);
         let key = (user.to_string(), name.to_string());
-        if let Some((cached_file, m)) = lock(&self.cache).get(&key) {
-            if *cached_file == file {
-                return Ok(m.clone());
+        let generation = {
+            let cache = lock(&self.cache);
+            if let Some((cached_file, m)) = cache.get(&key) {
+                if *cached_file == file {
+                    return Ok(m.clone());
+                }
             }
-        }
+            self.generation.load(Ordering::SeqCst)
+        };
         let bytes = fs::read(&file).map_err(|e| {
             query_err(format!(
                 "abort load module file error: {} ({e})",
@@ -637,6 +719,10 @@ impl PfnRegistry {
             .runtime
             .load(name, &bytes)
             .map_err(|e| query_err(format!("abort load module file error: {e}")))?;
+        #[cfg(test)]
+        if let Some(f) = lock(&self.before_cache).take() {
+            f(self);
+        }
         let mut cache = lock(&self.cache);
         if fresh_engine {
             // The modules of the replaced engine: dropped so it is freed (a
@@ -644,7 +730,11 @@ impl PfnRegistry {
             // it ends); they load into the new engine when called again.
             cache.clear();
         }
-        cache.insert(key, (file, module.clone()));
+        // Not when a function was changed meanwhile (this call still runs
+        // what it loaded, as a call that began before the change).
+        if self.generation.load(Ordering::SeqCst) == generation {
+            cache.insert(key, (file, module.clone()));
+        }
         Ok(module)
     }
 
@@ -825,6 +915,136 @@ mod tests {
         assert!(e.contains("pfn-wasm"), "{e}");
         let e = r.call("u", "g", "{}", &g, &opts).unwrap_err().to_string();
         assert!(e.contains("is not exist"), "{e}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Finding: the stored fields were bounded before JSON escaping (a
+    /// control character takes 6 bytes in `data.json`), so `data.json`
+    /// grew about 6× past its documented bound.
+    #[test]
+    fn stored_fields_are_bounded_as_stored() {
+        let base = tmp("bound");
+        let max = 10_000;
+        let r = PfnRegistry::new(&base).with_limits(PfnLimits {
+            max_module_bytes: max,
+            ..PfnLimits::default()
+        });
+        // 6008 bytes decoded, about 36 KB stored.
+        let body = format!("(module){}", "\u{1}".repeat(6000));
+        let e = r.create("alice", info("f", &body)).unwrap_err().to_string();
+        assert!(e.contains("stored"), "{e}");
+        // 20 KB of funDesc, about 120 KB stored.
+        let mut i = info("g", "(i32.const 1)");
+        i.desc = "\u{1}".repeat(20_000);
+        let e = r.create("alice", i).unwrap_err().to_string();
+        assert!(e.contains("funDesc"), "{e}");
+        // A URL-encoded definition (3 bytes a character) within the limit
+        // decoded is still accepted.
+        let encoded = format!("(i32.const 1){}", "%20".repeat(max / 2));
+        r.create("alice", info("h", &encoded)).unwrap();
+        // Whatever is accepted, an entry stays within its documented bound.
+        let stored = fs::metadata(base.join("src/alice/data.json")).unwrap().len();
+        assert!(stored as usize <= 3 * max + MAX_DESC_BYTES + 4096, "{stored}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Finding: create wrote the source before `data.json` and refused a
+    /// name whose source existed; a failed `data.json` write (or a source
+    /// left by a delete) then blocked the name for good.
+    #[test]
+    fn a_failed_write_never_blocks_a_name() {
+        let base = tmp("block");
+        let r = PfnRegistry::new(&base);
+        let blocker = base.join("src/alice/data.json.tmp");
+        fs::create_dir_all(&blocker).unwrap();
+        assert!(r.create("alice", info("deg", "(i32.const 1)")).is_err());
+        fs::remove_dir_all(&blocker).unwrap();
+        assert!(r.list("alice", None, None).unwrap().is_empty());
+        r.create("alice", info("deg", "(i32.const 1)")).unwrap();
+        // A source a delete left behind does not block the name either.
+        r.delete("alice", "deg").unwrap();
+        fs::write(r.source_file("alice", "deg"), "stray").unwrap();
+        r.create("alice", info("DEG", "(i32.const 1)")).unwrap();
+        assert_eq!(r.list("alice", None, None).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Finding: compile removed the module `data.json` named before it
+    /// rewrote `data.json`; when that write failed, the function (still
+    /// compiled there) could not be loaded after a restart.
+    #[cfg(feature = "pfn-wasm")]
+    #[test]
+    fn a_failed_compile_keeps_the_module_data_json_names() {
+        let base = tmp("keepmod");
+        let r = PfnRegistry::new(&base);
+        let db = crate::Database::build_from_str("pfn_k", "<http://a> <http://p> <http://b> .\n")
+            .unwrap();
+        let csr = db.csr().unwrap();
+        let g = super::super::CsrGraphCtx::new(&csr, db.dict());
+        let opts = CallOptions {
+            limits: PfnLimits::default(),
+            cancel: None,
+            max_output: 100,
+        };
+        r.create("u", info("f", "(call $emit_i64 (i64.const 7)) (i32.const 1)"))
+            .unwrap();
+        let first = r.compile("u", "f").unwrap().unwrap();
+        // The next compilation is stamped with another second.
+        while super::super::now() == first.last_time {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let blocker = base.join("src/u/data.json.tmp");
+        fs::create_dir_all(&blocker).unwrap();
+        assert!(r.compile("u", "f").is_err());
+        fs::remove_dir_all(&blocker).unwrap();
+        assert_eq!(r.module_files("u", "f").len(), 1);
+        // After a restart the function still runs.
+        let restarted = PfnRegistry::new(&base);
+        assert_eq!(restarted.call("u", "f", "{}", &g, &opts).unwrap(), "7");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Finding: a module loaded while the function was updated and
+    /// recompiled within the same second (so into the same file name) was
+    /// cached after the recompilation dropped the cache, and served from
+    /// then on.
+    #[cfg(feature = "pfn-wasm")]
+    #[test]
+    fn a_module_loaded_across_a_recompilation_is_not_cached() {
+        let base = tmp("stale");
+        let r = PfnRegistry::new(&base);
+        let db = crate::Database::build_from_str("pfn_s", "<http://a> <http://p> <http://b> .\n")
+            .unwrap();
+        let csr = db.csr().unwrap();
+        let g = super::super::CsrGraphCtx::new(&csr, db.dict());
+        let opts = CallOptions {
+            limits: PfnLimits::default(),
+            cancel: None,
+            max_output: 100,
+        };
+        let emit = |n: i64| format!("(call $emit_i64 (i64.const {n})) (i32.const 1)");
+        r.create("u", info("f", &emit(7))).unwrap();
+        // The update and both compilations must share their second: retry
+        // until they do.
+        for attempt in 0..20 {
+            r.update("u", info("f", &emit(7))).unwrap();
+            let before = r.compile("u", "f").unwrap().unwrap().last_time;
+            let emit8 = emit(8);
+            *lock(&r.before_cache) = Some(Box::new(move |r: &PfnRegistry| {
+                r.update("u", info("f", &emit8)).unwrap();
+                r.compile("u", "f").unwrap().unwrap();
+            }));
+            // This call loaded the old module; the recompilation ran
+            // before it was cached.
+            assert_eq!(r.call("u", "f", "{}", &g, &opts).unwrap(), "7");
+            let after = r.get("u", "f").unwrap().unwrap().last_time;
+            if after != before {
+                assert!(attempt < 19, "never within one second");
+                continue;
+            }
+            assert_eq!(r.call("u", "f", "{}", &g, &opts).unwrap(), "8");
+            break;
+        }
         let _ = fs::remove_dir_all(&base);
     }
 

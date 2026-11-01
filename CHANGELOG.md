@@ -40,8 +40,8 @@ landed; this records what joining them changed.
   `PFNInfo` object as a JSON string too (upstream's `PFNInfo(json)`); the
   body is WebAssembly text, sent unchanged and URL-decoded by the server as
   upstream does (documented). `showpfn`'s third column names the
-  WebAssembly source the server keeps (`src/<user>/<name>.wat`) where
-  upstream shows `./pfn/<name>.cpp`.
+  WebAssembly source the server keeps (`src/<user>/<name lower-cased>.wat`)
+  where upstream shows `./pfn/<name>.cpp`.
 - **Backups.** A database's rules and ownership ledgers travel with it
   through every Phase 5 backup path — `gbackup` / `grestore` (directory and
   `-z` zip), `/api` `backup compress=true` / zip `restore`, `drop`'s `.bak`
@@ -86,6 +86,78 @@ landed; this records what joining them changed.
   part with `pfn-wasm`), `config` and `console::commands`. One expectation
   changed intentionally: the fake-server test's `showpfn` third column.
   The default workspace runs 1,942 tests; the features add their own.
+
+#### Review fixes
+
+A review of the merged tree found these; each has a regression test
+(`tests/dt_merge4_fixes.rs`, and unit tests in `reason::manage`,
+`pfn::registry`, `console::commands`, `logging`, `dt_cli_compat`).
+
+- **Rule ledgers read back every term exactly.** Since Phase 5 the readers
+  let IRIs holding `>`, `\`, a tab or a newline into a database (as `\u`
+  escapes), and rules carried them into their ledgers raw: the strict
+  N-Triples reader then refused such a line — disable skipped it, reported
+  success and emptied the ledger, leaving the triple for good — or a line
+  split by a newline named another triple, which disable deleted; an IRI
+  holding a backslash-`u` sequence read back as the IRI it names, so
+  disable deleted a user's triple and kept the inferred one. A ledger term
+  is now written in an escaped N-Triples form that reads back exactly
+  (IRIs and datatypes as the exporters escape them; blank node labels and
+  language tags with `\uXXXX`), a line must be three terms and `.`, and a
+  line that cannot be read fails the disable — nothing retracted, the
+  ledger kept.
+- **Execute records before it inserts.** The insert is durable at once on
+  the on-disk and RocksDB layouts; the ledger was written after it, so a
+  failed ledger write (or a crash) left inferred triples no rule owned.
+  The ledger now records what the insert may add first, and is trimmed to
+  what it added after.
+- **Disable saves a snapshot database before emptying the ledger** (also
+  with `check_point` off — upstream saves at this point too); a crash after
+  the ledger was emptied left the inferred triples on disk with no owner.
+  When the save fails the rule keeps its ledger and status.
+- **Add writes a rule's (empty) ledger before its file, and delete removes
+  the file before the ledger**, so a crash never leaves a rule file without
+  a ledger — which is taken for an upstream rule and retracted upstream's
+  way, deleting every `<Rule:label>` triple. Rule-directory copies (backups)
+  copy the files before the ledger directory.
+- **Incremental backups carry the rules and ledgers of their time**, and
+  `restore_incremental` restores the last increment's (an increment taken
+  before keeps the base's); the replayed inferred triples were paired with
+  the base's rules.
+- **Directory swaps wait for `reasonManage` file operations.** The REST
+  `/drop`, `/restore`, a rebuilding `/build` and the `/api` `rename` now
+  take the rule directory's lock, as the `/api` `drop` and `restore` did;
+  an add, compile or delete could otherwise act on a directory being
+  replaced (e.g. delete the restored copy's rule and ledger).
+- **A rebuild in place drops the old database's rules** (REST `/build` over
+  an existing database, `gbuild --force`), as a drop and a build do; they
+  stayed executed, their ledgers naming triples the new data holds as
+  asserted ones.
+- **PFN.** `data.json` is the record: create no longer refuses a name whose
+  source file exists without an entry (a failed `data.json` write or a
+  crash blocked the name for good) and removes its source when the
+  `data.json` write fails; update restores the source then; compile
+  removes the old module only once `data.json` names the new one (a failed
+  write left the function unloadable after a restart). A module loaded
+  while its function was recompiled within the same second is no longer
+  cached (it was served from then on). `funDesc`, `funBody` and `funSubs`
+  are bounded as stored too (JSON-escaped: a control character takes 6
+  bytes), so `data.json` stays within its documented bound, corrected to
+  `pfn_max_functions` × (3 × `pfn_max_module_bytes` + 64 KiB).
+- **Logs.** Every diagnostic record is one line: line breaks in a message
+  (a PFN compile error naming an import, a failing function's output) are
+  written as `\n` / `\r` and other control characters as `\uXXXX`, so a
+  user can no longer forge records.
+- **gconsole.** A PFN value that is an object with a top-level `bindings`
+  key prints as the value (it printed `Update ans num 0`); `showreason`
+  lists the patterns of `{"condition": {…}}`-wrapped conditions and prefers
+  `conditions` to a stray `condition` field; a server's error message
+  (which may quote a failing PFN function's output) prints with its
+  control characters escaped, as answers do.
+- **Docs.** `disablereason`'s printed statement and the query log's record
+  of a disable are upstream's nominal `delete where`, not the `DELETE DATA`
+  of the ledger that ran (README, `docs/DEPLOY.md`); PFN file names are
+  lower-cased (README, `docs/DEPLOY.md`).
 
 #### Not yet
 

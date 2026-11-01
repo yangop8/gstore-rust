@@ -159,7 +159,7 @@ impl fmt::Display for Term {
 }
 
 /// Escape a literal's lexical value for N-Triples output (`"`, `\`, newlines…).
-fn escape_literal(s: &str) -> String {
+pub(crate) fn escape_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -188,7 +188,6 @@ fn excluded_from_iriref(c: char) -> bool {
 /// key is returned as is.
 pub fn export_key(key: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    use std::fmt::Write as _;
     let (head, iri) = if let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) {
         ("<", inner)
     } else if key.starts_with('"') && key.ends_with('>') {
@@ -204,6 +203,18 @@ pub fn export_key(key: &str) -> std::borrow::Cow<'_, str> {
     }
     let mut out = String::with_capacity(key.len() + 16);
     out.push_str(head);
+    escape_iriref(iri, &mut out);
+    out.push('>');
+    Cow::Owned(out)
+}
+
+/// Append `iri` (an IRI's text, without its brackets) to `out` as IRIREF
+/// holds it: every character IRIREF excludes (a space, a control character,
+/// `<>"{}|^`\`) as a `\uXXXX` escape, which the readers decode — so what
+/// is appended holds no ASCII space or control character, and no `\` but
+/// those escapes.
+pub(crate) fn escape_iriref(iri: &str, out: &mut String) {
+    use std::fmt::Write as _;
     for c in iri.chars() {
         if excluded_from_iriref(c) {
             let _ = write!(out, "\\u{:04X}", u32::from(c));
@@ -211,8 +222,6 @@ pub fn export_key(key: &str) -> std::borrow::Cow<'_, str> {
             out.push(c);
         }
     }
-    out.push('>');
-    Cow::Owned(out)
 }
 
 /// Whether an object position holds an entity or a literal (gStore:

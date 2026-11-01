@@ -249,6 +249,18 @@ impl<'a> RuleStore<'a> {
         }
     }
 
+    /// Whether rule `name`'s file exists (on disk: anything at its path).
+    pub fn exists(&self, name: &str) -> StoreResult<bool> {
+        match self {
+            RuleStore::Memory(m) => Ok(m.rules.contains_key(name)),
+            RuleStore::Dir { db_dir } => match fs::symlink_metadata(Self::rule_file(db_dir, name)) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.into()),
+            },
+        }
+    }
+
     /// Create rule `name` with `text`. `Ok(false)` when it already exists.
     pub fn create(&mut self, name: &str, text: &str) -> StoreResult<bool> {
         match self {
@@ -262,6 +274,8 @@ impl<'a> RuleStore<'a> {
             RuleStore::Dir { db_dir } => {
                 Self::ensure_dir(db_dir)?;
                 let path = Self::rule_file(db_dir, name);
+                #[cfg(test)]
+                crash::point();
                 let mut f = match fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -292,6 +306,8 @@ impl<'a> RuleStore<'a> {
             }
             RuleStore::Dir { db_dir } => {
                 Self::ensure_dir(db_dir)?;
+                #[cfg(test)]
+                crash::point();
                 fsutil::atomic_write(&Self::rule_file(db_dir, name), text.as_bytes())?;
                 Ok(())
             }
@@ -299,6 +315,10 @@ impl<'a> RuleStore<'a> {
     }
 
     /// Remove rule `name` (and its ledger). `Ok(false)` when it did not exist.
+    /// The rule file goes first: a rule file is never left without its
+    /// ledger (which would make it an upstream rule, see
+    /// [`super::manage`]); a ledger left without its rule file is ignored,
+    /// and replaced when a rule of the name is added.
     pub fn remove(&mut self, name: &str) -> StoreResult<bool> {
         match self {
             RuleStore::Memory(m) => {
@@ -306,16 +326,21 @@ impl<'a> RuleStore<'a> {
                 Ok(m.rules.remove(name).is_some())
             }
             RuleStore::Dir { db_dir } => {
-                fsutil::remove_file_if_exists(&Self::ledger_file(db_dir, name))?;
                 let path = Self::rule_file(db_dir, name);
-                match fs::remove_file(&path) {
+                #[cfg(test)]
+                crash::point();
+                let existed = match fs::remove_file(&path) {
                     Ok(()) => {
                         fsutil::sync_dir(&Self::rule_dir(db_dir))?;
-                        Ok(true)
+                        true
                     }
-                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-                    Err(e) => Err(e.into()),
-                }
+                    Err(e) if e.kind() == ErrorKind::NotFound => false,
+                    Err(e) => return Err(e.into()),
+                };
+                #[cfg(test)]
+                crash::point();
+                fsutil::remove_file_if_exists(&Self::ledger_file(db_dir, name))?;
+                Ok(existed)
             }
         }
     }
@@ -356,6 +381,8 @@ impl<'a> RuleStore<'a> {
             }
             RuleStore::Dir { db_dir } => {
                 let path = Self::ledger_file(db_dir, name);
+                #[cfg(test)]
+                crash::point();
                 let Some(lines) = ledger else {
                     fsutil::remove_file_if_exists(&path)?;
                     return Ok(());
@@ -438,18 +465,25 @@ pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> 
     fsutil::sync_dir(dst_db_dir)
 }
 
-/// Copy the regular files of `src` (and of its sub-directories) into `dst`.
+/// Copy the regular files of `src` (and of its sub-directories) into `dst`:
+/// the files first, then the sub-directories — so a rule file another
+/// process adds meanwhile (its ledger is written first) is never copied
+/// without its ledger.
 fn copy_tree(src: &Path, dst: &Path) -> crate::Result<()> {
     fs::create_dir_all(dst)?;
+    let mut dirs = Vec::new();
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_tree(&entry.path(), &to)?;
+            dirs.push((entry.path(), to));
         } else if ty.is_file() {
             fs::copy(entry.path(), &to)?;
         }
+    }
+    for (from, to) in dirs {
+        copy_tree(&from, &to)?;
     }
     fsutil::sync_dir(dst)
 }
@@ -501,4 +535,36 @@ pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<(
         )?;
     }
     Ok(())
+}
+
+/// A simulated crash for tests: [`arm`](crash::arm)`(n)` makes the `n`-th
+/// next change a directory store makes on disk (0: the next one) panic
+/// before it happens, on this thread.
+#[cfg(test)]
+pub(crate) mod crash {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn arm(n: usize) {
+        AT.with(|a| a.set(Some(n)));
+    }
+
+    pub(crate) fn disarm() {
+        AT.with(|a| a.set(None));
+    }
+
+    /// Before a change on disk: the simulated crash, when it is due.
+    pub(crate) fn point() {
+        AT.with(|a| match a.get() {
+            Some(0) => {
+                a.set(None);
+                panic!("simulated crash");
+            }
+            Some(n) => a.set(Some(n - 1)),
+            None => {}
+        });
+    }
 }

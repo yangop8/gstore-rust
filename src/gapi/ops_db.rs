@@ -1421,8 +1421,13 @@ fn rename(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(l) => l,
         Err(e) => return failed(format!("Rename fail: {e}")),
     };
-    if let Err(e) = fs::rename(&from, &to) {
-        return failed(format!("Rename fail: {e}"));
+    {
+        // As in drop: no `reasonManage` file operation is half-way through
+        // the rule directory moved.
+        let _rules = RuleStore::dir(&from).lock();
+        if let Err(e) = fs::rename(&from, &to) {
+            return failed(format!("Rename fail: {e}"));
+        }
     }
     drop(lock);
     let mut st = ctx.state();

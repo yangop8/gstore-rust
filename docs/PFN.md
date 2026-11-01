@@ -462,7 +462,7 @@ extensions) and applied to every served database like the `[query]` keys
 |-----|---------|---------|
 | `pfn_fuel_per_call` | `1000000000` | the most WebAssembly instructions one call may run (`0` = unlimited); past it: `run f fail: the instruction budget … is exhausted` |
 | `pfn_max_memory_pages` | `1024` (64 MiB) | the most 64 KiB pages the memory may grow to; `memory.grow` past it returns `-1`, as WebAssembly specifies |
-| `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts — also `funBody` and `funSubs` together as sent (URL-decoded, whitespace included); `funDesc` may have at most 64 KiB, and `funSubs` must be empty next to a complete module, when the function is created or updated |
+| `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts — also `funBody` and `funSubs` together as sent (URL-decoded, whitespace included), and at most 3 × this as stored in `data.json` (JSON-escaped: a control character takes 6 bytes); `funDesc` may have at most 64 KiB, also as stored, and `funSubs` must be empty next to a complete module, when the function is created or updated |
 | `pfn_max_functions` | `100` | the most functions one user may own |
 | `[query] gfun_max_output_bytes` | `67108864` | the most bytes one call may emit (and the most a call's result array may hold) |
 
@@ -504,7 +504,11 @@ lib/<user>/lib<name lower-cased><md5(lastTime)>.wasm   the compiled module
 
 Upstream keeps its C++ sources under `cpp/`; the WebAssembly sources are
 under `src/` so the two never mix (an upstream `pfn/` directory is not
-usable as is: its bodies are C++).
+usable as is: its bodies are C++). `data.json` is the record: a source or
+module file it does not name is ignored (replaced when a function of the
+name is created), so a write that failed half-way or a crash never blocks a
+name; a compilation removes the previous module only once `data.json`
+names the new one.
 
 The functions belong to users, not to databases: a database backup
 (`backup`, `gbackup`, zipped or not) does not hold them. Back up
