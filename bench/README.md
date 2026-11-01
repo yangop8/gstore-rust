@@ -193,18 +193,25 @@ CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore -p gstore-bench --
     --features gstore/rocksdb,gstore-bench/rocksdb
 export GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache
 for s in 8 38; do
-  target/release/gstore-bench run --profile reference --scale $s --backends snapshot,disk \
-      --out target/gstore-bench/ref$s-sd.json
-  target-rocks/release/gstore-bench run --profile reference --scale $s --backends rocksdb \
-      --bin-dir target-rocks/release --out target/gstore-bench/ref$s-r.json
+  flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale $s \
+      --backends snapshot,disk --drop-caches --verify-data --out target/gstore-bench/ref$s-sd.json
+  flock /tmp/gstore-bench.lock target-rocks/release/gstore-bench run --profile reference --scale $s \
+      --backends rocksdb --bin-dir target-rocks/release --drop-caches --verify-data \
+      --out target/gstore-bench/ref$s-r.json
   target/release/gstore-bench merge --out bench/results/pre-phase6-lubm$s.json \
       target/gstore-bench/ref$s-sd.json target/gstore-bench/ref$s-r.json
 done
 ```
 
+On the 4-vCPU reference VM the pre-Phase-6 recording took about 7.5 min
+(snapshot + disk) and 4.5 min (RocksDB) at univ 8, and 39 min (the disk
+build alone 27 min) and 24 min (RocksDB: 9 opens of about 60 s, each in a
+fresh process, plus 5 query processes) at univ 38. Run the long ones in the
+background and nothing else meanwhile.
+
 ## Tests
 
-`cargo test -p gstore-bench` (about 15 s in a debug build): golden values of
+`cargo test -p gstore-bench` (about 10 s in a debug build, after compiling): golden values of
 the generator stream, the hashes and the univ-1 data; all 14 queries
 non-empty at univ 1 and the micro row counts; the chunk's disjointness; the
 gates on synthetic results; and the binary end to end with the `micro`

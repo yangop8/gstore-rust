@@ -59,8 +59,11 @@
   `--self-test-slowdown X` canary. Profiles `micro` (tests), `smoke` (CI:
   univ 1, snapshot + disk) and `reference` (univ 8/38, every compiled
   backend, reps 5, 1 and 8 clients).
-- **Baseline:** `bench/baselines/smoke.json`, blessed **provisional** (recorded
-  on a busy shared machine; the measure stage re-blesses it).
+- **Baseline and reference:** `bench/baselines/smoke.json` (the CI gate's
+  baseline) and `bench/results/pre-phase6-lubm8.json` /
+  `pre-phase6-lubm38.json` (snapshot, disk and RocksDB on the pre-Phase-6
+  code; every Phase 6 ratio is taken against them), all recorded by the
+  quiet measure stage on the idle reference VM.
 - **CI:** new `.github/workflows/bench.yml` — `smoke` (release build,
   `gstore-bench ci` into `$GITHUB_STEP_SUMMARY`, the 3× canary must exit 1,
   results and logs uploaded), `rocksdb-correctness` (`cargo test -p
@@ -78,7 +81,7 @@
 
 阶段 6:进行中 — R1-BENCH:基准工具 gstore-bench(LUBM-like 生成器、各布局的
 build/open/query/update/并发阶段、闸门与 CI 冒烟)已就绪;pre-Phase-6 参考结果
-`bench/results/pre-phase6-lubm{8,38}.json` 由安静测量阶段记录。
+`bench/results/pre-phase6-lubm{8,38}.json`(snapshot/disk/RocksDB)已在空闲的参考机上记录。
 
 ## Docs notes
 
@@ -104,125 +107,230 @@ build/open/query/update/并发阶段、闸门与 CI 冒烟)已就绪;pre-Phase-6
 
 ## Measured numbers
 
-Implementer run, noisy (other agents compiling): a shared 4-vCPU / 16 GB VM
-(`Intel Xeon @ 2.10GHz`), load average 1.2–2.3 during the runs, every heavy
-run under `flock /tmp/gstore-bench.lock`. Release builds. Nothing at univ 38
-was run here (left to the measure stage).
+### Quiet measure stage — the pre-Phase-6 reference
 
-**Generator** (`gstore-bench gen`, release, writing to /tmp):
+Recorded on the reference VM (4 vCPU `Intel Xeon @ 2.10GHz`, 16 GB, Linux),
+idle apart from this stage (load average about 1, the measured process
+itself); every heavy command under `flock /tmp/gstore-bench.lock`, nothing
+built while measuring. Commit `e859f7e` = base `90b92d6` + this harness:
+the gstore code is the pre-Phase-6 base (one `#[rustfmt::skip]` apart).
+Release builds; snapshot and disk from the default build, RocksDB from the
+`--features rocksdb` build in `target-rocks`; `run --profile reference
+--drop-caches --verify-data` (first open cold, cached data re-hashed),
+joined with `merge` (cross-backend self-check passes; each file passes
+`compare` against itself, 281 gates). Reference profile: reps 5 in each of
+5 query processes, 3 warm opens, 100 single updates, 1 and 8 clients × 5 s.
+Wall time: univ 8 7.7 min (snapshot + disk) + 4.4 min (RocksDB); univ 38
+39.4 min (disk build 27.1 min) + 23.7 min (RocksDB).
 
-| scale | lines | unique triples | target ±5% | rate |
-|---|---|---|---|---|
-| univ 1 | 143,930 | 139,905 | 143K (−2.4%) | 1.67M lines/s |
-| univ 8 | 1,064,650 | 1,029,275 | 1.05M (−2.0%) | 1.64M lines/s |
-| univ 38 | 5,363,690 | 5,181,103 | 5.19M (−0.2%) | 1.90M lines/s |
+**Generator** (`gstore-bench gen --scale N --out /tmp/…`, release):
 
-All 14 queries are non-empty at univ 1, at the micro size (1 department)
-and at univ 8. Row counts at univ 8: Q1 3, Q2 25, Q3 10, Q4 9, Q5 576,
-Q6 80,056, Q7 23, Q8 10,778, Q9 1,081, Q10 3, Q11 325, Q12 21, Q13 85,670,
-Q14 60,576 (prototype data: 8/28/9/10/481/82,111/34/11,137/1,050/8/333/21/
-87,795/62,096).
+| scale | lines | unique triples | target ±5% | data fnv64 | time | rate (lines / unique triples per s) |
+|---|---:|---:|---|---|---:|---:|
+| univ 1 | 143,930 | 139,905 | 143K (−2.2%) | `b45d2e4d786f1a33` (golden) | 0.063 s | 2.28M / 2.22M |
+| univ 8 | 1,064,650 | 1,029,275 | 1.05M (−2.0%) | `ed44da2e7b3bbb98` | 0.494 s | 2.15M / 2.08M |
+| univ 38 | 5,363,690 | 5,181,103 | 5.19M (−0.2%) | `fcd6493725f3c66a` | 2.518 s | 2.13M / 2.06M |
 
-**Smoke profile, univ 1** (`gstore-bench run --profile smoke`, whole run
-54 s): snapshot build 1.48 s, gbuild peak RSS 41.6 MiB, 11.8 MB; open
-26.5 ms first / 29.0 ms warm; disk build 28.6 s, 77.7 MiB, 24.0 MB; open
-113 / 108 ms; every query equal on both layouts; update round trip ok
-(single insert median 0.11 ms snapshot, 1.67 ms disk). `gstore-bench ci`
-against the provisional baseline right after: PASS (193 gates; snapshot
-query geomean 1.27, disk 0.97 — machine noise). The real smoke baseline
-gated against itself: `check --from <baseline> --self-test-slowdown 1.3`
-exits 0, `1.6` exits 1, `3` (the canary) exits 1.
+The cached univ 1/8 files in `/tmp/gstore-bench-cache` matched their
+sidecars and these hashes (`--verify-data`); univ 38 was generated there by
+the first univ 38 run (3.5 s) with the same hash. Every query is non-empty
+at univ 1 (smoke: snapshot, disk), 8 and 38 (snapshot, disk, RocksDB), with
+identical rows and row hashes on every layout.
 
-**univ 8, snapshot, A/B in one session** (`run --profile reference --scale 8
---backends snapshot`, ~72 s per run): *base* = 90b92d6 with this harness
-copied in and built in a throwaway worktree; *branch* = this branch (same
-gstore code apart from a `#[rustfmt::skip]`).
+**Reference results** (`bench/results/pre-phase6-lubm{8,38}.json`; query
+times are warm medians, the minimum over the 5 query processes):
 
-| | base | branch |
-|---|---|---|
-| build (gbuild) | 14.27 s, 154.2 MiB peak | 14.30 s, 154.3 MiB peak |
-| database bytes (then with the parse log) | 85,480,278 | 85,480,278 (identical) |
-| open first / warm | 215.6 / 221.7 ms | 233.0 / 223.6 ms |
-| RSS after open / query HWM | 126.7 / 152.0 MiB | 126.7 / 152.5 MiB |
-| Q1–Q14 geomean ratio branch/base | — | 1.071 (all 14); 1.00 (the 10 of ≥ 1 ms, the gate's set) |
-| checkpoint after the update phase | 10.2 s | 8.2 s (VS-tree rebuilt after deletes) |
-| Q4 qps 1 → 8 clients, /sparql | 91.8 → 80.7 (0.88×) | 87.6 → 80.6 (0.92×) |
-| Q4 qps 1 → 8 clients, /api | 64.4 → 60.5 | 91.4 → 80.6 |
+**univ 8** (`pre-phase6-lubm8.json`, commit `e859f7e`, calibration 67.4 ms):
 
-| query | base median ms | branch median ms | prototype (ad-hoc) ms | base vs prototype |
-|---|---|---|---|---|
-| Q2 | 7.86 | 7.98 | 9.6 | −18% |
-| Q4 | 9.78 | 10.29 | 10.7 | −9% |
-| Q5 | 33.41 | 37.91 | 45.5 | −27% |
-| Q6 | 29.60 | 30.89 | 31.5 | −6% |
-| Q7 | 49.20 | 52.70 | 55.7 | −12% |
-| Q8 | 53.69 | 55.83 | 54.3 | −1% |
-| Q9 | 68.87 | 82.38 | 77.0 | −11% |
-| Q10 | 37.47 | 40.19 | 43.2 | −13% |
-| Q13 | 33.81 | 41.36 | 35.6 | −5% |
-| Q14 | 30.33 | 28.30 | 26.6 | +14% |
+| backend | build s | gbuild peak MiB | database bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| snapshot | 15.32 | 154.2 | 85,480,180 | 336 / 292 | 125.8 | 152.5 | 7.91 |
+| disk | 263.74 | 164.7 | 175,005,702 | 2240 / 1447 | 129.7 | 167.5 | 18.99 |
+| rocksdb | 53.93 | 285.5 | 41,162,410 | 9959 / 9989 | 145.8 | 184.9 | 43.27 |
 
-(Q1 0.29/0.31, Q3 0.44/0.47, Q11 0.38/0.39, Q12 0.17/0.18 ms.)
+| query | rows | snapshot ms | disk ms | rocksdb ms |
+|---|---:|---:|---:|---:|
+| Q1 | 3 | 0.31 | 0.42 | 9.47 |
+| Q2 | 25 | 8.04 | 38.4 | 87.1 |
+| Q3 | 10 | 0.44 | 0.48 | 29.3 |
+| Q4 | 9 | 9.50 | 9.73 | 123.3 |
+| Q5 | 576 | 37.3 | 115.5 | 69.9 |
+| Q6 | 80,056 | 31.0 | 97.3 | 68.2 |
+| Q7 | 23 | 54.0 | 216.5 | 131.8 |
+| Q8 | 10,778 | 51.0 | 164.9 | 162.1 |
+| Q9 | 1,081 | 70.4 | 266.3 | 241.4 |
+| Q10 | 3 | 36.1 | 114.0 | 69.6 |
+| Q11 | 325 | 0.39 | 0.54 | 2.71 |
+| Q12 | 21 | 0.16 | 0.15 | 1.52 |
+| Q13 | 85,670 | 35.2 | 172.1 | 76.8 |
+| Q14 | 60,576 | 21.1 | 60.2 | 50.0 |
 
-**Whole pipeline at univ 1, every layout** (`run --profile reference
---scale 1`): snapshot and disk from the default release build (121 s),
-rocksdb from the `--features rocksdb` build in `target-rocks` with
-`--drop-caches` (61 s), joined by `merge` (the merged self-check — rows equal
-on all three layouts, update round trips, identical concurrent bodies —
-passes), `report --markdown`, `compare` against itself exit 0.
+| backend | single INSERT median ms | chunk insert / delete ms | checkpoint ms | reopen ms | Q4 qps /sparql 1 → 8 clients | Q4 qps /api 1 → 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| snapshot | 0.86 | 29 / 26 | 8436 | 187 | 81.0 → 76.3 | 85.6 → 76.5 |
+| disk | 1.74 | 1679 / 1419 | 0 | 10006 | 84.9 → 79.3 | 85.9 → 76.4 |
+| rocksdb | 1.54 | 172 / 107 | 22 | 10121 | 7.2 → 6.3 | 7.4 → 6.7 |
 
-| | build | peak RSS | bytes | open first / warm | RSS after open |
-|---|---|---|---|---|---|
-| snapshot | 1.55 s | 41.4 MiB | 11,822,479 | 27 / 26 ms | 23.3 MiB |
-| disk | 30.57 s | 77.6 MiB | 24,006,662 | 155 / 107 ms | 30.5 MiB |
-| rocksdb | 6.05 s | 90.6 MiB | 6,286,368 | 1171 (cold) / 1172 ms | 32.7 MiB |
+**univ 38** (`pre-phase6-lubm38.json`, commit `e859f7e`, calibration 62.6 ms):
 
-Row counts at univ 1 (all layouts): 3, 4, 10, 9, 576, 10,778, 23, 10,778,
-157, 3, 325, 21, 11,540, 8,049.
+| backend | build s | gbuild peak MiB | database bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| snapshot | 76.82 | 741.0 | 430,848,180 | 1588 / 1465 | 596.4 | 710.3 | 46.65 |
+| disk | 1627.59 | 738.1 | 889,778,182 | 12387 / 7673 | 544.0 | 740.6 | 146.92 |
+| rocksdb | 277.76 | 634.2 | 206,253,032 | 60811 / 59389 | 522.0 | 663.3 | 311.50 |
 
-**Provisional smoke baseline** (`bench/baselines/smoke.json`): blessed from a
-final `run --profile smoke` of this branch (load 0.9–2.5); snapshot build
-1.60 s, disk build 29.9 s. The earlier `ci` result passes against it
-(geomean 1.01 snapshot, 0.81 disk); the canary on it exits 1.
+| query | rows | snapshot ms | disk ms | rocksdb ms |
+|---|---:|---:|---:|---:|
+| Q1 | 3 | 1.30 | 39.1 | 60.7 |
+| Q2 | 115 | 50.8 | 189.7 | 729.5 |
+| Q3 | 10 | 2.19 | 39.2 | 195.5 |
+| Q4 | 9 | 53.6 | 75.2 | 990.0 |
+| Q5 | 576 | 333.2 | 621.3 | 537.7 |
+| Q6 | 404,399 | 187.6 | 511.4 | 468.3 |
+| Q7 | 23 | 403.0 | 1147.7 | 977.6 |
+| Q8 | 10,778 | 363.5 | 871.8 | 904.9 |
+| Q9 | 5,507 | 529.3 | 1450.6 | 2125.9 |
+| Q10 | 3 | 326.6 | 697.1 | 594.9 |
+| Q11 | 325 | 1.09 | 1.49 | 16.8 |
+| Q12 | 21 | 0.59 | 0.72 | 10.2 |
+| Q13 | 432,512 | 223.9 | 906.1 | 511.9 |
+| Q14 | 305,503 | 132.1 | 320.3 | 382.7 |
 
-**Tests:** `cargo test -p gstore-bench`: 42 tests (18 unit, 8 golden, 10
-gates, 6 end to end of which 1 is `#[ignore]`d), ~9 s of test time in a
-debug build plus compilation. With `--features rocksdb` (release,
-`target-rocks`, gbuild built with RocksDB) all 42 pass, the ignored one
-included. Workspace: `cargo build --workspace --all-targets`, `cargo clippy
---workspace --all-targets -- -D warnings` clean, `cargo test --workspace`
-2001 passed, 0 failed.
+| backend | single INSERT median ms | chunk insert / delete ms | checkpoint ms | reopen ms | Q4 qps /sparql 1 → 8 clients | Q4 qps /api 1 → 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| snapshot | 5.04 | 49 / 45 | 46004 | 1122 | 17.1 → 13.4 | 17.8 → 15.4 |
+| disk | 2.33 | 4830 / 5024 | 0 | 51873 | 12.6 → 11.7 | 11.6 → 11.5 |
+| rocksdb | 4.35 | 186 / 149 | 39 | 55702 | 1.2 → 1.2 | 1.2 → 1.2 |
 
-**Acceptance (R1-BENCH), as of this branch:**
-- sizes univ 1/8/38 within ±5% — met (−2.4/−2.0/−0.2%); all 14 queries
-  non-empty — met at univ 1 and 8 (univ 38 by the measure stage);
-  generation ≥ 1M triples/s — met (1.6–1.9M);
-- fidelity, snapshot univ 8 — met on this noisy run (−27% … +16%; base
-  and branch); RocksDB open and disk Q5/Q9/Q13 at univ 8 — measure stage;
-- repeatability — noisy here (1.071 over all 14 queries, 1.00 over the ten
-  ≥ 1 ms queries; byte counts identical) — measure stage on an idle
-  machine;
-- gates (1.3× passes, 1.6× fails, a ≥ 20 ms query ×4 fails, a row-hash
-  change fails without retry, canary exits 1) — met (`tests/gates.rs`, and
-  on the real smoke baseline);
-- CI smoke ≤ 15 min warm — expected (release build of gstore + harness
-  ≈ 3–4 min, smoke run ≈ 1 min) but not observed on GitHub from here;
-- `pre-phase6-lubm{8,38}.json` committed — left to the measure stage (by
-  instruction); default `cargo test -p gstore-bench` ≤ 60 s — met (~9 s of
-  test time).
+Against the plan's §0 numbers (eaf5320, Python data, 5.19M): snapshot
+build 76.8 vs 67.8 s, 431 vs 432 MB, open 1.59 / 1.46 vs 1.53 / 1.36 s,
+RSS after open 596 vs 596 MiB; disk build 1628 vs 1522 s, 890 vs 891 MB,
+open 12.4 / 7.7 vs 11.7 / 7.7 s, RSS 544 vs 544 MiB; RocksDB build 278 vs
+199 s, 206 vs 206 MB, open 60.8 / 59.4 vs 57.1 / 53.2 s; Q1/Q4/Q9/Q14
+snapshot 1.3/53.6/529/132 vs 2.8/80.6/495/125 ms, disk 39/75/1451/320 vs
+49/71/1544/382, RocksDB 61/990/2126/383 vs 61/1031/2153/356. **gbuild's
+peak RSS is no longer 6.77 GiB**: 741 (snapshot) / 738 (disk) / 634
+(RocksDB) MiB at univ 38, because this base already has the phase 5
+streaming import — G1a's "pre" peak is therefore 738 MiB, not 6.77 GiB.
+Q4 univ 38 / univ 8 on snapshot: 53.6 / 9.50 = 5.6× (plan §0: 7.5×).
+Read scaling at univ 8, Q4 8 vs 1 clients: snapshot 0.94× (/sparql) and
+0.89× (/api), disk 0.93× / 0.89×.
+
+**Fidelity against the ad-hoc baseline** (univ 8; the Rust generator's data
+is not the Python prototype's, e.g. Q5 576 vs 481 rows, Q2 25 vs 28):
+
+| query | ad-hoc ms | reference (min of 5 processes) | Δ | median of the 5 process medians | Δ |
+|---|---:|---:|---:|---:|---:|
+| snapshot Q2 | 9.6 | 8.04 | −16% | 8.77 | −9% |
+| snapshot Q4 | 10.7 | 9.50 | −11% | 9.72 | −9% |
+| snapshot Q5 | 45.5 | 37.3 | −18% | 39.9 | −12% |
+| snapshot Q6 | 31.5 | 31.0 | −2% | 33.6 | +7% |
+| snapshot Q7 | 55.7 | 54.0 | −3% | 75.4 | +35% |
+| snapshot Q8 | 54.3 | 51.0 | −6% | 53.0 | −2% |
+| snapshot Q9 | 77.0 | 70.4 | −9% | 75.6 | −2% |
+| snapshot Q10 | 43.2 | 36.1 | −16% | 40.8 | −6% |
+| snapshot Q13 | 35.6 | 35.2 | −1% | 37.3 | +5% |
+| snapshot Q14 | 26.6 | 21.1 | −21% | 21.8 | −18% |
+| disk Q5 | 139 | 115.5 | −17% | 118.3 | −15% |
+| disk Q9 | 337 | 266.3 | −21% | 269.8 | −20% |
+| disk Q13 | 207 | 172.1 | −17% | 175.6 | −15% |
+| RocksDB open (univ 8) | 9.7 s | 9.96 s first (cold) / 9.99 s warm | +3% / +3% | | |
+
+All within ±30% on the reference figures. (Single-process figures from the
+first, pre-fix runs: disk Q5/Q9/Q13 110–113 / 266–282 / 166–183 ms,
+RocksDB open 9.61 s cold / 9.10 s warm.)
+
+**Repeatability, and a tool fix.** The harness as delivered ran the whole
+query phase in one process. Four univ 8 snapshot runs with it gave
+geomean ratios between pairs of them (the ten ≥ 1 ms queries) of 0.80,
+0.91, 0.92 and 0.99 (all 14: 0.81–0.93) — outside [0.93, 1.07]. Cause: each process of
+the pre-Phase-6 engine draws its own hash seeds and heap layout, and some
+queries are up to ~1.5× slower in one process than in the next while
+varying by a few percent within one. Fourteen fresh query processes on one
+univ 8 snapshot database (ASLR on or off alike): Q2 8.3–12.5 ms, Q4
+9.8–15.8, Q7 52–80, Q9 73–109, Q13 34–53; the per-process geomean of the
+ten ≥ 1 ms queries 31.4–40.9 ms. Fix (`e859f7e`): the query phase runs in
+`query_procs` fresh processes (reference 5, smoke 3, micro 2;
+`--query-procs N`) and keeps per query the minimum of the per-process
+medians (each process's median is kept in `proc_medians_ms`). With it, two
+univ 8 snapshot runs: **geomean 1.011** (the ten ≥ 1 ms queries; 1.013 over
+all 14; per query 0.94–1.12). Byte counts are identical across runs:
+snapshot 85,480,180 in all seven univ 8 builds, disk 175,005,702 in all
+three univ 8 builds, univ 1 11,822,479 / 24,006,662 in all four smoke runs.
+(R1-CORE's deterministic join hasher may narrow the per-process spread;
+the minimum over processes is robust either way.)
+
+**Gates on real files:**
+- `compare pre-phase6-lubm8.json` against itself: ×1 and ×1.3 exit 0
+  (281 gates); ×1.6 exits 1 (the three geomean gates, 1.60 > 1.50); ×3
+  exits 1.
+- The same file with snapshot Q9 (70.4 ms) ×4: exit 1, `time.query`
+  ratio 3.92 > 3.0 (the only failure).
+- The same file with one changed row hash (snapshot Q5): exit 1, exact
+  failures (`exact.rows`, `exact.cross_backend` ×2).
+- A live `check` against the smoke baseline with that Q5 hash changed:
+  exit 1, exact failure, **no retry** (no phase re-run).
+- New smoke baseline: `check --from` it with `--self-test-slowdown 1.3`
+  exits 0, `1.6` exits 1, `3` (the canary) exits 1; the same on the `ci`
+  result.
+- `tests/gates.rs` covers the same cases on synthetic results.
+
+**Smoke baseline** (`bench/baselines/smoke.json`, no longer provisional):
+blessed from a `run --profile smoke` on the idle VM (whole run 62 s):
+snapshot build 1.65 s, 11,822,479 bytes, open 27.8 / 26.8 ms; disk build
+32.3 s, 24,006,662 bytes, open 105.5 / 131.9 ms; every query equal on both
+layouts, update round trip ok. (The run before it had disk warm opens of
+149/228/215 ms; ten more fresh-process opens of a smoke disk database took
+107–151 ms, median 112, so the second run was blessed.) `gstore-bench ci`
+right after: **PASS, 193 gates** (geomean ratio snapshot 1.04, disk 0.89),
+62.7 s.
+
+**CI smoke duration:** not observed on GitHub (nothing pushed). Locally:
+release build of gbuild + gstore-bench from an empty target directory
+83 s, `gstore-bench ci` 63 s, canary < 1 s — well under 15 min.
+
+**Tests** (after `e859f7e`): `cargo test -p gstore-bench`: 44 tests (20 unit,
+8 golden, 10 gates, 6 end to end of which 1 `#[ignore]`d), 8.5 s of test
+time in a debug build after compiling; `cargo test --release -p
+gstore-bench --features rocksdb -- --include-ignored`: all 44 pass;
+`cargo clippy -p gstore-bench --all-targets -- -D warnings` and `cargo fmt
+-p gstore-bench -- --check` clean. (Only `bench/**` changed after the
+implementer's workspace-wide verification.)
+
+**Acceptance (R1-BENCH):**
+- sizes univ 1/8/38 within ±5% — **met** (−2.2/−2.0/−0.2%); all 14 queries
+  non-empty at every scale — **met** (univ 1, 8, 38, every layout);
+  generation ≥ 1M triples/s — **met** (2.06–2.22M unique triples/s);
+- fidelity — **met**: snapshot Q2/Q4–Q10/Q13/Q14 −21% … −1%; RocksDB open
+  9.96 s (+3%); disk Q5/Q9/Q13 −17/−21/−17%;
+- repeatability — **met** after the multi-process fix (geomean 1.011;
+  bytes identical); **not met** by the single-process harness (0.80–0.99);
+- gates — **met** (1.3× passes, 1.6× fails, a ≥ 20 ms query ×4 fails, a
+  row-hash change fails without retry, canary exits 1);
+- CI smoke ≤ 15 min warm — expected (≈ 2.5 min locally), not observed on
+  GitHub;
+- `pre-phase6-lubm8.json` and `pre-phase6-lubm38.json` committed — **met**;
+  default `cargo test -p gstore-bench` ≤ 60 s — **met** (8.5 s).
+
+### Implementer run (noisy machine; superseded by the tables above)
+
+Other agents were compiling (load 1.2–2.3). Univ 8 snapshot A/B of the
+base `90b92d6` (harness copied in) against this branch: build 14.27 vs
+14.30 s, identical database bytes, open and memory equal, query geomean
+1.00 over the ten ≥ 1 ms queries — the branch's gstore code performs as the
+base. Univ 1, every layout (`run --profile reference --scale 1`): build
+1.55 / 30.57 / 6.05 s, 11,822,479 / 24,006,662 / 6,286,368 bytes, open
+27 / 155 / 1171 (cold) ms for snapshot / disk / RocksDB; row counts 3, 4,
+10, 9, 576, 10,778, 23, 10,778, 157, 3, 325, 21, 11,540, 8,049 on all
+layouts. Its provisional smoke baseline is replaced by the one above.
 
 ## Requests/Not yet
 
-- **Measure stage (not done here, by instruction):** record
-  `bench/results/pre-phase6-lubm8.json` and `pre-phase6-lubm38.json`
-  (snapshot, disk from the default build; rocksdb from the `--features
-  rocksdb` build; joined with `gstore-bench merge`), re-bless
-  `bench/baselines/smoke.json` on an idle machine (drops `provisional`), and
-  check fidelity (snapshot Q2/Q4–Q10/Q13/Q14 within ±30% of the ad-hoc
-  numbers, RocksDB open at univ 8 9.7 s ± 30%, disk Q5/Q9/Q13 within ±30% of
-  139/337/207 ms), repeatability (two univ 8 snapshot runs, geomean in
-  [0.93, 1.07]; identical byte counts) and the CI smoke duration. The exact
-  commands are in `bench/README.md` ("Recording a reference").
+- **Every later round (measuring against the pre-Phase-6 JSON):** keep the
+  reference profile's 5 query processes (`--query-procs` ≥ 3 at least) —
+  a single query process moves the pre-Phase-6 query geomean by about ±10%
+  — and note that G1a's "pre" gbuild peak RSS is 738 MiB (disk, univ 38),
+  not the 6.77 GiB of the plan's §0 (the base already streams its import).
 - **Integrator:** the new `fmt` job fails until the planned one-time
   `cargo fmt --all` commit (and `.git-blame-ignore-revs` with its SHA) lands
   after the R1 merge.
