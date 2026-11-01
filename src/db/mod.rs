@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
+use crate::kvstore::StringIndex;
 use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
 use crate::model::term::export_key;
 use crate::model::{IdTriple, Term, Triple};
@@ -33,6 +34,7 @@ use crate::parser::sparql;
 use crate::parser::sparql::ast::{
     GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
 };
+use crate::query::engine::dictionary_string_index;
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::ReadScope;
@@ -316,6 +318,12 @@ pub struct Database {
     /// by [`mutations`](Self::mutations) so any data change invalidates it
     /// (see [`csr`](Self::csr)).
     csr_cache: CsrCache,
+    /// The dictionary substring index the evaluator prunes `CONTAINS` /
+    /// `STRSTARTS` / `STRENDS` / plain `REGEX` candidates with, built on
+    /// first use and kept for the dictionary [`generation`](Dictionary::generation)
+    /// it was built from (see [`string_index`](Self::string_index)); a
+    /// change that adds or frees a term drops it. In-memory dictionaries only.
+    string_index: Mutex<Option<(u64, Arc<StringIndex>)>>,
     /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
     /// failed (e.g. interned by a reasoner run whose term write failed). The
     /// next insert that uses one writes it first, so no persisted triple ever
@@ -464,6 +472,7 @@ impl Database {
             mutations: 0,
             vs_shrink_debt: 0,
             csr_cache: CsrCache::new(),
+            string_index: Mutex::new(None),
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
             dir_lock: None,
@@ -536,6 +545,57 @@ impl Database {
         self.query_cache_mut().clear();
         self.csr_cache.clear();
         self.mutations += 1;
+        // The substring index covers the dictionary: keep it while the
+        // dictionary is unchanged, drop it as soon as a term came or went.
+        let generation = self.dict.generation();
+        let index = self
+            .string_index
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        if index.as_ref().is_some_and(|(g, _)| *g != generation) {
+            *index = None;
+        }
+    }
+
+    /// The dictionary substring index for the current dictionary (see
+    /// [`dictionary_string_index`]): built on first use and cached until a
+    /// term is added or freed, so a second query with a substring `FILTER`
+    /// does not rebuild it. `None` for an out-of-core or a small dictionary,
+    /// where substring filters run without the prefilter (still exact).
+    pub fn string_index(&self) -> Option<Arc<StringIndex>> {
+        if self.dict.is_disk_backed() {
+            return None;
+        }
+        let generation = self.dict.generation();
+        // Built under the lock: concurrent readers wait for one build
+        // instead of each building its own.
+        let mut slot = match self.string_index.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.string_index.clear_poison();
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if let Some((g, idx)) = slot.as_ref() {
+            if *g == generation {
+                return Some(Arc::clone(idx));
+            }
+        }
+        let idx = dictionary_string_index(&self.dict)?;
+        *slot = Some((generation, Arc::clone(&idx)));
+        Some(idx)
+    }
+
+    /// The cached substring index, if one is cached for the current
+    /// dictionary (never builds). For tests and monitoring.
+    pub fn cached_string_index(&self) -> Option<Arc<StringIndex>> {
+        let generation = self.dict.generation();
+        let slot = self.string_index.lock().ok()?;
+        slot.as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, idx)| Arc::clone(idx))
     }
 
     /// The query cache, through its lock. A lock poisoned by a panic is
@@ -1464,8 +1524,10 @@ impl Database {
             }
         }
         // The advanced graph functions run on this database's cached
-        // CSR (see `csr`), built only when a query needs it.
+        // CSR (see `csr`), built only when a query needs it; substring
+        // filters on its cached dictionary index (see `string_index`).
         let csr = || self.csr();
+        let string_index = || self.string_index();
         // Use the VS-tree as a candidate filter only while it is
         // consistent with the store; otherwise evaluate without it.
         let mut eval = if self.index_valid {
@@ -1493,6 +1555,7 @@ impl Database {
         eval = eval
             .with_service_allowed(self.load_policy.allow_remote)
             .with_csr_provider(&csr)
+            .with_string_index_provider(&string_index)
             .with_integer_division(self.integer_division)
             .with_topk_options(self.topk)
             .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
@@ -1970,9 +2033,11 @@ impl Database {
             return eval.eval_update_modify(delete, insert, pattern);
         }
         let csr = || self.csr();
+        let string_index = || self.string_index();
         let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
             .with_named(&self.named)
-            .with_csr_provider(&csr);
+            .with_csr_provider(&csr)
+            .with_string_index_provider(&string_index);
         eval.eval_update_modify(delete, insert, pattern)
     }
 

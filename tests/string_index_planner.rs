@@ -99,3 +99,46 @@ fn strstarts_on_subject_iri_is_correct() {
         11
     );
 }
+
+/// The database keeps the index for the dictionary generation it was built
+/// from (Phase 6 R2-DICT): it equals a per-query build, the next substring
+/// query reuses it, a write that leaves the dictionary unchanged keeps it and
+/// a write that adds a term drops it.
+#[test]
+fn the_index_is_cached_per_dictionary_generation() {
+    use gstore::query::engine::dictionary_string_index;
+    use std::sync::Arc;
+
+    let mut db = Database::build_from_str("t", &dataset()).unwrap();
+    db.set_query_cache_size(0);
+    assert!(db.cached_string_index().is_none(), "built lazily");
+    let q = "SELECT ?s WHERE { ?s <http://ex/label> ?o . FILTER(CONTAINS(STR(?o), \"MARKER\")) }";
+    assert_eq!(count(&mut db, q), 3);
+    let first = db.cached_string_index().expect("built by the first query");
+    let fresh = dictionary_string_index(db.dict()).unwrap();
+    assert_eq!(first.len(), fresh.len());
+    for needle in ["MARKER", "plain", "label 4", "http", "ex/n9", "zzz"] {
+        assert_eq!(
+            first.contains_candidates(needle),
+            fresh.contains_candidates(needle)
+        );
+        assert_eq!(first.search_contains(needle), fresh.search_contains(needle));
+        assert_eq!(first.prefix(needle), fresh.prefix(needle));
+    }
+    // The second identical query reuses it.
+    assert_eq!(count(&mut db, q), 3);
+    assert!(Arc::ptr_eq(&first, &db.cached_string_index().unwrap()));
+    // A write of existing terms keeps it ...
+    db.query("INSERT DATA { <http://ex/n1> <http://ex/label> \"MARKER item 42\" }")
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &db.cached_string_index().unwrap()));
+    assert_eq!(count(&mut db, q), 4);
+    // ... a write that adds a term drops it, and the rebuilt index sees it.
+    db.query("INSERT DATA { <http://ex/n5> <http://ex/label> \"MARKER fresh\" }")
+        .unwrap();
+    assert!(db.cached_string_index().is_none());
+    assert_eq!(count(&mut db, q), 5);
+    let second = db.cached_string_index().unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.len(), first.len() + 1);
+}
