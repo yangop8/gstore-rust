@@ -408,9 +408,13 @@ fn time_sources(
     let mut sums = vec![vec![0u64; METHODS.len()]; sources.len()];
     for rep in 0..=reps {
         for m in 0..METHODS.len() {
-            for (k, src) in sources.iter().enumerate() {
+            // Rotate which source goes first, so none always runs right
+            // after the previous method's (cache-disturbing) runs.
+            for j in 0..sources.len() {
+                let k = (j + rep + m) % sources.len();
+                let src = sources[k];
                 let t = Instant::now();
-                let sum = black_box(run_method(*src, smp, m));
+                let sum = black_box(run_method(src, smp, m));
                 let ns = t.elapsed().as_secs_f64() * 1e9 / n as f64;
                 sums[k][m] = sum;
                 if rep > 0 {
