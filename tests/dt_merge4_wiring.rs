@@ -6,7 +6,8 @@
 //! kept as `.bak` — while `export` writes data only, as upstream's;
 //! `reasonManage` and the PFN operations reach the `/api` access and query
 //! logs like every other operation, and a PFN query over REST the REST
-//! query log.
+//! query log; and rules over the blank nodes the import pipeline mints
+//! (per-load scopes) retract exactly, whatever is imported after them.
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
@@ -464,4 +465,178 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
             .iter()
             .all(|r| field(r, "sparql") != api_pfn));
     }
+}
+
+/// The `<Rule:next2>` triples of `db` (`?s ?o` pairs, N-Triples).
+fn rule_pairs(srv: &Server, db: &str) -> Vec<String> {
+    let j = srv.op(
+        "query",
+        &[
+            ("db_name", db),
+            ("sparql", "SELECT ?s ?o WHERE { ?s <Rule:next2> ?o }"),
+            ("format", "n-triple"),
+        ],
+    );
+    ok(&j);
+    let mut out: Vec<String> = j
+        .get("results")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .map(|row| row.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+fn count(srv: &Server, db: &str, pattern: &str) -> i64 {
+    let j = srv.query(db, &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} }}"));
+    ok(&j);
+    let cell = j
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(Json::as_array)
+        .and_then(|b| b.first().cloned())
+        .and_then(|b| b.get("n").and_then(|n| n.get("value")).cloned())
+        .unwrap_or_else(|| panic!("{j}"));
+    cell.as_str().unwrap().parse().unwrap()
+}
+
+/// The ledger lines of `next2` in served database `db`.
+fn ledger(srv: &Server, db: &str) -> Vec<String> {
+    let path = served_dir(srv, db).join("reason_rule_files/inferred/next2.nt");
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A chain through blank nodes, as Turtle: explicit labels (`_:b1`, stored
+/// under the load's scope as `<scope>_b1`) and anonymous `[ … ]` nodes
+/// (minted `<scope>-<n>`), plus one IRI.
+const BLANK_CHAIN: &str = "@prefix ex: <http://ex/> .\n\
+    _:b1 ex:p _:b2 .\n\
+    _:b2 ex:p [ ex:p ex:end ] .\n";
+
+/// Reasoning over the blank nodes the import pipeline mints — scoped per
+/// build, `batchInsert` and SPARQL `LOAD`, explicit labels and anonymous
+/// nodes alike — executes and retracts exactly: every ledger line parses
+/// back (N-Triples `parse_term`) to the stored triple, imports after the
+/// execution (the same document again: new blank nodes; asserted
+/// `<Rule:…>` triples over blank nodes) leave the ledger as it was, and
+/// disabling the rule removes exactly what it inferred.
+#[test]
+fn rules_over_imported_blank_nodes_retract_exactly() {
+    let data = scratch("m4_blank_data");
+    let _data = DirGuard(data.clone());
+    let srv = Server::start_with_dir("m4_blank", Some(&data));
+    let ttl = data.join("chain.ttl");
+    fs::write(&ttl, BLANK_CHAIN).unwrap();
+    ok(&srv.build("bnode", &ttl));
+    srv.load("bnode");
+    // The same document LOADed: its own scope, so three more blank nodes.
+    let load = format!("LOAD <file://{}>", path_str(&ttl));
+    ok(&srv.query("bnode", &load));
+    assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o"), 6);
+    assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o FILTER(isBlank(?s))"), 6);
+
+    ok(&srv.op(
+        "reasonManage",
+        &[("db_name", "bnode"), ("type", "1"), ("ruleinfo", NEXT2)],
+    ));
+    ok(&reason(&srv, "bnode", "3", "next2"));
+    let j = reason(&srv, "bnode", "4", "next2");
+    ok(&j);
+    // Per copy: b1 → [], b2 → ex:end.
+    assert_eq!(int(&j, "AnsNum"), 4);
+    let inferred = rule_pairs(&srv, "bnode");
+    assert_eq!(inferred.len(), 4);
+    let lines = ledger(&srv, "bnode");
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    for line in &lines {
+        let t = gstore::reason::manage::parse_ledger_line(line)
+            .unwrap_or_else(|| panic!("ledger line does not parse: {line}"));
+        assert!(t.subject.to_string().starts_with("_:"), "{line}");
+        assert_eq!(gstore::reason::manage::ledger_line(&t), *line);
+    }
+    // Labels as the importer minted them: a scoped explicit label and a
+    // scoped anonymous one.
+    assert!(lines.iter().any(|l| l.contains("_b1\t")), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.split('\t').nth(2).is_some_and(|o| o.starts_with("_:") && o.contains('-'))),
+        "{lines:?}"
+    );
+
+    // Imports after the execution: the document again (new blank nodes), and
+    // asserted <Rule:next2> triples over blank nodes and IRIs. None of them
+    // touches the ledger.
+    let before = fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
+    let asserted = data.join("asserted.ttl");
+    fs::write(
+        &asserted,
+        "@prefix ex: <http://ex/> .\n\
+         _:b1 <Rule:next2> ex:end .\n\
+         ex:x <Rule:next2> [ ex:p ex:y ] .\n",
+    )
+    .unwrap();
+    for file in [&ttl, &asserted] {
+        let j = srv.op(
+            "batchInsert",
+            &[("db_name", "bnode"), ("file", &path_str(file))],
+        );
+        ok(&j);
+    }
+    ok(&srv.query("bnode", &format!("LOAD <file://{}>", path_str(&asserted))));
+    let after = fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
+    assert_eq!(before, after, "imports do not touch the ledger");
+    // 4 inferred + 2 asserted twice (batchInsert, LOAD: new blank nodes).
+    assert_eq!(rule_pairs(&srv, "bnode").len(), 8);
+
+    // Disable: exactly the four inferred triples go.
+    let j = reason(&srv, "bnode", "5", "next2");
+    ok(&j);
+    assert_eq!(int(&j, "AnsNum"), 4);
+    let left = rule_pairs(&srv, "bnode");
+    assert_eq!(left.len(), 4, "{left:?}");
+    assert!(inferred.iter().all(|t| !left.contains(t)), "{inferred:?} vs {left:?}");
+    assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o"), 11);
+}
+
+/// A tolerant import of a file holding `<Rule:…>` predicates (next to
+/// statements it skips) asserts those triples: no rule owns them, so a rule
+/// that derives one of them neither counts it as inferred nor retracts it.
+#[test]
+fn imported_rule_predicates_are_asserted_triples_no_rule_owns() {
+    let data = scratch("m4_tolerant_data");
+    let _data = DirGuard(data.clone());
+    let srv = Server::start_with_dir("m4_tolerant", Some(&data));
+    let nt = data.join("with_rules.nt");
+    fs::write(
+        &nt,
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+         <http://ex/b> <http://ex/p> <http://ex/c> .\n\
+         this line is not N-Triples\n\
+         <http://ex/a> <Rule:next2> <http://ex/c> .\n\
+         <http://ex/q> <Rule:next2> <http://ex/r> .\n",
+    )
+    .unwrap();
+    let j = srv.build("tol", &nt);
+    ok(&j);
+    srv.load("tol");
+    assert_eq!(rule_pairs(&srv, "tol").len(), 2);
+    ok(&srv.op(
+        "reasonManage",
+        &[("db_name", "tol"), ("type", "1"), ("ruleinfo", NEXT2)],
+    ));
+    ok(&reason(&srv, "tol", "3", "next2"));
+    let j = reason(&srv, "tol", "4", "next2");
+    ok(&j);
+    // a → c was already there: nothing new, nothing owned.
+    assert_eq!(int(&j, "AnsNum"), 0);
+    assert!(ledger(&srv, "tol").is_empty());
+    let j = reason(&srv, "tol", "5", "next2");
+    ok(&j);
+    assert_eq!(int(&j, "AnsNum"), 0);
+    assert_eq!(rule_pairs(&srv, "tol").len(), 2);
 }

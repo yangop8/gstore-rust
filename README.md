@@ -497,7 +497,12 @@ infer survives until both are disabled. A triple a user inserts *after* the
 rule inferred it is the same RDF triple and is retracted with the rule. A
 rule's conditions are evaluated once per execution and exactly the triples
 that evaluation derived are inserted, so a random filter cannot leave a triple
-unrecorded. A rule file without an ownership record was written by upstream
+unrecorded. Imported data is asserted data: `<Rule:…>` triples in a file
+given to `build`, `batchInsert` or SPARQL `LOAD` (tolerant or strict) belong
+to no rule, and a rule that derives one of them neither counts nor retracts
+it. Inferred triples over blank nodes are recorded under the labels the
+import pipeline stored (each load's own scope), so they retract exactly; a
+later import of the same document mints new blank nodes, which no rule owns. A rule file without an ownership record was written by upstream
 gStore: whatever its status (upstream's check and compile overwrite `已执行`),
 disabling it retracts with upstream's `delete where {?x <Rule:label> ?y.}`
 (built from the validated label alone, so a rule whose conditions this
