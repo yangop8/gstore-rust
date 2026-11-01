@@ -147,7 +147,7 @@ kvstore (`src/backend/` does not use it); no feature-gated code was touched.
   delegating to the inherent `count_po_by_s` … `count_so_by_p`,
   `distinct_p_of_s/o` and `has_subject/object/predicate` (exact, no
   materialization). Not done here because the trait methods do not exist on
-  this branch's base.
+  this branch's base. *Done at the R1 merge (f953d5b).*
 - **R2-DISKLIB:** `DiskTriples` should call the `try_*` reads and report errors
   through `note_read_error`; the legacy `TripleSource` impl still swallows them.
   `from_shared_pager` + `refresh()` give a read-only view over the writer's
@@ -155,6 +155,7 @@ kvstore (`src/backend/` does not use it); no feature-gated code was touched.
 - **R2-BULK / R1-CORE:** `vstree_entries` over a `DiskStore` can use
   `for_each_entity_adjacency` (one streaming pass instead of
   `subject_keys` + `object_keys` + per-entity `po_by_s` / `ps_by_o`).
+  *Done at the R1 merge for `build_disk_from_sources` (12bd4d6).*
 - **R4-RECLAIM:** add `FEATURE_FREE_IDS` to `format::SUPPORTED_FEATURES`
   together with the structures behind it; `src/signature/disk_vstree.rs`
   should then assert `pager.features() == 0` for `vstree.kv` (today any feature

@@ -244,7 +244,9 @@ round):
 1. **Export in a read scope (C2).** `Database::export_ntriples` lives in
    `src/db/admin.rs`, which is not in R1-CORE's list: wrap its store walk
    in a `ReadScope` and fail on a recorded error, like `read_as` does. No
-   backend reports read errors yet, so nothing changes today.
+   backend reports read errors yet, so nothing changes today. *Done at the
+   R1 merge (c76b9cc): `zipio::write_export` runs in a scope, and
+   `export_ntriples` delegates to it.*
 2. **Snapshot queries in a read scope (C2).** `ConcurrentDb` snapshot
    evaluation (`src/concurrent.rs`, R3-SRV / R4-SNAP) should run inside a
    `ReadScope` and neither answer nor cache when an error was recorded.
@@ -252,12 +254,14 @@ round):
    `distinct_p_of_s/o` and `has_*` on `DiskStore`; its `TripleSource` impl
    (R1-KV's `store.rs`) should override the C1 methods with them once both
    packages are merged — each must return exactly what the default returns
-   (the ordering contract makes `distinct_p_of_*` a run count).
+   (the ordering contract makes `distinct_p_of_*` a run count). *Done at
+   the R1 merge (f953d5b).*
 4. **Disk VS-tree build.** `build_disk_from_sources` (`persist.rs`, R2-DICT
    in Round 2) still signs a `DiskStore` through the generic
    `vstree_entries` (two lookups and copies per entity): R1-KV's
    `for_each_entity_adjacency` can feed it the way
    `TripleStore::for_each_entity_adjacency` now feeds the in-memory build.
+   *Done at the R1 merge (12bd4d6).*
 5. **RocksDB counts (C1).** `RocksStore` uses the C1 defaults, which
    materialize the list they count (the same cost as before). R3-ROCKS can
    override them with prefix counts. Note for G3: a reopened RocksDB
@@ -272,7 +276,8 @@ round):
    still enumerates `candidate_triples` and filters each triple with
    `cand_ok`; switching it to `candidate_triples_in` with the slot sets
    looked up once would give the streaming / Top-K paths the same win
-   (solutions and order are unchanged by construction).
+   (solutions and order are unchanged by construction). *Done at the R1
+   merge (67a67d9).*
 
 Not yet / notes:
 
