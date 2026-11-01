@@ -175,7 +175,7 @@ use regex::Regex;
 use crate::analytics::csr::CsrGraph;
 use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
 use crate::model::id::PredId;
@@ -1541,11 +1541,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 continue;
             }
             let entity = if layout.is_pred[idx] {
-                match self
-                    .dict
-                    .predicate_to_string(id)
-                    .and_then(|key| self.dict.entity_id(key))
-                {
+                match self.dict.pred(id).and_then(|key| self.dict.entity_id(&key)) {
                     Some(e) => e,
                     None => continue,
                 }
@@ -3006,9 +3002,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return self.extras.borrow().term(id).map(Term::to_string);
         }
         if is_pred {
-            self.dict.predicate_to_string(id).map(str::to_owned)
+            self.dict.pred(id).map(TermStr::into_string)
         } else {
-            self.dict.id_to_string(id).map(str::to_owned)
+            self.dict.term(id).map(TermStr::into_string)
         }
     }
 
@@ -3023,11 +3019,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return self.extras.borrow().term(id).map(Value::from_term);
         }
         let s = if is_pred {
-            self.dict.predicate_to_string(id)?
+            self.dict.pred(id)?
         } else {
-            self.dict.id_to_string(id)?
+            self.dict.term(id)?
         };
-        let term = key_term(s)?;
+        let term = key_term(&s)?;
         Some(Value::from_term(&term))
     }
 
@@ -3213,11 +3209,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return self.extras.borrow().term(id).cloned();
         }
         let s = if is_pred {
-            self.dict.predicate_to_string(id)?
+            self.dict.pred(id)?
         } else {
-            self.dict.id_to_string(id)?
+            self.dict.term(id)?
         };
-        key_term(s)
+        key_term(&s)
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term

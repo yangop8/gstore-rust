@@ -6,28 +6,15 @@
 //! as its [`DiskTermSource`]; the query engine then runs over `&Dictionary`
 //! unchanged while only the *looked-up* strings ever become resident.
 //!
-//! ## Residency / memory
-//! * **term → id** lookups (query constants) hit the B+tree on every call — no
-//!   string is cached for this direction, matching gStore's per-lookup resolve.
-//! * **id → str** materialization (result rows, FILTER values) fetches the
-//!   string from the B+tree once and retains it, so repeated resolves of the
-//!   same id are free and `resident_string_count` reflects exactly the touched
-//!   subset.
-//!
-//! Retained strings are `Box::leak`ed so `id_to_string` can hand back a `&str`
-//! valid for the dictionary's lifetime while the type stays `Send + Sync` and
-//! `unsafe`-free (a `RefCell`/`Mutex` guard cannot lend a `&str` past the call).
-//! Because `DiskStore` keeps one `DiskDict` and reuses it across queries, the
-//! leak is *bounded by the number of distinct terms ever materialized* — never
-//! more than the full dictionary, i.e. no worse than the old eager load, and
-//! typically far less. (Freeing on drop instead would require either `unsafe` —
-//! which this codebase avoids — or a stable string arena; see the backlog note.)
+//! Resolved strings are handed out as shared `Arc<str>` (no `Box::leak`).
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::dict::DiskTermSource;
-use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
+use crate::dict::{DiskTermSource, Space};
+use crate::error::Result;
+use crate::model::id::LITERAL_FIRST_ID;
 
 use super::bptree::{de32, BTree};
 use super::ivarray::IvArray;
@@ -36,24 +23,18 @@ use super::pager::Pager;
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
 pub struct DiskDict {
     /// Shared with the owning `DiskStore`, so both read through one page cache.
-    /// Dictionary resolution is read-only, so it takes the `RwLock` read guard
-    /// and can run concurrently with other readers (task 4).
     pager: Arc<RwLock<Pager>>,
     entity2id: BTree,
     literal2id: BTree,
     predicate2id: BTree,
-    // Reverse (id → string) stores use the integer-keyed dense [`IvArray`],
-    // matching `DiskStore` (gStore's IVArray/ISArray).
     id2entity: IvArray,
     id2literal: IvArray,
     id2predicate: IvArray,
     entity_count: usize,
     literal_count: usize,
     pred_count: usize,
-    /// Materialized entity/literal strings, keyed by public id (see module docs).
-    ent_lit_cache: Mutex<HashMap<EntityLiteralId, &'static str>>,
-    /// Materialized predicate strings, keyed by predicate id.
-    pred_cache: Mutex<HashMap<PredId, &'static str>>,
+    /// Materialized strings, keyed by `(space, id)`.
+    resolved: Mutex<HashMap<(Space, u32), Arc<str>>>,
 }
 
 impl DiskDict {
@@ -84,86 +65,91 @@ impl DiskDict {
             entity_count,
             literal_count,
             pred_count,
-            ent_lit_cache: Mutex::new(HashMap::new()),
-            pred_cache: Mutex::new(HashMap::new()),
+            resolved: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Resolve `key` to its id through `tree` (a `*2id` forward tree). Hits the
-    /// B+tree every call; nothing is cached for the term→id direction.
-    fn fetch_id(&self, tree: &BTree, key: &str) -> Option<u32> {
-        let pager = self.pager.read().unwrap();
-        tree.get(&pager, key.as_bytes())
-            .ok()
-            .flatten()
-            .map(|v| de32(&v))
+    fn tree(&self, space: Space) -> &BTree {
+        match space {
+            Space::Entity => &self.entity2id,
+            Space::Literal => &self.literal2id,
+            Space::Predicate => &self.predicate2id,
+        }
     }
 
-    /// Fetch the string for integer `key` from `arr` (an `id2*` reverse array)
-    /// and retain it (leaked) so the returned reference is valid for the
-    /// backend's life.
-    fn fetch_str(&self, arr: &IvArray, key: u32) -> Option<&'static str> {
-        let bytes = {
-            let pager = self.pager.read().unwrap();
-            arr.get(&pager, key).ok().flatten()?
-        };
-        let s = String::from_utf8_lossy(&bytes).into_owned();
-        Some(Box::leak(s.into_boxed_str()))
+    /// The `id2*` array of `space` and the array key of public id `id`.
+    fn array(&self, space: Space, id: u32) -> Option<(&IvArray, u32)> {
+        match space {
+            Space::Entity => Some((&self.id2entity, id)),
+            Space::Literal => Some((&self.id2literal, id.checked_sub(LITERAL_FIRST_ID)?)),
+            Space::Predicate => Some((&self.id2predicate, id)),
+        }
     }
 }
 
 impl DiskTermSource for DiskDict {
-    fn entity_id(&self, key: &str) -> Option<EntityLiteralId> {
-        self.fetch_id(&self.entity2id, key)
+    fn lookup(&self, space: Space, key: &str) -> Result<Option<u32>> {
+        let pager = self.pager.read().unwrap();
+        // The literal tree stores the *public* id (offset by LITERAL_FIRST_ID).
+        self.tree(space).get_with(&pager, key.as_bytes(), de32)
     }
 
-    fn literal_id(&self, key: &str) -> Option<EntityLiteralId> {
-        // The forward tree already stores the *public* literal id (offset by
-        // LITERAL_FIRST_ID), so the fetched value needs no further adjustment.
-        self.fetch_id(&self.literal2id, key)
-    }
-
-    fn predicate_id(&self, key: &str) -> Option<PredId> {
-        self.fetch_id(&self.predicate2id, key)
-    }
-
-    fn id_to_string(&self, id: EntityLiteralId) -> Option<&str> {
-        if let Some(&s) = self.ent_lit_cache.lock().unwrap().get(&id) {
-            return Some(s);
+    fn resolve(&self, space: Space, id: u32) -> Result<Option<Arc<str>>> {
+        if let Some(s) = self.resolved.lock().unwrap().get(&(space, id)) {
+            return Ok(Some(Arc::clone(s)));
         }
-        // Literals are keyed by their local index (id minus LITERAL_FIRST_ID),
-        // matching `DiskStore::intern_literal`.
-        let (arr, key) = if is_literal_id(id) {
-            (&self.id2literal, id - LITERAL_FIRST_ID)
-        } else {
-            (&self.id2entity, id)
+        let Some((arr, key)) = self.array(space, id) else {
+            return Ok(None);
         };
-        let s = self.fetch_str(arr, key)?;
-        self.ent_lit_cache.lock().unwrap().insert(id, s);
-        Some(s)
-    }
-
-    fn predicate_to_string(&self, id: PredId) -> Option<&str> {
-        if let Some(&s) = self.pred_cache.lock().unwrap().get(&id) {
-            return Some(s);
+        if key >= self.id_limit(space) - space.first_id() {
+            return Ok(None);
         }
-        let s = self.fetch_str(&self.id2predicate, id)?;
-        self.pred_cache.lock().unwrap().insert(id, s);
-        Some(s)
+        let s = {
+            let pager = self.pager.read().unwrap();
+            arr.get_with(&pager, key, |b| {
+                Arc::<str>::from(String::from_utf8_lossy(b))
+            })?
+        };
+        if let Some(s) = &s {
+            self.resolved
+                .lock()
+                .unwrap()
+                .insert((space, id), Arc::clone(s));
+        }
+        Ok(s)
     }
 
-    fn entity_num(&self) -> usize {
-        self.entity_count
+    fn for_each(
+        &self,
+        space: Space,
+        from: u32,
+        f: &mut dyn FnMut(u32, &str) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let first = space.first_id();
+        let Some((arr, start)) = self.array(space, from.max(first)) else {
+            return Ok(());
+        };
+        let end = self.id_limit(space) - first;
+        let pager = self.pager.read().unwrap();
+        arr.for_each_range(&pager, start, end, |k, v| {
+            f(first + k, &String::from_utf8_lossy(v))
+        })
     }
-    fn literal_num(&self) -> usize {
-        self.literal_count
+
+    fn count(&self, space: Space) -> usize {
+        match space {
+            Space::Entity => self.entity_count,
+            Space::Literal => self.literal_count,
+            Space::Predicate => self.pred_count,
+        }
     }
-    fn predicate_num(&self) -> usize {
-        self.pred_count
+
+    fn id_limit(&self, space: Space) -> u32 {
+        space.first_id() + self.count(space) as u32
     }
 
     fn resident_string_count(&self) -> usize {
-        self.ent_lit_cache.lock().unwrap().len() + self.pred_cache.lock().unwrap().len()
+        self.resolved.lock().unwrap().len()
     }
 }
 
