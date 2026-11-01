@@ -376,6 +376,13 @@ pub trait DiskTermSource: fmt::Debug + Send + Sync {
         )))
     }
 
+    /// Resolve a batch: `ids` are ascending, deduplicated and all in
+    /// `space`; the answer is aligned with them. A backend reads what it does
+    /// not hold in id order (the default resolves one by one).
+    fn resolve_sorted(&self, space: Space, ids: &[u32]) -> Result<Vec<Option<Arc<str>>>> {
+        ids.iter().map(|&id| self.resolve(space, id)).collect()
+    }
+
     /// Make the strings of `ids` (ascending, deduplicated, all in `space`)
     /// cheap to [`resolve`](Self::resolve) next — e.g. read them in id order
     /// into a cache. Advisory: the default does nothing.
@@ -1512,6 +1519,23 @@ impl Dictionary {
         }
     }
 
+    /// Resolve `ids` — ascending, deduplicated, all of `space` — aligned with
+    /// them: one batch for a backed dictionary (it reads what its cache does
+    /// not hold in id order), direct borrows in memory.
+    pub fn resolve_sorted(&self, space: Space, ids: &[u32]) -> Result<Vec<Option<TermStr<'_>>>> {
+        match &self.backing {
+            Some(b) => Ok(b
+                .resolve_sorted(space, ids)?
+                .into_iter()
+                .map(|s| s.map(TermStr::Shared))
+                .collect()),
+            None => Ok(ids
+                .iter()
+                .map(|&id| self.mem_resolve(space, id).map(TermStr::Borrowed))
+                .collect()),
+        }
+    }
+
     /// Resolve a batch of ids of one `space`, in the order given. A backed
     /// dictionary reads them in ascending id order (each distinct id once).
     pub fn resolve_many(&self, space: Space, ids: &[u32]) -> Result<Vec<Option<TermStr<'_>>>> {
@@ -1534,11 +1558,7 @@ impl Dictionary {
             .collect();
         order.sort_unstable();
         order.dedup();
-        b.prefetch(space, &order)?;
-        let mut found: Vec<Option<Arc<str>>> = Vec::with_capacity(order.len());
-        for &id in &order {
-            found.push(b.resolve(space, id)?);
-        }
+        let found = b.resolve_sorted(space, &order)?;
         Ok(ids
             .iter()
             .map(|id| {

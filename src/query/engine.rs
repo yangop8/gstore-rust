@@ -179,12 +179,13 @@ use crate::analytics::GraphView;
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
-use crate::model::id::PredId;
+use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
 use crate::parser::sparql::{builtins, rs_function_name, RS_NAMESPACE};
 use crate::signature::{EdgeDir, Signature, VsTree};
+use crate::store::read_scope::note_read_error;
 use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
@@ -1034,7 +1035,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // order; an in-memory one has nothing to prepare).
         let mut str_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
         for chunk in rows.chunks(MATERIALIZE_CHUNK_ROWS) {
-            self.prefetch_rows(chunk, &is_pred);
+            if self.dict.is_disk_backed() {
+                self.materialize_chunk(chunk, &is_pred, &mut str_rows);
+                continue;
+            }
             str_rows.extend(chunk.iter().map(|r| {
                 r.iter()
                     .enumerate()
@@ -1048,12 +1052,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })
     }
 
-    /// One sorted prefetch of every dictionary id in `rows` (columns flagged
-    /// by `is_pred` hold predicate ids). Nothing to do in memory.
-    fn prefetch_rows(&self, rows: &[Vec<Option<u32>>], is_pred: &[bool]) {
-        if !self.dict.is_disk_backed() {
-            return;
-        }
+    /// Materialize `rows` over an out-of-core dictionary: every distinct id
+    /// of the chunk is resolved in one sorted batch per space (the backend
+    /// reads what its cache lacks in id order), then each cell is copied
+    /// from the batch. Same strings as [`resolve_string`](Self::resolve_string);
+    /// a backend read error is noted (C2) and leaves the cells unbound.
+    fn materialize_chunk(
+        &self,
+        rows: &[Vec<Option<u32>>],
+        is_pred: &[bool],
+        out: &mut Vec<Vec<Option<String>>>,
+    ) {
         let (mut ids, mut pids) = (Vec::new(), Vec::new());
         for r in rows {
             for (i, id) in r.iter().enumerate() {
@@ -1069,7 +1078,42 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
             }
         }
-        self.dict.prefetch(&ids, &pids);
+        for v in [&mut ids, &mut pids] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let resolve = |space: Space, ids: &[u32]| match self.dict.resolve_sorted(space, ids) {
+            Ok(v) => v,
+            Err(e) => {
+                note_read_error(format_args!("dictionary {} batch: {e}", space.name()));
+                vec![None; ids.len()]
+            }
+        };
+        // Entity ids sort before literal ids.
+        let split = ids.partition_point(|&id| id < LITERAL_FIRST_ID);
+        let mut terms = resolve(Space::Entity, &ids[..split]);
+        terms.extend(resolve(Space::Literal, &ids[split..]));
+        let preds = resolve(Space::Predicate, &pids);
+        let find = |list: &[u32], found: &[Option<TermStr<'_>>], id: u32| {
+            list.binary_search(&id)
+                .ok()
+                .and_then(|i| found[i].as_deref().map(str::to_owned))
+        };
+        out.extend(rows.iter().map(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let id = id?;
+                    if is_synth(id) {
+                        self.resolve_string(Some(id), false)
+                    } else if is_pred.get(i).copied().unwrap_or(false) {
+                        find(&pids, &preds, id)
+                    } else {
+                        find(&ids, &terms, id)
+                    }
+                })
+                .collect::<Vec<_>>()
+        }));
     }
 
     /// Evaluate a SELECT into id-space result rows over its result variables.

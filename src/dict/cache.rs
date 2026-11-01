@@ -24,14 +24,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::Space;
+use crate::query::engine::FxBuildHasher;
 
 /// Default byte budget of the `id → string` cache.
 pub const DEFAULT_TERM_CACHE_BYTES: usize = 64 << 20;
 /// Default byte budget of the `key → id` cache.
 pub const DEFAULT_KEY_CACHE_BYTES: usize = 16 << 20;
-/// Bytes charged per entry on top of its string: the `Arc` header, the map
-/// bucket and the CLOCK slot.
-pub const ENTRY_OVERHEAD: usize = 64;
+/// Bytes charged per entry on top of its string: the `Arc` header (16), the
+/// map bucket (16), the CLOCK slot (32) and the allocator's rounding.
+pub const ENTRY_OVERHEAD: usize = 72;
 /// Shards per cache.
 const SHARDS: usize = 16;
 
@@ -77,13 +78,13 @@ impl CacheStats {
 struct Slot<K, V> {
     key: K,
     value: V,
-    cost: usize,
+    cost: u32,
     referenced: bool,
 }
 
 /// One shard: a map from key to ring position and the CLOCK ring.
-struct Shard<K, V> {
-    map: HashMap<K, usize>,
+struct Shard<K, V, S> {
+    map: HashMap<K, usize, S>,
     ring: Vec<Option<Slot<K, V>>>,
     /// Empty ring positions, reused before the ring grows.
     holes: Vec<usize>,
@@ -91,10 +92,10 @@ struct Shard<K, V> {
     bytes: usize,
 }
 
-impl<K: Hash + Eq + Clone, V: Clone> Shard<K, V> {
-    fn new() -> Shard<K, V> {
+impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> Shard<K, V, S> {
+    fn new() -> Shard<K, V, S> {
         Shard {
-            map: HashMap::new(),
+            map: HashMap::with_hasher(S::default()),
             ring: Vec::new(),
             holes: Vec::new(),
             hand: 0,
@@ -124,9 +125,9 @@ impl<K: Hash + Eq + Clone, V: Clone> Shard<K, V> {
                 Some(_) => {
                     let slot = self.ring[pos].take().expect("checked above");
                     self.map.remove(&slot.key);
-                    self.bytes -= slot.cost;
+                    self.bytes -= slot.cost as usize;
                     self.holes.push(pos);
-                    return Some(slot.cost);
+                    return Some(slot.cost as usize);
                 }
             }
         }
@@ -134,11 +135,12 @@ impl<K: Hash + Eq + Clone, V: Clone> Shard<K, V> {
 }
 
 /// A sharded, byte-bounded CLOCK cache. Values are cloned out (use cheap
-/// clones: `Arc<str>`, ids).
-pub struct ClockCache<K, V> {
-    shards: Box<[Mutex<Shard<K, V>>]>,
+/// clones: `Arc<str>`, ids). `S` hashes the keys (shard choice and the
+/// shards' maps).
+pub struct ClockCache<K, V, S = RandomState> {
+    shards: Box<[Mutex<Shard<K, V, S>>]>,
     shard_budget: usize,
-    hasher: RandomState,
+    hasher: S,
     generation: AtomicU64,
     entries: AtomicUsize,
     bytes: AtomicUsize,
@@ -148,14 +150,14 @@ pub struct ClockCache<K, V> {
     invalidations: AtomicU64,
 }
 
-impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
+impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> ClockCache<K, V, S> {
     /// A cache keeping at most `budget` charged bytes (split evenly between
     /// its shards; an entry larger than a shard's share is never cached).
-    pub fn new(budget: usize) -> ClockCache<K, V> {
+    pub fn new(budget: usize) -> ClockCache<K, V, S> {
         ClockCache {
             shards: (0..SHARDS).map(|_| Mutex::new(Shard::new())).collect(),
             shard_budget: budget / SHARDS,
-            hasher: RandomState::new(),
+            hasher: S::default(),
             generation: AtomicU64::new(0),
             entries: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
@@ -171,7 +173,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
         self.shard_budget * SHARDS
     }
 
-    fn shard<Q: Hash + ?Sized>(&self, key: &Q) -> MutexGuard<'_, Shard<K, V>> {
+    fn shard<Q: Hash + ?Sized>(&self, key: &Q) -> MutexGuard<'_, Shard<K, V, S>> {
         let i = (self.hasher.hash_one(key) >> 40) as usize % SHARDS;
         // A panic while a shard was locked leaves it consistent enough to
         // empty: recover by clearing it (it only holds copies).
@@ -253,7 +255,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
     /// Cache `key → value`, charged `cost` bytes, evicting by CLOCK to stay
     /// within the budget. A value already cached is kept as is.
     pub fn insert(&self, key: K, value: V, cost: usize) {
-        if cost > self.shard_budget {
+        if cost > self.shard_budget || cost > u32::MAX as usize {
             return;
         }
         let mut g = self.shard(&key);
@@ -273,7 +275,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
         let slot = Slot {
             key: key.clone(),
             value,
-            cost,
+            cost: cost as u32,
             // A new entry gets no second chance until it is used again, so a
             // one-pass scan cannot flush the entries that are re-used.
             referenced: false,
@@ -331,8 +333,9 @@ impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
 }
 
 /// `(space, id) → Arc<str>`: the out-of-core dictionary's id → string cache.
+/// Its keys are ids, so it hashes with the engine's fast FxHash.
 pub struct TermCache {
-    inner: ClockCache<u64, Arc<str>>,
+    inner: ClockCache<u64, Arc<str>, FxBuildHasher>,
 }
 
 fn term_key(space: Space, id: u32) -> u64 {
@@ -368,9 +371,34 @@ impl TermCache {
         self.inner.insert(term_key(space, id), s, cost)
     }
 
-    /// The underlying cache (counters, size).
-    pub fn cache(&self) -> &ClockCache<u64, Arc<str>> {
+    /// The underlying cache.
+    pub(crate) fn cache(&self) -> &ClockCache<u64, Arc<str>, FxBuildHasher> {
         &self.inner
+    }
+
+    /// Entries resident.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Bytes charged.
+    pub fn bytes(&self) -> usize {
+        self.inner.bytes()
+    }
+
+    /// The byte budget.
+    pub fn budget(&self) -> usize {
+        self.inner.budget()
+    }
+
+    /// `(hits, misses, evictions, invalidations)`.
+    pub fn counters(&self) -> (u64, u64, u64, u64) {
+        self.inner.counters()
     }
 }
 

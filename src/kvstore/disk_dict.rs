@@ -174,10 +174,14 @@ impl DiskDict {
         self.pager.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn fresh_caches(&self) {
-        let g = self.generation.load(Ordering::Acquire);
-        self.terms.check_generation(g);
-        self.keys.check_generation(g);
+    fn fresh_terms(&self) {
+        self.terms
+            .check_generation(self.generation.load(Ordering::Acquire));
+    }
+
+    fn fresh_keys(&self) {
+        self.keys
+            .check_generation(self.generation.load(Ordering::Acquire));
     }
 
     /// Read the strings of `ids` (ascending, within `arr`'s range) run by run,
@@ -227,7 +231,7 @@ fn decode(bytes: &[u8]) -> Arc<str> {
 
 impl DiskTermSource for DiskDict {
     fn lookup(&self, space: Space, key: &str) -> Result<Option<u32>> {
-        self.fresh_caches();
+        self.fresh_keys();
         if let Some(id) = self.keys.get(space, key) {
             return Ok(Some(id));
         }
@@ -251,7 +255,7 @@ impl DiskTermSource for DiskDict {
     }
 
     fn resolve(&self, space: Space, id: u32) -> Result<Option<Arc<str>>> {
-        self.fresh_caches();
+        self.fresh_terms();
         if let Some(s) = self.terms.get(space, id) {
             return Ok(Some(s));
         }
@@ -275,8 +279,45 @@ impl DiskTermSource for DiskDict {
         })
     }
 
+    /// One cache probe per id; the misses are read run by run in id order
+    /// and cached.
+    fn resolve_sorted(&self, space: Space, ids: &[u32]) -> Result<Vec<Option<Arc<str>>>> {
+        self.fresh_terms();
+        let first = space.first_id();
+        let mut out: Vec<Option<Arc<str>>> = Vec::with_capacity(ids.len());
+        // (position in `ids`, array key) of each miss, ascending.
+        let mut missing: Vec<(usize, u32)> = Vec::new();
+        let mut arr = None;
+        for (i, &id) in ids.iter().enumerate() {
+            let hit = self.terms.get(space, id);
+            if hit.is_none() {
+                if let Some((a, key)) = self.slot(space, id) {
+                    arr = Some(a);
+                    missing.push((i, key));
+                }
+            }
+            out.push(hit);
+        }
+        if let (Some(arr), false) = (arr, missing.is_empty()) {
+            let keys: Vec<u32> = missing.iter().map(|&(_, k)| k).collect();
+            let mut at = missing.iter().peekable();
+            let pager = self.pager();
+            self.read_runs(&pager, arr, first, &keys, &mut |id, s| {
+                while let Some(&&(i, k)) = at.peek() {
+                    at.next();
+                    if first + k == id {
+                        out[i] = Some(Arc::clone(&s));
+                        break;
+                    }
+                }
+                self.terms.insert(space, id, s);
+            })?;
+        }
+        Ok(out)
+    }
+
     fn prefetch(&self, space: Space, ids: &[u32]) -> Result<()> {
-        self.fresh_caches();
+        self.fresh_terms();
         let first = space.first_id();
         let mut missing: Vec<u32> = Vec::new();
         let mut arr = None;
