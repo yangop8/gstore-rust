@@ -25,9 +25,10 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 1,700 tests pass** across the workspace (incl. 159 for gNLQA), among them
-  ports of upstream gStore's own test scripts; `cargo clippy --workspace
-  --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
+* **About 1,770 tests pass** across the workspace (incl. 159 for gNLQA), among them
+  ports of upstream gStore's own test scripts; the `pfn-wasm`, `gzip`, `tls` and
+  `rocksdb` features add their own. `cargo clippy --workspace --all-targets --
+  -D warnings` is clean. Progress toward gStore 1.4 parity is
   planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
   [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -132,6 +133,11 @@ optimizer and a VS-tree signature filter.
   `coreTruss`, … with upstream's syntax, semantics and JSON output; the older
   gstore-rust graph functions remain available as `rs:NAME(…)` (see
   [Graph functions in SPARQL](#graph-functions-in-sparql)).
+* **PFN user graph functions** (`pfn`) — upstream's `funquery` / `funcudb` /
+  `funreview` and `SELECT (PFN.name({…}) AS ?v)`: each user's own graph
+  functions, written in WebAssembly text and run sandboxed over the graph
+  (feature `pfn-wasm`; see [PFN](#pfn-user-graph-functions) and
+  [`docs/PFN.md`](docs/PFN.md)).
 * **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
   — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
@@ -147,8 +153,10 @@ optimizer and a VS-tree signature filter.
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
 * **Reasoning** (`reason`) — upstream's JSON inference rules over `/api`
-  (`reasonManage`, see [Reasoning](#reasoning-reasonmanage)) and RDFS
-  materialization; an **RPC cluster** (`rpc` / `cluster`), and
+  (`reasonManage`: add, compile, execute, disable, … with exact retraction;
+  see [Reasoning](#reasoning-reasonmanage)) and RDFS materialization; the
+  inferred `<Rule:…>` edges are ordinary data to SPARQL, the graph functions
+  and PFN functions. Also an **RPC cluster** (`rpc` / `cluster`), and
   **concurrency/MVCC** (`concurrent`).
 
 Remaining large-refactor items are tracked in
