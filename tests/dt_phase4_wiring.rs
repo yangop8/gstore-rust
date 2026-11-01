@@ -1,6 +1,6 @@
 //! Phase 4 cross-package wiring: the reasoning rules (`reasonManage`, GAP_PLAN
 //! §3.2) meet the PFN user functions (§3.3), the advanced graph functions,
-//! the caches, `conf.ini` and the privilege model.
+//! the caches, `conf.ini`, the privilege model and the REST layer.
 //!
 //! * **Caches.** Executing a rule adds `<Rule:label>` edges and disabling it
 //!   retracts them through the database's update path, so the query cache
@@ -16,11 +16,15 @@
 //!   manage their own PFN functions (upstream grants `funquery` / `funcudb`
 //!   / `funreview` to everyone) but no reasoning rule (`reasonManage` is
 //!   root's); `showuser` lists upstream's seven privileges, nothing new.
+//! * **REST.** A database the REST layer built in memory keeps its rules in
+//!   the directory it is served from, so REST `/backup` carries them even
+//!   when no `reasonManage` call reached it in this process.
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
@@ -561,4 +565,39 @@ fn a_fresh_api_user_manages_pfn_functions_but_not_rules() {
             assert_eq!(v.as_str(), Some(""), "{k} of a fresh user");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// REST
+// ---------------------------------------------------------------------------
+
+/// A database the REST layer built in memory has no home directory; it
+/// still keeps its rules in the directory it is served from, so REST
+/// `/backup` carries rules that reached that directory without a
+/// `reasonManage` call in this process.
+#[test]
+fn rest_backup_carries_the_rules_of_a_database_rest_built() {
+    let srv = family_server("p4w_rest", "fam");
+    // A rule file written through /api on another database …
+    ok(&reason(&srv, "fam", "1"));
+    let rule = srv.root.join("fam.db/reason_rule_files/uncle.json");
+    assert!(rule.is_file());
+    // … copied into the directory of one REST builds.
+    let (status, text) = srv.rest("POST", "/build?db_name=restdb", FAMILY);
+    assert_eq!(status, 200, "{text}");
+    let rules = srv.root.join("restdb.db/reason_rule_files");
+    fs::create_dir_all(&rules).unwrap();
+    fs::copy(&rule, rules.join("uncle.json")).unwrap();
+    let (status, text) = srv.rest("POST", "/backup?db_name=restdb", "");
+    assert_eq!(status, 200, "{text}");
+    let j = json::parse(&text).unwrap();
+    let backup = Path::new(&string(&j, "path")).to_path_buf();
+    assert!(
+        backup.join("reason_rule_files/uncle.json").is_file(),
+        "{}",
+        backup.display()
+    );
+    // The rule is the database's own: it compiles and runs there.
+    ok(&reason(&srv, "restdb", "3"));
+    assert_eq!(int(&reason(&srv, "restdb", "4"), "AnsNum"), 1);
 }

@@ -32,7 +32,9 @@
 |----|------|---------|------|
 | 事务(commit/rollback) | ✅ | `Txn_manager` | `begin/commit/rollback`经undo日志实现原子性+回滚(单写者),覆盖所有UPDATE与命名图 |
 | 并发(快照隔离 + 每键版本链MVCC) | ✅ | `GraphLock`/`Latch`/KVstore MVCC | `concurrent::ConcurrentDb`:多读并发(无锁评估immutable `Arc<Snapshot>`)+ OCC多写者(first-committer-wins、写键集历史)+ **每键版本链MVCC**(每triple-key版本表,读者按snapshot选可见版本/墓碑,版本GC回收最老活跃snapshot以下);读者不被阻塞。**并行加载**:`Database::build_from_ntriples_parallel`(行对齐分块多线程解析)。缺:OpenMP级排序细节 |
-| RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range;`Database::materialize_rdfs` |
+| RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range(range不再给字面量加类型);`Database::materialize_rdfs` |
+| 推理规则 `reasonManage` | ✅ | `src/Reason`、`ApiReasonOperation.cpp` | Phase 4:上游JSON规则的新增/列表/编译/执行/失效/查看/删除/校验(type 1–8),编译结果逐字节一致,规则存`<db>.db/reason_rule_files/`;偏离:精确撤回(账本)、规则校验防SPARQL注入、已执行规则不可重编译(见README「Reasoning」) |
+| PFN 用户图函数 | ✅ | `ApiPFNOperation.cpp`、`GeneralEvaluation` pfn | Phase 4:`funquery`/`funcudb`/`funreview`按用户管理,`PFN.name({…})`求值并按上游返回`{"results":…}`;偏离:函数体为WebAssembly文本,在`wasmi`沙箱中运行(feature `pfn-wasm`),非g++编译+dlopen(见[`docs/PFN.md`](PFN.md)) |
 | Schema抽取 | ✅ | `Database::getSchemaInfo` | `Database::schema()` 抽类与属性 |
 | QueryCache | ✅ | `Database`/`QueryCache` | 读查询按SPARQL串缓存,任何写入即失效 |
 | 监控/统计API | ✅ | `getDBMonitorInfo` | `Database::stats()`→`DbStats`(计数+索引/事务状态) |
@@ -125,3 +127,5 @@
 > - 测试:默认workspace **689全过**;`--features rocksdb` 编译+lib全过;`--features gzip`/`tls` 各自编译+测试(含 `gzip_compresses_when_accepted`/`tls_https_round_trip`)+ clippy `--all-targets` 零告警(默认/gzip/tls/rocksdb 四组合)。
 >
 > **至此原"深度/子集项"仅剩**:RDFa/JSON-LD的完整1.1语义(仍common-subset);Decimal为i128界(非任意精度,刻意零依赖界)、÷与SUM走f64;StringIndex惰性按查询构建(未做持久化Database级索引)。**刻意偏离仍不补**:gRPC线格式、多语言客户端SDK、.so热加载UDF、发行工程。
+>
+> 更新(Phase 4,**推理规则 + PFN**):`reasonManage`(type 1–8,上游JSON规则全生命周期,精确撤回)与 PFN 用户图函数(`funquery`/`funcudb`/`funreview` + `PFN.name({…})`)已接入 `/api`。上文"PFN .so动态插件:改为安全的Rust进程内函数注册表"的偏离据此更新:PFN 现以**沙箱化 WebAssembly**(feature `pfn-wasm`,`wasmi` 解释器)实现上游的按用户函数管理与调用协议,仍不做 dlopen;上游 C++ 函数体需改写为 WAT。详见 [`docs/PFN.md`](PFN.md) 与 README 的 Reasoning / PFN 两节。

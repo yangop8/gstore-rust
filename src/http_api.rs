@@ -603,6 +603,13 @@ impl DbSlot {
     ) -> DbHandle {
         db.set_load_policy(policy.clone());
         db.apply_query_settings(query);
+        // Its reasoning rules (`reasonManage`) are those of the directory it
+        // is served from — also for a database built or created in memory,
+        // which has no home directory — so that its own backups (REST
+        // `/backup`, `Database::backup`) carry them.
+        if db.reason_db_dir().as_deref() != Some(dir.as_path()) {
+            db.set_reason_db_dir(dir.clone());
+        }
         // Hold `dir`'s inter-process lock while serving it (`crate::db::dirlock`):
         // a database opened from `dir` already does; one built in memory and
         // saved there takes it now. Best effort — a database not on disk yet

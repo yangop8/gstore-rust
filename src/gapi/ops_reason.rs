@@ -98,34 +98,16 @@ fn target(ctx: &Ctx<'_>, db: &str) -> (Option<DbHandle>, PathBuf) {
 /// database's lock (a long query may hold it): the rule directory's own lock
 /// orders it with execute / disable / check.
 fn file_store(ctx: &Ctx<'_>, db: &str) -> Result<RuleStore<'static>, GResp> {
+    // A loaded database already keeps its rules in the directory it is
+    // served from (`DbSlot::handle` tells it so), whose rules are these.
     let (handle, dir) = target(ctx, db);
-    match handle {
-        Some(h) => {
-            // Best effort: tell a loaded database where its rules are, so
-            // that its own backups carry them (see `note_rule_dir`).
-            if let Ok(mut slot) = h.try_lock() {
-                note_rule_dir(&mut slot);
-            }
-        }
-        None if !dir.is_dir() => {
-            return Err(GResp::error(
-                Status::OperationFailed,
-                format!("database[{db}] does not exist"),
-            ))
-        }
-        None => {}
+    if handle.is_none() && !dir.is_dir() {
+        return Err(GResp::error(
+            Status::OperationFailed,
+            format!("database[{db}] does not exist"),
+        ));
     }
     Ok(RuleStore::dir(dir))
-}
-
-/// Make a loaded database keep its rules in the directory the server serves
-/// it from — a database built in memory and saved there does not know that
-/// directory as its home, and `Database::backup` copies the rules from it.
-fn note_rule_dir(slot: &mut crate::http_api::DbSlot) {
-    if !slot.retired && slot.db.reason_db_dir().as_deref() != Some(slot.dir.as_path()) {
-        let dir = slot.dir.clone();
-        slot.db.set_reason_db_dir(dir);
-    }
 }
 
 /// `type` 1.
@@ -262,7 +244,6 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
         return not_loaded(db, dir.is_dir());
     }
     ctx.inner.sync_query_settings(&mut slot);
-    note_rule_dir(&mut slot);
     let mut store = RuleStore::dir(slot.dir.clone());
     let resp = match op {
         DataOp::Check => {

@@ -50,6 +50,8 @@
 | ❌ 缺失 | `check`、`testConnect`、`getCoreVersion`、`ipmanage`、`stat`(CPU/内存/磁盘)、`shutdown`/`restart`、`rename`、`backuppath`、`checkOperationState`、`querylogdate`、`accesslogdate`、`schema`、`loadcsr`、`file/download`、`reasonManage`(type 1–8)、`funquery`/`funcudb`/`funreview`、`init`/`refreshconf` |
 | ⚠️ 语义或字段不兼容 | `login`(应返回 `CoreVersion`/`licensetype`;失败时为 200+1001)、`show`(`ResponseBody` 里应有 creator/built_time/status)、`build`(应拒绝覆盖已有库,支持空库、多路径和 zip)、`drop`(默认 `is_backup` 只改名为 `.bak`;仅 root 可执行)、`backup`(带时间戳目录、`max_backups` 轮转、zip;返回 `backupfilepath`)、`restore`(路径可选,恢复前保留 `.bak`)、`export`(写服务端文件并返回 `filepath`)、`batchInsert`/`batchRemove`(读服务端 `file`/`dir`,返回 `success_num`/`failed_num`)、`upload`(先暂存到 upload 目录,再由 build 引用)、`monitor`(尊重 `db_name`,字段名对齐)、日志类接口(按日期分页的 JSON)、`usermanage`(`type` 1/2/3 分发)、`begin`(`isolevel`) |
 
+**状态(Phase 4)**:`reasonManage`(type 1–8,见 §3.2)与 `funquery`/`funcudb`/`funreview`(见 §3.3)已补齐。
+
 ### 2.3 权限与系统库
 
 - 权限改为**按库授权**:上游通过 `setpriv <usr> <db>` 授权,而本仓目前是全局权限。
@@ -110,6 +112,8 @@
 - **接入**:HTTP 接口加 gconsole 命令。
 - **修 bug**:RDFS range 规则会生成以字面量为主语的三元组(`src/reason/mod.rs:182-190`)。
 
+**状态(Phase 4 已完成)**:`src/reason/{rules,compile,store,manage}.rs` + `src/gapi/ops_reason.rs`。`reasonManage` type 1–8(新增/列表/编译/执行/失效/查看/删除/校验)沿用上游的参数、字段、状态字符串(`新建`/`已编译`/`已执行`/`已失效`/`已校验`)与消息;编译结果与上游 1.4 `Reason.cpp` 逐字节一致;规则按库存于 `<db>.db/reason_rule_files/`,随 unload/load、重启、`backup`/`restore` 保留,`drop` 时删除;仅 root(及 admin)可调用。执行/失效走数据库正常更新路径(查询缓存、CSR、持久化、日志、可取消),事务打开时拒绝。刻意偏离:按 `reason_rule_files/inferred/<rule>.nt` 账本**精确撤回**(上游 `delete where` 会误删用户断言或其他规则推出的同谓词三元组);规则逐项校验以杜绝 SPARQL 注入;已执行规则不可重新编译。RDFS range 字面量 bug 已修。gconsole 的 reason 系列命令属 Phase 5。测试:`tests/dt_reason_manage.rs`、`tests/dt_phase4_wiring.rs`。
+
 ### 3.3 PFN 自定义图函数
 
 - **图访问接口**:定义 `GraphCtx` trait,对应上游 GAnalysis/CSRQueryHandler 提供的能力(点数、边数、按谓词取出/入邻居、id↔string)。
@@ -117,6 +121,8 @@
 - **管理接口**:`funquery`/`funcudb`/`funreview`,函数按用户存储。
 - **调用与输出**:`pfn.` 调用语法,结果形如 `{"results":…}`。
 - **现有问题**:`ConcurrentDb` 的快照没有带上函数注册表(`src/concurrent.rs:221-228`)。
+
+**状态(Phase 4 已完成,见 [`docs/PFN.md`](PFN.md))**:运行时选定 **WASM**——用 `wasmi` 解释器(feature `pfn-wasm`,默认关闭,默认构建不引入依赖)运行 WebAssembly 文本写的函数体,而非 wasmtime;沙箱只开放 gStore 宿主接口(`GraphCtx`:点/边/谓词计数、按谓词出入度与邻居、id↔string、参数、输出),带指令预算、内存上限、输出上限,并响应查询取消。`funquery`/`funcudb`/`funreview` 按用户存储与隔离,沿用上游消息与状态;`PFN.name({…})` 按上游 `pfnQuery`/`pfnQueryByVar` 求值,`/api` `query` 返回 `{"results": …}`。`ConcurrentDb` 快照、版本视图、事务与 HTTP 事务快照都带上调用者。`conf.ini` 新增 `[pfn]` 段(`refreshconf` 重新生效),`[system] pfn_base_path` 决定存放位置。刻意偏离见 `docs/PFN.md`(上游 C++ 函数体需改写为 WAT)。测试:`tests/dt_pfn.rs`、`tests/dt_phase4_wiring.rs`。
 
 ### 3.4 Top-K 与查询提前终止
 
