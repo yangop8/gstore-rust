@@ -49,8 +49,9 @@
   the baseline and across backends, update round trip, concurrent body
   equality) and one-sided, calibration-normalized timing gates (per query
   `(m+2 ms)/(b+2 ms) > 3`, geomean > 1.5 over the queries of ≥ 1 ms, build
-  > 2.0 / 2.5 disk, warm open > 2.5), memory `(m+32 MiB)/(b+32 MiB) > 1.5`,
-  bytes > 1.25; two targeted retries (minimum of the medians);
+  ratio over 2.0 (2.5 for disk), warm open over 2.5), memory
+  `(m+32 MiB)/(b+32 MiB) > 1.5`, bytes over 1.25×; two targeted retries
+  (minimum of the medians); `check`/`compare --backends` gate a subset;
   `--self-test-slowdown X` canary. Profiles `micro` (tests), `smoke` (CI:
   univ 1, snapshot + disk) and `reference` (univ 8/38, every compiled
   backend, reps 5, 1 and 8 clients).
@@ -124,9 +125,9 @@ Q14 60,576 (prototype data: 8/28/9/10/481/82,111/34/11,137/1,050/8/333/21/
 113 / 108 ms; every query equal on both layouts; update round trip ok
 (single insert median 0.11 ms snapshot, 1.67 ms disk). `gstore-bench ci`
 against the provisional baseline right after: PASS (193 gates; snapshot
-query geomean 1.27, disk 0.97 — machine noise). On real results:
-`check --from … --self-test-slowdown 1.3` exits 0, `1.6` exits 1, `3`
-(the canary) exits 1.
+query geomean 1.27, disk 0.97 — machine noise). The real smoke baseline
+gated against itself: `check --from <baseline> --self-test-slowdown 1.3`
+exits 0, `1.6` exits 1, `3` (the canary) exits 1.
 
 **univ 8, snapshot, A/B in one session** (`run --profile reference --scale 8
 --backends snapshot`, ~72 s per run): *base* = 90b92d6 with this harness
@@ -136,7 +137,7 @@ gstore code apart from a `#[rustfmt::skip]`).
 | | base | branch |
 |---|---|---|
 | build (gbuild) | 14.27 s, 154.2 MiB peak | 14.30 s, 154.3 MiB peak |
-| database bytes | 85,480,278 | 85,480,278 (identical) |
+| database bytes (then with the parse log) | 85,480,278 | 85,480,278 (identical) |
 | open first / warm | 215.6 / 221.7 ms | 233.0 / 223.6 ms |
 | RSS after open / query HWM | 126.7 / 152.0 MiB | 126.7 / 152.5 MiB |
 | Q1–Q14 geomean ratio branch/base | — | 1.071 (all 14); 1.00 (the 10 of ≥ 1 ms, the gate's set) |
@@ -187,6 +188,24 @@ debug build plus compilation. With `--features rocksdb` (release,
 included. Workspace: `cargo build --workspace --all-targets`, `cargo clippy
 --workspace --all-targets -- -D warnings` clean, `cargo test --workspace`
 2001 passed, 0 failed.
+
+**Acceptance (R1-BENCH), as of this branch:**
+- sizes univ 1/8/38 within ±5% — met (−2.4/−2.0/−0.2%); all 14 queries
+  non-empty — met at univ 1 and 8 (univ 38 by the measure stage);
+  generation ≥ 1M triples/s — met (1.6–1.9M);
+- fidelity, snapshot univ 8 — met on this noisy run (−27% … +16%; base
+  and branch); RocksDB open and disk Q5/Q9/Q13 at univ 8 — measure stage;
+- repeatability — noisy here (1.071 over all 14 queries, 1.00 over the ten
+  ≥ 1 ms queries; byte counts identical) — measure stage on an idle
+  machine;
+- gates (1.3× passes, 1.6× fails, a ≥ 20 ms query ×4 fails, a row-hash
+  change fails without retry, canary exits 1) — met (`tests/gates.rs`, and
+  on the real smoke baseline);
+- CI smoke ≤ 15 min warm — expected (release build of gstore + harness
+  ≈ 3–4 min, smoke run ≈ 1 min) but not observed on GitHub from here;
+- `pre-phase6-lubm{8,38}.json` committed — left to the measure stage (by
+  instruction); default `cargo test -p gstore-bench` ≤ 60 s — met (~9 s of
+  test time).
 
 ## Requests/Not yet
 
