@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use super::Database;
 use crate::error::Result;
 use crate::model::id::{is_entity_id, is_literal_id, EntityLiteralId, PredId};
-use crate::model::term::export_key;
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
 use crate::store::{MutableStore, TripleSource};
@@ -73,22 +72,13 @@ impl Database {
     /// `Database::export_db`; what `gexport` writes). Returns the number of
     /// triples written. IRIs are written through
     /// [`export_key`](crate::model::term::export_key), so the export loads back.
+    ///
+    /// The same writer as `gexport` and `/api export`
+    /// ([`write_export`](crate::zipio::write_export) in N-Triples), so it
+    /// runs inside a read scope (contract C2): a read error a backend reports
+    /// fails the export.
     pub fn export_ntriples(&self, out: &mut dyn std::io::Write) -> Result<u64> {
-        let mut count = 0u64;
-        for t in self.store.iter_all() {
-            let (Some(s), Some(p), Some(o)) = (
-                self.dict.id_to_string(t.sub),
-                self.dict.predicate_to_string(t.pred),
-                self.dict.id_to_string(t.obj),
-            ) else {
-                continue;
-            };
-            let (s, p, o) = (export_key(s), export_key(p), export_key(o));
-            writeln!(out, "{s} {p} {o} .")?;
-            count += 1;
-        }
-        out.flush()?;
-        Ok(count)
+        crate::zipio::write_export(self, crate::zipio::ExportFormat::NTriples, out)
     }
 
     /// The number of distinct subjects of the default graph (upstream

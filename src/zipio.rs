@@ -54,6 +54,7 @@ use crate::config::GStoreConfig;
 use crate::db::Database;
 use crate::error::{GStoreError, Result};
 use crate::model::term::export_key;
+use crate::store::read_scope::ReadScope;
 use crate::store::TripleSource;
 
 /// Whether this build handles zip packages (feature `zip`).
@@ -758,7 +759,25 @@ impl ExportFormat {
 /// in id order). Returns the number of statements written. A statement whose
 /// terms the dictionary cannot resolve is skipped (as `export_ntriples`).
 /// IRIs are written through [`export_key`], so the export loads back.
+///
+/// The walk runs inside a [`ReadScope`] (contract C2): a read error a backend
+/// reports while exporting fails the export instead of silently dropping the
+/// statements it could not read.
 pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) -> Result<u64> {
+    let scope = ReadScope::enter();
+    let count = write_statements(db, format, out)?;
+    if let Some(e) = scope.take_error() {
+        return Err(GStoreError::Database(format!(
+            "a read from the store failed while exporting: {e}"
+        )));
+    }
+    drop(scope);
+    out.flush()?;
+    Ok(count)
+}
+
+/// The statements of [`write_export`], without the read scope or the flush.
+fn write_statements(db: &Database, format: ExportFormat, out: &mut dyn Write) -> Result<u64> {
     let dict = db.dict();
     let mut count = 0u64;
     for t in db.backend().iter_all() {
@@ -793,7 +812,6 @@ pub fn write_export(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
             }
         }
     }
-    out.flush()?;
     Ok(count)
 }
 
@@ -871,6 +889,43 @@ mod tests {
             export_key("<http://ok>"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// A sink that stands in for a backend whose reads fail: on the export's
+    /// thread, during the walk, it reports a read error (contract C2).
+    struct FailingReads(Vec<u8>);
+    impl Write for FailingReads {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            crate::store::read_scope::note_read_error("injected export read failure");
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_read_error_fails_the_export() {
+        use crate::store::read_scope::in_scope;
+        let db = Database::build_from_str(
+            "x",
+            "<http://a> <http://p> <http://b> .\n<http://b> <http://p> \"l\" .\n",
+        )
+        .unwrap();
+        for format in [ExportFormat::NTriples, ExportFormat::NQuads] {
+            let e = write_export(&db, format, &mut FailingReads(Vec::new())).unwrap_err();
+            assert!(matches!(e, GStoreError::Database(_)), "{e}");
+            assert!(e.to_string().contains("exporting"), "{e}");
+            assert!(e.to_string().contains("injected export read failure"), "{e}");
+        }
+        let e = db.export_ntriples(&mut FailingReads(Vec::new())).unwrap_err();
+        assert!(e.to_string().contains("injected export read failure"), "{e}");
+        // The errors landed in the export's scope, which is gone again.
+        assert!(!in_scope());
+        // Without an error the same export succeeds.
+        let mut out = Vec::new();
+        assert_eq!(db.export_ntriples(&mut out).unwrap(), 2);
     }
 
     #[test]
