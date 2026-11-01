@@ -1,8 +1,9 @@
 //! The staged, crash-safe install of a bulk build.
 //!
 //! The build holds the directory's [`DirLock`] (another process holding the
-//! directory makes it fail) and a [`BuildGuard`] (another bulk build of this
-//! process does), and writes everything into `<dir>/.bulk-tmp/`, which no
+//! directory makes it fail, and so does a database of this process that has
+//! it open) and a [`BuildGuard`] (another bulk build of this process makes
+//! it fail), and writes everything into `<dir>/.bulk-tmp/`, which no
 //! layout detection looks at. A stale `.bulk-tmp/` from a crashed build is
 //! removed first. Once both files are complete and `fsync`ed, the install
 //! runs; after each step a crash leaves a directory that an unmodified
@@ -164,8 +165,17 @@ pub(crate) fn build_disk(
 ) -> Result<BulkReport> {
     let started = Instant::now();
     fs::create_dir_all(dir)?;
-    let _lock = DirLock::acquire(dir)?;
     let _guard = BuildGuard::enter(dir)?;
+    if DirLock::held_here(dir) {
+        // A database of this process has the directory open: replacing its
+        // files under it would strand its later writes (and a WAL of the
+        // old store could replay into the new one).
+        return Err(GStoreError::Database(format!(
+            "database directory '{}' is open in this process; close it before rebuilding it",
+            dir.display()
+        )));
+    }
+    let _lock = DirLock::acquire(dir)?;
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
         // What a crashed build left: never part of a database.

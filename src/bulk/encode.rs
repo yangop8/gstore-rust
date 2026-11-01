@@ -143,9 +143,9 @@ fn render_graph(g: &Option<Term>, out: &mut Vec<u8>) -> bool {
 pub(crate) fn check_new_term(space: Space, key_len: usize, index: usize) -> Result<()> {
     let next = index as u64;
     match space {
-        Space::Entity => drop(checked_entity_id(next)?),
-        Space::Literal => drop(checked_literal_id(next)?),
-        Space::Predicate => drop(checked_predicate_id(next)?),
+        Space::Entity => checked_entity_id(next).map(|_| ())?,
+        Space::Literal => checked_literal_id(next).map(|_| ())?,
+        Space::Predicate => checked_predicate_id(next).map(|_| ())?,
     }
     // The `*2id` value is a 4-byte id.
     if NODE_HEADER + 2 + key_len + 2 + 4 > PAGE_SIZE {
@@ -187,7 +187,7 @@ impl<'a> Encoder<'a> {
 
     /// Encode a batch of quads. The batch is left as it is: its owner clears
     /// it (the parallel parser drops the quads on its own thread).
-    pub(crate) fn add(&mut self, batch: &mut Vec<Quad>) -> Result<()> {
+    pub(crate) fn add(&mut self, batch: &[Quad]) -> Result<()> {
         for q in batch.iter() {
             self.add_quad(q)?;
         }

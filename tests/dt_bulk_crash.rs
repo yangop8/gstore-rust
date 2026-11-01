@@ -293,6 +293,13 @@ fn a_second_build_in_this_process_and_a_stale_staging_area() {
         assert!(e.to_string().contains("being rebuilt"), "{e}");
     }
     assert!(!gstore::db::dirlock::BuildGuard::active(&dir));
+    // A database of this process holding the directory is not pulled from
+    // under it.
+    {
+        let _open = Database::open(&dir).unwrap();
+        let e = build_new(&dir).unwrap_err();
+        assert!(e.to_string().contains("open in this process"), "{e}");
+    }
     // What a crashed build leaves behind is removed by the next one.
     let staging = dir.join(bulk::STAGING_DIR);
     fs::create_dir_all(staging.join("gstore-bulk-scratch-1-0")).unwrap();

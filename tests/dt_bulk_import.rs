@@ -120,13 +120,14 @@ fn bulk_into(
     (r, log_lines(&log_path))
 }
 
-/// Triples and quads of a database as strings.
-fn content(
-    db: &Database,
-) -> (
+/// A database's triples and quads as strings.
+type Content = (
     BTreeSet<(String, String, String)>,
     BTreeSet<(String, String, String, String)>,
-) {
+);
+
+/// Triples and quads of a database as strings.
+fn content(db: &Database) -> Content {
     let d = db.dict();
     let s = |id| d.id_to_string(id).unwrap().to_string();
     let p = |id| d.predicate_to_string(id).unwrap().to_string();

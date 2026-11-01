@@ -33,6 +33,7 @@ use crate::kvstore::store::{key3, key4};
 use crate::kvstore::PageId;
 use crate::model::id::LITERAL_FIRST_ID;
 use crate::parser::import::{ErrorLog, ImportOptions, ImportReport};
+use crate::parser::nquads::Quad;
 use crate::signature::VsTree;
 
 use super::budget::Budget;
@@ -128,9 +129,8 @@ pub(crate) fn build_image(
         ExtSorter::new("spo", budget, scratch, budget.share(2)),
         ExtSorter::new("gspo", budget, scratch, budget.share(2)),
     );
-    img.import = source::import(input, opts, log, ctx.threads, &mut |b: &mut Vec<
-        crate::parser::nquads::Quad,
-    >| enc.add(b))?;
+    let mut sink = |b: &mut Vec<Quad>| enc.add(b);
+    img.import = source::import(input, opts, log, ctx.threads, &mut sink)?;
     let (mut dict, spo, gspo) = enc.into_parts();
     img.term_map_bytes = dict.heap_bytes();
     dict.entities.drop_table();

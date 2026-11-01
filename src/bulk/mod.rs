@@ -209,8 +209,9 @@ impl BulkReport {
 /// Fails without touching an existing database when the input fails (a
 /// strict import's first bad statement, an unreadable source, a term too
 /// long for the disk layout — with the incremental build's error text),
-/// when another process holds the directory, or when another bulk build of
-/// this process is rebuilding it.
+/// when another process holds the directory, when a database of this
+/// process has it open, or when another bulk build of this process is
+/// rebuilding it.
 pub fn build(
     dir: &Path,
     name: &str,
