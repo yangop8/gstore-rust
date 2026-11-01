@@ -118,9 +118,13 @@ pub struct RunConfig {
     /// `--gbuild-arg` values.
     #[serde(default)]
     pub gbuild_args: Vec<String>,
-    /// Warm query repetitions.
+    /// Warm query repetitions (per query process).
     #[serde(default)]
     pub reps: usize,
+    /// Fresh processes the query phase ran in (0 in files written before
+    /// this field existed, meaning one).
+    #[serde(default)]
+    pub query_procs: usize,
     /// Whether the page cache was dropped before the first open.
     #[serde(default)]
     pub drop_caches: bool,
@@ -218,12 +222,19 @@ pub struct QueryMeasure {
     pub name: String,
     pub rows: u64,
     pub rows_fnv64: String,
-    /// The first run after open.
+    /// The first run after open (the minimum over the query processes).
     pub first_ms: f64,
-    /// Median of the warm runs.
+    /// The median of the warm runs of one process, the minimum over the
+    /// query processes (see `proc_medians_ms`).
     pub median_ms: f64,
+    /// Every warm run, of every query process.
     #[serde(default)]
     pub runs_ms: Vec<f64>,
+    /// The warm median of each query process, in order. Each process draws
+    /// its own hash seeds and heap layout, which moves some query times by up
+    /// to ~1.5x from one process to the next but hardly within one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proc_medians_ms: Vec<f64>,
     /// Every run returned the same rows.
     #[serde(default = "yes")]
     pub stable: bool,

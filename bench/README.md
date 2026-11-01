@@ -36,7 +36,7 @@ an unreadable file — never 0.
 
 Run options: `--profile micro|smoke|reference`, `--workload`, `--scale`,
 `--seed`, `--departments`, `--backends snapshot,disk,rocksdb`, `--reps N`,
-`--open-reps N`, `--singles N`, `--no-update`, `--no-conc`,
+`--query-procs N`, `--open-reps N`, `--singles N`, `--no-update`, `--no-conc`,
 `--conc-clients 1,8`, `--conc-secs S`, `--conc-queries q1,q4`,
 `--conc-endpoints sparql,api`, `--timeout-s N`, `--bin-dir DIR`,
 `--data-dir DIR` (default `$GSTORE_BENCH_CACHE` or
@@ -50,11 +50,11 @@ root), `--no-calibrate`, `--verify-data` (re-hash a cached data file),
 
 ## Profiles
 
-| profile | workload | backends | reps | conc | use |
+| profile | workload | backends | reps × query processes | conc | use |
 |---|---|---|---|---|---|
-| `micro` | LUBM-like univ 1, one department (7.5K triples) | snapshot | 2 | 1, 2 clients × 0.25 s | the harness's own tests |
-| `smoke` | LUBM-like univ 1 (140K triples) | snapshot, disk | 3 | 1, 2 clients × 1 s (report-only) | CI gate |
-| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) | snapshot, disk, rocksdb if compiled | 5 | 1, 8 clients × 5 s | Phase 6 measurements |
+| `micro` | LUBM-like univ 1, one department (7.5K triples) | snapshot | 2 × 2 | 1, 2 clients × 0.25 s | the harness's own tests |
+| `smoke` | LUBM-like univ 1 (140K triples) | snapshot, disk | 3 × 3 | 1, 2 clients × 1 s (report-only) | CI gate |
+| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) | snapshot, disk, rocksdb if compiled | 5 × 5 | 1, 8 clients × 5 s | Phase 6 measurements |
 
 ## What a run measures
 
@@ -74,12 +74,20 @@ a crash or a timeout fails the run with exit code 2):
    warm figure is their median. RSS after the first open; the triple,
    entity, literal and predicate counts. `triple_num` must equal the
    generator's unique triples.
-3. **query** — open, query cache off (`set_query_cache_size(0)`), then every
-   query once plus `reps` warm runs, each text prefixed with a
-   `# gstore-bench run k` comment. First and median time, rows and
-   `rows_fnv64` (a multiset hash of the rows in which unbound ≠ `""`); the
-   rows must be identical in every run and on every backend. The process's
-   RSS and high-water mark afterwards.
+3. **query** — in each of `--query-procs` fresh processes: open, query
+   cache off (`set_query_cache_size(0)`), then every query once plus `reps`
+   warm runs, each text prefixed with a `# gstore-bench run k` comment.
+   Per query the result keeps the **minimum over the processes of the warm
+   median** (and of the first run), each process's median
+   (`proc_medians_ms`) and every warm run; rows and `rows_fnv64` (a
+   multiset hash of the rows in which unbound ≠ `""`) must be identical in
+   every run, in every process and on every backend. The largest RSS and
+   high-water mark of the processes afterwards. Several processes are
+   needed because each draws its own hash seeds and heap layout: on the
+   pre-Phase-6 engine some univ 8 queries take up to ~1.5× longer in one
+   process than in the next while varying by a few percent within one, so
+   a single process's median moved the Q1–Q14 geomean by ±10% between
+   runs.
 4. **conc** — the single-database `Server` (`GET /sparql`, TSV) and the
    multi-database `ApiServer` (`GET /api?operation=query`, JSON, after
    `operation=load`), in-process on an ephemeral port, query cache off;

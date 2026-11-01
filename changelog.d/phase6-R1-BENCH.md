@@ -33,8 +33,12 @@
   (`getrusage(RUSAGE_CHILDREN)`) and the database's bytes. Open (first —
   cold with `--drop-caches` — and `--open-reps` warm opens, each in a fresh
   process), query (cache off, `# gstore-bench run k` prefix, first + median
-  of `reps`, rows and an order-independent row hash that must be stable and
-  equal across backends), concurrency (in-process `Server` `GET /sparql` TSV
+  of `reps` in each of `query_procs` fresh processes — 5 in `reference`, 3
+  in `smoke` — keeping per query the minimum of the per-process medians,
+  because hash seeds and heap layout move some query times by up to ~1.5×
+  between processes of the pre-Phase-6 engine; rows and an
+  order-independent row hash that must be stable across runs and
+  processes and equal across backends), concurrency (in-process `Server` `GET /sparql` TSV
   and `ApiServer` `GET /api?operation=query`, closed-loop keep-alive
   clients, identical bodies required) and update (single INSERT/DELETE DATA
   median/p95, the chunk inserted and deleted with exact `triple_num`

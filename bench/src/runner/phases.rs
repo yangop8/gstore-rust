@@ -158,6 +158,7 @@ pub fn query_phase(dir: &Path, w: &dyn Workload, reps: usize) -> Result<QueryPha
                 median(&runs)
             },
             runs_ms: runs,
+            proc_medians_ms: Vec::new(),
             stable,
         });
     }
@@ -169,6 +170,49 @@ pub fn query_phase(dir: &Path, w: &dyn Workload, reps: usize) -> Result<QueryPha
             hwm_mib: sys::hwm_mib(),
         },
     })
+}
+
+/// Fold the query phases of several fresh processes into one.
+///
+/// Each process draws its own hash seeds and heap layout, and some query
+/// times move by up to ~1.5x from one process to the next while hardly
+/// moving within one, so a single process's median is not repeatable. Per
+/// query: the minimum over the processes of the warm median (and of the
+/// first run), every warm run, each process's median in
+/// `proc_medians_ms`, and `stable` only when every process was stable and
+/// returned the first process's rows and row hash. Memory: the largest of
+/// the processes. The open sample is the first process's.
+pub fn fold_query_phases(phases: Vec<QueryPhase>) -> Result<QueryPhase, String> {
+    let mut it = phases.into_iter();
+    let mut acc = it.next().ok_or("no query phase to fold")?;
+    for q in acc.queries.iter_mut() {
+        q.proc_medians_ms = vec![q.median_ms];
+    }
+    for p in it {
+        if p.queries.len() != acc.queries.len() {
+            return Err("query processes ran different query sets".into());
+        }
+        for (a, q) in acc.queries.iter_mut().zip(p.queries) {
+            if a.name != q.name {
+                return Err(format!(
+                    "query processes ran {} and {} in the same slot",
+                    a.name, q.name
+                ));
+            }
+            a.stable &= q.stable && q.rows == a.rows && q.rows_fnv64 == a.rows_fnv64;
+            a.first_ms = a.first_ms.min(q.first_ms);
+            a.median_ms = a.median_ms.min(q.median_ms);
+            a.proc_medians_ms.push(q.median_ms);
+            a.runs_ms.extend(q.runs_ms);
+        }
+        let max = |x: Option<f64>, y: Option<f64>| match (x, y) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
+        };
+        acc.mem.rss_mib = max(acc.mem.rss_mib, p.mem.rss_mib);
+        acc.mem.hwm_mib = max(acc.mem.hwm_mib, p.mem.hwm_mib);
+    }
+    Ok(acc)
 }
 
 /// Expected answers (name, rows, rows hash) for the update phase's check.
@@ -293,5 +337,70 @@ mod tests {
         let v: Vec<f64> = (1..=100).map(f64::from).collect();
         assert_eq!(percentile(&v, 95.0), 95.0);
         assert_eq!(percentile(&[7.0], 95.0), 7.0);
+    }
+
+    fn phase(medians: &[f64], rows: u64, hwm: f64) -> QueryPhase {
+        QueryPhase {
+            open: OpenSample::default(),
+            queries: medians
+                .iter()
+                .enumerate()
+                .map(|(i, &m)| QueryMeasure {
+                    name: format!("q{}", i + 1),
+                    rows,
+                    rows_fnv64: "00000000000000aa".into(),
+                    first_ms: m * 2.0,
+                    median_ms: m,
+                    runs_ms: vec![m, m],
+                    proc_medians_ms: Vec::new(),
+                    stable: true,
+                })
+                .collect(),
+            mem: MemInfo {
+                rss_mib: Some(hwm - 1.0),
+                hwm_mib: Some(hwm),
+            },
+        }
+    }
+
+    #[test]
+    fn fold_takes_the_minimum_over_processes() {
+        let one = fold_query_phases(vec![phase(&[10.0, 3.0], 5, 100.0)]).unwrap();
+        assert_eq!(one.queries[0].median_ms, 10.0);
+        assert_eq!(one.queries[0].proc_medians_ms, vec![10.0]);
+
+        let f = fold_query_phases(vec![
+            phase(&[10.0, 3.0], 5, 100.0),
+            phase(&[15.0, 2.0], 5, 120.0),
+            phase(&[9.0, 4.0], 5, 110.0),
+        ])
+        .unwrap();
+        let (q1, q2) = (&f.queries[0], &f.queries[1]);
+        assert_eq!((q1.median_ms, q2.median_ms), (9.0, 2.0));
+        assert_eq!((q1.first_ms, q2.first_ms), (18.0, 4.0));
+        assert_eq!(q1.proc_medians_ms, vec![10.0, 15.0, 9.0]);
+        assert_eq!(q1.runs_ms.len(), 6);
+        assert!(q1.stable && q2.stable);
+        assert_eq!(f.mem.hwm_mib, Some(120.0));
+        assert_eq!(f.mem.rss_mib, Some(119.0));
+    }
+
+    #[test]
+    fn fold_flags_answers_that_differ_between_processes() {
+        let mut odd = phase(&[10.0, 3.0], 5, 100.0);
+        odd.queries[1].rows_fnv64 = "00000000000000bb".into();
+        let f = fold_query_phases(vec![phase(&[10.0, 3.0], 5, 100.0), odd]).unwrap();
+        assert!(f.queries[0].stable);
+        assert!(!f.queries[1].stable);
+        let f = fold_query_phases(vec![
+            phase(&[10.0, 3.0], 5, 100.0),
+            phase(&[10.0, 3.0], 6, 100.0),
+        ])
+        .unwrap();
+        assert!(!f.queries[0].stable);
+        assert!(fold_query_phases(Vec::new()).is_err());
+        assert!(
+            fold_query_phases(vec![phase(&[1.0, 2.0], 5, 1.0), phase(&[1.0], 5, 1.0)]).is_err()
+        );
     }
 }

@@ -36,7 +36,7 @@ run options:
   --profile P            micro (tests), smoke (CI: univ 1, snapshot+disk), reference (univ 8/38)
   --workload W --scale N --seed S --departments D
   --backends a,b         snapshot, disk, rocksdb (rocksdb needs --features rocksdb)
-  --reps N --open-reps N --singles N --no-update
+  --reps N --query-procs N --open-reps N --singles N --no-update
   --no-conc --conc-clients 1,8 --conc-secs S --conc-queries q1,q4 --conc-endpoints sparql,api
   --timeout-s N          per-phase timeout (default from the profile)
   --bin-dir DIR          where gbuild is (default target/release)
@@ -167,6 +167,12 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
     }
     if let Some(n) = a.parsed("--reps")? {
         p.reps = n;
+    }
+    if let Some(n) = a.parsed::<usize>("--query-procs")? {
+        if n == 0 {
+            return Err("--query-procs must be at least 1".into());
+        }
+        p.query_procs = n;
     }
     if let Some(n) = a.parsed("--open-reps")? {
         p.open_reps = n;
@@ -733,7 +739,7 @@ mod tests {
     fn run_options_apply_overrides() {
         let mut a = Args {
             items:
-                "--profile reference --scale 38 --backends snapshot --reps 2 --no-conc --env A=b"
+                "--profile reference --scale 38 --backends snapshot --reps 2 --query-procs 3 --no-conc --env A=b"
                     .split(' ')
                     .map(String::from)
                     .collect(),
@@ -743,6 +749,7 @@ mod tests {
         assert_eq!(o.profile.spec.scale, 38);
         assert_eq!(o.profile.backends, vec!["snapshot"]);
         assert_eq!(o.profile.reps, 2);
+        assert_eq!(o.profile.query_procs, 3);
         assert!(o.profile.conc.is_none());
         assert_eq!(o.env, vec![("A".to_string(), "b".to_string())]);
         assert!(a.finish().unwrap().is_empty());

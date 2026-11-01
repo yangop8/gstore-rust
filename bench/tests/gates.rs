@@ -52,6 +52,7 @@ fn result(scale: f64) -> BenchResult {
                 first_ms: m * scale * 1.2,
                 median_ms: m * scale,
                 runs_ms: vec![m * scale],
+                proc_medians_ms: vec![m * scale],
                 stable: true,
             })
             .collect(),

@@ -42,8 +42,12 @@ pub struct Profile {
     pub name: String,
     pub spec: WorkloadSpec,
     pub backends: Vec<String>,
-    /// Warm query repetitions (after the first run).
+    /// Warm query repetitions (after the first run), per query process.
     pub reps: usize,
+    /// Fresh processes the query phase runs in; per query the minimum of
+    /// their warm medians is kept (see [`phases::fold_query_phases`]).
+    #[serde(default = "one")]
+    pub query_procs: usize,
     /// Warm opens, each in a fresh process (after the first open).
     pub open_reps: usize,
     /// Single-triple inserts (and deletes) of the update phase.
@@ -54,6 +58,10 @@ pub struct Profile {
     pub timeout_s: u64,
     /// Shrink the calibration (tests).
     pub quick_calib: bool,
+}
+
+fn one() -> usize {
+    1
 }
 
 /// The built-in profiles: `micro` (tests), `smoke` (CI) and `reference`
@@ -74,6 +82,7 @@ pub fn profile(name: &str) -> Option<Profile> {
             },
             backends: vec!["snapshot".into()],
             reps: 2,
+            query_procs: 2,
             open_reps: 1,
             singles: 3,
             update: true,
@@ -87,6 +96,7 @@ pub fn profile(name: &str) -> Option<Profile> {
             spec: WorkloadSpec::lubm(1, 0),
             backends: vec!["snapshot".into(), "disk".into()],
             reps: 3,
+            query_procs: 3,
             open_reps: 3,
             singles: 20,
             update: true,
@@ -100,6 +110,7 @@ pub fn profile(name: &str) -> Option<Profile> {
             spec: WorkloadSpec::lubm(8, 0),
             backends: backends::compiled().iter().map(|s| s.to_string()).collect(),
             reps: 5,
+            query_procs: 5,
             open_reps: 3,
             singles: 100,
             update: true,
@@ -510,9 +521,19 @@ impl Session {
             env: self.opts.env.iter().cloned().collect::<BTreeMap<_, _>>(),
             gbuild_args: self.opts.gbuild_args.clone(),
             reps: self.opts.profile.reps,
+            query_procs: self.opts.profile.query_procs.max(1),
             drop_caches: self.opts.drop_caches,
             calib_score_ms: self.calib_score,
         }
+    }
+
+    /// The query phase in `query_procs` fresh processes, folded.
+    fn queries(&self, backend: &str) -> Result<QueryPhase, String> {
+        let req = self.request("query", backend, self.backend_dir(backend));
+        let phases = (0..self.opts.profile.query_procs.max(1))
+            .map(|_| self.child::<QueryPhase>(&req))
+            .collect::<Result<Vec<_>, _>>()?;
+        phases::fold_query_phases(phases)
     }
 
     fn opens(&self, backend: &str, n: usize) -> Result<Vec<OpenSample>, String> {
@@ -573,7 +594,7 @@ impl Session {
             first.triple_num
         ));
 
-        let qp: QueryPhase = self.child(&self.request("query", backend, dir.clone()))?;
+        let qp = self.queries(backend)?;
         run.queries = qp.queries;
         run.query_mem = Some(qp.mem);
         let meds: Vec<String> = run
@@ -661,8 +682,7 @@ impl Session {
                 }
             }
             Phase::Query => {
-                let qp: QueryPhase =
-                    self.child(&self.request("query", &backend, self.backend_dir(&backend)))?;
+                let qp = self.queries(&backend)?;
                 for q in qp.queries {
                     if let Some(old) = run.queries.iter_mut().find(|o| o.name == q.name) {
                         old.stable &=
@@ -670,6 +690,7 @@ impl Session {
                         old.median_ms = old.median_ms.min(q.median_ms);
                         old.first_ms = old.first_ms.min(q.first_ms);
                         old.runs_ms.extend(q.runs_ms);
+                        old.proc_medians_ms.extend(q.proc_medians_ms);
                     }
                 }
                 if let (Some(m), Some(h)) = (run.query_mem.as_mut(), qp.mem.hwm_mib) {
