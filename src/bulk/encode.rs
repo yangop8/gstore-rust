@@ -185,10 +185,11 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    /// Encode a batch of quads (draining it).
+    /// Encode a batch of quads. The batch is left as it is: its owner clears
+    /// it (the parallel parser drops the quads on its own thread).
     pub(crate) fn add(&mut self, batch: &mut Vec<Quad>) -> Result<()> {
-        for q in batch.drain(..) {
-            self.add_quad(&q)?;
+        for q in batch.iter() {
+            self.add_quad(q)?;
         }
         Ok(())
     }

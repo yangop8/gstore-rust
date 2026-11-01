@@ -15,7 +15,7 @@
 //! so parsing and encoding overlap.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Mutex;
 
 use crate::error::{GStoreError, Result};
@@ -54,15 +54,24 @@ impl ErrorLog for FwdLog<'_> {
     }
 }
 
-/// Forwards batches to the channel.
+/// Forwards batches to the channel. The consumer sends each batch back once
+/// it is encoded, and the quads are dropped here, on the thread that
+/// allocated them (freeing another thread's allocations is markedly slower),
+/// and the batch's buffer is reused.
 struct FwdSink<'a> {
     tx: &'a SyncSender<Event>,
+    back: &'a Receiver<Vec<Quad>>,
     cap: usize,
 }
 
 impl QuadSink for FwdSink<'_> {
     fn quads(&mut self, batch: &mut Vec<Quad>) -> Result<()> {
-        let full = std::mem::replace(batch, Vec::with_capacity(self.cap));
+        let mut next = self
+            .back
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(self.cap));
+        next.clear();
+        let full = std::mem::replace(batch, next);
         self.tx
             .send(Event::Batch(full))
             .map_err(|_| GStoreError::Database("the bulk build stopped reading the input".into()))
@@ -101,11 +110,15 @@ fn parallel(
     let popts = &popts;
     let n = sources.len();
     let mut rxs: Vec<Option<Receiver<Event>>> = Vec::with_capacity(n);
-    let mut txs: Vec<Mutex<Option<SyncSender<Event>>>> = Vec::with_capacity(n);
+    let mut backs: Vec<Sender<Vec<Quad>>> = Vec::with_capacity(n);
+    type WorkerEnds = (SyncSender<Event>, Receiver<Vec<Quad>>);
+    let mut txs: Vec<Mutex<Option<WorkerEnds>>> = Vec::with_capacity(n);
     for _ in 0..n {
         let (tx, rx) = sync_channel(PIPE_DEPTH);
-        txs.push(Mutex::new(Some(tx)));
+        let (back_tx, back_rx) = channel();
+        txs.push(Mutex::new(Some((tx, back_rx))));
         rxs.push(Some(rx));
+        backs.push(back_tx);
     }
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -121,19 +134,20 @@ fn parallel(
                 if i >= n {
                     return;
                 }
-                let Some(tx) = txs[i].lock().unwrap().take() else {
+                let Some((tx, back)) = txs[i].lock().unwrap().take() else {
                     continue;
                 };
                 let mut flog = FwdLog { tx: &tx };
                 let mut fsink = FwdSink {
                     tx: &tx,
+                    back: &back,
                     cap: popts.batch_size,
                 };
                 let r = import::import_source(&sources[i], OPERATION, popts, &mut flog, &mut fsink);
                 let _ = tx.send(Event::Done(r));
             });
         }
-        let result = replay(sources, &mut rxs, log, sink);
+        let result = replay(sources, &mut rxs, &backs, log, sink);
         if result.is_err() {
             stop.store(true, Ordering::Relaxed);
         }
@@ -147,6 +161,7 @@ fn parallel(
 fn replay(
     sources: &[Source],
     rxs: &mut [Option<Receiver<Event>>],
+    backs: &[Sender<Vec<Quad>>],
     log: &mut dyn ErrorLog,
     sink: &mut dyn QuadSink,
 ) -> Result<ImportReport> {
@@ -158,7 +173,11 @@ fn replay(
         loop {
             match rx.recv() {
                 Ok(Event::Failed(e)) => log.failed(&name, &e),
-                Ok(Event::Batch(mut b)) => sink.quads(&mut b)?,
+                Ok(Event::Batch(mut b)) => {
+                    sink.quads(&mut b)?;
+                    // Back to the parser, which drops what is left in it.
+                    let _ = backs[i].send(b);
+                }
                 Ok(Event::Done(r)) => {
                     total.absorb(&r?);
                     break;
