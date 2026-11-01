@@ -51,6 +51,7 @@
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod format;
 pub mod isarray;
 pub mod ivarray;
 pub mod overflow;

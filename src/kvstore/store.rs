@@ -17,13 +17,38 @@
 //! default-graph mutation sets it, in the same pager commit as the mutated pages,
 //! so a `vstree.kv` signature index built beside the store is known to be out of
 //! date after any update that reached disk (see [`DiskStore::vstree_stale`]).
+//! Every header slot is assigned in the [`format`](super::format) registry.
+//!
+//! ## Reads
+//! The fallible `try_*` methods mirror every [`TripleSource`] method and return
+//! `io::Result`: they decode keys straight out of the cached pages (no per-key
+//! allocation) into the output vectors, **in the C1 contract order** of the
+//! trait (`po_by_s` → `(p,o)`, `ps_by_o` → `(p,s)`, `so_by_p` → `(s,o)`, all
+//! sorted; the id lists ascending; `iter_all` in `(p,s,o)` order) — the same
+//! order [`TripleStore`] produces, so plans and solution order do not depend on
+//! the backend. The infallible [`TripleSource`] impl delegates to them and
+//! turns a read error into an empty answer (a test-only convenience; the
+//! database layer reports read errors per query). Exact counts (`count_*`,
+//! `distinct_p_of_*`, `has_*`) never materialize a range.
+//!
+//! ## Writes
+//! Every logical write — interning a term, inserting or deleting a triple or a
+//! quad, and the key-level wrappers that do both — runs in **one** pager
+//! operation bracket while holding the pager write lock for its whole duration
+//! (see [`PagerOp`]): no commit can contain half of it, and an error midway
+//! rolls the whole operation back (pages, header, and this struct's counters).
+//! So a crash can no longer leave the three indexes disagreeing about a triple,
+//! or a term in `entity2id` whose id the count root does not cover (which would
+//! later be handed out twice).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io;
+use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::dict::{Dictionary, DiskTermSource};
-use crate::error::Result;
+use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::nquads::Quad;
@@ -31,54 +56,21 @@ use crate::parser::{import, sparql};
 use crate::query::{Evaluator, QueryResult};
 use crate::store::{MutableStore, TripleSource, TripleStore};
 
-use super::bptree::{be32, de32, BTree};
+use super::bptree::{be32, BTree};
 use super::disk_dict::DiskDict;
+use super::format::{
+    ENTITY2ID, GSPO, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, OSP, POS, PREDICATE2ID,
+    PRED_STATS, ROOT_COMPACTED, ROOT_DISTINCT_OBJ, ROOT_DISTINCT_SUBJ, ROOT_ENTITY_COUNT,
+    ROOT_LITERAL_COUNT, ROOT_PRED_COUNT, ROOT_QUAD_COUNT, ROOT_TRIPLE_COUNT, ROOT_VSTREE_STALE,
+    SP2O_VLIST, SPO,
+};
 use super::ivarray::IvArray;
 use super::overflow;
-use super::pager::{Pager, PAGE_SIZE};
+use super::pager::{Pager, PagerOp, PAGE_SIZE};
 use super::vlist;
 
-// Header root-slot assignment.
-const SPO: usize = 0;
-const POS: usize = 1;
-const OSP: usize = 2;
-const ENTITY2ID: usize = 3;
-const LITERAL2ID: usize = 4;
-const PREDICATE2ID: usize = 5;
-const ID2ENTITY: usize = 6;
-const ID2LITERAL: usize = 7;
-const ID2PREDICATE: usize = 8;
-const ROOT_TRIPLE_COUNT: usize = 9;
-const ROOT_ENTITY_COUNT: usize = 10;
-const ROOT_LITERAL_COUNT: usize = 11;
-const ROOT_PRED_COUNT: usize = 12;
-/// Root of the optional VList-compressed `(sub, pred) → objects` index.
-const SP2O_VLIST: usize = 13;
-/// `1` once [`DiskStore::compact`] has built `SP2O_VLIST`; cleared by any write.
-const ROOT_COMPACTED: usize = 14;
-/// Root of the maintained per-predicate statistics [`IvArray`] (gStore
-/// `pre2num`/`pre2sub`/`pre2obj`): predicate id → 12-byte record
-/// `[num: u32][distinct_subj: u32][distinct_obj: u32]`, all little-endian. A
-/// non-zero root here is also the sentinel that the maintained stats exist (used
-/// by [`DiskStore::open`] to lazily rebuild them for a pre-statistics file).
-const PRED_STATS: usize = 15;
-/// Maintained count of distinct ids that appear as a subject (exact; the
-/// in-memory counterpart of `TripleStore::distinct_subjects`).
-const ROOT_DISTINCT_SUBJ: usize = 16;
-/// Maintained count of distinct ids that appear as an object (exact).
-const ROOT_DISTINCT_OBJ: usize = 17;
-/// Root of the named-graph quad index: 16-byte `g|s|p|o` keys, empty values.
-const GSPO: usize = 18;
-/// Maintained number of quads (named-graph triples) in [`GSPO`].
-const ROOT_QUAD_COUNT: usize = 19;
-/// `1` once a default-graph mutation has made a separately-built VS-tree file
-/// stale; cleared by [`DiskStore::mark_vstree_fresh`]. `0` (the value of a file
-/// written before this flag existed, which was never mutated after its build)
-/// means "fresh".
-const ROOT_VSTREE_STALE: usize = 20;
-
 /// Bytes of a per-predicate stats record (`num`, `distinct_subj`, `distinct_obj`).
-const PRED_STAT_LEN: usize = 12;
+pub(crate) const PRED_STAT_LEN: usize = 12;
 
 /// Upper bound on a VList value stored *inline* in a B+tree leaf page. A
 /// `(sub, pred)` group whose delta+varint encoding fits within this is stored
@@ -94,13 +86,33 @@ const INLINE_TAG: u8 = 0;
 /// page chain. The record is `[OVERFLOW_TAG][head: u32 le][byte_len: u32 le]`.
 const OVERFLOW_TAG: u8 = 1;
 
+/// A per-predicate statistics record: `(num, distinct_subj, distinct_obj)`.
+type PredStat = (u32, u32, u32);
+
+/// The in-memory counters a write operation may change, restored if it fails.
+#[derive(Clone, Copy)]
+struct Counters {
+    triple_count: u64,
+    entity_count: u32,
+    literal_count: u32,
+    pred_count: u32,
+    distinct_subj: u32,
+    distinct_obj: u32,
+    quad_count: u64,
+    vstree_stale: bool,
+    compacted: bool,
+    nonempty_preds: usize,
+    stats_len: usize,
+}
+
 /// A disk-backed gStore database (dictionary + six-way triple index).
 pub struct DiskStore {
     /// `Arc<RwLock<_>>` (not `RefCell`) so the out-of-core [`DiskDict`] can share
     /// the very same pager/page-cache, and so the type stays `Send`-able. The
-    /// `RwLock` (task 4) lets many readers resolve pages concurrently — every
-    /// read path takes `.read()` and the [`Pager`]'s `read_page(&self)` only
-    /// briefly latches its internal cache — while mutations take `.write()`.
+    /// `RwLock` lets many readers resolve pages concurrently — every read path
+    /// takes `.read()` and the [`Pager`]'s `read_page_shared(&self)` only
+    /// briefly latches its internal cache — while every logical write holds
+    /// `.write()` for its whole operation.
     pager: Arc<RwLock<Pager>>,
     spo: BTree,
     pos: BTree,
@@ -114,7 +126,7 @@ pub struct DiskStore {
     id2literal: IvArray,
     id2predicate: IvArray,
     /// Optional VList-compressed `(sub, pred) → objects` index (gStore's value
-    /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`/`po_by_s`
+    /// list). Built by [`compact`](DiskStore::compact); read by `o_by_sp`
     /// when [`compacted`](Self::compacted) is set.
     sp2o_vlist: BTree,
     /// Named-graph quads, keyed `graph|sub|pred|obj` (all big-endian ids).
@@ -125,10 +137,17 @@ pub struct DiskStore {
     vstree_stale: bool,
     /// Maintained per-predicate statistics (gStore `pre2num`/`pre2sub`/`pre2obj`),
     /// an integer-keyed dense [`IvArray`] of fixed 12-byte counter records. Kept
-    /// current on every insert/delete so the optimizer reads `pred_card` /
-    /// `pred_distinct_subj` / `pred_distinct_obj` in `O(1)` instead of scanning a
-    /// whole predicate's triples.
+    /// current on every insert/delete.
     pred_stats: IvArray,
+    /// In-memory mirror of `pred_stats` (index = predicate id), loaded at open
+    /// in `O(P)` and maintained with it, so the optimizer's `pred_card` /
+    /// `pred_distinct_subj` / `pred_distinct_obj` read no page at all.
+    stats: Vec<PredStat>,
+    /// Predicates with at least one triple (exact `num_predicates`).
+    nonempty_preds: usize,
+    /// `(pred, previous record)` for each mirror entry the current write
+    /// operation changed (to undo a failed operation).
+    stats_undo: Vec<(PredId, PredStat)>,
     triple_count: u64,
     entity_count: u32,
     literal_count: u32,
@@ -146,32 +165,112 @@ pub struct DiskStore {
     /// materialized-string cache (and thus its leak) stays bounded by the set of
     /// terms ever touched. Invalidated on any write (counts may have changed).
     /// A `Mutex` (not `RefCell`) so `DiskStore` stays `Sync` and many threads can
-    /// share it via `Arc` and read concurrently (task 4).
+    /// share it via `Arc` and read concurrently.
     disk_dict: Mutex<Option<Arc<DiskDict>>>,
+    /// A view created by [`from_shared_pager`](Self::from_shared_pager): every
+    /// write (and commit) is refused.
+    read_only: bool,
+}
+
+/// A store read error as an `io::Error` (I/O errors keep their kind; anything
+/// else, such as a malformed page, is `InvalidData`).
+fn to_io(e: GStoreError) -> io::Error {
+    match e {
+        GStoreError::Io(e) => e,
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
+fn io<T>(r: Result<T>) -> io::Result<T> {
+    r.map_err(to_io)
+}
+
+fn malformed(what: &str) -> GStoreError {
+    GStoreError::Database(format!("corrupt kvstore: {what}"))
+}
+
+/// The big-endian `u32` at byte `i` of a key whose length was checked.
+#[inline]
+fn id_at(k: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([k[i], k[i + 1], k[i + 2], k[i + 3]])
+}
+
+/// Decode a 4-byte big-endian id value of a dictionary tree.
+fn id_value(v: &[u8]) -> Result<u32> {
+    <[u8; 4]>::try_from(v)
+        .map(u32::from_be_bytes)
+        .map_err(|_| malformed("dictionary value is not a 4-byte id"))
+}
+
+/// Look `key` up in a `*2id` tree.
+fn lookup_id(tree: &BTree, pager: &Pager, key: &[u8]) -> Result<Option<u32>> {
+    tree.get_with(pager, key, id_value)?.transpose()
+}
+
+/// Visit the keys of `tree` under `prefix`, each checked to be `len` bytes.
+fn scan_keys(
+    tree: &BTree,
+    pager: &Pager,
+    prefix: &[u8],
+    len: usize,
+    mut f: impl FnMut(&[u8]),
+) -> Result<()> {
+    let mut bad = false;
+    tree.scan_prefix_with(pager, prefix, |k, _| {
+        if k.len() != len {
+            bad = true;
+            return ControlFlow::Break(());
+        }
+        f(k);
+        ControlFlow::Continue(())
+    })?;
+    if bad {
+        return Err(malformed("an index key has the wrong length"));
+    }
+    Ok(())
 }
 
 impl DiskStore {
     /// Open (or create) a disk store at `path` with a `cache_pages`-page cache.
     pub fn open<P: AsRef<Path>>(path: P, cache_pages: usize) -> Result<DiskStore> {
         let pager = Pager::open(path, cache_pages)?;
-        let triple_count = pager.root(ROOT_TRIPLE_COUNT);
-        let entity_count = pager.root(ROOT_ENTITY_COUNT) as u32;
-        let literal_count = pager.root(ROOT_LITERAL_COUNT) as u32;
-        let pred_count = pager.root(ROOT_PRED_COUNT) as u32;
-        let compacted = pager.root(ROOT_COMPACTED) != 0;
-        let distinct_subj = pager.root(ROOT_DISTINCT_SUBJ) as u32;
-        let distinct_obj = pager.root(ROOT_DISTINCT_OBJ) as u32;
-        let quad_count = pager.root(ROOT_QUAD_COUNT);
-        let vstree_stale = pager.root(ROOT_VSTREE_STALE) != 0;
         // A file written before the maintained statistics existed has triples but
         // no `pred_stats` array (its root slot is still zero). Detect that and
         // rebuild the stats once, so an old on-disk database still gets O(1)
         // optimizer statistics. A store built by current code always has a
         // non-zero `pred_stats` root once it holds a triple, so this never fires
         // on the normal build→reopen path.
-        let needs_rebuild = triple_count > 0 && pager.root(PRED_STATS) == 0;
+        let needs_rebuild = pager.root(ROOT_TRIPLE_COUNT) > 0 && pager.root(PRED_STATS) == 0;
+        let mut store = DiskStore::with_pager(Arc::new(RwLock::new(pager)), false)?;
+        if needs_rebuild {
+            store.rebuild_stats()?;
+        }
+        Ok(store)
+    }
+
+    /// A **read-only** view over a pager another `DiskStore` (the writer) owns:
+    /// counts are read from the header roots and the statistics mirror is
+    /// loaded from the file as they are now; [`refresh`](Self::refresh)
+    /// re-reads them after the writer committed more operations. Every write
+    /// and commit through the view is refused.
+    pub fn from_shared_pager(pager: Arc<RwLock<Pager>>) -> Result<DiskStore> {
+        DiskStore::with_pager(pager, true)
+    }
+
+    /// The pager (and page cache) this store reads and writes through.
+    pub fn shared_pager(&self) -> Arc<RwLock<Pager>> {
+        Arc::clone(&self.pager)
+    }
+
+    /// Whether this is a read-only view (see
+    /// [`from_shared_pager`](Self::from_shared_pager)).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn with_pager(pager: Arc<RwLock<Pager>>, read_only: bool) -> Result<DiskStore> {
         let mut store = DiskStore {
-            pager: Arc::new(RwLock::new(pager)),
+            pager,
             spo: BTree::new(SPO),
             pos: BTree::new(POS),
             osp: BTree::new(OSP),
@@ -183,22 +282,53 @@ impl DiskStore {
             id2predicate: IvArray::new(ID2PREDICATE),
             sp2o_vlist: BTree::new(SP2O_VLIST),
             gspo: BTree::new(GSPO),
-            quad_count,
-            vstree_stale,
+            quad_count: 0,
+            vstree_stale: false,
             pred_stats: IvArray::new(PRED_STATS),
-            triple_count,
-            entity_count,
-            literal_count,
-            pred_count,
-            distinct_subj,
-            distinct_obj,
-            compacted,
+            stats: Vec::new(),
+            nonempty_preds: 0,
+            stats_undo: Vec::new(),
+            triple_count: 0,
+            entity_count: 0,
+            literal_count: 0,
+            pred_count: 0,
+            distinct_subj: 0,
+            distinct_obj: 0,
+            compacted: false,
             disk_dict: Mutex::new(None),
+            read_only,
         };
-        if needs_rebuild {
-            store.rebuild_stats()?;
-        }
+        store.refresh()?;
         Ok(store)
+    }
+
+    /// Re-read every counter from the header roots and reload the statistics
+    /// mirror (`O(P)`). A writer's own counters are always current; this is for
+    /// a read-only view catching up with its writer.
+    pub fn refresh(&mut self) -> Result<()> {
+        let pager = self.pager.read().unwrap();
+        self.triple_count = pager.root(ROOT_TRIPLE_COUNT);
+        self.entity_count = pager.root(ROOT_ENTITY_COUNT) as u32;
+        self.literal_count = pager.root(ROOT_LITERAL_COUNT) as u32;
+        self.pred_count = pager.root(ROOT_PRED_COUNT) as u32;
+        self.compacted = pager.root(ROOT_COMPACTED) != 0;
+        self.distinct_subj = pager.root(ROOT_DISTINCT_SUBJ) as u32;
+        self.distinct_obj = pager.root(ROOT_DISTINCT_OBJ) as u32;
+        self.quad_count = pager.root(ROOT_QUAD_COUNT);
+        self.vstree_stale = pager.root(ROOT_VSTREE_STALE) != 0;
+        let mut stats = vec![(0u32, 0u32, 0u32); self.pred_count as usize];
+        self.pred_stats
+            .for_each_range(&pager, 0, self.pred_count, |p, rec| {
+                if let Some(st) = decode_pred_stat(rec) {
+                    stats[p as usize] = st;
+                }
+                ControlFlow::Continue(())
+            })?;
+        self.nonempty_preds = stats.iter().filter(|s| s.0 > 0).count();
+        self.stats = stats;
+        self.stats_undo.clear();
+        *self.disk_dict.lock().unwrap() = None;
+        Ok(())
     }
 
     /// Build a disk store from RDF files (directories and URLs expand, see
@@ -290,13 +420,79 @@ impl DiskStore {
         Ok(store)
     }
 
-    // ---- building ---------------------------------------------------------
+    // ---- write operations ---------------------------------------------------
 
-    fn intern_entity(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        if let Some(v) = self.entity2id.get(pager, key.as_bytes())? {
-            return Ok(de32(&v));
+    fn check_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(GStoreError::Database(
+                "this kvstore view is read-only".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            triple_count: self.triple_count,
+            entity_count: self.entity_count,
+            literal_count: self.literal_count,
+            pred_count: self.pred_count,
+            distinct_subj: self.distinct_subj,
+            distinct_obj: self.distinct_obj,
+            quad_count: self.quad_count,
+            vstree_stale: self.vstree_stale,
+            compacted: self.compacted,
+            nonempty_preds: self.nonempty_preds,
+            stats_len: self.stats.len(),
+        }
+    }
+
+    fn restore_counters(&mut self, c: Counters) {
+        for (p, before) in std::mem::take(&mut self.stats_undo).into_iter().rev() {
+            if let Some(slot) = self.stats.get_mut(p as usize) {
+                *slot = before;
+            }
+        }
+        self.stats.truncate(c.stats_len);
+        self.triple_count = c.triple_count;
+        self.entity_count = c.entity_count;
+        self.literal_count = c.literal_count;
+        self.pred_count = c.pred_count;
+        self.distinct_subj = c.distinct_subj;
+        self.distinct_obj = c.distinct_obj;
+        self.quad_count = c.quad_count;
+        self.vstree_stale = c.vstree_stale;
+        self.compacted = c.compacted;
+        self.nonempty_preds = c.nonempty_preds;
+    }
+
+    /// Run one logical write as a single pager operation under the pager write
+    /// lock (see the module docs): it commits as a whole or, on error, leaves
+    /// no trace in the pages, the header or this struct's counters.
+    fn write_op<R>(&mut self, f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>) -> Result<R> {
+        self.check_writable()?;
+        let before = self.counters();
+        self.stats_undo.clear();
+        let pager = Arc::clone(&self.pager);
+        let mut guard = pager.write().unwrap();
+        let mut op = PagerOp::begin(&mut guard);
+        match f(self, &mut op) {
+            Ok(r) => {
+                self.stats_undo.clear();
+                op.commit()?;
+                Ok(r)
+            }
+            Err(e) => {
+                drop(op); // rolls the pages and the header back
+                self.restore_counters(before);
+                Err(e)
+            }
+        }
+    }
+
+    fn intern_entity_in(&mut self, pager: &mut Pager, key: &str) -> Result<EntityLiteralId> {
+        if let Some(id) = lookup_id(&self.entity2id, pager, key.as_bytes())? {
+            return Ok(id);
         }
         // Bounded like the in-memory dictionary: an entity id must never spill
         // into the literal range [LITERAL_FIRST_ID, ..).
@@ -305,36 +501,32 @@ impl DiskStore {
         // id2entity is integer-keyed by the dense entity id.
         self.id2entity.insert(pager, id, key.as_bytes())?;
         self.entity_count += 1;
-        // Keep the count root current so any pager flush (incl. eviction) is
-        // crash-consistent with the dictionary trees.
         pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
         Ok(id)
     }
 
-    fn intern_literal(&mut self, key: &str) -> Result<EntityLiteralId> {
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        if let Some(v) = self.literal2id.get(pager, key.as_bytes())? {
-            return Ok(de32(&v));
+    fn intern_literal_in(&mut self, pager: &mut Pager, key: &str) -> Result<EntityLiteralId> {
+        if let Some(id) = lookup_id(&self.literal2id, pager, key.as_bytes())? {
+            return Ok(id);
         }
         let id = crate::dict::checked_literal_id(u64::from(self.literal_count))?;
         self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
         // id2literal is integer-keyed by the *local* literal index (id minus the
         // LITERAL_FIRST_ID offset) so the dense array stays compact from 0.
-        self.id2literal.insert(pager, id - LITERAL_FIRST_ID, key.as_bytes())?;
+        self.id2literal
+            .insert(pager, id - LITERAL_FIRST_ID, key.as_bytes())?;
         self.literal_count += 1;
         pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
         Ok(id)
     }
 
-    fn intern_predicate(&mut self, key: &str) -> Result<PredId> {
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        if let Some(v) = self.predicate2id.get(pager, key.as_bytes())? {
-            return Ok(de32(&v));
+    fn intern_predicate_in(&mut self, pager: &mut Pager, key: &str) -> Result<PredId> {
+        if let Some(id) = lookup_id(&self.predicate2id, pager, key.as_bytes())? {
+            return Ok(id);
         }
         let id = crate::dict::checked_predicate_id(u64::from(self.pred_count))?;
-        self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
+        self.predicate2id
+            .insert(pager, key.as_bytes(), &be32(id))?;
         // id2predicate is integer-keyed by the dense predicate id.
         self.id2predicate.insert(pager, id, key.as_bytes())?;
         self.pred_count += 1;
@@ -343,12 +535,41 @@ impl DiskStore {
     }
 
     /// Intern an object key in the literal or the entity space.
-    fn intern_object(&mut self, key: &str, is_literal: bool) -> Result<EntityLiteralId> {
+    fn intern_object_in(
+        &mut self,
+        pager: &mut Pager,
+        key: &str,
+        is_literal: bool,
+    ) -> Result<EntityLiteralId> {
         if is_literal {
-            self.intern_literal(key)
+            self.intern_literal_in(pager, key)
         } else {
-            self.intern_entity(key)
+            self.intern_entity_in(pager, key)
         }
+    }
+
+    /// Intern an entity key (one atomic operation); returns its id.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn intern_entity(&mut self, key: &str) -> Result<EntityLiteralId> {
+        self.write_op(|st, pg| st.intern_entity_in(pg, key))
+    }
+
+    /// Intern a literal key (one atomic operation); returns its public id.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn intern_literal(&mut self, key: &str) -> Result<EntityLiteralId> {
+        self.write_op(|st, pg| st.intern_literal_in(pg, key))
+    }
+
+    /// Intern a predicate key (one atomic operation); returns its id.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn intern_predicate(&mut self, key: &str) -> Result<PredId> {
+        self.write_op(|st, pg| st.intern_predicate_in(pg, key))
+    }
+
+    /// Intern an object key in the literal or the entity space.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn intern_object(&mut self, key: &str, is_literal: bool) -> Result<EntityLiteralId> {
+        self.write_op(|st, pg| st.intern_object_in(pg, key, is_literal))
     }
 
     /// Insert one triple; returns `true` if newly added.
@@ -366,39 +587,41 @@ impl DiskStore {
     /// space. New terms are interned in this store's own dictionary. Returns
     /// `true` if the triple was newly added. This is the write-through entry
     /// point the `Database` facade uses: it works on strings, so the in-memory
-    /// working set's ids need not line up with this store's ids.
+    /// working set's ids need not line up with this store's ids. The terms and
+    /// the triple are one atomic operation.
     pub fn insert_keys(&mut self, s: &str, p: &str, o: &str, o_is_literal: bool) -> Result<bool> {
-        let s = self.intern_entity(s)?;
-        let p = self.intern_predicate(p)?;
-        let o = self.intern_object(o, o_is_literal)?;
-        self.insert_ids(IdTriple::new(s, p, o))
+        self.write_op(|st, pg| {
+            let s = st.intern_entity_in(pg, s)?;
+            let p = st.intern_predicate_in(pg, p)?;
+            let o = st.intern_object_in(pg, o, o_is_literal)?;
+            st.insert_ids_in(pg, IdTriple::new(s, p, o))
+        })
     }
 
     /// Delete one default-graph triple given its dictionary keys (see
     /// [`insert_keys`](Self::insert_keys)). Returns `false` if any term is
     /// unknown or the triple is absent. Dictionary entries are kept.
     pub fn delete_keys(&mut self, s: &str, p: &str, o: &str, o_is_literal: bool) -> Result<bool> {
-        match self.lookup_keys(s, p, o, o_is_literal)? {
-            Some(t) => self.delete_ids(t),
+        self.write_op(|st, pg| match st.lookup_keys_in(pg, s, p, o, o_is_literal)? {
+            Some(t) => st.delete_ids_in(pg, t),
             None => Ok(false),
-        }
+        })
     }
 
     /// Resolve a triple's keys to ids without interning (`None` if any term is
     /// unknown to this store's dictionary).
-    fn lookup_keys(
+    fn lookup_keys_in(
         &self,
+        pager: &Pager,
         s: &str,
         p: &str,
         o: &str,
         o_is_literal: bool,
     ) -> Result<Option<IdTriple>> {
-        let guard = self.pager.read().unwrap();
-        let pager = &*guard;
-        let Some(s) = self.entity2id.get(pager, s.as_bytes())? else {
+        let Some(s) = lookup_id(&self.entity2id, pager, s.as_bytes())? else {
             return Ok(None);
         };
-        let Some(p) = self.predicate2id.get(pager, p.as_bytes())? else {
+        let Some(p) = lookup_id(&self.predicate2id, pager, p.as_bytes())? else {
             return Ok(None);
         };
         let otree = if o_is_literal {
@@ -406,16 +629,17 @@ impl DiskStore {
         } else {
             &self.entity2id
         };
-        let Some(o) = otree.get(pager, o.as_bytes())? else {
+        let Some(o) = lookup_id(otree, pager, o.as_bytes())? else {
             return Ok(None);
         };
-        Ok(Some(IdTriple::new(de32(&s), de32(&p), de32(&o))))
+        Ok(Some(IdTriple::new(s, p, o)))
     }
 
     // ---- named graphs (GSPO quad index) -----------------------------------
 
     /// Insert a triple into the named graph `g` (the graph IRI's dictionary key,
-    /// e.g. `<http://ex/g>`). Returns `true` if the quad was newly added.
+    /// e.g. `<http://ex/g>`). Returns `true` if the quad was newly added. The
+    /// terms and the quad are one atomic operation.
     pub fn insert_quad_keys(
         &mut self,
         g: &str,
@@ -424,20 +648,13 @@ impl DiskStore {
         o: &str,
         o_is_literal: bool,
     ) -> Result<bool> {
-        let g = self.intern_entity(g)?;
-        let s = self.intern_entity(s)?;
-        let p = self.intern_predicate(p)?;
-        let o = self.intern_object(o, o_is_literal)?;
-        let key = key4(g, s, p, o);
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        if self.gspo.get(pager, &key)?.is_some() {
-            return Ok(false);
-        }
-        self.gspo.insert(pager, &key, b"")?;
-        self.quad_count += 1;
-        pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
-        Ok(true)
+        self.write_op(|st, pg| {
+            let g = st.intern_entity_in(pg, g)?;
+            let s = st.intern_entity_in(pg, s)?;
+            let p = st.intern_predicate_in(pg, p)?;
+            let o = st.intern_object_in(pg, o, o_is_literal)?;
+            st.insert_quad_ids_in(pg, g, IdTriple::new(s, p, o))
+        })
     }
 
     /// Delete a triple from the named graph `g` (see
@@ -451,20 +668,30 @@ impl DiskStore {
         o: &str,
         o_is_literal: bool,
     ) -> Result<bool> {
-        let Some(t) = self.lookup_keys(s, p, o, o_is_literal)? else {
+        self.write_op(|st, pg| {
+            let Some(t) = st.lookup_keys_in(pg, s, p, o, o_is_literal)? else {
+                return Ok(false);
+            };
+            let Some(gid) = lookup_id(&st.entity2id, pg, g.as_bytes())? else {
+                return Ok(false);
+            };
+            st.delete_quad_ids_in(pg, gid, t)
+        })
+    }
+
+    fn insert_quad_ids_in(&mut self, pager: &mut Pager, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+        let key = key4(g, t.sub, t.pred, t.obj);
+        if self.gspo.contains(pager, &key)? {
             return Ok(false);
-        };
-        let gid = {
-            let guard = self.pager.read().unwrap();
-            match self.entity2id.get(&guard, g.as_bytes())? {
-                Some(v) => de32(&v),
-                None => return Ok(false),
-            }
-        };
-        let key = key4(gid, t.sub, t.pred, t.obj);
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        if !self.gspo.delete(pager, &key)? {
+        }
+        self.gspo.insert(pager, &key, b"")?;
+        self.quad_count += 1;
+        pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        Ok(true)
+    }
+
+    fn delete_quad_ids_in(&mut self, pager: &mut Pager, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+        if !self.gspo.delete(pager, &key4(g, t.sub, t.pred, t.obj))? {
             return Ok(false);
         }
         self.quad_count = self.quad_count.saturating_sub(1);
@@ -472,19 +699,32 @@ impl DiskStore {
         Ok(true)
     }
 
+    /// Insert the quad `(g, t)` by id (one atomic operation). The ids must be
+    /// interned in this store. Returns `true` if newly added.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn insert_quad_ids(&mut self, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+        self.write_op(|st, pg| st.insert_quad_ids_in(pg, g, t))
+    }
+
+    /// Delete the quad `(g, t)` by id (one atomic operation). Returns `true` if
+    /// it existed.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn delete_quad_ids(&mut self, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+        self.write_op(|st, pg| st.delete_quad_ids_in(pg, g, t))
+    }
+
     /// Every named-graph quad as `(graph_id, triple)` in this store's id space,
     /// sorted by graph then `(s, p, o)`.
     pub fn quads(&self) -> Result<Vec<(EntityLiteralId, IdTriple)>> {
-        let rows = self.scan(&self.gspo, &[])?;
-        Ok(rows
-            .iter()
-            .map(|k| {
-                (
-                    de32(&k[0..4]),
-                    IdTriple::new(de32(&k[4..8]), de32(&k[8..12]), de32(&k[12..16])),
-                )
-            })
-            .collect())
+        let pager = self.pager.read().unwrap();
+        let mut out = Vec::with_capacity(self.quad_count as usize);
+        scan_keys(&self.gspo, &pager, &[], 16, |k| {
+            out.push((
+                id_at(k, 0),
+                IdTriple::new(id_at(k, 4), id_at(k, 8), id_at(k, 12)),
+            ));
+        })?;
+        Ok(out)
     }
 
     /// Number of named-graph quads stored.
@@ -523,21 +763,21 @@ impl DiskStore {
     /// Record that the VS-tree file beside this store was rebuilt from the
     /// current default graph (persisted on the next [`flush`](Self::flush)).
     pub fn mark_vstree_fresh(&mut self) {
+        if self.read_only {
+            return;
+        }
         self.vstree_stale = false;
-        self.pager.write().unwrap().set_root(ROOT_VSTREE_STALE, 0);
+        self.pager
+            .write()
+            .unwrap()
+            .set_root(ROOT_VSTREE_STALE, 0);
     }
 
-    // Crash-consistency scope: the WAL makes each *pager flush* atomic, and the
-    // count roots above are kept current so they never lag the trees. But a
-    // logical triple is three B+ tree inserts (SPO/POS/OSP); under cache pressure
-    // an eviction-triggered flush can land between them, so a crash mid-insert
-    // can leave the indexes disagreeing for that one triple. Full per-operation
-    // atomicity (a single WAL batch per triple / page pinning) is future work.
-    fn insert_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
+    /// Insert one triple by id: the three indexes, the counters and the
+    /// statistics, inside the caller's operation.
+    fn insert_ids_in(&mut self, pager: &mut Pager, t: IdTriple) -> Result<bool> {
         let spo = key3(t.sub, t.pred, t.obj);
-        if self.spo.get(pager, &spo)?.is_some() {
+        if self.spo.contains(pager, &spo)? {
             return Ok(false);
         }
         // Detect statistics transitions *before* inserting, while the trees still
@@ -550,8 +790,8 @@ impl DiskStore {
         let sp_is_new = !self.spo.prefix_exists(pager, &cat(t.sub, t.pred))?;
         let po_is_new = !self.pos.prefix_exists(pager, &cat(t.pred, t.obj))?;
 
-        // Flag a beside-the-store VS-tree as stale *before* touching any page,
-        // so whichever pager commit first carries this mutation carries the flag.
+        // Flag a beside-the-store VS-tree as stale with this mutation (both land
+        // in the same commit: the operation is never split).
         self.vstree_stale = true;
         pager.set_root(ROOT_VSTREE_STALE, 1);
         self.spo.insert(pager, &spo, b"")?;
@@ -569,14 +809,11 @@ impl DiskStore {
             self.distinct_obj += 1;
             pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
         }
-        let (num, dsub, dobj) = read_pred_stat(&self.pred_stats, pager, t.pred)?;
-        write_pred_stat(
-            &self.pred_stats,
+        let (num, dsub, dobj) = self.stat(t.pred);
+        self.set_pred_stat(
             pager,
             t.pred,
-            num + 1,
-            dsub + sp_is_new as u32,
-            dobj + po_is_new as u32,
+            (num + 1, dsub + sp_is_new as u32, dobj + po_is_new as u32),
         )?;
 
         if self.compacted {
@@ -587,26 +824,11 @@ impl DiskStore {
         Ok(true)
     }
 
-    /// Delete one triple from all three indexes (gStore `KVstore::removeTriple`).
-    /// Returns `true` if it existed. Dictionary entries are intentionally kept
-    /// (gStore does not reclaim string ids on triple deletion); only the triple
-    /// indexes shrink, with the B+ trees merging underfull nodes and freeing
-    /// pages. Returns `false` (no change) if any term is unknown or the triple
-    /// is absent.
-    pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
-        self.delete_keys(
-            &t.subject.dict_key(),
-            &t.predicate.dict_key(),
-            &t.object.dict_key(),
-            t.object.is_literal(),
-        )
-    }
-
-    fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
+    /// Delete one triple by id from all three indexes, inside the caller's
+    /// operation.
+    fn delete_ids_in(&mut self, pager: &mut Pager, t: IdTriple) -> Result<bool> {
         let spo = key3(t.sub, t.pred, t.obj);
-        if self.spo.get(pager, &spo)?.is_none() {
+        if !self.spo.contains(pager, &spo)? {
             return Ok(false);
         }
         self.vstree_stale = true;
@@ -632,14 +854,15 @@ impl DiskStore {
             self.distinct_obj = self.distinct_obj.saturating_sub(1);
             pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
         }
-        let (num, dsub, dobj) = read_pred_stat(&self.pred_stats, pager, t.pred)?;
-        write_pred_stat(
-            &self.pred_stats,
+        let (num, dsub, dobj) = self.stat(t.pred);
+        self.set_pred_stat(
             pager,
             t.pred,
-            num.saturating_sub(1),
-            dsub.saturating_sub(sp_gone as u32),
-            dobj.saturating_sub(po_gone as u32),
+            (
+                num.saturating_sub(1),
+                dsub.saturating_sub(sp_gone as u32),
+                dobj.saturating_sub(po_gone as u32),
+            ),
         )?;
 
         if self.compacted {
@@ -649,8 +872,68 @@ impl DiskStore {
         Ok(true)
     }
 
-    /// Persist counters and flush all dirty pages.
+    /// Insert one default-graph triple by id (one atomic operation). The ids
+    /// must be interned in this store. Returns `true` if newly added.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn insert_ids(&mut self, t: IdTriple) -> Result<bool> {
+        self.write_op(|st, pg| st.insert_ids_in(pg, t))
+    }
+
+    /// Delete one triple from all three indexes (gStore `KVstore::removeTriple`),
+    /// by id, as one atomic operation. Returns `true` if it existed. Dictionary
+    /// entries are intentionally kept (gStore does not reclaim string ids on
+    /// triple deletion); only the triple indexes shrink, with the B+ trees
+    /// merging underfull nodes and freeing pages.
+    #[allow(dead_code)] // crate API for the Phase 6 writers (DiskTriples, bulk build)
+    pub(crate) fn delete_ids(&mut self, t: IdTriple) -> Result<bool> {
+        self.write_op(|st, pg| st.delete_ids_in(pg, t))
+    }
+
+    /// Delete one triple given its terms (see [`delete_ids`](Self::delete_ids)).
+    /// Returns `false` (no change) if any term is unknown or the triple is
+    /// absent.
+    pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
+        self.delete_keys(
+            &t.subject.dict_key(),
+            &t.predicate.dict_key(),
+            &t.object.dict_key(),
+            t.object.is_literal(),
+        )
+    }
+
+    /// The mirrored statistics record of `pred` (`(0,0,0)` if it has none).
+    fn stat(&self, pred: PredId) -> PredStat {
+        self.stats.get(pred as usize).copied().unwrap_or((0, 0, 0))
+    }
+
+    /// Write `pred`'s statistics record to the file and the mirror.
+    fn set_pred_stat(&mut self, pager: &mut Pager, pred: PredId, st: PredStat) -> Result<()> {
+        write_pred_stat(&self.pred_stats, pager, pred, st)?;
+        let i = pred as usize;
+        if self.stats.len() <= i {
+            self.stats.resize(i + 1, (0, 0, 0));
+        }
+        let before = std::mem::replace(&mut self.stats[i], st);
+        self.stats_undo.push((pred, before));
+        match (before.0 > 0, st.0 > 0) {
+            (false, true) => self.nonempty_preds += 1,
+            (true, false) => self.nonempty_preds -= 1,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Commit every completed operation durably (one WAL-protected pager
+    /// flush). Through `&self`: every operation keeps the header roots
+    /// current, so there is nothing else to write. Refused on a read-only view.
+    pub fn commit(&self) -> Result<()> {
+        self.check_writable()?;
+        self.pager.write().unwrap().flush()
+    }
+
+    /// Persist counters and flush all dirty pages (see [`commit`](Self::commit)).
     pub fn flush(&mut self) -> Result<()> {
+        self.check_writable()?;
         let mut guard = self.pager.write().unwrap();
         let pager = &mut *guard;
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
@@ -718,26 +1001,17 @@ impl DiskStore {
 
     /// Triples with predicate `pred` (gStore `pre2num`) — maintained, O(1).
     pub fn pred_num(&self, pred: PredId) -> usize {
-        let pager = self.pager.read().unwrap();
-        read_pred_stat(&self.pred_stats, &pager, pred)
-            .map(|(n, _, _)| n as usize)
-            .unwrap_or(0)
+        self.stat(pred).0 as usize
     }
 
     /// Distinct subjects with predicate `pred` (gStore `pre2sub`) — maintained.
     pub fn pred_subject_count(&self, pred: PredId) -> usize {
-        let pager = self.pager.read().unwrap();
-        read_pred_stat(&self.pred_stats, &pager, pred)
-            .map(|(_, s, _)| s as usize)
-            .unwrap_or(0)
+        self.stat(pred).1 as usize
     }
 
     /// Distinct objects with predicate `pred` (gStore `pre2obj`) — maintained.
     pub fn pred_object_count(&self, pred: PredId) -> usize {
-        let pager = self.pager.read().unwrap();
-        read_pred_stat(&self.pred_stats, &pager, pred)
-            .map(|(_, _, o)| o as usize)
-            .unwrap_or(0)
+        self.stat(pred).2 as usize
     }
 
     /// Distinct ids appearing as a subject (exact, maintained).
@@ -750,6 +1024,11 @@ impl DiskStore {
         self.distinct_obj as usize
     }
 
+    /// Predicates with at least one triple (exact, maintained).
+    pub fn nonempty_predicate_count(&self) -> usize {
+        self.nonempty_preds
+    }
+
     /// Recompute every maintained statistic (per-predicate `pre2num`/`pre2sub`/
     /// `pre2obj` and the distinct subject/object counts) from the authoritative
     /// SPO index. Called automatically by [`open`](Self::open) for a database
@@ -758,7 +1037,7 @@ impl DiskStore {
     /// the incremental path already maintains).
     pub fn rebuild_stats(&mut self) -> Result<()> {
         // 1. Aggregate from the authoritative triples (one SPO scan).
-        let all = self.iter_all()?;
+        let all = self.try_iter_spo().map_err(GStoreError::Io)?;
         let np = self.pred_count as usize;
         let mut num = vec![0u32; np];
         let mut psub: Vec<HashSet<u32>> = vec![HashSet::new(); np];
@@ -775,24 +1054,22 @@ impl DiskStore {
             }
         }
 
-        // 2. Write the recomputed statistics under a single write guard.
-        let mut guard = self.pager.write().unwrap();
-        let pager = &mut *guard;
-        for p in 0..np as u32 {
-            write_pred_stat(
-                &self.pred_stats,
-                pager,
-                p,
-                num[p as usize],
-                psub[p as usize].len() as u32,
-                pobj[p as usize].len() as u32,
-            )?;
-        }
-        self.distinct_subj = subs.len() as u32;
-        self.distinct_obj = objs.len() as u32;
-        pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
-        pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
-        Ok(())
+        // 2. Write the recomputed statistics as one operation.
+        self.write_op(|st, pager| {
+            for p in 0..np as u32 {
+                let i = p as usize;
+                st.set_pred_stat(
+                    pager,
+                    p,
+                    (num[i], psub[i].len() as u32, pobj[i].len() as u32),
+                )?;
+            }
+            st.distinct_subj = subs.len() as u32;
+            st.distinct_obj = objs.len() as u32;
+            pager.set_root(ROOT_DISTINCT_SUBJ, st.distinct_subj as u64);
+            pager.set_root(ROOT_DISTINCT_OBJ, st.distinct_obj as u64);
+            Ok(())
+        })
     }
 
     // ---- dictionary resolution -------------------------------------------
@@ -805,15 +1082,12 @@ impl DiskStore {
         } else {
             &self.entity2id
         };
-        Ok(tree.get(&pager, key.as_bytes())?.map(|v| de32(&v)))
+        lookup_id(tree, &pager, key.as_bytes())
     }
 
     pub fn predicate_id(&self, dict_key: &str) -> Result<Option<PredId>> {
         let pager = self.pager.read().unwrap();
-        Ok(self
-            .predicate2id
-            .get(&pager, dict_key.as_bytes())?
-            .map(|v| de32(&v)))
+        lookup_id(&self.predicate2id, &pager, dict_key.as_bytes())
     }
 
     pub fn id_to_string(&self, id: EntityLiteralId) -> Result<Option<String>> {
@@ -824,101 +1098,407 @@ impl DiskStore {
         } else {
             (&self.id2entity, id)
         };
-        Ok(arr
-            .get(&pager, key)?
-            .map(|b| String::from_utf8_lossy(&b).into_owned()))
+        arr.get_with(&pager, key, |b| String::from_utf8_lossy(b).into_owned())
     }
 
     pub fn predicate_to_string(&self, id: PredId) -> Result<Option<String>> {
         let pager = self.pager.read().unwrap();
-        Ok(self
-            .id2predicate
-            .get(&pager, id)?
-            .map(|b| String::from_utf8_lossy(&b).into_owned()))
+        self.id2predicate
+            .get_with(&pager, id, |b| String::from_utf8_lossy(b).into_owned())
     }
 
-    // ---- access patterns (mirror TripleStore) ----------------------------
+    // ---- fallible reads in the C1 contract order -------------------------
+
+    fn read_pager(&self) -> RwLockReadGuard<'_, Pager> {
+        self.pager.read().unwrap()
+    }
+
+    /// `s p o` — does this exact triple exist?
+    pub fn try_exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> io::Result<bool> {
+        io(self.spo.contains(&self.read_pager(), &key3(s, p, o)))
+    }
+
+    /// `s ? ?` → `(pred, obj)` pairs, sorted.
+    pub fn try_po_by_s(&self, s: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        let mut out = Vec::new();
+        io(scan_keys(&self.spo, &self.read_pager(), &be32(s), 12, |k| {
+            out.push((id_at(k, 4), id_at(k, 8)));
+        }))?;
+        Ok(out)
+    }
+
+    /// `s p ?` → objects, ascending. When the store has been
+    /// [`compact`](Self::compact)ed, this is a point lookup into the VList index
+    /// + a varint decode (following an [`overflow`] page chain for an oversize
+    /// group), instead of a multi-key prefix scan; it transparently falls back
+    /// to the SPO scan for any group not present in the index.
+    pub fn try_o_by_sp(&self, s: EntityLiteralId, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        let pager = self.read_pager();
+        if self.compacted {
+            if let Some(rec) = io(self.sp2o_vlist.get(&pager, &cat(s, p)))? {
+                let bytes = io(materialize_vlist(&pager, &rec))?;
+                return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
+            }
+        }
+        let mut out = Vec::new();
+        io(scan_keys(&self.spo, &pager, &cat(s, p), 12, |k| {
+            out.push(id_at(k, 8));
+        }))?;
+        Ok(out)
+    }
+
+    /// `s ? o` → predicates linking subject to object, ascending.
+    pub fn try_p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> io::Result<Vec<PredId>> {
+        // OSP key = (o, s, p); prefix (o, s) → p.
+        let mut out = Vec::new();
+        io(scan_keys(&self.osp, &self.read_pager(), &cat(o, s), 12, |k| {
+            out.push(id_at(k, 8));
+        }))?;
+        Ok(out)
+    }
+
+    /// `? ? o` → `(pred, sub)` pairs, sorted.
+    pub fn try_ps_by_o(&self, o: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
+        // OSP key = (o, s, p): the scan yields (s, p) order; sort to (p, s).
+        let mut out = Vec::new();
+        io(scan_keys(&self.osp, &self.read_pager(), &be32(o), 12, |k| {
+            out.push((id_at(k, 8), id_at(k, 4)));
+        }))?;
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// `? p o` → subjects, ascending.
+    pub fn try_s_by_po(&self, p: PredId, o: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>> {
+        let mut out = Vec::new();
+        io(scan_keys(&self.pos, &self.read_pager(), &cat(p, o), 12, |k| {
+            out.push(id_at(k, 8));
+        }))?;
+        Ok(out)
+    }
+
+    /// `? p ?` → `(sub, obj)` pairs, sorted.
+    pub fn try_so_by_p(&self, p: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
+        // POS key = (p, o, s): the scan yields (o, s) order; sort to (s, o).
+        let mut out = Vec::with_capacity(self.stat(p).0 as usize);
+        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
+            out.push((id_at(k, 8), id_at(k, 4)));
+        }))?;
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Distinct subjects of predicate `p`, ascending.
+    pub fn try_subs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        let mut out = Vec::with_capacity(self.stat(p).1 as usize);
+        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
+            out.push(id_at(k, 8));
+        }))?;
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Distinct objects of predicate `p`, ascending (POS order needs no sort).
+    pub fn try_objs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
+        let mut out: Vec<u32> = Vec::with_capacity(self.stat(p).2 as usize);
+        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
+            let o = id_at(k, 4);
+            if out.last() != Some(&o) {
+                out.push(o);
+            }
+        }))?;
+        Ok(out)
+    }
+
+    /// Every id used as a subject, ascending: one streaming pass over SPO.
+    pub fn try_subject_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        let mut out: Vec<u32> = Vec::with_capacity(self.distinct_subj as usize);
+        io(scan_keys(&self.spo, &self.read_pager(), &[], 12, |k| {
+            let s = id_at(k, 0);
+            if out.last() != Some(&s) {
+                out.push(s);
+            }
+        }))?;
+        Ok(out)
+    }
+
+    /// Every id used as an object, ascending: one streaming pass over OSP.
+    pub fn try_object_keys(&self) -> io::Result<Vec<EntityLiteralId>> {
+        let mut out: Vec<u32> = Vec::with_capacity(self.distinct_obj as usize);
+        io(scan_keys(&self.osp, &self.read_pager(), &[], 12, |k| {
+            let o = id_at(k, 0);
+            if out.last() != Some(&o) {
+                out.push(o);
+            }
+        }))?;
+        Ok(out)
+    }
+
+    /// Every triple in SPO order (the cheapest full scan).
+    pub fn try_iter_spo(&self) -> io::Result<Vec<IdTriple>> {
+        let mut out = Vec::with_capacity(self.triple_count as usize);
+        io(scan_keys(&self.spo, &self.read_pager(), &[], 12, |k| {
+            out.push(IdTriple::new(id_at(k, 0), id_at(k, 4), id_at(k, 8)));
+        }))?;
+        Ok(out)
+    }
+
+    /// Every triple in the contract order `(p, s, o)`: the SPO scan, then a
+    /// stable bucketing by predicate (within a predicate, SPO order already is
+    /// `(s, o)` order), so no comparison sort runs.
+    pub fn try_iter_all(&self) -> io::Result<Vec<IdTriple>> {
+        let spo = self.try_iter_spo()?;
+        let np = spo.iter().map(|t| t.pred as usize + 1).max().unwrap_or(0);
+        let mut start = vec![0usize; np + 1];
+        for t in &spo {
+            start[t.pred as usize + 1] += 1;
+        }
+        for i in 0..np {
+            start[i + 1] += start[i];
+        }
+        let mut out = vec![IdTriple::new(0, 0, 0); spo.len()];
+        for t in spo {
+            let slot = &mut start[t.pred as usize];
+            out[*slot] = t;
+            *slot += 1;
+        }
+        Ok(out)
+    }
+
+    pub fn try_triple_count(&self) -> io::Result<u64> {
+        Ok(self.triple_count)
+    }
+    /// Exact number of distinct subjects.
+    pub fn try_distinct_subjects(&self) -> io::Result<usize> {
+        Ok(self.distinct_subj as usize)
+    }
+    /// Exact number of distinct objects.
+    pub fn try_distinct_objects(&self) -> io::Result<usize> {
+        Ok(self.distinct_obj as usize)
+    }
+    /// Number of predicates with at least one triple.
+    pub fn try_num_predicates(&self) -> io::Result<usize> {
+        Ok(self.nonempty_preds)
+    }
+    pub fn try_pred_card(&self, p: PredId) -> io::Result<usize> {
+        Ok(self.pred_num(p))
+    }
+    pub fn try_pred_distinct_subj(&self, p: PredId) -> io::Result<usize> {
+        Ok(self.pred_subject_count(p))
+    }
+    pub fn try_pred_distinct_obj(&self, p: PredId) -> io::Result<usize> {
+        Ok(self.pred_object_count(p))
+    }
+
+    // ---- exact counts without materializing (C1) -------------------------
+
+    fn count(&self, tree: &BTree, prefix: &[u8]) -> io::Result<u64> {
+        io(tree.count_prefix(&self.read_pager(), prefix)).map(|n| n as u64)
+    }
+
+    /// `len(po_by_s(s))`.
+    pub fn try_count_po_by_s(&self, s: EntityLiteralId) -> io::Result<u64> {
+        self.count(&self.spo, &be32(s))
+    }
+    /// `len(o_by_sp(s, p))`.
+    pub fn try_count_o_by_sp(&self, s: EntityLiteralId, p: PredId) -> io::Result<u64> {
+        self.count(&self.spo, &cat(s, p))
+    }
+    /// `len(p_by_so(s, o))`.
+    pub fn try_count_p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> io::Result<u64> {
+        self.count(&self.osp, &cat(o, s))
+    }
+    /// `len(ps_by_o(o))`.
+    pub fn try_count_ps_by_o(&self, o: EntityLiteralId) -> io::Result<u64> {
+        self.count(&self.osp, &be32(o))
+    }
+    /// `len(s_by_po(p, o))`.
+    pub fn try_count_s_by_po(&self, p: PredId, o: EntityLiteralId) -> io::Result<u64> {
+        self.count(&self.pos, &cat(p, o))
+    }
+    /// `len(so_by_p(p))`, from the maintained statistics.
+    pub fn try_count_so_by_p(&self, p: PredId) -> io::Result<u64> {
+        Ok(u64::from(self.stat(p).0))
+    }
+
+    /// `len(po_by_s(s))`; a read error counts as an empty range (like the
+    /// legacy [`TripleSource`] impl).
+    pub fn count_po_by_s(&self, s: EntityLiteralId) -> u64 {
+        self.try_count_po_by_s(s).unwrap_or(0)
+    }
+    /// `len(o_by_sp(s, p))` (0 on a read error).
+    pub fn count_o_by_sp(&self, s: EntityLiteralId, p: PredId) -> u64 {
+        self.try_count_o_by_sp(s, p).unwrap_or(0)
+    }
+    /// `len(p_by_so(s, o))` (0 on a read error).
+    pub fn count_p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> u64 {
+        self.try_count_p_by_so(s, o).unwrap_or(0)
+    }
+    /// `len(ps_by_o(o))` (0 on a read error).
+    pub fn count_ps_by_o(&self, o: EntityLiteralId) -> u64 {
+        self.try_count_ps_by_o(o).unwrap_or(0)
+    }
+    /// `len(s_by_po(p, o))` (0 on a read error).
+    pub fn count_s_by_po(&self, p: PredId, o: EntityLiteralId) -> u64 {
+        self.try_count_s_by_po(p, o).unwrap_or(0)
+    }
+    /// `len(so_by_p(p))`.
+    pub fn count_so_by_p(&self, p: PredId) -> u64 {
+        u64::from(self.stat(p).0)
+    }
+
+    /// Number of distinct predicates among `po_by_s(s)`.
+    pub fn try_distinct_p_of_s(&self, s: EntityLiteralId) -> io::Result<u64> {
+        let (mut n, mut last) = (0u64, None);
+        io(scan_keys(&self.spo, &self.read_pager(), &be32(s), 12, |k| {
+            let p = id_at(k, 4);
+            if last != Some(p) {
+                n += 1;
+                last = Some(p);
+            }
+        }))?;
+        Ok(n)
+    }
+
+    /// Number of distinct predicates among `ps_by_o(o)`.
+    pub fn try_distinct_p_of_o(&self, o: EntityLiteralId) -> io::Result<u64> {
+        let mut ps: Vec<u32> = Vec::new();
+        io(scan_keys(&self.osp, &self.read_pager(), &be32(o), 12, |k| {
+            ps.push(id_at(k, 8));
+        }))?;
+        ps.sort_unstable();
+        ps.dedup();
+        Ok(ps.len() as u64)
+    }
+
+    /// Number of distinct predicates of subject `s` (0 on a read error).
+    pub fn distinct_p_of_s(&self, s: EntityLiteralId) -> u64 {
+        self.try_distinct_p_of_s(s).unwrap_or(0)
+    }
+
+    /// Number of distinct predicates of object `o` (0 on a read error).
+    pub fn distinct_p_of_o(&self, o: EntityLiteralId) -> u64 {
+        self.try_distinct_p_of_o(o).unwrap_or(0)
+    }
+
+    /// Whether `id` is the subject of some triple. `true` on a read error:
+    /// never free an id when in doubt.
+    pub fn has_subject(&self, id: EntityLiteralId) -> bool {
+        self.spo
+            .prefix_exists(&self.read_pager(), &be32(id))
+            .unwrap_or(true)
+    }
+
+    /// Whether `id` is the object of some triple (`true` on a read error).
+    pub fn has_object(&self, id: EntityLiteralId) -> bool {
+        self.osp
+            .prefix_exists(&self.read_pager(), &be32(id))
+            .unwrap_or(true)
+    }
+
+    /// Whether predicate `p` has some triple (`true` on a read error).
+    pub fn has_predicate(&self, p: PredId) -> bool {
+        self.pos
+            .prefix_exists(&self.read_pager(), &be32(p))
+            .unwrap_or(true)
+    }
+
+    /// One merged, streaming pass over SPO and OSP for VS-tree (re)builds:
+    /// `f(entity, out_edges, in_edges)` for every entity that is a subject or
+    /// an entity object, in ascending id order, where `out_edges` are its
+    /// `(p, o)` pairs (= `po_by_s`) and `in_edges` its `(p, s)` pairs
+    /// (= `ps_by_o`), both sorted. Literal objects are not visited (the VS-tree
+    /// indexes entities only). `f` may stop the pass with
+    /// [`ControlFlow::Break`]. Holds the pager read lock for the whole pass.
+    pub fn for_each_entity_adjacency(
+        &self,
+        mut f: impl FnMut(
+            EntityLiteralId,
+            &[(PredId, EntityLiteralId)],
+            &[(PredId, EntityLiteralId)],
+        ) -> ControlFlow<()>,
+    ) -> io::Result<()> {
+        let pager = self.read_pager();
+        let mut spo = io(self.spo.cursor_ge(&pager, &[]))?;
+        let mut osp = io(self.osp.cursor_ge(&pager, &[]))?;
+        let next = |cur: &mut super::bptree::LeafCursor| -> io::Result<Option<[u32; 3]>> {
+            match io(cur.next_entry(&pager))? {
+                None => Ok(None),
+                Some((k, _)) if k.len() == 12 => Ok(Some([id_at(k, 0), id_at(k, 4), id_at(k, 8)])),
+                Some(_) => Err(to_io(malformed("an index key has the wrong length"))),
+            }
+        };
+        // OSP keys of literal objects sort after every entity object.
+        let next_entity_obj = |cur: &mut super::bptree::LeafCursor| -> io::Result<Option<[u32; 3]>> {
+            Ok(next(cur)?.filter(|k| !is_literal_id(k[0])))
+        };
+        let mut s_head = next(&mut spo)?;
+        let mut o_head = next_entity_obj(&mut osp)?;
+        let (mut out, mut inn) = (Vec::new(), Vec::new());
+        loop {
+            let id = match (s_head, o_head) {
+                (None, None) => return Ok(()),
+                (Some(a), None) => a[0],
+                (None, Some(b)) => b[0],
+                (Some(a), Some(b)) => a[0].min(b[0]),
+            };
+            out.clear();
+            inn.clear();
+            while let Some(k) = s_head.filter(|k| k[0] == id) {
+                out.push((k[1], k[2]));
+                s_head = next(&mut spo)?;
+            }
+            while let Some(k) = o_head.filter(|k| k[0] == id) {
+                inn.push((k[2], k[1]));
+                o_head = next_entity_obj(&mut osp)?;
+            }
+            inn.sort_unstable();
+            if f(id, &out, &inn).is_break() {
+                return Ok(());
+            }
+        }
+    }
+
+    // ---- legacy access patterns (crate `Result`, contract order) ---------
 
     pub fn exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> Result<bool> {
-        let pager = self.pager.read().unwrap();
-        Ok(self.spo.get(&pager, &key3(s, p, o))?.is_some())
+        self.try_exists(s, p, o).map_err(GStoreError::Io)
     }
 
     /// `s ? ?` → `(pred, obj)` pairs (sorted by (pred, obj)).
     pub fn po_by_s(&self, s: EntityLiteralId) -> Result<Vec<(PredId, EntityLiteralId)>> {
-        let rows = self.scan(&self.spo, &be32(s))?;
-        Ok(rows
-            .iter()
-            .map(|k| (de32(&k[4..8]), de32(&k[8..12])))
-            .collect())
+        self.try_po_by_s(s).map_err(GStoreError::Io)
     }
 
-    /// `s p ?` → objects. When the store has been [`compact`](Self::compact)ed,
-    /// this is a point lookup into the VList index + a varint decode (following
-    /// an [`overflow`] page chain for an oversize group), instead of a multi-key
-    /// prefix scan; it transparently falls back to the SPO scan for any group
-    /// not present in the index.
+    /// `s p ?` → objects (see [`try_o_by_sp`](Self::try_o_by_sp)).
     pub fn o_by_sp(&self, s: EntityLiteralId, p: PredId) -> Result<Vec<EntityLiteralId>> {
-        if self.compacted {
-            let pager = self.pager.read().unwrap();
-            if let Some(rec) = self.sp2o_vlist.get(&pager, &cat(s, p))? {
-                let bytes = materialize_vlist(&pager, &rec)?;
-                return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
-            }
-        }
-        let rows = self.scan(&self.spo, &cat(s, p))?;
-        Ok(rows.iter().map(|k| de32(&k[8..12])).collect())
+        self.try_o_by_sp(s, p).map_err(GStoreError::Io)
     }
 
     /// `? p o` → subjects.
     pub fn s_by_po(&self, p: PredId, o: EntityLiteralId) -> Result<Vec<EntityLiteralId>> {
-        let rows = self.scan(&self.pos, &cat(p, o))?;
-        Ok(rows.iter().map(|k| de32(&k[8..12])).collect())
+        self.try_s_by_po(p, o).map_err(GStoreError::Io)
     }
 
-    /// `? p ?` → `(sub, obj)` pairs.
+    /// `? p ?` → `(sub, obj)` pairs, sorted.
     pub fn so_by_p(&self, p: PredId) -> Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
-        // POS key = (p, o, s); map to (s, o).
-        let rows = self.scan(&self.pos, &be32(p))?;
-        Ok(rows
-            .iter()
-            .map(|k| (de32(&k[8..12]), de32(&k[4..8])))
-            .collect())
+        self.try_so_by_p(p).map_err(GStoreError::Io)
     }
 
-    /// `? ? o` → `(pred, sub)` pairs.
+    /// `? ? o` → `(pred, sub)` pairs, sorted.
     pub fn ps_by_o(&self, o: EntityLiteralId) -> Result<Vec<(PredId, EntityLiteralId)>> {
-        // OSP key = (o, s, p); map to (p, s).
-        let rows = self.scan(&self.osp, &be32(o))?;
-        Ok(rows
-            .iter()
-            .map(|k| (de32(&k[8..12]), de32(&k[4..8])))
-            .collect())
+        self.try_ps_by_o(o).map_err(GStoreError::Io)
     }
 
     /// `s ? o` → predicates linking subject to object.
     pub fn p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> Result<Vec<PredId>> {
-        // OSP key = (o, s, p); prefix (o, s) → p.
-        let rows = self.scan(&self.osp, &cat(o, s))?;
-        Ok(rows.iter().map(|k| de32(&k[8..12])).collect())
+        self.try_p_by_so(s, o).map_err(GStoreError::Io)
     }
 
-    /// Iterate every triple (driven by the SPO index).
+    /// Every triple, in `(p, s, o)` order.
     pub fn iter_all(&self) -> Result<Vec<IdTriple>> {
-        let rows = self.scan(&self.spo, &[])?;
-        Ok(rows
-            .iter()
-            .map(|k| IdTriple::new(de32(&k[0..4]), de32(&k[4..8]), de32(&k[8..12])))
-            .collect())
-    }
-
-    fn scan(&self, tree: &BTree, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let pager = self.pager.read().unwrap();
-        Ok(tree
-            .scan_prefix(&pager, prefix)?
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect())
+        self.try_iter_all().map_err(GStoreError::Io)
     }
 
     // ---- VList value compaction (gStore value lists) ----------------------
@@ -934,15 +1514,16 @@ impl DiskStore {
     /// round-trip on disk rather than being skipped.
     ///
     /// Any subsequent insert/delete clears the compacted flag, so the index is a
-    /// read-side optimization that never returns stale data.
+    /// read-side optimization that never returns stale data. Each step is its
+    /// own operation: a crash midway leaves the flag clear (reads use SPO).
     pub fn compact(&mut self) -> Result<()> {
         // 0. Mark the index stale up-front: if a crash interrupts the rebuild
         //    below, the next open falls back to the authoritative SPO scan.
-        {
-            let mut guard = self.pager.write().unwrap();
-            self.compacted = false;
-            guard.set_root(ROOT_COMPACTED, 0);
-        }
+        self.write_op(|st, pager| {
+            st.compacted = false;
+            pager.set_root(ROOT_COMPACTED, 0);
+            Ok(())
+        })?;
 
         // 1. Drop any previous VList entries so vanished groups can't be read,
         //    freeing each overflow chain so its pages return to the free list.
@@ -951,36 +1532,39 @@ impl DiskStore {
             self.sp2o_vlist.iter_all(&guard)?
         };
         for (k, v) in &stale {
-            let mut guard = self.pager.write().unwrap();
-            if let Some(head) = overflow_head(v) {
-                overflow::free_chain(&mut guard, head)?;
-            }
-            self.sp2o_vlist.delete(&mut guard, k)?;
+            self.write_op(|st, pager| {
+                if let Some(head) = overflow_head(v) {
+                    overflow::free_chain(pager, head)?;
+                }
+                st.sp2o_vlist.delete(pager, k)?;
+                Ok(())
+            })?;
         }
 
         // 2. Group the SPO index by (sub, pred); each group's objects are already
         //    sorted ascending and distinct (SPO key order), ready for encoding.
-        let all = self.scan(&self.spo, &[])?;
+        let all = self.try_iter_spo().map_err(GStoreError::Io)?;
         let mut i = 0;
         while i < all.len() {
-            let s = de32(&all[i][0..4]);
-            let p = de32(&all[i][4..8]);
+            let (s, p) = (all[i].sub, all[i].pred);
             let mut objs = Vec::new();
-            while i < all.len() && de32(&all[i][0..4]) == s && de32(&all[i][4..8]) == p {
-                objs.push(de32(&all[i][8..12]));
+            while i < all.len() && all[i].sub == s && all[i].pred == p {
+                objs.push(all[i].obj);
                 i += 1;
             }
             let enc = vlist::encode_u32s(&objs);
-            let mut guard = self.pager.write().unwrap();
-            let rec = encode_vlist_record(&mut guard, &enc)?;
-            self.sp2o_vlist.insert(&mut guard, &cat(s, p), &rec)?;
+            self.write_op(|st, pager| {
+                let rec = encode_vlist_record(pager, &enc)?;
+                st.sp2o_vlist.insert(pager, &cat(s, p), &rec)
+            })?;
         }
 
         // 3. Publish: reads may now use the VList index.
-        let mut guard = self.pager.write().unwrap();
-        self.compacted = true;
-        guard.set_root(ROOT_COMPACTED, 1);
-        Ok(())
+        self.write_op(|st, pager| {
+            st.compacted = true;
+            pager.set_root(ROOT_COMPACTED, 1);
+            Ok(())
+        })
     }
 
     /// Whether the VList-compressed index is currently valid (set by
@@ -1002,10 +1586,8 @@ impl DiskStore {
     /// independent of where the bytes physically live.
     pub fn compact_value_len(&self, s: EntityLiteralId, p: PredId) -> Result<Option<usize>> {
         let pager = self.pager.read().unwrap();
-        Ok(self
-            .sp2o_vlist
-            .get(&pager, &cat(s, p))?
-            .map(|v| record_logical_len(&v)))
+        self.sp2o_vlist
+            .get_with(&pager, &cat(s, p), record_logical_len)
     }
 
     /// Whether the stored VList value for `(s, p)` uses an [`overflow`] page
@@ -1014,10 +1596,8 @@ impl DiskStore {
     /// decision for tests.
     pub fn compact_value_is_overflow(&self, s: EntityLiteralId, p: PredId) -> Result<Option<bool>> {
         let pager = self.pager.read().unwrap();
-        Ok(self
-            .sp2o_vlist
-            .get(&pager, &cat(s, p))?
-            .map(|v| v.first() == Some(&OVERFLOW_TAG)))
+        self.sp2o_vlist
+            .get_with(&pager, &cat(s, p), |v| v.first() == Some(&OVERFLOW_TAG))
     }
 
     // ---- bridge to the in-memory engine ----------------------------------
@@ -1029,31 +1609,25 @@ impl DiskStore {
     pub fn to_memory(&self) -> Result<(Dictionary, TripleStore)> {
         let dict = self.dictionary()?;
         let mut store = TripleStore::new();
-        store.bulk_load(self.iter_all()?);
+        store.bulk_load(self.try_iter_spo().map_err(GStoreError::Io)?);
         Ok((dict, store))
     }
 
     /// Reconstruct just the in-memory [`Dictionary`] (ids in disk order, so they
-    /// line up with the on-disk triple indexes). Used by [`query`](Self::query)
-    /// to answer reads while leaving the triples on disk.
+    /// line up with the on-disk triple indexes). One sequential pass over each
+    /// `id2*` array (a directory page serves 32 ids).
     pub fn dictionary(&self) -> Result<Dictionary> {
         let mut dict = Dictionary::new();
-        for id in 0..self.entity_count {
-            if let Some(s) = self.id_to_string(id)? {
-                dict.try_intern_entity(&s)?;
-            }
-        }
-        for i in 0..self.literal_count {
-            let lit_id = crate::dict::checked_literal_id(u64::from(i))?;
-            if let Some(s) = self.id_to_string(lit_id)? {
-                dict.try_intern_literal(&s)?;
-            }
-        }
-        for id in 0..self.pred_count {
-            if let Some(s) = self.predicate_to_string(id)? {
-                dict.try_intern_predicate(&s)?;
-            }
-        }
+        let pager = self.pager.read().unwrap();
+        load_terms(&self.id2entity, &pager, self.entity_count, |s| {
+            dict.try_intern_entity(s)
+        })?;
+        load_terms(&self.id2literal, &pager, self.literal_count, |s| {
+            dict.try_intern_literal(s)
+        })?;
+        load_terms(&self.id2predicate, &pager, self.pred_count, |s| {
+            dict.try_intern_predicate(s)
+        })?;
         Ok(dict)
     }
 
@@ -1123,80 +1697,59 @@ impl DiskStore {
     }
 }
 
-/// Distinct first / second components of `(a, b)` pairs.
-fn distinct_a(pairs: &[(u32, u32)]) -> Vec<u32> {
-    let mut v: Vec<u32> = pairs.iter().map(|&(a, _)| a).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-fn distinct_b(pairs: &[(u32, u32)]) -> Vec<u32> {
-    let mut v: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 /// Let the query engine evaluate directly against the on-disk store, *streaming*
 /// the index ranges each pattern touches through the page cache rather than
-/// materializing the whole graph in memory. IO errors degrade to empty results
-/// (a read-only path; a healthy store never hits them). Cardinality stats use
-/// the O(1) dictionary counters as estimates, avoiding full scans on the hot
-/// optimizer path.
+/// materializing the whole graph in memory. Every method delegates to the
+/// matching `try_*` (so answers come in the trait's contract order); a read
+/// error degrades to an empty answer here — the database layer, not this
+/// convenience impl, is where read errors are reported per query.
 impl TripleSource for DiskStore {
     fn exists(&self, s: u32, p: u32, o: u32) -> bool {
-        DiskStore::exists(self, s, p, o).unwrap_or(false)
+        self.try_exists(s, p, o).unwrap_or(false)
     }
     fn po_by_s(&self, s: u32) -> Vec<(u32, u32)> {
-        DiskStore::po_by_s(self, s).unwrap_or_default()
+        self.try_po_by_s(s).unwrap_or_default()
     }
     fn o_by_sp(&self, s: u32, p: u32) -> Vec<u32> {
-        DiskStore::o_by_sp(self, s, p).unwrap_or_default()
+        self.try_o_by_sp(s, p).unwrap_or_default()
     }
     fn p_by_so(&self, s: u32, o: u32) -> Vec<u32> {
-        DiskStore::p_by_so(self, s, o).unwrap_or_default()
+        self.try_p_by_so(s, o).unwrap_or_default()
     }
     fn ps_by_o(&self, o: u32) -> Vec<(u32, u32)> {
-        DiskStore::ps_by_o(self, o).unwrap_or_default()
+        self.try_ps_by_o(o).unwrap_or_default()
     }
     fn s_by_po(&self, p: u32, o: u32) -> Vec<u32> {
-        DiskStore::s_by_po(self, p, o).unwrap_or_default()
+        self.try_s_by_po(p, o).unwrap_or_default()
     }
     fn so_by_p(&self, p: u32) -> Vec<(u32, u32)> {
-        DiskStore::so_by_p(self, p).unwrap_or_default()
+        self.try_so_by_p(p).unwrap_or_default()
     }
     fn subs_by_p(&self, p: u32) -> Vec<u32> {
-        distinct_a(&DiskStore::so_by_p(self, p).unwrap_or_default())
+        self.try_subs_by_p(p).unwrap_or_default()
     }
     fn objs_by_p(&self, p: u32) -> Vec<u32> {
-        distinct_b(&DiskStore::so_by_p(self, p).unwrap_or_default())
+        self.try_objs_by_p(p).unwrap_or_default()
     }
     fn subject_keys(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self.iter_all().unwrap_or_default().iter().map(|t| t.sub).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        self.try_subject_keys().unwrap_or_default()
     }
     fn object_keys(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self.iter_all().unwrap_or_default().iter().map(|t| t.obj).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        self.try_object_keys().unwrap_or_default()
     }
     fn triple_count(&self) -> u64 {
         DiskStore::triple_count(self)
     }
-    // Maintained counters keep every statistic O(1) on the hot planning path —
-    // and, unlike the previous dictionary-count estimates / per-predicate scans,
-    // these are *exact* (they track the triples actually present, incrementally).
+    // Maintained counters keep every statistic O(1) on the hot planning path,
+    // and exact (they track the triples actually present, incrementally).
     fn distinct_subjects(&self) -> usize {
-        self.distinct_subject_count().max(1)
+        self.distinct_subject_count()
     }
     fn distinct_objects(&self) -> usize {
         self.distinct_object_count()
     }
     fn num_predicates(&self) -> usize {
-        self.predicate_num()
+        self.nonempty_preds
     }
     fn pred_card(&self, p: u32) -> usize {
         self.pred_num(p)
@@ -1208,7 +1761,7 @@ impl TripleSource for DiskStore {
         self.pred_object_count(p)
     }
     fn iter_all(&self) -> Vec<IdTriple> {
-        DiskStore::iter_all(self).unwrap_or_default()
+        self.try_iter_all().unwrap_or_default()
     }
 }
 
@@ -1268,31 +1821,42 @@ fn overflow_head(rec: &[u8]) -> Option<super::pager::PageId> {
     }
 }
 
-/// Read a predicate's `(num, distinct_subj, distinct_obj)` stats record from the
-/// maintained [`IvArray`], returning `(0, 0, 0)` for a predicate not yet present.
-fn read_pred_stat(stats: &IvArray, pager: &Pager, pred: PredId) -> Result<(u32, u32, u32)> {
-    match stats.get(pager, pred)? {
-        Some(rec) if rec.len() >= PRED_STAT_LEN => Ok((
-            u32::from_le_bytes(rec[0..4].try_into().unwrap()),
-            u32::from_le_bytes(rec[4..8].try_into().unwrap()),
-            u32::from_le_bytes(rec[8..12].try_into().unwrap()),
-        )),
-        _ => Ok((0, 0, 0)),
+/// Intern every string of `arr` in `0..n`, in id order (an absent id is
+/// skipped, as the per-id loop this replaces did).
+fn load_terms(
+    arr: &IvArray,
+    pager: &Pager,
+    n: u32,
+    mut intern: impl FnMut(&str) -> Result<u32>,
+) -> Result<()> {
+    let mut failed = None;
+    arr.for_each_range(pager, 0, n, |_, b| {
+        match intern(&String::from_utf8_lossy(b)) {
+            Ok(_) => ControlFlow::Continue(()),
+            Err(e) => {
+                failed = Some(e);
+                ControlFlow::Break(())
+            }
+        }
+    })?;
+    failed.map_or(Ok(()), Err)
+}
+
+/// Decode a `(num, distinct_subj, distinct_obj)` stats record.
+fn decode_pred_stat(rec: &[u8]) -> Option<PredStat> {
+    if rec.len() < PRED_STAT_LEN {
+        return None;
     }
+    let u = |i: usize| u32::from_le_bytes([rec[i], rec[i + 1], rec[i + 2], rec[i + 3]]);
+    Some((u(0), u(4), u(8)))
 }
 
 /// Write a predicate's `(num, distinct_subj, distinct_obj)` stats record. A
 /// predicate whose triple count has fallen to zero is removed from the array
 /// (its distinct counts are zero too), keeping the array sparse over live
 /// predicates.
-fn write_pred_stat(
-    stats: &IvArray,
-    pager: &mut Pager,
-    pred: PredId,
-    num: u32,
-    dsub: u32,
-    dobj: u32,
-) -> Result<()> {
+fn write_pred_stat(stats: &IvArray, pager: &mut Pager, pred: PredId, st: PredStat) -> Result<()> {
+    let (num, dsub, dobj) = st;
     if num == 0 {
         stats.delete(pager, pred)?;
         return Ok(());
@@ -1305,7 +1869,7 @@ fn write_pred_stat(
 }
 
 /// 12-byte composite key from three ids (big-endian, ordering-preserving).
-fn key3(a: u32, b: u32, c: u32) -> [u8; 12] {
+pub(crate) fn key3(a: u32, b: u32, c: u32) -> [u8; 12] {
     let mut k = [0u8; 12];
     k[0..4].copy_from_slice(&be32(a));
     k[4..8].copy_from_slice(&be32(b));
@@ -1314,7 +1878,7 @@ fn key3(a: u32, b: u32, c: u32) -> [u8; 12] {
 }
 
 /// 16-byte quad key `g|s|p|o` (big-endian, ordering-preserving).
-fn key4(g: u32, s: u32, p: u32, o: u32) -> [u8; 16] {
+pub(crate) fn key4(g: u32, s: u32, p: u32, o: u32) -> [u8; 16] {
     let mut k = [0u8; 16];
     k[0..4].copy_from_slice(&be32(g));
     k[4..16].copy_from_slice(&key3(s, p, o));
@@ -1342,7 +1906,7 @@ mod tests {
 ";
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_disk_{tag}.kv"));
+        let p = std::env::temp_dir().join(format!("gstore_disk_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p

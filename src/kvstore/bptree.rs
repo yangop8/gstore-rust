@@ -1,18 +1,243 @@
 //! A disk-backed B+ tree (variable-length byte key → variable-length byte value).
 //!
 //! Corresponds to gStore's `SITree`/`Tree` B+ trees. Nodes live in [`Pager`]
-//! pages; this implementation parses a page into an in-memory [`Node`], mutates
-//! it, and writes it back (correctness-first; the page cache keeps hot nodes in
-//! memory). Leaves are linked for ordered range scans, which give the RDF store
-//! its prefix lookups (e.g. all `(p, o)` for a subject = prefix scan on SPO).
+//! pages. Writes parse a page into an in-memory [`Node`], mutate it, and write
+//! it back (correctness-first). Reads never materialize a node: they walk the
+//! shared cached page through a zero-copy, bounds-checked [`NodeView`] (a
+//! malformed page is an `Err`, never a panic), so a lookup or a range scan
+//! copies and allocates nothing per entry. Leaves are linked for ordered range
+//! scans, which give the RDF store its prefix lookups (e.g. all `(p, o)` for a
+//! subject = prefix scan on SPO).
 //!
 //! Both keys and values are byte strings: keys carry composite triple keys or
 //! dictionary strings; values carry ids (as bytes) or, for `id → string`, the
 //! string itself.
+//!
+//! Page layout (unchanged since the first version):
+//! ```text
+//! [is_leaf: u8][link: u32 LE][count: u16 LE] then `count` entries:
+//!   leaf:     [klen: u16 LE][key][vlen: u16 LE][value]
+//!   internal: [klen: u16 LE][key][child: u32 LE]
+//! ```
+//! A leaf's `link` is the next leaf (0 = none); an internal node's `link` is
+//! its leftmost child, for keys below its first separator.
+
+use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::error::{GStoreError, Result};
 
-use super::pager::{PageId, Pager, PAGE_SIZE};
+use super::pager::{Page, PageId, Pager, PAGE_SIZE};
+
+/// Deepest descent a read accepts before declaring the tree corrupt (a cycle
+/// of child pointers would otherwise loop forever). A 4 KiB-page tree of
+/// 12-byte keys is 5 levels deep at a billion entries.
+const MAX_DEPTH: usize = 64;
+
+fn corrupt(what: &str) -> GStoreError {
+    GStoreError::Database(format!("corrupt B+ tree page: {what}"))
+}
+
+/// The `u16 LE` at `off`, bounds-checked.
+#[inline]
+fn read_u16_at(page: &[u8], off: usize) -> Result<usize> {
+    match page.get(off..off + 2) {
+        Some(b) => Ok(u16::from_le_bytes([b[0], b[1]]) as usize),
+        None => Err(corrupt("entry header past the page end")),
+    }
+}
+
+/// The `len` bytes at `off`, bounds-checked.
+#[inline]
+fn slice_at(page: &[u8], off: usize, len: usize) -> Result<&[u8]> {
+    page.get(off..off + len)
+        .ok_or_else(|| corrupt("entry past the page end"))
+}
+
+/// A zero-copy view of one node page: the header is decoded eagerly, entries
+/// lazily (every access is bounds-checked, so a malformed page yields `Err`).
+#[derive(Clone, Copy)]
+pub struct NodeView<'a> {
+    page: &'a [u8],
+    is_leaf: bool,
+    link: PageId,
+    count: usize,
+}
+
+impl<'a> NodeView<'a> {
+    /// View `page` (normally a whole [`PAGE_SIZE`] page).
+    pub fn new(page: &'a [u8]) -> Result<NodeView<'a>> {
+        if page.len() < 7 {
+            return Err(corrupt("shorter than a node header"));
+        }
+        Ok(NodeView {
+            page,
+            is_leaf: page[0] != 0,
+            link: u32::from_le_bytes([page[1], page[2], page[3], page[4]]),
+            count: u16::from_le_bytes([page[5], page[6]]) as usize,
+        })
+    }
+
+    /// Whether this is a leaf.
+    pub fn is_leaf(&self) -> bool {
+        self.is_leaf
+    }
+
+    /// Leaf: the next leaf (0 = none). Internal: the leftmost child.
+    pub fn link(&self) -> PageId {
+        self.link
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the node has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The entries in order.
+    pub fn entries(&self) -> Entries<'a> {
+        Entries {
+            page: self.page,
+            off: 7,
+            left: self.count,
+            is_leaf: self.is_leaf,
+        }
+    }
+
+    /// Internal node: the child to descend into for `key` (the child after the
+    /// last separator `<= key`, or the leftmost child).
+    pub fn child_for(&self, key: &[u8]) -> Result<PageId> {
+        if self.is_leaf {
+            return Err(corrupt("child lookup on a leaf"));
+        }
+        let mut child = self.link;
+        let mut it = self.entries();
+        while let Some((k, c)) = it.next_child()? {
+            if k > key {
+                break;
+            }
+            child = c;
+        }
+        Ok(child)
+    }
+}
+
+/// A cursor over a node's entries (see [`NodeView::entries`]).
+#[derive(Clone, Copy)]
+pub struct Entries<'a> {
+    page: &'a [u8],
+    off: usize,
+    left: usize,
+    is_leaf: bool,
+}
+
+impl<'a> Entries<'a> {
+    /// Leaf: the next `(key, value)`.
+    pub fn next_kv(&mut self) -> Result<Option<(&'a [u8], &'a [u8])>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        if !self.is_leaf {
+            return Err(corrupt("key/value read on an internal node"));
+        }
+        let klen = read_u16_at(self.page, self.off)?;
+        let key = slice_at(self.page, self.off + 2, klen)?;
+        let voff = self.off + 2 + klen;
+        let vlen = read_u16_at(self.page, voff)?;
+        let val = slice_at(self.page, voff + 2, vlen)?;
+        self.off = voff + 2 + vlen;
+        self.left -= 1;
+        Ok(Some((key, val)))
+    }
+
+    /// Internal: the next `(separator, child)`.
+    pub fn next_child(&mut self) -> Result<Option<(&'a [u8], PageId)>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        if self.is_leaf {
+            return Err(corrupt("child read on a leaf"));
+        }
+        let klen = read_u16_at(self.page, self.off)?;
+        let key = slice_at(self.page, self.off + 2, klen)?;
+        let c = slice_at(self.page, self.off + 2 + klen, 4)?;
+        self.off += 2 + klen + 4;
+        self.left -= 1;
+        Ok(Some((key, u32::from_le_bytes([c[0], c[1], c[2], c[3]]))))
+    }
+
+    /// Leaf: the key of the next entry without consuming it.
+    fn peek_key(&self) -> Result<Option<&'a [u8]>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let klen = read_u16_at(self.page, self.off)?;
+        slice_at(self.page, self.off + 2, klen).map(Some)
+    }
+}
+
+/// A forward cursor over a tree's leaf entries, holding the current leaf as a
+/// shared page (see [`BTree::cursor_ge`]). Each step is zero-copy; moving to
+/// the next leaf costs one cache lookup.
+pub struct LeafCursor {
+    page: Option<Arc<Page>>,
+    off: usize,
+    left: usize,
+    next_leaf: PageId,
+    /// Leaves visited, to detect a cyclic leaf chain in a corrupt file.
+    hops: u64,
+}
+
+impl LeafCursor {
+    fn empty() -> LeafCursor {
+        LeafCursor {
+            page: None,
+            off: 7,
+            left: 0,
+            next_leaf: 0,
+            hops: 0,
+        }
+    }
+
+    /// The next `(key, value)` in key order, or `None` at the end of the tree.
+    pub fn next_entry<'s>(&'s mut self, pager: &Pager) -> Result<Option<(&'s [u8], &'s [u8])>> {
+        while self.left == 0 {
+            if self.next_leaf == 0 {
+                return Ok(None);
+            }
+            self.hops += 1;
+            if self.hops > u64::from(pager.page_count()) {
+                return Err(corrupt("cyclic leaf chain"));
+            }
+            let page = pager.read_page_shared(self.next_leaf)?;
+            let view = NodeView::new(&page[..])?;
+            if !view.is_leaf() {
+                return Err(corrupt("leaf chain reaches an internal node"));
+            }
+            self.next_leaf = view.link();
+            self.left = view.len();
+            self.off = 7;
+            self.page = Some(page);
+        }
+        let Some(page) = self.page.as_deref() else {
+            return Ok(None);
+        };
+        let mut it = Entries {
+            page: &page[..],
+            off: self.off,
+            left: self.left,
+            is_leaf: true,
+        };
+        let (k, v) = it.next_kv()?.ok_or_else(|| corrupt("entry count"))?;
+        self.off = it.off;
+        self.left = it.left;
+        Ok(Some((k, v)))
+    }
+}
 
 /// A handle to one B+ tree, rooted at a [`Pager`] header slot. The handle is a
 /// plain slot index (the tree itself lives in pager pages), so it is `Copy` —
@@ -290,28 +515,134 @@ impl BTree {
         Ok(Some((sep, right_id)))
     }
 
-    /// Look up the value for `key`. Read-only (`&Pager`), so it can run under a
-    /// shared [`std::sync::RwLock`] read guard concurrently with other readers.
-    pub fn get(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut page = self.root(pager);
-        if page == 0 {
+    /// Descend from the root to the leaf whose key range holds `key`. `None`
+    /// for an empty tree. Zero-copy: every level is a [`NodeView`] over the
+    /// shared cached page.
+    fn leaf_for(&self, pager: &Pager, key: &[u8]) -> Result<Option<(PageId, Arc<Page>)>> {
+        let mut id = self.root(pager);
+        if id == 0 {
             return Ok(None);
         }
-        loop {
-            let node = Node::parse(&pager.read_page(page)?);
-            if node.is_leaf {
-                return Ok(node
-                    .keys
-                    .binary_search_by(|k| k.as_slice().cmp(key))
-                    .ok()
-                    .map(|i| node.vals[i].clone()));
+        for _ in 0..MAX_DEPTH {
+            let page = pager.read_page_shared(id)?;
+            let next = {
+                let view = NodeView::new(&page[..])?;
+                if view.is_leaf() {
+                    None
+                } else {
+                    Some(view.child_for(key)?)
+                }
+            };
+            match next {
+                None => return Ok(Some((id, page))),
+                Some(child) => id = child,
             }
-            page = node.child_for(key);
         }
+        Err(corrupt("tree deeper than the depth limit (a cycle?)"))
     }
 
-    /// All entries whose key starts with `prefix`, in key order. Read-only
-    /// (`&Pager`) so it can run concurrently with other readers.
+    /// Look up the value for `key` and hand it to `f` without copying it.
+    /// Read-only (`&Pager`), so it can run under a shared
+    /// [`std::sync::RwLock`] read guard concurrently with other readers.
+    pub fn get_with<R>(
+        &self,
+        pager: &Pager,
+        key: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>> {
+        let Some((_, page)) = self.leaf_for(pager, key)? else {
+            return Ok(None);
+        };
+        let mut it = NodeView::new(&page[..])?.entries();
+        while let Some((k, v)) = it.next_kv()? {
+            match k.cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => return Ok(Some(f(v))),
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Look up the value for `key` (an owned copy; see
+    /// [`get_with`](Self::get_with) for the zero-copy form). Read-only.
+    pub fn get(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_with(pager, key, <[u8]>::to_vec)
+    }
+
+    /// Whether `key` is present. Read-only.
+    pub fn contains(&self, pager: &Pager, key: &[u8]) -> Result<bool> {
+        Ok(self.get_with(pager, key, |_| ())?.is_some())
+    }
+
+    /// A cursor positioned at the first entry whose key is `>= key`. Read-only.
+    pub fn cursor_ge(&self, pager: &Pager, key: &[u8]) -> Result<LeafCursor> {
+        let Some((_, page)) = self.leaf_for(pager, key)? else {
+            return Ok(LeafCursor::empty());
+        };
+        let (off, left, next_leaf) = {
+            let view = NodeView::new(&page[..])?;
+            let mut it = view.entries();
+            loop {
+                match it.peek_key()? {
+                    Some(k) if k < key => {
+                        it.next_kv()?;
+                    }
+                    _ => break,
+                }
+            }
+            (it.off, it.left, view.link())
+        };
+        Ok(LeafCursor {
+            page: Some(page),
+            off,
+            left,
+            next_leaf,
+            hops: 0,
+        })
+    }
+
+    /// Visit every entry whose key starts with `prefix`, in key order, without
+    /// copying: `f(key, value)` sees slices of the cached page and may stop
+    /// the scan by returning [`ControlFlow::Break`]. Read-only.
+    pub fn scan_prefix_with(
+        &self,
+        pager: &Pager,
+        prefix: &[u8],
+        mut f: impl FnMut(&[u8], &[u8]) -> ControlFlow<()>,
+    ) -> Result<()> {
+        let mut cur = self.cursor_ge(pager, prefix)?;
+        while let Some((k, v)) = cur.next_entry(pager)? {
+            // From the first key >= prefix, the matching keys are contiguous.
+            if !k.starts_with(prefix) {
+                break;
+            }
+            if f(k, v).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The first entry whose key starts with `prefix` (owned copies). Read-only.
+    pub fn first_with_prefix(
+        &self,
+        pager: &Pager,
+        prefix: &[u8],
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut cur = self.cursor_ge(pager, prefix)?;
+        Ok(match cur.next_entry(pager)? {
+            Some((k, v)) if k.starts_with(prefix) => Some((k.to_vec(), v.to_vec())),
+            _ => None,
+        })
+    }
+
+    /// All entries whose key starts with `prefix`, in key order, as owned
+    /// copies. Read-only (`&Pager`) so it can run concurrently with other
+    /// readers. Prefer [`scan_prefix_with`](Self::scan_prefix_with), which
+    /// allocates nothing per entry; this materializing form parses whole
+    /// [`Node`]s and is kept as the reference the zero-copy path is tested
+    /// against.
     pub fn scan_prefix(&self, pager: &Pager, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
         let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
@@ -338,7 +669,12 @@ impl BTree {
 
     /// All entries in key order.
     pub fn iter_all(&self, pager: &Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix(pager, &[])
+        let mut out = Vec::new();
+        self.scan_prefix_with(pager, &[], |k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            ControlFlow::Continue(())
+        })?;
+        Ok(out)
     }
 
     /// Number of entries whose key starts with `prefix`, without materializing
@@ -348,67 +684,38 @@ impl BTree {
     /// has) costs `O(height + matches)` and allocates nothing. Read-only.
     pub fn count_prefix(&self, pager: &Pager, prefix: &[u8]) -> Result<usize> {
         let mut n = 0usize;
-        let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
-            return Ok(0);
-        };
-        loop {
-            let node = Node::parse(&pager.read_page(page)?);
-            while idx < node.keys.len() {
-                let k = &node.keys[idx];
-                if k.starts_with(prefix) {
-                    n += 1;
-                } else if k.as_slice() > prefix {
-                    return Ok(n);
-                }
-                idx += 1;
-            }
-            if node.link == 0 {
-                return Ok(n);
-            }
-            page = node.link;
-            idx = 0;
-        }
+        self.scan_prefix_with(pager, prefix, |_, _| {
+            n += 1;
+            ControlFlow::Continue(())
+        })?;
+        Ok(n)
     }
 
     /// Whether *any* entry has a key starting with `prefix`. Descends to the first
-    /// key `>= prefix` and checks it — `O(height)`, touching a single leaf — so it
-    /// is far cheaper than [`scan_prefix`](Self::scan_prefix) when the caller only
+    /// key `>= prefix` and checks it — `O(height)`, touching a single leaf (or
+    /// its successor) — so it is far cheaper than a scan when the caller only
     /// needs a yes/no (e.g. maintaining a distinct-count on insert/delete).
     /// Read-only.
     pub fn prefix_exists(&self, pager: &Pager, prefix: &[u8]) -> Result<bool> {
-        let Some((mut page, mut idx)) = self.find_leaf_ge(pager, prefix)? else {
-            return Ok(false);
-        };
-        loop {
-            let node = Node::parse(&pager.read_page(page)?);
-            if idx < node.keys.len() {
-                // The first key `>= prefix` is a prefix match iff the whole
-                // (contiguous) matching run is non-empty.
-                return Ok(node.keys[idx].starts_with(prefix));
-            }
-            // `prefix` sorts after every key in this leaf; the first candidate is
-            // the next leaf's first key.
-            if node.link == 0 {
-                return Ok(false);
-            }
-            page = node.link;
-            idx = 0;
-        }
+        let mut cur = self.cursor_ge(pager, prefix)?;
+        Ok(matches!(cur.next_entry(pager)?, Some((k, _)) if k.starts_with(prefix)))
     }
 
+    /// The leaf holding the first key `>= key` and that key's index in it.
     fn find_leaf_ge(&self, pager: &Pager, key: &[u8]) -> Result<Option<(PageId, usize)>> {
-        let mut page = self.root(pager);
-        if page == 0 {
+        let Some((id, page)) = self.leaf_for(pager, key)? else {
             return Ok(None);
-        }
-        loop {
-            let node = Node::parse(&pager.read_page(page)?);
-            if node.is_leaf {
-                let idx = node.keys.partition_point(|k| k.as_slice() < key);
-                return Ok(Some((page, idx)));
+        };
+        let mut it = NodeView::new(&page[..])?.entries();
+        let mut idx = 0;
+        while let Some(k) = it.peek_key()? {
+            if k >= key {
+                break;
             }
-            page = node.child_for(key);
+            it.next_kv()?;
+            idx += 1;
         }
+        Ok(Some((id, idx)))
     }
 
     // ---- deletion (gStore tree node merge / redistribution) ---------------
@@ -683,7 +990,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_bt_{tag}.kv"));
+        let p = std::env::temp_dir().join(format!("gstore_bt_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p

@@ -56,10 +56,10 @@ pub fn write_chain(pager: &mut Pager, data: &[u8]) -> Result<PageId> {
 /// comes first (a well-formed chain reaches both at the same point). Read-only
 /// (`&Pager`), so it runs under a shared read guard like other reads.
 pub fn read_chain(pager: &Pager, head: PageId, len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(len);
+    let mut out = Vec::with_capacity(len.min(1 << 20));
     let mut page_id = head;
     while page_id != 0 && out.len() < len {
-        let page = pager.read_page(page_id)?;
+        let page = pager.read_page_shared(page_id)?;
         let next = u32::from_le_bytes(page[0..4].try_into().unwrap());
         let take = (len - out.len()).min(CHAIN_PAYLOAD);
         out.extend_from_slice(&page[4..4 + take]);
@@ -74,7 +74,7 @@ pub fn read_chain(pager: &Pager, head: PageId, len: usize) -> Result<Vec<u8>> {
 pub fn free_chain(pager: &mut Pager, head: PageId) -> Result<()> {
     let mut page_id = head;
     while page_id != 0 {
-        let page = pager.read_page(page_id)?;
+        let page = pager.read_page_shared(page_id)?;
         let next = u32::from_le_bytes(page[0..4].try_into().unwrap());
         pager.free(page_id)?;
         page_id = next;
@@ -88,7 +88,7 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_overflow_{tag}.kv"));
+        let p = std::env::temp_dir().join(format!("gstore_overflow_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
