@@ -323,7 +323,7 @@ pub struct Database {
     /// first use and kept for the dictionary [`generation`](Dictionary::generation)
     /// it was built from (see [`string_index`](Self::string_index)); a
     /// change that adds or frees a term drops it. In-memory dictionaries only.
-    string_index: Mutex<Option<(u64, Arc<StringIndex>)>>,
+    string_index: StringIndexCache,
     /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
     /// failed (e.g. interned by a reasoner run whose term write failed). The
     /// next insert that uses one writes it first, so no persisted triple ever
@@ -334,6 +334,22 @@ pub struct Database {
     /// (see [`dirlock`]); declared last so it is released only after every
     /// other field (the on-disk store included) has been dropped.
     dir_lock: Option<dirlock::DirLock>,
+}
+
+/// The cached dictionary substring index of a [`Database`] (see
+/// [`Database::string_index`]): `(dictionary generation, index)`. Its `Debug`
+/// shows only the generation and the index size.
+#[derive(Default)]
+struct StringIndexCache(Mutex<Option<(u64, Arc<StringIndex>)>>);
+
+impl std::fmt::Debug for StringIndexCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.try_lock().as_deref() {
+            Ok(Some((g, idx))) => write!(f, "StringIndex(generation {g}, {} terms)", idx.len()),
+            Ok(None) => f.write_str("None"),
+            Err(_) => f.write_str("<locked>"),
+        }
+    }
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -472,7 +488,7 @@ impl Database {
             mutations: 0,
             vs_shrink_debt: 0,
             csr_cache: CsrCache::new(),
-            string_index: Mutex::new(None),
+            string_index: StringIndexCache::default(),
             #[cfg(feature = "rocksdb")]
             unpersisted_terms: HashSet::new(),
             dir_lock: None,
@@ -550,6 +566,7 @@ impl Database {
         let generation = self.dict.generation();
         let index = self
             .string_index
+            .0
             .get_mut()
             .unwrap_or_else(|e| e.into_inner());
         if index.as_ref().is_some_and(|(g, _)| *g != generation) {
@@ -569,10 +586,10 @@ impl Database {
         let generation = self.dict.generation();
         // Built under the lock: concurrent readers wait for one build
         // instead of each building its own.
-        let mut slot = match self.string_index.lock() {
+        let mut slot = match self.string_index.0.lock() {
             Ok(g) => g,
             Err(poisoned) => {
-                self.string_index.clear_poison();
+                self.string_index.0.clear_poison();
                 let mut g = poisoned.into_inner();
                 *g = None;
                 g
@@ -592,7 +609,7 @@ impl Database {
     /// dictionary (never builds). For tests and monitoring.
     pub fn cached_string_index(&self) -> Option<Arc<StringIndex>> {
         let generation = self.dict.generation();
-        let slot = self.string_index.lock().ok()?;
+        let slot = self.string_index.0.lock().ok()?;
         slot.as_ref()
             .filter(|(g, _)| *g == generation)
             .map(|(_, idx)| Arc::clone(idx))

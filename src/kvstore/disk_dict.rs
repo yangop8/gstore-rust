@@ -285,7 +285,7 @@ impl DiskTermSource for DiskDict {
                 continue;
             };
             arr = Some(a);
-            if self.terms.get(space, id).is_none() {
+            if !self.terms.contains(space, id) {
                 missing.push(key);
             }
         }

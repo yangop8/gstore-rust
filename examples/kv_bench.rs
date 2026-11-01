@@ -516,7 +516,11 @@ fn contains(o: &Opts) {
     let t = Instant::now();
     let mut db = Database::open(&o.dir).expect("open");
     db.set_query_cache_size(0);
-    println!("contains_open_ms={:.1}", ms(t));
+    println!(
+        "contains_open_ms={:.1} contains_rss_open_kib={}",
+        ms(t),
+        rss_kib()
+    );
     let t = Instant::now();
     let first = rows_hash(&db.query(&q).expect("query"));
     let first_ms = ms(t);
@@ -530,9 +534,10 @@ fn contains(o: &Opts) {
     let second_ms = later[0];
     println!(
         "contains_rows={} contains_first_ms={first_ms:.1} contains_second_ms={second_ms:.1} \
-         contains_warm_median_ms={:.1} contains_ratio={:.3}",
+         contains_warm_median_ms={:.1} contains_ratio={:.3} contains_rss_after_kib={}",
         first.0,
         median(later.clone()),
-        second_ms / first_ms
+        second_ms / first_ms,
+        rss_kib()
     );
 }

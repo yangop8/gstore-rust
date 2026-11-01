@@ -215,6 +215,16 @@ impl<K: Hash + Eq + Clone, V: Clone> ClockCache<K, V> {
         }
     }
 
+    /// Whether `key` is cached (neither marks it used nor counts as a hit or
+    /// a miss).
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.shard(key).map.contains_key(key)
+    }
+
     /// The cached value of `key` (marking it used).
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
@@ -345,6 +355,11 @@ impl TermCache {
     /// The cached string of `id` in `space`.
     pub fn get(&self, space: Space, id: u32) -> Option<Arc<str>> {
         self.inner.get(&term_key(space, id))
+    }
+
+    /// Whether the string of `id` in `space` is cached (no counters move).
+    pub fn contains(&self, space: Space, id: u32) -> bool {
+        self.inner.contains(&term_key(space, id))
     }
 
     /// Cache the string of `id` in `space`.
