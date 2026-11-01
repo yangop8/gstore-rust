@@ -357,6 +357,25 @@ fn tiny_backends_agree_and_the_data_cache_regenerates() {
     let outcomes = self_check(&merged);
     assert_eq!(verdict(&outcomes), Verdict::Pass, "{outcomes:#?}");
     assert!(outcomes.iter().any(|o| o.gate == "exact.cross_backend"));
+    // A result without some of the baseline's backends fails, unless
+    // --backends limits the comparison.
+    assert_eq!(bench(&args(&["compare", &m, &a_json])).0, 1);
+    ok(
+        &bench(&args(&["compare", &m, &a_json, "--backends", "snapshot"])),
+        "compare --backends",
+    );
+    ok(
+        &bench(&args(&[
+            "check",
+            "--baseline",
+            &m,
+            "--from",
+            &a_json,
+            "--backends",
+            "snapshot",
+        ])),
+        "check --from --backends",
+    );
     // Merging a result with itself repeats a backend.
     assert_eq!(bench(&args(&["merge", "--out", &m, &a_json, &a_json])).0, 2);
 }

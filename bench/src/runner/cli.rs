@@ -23,8 +23,11 @@ usage:
   gstore-bench check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X]
                      [--summary FILE] [RUN OPTIONS] [--out FILE]
   gstore-bench ci [--baseline bench/baselines/smoke.json] [--summary FILE] [RUN OPTIONS] [--out FILE]
-  gstore-bench compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--markdown]
+  gstore-bench compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b]
+                       [--markdown] [--summary FILE]
   gstore-bench report RESULT [--markdown] [--compare BASELINE]
+
+  check / compare: --backends also limits which of the baseline's backends are gated.
   gstore-bench bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]
   gstore-bench merge --out FILE RESULT RESULT...
   gstore-bench calibrate [--quick]
@@ -422,10 +425,27 @@ fn thresholds(a: &mut Args) -> Result<Thresholds, Error> {
 fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
     let baseline_path =
         usage(a.value("--baseline"))?.unwrap_or_else(|| "bench/baselines/smoke.json".into());
-    let baseline = failed(BenchResult::load(Path::new(&baseline_path)))?;
+    let mut baseline = failed(BenchResult::load(Path::new(&baseline_path)))?;
     let t = thresholds(a)?;
     let slowdown: f64 = usage(a.parsed("--self-test-slowdown"))?.unwrap_or(1.0);
     let from = usage(a.value("--from"))?;
+    // `--backends` also limits which of the baseline's backends are gated.
+    let backends_arg: Option<Vec<String>> = a
+        .items
+        .iter()
+        .position(|x| x == "--backends")
+        .and_then(|i| a.items.get(i + 1))
+        .or_else(|| a.items.iter().find(|x| x.starts_with("--backends=")))
+        .map(|v| {
+            v.trim_start_matches("--backends=")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+    if let Some(keep) = &backends_arg {
+        baseline.runs.retain(|r| keep.contains(&r.backend));
+    }
     let summary = usage(a.value("--summary"))?
         .or_else(|| {
             if ci {
@@ -438,6 +458,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
     let out_arg = usage(a.value("--out"))?;
 
     let (result, outcomes) = if let Some(f) = from {
+        usage(a.value("--backends"))?;
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
         let r = failed(BenchResult::load(Path::new(&f)))?;
         let o = evaluate(&baseline, &r, &t, slowdown);
@@ -523,12 +544,17 @@ fn cmd_compare(a: &mut Args) -> CmdResult {
     let slowdown: f64 = usage(a.parsed("--self-test-slowdown"))?.unwrap_or(1.0);
     let _ = a.flag("--markdown");
     let summary = usage(a.value("--summary"))?.map(PathBuf::from);
+    let only = usage(a.list("--backends"))?;
     let pos = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
     let [base, res] = pos.as_slice() else {
         return Err(Error::Usage("compare needs BASELINE and RESULT".into()));
     };
-    let base = failed(BenchResult::load(Path::new(base)))?;
-    let res = failed(BenchResult::load(Path::new(res)))?;
+    let mut base = failed(BenchResult::load(Path::new(base)))?;
+    let mut res = failed(BenchResult::load(Path::new(res)))?;
+    if let Some(keep) = &only {
+        base.runs.retain(|r| keep.contains(&r.backend));
+        res.runs.retain(|r| keep.contains(&r.backend));
+    }
     let outcomes = evaluate(&base, &res, &t, slowdown);
     let mut text = report::markdown(&res, Some(&base));
     text.push_str(&report::gates_markdown(&outcomes, false));

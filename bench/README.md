@@ -23,9 +23,9 @@ for data, databases and results) are relative paths.
 |---|---|---|
 | `gen [--workload lubm\|tiny] [--scale N] [--seed S] [--departments D] [--chunk] [--out FILE\|-]` | write a data set (or its update chunk) as N-Triples; prints lines, unique triples, bytes, FNV-1a hash and triples/s | 0 |
 | `run [--profile P] [RUN OPTIONS] [--out FILE] [--note TEXT]` | measure a profile, write the result JSON, print a Markdown report | 0, or 1 when the result fails its own exact checks |
-| `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians) | 0 pass, 1 fail |
+| `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians); `--backends` also limits which baseline backends are gated | 0 pass, 1 fail |
 | `ci [same options]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY` | 0 pass, 1 fail |
-| `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--markdown] [--summary FILE]` | gate two existing files | 0 pass, 1 fail |
+| `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b] [--markdown] [--summary FILE]` | gate two existing files (`--backends`: only those backends) | 0 pass, 1 fail |
 | `report RESULT [--markdown] [--compare BASELINE]` | Markdown tables (and ratios plus gate table against BASELINE) | 0 |
 | `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks | 0, or 1 when refused |
 | `merge --out FILE RESULT RESULT...` | join results of the same workload measured by different binaries (e.g. RocksDB from a `--features rocksdb` build) | 0, or 1 on a failed self-check |
