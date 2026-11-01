@@ -93,7 +93,10 @@ fn run_with_closed_stdout(cmd: &mut Command) -> (std::process::ExitStatus, Strin
         .stderr(std::process::Stdio::piped())
         .output()
         .expect("run the tool");
-    (out.status, String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// A tool whose standard output is a closed pipe (`gserver -S | head -1`,
@@ -115,7 +118,10 @@ fn a_closed_stdout_pipe_ends_the_output_quietly() {
 
     let quiet = |what: &str, (status, stderr): (std::process::ExitStatus, String)| {
         assert!(!stderr.contains("panicked"), "{what} panicked: {stderr}");
-        assert!(!stderr.contains("Broken pipe"), "{what} reported the pipe: {stderr}");
+        assert!(
+            !stderr.contains("Broken pipe"),
+            "{what} reported the pipe: {stderr}"
+        );
         assert!(status.success(), "{what} exited with {status}: {stderr}");
     };
     // Every tool's help.
@@ -138,7 +144,11 @@ fn a_closed_stdout_pipe_ends_the_output_quietly() {
     // Status and listing output.
     quiet(
         "gserver -S",
-        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gserver")).arg("-S").current_dir(&work)),
+        run_with_closed_stdout(
+            Command::new(env!("CARGO_BIN_EXE_gserver"))
+                .arg("-S")
+                .current_dir(&work),
+        ),
     );
     quiet(
         "gshow",
@@ -177,7 +187,11 @@ fn a_closed_stdout_pipe_ends_the_output_quietly() {
     // The output is gone, but the work was done: a mutating tool finished.
     quiet(
         "gadd",
-        run_with_closed_stdout(Command::new(env!("CARGO_BIN_EXE_gadd")).arg(&name).arg(small_nt())),
+        run_with_closed_stdout(
+            Command::new(env!("CARGO_BIN_EXE_gadd"))
+                .arg(&name)
+                .arg(small_nt()),
+        ),
     );
     let _ = std::fs::remove_dir_all(&work);
 }

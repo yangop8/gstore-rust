@@ -197,7 +197,11 @@ fn is_std_local_char(c: char) -> bool {
 /// A character a local name may contain in the lenient loader (see the
 /// module docs): the standard ones plus upstream's extras.
 fn is_lenient_local_char(c: char) -> bool {
-    is_std_local_char(c) || matches!(c, '/' | '#' | '?' | '=' | '&' | '~' | '!' | '$' | '*' | '+' | '@')
+    is_std_local_char(c)
+        || matches!(
+            c,
+            '/' | '#' | '?' | '=' | '&' | '~' | '!' | '$' | '*' | '+' | '@'
+        )
 }
 
 /// A character a blank node label may contain besides `.`.
@@ -500,7 +504,9 @@ impl<R: BufRead> Parser<R> {
                 self.in_block = true;
                 self.graph = None;
             }
-            Some(_) if self.trig && self.keyword_ahead("GRAPH", |c| c.is_whitespace() || c == '<') => {
+            Some(_)
+                if self.trig && self.keyword_ahead("GRAPH", |c| c.is_whitespace() || c == '<') =>
+            {
                 for _ in 0..5 {
                     self.bump();
                 }
@@ -864,7 +870,10 @@ impl<R: BufRead> Parser<R> {
             // Stop at the ':' that ends the prefix, or any term separator.
             if c == ':'
                 || c.is_whitespace()
-                || matches!(c, '.' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\'')
+                || matches!(
+                    c,
+                    '.' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\''
+                )
             {
                 break;
             }
@@ -884,14 +893,8 @@ impl<R: BufRead> Parser<R> {
         if !verb_pos && (prefix == "true" || prefix == "false") {
             return Ok(Term::typed_literal(prefix, xsd::BOOLEAN));
         }
-        let found = prefix
-            .chars()
-            .next()
-            .or_else(|| self.peek())
-            .unwrap_or(' ');
-        Err(self.err(format!(
-            "expected a prefixed name or IRI, found '{found}'"
-        )))
+        let found = prefix.chars().next().or_else(|| self.peek()).unwrap_or(' ');
+        Err(self.err(format!("expected a prefixed name or IRI, found '{found}'")))
     }
 
     /// The local part of a prefixed name (lenient, see the module docs).
@@ -1170,7 +1173,6 @@ impl<R: BufRead> Parser<R> {
         }
     }
 }
-
 
 /// The error of a statement replayed from the first raw line break of one
 /// of its short string literals (opened on `line`): reported on that line,
@@ -1458,7 +1460,10 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         // (B :q :r), (B :u :v), (:s :p B)
         assert_eq!(ts.len(), 3);
-        let outer = ts.iter().find(|t| t.predicate == Term::iri("http://e/p")).unwrap();
+        let outer = ts
+            .iter()
+            .find(|t| t.predicate == Term::iri("http://e/p"))
+            .unwrap();
         let b = match &outer.object {
             Term::Blank(l) => l.clone(),
             other => panic!("expected blank object, got {other:?}"),
@@ -1531,7 +1536,10 @@ mod tests {
             "(".repeat(400),
             ")".repeat(400)
         );
-        assert!(parse_str(&doc).is_err(), "pathologically deep nesting must be rejected");
+        assert!(
+            parse_str(&doc).is_err(),
+            "pathologically deep nesting must be rejected"
+        );
     }
 
     #[test]
@@ -1638,7 +1646,10 @@ mod tests {
         assert!(sink.errors[0].context.contains("<http://e/b>"));
         // A strict parse of the same document stops at line 3.
         let err = parse_str(doc).unwrap_err();
-        assert!(matches!(err, GStoreError::RdfParse { line: 3, .. }), "{err}");
+        assert!(
+            matches!(err, GStoreError::RdfParse { line: 3, .. }),
+            "{err}"
+        );
     }
 
     #[test]

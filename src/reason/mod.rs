@@ -198,8 +198,7 @@ fn gather<S: TripleSource>(
             }
         }
         for &(p_ent, q_ent) in &pairs {
-            let (Some(p_pred), Some(q_pred)) =
-                (ent_to_pred(dict, p_ent), ent_to_pred(dict, q_ent))
+            let (Some(p_pred), Some(q_pred)) = (ent_to_pred(dict, p_ent), ent_to_pred(dict, q_ent))
             else {
                 continue;
             };
@@ -1021,7 +1020,8 @@ mod tests {
             "variable predicate"
         );
         assert!(
-            rs.add_rule("c", "?x <p> ?y => ?x <q> ?y . ?a <r> ?b").is_err(),
+            rs.add_rule("c", "?x <p> ?y => ?x <q> ?y . ?a <r> ?b")
+                .is_err(),
             "multi-pattern head"
         );
         assert!(

@@ -437,8 +437,8 @@ impl<'s> Parser<'s> {
 
         self.skip_dataset_clauses()?;
         self.eat_keyword("WHERE"); // optional
-        // Each `GROUP BY (expr AS ?v)` wraps the WHERE pattern in one more
-        // `Extend` node: a chain on top of the pattern's own height.
+                                   // Each `GROUP BY (expr AS ?v)` wraps the WHERE pattern in one more
+                                   // `Extend` node: a chain on top of the pattern's own height.
         let mut chain = self.chain_begin();
         let mut pattern = self.parse_group_graph_pattern()?;
         let (group_by, having) = self.parse_group_having(&mut pattern, &mut chain)?;
@@ -2852,9 +2852,7 @@ impl<'s> Parser<'s> {
                     }
                 }
             }
-            other => Err(self.err(format!(
-                "GRAPH expects an IRI or variable, found {other:?}"
-            ))),
+            other => Err(self.err(format!("GRAPH expects an IRI or variable, found {other:?}"))),
         }
     }
 
@@ -2873,9 +2871,9 @@ impl<'s> Parser<'s> {
                         self.bump();
                         Ok(ServiceRef::Iri(s))
                     }
-                    other => Err(self.err(format!(
-                        "SERVICE expects an IRI or variable, got {other:?}"
-                    ))),
+                    other => {
+                        Err(self.err(format!("SERVICE expects an IRI or variable, got {other:?}")))
+                    }
                 }
             }
             other => Err(self.err(format!(
@@ -3251,19 +3249,26 @@ mod tests {
             // Nesting: one level is spent on the outer group / FILTER.
             let nested = MAX_NESTING_DEPTH / 2 - 2;
             for (name, q) in deep_shapes(nested) {
-                db.query(&q).unwrap_or_else(|e| panic!("{name} at {nested}: {e}"));
+                db.query(&q)
+                    .unwrap_or_else(|e| panic!("{name} at {nested}: {e}"));
             }
             // Chains: far longer than the nesting limit.
             let long = MAX_TREE_HEIGHT - 8;
             for (name, q) in deep_shapes(long) {
                 if matches!(
                     name,
-                    "or" | "sum" | "optional-chain" | "union" | "path-seq" | "path-postfix" | "binds"
+                    "or" | "sum"
+                        | "optional-chain"
+                        | "union"
+                        | "path-seq"
+                        | "path-postfix"
+                        | "binds"
                         | "path-patterns"
                         | "group-by-as"
                         | "delete-where-graphs"
                 ) {
-                    db.query(&q).unwrap_or_else(|e| panic!("{name} at {long}: {e}"));
+                    db.query(&q)
+                        .unwrap_or_else(|e| panic!("{name} at {long}: {e}"));
                 }
             }
         });
@@ -3272,7 +3277,10 @@ mod tests {
         let or_chain = |n: usize| {
             format!(
                 "ASK {{ FILTER({}) }}",
-                (0..n).map(|i| format!("{i} = 0")).collect::<Vec<_>>().join(" || ")
+                (0..n)
+                    .map(|i| format!("{i} = 0"))
+                    .collect::<Vec<_>>()
+                    .join(" || ")
             )
         };
         assert!(parse(&or_chain(MAX_TREE_HEIGHT - 8)).is_ok());
@@ -3295,7 +3303,10 @@ mod tests {
         );
         on_worker_stack(move || match parse(&with) {
             Err(GStoreError::SparqlParse(m)) => {
-                assert!(m.contains("WITH <iri> must be followed by DELETE/INSERT"), "{m}")
+                assert!(
+                    m.contains("WITH <iri> must be followed by DELETE/INSERT"),
+                    "{m}"
+                )
             }
             other => panic!("expected a parse error, got {other:?}"),
         });
@@ -3431,11 +3442,9 @@ mod tests {
         // single-arg, and multi-arg shapes all supported. (The legacy
         // two-argument SHORTESTPATHLEN is now reached as rs:SHORTESTPATHLEN;
         // the bare name is upstream gStore's shortestPathLen.)
-        let q = sel(
-            "SELECT (SUBSTR(?s,1,2) AS ?a) (now() AS ?b) (md5(?s) AS ?c)
+        let q = sel("SELECT (SUBSTR(?s,1,2) AS ?a) (now() AS ?b) (md5(?s) AS ?c)
                     (rs:SHORTESTPATHLEN(<x>,<y>) AS ?d) (UUID() AS ?e) (if(true,1,2) AS ?f)
-             WHERE { ?s <p> ?o }",
-        );
+             WHERE { ?s <p> ?o }");
         let got = builtin_calls(&q);
         assert_eq!(
             got,
@@ -3455,12 +3464,10 @@ mod tests {
         // The legacy gstore-rust graph-analytics built-ins are reached through
         // the rs: namespace — local names case-insensitive — with zero-, one-,
         // and two-argument shapes all supported.
-        let q = sel(
-            "SELECT (rs:SSSP(<a>,<b>) AS ?p) (rs:khopCount(<a>,2) AS ?k)
+        let q = sel("SELECT (rs:SSSP(<a>,<b>) AS ?p) (rs:khopCount(<a>,2) AS ?k)
                     (rs:TriangleCounting() AS ?t) (rs:PPR(<a>,<b>) AS ?r)
                     (rs:DIAMETERESTIMATION() AS ?d) (rs:BfsCount(<a>) AS ?c)
-             WHERE { ?s <p> ?o }",
-        );
+             WHERE { ?s <p> ?o }");
         let got = builtin_calls(&q);
         assert_eq!(
             got,
@@ -3638,9 +3645,7 @@ mod tests {
     #[test]
     fn parses_delete_insert_where() {
         match one_op("DELETE { ?s <old> ?o } INSERT { ?s <new> ?o } WHERE { ?s <old> ?o }") {
-            UpdateOp::Modify {
-                delete, insert, ..
-            } => {
+            UpdateOp::Modify { delete, insert, .. } => {
                 assert_eq!(delete.len(), 1);
                 assert_eq!(insert.len(), 1);
             }
@@ -3656,7 +3661,10 @@ mod tests {
         ));
         assert!(matches!(
             one_op("CLEAR ALL"),
-            UpdateOp::Clear { target: GraphTarget::All, .. }
+            UpdateOp::Clear {
+                target: GraphTarget::All,
+                ..
+            }
         ));
         assert!(matches!(
             one_op("LOAD <file:///tmp/x.ttl>"),
@@ -3664,7 +3672,10 @@ mod tests {
         ));
         assert!(matches!(
             one_op("DROP SILENT DEFAULT"),
-            UpdateOp::Drop { target: GraphTarget::Default, silent: true }
+            UpdateOp::Drop {
+                target: GraphTarget::Default,
+                silent: true
+            }
         ));
     }
 

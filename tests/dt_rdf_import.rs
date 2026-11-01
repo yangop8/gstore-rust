@@ -522,7 +522,10 @@ fn directory_sources_load_every_rdf_file_sorted_and_recursively() {
     #[cfg(unix)]
     {
         let outside = tmp("dirsrc_outside");
-        let secret = write(&outside.join("secret.nt"), "<http://e/x> <http://e/y> <http://e/z> .\n");
+        let secret = write(
+            &outside.join("secret.nt"),
+            "<http://e/x> <http://e/y> <http://e/z> .\n",
+        );
         std::os::unix::fs::symlink(&secret, data.join("link.nt")).unwrap();
         let err = import::expand_sources(&input, &allowed).unwrap_err();
         assert!(err.to_string().contains("load policy"), "{err}");

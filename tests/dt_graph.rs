@@ -39,7 +39,10 @@ fn graph_const_queries_a_named_graph_only() {
     let mut db = db();
     // g1 holds <a>; g2 holds <c>; default holds <x>.
     assert_eq!(
-        col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s <http://ex/p> ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s <http://ex/p> ?o } }"
+        ),
         vec!["<http://ex/a>"]
     );
     // The default graph does NOT see named-graph triples.
@@ -86,10 +89,17 @@ fn delete_data_from_named_graph() {
         other => panic!("got {other:?}"),
     };
     assert_eq!(changed, 1);
-    assert!(col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s <http://ex/p> ?o } }").is_empty());
+    assert!(col0(
+        &mut db,
+        "SELECT ?s WHERE { GRAPH <http://ex/g1> { ?s <http://ex/p> ?o } }"
+    )
+    .is_empty());
     // g2 untouched
     assert_eq!(
-        col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s <http://ex/p> ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s <http://ex/p> ?o } }"
+        ),
         vec!["<http://ex/c>"]
     );
 }
@@ -102,9 +112,12 @@ fn clear_named_graph_and_clear_all() {
         QueryResult::Update { changed } => assert_eq!(changed, 1),
         other => panic!("got {other:?}"),
     }
-    assert!(col0(&mut db, "SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o } }")
-        .iter()
-        .all(|_| true));
+    assert!(col0(
+        &mut db,
+        "SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o } }"
+    )
+    .iter()
+    .all(|_| true));
     // g2 still present, default still present.
     assert_eq!(
         col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }"),
@@ -130,7 +143,10 @@ fn named_graphs_persist_across_save_load() {
     }
     let mut db = Database::load(&dir).unwrap();
     assert_eq!(
-        col0(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s <http://ex/p> ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?s WHERE { GRAPH <http://ex/g2> { ?s <http://ex/p> ?o } }"
+        ),
         vec!["<http://ex/c>"]
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -165,12 +181,19 @@ fn graph_update_rolls_back() {
     db.query("INSERT DATA { GRAPH <http://ex/g1> { <http://ex/a> <http://ex/p> <http://ex/z> } }")
         .unwrap();
     assert_eq!(
-        col0(&mut db, "SELECT ?o WHERE { GRAPH <http://ex/g1> { <http://ex/a> <http://ex/p> ?o } }").len(),
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { GRAPH <http://ex/g1> { <http://ex/a> <http://ex/p> ?o } }"
+        )
+        .len(),
         2
     );
     db.rollback().unwrap();
     assert_eq!(
-        col0(&mut db, "SELECT ?o WHERE { GRAPH <http://ex/g1> { <http://ex/a> <http://ex/p> ?o } }"),
+        col0(
+            &mut db,
+            "SELECT ?o WHERE { GRAPH <http://ex/g1> { <http://ex/a> <http://ex/p> ?o } }"
+        ),
         vec!["<http://ex/b>"]
     );
 }

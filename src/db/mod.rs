@@ -38,9 +38,9 @@ use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::ReadScope;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
-pub(crate) mod fsutil;
 mod admin;
 pub mod dirlock;
+pub(crate) mod fsutil;
 pub(crate) mod persist;
 mod statement;
 pub use statement::Statement;
@@ -53,9 +53,9 @@ pub use persist::StorageKind;
 
 #[cfg(test)]
 mod hardening_tests;
+mod load_policy;
 #[cfg(test)]
 mod review_tests;
-mod load_policy;
 pub use load_policy::{LoadPolicy, LoadSource};
 mod query_cache;
 use query_cache::QueryCache;
@@ -148,7 +148,9 @@ fn memory_vstree_entries(store: &TripleStore) -> Vec<(EntityLiteralId, Signature
 /// read error fails the build instead of signing an entity with missing edges.
 ///
 /// [`DiskStore::for_each_entity_adjacency`]: crate::kvstore::DiskStore::for_each_entity_adjacency
-fn disk_vstree_entries(store: &crate::kvstore::DiskStore) -> Result<Vec<(EntityLiteralId, Signature)>> {
+fn disk_vstree_entries(
+    store: &crate::kvstore::DiskStore,
+) -> Result<Vec<(EntityLiteralId, Signature)>> {
     let mut out = Vec::new();
     store.for_each_entity_adjacency(|e, outgoing, incoming| {
         let mut sig = Signature::new();
@@ -678,8 +680,12 @@ impl Database {
         files: &[P],
     ) -> Result<Database> {
         let sources = import::sources_from_paths(files)?;
-        let (db, _) =
-            Database::build_from_sources(name, &sources, &import::ImportOptions::strict(), &mut ())?;
+        let (db, _) = Database::build_from_sources(
+            name,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )?;
         Ok(db)
     }
 
@@ -696,13 +702,10 @@ impl Database {
     ) -> Result<(Database, import::ImportReport)> {
         let mut db = Database::new(name);
         let mut acc = BuildAccumulator::default();
-        let report = import::import_sources(
-            sources,
-            "build",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| acc.add(&mut db, batch),
-        )?;
+        let report =
+            import::import_sources(sources, "build", opts, log, &mut |batch: &mut Vec<Quad>| {
+                acc.add(&mut db, batch)
+            })?;
         acc.finish(&mut db);
         Ok((db, report))
     }
@@ -1313,9 +1316,8 @@ impl Database {
     /// typing. Returns the number of inferred triples added; the VS-tree is
     /// invalidated (and rebuilt lazily on save / next consistent query).
     pub fn materialize_rdfs(&mut self) -> usize {
-        let added = self.infer(|dict, store, insert| {
-            crate::reason::materialize_with(dict, store, insert)
-        });
+        let added =
+            self.infer(|dict, store, insert| crate::reason::materialize_with(dict, store, insert));
         self.record_inferred(added)
     }
 
@@ -1790,7 +1792,10 @@ impl Database {
         let Some(gid) = self.dict.entity_id(&Term::iri(graph).dict_key()) else {
             return 0;
         };
-        let n = self.named.get(&gid).map_or(0, |s| s.triple_count() as usize);
+        let n = self
+            .named
+            .get(&gid)
+            .map_or(0, |s| s.triple_count() as usize);
         if n > 0 {
             if let Some(log) = self.txn.as_mut() {
                 if let Some(s) = self.named.get(&gid) {
@@ -2259,8 +2264,7 @@ impl Database {
         let outcome = (|| {
             for dir in incr_dirs {
                 let dir = dir.as_ref();
-                let (base, end) =
-                    read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE))?;
+                let (base, end) = read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE))?;
                 if base != expected {
                     return Err(GStoreError::Database(format!(
                         "incremental backup '{}' starts at offset {base} but {expected} \
@@ -2349,10 +2353,9 @@ impl Database {
             }
             let _millis = it.next();
             let _changed = it.next();
-            let len: usize = it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database("missing length in update.log record".into()))?;
+            let len: usize = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                GStoreError::Database("missing length in update.log record".into())
+            })?;
             let start = nl + 1;
             let end = start + len;
             if end > bytes.len() {
@@ -2739,7 +2742,10 @@ impl Database {
     fn persist_for_rules(&self) -> Result<()> {
         if self.storage() == crate::StorageKind::Snapshot {
             if let Some(home) = self.home.clone() {
-                if self.reason_db_dir().is_some_and(|d| fsutil::same_dir(&d, &home)) {
+                if self
+                    .reason_db_dir()
+                    .is_some_and(|d| fsutil::same_dir(&d, &home))
+                {
                     return self.save(&home);
                 }
             }
@@ -3291,7 +3297,10 @@ impl BuildAccumulator {
 /// makes the body opaque, so a statement may contain any bytes (including the
 /// record-delimiter text) without corrupting the log.
 fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -3308,7 +3317,10 @@ fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
 /// taken for the default graph). The lengths make the graph/triple bodies
 /// opaque, so they may hold any bytes.
 fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     for r in recs {
         let g = r.graph.as_deref().unwrap_or("");
         let flag = if r.graph.is_some() { " G" } else { "" };
@@ -3339,10 +3351,9 @@ fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
     for line in lines {
         let mut it = line.split_whitespace();
         if it.next() == Some(key) {
-            return it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database(format!("marker field '{key}' is not a u64")));
+            return it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                GStoreError::Database(format!("marker field '{key}' is not a u64"))
+            });
         }
     }
     Err(GStoreError::Database(format!(
@@ -3662,11 +3673,7 @@ mod tests {
 
         let mut accumulated = SMALL.to_string();
         for (s, p, o) in extra {
-            assert!(inc.insert_triple(&Triple::new(
-                Term::iri(s),
-                Term::iri(p),
-                Term::iri(o)
-            )));
+            assert!(inc.insert_triple(&Triple::new(Term::iri(s), Term::iri(p), Term::iri(o))));
             // The whole point of task 1: the index is *not* invalidated.
             assert!(
                 inc.stats().index_valid,
@@ -3705,11 +3712,7 @@ mod tests {
         for i in 0..n {
             let s = format!("e{i}");
             let o = format!("t{}", i % 23);
-            assert!(inc.insert_triple(&Triple::new(
-                Term::iri(&s),
-                Term::iri("p"),
-                Term::iri(&o)
-            )));
+            assert!(inc.insert_triple(&Triple::new(Term::iri(&s), Term::iri("p"), Term::iri(&o))));
             accumulated.push_str(&format!("<{s}> <p> <{o}> .\n"));
         }
         assert!(
@@ -3784,13 +3787,19 @@ mod tests {
         let mut text = String::new();
         for _ in 0..1500 {
             let (s, p, o) = (next(300), next(6), next(300));
-            text.push_str(&format!("<http://ex/e{s}> <http://ex/p{p}> <http://ex/e{o}> .\n"));
+            text.push_str(&format!(
+                "<http://ex/e{s}> <http://ex/p{p}> <http://ex/e{o}> .\n"
+            ));
         }
         let mut db = Database::build_from_str("vs", &text).unwrap();
         let check = |db: &mut Database, step: usize| {
             assert!(db.stats().index_valid, "step {step}: the index stays valid");
             let truth = vstree_entries(&db.store);
-            assert_eq!(truth, backend_vstree_entries(&db.store), "step {step}: fast path");
+            assert_eq!(
+                truth,
+                backend_vstree_entries(&db.store),
+                "step {step}: fast path"
+            );
             for &(e, sig) in truth.iter().step_by(7) {
                 // A query made of each real edge of `e` must find `e`.
                 for &(p, o) in &db.store.po_by_s(e) {
@@ -3819,7 +3828,13 @@ mod tests {
                     for _ in 0..40 {
                         db.remove_triple(&triple(next(300), next(6), next(300)));
                     }
-                    for (s, p, o) in db.store.iter_all().into_iter().take(30).map(|t| (t.sub, t.pred, t.obj)) {
+                    for (s, p, o) in db
+                        .store
+                        .iter_all()
+                        .into_iter()
+                        .take(30)
+                        .map(|t| (t.sub, t.pred, t.obj))
+                    {
                         db.remove_default_id(IdTriple::new(s, p, o));
                     }
                     for _ in 0..20 {
@@ -3831,7 +3846,13 @@ mod tests {
                 // back: the deleted edges come back and must be re-signed.
                 _ => {
                     db.begin().unwrap();
-                    let victims: Vec<IdTriple> = db.store.iter_all().into_iter().step_by(17).take(25).collect();
+                    let victims: Vec<IdTriple> = db
+                        .store
+                        .iter_all()
+                        .into_iter()
+                        .step_by(17)
+                        .take(25)
+                        .collect();
                     for t in &victims {
                         assert!(db.remove_default_id(*t));
                     }
@@ -3952,9 +3973,19 @@ mod tests {
         for _ in 0..1200 {
             let (s, p, o) = (next(200), next(5), next(320));
             let line = if next(4) == 0 {
-                (format!("<http://ex/e{s}>"), format!("<http://ex/p{p}>"), format!("\"v{o}\""), true)
+                (
+                    format!("<http://ex/e{s}>"),
+                    format!("<http://ex/p{p}>"),
+                    format!("\"v{o}\""),
+                    true,
+                )
             } else {
-                (format!("<http://ex/e{s}>"), format!("<http://ex/p{p}>"), format!("<http://ex/e{o}>"), false)
+                (
+                    format!("<http://ex/e{s}>"),
+                    format!("<http://ex/p{p}>"),
+                    format!("<http://ex/e{o}>"),
+                    false,
+                )
             };
             lines.push(line);
         }
@@ -3983,7 +4014,8 @@ mod tests {
         assert!(db.redo_log_enabled());
 
         // A mix of auto-commit mutations.
-        db.query("INSERT DATA { <root> <contain> <nodeX> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <nodeX> }")
+            .unwrap();
         db.insert_triple(&Triple::new(
             Term::iri("nodeX"),
             Term::iri("own"),
@@ -4077,7 +4109,8 @@ mod tests {
         db.enable_redo_log_in(&db_dir).unwrap();
 
         // An update BEFORE the full backup: captured by the base snapshot itself.
-        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <n_pre> }")
+            .unwrap();
 
         // Full backup: base snapshot + checkpoint at the current redo-log length.
         db.backup(&base_dir).unwrap();
@@ -4087,7 +4120,8 @@ mod tests {
         // Updates AFTER the full backup ⇒ first increment (insert + delete).
         db.query("INSERT DATA { <root> <contain> <n1> . <n1> <own> <p1> }")
             .unwrap();
-        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
         db.backup_incremental(&incr1_dir).unwrap();
         let ck1 = db.backup_checkpoint();
         assert!(ck1 > base_ck, "checkpoint advanced past the base");
@@ -4130,7 +4164,10 @@ mod tests {
 
         // Restoring ONLY the base reproduces the pre-increment state.
         let mut base_only = Database::restore(&base_dir).unwrap();
-        assert!(base_only.triple_num() < live_count, "base predates the increments");
+        assert!(
+            base_only.triple_num() < live_count,
+            "base predates the increments"
+        );
         assert_eq!(
             base_only
                 .select("SELECT ?o WHERE { <n1> <own> ?o }")
@@ -4175,7 +4212,8 @@ mod tests {
 
         let mut db = Database::build_from_str("bk", SMALL).unwrap();
         db.enable_redo_log_in(&db_dir).unwrap();
-        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <n_pre> }")
+            .unwrap();
         db.backup(&base_dir).unwrap();
         db.query("INSERT DATA { <root> <contain> <n1> }").unwrap();
         db.backup_incremental(&incr_dir).unwrap();
@@ -4207,22 +4245,33 @@ mod tests {
         db.backup(&base_dir).unwrap();
 
         // (a) direct-API insert (bypasses the SPARQL update path entirely)
-        db.insert_triple(&Triple::new(Term::iri("root"), Term::iri("contain"), Term::iri("api_node")));
+        db.insert_triple(&Triple::new(
+            Term::iri("root"),
+            Term::iri("contain"),
+            Term::iri("api_node"),
+        ));
         // (b) a transaction that is rolled back — must leave no trace
         db.begin().unwrap();
-        db.query("INSERT DATA { <root> <contain> <ghost> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <ghost> }")
+            .unwrap();
         db.rollback().unwrap();
 
         db.backup_incremental(&incr_dir).unwrap();
         let mut restored = Database::restore_incremental(&base_dir, &[&incr_dir]).unwrap();
 
         assert_eq!(
-            restored.select("SELECT ?s WHERE { ?s <contain> <api_node> }").unwrap().row_count(),
+            restored
+                .select("SELECT ?s WHERE { ?s <contain> <api_node> }")
+                .unwrap()
+                .row_count(),
             1,
             "direct-API insert must be captured by the redo-based increment"
         );
         assert_eq!(
-            restored.select("SELECT ?s WHERE { ?s <contain> <ghost> }").unwrap().row_count(),
+            restored
+                .select("SELECT ?s WHERE { ?s <contain> <ghost> }")
+                .unwrap()
+                .row_count(),
             0,
             "a rolled-back transaction must NOT be resurrected by restore"
         );
@@ -4307,7 +4356,8 @@ mod tests {
         let mut db = Database::build_from_str("inv", SMALL).unwrap();
         db.query("SELECT ?o WHERE { <root> <contain> ?o }").unwrap();
         assert_eq!(db.query_cache_len(), 1);
-        db.query("INSERT DATA { <root> <contain> <nodeZ> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <nodeZ> }")
+            .unwrap();
         assert_eq!(db.query_cache_len(), 0, "any write clears the cache");
     }
 
@@ -4320,19 +4370,26 @@ mod tests {
         let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
 
         // Delete the only triple using <node0>; its id is not auto-freed.
-        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
-        assert!(db.dict().entity_id(&Term::iri("node0").dict_key()).is_some());
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
+        assert!(db
+            .dict()
+            .entity_id(&Term::iri("node0").dict_key())
+            .is_some());
 
         let freed = db.reclaim_unused();
         assert_eq!(freed, 1, "only <node0> became unreferenced");
         assert_eq!(db.entity_num(), before_entities - 1);
         assert!(
-            db.dict().entity_id(&Term::iri("node0").dict_key()).is_none(),
+            db.dict()
+                .entity_id(&Term::iri("node0").dict_key())
+                .is_none(),
             "node0 was reclaimed"
         );
 
         // A brand-new term reuses node0's freed id.
-        db.query("INSERT DATA { <root> <contain> <fresh> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <fresh> }")
+            .unwrap();
         assert_eq!(
             db.dict().entity_id(&Term::iri("fresh").dict_key()),
             Some(node0_id),
@@ -4378,7 +4435,9 @@ mod tests {
         // Enough entities to force a multi-node VS-tree, plus a distinctive edge.
         let mut content = String::new();
         for i in 0..400u32 {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
         let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree.nt");
@@ -4387,11 +4446,20 @@ mod tests {
         Database::build_disk(&dir, &[&rdf]).unwrap();
         assert!(Database::is_disk(&dir));
         // The dedicated on-disk VS-tree node file was produced.
-        assert!(dir.join(VSTREE_KV_FILE).is_file(), "build_disk must write the VS-tree node file");
+        assert!(
+            dir.join(VSTREE_KV_FILE).is_file(),
+            "build_disk must write the VS-tree node file"
+        );
 
         let mut db = Database::load_disk(&dir).unwrap();
-        assert!(db.vstree.is_disk_backed(), "loaded disk db must use the on-disk VS-tree");
-        assert!(db.stats().index_valid, "the disk-backed index is valid for filtering");
+        assert!(
+            db.vstree.is_disk_backed(),
+            "loaded disk db must use the on-disk VS-tree"
+        );
+        assert!(
+            db.stats().index_valid,
+            "the disk-backed index is valid for filtering"
+        );
 
         // In-memory baseline over the same data (full VS-tree rebuild).
         let mut base = Database::build_from_str("base", &content).unwrap();
@@ -4405,7 +4473,10 @@ mod tests {
             let mut b = base.select(q).unwrap().rows;
             a.sort();
             b.sort();
-            assert_eq!(a, b, "disk-vstree query {q:?} diverged from in-memory baseline");
+            assert_eq!(
+                a, b,
+                "disk-vstree query {q:?} diverged from in-memory baseline"
+            );
         }
 
         // The distinctive marker query returns exactly the special subject — and
@@ -4417,7 +4488,10 @@ mod tests {
         assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
         // Running the query touched only some VS-tree node pages, not the whole
         // tree — proving it need not be fully resident.
-        assert!(db.vstree.disk_pages_read() > 0, "the disk VS-tree was actually traversed");
+        assert!(
+            db.vstree.disk_pages_read() > 0,
+            "the disk VS-tree was actually traversed"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&rdf);
@@ -4437,7 +4511,10 @@ mod tests {
 
         // An insert can't update the on-disk tree in place ⇒ index invalidates.
         assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
-        assert!(!db.stats().index_valid, "mutation invalidates the disk-backed index");
+        assert!(
+            !db.stats().index_valid,
+            "mutation invalidates the disk-backed index"
+        );
 
         // Query still correct (evaluates without the stale tree).
         let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
@@ -4459,7 +4536,9 @@ mod tests {
     fn streaming_vstree_matches_in_memory_path() {
         let mut content = String::new();
         for i in 0..400u32 {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
 
@@ -4472,8 +4551,14 @@ mod tests {
         let dir = temp_dir("stream_vstree");
         let path = dir.join(VSTREE_KV_FILE);
         streamed.use_streaming_vstree(&path).unwrap();
-        assert!(streamed.vstree.is_disk_backed(), "opted into out-of-core VS-tree");
-        assert!(streamed.stats().index_valid, "streaming index is valid for filtering");
+        assert!(
+            streamed.vstree.is_disk_backed(),
+            "opted into out-of-core VS-tree"
+        );
+        assert!(
+            streamed.stats().index_valid,
+            "streaming index is valid for filtering"
+        );
         // The store stayed in memory; only the filter went out-of-core.
         assert!(matches!(streamed.store, Backend::Memory(_)));
 
@@ -4502,10 +4587,9 @@ mod tests {
     #[test]
     fn build_reports_progress_stages() {
         let stages = std::cell::RefCell::new(Vec::new());
-        let db = Database::build_from_str_with_progress("p", SMALL, |s| {
-            stages.borrow_mut().push(s)
-        })
-        .unwrap();
+        let db =
+            Database::build_from_str_with_progress("p", SMALL, |s| stages.borrow_mut().push(s))
+                .unwrap();
         assert_eq!(db.triple_num(), 5);
         assert_eq!(
             stages.into_inner(),

@@ -852,10 +852,8 @@ mod tests {
         };
         // (Each simulated crash prints its panic message.)
         for n in 0..4 {
-            let dir = std::env::temp_dir().join(format!(
-                "gstore_manage_crash_{}_{n}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("gstore_manage_crash_{}_{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let mut store = RuleStore::dir(&dir);
@@ -872,9 +870,8 @@ mod tests {
             }
             add(&mut store, &rule, "t").unwrap();
             crash::arm(n);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                delete(&mut store, "u")
-            }));
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| delete(&mut store, "u")));
             crash::disarm();
             consistent(&store);
             let _ = std::fs::remove_dir_all(&dir);
@@ -914,7 +911,14 @@ mod tests {
     fn ledger_lines_hold_any_term_exactly() {
         use crate::model::{Term, Triple};
         let weird = [
-            "a>b", "c\\d", "t\tab", "n\newline", "r\rcr", "s p", "x\\u0041", "<>\"{}|^`",
+            "a>b",
+            "c\\d",
+            "t\tab",
+            "n\newline",
+            "r\rcr",
+            "s p",
+            "x\\u0041",
+            "<>\"{}|^`",
             "",
         ];
         let lit = |v: &str, dt: Option<&str>, lang: Option<&str>| Term::Literal {
@@ -940,7 +944,11 @@ mod tests {
             }
         }
         // An ordinary triple is written as N-Triples (as before).
-        let t = Triple::new(Term::iri("http://ex/a"), Term::iri("Rule:x"), lit("v", None, Some("en")));
+        let t = Triple::new(
+            Term::iri("http://ex/a"),
+            Term::iri("Rule:x"),
+            lit("v", None, Some("en")),
+        );
         assert_eq!(ledger_line(&t), "<http://ex/a>\t<Rule:x>\t\"v\"@en\t.");
         for bad in [
             "<a>\t<b>\t<c>",

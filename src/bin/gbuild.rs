@@ -206,14 +206,14 @@ fn main() -> ExitCode {
         }
         report
     } else {
-        let (db, report) = match Database::build_from_sources(name.clone(), &sources, &opts, &mut log)
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("build failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+        let (db, report) =
+            match Database::build_from_sources(name.clone(), &sources, &opts, &mut log) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("build failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
         if let Err(e) = db.save(&dir) {
             eprintln!("failed to save database to {dir}: {e}");
             return ExitCode::FAILURE;
@@ -280,17 +280,17 @@ fn build_rocksdb(
     started: Instant,
 ) -> ExitCode {
     // Close the freshly built store before reopening it (RocksDB takes a lock).
-    let report = match Database::build_rocksdb_from_sources(name.to_string(), dir, sources, opts, log)
-    {
-        Ok((db, report)) => {
-            drop(db);
-            report
-        }
-        Err(e) => {
-            eprintln!("rocksdb build failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let report =
+        match Database::build_rocksdb_from_sources(name.to_string(), dir, sources, opts, log) {
+            Ok((db, report)) => {
+                drop(db);
+                report
+            }
+            Err(e) => {
+                eprintln!("rocksdb build failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     match Database::open(dir) {
         Ok(db) => print_stats(name, dir, &db, started, "RocksDB"),
         Err(e) => {
@@ -345,7 +345,8 @@ fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: 
 fn print_report(report: &ImportReport, log: &Path) {
     gstore::outln!(
         "  read {} statement(s) from {} source(s)",
-        report.statements, report.documents
+        report.statements,
+        report.documents
     );
     if report.failed > 0 {
         gstore::outln!(

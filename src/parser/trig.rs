@@ -99,7 +99,10 @@ mod tests {
         let b1 = blank_of("p"); // the [ … ] in :g1
         let b2 = blank_of("y"); // the [ … ] in :g2
         assert!(matches!(b1, Term::Blank(_)) && matches!(b2, Term::Blank(_)));
-        assert_ne!(b1, b2, "anonymous nodes in different graphs must stay distinct");
+        assert_ne!(
+            b1, b2,
+            "anonymous nodes in different graphs must stay distinct"
+        );
     }
 
     #[test]

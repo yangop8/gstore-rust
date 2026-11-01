@@ -107,7 +107,9 @@ fn create_tmp(tmp: &Path, path: &Path, new_mode: Option<u32>) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let target = fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777);
+        let target = fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777);
         // A stale temp file (from a crash) would keep its own mode.
         remove_file_if_exists(tmp)?;
         let mut opts = OpenOptions::new();

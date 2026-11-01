@@ -122,13 +122,28 @@ fn disk_reads_follow_the_memory_order_at_lubm_scale() {
     let ds = DiskStore::build_files(&path, 512, &[lubm_nt()]).unwrap();
     let (_dict, mem) = ds.to_memory().unwrap();
     assert_eq!(ds.try_iter_all().unwrap(), TripleSource::iter_all(&mem));
-    assert_eq!(ds.try_subject_keys().unwrap(), TripleSource::subject_keys(&mem));
-    assert_eq!(ds.try_object_keys().unwrap(), TripleSource::object_keys(&mem));
+    assert_eq!(
+        ds.try_subject_keys().unwrap(),
+        TripleSource::subject_keys(&mem)
+    );
+    assert_eq!(
+        ds.try_object_keys().unwrap(),
+        TripleSource::object_keys(&mem)
+    );
     for p in 0..ds.predicate_num() as u32 {
         assert_eq!(ds.try_so_by_p(p).unwrap(), TripleSource::so_by_p(&mem, p));
-        assert_eq!(ds.try_subs_by_p(p).unwrap(), TripleSource::subs_by_p(&mem, p));
-        assert_eq!(ds.try_objs_by_p(p).unwrap(), TripleSource::objs_by_p(&mem, p));
-        assert_eq!(ds.count_so_by_p(p), TripleSource::so_by_p(&mem, p).len() as u64);
+        assert_eq!(
+            ds.try_subs_by_p(p).unwrap(),
+            TripleSource::subs_by_p(&mem, p)
+        );
+        assert_eq!(
+            ds.try_objs_by_p(p).unwrap(),
+            TripleSource::objs_by_p(&mem, p)
+        );
+        assert_eq!(
+            ds.count_so_by_p(p),
+            TripleSource::so_by_p(&mem, p).len() as u64
+        );
     }
     // Every 7th subject and object id, with their two-id patterns.
     for s in ds.try_subject_keys().unwrap().into_iter().step_by(7) {
@@ -136,8 +151,14 @@ fn disk_reads_follow_the_memory_order_at_lubm_scale() {
         assert_eq!(ds.try_po_by_s(s).unwrap(), po);
         assert_eq!(ds.count_po_by_s(s), po.len() as u64);
         for &(p, o) in po.iter().step_by(3) {
-            assert_eq!(ds.try_o_by_sp(s, p).unwrap(), TripleSource::o_by_sp(&mem, s, p));
-            assert_eq!(ds.try_p_by_so(s, o).unwrap(), TripleSource::p_by_so(&mem, s, o));
+            assert_eq!(
+                ds.try_o_by_sp(s, p).unwrap(),
+                TripleSource::o_by_sp(&mem, s, p)
+            );
+            assert_eq!(
+                ds.try_p_by_so(s, o).unwrap(),
+                TripleSource::p_by_so(&mem, s, o)
+            );
         }
     }
     for o in ds.try_object_keys().unwrap().into_iter().step_by(7) {
@@ -145,11 +166,20 @@ fn disk_reads_follow_the_memory_order_at_lubm_scale() {
         assert_eq!(ds.try_ps_by_o(o).unwrap(), ps);
         assert_eq!(ds.count_ps_by_o(o), ps.len() as u64);
         for &(p, _) in ps.iter().step_by(3) {
-            assert_eq!(ds.try_s_by_po(p, o).unwrap(), TripleSource::s_by_po(&mem, p, o));
+            assert_eq!(
+                ds.try_s_by_po(p, o).unwrap(),
+                TripleSource::s_by_po(&mem, p, o)
+            );
         }
     }
-    assert_eq!(TripleSource::distinct_subjects(&ds), TripleSource::distinct_subjects(&mem));
-    assert_eq!(TripleSource::num_predicates(&ds), TripleSource::num_predicates(&mem));
+    assert_eq!(
+        TripleSource::distinct_subjects(&ds),
+        TripleSource::distinct_subjects(&mem)
+    );
+    assert_eq!(
+        TripleSource::num_predicates(&ds),
+        TripleSource::num_predicates(&mem)
+    );
     drop(ds);
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(path.with_extension("kv.wal")).ok();
@@ -159,7 +189,8 @@ fn disk_reads_follow_the_memory_order_at_lubm_scale() {
 /// same rows as the in-memory database (as multisets).
 #[test]
 fn disk_streaming_query_matches_memory_rows_on_lubm() {
-    let path = std::env::temp_dir().join(format!("gstore_dt_stream_lubm_{}.kv", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("gstore_dt_stream_lubm_{}.kv", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     let ds = DiskStore::build_files(&path, 1024, &[lubm_nt()]).unwrap();

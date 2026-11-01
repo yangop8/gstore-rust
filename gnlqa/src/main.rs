@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use gnlqa::{
     load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
-    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session, SolveEngine,
+    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session,
+    SolveEngine,
 };
 
 /// Build the engine. `mode` is the default answering mode (so `GNLQA_MODE` applies
@@ -29,7 +30,10 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
     let llm: Box<dyn LlmClient> = if cfg.llm_provider == "openai" {
         Box::new(
             OpenAiClient::new(
-                cfg.openai_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
+                cfg.openai_api_key
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_default(),
                 cfg.openai_base_url.clone(),
                 cfg.model.clone(),
             )
@@ -39,7 +43,10 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
     } else {
         Box::new(
             AnthropicClient::new(
-                cfg.anthropic_api_key.as_ref().map(|s| s.expose().to_string()).unwrap_or_default(),
+                cfg.anthropic_api_key
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_default(),
                 cfg.anthropic_base_url.clone(),
                 cfg.model.clone(),
             )
@@ -101,7 +108,10 @@ fn run_chat(cfg: &Config, mut mode: Mode) {
     let engine = build_engine(cfg, mode, true);
     let mut sess = Session::new(&engine);
     eprintln!("gNLQA chat — ask a question; /mode <auto|structured|graphrag|open> to switch,");
-    eprintln!("            :reset to clear context, :quit to exit. (mode: {})", mode.name());
+    eprintln!(
+        "            :reset to clear context, :quit to exit. (mode: {})",
+        mode.name()
+    );
     if !cfg.has_api_key() {
         eprintln!("warning: no API key set — live answers will fail.");
     }
@@ -185,7 +195,10 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
         }
     };
     let engine = build_engine(cfg, Mode::Auto, false);
-    let opts = EvalOptions { limit: None, resolve_gold_via_kb };
+    let opts = EvalOptions {
+        limit: None,
+        resolve_gold_via_kb,
+    };
     let report = run_eval(&engine, &questions, &opts);
     println!("{}", report.summary());
 }
@@ -212,10 +225,16 @@ fn main() {
             eprintln!("  gnlqa serve [addr]      run the HTTP server (default 127.0.0.1:9100)");
             eprintln!(
                 "  provider={}  model={}  mode={}  gstore={}",
-                cfg.llm_provider, cfg.model, mode.name(), cfg.gstore_endpoint
+                cfg.llm_provider,
+                cfg.model,
+                mode.name(),
+                cfg.gstore_endpoint
             );
             if !cfg.has_api_key() {
-                eprintln!("  warning: no API key set for provider '{}' — live answers will fail.", cfg.llm_provider);
+                eprintln!(
+                    "  warning: no API key set for provider '{}' — live answers will fail.",
+                    cfg.llm_provider
+                );
             }
         }
         Some("chat") => run_chat(&cfg, mode),
@@ -226,7 +245,10 @@ fn main() {
         }
         Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
-            let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9100".to_string());
+            let addr = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:9100".to_string());
             let engine = Arc::new(build_engine(&cfg, mode, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {

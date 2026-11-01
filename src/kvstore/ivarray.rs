@@ -222,9 +222,8 @@ impl IvArray {
             let dbuf = pager.read_page_shared(dir)?;
             while key < end.min(dir_end) {
                 let k = key;
-                let flow = Self::with_slot(pager, &dbuf[..], k % SLOTS_PER_DIR, k, |v| {
-                    f(k as u32, v)
-                })?;
+                let flow =
+                    Self::with_slot(pager, &dbuf[..], k % SLOTS_PER_DIR, k, |v| f(k as u32, v))?;
                 if let Some(ControlFlow::Break(())) = flow {
                     return Ok(());
                 }
@@ -342,7 +341,8 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_ivarray_{tag}_{}.kv", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("gstore_ivarray_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
@@ -358,7 +358,10 @@ mod tests {
         a.insert(&mut pg, 100, b"\"hello world\"").unwrap();
         assert_eq!(a.get(&pg, 0).unwrap().as_deref(), Some(&b"<alice>"[..]));
         assert_eq!(a.get(&pg, 5).unwrap().as_deref(), Some(&b"<bob>"[..]));
-        assert_eq!(a.get(&pg, 100).unwrap().as_deref(), Some(&b"\"hello world\""[..]));
+        assert_eq!(
+            a.get(&pg, 100).unwrap().as_deref(),
+            Some(&b"\"hello world\""[..])
+        );
         // Unset keys (in and out of allocated directories) are None.
         assert_eq!(a.get(&pg, 1).unwrap(), None);
         assert_eq!(a.get(&pg, 999_999).unwrap(), None);
@@ -403,7 +406,8 @@ mod tests {
         // Well past one directory page (32 slots) ⇒ exercises the page table.
         let n = 5000u32;
         for i in 0..n {
-            a.insert(&mut pg, i, format!("<node{i}>").as_bytes()).unwrap();
+            a.insert(&mut pg, i, format!("<node{i}>").as_bytes())
+                .unwrap();
         }
         for i in 0..n {
             assert_eq!(
@@ -426,10 +430,17 @@ mod tests {
             a.insert(&mut pg, k, format!("v{k}").as_bytes()).unwrap();
         }
         for &k in &[0u32, 1000, 1_000_000, 5_000_000] {
-            assert_eq!(a.get(&pg, k).unwrap().unwrap(), format!("v{k}").into_bytes());
+            assert_eq!(
+                a.get(&pg, k).unwrap().unwrap(),
+                format!("v{k}").into_bytes()
+            );
         }
         // Far fewer pages than 5M slots would need if it were truly dense.
-        assert!(pg.page_count() < 64, "sparse keys allocated too many pages: {}", pg.page_count());
+        assert!(
+            pg.page_count() < 64,
+            "sparse keys allocated too many pages: {}",
+            pg.page_count()
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -465,7 +476,10 @@ mod tests {
         let pg = Pager::open(&path, 64).unwrap();
         let a = IvArray::new(0);
         assert_eq!(a.get(&pg, 500).unwrap().unwrap(), b"s500".to_vec());
-        assert_eq!(a.get(&pg, 2000).unwrap().unwrap(), vec![7u8; INLINE_CAP * 3]);
+        assert_eq!(
+            a.get(&pg, 2000).unwrap().unwrap(),
+            vec![7u8; INLINE_CAP * 3]
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -479,8 +493,14 @@ mod tests {
         let id2pred = IvArray::new(1);
         id2ent.insert(&mut pg, 1, b"<entity1>").unwrap();
         id2pred.insert(&mut pg, 1, b"<pred1>").unwrap();
-        assert_eq!(id2ent.get(&pg, 1).unwrap().as_deref(), Some(&b"<entity1>"[..]));
-        assert_eq!(id2pred.get(&pg, 1).unwrap().as_deref(), Some(&b"<pred1>"[..]));
+        assert_eq!(
+            id2ent.get(&pg, 1).unwrap().as_deref(),
+            Some(&b"<entity1>"[..])
+        );
+        assert_eq!(
+            id2pred.get(&pg, 1).unwrap().as_deref(),
+            Some(&b"<pred1>"[..])
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -514,7 +534,9 @@ mod tests {
         // Dense keys across several directories, gaps, and every few keys a
         // value long enough to need an overflow chain (some span 2+ pages).
         for k in 0..3000u32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             if (seed >> 33).is_multiple_of(5) {
                 continue; // a hole
             }
@@ -542,7 +564,11 @@ mod tests {
             (2990, 70_001),
             (999_999, 5_000_001),
         ] {
-            assert_eq!(range(&a, &pg, from, to), by_get(&a, &pg, from, to), "{from}..{to}");
+            assert_eq!(
+                range(&a, &pg, from, to),
+                by_get(&a, &pg, from, to),
+                "{from}..{to}"
+            );
         }
         let all = range(&a, &pg, 0, u32::MAX);
         assert_eq!(all.len(), keys.len() - 1 + 4);
@@ -550,7 +576,10 @@ mod tests {
         assert!(range(&a, &pg, CAPACITY as u32, u32::MAX).is_empty());
         // get_with sees the same bytes as get, inline or chained.
         for &k in keys.iter().take(400) {
-            assert_eq!(a.get_with(&pg, k, |v| v.to_vec()).unwrap(), a.get(&pg, k).unwrap());
+            assert_eq!(
+                a.get_with(&pg, k, |v| v.to_vec()).unwrap(),
+                a.get(&pg, k).unwrap()
+            );
         }
         // Early stop.
         let mut n = 0;

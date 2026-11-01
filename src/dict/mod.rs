@@ -453,9 +453,8 @@ impl Dictionary {
     /// front-codes well. (Disk-backed dictionaries keep no in-memory strings, so
     /// this is empty for them.)
     pub fn all_strings_sorted(&self) -> Vec<String> {
-        let mut v: Vec<String> = Vec::with_capacity(
-            self.entities.len() + self.literals.len() + self.predicates.len(),
-        );
+        let mut v: Vec<String> =
+            Vec::with_capacity(self.entities.len() + self.literals.len() + self.predicates.len());
         v.extend(self.entities.strings().map(str::to_owned));
         v.extend(self.literals.strings().map(str::to_owned));
         v.extend(self.predicates.strings().map(str::to_owned));
@@ -758,7 +757,8 @@ mod tests {
     fn entity_space_is_bounded_below_literal_first_id() {
         use crate::model::id::{is_entity_id, is_literal_id};
         let mut d = Dictionary::new();
-        d.debug_advance_id_counters(ENTITY_ID_LIMIT - 2, 0, 0).unwrap();
+        d.debug_advance_id_counters(ENTITY_ID_LIMIT - 2, 0, 0)
+            .unwrap();
         let a = d.try_intern_entity("<a>").unwrap();
         let b = d.try_intern_entity("<b>").unwrap();
         assert_eq!((a, b), (LITERAL_FIRST_ID - 2, LITERAL_FIRST_ID - 1));
@@ -767,7 +767,10 @@ mod tests {
 
         // The next brand-new entity is refused — not given a literal-range id.
         let err = d.try_intern_entity("<c>").unwrap_err();
-        assert!(err.to_string().contains("entity id space exhausted"), "{err}");
+        assert!(
+            err.to_string().contains("entity id space exhausted"),
+            "{err}"
+        );
         assert_eq!(d.entity_id("<c>"), None);
         assert_eq!(d.entity_num(), 2);
         // Existing entities still resolve; a term routed to the full space errs.
@@ -785,14 +788,18 @@ mod tests {
     #[test]
     fn literal_space_is_bounded_to_twice_literal_first_id() {
         let mut d = Dictionary::new();
-        d.debug_advance_id_counters(0, LITERAL_INDEX_LIMIT - 1, 0).unwrap();
+        d.debug_advance_id_counters(0, LITERAL_INDEX_LIMIT - 1, 0)
+            .unwrap();
         let last = d.try_intern_literal("\"last\"").unwrap();
         assert_eq!(last, 3_999_999_999);
         assert_eq!(d.literal_id("\"last\""), Some(last));
         assert_eq!(d.id_to_string(last), Some("\"last\""));
         assert_eq!(d.entity_literal_entries(), vec![(last, "\"last\"")]);
         let err = d.try_intern_literal("\"one more\"").unwrap_err();
-        assert!(err.to_string().contains("literal id space exhausted"), "{err}");
+        assert!(
+            err.to_string().contains("literal id space exhausted"),
+            "{err}"
+        );
         assert!(d.try_intern_term(&Term::plain_literal("x")).is_err());
         assert_eq!(d.try_intern_entity("<e>").unwrap(), 0);
     }
@@ -800,11 +807,18 @@ mod tests {
     #[test]
     fn predicate_space_is_bounded() {
         let mut d = Dictionary::new();
-        d.debug_advance_id_counters(0, 0, PREDICATE_ID_LIMIT - 1).unwrap();
-        assert_eq!(d.try_intern_predicate("<p>").unwrap(), PREDICATE_ID_LIMIT - 1);
+        d.debug_advance_id_counters(0, 0, PREDICATE_ID_LIMIT - 1)
+            .unwrap();
+        assert_eq!(
+            d.try_intern_predicate("<p>").unwrap(),
+            PREDICATE_ID_LIMIT - 1
+        );
         assert_eq!(d.predicate_to_string(PREDICATE_ID_LIMIT - 1), Some("<p>"));
         let err = d.try_intern_predicate("<q>").unwrap_err();
-        assert!(err.to_string().contains("predicate id space exhausted"), "{err}");
+        assert!(
+            err.to_string().contains("predicate id space exhausted"),
+            "{err}"
+        );
     }
 
     #[test]

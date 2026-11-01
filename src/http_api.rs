@@ -362,7 +362,10 @@ impl TxnIsolation {
     /// separator-insensitive). `None` for anything else.
     pub fn parse(s: &str) -> Option<TxnIsolation> {
         let s = s.trim();
-        let norm: String = if s.chars().all(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-' | ' ')) {
+        let norm: String = if s
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '-' | ' '))
+        {
             s.chars()
                 .filter(|c| !matches!(c, '_' | '-' | ' '))
                 .collect::<String>()
@@ -988,7 +991,10 @@ impl ApiState {
                 OpErrorKind::TxnEnded,
                 format!("transaction {tid} is not running (already {outcome})"),
             ),
-            None => OpError::new(OpErrorKind::TxnUnknown, format!("no open transaction {tid}")),
+            None => OpError::new(
+                OpErrorKind::TxnUnknown,
+                format!("no open transaction {tid}"),
+            ),
         })
     }
 
@@ -1478,7 +1484,10 @@ impl ApiServer {
                         .with_limits(config.query_settings().pfn),
                 );
             }
-            *inner.config.get_mut().unwrap_or_else(PoisonError::into_inner) = Arc::new(config);
+            *inner
+                .config
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner) = Arc::new(config);
         }
         self
     }
@@ -1696,15 +1705,26 @@ impl ApiServer {
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
-            let inner = Arc::clone(&self.inner);
-            Box::new(move || {
-                let ctl = acc.stream.try_clone().ok();
-                serve_connection(acc.stream, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
-                    inner.handle(s, req, meta)
-                });
-            })
-        });
+        let drained = run_accept_loop(
+            &self.listener,
+            &self.life,
+            self.inner.grace,
+            &self.http,
+            |acc| {
+                let inner = Arc::clone(&self.inner);
+                Box::new(move || {
+                    let ctl = acc.stream.try_clone().ok();
+                    serve_connection(
+                        acc.stream,
+                        ctl.as_ref(),
+                        Some(acc.peer),
+                        acc.guard,
+                        &acc.env,
+                        |s, req, meta| inner.handle(s, req, meta),
+                    );
+                })
+            },
+        );
         self.finish_shutdown(drained)
     }
 
@@ -1714,20 +1734,31 @@ impl ApiServer {
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
-        let drained = run_accept_loop(&self.listener, &self.life, self.inner.grace, &self.http, |acc| {
-            let inner = Arc::clone(&self.inner);
-            let config = Arc::clone(&config);
-            Box::new(move || {
-                let Ok(conn) = rustls::ServerConnection::new(config) else {
-                    return;
-                };
-                let ctl = acc.stream.try_clone().ok();
-                let tls = rustls::StreamOwned::new(conn, acc.stream);
-                serve_connection(tls, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
-                    inner.handle(s, req, meta)
-                });
-            })
-        });
+        let drained = run_accept_loop(
+            &self.listener,
+            &self.life,
+            self.inner.grace,
+            &self.http,
+            |acc| {
+                let inner = Arc::clone(&self.inner);
+                let config = Arc::clone(&config);
+                Box::new(move || {
+                    let Ok(conn) = rustls::ServerConnection::new(config) else {
+                        return;
+                    };
+                    let ctl = acc.stream.try_clone().ok();
+                    let tls = rustls::StreamOwned::new(conn, acc.stream);
+                    serve_connection(
+                        tls,
+                        ctl.as_ref(),
+                        Some(acc.peer),
+                        acc.guard,
+                        &acc.env,
+                        |s, req, meta| inner.handle(s, req, meta),
+                    );
+                })
+            },
+        );
         self.finish_shutdown(drained)
     }
 
@@ -1751,7 +1782,9 @@ impl ApiServer {
         // (`TaskConfig::shutdown_wait`) — one that ignores the request keeps
         // running past this point, against databases about to be retired.
         inner.tasks.cancel_all();
-        let _ = inner.tasks.wait_async_idle(inner.tasks.config().shutdown_wait);
+        let _ = inner
+            .tasks
+            .wait_async_idle(inner.tasks.config().shutdown_wait);
         let mut report = ShutdownReport {
             drained,
             ..ShutdownReport::default()
@@ -1782,7 +1815,12 @@ impl ApiServer {
                 append_log(
                     &st.root,
                     "txn.log",
-                    &format!("{}\trollback\t{}\t{}\t(shutdown)", now_millis(), name, open.tid),
+                    &format!(
+                        "{}\trollback\t{}\t{}\t(shutdown)",
+                        now_millis(),
+                        name,
+                        open.tid
+                    ),
                 );
                 inner
                     .apilogs
@@ -1902,17 +1940,25 @@ impl ApiInner {
         // everything but `/login` (as `/api` exempts its `login`).
         let ip = peer_ip(peer);
         if !self.ipfilter.permits(&ip) {
-            return (Resp::fail(403, crate::gapi::ipfilter::BLOCKED_MSG), "-".to_string());
+            return (
+                Resp::fail(403, crate::gapi::ipfilter::BLOCKED_MSG),
+                "-".to_string(),
+            );
         }
         if req.path != "/login" && self.ipfilter.locked_out(&ip) {
-            return (Resp::fail(403, crate::gapi::ipfilter::LOCKED_MSG), "-".to_string());
+            return (
+                Resp::fail(403, crate::gapi::ipfilter::LOCKED_MSG),
+                "-".to_string(),
+            );
         }
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
         // held, so a client sending bad credentials (no account needed) cannot
         // stall every other request — `/cancel` included — behind it.
         let basic = parse_basic_auth(req).map(|(u, p)| {
-            let attempt = locked(&self.state).users.begin_check(&u, &p, PasswordForm::Plain);
+            let attempt = locked(&self.state)
+                .users
+                .begin_check(&u, &p, PasswordForm::Plain);
             (u, attempt.verify())
         });
         // Short critical section: count the request, resolve the caller, route.
@@ -1987,7 +2033,10 @@ impl ApiInner {
         if slot.retired {
             return Err(OpError::new(
                 OpErrorKind::NotLoaded,
-                format!("database '{}' was unloaded while this request waited", job.name),
+                format!(
+                    "database '{}' was unloaded while this request waited",
+                    job.name
+                ),
             ));
         }
         self.sync_query_settings(&mut slot);
@@ -1998,7 +2047,11 @@ impl ApiInner {
             let snapshot = Arc::clone(&open.snapshot);
             drop(slot);
             return snapshot
-                .query_as(&job.sparql, Some(job.cancel), Some(&self.pfn_caller(&job.user)))
+                .query_as(
+                    &job.sparql,
+                    Some(job.cancel),
+                    Some(&self.pfn_caller(&job.user)),
+                )
                 .map(JobOutput::Read)
                 .map_err(|e| OpError::new(OpErrorKind::Query, e.to_string()));
         }
@@ -2051,7 +2104,8 @@ impl ApiInner {
                 return Some(u);
             }
             // Counts towards the address's lockout, as a failed `/api` login.
-            self.ipfilter.note_failure(&peer_ip(crate::server::current_peer()));
+            self.ipfilter
+                .note_failure(&peer_ip(crate::server::current_peer()));
         }
         if let Some(tok) = req.bearer_or_session_token() {
             if let Some(u) = st.users.session_user(&tok) {
@@ -2195,12 +2249,8 @@ impl ApiInner {
             ("POST", "/backup") => Some(("backup", Self::handle_backup as Handler)),
             ("POST", "/restore") => Some(("restore", Self::handle_restore as Handler)),
             ("GET" | "POST", "/export") => Some(("export", Self::handle_export as Handler)),
-            ("POST", "/batchInsert") => {
-                Some(("batchInsert", Self::handle_batch_insert as Handler))
-            }
-            ("POST", "/batchRemove") => {
-                Some(("batchRemove", Self::handle_batch_remove as Handler))
-            }
+            ("POST", "/batchInsert") => Some(("batchInsert", Self::handle_batch_insert as Handler)),
+            ("POST", "/batchRemove") => Some(("batchRemove", Self::handle_batch_remove as Handler)),
             _ => None,
         };
         if let Some((op, handler)) = deferred {
@@ -2215,9 +2265,9 @@ impl ApiInner {
             ("POST", "/user/create") => self.guarded(st, &user, "usermanage", |s, st| {
                 s.handle_user_create(st, req)
             }),
-            ("POST", "/user/drop") => self.guarded(st, &user, "usermanage", |s, st| {
-                s.handle_user_drop(st, req)
-            }),
+            ("POST", "/user/drop") => {
+                self.guarded(st, &user, "usermanage", |s, st| s.handle_user_drop(st, req))
+            }
             ("POST", "/user/password") => self.handle_user_password(st, req, &user),
             ("POST", "/user/grant") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, true)
@@ -2225,21 +2275,19 @@ impl ApiInner {
             ("POST", "/user/revoke") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, false)
             }),
-            ("GET", "/user/show") => self.guarded(st, &user, "showuser", |s, st| {
-                s.handle_user_show(st)
-            }),
-            ("GET", "/querylog") => self.guarded(st, &user, "querylog", |s, st| {
-                s.read_log(st, "query.log")
-            }),
-            ("GET", "/accesslog") => self.guarded(st, &user, "accesslog", |s, st| {
-                s.read_log(st, "access.log")
-            }),
-            ("GET", "/txnlog") => self.guarded(st, &user, "txnlog", |s, st| {
-                s.read_log(st, "txn.log")
-            }),
-            ("GET", "/tasklist") => self.guarded(st, &user, "tasklist", |s, _| {
-                s.handle_tasklist()
-            }),
+            ("GET", "/user/show") => {
+                self.guarded(st, &user, "showuser", |s, st| s.handle_user_show(st))
+            }
+            ("GET", "/querylog") => {
+                self.guarded(st, &user, "querylog", |s, st| s.read_log(st, "query.log"))
+            }
+            ("GET", "/accesslog") => {
+                self.guarded(st, &user, "accesslog", |s, st| s.read_log(st, "access.log"))
+            }
+            ("GET", "/txnlog") => {
+                self.guarded(st, &user, "txnlog", |s, st| s.read_log(st, "txn.log"))
+            }
+            ("GET", "/tasklist") => self.guarded(st, &user, "tasklist", |s, _| s.handle_tasklist()),
             ("POST", "/cancel") => {
                 // Either privilege can cancel: Update on some database (only
                 // your *own* long-running work) or Admin (an operator
@@ -2271,12 +2319,15 @@ impl ApiInner {
     /// state lock released (see [`UserStore::begin_check`]) — and issue a
     /// session token.
     fn handle_login(&self, req: &Request) -> Dispatch {
-        let (Some(username), Some(password)) = (req.param("username"), req.param("password")) else {
+        let (Some(username), Some(password)) = (req.param("username"), req.param("password"))
+        else {
             return Dispatch::Done(Resp::fail(400, "missing username or password"));
         };
         Dispatch::Deferred(Box::new(move |inner| {
             let attempt =
-                locked(&inner.state).users.begin_check(&username, &password, PasswordForm::Plain);
+                locked(&inner.state)
+                    .users
+                    .begin_check(&username, &password, PasswordForm::Plain);
             let checked = attempt.verify();
             let ip = peer_ip(crate::server::current_peer());
             let mut st = locked(&inner.state);
@@ -2519,9 +2570,8 @@ impl ApiInner {
             st.dbs.contains_key(&name) || st.sysdb.contains(&name) || st.db_dir(&name).exists();
         // Still registered, but neither loaded nor on disk: dropped outside
         // the server (`gdrop`). The new database must not inherit its grants.
-        let vanished = st.sysdb.contains(&name)
-            && !st.dbs.contains_key(&name)
-            && !st.db_dir(&name).exists();
+        let vanished =
+            st.sysdb.contains(&name) && !st.dbs.contains_key(&name) && !st.db_dir(&name).exists();
         if !exists && st.database_limit_reached(max_dbs) {
             return Dispatch::Done(Resp::fail(
                 409,
@@ -2536,7 +2586,11 @@ impl ApiInner {
         }
         // Build from a server-local file path, or from the request body (RDF).
         let path = req.param("db_path").or_else(|| req.param("path"));
-        let body = if path.is_none() { req.body_str() } else { String::new() };
+        let body = if path.is_none() {
+            req.body_str()
+        } else {
+            String::new()
+        };
         let dir = st.db_dir(&name);
         let policy = st.load_policy.clone();
         let creator = user.to_string();
@@ -2798,7 +2852,9 @@ impl ApiInner {
                 if let Err(e) = slot.db.sync() {
                     return Resp::fail(
                         500,
-                        &format!("unload aborted: committing '{name}' failed ({e}); it stays loaded"),
+                        &format!(
+                            "unload aborted: committing '{name}' failed ({e}); it stays loaded"
+                        ),
                     );
                 }
                 false
@@ -2884,8 +2940,11 @@ impl ApiInner {
         // scan and per-db counts run with the state lock released (see
         // Dispatch::Deferred).
         let root = st.root.clone();
-        let loaded: HashMap<String, DbHandle> =
-            st.dbs.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
+        let loaded: HashMap<String, DbHandle> = st
+            .dbs
+            .iter()
+            .map(|(n, d)| (n.clone(), Arc::clone(d)))
+            .collect();
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let mut names: Vec<String> = Vec::new();
@@ -3035,12 +3094,18 @@ impl ApiInner {
         // Checked under the db lock, which the shutdown takes after setting
         // the flag: no transaction can begin after its rollback pass.
         if self.closing.load(Ordering::SeqCst) {
-            return Err(OpError::new(OpErrorKind::ShuttingDown, "the server is shutting down"));
+            return Err(OpError::new(
+                OpErrorKind::ShuttingDown,
+                "the server is shutting down",
+            ));
         }
         self.sync_query_settings(&mut slot);
         let snapshot = Arc::new(ReadSnapshot::capture(&slot.db));
         if let Err(e) = slot.db.begin() {
-            return Err(OpError::new(OpErrorKind::Failed, format!("begin failed: {e}")));
+            return Err(OpError::new(
+                OpErrorKind::Failed,
+                format!("begin failed: {e}"),
+            ));
         }
         // Register it while the db lock is held, so the registry and the
         // slot always agree (a /commit locks the db before the registry).
@@ -3235,7 +3300,13 @@ impl ApiInner {
         self.handle_txn_end(st, req, user, false)
     }
 
-    fn handle_txn_end(&self, st: &mut ApiState, req: &Request, user: &str, commit: bool) -> Dispatch {
+    fn handle_txn_end(
+        &self,
+        st: &mut ApiState,
+        req: &Request,
+        user: &str,
+        commit: bool,
+    ) -> Dispatch {
         let Some(tid) = self.txn_id(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
@@ -3336,7 +3407,10 @@ impl ApiInner {
             .txn_end(&self.root, &txn.db, tid, &txn.owner, state);
         match result {
             Some(Ok(warning)) => Ok(warning),
-            Some(Err(e)) => Err(OpError::new(OpErrorKind::Failed, format!("{verb} failed: {e}"))),
+            Some(Err(e)) => Err(OpError::new(
+                OpErrorKind::Failed,
+                format!("{verb} failed: {e}"),
+            )),
             None => Err(OpError::new(
                 OpErrorKind::NotLoaded,
                 format!("database '{}' is not loaded", txn.db),
@@ -3434,9 +3508,11 @@ impl ApiInner {
                 Err(r) => return r,
             };
             // Claim the directory for this database before writing into it.
-            let claimed = fs::create_dir_all(&path).map_err(GStoreError::from).and_then(|()| {
-                crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
-            });
+            let claimed = fs::create_dir_all(&path)
+                .map_err(GStoreError::from)
+                .and_then(|()| {
+                    crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
+                });
             if let Err(e) = claimed {
                 return Resp::fail(500, &format!("backup failed: {e}"));
             }
@@ -3594,14 +3670,16 @@ impl ApiInner {
                     }
                     Resp::ok(&format!("database '{name}' restored"))
                 }
-                (Ok(()), Err(e)) => {
-                    Resp::fail(500, &format!("restore failed to open the restored copy: {e}"))
-                }
+                (Ok(()), Err(e)) => Resp::fail(
+                    500,
+                    &format!("restore failed to open the restored copy: {e}"),
+                ),
                 (Err(e), reopened) => {
                     Database::discard_staged_restore(&staged);
                     if let (Ok(db), true) = (reopened, loaded.is_some()) {
                         let mut st = locked(&inner.state);
-                        let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                        let slot =
+                            DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                     }
                     Resp::fail(500, &format!("restore failed: {e}"))
@@ -4140,7 +4218,10 @@ fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Resu
     let conflict = |what: &str| {
         Resp::fail(
             409,
-            &format!("backup path '{}' {what}; choose another path", target.display()),
+            &format!(
+                "backup path '{}' {what}; choose another path",
+                target.display()
+            ),
         )
     };
     let base = fs::canonicalize(backup_dir).unwrap_or_default();
@@ -4168,11 +4249,15 @@ fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Resu
         Err(_) => Ok(target),
         Ok(m) if m.is_dir() => {
             let owner = fs::read_to_string(target.join(BACKUP_OWNER_FILE)).ok();
-            let empty = fs::read_dir(&target).map(|mut d| d.next().is_none()).unwrap_or(false);
+            let empty = fs::read_dir(&target)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
             if empty || owner.as_deref() == Some(name) {
                 Ok(target)
             } else {
-                Err(conflict(&format!("already holds data that is not a backup of '{name}'")))
+                Err(conflict(&format!(
+                    "already holds data that is not a backup of '{name}'"
+                )))
             }
         }
         Ok(_) => Err(conflict("exists and is not a directory")),
@@ -4219,7 +4304,13 @@ pub(crate) fn log_query(cfg: &GStoreConfig, root: &Path, db: &str, user: &str, s
     append_daily_log(
         root,
         "query.log",
-        &format!("{}\t{}\t{}\t{}", now_millis(), db, user, sparql.replace('\n', " ")),
+        &format!(
+            "{}\t{}\t{}\t{}",
+            now_millis(),
+            db,
+            user,
+            sparql.replace('\n', " ")
+        ),
         cfg.querylog_days,
     );
 }
@@ -4247,11 +4338,20 @@ pub(crate) struct RestQueryLog {
 impl RestQueryLog {
     /// Must run on the request's worker thread (it reads the client's
     /// address from [`crate::server::current_peer`]).
-    pub(crate) fn start(inner: &ApiInner, db: &str, sparql: &str, fmt: ResultFormat) -> RestQueryLog {
+    pub(crate) fn start(
+        inner: &ApiInner,
+        db: &str,
+        sparql: &str,
+        fmt: ResultFormat,
+    ) -> RestQueryLog {
         let on = inner.config().querylog_mode;
         RestQueryLog {
             db: db.to_string(),
-            sparql: if on { sparql.to_string() } else { String::new() },
+            sparql: if on {
+                sparql.to_string()
+            } else {
+                String::new()
+            },
             format: format_name(fmt),
             ip: peer_ip(crate::server::current_peer()),
             started: SystemTime::now(),
@@ -4276,7 +4376,11 @@ impl RestQueryLog {
             return;
         }
         let (ans_num, status_code, status_msg) = match outcome {
-            Ok(n) => (i64::try_from(n).unwrap_or(i64::MAX), 0, "success".to_string()),
+            Ok(n) => (
+                i64::try_from(n).unwrap_or(i64::MAX),
+                0,
+                "success".to_string(),
+            ),
             Err(e) => (0, i64::from(e.http()), e.msg.replace(['\r', '\n'], " ")),
         };
         let rec = crate::gapi::apilog::QueryLogRecord {
@@ -4410,7 +4514,11 @@ fn parse_batch_payload(
             "rdfxml" | "rdf" | "xml" => "rdfxml",
             "trig" => "trig",
             "jsonld" | "json-ld" => "jsonld",
-            other => return Err(format!("(unknown format '{other}'; use ntriples or turtle)")),
+            other => {
+                return Err(format!(
+                    "(unknown format '{other}'; use ntriples or turtle)"
+                ))
+            }
         };
         return parse_rdf(canonical, payload)
             .map(|ts| (canonical, ts))
@@ -4497,7 +4605,12 @@ fn upload_format(req: &Request) -> String {
         return f.trim().to_ascii_lowercase();
     }
     if let Some(ct) = req.header("content-type") {
-        let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let ct = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         let mapped = match ct.as_str() {
             "text/turtle" | "application/x-turtle" => Some("turtle"),
             "application/n-triples" => Some("ntriples"),
@@ -4744,7 +4857,13 @@ mod tests {
 
     /// Send one HTTP/1.1 request; return the full raw response (status line +
     /// headers + body) so callers can inspect headers as well as the body.
-    fn raw_request(addr: &SocketAddr, method: &str, target: &str, auth: Option<&str>, body: &str) -> String {
+    fn raw_request(
+        addr: &SocketAddr,
+        method: &str,
+        target: &str,
+        auth: Option<&str>,
+        body: &str,
+    ) -> String {
         let mut s = TcpStream::connect(addr).unwrap();
         let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
         if let Some(a) = auth {
@@ -4783,8 +4902,16 @@ mod tests {
             let n = (b0 << 16) | (b1 << 8) | b2;
             out.push(A[((n >> 18) & 63) as usize] as char);
             out.push(A[((n >> 12) & 63) as usize] as char);
-            out.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
-            out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                A[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[(n & 63) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -4799,7 +4926,13 @@ mod tests {
         let root = basic("root", "root");
 
         // Build an empty database, then /upload N-Triples into it.
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=up", Some(&root), ""));
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=up",
+            Some(&root),
+            "",
+        ));
         assert_eq!(status, 200);
 
         let ntriples = "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
@@ -4823,7 +4956,10 @@ mod tests {
             "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }",
         ));
         assert_eq!(status, 200);
-        assert!(body.contains("http://ex/b"), "uploaded triple must be queryable: {body}");
+        assert!(
+            body.contains("http://ex/b"),
+            "uploaded triple must be queryable: {body}"
+        );
 
         // Re-uploading the same content inserts nothing new.
         let (status, body) = split_status_body(&raw_request(
@@ -4834,7 +4970,10 @@ mod tests {
             ntriples,
         ));
         assert_eq!(status, 200);
-        assert!(body.contains("\"triples_inserted\":0"), "dup upload: {body}");
+        assert!(
+            body.contains("\"triples_inserted\":0"),
+            "dup upload: {body}"
+        );
     }
 
     #[test]
@@ -4845,7 +4984,13 @@ mod tests {
         // No prior /build: the default format (turtle) and an unseen db_name
         // must still work, creating the database on the fly.
         let ttl = "@prefix : <http://ex/> .\n:a :p :b .\n";
-        let (status, body) = split_status_body(&raw_request(&addr, "POST", "/upload?db_name=fresh", Some(&root), ttl));
+        let (status, body) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/upload?db_name=fresh",
+            Some(&root),
+            ttl,
+        ));
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"triples_parsed\":1"), "{body}");
 
@@ -4865,20 +5010,35 @@ mod tests {
         let (_srv, addr) = start("export_dl");
         let root = basic("root", "root");
         let data = "@prefix : <http://ex/> .\n:a :p :b .\n";
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=ex2", Some(&root), data));
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=ex2",
+            Some(&root),
+            data,
+        ));
         assert_eq!(status, 200);
 
         // Default: an attachment (file download) with a filename.
         let resp = raw_request(&addr, "GET", "/export?db_name=ex2", Some(&root), "");
         assert!(resp.contains("200 OK"));
-        assert!(resp.contains("Content-Type: application/n-triples"), "{resp}");
+        assert!(
+            resp.contains("Content-Type: application/n-triples"),
+            "{resp}"
+        );
         assert!(
             resp.contains("Content-Disposition: attachment; filename=\"ex2.nt\""),
             "{resp}"
         );
 
         // `download=0` switches to an inline disposition.
-        let inline = raw_request(&addr, "GET", "/export?db_name=ex2&download=0", Some(&root), "");
+        let inline = raw_request(
+            &addr,
+            "GET",
+            "/export?db_name=ex2&download=0",
+            Some(&root),
+            "",
+        );
         assert!(
             inline.contains("Content-Disposition: inline; filename=\"ex2.nt\""),
             "{inline}"
@@ -4904,7 +5064,13 @@ mod tests {
     fn tasklist_and_cancel_basic() {
         let (_srv, addr) = start("tasks");
         let root = basic("root", "root");
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=tk", Some(&root), ""));
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=tk",
+            Some(&root),
+            "",
+        ));
         assert_eq!(status, 200);
 
         // A completed query leaves no residue in the registry (single-
@@ -4918,12 +5084,19 @@ mod tests {
             "SELECT * WHERE { ?s ?p ?o }",
         ));
         assert_eq!(status, 200);
-        let (status, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+        let (status, body) =
+            split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
         assert_eq!(status, 200);
         assert!(body.contains("\"tasks\":[]"), "{body}");
 
         // Cancelling an unknown task id is 404.
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/cancel?id=999999", Some(&root), ""));
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/cancel?id=999999",
+            Some(&root),
+            "",
+        ));
         assert_eq!(status, 404);
 
         // /tasklist is Admin-gated.
@@ -4936,11 +5109,18 @@ mod tests {
         ));
         assert_eq!(status, 200);
         let reader = basic("reader", "pw");
-        let (status, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&reader), ""));
+        let (status, _) =
+            split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&reader), ""));
         assert_eq!(status, 403, "query-only user must not see /tasklist");
 
         // /cancel needs Admin or Update; a Query-only user is forbidden.
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/cancel?id=1", Some(&reader), ""));
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/cancel?id=1",
+            Some(&reader),
+            "",
+        ));
         assert_eq!(status, 403, "query-only user must not reach /cancel");
 
         // An Update-privileged (non-admin) user CAN reach the /cancel
@@ -4954,8 +5134,17 @@ mod tests {
         ));
         assert_eq!(status, 200);
         let writer = basic("writer", "pw");
-        let (status, _) = split_status_body(&raw_request(&addr, "POST", "/cancel?id=999999", Some(&writer), ""));
-        assert_eq!(status, 404, "update-privileged user must reach the handler, not be forbidden");
+        let (status, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/cancel?id=999999",
+            Some(&writer),
+            "",
+        ));
+        assert_eq!(
+            status, 404,
+            "update-privileged user must reach the handler, not be forbidden"
+        );
     }
 
     #[test]
@@ -4969,8 +5158,12 @@ mod tests {
         let (server, addr) = start("cancel_own");
         {
             let mut st = server.inner.state.lock().unwrap();
-            st.users.add("alice", "pw", BTreeSet::from([Privilege::Update])).unwrap();
-            st.users.add("bob", "pw", BTreeSet::from([Privilege::Update])).unwrap();
+            st.users
+                .add("alice", "pw", BTreeSet::from([Privilege::Update]))
+                .unwrap();
+            st.users
+                .add("bob", "pw", BTreeSet::from([Privilege::Update]))
+                .unwrap();
         }
         let (id, cancel) = server.inner.tasks.register("query", "d", "q", "alice");
         let target = format!("/cancel?id={id}");
@@ -4984,7 +5177,11 @@ mod tests {
         let reset = || cancel.store(false, Ordering::Relaxed);
         assert!(Arc::ptr_eq(&server.task_cancel_flag(id).unwrap(), &cancel));
 
-        assert_eq!(cancel_as("bob", "pw"), 403, "non-owner non-admin must be forbidden");
+        assert_eq!(
+            cancel_as("bob", "pw"),
+            403,
+            "non-owner non-admin must be forbidden"
+        );
         assert!(!flag(), "a forbidden cancel must not set the flag");
         assert_eq!(cancel_as("alice", "pw"), 200, "the owner may cancel");
         assert!(flag(), "owner's cancel sets the flag");
@@ -5018,8 +5215,16 @@ mod tests {
                 let mut n = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     let (s, _) = match (i + n) % 5 {
-                        0 => split_status_body(&raw_request(&addr, "GET", "/status", Some(&bad), "")),
-                        1 => split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&wrong), "")),
+                        0 => {
+                            split_status_body(&raw_request(&addr, "GET", "/status", Some(&bad), ""))
+                        }
+                        1 => split_status_body(&raw_request(
+                            &addr,
+                            "GET",
+                            "/tasklist",
+                            Some(&wrong),
+                            "",
+                        )),
                         2 => split_status_body(&raw_request(
                             &addr,
                             "POST",
@@ -5107,7 +5312,10 @@ mod tests {
     /// The `"TID"` of a `/begin` response.
     fn tid_of(begin_body: &str) -> String {
         let i = begin_body.find("\"TID\":\"").expect("TID") + "\"TID\":\"".len();
-        begin_body[i..].chars().take_while(|c| c.is_ascii_digit()).collect()
+        begin_body[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect()
     }
 
     /// No endpoint may wait for a database's lock while holding the server's
@@ -5120,7 +5328,13 @@ mod tests {
         let (srv, addr) = start("wedge");
         let root = basic("root", "root");
         let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
-        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=w", Some(&root), data));
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=w",
+            Some(&root),
+            data,
+        ));
         assert_eq!(s, 200, "build: {b}");
         // Inside the server's backup directory (the only place `/backup` writes).
         let backup = srv.root_dir().join("backups").join("w.bak");
@@ -5163,9 +5377,15 @@ mod tests {
         let nt = "<http://ex/n> <http://ex/p> <http://ex/m> .";
         assert_eq!(probe("POST", format!("/batchInsert{w}"), nt).0, 200);
         assert_eq!(probe("POST", format!("/batchRemove{w}"), nt).0, 200);
-        assert_eq!(probe("POST", format!("/upload{w}&format=ntriples"), nt).0, 200);
+        assert_eq!(
+            probe("POST", format!("/upload{w}&format=ntriples"), nt).0,
+            200
+        );
         assert_eq!(probe("POST", format!("/checkpoint{w}"), "").0, 200);
-        assert_eq!(probe("POST", format!("/backup{w}&path={backup}"), "").0, 200);
+        assert_eq!(
+            probe("POST", format!("/backup{w}&path={backup}"), "").0,
+            200
+        );
         assert_eq!(probe("GET", format!("/export{w}"), "").0, 200);
         let (s, b) = probe("POST", format!("/begin{w}"), "");
         assert_eq!(s, 200, "{b}");
@@ -5173,13 +5393,28 @@ mod tests {
         let sel = "SELECT * WHERE { ?s ?p ?o }";
         assert_eq!(probe("POST", format!("/tquery?tid={tid}"), sel).0, 200);
         assert_eq!(probe("POST", format!("/commit?tid={tid}"), "").0, 200);
-        let (_, b) = split_status_body(&raw_request(&addr, "POST", &format!("/begin{w}"), Some(&root), ""));
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            &format!("/begin{w}"),
+            Some(&root),
+            "",
+        ));
         let tid = tid_of(&b);
         assert_eq!(probe("POST", format!("/rollback?tid={tid}"), "").0, 200);
         assert_eq!(probe("POST", format!("/build{w}"), data).0, 200);
-        assert_eq!(probe("POST", format!("/restore{w}&path={backup}"), "").0, 200);
+        assert_eq!(
+            probe("POST", format!("/restore{w}&path={backup}"), "").0,
+            200
+        );
         assert_eq!(probe("POST", format!("/unload{w}"), "").0, 200);
-        let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/load{w}"), Some(&root), ""));
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            &format!("/load{w}"),
+            Some(&root),
+            "",
+        ));
         assert_eq!(s, 200, "load: {b}");
         assert_eq!(probe("POST", format!("/drop{w}"), "").0, 200);
         srv.shutdown();
@@ -5203,7 +5438,13 @@ mod tests {
         let serving = std::thread::spawn(move || s2.serve_forever());
         let root = basic("root", "root");
         let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
-        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/build?db_name=s", Some(&root), data));
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=s",
+            Some(&root),
+            data,
+        ));
         assert_eq!(s, 200, "build: {b}");
 
         // A client that has sent its headers but not yet its body.
@@ -5233,8 +5474,14 @@ mod tests {
             .query("ASK { <http://ex/late> <http://ex/p> <http://ex/x> }")
             .unwrap()
             == QueryResult::Ask(true);
-        assert!(status != 200 || durable, "acknowledged ({body}) but not saved");
-        assert_ne!(status, 200, "a write after the final save is refused: {body}");
+        assert!(
+            status != 200 || durable,
+            "acknowledged ({body}) but not saved"
+        );
+        assert_ne!(
+            status, 200,
+            "a write after the final save is refused: {body}"
+        );
         let _ = fs::remove_dir_all(&root_dir);
     }
 
@@ -5248,7 +5495,13 @@ mod tests {
         let root = basic("root", "root");
         let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
         for db in ["x", "y"] {
-            let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/build?db_name={db}"), Some(&root), data));
+            let (s, b) = split_status_body(&raw_request(
+                &addr,
+                "POST",
+                &format!("/build?db_name={db}"),
+                Some(&root),
+                data,
+            ));
             assert_eq!(s, 200, "build: {b}");
         }
         // LOAD is refused by the server's restricted policy: the update fails
@@ -5256,21 +5509,51 @@ mod tests {
         let failing = |s: &str| {
             format!("INSERT DATA {{ <http://ex/{s}> <http://ex/p> <http://ex/d> }} ; LOAD <file:///nonexistent/x.ttl>")
         };
-        let (s, b) = split_status_body(&raw_request(&addr, "POST", "/update?db_name=x", Some(&root), &failing("c")));
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/update?db_name=x",
+            Some(&root),
+            &failing("c"),
+        ));
         assert_eq!(s, 400, "{b}");
         assert!(b.contains("were applied"), "the client is told: {b}");
         let on_disk = |db: &str, s: &str| {
             let mut d = Database::open(srv.root_dir().join(format!("{db}.db"))).unwrap();
-            d.query(&format!("ASK {{ <http://ex/{s}> <http://ex/p> <http://ex/d> }}")).unwrap()
+            d.query(&format!(
+                "ASK {{ <http://ex/{s}> <http://ex/p> <http://ex/d> }}"
+            ))
+            .unwrap()
                 == QueryResult::Ask(true)
         };
-        assert!(on_disk("x", "c"), "the applied part was saved (check_point)");
+        assert!(
+            on_disk("x", "c"),
+            "the applied part was saved (check_point)"
+        );
 
-        let (_, b) = split_status_body(&raw_request(&addr, "POST", "/begin?db_name=y", Some(&root), ""));
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/begin?db_name=y",
+            Some(&root),
+            "",
+        ));
         let tid = tid_of(&b);
-        let (s, _) = split_status_body(&raw_request(&addr, "POST", &format!("/tquery?tid={tid}"), Some(&root), &failing("t")));
+        let (s, _) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            &format!("/tquery?tid={tid}"),
+            Some(&root),
+            &failing("t"),
+        ));
         assert_eq!(s, 400);
-        let (s, b) = split_status_body(&raw_request(&addr, "POST", &format!("/commit?tid={tid}"), Some(&root), ""));
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            &format!("/commit?tid={tid}"),
+            Some(&root),
+            "",
+        ));
         assert_eq!(s, 200, "{b}");
         assert!(on_disk("y", "t"), "the committed part was saved");
         srv.shutdown();
@@ -5365,9 +5648,13 @@ mod tests {
         });
         let mut task = None;
         for _ in 0..5000 {
-            let (_, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+            let (_, body) =
+                split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
             if let Some(id) = first_task_id(&body) {
-                assert!(body.contains("\"db\":\"t\"") && body.contains("\"user\":\"root\""), "{body}");
+                assert!(
+                    body.contains("\"db\":\"t\"") && body.contains("\"user\":\"root\""),
+                    "{body}"
+                );
                 task = Some(id);
                 break;
             }
@@ -5396,12 +5683,21 @@ mod tests {
         let (server, addr) = start("parse_off_lock");
         let root = basic("root", "root");
         assert_eq!(
-            split_status_body(&raw_request(&addr, "POST", "/build?db_name=b", Some(&root), "")).0,
+            split_status_body(&raw_request(
+                &addr,
+                "POST",
+                "/build?db_name=b",
+                Some(&root),
+                ""
+            ))
+            .0,
             200
         );
         let mut nt = String::new();
         for i in 0..150_000 {
-            nt.push_str(&format!("<http://ex/s{i}> <http://ex/p> \"value number {i}\" .\n"));
+            nt.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> \"value number {i}\" .\n"
+            ));
         }
         let mut values = String::from("SELECT * WHERE { VALUES ?x { ");
         for i in 0..150_000 {
@@ -5419,7 +5715,8 @@ mod tests {
             let (stop, root) = (Arc::clone(&stop), root.clone());
             std::thread::spawn(move || {
                 for (target, body) in requests {
-                    let (s, b) = split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body));
+                    let (s, b) =
+                        split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body));
                     assert!(s == 200 || s == 400, "{target}: {s} {b}");
                 }
                 stop.store(true, Ordering::Relaxed);
@@ -5434,7 +5731,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         worker.join().unwrap();
-        assert!(samples > 20, "the requests took too little time to sample: {samples}");
+        assert!(
+            samples > 20,
+            "the requests took too little time to sample: {samples}"
+        );
         // Parsing under the lock shows up as ~35% here; what remains without
         // it (copying the body out of the request) is ~5%.
         assert!(
@@ -5460,8 +5760,13 @@ mod tests {
         for i in 0..100 {
             ttl.push_str(&format!(":s{i} :p :o{i} .\n"));
         }
-        let (status, body) =
-            split_status_body(&raw_request(&addr, "POST", "/build?db_name=slow", Some(&root), &ttl));
+        let (status, body) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=slow",
+            Some(&root),
+            &ttl,
+        ));
         assert_eq!(status, 200, "build: {body}");
 
         // Kick off the slow query on its own thread.
@@ -5498,7 +5803,10 @@ mod tests {
             Some(&root),
             "",
         ));
-        assert_eq!(cstatus, 200, "the concurrent cancel must be accepted: {cbody}");
+        assert_eq!(
+            cstatus, 200,
+            "the concurrent cancel must be accepted: {cbody}"
+        );
 
         // The query, whose cancel flag was flipped while it ran, returns the
         // cancellation error (HTTP 400 + "query cancelled").
@@ -5517,19 +5825,45 @@ mod tests {
         let req = |method: &str, target: &str, body: &str| {
             split_status_body(&raw_request(&addr, method, target, Some(&root), body))
         };
-        assert_eq!(req("POST", "/build?db_name=p", "<http://ex/a> <http://ex/p> <http://ex/b> .").0, 200);
+        assert_eq!(
+            req(
+                "POST",
+                "/build?db_name=p",
+                "<http://ex/a> <http://ex/p> <http://ex/b> ."
+            )
+            .0,
+            200
+        );
 
         // Panics while holding BOTH the state lock and db `p`'s lock.
         let (status, body) = req("GET", "/__test/panic?db_name=p", "");
         assert_eq!(status, 500, "{body}");
-        assert!(body.contains("\"StatusCode\":500") && body.contains("panicked"), "{body}");
-        assert!(server.inner.state.is_poisoned(), "the test route poisoned the state lock");
+        assert!(
+            body.contains("\"StatusCode\":500") && body.contains("panicked"),
+            "{body}"
+        );
+        assert!(
+            server.inner.state.is_poisoned(),
+            "the test route poisoned the state lock"
+        );
 
         // Both poisoned locks are recovered: the server keeps answering.
-        let (status, body) = req("POST", "/sparql?db_name=p", "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }");
+        let (status, body) = req(
+            "POST",
+            "/sparql?db_name=p",
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }",
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("http://ex/b"), "{body}");
-        assert_eq!(req("POST", "/update?db_name=p", "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }").0, 200);
+        assert_eq!(
+            req(
+                "POST",
+                "/update?db_name=p",
+                "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }"
+            )
+            .0,
+            200
+        );
         assert_eq!(req("GET", "/status", "").0, 200);
         assert_eq!(req("GET", "/show", "").0, 200);
         // The access log still records requests (written outside the state lock).
@@ -5553,7 +5887,10 @@ mod tests {
         );
         assert_eq!(status, 500, "{body}");
         let (_, tasks) = req("GET", "/tasklist", "");
-        assert!(tasks.contains("\"tasks\":[]"), "the panicked task is unregistered: {tasks}");
+        assert!(
+            tasks.contains("\"tasks\":[]"),
+            "the panicked task is unregistered: {tasks}"
+        );
         let (status, _) = req("POST", "/sparql?db_name=q", "SELECT * WHERE { ?s ?p ?o }");
         assert_eq!(status, 200, "the poisoned db lock is recovered");
     }
@@ -5563,14 +5900,30 @@ mod tests {
         assert_eq!(TxnIsolation::parse("1"), Some(TxnIsolation::Serializable));
         assert_eq!(TxnIsolation::parse(" 2 "), Some(TxnIsolation::Snapshot));
         assert_eq!(TxnIsolation::parse("3"), Some(TxnIsolation::ReadCommitted));
-        assert_eq!(TxnIsolation::parse("read_committed"), Some(TxnIsolation::ReadCommitted));
-        assert_eq!(TxnIsolation::parse("Read-Committed"), Some(TxnIsolation::ReadCommitted));
-        assert_eq!(TxnIsolation::parse("SNAPSHOT"), Some(TxnIsolation::Snapshot));
-        assert_eq!(TxnIsolation::parse("serializable"), Some(TxnIsolation::Serializable));
+        assert_eq!(
+            TxnIsolation::parse("read_committed"),
+            Some(TxnIsolation::ReadCommitted)
+        );
+        assert_eq!(
+            TxnIsolation::parse("Read-Committed"),
+            Some(TxnIsolation::ReadCommitted)
+        );
+        assert_eq!(
+            TxnIsolation::parse("SNAPSHOT"),
+            Some(TxnIsolation::Snapshot)
+        );
+        assert_eq!(
+            TxnIsolation::parse("serializable"),
+            Some(TxnIsolation::Serializable)
+        );
         for bad in ["0", "4", "-1", "", "abc", "12"] {
             assert_eq!(TxnIsolation::parse(bad), None, "{bad:?}");
         }
-        for level in [TxnIsolation::Serializable, TxnIsolation::Snapshot, TxnIsolation::ReadCommitted] {
+        for level in [
+            TxnIsolation::Serializable,
+            TxnIsolation::Snapshot,
+            TxnIsolation::ReadCommitted,
+        ] {
             assert_eq!(TxnIsolation::parse(&level.code().to_string()), Some(level));
             assert_eq!(TxnIsolation::parse(level.name()), Some(level));
         }
@@ -5584,25 +5937,40 @@ mod tests {
             assert!(parse_batch_payload(fmt, inject).is_err(), "{fmt:?}");
         }
         // N-Triples by default, one statement per line.
-        let (f, ts) = parse_batch_payload(None, "<http://a> <http://b> <http://c> .\n<http://a> <http://b> \"x\" .\n").unwrap();
+        let (f, ts) = parse_batch_payload(
+            None,
+            "<http://a> <http://b> <http://c> .\n<http://a> <http://b> \"x\" .\n",
+        )
+        .unwrap();
         assert_eq!((f, ts.len()), ("ntriples", 2));
         // Several statements on one line fall back to Turtle (a superset).
-        let (f, ts) = parse_batch_payload(None, "<http://a> <http://b> <http://c> . <http://d> <http://b> <http://c> .").unwrap();
+        let (f, ts) = parse_batch_payload(
+            None,
+            "<http://a> <http://b> <http://c> . <http://d> <http://b> <http://c> .",
+        )
+        .unwrap();
         assert_eq!((f, ts.len()), ("turtle", 2));
         // @prefix / PREFIX select Turtle.
-        let (f, ts) = parse_batch_payload(None, "@prefix : <http://ex/> .\n:a :p :b , :c .").unwrap();
+        let (f, ts) =
+            parse_batch_payload(None, "@prefix : <http://ex/> .\n:a :p :b , :c .").unwrap();
         assert_eq!((f, ts.len()), ("turtle", 2));
         let (f, _) = parse_batch_payload(None, "PREFIX : <http://ex/>\n:a :p :b .").unwrap();
         assert_eq!(f, "turtle");
         // An explicit format wins; bare `json` (a response format) is ignored.
-        let (f, _) = parse_batch_payload(Some("TTL"), "<http://a> <http://b> <http://c> .").unwrap();
+        let (f, _) =
+            parse_batch_payload(Some("TTL"), "<http://a> <http://b> <http://c> .").unwrap();
         assert_eq!(f, "turtle");
-        let (f, _) = parse_batch_payload(Some("json"), "<http://a> <http://b> <http://c> .").unwrap();
+        let (f, _) =
+            parse_batch_payload(Some("json"), "<http://a> <http://b> <http://c> .").unwrap();
         assert_eq!(f, "ntriples");
         assert!(parse_batch_payload(Some("nt"), "@prefix : <http://ex/> .\n:a :p :b .").is_err());
-        assert!(parse_batch_payload(Some("csv"), "a,b,c").unwrap_err().contains("unknown format"));
+        assert!(parse_batch_payload(Some("csv"), "a,b,c")
+            .unwrap_err()
+            .contains("unknown format"));
         // A SPARQL update is not RDF.
-        assert!(parse_batch_payload(None, "INSERT DATA { <http://a> <http://b> <http://c> }").is_err());
+        assert!(
+            parse_batch_payload(None, "INSERT DATA { <http://a> <http://b> <http://c> }").is_err()
+        );
         assert!(parse_batch_payload(None, "DROP ALL").is_err());
     }
 
@@ -5646,7 +6014,8 @@ mod tests {
         let (_, b) = api(&op(r#""operation":"show""#));
         assert!(b.contains("\"csr\":true"), "{b}");
 
-        let sp = r#"SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?l) WHERE {}"#;
+        let sp =
+            r#"SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?l) WHERE {}"#;
         let query = op(&format!(r#""operation":"query","sparql":{}"#, json_str(sp)));
         let (_, b) = api(&query);
         assert!(b.contains("length"), "{b}");
@@ -5657,7 +6026,10 @@ mod tests {
         // A write invalidates it; the next graph-function query rebuilds it,
         // and `load csr=1` on the loaded database builds it again too.
         let insert = r#"INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }"#;
-        let (_, b) = api(&op(&format!(r#""operation":"query","sparql":{}"#, json_str(insert))));
+        let (_, b) = api(&op(&format!(
+            r#""operation":"query","sparql":{}"#,
+            json_str(insert)
+        )));
         assert!(b.contains("\"StatusCode\":0"), "{b}");
         assert!(cached().is_none(), "a write drops the CSR");
         let (_, b) = api(&op(r#""operation":"show""#));
@@ -5710,9 +6082,12 @@ mod tests {
         let rest = |method: &str, target: &str, body: &str| {
             split_status_body(&raw_request(&addr, method, target, Some(&auth), body))
         };
-        let api = |body: String| split_status_body(&raw_request(&addr, "POST", "/api", None, &body));
+        let api =
+            |body: String| split_status_body(&raw_request(&addr, "POST", "/api", None, &body));
         let op = |op: &str, db: &str| {
-            format!(r#"{{"username":"root","password":"root","operation":"{op}","db_name":"{db}"}}"#)
+            format!(
+                r#"{{"username":"root","password":"root","operation":"{op}","db_name":"{db}"}}"#
+            )
         };
         let settings_of = |name: &str| {
             let h = Arc::clone(locked(&server.inner.state).dbs.get(name).expect("loaded"));
@@ -5743,7 +6118,14 @@ mod tests {
         // REST backup + restore, then /api backup + restore.
         let (s, b) = rest("POST", "/backup?db_name=one", "");
         assert_eq!(s, 200, "{b}");
-        let path = b.split("\"path\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let path = b
+            .split("\"path\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
         let (s, b) = rest("POST", &format!("/restore?db_name=one&path={path}"), "");
         assert_eq!(s, 200, "{b}");
         assert_eq!(settings_of("one"), custom);
@@ -5760,7 +6142,14 @@ mod tests {
         // A transaction's read snapshot divides like the database.
         let (s, b) = rest("POST", "/begin?db_name=one", "");
         assert_eq!(s, 200, "{b}");
-        let tid = b.split("\"TID\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let tid = b
+            .split("\"TID\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
         let (_, b) = rest("POST", "/sparql?db_name=one", div);
         assert!(b.contains("\"value\":\"3\""), "snapshot read: {b}");
         let (_, b) = rest("POST", &format!("/tquery?tid={tid}"), div);
@@ -5913,16 +6302,33 @@ mod tests {
         server.inner.apply_query_settings(new);
         let resp = work(&server.inner);
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
-        let h = Arc::clone(locked(&server.inner.state).dbs.get("fresh").expect("created"));
+        let h = Arc::clone(
+            locked(&server.inner.state)
+                .dbs
+                .get("fresh")
+                .expect("created"),
+        );
         assert_eq!(locked(&h).db.query_settings(), new);
     }
 
     #[test]
     fn invalid_ground_triples_are_not_applied() {
         let t = |s: Term, p: Term| Triple::new(s, p, Term::iri("http://o"));
-        assert!(valid_ground_triple(&t(Term::iri("http://s"), Term::iri("http://p"))));
-        assert!(valid_ground_triple(&t(Term::Blank("b".into()), Term::iri("http://p"))));
-        assert!(!valid_ground_triple(&t(Term::plain_literal("lit"), Term::iri("http://p"))));
-        assert!(!valid_ground_triple(&t(Term::iri("http://s"), Term::Blank("b".into()))));
+        assert!(valid_ground_triple(&t(
+            Term::iri("http://s"),
+            Term::iri("http://p")
+        )));
+        assert!(valid_ground_triple(&t(
+            Term::Blank("b".into()),
+            Term::iri("http://p")
+        )));
+        assert!(!valid_ground_triple(&t(
+            Term::plain_literal("lit"),
+            Term::iri("http://p")
+        )));
+        assert!(!valid_ground_triple(&t(
+            Term::iri("http://s"),
+            Term::Blank("b".into())
+        )));
     }
 }

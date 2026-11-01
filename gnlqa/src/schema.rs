@@ -22,15 +22,25 @@ pub(crate) fn checked_iri(uri: &str) -> Result<&str> {
                 || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '\\' | '`')
         });
     if bad {
-        return Err(Error::Sparql(format!("refusing to interpolate non-IRIREF URI: {uri:?}")));
+        return Err(Error::Sparql(format!(
+            "refusing to interpolate non-IRIREF URI: {uri:?}"
+        )));
     }
     Ok(uri)
 }
 
 /// Distinct values bound to `var` for `where_body`, plus whether the result hit
 /// the `sample` cap (fetched as `sample+1`, trimmed to `sample`).
-fn capped(kb: &dyn KbClient, where_body: &str, var: &str, sample: usize) -> Result<(Vec<String>, bool)> {
-    let q = format!("SELECT DISTINCT ?{var} WHERE {{ {where_body} }} LIMIT {}", sample + 1);
+fn capped(
+    kb: &dyn KbClient,
+    where_body: &str,
+    var: &str,
+    sample: usize,
+) -> Result<(Vec<String>, bool)> {
+    let q = format!(
+        "SELECT DISTINCT ?{var} WHERE {{ {where_body} }} LIMIT {}",
+        sample + 1
+    );
     let mut vals = kb.query(&q)?.column_values(var);
     let truncated = vals.len() > sample;
     vals.truncate(sample);
@@ -92,9 +102,24 @@ pub fn entity_schema(kb: &dyn KbClient, uri: &str, sample: usize) -> Result<Enti
 /// Fetch one predicate's sampled domain/range types.
 pub fn predicate_schema(kb: &dyn KbClient, uri: &str, sample: usize) -> Result<PredicateSchema> {
     let uri = checked_iri(uri)?;
-    let (domain, t1) = capped(kb, &format!("?s <{uri}> ?o . ?s <{RDF_TYPE}> ?t"), "t", sample)?;
-    let (range, t2) = capped(kb, &format!("?s <{uri}> ?o . ?o <{RDF_TYPE}> ?t"), "t", sample)?;
-    Ok(PredicateSchema { uri: uri.to_string(), domain_types: domain, range_types: range, truncated: t1 || t2 })
+    let (domain, t1) = capped(
+        kb,
+        &format!("?s <{uri}> ?o . ?s <{RDF_TYPE}> ?t"),
+        "t",
+        sample,
+    )?;
+    let (range, t2) = capped(
+        kb,
+        &format!("?s <{uri}> ?o . ?o <{RDF_TYPE}> ?t"),
+        "t",
+        sample,
+    )?;
+    Ok(PredicateSchema {
+        uri: uri.to_string(),
+        domain_types: domain,
+        range_types: range,
+        truncated: t1 || t2,
+    })
 }
 
 /// Does the entity participate in this predicate (as subject or object)? This is
@@ -134,7 +159,10 @@ impl SchemaContext {
                 Err(e) => eprintln!("gnlqa: warning: schema for {u}: {e}"),
             }
         }
-        Ok(SchemaContext { entities, predicates })
+        Ok(SchemaContext {
+            entities,
+            predicates,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -175,7 +203,10 @@ impl SchemaContext {
 }
 
 fn join_uris(uris: &[String]) -> String {
-    uris.iter().map(|u| format!("<{u}>")).collect::<Vec<_>>().join(", ")
+    uris.iter()
+        .map(|u| format!("<{u}>"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -188,7 +219,14 @@ mod tests {
             vars: vec![var.to_string()],
             rows: uris
                 .iter()
-                .map(|u| vec![Some(RdfTerm { kind: TermKind::Uri, value: (*u).into(), datatype: None, lang: None })])
+                .map(|u| {
+                    vec![Some(RdfTerm {
+                        kind: TermKind::Uri,
+                        value: (*u).into(),
+                        datatype: None,
+                        lang: None,
+                    })]
+                })
                 .collect(),
         }
     }
@@ -222,7 +260,7 @@ mod tests {
             sel("p", &["http://ex/capitalOf"]),
             sel("p", &[]),
             sel("t", &["http://ex/City"]),
-            sel("t", &["http://ex/City"]),   // predicate domain
+            sel("t", &["http://ex/City"]),    // predicate domain
             sel("t", &["http://ex/Country"]), // predicate range
         ]);
         let ctx = SchemaContext::gather(
@@ -234,7 +272,9 @@ mod tests {
         .unwrap();
         let r = ctx.render();
         assert!(r.contains("<http://ex/Berlin> types:[<http://ex/City>]"));
-        assert!(r.contains("<http://ex/capitalOf> domain:[<http://ex/City>] range:[<http://ex/Country>]"));
+        assert!(r.contains(
+            "<http://ex/capitalOf> domain:[<http://ex/City>] range:[<http://ex/Country>]"
+        ));
     }
 
     #[test]
@@ -271,7 +311,10 @@ mod tests {
         let es = entity_schema(&kb, "http://ex/E", 1).unwrap();
         assert!(es.truncated);
         assert_eq!(es.out_predicates.len(), 1); // trimmed back to sample
-        let ctx = SchemaContext { entities: vec![es], predicates: vec![] };
+        let ctx = SchemaContext {
+            entities: vec![es],
+            predicates: vec![],
+        };
         assert!(ctx.render().contains("(partial)"));
     }
 }

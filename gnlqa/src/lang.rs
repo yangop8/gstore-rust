@@ -34,10 +34,10 @@ pub fn detect_script_lang(text: &str) -> Option<&'static str> {
         total += 1;
         match c {
             '\u{3040}'..='\u{30FF}' => kana += 1,   // Hiragana + Katakana
-            '\u{AC00}'..='\u{D7AF}' => hangul += 1,  // Hangul syllables
-            '\u{4E00}'..='\u{9FFF}' => han += 1,     // CJK unified ideographs
-            '\u{0400}'..='\u{04FF}' => cyr += 1,     // Cyrillic
-            '\u{0600}'..='\u{06FF}' => arab += 1,    // Arabic
+            '\u{AC00}'..='\u{D7AF}' => hangul += 1, // Hangul syllables
+            '\u{4E00}'..='\u{9FFF}' => han += 1,    // CJK unified ideographs
+            '\u{0400}'..='\u{04FF}' => cyr += 1,    // Cyrillic
+            '\u{0600}'..='\u{06FF}' => arab += 1,   // Arabic
             _ => {}
         }
     }
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(detect_script_lang("Это русский"), Some("ru"));
         assert_eq!(detect_script_lang("hello world"), None);
         assert_eq!(detect_script_lang("123 !!!"), None); // no letters
-        // stray CJK punctuation (katakana middle dot) in Latin text ≠ Japanese
+                                                         // stray CJK punctuation (katakana middle dot) in Latin text ≠ Japanese
         assert_eq!(detect_script_lang("A・B testing"), None);
     }
 
@@ -155,7 +155,13 @@ mod tests {
     #[test]
     fn abstain_localized_with_english_fallback() {
         assert!(abstain_message("zh").contains("把握"));
-        assert_eq!(abstain_message("en"), "I'm not confident enough to answer this from the data.");
-        assert_eq!(abstain_message("qq"), "I'm not confident enough to answer this from the data.");
+        assert_eq!(
+            abstain_message("en"),
+            "I'm not confident enough to answer this from the data."
+        );
+        assert_eq!(
+            abstain_message("qq"),
+            "I'm not confident enough to answer this from the data."
+        );
     }
 }

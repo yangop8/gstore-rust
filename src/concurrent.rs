@@ -1170,7 +1170,7 @@ mod tests {
     fn legacy_write_during_txn_conflicts() {
         let c = cdb();
         let mut txn = c.begin(); // starts at version 1
-        // A legacy (non-transactional) update commits during the txn's lifetime.
+                                 // A legacy (non-transactional) update commits during the txn's lifetime.
         c.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/x> }")
             .unwrap();
         txn.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
@@ -1180,8 +1180,14 @@ mod tests {
             "a legacy write during the txn must conflict, got {res:?}"
         );
         // The legacy write persisted; the aborted txn's buffered write did not.
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 2);
-        assert_eq!(count(&c, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/r> }"), 0);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            2
+        );
+        assert_eq!(
+            count(&c, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/r> }"),
+            0
+        );
     }
 
     #[test]
@@ -1201,18 +1207,27 @@ mod tests {
     fn single_thread_read_write_roundtrip() {
         let c = cdb();
         assert_eq!(c.version(), 1);
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 1);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            1
+        );
 
         let n = c
             .update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(c.version(), 2);
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 2);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            2
+        );
 
         c.update("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
             .unwrap();
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 1);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            1
+        );
     }
 
     #[test]
@@ -1270,7 +1285,11 @@ mod tests {
         let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(total > 0, "readers should have run");
         // 400 commits happened on top of the initial version.
-        assert!(c.version() >= 401, "version should advance per commit: {}", c.version());
+        assert!(
+            c.version() >= 401,
+            "version should advance per commit: {}",
+            c.version()
+        );
     }
 
     // ---- optimistic multi-writer transactions ----------------------------
@@ -1284,7 +1303,10 @@ mod tests {
         txn.insert(t.clone());
         assert!(txn.contains(&t)); // read-your-writes
                                    // ...but the snapshot query (version V) does not see the buffered write.
-        assert_eq!(snap_count(txn.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"), 1);
+        assert_eq!(
+            snap_count(txn.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"),
+            1
+        );
         let v = txn.commit().unwrap();
         assert_eq!(v, 2);
         assert_eq!(count(&c, "SELECT ?o WHERE { ?s ?p ?o }"), 2);
@@ -1328,7 +1350,11 @@ mod tests {
         }
 
         assert_eq!(commits.load(Ordering::SeqCst), 1, "exactly one must commit");
-        assert_eq!(conflicts.load(Ordering::SeqCst), 1, "the other must conflict");
+        assert_eq!(
+            conflicts.load(Ordering::SeqCst),
+            1,
+            "the other must conflict"
+        );
         assert_eq!(c.version(), 2, "only one commit advanced the version");
     }
 
@@ -1420,12 +1446,19 @@ mod tests {
         // Commit several new versions via independent write transactions.
         for i in 0..5 {
             let mut w = c.begin();
-            w.insert(triple(&format!("http://ex/n{i}"), "http://ex/p", "http://ex/o"));
+            w.insert(triple(
+                &format!("http://ex/n{i}"),
+                "http://ex/p",
+                "http://ex/o",
+            ));
             w.commit().unwrap();
         }
 
         // The reader's captured snapshot is unchanged...
-        assert_eq!(snap_count(reader.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"), 1);
+        assert_eq!(
+            snap_count(reader.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"),
+            1
+        );
         match reader.query("SELECT ?o WHERE { ?s ?p ?o }").unwrap() {
             QueryResult::Select(rs) => assert_eq!(rs.row_count(), 1),
             other => panic!("{other:?}"),
@@ -1497,7 +1530,11 @@ mod tests {
 
         for i in 0..5 {
             let mut w = c.begin();
-            w.insert(triple(&format!("http://ex/n{i}"), "http://ex/p", "http://ex/o"));
+            w.insert(triple(
+                &format!("http://ex/n{i}"),
+                "http://ex/p",
+                "http://ex/o",
+            ));
             w.commit().unwrap();
         }
 
@@ -1538,7 +1575,11 @@ mod tests {
         .unwrap(); // v4: insert again
 
         assert_eq!(c.version(), 4);
-        assert_eq!(c.chain_len(&k.to_string()), 3, "all three versions retained");
+        assert_eq!(
+            c.chain_len(&k.to_string()),
+            3,
+            "all three versions retained"
+        );
 
         assert!(!c.version_view_at(1).contains(&k), "v1: before any record");
         assert!(c.version_view_at(2).contains(&k), "v2: inserted");
@@ -1618,7 +1659,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(c.chain_len(&k.to_string()) > 0, "records retained while pinned");
+        assert!(
+            c.chain_len(&k.to_string()) > 0,
+            "records retained while pinned"
+        );
         drop(pin); // floor rises to u64::MAX; GC runs
         assert_eq!(
             c.chain_len(&k.to_string()),

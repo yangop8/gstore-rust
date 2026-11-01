@@ -2412,8 +2412,10 @@ mod tests {
     #[test]
     fn server_messages_are_printable() {
         let r = Resp::from_json(
-            json::parse(r#"{"StatusCode":1005,"StatusMsg":"failed: \u001b[31mRED\u001b[0m\u0007 x"}"#)
-                .unwrap(),
+            json::parse(
+                r#"{"StatusCode":1005,"StatusMsg":"failed: \u001b[31mRED\u001b[0m\u0007 x"}"#,
+            )
+            .unwrap(),
         );
         assert!(!r.msg.contains(['\u{1b}', '\u{7}']), "{:?}", r.msg);
         assert!(r.msg.contains("RED"), "{:?}", r.msg);

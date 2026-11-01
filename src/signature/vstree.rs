@@ -187,7 +187,10 @@ fn seed_split<T>(
     // Move items into their groups (each taken exactly once).
     let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
     let left: Vec<T> = left_idx.iter().map(|&i| slots[i].take().unwrap()).collect();
-    let right: Vec<T> = right_idx.iter().map(|&i| slots[i].take().unwrap()).collect();
+    let right: Vec<T> = right_idx
+        .iter()
+        .map(|&i| slots[i].take().unwrap())
+        .collect();
     (left, lsig, right, rsig)
 }
 
@@ -861,7 +864,10 @@ mod tests {
         }
         assert_eq!(tree.entity_count(), n as usize);
         // Splitting must have grown the tree past a single leaf.
-        assert!(tree.height() > 1, "incremental inserts should split the tree");
+        assert!(
+            tree.height() > 1,
+            "incremental inserts should split the tree"
+        );
 
         // Soundness: for several queries the candidate set is a superset of the
         // brute-force matches over every inserted entity. Each query is a real
@@ -885,7 +891,10 @@ mod tests {
             }
             // The filter is selective: it prunes far below the full set.
             assert!(truth >= 1, "query should have at least one true match");
-            assert!(cands.len() < n as usize, "filter should prune some entities");
+            assert!(
+                cands.len() < n as usize,
+                "filter should prune some entities"
+            );
         }
     }
 
@@ -919,8 +928,14 @@ mod tests {
         let mut q = Signature::new();
         q.encode_query_edge(Some(11), Some(9999), EdgeDir::In);
         let cands = tree.candidates(&q).unwrap();
-        assert!(cands.contains(&300), "inserted true match 300 must be a candidate");
-        assert!(cands.len() < (n_base + n_more) as usize, "filter should prune");
+        assert!(
+            cands.contains(&300),
+            "inserted true match 300 must be a candidate"
+        );
+        assert!(
+            cands.len() < (n_base + n_more) as usize,
+            "filter should prune"
+        );
 
         // Full soundness sweep over a few queries.
         for &(pred, nb, dir) in &[(3u32, 250u32, EdgeDir::Out), (0, 5, EdgeDir::Out)] {
@@ -930,7 +945,10 @@ mod tests {
                 tree.candidates(&q).unwrap().into_iter().collect();
             for (id, sig) in &all {
                 if sig.contains(&q) {
-                    assert!(cands.contains(id), "entity {id} missing after incremental insert");
+                    assert!(
+                        cands.contains(id),
+                        "entity {id} missing after incremental insert"
+                    );
                 }
             }
         }
@@ -978,7 +996,10 @@ mod tests {
         q.encode_query_edge(Some(2), Some(99), EdgeDir::Out);
         let cands: std::collections::HashSet<u32> =
             tree.candidates(&q).unwrap().into_iter().collect();
-        assert!(!cands.contains(&7), "shrunk entity drops out of the candidate set");
+        assert!(
+            !cands.contains(&7),
+            "shrunk entity drops out of the candidate set"
+        );
         for i in 0..60u32 {
             if i != 7 {
                 assert!(cands.contains(&i), "entity {i} must remain a candidate");
@@ -1138,8 +1159,15 @@ mod tests {
 
         // The streaming filter actually paged nodes from disk; the in-memory
         // filter never reads a page.
-        assert_eq!(filters[0].pages_read(), 0, "in-memory filter reads no pages");
-        assert!(filters[1].pages_read() > 0, "streaming filter must page from disk");
+        assert_eq!(
+            filters[0].pages_read(),
+            0,
+            "in-memory filter reads no pages"
+        );
+        assert!(
+            filters[1].pages_read() > 0,
+            "streaming filter must page from disk"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

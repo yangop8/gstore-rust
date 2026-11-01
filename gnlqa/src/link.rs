@@ -87,7 +87,13 @@ impl Linker {
         let ent = VectorIndex::build(embedder.as_ref(), entities)?;
         let pred = VectorIndex::build(embedder.as_ref(), predicates)?;
         let typ = VectorIndex::build(embedder.as_ref(), types)?;
-        Ok(Linker { embedder, entities: ent, predicates: pred, types: typ, min_score })
+        Ok(Linker {
+            embedder,
+            entities: ent,
+            predicates: pred,
+            types: typ,
+            min_score,
+        })
     }
 
     /// Build the indexes by querying gStore for entity labels (`rdfs:label`),
@@ -118,7 +124,9 @@ impl Linker {
         // Restrict to the requested languages (+ no-language) and (optionally) cap
         // the count; a real KB can have millions of labels (full paging is a later
         // step).
-        let lim = entity_limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+        let lim = entity_limit
+            .map(|n| format!(" LIMIT {n}"))
+            .unwrap_or_default();
         let ent_q = format!(
             "SELECT DISTINCT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l \
              FILTER({}) }}{lim}",
@@ -143,17 +151,32 @@ impl Linker {
         (self.entities.len(), self.predicates.len(), self.types.len())
     }
 
-    fn search(&self, index: &VectorIndex, kind: LinkKind, text: &str, k: usize) -> Result<Vec<Candidate>> {
+    fn search(
+        &self,
+        index: &VectorIndex,
+        kind: LinkKind,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<Candidate>> {
         let hits = index.search_text(self.embedder.as_ref(), text, k)?;
-        let mk = |h: crate::embed::Scored| Candidate { uri: h.id, label: h.text, kind, score: h.score };
+        let mk = |h: crate::embed::Scored| Candidate {
+            uri: h.id,
+            label: h.text,
+            kind,
+            score: h.score,
+        };
         // A zero (or negative) score means no lexical/semantic overlap at all —
         // there is no evidence, so it must never link (otherwise a mention with no
         // matching label deterministically links to the lexicographically-first
         // entity, feeding a bogus seed to GraphRAG / analytics). Keep the primary
         // threshold, but never below this evidence floor.
         let floor = self.min_score.max(MIN_EVIDENCE);
-        let mut kept: Vec<Candidate> =
-            hits.iter().filter(|h| h.score >= floor).cloned().map(mk).collect();
+        let mut kept: Vec<Candidate> = hits
+            .iter()
+            .filter(|h| h.score >= floor)
+            .cloned()
+            .map(mk)
+            .collect();
         // Relaxation (à la gAnswer): if the threshold pruned everything but there
         // was a best hit *with real evidence*, keep it so linking never hard-fails
         // on a genuine but low-scoring match — downstream (C7) validates against
@@ -195,8 +218,11 @@ impl Linker {
 fn lang_filter_clause(languages: &[&str]) -> String {
     let mut clauses = vec!["lang(?l) = \"\"".to_string()];
     for l in languages {
-        let code: String =
-            l.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_lowercase();
+        let code: String = l
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect::<String>()
+            .to_lowercase();
         if !code.is_empty() {
             clauses.push(format!("lang(?l) = \"{code}\""));
         }
@@ -271,9 +297,18 @@ mod tests {
     fn linker() -> Linker {
         Linker::from_labels(
             Box::new(HashEmbedder::new(128)),
-            &[ent("http://ex/Berlin", "Berlin"), ent("http://ex/Paris", "Paris capital France")],
-            &[ent("http://ex/capitalOf", "capital of"), ent("http://ex/population", "population")],
-            &[ent("http://ex/City", "City"), ent("http://ex/Country", "Country")],
+            &[
+                ent("http://ex/Berlin", "Berlin"),
+                ent("http://ex/Paris", "Paris capital France"),
+            ],
+            &[
+                ent("http://ex/capitalOf", "capital of"),
+                ent("http://ex/population", "population"),
+            ],
+            &[
+                ent("http://ex/City", "City"),
+                ent("http://ex/Country", "Country"),
+            ],
             0.0,
         )
         .unwrap()
@@ -290,11 +325,27 @@ mod tests {
     fn links_entity_type_predicate() {
         let l = linker();
         assert_eq!(l.sizes(), (2, 2, 2));
-        let e = l.link_mention(&Mention { text: "Berlin".into(), kind: MentionKind::Entity }, 1).unwrap();
+        let e = l
+            .link_mention(
+                &Mention {
+                    text: "Berlin".into(),
+                    kind: MentionKind::Entity,
+                },
+                1,
+            )
+            .unwrap();
         assert_eq!(e[0].uri, "http://ex/Berlin");
         assert_eq!(e[0].kind, LinkKind::Entity);
 
-        let t = l.link_mention(&Mention { text: "City".into(), kind: MentionKind::Type }, 1).unwrap();
+        let t = l
+            .link_mention(
+                &Mention {
+                    text: "City".into(),
+                    kind: MentionKind::Type,
+                },
+                1,
+            )
+            .unwrap();
         assert_eq!(t[0].uri, "http://ex/City");
 
         let p = l.link_predicate("capital of", 1).unwrap();
@@ -305,7 +356,15 @@ mod tests {
     #[test]
     fn literal_mention_passes_through() {
         let l = linker();
-        let lit = l.link_mention(&Mention { text: "42".into(), kind: MentionKind::Literal }, 3).unwrap();
+        let lit = l
+            .link_mention(
+                &Mention {
+                    text: "42".into(),
+                    kind: MentionKind::Literal,
+                },
+                3,
+            )
+            .unwrap();
         assert_eq!(lit[0].kind, LinkKind::Literal);
         assert_eq!(lit[0].to_term(), "\"42\"");
     }
@@ -322,7 +381,15 @@ mod tests {
         .unwrap();
         // A partial match ("Germany" shares a token with the label) scores below
         // the 0.99 threshold but has real evidence, so relaxation keeps it.
-        let e = l.link_mention(&Mention { text: "Germany".into(), kind: MentionKind::Entity }, 5).unwrap();
+        let e = l
+            .link_mention(
+                &Mention {
+                    text: "Germany".into(),
+                    kind: MentionKind::Entity,
+                },
+                5,
+            )
+            .unwrap();
         assert_eq!(e.len(), 1);
         assert!(e[0].score > 0.0 && e[0].score < 0.99);
     }
@@ -335,21 +402,41 @@ mod tests {
         // between the distinctive mention token and the label tokens).
         let l = Linker::from_labels(
             Box::new(HashEmbedder::new(1 << 20)),
-            &[ent("http://ex/Aardvark", "aardvark"), ent("http://ex/Berlin", "berlin")],
+            &[
+                ent("http://ex/Aardvark", "aardvark"),
+                ent("http://ex/Berlin", "berlin"),
+            ],
             &[],
             &[],
             0.0, // the shipped default: even here a zero-overlap hit must be dropped
         )
         .unwrap();
-        let e = l.link_mention(&Mention { text: "zzqxwv".into(), kind: MentionKind::Entity }, 5).unwrap();
-        assert!(e.is_empty(), "zero-overlap mention must not link to an arbitrary entity");
+        let e = l
+            .link_mention(
+                &Mention {
+                    text: "zzqxwv".into(),
+                    kind: MentionKind::Entity,
+                },
+                5,
+            )
+            .unwrap();
+        assert!(
+            e.is_empty(),
+            "zero-overlap mention must not link to an arbitrary entity"
+        );
     }
 
     #[test]
     fn literal_to_term_escapes_quotes() {
         let l = linker();
         let c = l
-            .link_mention(&Mention { text: "say \"hi\"\nbye".into(), kind: MentionKind::Literal }, 1)
+            .link_mention(
+                &Mention {
+                    text: "say \"hi\"\nbye".into(),
+                    kind: MentionKind::Literal,
+                },
+                1,
+            )
             .unwrap();
         // no raw quote/newline can break out of the SPARQL literal
         assert_eq!(c[0].to_term(), "\"say \\\"hi\\\"\\nbye\"");
@@ -364,10 +451,20 @@ mod tests {
     #[test]
     fn build_from_kb_runs_label_queries() {
         fn uri(v: &str) -> Option<RdfTerm> {
-            Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })
+            Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: v.into(),
+                datatype: None,
+                lang: None,
+            })
         }
         fn lit(v: &str) -> Option<RdfTerm> {
-            Some(RdfTerm { kind: TermKind::Literal, value: v.into(), datatype: None, lang: None })
+            Some(RdfTerm {
+                kind: TermKind::Literal,
+                value: v.into(),
+                datatype: None,
+                lang: None,
+            })
         }
         // Answers in query order: entities (?s ?l), predicates (?p), types (?t).
         let entities = SparqlAnswer::Select {
@@ -406,10 +503,20 @@ mod tests {
     #[test]
     fn build_from_kb_langs_filters_by_language() {
         fn uri(v: &str) -> Option<RdfTerm> {
-            Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })
+            Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: v.into(),
+                datatype: None,
+                lang: None,
+            })
         }
         fn lit_lang(v: &str, l: &str) -> Option<RdfTerm> {
-            Some(RdfTerm { kind: TermKind::Literal, value: v.into(), datatype: None, lang: Some(l.into()) })
+            Some(RdfTerm {
+                kind: TermKind::Literal,
+                value: v.into(),
+                datatype: None,
+                lang: Some(l.into()),
+            })
         }
         // Entity labels in Chinese; the ?s ?l answer is what our FILTER'd query
         // would return. Ordering: entities, predicates, types.
@@ -417,19 +524,28 @@ mod tests {
             vars: vec!["s".into(), "l".into()],
             rows: vec![vec![uri("http://ex/Beijing"), lit_lang("北京", "zh")]],
         };
-        let predicates = SparqlAnswer::Select { vars: vec!["p".into()], rows: vec![] };
-        let types = SparqlAnswer::Select { vars: vec!["t".into()], rows: vec![] };
+        let predicates = SparqlAnswer::Select {
+            vars: vec!["p".into()],
+            rows: vec![],
+        };
+        let types = SparqlAnswer::Select {
+            vars: vec!["t".into()],
+            rows: vec![],
+        };
         let kb = MockKb::new(vec![entities, predicates, types]);
-        let l = Linker::build_from_kb_langs(
-            &kb,
-            Box::new(HashEmbedder::new(128)),
-            0.0,
-            None,
-            &["zh"],
-        )
-        .unwrap();
+        let l =
+            Linker::build_from_kb_langs(&kb, Box::new(HashEmbedder::new(128)), 0.0, None, &["zh"])
+                .unwrap();
         assert_eq!(l.sizes().0, 1); // the Chinese-labeled entity was indexed
-        let hits = l.link_mention(&Mention { text: "北京".into(), kind: MentionKind::Entity }, 1).unwrap();
+        let hits = l
+            .link_mention(
+                &Mention {
+                    text: "北京".into(),
+                    kind: MentionKind::Entity,
+                },
+                1,
+            )
+            .unwrap();
         assert_eq!(hits[0].uri, "http://ex/Beijing");
     }
 }

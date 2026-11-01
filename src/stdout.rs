@@ -71,4 +71,3 @@ macro_rules! out {
         $crate::stdout::print(::std::format_args!($($arg)*))
     };
 }
-

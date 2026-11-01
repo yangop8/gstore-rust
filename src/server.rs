@@ -437,9 +437,14 @@ impl Server {
             let inner = Arc::clone(&self.inner);
             Box::new(move || {
                 let ctl = acc.stream.try_clone().ok();
-                serve_connection(acc.stream, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
-                    inner.handle(s, req, meta)
-                });
+                serve_connection(
+                    acc.stream,
+                    ctl.as_ref(),
+                    Some(acc.peer),
+                    acc.guard,
+                    &acc.env,
+                    |s, req, meta| inner.handle(s, req, meta),
+                );
             })
         });
         self.finish_shutdown(drained)
@@ -459,9 +464,14 @@ impl Server {
                 };
                 let ctl = acc.stream.try_clone().ok();
                 let tls = rustls::StreamOwned::new(conn, acc.stream);
-                serve_connection(tls, ctl.as_ref(), Some(acc.peer), acc.guard, &acc.env, |s, req, meta| {
-                    inner.handle(s, req, meta)
-                });
+                serve_connection(
+                    tls,
+                    ctl.as_ref(),
+                    Some(acc.peer),
+                    acc.guard,
+                    &acc.env,
+                    |s, req, meta| inner.handle(s, req, meta),
+                );
             })
         });
         self.finish_shutdown(drained)
@@ -1143,7 +1153,9 @@ fn wait_for_request<S: Read>(
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(_) => return false,
         }
@@ -1154,10 +1166,8 @@ fn wait_for_request<S: Read>(
 /// sent `Connection: close`; HTTP/1.0 only with `Connection: keep-alive`.
 fn wants_keep_alive(req: &Request, http10: bool) -> bool {
     let tokens = |name: &str| {
-        req.header("connection").is_some_and(|v| {
-            v.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case(name))
-        })
+        req.header("connection")
+            .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(name)))
     };
     if tokens("close") {
         return false;
@@ -1601,8 +1611,13 @@ impl ServerInner {
             } => write_response_maybe_gzip(stream, status, &ctype, &meta.headers(&[]), &body, enc)
                 .map(|()| true),
             Reply::Buffered {
-                status, ctype, body, ..
-            } => write_response_ext(stream, status, &ctype, &meta.headers(&[]), &body).map(|()| true),
+                status,
+                ctype,
+                body,
+                ..
+            } => {
+                write_response_ext(stream, status, &ctype, &meta.headers(&[]), &body).map(|()| true)
+            }
             Reply::Stream(fmt, rs) => {
                 stream_select(stream, fmt, &rs, &meta.cors_headers()).map(|()| false)
             }
@@ -1880,7 +1895,9 @@ impl Request {
             let h = h.trim_start();
             // `get` (not byte slicing): a multi-byte character across the
             // prefix boundary must not panic.
-            if h.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("bearer ")) {
+            if h.get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+            {
                 return Some(h[7..].trim().to_string());
             }
         }
@@ -2147,7 +2164,10 @@ pub fn load_tls_config(
     }
     let mut kr = BufReader::new(File::open(key_pem)?);
     let key = rustls_pemfile::private_key(&mut kr)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no private key found in the key PEM")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no private key found in the key PEM",
+        )
     })?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
@@ -2357,7 +2377,8 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -2444,14 +2465,24 @@ mod tests {
     fn handler_panic_returns_500_and_the_server_keeps_serving() {
         let (_srv, addr) = start();
         // The test-only route panics while holding the database lock.
-        let resp = http(&addr, "GET /__test/panic HTTP/1.1\r\nConnection: close\r\n\r\n");
+        let resp = http(
+            &addr,
+            "GET /__test/panic HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
         assert!(resp.contains("500 Internal Server Error"), "{resp}");
         assert!(resp.contains("application/json"), "{resp}");
-        assert!(resp.contains("\"error\"") && resp.contains("panicked"), "{resp}");
+        assert!(
+            resp.contains("\"error\"") && resp.contains("panicked"),
+            "{resp}"
+        );
         // The poisoned database lock is recovered: reads and writes still work.
         let ok = post(&addr, "/sparql", SELECT_O);
         assert!(ok.contains("200 OK") && ok.contains("http://ex/b"), "{ok}");
-        let upd = post(&addr, "/update", "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }");
+        let upd = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        );
         assert!(upd.contains("\"changed\":1"), "{upd}");
         let status = http(&addr, "GET /status HTTP/1.1\r\nConnection: close\r\n\r\n");
         assert!(status.contains("\"triples\":3"), "{status}");
@@ -2474,7 +2505,13 @@ mod tests {
         assert!(report.drained);
         assert!(std::net::TcpStream::connect(addr).is_err());
         // serve_forever after a shutdown returns immediately.
-        assert_eq!(server.serve_forever(), ShutdownReport { drained: true, ..Default::default() });
+        assert_eq!(
+            server.serve_forever(),
+            ShutdownReport {
+                drained: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -2490,7 +2527,11 @@ mod tests {
     #[test]
     fn select_returns_sparql_json() {
         let (_srv, addr) = start();
-        let resp = post(&addr, "/sparql", "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }");
+        let resp = post(
+            &addr,
+            "/sparql",
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }",
+        );
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("application/sparql-results+json"));
         assert!(resp.contains("\"vars\":[\"o\"]"));
@@ -2507,7 +2548,11 @@ mod tests {
             "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
         );
         assert!(resp.contains("\"changed\":1"));
-        let resp2 = post(&addr, "/sparql", "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/d> }");
+        let resp2 = post(
+            &addr,
+            "/sparql",
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/d> }",
+        );
         assert!(resp2.contains("http://ex/c"));
     }
 
@@ -2560,8 +2605,11 @@ mod tests {
     /// Like [`start`], but the server requires HTTP Basic `user:pass`.
     fn start_auth() -> (Arc<Server>, SocketAddr) {
         let db = Database::build_from_str("srv_auth", DATA).unwrap();
-        let server =
-            Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_basic_auth("user", "pass"));
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_basic_auth("user", "pass"),
+        );
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         thread::spawn(move || s2.serve_forever());
@@ -2714,7 +2762,12 @@ mod tests {
     fn format_param_overrides_accept_and_default_is_json() {
         let (_srv, addr) = start();
         // `format=` wins over an Accept that asks for XML.
-        let csv = post_accept(&addr, "/sparql?format=csv", SELECT_O, "application/sparql-results+xml");
+        let csv = post_accept(
+            &addr,
+            "/sparql?format=csv",
+            SELECT_O,
+            "application/sparql-results+xml",
+        );
         assert!(csv.contains("text/csv"));
         // `*/*` (and no format param) falls back to JSON.
         let json = post_accept(&addr, "/sparql", SELECT_O, "*/*");
@@ -2809,7 +2862,10 @@ mod tests {
             SELECT_O
         );
         let resp = http(&addr, &raw);
-        assert!(!resp.contains("Content-Encoding"), "must not compress: {resp}");
+        assert!(
+            !resp.contains("Content-Encoding"),
+            "must not compress: {resp}"
+        );
         assert!(resp.contains("http://ex/b"), "{resp}");
     }
 
@@ -2821,7 +2877,11 @@ mod tests {
         opts: HttpOptions,
     ) -> (Arc<Server>, SocketAddr, thread::JoinHandle<ShutdownReport>) {
         let db = Database::build_from_str("conn", DATA).unwrap();
-        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_http_options(opts));
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_http_options(opts),
+        );
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         let serving = thread::spawn(move || s2.serve_forever());
@@ -2882,7 +2942,10 @@ mod tests {
         assert!(body.contains("http://ex/b"), "{body}");
         let mut rest = Vec::new();
         r.read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty(), "the server closed after `Connection: close`");
+        assert!(
+            rest.is_empty(),
+            "the server closed after `Connection: close`"
+        );
     }
 
     #[test]
@@ -2932,7 +2995,8 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
-        w.write_all(b"GET /status HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        w.write_all(b"GET /status HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
         let (head, _) = read_one(&mut r);
         assert!(head.contains("Connection: keep-alive"), "{head}");
 
@@ -2941,7 +3005,8 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
-        w.write_all(get_status("Keep-Alive: timeout=5, max=1\r\n").as_bytes()).unwrap();
+        w.write_all(get_status("Keep-Alive: timeout=5, max=1\r\n").as_bytes())
+            .unwrap();
         let (head, _) = read_one(&mut r);
         assert!(head.contains("Connection: close"), "{head}");
     }
@@ -2977,7 +3042,10 @@ mod tests {
         let mut rest = Vec::new();
         r.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
-        assert!(t0.elapsed() < Duration::from_secs(5), "closed after the idle timeout");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "closed after the idle timeout"
+        );
 
         // An idle connection does not hold up a graceful shutdown.
         let s = TcpStream::connect(addr).unwrap();
@@ -3015,8 +3083,12 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         // The third (N+1-th) connection is accepted but must wait for a worker.
         let mut third = TcpStream::connect(addr).unwrap();
-        third.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        third.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        third
+            .write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
         let mut buf = [0u8; 64];
         let early = third.read(&mut buf);
         assert!(
@@ -3026,10 +3098,14 @@ mod tests {
         // Finishing one slow request frees its worker for the third connection.
         slow[0].write_all(b"Connection: close\r\n\r\n").unwrap();
         let mut resp = String::new();
-        slow[0].set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        slow[0]
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         slow[0].read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut resp = String::new();
         third.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
@@ -3057,7 +3133,8 @@ mod tests {
         let t0 = Instant::now();
         let mut b = TcpStream::connect(addr).unwrap();
         b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        b.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        b.write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
         let mut resp = String::new();
         b.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
@@ -3098,12 +3175,16 @@ mod tests {
         let t0 = Instant::now();
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s.write_all(get_status("Connection: close\r\n").as_bytes()).unwrap();
+        s.write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
-        assert!(dripper.join().unwrap(), "the dripping connection was dropped");
+        assert!(
+            dripper.join().unwrap(),
+            "the dripping connection was dropped"
+        );
     }
 
     #[test]
@@ -3116,7 +3197,10 @@ mod tests {
         let (head, body) = split_resp(&resp);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
-        assert!(head.contains("Access-Control-Allow-Methods: POST"), "{head}");
+        assert!(
+            head.contains("Access-Control-Allow-Methods: POST"),
+            "{head}"
+        );
         assert_eq!(body, "ok");
         let resp = http(
             &addr,
@@ -3128,7 +3212,10 @@ mod tests {
             "OPTIONS /sparql HTTP/1.1\r\nAccess-Control-Request-Headers: X-Foo, Content-Type\r\n\
              Connection: close\r\n\r\n",
         );
-        assert!(resp.contains("Access-Control-Allow-Headers: X-Foo, Content-Type"), "{resp}");
+        assert!(
+            resp.contains("Access-Control-Allow-Headers: X-Foo, Content-Type"),
+            "{resp}"
+        );
         // Ordinary responses carry the allow-origin header too.
         let resp = http(&addr, &get_status("Connection: close\r\n"));
         assert!(resp.contains("Access-Control-Allow-Origin: *"), "{resp}");
@@ -3141,7 +3228,10 @@ mod tests {
         let (_srv2, addr2, _serving) = start_with(opts);
         let resp = http(&addr2, &get_status("Connection: close\r\n"));
         assert!(!resp.contains("Access-Control"), "{resp}");
-        let resp = http(&addr2, "OPTIONS /sparql HTTP/1.1\r\nConnection: close\r\n\r\n");
+        let resp = http(
+            &addr2,
+            "OPTIONS /sparql HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
     }
 
@@ -3164,7 +3254,10 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
         // A malformed one is a plain 400.
-        let resp = http(&addr, "POST /update HTTP/1.1\r\nContent-Length: abc\r\n\r\n");
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
+        );
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         // Within the cap, requests work.
         let resp = http(&addr, &get_status("Connection: close\r\n"));
@@ -3203,7 +3296,10 @@ mod tests {
         s.write_all(SELECT_O.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("http://ex/b"), "{resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("http://ex/b"),
+            "{resp}"
+        );
     }
 
     #[test]
@@ -3223,7 +3319,13 @@ mod tests {
     fn a_non_ascii_authorization_header_is_rejected_without_a_panic() {
         // A multi-byte character straddling the `Basic ` / `Bearer ` prefix
         // boundary must not make the byte-indexed prefix check panic.
-        for value in ["abcde\u{e9}xyz", "abcdef\u{e9}xyz", "\u{e9}", "Basic\u{e9}", "Bearer\u{e9}x"] {
+        for value in [
+            "abcde\u{e9}xyz",
+            "abcdef\u{e9}xyz",
+            "\u{e9}",
+            "Basic\u{e9}",
+            "Bearer\u{e9}x",
+        ] {
             let raw = format!("GET / HTTP/1.1\r\nAuthorization: {value}\r\n\r\n");
             let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
             assert_eq!(parse_basic_auth(&req), None, "{value:?}");
@@ -3362,7 +3464,8 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(Arc::new(client_config), name).unwrap();
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut tls = BufReader::new(rustls::StreamOwned::new(conn, sock));
         tls.get_mut().write_all(get_status("").as_bytes()).unwrap();
         let (head, body) = read_one(&mut tls);
@@ -3400,7 +3503,12 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         let mut sink = ResponseSink::new(Vec::new());
         sink.start_response(true);
         // The header terminator split across writes.
-        for part in [&b"HTTP/1.1 200 OK\r\nA: b\r"[..], b"\n\r", b"\nbody", b"more"] {
+        for part in [
+            &b"HTTP/1.1 200 OK\r\nA: b\r"[..],
+            b"\n\r",
+            b"\nbody",
+            b"more",
+        ] {
             assert_eq!(sink.write(part).unwrap(), part.len());
         }
         assert_eq!(sink.inner, b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n");

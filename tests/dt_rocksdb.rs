@@ -137,7 +137,11 @@ fn rocks_matches_memory_on_all_patterns_and_stats() {
     assert!(mem.insert(IdTriple::new(4, 3, 9)));
     assert!(rocks.insert(IdTriple::new(4, 3, 9)));
 
-    assert_eq!(fingerprint(&mem), fingerprint(&rocks), "after remove + insert");
+    assert_eq!(
+        fingerprint(&mem),
+        fingerprint(&rocks),
+        "after remove + insert"
+    );
 
     // Removing everything must drain both stores' counters back to zero.
     for t in TripleSource::iter_all(&mem) {
@@ -215,7 +219,11 @@ fn sparql_results_match_memory_backend() {
     ];
     for q in queries {
         let ast = sparql::parse(q).unwrap();
-        let mem_n = row_count(Evaluator::new(db.dict(), db.store()).evaluate(&ast).unwrap());
+        let mem_n = row_count(
+            Evaluator::new(db.dict(), db.store())
+                .evaluate(&ast)
+                .unwrap(),
+        );
         let rocks_n = row_count(Evaluator::new(db.dict(), &rocks).evaluate(&ast).unwrap());
         assert_eq!(mem_n, rocks_n, "row-count mismatch for query: {q}");
     }
@@ -268,12 +276,17 @@ fn gbuild_cli_rocksdb_builds_reopenable_db() {
     assert!(status.success(), "gbuild --rocksdb exited with failure");
 
     let db_dir = base.join("movies.db");
-    assert!(Database::is_rocksdb(&db_dir), "gbuild --rocksdb did not create a RocksDB store");
+    assert!(
+        Database::is_rocksdb(&db_dir),
+        "gbuild --rocksdb did not create a RocksDB store"
+    );
 
     // The gserver --rocksdb path: reopen from disk and run a real query.
     let mut db = Database::open_rocksdb(&db_dir).unwrap();
     assert_eq!(db.triple_num(), 2);
-    let rs = db.select("SELECT ?d WHERE { ?m <http://ex/directedBy> ?d }").unwrap();
+    let rs = db
+        .select("SELECT ?d WHERE { ?m <http://ex/directedBy> ?d }")
+        .unwrap();
     assert_eq!(rs.row_count(), 2);
     cleanup(&base);
 }
@@ -315,7 +328,10 @@ fn reopen_skips_the_vstree_rebuild_with_equal_answers() {
         }
         other => panic!("SELECT expected, got {other:?}"),
     };
-    let expected: Vec<_> = queries.iter().map(|q| sorted(mem.query(q).unwrap())).collect();
+    let expected: Vec<_> = queries
+        .iter()
+        .map(|q| sorted(mem.query(q).unwrap()))
+        .collect();
     for (q, want) in queries.iter().zip(&expected) {
         assert_eq!(&sorted(db.query(q).unwrap()), want, "without a tree: {q}");
     }

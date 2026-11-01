@@ -317,9 +317,11 @@ fn export_writes_the_inferred_triples_but_not_the_rules() {
     let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     assert_eq!(text.matches("<Rule:next2>").count(), 3, "{text}");
     let export_dir = file.parent().unwrap();
-    assert!(fs::read_dir(export_dir)
+    assert!(fs::read_dir(export_dir).unwrap().all(|e| !e
         .unwrap()
-        .all(|e| !e.unwrap().file_name().to_string_lossy().contains("reason")));
+        .file_name()
+        .to_string_lossy()
+        .contains("reason")));
 
     // Rebuilt from the export, executing the rule takes over nothing: the
     // triples were there before it ran, so disabling it leaves them.
@@ -420,7 +422,11 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
     let api_pfn = "select (PFN.one({}) AS ?r) where {}";
     let j = srv.query("fam", api_pfn);
     if cfg!(feature = "pfn-wasm") {
-        assert_eq!(j.get("results").map(Json::to_string).as_deref(), Some("1"), "{j}");
+        assert_eq!(
+            j.get("results").map(Json::to_string).as_deref(),
+            Some("1"),
+            "{j}"
+        );
     } else {
         assert_ne!(code(&j), 0, "{j}");
     }
@@ -449,7 +455,9 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
     // operation logs the ones that ran — as upstream's, whose `catch`
     // returns before the log callback — so the /api PFN query is logged
     // when the runtime is there.
-    let r = logged(&srv, "query", "the REST PFN query", |r| field(r, "sparql") == rest_pfn);
+    let r = logged(&srv, "query", "the REST PFN query", |r| {
+        field(r, "sparql") == rest_pfn
+    });
     assert_eq!(field(&r, "dbname"), "fam", "{r}");
     assert_eq!(
         r.get("statusCode").and_then(Json::as_i64) == Some(0),
@@ -457,7 +465,9 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
         "{r}"
     );
     if cfg!(feature = "pfn-wasm") {
-        let r = logged(&srv, "query", "the /api PFN query", |r| field(r, "sparql") == api_pfn);
+        let r = logged(&srv, "query", "the /api PFN query", |r| {
+            field(r, "sparql") == api_pfn
+        });
         assert_eq!(field(&r, "dbname"), "fam", "{r}");
         assert_eq!(r.get("statusCode").and_then(Json::as_i64), Some(0), "{r}");
     } else {
@@ -490,7 +500,10 @@ fn rule_pairs(srv: &Server, db: &str) -> Vec<String> {
 }
 
 fn count(srv: &Server, db: &str, pattern: &str) -> i64 {
-    let j = srv.query(db, &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} }}"));
+    let j = srv.query(
+        db,
+        &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} }}"),
+    );
     ok(&j);
     let cell = j
         .get("results")
@@ -539,7 +552,10 @@ fn rules_over_imported_blank_nodes_retract_exactly() {
     let load = format!("LOAD <file://{}>", path_str(&ttl));
     ok(&srv.query("bnode", &load));
     assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o"), 6);
-    assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o FILTER(isBlank(?s))"), 6);
+    assert_eq!(
+        count(&srv, "bnode", "?s <http://ex/p> ?o FILTER(isBlank(?s))"),
+        6
+    );
 
     ok(&srv.op(
         "reasonManage",
@@ -564,14 +580,18 @@ fn rules_over_imported_blank_nodes_retract_exactly() {
     // scoped anonymous one.
     assert!(lines.iter().any(|l| l.contains("_b1\t")), "{lines:?}");
     assert!(
-        lines.iter().any(|l| l.split('\t').nth(2).is_some_and(|o| o.starts_with("_:") && o.contains('-'))),
+        lines.iter().any(|l| l
+            .split('\t')
+            .nth(2)
+            .is_some_and(|o| o.starts_with("_:") && o.contains('-'))),
         "{lines:?}"
     );
 
     // Imports after the execution: the document again (new blank nodes), and
     // asserted <Rule:next2> triples over blank nodes and IRIs. None of them
     // touches the ledger.
-    let before = fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
+    let before =
+        fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
     let asserted = data.join("asserted.ttl");
     fs::write(
         &asserted,
@@ -588,7 +608,8 @@ fn rules_over_imported_blank_nodes_retract_exactly() {
         ok(&j);
     }
     ok(&srv.query("bnode", &format!("LOAD <file://{}>", path_str(&asserted))));
-    let after = fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
+    let after =
+        fs::read(served_dir(&srv, "bnode").join("reason_rule_files/inferred/next2.nt")).unwrap();
     assert_eq!(before, after, "imports do not touch the ledger");
     // 4 inferred + 2 asserted twice (batchInsert, LOAD: new blank nodes).
     assert_eq!(rule_pairs(&srv, "bnode").len(), 8);
@@ -599,7 +620,10 @@ fn rules_over_imported_blank_nodes_retract_exactly() {
     assert_eq!(int(&j, "AnsNum"), 4);
     let left = rule_pairs(&srv, "bnode");
     assert_eq!(left.len(), 4, "{left:?}");
-    assert!(inferred.iter().all(|t| !left.contains(t)), "{inferred:?} vs {left:?}");
+    assert!(
+        inferred.iter().all(|t| !left.contains(t)),
+        "{inferred:?} vs {left:?}"
+    );
     assert_eq!(count(&srv, "bnode", "?s <http://ex/p> ?o"), 11);
 }
 
@@ -705,12 +729,18 @@ fn one_refreshconf_reapplies_query_pfn_and_log_sections() {
     };
     let nt = dir.join("d.nt");
     fs::write(&nt, CHAIN).unwrap();
-    ok(&op("build", &[("db_name", "conf"), ("db_path", &path_str(&nt))]));
+    ok(&op(
+        "build",
+        &[("db_name", "conf"), ("db_path", &path_str(&nt))],
+    ));
     ok(&op("load", &[("db_name", "conf")]));
     let div = || {
         let j = op(
             "query",
-            &[("db_name", "conf"), ("sparql", "SELECT ((7/2) AS ?x) WHERE {}")],
+            &[
+                ("db_name", "conf"),
+                ("sparql", "SELECT ((7/2) AS ?x) WHERE {}"),
+            ],
         );
         ok(&j);
         j.to_string()

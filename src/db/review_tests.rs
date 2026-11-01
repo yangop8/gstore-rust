@@ -12,10 +12,7 @@ use super::fsutil;
 use super::{Database, StorageKind, ROCKS_SUBDIR};
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "gstore_review_{tag}_{}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("gstore_review_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -49,7 +46,8 @@ fn crash_while_removing_a_replaced_rocksdb_dir_keeps_the_new_snapshot() {
     let mut back = Database::open(&dir).unwrap();
     assert_eq!(back.triple_num(), 1);
     assert_eq!(
-        back.query("ASK { <http://ex/a> <http://ex/p> <http://ex/b> }").unwrap(),
+        back.query("ASK { <http://ex/a> <http://ex/p> <http://ex/b> }")
+            .unwrap(),
         crate::QueryResult::Ask(true)
     );
     assert!(
@@ -102,7 +100,10 @@ mod rocks {
         fail_side_writes(&db, true);
         assert!(db.query(insert).is_err(), "the failed write is reported");
         fail_side_writes(&db, false);
-        assert_eq!(db.query(insert).unwrap(), QueryResult::Update { changed: 1 });
+        assert_eq!(
+            db.query(insert).unwrap(),
+            QueryResult::Update { changed: 1 }
+        );
         drop(db);
 
         let mut db = Database::open(&dir).unwrap();
@@ -129,20 +130,31 @@ mod rocks {
     fn failed_quad_write_is_persisted_by_the_retry() {
         let (dir, mut db) = open_rocks("rocks_quad_retry", BASE);
         // Every term is known already: only the quad write itself can fail.
-        let insert = "INSERT DATA { GRAPH <http://ex/g> { <http://ex/a> <http://ex/p> <http://ex/b> } }";
+        let insert =
+            "INSERT DATA { GRAPH <http://ex/g> { <http://ex/a> <http://ex/p> <http://ex/b> } }";
         fail_side_writes(&db, true);
         assert!(db.query(insert).is_err(), "the failed write is reported");
         assert!(
-            rows(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }").is_empty(),
+            rows(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+            )
+            .is_empty(),
             "a quad RocksDB does not hold is not visible either"
         );
         fail_side_writes(&db, false);
-        assert_eq!(db.query(insert).unwrap(), QueryResult::Update { changed: 1 });
+        assert_eq!(
+            db.query(insert).unwrap(),
+            QueryResult::Update { changed: 1 }
+        );
         drop(db);
 
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(
-            rows(&mut db, "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"),
+            rows(
+                &mut db,
+                "SELECT ?s WHERE { GRAPH <http://ex/g> { ?s ?p ?o } }"
+            ),
             vec![vec![Some("<http://ex/a>".to_string())]]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -159,7 +171,11 @@ mod rocks {
                     <http://ex/x2> <http://ex/p> <http://ex/y> .\n";
         let (dir, mut db) = open_rocks("rocks_infer_terms", data);
         fail_side_writes(&db, true);
-        assert_eq!(db.materialize_rdfs(), 0, "nothing inferred without its terms");
+        assert_eq!(
+            db.materialize_rdfs(),
+            0,
+            "nothing inferred without its terms"
+        );
         assert!(db.sync().is_err(), "the failed term write is reported");
         drop(db); // what a crash right now would leave behind
 
@@ -190,7 +206,8 @@ mod rocks {
         assert_eq!(db.materialize_rdfs(), 0);
         fail_side_writes(&db, false);
         let _ = db.sync(); // collect the reported failure
-        db.query("INSERT DATA { <http://ex/z> a <http://ex/C> }").unwrap();
+        db.query("INSERT DATA { <http://ex/z> a <http://ex/C> }")
+            .unwrap();
         drop(db);
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(
@@ -251,15 +268,18 @@ mod rocks {
         let check = |db: &mut Database| {
             assert_eq!(db.triple_num(), 2);
             assert_eq!(
-                db.query("ASK { <http://ex/a> <http://ex/p> <http://ex/b> }").unwrap(),
+                db.query("ASK { <http://ex/a> <http://ex/p> <http://ex/b> }")
+                    .unwrap(),
                 QueryResult::Ask(true)
             );
             assert_eq!(
-                db.query("ASK { <http://ex/t> <http://ex/p> <http://ex/u> }").unwrap(),
+                db.query("ASK { <http://ex/t> <http://ex/p> <http://ex/u> }")
+                    .unwrap(),
                 QueryResult::Ask(false)
             );
             assert_eq!(
-                db.query("ASK { GRAPH <http://ex/g> { ?s ?p ?o } }").unwrap(),
+                db.query("ASK { GRAPH <http://ex/g> { ?s ?p ?o } }")
+                    .unwrap(),
                 QueryResult::Ask(false)
             );
         };

@@ -26,8 +26,16 @@ pub fn build_prompt(question: &str, links_block: &str, schema_block: &str, n: us
          Linked terms:\n{links}\n\n\
          Schema:\n{schema}\n\n\
          Produce up to {n} candidate SPARQL 1.1 queries as a JSON array of strings.",
-        links = if links_block.is_empty() { "(none)" } else { links_block },
-        schema = if schema_block.is_empty() { "(none)" } else { schema_block },
+        links = if links_block.is_empty() {
+            "(none)"
+        } else {
+            links_block
+        },
+        schema = if schema_block.is_empty() {
+            "(none)"
+        } else {
+            schema_block
+        },
     )
 }
 
@@ -211,7 +219,9 @@ mod tests {
         assert!(!is_grounded(
             "SELECT ?x WHERE { ?x ?p ?o . FILTER(?x != <urn:x>) }"
         ));
-        assert!(!is_grounded("SELECT ?x WHERE { ?x ?p ?o . FILTER(?o < 5) }"));
+        assert!(!is_grounded(
+            "SELECT ?x WHERE { ?x ?p ?o . FILTER(?o < 5) }"
+        ));
     }
 
     #[test]
@@ -234,7 +244,8 @@ mod tests {
     #[test]
     fn prefers_largest_parseable_array() {
         // a small valid prose array before the real (larger) candidate array
-        let raw = "Options: [\"a\"]. Answer: [\"SELECT ?x WHERE { ?x ?p ?o }\", \"ASK { ?s ?p ?o }\"]";
+        let raw =
+            "Options: [\"a\"]. Answer: [\"SELECT ?x WHERE { ?x ?p ?o }\", \"ASK { ?s ?p ?o }\"]";
         let c = parse_candidates(raw);
         assert_eq!(c.len(), 2);
         assert!(c[0].starts_with("SELECT"));
@@ -257,7 +268,7 @@ mod tests {
     fn valid_candidates_filters_and_dedups() {
         let cands = vec![
             "SELECT ?x WHERE { ?x <http://ex/p> ?o }".to_string(),
-            "not sparql".to_string(),                              // invalid → dropped
+            "not sparql".to_string(), // invalid → dropped
             "SELECT ?x WHERE { ?x <http://ex/p> ?o }".to_string(), // dup → dropped
             "ASK { ?s <http://ex/p> \"v\" }".to_string(),
         ];
@@ -279,7 +290,10 @@ mod tests {
             "SELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }".to_string(),
         ];
         let v = valid_candidates(&cands, 10);
-        assert_eq!(v, vec!["SELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }".to_string()]);
+        assert_eq!(
+            v,
+            vec!["SELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }".to_string()]
+        );
     }
 
     #[test]
@@ -287,7 +301,15 @@ mod tests {
         let llm = MockLlm::fixed(
             r#"["SELECT ?c WHERE { ?c <http://ex/capitalOf> <http://ex/Germany> }", "bad query"]"#,
         );
-        let v = generate_candidates(&llm, "capital of Germany?", "<http://ex/Germany>", "", 3, None).unwrap();
+        let v = generate_candidates(
+            &llm,
+            "capital of Germany?",
+            "<http://ex/Germany>",
+            "",
+            3,
+            None,
+        )
+        .unwrap();
         assert_eq!(v.len(), 1); // the invalid one is dropped
         assert!(v[0].contains("capitalOf"));
     }

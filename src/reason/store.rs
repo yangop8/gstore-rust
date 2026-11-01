@@ -253,11 +253,13 @@ impl<'a> RuleStore<'a> {
     pub fn exists(&self, name: &str) -> StoreResult<bool> {
         match self {
             RuleStore::Memory(m) => Ok(m.rules.contains_key(name)),
-            RuleStore::Dir { db_dir } => match fs::symlink_metadata(Self::rule_file(db_dir, name)) {
-                Ok(_) => Ok(true),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-                Err(e) => Err(e.into()),
-            },
+            RuleStore::Dir { db_dir } => {
+                match fs::symlink_metadata(Self::rule_file(db_dir, name)) {
+                    Ok(_) => Ok(true),
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            }
         }
     }
 

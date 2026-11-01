@@ -103,7 +103,8 @@ mod tests {
     #[test]
     fn ragged_rows_do_not_panic() {
         let mut rs = ResultSet::new(vec!["x".into()]);
-        rs.rows.push(vec![Some("<a>".into()), Some("<extra>".into())]);
+        rs.rows
+            .push(vec![Some("<a>".into()), Some("<extra>".into())]);
         rs.rows.push(vec![]);
         let s = rs.to_table_string();
         assert!(s.contains("<extra>"));

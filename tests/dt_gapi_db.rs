@@ -482,7 +482,10 @@ fn build_show_load_monitor_schema_unload() {
         &[
             ("operation", "query"),
             ("db_name", "lubm"),
-            ("sparql", "DELETE DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }"),
+            (
+                "sparql",
+                "DELETE DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }",
+            ),
         ],
     );
     ok(&j);
@@ -491,7 +494,10 @@ fn build_show_load_monitor_schema_unload() {
         &[
             ("operation", "query"),
             ("db_name", "lubm"),
-            ("sparql", "INSERT DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }"),
+            (
+                "sparql",
+                "INSERT DATA { <http://ex/a> <http://ex/onto#worksAt> <http://ex/u> }",
+            ),
         ],
     );
     ok(&j);
@@ -1538,7 +1544,11 @@ fn uploads_land_in_the_upload_dir_and_feed_build() {
             ("db_path", &string(&j, "filepath")),
         ],
     );
-    assert_eq!(code(&j), if cfg!(feature = "zip") { 1 } else { 1003 }, "{j}");
+    assert_eq!(
+        code(&j),
+        if cfg!(feature = "zip") { 1 } else { 1003 },
+        "{j}"
+    );
     // Only the uploads are in the upload directory (no unpacked leftovers).
     let names: Vec<String> = fs::read_dir(srv.upload_dir())
         .unwrap()

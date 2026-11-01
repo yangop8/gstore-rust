@@ -28,11 +28,20 @@ pub struct Triple {
 impl Triple {
     /// De-dup key over the raw term values.
     fn key(&self) -> (String, String, String) {
-        (self.s.value.clone(), self.p.value.clone(), self.o.value.clone())
+        (
+            self.s.value.clone(),
+            self.p.value.clone(),
+            self.o.value.clone(),
+        )
     }
     /// `<s> <p> <o> .` surface form for the LLM prompt.
     pub fn render(&self) -> String {
-        format!("{} {} {} .", self.s.to_term_string(), self.p.to_term_string(), self.o.to_term_string())
+        format!(
+            "{} {} {} .",
+            self.s.to_term_string(),
+            self.p.to_term_string(),
+            self.o.to_term_string()
+        )
     }
     /// As a citation (uniform surface forms), for grounding the answer.
     pub fn to_citation(&self) -> Citation {
@@ -57,12 +66,21 @@ pub struct RetrievalCfg {
 
 impl Default for RetrievalCfg {
     fn default() -> Self {
-        RetrievalCfg { hops: 1, per_node: 40, total: 200 }
+        RetrievalCfg {
+            hops: 1,
+            per_node: 40,
+            total: 200,
+        }
     }
 }
 
 fn uri_term(value: &str) -> RdfTerm {
-    RdfTerm { kind: TermKind::Uri, value: value.to_string(), datatype: None, lang: None }
+    RdfTerm {
+        kind: TermKind::Uri,
+        value: value.to_string(),
+        datatype: None,
+        lang: None,
+    }
 }
 
 fn out_query(iri: &str, limit: usize) -> String {
@@ -79,9 +97,10 @@ fn pair_terms(ans: &SparqlAnswer, a: &str, b: &str) -> Vec<(RdfTerm, RdfTerm)> {
     let SparqlAnswer::Select { vars, rows } = ans else {
         return Vec::new();
     };
-    let (Some(ia), Some(ib)) =
-        (vars.iter().position(|v| v == a), vars.iter().position(|v| v == b))
-    else {
+    let (Some(ia), Some(ib)) = (
+        vars.iter().position(|v| v == a),
+        vars.iter().position(|v| v == b),
+    ) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -131,7 +150,11 @@ pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg)
                     if triples.len() >= cfg.total {
                         break 'hops;
                     }
-                    let t = Triple { s: uri_term(&node), p, o };
+                    let t = Triple {
+                        s: uri_term(&node),
+                        p,
+                        o,
+                    };
                     if seen.insert(t.key()) {
                         if t.o.kind == TermKind::Uri && !visited.contains(&t.o.value) {
                             next.push(t.o.value.clone());
@@ -146,7 +169,11 @@ pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg)
                     if triples.len() >= cfg.total {
                         break 'hops;
                     }
-                    let t = Triple { s, p, o: uri_term(&node) };
+                    let t = Triple {
+                        s,
+                        p,
+                        o: uri_term(&node),
+                    };
                     if seen.insert(t.key()) {
                         if t.s.kind == TermKind::Uri && !visited.contains(&t.s.value) {
                             next.push(t.s.value.clone());
@@ -166,7 +193,11 @@ pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg)
 
 /// Render a subgraph as newline-separated `<s> <p> <o> .` lines.
 pub fn render_subgraph(triples: &[Triple]) -> String {
-    triples.iter().map(Triple::render).collect::<Vec<_>>().join("\n")
+    triples
+        .iter()
+        .map(Triple::render)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// System prompt: answer strictly from the provided triples, or say "I don't know".
@@ -202,26 +233,30 @@ pub fn answer_from_subgraph(
 /// common localized variants (defense in depth) — a matched non-answer falls
 /// through to the structured result / abstention instead of being surfaced.
 pub fn is_dont_know(s: &str) -> bool {
-    let t = s.trim().trim_end_matches(['.', '!', '。', '！', ' ']).trim().to_lowercase();
+    let t = s
+        .trim()
+        .trim_end_matches(['.', '!', '。', '！', ' '])
+        .trim()
+        .to_lowercase();
     if t.is_empty() {
         return true;
     }
     const NEEDLES: &[&str] = &[
         "i don't know",
         "i do not know",
-        "je ne sais pas",   // fr
-        "no lo sé",         // es
+        "je ne sais pas", // fr
+        "no lo sé",       // es
         "no lo se",
-        "não sei",          // pt
+        "não sei",           // pt
         "ich weiß es nicht", // de
         "ich weiss es nicht",
-        "我不知道",          // zh
-        "不知道",            // zh
-        "わかりません",       // ja
-        "分かりません",       // ja
-        "모르겠",            // ko
-        "не знаю",          // ru
-        "لا أعرف",          // ar
+        "我不知道",     // zh
+        "不知道",       // zh
+        "わかりません", // ja
+        "分かりません", // ja
+        "모르겠",       // ko
+        "не знаю",      // ru
+        "لا أعرف",       // ar
     ];
     NEEDLES.iter().any(|n| t == *n || t.starts_with(n))
 }
@@ -233,10 +268,20 @@ mod tests {
     use crate::llm::MockLlm;
 
     fn t_uri(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
     fn t_lit(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Literal, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Literal,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
 
     #[test]
@@ -244,11 +289,17 @@ mod tests {
         // query order per node: outgoing (?p ?o), then incoming (?s ?p).
         let out = SparqlAnswer::Select {
             vars: vec!["p".into(), "o".into()],
-            rows: vec![vec![Some(t_uri("http://ex/directed")), Some(t_uri("http://ex/RidleyScott"))]],
+            rows: vec![vec![
+                Some(t_uri("http://ex/directed")),
+                Some(t_uri("http://ex/RidleyScott")),
+            ]],
         };
         let inc = SparqlAnswer::Select {
             vars: vec!["s".into(), "p".into()],
-            rows: vec![vec![Some(t_uri("http://ex/Prometheus")), Some(t_uri("http://ex/relatedTo"))]],
+            rows: vec![vec![
+                Some(t_uri("http://ex/Prometheus")),
+                Some(t_uri("http://ex/relatedTo")),
+            ]],
         };
         let kb = MockKb::new(vec![out, inc]);
         let ts = retrieve_subgraph(&kb, &["http://ex/Alien".into()], RetrievalCfg::default());
@@ -272,7 +323,11 @@ mod tests {
         let ts = retrieve_subgraph(
             &kb,
             &["not a<iri>".into(), "http://ex/A".into()],
-            RetrievalCfg { hops: 1, per_node: 10, total: 100 },
+            RetrievalCfg {
+                hops: 1,
+                per_node: 10,
+                total: 100,
+            },
         );
         assert!(!ts.is_empty());
         assert!(ts.iter().all(|t| t.s.value == "http://ex/A"));
@@ -283,14 +338,23 @@ mod tests {
         let ans = SparqlAnswer::Select {
             vars: vec!["p".into(), "o".into()],
             rows: (0..50)
-                .map(|i| vec![Some(t_uri("http://ex/p")), Some(t_uri(&format!("http://ex/o{i}")))])
+                .map(|i| {
+                    vec![
+                        Some(t_uri("http://ex/p")),
+                        Some(t_uri(&format!("http://ex/o{i}"))),
+                    ]
+                })
                 .collect(),
         };
         let kb = MockKb::new(vec![ans]);
         let ts = retrieve_subgraph(
             &kb,
             &["http://ex/A".into()],
-            RetrievalCfg { hops: 1, per_node: 50, total: 5 },
+            RetrievalCfg {
+                hops: 1,
+                per_node: 50,
+                total: 5,
+            },
         );
         assert!(ts.len() <= 5, "got {}", ts.len());
     }

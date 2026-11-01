@@ -124,7 +124,10 @@ mod tests {
         assert_eq!(read_varint(&[0x80], &mut pos), None);
         // Six bytes (overlong for a u32).
         let mut pos = 0;
-        assert_eq!(read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x01], &mut pos), None);
+        assert_eq!(
+            read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0x01], &mut pos),
+            None
+        );
     }
 
     #[test]

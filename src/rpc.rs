@@ -1052,7 +1052,12 @@ mod tests {
                 bytes: Vec::new(),
             };
             write_message(&mut w, payload).unwrap();
-            assert_eq!(w.writes, 1, "frame of {} bytes split across writes", payload.len());
+            assert_eq!(
+                w.writes,
+                1,
+                "frame of {} bytes split across writes",
+                payload.len()
+            );
             assert_eq!(read_message(&mut Cursor::new(w.bytes)).unwrap(), payload);
         }
     }

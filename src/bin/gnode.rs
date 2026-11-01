@@ -140,8 +140,13 @@ fn run_cluster(args: &[&str]) -> ExitCode {
     }
 
     let peer_ids: Vec<NodeId> = peers.iter().map(|(p, _)| *p).collect();
-    let node = match ClusterNode::bind(id, peer_ids, TripleStore::new(), bind_addr, RaftConfig::default())
-    {
+    let node = match ClusterNode::bind(
+        id,
+        peer_ids,
+        TripleStore::new(),
+        bind_addr,
+        RaftConfig::default(),
+    ) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("gnode cluster: failed to bind '{bind_addr}': {e}");

@@ -943,8 +943,13 @@ mod tests {
         let encoded = format!("(i32.const 1){}", "%20".repeat(max / 2));
         r.create("alice", info("h", &encoded)).unwrap();
         // Whatever is accepted, an entry stays within its documented bound.
-        let stored = fs::metadata(base.join("src/alice/data.json")).unwrap().len();
-        assert!(stored as usize <= 3 * max + MAX_DESC_BYTES + 4096, "{stored}");
+        let stored = fs::metadata(base.join("src/alice/data.json"))
+            .unwrap()
+            .len();
+        assert!(
+            stored as usize <= 3 * max + MAX_DESC_BYTES + 4096,
+            "{stored}"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -986,8 +991,11 @@ mod tests {
             cancel: None,
             max_output: 100,
         };
-        r.create("u", info("f", "(call $emit_i64 (i64.const 7)) (i32.const 1)"))
-            .unwrap();
+        r.create(
+            "u",
+            info("f", "(call $emit_i64 (i64.const 7)) (i32.const 1)"),
+        )
+        .unwrap();
         let first = r.compile("u", "f").unwrap().unwrap();
         // The next compilation is stamped with another second.
         while super::super::now() == first.last_time {

@@ -170,7 +170,10 @@ fn vstree_stays_sound_after_deletes() {
                 .evaluate(&parsed)
                 .unwrap(),
         );
-        assert_eq!(with, without, "q{i}: the VS-tree changed the answer after deletes");
+        assert_eq!(
+            with, without,
+            "q{i}: the VS-tree changed the answer after deletes"
+        );
         assert_eq!(shared, without, "q{i}: the shared read path differs");
     }
 }

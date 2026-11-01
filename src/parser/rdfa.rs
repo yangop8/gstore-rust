@@ -137,7 +137,9 @@ impl Lexer {
         c
     }
     fn starts_with(&self, s: &str) -> bool {
-        s.chars().enumerate().all(|(i, c)| self.peek_at(i) == Some(c))
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| self.peek_at(i) == Some(c))
     }
     fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(c) if c.is_whitespace()) {
@@ -465,14 +467,22 @@ fn build_tree(tokens: Vec<Token>) -> Node {
                     children: Vec::new(),
                 };
                 if self_closing || is_void_element(&name) {
-                    stack.last_mut().unwrap().children.push(Child::Element(node));
+                    stack
+                        .last_mut()
+                        .unwrap()
+                        .children
+                        .push(Child::Element(node));
                 } else if stack.len() >= MAX_TREE_DEPTH {
                     // Bound nesting: past the cap, attach the element (childless) to
                     // the current parent instead of descending, so pathological
                     // input (e.g. a megabyte of `<div>`) cannot grow an unbounded
                     // tree that overflows the recursive walks (find_base/process/
                     // collect_text) or the recursive `Node` drop.
-                    stack.last_mut().unwrap().children.push(Child::Element(node));
+                    stack
+                        .last_mut()
+                        .unwrap()
+                        .children
+                        .push(Child::Element(node));
                 } else {
                     stack.push(node);
                 }
@@ -639,7 +649,9 @@ impl Extractor {
                 } else if is_root {
                     Some(Term::Iri(base.clone()))
                 } else {
-                    ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                    ctx.parent_object
+                        .clone()
+                        .or(Some(ctx.parent_subject.clone()))
                 };
                 if has_typeof {
                     typed_resource = if let Some(a) = el.attr("about") {
@@ -673,7 +685,9 @@ impl Extractor {
                     if !has_property {
                         skip = true;
                     }
-                    ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                    ctx.parent_object
+                        .clone()
+                        .or(Some(ctx.parent_subject.clone()))
                 };
                 if has_typeof {
                     typed_resource = new_subject.clone();
@@ -686,7 +700,9 @@ impl Extractor {
             } else if is_root {
                 Some(Term::Iri(base.clone()))
             } else {
-                ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                ctx.parent_object
+                    .clone()
+                    .or(Some(ctx.parent_subject.clone()))
             };
             // The current object resource comes from @resource/@href/@src.
             current_object_resource = el
@@ -782,7 +798,8 @@ impl Extractor {
         // Step 11: @property literals / resources.
         if has_property {
             if let Some(subj) = &new_subject {
-                let obj = self.property_object(el, &local, &lang, &typed_resource, has_rel || has_rev);
+                let obj =
+                    self.property_object(el, &local, &lang, &typed_resource, has_rel || has_rev);
                 if let (Some(obj), Some(prop)) = (obj, el.attr("property")) {
                     for tok in prop.split_whitespace() {
                         if let Some(p) = resolve_term_or_curie(tok, &local) {
@@ -1039,7 +1056,10 @@ fn resolve_iri(base: &str, reference: &str) -> String {
         // Replace path from the authority onward (best-effort).
         if let Some(scheme_end) = base.find("://") {
             let after = &base[scheme_end + 3..];
-            let auth_end = after.find('/').map(|i| scheme_end + 3 + i).unwrap_or(base.len());
+            let auth_end = after
+                .find('/')
+                .map(|i| scheme_end + 3 + i)
+                .unwrap_or(base.len());
             return format!("{}{}", &base[..auth_end], reference);
         }
         return reference.to_string();
@@ -1173,7 +1193,11 @@ mod tests {
         assert_eq!(knows[0].object, Term::iri("http://ex/b"));
         let types = find(&ts, RDF_TYPE);
         assert_eq!(types.len(), 1);
-        assert_eq!(types[0].subject, Term::iri("http://ex/b"), "type must be on the rel object");
+        assert_eq!(
+            types[0].subject,
+            Term::iri("http://ex/b"),
+            "type must be on the rel object"
+        );
         assert_eq!(types[0].object, Term::iri("http://ex/Person"));
     }
 
@@ -1191,7 +1215,11 @@ mod tests {
         </div>"#;
         let ts = parse_str(doc).unwrap();
         let authored = find(&ts, "http://ex/p");
-        assert_eq!(authored[0].subject, Term::Blank("rdfa0".into()), "author label preserved");
+        assert_eq!(
+            authored[0].subject,
+            Term::Blank("rdfa0".into()),
+            "author label preserved"
+        );
         let types = find(&ts, RDF_TYPE);
         assert_eq!(types.len(), 1);
         let Term::Blank(minted) = &types[0].subject else {
@@ -1203,7 +1231,10 @@ mod tests {
             types[0].subject,
             "minted label must round-trip"
         );
-        assert_ne!(&types[0].subject, &authored[0].subject, "minted must not equal author blank");
+        assert_ne!(
+            &types[0].subject, &authored[0].subject,
+            "minted must not equal author blank"
+        );
     }
 
     #[test]
@@ -1213,10 +1244,18 @@ mod tests {
         let doc = r#"<a about="http://ex/a" rel="http://ex/next" property="http://ex/ref" href="http://ex/y">text</a>"#;
         let ts = parse_str(doc).unwrap();
         let next = find(&ts, "http://ex/next");
-        assert_eq!(next[0].object, Term::iri("http://ex/y"), "rel object is the href target");
+        assert_eq!(
+            next[0].object,
+            Term::iri("http://ex/y"),
+            "rel object is the href target"
+        );
         let refs = find(&ts, "http://ex/ref");
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].object, Term::plain_literal("text"), "property value is the text literal");
+        assert_eq!(
+            refs[0].object,
+            Term::plain_literal("text"),
+            "property value is the text literal"
+        );
     }
 
     #[test]
@@ -1251,7 +1290,11 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         assert_eq!(
             find(&ts, "http://ex/label")[0].object,
-            Term::Literal { value: "chat".into(), datatype: None, lang: Some("fr".into()) }
+            Term::Literal {
+                value: "chat".into(),
+                datatype: None,
+                lang: Some("fr".into())
+            }
         );
     }
 
@@ -1339,14 +1382,20 @@ mod tests {
           </body>
         </html>"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/name")[0].subject, Term::iri("http://ex/alice"));
+        assert_eq!(
+            find(&ts, "http://ex/name")[0].subject,
+            Term::iri("http://ex/alice")
+        );
     }
 
     #[test]
     fn entities_in_text() {
         let doc = r#"<div about="http://ex/a"><span property="http://ex/n">a &lt; b &amp; c</span></div>"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/n")[0].object, Term::plain_literal("a < b & c"));
+        assert_eq!(
+            find(&ts, "http://ex/n")[0].object,
+            Term::plain_literal("a < b & c")
+        );
     }
 
     #[test]

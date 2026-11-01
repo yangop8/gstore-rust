@@ -819,7 +819,11 @@ impl Extractor {
 
         // Typed node: a non-`rdf:Description` element name is an rdf:type.
         if !(ns == RDF_NS && local == "Description") {
-            self.push(subject.clone(), iri_type(), Term::Iri(format!("{ns}{local}")));
+            self.push(
+                subject.clone(),
+                iri_type(),
+                Term::Iri(format!("{ns}{local}")),
+            );
         }
 
         // Property attributes (shorthand literal-valued properties) and rdf:type.
@@ -1212,14 +1216,10 @@ mod tests {
 </rdf:RDF>"#;
         let ts = parse_str(doc).unwrap();
         assert_eq!(ts.len(), 2);
-        assert!(ts
-            .iter()
-            .any(|t| t.predicate == Term::iri("http://ex/name")
-                && t.object == Term::plain_literal("Alice")));
-        assert!(ts
-            .iter()
-            .any(|t| t.predicate == Term::iri("http://ex/city")
-                && t.object == Term::plain_literal("NYC")));
+        assert!(ts.iter().any(|t| t.predicate == Term::iri("http://ex/name")
+            && t.object == Term::plain_literal("Alice")));
+        assert!(ts.iter().any(|t| t.predicate == Term::iri("http://ex/city")
+            && t.object == Term::plain_literal("NYC")));
     }
 
     #[test]
@@ -1281,8 +1281,9 @@ mod tests {
             .any(|t| t.predicate == Term::iri(format!("{RDF_NS}_2"))
                 && t.object == Term::iri("http://ex/b")));
         // The container is typed rdf:Seq.
-        assert!(ts.iter().any(|t| t.predicate == iri_type()
-            && t.object == Term::iri(format!("{RDF_NS}Seq"))));
+        assert!(ts
+            .iter()
+            .any(|t| t.predicate == iri_type() && t.object == Term::iri(format!("{RDF_NS}Seq"))));
     }
 
     #[test]

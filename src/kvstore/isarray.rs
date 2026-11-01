@@ -146,7 +146,9 @@ fn push_entry(out: &mut Vec<u8>, key: &[u8], val: &[u8]) {
 
 /// The value for `key` in a bucket payload, if present.
 fn find_entry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-    entries(payload).find(|&(k, _, _)| k == key).map(|(_, v, _)| v.to_vec())
+    entries(payload)
+        .find(|&(k, _, _)| k == key)
+        .map(|(_, v, _)| v.to_vec())
 }
 
 /// Rebuild a bucket payload with `key → val` inserted or overwritten, preserving
@@ -194,7 +196,8 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_isarray_{tag}_{}.kv", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("gstore_isarray_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
@@ -207,7 +210,8 @@ mod tests {
         let a = IsArray::new(0);
         a.insert(&mut pg, b"<alice>", &1u32.to_le_bytes()).unwrap();
         a.insert(&mut pg, b"<bob>", &2u32.to_le_bytes()).unwrap();
-        a.insert(&mut pg, b"\"a literal\"", &3u32.to_le_bytes()).unwrap();
+        a.insert(&mut pg, b"\"a literal\"", &3u32.to_le_bytes())
+            .unwrap();
         assert_eq!(a.get(&pg, b"<alice>").unwrap().unwrap(), 1u32.to_le_bytes());
         assert_eq!(a.get(&pg, b"<bob>").unwrap().unwrap(), 2u32.to_le_bytes());
         assert_eq!(
@@ -257,8 +261,12 @@ mod tests {
         let a = IsArray::new(0);
         let n = 5000u32;
         for i in 0..n {
-            a.insert(&mut pg, format!("<http://ex/node{i}>").as_bytes(), &i.to_le_bytes())
-                .unwrap();
+            a.insert(
+                &mut pg,
+                format!("<http://ex/node{i}>").as_bytes(),
+                &i.to_le_bytes(),
+            )
+            .unwrap();
         }
         for i in 0..n {
             assert_eq!(

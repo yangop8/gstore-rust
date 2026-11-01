@@ -334,7 +334,10 @@ impl CredentialAttempt {
         // already MD5-based, so it can only refresh its parameters.
         let rehashed = (self.migrate
             && outcome == CredentialCheck::Valid
-            && self.stored.as_ref().is_some_and(PasswordHash::needs_upgrade))
+            && self
+                .stored
+                .as_ref()
+                .is_some_and(PasswordHash::needs_upgrade))
         .then(|| match self.form {
             PasswordForm::Plain => Some(PasswordHash::new(&self.secret)),
             PasswordForm::Md5Hex => {
@@ -1113,7 +1116,12 @@ impl UserStore {
     /// keeps the store behind a shared lock should use the phased form
     /// ([`begin_check`](Self::begin_check)) instead, so the hash runs with the
     /// lock released.
-    pub fn check_credentials(&self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
+    pub fn check_credentials(
+        &self,
+        name: &str,
+        secret: &str,
+        form: PasswordForm,
+    ) -> CredentialCheck {
         let mut attempt = self.begin_check(name, secret, form);
         attempt.migrate = false;
         let checked = attempt.verify();
@@ -1217,7 +1225,12 @@ impl UserStore {
     /// transparently re-hash an entry that is not in the current format (see
     /// [`finish_check`](Self::finish_check)). Runs the slow hash in place, like
     /// `check_credentials`.
-    pub fn authenticate(&mut self, name: &str, secret: &str, form: PasswordForm) -> CredentialCheck {
+    pub fn authenticate(
+        &mut self,
+        name: &str,
+        secret: &str,
+        form: PasswordForm,
+    ) -> CredentialCheck {
         let checked = self.begin_check(name, secret, form).verify();
         self.finish_check(checked)
     }
@@ -1432,7 +1445,9 @@ mod tests {
         assert_eq!(parts[1], PBKDF2_ITERATIONS.to_string());
         assert_eq!(parts[2].len(), SALT_LEN * 2, "16-byte salt, hex");
         assert_eq!(parts[3].len(), HASH_LEN * 2, "32-byte key, hex");
-        assert!(parts[2..].iter().all(|p| p.bytes().all(|b| b.is_ascii_hexdigit())));
+        assert!(parts[2..]
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit())));
     }
 
     /// The stored form is plain PBKDF2-HMAC-SHA256, so it is pinned by the
@@ -1469,7 +1484,10 @@ mod tests {
     fn salts_and_tokens_come_from_the_os_rng() {
         let mut a = [0u8; 16];
         #[cfg(target_os = "linux")]
-        assert!(os_random_bytes(&mut a), "/dev/urandom must be readable on Linux");
+        assert!(
+            os_random_bytes(&mut a),
+            "/dev/urandom must be readable on Linux"
+        );
         random_bytes(&mut a);
         let mut b = [0u8; 16];
         random_bytes(&mut b);
@@ -1522,7 +1540,10 @@ mod tests {
         assert!(alice.starts_with("alice\tpbkdf2-sha256-md5$"), "{alice}");
         assert!(alice.ends_with("\tquery,update"), "{alice}");
         let root = text.lines().find(|l| l.starts_with("root\t")).unwrap();
-        assert!(root.starts_with(&format!("root\t{root_salt:016x}\t")), "{root}");
+        assert!(
+            root.starts_with(&format!("root\t{root_salt:016x}\t")),
+            "{root}"
+        );
 
         // After a reload the migrated entry still verifies; root still legacy.
         let mut store = UserStore::open(&path, "ignored").unwrap();
@@ -1530,7 +1551,10 @@ mod tests {
         assert!(!store.verify("alice", "wrong"));
         assert!(store.verify_and_upgrade(ROOT_USER, "rootpw"));
         let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.lines().any(|l| !l.contains("pbkdf2-sha256-md5$")), "{text}");
+        assert!(
+            !text.lines().any(|l| !l.contains("pbkdf2-sha256-md5$")),
+            "{text}"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1550,7 +1574,10 @@ mod tests {
         let digest = "5f4dcc3b5aa765d61d8327deb882cf99";
         assert_eq!(md5_hex("password"), digest);
         assert_eq!(verify_password_md5(&stored, digest), Some(true));
-        assert_eq!(verify_password_md5(&stored, &digest.to_ascii_uppercase()), Some(true));
+        assert_eq!(
+            verify_password_md5(&stored, &digest.to_ascii_uppercase()),
+            Some(true)
+        );
         assert_eq!(verify_password_md5(&stored, &md5_hex("nope")), Some(false));
         // The plaintext itself (or a malformed digest) is not a valid digest.
         assert_eq!(verify_password_md5(&stored, "password"), Some(false));
@@ -1573,7 +1600,12 @@ mod tests {
     fn older_entries_need_one_plaintext_login_before_md5_clients_work() {
         let path = tmp("md5_migrate");
         let mut raw_hash = [0u8; HASH_LEN];
-        pbkdf2_hmac_sha256(b"bobpw", b"0123456789abcdef", PBKDF2_ITERATIONS, &mut raw_hash);
+        pbkdf2_hmac_sha256(
+            b"bobpw",
+            b"0123456789abcdef",
+            PBKDF2_ITERATIONS,
+            &mut raw_hash,
+        );
         let raw = format!(
             "pbkdf2-sha256${PBKDF2_ITERATIONS}${}${}",
             hex_encode(b"0123456789abcdef"),
@@ -1598,23 +1630,46 @@ mod tests {
                 CredentialCheck::NeedsPlaintextLogin,
                 "{user}"
             );
-            assert_eq!(store.authenticate(user, "wrong", plain), CredentialCheck::Invalid);
+            assert_eq!(
+                store.authenticate(user, "wrong", plain),
+                CredentialCheck::Invalid
+            );
             assert_eq!(store.authenticate(user, pw, plain), CredentialCheck::Valid);
-            assert_eq!(store.authenticate(user, &md5_hex(pw), md5), CredentialCheck::Valid, "{user}");
+            assert_eq!(
+                store.authenticate(user, &md5_hex(pw), md5),
+                CredentialCheck::Valid,
+                "{user}"
+            );
             assert_eq!(
                 store.authenticate(user, &md5_hex("wrong"), md5),
                 CredentialCheck::Invalid
             );
         }
         // root was created in the current format: digest clients work at once.
-        assert_eq!(store.check_credentials(ROOT_USER, &md5_hex("rootpw"), md5), CredentialCheck::Valid);
-        assert_eq!(store.check_credentials("nobody", &md5_hex("x"), md5), CredentialCheck::Invalid);
+        assert_eq!(
+            store.check_credentials(ROOT_USER, &md5_hex("rootpw"), md5),
+            CredentialCheck::Valid
+        );
+        assert_eq!(
+            store.check_credentials("nobody", &md5_hex("x"), md5),
+            CredentialCheck::Invalid
+        );
         // Migrated entries survive a reload, in the current format only.
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.lines().all(|l| l.split('\t').nth(1).unwrap().starts_with("pbkdf2-sha256-md5$")), "{text}");
+        assert!(
+            text.lines().all(|l| l
+                .split('\t')
+                .nth(1)
+                .unwrap()
+                .starts_with("pbkdf2-sha256-md5$")),
+            "{text}"
+        );
         let store = UserStore::open(&path, "ignored").unwrap();
         assert!(store.verify("bob", "bobpw"));
-        assert_eq!(store.check_credentials("carl", &md5_hex("carlpw"), md5), CredentialCheck::Valid);
+        assert_eq!(
+            store.check_credentials("carl", &md5_hex("carlpw"), md5),
+            CredentialCheck::Valid
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1626,14 +1681,23 @@ mod tests {
         let mut store = UserStore::open(&path, "rootpw").unwrap();
         store.add("dana", "old", BTreeSet::new()).unwrap();
         let md5 = PasswordForm::Md5Hex;
-        assert_eq!(store.check_credentials("dana", &md5_hex("old"), md5), CredentialCheck::Valid);
+        assert_eq!(
+            store.check_credentials("dana", &md5_hex("old"), md5),
+            CredentialCheck::Valid
+        );
         assert!(store.verify("dana", "old"));
         // A plaintext password that happens to be the digest is not the digest.
         assert!(!store.verify("dana", &md5_hex("old")));
         store.set_password("dana", "new").unwrap();
-        assert_eq!(store.check_credentials("dana", &md5_hex("old"), md5), CredentialCheck::Invalid);
+        assert_eq!(
+            store.check_credentials("dana", &md5_hex("old"), md5),
+            CredentialCheck::Invalid
+        );
         assert!(!store.verify("dana", "old"));
-        assert_eq!(store.check_credentials("dana", &md5_hex("new"), md5), CredentialCheck::Valid);
+        assert_eq!(
+            store.check_credentials("dana", &md5_hex("new"), md5),
+            CredentialCheck::Valid
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -1655,7 +1719,9 @@ mod tests {
         // Missing file: root is created with the new password.
         let fresh = tmp("reset_fresh");
         UserStore::reset_password_offline(&fresh, ROOT_USER, "pw2").unwrap();
-        assert!(UserStore::open(&fresh, "other").unwrap().verify(ROOT_USER, "pw2"));
+        assert!(UserStore::open(&fresh, "other")
+            .unwrap()
+            .verify(ROOT_USER, "pw2"));
         // Unknown users are an error, not silently created.
         assert!(UserStore::reset_password_offline(&fresh, "nobody", "x").is_err());
         // Resetting a non-root user never seeds a root with that password.
@@ -1679,7 +1745,10 @@ mod tests {
         assert!(store.verify("carol", "old"));
         assert!(store.verify("carol", "old"), "cached fast path");
         store.set_password("carol", "new").unwrap();
-        assert!(!store.verify("carol", "old"), "stale cache entry must not verify");
+        assert!(
+            !store.verify("carol", "old"),
+            "stale cache entry must not verify"
+        );
         assert!(store.verify("carol", "new"));
         store.drop_user("carol").unwrap();
         assert!(!store.verify("carol", "new"));
@@ -1715,7 +1784,10 @@ mod tests {
             let c = store.begin_check("eve", "pw", PasswordForm::Plain).verify();
             store.set_password("eve", "pw").unwrap();
             assert_eq!(store.finish_check(c), CredentialCheck::Invalid);
-            assert!(store.verify("eve", "pw"), "re-verifies against the new hash");
+            assert!(
+                store.verify("eve", "pw"),
+                "re-verifies against the new hash"
+            );
         }
         let c = store.begin_check("eve", "pw", PasswordForm::Plain).verify();
         store.drop_user("eve").unwrap();
@@ -1733,7 +1805,12 @@ mod tests {
     fn split_credential_checks_tolerate_concurrent_changes() {
         let path = tmp("split");
         let mut raw_hash = [0u8; HASH_LEN];
-        pbkdf2_hmac_sha256(b"danpw", b"0123456789abcdef", PBKDF2_ITERATIONS, &mut raw_hash);
+        pbkdf2_hmac_sha256(
+            b"danpw",
+            b"0123456789abcdef",
+            PBKDF2_ITERATIONS,
+            &mut raw_hash,
+        );
         fs::write(
             &path,
             format!(
@@ -1814,8 +1891,16 @@ mod tests {
         let alice = store.login("alice", "oldpw").unwrap();
         let bob = store.login("bob", "bobpw").unwrap();
         store.set_password("alice", "newpw").unwrap();
-        assert_eq!(store.session_user(&alice), None, "alice's old session is revoked");
-        assert_eq!(store.session_user(&bob).as_deref(), Some("bob"), "others keep theirs");
+        assert_eq!(
+            store.session_user(&alice),
+            None,
+            "alice's old session is revoked"
+        );
+        assert_eq!(
+            store.session_user(&bob).as_deref(),
+            Some("bob"),
+            "others keep theirs"
+        );
         let fresh = store.login("alice", "newpw").unwrap();
         assert_eq!(store.session_user(&fresh).as_deref(), Some("alice"));
         let _ = fs::remove_file(&path);
@@ -1830,13 +1915,19 @@ mod tests {
         let path = tmp("privcol");
         let mut store = UserStore::open(&path, "rootpw").unwrap();
         store
-            .add("zed", "pw", BTreeSet::from([Privilege::Query, Privilege::Update]))
+            .add(
+                "zed",
+                "pw",
+                BTreeSet::from([Privilege::Query, Privilege::Update]),
+            )
             .unwrap();
         let full = fs::read_to_string(&path).unwrap();
         assert!(full.contains("\tquery,update\n"), "{full}");
         for damaged in ["\tquery,upd\n", "\tquery,grant\n"] {
             fs::write(&path, full.replace("\tquery,update\n", damaged)).unwrap();
-            let err = UserStore::open(&path, "rootpw").err().expect("must be refused");
+            let err = UserStore::open(&path, "rootpw")
+                .err()
+                .expect("must be refused");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{damaged:?}");
         }
         // An empty column (a user with no privileges) and a missing one (an
@@ -1918,7 +2009,10 @@ mod tests {
                 !store.has_priv("alice", Privilege::Query),
                 "not on every database"
             );
-            assert!(store.has_priv_on("alice", Privilege::Export, "movie"), "global");
+            assert!(
+                store.has_priv_on("alice", Privilege::Export, "movie"),
+                "global"
+            );
             assert!(store.has_priv_anywhere("alice", Privilege::Update));
             assert!(!store.has_priv_anywhere("alice", Privilege::Backup));
             assert!(store
@@ -2016,7 +2110,11 @@ mod tests {
             .add("carol", "pw", BTreeSet::from([Privilege::Query]))
             .unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("carol"));
-        assert_eq!(fs::read(&link).unwrap(), before, "the old inode is untouched");
+        assert_eq!(
+            fs::read(&link).unwrap(),
+            before,
+            "the old inode is untouched"
+        );
         assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&link);
@@ -2035,7 +2133,9 @@ mod tests {
         assert_eq!(mode(), 0o600, "a new user file is owner-only");
         for m in [0o600, 0o640] {
             fs::set_permissions(&path, fs::Permissions::from_mode(m)).unwrap();
-            store.add(&format!("u{m:o}"), "pw", BTreeSet::new()).unwrap();
+            store
+                .add(&format!("u{m:o}"), "pw", BTreeSet::new())
+                .unwrap();
             assert_eq!(mode(), m);
         }
         let _ = fs::remove_file(&path);
@@ -2050,13 +2150,17 @@ mod tests {
         let path = tmp("torn");
         let mut store = UserStore::open(&path, "operator-root-pw").unwrap();
         for u in ["alice", "bob"] {
-            store.add(u, "pw", BTreeSet::from([Privilege::Query])).unwrap();
+            store
+                .add(u, "pw", BTreeSet::from([Privilege::Query]))
+                .unwrap();
         }
         let full = fs::read_to_string(&path).unwrap();
         // Cut in the middle of the last line (`root`, which sorts last).
         let cut = full.trim_end().len() - 10;
         fs::write(&path, &full[..cut]).unwrap();
-        let err = UserStore::open(&path, "123456").err().expect("must be refused");
+        let err = UserStore::open(&path, "123456")
+            .err()
+            .expect("must be refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("line 3"), "{err}");
         // Nothing was rewritten: the damaged file is left for the operator.

@@ -108,7 +108,11 @@ impl Ini {
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
             // A UTF-8 BOM on the first line is not part of the content.
-            let raw = if idx == 0 { raw.trim_start_matches('\u{feff}') } else { raw };
+            let raw = if idx == 0 {
+                raw.trim_start_matches('\u{feff}')
+            } else {
+                raw
+            };
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
@@ -542,15 +546,26 @@ pub enum ConfigError {
     /// Not one of [`KNOWN_KEYS`] (or an alias).
     UnknownKey(String),
     /// The value does not parse for this key.
-    BadValue { key: String, value: String, expected: &'static str },
+    BadValue {
+        key: String,
+        value: String,
+        expected: &'static str,
+    },
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::UnknownKey(k) => write!(f, "unknown configuration key '{k}'"),
-            ConfigError::BadValue { key, value, expected } => {
-                write!(f, "invalid value '{value}' for '{key}' (expected {expected})")
+            ConfigError::BadValue {
+                key,
+                value,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "invalid value '{value}' for '{key}' (expected {expected})"
+                )
             }
         }
     }
@@ -581,8 +596,10 @@ impl GStoreConfig {
     /// value; unknown keys, misplaced keys and bad values are warnings.
     pub fn apply_ini(&mut self, ini: &Ini) {
         for (line, text) in ini.malformed() {
-            self.warnings
-                .push(format!("line {line}: ignoring unrecognised line '{}'", text.trim()));
+            self.warnings.push(format!(
+                "line {line}: ignoring unrecognised line '{}'",
+                text.trim()
+            ));
         }
         // Keys in their own section first, so a correctly placed key always
         // beats a misplaced copy; within a section the first occurrence wins.
@@ -657,10 +674,14 @@ impl GStoreConfig {
                     .filter(|n| *n >= 1)
                     .ok_or_else(|| bad("a positive integer"))?
             }
-            "max_database_num" => self.max_database_num = parse_num(v).ok_or_else(|| bad("an integer"))?,
+            "max_database_num" => {
+                self.max_database_num = parse_num(v).ok_or_else(|| bad("an integer"))?
+            }
             "max_user_num" => self.max_user_num = parse_num(v).ok_or_else(|| bad("an integer"))?,
             "deamon" => self.deamon = parse_switch(v).ok_or_else(|| bad("on or off"))?,
-            "max_output_size" => self.max_output_size = parse_num(v).ok_or_else(|| bad("an integer"))?,
+            "max_output_size" => {
+                self.max_output_size = parse_num(v).ok_or_else(|| bad("an integer"))?
+            }
             "ip_allow_path" => self.ip_allow_path = parse_opt_path(v),
             "ip_deny_path" => self.ip_deny_path = parse_opt_path(v),
             "listen_addr" => {
@@ -688,9 +709,17 @@ impl GStoreConfig {
             "min_million_memory" => {
                 self.min_million_memory = parse_num(v).ok_or_else(|| bad("an integer (MB)"))?
             }
-            "resource_check" => self.resource_check = parse_switch(v).ok_or_else(|| bad("on or off"))?,
-            "db_home" => self.db_home = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?),
-            "db_suffix" => self.db_suffix = nonempty(v).ok_or_else(|| bad("a suffix such as .db"))?.to_string(),
+            "resource_check" => {
+                self.resource_check = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "db_home" => {
+                self.db_home = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?)
+            }
+            "db_suffix" => {
+                self.db_suffix = nonempty(v)
+                    .ok_or_else(|| bad("a suffix such as .db"))?
+                    .to_string()
+            }
             "root_username" => {
                 self.root_username = nonempty(v).ok_or_else(|| bad("a user name"))?.to_string()
             }
@@ -713,8 +742,12 @@ impl GStoreConfig {
             "querylog_path" => {
                 self.querylog_path = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?)
             }
-            "querylog_days" => self.querylog_days = parse_num(v).ok_or_else(|| bad("a number of days"))?,
-            "accesslog_mode" => self.accesslog_mode = parse_switch(v).ok_or_else(|| bad("0 or 1"))?,
+            "querylog_days" => {
+                self.querylog_days = parse_num(v).ok_or_else(|| bad("a number of days"))?
+            }
+            "accesslog_mode" => {
+                self.accesslog_mode = parse_switch(v).ok_or_else(|| bad("0 or 1"))?
+            }
             "accesslog_path" => {
                 self.accesslog_path = PathBuf::from(nonempty(v).ok_or_else(|| bad("a directory"))?)
             }
@@ -726,7 +759,11 @@ impl GStoreConfig {
                     .map_err(|()| bad("trace, debug, info, warn, error or off"))?;
                 self.log_level = crate::logging::filter_name(level).to_string()
             }
-            "log_file" => self.log_file = nonempty(v).ok_or_else(|| bad("a file path or off"))?.to_string(),
+            "log_file" => {
+                self.log_file = nonempty(v)
+                    .ok_or_else(|| bad("a file path or off"))?
+                    .to_string()
+            }
             "log_days" => self.log_days = parse_num(v).ok_or_else(|| bad("a number of days"))?,
             "log_stderr" => self.log_stderr = parse_switch(v).ok_or_else(|| bad("on or off"))?,
             "backup_path" => {
@@ -1101,7 +1138,11 @@ upload_allow_compress_packages = "zip"
              k1=\n\
              k2 = #not-a-comment\n",
         );
-        assert_eq!(ini.get("b", "k2"), Some("#not-a-comment"), "a value may start with #");
+        assert_eq!(
+            ini.get("b", "k2"),
+            Some("#not-a-comment"),
+            "a value may start with #"
+        );
         assert_eq!(ini.get("", "top"), Some("ignored"));
         assert_eq!(ini.get("a", "k1"), Some("v1"), "first occurrence wins");
         assert_eq!(ini.get("a", "k2"), Some("quoted value"));
@@ -1135,7 +1176,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.system_username, "system");
         assert_eq!(c.pfn_base_path, PathBuf::from("./pfn/"));
         assert_eq!(c.licensetype, "opensource");
-        assert_eq!((c.min_memory, c.min_million_disk, c.min_million_memory), (512, 50, 20));
+        assert_eq!(
+            (c.min_memory, c.min_million_disk, c.min_million_memory),
+            (512, 50, 20)
+        );
         assert!(!c.resource_check && c.check_point && c.build_multi_thread);
         assert_eq!(c.log_mode, "conf/slog.properties");
         assert!(c.querylog_mode && c.accesslog_mode);
@@ -1170,7 +1214,8 @@ upload_allow_compress_packages = "zip"
             let v = c.value(key).unwrap_or_else(|| panic!("value({key})"));
             let mut d = GStoreConfig::default();
             if !v.is_empty() {
-                d.set(key, &v).unwrap_or_else(|e| panic!("set({key}, {v}): {e}"));
+                d.set(key, &v)
+                    .unwrap_or_else(|e| panic!("set({key}, {v}): {e}"));
                 assert_eq!(d.value(key).as_deref(), Some(v.as_str()), "{key}");
             }
         }
@@ -1191,7 +1236,10 @@ upload_allow_compress_packages = "zip"
         // `ip_allow_path=` is empty ⇒ unset; quotes are stripped.
         assert_eq!(c.ip_allow_path, None);
         assert_eq!(c.ip_deny_path, Some(PathBuf::from("./conf/ipDeny.config")));
-        assert_eq!((c.min_memory, c.min_million_disk, c.min_million_memory), (1024, 200, 200));
+        assert_eq!(
+            (c.min_memory, c.min_million_disk, c.min_million_memory),
+            (1024, 200, 200)
+        );
         assert!(!c.build_multi_thread);
         assert_eq!(c.root_password, "123456");
         assert_eq!(c.log_mode, "./conf/slog.properties");
@@ -1217,7 +1265,11 @@ upload_allow_compress_packages = "zip"
         // again.
         assert_eq!(
             c.upload_allow_extensions,
-            [upstream.upload_allow_extensions.clone(), vec!["nq".into(), "trig".into()]].concat()
+            [
+                upstream.upload_allow_extensions.clone(),
+                vec!["nq".into(), "trig".into()]
+            ]
+            .concat()
         );
     }
 
@@ -1289,16 +1341,28 @@ upload_allow_compress_packages = "zip"
                     pfn_max_module_bytes=5000\npfn_max_functions=3\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
-        assert!(KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)), "every key counted as set");
+        assert!(
+            KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)),
+            "every key counted as set"
+        );
         assert_eq!((c.port, c.tcp_port, c.thread_num), (9100, 9200, 4));
-        assert_eq!((c.max_database_num, c.max_user_num, c.max_output_size), (5, 6, 7));
+        assert_eq!(
+            (c.max_database_num, c.max_user_num, c.max_output_size),
+            (5, 6, 7)
+        );
         assert!(c.deamon);
         assert_eq!(c.ip_allow_path, Some(PathBuf::from("allow.txt")));
         assert_eq!(c.ip_deny_path, None, "`off` disables the deny list");
         assert_eq!(c.listen_addr, "0.0.0.0");
-        assert_eq!((c.keep_alive_timeout, c.keep_alive_max, c.queue_size), (0, 3, 0));
+        assert_eq!(
+            (c.keep_alive_timeout, c.keep_alive_max, c.queue_size),
+            (0, 3, 0)
+        );
         assert!(!c.cors);
-        assert_eq!((c.min_memory, c.min_million_disk, c.min_million_memory), (1, 2, 3));
+        assert_eq!(
+            (c.min_memory, c.min_million_disk, c.min_million_memory),
+            (1, 2, 3)
+        );
         assert!(c.resource_check && !c.check_point && !c.build_multi_thread);
         assert_eq!(c.db_home, PathBuf::from("/data/gs"));
         assert_eq!(c.db_suffix, ".gdb");
@@ -1323,7 +1387,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.upload_max_body_size, 1024);
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip", "tar"]);
-        assert_eq!(c.value("upload_allow_compress_packages").unwrap(), "zip|tar");
+        assert_eq!(
+            c.value("upload_allow_compress_packages").unwrap(),
+            "zip|tar"
+        );
         assert_eq!((c.unzip_max_entries, c.unzip_max_size), (12, 4096));
         assert_eq!(c.value("querylog_mode").unwrap(), "0");
         assert_eq!(c.value("deamon").unwrap(), "on");
@@ -1392,7 +1459,10 @@ upload_allow_compress_packages = "zip"
         );
         let w = c.warnings().join("\n");
         assert!(w.contains("invalid value 'chatty' for 'log_level'"), "{w}");
-        assert!(w.contains("'log_days'") && w.contains("'log_stderr'"), "{w}");
+        assert!(
+            w.contains("'log_days'") && w.contains("'log_stderr'"),
+            "{w}"
+        );
         assert!(!c.is_set("log_level") && !c.is_set("log_file"));
         let mut c = GStoreConfig::default();
         c.set("log_level", "OFF").unwrap();
@@ -1421,7 +1491,10 @@ upload_allow_compress_packages = "zip"
             })
         );
         assert_eq!(c.port, 9200, "a rejected override keeps the old value");
-        assert_eq!(c.set("nope", "1"), Err(ConfigError::UnknownKey("nope".into())));
+        assert_eq!(
+            c.set("nope", "1"),
+            Err(ConfigError::UnknownKey("nope".into()))
+        );
     }
 
     #[test]

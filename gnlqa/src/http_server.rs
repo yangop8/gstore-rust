@@ -46,7 +46,11 @@ impl HttpServer {
     /// Bind to `addr` (e.g. `127.0.0.1:0` for an ephemeral port).
     pub fn bind(engine: Arc<SolveEngine>, addr: impl ToSocketAddrs) -> Result<HttpServer> {
         let listener = TcpListener::bind(addr).map_err(|e| Error::Http(e.to_string()))?;
-        Ok(HttpServer { engine, listener, max_conn: 64 })
+        Ok(HttpServer {
+            engine,
+            listener,
+            max_conn: 64,
+        })
     }
 
     /// Cap the number of concurrently-handled connections (excess → 503).
@@ -57,7 +61,9 @@ impl HttpServer {
 
     /// The bound local address (useful after binding to port 0).
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.listener.local_addr().map_err(|e| Error::Http(e.to_string()))
+        self.listener
+            .local_addr()
+            .map_err(|e| Error::Http(e.to_string()))
     }
 
     /// Accept and serve connections forever. Each connection gets socket
@@ -71,7 +77,11 @@ impl HttpServer {
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
             if active.load(Ordering::Acquire) >= self.max_conn {
-                let _ = write_json(&mut stream, 503, &json!({"status":"error","message":"server busy"}));
+                let _ = write_json(
+                    &mut stream,
+                    503,
+                    &json!({"status":"error","message":"server busy"}),
+                );
                 continue;
             }
             active.fetch_add(1, Ordering::AcqRel);
@@ -89,7 +99,11 @@ impl HttpServer {
 fn handle_connection(mut stream: TcpStream, engine: &SolveEngine) -> std::io::Result<()> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let Some((method, path, body)) = read_request(&mut stream, deadline)? else {
-        return write_json(&mut stream, 400, &json!({"status":"error","message":"bad request"}));
+        return write_json(
+            &mut stream,
+            400,
+            &json!({"status":"error","message":"bad request"}),
+        );
     };
 
     let (status, payload) = route(engine, &method, &path, &body);
@@ -120,7 +134,10 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                 // can detect it), unlike the gAnswer-compat /gSolve below.
                 Err(e) => (500, json!({"status":"error","message": e.to_string()})),
             },
-            None => (400, json!({"status":"error","message":"missing 'question'"})),
+            None => (
+                400,
+                json!({"status":"error","message":"missing 'question'"}),
+            ),
         },
         ("POST", "/gSolve") => match question_of(body) {
             Some(q) => match engine.ask(&q) {
@@ -137,9 +154,15 @@ fn route(engine: &SolveEngine, method: &str, path: &str, body: &str) -> (u16, Va
                         "confidence": round3(a.confidence),
                     }),
                 ),
-                Err(e) => (200, json!({"status":"error","question": q, "message": e.to_string()})),
+                Err(e) => (
+                    200,
+                    json!({"status":"error","question": q, "message": e.to_string()}),
+                ),
             },
-            None => (400, json!({"status":"error","message":"missing 'question'"})),
+            None => (
+                400,
+                json!({"status":"error","message":"missing 'question'"}),
+            ),
         },
         _ => (404, json!({"status":"error","message":"not found"})),
     }
@@ -164,7 +187,10 @@ fn citations_json(citations: &[crate::ground::Citation]) -> Value {
 /// Extract `question` from a JSON body (or a raw non-JSON body as the question).
 fn question_of(body: &str) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
-        return v["question"].as_str().map(str::to_string).filter(|s| !s.trim().is_empty());
+        return v["question"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
     }
     let t = body.trim();
     (!t.is_empty()).then(|| t.to_string())
@@ -185,7 +211,10 @@ fn read_request(
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Ok(None);
     };
-    let (method, path) = (method.to_string(), target.split('?').next().unwrap_or("/").to_string());
+    let (method, path) = (
+        method.to_string(),
+        target.split('?').next().unwrap_or("/").to_string(),
+    );
 
     // Headers → find Content-Length (bounded line length AND header count).
     let mut content_length = 0usize;
@@ -214,12 +243,20 @@ fn read_request(
     let Some(body) = read_body(&mut reader, content_length, deadline)? else {
         return Ok(None); // slow-drip body past the deadline
     };
-    Ok(Some((method, path, String::from_utf8_lossy(&body).into_owned())))
+    Ok(Some((
+        method,
+        path,
+        String::from_utf8_lossy(&body).into_owned(),
+    )))
 }
 
 /// Read exactly `len` body bytes, giving up once the request `deadline` passes so
 /// a slow-drip body can't hold the connection open forever.
-fn read_body<R: BufRead>(reader: &mut R, len: usize, deadline: Instant) -> std::io::Result<Option<Vec<u8>>> {
+fn read_body<R: BufRead>(
+    reader: &mut R,
+    len: usize,
+    deadline: Instant,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut body = Vec::with_capacity(len.min(8192));
     let mut chunk = [0u8; 4096];
     let mut got = 0usize;
@@ -267,7 +304,9 @@ fn read_line_capped<R: BufRead>(
             return Ok(None);
         }
     }
-    let s = String::from_utf8_lossy(&buf).trim_end_matches('\r').to_string();
+    let s = String::from_utf8_lossy(&buf)
+        .trim_end_matches('\r')
+        .to_string();
     Ok(Some(s))
 }
 
@@ -298,7 +337,12 @@ mod tests {
     use std::io::Read; // the in-test HTTP client reads the response body
 
     fn answer_row(v: &str) -> Vec<Option<RdfTerm>> {
-        vec![Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })]
+        vec![Some(RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        })]
     }
 
     /// Start an in-process server backed by mocks; return its address.
@@ -338,7 +382,9 @@ mod tests {
         let h = request(addr, "GET", "/health", "");
         assert!(h.contains("\"status\":\"ok\""));
 
-        let a: Value = serde_json::from_str(&request(addr, "POST", "/ask", r#"{"question":"which x?"}"#)).unwrap();
+        let a: Value =
+            serde_json::from_str(&request(addr, "POST", "/ask", r#"{"question":"which x?"}"#))
+                .unwrap();
         assert_eq!(a["values"][0], "http://ex/a");
         assert!(a["sparql"].as_str().unwrap().contains("<http://ex/p>"));
         // citations are now surfaced (was silently dropped) — always an array.
@@ -357,13 +403,17 @@ mod tests {
         s.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
-        assert!(resp.contains("bad request"), "expected 400 for a header flood, got: {resp}");
+        assert!(
+            resp.contains("bad request"),
+            "expected 400 for a header flood, got: {resp}"
+        );
     }
 
     #[test]
     fn gsolve_compat_shape() {
         let addr = start();
-        let g: Value = serde_json::from_str(&request(addr, "POST", "/gSolve", r#"{"question":"q"}"#)).unwrap();
+        let g: Value =
+            serde_json::from_str(&request(addr, "POST", "/gSolve", r#"{"question":"q"}"#)).unwrap();
         assert_eq!(g["status"], "ok");
         assert_eq!(g["answers"][0], "http://ex/a");
         assert_eq!(g["question"], "q");

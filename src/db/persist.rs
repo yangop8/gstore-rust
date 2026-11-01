@@ -928,13 +928,12 @@ impl Database {
     ) -> Result<(Database, import::ImportReport)> {
         let mut db = Database::new(name);
         let mut acc = super::BuildAccumulator::default();
-        let report = import::import_sources(
-            sources,
-            "build",
-            opts,
-            log,
-            &mut |batch: &mut Vec<crate::parser::nquads::Quad>| acc.add(&mut db, batch),
-        )?;
+        let report =
+            import::import_sources(sources, "build", opts, log, &mut |batch: &mut Vec<
+                crate::parser::nquads::Quad,
+            >| {
+                acc.add(&mut db, batch)
+            })?;
         Ok((Database::create_rocksdb(db, acc, dir.as_ref())?, report))
     }
 
@@ -949,7 +948,10 @@ impl Database {
         use crate::backend::rocks::RocksStore;
         // Everything is encoded already: an exhausted id space has failed
         // before anything in `dir` is replaced.
-        let super::BuildAccumulator { default: ids, named } = acc;
+        let super::BuildAccumulator {
+            default: ids,
+            named,
+        } = acc;
         fs::create_dir_all(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
@@ -1470,7 +1472,10 @@ impl Database {
             ];
             for (space, id) in used.into_iter().flatten() {
                 let pending = self.unpersisted_terms.contains(&(space, id))
-                    && !fresh.iter().chain(&retried).any(|(sp, i, _)| (*sp, *i) == (space, id));
+                    && !fresh
+                        .iter()
+                        .chain(&retried)
+                        .any(|(sp, i, _)| (*sp, *i) == (space, id));
                 let key = match space {
                     TermSpace::Predicate => self.dict.predicate_to_string(id),
                     _ => self.dict.id_to_string(id),
@@ -1576,7 +1581,9 @@ impl Database {
             }
             return added;
         }
-        run(&mut self.dict, &mut self.store, &mut |_, store, t| store.insert(t))
+        run(&mut self.dict, &mut self.store, &mut |_, store, t| {
+            store.insert(t)
+        })
     }
 
     /// After id reclamation: rewrite RocksDB's stored dictionary so freed ids
@@ -1599,7 +1606,10 @@ impl Database {
 #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 fn vstree_on_open() -> bool {
     std::env::var("GSTORE_VSTREE_ON_OPEN").is_ok_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -1618,9 +1628,9 @@ fn validate_restored_copy(dir: &Path, kind: StorageKind) -> Result<()> {
             )))
         };
     }
-    Database::open(dir).map(drop).map_err(|e| {
-        GStoreError::Database(format!("the backup is not a readable database: {e}"))
-    })
+    Database::open(dir)
+        .map(drop)
+        .map_err(|e| GStoreError::Database(format!("the backup is not a readable database: {e}")))
 }
 
 /// Reconcile a legacy shadow snapshot found next to `kvstore.kv` (see the

@@ -291,13 +291,25 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(base.join("allowed/f"), b"x").unwrap();
         let p = LoadPolicy::restricted().with_allowed_dir(base.join("allowed"));
-        assert_eq!(p.allowed_local_dir(&inside), Some(std::fs::canonicalize(&inside).unwrap()));
-        assert_eq!(p.allowed_local_dir(&base.join("allowed/sub/../../other")), None);
+        assert_eq!(
+            p.allowed_local_dir(&inside),
+            Some(std::fs::canonicalize(&inside).unwrap())
+        );
+        assert_eq!(
+            p.allowed_local_dir(&base.join("allowed/sub/../../other")),
+            None
+        );
         assert_eq!(p.allowed_local_dir(&outside), None);
-        assert_eq!(p.allowed_local_dir(&base.join("allowed/f")), None, "not a directory");
+        assert_eq!(
+            p.allowed_local_dir(&base.join("allowed/f")),
+            None,
+            "not a directory"
+        );
         assert_eq!(p.allowed_local_dir(&base.join("allowed/missing")), None);
         assert_eq!(LoadPolicy::restricted().allowed_local_dir(&inside), None);
-        assert!(LoadPolicy::permissive().allowed_local_dir(&outside).is_some());
+        assert!(LoadPolicy::permissive()
+            .allowed_local_dir(&outside)
+            .is_some());
         let _ = std::fs::remove_dir_all(&base);
     }
 

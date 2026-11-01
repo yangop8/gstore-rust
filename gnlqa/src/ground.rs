@@ -41,8 +41,14 @@ pub fn gather_citations(
             Ok(SparqlAnswer::Select { vars, rows }) => {
                 let (pi, oi) = (pos(&vars, "p"), pos(&vars, "o"));
                 for r in rows {
-                    let (Some(p), Some(o)) = (cell(&r, pi), cell(&r, oi)) else { continue };
-                    out.push(Citation { subject: format!("<{uri}>"), predicate: p, object: o });
+                    let (Some(p), Some(o)) = (cell(&r, pi), cell(&r, oi)) else {
+                        continue;
+                    };
+                    out.push(Citation {
+                        subject: format!("<{uri}>"),
+                        predicate: p,
+                        object: o,
+                    });
                     if out.len() >= max_total {
                         break;
                     }
@@ -123,18 +129,34 @@ mod tests {
     use crate::llm::MockLlm;
 
     fn uterm(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
     fn lterm(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Literal, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Literal,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
 
     #[test]
     fn gathers_citations_for_uri_answers() {
-        let answer = SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![vec![Some(uterm("http://ex/Berlin"))]] };
+        let answer = SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![vec![Some(uterm("http://ex/Berlin"))]],
+        };
         let triples = SparqlAnswer::Select {
             vars: vec!["p".into(), "o".into()],
-            rows: vec![vec![Some(uterm("http://ex/capitalOf")), Some(uterm("http://ex/Germany"))]],
+            rows: vec![vec![
+                Some(uterm("http://ex/capitalOf")),
+                Some(uterm("http://ex/Germany")),
+            ]],
         };
         let kb = MockKb::new(vec![triples]);
         let c = gather_citations(&kb, &answer, 10, 10, 50).unwrap();
@@ -146,9 +168,14 @@ mod tests {
 
     #[test]
     fn literal_answers_have_no_citations() {
-        let answer = SparqlAnswer::Select { vars: vec!["n".into()], rows: vec![vec![Some(lterm("3.4M"))]] };
+        let answer = SparqlAnswer::Select {
+            vars: vec!["n".into()],
+            rows: vec![vec![Some(lterm("3.4M"))]],
+        };
         let kb = MockKb::new(vec![SparqlAnswer::Boolean(true)]);
-        assert!(gather_citations(&kb, &answer, 10, 10, 50).unwrap().is_empty());
+        assert!(gather_citations(&kb, &answer, 10, 10, 50)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -159,7 +186,10 @@ mod tests {
             object: "<http://ex/Germany>".into(),
         }];
         let good = MockLlm::fixed("Berlin is the capital of Germany.");
-        assert_eq!(explain(&good, "capital?", &cites, None, "en").as_deref(), Some("Berlin is the capital of Germany."));
+        assert_eq!(
+            explain(&good, "capital?", &cites, None, "en").as_deref(),
+            Some("Berlin is the capital of Germany.")
+        );
         let bad = MockLlm::new(vec![]); // errors → None
         assert!(explain(&bad, "q", &cites, None, "en").is_none());
         // no citations → None (don't risk ungrounded prose)

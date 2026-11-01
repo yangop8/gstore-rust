@@ -23,10 +23,7 @@ const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n
 fn tmp_dir(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "gstore_review_it_{tag}_{}_{n}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("gstore_review_it_{tag}_{}_{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -49,7 +46,10 @@ fn snapshot_target(base: &Path) -> PathBuf {
 fn assert_original_intact(target: &Path) {
     let mut db = Database::open(target).expect("the original database still opens");
     assert_eq!(db.triple_num(), 2);
-    assert!(ask(&mut db, "ASK { <http://ex/a> <http://ex/p> <http://ex/b> }"));
+    assert!(ask(
+        &mut db,
+        "ASK { <http://ex/a> <http://ex/p> <http://ex/b> }"
+    ));
     let staged = PathBuf::from(format!("{}.restore-tmp", target.display()));
     assert!(!staged.exists(), "the staged copy is cleaned up");
 }
@@ -59,7 +59,9 @@ fn assert_original_intact(target: &Path) {
 fn garbage_disk_backup(base: &Path) -> PathBuf {
     let bad = base.join("bad_backup");
     std::fs::create_dir_all(&bad).unwrap();
-    let junk: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let junk: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
     std::fs::write(bad.join("kvstore.kv"), junk).unwrap();
     bad
 }
@@ -128,9 +130,15 @@ fn an_interrupted_restore_swap_is_completed_on_open() {
         .unwrap()
         .save(&restored)
         .unwrap();
-    Database::build_from_str("t", DATA).unwrap().save(&old).unwrap();
+    Database::build_from_str("t", DATA)
+        .unwrap()
+        .save(&old)
+        .unwrap();
     let mut db = Database::open(&target).unwrap();
-    assert!(ask(&mut db, "ASK { <http://ex/new> <http://ex/p> <http://ex/o> }"));
+    assert!(ask(
+        &mut db,
+        "ASK { <http://ex/new> <http://ex/p> <http://ex/o> }"
+    ));
     assert!(!restored.exists() && !old.exists());
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -157,7 +165,14 @@ fn request(addr: &SocketAddr, method: &str, target: &str, body: &str) -> (u16, S
     (status, body.to_string())
 }
 
-fn start_api(root: &Path, check_point: bool) -> (Arc<ApiServer>, SocketAddr, thread::JoinHandle<gstore::server::ShutdownReport>) {
+fn start_api(
+    root: &Path,
+    check_point: bool,
+) -> (
+    Arc<ApiServer>,
+    SocketAddr,
+    thread::JoinHandle<gstore::server::ShutdownReport>,
+) {
     let server = Arc::new(
         ApiServer::bind(root, "root", "127.0.0.1:0")
             .unwrap()
@@ -222,7 +237,10 @@ fn api_restore_of_a_corrupt_backup_keeps_the_loaded_database_and_its_changes() {
     let report = serving.join().unwrap();
     assert_eq!(report.saved, vec![root.join("t.db")], "{report:?}");
     on_disk = Database::open(root.join("t.db")).unwrap();
-    assert!(ask(&mut on_disk, "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }"));
+    assert!(ask(
+        &mut on_disk,
+        "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }"
+    ));
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -237,7 +255,10 @@ mod rocks {
 
     fn rocks_db(tag: &str) -> PathBuf {
         let dir = tmp_dir(tag).join("r.db");
-        drop(Database::build_rocksdb_from_str("r", &dir, "<http://a> <http://p> <http://b> .").unwrap());
+        drop(
+            Database::build_rocksdb_from_str("r", &dir, "<http://a> <http://p> <http://b> .")
+                .unwrap(),
+        );
         dir
     }
 
@@ -264,8 +285,14 @@ mod rocks {
         db.commit().unwrap();
         drop(db);
         let mut db = Database::open(&dir).unwrap();
-        assert!(ask(&mut db, "ASK { <http://x> <http://p> <http://y> }"), "committed");
-        assert!(ask(&mut db, "ASK { GRAPH <http://g> { <http://gx> ?p ?o } }"));
+        assert!(
+            ask(&mut db, "ASK { <http://x> <http://p> <http://y> }"),
+            "committed"
+        );
+        assert!(ask(
+            &mut db,
+            "ASK { GRAPH <http://g> { <http://gx> ?p ?o } }"
+        ));
     }
 
     /// Child half of the crash test: open a transaction, write, and die

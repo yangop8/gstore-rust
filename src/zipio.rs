@@ -917,10 +917,18 @@ mod tests {
             let e = write_export(&db, format, &mut FailingReads(Vec::new())).unwrap_err();
             assert!(matches!(e, GStoreError::Database(_)), "{e}");
             assert!(e.to_string().contains("exporting"), "{e}");
-            assert!(e.to_string().contains("injected export read failure"), "{e}");
+            assert!(
+                e.to_string().contains("injected export read failure"),
+                "{e}"
+            );
         }
-        let e = db.export_ntriples(&mut FailingReads(Vec::new())).unwrap_err();
-        assert!(e.to_string().contains("injected export read failure"), "{e}");
+        let e = db
+            .export_ntriples(&mut FailingReads(Vec::new()))
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("injected export read failure"),
+            "{e}"
+        );
         // The errors landed in the export's scope, which is gone again.
         assert!(!in_scope());
         // Without an error the same export succeeds.

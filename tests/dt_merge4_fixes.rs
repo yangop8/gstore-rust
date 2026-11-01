@@ -39,10 +39,7 @@ use harness::{code, http_with, int, ok, path_str, scratch, Server};
 fn tmp_root(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!(
-        "gstore_m4fix_{tag}_{}_{n}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("gstore_m4fix_{tag}_{}_{n}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -68,7 +65,8 @@ fn ask(db: &mut Database, pattern: &str) -> bool {
 }
 
 fn ledger_text(dir: &Path, rule: &str) -> String {
-    fs::read_to_string(dir.join(format!("reason_rule_files/inferred/{rule}.nt"))).unwrap_or_default()
+    fs::read_to_string(dir.join(format!("reason_rule_files/inferred/{rule}.nt")))
+        .unwrap_or_default()
 }
 
 fn status(db: &mut Database, name: &str) -> String {
@@ -195,7 +193,10 @@ fn a_split_ledger_line_never_names_a_victim() {
     assert_eq!(run_rule(&mut db, NEXT2, "next2"), (1, 1));
     assert_eq!(ledger_text(&root, "next2").lines().count(), 1);
     assert_eq!(db.reason_disable("next2").unwrap().removed, 1);
-    assert!(ask(&mut db, "<http://ex/victim> <http://ex/q> <http://ex/o>"));
+    assert!(ask(
+        &mut db,
+        "<http://ex/victim> <http://ex/q> <http://ex/o>"
+    ));
     assert!(!ask(&mut db, "?s <Rule:next2> ?o"));
     let _ = fs::remove_dir_all(&root);
 }
@@ -312,8 +313,7 @@ fn incremental_backups_carry_the_rules_of_their_time() {
     db.reason_disable("r").unwrap();
     db.reason_delete("r").unwrap();
     db.backup_incremental(root2.join("inc2")).unwrap();
-    let mut one =
-        Database::restore_incremental(root2.join("base"), &[root2.join("inc1")]).unwrap();
+    let mut one = Database::restore_incremental(root2.join("base"), &[root2.join("inc1")]).unwrap();
     assert_eq!(one.reason_list().unwrap().len(), 1);
     assert_eq!(one.reason_disable("r").unwrap().removed, 1);
     let mut two = Database::restore_incremental(
@@ -431,7 +431,10 @@ fn data_file(tag: &str) -> (PathBuf, PathBuf) {
 fn a_served_disable_is_saved_even_with_check_point_off() {
     let (data, file) = data_file("cpoff");
     let srv = Srv::start("m4fix_cpoff", &data, false);
-    ok(&srv.op("build", &[("db_name", "fam"), ("db_path", &path_str(&file))]));
+    ok(&srv.op(
+        "build",
+        &[("db_name", "fam"), ("db_path", &path_str(&file))],
+    ));
     ok(&srv.op("load", &[("db_name", "fam")]));
     add_rule(&srv.addr, "fam", NEXT2);
     ok(&reason(&srv.addr, "fam", "3", "next2"));
@@ -516,7 +519,11 @@ fn directory_swaps_wait_for_reason_file_operations() {
     // /api rename
     build("dbfour");
     let (early, r) = while_rule_lock_held(&dir("dbfour"), move || {
-        api(&addr, "rename", &[("db_name", "dbfour"), ("new_name", "dbfive")])
+        api(
+            &addr,
+            "rename",
+            &[("db_name", "dbfour"), ("new_name", "dbfive")],
+        )
     });
     assert_eq!(code(&r), 0, "{r}");
     assert!(!early, "rename waits for the rule lock");

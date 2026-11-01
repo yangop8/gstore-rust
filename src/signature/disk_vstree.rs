@@ -221,7 +221,11 @@ impl DiskTree {
         for i in 0..count {
             let off = OFF_ENTRIES + i * ENTRY_SIZE;
             let sig = Signature::read_le(&buf[off..off + SIG_BYTES]);
-            let value = u32::from_le_bytes(buf[off + SIG_BYTES..off + SIG_BYTES + 4].try_into().unwrap());
+            let value = u32::from_le_bytes(
+                buf[off + SIG_BYTES..off + SIG_BYTES + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             if !sig.contains(query) {
                 continue;
             }
@@ -358,7 +362,10 @@ mod tests {
         }
         let t = DiskTree::build(&path, entries).unwrap();
         let total_pages = t.pager.page_count();
-        assert!(total_pages > 100, "expected a multi-page tree, got {total_pages}");
+        assert!(
+            total_pages > 100,
+            "expected a multi-page tree, got {total_pages}"
+        );
 
         let mut q = Signature::new();
         q.encode_query_edge(Some(1), Some(2024), EdgeDir::Out);

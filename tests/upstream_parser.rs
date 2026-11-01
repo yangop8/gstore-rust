@@ -175,7 +175,14 @@ fn every_case_has_a_test() {
     let src = include_str!("upstream_parser.rs");
     let listed: Vec<usize> = src
         .lines()
-        .filter_map(|l| l.trim().strip_suffix(';')?.split_once("=> ")?.1.parse().ok())
+        .filter_map(|l| {
+            l.trim()
+                .strip_suffix(';')?
+                .split_once("=> ")?
+                .1
+                .parse()
+                .ok()
+        })
         .collect();
     assert_eq!(listed, (1..=TOTAL_CASE).collect::<Vec<_>>());
 }

@@ -56,7 +56,11 @@ fn full_cli_lifecycle() {
 
     // gadd: insert two new triples from an N-Triples file.
     let add_file = tmp("add.nt");
-    std::fs::write(&add_file, "<root> <contain> <nodeADD> .\n<nodeADD> <own> <pZ> .\n").unwrap();
+    std::fs::write(
+        &add_file,
+        "<root> <contain> <nodeADD> .\n<nodeADD> <own> <pZ> .\n",
+    )
+    .unwrap();
     let add = run(
         env!("CARGO_BIN_EXE_gadd"),
         &[name.as_os_str(), add_file.as_os_str()],
@@ -88,7 +92,10 @@ fn full_cli_lifecycle() {
     assert!(exp.status.success(), "gexport failed: {exp:?}");
     let dumped = std::fs::read_to_string(&export).unwrap();
     assert_eq!(dumped.lines().count(), 25, "export line count");
-    assert!(dumped.contains("<root> <contain> <node0> ."), "export: {dumped}");
+    assert!(
+        dumped.contains("<root> <contain> <node0> ."),
+        "export: {dumped}"
+    );
 
     // gbackup then grestore into a new db, which must hold the same 25 triples.
     let backup = tmp("backup_dir");
@@ -110,11 +117,17 @@ fn full_cli_lifecycle() {
     assert!(rs.status.success(), "grestore failed: {rs:?}");
     let show3 = run(env!("CARGO_BIN_EXE_gshow"), &[restored.as_os_str()]);
     let show3_out = String::from_utf8_lossy(&show3.stdout);
-    assert!(show3_out.contains("triples   : 25"), "restored: {show3_out}");
+    assert!(
+        show3_out.contains("triples   : 25"),
+        "restored: {show3_out}"
+    );
 
     // gdrop without confirmation refuses; with --yes it deletes.
     let nodrop = run(env!("CARGO_BIN_EXE_gdrop"), &[name.as_os_str()]);
-    assert!(!nodrop.status.success(), "gdrop should refuse without --yes");
+    assert!(
+        !nodrop.status.success(),
+        "gdrop should refuse without --yes"
+    );
     assert!(std::path::Path::new(&dir).is_dir(), "db must still exist");
 
     let drop = run(

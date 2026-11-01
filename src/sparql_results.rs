@@ -48,7 +48,12 @@ impl ResultFormat {
         if let Some(accept) = accept {
             for media in accept.split(',') {
                 // Drop any `;q=…` / parameters and normalize case.
-                let m = media.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                let m = media
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
                 if let Some(fmt) = ResultFormat::from_media_type(&m) {
                     return fmt;
                 }
@@ -110,7 +115,9 @@ pub fn write_select<W: Write>(fmt: ResultFormat, rs: &ResultSet, w: &mut W) -> i
 /// Serialize an ASK boolean in `fmt`.
 pub fn write_ask<W: Write>(fmt: ResultFormat, value: bool, w: &mut W) -> io::Result<()> {
     match fmt {
-        ResultFormat::Json => w.write_all(format!("{{\"head\":{{}},\"boolean\":{value}}}").as_bytes()),
+        ResultFormat::Json => {
+            w.write_all(format!("{{\"head\":{{}},\"boolean\":{value}}}").as_bytes())
+        }
         ResultFormat::Xml => w.write_all(
             format!(
                 "<?xml version=\"1.0\"?>\n\
@@ -253,9 +260,17 @@ fn binding_xml(cell: &str) -> String {
             lang,
         }) => {
             if let Some(l) = lang {
-                format!("<literal xml:lang={}>{}</literal>", xml_attr(&l), xml_text(&value))
+                format!(
+                    "<literal xml:lang={}>{}</literal>",
+                    xml_attr(&l),
+                    xml_text(&value)
+                )
             } else if let Some(dt) = datatype {
-                format!("<literal datatype={}>{}</literal>", xml_attr(&dt), xml_text(&value))
+                format!(
+                    "<literal datatype={}>{}</literal>",
+                    xml_attr(&dt),
+                    xml_text(&value)
+                )
             } else {
                 format!("<literal>{}</literal>", xml_text(&value))
             }
@@ -470,7 +485,9 @@ pub fn upstream_select_json(rs: &ResultSet, limit: Option<usize>) -> Json {
     Json::obj()
         .with(
             "head",
-            Json::obj().with("link", Json::arr()).with("vars", Json::Arr(vars)),
+            Json::obj()
+                .with("link", Json::arr())
+                .with("vars", Json::Arr(vars)),
         )
         .with("results", Json::obj().with("bindings", Json::Arr(bindings)))
 }
@@ -484,7 +501,11 @@ pub fn upstream_select_json(rs: &ResultSet, limit: Option<usize>) -> Json {
 /// `^^<datatype>` ([`upstream_term_text`]) — so a client strips the quotes
 /// off a graph function's value to get its JSON. At most `limit` rows.
 pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
-    let head: Vec<Json> = rs.vars.iter().map(|v| Json::from(format!("?{v}"))).collect();
+    let head: Vec<Json> = rs
+        .vars
+        .iter()
+        .map(|v| Json::from(format!("?{v}")))
+        .collect();
     let mut rows = Vec::new();
     for row in rs.rows.iter().take(limit.unwrap_or(usize::MAX)) {
         let cells: Vec<Json> = row
@@ -549,7 +570,8 @@ pub fn upstream_tsv(rs: &ResultSet) -> String {
 /// An ASK answer as upstream's one-row `_askResult` table.
 pub fn upstream_ask_result(value: bool) -> ResultSet {
     let mut rs = ResultSet::new(vec!["_askResult".to_string()]);
-    rs.rows.push(vec![Some(format!("\"{value}\"^^<{XSD_BOOLEAN}>"))]);
+    rs.rows
+        .push(vec![Some(format!("\"{value}\"^^<{XSD_BOOLEAN}>"))]);
     rs
 }
 
@@ -579,8 +601,7 @@ mod tests {
             Some("\"he said \\\"hi\\\", ok\"".to_string()),
         ]);
         // Row 2: an IRI with y unbound, plus a typed literal swapped in for x.
-        rs.rows
-            .push(vec![Some("<http://ex/b>".to_string()), None]);
+        rs.rows.push(vec![Some("<http://ex/b>".to_string()), None]);
         rs
     }
 
@@ -592,7 +613,10 @@ mod tests {
 
     #[test]
     fn negotiate_param_beats_accept_and_defaults_to_json() {
-        assert_eq!(ResultFormat::negotiate(Some("csv"), None), ResultFormat::Csv);
+        assert_eq!(
+            ResultFormat::negotiate(Some("csv"), None),
+            ResultFormat::Csv
+        );
         assert_eq!(
             ResultFormat::negotiate(Some("xml"), Some("text/csv")),
             ResultFormat::Xml
@@ -606,7 +630,10 @@ mod tests {
             ResultFormat::negotiate(None, Some("text/html, text/csv;q=0.9")),
             ResultFormat::Csv
         );
-        assert_eq!(ResultFormat::negotiate(None, Some("*/*")), ResultFormat::Json);
+        assert_eq!(
+            ResultFormat::negotiate(None, Some("*/*")),
+            ResultFormat::Json
+        );
         assert_eq!(ResultFormat::negotiate(None, None), ResultFormat::Json);
         assert_eq!(
             ResultFormat::negotiate(Some("garbage"), None),
@@ -620,10 +647,7 @@ mod tests {
         let mut lines = csv.split("\r\n");
         assert_eq!(lines.next().unwrap(), "x,y");
         // The literal value (lexical only) has a comma + quotes, so it is quoted.
-        assert_eq!(
-            lines.next().unwrap(),
-            r#"http://ex/a,"he said ""hi"", ok""#
-        );
+        assert_eq!(lines.next().unwrap(), r#"http://ex/a,"he said ""hi"", ok""#);
         // y is unbound -> empty trailing field.
         assert_eq!(lines.next().unwrap(), "http://ex/b,");
     }
@@ -661,8 +685,7 @@ mod tests {
     #[test]
     fn xml_escapes_markup_in_values() {
         let mut rs = ResultSet::new(vec!["v".to_string()]);
-        rs.rows
-            .push(vec![Some("\"a < b & c > d\"".to_string())]);
+        rs.rows.push(vec![Some("\"a < b & c > d\"".to_string())]);
         let xml = render(ResultFormat::Xml, &rs);
         assert!(xml.contains("<literal>a &lt; b &amp; c &gt; d</literal>"));
     }
@@ -683,7 +706,10 @@ mod tests {
     fn ask_formats() {
         let mut buf = Vec::new();
         write_ask(ResultFormat::Json, true, &mut buf).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "{\"head\":{},\"boolean\":true}");
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "{\"head\":{},\"boolean\":true}"
+        );
 
         let mut buf = Vec::new();
         write_ask(ResultFormat::Csv, false, &mut buf).unwrap();
@@ -700,7 +726,10 @@ mod tests {
     #[test]
     fn upstream_term_encodings() {
         let enc = |cell: &str| upstream_binding(cell).to_string();
-        assert_eq!(enc("<http://ex/a>"), r#"{"type":"uri","value":"http://ex/a"}"#);
+        assert_eq!(
+            enc("<http://ex/a>"),
+            r#"{"type":"uri","value":"http://ex/a"}"#
+        );
         assert_eq!(enc("\"plain\""), r#"{"type":"literal","value":"plain"}"#);
         assert_eq!(
             enc("\"chat\"@fr"),
@@ -712,7 +741,10 @@ mod tests {
         );
         assert_eq!(enc("_:b7"), r#"{"type":"bnode","value":"_:b7"}"#);
         // Escapes are decoded into the value, then JSON-escaped.
-        assert_eq!(enc("\"a\\\"b\\nc\""), r#"{"type":"literal","value":"a\"b\nc"}"#);
+        assert_eq!(
+            enc("\"a\\\"b\\nc\""),
+            r#"{"type":"literal","value":"a\"b\nc"}"#
+        );
     }
 
     #[test]
@@ -725,13 +757,31 @@ mod tests {
             j.get("head").unwrap().to_string(),
             r#"{"link":[],"vars":["x","y"]}"#
         );
-        let b = j.get("results").unwrap().get("bindings").unwrap().as_array().unwrap();
+        let b = j
+            .get("results")
+            .unwrap()
+            .get("bindings")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(b.len(), 3);
         assert!(b[1].get("y").is_none(), "unbound cells are omitted");
-        assert_eq!(b[0].get("y").unwrap().get("value").unwrap().as_str(), Some("he said \"hi\", ok"));
+        assert_eq!(
+            b[0].get("y").unwrap().get("value").unwrap().as_str(),
+            Some("he said \"hi\", ok")
+        );
         // The limit counts rows before empty ones are dropped (as upstream).
         let j = upstream_select_json(&rs, Some(3));
-        assert_eq!(j.get("results").unwrap().get("bindings").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(
+            j.get("results")
+                .unwrap()
+                .get("bindings")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -772,12 +822,23 @@ mod tests {
                 "_:b0",
             ]
         );
-        assert_eq!(upstream_ntriple_json(&rs, Some(1)).get("results").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            upstream_ntriple_json(&rs, Some(1))
+                .get("results")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             upstream_tsv(&rs),
             "?x\t?y\n<http://ex/a>\t\"he said \\\"hi\\\", ok\"\n<http://ex/b>\t\n"
         );
-        assert_eq!(upstream_tsv(&ResultSet::new(vec!["x".into()])), "[empty result]\n");
+        assert_eq!(
+            upstream_tsv(&ResultSet::new(vec!["x".into()])),
+            "[empty result]\n"
+        );
     }
 
     #[test]

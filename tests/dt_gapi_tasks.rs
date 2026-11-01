@@ -912,7 +912,10 @@ fn graph_function_queries_are_cancelled_like_any_query() {
         &[
             ("operation", "query"),
             ("db_name", "slow"),
-            ("sparql", "SELECT (PR(true, {}, 1, alpha=0.85, maxIter=5, tol=0.1) AS ?pr) WHERE {}"),
+            (
+                "sparql",
+                "SELECT (PR(true, {}, 1, alpha=0.85, maxIter=5, tol=0.1) AS ?pr) WHERE {}",
+            ),
         ],
     );
     assert_eq!(code(&j), 0, "{j}");
@@ -941,7 +944,12 @@ fn shutdown_cancels_a_running_graph_function_query() {
         started.elapsed()
     );
     let r = query.join().unwrap();
-    assert!(r.body.to_lowercase().contains("cancel"), "{} {}", r.status, r.body);
+    assert!(
+        r.body.to_lowercase().contains("cancel"),
+        "{} {}",
+        r.status,
+        r.body
+    );
 }
 
 /// An UPDATE whose WHERE clause runs that same graph function (in a
@@ -1065,7 +1073,10 @@ fn graph_function_output_is_bounded_by_the_server_setting() {
     let all = "SELECT (kHopNeighbor(<http://ex/s1>, false, 2, {}) AS ?n) WHERE {}";
     let paths = "SELECT (PR(true, {}, -1, alpha=0.85, maxIter=5, tol=0.1) AS ?pr) WHERE {}";
     for q in [all, paths] {
-        let j = api(&addr, &[("operation", "query"), ("db_name", "big"), ("sparql", q)]);
+        let j = api(
+            &addr,
+            &[("operation", "query"), ("db_name", "big"), ("sparql", q)],
+        );
         if q == paths {
             assert_ne!(code(&j), 0, "300 vertices' scores exceed 64 bytes: {j}");
             assert!(msg(&j).contains("bytes"), "{j}");
@@ -1079,7 +1090,14 @@ fn graph_function_output_is_bounded_by_the_server_setting() {
             assert_eq!(r.status, 200, "{}", r.body);
         }
     }
-    let j = api(&addr, &[("operation", "query"), ("db_name", "big"), ("sparql", "ASK { ?s ?p ?o }")]);
+    let j = api(
+        &addr,
+        &[
+            ("operation", "query"),
+            ("db_name", "big"),
+            ("sparql", "ASK { ?s ?p ?o }"),
+        ],
+    );
     assert_eq!(code(&j), 0, "{j}");
 }
 

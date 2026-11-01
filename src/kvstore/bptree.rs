@@ -260,7 +260,13 @@ impl<'a> NodeView<'a> {
 
     /// Entry `i` of a uniform leaf (see [`ukey`](Self::ukey)).
     #[inline]
-    fn ukv(&self, stride: usize, klen: usize, vlen: usize, i: usize) -> Result<(&'a [u8], &'a [u8])> {
+    fn ukv(
+        &self,
+        stride: usize,
+        klen: usize,
+        vlen: usize,
+        i: usize,
+    ) -> Result<(&'a [u8], &'a [u8])> {
         let at = 7 + i * stride;
         if u16_in(self.page, at) != klen || u16_in(self.page, at + 2 + klen) != vlen {
             return Err(corrupt("entry size differs from its node's layout"));
@@ -1163,7 +1169,11 @@ impl BTree {
             };
         }
         let ci = node.keys.partition_point(|k| k.as_slice() <= key);
-        let child_page = if ci == 0 { node.link } else { node.children[ci - 1] };
+        let child_page = if ci == 0 {
+            node.link
+        } else {
+            node.children[ci - 1]
+        };
         let removed = self.delete_rec(pager, child_page, key)?;
         if removed {
             let child = Node::parse(&pager.read_page(child_page)?);
@@ -1495,10 +1505,7 @@ mod tests {
         t.insert(&mut pg, b"bob", b"2").unwrap();
         t.insert(&mut pg, b"carol", b"3").unwrap();
         assert_eq!(t.get(&pg, b"bob").unwrap().as_deref(), Some(&b"2"[..]));
-        assert_eq!(
-            t.get(&pg, b"alice").unwrap().as_deref(),
-            Some(&b"1"[..])
-        );
+        assert_eq!(t.get(&pg, b"alice").unwrap().as_deref(), Some(&b"1"[..]));
         assert_eq!(t.get(&pg, b"dave").unwrap(), None);
         std::fs::remove_file(&path).ok();
     }
@@ -1525,9 +1532,9 @@ mod tests {
         let count_via_scan = |prefix: &[u8]| t.scan_prefix(&pg, prefix).unwrap().len();
         for prefix in [
             &[][..],
-            &be32(1)[..],           // a = 1  → 12
-            &be32(2)[..],           // a = 2  → 12
-            &be32(3)[..],           // absent → 0
+            &be32(1)[..], // a = 1  → 12
+            &be32(2)[..], // a = 2  → 12
+            &be32(3)[..], // absent → 0
             &{
                 let mut p = [0u8; 8];
                 p[0..4].copy_from_slice(&be32(1));
@@ -1965,7 +1972,10 @@ mod tests {
                 let hit = want.first().map(|(_, v)| v.clone());
                 assert_eq!(t.get(&pg, p).unwrap(), hit);
                 assert_eq!(t.contains(&pg, p).unwrap(), !want.is_empty());
-                assert_eq!(t.get_with(&pg, p, |v| v.len()).unwrap(), want.first().map(|e| e.1.len()));
+                assert_eq!(
+                    t.get_with(&pg, p, |v| v.len()).unwrap(),
+                    want.first().map(|e| e.1.len())
+                );
             }
         }
         // The cursor walks the whole tree in order.
@@ -1998,8 +2008,14 @@ mod tests {
         for k in keys.iter().step_by(4) {
             shaped.delete(&mut pg, k).unwrap();
         }
-        assert!(shaped.insert(&mut pg, b"short", b"").is_err(), "wrong key size");
-        assert!(shaped.insert(&mut pg, &[0u8; 12], b"v").is_err(), "wrong value size");
+        assert!(
+            shaped.insert(&mut pg, b"short", b"").is_err(),
+            "wrong key size"
+        );
+        assert!(
+            shaped.insert(&mut pg, &[0u8; 12], b"v").is_err(),
+            "wrong value size"
+        );
         let mut prefixes: Vec<Vec<u8>> = vec![Vec::new()];
         for _ in 0..200 {
             let mut p = be32(rng.below(52) as u32).to_vec();
@@ -2030,7 +2046,10 @@ mod tests {
             assert_eq!(shaped.count_prefix(&pg, p).unwrap(), want.len());
             assert_eq!(shaped.prefix_exists(&pg, p).unwrap(), !want.is_empty());
             if p.len() == 12 {
-                assert_eq!(shaped.contains(&pg, p).unwrap(), plain.contains(&pg, p).unwrap());
+                assert_eq!(
+                    shaped.contains(&pg, p).unwrap(),
+                    plain.contains(&pg, p).unwrap()
+                );
             }
         }
         // A leaf that only looks uniform (a middle entry's key length is

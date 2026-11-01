@@ -758,10 +758,7 @@ impl<'a> PagerOp<'a> {
     /// Open a bracket on `pager`.
     pub fn begin(pager: &'a mut Pager) -> PagerOp<'a> {
         pager.begin_op();
-        PagerOp {
-            pager,
-            done: false,
-        }
+        PagerOp { pager, done: false }
     }
 
     /// End the bracket (see [`Pager::end_op`]).
@@ -1027,10 +1024,14 @@ mod tests {
             pg.write_page(a, &[9u8; PAGE_SIZE]).unwrap();
             pg.flush().unwrap(); // commit the allocation
             pg.write_page(a, &[5u8; PAGE_SIZE]).unwrap(); // dirty, never flushed
-            // drop without flushing ⇒ the second write is lost
+                                                          // drop without flushing ⇒ the second write is lost
         }
         let pg = Pager::open(&path, 16).unwrap();
-        assert_eq!(pg.read_page(a).unwrap()[0], 9, "uncommitted write must be lost");
+        assert_eq!(
+            pg.read_page(a).unwrap()[0],
+            9,
+            "uncommitted write must be lost"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1186,7 +1187,10 @@ mod tests {
             }
         }
         assert_eq!(pg.dirty_pages(), 3);
-        assert!(pg.cached_pages() <= 8, "clean pages are evicted to stay in capacity");
+        assert!(
+            pg.cached_pages() <= 8,
+            "clean pages are evicted to stay in capacity"
+        );
         assert_eq!(pg.flush_count(), flushes, "reads never commit");
         for &id in &ids[..3] {
             let cache = pg.cache.lock().unwrap();
@@ -1285,10 +1289,20 @@ mod tests {
         let mut op = PagerOp::begin(&mut pg);
         let ids = big_op(&mut op, 50, 100);
         assert_eq!(op.flush_count(), before, "no commit inside an operation");
-        assert!(op.cached_pages() > op.capacity(), "the cache overshoots instead");
-        assert!(op.flush().is_err(), "an explicit commit mid-operation is refused");
+        assert!(
+            op.cached_pages() > op.capacity(),
+            "the cache overshoots instead"
+        );
+        assert!(
+            op.flush().is_err(),
+            "an explicit commit mid-operation is refused"
+        );
         op.commit().unwrap();
-        assert_eq!(pg.flush_count(), before + 1, "end_op commits the oversize op");
+        assert_eq!(
+            pg.flush_count(),
+            before + 1,
+            "end_op commits the oversize op"
+        );
         assert!(pg.cached_pages() <= pg.capacity(), "capacity restored");
         assert_eq!(pg.dirty_pages(), 0);
         drop(pg);
@@ -1307,7 +1321,11 @@ mod tests {
         let mut op = PagerOp::begin(&mut pg);
         big_op(&mut op, 5, 0);
         op.commit().unwrap();
-        assert_eq!(pg.flush_count(), before, "an op within capacity stays cached");
+        assert_eq!(
+            pg.flush_count(),
+            before,
+            "an op within capacity stays cached"
+        );
         assert_eq!(pg.dirty_pages(), 5);
         cleanup(&path);
     }
@@ -1414,7 +1432,10 @@ mod tests {
                 inner.write_page(a, &page_with(3)).unwrap();
                 // inner dropped without commit
             }
-            assert!(outer.commit().is_err(), "a failed nested op fails the outer one");
+            assert!(
+                outer.commit().is_err(),
+                "a failed nested op fails the outer one"
+            );
         }
         assert_eq!(pg.page_count(), count);
         assert_eq!(tag_of(&pg.read_page(a).unwrap()), 1);
@@ -1438,7 +1459,9 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..8], format::MAGIC_V1);
         assert!(
-            bytes[16 + format::NROOTS_V1 * 8..PAGE_SIZE].iter().all(|&b| b == 0),
+            bytes[16 + format::NROOTS_V1 * 8..PAGE_SIZE]
+                .iter()
+                .all(|&b| b == 0),
             "a V1 header has nothing past the pre-Phase-6 root slots"
         );
         let pg = Pager::open(&path, 16).unwrap();
@@ -1463,14 +1486,20 @@ mod tests {
         // V2 + an unknown (undefined) bit.
         patch_header(&path, 0, format::MAGIC_V2);
         patch_header(&path, feat_off, &(1u64 << 33).to_le_bytes());
-        let e = Pager::open(&path, 16).err().expect("unknown bit refused").to_string();
+        let e = Pager::open(&path, 16)
+            .err()
+            .expect("unknown bit refused")
+            .to_string();
         assert!(e.contains("feature bits"), "{e}");
         // V2 + a defined bit this binary does not implement yet.
         patch_header(&path, feat_off, &format::FEATURE_LONG_KEYS.to_le_bytes());
         assert!(Pager::open(&path, 16).is_err());
         // V2 without features.
         patch_header(&path, feat_off, &0u64.to_le_bytes());
-        let e = Pager::open(&path, 16).err().expect("V2 without bits refused").to_string();
+        let e = Pager::open(&path, 16)
+            .err()
+            .expect("V2 without bits refused")
+            .to_string();
         assert!(e.contains("without feature bits"), "{e}");
         // V1 with features.
         patch_header(&path, 0, format::MAGIC_V1);
@@ -1496,7 +1525,10 @@ mod tests {
                 pg.enable_feature(format::FEATURE_FREE_IDS).is_err(),
                 "not implemented by this binary yet"
             );
-            assert!(pg.enable_feature_with(1 << 20, u64::MAX).is_err(), "undefined bit");
+            assert!(
+                pg.enable_feature_with(1 << 20, u64::MAX).is_err(),
+                "undefined bit"
+            );
             let a = pg.alloc().unwrap();
             pg.write_page(a, &page_with(5)).unwrap();
             pg.enable_feature_with(format::FEATURE_FREE_IDS, format::DEFINED_FEATURES)
@@ -1513,10 +1545,20 @@ mod tests {
             pg.flush().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[0..8], format::MAGIC_V2, "the bit and V2 commit together");
+        assert_eq!(
+            &bytes[0..8],
+            format::MAGIC_V2,
+            "the bit and V2 commit together"
+        );
         let feat_off = 16 + format::FEATURES * 8;
-        assert_eq!(&bytes[feat_off..feat_off + 8], &format::FEATURE_FREE_IDS.to_le_bytes());
-        assert!(Pager::open(&path, 16).is_err(), "this binary refuses the new feature");
+        assert_eq!(
+            &bytes[feat_off..feat_off + 8],
+            &format::FEATURE_FREE_IDS.to_le_bytes()
+        );
+        assert!(
+            Pager::open(&path, 16).is_err(),
+            "this binary refuses the new feature"
+        );
         cleanup(&path);
     }
 }

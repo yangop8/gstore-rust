@@ -125,8 +125,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gstore::config::{GStoreConfig, DEFAULT_ROOT_PASSWORD};
 use gstore::http_api::ApiServer;
 use gstore::logging::{self, LogConfig};
-use gstore::{gs_announce, gs_error, gs_info, gs_warn};
 use gstore::server::{shutdown_on_signals, Server, ShutdownHandle, ShutdownReport};
+use gstore::{gs_announce, gs_error, gs_info, gs_warn};
 use gstore::{Database, LoadPolicy, StorageKind};
 
 /// Set in the environment of a server started by `-b` (recorded in the pid
@@ -276,7 +276,9 @@ impl Cli {
         let mut i = 0;
         let value = |i: &mut usize, flag: &str| -> Result<OsString, String> {
             *i += 1;
-            args.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
         };
         while i < args.len() {
             let arg = args[i].to_string_lossy().into_owned();
@@ -292,7 +294,9 @@ impl Cli {
             };
             if let Some(m) = mode {
                 if cli.mode.is_some_and(|old| old != m) {
-                    return Err(format!("only one of -s/-b/-t/-r/-k/-S may be given (got {arg} too)"));
+                    return Err(format!(
+                        "only one of -s/-b/-t/-r/-k/-S may be given (got {arg} too)"
+                    ));
                 }
                 cli.mode = Some(m);
                 i += 1;
@@ -335,9 +339,15 @@ impl Cli {
                 "--allow-unauthenticated" => cli.allow_unauthenticated = true,
                 "--pid-file" => cli.pid_file = Some(value(&mut i, &arg)?.into()),
                 "--log-file" => cli.log_file = Some(value(&mut i, &arg)?.into()),
-                "--tls-cert" => cli.tls_cert = Some(value(&mut i, &arg)?.to_string_lossy().into_owned()),
-                "--tls-key" => cli.tls_key = Some(value(&mut i, &arg)?.to_string_lossy().into_owned()),
-                s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option '{s}'")),
+                "--tls-cert" => {
+                    cli.tls_cert = Some(value(&mut i, &arg)?.to_string_lossy().into_owned())
+                }
+                "--tls-key" => {
+                    cli.tls_key = Some(value(&mut i, &arg)?.to_string_lossy().into_owned())
+                }
+                s if s.starts_with('-') && s.len() > 1 => {
+                    return Err(format!("unknown option '{s}'"))
+                }
                 _ => {
                     if cli.dir.is_some() {
                         return Err(format!("more than one directory given ('{arg}')"));
@@ -380,7 +390,10 @@ fn load_config(cli: &Cli) -> GStoreConfig {
         Some(path) => match GStoreConfig::load(path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("gserver: cannot read configuration file '{}': {e}", path.display());
+                eprintln!(
+                    "gserver: cannot read configuration file '{}': {e}",
+                    path.display()
+                );
                 std::process::exit(1);
             }
         },
@@ -389,7 +402,10 @@ fn load_config(cli: &Cli) -> GStoreConfig {
             if default.is_file() {
                 GStoreConfig::load(default).unwrap_or_else(|e| {
                     let mut c = GStoreConfig::default();
-                    c.warn(format!("cannot read '{}': {e}; using defaults", default.display()));
+                    c.warn(format!(
+                        "cannot read '{}': {e}; using defaults",
+                        default.display()
+                    ));
                     c
                 })
             } else {
@@ -760,7 +776,10 @@ fn start_background(cli: &Cli, target: &Target) -> u8 {
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(Some(st)) = child.try_wait() {
-                eprintln!("gserver: the server failed to start ({st}); log '{}':", log.display());
+                eprintln!(
+                    "gserver: the server failed to start ({st}); log '{}':",
+                    log.display()
+                );
                 eprint!("{}", log_tail(log, log_start));
                 return 1;
             }
@@ -771,7 +790,11 @@ fn start_background(cli: &Cli, target: &Target) -> u8 {
                         "gserver started in the background (pid {}), listening on http://{addr}",
                         info.pid
                     );
-                    gstore::outln!("gserver: log file '{}', pid file '{}'", log.display(), target.pid_file.display());
+                    gstore::outln!(
+                        "gserver: log file '{}', pid file '{}'",
+                        log.display(),
+                        target.pid_file.display()
+                    );
                     return 0;
                 }
             }
@@ -794,11 +817,8 @@ fn start_background(cli: &Cli, target: &Target) -> u8 {
 fn live_supervisor(target: &Target) -> Option<u32> {
     let info = read_pid_file(&target.pid_file)?;
     let pid = info.supervisor;
-    (pid != 0
-        && pid != std::process::id()
-        && proc_util::alive(pid)
-        && proc_util::is_gserver(pid))
-    .then_some(pid)
+    (pid != 0 && pid != std::process::id() && proc_util::alive(pid) && proc_util::is_gserver(pid))
+        .then_some(pid)
 }
 
 fn stop(target: &Target) -> u8 {
@@ -852,7 +872,10 @@ fn stop(target: &Target) -> u8 {
     }
     // A supervisor ends by itself once its server exits normally.
     if info.supervisor != 0 && !proc_util::wait_exit(info.supervisor, Duration::from_secs(10)) {
-        eprintln!("gserver: supervisor pid {} is still running", info.supervisor);
+        eprintln!(
+            "gserver: supervisor pid {} is still running",
+            info.supervisor
+        );
     }
     remove_pid_file_of(&target.pid_file, info.pid);
     gstore::outln!("the Server [{}] stop successfully.", info.pid);
@@ -911,12 +934,20 @@ fn status(target: &Target) -> u8 {
             gstore::outln!("\tActive: active (running)");
             gstore::outln!("\tMain PID: {}", info.pid);
             if let Some(a) = info.addr {
-                let answering = if info.answers() { "" } else { " (not answering)" };
+                let answering = if info.answers() {
+                    ""
+                } else {
+                    " (not answering)"
+                };
                 gstore::outln!("\tAddress: http://{a}{answering}");
             }
             gstore::outln!(
                 "\tStarted: {}",
-                if info.background { "in the background (-b)" } else { "in the foreground" }
+                if info.background {
+                    "in the background (-b)"
+                } else {
+                    "in the foreground"
+                }
             );
             if info.supervisor != 0 {
                 gstore::outln!("\tSupervisor PID: {} (deamon=on)", info.supervisor);
@@ -924,7 +955,9 @@ fn status(target: &Target) -> u8 {
         }
         None => match live_supervisor(target) {
             Some(sup) => {
-                gstore::outln!("\tActive: activating (the server stopped; its supervisor restarts it)");
+                gstore::outln!(
+                    "\tActive: activating (the server stopped; its supervisor restarts it)"
+                );
                 gstore::outln!("\tSupervisor PID: {sup} (deamon=on)");
             }
             None => gstore::outln!("\tActive: inactive (dead)"),
@@ -1010,7 +1043,10 @@ fn supervise(cli: &Cli) -> u8 {
             let abnormal = status.signal().is_some() || status.code() == Some(101);
             if !abnormal || stopping.load(Ordering::SeqCst) {
                 gs_announce!("gserver: server stopped ({status}); supervisor exiting");
-                return status.code().and_then(|c| u8::try_from(c).ok()).unwrap_or(1);
+                return status
+                    .code()
+                    .and_then(|c| u8::try_from(c).ok())
+                    .unwrap_or(1);
             }
             if started.elapsed() > Duration::from_secs(60) {
                 backoff = Duration::from_secs(1);
@@ -1075,7 +1111,11 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                 // gserver owns the diagnostic log: refreshconf re-reads it.
                 Ok(s) => s.with_load_policy(load_policy).with_log_refresh(),
                 Err(e) => {
-                    gs_error!("failed to start API server at {}:{}: {e}", cfg.listen_addr, cfg.port);
+                    gs_error!(
+                        "failed to start API server at {}:{}: {e}",
+                        cfg.listen_addr,
+                        cfg.port
+                    );
                     return 1;
                 }
             };
@@ -1103,7 +1143,13 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                 );
             }
             let local = server.local_addr().ok();
-            announce_pid(target, local, server.system_password(), background, supervisor);
+            announce_pid(
+                target,
+                local,
+                server.system_password(),
+                background,
+                supervisor,
+            );
             let handle = server.shutdown_handle();
             install_signals(&handle);
             gs_announce!(
@@ -1218,7 +1264,11 @@ fn announce_pid(
         supervisor,
     };
     match write_pid_file(&target.pid_file, &info) {
-        Ok(()) => gs_announce!("gserver: pid {} (pid file '{}')", info.pid, target.pid_file.display()),
+        Ok(()) => gs_announce!(
+            "gserver: pid {} (pid file '{}')",
+            info.pid,
+            target.pid_file.display()
+        ),
         Err(e) => gs_warn!(
             "cannot write pid file '{}': {e} (-t/-S/-k will not find this server)",
             target.pid_file.display()
@@ -1294,7 +1344,9 @@ fn reexec(cli: &Cli) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(self_exe()).args(cli.start_args()).exec();
+        let err = std::process::Command::new(self_exe())
+            .args(cli.start_args())
+            .exec();
         gs_error!("restart failed: {err}");
     }
     #[cfg(not(unix))]
@@ -1395,8 +1447,8 @@ fn load_policy_for(dirs: &[String], allow_service: bool) -> LoadPolicy {
 /// stand-in could later be saved over the real database.
 fn open_or_exit(dir: &str, expect_rocksdb: bool) -> Database {
     let path = Path::new(dir);
-    let is_empty_dir = path.is_dir()
-        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
+    let is_empty_dir =
+        path.is_dir() && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none());
     if !path.exists() || is_empty_dir {
         if expect_rocksdb {
             gs_error!("--rocksdb given but '{dir}' holds no database");
@@ -1493,7 +1545,9 @@ mod proc_util {
             .and_then(|s| {
                 // `pid (comm) S ...` — comm may contain spaces/parens.
                 let rest = &s[s.rfind(')')? + 1..];
-                rest.split_whitespace().next().map(|st| st == "Z" || st == "X")
+                rest.split_whitespace()
+                    .next()
+                    .map(|st| st == "Z" || st == "X")
             })
             .unwrap_or(false)
     }
@@ -1563,7 +1617,15 @@ mod tests {
             assert!(cli(&[flag]).unwrap().mode() == mode, "{flag}");
         }
         // Legacy invocations keep working.
-        let c = cli(&["db/lubm.db", "--port", "0", "--no-checkpoint", "--load-dir", "x"]).unwrap();
+        let c = cli(&[
+            "db/lubm.db",
+            "--port",
+            "0",
+            "--no-checkpoint",
+            "--load-dir",
+            "x",
+        ])
+        .unwrap();
         assert_eq!(c.dir.as_deref(), Some(Path::new("db/lubm.db")));
         assert!(c.no_checkpoint && c.port == Some(0) && c.load_dirs == ["x"]);
         assert!(!c.allow_service && cli(&["--allow-service"]).unwrap().allow_service);
@@ -1575,7 +1637,11 @@ mod tests {
         assert!(cli(&["-p"]).is_err());
         assert!(cli(&["--bogus"]).is_err());
         assert!(cli(&["a", "b"]).is_err());
-        for bad in [["--thread-num", "0"], ["--thread-num", "x"], ["--db-home", " "]] {
+        for bad in [
+            ["--thread-num", "0"],
+            ["--thread-num", "x"],
+            ["--db-home", " "],
+        ] {
             assert!(cli(&bad).is_err(), "{bad:?}");
         }
         assert!(cli(&["--thread-num"]).is_err());
@@ -1601,7 +1667,10 @@ mod tests {
         assert_eq!(t.kind, Kind::Single(PathBuf::from("/data/lubm.db/")));
         assert_eq!(t.pid_file, PathBuf::from("/data/lubm.db.pid"));
         assert_eq!(t.log_file, PathBuf::from("/data/lubm.db.log"));
-        let t = Target::resolve(&cli(&["--pid-file", "/run/g.pid", "--log-file", "/var/g.log"]).unwrap(), &cfg);
+        let t = Target::resolve(
+            &cli(&["--pid-file", "/run/g.pid", "--log-file", "/var/g.log"]).unwrap(),
+            &cfg,
+        );
         assert_eq!(t.pid_file, PathBuf::from("/run/g.pid"));
         assert_eq!(t.log_file, PathBuf::from("/var/g.log"));
     }
@@ -1611,22 +1680,54 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gserver_unit_cfg_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let ini = dir.join("conf.ini");
-        fs::write(&ini, "[server]\nport=9555\nthread_num=3\n[system]\nroot_password=fromfile\ncheck_point=on\n").unwrap();
+        fs::write(
+            &ini,
+            "[server]\nport=9555\nthread_num=3\n[system]\nroot_password=fromfile\ncheck_point=on\n",
+        )
+        .unwrap();
         let ini_s = ini.to_string_lossy().into_owned();
         let c = load_config(&cli(&["-S", "-c", &ini_s]).unwrap());
-        assert_eq!((c.port, c.thread_num, c.root_password.as_str()), (9555, 3, "fromfile"));
+        assert_eq!(
+            (c.port, c.thread_num, c.root_password.as_str()),
+            (9555, 3, "fromfile")
+        );
         assert!(c.check_point);
         let c = load_config(
-            &cli(&["-S", "-c", &ini_s, "-p", "9600", "--password", "cli", "--no-checkpoint"]).unwrap(),
+            &cli(&[
+                "-S",
+                "-c",
+                &ini_s,
+                "-p",
+                "9600",
+                "--password",
+                "cli",
+                "--no-checkpoint",
+            ])
+            .unwrap(),
         );
-        assert_eq!((c.port, c.thread_num, c.root_password.as_str()), (9600, 3, "cli"));
+        assert_eq!(
+            (c.port, c.thread_num, c.root_password.as_str()),
+            (9600, 3, "cli")
+        );
         assert!(!c.check_point);
         // --thread-num and --db-home override the file too; --db-home also
         // roots a bare `--api`.
         let c = load_config(
-            &cli(&["-S", "-c", &ini_s, "--thread-num", "5", "--db-home", "/srv/h"]).unwrap(),
+            &cli(&[
+                "-S",
+                "-c",
+                &ini_s,
+                "--thread-num",
+                "5",
+                "--db-home",
+                "/srv/h",
+            ])
+            .unwrap(),
         );
-        assert_eq!((c.thread_num, c.db_home.as_path()), (5, Path::new("/srv/h")));
+        assert_eq!(
+            (c.thread_num, c.db_home.as_path()),
+            (5, Path::new("/srv/h"))
+        );
         assert_eq!(c.http_options().threads, 5);
         let args = cli(&["--api", "--db-home", "/srv/h"]).unwrap();
         let t = Target::resolve(&args, &load_config(&args));
@@ -1647,7 +1748,10 @@ mod tests {
         assert_eq!(info.connect_addr(), Some("127.0.0.1:9000".parse().unwrap()));
         // Upstream's three-line format still parses.
         let up = PidInfo::parse("4242\nsecret\n0\n").unwrap();
-        assert_eq!((up.pid, up.system_password.as_str(), up.background), (4242, "secret", false));
+        assert_eq!(
+            (up.pid, up.system_password.as_str(), up.background),
+            (4242, "secret", false)
+        );
         assert_eq!((up.addr, up.supervisor), (None, 0));
         // pid 0 / negative / huge would make kill(2) signal process groups.
         assert_eq!(PidInfo::parse("0\n"), None);
@@ -1663,7 +1767,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "the pid file holds the system password");
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the pid file holds the system password"
+            );
         }
         remove_pid_file_of(&path, 1);
         assert!(path.exists(), "only removed when it names the given pid");

@@ -870,7 +870,9 @@ impl Gserver {
             .spawn()
             .unwrap();
         let srv = Gserver { child, port };
-        wait_for("gserver", || TcpStream::connect(("127.0.0.1", port)).is_ok());
+        wait_for("gserver", || {
+            TcpStream::connect(("127.0.0.1", port)).is_ok()
+        });
         srv
     }
 
@@ -989,7 +991,9 @@ fn reasoning_commands_run_a_rules_whole_lifecycle() {
     let last_list = out.rfind("| ruleid | rulename | description").unwrap();
     assert!(!out[last_list..].contains("| 1 "), "{r:?}");
     assert!(dir.join("dbhome/small.db/reason_rule_files").is_dir());
-    assert!(!dir.join("dbhome/small.db/reason_rule_files/holds.json").exists());
+    assert!(!dir
+        .join("dbhome/small.db/reason_rule_files/holds.json")
+        .exists());
     assert_eq!(r.code, 1, "the failing commands set the exit code: {r:?}");
 }
 
@@ -1002,9 +1006,7 @@ fn pfn_file(name: &str, key: &str, host: &str) -> String {
         .with("funDesc", format!("{host} as JSON"))
         .with(
             "funSubs",
-            format!(
-                "(data (i32.const 0) \"{open}\") (data (i32.const 32) \"}}\")",
-            ),
+            format!("(data (i32.const 0) \"{open}\") (data (i32.const 32) \"}}\")",),
         )
         .with(
             "funBody",
@@ -1029,8 +1031,16 @@ fn function_commands_run_a_pfn_lifecycle() {
     let dir = scratch("gc_pfn_life");
     let _dir = DirGuard(dir.clone());
     let srv = Gserver::start(&dir, "pfn_base_path=./pfnhome/\n");
-    fs::write(dir.join("vcount.json"), pfn_file("vcount", "n", "vertex_count")).unwrap();
-    fs::write(dir.join("ecount.json"), pfn_file("vcount", "e", "edge_count")).unwrap();
+    fs::write(
+        dir.join("vcount.json"),
+        pfn_file("vcount", "n", "vertex_count"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("ecount.json"),
+        pfn_file("vcount", "e", "edge_count"),
+    )
+    .unwrap();
     let small = path_str(&data("small/small.nt"));
     let call = r#"select (PFN.vcount({}) AS ?r) where {};"#;
     let per_var = r#"SELECT ?x (PFN.vcount({"src":"?x"}) AS ?r) WHERE { <root> <contain> ?x };"#;
@@ -1109,7 +1119,10 @@ fn function_commands_run_a_pfn_lifecycle() {
     // source.
     assert!(dir.join("pfnhome/src/root/data.json").is_file(), "{r:?}");
     assert!(!dir.join("pfnhome/src/root/vcount.wat").exists(), "{r:?}");
-    assert!(!out.contains("Update ans num"), "a PFN answer is not an update: {r:?}");
+    assert!(
+        !out.contains("Update ans num"),
+        "a PFN answer is not an update: {r:?}"
+    );
     assert_eq!(r.code, 1, "the failing commands set the exit code: {r:?}");
 }
 

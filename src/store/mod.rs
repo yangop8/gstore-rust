@@ -739,13 +739,17 @@ impl TripleStore {
     /// Distinct subjects appearing with predicate `p` (gStore: `pre2sub`),
     /// from the maintained statistics: O(log P).
     pub fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        self.pred_stats.get(&pred).map_or(0, |&(subjects, _)| subjects)
+        self.pred_stats
+            .get(&pred)
+            .map_or(0, |&(subjects, _)| subjects)
     }
 
     /// Distinct objects appearing with predicate `p` (gStore: `pre2obj`),
     /// from the maintained statistics: O(log P).
     pub fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        self.pred_stats.get(&pred).map_or(0, |&(_, objects)| objects)
+        self.pred_stats
+            .get(&pred)
+            .map_or(0, |&(_, objects)| objects)
     }
 }
 
@@ -916,7 +920,10 @@ mod tests {
         }
         fn check(s: &TripleStore) {
             for p in 0..9u32 {
-                assert_eq!((s.pred_distinct_subj(p), s.pred_distinct_obj(p)), brute(s, p));
+                assert_eq!(
+                    (s.pred_distinct_subj(p), s.pred_distinct_obj(p)),
+                    brute(s, p)
+                );
             }
             let mut fresh = s.clone();
             fresh.recompute_pred_stats();

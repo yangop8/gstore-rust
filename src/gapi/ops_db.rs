@@ -596,7 +596,12 @@ fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<In
         if !seen.insert(r.as_str()) {
             continue;
         }
-        let failed = || GResp::error(Status::OperationFailed, format!("Download file '{r}' failed."));
+        let failed = || {
+            GResp::error(
+                Status::OperationFailed,
+                format!("Download file '{r}' failed."),
+            )
+        };
         if !import::is_url(r) {
             return Err(failed());
         }
@@ -617,7 +622,13 @@ fn remote_sources(ctx: &Ctx<'_>, requested: &[String], param: &str) -> Result<In
             .strip_suffix(&format!(".{ext}"))
             .unwrap_or(name)
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let body = import::fetch_url_with(r, import::DEFAULT_MAX_DOCUMENT_BYTES, refuse_local)
             .map_err(|_| failed())?;
@@ -818,9 +829,10 @@ fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
     if slot.db.csr_is_cached() {
         return Ok(true);
     }
-    slot.db.preload_csr().map(|()| false).map_err(|e| {
-        GResp::error(Status::OperationFailed, format!("load csr fail: {e}"))
-    })
+    slot.db
+        .preload_csr()
+        .map(|()| false)
+        .map_err(|e| GResp::error(Status::OperationFailed, format!("load csr fail: {e}")))
 }
 
 /// `load` — open `db_name` (any layout: snapshot, on-disk, RocksDB) and serve
@@ -1213,20 +1225,20 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(l) => l,
         Err(e) => return fail(e.to_string()),
     };
-    progress(
-        &format!("parsing {} RDF file(s)", inputs.sources.len()),
-        0,
-    );
-    let (built, report) =
-        match Database::build_from_sources(db.clone(), &inputs.sources, &load_options(), &mut log)
-        {
-            Ok(b) => b,
-            Err(e) => {
-                drop(log);
-                let _ = fs::remove_dir_all(&staging);
-                return fail(e.to_string());
-            }
-        };
+    progress(&format!("parsing {} RDF file(s)", inputs.sources.len()), 0);
+    let (built, report) = match Database::build_from_sources(
+        db.clone(),
+        &inputs.sources,
+        &load_options(),
+        &mut log,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            drop(log);
+            let _ = fs::remove_dir_all(&staging);
+            return fail(e.to_string());
+        }
+    };
     drop(log);
     drop(inputs);
     progress("saving the database", report.statements);
@@ -1939,7 +1951,8 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         if loaded.is_some() {
             if let Ok(old) = Database::open(&dir) {
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
+                let slot =
+                    DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
         }
@@ -1949,7 +1962,13 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         match Database::open(&dir) {
             Ok(restored) => {
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(restored, dir.clone(), false, &st.load_policy, &st.query_settings);
+                let slot = DbSlot::handle(
+                    restored,
+                    dir.clone(),
+                    false,
+                    &st.load_policy,
+                    &st.query_settings,
+                );
                 st.dbs.insert(db.clone(), slot);
             }
             Err(e) => return fail(format!("the restored copy could not be opened: {e}")),
@@ -2223,13 +2242,11 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
 /// named-graph quads (`build`'s `success_num`).
 fn statement_count(db: &Database) -> u64 {
     db.triple_num()
-        + db
-            .named_graphs()
+        + db.named_graphs()
             .values()
             .map(|g| g.triple_count())
             .sum::<u64>()
 }
-
 
 #[cfg(test)]
 mod tests {

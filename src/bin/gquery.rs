@@ -93,7 +93,8 @@ fn main() -> ExitCode {
         },
         // Upstream enters an interactive console here; use gconsole.
         (None, None) => {
-            return TOOL.usage_error("no query given (use -q FILE or -e QUERY; gconsole is interactive)")
+            return TOOL
+                .usage_error("no query given (use -q FILE or -e QUERY; gconsole is interactive)")
         }
     };
     let name = &name;

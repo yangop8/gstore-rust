@@ -150,10 +150,10 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::analytics::csr::{CsrGraph, Direction, EdgeDir, Node, PredFilter};
-pub use from_ast::{iri_entity, iri_node, GCall, PredSetArg};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId, INVALID_ENTITY_LITERAL_ID};
+pub use from_ast::{iri_entity, iri_node, GCall, PredSetArg};
 
 // ---------------------------------------------------------------------------
 // function kinds

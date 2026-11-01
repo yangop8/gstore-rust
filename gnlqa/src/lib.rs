@@ -40,8 +40,8 @@ pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
 pub use eval::{
-    load_lcquad, load_qald, normalize_answer, prf1, run_eval, EvalOptions, EvalQuestion, EvalReport,
-    Metrics,
+    load_lcquad, load_qald, normalize_answer, prf1, run_eval, EvalOptions, EvalQuestion,
+    EvalReport, Metrics,
 };
 pub use generate::{generate_candidates, parse_candidates};
 pub use graphrag::{
@@ -57,13 +57,15 @@ pub use kb::{
     sparql_escape_literal, validate_readonly_sparql, validate_sparql, GStoreClient, KbClient,
     MockKb, RdfTerm, SparqlAnswer, TermKind,
 };
-pub use lang::{abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang};
+pub use lang::{
+    abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang,
+};
 pub use link::{local_name, Candidate, LinkKind, Linker};
-pub use mcp::McpServer;
-pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, OpenAiClient, Role};
+pub use mcp::McpServer;
 pub use pipeline::{Answer, AskEngine, Provenance};
 pub use repair::{solve_with_repair, RepairOutcome};
+pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
+pub use secret::Secret;
 pub use session::{rewrite_followup, Session};
 pub use solve::{best_of, score_outcome, Mode, SolveEngine};
-pub use secret::Secret;

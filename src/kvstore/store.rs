@@ -378,18 +378,12 @@ impl DiskStore {
         opts: &import::ImportOptions,
         log: &mut dyn import::ErrorLog,
     ) -> Result<import::ImportReport> {
-        import::import_sources(
-            sources,
-            "build",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| {
-                for q in batch.drain(..) {
-                    self.insert_quad(&q)?;
-                }
-                Ok(())
-            },
-        )
+        import::import_sources(sources, "build", opts, log, &mut |batch: &mut Vec<Quad>| {
+            for q in batch.drain(..) {
+                self.insert_quad(&q)?;
+            }
+            Ok(())
+        })
     }
 
     /// Insert one imported quad (a default-graph triple when it has no graph;
@@ -492,7 +486,10 @@ impl DiskStore {
     /// inside the operation (a bug) is rolled back and returned as an error
     /// the same way, instead of unwinding through the write guard: that would
     /// poison the pager for every reader and writer sharing it.
-    fn write_op<R>(&mut self, f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>) -> Result<R> {
+    fn write_op<R>(
+        &mut self,
+        f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>,
+    ) -> Result<R> {
         self.check_writable()?;
         let before = self.counters();
         self.stats_undo.clear();
@@ -559,8 +556,7 @@ impl DiskStore {
             return Ok(id);
         }
         let id = crate::dict::checked_predicate_id(u64::from(self.pred_count))?;
-        self.predicate2id
-            .insert(pager, key.as_bytes(), &be32(id))?;
+        self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
         // id2predicate is integer-keyed by the dense predicate id.
         self.id2predicate.insert(pager, id, key.as_bytes())?;
         self.pred_count += 1;
@@ -636,10 +632,12 @@ impl DiskStore {
     /// [`insert_keys`](Self::insert_keys)). Returns `false` if any term is
     /// unknown or the triple is absent. Dictionary entries are kept.
     pub fn delete_keys(&mut self, s: &str, p: &str, o: &str, o_is_literal: bool) -> Result<bool> {
-        self.write_op(|st, pg| match st.lookup_keys_in(pg, s, p, o, o_is_literal)? {
-            Some(t) => st.delete_ids_in(pg, t),
-            None => Ok(false),
-        })
+        self.write_op(
+            |st, pg| match st.lookup_keys_in(pg, s, p, o, o_is_literal)? {
+                Some(t) => st.delete_ids_in(pg, t),
+                None => Ok(false),
+            },
+        )
     }
 
     /// Resolve a triple's keys to ids without interning (`None` if any term is
@@ -713,7 +711,12 @@ impl DiskStore {
         })
     }
 
-    fn insert_quad_ids_in(&mut self, pager: &mut Pager, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+    fn insert_quad_ids_in(
+        &mut self,
+        pager: &mut Pager,
+        g: EntityLiteralId,
+        t: IdTriple,
+    ) -> Result<bool> {
         let key = key4(g, t.sub, t.pred, t.obj);
         if self.gspo.contains(pager, &key)? {
             return Ok(false);
@@ -724,7 +727,12 @@ impl DiskStore {
         Ok(true)
     }
 
-    fn delete_quad_ids_in(&mut self, pager: &mut Pager, g: EntityLiteralId, t: IdTriple) -> Result<bool> {
+    fn delete_quad_ids_in(
+        &mut self,
+        pager: &mut Pager,
+        g: EntityLiteralId,
+        t: IdTriple,
+    ) -> Result<bool> {
         if !self.gspo.delete(pager, &key4(g, t.sub, t.pred, t.obj))? {
             return Ok(false);
         }
@@ -801,10 +809,7 @@ impl DiskStore {
             return;
         }
         self.vstree_stale = false;
-        self.pager
-            .write()
-            .unwrap()
-            .set_root(ROOT_VSTREE_STALE, 0);
+        self.pager.write().unwrap().set_root(ROOT_VSTREE_STALE, 0);
     }
 
     /// Insert one triple by id: the three indexes, the counters and the
@@ -1148,16 +1153,27 @@ impl DiskStore {
     }
 
     /// `s p o` — does this exact triple exist?
-    pub fn try_exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> io::Result<bool> {
+    pub fn try_exists(
+        &self,
+        s: EntityLiteralId,
+        p: PredId,
+        o: EntityLiteralId,
+    ) -> io::Result<bool> {
         io(self.spo.contains(&self.read_pager(), &key3(s, p, o)))
     }
 
     /// `s ? ?` → `(pred, obj)` pairs, sorted.
     pub fn try_po_by_s(&self, s: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
         let mut out = Vec::new();
-        io(scan_keys(&self.spo, &self.read_pager(), &be32(s), 12, |k| {
-            out.push((id_at(k, 4), id_at(k, 8)));
-        }))?;
+        io(scan_keys(
+            &self.spo,
+            &self.read_pager(),
+            &be32(s),
+            12,
+            |k| {
+                out.push((id_at(k, 4), id_at(k, 8)));
+            },
+        ))?;
         Ok(out)
     }
 
@@ -1188,9 +1204,15 @@ impl DiskStore {
     pub fn try_p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> io::Result<Vec<PredId>> {
         // OSP key = (o, s, p); prefix (o, s) → p.
         let mut out = Vec::new();
-        io(scan_keys(&self.osp, &self.read_pager(), &cat(o, s), 12, |k| {
-            out.push(id_at(k, 8));
-        }))?;
+        io(scan_keys(
+            &self.osp,
+            &self.read_pager(),
+            &cat(o, s),
+            12,
+            |k| {
+                out.push(id_at(k, 8));
+            },
+        ))?;
         Ok(out)
     }
 
@@ -1198,9 +1220,15 @@ impl DiskStore {
     pub fn try_ps_by_o(&self, o: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
         // OSP key = (o, s, p): the scan yields (s, p) order; sort to (p, s).
         let mut out = Vec::new();
-        io(scan_keys(&self.osp, &self.read_pager(), &be32(o), 12, |k| {
-            out.push((id_at(k, 8), id_at(k, 4)));
-        }))?;
+        io(scan_keys(
+            &self.osp,
+            &self.read_pager(),
+            &be32(o),
+            12,
+            |k| {
+                out.push((id_at(k, 8), id_at(k, 4)));
+            },
+        ))?;
         out.sort_unstable();
         Ok(out)
     }
@@ -1208,9 +1236,15 @@ impl DiskStore {
     /// `? p o` → subjects, ascending.
     pub fn try_s_by_po(&self, p: PredId, o: EntityLiteralId) -> io::Result<Vec<EntityLiteralId>> {
         let mut out = Vec::new();
-        io(scan_keys(&self.pos, &self.read_pager(), &cat(p, o), 12, |k| {
-            out.push(id_at(k, 8));
-        }))?;
+        io(scan_keys(
+            &self.pos,
+            &self.read_pager(),
+            &cat(p, o),
+            12,
+            |k| {
+                out.push(id_at(k, 8));
+            },
+        ))?;
         Ok(out)
     }
 
@@ -1218,9 +1252,15 @@ impl DiskStore {
     pub fn try_so_by_p(&self, p: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
         // POS key = (p, o, s): the scan yields (o, s) order; sort to (s, o).
         let mut out = with_hint(self.stat(p).0.into());
-        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
-            out.push((id_at(k, 8), id_at(k, 4)));
-        }))?;
+        io(scan_keys(
+            &self.pos,
+            &self.read_pager(),
+            &be32(p),
+            12,
+            |k| {
+                out.push((id_at(k, 8), id_at(k, 4)));
+            },
+        ))?;
         out.sort_unstable();
         Ok(out)
     }
@@ -1228,9 +1268,15 @@ impl DiskStore {
     /// Distinct subjects of predicate `p`, ascending.
     pub fn try_subs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
         let mut out = with_hint(self.stat(p).1.into());
-        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
-            out.push(id_at(k, 8));
-        }))?;
+        io(scan_keys(
+            &self.pos,
+            &self.read_pager(),
+            &be32(p),
+            12,
+            |k| {
+                out.push(id_at(k, 8));
+            },
+        ))?;
         out.sort_unstable();
         out.dedup();
         Ok(out)
@@ -1239,12 +1285,18 @@ impl DiskStore {
     /// Distinct objects of predicate `p`, ascending (POS order needs no sort).
     pub fn try_objs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
         let mut out: Vec<u32> = with_hint(self.stat(p).2.into());
-        io(scan_keys(&self.pos, &self.read_pager(), &be32(p), 12, |k| {
-            let o = id_at(k, 4);
-            if out.last() != Some(&o) {
-                out.push(o);
-            }
-        }))?;
+        io(scan_keys(
+            &self.pos,
+            &self.read_pager(),
+            &be32(p),
+            12,
+            |k| {
+                let o = id_at(k, 4);
+                if out.last() != Some(&o) {
+                    out.push(o);
+                }
+            },
+        ))?;
         Ok(out)
     }
 
@@ -1388,22 +1440,34 @@ impl DiskStore {
     /// Number of distinct predicates among `po_by_s(s)`.
     pub fn try_distinct_p_of_s(&self, s: EntityLiteralId) -> io::Result<u64> {
         let (mut n, mut last) = (0u64, None);
-        io(scan_keys(&self.spo, &self.read_pager(), &be32(s), 12, |k| {
-            let p = id_at(k, 4);
-            if last != Some(p) {
-                n += 1;
-                last = Some(p);
-            }
-        }))?;
+        io(scan_keys(
+            &self.spo,
+            &self.read_pager(),
+            &be32(s),
+            12,
+            |k| {
+                let p = id_at(k, 4);
+                if last != Some(p) {
+                    n += 1;
+                    last = Some(p);
+                }
+            },
+        ))?;
         Ok(n)
     }
 
     /// Number of distinct predicates among `ps_by_o(o)`.
     pub fn try_distinct_p_of_o(&self, o: EntityLiteralId) -> io::Result<u64> {
         let mut ps: Vec<u32> = Vec::new();
-        io(scan_keys(&self.osp, &self.read_pager(), &be32(o), 12, |k| {
-            ps.push(id_at(k, 8));
-        }))?;
+        io(scan_keys(
+            &self.osp,
+            &self.read_pager(),
+            &be32(o),
+            12,
+            |k| {
+                ps.push(id_at(k, 8));
+            },
+        ))?;
         ps.sort_unstable();
         ps.dedup();
         Ok(ps.len() as u64)
@@ -1467,9 +1531,10 @@ impl DiskStore {
             }
         };
         // OSP keys of literal objects sort after every entity object.
-        let next_entity_obj = |cur: &mut super::bptree::LeafCursor| -> io::Result<Option<[u32; 3]>> {
-            Ok(next(cur)?.filter(|k| !is_literal_id(k[0])))
-        };
+        let next_entity_obj =
+            |cur: &mut super::bptree::LeafCursor| -> io::Result<Option<[u32; 3]>> {
+                Ok(next(cur)?.filter(|k| !is_literal_id(k[0])))
+            };
         let mut s_head = next(&mut spo)?;
         let mut o_head = next_entity_obj(&mut osp)?;
         let (mut out, mut inn) = (Vec::new(), Vec::new());
@@ -2083,7 +2148,10 @@ mod tests {
             let (dict, _) = ds.to_memory().unwrap();
             dict.entity_id(&Term::iri("node1").dict_key()).unwrap()
         };
-        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+        let own = ds
+            .predicate_id(&Term::iri("own").dict_key())
+            .unwrap()
+            .unwrap();
         let point0 = {
             let (dict, _) = ds.to_memory().unwrap();
             dict.entity_id(&Term::iri("point0").dict_key()).unwrap()
@@ -2119,12 +2187,24 @@ mod tests {
         let path = tmp("keys");
         {
             let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
-            assert!(ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap());
-            assert!(!ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true).unwrap(), "dup");
-            assert!(ds.delete_keys("<root>", "<contain>", "<node0>", false).unwrap());
+            assert!(ds
+                .insert_keys("<new>", "<rel>", "\"lit\"@en", true)
+                .unwrap());
+            assert!(
+                !ds.insert_keys("<new>", "<rel>", "\"lit\"@en", true)
+                    .unwrap(),
+                "dup"
+            );
+            assert!(ds
+                .delete_keys("<root>", "<contain>", "<node0>", false)
+                .unwrap());
             // Unknown terms and wrong id spaces are simply absent.
-            assert!(!ds.delete_keys("<ghost>", "<contain>", "<node0>", false).unwrap());
-            assert!(!ds.delete_keys("<new>", "<rel>", "\"lit\"@en", false).unwrap());
+            assert!(!ds
+                .delete_keys("<ghost>", "<contain>", "<node0>", false)
+                .unwrap());
+            assert!(!ds
+                .delete_keys("<new>", "<rel>", "\"lit\"@en", false)
+                .unwrap());
             ds.flush().unwrap();
         }
         let ds = DiskStore::open(&path, 64).unwrap();
@@ -2142,12 +2222,26 @@ mod tests {
         let path = tmp("quads");
         {
             let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
-            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap());
-            assert!(ds.insert_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
-            assert!(ds.insert_quad_keys("<g2>", "<root>", "<contain>", "<node0>", false).unwrap());
-            assert!(!ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false).unwrap(), "dup");
-            assert!(ds.delete_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true).unwrap());
-            assert!(!ds.delete_quad_keys("<g9>", "<a>", "<p>", "<b>", false).unwrap());
+            assert!(ds
+                .insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false)
+                .unwrap());
+            assert!(ds
+                .insert_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true)
+                .unwrap());
+            assert!(ds
+                .insert_quad_keys("<g2>", "<root>", "<contain>", "<node0>", false)
+                .unwrap());
+            assert!(
+                !ds.insert_quad_keys("<g1>", "<a>", "<p>", "<b>", false)
+                    .unwrap(),
+                "dup"
+            );
+            assert!(ds
+                .delete_quad_keys("<g1>", "<a>", "<p>", "\"x\"", true)
+                .unwrap());
+            assert!(!ds
+                .delete_quad_keys("<g9>", "<a>", "<p>", "<b>", false)
+                .unwrap());
             ds.flush().unwrap();
         }
         let ds = DiskStore::open(&path, 64).unwrap();
@@ -2181,10 +2275,12 @@ mod tests {
             let mut ds = DiskStore::open(&path, 64).unwrap();
             assert!(!ds.vstree_stale(), "fresh persists");
             // A named-graph write does not affect the default-graph index …
-            ds.insert_quad_keys("<g>", "<a>", "<p>", "<b>", false).unwrap();
+            ds.insert_quad_keys("<g>", "<a>", "<p>", "<b>", false)
+                .unwrap();
             assert!(!ds.vstree_stale());
             // … a default-graph delete does, and the flag is committed with it.
-            ds.delete_keys("<node1>", "<own>", "<point0>", false).unwrap();
+            ds.delete_keys("<node1>", "<own>", "<point0>", false)
+                .unwrap();
             assert!(ds.vstree_stale());
             ds.flush().unwrap();
         }
@@ -2198,9 +2294,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ttl = dir.join("d.ttl");
-        std::fs::write(&ttl, "@prefix ex: <http://ex/> .\nex:a ex:p ex:b , ex:c .\n").unwrap();
+        std::fs::write(
+            &ttl,
+            "@prefix ex: <http://ex/> .\nex:a ex:p ex:b , ex:c .\n",
+        )
+        .unwrap();
         let nq = dir.join("d.nq");
-        std::fs::write(&nq, "<http://ex/d> <http://ex/p> <http://ex/e> <http://ex/g> .\n").unwrap();
+        std::fs::write(
+            &nq,
+            "<http://ex/d> <http://ex/p> <http://ex/e> <http://ex/g> .\n",
+        )
+        .unwrap();
         let ds = DiskStore::build_files(dir.join("kv"), 64, &[&ttl, &nq]).unwrap();
         // The N-Quads statement keeps its graph: two default-graph triples and
         // one named-graph quad (no longer flattened into the default graph).
@@ -2224,7 +2328,11 @@ mod tests {
         // term → id goes straight to the B+tree and caches no string.
         let node1 = dict.entity_id(&Term::iri("node1").dict_key()).unwrap();
         let own = dict.predicate_id(&Term::iri("own").dict_key()).unwrap();
-        assert_eq!(ds.resident_string_count(), 0, "term→id must not materialize");
+        assert_eq!(
+            ds.resident_string_count(),
+            0,
+            "term→id must not materialize"
+        );
 
         // id → str materializes exactly the looked-up strings.
         assert_eq!(dict.id_to_string(node1), Some("<node1>"));
@@ -2248,12 +2356,18 @@ mod tests {
         let n = 300u32;
         let mut content = String::new();
         for i in 0..n {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         let ds = DiskStore::build_str(&path, 64, &content).unwrap();
         // s0..s(n-1) and o0..o(n-1) are distinct entities; p is a predicate.
         assert_eq!(ds.entity_num(), 2 * n as usize);
-        assert_eq!(ds.resident_string_count(), 0, "nothing resident before a query");
+        assert_eq!(
+            ds.resident_string_count(),
+            0,
+            "nothing resident before a query"
+        );
 
         let res = ds
             .query("SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }")
@@ -2286,7 +2400,9 @@ mod tests {
         let n = 50u32;
         let mut content = String::new();
         for i in 0..n {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         let ds = DiskStore::build_str(&path, 64, &content).unwrap();
         let sparql = "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }";
@@ -2322,7 +2438,9 @@ mod tests {
     fn hub_store(path: &std::path::Path, n: u32) -> DiskStore {
         let mut content = String::new();
         for i in 0..n {
-            content.push_str(&format!("<http://ex/hub> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/hub> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         DiskStore::build_str(path, 64, &content).unwrap()
     }
@@ -2527,10 +2645,14 @@ mod tests {
         let path = tmp("vlist_mixed");
         let mut content = String::new();
         for i in 0..5u32 {
-            content.push_str(&format!("<http://ex/small> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/small> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         for i in 0..6000u32 {
-            content.push_str(&format!("<http://ex/big> <http://ex/p> <http://ex/b{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/big> <http://ex/p> <http://ex/b{i}> .\n"
+            ));
         }
         let mut ds = DiskStore::build_str(&path, 64, &content).unwrap();
         let small = ds.term_id(&Term::iri("http://ex/small")).unwrap().unwrap();
@@ -2598,7 +2720,10 @@ mod tests {
 
         // Direct id→string round-trip (entity + literal).
         let subj = ds.term_id(&Term::iri(&long_iri)).unwrap().unwrap();
-        assert_eq!(ds.id_to_string(subj).unwrap().unwrap(), format!("<{long_iri}>"));
+        assert_eq!(
+            ds.id_to_string(subj).unwrap().unwrap(),
+            format!("<{long_iri}>")
+        );
 
         // Full query path (uses the out-of-core DiskDict, also IvArray-backed).
         let res = ds
@@ -2607,8 +2732,14 @@ mod tests {
         match res {
             QueryResult::Select(rs) => {
                 assert_eq!(rs.row_count(), 1);
-                assert_eq!(rs.rows[0][0].as_deref(), Some(format!("<{long_iri}>").as_str()));
-                assert_eq!(rs.rows[0][1].as_deref(), Some(format!("\"{long_lit}\"").as_str()));
+                assert_eq!(
+                    rs.rows[0][0].as_deref(),
+                    Some(format!("<{long_iri}>").as_str())
+                );
+                assert_eq!(
+                    rs.rows[0][1].as_deref(),
+                    Some(format!("\"{long_lit}\"").as_str())
+                );
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
@@ -2638,8 +2769,16 @@ mod tests {
     /// Assert the maintained statistics equal the authoritative scan.
     fn assert_stats_consistent(ds: &DiskStore) {
         let (subs, objs, per_pred) = scan_stats(ds);
-        assert_eq!(ds.distinct_subject_count(), subs as usize, "distinct subjects");
-        assert_eq!(ds.distinct_object_count(), objs as usize, "distinct objects");
+        assert_eq!(
+            ds.distinct_subject_count(),
+            subs as usize,
+            "distinct subjects"
+        );
+        assert_eq!(
+            ds.distinct_object_count(),
+            objs as usize,
+            "distinct objects"
+        );
         for (p, &(num, dsub, dobj)) in per_pred.iter().enumerate() {
             let p = p as u32;
             assert_eq!(ds.pred_num(p), num as usize, "pre2num({p})");
@@ -2659,7 +2798,10 @@ mod tests {
         assert_stats_consistent(&ds);
         // Spot-check exact values for the known SMALL shape.
         // subjects: root, node1 → 2 distinct; contain has 2 objs (node0,node1).
-        let contain = ds.predicate_id(&Term::iri("contain").dict_key()).unwrap().unwrap();
+        let contain = ds
+            .predicate_id(&Term::iri("contain").dict_key())
+            .unwrap()
+            .unwrap();
         assert_eq!(ds.pred_num(contain), 2);
         assert_eq!(ds.pred_subject_count(contain), 1); // only <root>
         assert_eq!(ds.pred_object_count(contain), 2); // node0, node1
@@ -2686,7 +2828,10 @@ mod tests {
             assert!(ds.delete_triple(&t).unwrap());
         }
         assert_stats_consistent(&ds);
-        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+        let own = ds
+            .predicate_id(&Term::iri("own").dict_key())
+            .unwrap()
+            .unwrap();
         assert_eq!(ds.pred_num(own), 0, "own group fully deleted");
         assert_eq!(ds.pred_subject_count(own), 0);
         assert_eq!(ds.pred_object_count(own), 0);
@@ -2769,17 +2914,26 @@ mod tests {
         let root = ds.term_id(&Term::iri("root")).unwrap().unwrap();
         let node1 = ds.term_id(&Term::iri("node1")).unwrap().unwrap();
         let point0 = ds.term_id(&Term::iri("point0")).unwrap().unwrap();
-        let contain = ds.predicate_id(&Term::iri("contain").dict_key()).unwrap().unwrap();
-        let own = ds.predicate_id(&Term::iri("own").dict_key()).unwrap().unwrap();
+        let contain = ds
+            .predicate_id(&Term::iri("contain").dict_key())
+            .unwrap()
+            .unwrap();
+        let own = ds
+            .predicate_id(&Term::iri("own").dict_key())
+            .unwrap()
+            .unwrap();
 
         // subject_degree = number of triples with that subject (out-degree).
-        assert_eq!(ds.subject_degree(root).unwrap(), ds.po_by_s(root).unwrap().len());
+        assert_eq!(
+            ds.subject_degree(root).unwrap(),
+            ds.po_by_s(root).unwrap().len()
+        );
         assert_eq!(ds.subject_degree(root).unwrap(), 3); // name + contain*2
         assert_eq!(ds.subject_degree(node1).unwrap(), 2); // own*2
-        // object_degree = in-degree.
+                                                          // object_degree = in-degree.
         assert_eq!(ds.object_degree(point0).unwrap(), 1);
         assert_eq!(ds.object_degree(root).unwrap(), 0); // root never an object
-        // getSubjectPredicateDegree / getObjectPredicateDegree.
+                                                        // getSubjectPredicateDegree / getObjectPredicateDegree.
         assert_eq!(
             ds.subject_predicate_degree(root, contain).unwrap(),
             ds.o_by_sp(root, contain).unwrap().len()
@@ -2815,7 +2969,9 @@ mod tests {
         let n = 200u32;
         let mut content = String::new();
         for i in 0..n {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         let mut ds = DiskStore::build_str(&path, 64, &content).unwrap();
         ds.compact().unwrap();
@@ -2900,16 +3056,24 @@ mod tests {
     /// `n` random inserts (entities, literals and a few predicates, interned
     /// through the store so ids are the store's), then every `del`-th triple
     /// deleted from both.
-    fn twin_stores(path: &std::path::Path, seed: u64, n: usize, del: usize) -> (DiskStore, TripleStore) {
+    fn twin_stores(
+        path: &std::path::Path,
+        seed: u64,
+        n: usize,
+        del: usize,
+    ) -> (DiskStore, TripleStore) {
         let mut ds = DiskStore::open(path, 64).unwrap();
         let mut mem = TripleStore::new();
         let mut rng = Rng(seed);
         let mut added = Vec::new();
         for _ in 0..n {
             let s = ds.intern_entity(&format!("<s{}>", rng.below(60))).unwrap();
-            let p = ds.intern_predicate(&format!("<p{}>", rng.below(7))).unwrap();
+            let p = ds
+                .intern_predicate(&format!("<p{}>", rng.below(7)))
+                .unwrap();
             let o = if rng.below(3) == 0 {
-                ds.intern_literal(&format!("\"l{}\"", rng.below(40))).unwrap()
+                ds.intern_literal(&format!("\"l{}\"", rng.below(40)))
+                    .unwrap()
             } else {
                 // Objects overlap the subjects, so ids are both.
                 ds.intern_entity(&format!("<s{}>", rng.below(90))).unwrap()
@@ -2937,7 +3101,11 @@ mod tests {
         let mem_src: &dyn TripleSource = mem;
         let disk_src: &dyn TripleSource = ds;
         for &s in &ents {
-            assert_eq!(ds.try_po_by_s(s).unwrap(), mem.po_by_s(s).to_vec(), "po_by_s({s})");
+            assert_eq!(
+                ds.try_po_by_s(s).unwrap(),
+                mem.po_by_s(s).to_vec(),
+                "po_by_s({s})"
+            );
             assert_eq!(ds.count_po_by_s(s), mem.po_by_s(s).len() as u64);
             assert_eq!(disk_src.po_by_s(s), mem_src.po_by_s(s));
             let distinct_p = {
@@ -2948,17 +3116,29 @@ mod tests {
             assert_eq!(ds.distinct_p_of_s(s), distinct_p);
             assert_eq!(ds.has_subject(s), !mem.po_by_s(s).is_empty());
             for &p in &preds {
-                assert_eq!(ds.try_o_by_sp(s, p).unwrap(), mem.o_by_sp(s, p), "o_by_sp({s},{p})");
+                assert_eq!(
+                    ds.try_o_by_sp(s, p).unwrap(),
+                    mem.o_by_sp(s, p),
+                    "o_by_sp({s},{p})"
+                );
                 assert_eq!(ds.count_o_by_sp(s, p), mem.o_by_sp(s, p).len() as u64);
             }
             for &o in &ids {
-                assert_eq!(ds.try_p_by_so(s, o).unwrap(), mem.p_by_so(s, o), "p_by_so({s},{o})");
+                assert_eq!(
+                    ds.try_p_by_so(s, o).unwrap(),
+                    mem.p_by_so(s, o),
+                    "p_by_so({s},{o})"
+                );
                 assert_eq!(ds.count_p_by_so(s, o), mem.p_by_so(s, o).len() as u64);
                 assert_eq!(ds.try_exists(s, 0, o).unwrap(), mem.exists(s, 0, o));
             }
         }
         for &o in &ids {
-            assert_eq!(ds.try_ps_by_o(o).unwrap(), mem.ps_by_o(o).to_vec(), "ps_by_o({o})");
+            assert_eq!(
+                ds.try_ps_by_o(o).unwrap(),
+                mem.ps_by_o(o).to_vec(),
+                "ps_by_o({o})"
+            );
             assert_eq!(ds.count_ps_by_o(o), mem.ps_by_o(o).len() as u64);
             assert_eq!(disk_src.ps_by_o(o), mem_src.ps_by_o(o));
             let mut ps: Vec<u32> = mem.ps_by_o(o).iter().map(|x| x.0).collect();
@@ -2966,24 +3146,52 @@ mod tests {
             assert_eq!(ds.distinct_p_of_o(o), ps.len() as u64);
             assert_eq!(ds.has_object(o), !mem.ps_by_o(o).is_empty());
             for &p in &preds {
-                assert_eq!(ds.try_s_by_po(p, o).unwrap(), mem.s_by_po(p, o), "s_by_po({p},{o})");
+                assert_eq!(
+                    ds.try_s_by_po(p, o).unwrap(),
+                    mem.s_by_po(p, o),
+                    "s_by_po({p},{o})"
+                );
                 assert_eq!(ds.count_s_by_po(p, o), mem.s_by_po(p, o).len() as u64);
             }
         }
         for &p in &preds {
-            assert_eq!(ds.try_so_by_p(p).unwrap(), mem.so_by_p(p).to_vec(), "so_by_p({p})");
+            assert_eq!(
+                ds.try_so_by_p(p).unwrap(),
+                mem.so_by_p(p).to_vec(),
+                "so_by_p({p})"
+            );
             assert_eq!(ds.count_so_by_p(p), mem.so_by_p(p).len() as u64);
-            assert_eq!(ds.try_subs_by_p(p).unwrap(), mem.subs_by_p(p), "subs_by_p({p})");
-            assert_eq!(ds.try_objs_by_p(p).unwrap(), mem.objs_by_p(p), "objs_by_p({p})");
+            assert_eq!(
+                ds.try_subs_by_p(p).unwrap(),
+                mem.subs_by_p(p),
+                "subs_by_p({p})"
+            );
+            assert_eq!(
+                ds.try_objs_by_p(p).unwrap(),
+                mem.objs_by_p(p),
+                "objs_by_p({p})"
+            );
             assert_eq!(disk_src.so_by_p(p), mem_src.so_by_p(p));
             assert_eq!(ds.has_predicate(p), !mem.so_by_p(p).is_empty());
             assert_eq!(disk_src.pred_card(p), mem_src.pred_card(p));
-            assert_eq!(disk_src.pred_distinct_subj(p), mem_src.pred_distinct_subj(p));
+            assert_eq!(
+                disk_src.pred_distinct_subj(p),
+                mem_src.pred_distinct_subj(p)
+            );
             assert_eq!(disk_src.pred_distinct_obj(p), mem_src.pred_distinct_obj(p));
         }
-        assert_eq!(ds.try_subject_keys().unwrap(), mem.subject_keys().collect::<Vec<_>>());
-        assert_eq!(ds.try_object_keys().unwrap(), mem.object_keys().collect::<Vec<_>>());
-        assert_eq!(ds.try_iter_all().unwrap(), mem.iter_all().collect::<Vec<_>>());
+        assert_eq!(
+            ds.try_subject_keys().unwrap(),
+            mem.subject_keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ds.try_object_keys().unwrap(),
+            mem.object_keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ds.try_iter_all().unwrap(),
+            mem.iter_all().collect::<Vec<_>>()
+        );
         assert_eq!(disk_src.iter_all(), mem_src.iter_all());
         let mut spo: Vec<IdTriple> = mem.iter_all().collect();
         spo.sort_unstable_by_key(|t| (t.sub, t.pred, t.obj));
@@ -3008,11 +3216,23 @@ mod tests {
     ) {
         let runs = |v: &[(u32, u32)]| crate::store::distinct_first(v);
         for &s in ents {
-            assert_eq!(disk.count_po_by_s(s), disk.po_by_s(s).len() as u64, "count_po_by_s({s})");
+            assert_eq!(
+                disk.count_po_by_s(s),
+                disk.po_by_s(s).len() as u64,
+                "count_po_by_s({s})"
+            );
             assert_eq!(disk.count_po_by_s(s), mem.count_po_by_s(s));
-            assert_eq!(disk.distinct_p_of_s(s), runs(&disk.po_by_s(s)), "distinct_p_of_s({s})");
+            assert_eq!(
+                disk.distinct_p_of_s(s),
+                runs(&disk.po_by_s(s)),
+                "distinct_p_of_s({s})"
+            );
             assert_eq!(disk.distinct_p_of_s(s), mem.distinct_p_of_s(s));
-            assert_eq!(disk.has_subject(s), !disk.po_by_s(s).is_empty(), "has_subject({s})");
+            assert_eq!(
+                disk.has_subject(s),
+                !disk.po_by_s(s).is_empty(),
+                "has_subject({s})"
+            );
             assert_eq!(disk.has_subject(s), mem.has_subject(s));
             for &p in preds {
                 assert_eq!(disk.count_o_by_sp(s, p), disk.o_by_sp(s, p).len() as u64);
@@ -3024,11 +3244,23 @@ mod tests {
             }
         }
         for &o in ids {
-            assert_eq!(disk.count_ps_by_o(o), disk.ps_by_o(o).len() as u64, "count_ps_by_o({o})");
+            assert_eq!(
+                disk.count_ps_by_o(o),
+                disk.ps_by_o(o).len() as u64,
+                "count_ps_by_o({o})"
+            );
             assert_eq!(disk.count_ps_by_o(o), mem.count_ps_by_o(o));
-            assert_eq!(disk.distinct_p_of_o(o), runs(&disk.ps_by_o(o)), "distinct_p_of_o({o})");
+            assert_eq!(
+                disk.distinct_p_of_o(o),
+                runs(&disk.ps_by_o(o)),
+                "distinct_p_of_o({o})"
+            );
             assert_eq!(disk.distinct_p_of_o(o), mem.distinct_p_of_o(o));
-            assert_eq!(disk.has_object(o), !disk.ps_by_o(o).is_empty(), "has_object({o})");
+            assert_eq!(
+                disk.has_object(o),
+                !disk.ps_by_o(o).is_empty(),
+                "has_object({o})"
+            );
             assert_eq!(disk.has_object(o), mem.has_object(o));
             for &p in preds {
                 assert_eq!(disk.count_s_by_po(p, o), disk.s_by_po(p, o).len() as u64);
@@ -3036,16 +3268,30 @@ mod tests {
             }
         }
         for &p in preds {
-            assert_eq!(disk.count_so_by_p(p), disk.so_by_p(p).len() as u64, "count_so_by_p({p})");
+            assert_eq!(
+                disk.count_so_by_p(p),
+                disk.so_by_p(p).len() as u64,
+                "count_so_by_p({p})"
+            );
             assert_eq!(disk.count_so_by_p(p), mem.count_so_by_p(p));
-            assert_eq!(disk.has_predicate(p), !disk.so_by_p(p).is_empty(), "has_predicate({p})");
+            assert_eq!(
+                disk.has_predicate(p),
+                !disk.so_by_p(p).is_empty(),
+                "has_predicate({p})"
+            );
             assert_eq!(disk.has_predicate(p), mem.has_predicate(p));
         }
     }
 
     #[test]
     fn try_reads_equal_triple_store_in_order() {
-        for (seed, n, del) in [(1u64, 0usize, 0usize), (2, 1, 0), (3, 400, 0), (4, 900, 3), (5, 700, 1)] {
+        for (seed, n, del) in [
+            (1u64, 0usize, 0usize),
+            (2, 1, 0),
+            (3, 400, 0),
+            (4, 900, 3),
+            (5, 700, 1),
+        ] {
             let path = tmp(&format!("twin_{seed}"));
             let (ds, mem) = twin_stores(&path, seed, n, del);
             assert_same_reads(&ds, &mem);
@@ -3126,7 +3372,9 @@ mod tests {
         // The predicate space is full, so the insert fails *after* interning
         // its new subject: the whole operation is rolled back.
         ds.pred_count = crate::dict::PREDICATE_ID_LIMIT;
-        assert!(ds.insert_keys("<brand-new>", "<rel>", "<x>", false).is_err());
+        assert!(ds
+            .insert_keys("<brand-new>", "<rel>", "<x>", false)
+            .is_err());
         ds.pred_count = preds as u32;
         assert_eq!(ds.entity_num(), ents, "the subject term was rolled back");
         assert_eq!(ds.term_id(&Term::iri("brand-new")).unwrap(), None);
@@ -3134,10 +3382,14 @@ mod tests {
         assert_eq!(ds.triple_count(), 5);
         // A key too large for a page fails the same way, after the subject.
         let huge = format!("<{}>", "z".repeat(PAGE_SIZE));
-        assert!(ds.insert_keys("<brand-new>", "<rel>", &huge, false).is_err());
+        assert!(ds
+            .insert_keys("<brand-new>", "<rel>", &huge, false)
+            .is_err());
         assert_eq!(ds.entity_num(), ents);
         // The store stays usable and consistent.
-        assert!(ds.insert_keys("<brand-new>", "<rel>", "<x>", false).unwrap());
+        assert!(ds
+            .insert_keys("<brand-new>", "<rel>", "<x>", false)
+            .unwrap());
         assert_eq!(ds.entity_num(), ents + 2);
         ds.flush().unwrap();
         drop(ds);
@@ -3242,7 +3494,10 @@ mod tests {
                     pos += snap.try_so_by_p(p).unwrap().len();
                 }
                 assert_eq!(pos, spo.len(), "POS agrees with SPO at a commit point");
-                assert_eq!(snap.try_object_keys().unwrap().len() as u64, snap.triple_count());
+                assert_eq!(
+                    snap.try_object_keys().unwrap().len() as u64,
+                    snap.triple_count()
+                );
                 let (dict, _) = snap.to_memory().unwrap();
                 assert_eq!(dict.entity_num(), snap.entity_num());
             }
@@ -3373,14 +3628,23 @@ mod tests {
         let ds = DiskStore::build_str(&path, 32, &content).unwrap();
         let dict = ds.dictionary().unwrap();
         for id in 0..ds.entity_num() as u32 {
-            assert_eq!(ds.id_to_string(id).unwrap().as_deref(), dict.id_to_string(id));
+            assert_eq!(
+                ds.id_to_string(id).unwrap().as_deref(),
+                dict.id_to_string(id)
+            );
         }
         for i in 0..ds.literal_num() as u32 {
             let id = LITERAL_FIRST_ID + i;
-            assert_eq!(ds.id_to_string(id).unwrap().as_deref(), dict.id_to_string(id));
+            assert_eq!(
+                ds.id_to_string(id).unwrap().as_deref(),
+                dict.id_to_string(id)
+            );
         }
         for p in 0..ds.predicate_num() as u32 {
-            assert_eq!(ds.predicate_to_string(p).unwrap().as_deref(), dict.predicate_to_string(p));
+            assert_eq!(
+                ds.predicate_to_string(p).unwrap().as_deref(),
+                dict.predicate_to_string(p)
+            );
         }
         cleanup(&path);
     }

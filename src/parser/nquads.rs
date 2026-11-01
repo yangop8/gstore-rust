@@ -202,9 +202,7 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Option<Quad>> {
             let g = scanner.parse_term()?;
             match g {
                 Term::Iri(_) | Term::Blank(_) => Some(g),
-                Term::Literal { .. } => {
-                    return Err(scanner.err("graph label cannot be a literal"))
-                }
+                Term::Literal { .. } => return Err(scanner.err("graph label cannot be a literal")),
             }
         }
         Some(c) => return Err(scanner.err(format!("unexpected '{c}' before statement end"))),

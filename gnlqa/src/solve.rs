@@ -32,7 +32,9 @@ pub fn score_outcome(o: &RepairOutcome) -> f32 {
 /// Order-preserving de-duplication of URIs.
 fn dedup(uris: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    uris.into_iter().filter(|u| seen.insert(u.clone())).collect()
+    uris.into_iter()
+        .filter(|u| seen.insert(u.clone()))
+        .collect()
 }
 
 /// Solve every candidate (with repair) and return the highest-scoring outcome.
@@ -82,7 +84,12 @@ struct Cache {
 
 impl Cache {
     fn new(cap: usize) -> Cache {
-        Cache { cap: cap.max(1), ttl: None, map: HashMap::new(), order: VecDeque::new() }
+        Cache {
+            cap: cap.max(1),
+            ttl: None,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
     fn get(&self, k: &str) -> Option<Answer> {
         let (v, at) = self.map.get(k)?;
@@ -281,7 +288,10 @@ impl SolveEngine {
 
     /// Pick the model for generation/repair based on question difficulty.
     fn route_model(&self, intent: &QuestionIntent) -> Option<String> {
-        let hard = matches!(intent.qtype, QType::Analytics | QType::Path | QType::Compare | QType::Open);
+        let hard = matches!(
+            intent.qtype,
+            QType::Analytics | QType::Path | QType::Compare | QType::Open
+        );
         if hard {
             self.model.clone()
         } else {
@@ -370,7 +380,10 @@ impl SolveEngine {
         if let Some(cache) = &self.cache {
             if !answer.abstained {
                 let val = answer.clone(); // clone outside the lock
-                cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, val);
+                cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(key, val);
             }
         }
         Ok(answer)
@@ -380,7 +393,11 @@ impl SolveEngine {
     /// answer)` turns (routed to the fast model), falling back to the raw
     /// question on any error. Exposed so a [`Session`](crate::session::Session)
     /// can record the *resolved* question rather than the elliptical one.
-    pub fn rewrite_followup_question(&self, history: &[(String, String)], question: &str) -> String {
+    pub fn rewrite_followup_question(
+        &self,
+        history: &[(String, String)],
+        question: &str,
+    ) -> String {
         let m = self.fast_model.clone().or_else(|| self.model.clone());
         crate::session::rewrite_followup(self.llm.as_ref(), history, question, m.as_deref())
             .unwrap_or_else(|_| question.to_string())
@@ -402,8 +419,8 @@ impl SolveEngine {
         // model. A parse failure shouldn't kill the query — degrade.
         self.note("understanding question… (model)");
         let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
-        let intent =
-            extract_intent(self.llm.as_ref(), question, intent_model.as_deref()).unwrap_or_default();
+        let intent = extract_intent(self.llm.as_ref(), question, intent_model.as_deref())
+            .unwrap_or_default();
         // Resolve the answer language (LLM tag → script fallback → English) so
         // LLM-generated answers come back in the user's language.
         let lang = crate::lang::resolve_lang(&intent.lang, question);
@@ -426,13 +443,18 @@ impl SolveEngine {
                 let cands = linker.link_mention(m, self.link_k)?;
                 if !cands.is_empty() {
                     links.push_str(&format!("{:?} '{}' -> ", m.kind, m.text));
-                    links.push_str(&cands.iter().map(|c| c.to_term()).collect::<Vec<_>>().join(", "));
+                    links.push_str(
+                        &cands
+                            .iter()
+                            .map(|c| c.to_term())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
                     links.push('\n');
                 }
-                if let Some(rep) = cands
-                    .iter()
-                    .find(|c| matches!(c.kind, LinkKind::Entity | LinkKind::Type) && !c.uri.is_empty())
-                {
+                if let Some(rep) = cands.iter().find(|c| {
+                    matches!(c.kind, LinkKind::Entity | LinkKind::Type) && !c.uri.is_empty()
+                }) {
                     if !analytics_seeds.contains(&rep.uri) {
                         analytics_seeds.push(rep.uri.clone());
                     }
@@ -449,7 +471,13 @@ impl SolveEngine {
                 let cands = linker.link_predicate(&r.phrase, self.link_k)?;
                 if !cands.is_empty() {
                     links.push_str(&format!("relation '{}' -> ", r.phrase));
-                    links.push_str(&cands.iter().map(|c| c.to_term()).collect::<Vec<_>>().join(", "));
+                    links.push_str(
+                        &cands
+                            .iter()
+                            .map(|c| c.to_term())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
                     links.push('\n');
                 }
                 for c in cands {
@@ -536,8 +564,14 @@ impl SolveEngine {
         // produced nothing parser-valid, fail honestly rather than fabricating an
         // answer from a wildcard query.
         self.note("generating SPARQL… (model)");
-        let candidates =
-            generate_candidates(self.llm.as_ref(), question, &links, &schema, self.candidates, model)?;
+        let candidates = generate_candidates(
+            self.llm.as_ref(),
+            question,
+            &links,
+            &schema,
+            self.candidates,
+            model,
+        )?;
         self.note("querying gStore…");
         // `?` propagates a transport outage (endpoint unreachable) as a real error
         // instead of letting it look like "no candidate produced an answer".
@@ -611,7 +645,9 @@ impl SolveEngine {
                     provenance: Provenance::GStore,
                 })
             }
-            None => Err(Error::Sparql("no candidate query produced an answer".into())),
+            None => Err(Error::Sparql(
+                "no candidate query produced an answer".into(),
+            )),
         }
     }
 
@@ -638,7 +674,9 @@ impl SolveEngine {
         self.note("open answer… (model, no KB)");
         let sys = "You are a helpful assistant. Answer the user's question directly \
             and concisely. If you are not sure, say so rather than inventing facts.";
-        let mut req = LlmRequest::prompt(question.to_string()).system(sys).max_tokens(1024);
+        let mut req = LlmRequest::prompt(question.to_string())
+            .system(sys)
+            .max_tokens(1024);
         if let Some(m) = &self.model {
             req = req.model(m.clone());
         }
@@ -666,7 +704,9 @@ impl SolveEngine {
         model: Option<&str>,
         lang: &str,
     ) -> Option<Answer> {
-        use crate::graphrag::{answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph};
+        use crate::graphrag::{
+            answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph,
+        };
         let triples = retrieve_subgraph(self.kb.as_ref(), seeds, self.rag);
         if triples.is_empty() {
             return None;
@@ -676,8 +716,11 @@ impl SolveEngine {
         if is_dont_know(&raw) {
             return None;
         }
-        let citations =
-            if self.cite { triples.iter().take(30).map(|t| t.to_citation()).collect() } else { Vec::new() };
+        let citations = if self.cite {
+            triples.iter().take(30).map(|t| t.to_citation()).collect()
+        } else {
+            Vec::new()
+        };
         Some(Answer {
             text: raw.trim().to_string(),
             values: Vec::new(),
@@ -702,18 +745,38 @@ mod tests {
     fn nonempty() -> SparqlAnswer {
         SparqlAnswer::Select {
             vars: vec!["x".into()],
-            rows: vec![vec![Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/a".into(), datatype: None, lang: None })]],
+            rows: vec![vec![Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: "http://ex/a".into(),
+                datatype: None,
+                lang: None,
+            })]],
         }
     }
     fn empty() -> SparqlAnswer {
-        SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![] }
+        SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![],
+        }
     }
 
     #[test]
     fn score_prefers_nonempty_and_fewer_rounds() {
-        let a = RepairOutcome { sparql: "q".into(), answer: nonempty(), rounds: 0 };
-        let b = RepairOutcome { sparql: "q".into(), answer: nonempty(), rounds: 2 };
-        let c = RepairOutcome { sparql: "q".into(), answer: empty(), rounds: 0 };
+        let a = RepairOutcome {
+            sparql: "q".into(),
+            answer: nonempty(),
+            rounds: 0,
+        };
+        let b = RepairOutcome {
+            sparql: "q".into(),
+            answer: nonempty(),
+            rounds: 2,
+        };
+        let c = RepairOutcome {
+            sparql: "q".into(),
+            answer: empty(),
+            rounds: 0,
+        };
         assert!(score_outcome(&a) > score_outcome(&b));
         assert!(score_outcome(&b) > score_outcome(&c));
     }
@@ -727,7 +790,9 @@ mod tests {
             "SELECT ?x WHERE { ?x <http://ex/p1> ?o }".to_string(),
             "SELECT ?x WHERE { ?x <http://ex/p2> ?o }".to_string(),
         ];
-        let best = best_of(&llm, &kb, "q", "", "", &cands, 0, None).unwrap().unwrap();
+        let best = best_of(&llm, &kb, "q", "", "", &cands, 0, None)
+            .unwrap()
+            .unwrap();
         assert!(!is_empty_answer(&best.answer));
         assert!(best.sparql.contains("p2"));
     }
@@ -736,7 +801,9 @@ mod tests {
     struct DeadKb;
     impl KbClient for DeadKb {
         fn query(&self, _sparql: &str) -> Result<SparqlAnswer> {
-            Err(Error::Http("gStore endpoint unreachable: Connection refused".into()))
+            Err(Error::Http(
+                "gStore endpoint unreachable: Connection refused".into(),
+            ))
         }
     }
 
@@ -749,7 +816,11 @@ mod tests {
         // repair LLM calls trying to "fix" a query against a dead socket.
         let err = best_of(&Arc::clone(&llm), &DeadKb, "q", "", "", &cands, 3, None).unwrap_err();
         assert!(matches!(err, Error::Http(_)));
-        assert_eq!(llm.call_count(), 0, "no repair calls against an unreachable endpoint");
+        assert_eq!(
+            llm.call_count(),
+            0,
+            "no repair calls against an unreachable endpoint"
+        );
     }
 
     #[test]
@@ -760,7 +831,10 @@ mod tests {
         ]);
         let engine = SolveEngine::new(Box::new(llm), Box::new(DeadKb));
         let err = engine.ask("which x?").unwrap_err();
-        assert!(matches!(err, Error::Http(_)), "outage must propagate, got {err:?}");
+        assert!(
+            matches!(err, Error::Http(_)),
+            "outage must propagate, got {err:?}"
+        );
     }
 
     #[test]
@@ -846,7 +920,10 @@ mod tests {
             r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
         ]);
         let kb = MockKb::new(vec![nonempty()]);
-        let a = SolveEngine::new(Box::new(llm), Box::new(kb)).with_citations(false).ask("q").unwrap();
+        let a = SolveEngine::new(Box::new(llm), Box::new(kb))
+            .with_citations(false)
+            .ask("q")
+            .unwrap();
         assert!(a.confidence > 0.9 && !a.abstained);
 
         // empty result + high abstain threshold → abstain, but SPARQL stays visible
@@ -887,8 +964,14 @@ mod tests {
         let e = SolveEngine::new(Box::new(MockLlm::fixed("x")), Box::new(MockKb::new(vec![])))
             .with_model("opus-primary")
             .with_fast_model("sonnet-fast");
-        let factoid = QuestionIntent { qtype: QType::Factoid, ..Default::default() };
-        let analytics = QuestionIntent { qtype: QType::Analytics, ..Default::default() };
+        let factoid = QuestionIntent {
+            qtype: QType::Factoid,
+            ..Default::default()
+        };
+        let analytics = QuestionIntent {
+            qtype: QType::Analytics,
+            ..Default::default()
+        };
         assert_eq!(e.route_model(&factoid).as_deref(), Some("sonnet-fast"));
         assert_eq!(e.route_model(&analytics).as_deref(), Some("opus-primary"));
     }
@@ -897,7 +980,10 @@ mod tests {
     fn engine_fails_honestly_when_no_valid_candidate() {
         // generation yields only an invalid candidate, GraphRAG disabled → no
         // fabricated answer
-        let llm = MockLlm::new(vec![r#"{"qtype":"factoid"}"#.to_string(), r#"["not sparql"]"#.to_string()]);
+        let llm = MockLlm::new(vec![
+            r#"{"qtype":"factoid"}"#.to_string(),
+            r#"["not sparql"]"#.to_string(),
+        ]);
         let kb = MockKb::new(vec![nonempty()]);
         let engine = SolveEngine::new(Box::new(llm), Box::new(kb)).with_graphrag(false);
         assert!(engine.ask("q").is_err());
@@ -926,8 +1012,18 @@ mod tests {
         let po = SparqlAnswer::Select {
             vars: vec!["p".into(), "o".into()],
             rows: vec![vec![
-                Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/directed".into(), datatype: None, lang: None }),
-                Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/RidleyScott".into(), datatype: None, lang: None }),
+                Some(RdfTerm {
+                    kind: TermKind::Uri,
+                    value: "http://ex/directed".into(),
+                    datatype: None,
+                    lang: None,
+                }),
+                Some(RdfTerm {
+                    kind: TermKind::Uri,
+                    value: "http://ex/RidleyScott".into(),
+                    datatype: None,
+                    lang: None,
+                }),
             ]],
         };
         let kb = MockKb::new(vec![po]);
@@ -968,7 +1064,10 @@ mod tests {
             .with_abstain_below(0.7)
             .ask("tell me about Alien")
             .unwrap();
-        assert!(a.abstained, "sub-threshold RAG must not override the abstain policy");
+        assert!(
+            a.abstained,
+            "sub-threshold RAG must not override the abstain policy"
+        );
         assert!(a.confidence < 0.7);
     }
 }

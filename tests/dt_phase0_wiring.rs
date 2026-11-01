@@ -148,7 +148,10 @@ fn api_serves_an_on_disk_database_and_writes_it_through() {
 
     // Still an on-disk database, never shadowed by a snapshot.
     assert_eq!(Database::storage_kind(&dir), Some(StorageKind::Disk));
-    assert!(!dir.join("store.bin").exists(), "no shadow snapshot is written");
+    assert!(
+        !dir.join("store.bin").exists(),
+        "no shadow snapshot is written"
+    );
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);
     assert!(ask(&mut db, "http://ex/c", "http://ex/p", "http://ex/d"));
@@ -189,7 +192,11 @@ fn api_restore_of_a_disk_backup_never_writes_into_the_backup() {
 
     // A backup outside the server's backup directory is restorable only from a
     // directory the load policy allows.
-    let api = Api::start(&root, true, Some(LoadPolicy::restricted().with_allowed_dir(&backup_dir)));
+    let api = Api::start(
+        &root,
+        true,
+        Some(LoadPolicy::restricted().with_allowed_dir(&backup_dir)),
+    );
     let (s, body) = api.root(
         "POST",
         &format!("/restore?db_name=r&path={}", backup.display()),
@@ -210,7 +217,10 @@ fn api_restore_of_a_disk_backup_never_writes_into_the_backup() {
         "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }",
     );
     assert_eq!(s, 200, "{body}");
-    assert!(body.contains("false"), "restored again from the backup: {body}");
+    assert!(
+        body.contains("false"),
+        "restored again from the backup: {body}"
+    );
     assert_eq!(api.root("POST", "/update?db_name=r", NEW_TRIPLE).0, 200);
     // A path outside the allowed directories, or one that holds no backup, is
     // refused before anything is replaced.
@@ -219,7 +229,10 @@ fn api_restore_of_a_disk_backup_never_writes_into_the_backup() {
     std::fs::create_dir_all(backup_dir.join("empty")).unwrap();
     let (s, _) = api.root(
         "POST",
-        &format!("/restore?db_name=r&path={}", backup_dir.join("empty").display()),
+        &format!(
+            "/restore?db_name=r&path={}",
+            backup_dir.join("empty").display()
+        ),
         "",
     );
     assert_eq!(s, 500);
@@ -336,7 +349,10 @@ fn single_server_serves_an_on_disk_database() {
     let report = serving.join().unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
 
-    assert!(!dir.join("store.bin").exists(), "no shadow snapshot is written");
+    assert!(
+        !dir.join("store.bin").exists(),
+        "no shadow snapshot is written"
+    );
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.storage(), StorageKind::Disk);
     assert!(ask(&mut db, "http://ex/c", "http://ex/p", "http://ex/d"));
@@ -400,7 +416,12 @@ fn gserver_refuses_a_directory_it_cannot_open() {
     };
     assert!(!status.success());
     let mut err = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
     assert!(err.contains("could not open"), "{err}");
     // Nothing was written over it.
     assert_eq!(

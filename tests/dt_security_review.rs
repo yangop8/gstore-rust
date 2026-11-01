@@ -37,7 +37,11 @@ fn tmp_dir(tag: &str) -> PathBuf {
 fn request(addr: &SocketAddr, method: &str, target: &str, auth: bool, body: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-    let auth = if auth { "Authorization: Basic cm9vdDpyb290\r\n" } else { "" };
+    let auth = if auth {
+        "Authorization: Basic cm9vdDpyb290\r\n"
+    } else {
+        ""
+    };
     let raw = format!(
         "{method} {target} HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
@@ -94,11 +98,19 @@ impl Drop for Api {
 }
 
 fn deep_filter(n: usize) -> String {
-    format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}", "(".repeat(n), ")".repeat(n))
+    format!(
+        "SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}",
+        "(".repeat(n),
+        ")".repeat(n)
+    )
 }
 
 fn deep_groups(n: usize) -> String {
-    format!("SELECT * WHERE {}?s ?p ?o{}", "{ ".repeat(n), " }".repeat(n))
+    format!(
+        "SELECT * WHERE {}?s ?p ?o{}",
+        "{ ".repeat(n),
+        " }".repeat(n)
+    )
 }
 
 /// Phase 2/3 grammar: nested `[ … ]` triples nodes, `IN` lists and
@@ -112,7 +124,11 @@ fn deep_triples_nodes(n: usize) -> String {
 }
 
 fn deep_in_lists(n: usize) -> String {
-    format!("SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}", "?o IN (".repeat(n), ")".repeat(n))
+    format!(
+        "SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}",
+        "?o IN (".repeat(n),
+        ")".repeat(n)
+    )
 }
 
 fn deep_insert_data(n: usize) -> String {
@@ -155,7 +171,12 @@ fn deeply_nested_sparql_is_refused_by_the_api_server() {
     // Inside a transaction too.
     let (s, b) = api.root("POST", "/begin?db_name=d", "");
     assert_eq!(s, 200, "{b}");
-    let tid = b.split("\"TID\":\"").nth(1).and_then(|x| x.split('"').next()).unwrap().to_string();
+    let tid = b
+        .split("\"TID\":\"")
+        .nth(1)
+        .and_then(|x| x.split('"').next())
+        .unwrap()
+        .to_string();
     let (s, b) = api.root("POST", &format!("/tquery?tid={tid}"), &deep_groups(100_000));
     assert_eq!(s, 400, "{b}");
     api.alive();
@@ -190,7 +211,10 @@ fn deeply_nested_rdfxml_is_refused_by_upload_and_batch_insert() {
     let api = Api::start("deep_rdfxml", None);
     assert_eq!(api.root("POST", "/build?db_name=x", DATA).0, 200);
     let doc = deep_rdfxml(50_000);
-    for target in ["/upload?db_name=x&format=rdfxml", "/batchInsert?db_name=x&format=rdfxml"] {
+    for target in [
+        "/upload?db_name=x&format=rdfxml",
+        "/batchInsert?db_name=x&format=rdfxml",
+    ] {
         let (s, b) = api.root("POST", target, &doc);
         assert_eq!(s, 400, "{target}: {b}");
         assert!(b.contains("nested"), "{b}");
@@ -209,16 +233,28 @@ fn build_from_a_server_path_follows_the_load_policy() {
     // The default (restricted) policy: no server-local file at all, the same
     // as SPARQL LOAD.
     let api = Api::start("build_restricted", None);
-    for path in [secret.display().to_string(), "/etc/passwd".into(), "/dev/zero".into()] {
+    for path in [
+        secret.display().to_string(),
+        "/etc/passwd".into(),
+        "/dev/zero".into(),
+    ] {
         let (s, b) = api.root("POST", &format!("/build?db_name=leak&db_path={path}"), "");
         assert_eq!(s, 403, "{path}: {b}");
         assert!(!b.contains("TOP-SECRET") && !b.contains("root:"), "{b}");
     }
-    let (s, _) = api.root("POST", "/sparql?db_name=leak", "SELECT * WHERE { ?s ?p ?o }");
+    let (s, _) = api.root(
+        "POST",
+        "/sparql?db_name=leak",
+        "SELECT * WHERE { ?s ?p ?o }",
+    );
     assert_ne!(s, 200, "nothing was built");
     // Refusals do not reveal whether a path exists.
     let (_, missing) = api.root("POST", "/build?db_name=leak&db_path=/nonexistent/x.nt", "");
-    let (_, present) = api.root("POST", &format!("/build?db_name=leak&db_path={}", secret.display()), "");
+    let (_, present) = api.root(
+        "POST",
+        &format!("/build?db_name=leak&db_path={}", secret.display()),
+        "",
+    );
     assert_eq!(
         missing.replace("/nonexistent/x.nt", "P"),
         present.replace(&secret.display().to_string(), "P")
@@ -228,12 +264,26 @@ fn build_from_a_server_path_follows_the_load_policy() {
     // escaping it) are not, and non-regular files never.
     let allowed = tmp_dir("build_allowed");
     std::fs::write(allowed.join("ok.nt"), DATA).unwrap();
-    let api = Api::start("build_allowed_srv", Some(LoadPolicy::restricted().with_allowed_dir(&allowed)));
+    let api = Api::start(
+        "build_allowed_srv",
+        Some(LoadPolicy::restricted().with_allowed_dir(&allowed)),
+    );
     let ok = allowed.join("ok.nt").display().to_string();
     let (s, b) = api.root("POST", &format!("/build?db_name=ok&db_path={ok}"), "");
     assert_eq!(s, 200, "{b}");
-    let escape = format!("{}/../{}", allowed.display(), secret.strip_prefix(secret.parent().unwrap().parent().unwrap()).unwrap().display());
-    for path in [secret.display().to_string(), escape, allowed.display().to_string()] {
+    let escape = format!(
+        "{}/../{}",
+        allowed.display(),
+        secret
+            .strip_prefix(secret.parent().unwrap().parent().unwrap())
+            .unwrap()
+            .display()
+    );
+    for path in [
+        secret.display().to_string(),
+        escape,
+        allowed.display().to_string(),
+    ] {
         let (s, b) = api.root("POST", &format!("/build?db_name=no&db_path={path}"), "");
         assert_eq!(s, 403, "{path}: {b}");
     }
@@ -242,7 +292,10 @@ fn build_from_a_server_path_follows_the_load_policy() {
         std::os::unix::fs::symlink("/dev/zero", allowed.join("zero.nt")).unwrap();
         let (s, b) = api.root(
             "POST",
-            &format!("/build?db_name=no&db_path={}", allowed.join("zero.nt").display()),
+            &format!(
+                "/build?db_name=no&db_path={}",
+                allowed.join("zero.nt").display()
+            ),
             "",
         );
         assert_eq!(s, 403, "a device is never read: {b}");
@@ -253,7 +306,11 @@ fn build_from_a_server_path_follows_the_load_policy() {
 
 fn snapshot_files(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
-        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
         .unwrap_or_default();
     v.sort();
     v
@@ -286,7 +343,11 @@ fn backup_writes_only_inside_the_backup_directory() {
         assert_eq!(s, 403, "{path}: {b}");
     }
     assert!(outside.join("rocksdb/CURRENT").exists() && outside.join("kvstore.kv").exists());
-    assert_eq!(snapshot_files(&victim_db), before, "another database is untouched");
+    assert_eq!(
+        snapshot_files(&victim_db),
+        before,
+        "another database is untouched"
+    );
     #[cfg(unix)]
     {
         // A symlink inside the backup directory pointing out of it.
@@ -314,12 +375,22 @@ fn backup_writes_only_inside_the_backup_directory() {
     let victim_backup = snapshot_files(&backups.join("victim.backup"));
     std::fs::create_dir_all(backups.join("other")).unwrap();
     std::fs::write(backups.join("other/kvstore.kv"), b"precious").unwrap();
-    for (path, status) in [("victim.backup", 409), ("other", 409), ("victim.backup/sub", 409)] {
+    for (path, status) in [
+        ("victim.backup", 409),
+        ("other", 409),
+        ("victim.backup/sub", 409),
+    ] {
         let (s, b) = api.root("POST", &format!("/backup?db_name=d1&path={path}"), "");
         assert_eq!(s, status, "{path}: {b}");
     }
-    assert_eq!(snapshot_files(&backups.join("victim.backup")), victim_backup);
-    assert_eq!(std::fs::read(backups.join("other/kvstore.kv")).unwrap(), b"precious");
+    assert_eq!(
+        snapshot_files(&backups.join("victim.backup")),
+        victim_backup
+    );
+    assert_eq!(
+        std::fs::read(backups.join("other/kvstore.kv")).unwrap(),
+        b"precious"
+    );
 }
 
 #[test]
@@ -333,13 +404,20 @@ fn restore_reads_only_from_the_backup_directory_or_allowed_dirs() {
 
     let api = Api::start("restore_confine", None);
     assert_eq!(api.root("POST", "/build?db_name=r", DATA).0, 200);
-    let (s, b) = api.root("POST", &format!("/restore?db_name=r&path={}", foreign.display()), "");
+    let (s, b) = api.root(
+        "POST",
+        &format!("/restore?db_name=r&path={}", foreign.display()),
+        "",
+    );
     assert_eq!(s, 403, "{b}");
     // Another server database's own directory is not a backup source either.
     assert_eq!(api.root("POST", "/build?db_name=other", DATA).0, 200);
     let (s, b) = api.root(
         "POST",
-        &format!("/restore?db_name=r&path={}", api.root.join("other.db").display()),
+        &format!(
+            "/restore?db_name=r&path={}",
+            api.root.join("other.db").display()
+        ),
         "",
     );
     assert_eq!(s, 403, "{b}");
@@ -352,8 +430,15 @@ fn restore_reads_only_from_the_backup_directory_or_allowed_dirs() {
     assert_eq!(s, 200, "{b}");
 
     // A directory the load policy allows is a valid source.
-    let api = Api::start("restore_allowed", Some(LoadPolicy::restricted().with_allowed_dir(&elsewhere)));
-    let (s, b) = api.root("POST", &format!("/restore?db_name=r&path={}", foreign.display()), "");
+    let api = Api::start(
+        "restore_allowed",
+        Some(LoadPolicy::restricted().with_allowed_dir(&elsewhere)),
+    );
+    let (s, b) = api.root(
+        "POST",
+        &format!("/restore?db_name=r&path={}", foreign.display()),
+        "",
+    );
     assert_eq!(s, 200, "{b}");
     let (_, b) = api.root("POST", "/sparql?db_name=r", "SELECT ?o WHERE { ?s ?p ?o }");
     assert!(b.contains("FOREIGN"), "{b}");
@@ -402,7 +487,10 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
     for q in &queries {
         let (s, b) = api.root("POST", "/sparql?db_name=d", q);
         assert_eq!(s, 400, "{q}: {b}");
-        assert!(b.contains("SERVICE is disabled") && !b.contains("internal-secret"), "{b}");
+        assert!(
+            b.contains("SERVICE is disabled") && !b.contains("internal-secret"),
+            "{b}"
+        );
     }
     let update = format!(
         "INSERT {{ <http://ex/leak> <http://ex/p> ?x }} WHERE {{ SERVICE <{url}> {{ ?x ?y ?z }} }}"
@@ -437,7 +525,10 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
     for q in &more_queries {
         let (s, b) = api.root("POST", "/sparql?db_name=d", q);
         assert_eq!(s, 400, "{q}: {b}");
-        assert!(b.contains("SERVICE is disabled") && !b.contains("internal-secret"), "{b}");
+        assert!(
+            b.contains("SERVICE is disabled") && !b.contains("internal-secret"),
+            "{b}"
+        );
     }
     for update in [
         format!(
@@ -460,16 +551,28 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
     // A read answered from an open transaction's snapshot is no way around it.
     let (s, b) = api.root("POST", "/begin?db_name=d", "");
     assert_eq!(s, 200, "{b}");
-    let tid = b.split("\"TID\":\"").nth(1).and_then(|x| x.split('"').next()).unwrap().to_string();
+    let tid = b
+        .split("\"TID\":\"")
+        .nth(1)
+        .and_then(|x| x.split('"').next())
+        .unwrap()
+        .to_string();
     for q in queries.iter().chain(&more_queries) {
         let (s, b) = api.root("POST", "/sparql?db_name=d", q);
         assert_eq!(s, 400, "snapshot read {q}: {b}");
-        assert!(b.contains("SERVICE is disabled") && !b.contains("internal-secret"), "{b}");
+        assert!(
+            b.contains("SERVICE is disabled") && !b.contains("internal-secret"),
+            "{b}"
+        );
     }
     let (s, b) = api.root("POST", &format!("/tquery?tid={tid}"), &queries[0]);
     assert_eq!(s, 400, "{b}");
     assert_eq!(api.root("POST", &format!("/rollback?tid={tid}"), "").0, 200);
-    let (_, b) = api.root("POST", "/sparql?db_name=d", "SELECT ?o WHERE { <http://ex/leak> ?p ?o }");
+    let (_, b) = api.root(
+        "POST",
+        "/sparql?db_name=d",
+        "SELECT ?o WHERE { <http://ex/leak> ?p ?o }",
+    );
     assert!(!b.contains("internal-secret"), "{b}");
 
     // The single-database server (unauthenticated, restricted by default).
@@ -485,7 +588,10 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
     }
     server.shutdown();
     thread::sleep(Duration::from_millis(100));
-    assert!(!hit.load(Ordering::SeqCst), "no connection may reach the internal host");
+    assert!(
+        !hit.load(Ordering::SeqCst),
+        "no connection may reach the internal host"
+    );
 
     // An operator who opts in (`gserver --allow-service`) gets federation.
     let mut policy = LoadPolicy::restricted();

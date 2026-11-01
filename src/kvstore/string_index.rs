@@ -149,11 +149,7 @@ impl StringIndex {
     pub fn search_contains(&self, needle: &str) -> Vec<u32> {
         self.contains_candidates(needle)
             .into_iter()
-            .filter(|id| {
-                self.by_id
-                    .get(id)
-                    .is_some_and(|s| s.contains(needle))
-            })
+            .filter(|id| self.by_id.get(id).is_some_and(|s| s.contains(needle)))
             .collect()
     }
 
@@ -195,9 +191,8 @@ impl StringIndex {
     fn sort_ordered(&mut self) {
         // Sort ids by their string (then id) so the order is total and stable.
         let by_id = &self.by_id;
-        self.ordered.sort_by(|a, b| {
-            by_id[a].as_str().cmp(by_id[b].as_str()).then(a.cmp(b))
-        });
+        self.ordered
+            .sort_by(|a, b| by_id[a].as_str().cmp(by_id[b].as_str()).then(a.cmp(b)));
     }
 
     fn all_ids(&self) -> Vec<u32> {
@@ -327,7 +322,10 @@ mod tests {
             inc.insert(id, s);
         }
         assert_eq!(inc.search_contains("alic"), built.search_contains("alic"));
-        assert_eq!(inc.prefix("<http://example.org/"), built.prefix("<http://example.org/"));
+        assert_eq!(
+            inc.prefix("<http://example.org/"),
+            built.prefix("<http://example.org/")
+        );
     }
 
     #[test]
@@ -336,7 +334,10 @@ mod tests {
         let bytes = bincode::serialize(&idx).unwrap();
         let back: StringIndex = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back.search_contains("alic"), idx.search_contains("alic"));
-        assert_eq!(back.prefix("<http://example.org/"), idx.prefix("<http://example.org/"));
+        assert_eq!(
+            back.prefix("<http://example.org/"),
+            idx.prefix("<http://example.org/")
+        );
         assert_eq!(back.len(), idx.len());
     }
 

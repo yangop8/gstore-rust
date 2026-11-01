@@ -42,7 +42,8 @@ pub fn rewrite_followup(
         .map(|(q, a)| format!("Q: {q}\nA: {a}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let user = format!("Conversation so far:\n{convo}\n\nFollow-up: {question}\n\nStandalone question:");
+    let user =
+        format!("Conversation so far:\n{convo}\n\nFollow-up: {question}\n\nStandalone question:");
     let mut req = LlmRequest::prompt(user).system(SYS_REWRITE);
     if let Some(m) = model {
         req = req.model(m);
@@ -134,7 +135,10 @@ pub struct Session<'a> {
 impl<'a> Session<'a> {
     /// Start an empty conversation backed by `engine`.
     pub fn new(engine: &'a SolveEngine) -> Self {
-        Session { engine, history: Vec::new() }
+        Session {
+            engine,
+            history: Vec::new(),
+        }
     }
 
     /// Ask the next turn: rewrite against history, solve, and record the turn.
@@ -155,11 +159,15 @@ impl<'a> Session<'a> {
     /// resolution.
     pub fn ask_with_mode(&mut self, question: &str, mode: Mode) -> Result<Answer> {
         let standalone = if mode == Mode::Structured {
-            let redacted: Vec<(String, String)> =
-                self.history.iter().map(|(q, _)| (q.clone(), String::new())).collect();
+            let redacted: Vec<(String, String)> = self
+                .history
+                .iter()
+                .map(|(q, _)| (q.clone(), String::new()))
+                .collect();
             self.engine.rewrite_followup_question(&redacted, question)
         } else {
-            self.engine.rewrite_followup_question(&self.history, question)
+            self.engine
+                .rewrite_followup_question(&self.history, question)
         };
         let answer = self.engine.ask_with_mode(&standalone, mode)?;
         self.history.push((standalone, summarize_answer(&answer)));
@@ -240,8 +248,14 @@ mod tests {
     fn does_not_mangle_leading_quoted_phrase() {
         // Only a *balanced* wrapping quote pair is stripped; a leading quote with
         // a trailing '?' must be left intact.
-        assert_eq!(clean_rewrite("\"Blade Runner\" director?"), "\"Blade Runner\" director?");
-        assert_eq!(clean_rewrite("\"Who directed Alien?\""), "Who directed Alien?");
+        assert_eq!(
+            clean_rewrite("\"Blade Runner\" director?"),
+            "\"Blade Runner\" director?"
+        );
+        assert_eq!(
+            clean_rewrite("\"Who directed Alien?\""),
+            "Who directed Alien?"
+        );
     }
 
     #[test]
@@ -289,7 +303,7 @@ mod tests {
         let _ = sess.ask("and then?").unwrap();
         assert_eq!(sess.len(), 2);
         assert_eq!(sess.history()[0].0, "first?"); // empty history → verbatim
-        // Turn 2 records the *resolved* standalone question, not the raw one.
+                                                   // Turn 2 records the *resolved* standalone question, not the raw one.
         assert!(!sess.history()[1].0.is_empty());
         sess.clear();
         assert!(sess.is_empty());
@@ -309,7 +323,11 @@ mod tests {
             })
         }
         fn saw(&self, needle: &str) -> bool {
-            self.prompts.lock().unwrap().iter().any(|p| p.contains(needle))
+            self.prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains(needle))
         }
     }
     impl LlmClient for SeqRecLlm {
@@ -350,14 +368,20 @@ mod tests {
         let a1 = sess.ask_with_mode("who?", mode).unwrap();
         assert!(a1.text.contains("SECRETVALUE"));
         let _ = sess.ask_with_mode("and then?", mode).unwrap();
-        assert!(llm.saw("and then?"), "the rewrite step must have run on turn 2");
+        assert!(
+            llm.saw("and then?"),
+            "the rewrite step must have run on turn 2"
+        );
         llm
     }
 
     #[test]
     fn structured_mode_rewrite_omits_prior_answer_data() {
         let llm = run_two_turns(Mode::Structured);
-        assert!(!llm.saw("SECRETVALUE"), "structured mode leaked a KB answer value to the LLM");
+        assert!(
+            !llm.saw("SECRETVALUE"),
+            "structured mode leaked a KB answer value to the LLM"
+        );
     }
 
     #[test]
@@ -365,7 +389,10 @@ mod tests {
         // Contrast: confirms the redaction above is real (not that the value is
         // simply never present). Auto permits egress, so it carries the answer.
         let llm = run_two_turns(Mode::Auto);
-        assert!(llm.saw("SECRETVALUE"), "auto mode should fold the prior answer into the rewrite");
+        assert!(
+            llm.saw("SECRETVALUE"),
+            "auto mode should fold the prior answer into the rewrite"
+        );
     }
 
     use std::sync::{Arc, Mutex};

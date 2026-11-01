@@ -133,9 +133,17 @@ fn login_and_privilege_enforcement() {
     assert_eq!(s, 401, "bad login must be 401");
 
     // root can log in and receives a session token.
-    let (s, body) = request(&addr, "POST", "/login?username=root&password=root", None, "");
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/login?username=root&password=root",
+        None,
+        "",
+    );
     assert_eq!(s, 200);
-    let token = json_field(&body, "session").expect("session token").to_string();
+    let token = json_field(&body, "session")
+        .expect("session token")
+        .to_string();
     assert!(!token.is_empty());
 
     // root builds a database (RDF in the body).
@@ -208,7 +216,13 @@ fn http_transaction_commit_and_rollback() {
         "INSERT DATA { <http://ex/s1> <http://ex/p> <http://ex/o1> }",
     );
     assert_eq!(s, 200);
-    let (s, _) = request(&addr, "POST", &format!("/commit?txn={tid}"), Some(&root), "");
+    let (s, _) = request(
+        &addr,
+        "POST",
+        &format!("/commit?txn={tid}"),
+        Some(&root),
+        "",
+    );
     assert_eq!(s, 200);
 
     let (s, body) = request(
@@ -273,9 +287,18 @@ fn backup_and_restore_roundtrip() {
     assert_eq!(s, 200);
 
     // Backup the original state.
-    let (s, body) = request(&addr, "POST", "/backup?db_name=bk&path=bk_snapshot", Some(&root), "");
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/backup?db_name=bk&path=bk_snapshot",
+        Some(&root),
+        "",
+    );
     assert_eq!(s, 200, "backup: {body}");
-    assert!(Database::storage_kind(&backup_path).is_some(), "backup written to {backup_path:?}: {body}");
+    assert!(
+        Database::storage_kind(&backup_path).is_some(),
+        "backup written to {backup_path:?}: {body}"
+    );
 
     // Mutate after the backup: add :c :p :d .
     let (s, _) = request(
@@ -338,9 +361,18 @@ fn batch_insert_reflected_in_query() {
     let triples = "<http://ex/p1> <http://ex/k> <http://ex/v1> . \
                    <http://ex/p2> <http://ex/k> <http://ex/v2> . \
                    <http://ex/p3> <http://ex/k> <http://ex/v3> .";
-    let (s, body) = request(&addr, "POST", "/batchInsert?db_name=batch", Some(&root), triples);
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/batchInsert?db_name=batch",
+        Some(&root),
+        triples,
+    );
     assert_eq!(s, 200, "batchInsert: {body}");
-    assert!(body.contains("\"changed\":3"), "three triples added: {body}");
+    assert!(
+        body.contains("\"changed\":3"),
+        "three triples added: {body}"
+    );
 
     let (s, body) = request(
         &addr,
@@ -351,7 +383,10 @@ fn batch_insert_reflected_in_query() {
     );
     assert_eq!(s, 200);
     for s in ["http://ex/p1", "http://ex/p2", "http://ex/p3"] {
-        assert!(body.contains(s), "batch triple {s} must be queryable: {body}");
+        assert!(
+            body.contains(s),
+            "batch triple {s} must be queryable: {body}"
+        );
     }
 
     // batchRemove takes some away again.
@@ -406,9 +441,18 @@ fn export_returns_ntriples() {
 
     let (s, body) = request(&addr, "GET", "/export?db_name=ex", Some(&root), "");
     assert_eq!(s, 200);
-    assert!(body.contains("<http://ex/a>"), "export contains subjects: {body}");
-    assert!(body.contains("<http://ex/p>"), "export contains predicates: {body}");
-    assert!(body.trim_end().ends_with('.'), "N-Triples lines end with a dot");
+    assert!(
+        body.contains("<http://ex/a>"),
+        "export contains subjects: {body}"
+    );
+    assert!(
+        body.contains("<http://ex/p>"),
+        "export contains predicates: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with('.'),
+        "N-Triples lines end with a dot"
+    );
 }
 
 #[test]
@@ -427,7 +471,10 @@ fn monitor_and_logs_are_admin_gated() {
     // The access log (admin-only) records the requests we just made.
     let (s, body) = request(&addr, "GET", "/accesslog", Some(&root), "");
     assert_eq!(s, 200);
-    assert!(body.contains("/monitor"), "access log captured /monitor: {body}");
+    assert!(
+        body.contains("/monitor"),
+        "access log captured /monitor: {body}"
+    );
 
     // A non-admin user cannot read logs.
     let (s, _) = request(

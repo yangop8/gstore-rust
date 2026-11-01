@@ -658,7 +658,10 @@ mod tests {
             "name": "Bob"
         }"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://schema.org/name")[0].object, Term::plain_literal("Bob"));
+        assert_eq!(
+            find(&ts, "http://schema.org/name")[0].object,
+            Term::plain_literal("Bob")
+        );
     }
 
     #[test]
@@ -694,9 +697,18 @@ mod tests {
             "active": true
         }"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/age")[0].object, Term::typed_literal("42", xsd::INTEGER));
-        assert_eq!(find(&ts, "http://ex/height")[0].object, Term::typed_literal("1.75", xsd::DOUBLE));
-        assert_eq!(find(&ts, "http://ex/active")[0].object, Term::typed_literal("true", xsd::BOOLEAN));
+        assert_eq!(
+            find(&ts, "http://ex/age")[0].object,
+            Term::typed_literal("42", xsd::INTEGER)
+        );
+        assert_eq!(
+            find(&ts, "http://ex/height")[0].object,
+            Term::typed_literal("1.75", xsd::DOUBLE)
+        );
+        assert_eq!(
+            find(&ts, "http://ex/active")[0].object,
+            Term::typed_literal("true", xsd::BOOLEAN)
+        );
     }
 
     #[test]
@@ -707,7 +719,10 @@ mod tests {
             "knows": "http://ex/b"
         }"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/knows")[0].object, Term::iri("http://ex/b"));
+        assert_eq!(
+            find(&ts, "http://ex/knows")[0].object,
+            Term::iri("http://ex/b")
+        );
     }
 
     #[test]
@@ -786,8 +801,15 @@ mod tests {
             "keep": "v"
         }"#;
         let ts = parse_str(doc).unwrap();
-        assert!(find(&ts, "http://other/keep").is_empty(), "nulled term mapping must be removed");
-        assert_eq!(find(&ts, "http://ex/keep").len(), 1, "term falls back to @vocab expansion");
+        assert!(
+            find(&ts, "http://other/keep").is_empty(),
+            "nulled term mapping must be removed"
+        );
+        assert_eq!(
+            find(&ts, "http://ex/keep").len(),
+            1,
+            "term falls back to @vocab expansion"
+        );
     }
 
     #[test]
@@ -848,14 +870,20 @@ mod tests {
         let name = find(&ts, "http://ex/name");
         assert!(name.iter().any(|t| t.subject == Term::blank("b0")));
         // the nested node without @id gets a generated blank subject
-        assert!(name.iter().any(|t| matches!(&t.subject, Term::Blank(l) if l != "b0")));
+        assert!(name
+            .iter()
+            .any(|t| matches!(&t.subject, Term::Blank(l) if l != "b0")));
     }
 
     #[test]
     fn string_escapes_and_unicode() {
-        let doc = r#"{"@context":{"@vocab":"http://ex/"},"@id":"http://ex/a","v":"line1\nline2 é"}"#;
+        let doc =
+            r#"{"@context":{"@vocab":"http://ex/"},"@id":"http://ex/a","v":"line1\nline2 é"}"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/v")[0].object, Term::plain_literal("line1\nline2 é"));
+        assert_eq!(
+            find(&ts, "http://ex/v")[0].object,
+            Term::plain_literal("line1\nline2 é")
+        );
     }
 
     #[test]
@@ -868,7 +896,11 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         assert_eq!(
             find(&ts, "http://ex/name")[0].object,
-            Term::Literal { value: "Alice".into(), datatype: None, lang: Some("en".into()) }
+            Term::Literal {
+                value: "Alice".into(),
+                datatype: None,
+                lang: Some("en".into())
+            }
         );
     }
 

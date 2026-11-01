@@ -465,16 +465,22 @@ impl RocksStore {
         let mut out = Vec::new();
         let mode = IteratorMode::From(JOURNAL_PREFIX, Direction::Forward);
         for item in self.db.iterator_cf(self.cf(CF_META), mode) {
-            let (k, v) = item
-                .map_err(|e| GStoreError::Database(format!("rocksdb read (journal): {e}")))?;
+            let (k, v) =
+                item.map_err(|e| GStoreError::Database(format!("rocksdb read (journal): {e}")))?;
             if !k.starts_with(JOURNAL_PREFIX) {
                 break;
             }
             if v.len() != 18 || !matches!(v[0], UNDO_INSERT | UNDO_REMOVE) {
-                return Err(GStoreError::Database("corrupt rocksdb undo journal record".into()));
+                return Err(GStoreError::Database(
+                    "corrupt rocksdb undo journal record".into(),
+                ));
             }
             let graph = (v[1] == 1).then(|| de(&v[2..6]));
-            out.push((v[0], graph, IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18]))));
+            out.push((
+                v[0],
+                graph,
+                IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18])),
+            ));
         }
         Ok(out)
     }

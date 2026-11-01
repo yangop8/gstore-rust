@@ -50,7 +50,10 @@ fn request_h(
     for (k, v) in headers {
         raw.push_str(&format!("{k}: {v}\r\n"));
     }
-    raw.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()));
+    raw.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
     s.write_all(raw.as_bytes()).unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
@@ -82,8 +85,14 @@ fn status_code(body: &str) -> i64 {
 fn start_api(
     root: &Path,
     configure: impl FnOnce(ApiServer) -> ApiServer,
-) -> (Arc<ApiServer>, SocketAddr, thread::JoinHandle<ShutdownReport>) {
-    let server = Arc::new(configure(ApiServer::bind(root, "root", "127.0.0.1:0").unwrap()));
+) -> (
+    Arc<ApiServer>,
+    SocketAddr,
+    thread::JoinHandle<ShutdownReport>,
+) {
+    let server = Arc::new(configure(
+        ApiServer::bind(root, "root", "127.0.0.1:0").unwrap(),
+    ));
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     let serving = thread::spawn(move || s2.serve_forever());
@@ -94,7 +103,10 @@ fn start_api(
 fn join_within(serving: thread::JoinHandle<ShutdownReport>, limit: Duration) -> ShutdownReport {
     let t0 = Instant::now();
     while !serving.is_finished() {
-        assert!(t0.elapsed() < limit, "the server did not shut down within {limit:?}");
+        assert!(
+            t0.elapsed() < limit,
+            "the server did not shut down within {limit:?}"
+        );
         thread::sleep(Duration::from_millis(20));
     }
     serving.join().unwrap()
@@ -171,7 +183,11 @@ fn shutdown_route_accepts_the_system_user_from_headers_and_md5() {
         &addr,
         "GET",
         "/grpc/shutdown",
-        &[("username", "system"), ("password", &digest), ("encryption", "1")],
+        &[
+            ("username", "system"),
+            ("password", &digest),
+            ("encryption", "1"),
+        ],
         "",
     );
     assert_eq!((s, status_code(&body)), (200, 0), "{body}");
@@ -191,7 +207,9 @@ fn shutdown_route_checks_root_through_the_api_credential_check() {
         &addr,
         "POST",
         "/api",
-        &format!(r#"{{"operation":"login","username":"root","password":"{digest}","encryption":"1"}}"#),
+        &format!(
+            r#"{{"operation":"login","username":"root","password":"{digest}","encryption":"1"}}"#
+        ),
     );
     assert_eq!(status_code(&body), 0, "{body}");
     let (s, body) = request(
@@ -235,7 +253,11 @@ fn shutdown_route_saves_unsaved_changes_like_sigterm() {
     let r = db
         .query("ASK { <http://ex/new> <http://ex/p> <http://ex/o> }")
         .unwrap();
-    assert_eq!(r, gstore::QueryResult::Ask(true), "the update survived /shutdown");
+    assert_eq!(
+        r,
+        gstore::QueryResult::Ask(true),
+        "the update survived /shutdown"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -282,12 +304,18 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     let (s, body) = request(&addr, "POST", "/login", "username=root&password=cfgpw");
     assert_eq!(s, 200, "{body}");
     // The upstream `/api` protocol is served too, reporting the licensetype.
-    let (s, body) = request(&addr, "GET", "/api?operation=login&username=root&password=cfgpw", "");
+    let (s, body) = request(
+        &addr,
+        "GET",
+        "/api?operation=login&username=root&password=cfgpw",
+        "",
+    );
     assert_eq!((s, status_code(&body)), (200, 0), "{body}");
     assert!(body.contains(r#""licensetype":"trial""#), "{body}");
     // keep_alive_timeout=0 ⇒ every response closes; cors=off ⇒ no CORS header.
     let mut sock = TcpStream::connect(addr).unwrap();
-    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
     let mut resp = String::new();
     sock.read_to_string(&mut resp).unwrap();
     assert!(resp.contains("Connection: close"), "{resp}");
@@ -297,9 +325,23 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     assert_eq!(s, 413);
     // system_username names the user that may stop the server.
     let pw = server.system_password().to_string();
-    let (_, body) = request(&addr, "GET", &format!("/shutdown?username=system&password={pw}"), "");
-    assert_eq!(status_code(&body), 1001, "only `sys` is the system user here: {body}");
-    let (_, body) = request(&addr, "GET", &format!("/shutdown?username=sys&password={pw}"), "");
+    let (_, body) = request(
+        &addr,
+        "GET",
+        &format!("/shutdown?username=system&password={pw}"),
+        "",
+    );
+    assert_eq!(
+        status_code(&body),
+        1001,
+        "only `sys` is the system user here: {body}"
+    );
+    let (_, body) = request(
+        &addr,
+        "GET",
+        &format!("/shutdown?username=sys&password={pw}"),
+        "",
+    );
     assert_eq!(status_code(&body), 0, "{body}");
     join_within(serving, Duration::from_secs(20));
     let _ = std::fs::remove_dir_all(&root);
@@ -376,7 +418,10 @@ mod binary {
             .unwrap_or(false);
         let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
-            .and_then(|s| s.rfind(')').map(|i| s[i + 1..].trim_start().starts_with('Z')))
+            .and_then(|s| {
+                s.rfind(')')
+                    .map(|i| s[i + 1..].trim_start().starts_with('Z'))
+            })
             .unwrap_or(false);
         probe && !zombie
     }
@@ -393,7 +438,10 @@ mod binary {
     }
 
     fn sigkill(pid: &str) {
-        let _ = Command::new("kill").args(["-9", pid]).stderr(Stdio::null()).status();
+        let _ = Command::new("kill")
+            .args(["-9", pid])
+            .stderr(Stdio::null())
+            .status();
     }
 
     /// Kills whatever the pid file names when dropped (test failure cleanup),
@@ -440,7 +488,10 @@ mod binary {
             pid_file: pid_file.clone(),
         };
 
-        let (code, out, err) = gserver(&dir, &["-b", "--api", &home_s, "-p", "0", "--password", "pw"]);
+        let (code, out, err) = gserver(
+            &dir,
+            &["-b", "--api", &home_s, "-p", "0", "--password", "pw"],
+        );
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         let addr = printed_addr(&out);
         let lines = pid_lines(&pid_file).expect("pid file written");
@@ -450,7 +501,10 @@ mod binary {
         assert_eq!(lines[2], "1", "started in the background");
         assert_eq!(lines[3], addr.to_string());
         assert_eq!(lines[4], "0", "no supervisor");
-        assert!(home.join("gserver.log").exists(), "output goes to the log file");
+        assert!(
+            home.join("gserver.log").exists(),
+            "output goes to the log file"
+        );
 
         // It serves the multi-database API.
         let (s, body) = request_h(&addr, "POST", "/login", &[], "username=root&password=pw");
@@ -536,7 +590,10 @@ mod binary {
         // password file as the refusal advises (and as docs/DEPLOY.md's
         // `docker run` does), seeds a new one from it instead of finding root
         // with the default password and refusing again.
-        assert!(!home.join("users.db").exists(), "a refused start left a user store");
+        assert!(
+            !home.join("users.db").exists(),
+            "a refused start left a user store"
+        );
         let pw0 = dir.join("root_pw0");
         std::fs::write(&pw0, "set-after-refusal\n").unwrap();
         let pw0_s = pw0.to_string_lossy().into_owned();
@@ -557,7 +614,12 @@ mod binary {
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         let port = addr_of(&pid_file).port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let (s, body) = request(&addr, "POST", "/login", "username=root&password=set-after-refusal");
+        let (s, body) = request(
+            &addr,
+            "POST",
+            "/login",
+            "username=root&password=set-after-refusal",
+        );
         assert_eq!(s, 200, "{body}");
         let (code, _, _) = gserver(&dir, &["-t", "--api", &home_s]);
         assert_eq!(code, 0);
@@ -664,20 +726,31 @@ mod binary {
         // conf.ini supplies port, db_home (hence the pid file) and root's password.
         let (code, out, err) = gserver(&dir, &["-b", "-c", &ini_s]);
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
-        assert!(err.contains("unknown key 'unknown_key'"), "unknown keys warn: {err}");
+        assert!(
+            err.contains("unknown key 'unknown_key'"),
+            "unknown keys warn: {err}"
+        );
         assert_eq!(addr_of(&pid_file).port(), p1);
         let addr: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
         let (s, body) = request(&addr, "POST", "/login", "username=root&password=frominit");
         assert_eq!(s, 200, "root_password from conf.ini: {body}");
         // The default mode serves the upstream `/api` protocol on the same
         // users (per-request credentials, the gStore envelope).
-        let (s, body) = request(&addr, "GET", "/api?operation=login&username=root&password=frominit", "");
+        let (s, body) = request(
+            &addr,
+            "GET",
+            "/api?operation=login&username=root&password=frominit",
+            "",
+        );
         assert_eq!((s, status_code(&body)), (200, 0), "{body}");
         assert!(body.contains("\"CoreVersion\""), "{body}");
         let (s, body) = request(&addr, "POST", "/", r#"{"operation":"check"}"#);
         assert_eq!((s, status_code(&body)), (200, 0), "{body}");
         let log = std::fs::read_to_string(home.join("gserver.log")).unwrap();
-        assert!(log.contains("4 worker threads"), "thread_num from conf.ini: {log}");
+        assert!(
+            log.contains("4 worker threads"),
+            "thread_num from conf.ini: {log}"
+        );
         let (code, _, _) = gserver(&dir, &["-t", "-c", &ini_s]);
         assert_eq!(code, 0);
 
@@ -733,7 +806,10 @@ mod binary {
 
         let (code, out, err) = gserver(&dir, &["-b", "-c", &ini_s]);
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
-        assert!(!err.contains("unknown key"), "the [query] keys are known: {err}");
+        assert!(
+            !err.contains("unknown key"),
+            "the [query] keys are known: {err}"
+        );
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let auth = [("Authorization", "Basic cm9vdDpwdw==")]; // root:pw
         let (s, body) = request_h(
@@ -746,7 +822,10 @@ mod binary {
         assert_eq!(s, 200, "{body}");
         let (s, body) = request_h(&addr, "POST", "/sparql?db_name=q", &auth, div);
         assert_eq!(s, 200, "{body}");
-        assert!(body.contains("\"value\":\"3\""), "integer_division=truncate: {body}");
+        assert!(
+            body.contains("\"value\":\"3\""),
+            "integer_division=truncate: {body}"
+        );
         // 32 bytes cannot hold the path's JSON: the call fails.
         let (s, body) = request_h(&addr, "POST", "/sparql?db_name=q", &auth, gfun);
         assert_eq!(s, 400, "{body}");
@@ -771,7 +850,10 @@ mod binary {
         let addr = printed_addr(&out);
         let (s, body) = request(&addr, "POST", "/sparql", div);
         assert_eq!(s, 200, "{body}");
-        assert!(body.contains("\"value\":\"3\""), "integer_division=truncate: {body}");
+        assert!(
+            body.contains("\"value\":\"3\""),
+            "integer_division=truncate: {body}"
+        );
         let (s, body) = request(&addr, "POST", "/sparql", gfun);
         assert_eq!(s, 400, "{body}");
         let (code, _, _) = gserver(&dir, &["-t", &db_s]);
@@ -795,7 +877,10 @@ mod binary {
         // -r stops the background server and starts it again in the background.
         let (code, out, err) = gserver(&dir, &["-r", "--api", &home_s, "-p", "0"]);
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
-        assert!(out.contains("stop server...") && out.contains("start server..."), "{out}");
+        assert!(
+            out.contains("stop server...") && out.contains("start server..."),
+            "{out}"
+        );
         assert!(wait_dead(&first, Duration::from_secs(5)));
         let lines = pid_lines(&pid_file).unwrap();
         let second = lines[0].clone();
@@ -826,7 +911,16 @@ mod binary {
         let port = free_port().to_string();
         let (code, out, err) = gserver(
             &dir,
-            &["-b", "--api", &home_s, "-p", &port, "--password", "pw", "--no-checkpoint"],
+            &[
+                "-b",
+                "--api",
+                &home_s,
+                "-p",
+                &port,
+                "--password",
+                "pw",
+                "--no-checkpoint",
+            ],
         );
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         let addr = printed_addr(&out);
@@ -849,7 +943,12 @@ mod binary {
         );
         assert_eq!(s, 200, "{body}");
 
-        let (s, body) = request(&addr, "POST", "/restart", r#"{"username":"root","password":"pw"}"#);
+        let (s, body) = request(
+            &addr,
+            "POST",
+            "/restart",
+            r#"{"username":"root","password":"pw"}"#,
+        );
         assert_eq!((s, status_code(&body)), (200, 0), "{body}");
 
         // Same pid, a fresh system password, and serving again.
@@ -860,13 +959,19 @@ mod binary {
                     break l;
                 }
             }
-            assert!(t0.elapsed() < Duration::from_secs(60), "the server did not come back");
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "the server did not come back"
+            );
             thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(after[0], before[0], "re-executed in place");
         assert_eq!(after[2], "1", "still a background server");
         let log = std::fs::read_to_string(home.join("gserver.log")).unwrap();
-        assert!(log.contains("saved database to"), "unsaved changes were saved: {log}");
+        assert!(
+            log.contains("saved database to"),
+            "unsaved changes were saved: {log}"
+        );
         assert!(log.contains("gserver: restarting"), "{log}");
         // The update made before the restart is there after it.
         let (s, body) = request_h(&addr, "POST", "/load?db_name=r", &auth, "");
@@ -928,7 +1033,8 @@ mod binary {
         let t0 = Instant::now();
         let restarted = loop {
             if let Some(l) = pid_lines(&pid_file) {
-                if l[0] != server && alive(&l[0]) && TcpStream::connect(addr_of(&pid_file)).is_ok() {
+                if l[0] != server && alive(&l[0]) && TcpStream::connect(addr_of(&pid_file)).is_ok()
+                {
                     break l;
                 }
             }
@@ -941,7 +1047,10 @@ mod binary {
         let (code, out, err) = gserver(&dir, &["-t", "-c", &ini_s]);
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         assert!(wait_dead(&restarted[0], Duration::from_secs(10)));
-        assert!(wait_dead(&supervisor, Duration::from_secs(10)), "the supervisor exited");
+        assert!(
+            wait_dead(&supervisor, Duration::from_secs(10)),
+            "the supervisor exited"
+        );
     }
 
     /// A server killed while its supervisor waits to restart it: `-t` stops
@@ -1025,7 +1134,10 @@ mod binary {
         thread::sleep(Duration::from_millis(300));
         term();
         thread::sleep(Duration::from_millis(300));
-        assert!(alive(&pid), "the second SIGTERM killed the shutting-down server");
+        assert!(
+            alive(&pid),
+            "the second SIGTERM killed the shutting-down server"
+        );
         drop(idle);
         assert!(wait_dead(&pid, Duration::from_secs(30)));
         let mut db = gstore::Database::open(&db_dir).unwrap();
@@ -1103,11 +1215,13 @@ mod binary {
         assert_eq!(s, 200, "{body}");
         // Keep-alive: two requests on one connection.
         let sock = TcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut w = sock.try_clone().unwrap();
         let mut r = BufReader::new(sock);
         for _ in 0..2 {
-            w.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            w.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
             let mut head = String::new();
             loop {
                 let mut line = String::new();
@@ -1137,6 +1251,10 @@ mod binary {
         let r = db
             .query("ASK { <http://ex/x> <http://ex/p> <http://ex/y> }")
             .unwrap();
-        assert_eq!(r, gstore::QueryResult::Ask(true), "saved on the graceful stop");
+        assert_eq!(
+            r,
+            gstore::QueryResult::Ask(true),
+            "saved on the graceful stop"
+        );
     }
 }

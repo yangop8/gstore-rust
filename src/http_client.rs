@@ -229,7 +229,10 @@ impl HttpGetReply {
 pub fn get_with(url: &str, accept: &str, opts: &PostOptions) -> io::Result<HttpGetReply> {
     let target = parse_url(url)?;
     if accept.contains(['\r', '\n']) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "malformed Accept"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "malformed Accept",
+        ));
     }
     let default_port = if target.tls { 443 } else { 80 };
     let host_header = if target.port == default_port {
@@ -634,9 +637,9 @@ pub fn parse_sparql_json(body: &str) -> io::Result<Vec<ServiceSolution>> {
 
     let mut out = Vec::with_capacity(bindings.len());
     for row in bindings {
-        let obj = row
-            .as_object()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "binding is not an object"))?;
+        let obj = row.as_object().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "binding is not an object")
+        })?;
         let mut sol = Vec::with_capacity(obj.len());
         for (var, cell) in obj {
             let term = rdf_term_from_json(cell)?;
@@ -663,7 +666,10 @@ fn rdf_term_from_json(cell: &Json) -> io::Result<Term> {
         "bnode" => Term::Blank(value),
         // "literal" and the legacy "typed-literal" both carry datatype/lang.
         _ => {
-            let datatype = cell.get("datatype").and_then(Json::as_str).map(str::to_string);
+            let datatype = cell
+                .get("datatype")
+                .and_then(Json::as_str)
+                .map(str::to_string);
             let lang = cell
                 .get("xml:lang")
                 .and_then(Json::as_str)
@@ -961,7 +967,11 @@ mod tests {
         let started = Instant::now();
         let err = sparql_post_with(&url, "SELECT * WHERE { ?s ?p ?o }", limits).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A response over the size cap is refused instead of buffered whole.
@@ -1239,7 +1249,13 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
         ] {
             assert!(is_local_addr(&local.parse().unwrap()), "{local}");
         }
-        for remote in ["10.0.0.1", "192.168.1.2", "8.8.8.8", "2001:db8::1", "fd00::1"] {
+        for remote in [
+            "10.0.0.1",
+            "192.168.1.2",
+            "8.8.8.8",
+            "2001:db8::1",
+            "fd00::1",
+        ] {
             assert!(!is_local_addr(&remote.parse().unwrap()), "{remote}");
         }
     }
@@ -1255,8 +1271,13 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             ..PostOptions::default()
         };
         for host in ["127.0.0.1", "localhost"] {
-            let err = post_with(&format!("http://{host}:{port}/x"), "text/plain", b"x", &opts)
-                .unwrap_err();
+            let err = post_with(
+                &format!("http://{host}:{port}/x"),
+                "text/plain",
+                b"x",
+                &opts,
+            )
+            .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         }
         assert!(listener.accept().is_err(), "nothing connected");

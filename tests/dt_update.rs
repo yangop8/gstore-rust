@@ -34,14 +34,20 @@ fn insert_and_delete_data() {
         "INSERT DATA { <http://ex/dave> <http://ex/age> 50 }",
     );
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
 
     let n = changed(
         &mut db,
         "DELETE DATA { <http://ex/dave> <http://ex/age> 50 }",
     );
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        0
+    );
 }
 
 #[test]
@@ -50,9 +56,15 @@ fn delete_where_removes_matches() {
     // Remove everyone's city edge.
     let n = changed(&mut db, "DELETE WHERE { ?s <http://ex/city> ?c }");
     assert_eq!(n, 3);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
     // age edges untouched
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> ?a }"), 3);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> ?a }"),
+        3
+    );
 }
 
 #[test]
@@ -92,10 +104,7 @@ fn insert_where_derives_new_triples() {
     );
     assert_eq!(n, 3);
     assert_eq!(
-        count(
-            &mut db,
-            "SELECT ?s WHERE { ?s a <http://ex/Person> }"
-        ),
+        count(&mut db, "SELECT ?s WHERE { ?s a <http://ex/Person> }"),
         3
     );
 }
@@ -120,7 +129,10 @@ fn update_sequence_applies_in_order() {
     );
     assert_eq!(n, 1 + 3);
     assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }"), 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
 }
 
 #[test]
@@ -135,7 +147,10 @@ fn load_reads_local_turtle_file() {
     let q = format!("LOAD <file://{}>", path.display());
     let n = changed(&mut db, &q);
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 22 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 22 }"),
+        1
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -144,7 +159,10 @@ fn load_remote_errors_unless_silent() {
     let mut db = db();
     assert!(db.query("LOAD <http://example.org/x.ttl>").is_err());
     // SILENT swallows the failure.
-    assert_eq!(changed(&mut db, "LOAD SILENT <http://example.org/x.ttl>"), 0);
+    assert_eq!(
+        changed(&mut db, "LOAD SILENT <http://example.org/x.ttl>"),
+        0
+    );
 }
 
 #[test]
@@ -152,15 +170,28 @@ fn transaction_rollback_reverts_updates() {
     let mut db = db();
     let before = count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }");
     db.begin().unwrap();
-    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }")
+        .unwrap();
     db.query("DELETE WHERE { ?s <http://ex/city> ?c }").unwrap();
     // changes are visible inside the transaction
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
     db.rollback().unwrap();
     // everything is restored
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 0);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 3);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        0
+    );
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        3
+    );
     assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }"), before);
 }
 
@@ -168,10 +199,14 @@ fn transaction_rollback_reverts_updates() {
 fn transaction_commit_persists_updates() {
     let mut db = db();
     db.begin().unwrap();
-    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }")
+        .unwrap();
     db.commit().unwrap();
     db.rollback().unwrap_err(); // nothing to roll back after commit
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
 }
 
 #[test]

@@ -839,7 +839,10 @@ mod tests {
             if fresh {
                 break;
             }
-            assert!(loads * bytes.len() <= ENGINE_RECYCLE_BYTES + bytes.len(), "{loads}");
+            assert!(
+                loads * bytes.len() <= ENGINE_RECYCLE_BYTES + bytes.len(),
+                "{loads}"
+            );
         }
         assert!(!rt.load("f", &bytes).unwrap().1);
         let db =

@@ -124,8 +124,11 @@ impl GraphView {
     pub fn from_source<S: TripleSource>(store: &S) -> Self {
         // Collect raw (sub, obj) pairs from every triple in one pass. The trait
         // `iter_all` returns an owned Vec (vs `TripleStore`'s inherent iterator).
-        let raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)> =
-            store.iter_all().into_iter().map(|t| (t.sub, t.obj)).collect();
+        let raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)> = store
+            .iter_all()
+            .into_iter()
+            .map(|t| (t.sub, t.obj))
+            .collect();
         Self::from_raw_pairs(raw_pairs)
     }
 
@@ -139,8 +142,12 @@ impl GraphView {
         let n = id_set.len();
 
         // 2. Sparse → dense lookup.
-        let id_to_idx: HashMap<EntityLiteralId, usize> =
-            id_set.iter().copied().enumerate().map(|(i, id)| (id, i)).collect();
+        let id_to_idx: HashMap<EntityLiteralId, usize> = id_set
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
 
         // 3. De-duplicate directed edges (multiple predicates can share (s,o)).
         let mut raw_edges: Vec<(usize, usize)> = raw_pairs
@@ -187,7 +194,14 @@ impl GraphView {
             }
         }
 
-        GraphView { nodes: id_set, id_to_idx, out_ptr, out_adj, in_ptr, in_adj }
+        GraphView {
+            nodes: id_set,
+            id_to_idx,
+            out_ptr,
+            out_adj,
+            in_ptr,
+            in_adj,
+        }
     }
 
     /// Number of nodes in the graph.
@@ -333,11 +347,7 @@ impl GraphView {
     /// Length (in edges) of the shortest directed path `src ⇝ dst`, backing the
     /// `SHORTESTPATHLEN` built-in. `Some(0)` when `src == dst`; `None` when
     /// either node is absent or no directed path exists.
-    pub fn shortest_path_len(
-        &self,
-        src: EntityLiteralId,
-        dst: EntityLiteralId,
-    ) -> Option<usize> {
+    pub fn shortest_path_len(&self, src: EntityLiteralId, dst: EntityLiteralId) -> Option<usize> {
         self.shortest_path(src, dst).map(|p| p.len() - 1)
     }
 
@@ -427,8 +437,7 @@ impl GraphView {
         // each component, counting distinct components as we encounter new roots.
         let mut root_to_rep: HashMap<usize, EntityLiteralId> = HashMap::new();
         let mut num_components = 0usize;
-        let mut comp_map: HashMap<EntityLiteralId, EntityLiteralId> =
-            HashMap::with_capacity(n);
+        let mut comp_map: HashMap<EntityLiteralId, EntityLiteralId> = HashMap::with_capacity(n);
         for i in 0..n {
             let root = uf_find(&mut parent, i);
             let rep = *root_to_rep.entry(root).or_insert_with(|| {
@@ -470,8 +479,7 @@ impl GraphView {
 
         for _ in 0..max_iters {
             // Collect rank from dangling nodes for uniform redistribution.
-            let dangling_sum: f64 =
-                (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
+            let dangling_sum: f64 = (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
 
             // Teleportation base received by every node.
             let base = (1.0 - damping + damping * dangling_sum) / n as f64;
@@ -488,15 +496,22 @@ impl GraphView {
                 }
             }
             // Convergence check.
-            let delta: f64 =
-                rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+            let delta: f64 = rank
+                .iter()
+                .zip(next.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum();
             std::mem::swap(&mut rank, &mut next);
             if delta < tol {
                 break;
             }
         }
 
-        self.nodes.iter().enumerate().map(|(i, &id)| (id, rank[i])).collect()
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, rank[i]))
+            .collect()
     }
 
     // ---- Triangle count (undirected) --------------------------------------
@@ -566,9 +581,7 @@ impl GraphView {
     /// A directed cycle collapses to a single SCC; an acyclic chain of `N`
     /// nodes yields `N` singleton SCCs.  Self-loops do not merge a node with
     /// any other, so a self-looping node remains a singleton SCC.
-    pub fn strongly_connected_components(
-        &self,
-    ) -> (HashMap<EntityLiteralId, usize>, usize) {
+    pub fn strongly_connected_components(&self) -> (HashMap<EntityLiteralId, usize>, usize) {
         let n = self.nodes.len();
         const UNVISITED: usize = usize::MAX;
 
@@ -699,7 +712,11 @@ impl GraphView {
             }
         }
 
-        self.nodes.iter().enumerate().map(|(i, &id)| (id, bc[i])).collect()
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, bc[i]))
+            .collect()
     }
 
     // ---- Closeness centrality ---------------------------------------------
@@ -872,9 +889,7 @@ impl GraphView {
                 next_adj[a].push((b, w));
             }
             let next_deg: Vec<f64> = (0..k)
-                .map(|i| {
-                    next_adj[i].iter().map(|&(_, w)| w).sum::<f64>() + 2.0 * new_self[i]
-                })
+                .map(|i| next_adj[i].iter().map(|&(_, w)| w).sum::<f64>() + 2.0 * new_self[i])
                 .collect();
 
             adj = next_adj;
@@ -1250,7 +1265,11 @@ impl GraphView {
             udj[v] = neighbors;
         }
 
-        self.nodes.iter().enumerate().map(|(i, &id)| (id, core[i])).collect()
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, core[i]))
+            .collect()
     }
 
     // =======================================================================
@@ -1608,8 +1627,10 @@ impl GraphView {
         if n == 0 {
             return HashMap::new();
         }
-        let src_idx: Vec<usize> =
-            sources.iter().filter_map(|s| self.id_to_idx.get(s).copied()).collect();
+        let src_idx: Vec<usize> = sources
+            .iter()
+            .filter_map(|s| self.id_to_idx.get(s).copied())
+            .collect();
         if src_idx.is_empty() {
             return HashMap::new();
         }
@@ -1618,13 +1639,13 @@ impl GraphView {
         for &s in &src_idx {
             teleport[s] += share;
         }
-        let out_deg: Vec<usize> =
-            (0..n).map(|i| self.out_ptr[i + 1] - self.out_ptr[i]).collect();
+        let out_deg: Vec<usize> = (0..n)
+            .map(|i| self.out_ptr[i + 1] - self.out_ptr[i])
+            .collect();
         let mut rank = teleport.clone();
         let mut next = vec![0.0f64; n];
         for _ in 0..max_iters {
-            let dangling_sum: f64 =
-                (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
+            let dangling_sum: f64 = (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
             // Restart + dangling mass both land on the source set.
             let base = (1.0 - damping) + damping * dangling_sum;
             for i in 0..n {
@@ -1638,14 +1659,21 @@ impl GraphView {
                     }
                 }
             }
-            let delta: f64 =
-                rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+            let delta: f64 = rank
+                .iter()
+                .zip(next.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum();
             std::mem::swap(&mut rank, &mut next);
             if delta < tol {
                 break;
             }
         }
-        self.nodes.iter().enumerate().map(|(i, &id)| (id, rank[i])).collect()
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, rank[i]))
+            .collect()
     }
 
     // ---- k-hop neighbourhood queries --------------------------------------
@@ -1706,7 +1734,9 @@ impl GraphView {
         } else {
             self.bounded_out_bfs(si, max_hops)
         };
-        (0..self.nodes.len()).filter(|&i| i != si && dist[i] != u32::MAX).count()
+        (0..self.nodes.len())
+            .filter(|&i| i != si && dist[i] != u32::MAX)
+            .count()
     }
 
     /// Every simple directed path starting at `src` with `1..=k` edges, each as
@@ -1771,11 +1801,7 @@ impl GraphView {
     /// path-counting à la Brandes). `Some(1)` when `src == dst`; `Some(0)` when
     /// `dst` is unreachable; `None` if either node is absent. Saturates rather
     /// than overflowing on pathological fan-out.
-    pub fn count_shortest_paths(
-        &self,
-        src: EntityLiteralId,
-        dst: EntityLiteralId,
-    ) -> Option<u64> {
+    pub fn count_shortest_paths(&self, src: EntityLiteralId, dst: EntityLiteralId) -> Option<u64> {
         let si = *self.id_to_idx.get(&src)?;
         let di = *self.id_to_idx.get(&dst)?;
         if si == di {
@@ -1891,12 +1917,20 @@ pub struct PatternEdge {
 impl PatternEdge {
     /// Edge constrained to a specific predicate.
     pub fn labeled(src: usize, dst: usize, pred: PredId) -> PatternEdge {
-        PatternEdge { src, dst, pred: Some(pred) }
+        PatternEdge {
+            src,
+            dst,
+            pred: Some(pred),
+        }
     }
 
     /// Edge that matches any predicate.
     pub fn any(src: usize, dst: usize) -> PatternEdge {
-        PatternEdge { src, dst, pred: None }
+        PatternEdge {
+            src,
+            dst,
+            pred: None,
+        }
     }
 }
 
@@ -2044,8 +2078,12 @@ impl WeightedGraphView {
         id_set.sort_unstable();
         id_set.dedup();
         let n = id_set.len();
-        let id_to_idx: HashMap<EntityLiteralId, usize> =
-            id_set.iter().copied().enumerate().map(|(i, id)| (id, i)).collect();
+        let id_to_idx: HashMap<EntityLiteralId, usize> = id_set
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
 
         // 3. Dense edges, sorted by (s, o, pred) and de-duplicated by (s, p, o).
         let mut edges: Vec<(usize, usize, PredId, f64)> = raw
@@ -2065,11 +2103,22 @@ impl WeightedGraphView {
         for i in 0..n {
             out_ptr[i + 1] = out_ptr[i] + out_deg[i];
         }
-        let mut out_edges = vec![WEdge { node: 0, pred: 0, weight: 0.0 }; m];
+        let mut out_edges = vec![
+            WEdge {
+                node: 0,
+                pred: 0,
+                weight: 0.0
+            };
+            m
+        ];
         {
             let mut cur = out_ptr[..n].to_vec();
             for &(s, o, p, w) in &edges {
-                out_edges[cur[s]] = WEdge { node: o, pred: p, weight: w };
+                out_edges[cur[s]] = WEdge {
+                    node: o,
+                    pred: p,
+                    weight: w,
+                };
                 cur[s] += 1;
             }
         }
@@ -2085,16 +2134,34 @@ impl WeightedGraphView {
         for i in 0..n {
             in_ptr[i + 1] = in_ptr[i] + in_deg[i];
         }
-        let mut in_edges = vec![WEdge { node: 0, pred: 0, weight: 0.0 }; m];
+        let mut in_edges = vec![
+            WEdge {
+                node: 0,
+                pred: 0,
+                weight: 0.0
+            };
+            m
+        ];
         {
             let mut cur = in_ptr[..n].to_vec();
             for &(s, o, p, w) in &iedges {
-                in_edges[cur[o]] = WEdge { node: s, pred: p, weight: w };
+                in_edges[cur[o]] = WEdge {
+                    node: s,
+                    pred: p,
+                    weight: w,
+                };
                 cur[o] += 1;
             }
         }
 
-        WeightedGraphView { nodes: id_set, id_to_idx, out_ptr, out_edges, in_ptr, in_edges }
+        WeightedGraphView {
+            nodes: id_set,
+            id_to_idx,
+            out_ptr,
+            out_edges,
+            in_ptr,
+            in_edges,
+        }
     }
 
     /// Build a weighted view with unit weight (1.0) on every edge, retaining the
@@ -2121,13 +2188,20 @@ impl WeightedGraphView {
     /// `set` are relaxed.  Returns `(dist, prev)` keyed by dense index; `dist`
     /// is `INFINITY` for unreachable nodes and `prev` is `usize::MAX` for nodes
     /// without a predecessor.
-    fn dijkstra(&self, src_i: usize, pred_filter: Option<&HashSet<PredId>>) -> (Vec<f64>, Vec<usize>) {
+    fn dijkstra(
+        &self,
+        src_i: usize,
+        pred_filter: Option<&HashSet<PredId>>,
+    ) -> (Vec<f64>, Vec<usize>) {
         let n = self.nodes.len();
         let mut dist = vec![f64::INFINITY; n];
         let mut prev = vec![usize::MAX; n];
         let mut heap: BinaryHeap<DijkstraItem> = BinaryHeap::new();
         dist[src_i] = 0.0;
-        heap.push(DijkstraItem { dist: 0.0, node: src_i });
+        heap.push(DijkstraItem {
+            dist: 0.0,
+            node: src_i,
+        });
 
         while let Some(DijkstraItem { dist: d, node: u }) = heap.pop() {
             if d > dist[u] {
@@ -2143,7 +2217,10 @@ impl WeightedGraphView {
                 if nd < dist[e.node] {
                     dist[e.node] = nd;
                     prev[e.node] = u;
-                    heap.push(DijkstraItem { dist: nd, node: e.node });
+                    heap.push(DijkstraItem {
+                        dist: nd,
+                        node: e.node,
+                    });
                 }
             }
         }
@@ -2163,7 +2240,10 @@ impl WeightedGraphView {
     /// Weighted single-source shortest-path distances from `src` over
     /// non-negative edge weights.  Returns `entity_id → distance` for every
     /// reachable node (including `src` at 0.0), or `None` if `src` is absent.
-    pub fn weighted_distances(&self, src: EntityLiteralId) -> Option<HashMap<EntityLiteralId, f64>> {
+    pub fn weighted_distances(
+        &self,
+        src: EntityLiteralId,
+    ) -> Option<HashMap<EntityLiteralId, f64>> {
         let s = *self.id_to_idx.get(&src)?;
         let (dist, _) = self.dijkstra(s, None);
         Some(self.collect_dist(&dist))
@@ -2302,8 +2382,7 @@ impl WeightedGraphView {
             .collect();
 
         for _ in 0..max_iters {
-            let dangling_sum: f64 =
-                (0..n).filter(|&i| out_w[i] <= 0.0).map(|i| rank[i]).sum();
+            let dangling_sum: f64 = (0..n).filter(|&i| out_w[i] <= 0.0).map(|i| rank[i]).sum();
             let base = (1.0 - damping + damping * dangling_sum) / n as f64;
             for v in next.iter_mut() {
                 *v = base;
@@ -2316,15 +2395,22 @@ impl WeightedGraphView {
                     }
                 }
             }
-            let delta: f64 =
-                rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+            let delta: f64 = rank
+                .iter()
+                .zip(next.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum();
             std::mem::swap(&mut rank, &mut next);
             if delta < tol {
                 break;
             }
         }
 
-        self.nodes.iter().enumerate().map(|(i, &id)| (id, rank[i])).collect()
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, rank[i]))
+            .collect()
     }
 
     // ---- top-k subgraph query ---------------------------------------------
@@ -2344,7 +2430,10 @@ impl WeightedGraphView {
     /// Representative data edge between a fixed pair under a predicate
     /// constraint: the maximum-weight match, ties broken by the smallest
     /// predicate id.  `None` if no data edge satisfies the constraint.
-    fn representative(list: Option<&[(PredId, f64)]>, pred: Option<PredId>) -> Option<(PredId, f64)> {
+    fn representative(
+        list: Option<&[(PredId, f64)]>,
+        pred: Option<PredId>,
+    ) -> Option<(PredId, f64)> {
         let list = list?;
         let mut best: Option<(PredId, f64)> = None;
         for &(p, w) in list {
@@ -2466,15 +2555,19 @@ impl WeightedGraphView {
     /// Backtracking core of the top-k matcher (see [`run_topk`](Self::run_topk)).
     fn topk_rec(&self, ctx: &TopkCtx, st: &mut TopkState, depth: usize) {
         if depth == ctx.order.len() {
-            let vars: Vec<EntityLiteralId> =
-                st.assign.iter().map(|&d| self.nodes[d]).collect();
+            let vars: Vec<EntityLiteralId> = st.assign.iter().map(|&d| self.nodes[d]).collect();
             let mut edges = Vec::with_capacity(ctx.pattern.edges.len());
             for e in &ctx.pattern.edges {
                 let a = st.assign[e.src];
                 let b = st.assign[e.dst];
                 let (p, w) = Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred)
                     .expect("closing checks guarantee every pattern edge is bound");
-                edges.push(MatchedEdge { src: self.nodes[a], pred: p, dst: self.nodes[b], weight: w });
+                edges.push(MatchedEdge {
+                    src: self.nodes[a],
+                    pred: p,
+                    dst: self.nodes[b],
+                    weight: w,
+                });
             }
             let s = (ctx.score)(&vars, &edges);
             if ctx.prune {
@@ -2485,7 +2578,11 @@ impl WeightedGraphView {
                     st.topk.push(Reverse(OrdF(s)));
                 }
             }
-            st.results.push(SubgraphMatch { vars, edges, score: s });
+            st.results.push(SubgraphMatch {
+                vars,
+                edges,
+                score: s,
+            });
             return;
         }
 
@@ -2602,7 +2699,11 @@ impl WeightedGraphView {
 
         // Deterministic top-k: score descending, then assignment lexicographic.
         let mut results = st.results;
-        results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.vars.cmp(&b.vars)));
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.vars.cmp(&b.vars))
+        });
         results.truncate(k);
         results
     }
@@ -2639,7 +2740,12 @@ impl WeightedGraphView {
     /// the search fully enumerates structural matches (still pruned by
     /// connectivity and injectivity) before keeping the `k` best.  Complexity is
     /// `O(M)` in the number of structural matches `M`, plus `O(M log M)` to rank.
-    pub fn topk_subgraph_by<F>(&self, pattern: &QueryPattern, k: usize, score: F) -> Vec<SubgraphMatch>
+    pub fn topk_subgraph_by<F>(
+        &self,
+        pattern: &QueryPattern,
+        k: usize,
+        score: F,
+    ) -> Vec<SubgraphMatch>
     where
         F: Fn(&[EntityLiteralId], &[MatchedEdge]) -> f64,
     {
@@ -2822,7 +2928,12 @@ impl WeightedGraphView {
                 let b = st.assign[e.dst];
                 let (p, w) = Self::representative(ctx.pair.get(&(a, b)).map(Vec::as_slice), e.pred)
                     .expect("closing checks guarantee every pattern edge is bound");
-                edges.push(MatchedEdge { src: self.nodes[a], pred: p, dst: self.nodes[b], weight: w });
+                edges.push(MatchedEdge {
+                    src: self.nodes[a],
+                    pred: p,
+                    dst: self.nodes[b],
+                    weight: w,
+                });
             }
             let s = (ctx.score)(&vars, &edges);
             if ctx.prune {
@@ -2833,7 +2944,11 @@ impl WeightedGraphView {
                     st.topk.push(Reverse(OrdF(s)));
                 }
             }
-            st.results.push(SubgraphMatch { vars, edges, score: s });
+            st.results.push(SubgraphMatch {
+                vars,
+                edges,
+                score: s,
+            });
             return;
         }
 
@@ -2947,7 +3062,11 @@ impl WeightedGraphView {
         self.topk_rec_memo(&ctx, &mut st, 0, &mut memo, &mut stats);
 
         let mut results = st.results;
-        results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.vars.cmp(&b.vars)));
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.vars.cmp(&b.vars))
+        });
         results.truncate(k);
         (results, stats)
     }
@@ -3411,7 +3530,10 @@ mod tests {
             assert!(bc[&leaf].abs() < 1e-9, "leaf {leaf} betweenness must be 0");
         }
         // k=4 leaves ⇒ hub lies on all 4·3 = 12 ordered leaf pairs.
-        assert!((hub_score - 12.0).abs() < 1e-9, "hub score should be 12, got {hub_score}");
+        assert!(
+            (hub_score - 12.0).abs() < 1e-9,
+            "hub score should be 12, got {hub_score}"
+        );
     }
 
     // ---- closeness centrality ---------------------------------------------
@@ -3689,12 +3811,21 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let wg = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let wg =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
 
         let prw = wg.weighted_pagerank(0.85, 200, 1e-12);
-        assert!(prw[&2] > prw[&3] + 1e-9, "X({}) must outrank Y({})", prw[&2], prw[&3]);
+        assert!(
+            prw[&2] > prw[&3] + 1e-9,
+            "X({}) must outrank Y({})",
+            prw[&2],
+            prw[&3]
+        );
         let sum: f64 = prw.values().sum();
-        assert!((sum - 1.0).abs() < 1e-6, "weighted PR must sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "weighted PR must sum to 1, got {sum}"
+        );
 
         // Unweighted: X and Y are symmetric, so their ranks coincide.
         let ug = GraphView::from_store(&s);
@@ -3732,7 +3863,10 @@ mod tests {
 
     /// Two-edge path pattern: v0 -p1-> v1 -p1-> v2.
     fn path_pattern() -> QueryPattern {
-        QueryPattern::new(3, vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)])
+        QueryPattern::new(
+            3,
+            vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)],
+        )
     }
 
     #[test]
@@ -3779,7 +3913,7 @@ mod tests {
         let scores: Vec<f64> = all.iter().map(|m| m.score).collect();
         assert!((scores[0] - 10.0).abs() < 1e-9);
         assert!((scores[5] - 2.0).abs() < 1e-9); // (1,4,5) is the weakest
-        // Scores are non-increasing.
+                                                 // Scores are non-increasing.
         for w in scores.windows(2) {
             assert!(w[0] >= w[1] - 1e-12);
         }
@@ -3820,7 +3954,8 @@ mod tests {
         }
         let wmap: HashMap<(u32, u32, u32), f64> =
             edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
-        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let g =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
 
         let pattern = QueryPattern::new(
             3,
@@ -3849,9 +3984,11 @@ mod tests {
         let mut s = TripleStore::new();
         s.insert(IdTriple::new(1, 1, 2));
         s.insert(IdTriple::new(1, 2, 2));
-        let wmap: HashMap<(u32, u32, u32), f64> =
-            [((1u32, 1u32, 2u32), 4.0), ((1, 2, 2), 9.0)].into_iter().collect();
-        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let wmap: HashMap<(u32, u32, u32), f64> = [((1u32, 1u32, 2u32), 4.0), ((1, 2, 2), 9.0)]
+            .into_iter()
+            .collect();
+        let g =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
 
         let pattern = QueryPattern::new(2, vec![PatternEdge::any(0, 1)]);
         let top = g.topk_subgraph(&pattern, 5);
@@ -3907,7 +4044,8 @@ mod tests {
         }
         let wmap: HashMap<(u32, u32, u32), f64> =
             edges.iter().map(|&(a, p, b, w)| ((a, p, b), w)).collect();
-        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let g =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
         let pattern = QueryPattern::new(
             3,
             vec![
@@ -3937,17 +4075,48 @@ mod tests {
         };
         for i in 0..20u32 {
             // each L node points to two M nodes
-            add(&mut s, &mut wmap, i, 1, 100 + (i % 10), 1.0 + (i % 5) as f64);
-            add(&mut s, &mut wmap, i, 1, 100 + ((i + 3) % 10), 2.0 + (i % 3) as f64);
+            add(
+                &mut s,
+                &mut wmap,
+                i,
+                1,
+                100 + (i % 10),
+                1.0 + (i % 5) as f64,
+            );
+            add(
+                &mut s,
+                &mut wmap,
+                i,
+                1,
+                100 + ((i + 3) % 10),
+                2.0 + (i % 3) as f64,
+            );
         }
         for j in 0..10u32 {
             // each M node points to two R nodes
-            add(&mut s, &mut wmap, 100 + j, 1, 200 + (j % 7), 3.0 + (j % 4) as f64);
-            add(&mut s, &mut wmap, 100 + j, 1, 200 + ((j + 2) % 7), 1.5 + (j % 2) as f64);
+            add(
+                &mut s,
+                &mut wmap,
+                100 + j,
+                1,
+                200 + (j % 7),
+                3.0 + (j % 4) as f64,
+            );
+            add(
+                &mut s,
+                &mut wmap,
+                100 + j,
+                1,
+                200 + ((j + 2) % 7),
+                1.5 + (j % 2) as f64,
+            );
         }
-        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
-        let pattern =
-            QueryPattern::new(3, vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)]);
+        let g =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let pattern = QueryPattern::new(
+            3,
+            vec![PatternEdge::labeled(0, 1, 1), PatternEdge::labeled(1, 2, 1)],
+        );
         for k in [1usize, 5, 20, 1000] {
             assert_same_matches(
                 &g.topk_subgraph(&pattern, k),
@@ -3968,7 +4137,8 @@ mod tests {
             s.insert(IdTriple::new(1, 1, dst));
             wmap.insert((1, 1, dst), 1.0 + idx as f64);
         }
-        let g = WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
+        let g =
+            WeightedGraphView::from_store_with_weights(&s, move |t| wmap[&(t.sub, t.pred, t.obj)]);
 
         // v0 -p1-> v1 and v0 -p1-> v2: v0 is the spanning-tree parent of both v1
         // and v2, so binding v2 re-requests v0's already-cached expansion.

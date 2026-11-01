@@ -515,11 +515,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Build an evaluator that uses `vstree` to prune entity-variable bindings.
-    pub fn with_vstree(
-        dict: &'a Dictionary,
-        store: &'a S,
-        vstree: &'a VsTree,
-    ) -> Evaluator<'a, S> {
+    pub fn with_vstree(dict: &'a Dictionary, store: &'a S, vstree: &'a VsTree) -> Evaluator<'a, S> {
         Evaluator {
             dict,
             store,
@@ -568,7 +564,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// entry, between BGP join patterns, and after pattern evaluation — so a large
     /// multi-pattern join is cancellable, though a single unbounded scan is not
     /// preempted mid-scan.
-    pub fn with_cancel(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Evaluator<'a, S> {
+    pub fn with_cancel(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Evaluator<'a, S> {
         self.cancel = Some(flag);
         self
     }
@@ -808,9 +807,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let layout = VarLayout::build(pat);
                 let sols = self.eval_pattern(pat, &layout);
                 self.check_cancel()?; // convert a mid-run cancel into Cancelled, not an empty describe
-                // Only describe resource-valued columns: predicate-typed columns
-                // hold predicate ids (a different id space), and synthetic ids are
-                // computed values, not stored resources.
+                                      // Only describe resource-valued columns: predicate-typed columns
+                                      // hold predicate ids (a different id space), and synthetic ids are
+                                      // computed values, not stored resources.
                 let want: Vec<usize> = if d.all {
                     (0..layout.len())
                         .filter(|&i| !layout.is_pred[i] && !is_anon_var(&layout.names[i]))
@@ -1092,110 +1091,109 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // that one keeps a row per solution, its value on the last, as next
         // to other projections (GE:2526-2530).
         let one_row = only_gfn && !matches!(gfns[0].call, ProjCall::Pfn { .. });
-        let rows = if !gfns.is_empty()
-            && (solutions.is_empty() || pattern_is_trivially_empty(pattern))
-        {
-            // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
-            // function is evaluated once with its arguments read as constants
-            // (a variable is looked up as an IRI and is missing); next to
-            // other projections there is no row at all.
-            if only_gfn {
-                vec![vec![self.eval_proj_call(
-                    &gfns[0].call,
-                    &[],
-                    &layout,
-                    &bind_only,
-                    true,
-                )?]]
-            } else {
-                Vec::new()
-            }
-        } else if one_row && !has_agg {
-            // A lone graph function over the solutions: exactly one row
-            // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
-            // form one group: a failing HAVING leaves the value unset
-            // (GE:2071-2075).
-            let all: Vec<&Binding> = solutions.iter().collect();
-            let value = if self.having_holds(q, &all, &layout) {
-                self.eval_proj_call(&gfns[0].call, &all, &layout, &bind_only, false)?
-            } else {
-                None
-            };
-            vec![vec![value]]
-        } else if has_agg {
-            // Grouped, filtered by HAVING, joined with a trailing VALUES and
-            // ordered by ORDER BY there.
-            self.eval_aggregation(&solutions, &layout, &bind_only, q)?
-        } else {
-            // Graph functions next to other projections: one row per
-            // solution, each function's value on the *last* solution only
-            // (upstream writes it to `result.back()`, GE:3100-3108; "last" is
-            // in WHERE order, before ORDER BY), or on none when HAVING fails
-            // over the solutions as one group. The value becomes a column
-            // under its alias so ORDER BY can refer to it.
-            if !gfns.is_empty() {
+        let rows =
+            if !gfns.is_empty() && (solutions.is_empty() || pattern_is_trivially_empty(pattern)) {
+                // Upstream's "result0_size == 0" (GE:1508-2033): a lone graph
+                // function is evaluated once with its arguments read as constants
+                // (a variable is looked up as an IRI and is missing); next to
+                // other projections there is no row at all.
+                if only_gfn {
+                    vec![vec![self.eval_proj_call(
+                        &gfns[0].call,
+                        &[],
+                        &layout,
+                        &bind_only,
+                        true,
+                    )?]]
+                } else {
+                    Vec::new()
+                }
+            } else if one_row && !has_agg {
+                // A lone graph function over the solutions: exactly one row
+                // (upstream reserves `resultSz = 1`, GE:2041-2050). The solutions
+                // form one group: a failing HAVING leaves the value unset
+                // (GE:2071-2075).
                 let all: Vec<&Binding> = solutions.iter().collect();
-                let keep = self.having_holds(q, &all, &layout);
-                let mut values = Vec::with_capacity(gfns.len());
-                for g in &gfns {
-                    values.push(if keep {
-                        self.eval_proj_call(&g.call, &all, &layout, &bind_only, false)?
-                    } else {
-                        None
-                    });
-                }
-                for (g, v) in gfns.iter().zip(values) {
-                    if layout.index.contains_key(&g.alias) {
-                        return Err(GStoreError::Query(format!(
-                            "?{} is already bound by the WHERE clause; ({}(…) AS ?v) needs a \
+                let value = if self.having_holds(q, &all, &layout) {
+                    self.eval_proj_call(&gfns[0].call, &all, &layout, &bind_only, false)?
+                } else {
+                    None
+                };
+                vec![vec![value]]
+            } else if has_agg {
+                // Grouped, filtered by HAVING, joined with a trailing VALUES and
+                // ordered by ORDER BY there.
+                self.eval_aggregation(&solutions, &layout, &bind_only, q)?
+            } else {
+                // Graph functions next to other projections: one row per
+                // solution, each function's value on the *last* solution only
+                // (upstream writes it to `result.back()`, GE:3100-3108; "last" is
+                // in WHERE order, before ORDER BY), or on none when HAVING fails
+                // over the solutions as one group. The value becomes a column
+                // under its alias so ORDER BY can refer to it.
+                if !gfns.is_empty() {
+                    let all: Vec<&Binding> = solutions.iter().collect();
+                    let keep = self.having_holds(q, &all, &layout);
+                    let mut values = Vec::with_capacity(gfns.len());
+                    for g in &gfns {
+                        values.push(if keep {
+                            self.eval_proj_call(&g.call, &all, &layout, &bind_only, false)?
+                        } else {
+                            None
+                        });
+                    }
+                    for (g, v) in gfns.iter().zip(values) {
+                        if layout.index.contains_key(&g.alias) {
+                            return Err(GStoreError::Query(format!(
+                                "?{} is already bound by the WHERE clause; ({}(…) AS ?v) needs a \
                              fresh variable",
-                            g.alias,
-                            g.call.label()
-                        )));
-                    }
-                    layout.index.insert(g.alias.clone(), layout.names.len());
-                    layout.names.push(g.alias.clone());
-                    layout.is_pred.push(false);
-                    let last = solutions.len().saturating_sub(1);
-                    for (i, b) in solutions.iter_mut().enumerate() {
-                        b.push(if i == last { v } else { None });
+                                g.alias,
+                                g.call.label()
+                            )));
+                        }
+                        layout.index.insert(g.alias.clone(), layout.names.len());
+                        layout.names.push(g.alias.clone());
+                        layout.is_pred.push(false);
+                        let last = solutions.len().saturating_sub(1);
+                        for (i, b) in solutions.iter_mut().enumerate() {
+                            b.push(if i == last { v } else { None });
+                        }
                     }
                 }
-            }
-            // SPARQL evaluates ORDER BY over the *pre-projection* solution
-            // sequence, so it may sort by a pattern variable that is not selected
-            // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
-            // alias. Extend the layout + bindings with the aliases, sort, then
-            // project — a stable sort preserves the resulting order.
-            if !q.order_by.is_empty() {
-                if let Projection::Items(items) = &q.projection {
-                    for it in items {
-                        if let SelectItem::Expr(e, alias) = it {
-                            if !layout.index.contains_key(alias) {
-                                let idx = layout.names.len();
-                                layout.index.insert(alias.clone(), idx);
-                                layout.names.push(alias.clone());
-                                layout.is_pred.push(false);
-                                for b in solutions.iter_mut() {
-                                    // The column exists (unbound) while its
-                                    // expression is evaluated, so a reference
-                                    // to the alias itself reads unbound
-                                    // instead of indexing past the end — as
-                                    // the Top-K path (`order_extend`) does.
-                                    b.push(None);
-                                    b[idx] = self.eval_id(e, b, &layout);
+                // SPARQL evaluates ORDER BY over the *pre-projection* solution
+                // sequence, so it may sort by a pattern variable that is not selected
+                // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
+                // alias. Extend the layout + bindings with the aliases, sort, then
+                // project — a stable sort preserves the resulting order.
+                if !q.order_by.is_empty() {
+                    if let Projection::Items(items) = &q.projection {
+                        for it in items {
+                            if let SelectItem::Expr(e, alias) = it {
+                                if !layout.index.contains_key(alias) {
+                                    let idx = layout.names.len();
+                                    layout.index.insert(alias.clone(), idx);
+                                    layout.names.push(alias.clone());
+                                    layout.is_pred.push(false);
+                                    for b in solutions.iter_mut() {
+                                        // The column exists (unbound) while its
+                                        // expression is evaluated, so a reference
+                                        // to the alias itself reads unbound
+                                        // instead of indexing past the end — as
+                                        // the Top-K path (`order_extend`) does.
+                                        b.push(None);
+                                        b[idx] = self.eval_id(e, b, &layout);
+                                    }
                                 }
                             }
                         }
                     }
+                    self.sort_solutions(&mut solutions, &q.order_by, &layout);
                 }
-                self.sort_solutions(&mut solutions, &q.order_by, &layout);
-            }
-            solutions
-                .iter()
-                .map(|b| self.project_items(b, &layout, q, &result_vars))
-                .collect::<Result<Vec<_>>>()?
-        };
+                solutions
+                    .iter()
+                    .map(|b| self.project_items(b, &layout, q, &result_vars))
+                    .collect::<Result<Vec<_>>>()?
+            };
 
         // DISTINCT / OFFSET / LIMIT over the projected result rows (ORDER BY was
         // applied above — before projection for the non-aggregate path).
@@ -1772,7 +1770,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             } = a
             {
                 gb[layout.len() + i] = self
-                    .eval_aggregate(*func, *distinct, arg.as_deref(), sep.as_deref(), sols, layout)
+                    .eval_aggregate(
+                        *func,
+                        *distinct,
+                        arg.as_deref(),
+                        sep.as_deref(),
+                        sols,
+                        layout,
+                    )
                     .map(|v| self.value_to_id(&v));
             }
         }
@@ -3172,9 +3177,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let av = self.eval_value(args.first()?, b, l)?;
         let cv = self.eval_value(args.get(1)?, b, l)?;
         if let (Value::Iri(_), Value::Iri(_)) = (&av, &cv) {
-            if let (Some(a), Some(c)) =
-                (self.dict.term_id(&value_to_term(&av)), self.dict.term_id(&value_to_term(&cv)))
-            {
+            if let (Some(a), Some(c)) = (
+                self.dict.term_id(&value_to_term(&av)),
+                self.dict.term_id(&value_to_term(&cv)),
+            ) {
                 if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
                     return Some(Value::Double(sim));
                 }
@@ -3187,7 +3193,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// solution compatible with the current binding `b`. We substitute `b`'s
     /// bound variables into `pat` as constants (so inner FILTER/BIND that
     /// reference outer variables see their values), then test non-emptiness.
-    fn eval_exists(&self, negated: bool, pat: &GraphPattern, b: &Binding, outer: &VarLayout) -> bool {
+    fn eval_exists(
+        &self,
+        negated: bool,
+        pat: &GraphPattern,
+        b: &Binding,
+        outer: &VarLayout,
+    ) -> bool {
         let bound = self.subst_pattern(pat, b, outer);
         let layout = VarLayout::build(&bound);
         let found = self.pattern_has_solution(&bound, &layout);
@@ -3364,7 +3376,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             } => Expr::Aggregate {
                 func: *func,
                 distinct: *distinct,
-                arg: arg.as_ref().map(|a| Box::new(self.subst_expr(a, b, layout))),
+                arg: arg
+                    .as_ref()
+                    .map(|a| Box::new(self.subst_expr(a, b, layout))),
                 sep: sep.clone(),
             },
         }
@@ -3418,11 +3432,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
             // Type-preserving (an integer stays an integer, a decimal a
             // decimal, a float a float); `ROUND` rounds halves upward.
-            "ABS" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Abs),
-            "CEIL" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Ceil),
-            "FLOOR" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Floor),
-            "ROUND" => self.eval_value(args.first()?, b, l)?.numeric_fn(NumericFn::Round),
-            "ISNUMERIC" => Some(Value::Bool(self.eval_value(args.first()?, b, l)?.is_numeric())),
+            "ABS" => self
+                .eval_value(args.first()?, b, l)?
+                .numeric_fn(NumericFn::Abs),
+            "CEIL" => self
+                .eval_value(args.first()?, b, l)?
+                .numeric_fn(NumericFn::Ceil),
+            "FLOOR" => self
+                .eval_value(args.first()?, b, l)?
+                .numeric_fn(NumericFn::Floor),
+            "ROUND" => self
+                .eval_value(args.first()?, b, l)?
+                .numeric_fn(NumericFn::Round),
+            "ISNUMERIC" => Some(Value::Bool(
+                self.eval_value(args.first()?, b, l)?.is_numeric(),
+            )),
             "ISIRI" | "ISURI" => Some(Value::Bool(matches!(
                 self.eval_value(args.first()?, b, l)?,
                 Value::Iri(_)
@@ -3596,10 +3620,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // legacy gstore-rust node/string similarity is `rs:SIMILARITY`.
                 let av = self.eval_value(args.first()?, b, l)?;
                 let cv = self.eval_value(args.get(1)?, b, l)?;
-                Some(Value::Double(crate::analytics::gfun::metrics::jaro_similarity(
-                    &value_to_term(&av).dict_key(),
-                    &value_to_term(&cv).dict_key(),
-                )))
+                Some(Value::Double(
+                    crate::analytics::gfun::metrics::jaro_similarity(
+                        &value_to_term(&av).dict_key(),
+                        &value_to_term(&cv).dict_key(),
+                    ),
+                ))
             }
 
             // ---- numeric -------------------------------------------------
@@ -3708,7 +3734,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
                 let path = self.graph_view().shortest_path(a, c).unwrap_or_default();
-                Some(Value::Str { value: self.serialize_nodes(&path), lang: None })
+                Some(Value::Str {
+                    value: self.serialize_nodes(&path),
+                    lang: None,
+                })
             }
             // SSSPLEN(a, b): alias of SHORTESTPATHLEN — #edges, -1 if unreachable.
             "SSSPLEN" => {
@@ -3737,14 +3766,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
                 let ids = self.graph_view().khop_neighbors(a, k);
-                Some(Value::Str { value: self.serialize_nodes(&ids), lang: None })
+                Some(Value::Str {
+                    value: self.serialize_nodes(&ids),
+                    lang: None,
+                })
             }
             // KHOPALLNEIGHBORS(a, k): nodes within ≤ k out-hops (excl. a).
             "KHOPALLNEIGHBORS" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
                 let ids = self.graph_view().khop_all_neighbors(a, k);
-                Some(Value::Str { value: self.serialize_nodes(&ids), lang: None })
+                Some(Value::Str {
+                    value: self.serialize_nodes(&ids),
+                    lang: None,
+                })
             }
             // KHOPENUMERATEPATH(a, k): simple paths of ≤ k edges from a; paths
             // separated by " ; ", nodes by " " (bounded to 1024 paths).
@@ -3757,7 +3792,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .map(|p| self.serialize_nodes(p))
                     .collect::<Vec<_>>()
                     .join(" ; ");
-                Some(Value::Str { value: s, lang: None })
+                Some(Value::Str {
+                    value: s,
+                    lang: None,
+                })
             }
             // BFSCOUNT(a [, k]): #nodes within ≤ k out-hops (excl. a); no k or
             // k < 0 ⇒ all reachable.
@@ -3784,7 +3822,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     }
                     None => {
                         let rep = comp.get(&a)?;
-                        Some(Value::Int(comp.values().filter(|&r| r == rep).count() as i64))
+                        Some(Value::Int(
+                            comp.values().filter(|&r| r == rep).count() as i64
+                        ))
                     }
                 }
             }
@@ -3803,7 +3843,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     }
                     None => {
                         let cid = comm.get(&a)?;
-                        Some(Value::Int(comm.values().filter(|&x| x == cid).count() as i64))
+                        Some(Value::Int(
+                            comm.values().filter(|&x| x == cid).count() as i64
+                        ))
                     }
                 }
             }
@@ -3822,7 +3864,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     }
                     None => {
                         let cid = comm.get(&a)?;
-                        Some(Value::Int(comm.values().filter(|&x| x == cid).count() as i64))
+                        Some(Value::Int(
+                            comm.values().filter(|&x| x == cid).count() as i64
+                        ))
                     }
                 }
             }
@@ -3856,7 +3900,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(e) => {
                     let a = self.node_id(e, b, l)?;
                     Some(Value::Double(
-                        self.graph_view().local_clustering_coefficient(a).unwrap_or(0.0),
+                        self.graph_view()
+                            .local_clustering_coefficient(a)
+                            .unwrap_or(0.0),
                     ))
                 }
             },
@@ -4032,7 +4078,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         if let Some(r) = self.algo_cache.borrow().ppr.get(&src).cloned() {
             return r;
         }
-        let r = Rc::new(self.graph_view().personalized_pagerank(&[src], 0.85, 100, 1e-9));
+        let r = Rc::new(
+            self.graph_view()
+                .personalized_pagerank(&[src], 0.85, 100, 1e-9),
+        );
         self.algo_cache.borrow_mut().ppr.insert(src, Rc::clone(&r));
         r
     }
@@ -4077,7 +4126,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Serialise an entity-id list as space-separated term strings.
     fn serialize_nodes(&self, ids: &[u32]) -> String {
-        ids.iter().map(|&id| self.node_label(id)).collect::<Vec<_>>().join(" ")
+        ids.iter()
+            .map(|&id| self.node_label(id))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Evaluate a SPARQL numeric argument into a hop budget: a negative value
@@ -4191,7 +4243,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             std::cmp::Ordering::Equal
         });
-        let sorted: Vec<Binding> = perm.iter().map(|&i| std::mem::take(&mut solutions[i])).collect();
+        let sorted: Vec<Binding> = perm
+            .iter()
+            .map(|&i| std::mem::take(&mut solutions[i]))
+            .collect();
         for (slot, b) in solutions.iter_mut().zip(sorted) {
             *slot = b;
         }
@@ -4462,8 +4517,7 @@ fn encode_for_uri(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &byte in s.as_bytes() {
-        let unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if unreserved {
             out.push(byte as char);
         } else {
@@ -4578,10 +4632,22 @@ fn gen_uuid() -> String {
     let h = |b: u8| format!("{b:02x}");
     format!(
         "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
-        h(bytes[0]), h(bytes[1]), h(bytes[2]), h(bytes[3]),
-        h(bytes[4]), h(bytes[5]), h(bytes[6]), h(bytes[7]),
-        h(bytes[8]), h(bytes[9]), h(bytes[10]), h(bytes[11]),
-        h(bytes[12]), h(bytes[13]), h(bytes[14]), h(bytes[15]),
+        h(bytes[0]),
+        h(bytes[1]),
+        h(bytes[2]),
+        h(bytes[3]),
+        h(bytes[4]),
+        h(bytes[5]),
+        h(bytes[6]),
+        h(bytes[7]),
+        h(bytes[8]),
+        h(bytes[9]),
+        h(bytes[10]),
+        h(bytes[11]),
+        h(bytes[12]),
+        h(bytes[13]),
+        h(bytes[14]),
+        h(bytes[15]),
     )
 }
 
@@ -5718,13 +5784,16 @@ fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<us
             // pattern (rather than indexing `args[0]`) keeps a zero-argument
             // call such as `FILTER(STR())` from panicking here.
             let (target, needle) = match (name.as_str(), args.as_slice()) {
-                ("CONTAINS" | "STRSTARTS" | "STRENDS", [target, pat]) => (target, const_string(pat)),
+                ("CONTAINS" | "STRSTARTS" | "STRENDS", [target, pat]) => {
+                    (target, const_string(pat))
+                }
                 // A metacharacter-free regex pattern is just a literal substring.
                 // Only the plain two-arg form: a flags arg (e.g. "i") could break
                 // byte-substring soundness.
-                ("REGEX", [target, pat]) => {
-                    (target, const_string(pat).filter(|p| is_plain_literal_regex(p)))
-                }
+                ("REGEX", [target, pat]) => (
+                    target,
+                    const_string(pat).filter(|p| is_plain_literal_regex(p)),
+                ),
                 _ => return,
             };
             if let (Some(vi), Some(n)) = (substr_target_var(target, layout), needle) {
@@ -5882,7 +5951,10 @@ mod builtin_tests {
         ];
         assert_eq!(sum_values(&decimals).lexical(), "3.75");
         // Mixed int/bigint stays exact.
-        assert_eq!(sum_values(&[Value::BigInt(5), Value::Int(2)]).lexical(), "7");
+        assert_eq!(
+            sum_values(&[Value::BigInt(5), Value::Int(2)]).lexical(),
+            "7"
+        );
         // Empty group is still 0.
         assert_eq!(sum_values(&[]), Value::Int(0));
     }
@@ -5903,7 +5975,10 @@ mod builtin_tests {
         // CONTAINS(?o, "marker") → constraint on ?o (index 1).
         let mut out = HashMap::new();
         collect_substr_constraints(
-            &Expr::Builtin("CONTAINS".into(), vec![Expr::Var("o".into()), lit("marker")]),
+            &Expr::Builtin(
+                "CONTAINS".into(),
+                vec![Expr::Var("o".into()), lit("marker")],
+            ),
             &layout,
             &mut out,
         );
@@ -5956,7 +6031,10 @@ mod builtin_tests {
         ] {
             collect_substr_constraints(&e, &layout, &mut out3);
         }
-        assert!(out3.is_empty(), "unsound/unhelpful filters extract nothing: {out3:?}");
+        assert!(
+            out3.is_empty(),
+            "unsound/unhelpful filters extract nothing: {out3:?}"
+        );
     }
 
     /// Regression: `FILTER(STR())` reached `collect_substr_constraints`, which
@@ -5969,7 +6047,10 @@ mod builtin_tests {
             collect_substr_constraints(&Expr::Builtin(name.into(), vec![]), &layout, &mut out);
             let nested = Expr::Builtin(
                 "CONTAINS".into(),
-                vec![Expr::Builtin("STR".into(), vec![]), Expr::Const(Term::plain_literal("abc"))],
+                vec![
+                    Expr::Builtin("STR".into(), vec![]),
+                    Expr::Const(Term::plain_literal("abc")),
+                ],
             );
             collect_substr_constraints(&nested, &layout, &mut out);
         }
@@ -5990,8 +6071,8 @@ mod builtin_tests {
             .map(|i| start + i)
             .expect("eval_custom_function follows eval_builtin");
         let body = &src[start..end];
-        let re = Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#)
-            .unwrap();
+        let re =
+            Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#).unwrap();
         let handled: HashSet<&str> = re
             .captures_iter(body)
             .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))
@@ -5999,8 +6080,14 @@ mod builtin_tests {
         let table: HashSet<&str> = builtins::BUILTINS.iter().map(|b| b.name).collect();
         let missing_arm: Vec<_> = table.difference(&handled).collect();
         let missing_entry: Vec<_> = handled.difference(&table).collect();
-        assert!(missing_arm.is_empty(), "table names without an engine arm: {missing_arm:?}");
-        assert!(missing_entry.is_empty(), "engine arms missing from the table: {missing_entry:?}");
+        assert!(
+            missing_arm.is_empty(),
+            "table names without an engine arm: {missing_arm:?}"
+        );
+        assert!(
+            missing_entry.is_empty(),
+            "engine arms missing from the table: {missing_entry:?}"
+        );
     }
 
     /// Every built-in evaluated with 0–4 arguments, as an AST the parser would
@@ -6027,7 +6114,11 @@ mod builtin_tests {
                 }));
                 let v = r.unwrap_or_else(|_| panic!("{}({n} args) panicked", spec.name));
                 if !spec.arity.accepts(n) {
-                    assert!(v.is_none(), "{}({n} args) must be an evaluation error", spec.name);
+                    assert!(
+                        v.is_none(),
+                        "{}({n} args) must be an evaluation error",
+                        spec.name
+                    );
                 }
             }
         }
@@ -6062,14 +6153,17 @@ mod builtin_tests {
             }
         }
         // A deterministic key still sorts correctly through the cached keys.
-        let parsed = parse("SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY DESC(?s) LIMIT 2")
-            .unwrap();
+        let parsed =
+            parse("SELECT ?s WHERE { ?s <http://ex/p> ?o } ORDER BY DESC(?s) LIMIT 2").unwrap();
         let QueryResult::Select(rs) = Evaluator::new(&d, &s).evaluate(&parsed).unwrap() else {
             panic!("expected SELECT")
         };
         assert_eq!(
             rs.rows,
-            vec![vec![Some("<http://ex/s99>".into())], vec![Some("<http://ex/s98>".into())]]
+            vec![
+                vec![Some("<http://ex/s99>".into())],
+                vec![Some("<http://ex/s98>".into())]
+            ]
         );
     }
 
@@ -6083,8 +6177,10 @@ mod builtin_tests {
 
     #[test]
     fn datetime_with_huge_year_compares_without_overflow() {
-        let huge = "\"999999999999999999-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
-        let neg = "\"-9223372036854775807-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+        let huge =
+            "\"999999999999999999-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
+        let neg =
+            "\"-9223372036854775807-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>";
         assert!(scalar(&format!("({huge} > {DTL})")).contains("true"));
         assert!(scalar(&format!("({neg} < {DTL})")).contains("true"));
         assert!(scalar(&format!("YEAR({huge})")).contains("999999999999999999"));
@@ -6160,8 +6256,14 @@ mod builtin_tests {
         let q = parse("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").unwrap();
         // A pre-set cancel flag aborts the read with Cancelled.
         let flag = Arc::new(AtomicBool::new(true));
-        let err = Evaluator::new(&d, &s).with_cancel(flag).evaluate(&q).unwrap_err();
-        assert!(matches!(err, GStoreError::Cancelled), "expected Cancelled, got {err:?}");
+        let err = Evaluator::new(&d, &s)
+            .with_cancel(flag)
+            .evaluate(&q)
+            .unwrap_err();
+        assert!(
+            matches!(err, GStoreError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
         // An unset flag runs to completion.
         let ok = Arc::new(AtomicBool::new(false));
         assert!(Evaluator::new(&d, &s).with_cancel(ok).evaluate(&q).is_ok());
@@ -6194,7 +6296,10 @@ mod builtin_tests {
     #[test]
     fn replace_plain_and_regex() {
         assert_eq!(scalar(r#"REPLACE("abcabc", "b", "X")"#), r#""aXcaXc""#);
-        assert_eq!(scalar(r#"REPLACE("Hello", "[aeiou]", "_", "i")"#), r#""H_ll_""#);
+        assert_eq!(
+            scalar(r#"REPLACE("Hello", "[aeiou]", "_", "i")"#),
+            r#""H_ll_""#
+        );
         // group reference $1.
         assert_eq!(
             scalar(r#"REPLACE("2024-06-30", "(\\d+)-(\\d+)-(\\d+)", "$3/$2/$1")"#),
@@ -6253,7 +6358,10 @@ mod builtin_tests {
             sim(r#"SIMILARITY(?n, "Hello")"#),
             upstream("\"Hello World\"", "\"Hello\"")
         );
-        assert_eq!(lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")), "1.0");
+        assert_eq!(
+            lit(&scalar("SIMILARITY(<http://ex/a>, <http://ex/a>)")),
+            "1.0"
+        );
         // The legacy gstore-rust SIMILARITY (lexical forms, textbook Jaro)
         // stays reachable as rs:SIMILARITY: "abc" is a substring of "abcdef"
         // there, (3/6 + 2)/3.
@@ -6323,7 +6431,10 @@ mod builtin_tests {
         assert!(scalar("BNODE()").starts_with("_:"));
         assert!(scalar(r#"BNODE("seed")"#).starts_with("_:b"));
         let uuid = scalar("UUID()");
-        assert!(uuid.starts_with("<urn:uuid:") && uuid.ends_with('>'), "{uuid}");
+        assert!(
+            uuid.starts_with("<urn:uuid:") && uuid.ends_with('>'),
+            "{uuid}"
+        );
         let struuid = lit(&scalar("STRUUID()"));
         assert_eq!(struuid.len(), 36);
         assert_eq!(struuid.matches('-').count(), 4);
@@ -6335,7 +6446,10 @@ mod builtin_tests {
 
     #[test]
     fn hash_builtins_match_known_vectors() {
-        assert_eq!(lit(&scalar(r#"MD5("abc")"#)), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            lit(&scalar(r#"MD5("abc")"#)),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
         assert_eq!(
             lit(&scalar(r#"SHA1("abc")"#)),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
@@ -6363,11 +6477,15 @@ mod builtin_tests {
     #[test]
     fn new_builtins_work_inside_filter() {
         assert_eq!(
-            count(r#"<http://ex/a> <http://ex/name> ?n FILTER(STRSTARTS(SUBSTR(?n,1,5), "Hello"))"#),
+            count(
+                r#"<http://ex/a> <http://ex/name> ?n FILTER(STRSTARTS(SUBSTR(?n,1,5), "Hello"))"#
+            ),
             1
         );
         assert_eq!(
-            count(r#"<http://ex/a> <http://ex/name> ?n FILTER(LANGMATCHES("en", "*") && IF(1>0, true, false))"#),
+            count(
+                r#"<http://ex/a> <http://ex/name> ?n FILTER(LANGMATCHES("en", "*") && IF(1>0, true, false))"#
+            ),
             1
         );
         assert_eq!(
@@ -6560,7 +6678,10 @@ mod builtin_tests {
         ))
         .parse()
         .unwrap();
-        assert!(s < 0.7, "stored literals must use string similarity, got {s}");
+        assert!(
+            s < 0.7,
+            "stored literals must use string similarity, got {s}"
+        );
         // String-mode SIMILARITY still works for non-node arguments.
         assert_eq!(lit(&scalar(r#"SIMILARITY("abc", "abc")"#)), "1.0");
     }
@@ -6897,10 +7018,8 @@ mod pfn_tests {
     #[test]
     fn order_by_non_projected_var_with_limit() {
         let (d, s) = fixture();
-        let q = parse(
-            "SELECT ?x WHERE { ?x <http://ex/salary> ?sal } ORDER BY DESC(?sal) LIMIT 1",
-        )
-        .unwrap();
+        let q = parse("SELECT ?x WHERE { ?x <http://ex/salary> ?sal } ORDER BY DESC(?sal) LIMIT 1")
+            .unwrap();
         let eval = Evaluator::new(&d, &s);
         let rs = match eval.evaluate(&q).unwrap() {
             QueryResult::Select(rs) => rs,
@@ -6928,22 +7047,27 @@ mod pfn_tests {
             other => panic!("expected SELECT, got {other:?}"),
         };
         assert_eq!(rs.row_count(), 1);
-        assert!(rs.rows[0][0].as_ref().unwrap().contains("9223372036854775808"));
+        assert!(rs.rows[0][0]
+            .as_ref()
+            .unwrap()
+            .contains("9223372036854775808"));
     }
 
     /// Use a custom predicate function inside a FILTER (case-insensitive name).
     #[test]
     fn custom_function_in_filter() {
         let (d, s) = fixture();
-        let q = parse(
-            "SELECT ?x WHERE { ?x <http://ex/salary> ?sal . FILTER(isHigh(?sal)) }",
-        )
-        .unwrap();
+        let q =
+            parse("SELECT ?x WHERE { ?x <http://ex/salary> ?sal . FILTER(isHigh(?sal)) }").unwrap();
         let mut reg = FunctionRegistry::new();
         reg.register("isHigh", |args| {
             Some(Value::Bool(args.first()?.as_f64()? > 2800.0))
         });
-        let rs = match Evaluator::new(&d, &s).with_functions(reg).evaluate(&q).unwrap() {
+        let rs = match Evaluator::new(&d, &s)
+            .with_functions(reg)
+            .evaluate(&q)
+            .unwrap()
+        {
             QueryResult::Select(rs) => rs,
             other => panic!("expected SELECT, got {other:?}"),
         };
@@ -6957,10 +7081,8 @@ mod pfn_tests {
     #[test]
     fn unknown_function_excludes_solution() {
         let (d, s) = fixture();
-        let q = parse(
-            "SELECT ?x (noSuchFn(?sal) AS ?d) WHERE { ?x <http://ex/salary> ?sal }",
-        )
-        .unwrap();
+        let q =
+            parse("SELECT ?x (noSuchFn(?sal) AS ?d) WHERE { ?x <http://ex/salary> ?sal }").unwrap();
         let rs = match Evaluator::new(&d, &s).evaluate(&q).unwrap() {
             QueryResult::Select(rs) => rs,
             other => panic!("expected SELECT, got {other:?}"),
@@ -7020,7 +7142,8 @@ mod pfn_tests {
     #[test]
     fn builtin_takes_precedence() {
         let (d, s) = fixture();
-        let q = parse("SELECT (ABS(-5) AS ?r) WHERE { ?x <http://ex/salary> ?sal } LIMIT 1").unwrap();
+        let q =
+            parse("SELECT (ABS(-5) AS ?r) WHERE { ?x <http://ex/salary> ?sal } LIMIT 1").unwrap();
         let eval = Evaluator::new(&d, &s).with_function("ABS", |_| Some(Value::Int(999)));
         let rs = match eval.evaluate(&q).unwrap() {
             QueryResult::Select(rs) => rs,

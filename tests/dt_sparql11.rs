@@ -293,9 +293,9 @@ fn describe_returns_outgoing_triples() {
         QueryResult::Construct(triples) => {
             // alice: dept d1, salary 2500, name "Alice", knows bob.
             assert_eq!(triples.len(), 4);
-            assert!(triples.iter().all(|t| {
-                matches!(&t.subject, gstore::Term::Iri(i) if i == "http://ex/alice")
-            }));
+            assert!(triples
+                .iter()
+                .all(|t| { matches!(&t.subject, gstore::Term::Iri(i) if i == "http://ex/alice") }));
             assert!(triples
                 .iter()
                 .any(|t| matches!(&t.predicate, gstore::Term::Iri(i) if i == "http://ex/knows")));
@@ -327,10 +327,7 @@ fn describe_predicate_variable_yields_nothing() {
     let mut db = db();
     // ?p binds predicates (a different id space); DESCRIBE skips predicate-typed
     // columns, so describing a predicate variable returns no triples.
-    match db
-        .query("DESCRIBE ?p WHERE { ?s ?p ?o }")
-        .unwrap()
-    {
+    match db.query("DESCRIBE ?p WHERE { ?s ?p ?o }").unwrap() {
         QueryResult::Construct(triples) => assert_eq!(triples.len(), 0),
         other => panic!("expected Construct, got {other:?}"),
     }

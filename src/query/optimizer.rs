@@ -351,7 +351,11 @@ struct CostModelLite {
 }
 
 impl CostModelLite {
-    fn build(plans: &[PatPlan], store: &impl TripleSource, candidates: &Candidates) -> CostModelLite {
+    fn build(
+        plans: &[PatPlan],
+        store: &impl TripleSource,
+        candidates: &Candidates,
+    ) -> CostModelLite {
         let n = plans.len();
         let mut card = vec![1.0; n];
         let mut vars = vec![Vec::new(); n];

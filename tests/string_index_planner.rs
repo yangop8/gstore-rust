@@ -81,7 +81,10 @@ fn contains_is_sound_for_escaped_characters() {
         &mut db,
         "SELECT ?s WHERE { ?s <http://ex/tag> ?o . FILTER(CONTAINS(STR(?o), \"o\\nb\")) }",
     );
-    assert_eq!(n, 1, "an escaped-character needle must match the unescaped value");
+    assert_eq!(
+        n, 1,
+        "an escaped-character needle must match the unescaped value"
+    );
 }
 
 #[test]

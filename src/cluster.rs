@@ -682,8 +682,12 @@ impl RemoteShard {
 /// that failure must reach the caller rather than be merged in as an empty
 /// answer.
 trait ShardRead {
-    fn read_exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId)
-        -> io::Result<bool>;
+    fn read_exists(
+        &self,
+        sub: EntityLiteralId,
+        pred: PredId,
+        obj: EntityLiteralId,
+    ) -> io::Result<bool>;
     fn read_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>>;
     fn read_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> io::Result<Vec<EntityLiteralId>>;
     fn read_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> io::Result<Vec<PredId>>;
@@ -756,7 +760,11 @@ impl ShardRead for RemoteShard {
         pred: PredId,
         obj: EntityLiteralId,
     ) -> io::Result<bool> {
-        self.read("exists", Request::Exists { sub, pred, obj }, Response::into_bool)
+        self.read(
+            "exists",
+            Request::Exists { sub, pred, obj },
+            Response::into_bool,
+        )
     }
     fn read_po_by_s(&self, sub: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
         self.read("po_by_s", Request::PoByS { sub }, Response::into_pairs)
@@ -795,7 +803,11 @@ impl ShardRead for RemoteShard {
         self.read("triple_count", Request::TripleCount, Response::into_count)
     }
     fn read_pred_card(&self, pred: PredId) -> io::Result<u64> {
-        self.read("pred_card", Request::PredCard { pred }, Response::into_count)
+        self.read(
+            "pred_card",
+            Request::PredCard { pred },
+            Response::into_count,
+        )
     }
 }
 
@@ -935,7 +947,12 @@ pub trait TryTripleSource {
     fn scatter(&self) -> io::Result<Scatter<'_>>;
 
     /// Fallible [`TripleSource::exists`].
-    fn try_exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> io::Result<bool> {
+    fn try_exists(
+        &self,
+        sub: EntityLiteralId,
+        pred: PredId,
+        obj: EntityLiteralId,
+    ) -> io::Result<bool> {
         self.scatter()?.exists(sub, pred, obj)
     }
     /// Fallible [`TripleSource::po_by_s`].
@@ -1231,10 +1248,7 @@ impl NetworkShardedStore {
     }
 
     /// Routed bulk insert; returns the number of triples newly added.
-    pub fn insert_all(
-        &mut self,
-        triples: impl IntoIterator<Item = IdTriple>,
-    ) -> io::Result<u64> {
+    pub fn insert_all(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> io::Result<u64> {
         let mut added = 0;
         for t in triples {
             if self.insert(t)? {
@@ -1256,7 +1270,9 @@ impl NetworkShardedStore {
 
 impl TryTripleSource for NetworkShardedStore {
     fn scatter(&self) -> io::Result<Scatter<'_>> {
-        Ok(Scatter::new(self.shards.iter().map(Shard::reader).collect()))
+        Ok(Scatter::new(
+            self.shards.iter().map(Shard::reader).collect(),
+        ))
     }
 }
 
@@ -1543,7 +1559,10 @@ impl ShardCluster {
     /// Route a triple to its bucket's owner and insert it there.
     pub fn insert(&mut self, t: IdTriple) -> io::Result<bool> {
         let owner = self.config.owner_of_subject(t.sub).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "cluster has no members to route to")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "cluster has no members to route to",
+            )
         })?;
         match self.endpoints.get_mut(&owner) {
             Some(ep) => ep.insert(t),
@@ -1576,7 +1595,9 @@ impl ShardCluster {
 
 impl TryTripleSource for ShardCluster {
     fn scatter(&self) -> io::Result<Scatter<'_>> {
-        Ok(Scatter::new(self.endpoints.values().map(Shard::reader).collect()))
+        Ok(Scatter::new(
+            self.endpoints.values().map(Shard::reader).collect(),
+        ))
     }
 }
 
@@ -1869,9 +1890,7 @@ pub struct RaftState {
 impl RaftState {
     /// Create a fresh node `id` whose cluster peers are `peers` (excluding self).
     pub fn new(id: NodeId, peers: Vec<NodeId>, cfg: &RaftConfig) -> RaftState {
-        let mut seed = id
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ 0xD1B5_4A32_D192_ED03;
+        let mut seed = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
         if seed == 0 {
             seed = 0x1234_5678_9ABC_DEF1;
         }
@@ -2311,7 +2330,12 @@ impl RaftState {
                     // Within one term a follower's agreed prefix only grows, so
                     // a late reply to an older AppendEntries must not move
                     // `match_index` (and with it the commit count) backwards.
-                    let matched = self.match_index.get(&from).copied().unwrap_or(0).max(match_index);
+                    let matched = self
+                        .match_index
+                        .get(&from)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(match_index);
                     self.match_index.insert(from, matched);
                     self.next_index.insert(from, matched + 1);
                     let advanced = self.advance_commit();
@@ -2651,12 +2675,18 @@ impl ClusterNode {
     /// Bound how long a [`Request::ClientWrite`] served by this node waits for
     /// its entry to commit before replying `ok: false` (outcome unknown).
     pub fn set_commit_timeout(&self, timeout: Duration) {
-        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+        *self
+            .commit_timeout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = timeout;
     }
 
     /// The current [`Request::ClientWrite`] commit-wait bound.
     pub fn commit_timeout(&self) -> Duration {
-        *self.commit_timeout.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .commit_timeout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Register a peer's resolved address (call once per peer before
@@ -2784,7 +2814,10 @@ impl ClusterNode {
     pub fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
         for link in self.links.values() {
-            link.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            link.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             link.ready.notify_one();
         }
     }
@@ -2856,7 +2889,8 @@ impl ClusterNode {
             let req = match Request::decode(&bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = rpc::write_message(&mut stream, &Response::Error(e.to_string()).encode());
+                    let _ =
+                        rpc::write_message(&mut stream, &Response::Error(e.to_string()).encode());
                     continue;
                 }
             };
@@ -3762,7 +3796,11 @@ mod tests {
             base.object_keys().collect::<Vec<_>>(),
             "object_keys"
         );
-        assert_eq!(sharded.iter_all(), base.iter_all().collect::<Vec<_>>(), "iter_all");
+        assert_eq!(
+            sharded.iter_all(),
+            base.iter_all().collect::<Vec<_>>(),
+            "iter_all"
+        );
 
         // Subject-rooted accesses over every id that appears anywhere.
         let mut ids: Vec<EntityLiteralId> = base.subject_keys().collect();
@@ -4061,7 +4099,9 @@ mod net_tests {
         let mut net = NetworkShardedStore::new(shards);
 
         // Routed insert of every triple over the wire.
-        let added = net.insert_all(triples.iter().copied()).expect("routed insert");
+        let added = net
+            .insert_all(triples.iter().copied())
+            .expect("routed insert");
         assert_eq!(added, base.triple_count(), "all distinct triples inserted");
         // Each triple lands on exactly one node → per-node counts sum to total.
         assert_eq!(
@@ -4133,7 +4173,8 @@ mod net_tests {
             Shard::Remote(RemoteShard::connect(addr1).expect("connect 1")),
         ];
         let mut net = NetworkShardedStore::new(shards);
-        net.insert_all(triples.iter().copied()).expect("routed insert");
+        net.insert_all(triples.iter().copied())
+            .expect("routed insert");
 
         assert_eq!(net.try_triple_count().unwrap(), base.triple_count());
         assert_eq!(net.try_iter_all().unwrap(), base.iter_all());
@@ -4169,7 +4210,10 @@ mod net_tests {
         net.insert_all(triples.iter().copied()).unwrap();
 
         assert_eq!(net.try_triple_count().unwrap(), base.triple_count());
-        assert_eq!(net.try_distinct_subjects().unwrap(), base.distinct_subjects());
+        assert_eq!(
+            net.try_distinct_subjects().unwrap(),
+            base.distinct_subjects()
+        );
         assert_eq!(net.try_distinct_objects().unwrap(), base.distinct_objects());
         assert_eq!(net.try_num_predicates().unwrap(), base.num_predicates());
         assert_eq!(net.try_subject_keys().unwrap(), base.subject_keys());
@@ -4185,8 +4229,14 @@ mod net_tests {
             assert_eq!(net.try_subs_by_p(p).unwrap(), base.subs_by_p(p));
             assert_eq!(net.try_objs_by_p(p).unwrap(), base.objs_by_p(p));
             assert_eq!(net.try_pred_card(p).unwrap(), base.pred_card(p));
-            assert_eq!(net.try_pred_distinct_subj(p).unwrap(), base.pred_distinct_subj(p));
-            assert_eq!(net.try_pred_distinct_obj(p).unwrap(), base.pred_distinct_obj(p));
+            assert_eq!(
+                net.try_pred_distinct_subj(p).unwrap(),
+                base.pred_distinct_subj(p)
+            );
+            assert_eq!(
+                net.try_pred_distinct_obj(p).unwrap(),
+                base.pred_distinct_obj(p)
+            );
         }
         for &s in &ids {
             assert_eq!(net.try_po_by_s(s).unwrap(), base.po_by_s(s), "po_by_s({s})");
@@ -4240,7 +4290,10 @@ mod net_tests {
             .unwrap();
         let surviving = ShardedStore::from_triples(
             1,
-            triples.iter().copied().filter(|t| net.shard_index(t.sub) != victim),
+            triples
+                .iter()
+                .copied()
+                .filter(|t| net.shard_index(t.sub) != victim),
         );
         assert_ne!(
             rows(surviving.query(&d, q).unwrap()),
@@ -4249,7 +4302,9 @@ mod net_tests {
         );
         links[victim].cut();
 
-        let err = net.query(&d, q).expect_err("a down shard must fail the query");
+        let err = net
+            .query(&d, q)
+            .expect_err("a down shard must fail the query");
         assert!(matches!(err, GStoreError::Io(_)), "got {err:?}");
         let victim_addr = links[victim].addr().to_string();
         assert!(
@@ -4510,13 +4565,24 @@ mod raft_tests {
             .into_iter()
             .filter(|o| o.to == 1)
             .collect();
-        assert!(!appends.is_empty(), "leader emits an AppendEntries to node1");
+        assert!(
+            !appends.is_empty(),
+            "leader emits an AppendEntries to node1"
+        );
         for o in appends {
             let reply = sim.nodes[1].handle(o.msg);
             let _dropped = sim.nodes[0].handle_reply(1, reply);
         }
-        assert_eq!(sim.nodes[0].commit_index(), idx, "leader committed the entry");
-        assert_eq!(sim.nodes[1].commit_index(), 0, "follower not told it committed");
+        assert_eq!(
+            sim.nodes[0].commit_index(),
+            idx,
+            "leader committed the entry"
+        );
+        assert_eq!(
+            sim.nodes[1].commit_index(),
+            0,
+            "follower not told it committed"
+        );
 
         // node0 dies; node1 (whose log holds the entry) wins the next election and
         // is driven until its own commit covers the entry — with no new write.
@@ -4625,7 +4691,11 @@ mod raft_tests {
         for &tr in &triples {
             sim.propose(0, LogOp::Insert(tr));
         }
-        assert_eq!(sim.stores[2].triple_count(), 0, "offline node missed writes");
+        assert_eq!(
+            sim.stores[2].triple_count(),
+            0,
+            "offline node missed writes"
+        );
 
         // Node 2 rejoins; leader heartbeats backfill the missing entries.
         sim.set_down(2, false);
@@ -4746,10 +4816,34 @@ mod raft_tests {
         sim.elect(0);
         // Found the cluster (admit the three running nodes), then a fourth joins,
         // then one leaves — every step a committed config-change entry.
-        sim.propose(0, LogOp::AddNode { id: 0, addr: a(6000) });
-        sim.propose(0, LogOp::AddNode { id: 1, addr: a(6001) });
-        sim.propose(0, LogOp::AddNode { id: 2, addr: a(6002) });
-        sim.propose(0, LogOp::AddNode { id: 3, addr: a(6003) }); // join
+        sim.propose(
+            0,
+            LogOp::AddNode {
+                id: 0,
+                addr: a(6000),
+            },
+        );
+        sim.propose(
+            0,
+            LogOp::AddNode {
+                id: 1,
+                addr: a(6001),
+            },
+        );
+        sim.propose(
+            0,
+            LogOp::AddNode {
+                id: 2,
+                addr: a(6002),
+            },
+        );
+        sim.propose(
+            0,
+            LogOp::AddNode {
+                id: 3,
+                addr: a(6003),
+            },
+        ); // join
         sim.propose(0, LogOp::RemoveNode { id: 1 }); // leave
 
         let c0 = sim.config(0).clone();
@@ -4780,10 +4874,18 @@ mod raft_tests {
         // commit (node 2 and the commit broadcast are dropped).
         sim.nodes[0].propose(LogOp::Insert(t(1, 1, 1))).unwrap();
         sim.nodes[0].propose(LogOp::Insert(t(2, 2, 2))).unwrap();
-        for o in sim.nodes[0].replicate_now().into_iter().filter(|o| o.to == 1) {
+        for o in sim.nodes[0]
+            .replicate_now()
+            .into_iter()
+            .filter(|o| o.to == 1)
+        {
             let _ = sim.nodes[1].handle(o.msg);
         }
-        assert_eq!(sim.nodes[1].log_len(), 2, "node 1 holds the unverified suffix");
+        assert_eq!(
+            sim.nodes[1].log_len(),
+            2,
+            "node 1 holds the unverified suffix"
+        );
         assert_eq!(sim.nodes[1].commit_index(), 0);
 
         // A newer leader's AppendEntries that only vouches for the log up to
@@ -5028,7 +5130,11 @@ mod raft_tests {
             !nodes[l].is_leader(),
             "a revived node must not resume its stale leadership"
         );
-        let all: Vec<IdTriple> = triples.iter().copied().chain(std::iter::once(extra)).collect();
+        let all: Vec<IdTriple> = triples
+            .iter()
+            .copied()
+            .chain(std::iter::once(extra))
+            .collect();
         assert!(
             wait_until(|| nodes[l].store_triple_count() == 4
                 && all.iter().all(|&tr| nodes[l].store_contains(tr))),
@@ -5126,14 +5232,22 @@ mod raft_tests {
 
         let tr = t(9, 90, 900);
         let mut s = client(nodes[l].local_addr().unwrap());
-        let resp = crate::rpc::round_trip(&mut s, &Request::ClientWrite { op: LogOp::Insert(tr) })
-            .expect("client write round-trip");
+        let resp = crate::rpc::round_trip(
+            &mut s,
+            &Request::ClientWrite {
+                op: LogOp::Insert(tr),
+            },
+        )
+        .expect("client write round-trip");
         assert!(
             matches!(resp, Response::WriteAck { ok: false, .. }),
             "a write without a quorum must not be acknowledged, got {resp:?}\n{}",
             describe(&nodes)
         );
-        assert!(!nodes[l].store_contains(tr), "an uncommitted write is never applied");
+        assert!(
+            !nodes[l].store_contains(tr),
+            "an uncommitted write is never applied"
+        );
         assert!(
             matches!(
                 nodes[l].propose_and_wait(LogOp::Insert(t(9, 91, 901)), Duration::from_millis(200)),
@@ -5263,7 +5377,10 @@ mod raft_tests {
         // A surviving replica answers a read RPC over the wire (no data lost).
         let mut s = client(nodes[survivors[0]].local_addr().unwrap());
         let resp = crate::rpc::round_trip(&mut s, &Request::TripleCount).unwrap();
-        assert!(matches!(resp, Response::Count(n) if n >= 2), "read served by survivor");
+        assert!(
+            matches!(resp, Response::Count(n) if n >= 2),
+            "read served by survivor"
+        );
 
         // The failed replica revives and catches up to both writes.
         nodes[f].revive();
@@ -5288,8 +5405,17 @@ mod raft_tests {
         // Submit an AddNode config-change as a wire ClientWrite; the ack means
         // it is committed and applied on the acknowledging leader.
         let new_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let (l, _) = client_write_committed(&nodes, LogOp::AddNode { id: 42, addr: new_addr });
-        assert!(nodes[l].config().contains(42), "acknowledged ⇒ applied on the leader");
+        let (l, _) = client_write_committed(
+            &nodes,
+            LogOp::AddNode {
+                id: 42,
+                addr: new_addr,
+            },
+        );
+        assert!(
+            nodes[l].config().contains(42),
+            "acknowledged ⇒ applied on the leader"
+        );
 
         // Every replica converges on the new membership.
         assert!(
@@ -5301,7 +5427,8 @@ mod raft_tests {
         // A follower serves the committed config over the wire.
         let f = (0..3).find(|&i| i != l).unwrap();
         let mut sf = client(nodes[f].local_addr().unwrap());
-        let cfg = crate::rpc::round_trip(&mut sf, &Request::GetConfig).expect("GetConfig round-trip");
+        let cfg =
+            crate::rpc::round_trip(&mut sf, &Request::GetConfig).expect("GetConfig round-trip");
         match cfg {
             Response::Config {
                 epoch,
@@ -5348,7 +5475,10 @@ mod membership_tests {
         for id in [3u64, 1, 0, 2] {
             b.add_node(id, addr(7000 + id as u16));
         }
-        assert_eq!(a, b, "same member set => identical config regardless of order");
+        assert_eq!(
+            a, b,
+            "same member set => identical config regardless of order"
+        );
         assert_eq!(a.assignment().len(), 32);
         for s in 0..32 {
             assert!(
@@ -5410,8 +5540,14 @@ mod membership_tests {
         let mut viaop = ClusterConfig::new(16);
         let mut direct = ClusterConfig::new(16);
         let ops = [
-            LogOp::AddNode { id: 5, addr: addr(1005) },
-            LogOp::AddNode { id: 1, addr: addr(1001) },
+            LogOp::AddNode {
+                id: 5,
+                addr: addr(1005),
+            },
+            LogOp::AddNode {
+                id: 1,
+                addr: addr(1001),
+            },
             LogOp::RemoveNode { id: 5 },
             LogOp::Insert(IdTriple::new(1, 2, 3)), // data op: not a config change
             LogOp::Delete(IdTriple::new(1, 2, 3)),
@@ -5423,7 +5559,11 @@ mod membership_tests {
         direct.add_node(1, addr(1001));
         direct.remove_node(5);
         assert_eq!(viaop, direct);
-        assert_eq!(viaop.epoch(), 3, "only the 3 membership changes bump the epoch");
+        assert_eq!(
+            viaop.epoch(),
+            3,
+            "only the 3 membership changes bump the epoch"
+        );
         assert_eq!(viaop.members(), vec![1]);
     }
 
@@ -5489,7 +5629,10 @@ mod shard_cluster_tests {
         let node = Arc::new(ShardNode::bind(TripleStore::new(), "127.0.0.1:0").expect("bind"));
         let addr = node.local_addr().expect("addr");
         thread::spawn(move || node.serve_forever());
-        (addr, Shard::Remote(RemoteShard::connect(addr).expect("connect")))
+        (
+            addr,
+            Shard::Remote(RemoteShard::connect(addr).expect("connect")),
+        )
     }
 
     fn endpoint_count(cluster: &ShardCluster, id: NodeId) -> u64 {
@@ -5539,7 +5682,10 @@ mod shard_cluster_tests {
             .filter(|&s| cluster.config().owner(s) == Some(2))
             .count();
         assert!(owns > 0, "the joiner should own some buckets");
-        assert!(endpoint_count(&cluster, 2) > 0, "the joiner received its shards");
+        assert!(
+            endpoint_count(&cluster, 2) > 0,
+            "the joiner received its shards"
+        );
 
         // No data was lost or duplicated, and the distributed query is unchanged.
         assert_eq!(cluster.try_triple_count().unwrap(), base.triple_count());
@@ -5567,7 +5713,11 @@ mod shard_cluster_tests {
         cluster.remove_node(1).unwrap();
         assert_eq!(cluster.members(), vec![0, 2], "node 1 left the membership");
         for s in 0..cluster.num_shards() {
-            assert_ne!(cluster.config().owner(s), Some(1), "no bucket left on a departed node");
+            assert_ne!(
+                cluster.config().owner(s),
+                Some(1),
+                "no bucket left on a departed node"
+            );
         }
         // No data lost and the query is still correct.
         assert_eq!(
@@ -5657,13 +5807,16 @@ mod shard_cluster_tests {
         assert_eq!(select_rows(cluster.query(&d, BGP).unwrap()), expected);
 
         // Down a member that actually holds data.
-        let victim = (0..3u64).find(|&id| endpoint_count(&cluster, id) > 0).unwrap();
+        let victim = (0..3u64)
+            .find(|&id| endpoint_count(&cluster, id) > 0)
+            .unwrap();
         links[victim as usize].cut();
         let err = cluster
             .query(&d, BGP)
             .expect_err("a down member must fail the query");
         assert!(
-            err.to_string().contains(&links[victim as usize].addr().to_string()),
+            err.to_string()
+                .contains(&links[victim as usize].addr().to_string()),
             "error should name the down member: {err}"
         );
         assert!(cluster.try_triple_count().is_err());
@@ -5777,7 +5930,11 @@ mod replicated_shard_tests {
         let mut cluster = ShardedRaftCluster::new(4, 3, RaftConfig::default());
         cluster.bootstrap();
         let added = cluster.insert_all(triples.iter().copied());
-        assert_eq!(added, base.triple_count(), "all triples committed, none lost");
+        assert_eq!(
+            added,
+            base.triple_count(),
+            "all triples committed, none lost"
+        );
         // A duplicate routed insert is idempotent (already committed).
         assert_eq!(cluster.insert(triples[0]), Some(false));
 
@@ -5852,7 +6009,11 @@ mod replicated_shard_tests {
 
         // The shard still commits a new write on the survivors, and serves reads.
         assert_eq!(cluster.insert(t(4, 5, 6)), Some(true));
-        assert_eq!(cluster.group(0).triple_count().unwrap(), 2, "quorum committed the write");
+        assert_eq!(
+            cluster.group(0).triple_count().unwrap(),
+            2,
+            "quorum committed the write"
+        );
         assert!(cluster.try_exists(4, 5, 6).unwrap());
         assert_eq!(cluster.group(0).leader(), Some(leader), "leader retained");
 
@@ -5860,7 +6021,11 @@ mod replicated_shard_tests {
         // commit, so nothing new is applied.
         cluster.set_replica_down(0, followers[2], true);
         let before = cluster.group(0).state(leader).commit_index();
-        assert_eq!(cluster.insert(t(7, 8, 9)), Some(true), "leader still appends");
+        assert_eq!(
+            cluster.insert(t(7, 8, 9)),
+            Some(true),
+            "leader still appends"
+        );
         let after = cluster.group(0).state(leader).commit_index();
         assert_eq!(before, after, "no quorum => nothing new commits");
         assert!(
@@ -5889,7 +6054,10 @@ mod replicated_shard_tests {
         }
         // The leader compacted past index 0 while the follower was away.
         let base = cluster.group(0).state(leader).base_index();
-        assert!(base > 0, "leader compacted its committed log into a snapshot");
+        assert!(
+            base > 0,
+            "leader compacted its committed log into a snapshot"
+        );
         assert_eq!(
             cluster.group(0).store(follower).triple_count(),
             0,
@@ -5911,7 +6079,10 @@ mod replicated_shard_tests {
             "follower adopted the leader's snapshot base"
         );
         for &tr in &triples {
-            assert!(cluster.group(0).store(follower).exists(tr.sub, tr.pred, tr.obj));
+            assert!(cluster
+                .group(0)
+                .store(follower)
+                .exists(tr.sub, tr.pred, tr.obj));
         }
 
         // A subsequent write reaches the recovered follower by ordinary
@@ -5952,7 +6123,10 @@ mod replicated_shard_tests {
             "caught up by backfill, not a snapshot"
         );
         for &tr in &triples {
-            assert!(cluster.group(0).store(follower).exists(tr.sub, tr.pred, tr.obj));
+            assert!(cluster
+                .group(0)
+                .store(follower)
+                .exists(tr.sub, tr.pred, tr.obj));
         }
     }
 
@@ -6023,7 +6197,11 @@ mod replicated_shard_tests {
         // AppendEntries will reach it, so only note_revived can demote it.
         c.set_replica_down(0, old, false);
         c.set_replica_down(0, survivor, true);
-        assert_ne!(c.group(0).leader(), Some(old), "a revived stale leader must not lead");
+        assert_ne!(
+            c.group(0).leader(),
+            Some(old),
+            "a revived stale leader must not lead"
+        );
 
         // Failover to the most up-to-date survivor still sees the committed write.
         let leader = c.group_mut(0).ensure_leader();
@@ -6045,7 +6223,7 @@ mod replicated_shard_tests {
         assert_eq!(c.insert(t(7, 8, 9)), Some(true)); // commits on {0, 2}
         c.set_replica_down(0, 0, true); // kill leader
         c.set_replica_down(0, 1, false); // revive the stale node 1
-        // up = {1 (stale), 2 (has the entry)} — node 2 must be elected.
+                                         // up = {1 (stale), 2 (has the entry)} — node 2 must be elected.
         let leader = c.group_mut(0).ensure_leader();
         assert_eq!(leader, 2, "the up-to-date replica is elected, no panic");
         assert!(c.group(0).store(2).exists(7, 8, 9));
@@ -6064,7 +6242,11 @@ mod replicated_shard_tests {
         c.set_replica_down(0, 0, true); // kill leader
         c.set_replica_down(0, 1, false); // revive stale node 1 (empty store)
         assert_eq!(c.group(0).leader(), None, "group is leaderless");
-        assert_eq!(c.remove(tr), None, "no leader ⇒ None, not a spurious 'absent'");
+        assert_eq!(
+            c.remove(tr),
+            None,
+            "no leader ⇒ None, not a spurious 'absent'"
+        );
     }
 
     /// Reads stay correct after one replica per bucket fails: each bucket keeps a
@@ -6130,7 +6312,10 @@ mod replicated_shard_tests {
         );
         assert!(cluster.try_triple_count().is_err());
         assert!(cluster.try_iter_all().is_err());
-        assert!(cluster.group(g).triple_count().is_err(), "not a misleading 0");
+        assert!(
+            cluster.group(g).triple_count().is_err(),
+            "not a misleading 0"
+        );
 
         // One replica back (a committed-prefix follower read) restores the
         // complete answer.

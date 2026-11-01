@@ -136,7 +136,9 @@ mod tests {
     #[test]
     fn missing_arg_yields_none() {
         let mut r = FunctionRegistry::new();
-        r.register("needsnum", |args| Some(Value::Double(args.first()?.as_f64()? + 1.0)));
+        r.register("needsnum", |args| {
+            Some(Value::Double(args.first()?.as_f64()? + 1.0))
+        });
         let f = r.get("NEEDSNUM").unwrap();
         assert_eq!(f(&[Value::Iri("x".into())]), None);
     }

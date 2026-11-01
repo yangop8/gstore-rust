@@ -175,7 +175,11 @@ pub fn parse_intent(raw: &str) -> Result<QuestionIntent> {
             Ok(mut intent) => {
                 // A content-free aggregation block normalizes to None, so callers
                 // can treat `aggregation.is_some()` as "there is a real one".
-                if intent.aggregation.as_ref().is_some_and(|a| !a.is_meaningful()) {
+                if intent
+                    .aggregation
+                    .as_ref()
+                    .is_some_and(|a| !a.is_meaningful())
+                {
                     intent.aggregation = None;
                 }
                 return Ok(intent);
@@ -280,7 +284,8 @@ mod tests {
 
     #[test]
     fn unknown_enum_values_fall_back() {
-        let it = parse_intent(r#"{"qtype":"weirdtype","mentions":[{"text":"X","kind":"galaxy"}]}"#).unwrap();
+        let it = parse_intent(r#"{"qtype":"weirdtype","mentions":[{"text":"X","kind":"galaxy"}]}"#)
+            .unwrap();
         assert_eq!(it.qtype, QType::Open); // serde(other)
         assert_eq!(it.mentions[0].kind, MentionKind::Entity); // serde(other)
     }

@@ -437,7 +437,10 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         ctx.user(),
         &sparql,
     );
-    match ctx.inner.run_in_txn_task(&dbh, &db, tid, &sparql, ctx.user()) {
+    match ctx
+        .inner
+        .run_in_txn_task(&dbh, &db, tid, &sparql, ctx.user())
+    {
         Ok(QueryResult::Update { changed }) => {
             GResp::success("Transaction query success").with("AnsNum", changed)
         }

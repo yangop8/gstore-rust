@@ -88,10 +88,7 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -287,7 +284,9 @@ impl Sha256 {
         }
         let mut blocks = data.chunks_exact(64);
         for block in &mut blocks {
-            let block: &[u8; 64] = block.try_into().expect("chunks_exact yields 64-byte blocks");
+            let block: &[u8; 64] = block
+                .try_into()
+                .expect("chunks_exact yields 64-byte blocks");
             sha256_compress(&mut self.h, block);
         }
         let rest = blocks.remainder();
@@ -387,7 +386,9 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &m
     for (block_idx, chunk) in out.chunks_mut(32).enumerate() {
         // INT(i): the 1-based block index, big-endian. `out` would need to be
         // > 128 GiB for this to overflow u32.
-        let i = u32::try_from(block_idx + 1).unwrap_or(u32::MAX).to_be_bytes();
+        let i = u32::try_from(block_idx + 1)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes();
         let mut u = prf.mac(&[salt, &i]);
         let mut t = u;
         for _ in 1..iterations {
@@ -700,7 +701,10 @@ mod tests {
         );
         // Test cases 6–7: a key longer than the block size is hashed first.
         assert_eq!(
-            tc(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            tc(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
         assert_eq!(
@@ -794,9 +798,6 @@ mod tests {
         assert_eq!(sha512_hex(&big).len(), 128);
         // Known vector: SHA-256 of one million 'a' chars starts with cdc76e5c…;
         // here we just pin the 1000-'a' SHA-1 to guard the multi-block path.
-        assert_eq!(
-            sha1_hex(&big),
-            "291e9a6c66994949b57ba5e650361e98fc36b1ba"
-        );
+        assert_eq!(sha1_hex(&big), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
     }
 }

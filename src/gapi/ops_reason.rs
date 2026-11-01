@@ -183,9 +183,9 @@ fn compile(ctx: &mut Ctx<'_>, db: &str, name: &str) -> GResp {
                 c.check_sparql
             );
             GResp::success("ok")
-            .with("insert_sparql", c.insert_sparql)
-            .with("delete_sparql", c.delete_sparql)
-            .with("check_sparql", c.check_sparql)
+                .with("insert_sparql", c.insert_sparql)
+                .with("delete_sparql", c.delete_sparql)
+                .with("check_sparql", c.check_sparql)
         }
         Err(e) => reason_error(e),
     }
