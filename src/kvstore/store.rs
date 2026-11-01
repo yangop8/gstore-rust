@@ -271,9 +271,11 @@ impl DiskStore {
     fn with_pager(pager: Arc<RwLock<Pager>>, read_only: bool) -> Result<DiskStore> {
         let mut store = DiskStore {
             pager,
-            spo: BTree::new(SPO),
-            pos: BTree::new(POS),
-            osp: BTree::new(OSP),
+            // The triple and quad indexes hold fixed-width keys and empty
+            // values, so their nodes are classified in O(1) and binary-searched.
+            spo: BTree::with_fixed_shape(SPO, 12, 0),
+            pos: BTree::with_fixed_shape(POS, 12, 0),
+            osp: BTree::with_fixed_shape(OSP, 12, 0),
             entity2id: BTree::new(ENTITY2ID),
             literal2id: BTree::new(LITERAL2ID),
             predicate2id: BTree::new(PREDICATE2ID),
@@ -281,7 +283,7 @@ impl DiskStore {
             id2literal: IvArray::new(ID2LITERAL),
             id2predicate: IvArray::new(ID2PREDICATE),
             sp2o_vlist: BTree::new(SP2O_VLIST),
-            gspo: BTree::new(GSPO),
+            gspo: BTree::with_fixed_shape(GSPO, 16, 0),
             quad_count: 0,
             vstree_stale: false,
             pred_stats: IvArray::new(PRED_STATS),
@@ -2787,5 +2789,323 @@ mod tests {
         drop(ds);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("kv.wal")).ok();
+    }
+
+    // ---- Phase 6 R1-KV: contract-ordered try_* reads, exact counts --------
+
+    fn cleanup(path: &std::path::Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(path.with_extension("kv.wal")).ok();
+    }
+
+    /// xorshift64*: deterministic data for the equivalence tests.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n) as u32
+        }
+    }
+
+    /// Build a disk store and an in-memory store holding the same id triples:
+    /// `n` random inserts (entities, literals and a few predicates, interned
+    /// through the store so ids are the store's), then every `del`-th triple
+    /// deleted from both.
+    fn twin_stores(path: &std::path::Path, seed: u64, n: usize, del: usize) -> (DiskStore, TripleStore) {
+        let mut ds = DiskStore::open(path, 64).unwrap();
+        let mut mem = TripleStore::new();
+        let mut rng = Rng(seed);
+        let mut added = Vec::new();
+        for _ in 0..n {
+            let s = ds.intern_entity(&format!("<s{}>", rng.below(60))).unwrap();
+            let p = ds.intern_predicate(&format!("<p{}>", rng.below(7))).unwrap();
+            let o = if rng.below(3) == 0 {
+                ds.intern_literal(&format!("\"l{}\"", rng.below(40))).unwrap()
+            } else {
+                // Objects overlap the subjects, so ids are both.
+                ds.intern_entity(&format!("<s{}>", rng.below(90))).unwrap()
+            };
+            let t = IdTriple::new(s, p, o);
+            assert_eq!(ds.insert_ids(t).unwrap(), mem.insert(t));
+            added.push(t);
+        }
+        if del > 0 {
+            for t in added.iter().step_by(del) {
+                assert_eq!(ds.delete_ids(*t).unwrap(), mem.remove(*t));
+            }
+        }
+        (ds, mem)
+    }
+
+    /// Every read of `ds` equals (in order) the same read of `mem`.
+    fn assert_same_reads(ds: &DiskStore, mem: &TripleStore) {
+        let ents: Vec<u32> = (0..ds.entity_num() as u32 + 2).collect();
+        let lits: Vec<u32> = (0..ds.literal_num() as u32 + 2)
+            .map(|i| LITERAL_FIRST_ID + i)
+            .collect();
+        let ids: Vec<u32> = ents.iter().chain(&lits).copied().collect();
+        let preds: Vec<u32> = (0..ds.predicate_num() as u32 + 2).collect();
+        let mem_src: &dyn TripleSource = mem;
+        let disk_src: &dyn TripleSource = ds;
+        for &s in &ents {
+            assert_eq!(ds.try_po_by_s(s).unwrap(), mem.po_by_s(s).to_vec(), "po_by_s({s})");
+            assert_eq!(ds.count_po_by_s(s), mem.po_by_s(s).len() as u64);
+            assert_eq!(disk_src.po_by_s(s), mem_src.po_by_s(s));
+            let distinct_p = {
+                let mut v: Vec<u32> = mem.po_by_s(s).iter().map(|x| x.0).collect();
+                v.dedup();
+                v.len() as u64
+            };
+            assert_eq!(ds.distinct_p_of_s(s), distinct_p);
+            assert_eq!(ds.has_subject(s), !mem.po_by_s(s).is_empty());
+            for &p in &preds {
+                assert_eq!(ds.try_o_by_sp(s, p).unwrap(), mem.o_by_sp(s, p), "o_by_sp({s},{p})");
+                assert_eq!(ds.count_o_by_sp(s, p), mem.o_by_sp(s, p).len() as u64);
+            }
+            for &o in &ids {
+                assert_eq!(ds.try_p_by_so(s, o).unwrap(), mem.p_by_so(s, o), "p_by_so({s},{o})");
+                assert_eq!(ds.count_p_by_so(s, o), mem.p_by_so(s, o).len() as u64);
+                assert_eq!(ds.try_exists(s, 0, o).unwrap(), mem.exists(s, 0, o));
+            }
+        }
+        for &o in &ids {
+            assert_eq!(ds.try_ps_by_o(o).unwrap(), mem.ps_by_o(o).to_vec(), "ps_by_o({o})");
+            assert_eq!(ds.count_ps_by_o(o), mem.ps_by_o(o).len() as u64);
+            assert_eq!(disk_src.ps_by_o(o), mem_src.ps_by_o(o));
+            let mut ps: Vec<u32> = mem.ps_by_o(o).iter().map(|x| x.0).collect();
+            ps.dedup();
+            assert_eq!(ds.distinct_p_of_o(o), ps.len() as u64);
+            assert_eq!(ds.has_object(o), !mem.ps_by_o(o).is_empty());
+            for &p in &preds {
+                assert_eq!(ds.try_s_by_po(p, o).unwrap(), mem.s_by_po(p, o), "s_by_po({p},{o})");
+                assert_eq!(ds.count_s_by_po(p, o), mem.s_by_po(p, o).len() as u64);
+            }
+        }
+        for &p in &preds {
+            assert_eq!(ds.try_so_by_p(p).unwrap(), mem.so_by_p(p).to_vec(), "so_by_p({p})");
+            assert_eq!(ds.count_so_by_p(p), mem.so_by_p(p).len() as u64);
+            assert_eq!(ds.try_subs_by_p(p).unwrap(), mem.subs_by_p(p), "subs_by_p({p})");
+            assert_eq!(ds.try_objs_by_p(p).unwrap(), mem.objs_by_p(p), "objs_by_p({p})");
+            assert_eq!(disk_src.so_by_p(p), mem_src.so_by_p(p));
+            assert_eq!(ds.has_predicate(p), !mem.so_by_p(p).is_empty());
+            assert_eq!(disk_src.pred_card(p), mem_src.pred_card(p));
+            assert_eq!(disk_src.pred_distinct_subj(p), mem_src.pred_distinct_subj(p));
+            assert_eq!(disk_src.pred_distinct_obj(p), mem_src.pred_distinct_obj(p));
+        }
+        assert_eq!(ds.try_subject_keys().unwrap(), mem.subject_keys().collect::<Vec<_>>());
+        assert_eq!(ds.try_object_keys().unwrap(), mem.object_keys().collect::<Vec<_>>());
+        assert_eq!(ds.try_iter_all().unwrap(), mem.iter_all().collect::<Vec<_>>());
+        assert_eq!(disk_src.iter_all(), mem_src.iter_all());
+        let mut spo: Vec<IdTriple> = mem.iter_all().collect();
+        spo.sort_unstable_by_key(|t| (t.sub, t.pred, t.obj));
+        assert_eq!(ds.try_iter_spo().unwrap(), spo);
+        assert_eq!(disk_src.triple_count(), mem_src.triple_count());
+        assert_eq!(disk_src.distinct_subjects(), mem_src.distinct_subjects());
+        assert_eq!(disk_src.distinct_objects(), mem_src.distinct_objects());
+        assert_eq!(disk_src.num_predicates(), mem_src.num_predicates());
+        assert_eq!(ds.try_num_predicates().unwrap(), mem.num_predicates());
+    }
+
+    #[test]
+    fn try_reads_equal_triple_store_in_order() {
+        for (seed, n, del) in [(1u64, 0usize, 0usize), (2, 1, 0), (3, 400, 0), (4, 900, 3), (5, 700, 1)] {
+            let path = tmp(&format!("twin_{seed}"));
+            let (ds, mem) = twin_stores(&path, seed, n, del);
+            assert_same_reads(&ds, &mem);
+            // The same after a commit and a reopen (the stats mirror reloads).
+            ds.commit().unwrap();
+            drop(ds);
+            let ds = DiskStore::open(&path, 64).unwrap();
+            assert_same_reads(&ds, &mem);
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn exact_counts_after_deleting_whole_predicates_and_subjects() {
+        let path = tmp("exact_counts");
+        let (mut ds, mut mem) = twin_stores(&path, 9, 500, 0);
+        // Remove every triple of predicate 0 and of subject 0.
+        let doomed: Vec<IdTriple> = mem
+            .iter_all()
+            .filter(|t| t.pred == 0 || t.sub == 0)
+            .collect();
+        for t in doomed {
+            assert!(ds.delete_ids(t).unwrap());
+            assert!(mem.remove(t));
+        }
+        assert_eq!(ds.distinct_subject_count(), mem.distinct_subjects());
+        assert_eq!(TripleSource::num_predicates(&ds), mem.num_predicates());
+        assert!(TripleSource::num_predicates(&ds) < ds.predicate_num());
+        assert!(!ds.has_predicate(0) && !ds.has_subject(0));
+        assert_same_reads(&ds, &mem);
+        // Empty store: zero, not one.
+        let path2 = tmp("exact_counts_empty");
+        let empty = DiskStore::open(&path2, 16).unwrap();
+        assert_eq!(TripleSource::distinct_subjects(&empty), 0);
+        assert_eq!(TripleSource::num_predicates(&empty), 0);
+        cleanup(&path);
+        cleanup(&path2);
+    }
+
+    #[test]
+    fn entity_adjacency_pass_matches_per_entity_reads() {
+        let path = tmp("adjacency");
+        let (ds, mem) = twin_stores(&path, 21, 800, 4);
+        // The reference: what `vstree_entries` reads per entity.
+        let mut ids: Vec<u32> = mem.subject_keys().collect();
+        ids.extend(mem.object_keys().filter(|&o| !is_literal_id(o)));
+        ids.sort_unstable();
+        ids.dedup();
+        let mut seen = Vec::new();
+        ds.for_each_entity_adjacency(|e, out, inn| {
+            assert_eq!(out, mem.po_by_s(e), "out edges of {e}");
+            assert_eq!(inn, mem.ps_by_o(e), "in edges of {e}");
+            seen.push(e);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(seen, ids);
+        let mut n = 0;
+        ds.for_each_entity_adjacency(|_, _, _| {
+            n += 1;
+            if n == 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_trace() {
+        let path = tmp("atomic_fail");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let (ents, preds) = (ds.entity_num(), ds.predicate_num());
+        let pages = ds.page_count_for_test();
+        // The predicate space is full, so the insert fails *after* interning
+        // its new subject: the whole operation is rolled back.
+        ds.pred_count = crate::dict::PREDICATE_ID_LIMIT;
+        assert!(ds.insert_keys("<brand-new>", "<rel>", "<x>", false).is_err());
+        ds.pred_count = preds as u32;
+        assert_eq!(ds.entity_num(), ents, "the subject term was rolled back");
+        assert_eq!(ds.term_id(&Term::iri("brand-new")).unwrap(), None);
+        assert_eq!(ds.page_count_for_test(), pages);
+        assert_eq!(ds.triple_count(), 5);
+        // A key too large for a page fails the same way, after the subject.
+        let huge = format!("<{}>", "z".repeat(PAGE_SIZE));
+        assert!(ds.insert_keys("<brand-new>", "<rel>", &huge, false).is_err());
+        assert_eq!(ds.entity_num(), ents);
+        // The store stays usable and consistent.
+        assert!(ds.insert_keys("<brand-new>", "<rel>", "<x>", false).unwrap());
+        assert_eq!(ds.entity_num(), ents + 2);
+        ds.flush().unwrap();
+        drop(ds);
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.entity_num(), ents + 2);
+        assert_eq!(ds.triple_count(), 6);
+        let (dict, mem) = ds.to_memory().unwrap();
+        assert_eq!(dict.entity_num(), ents + 2);
+        assert_eq!(mem.triple_count(), 6);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_logical_insert_is_one_commit_unit_even_with_a_tiny_cache() {
+        // With an 8-page cache, a single insert touches more pages than fit;
+        // the operation must still never be committed in part, so the file only
+        // ever holds whole triples. We check that every commit point (flushes
+        // forced by later operations) leaves the three indexes in agreement.
+        let path = tmp("atomic_tiny_cache");
+        let mut ds = DiskStore::open(&path, 8).unwrap();
+        for i in 0..300u32 {
+            ds.insert_keys(
+                &format!("<http://ex/subject/with/a/long/iri/{i}>"),
+                &format!("<http://ex/p{}>", i % 5),
+                &format!("\"literal value number {i}\""),
+                true,
+            )
+            .unwrap();
+            if i % 37 == 0 {
+                // Open the committed file alone: it must be self-consistent.
+                let snap = DiskStore::open(&path, 64).unwrap();
+                let spo = snap.try_iter_spo().unwrap();
+                assert_eq!(spo.len() as u64, snap.triple_count());
+                let mut pos = 0;
+                for p in 0..snap.predicate_num() as u32 {
+                    pos += snap.try_so_by_p(p).unwrap().len();
+                }
+                assert_eq!(pos, spo.len(), "POS agrees with SPO at a commit point");
+                assert_eq!(snap.try_object_keys().unwrap().len() as u64, snap.triple_count());
+                let (dict, _) = snap.to_memory().unwrap();
+                assert_eq!(dict.entity_num(), snap.entity_num());
+            }
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_view_shares_the_pager() {
+        let path = tmp("view");
+        let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let mut view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+        assert!(view.is_read_only());
+        assert_eq!(view.triple_count(), 5);
+        assert_eq!(view.try_iter_all().unwrap(), ds.try_iter_all().unwrap());
+        assert_eq!(TripleSource::num_predicates(&view), 3);
+        assert!(view.insert_keys("<a>", "<b>", "<c>", false).is_err());
+        assert!(view.flush().is_err() && view.commit().is_err());
+        // The writer goes on; the view's counters catch up on refresh, its
+        // index reads see the shared pages at once.
+        assert!(ds.insert_keys("<a>", "<b>", "<c>", false).unwrap());
+        assert_eq!(view.triple_count(), 5);
+        assert_eq!(view.try_iter_spo().unwrap().len(), 6);
+        view.refresh().unwrap();
+        assert_eq!(view.triple_count(), 6);
+        assert_eq!(TripleSource::num_predicates(&view), 4);
+        ds.commit().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dictionary_bulk_load_matches_per_id_resolution() {
+        let path = tmp("dict_bulk");
+        let mut content = String::new();
+        for i in 0..250u32 {
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p{}> \"{}\" .\n",
+                i % 3,
+                "v".repeat(i as usize % 200)
+            ));
+        }
+        let ds = DiskStore::build_str(&path, 32, &content).unwrap();
+        let dict = ds.dictionary().unwrap();
+        for id in 0..ds.entity_num() as u32 {
+            assert_eq!(ds.id_to_string(id).unwrap().as_deref(), dict.id_to_string(id));
+        }
+        for i in 0..ds.literal_num() as u32 {
+            let id = LITERAL_FIRST_ID + i;
+            assert_eq!(ds.id_to_string(id).unwrap().as_deref(), dict.id_to_string(id));
+        }
+        for p in 0..ds.predicate_num() as u32 {
+            assert_eq!(ds.predicate_to_string(p).unwrap().as_deref(), dict.predicate_to_string(p));
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_store_written_by_this_build_keeps_the_v1_header() {
+        let path = tmp("v1_header");
+        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        drop(ds);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..8], super::super::format::MAGIC_V1);
+        assert!(bytes[16 + 24 * 8..PAGE_SIZE].iter().all(|&b| b == 0));
+        cleanup(&path);
     }
 }

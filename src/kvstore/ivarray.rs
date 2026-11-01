@@ -483,4 +483,107 @@ mod tests {
         assert_eq!(id2pred.get(&pg, 1).unwrap().as_deref(), Some(&b"<pred1>"[..]));
         std::fs::remove_file(&path).ok();
     }
+
+    // ---- Phase 6 R1-KV: get_with / for_each_range -------------------------
+
+    /// Collect `for_each_range(from, to)`.
+    fn range(a: &IvArray, pg: &Pager, from: u32, to: u32) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        a.for_each_range(pg, from, to, |k, v| {
+            out.push((k, v.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// `get` for every key in `from..to`, as `for_each_range` reports it.
+    fn by_get(a: &IvArray, pg: &Pager, from: u32, to: u32) -> Vec<(u32, Vec<u8>)> {
+        (from..to)
+            .filter_map(|k| a.get(pg, k).unwrap().map(|v| (k, v)))
+            .collect()
+    }
+
+    #[test]
+    fn for_each_range_equals_get_including_overflow_chains() {
+        let path = tmp("range");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let a = IvArray::new(0);
+        let mut seed = 0x9E37_79B9u64;
+        let mut keys = Vec::new();
+        // Dense keys across several directories, gaps, and every few keys a
+        // value long enough to need an overflow chain (some span 2+ pages).
+        for k in 0..3000u32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if (seed >> 33) % 5 == 0 {
+                continue; // a hole
+            }
+            let len = match (seed >> 40) % 7 {
+                0 => INLINE_CAP + 1 + (seed >> 20) as usize % (2 * PAGE_SIZE),
+                1 => INLINE_CAP,
+                2 => 0,
+                _ => (seed >> 45) as usize % 60,
+            };
+            let v: Vec<u8> = (0..len).map(|i| (i as u32 ^ k) as u8).collect();
+            a.insert(&mut pg, k, &v).unwrap();
+            keys.push(k);
+        }
+        // Sparse keys in far-away page-table spans.
+        for &k in &[70_000u32, 1_000_000, 5_000_000, (CAPACITY - 1) as u32] {
+            a.insert(&mut pg, k, format!("far{k}").as_bytes()).unwrap();
+        }
+        a.delete(&mut pg, keys[10]).unwrap();
+        for (from, to) in [
+            (0, 3000),
+            (0, 32),
+            (31, 33),
+            (5, 5),
+            (100, 90),
+            (2990, 70_001),
+            (999_999, 5_000_001),
+        ] {
+            assert_eq!(range(&a, &pg, from, to), by_get(&a, &pg, from, to), "{from}..{to}");
+        }
+        let all = range(&a, &pg, 0, u32::MAX);
+        assert_eq!(all.len(), keys.len() - 1 + 4);
+        assert_eq!(all.last().unwrap().0, (CAPACITY - 1) as u32);
+        assert!(range(&a, &pg, CAPACITY as u32, u32::MAX).is_empty());
+        // get_with sees the same bytes as get, inline or chained.
+        for &k in keys.iter().take(400) {
+            assert_eq!(a.get_with(&pg, k, |v| v.to_vec()).unwrap(), a.get(&pg, k).unwrap());
+        }
+        // Early stop.
+        let mut n = 0;
+        a.for_each_range(&pg, 0, 3000, |_, _| {
+            n += 1;
+            if n == 7 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 7);
+        // An empty array visits nothing.
+        assert!(range(&IvArray::new(1), &pg, 0, 100).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn corrupt_slot_lengths_are_errors() {
+        let path = tmp("corrupt_slot");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let a = IvArray::new(0);
+        a.insert(&mut pg, 3, b"abc").unwrap();
+        let (l0i, l1i, si) = IvArray::locate(3).unwrap();
+        let dir = a.dir_page(&pg, l0i, l1i).unwrap().unwrap();
+        let mut page = pg.read_page(dir).unwrap();
+        write_u32(&mut page, si * SLOT_SIZE + 1, 4000); // inline length > slot
+        pg.write_page(dir, &page).unwrap();
+        assert!(a.get(&pg, 3).is_err());
+        assert!(a
+            .for_each_range(&pg, 0, 10, |_, _| ControlFlow::Continue(()))
+            .is_err());
+        std::fs::remove_file(&path).ok();
+    }
 }
