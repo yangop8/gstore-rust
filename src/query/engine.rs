@@ -1478,13 +1478,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         };
         let run = |params: &str| -> Result<String> {
             self.check_cancel()?;
-            caller.run(
-                &func,
-                params,
-                &graph,
-                self.cancel.as_deref(),
-                self.gfun_max_output,
-            )
+            // Upstream logs each call (`SLOG_CORE`) and a failed one
+            // (`SLOG_ERROR("run dynamic function fail: …")`).
+            crate::gs_debug!("PFN.{name}: calling with {params}");
+            caller
+                .run(
+                    &func,
+                    params,
+                    &graph,
+                    self.cancel.as_deref(),
+                    self.gfun_max_output,
+                )
+                .inspect_err(|e| {
+                    if !matches!(e, GStoreError::Cancelled) {
+                        crate::gs_warn!("PFN.{name}: the call failed: {e}");
+                    }
+                })
         };
         let text = crate::pfn::call::evaluate(
             name,

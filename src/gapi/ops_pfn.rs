@@ -141,6 +141,7 @@ fn funcudb(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         return GResp::error(Status::ParamIsIllegal, EMPTY_INFO);
     }
     let user = ctx.user().to_string();
+    let name = info.name.clone();
     let reg = &ctx.inner.pfn;
     let (op, outcome) = match kind.as_str() {
         "1" => ("create", reg.create(&user, info).map(|_| ())),
@@ -148,13 +149,22 @@ fn funcudb(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         "3" => ("delete", reg.delete(&user, &info.name)),
         "4" => {
             return match reg.compile(&user, &info.name) {
-                Ok(Ok(_)) => GResp::success("Function build success."),
+                Ok(Ok(_)) => {
+                    crate::gs_info!("PFN: function '{name}' of user '{user}' compiled");
+                    GResp::success("Function build success.")
+                }
                 // Upstream answers the compiler's log as is.
-                Ok(Err(log)) => GResp::error(Status::OperationFailed, log),
-                Err(e) => GResp::error(
-                    Status::OperationFailed,
-                    format!("Function build fail: {}", reason(e)),
-                ),
+                Ok(Err(log)) => {
+                    crate::gs_info!(
+                        "PFN: function '{name}' of user '{user}' failed to compile: {log}"
+                    );
+                    GResp::error(Status::OperationFailed, log)
+                }
+                Err(e) => {
+                    let e = reason(e);
+                    crate::gs_warn!("PFN: function '{name}' of user '{user}': build fail: {e}");
+                    GResp::error(Status::OperationFailed, format!("Function build fail: {e}"))
+                }
             };
         }
         _ => {
@@ -165,7 +175,10 @@ fn funcudb(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         }
     };
     match outcome {
-        Ok(()) => GResp::success(&format!("Function {op} success.")),
+        Ok(()) => {
+            crate::gs_debug!("PFN: function '{name}' of user '{user}': {op} done");
+            GResp::success(&format!("Function {op} success."))
+        }
         Err(e) => GResp::error(
             Status::OperationFailed,
             format!("Function {op} fail: {}", reason(e)),

@@ -155,10 +155,16 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 // under the name must not inherit them.
                 Ok(()) => match ctx.inner.pfn.drop_user(&op_username) {
                     Ok(()) => GResp::success("Delete user done."),
-                    Err(e) => GResp::error(
-                        Status::OperationFailed,
-                        format!("delete user done, but removing its PFN functions failed: {e}"),
-                    ),
+                    Err(e) => {
+                        crate::gs_error!(
+                            "user '{op_username}' deleted, but removing its PFN functions \
+                             failed: {e}"
+                        );
+                        GResp::error(
+                            Status::OperationFailed,
+                            format!("delete user done, but removing its PFN functions failed: {e}"),
+                        )
+                    }
                 },
                 Err(e) => GResp::error(Status::OperationFailed, format!("delete user failed: {e}")),
             }

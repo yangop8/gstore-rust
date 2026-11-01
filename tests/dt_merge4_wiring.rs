@@ -3,7 +3,10 @@
 //! a database's reasoning rules and their ownership ledgers travel with it
 //! through every backup path — `gbackup` / `grestore` (directory and zip),
 //! the `/api` `backup` / `restore` (plain and `compress=true`) and a `drop`
-//! kept as `.bak` — while `export` writes data only, as upstream's.
+//! kept as `.bak` — while `export` writes data only, as upstream's;
+//! `reasonManage` and the PFN operations reach the `/api` access and query
+//! logs like every other operation, and a PFN query over REST the REST
+//! query log.
 
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
@@ -11,6 +14,8 @@ mod harness;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use gstore::json::{self, Json};
 use gstore::{Database, StorageKind};
@@ -337,4 +342,126 @@ fn export_writes_the_inferred_triples_but_not_the_rules() {
         "SELECT (COUNT(*) AS ?n) WHERE { ?s <Rule:next2> ?o }",
     );
     assert!(j.to_string().contains("\"3\""), "{j}");
+}
+
+/// Every record of the `/api` query (`kind` `"query"`) or access
+/// (`"access"`) log, all days.
+fn log_records(srv: &Server, kind: &str) -> Vec<Json> {
+    let dates = srv.op(&format!("{kind}logdate"), &[]);
+    ok(&dates);
+    let mut out = Vec::new();
+    for date in dates
+        .get("list")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Json::as_str)
+    {
+        let j = srv.op(
+            &format!("{kind}log"),
+            &[("date", date), ("pageNo", "1"), ("pageSize", "10000")],
+        );
+        ok(&j);
+        out.extend(
+            j.get("list")
+                .and_then(Json::as_array)
+                .unwrap_or_default()
+                .iter()
+                .cloned(),
+        );
+    }
+    out
+}
+
+/// Wait (bounded) until `kind`'s log holds a record satisfying `found`.
+fn logged(srv: &Server, kind: &str, what: &str, found: impl Fn(&Json) -> bool) -> Json {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = log_records(srv, kind);
+        if let Some(r) = records.iter().find(|r| found(r)) {
+            return r.clone();
+        }
+        assert!(
+            Instant::now() < until,
+            "no {kind}-log record of {what}: {records:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn field<'a>(r: &'a Json, key: &str) -> &'a str {
+    r.get(key).and_then(Json::as_str).unwrap_or_default()
+}
+
+/// `reasonManage` and the PFN operations are recorded in the `/api` access
+/// log like every other operation; the statement a rule executes is in the
+/// query log, and so is a PFN query — sent to `/api` `query` or to the
+/// REST `/sparql` endpoint — whether or not the function could run (it
+/// cannot without the `pfn-wasm` runtime; the failure is logged then).
+#[test]
+fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
+    let data = scratch("m4_logs_data");
+    let _data = DirGuard(data.clone());
+    let srv = Server::start_with_dir("m4_logs", Some(&data));
+    served_executed(&srv, &data, "fam");
+    let info = Json::obj()
+        .with("funName", "one")
+        .with("funBody", "(call $emit_i64 (i64.const 1)) (i32.const 1)")
+        .to_string();
+    ok(&srv.op("funcudb", &[("type", "1"), ("funInfo", &info)]));
+    let built = srv.op(
+        "funcudb",
+        &[("type", "4"), ("funInfo", r#"{"funName":"one"}"#)],
+    );
+    assert_eq!(code(&built) == 0, cfg!(feature = "pfn-wasm"), "{built}");
+    ok(&srv.op("funquery", &[]));
+    ok(&srv.op("funreview", &[("funInfo", &info)]));
+    let api_pfn = "select (PFN.one({}) AS ?r) where {}";
+    let j = srv.query("fam", api_pfn);
+    if cfg!(feature = "pfn-wasm") {
+        assert_eq!(j.get("results").map(Json::to_string).as_deref(), Some("1"), "{j}");
+    } else {
+        assert_ne!(code(&j), 0, "{j}");
+    }
+    let rest_pfn = "SELECT (PFN.one({\"src\":\"rest\"}) AS ?r) WHERE {}";
+    let (status, body) = srv.rest("POST", "/sparql?db_name=fam", rest_pfn);
+    assert_eq!(status == 200, cfg!(feature = "pfn-wasm"), "{status} {body}");
+
+    // The access log: one record per operation, with its database.
+    for (op, db) in [
+        ("reasonManage", "fam"),
+        ("funcudb", ""),
+        ("funquery", ""),
+        ("funreview", ""),
+    ] {
+        let r = logged(&srv, "access", op, |r| field(r, "operation") == op);
+        assert_eq!(field(&r, "dbname"), db, "{r}");
+        assert_eq!(field(&r, "ip"), "127.0.0.1", "{r}");
+    }
+    // The query log: the executed rule's statement, and both PFN queries.
+    let r = logged(&srv, "query", "the rule's insert", |r| {
+        field(r, "sparql").starts_with("insert { ?x <Rule:next2> ?z. }")
+    });
+    assert_eq!(field(&r, "dbname"), "fam", "{r}");
+    assert_eq!(r.get("statusCode").and_then(Json::as_i64), Some(0), "{r}");
+    // The REST endpoints log failed statements too; the /api `query`
+    // operation logs the ones that ran — as upstream's, whose `catch`
+    // returns before the log callback — so the /api PFN query is logged
+    // when the runtime is there.
+    let r = logged(&srv, "query", "the REST PFN query", |r| field(r, "sparql") == rest_pfn);
+    assert_eq!(field(&r, "dbname"), "fam", "{r}");
+    assert_eq!(
+        r.get("statusCode").and_then(Json::as_i64) == Some(0),
+        cfg!(feature = "pfn-wasm"),
+        "{r}"
+    );
+    if cfg!(feature = "pfn-wasm") {
+        let r = logged(&srv, "query", "the /api PFN query", |r| field(r, "sparql") == api_pfn);
+        assert_eq!(field(&r, "dbname"), "fam", "{r}");
+        assert_eq!(r.get("statusCode").and_then(Json::as_i64), Some(0), "{r}");
+    } else {
+        assert!(log_records(&srv, "query")
+            .iter()
+            .all(|r| field(r, "sparql") != api_pfn));
+    }
 }

@@ -173,10 +173,20 @@ fn compile(ctx: &mut Ctx<'_>, db: &str, name: &str) -> GResp {
         Err(r) => return r,
     };
     match manage::compile(&mut store, name) {
-        Ok(c) => GResp::success("ok")
+        // Upstream logs the compiled statements (`SLOG_CORE`).
+        Ok(c) => {
+            crate::gs_debug!(
+                "reasonManage: rule '{name}' of database '{db}' compiled: insert_sparql: {}; \
+                 delete_sparql: {}; check_sparql: {}",
+                c.insert_sparql,
+                c.delete_sparql,
+                c.check_sparql
+            );
+            GResp::success("ok")
             .with("insert_sparql", c.insert_sparql)
             .with("delete_sparql", c.delete_sparql)
-            .with("check_sparql", c.check_sparql),
+            .with("check_sparql", c.check_sparql)
+        }
         Err(e) => reason_error(e),
     }
 }
@@ -295,6 +305,13 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                 DataOp::Execute => {
                     manage::execute(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel))).map(
                         |x| {
+                            crate::gs_info!(
+                                "reasonManage: rule '{name}' of database '{db}' executed by '{}': \
+                                 {} triple(s) inferred, {} owned",
+                                ctx.user(),
+                                x.inserted,
+                                x.owned
+                            );
                             GResp::success("ok")
                                 .with("insert_sparql", x.insert_sparql)
                                 .with("select_sparql", x.select_sparql)
@@ -304,6 +321,12 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                 }
                 _ => manage::disable(&mut slot.db, &mut store, name, Some(Arc::clone(&cancel)))
                     .map(|x| {
+                        crate::gs_info!(
+                            "reasonManage: rule '{name}' of database '{db}' disabled by '{}': \
+                             {} triple(s) retracted",
+                            ctx.user(),
+                            x.removed
+                        );
                         GResp::success("ok")
                             .with("delete_sparql", x.delete_sparql)
                             .with("AnsNum", x.removed)
@@ -325,7 +348,10 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
                     }
                     r
                 }
-                Err(e) => reason_error(e),
+                Err(e) => {
+                    crate::gs_warn!("reasonManage: rule '{name}' of database '{db}': {e}");
+                    reason_error(e)
+                }
             }
         }
     };

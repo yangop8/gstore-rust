@@ -3845,10 +3845,17 @@ impl ApiInner {
             // Its PFN functions go with it (see `PfnRegistry::drop_user`).
             Ok(()) => match self.pfn.drop_user(&name) {
                 Ok(()) => Resp::ok(&format!("user '{name}' dropped")),
-                Err(e) => Resp::fail(
-                    500,
-                    &format!("user '{name}' dropped, but removing its PFN functions failed: {e}"),
-                ),
+                Err(e) => {
+                    crate::gs_error!(
+                        "user '{name}' dropped, but removing its PFN functions failed: {e}"
+                    );
+                    Resp::fail(
+                        500,
+                        &format!(
+                            "user '{name}' dropped, but removing its PFN functions failed: {e}"
+                        ),
+                    )
+                }
             },
             Err(e) => Resp::fail(400, &e),
         }

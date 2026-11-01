@@ -289,6 +289,12 @@ analogue of upstream's log4cplus `SLOG_*` log):
   `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [module] message`.
 * The startup lines `gserver` prints on standard output (where it listens,
   its pid file, …) are recorded in the log file too.
+* Reasoning and PFN events, as upstream logs them: a rule executed or
+  disabled (`info`, with the triples inferred / retracted; a failure
+  `warn`), its compiled statements (`debug`); a PFN function compiled or
+  failing to compile (`info`), each call (`debug`) and a failed call
+  (`warn`); a stale PFN file that cannot be removed or an unreadable
+  `data.json` line (`warn` / `error`).
 * `/api` `refreshconf` re-reads `log_mode`'s file and these keys and
   reconfigures the log (another file or level takes effect at once), as
   upstream's `refreshconf` re-runs log4cplus.
@@ -298,11 +304,16 @@ analogue of upstream's log4cplus `SLOG_*` log):
 
 * `querylog_mode` / `querylog_path` / `querylog_days`: one JSON record per
   SPARQL statement — `/api` `query` and the REST endpoints `/sparql`,
-  `/update`, `/tquery` alike — with the client IP (`remoteIP`), the number
-  of answers (`ansNum`), the latency in ms (`queryTime`), the status, the
-  format and the database, in a daily file `<querylog_path>/YYYYMMDD.log`.
+  `/update`, `/tquery` alike, PFN calls included, and the statement a
+  `reasonManage` execute / disable / check runs — with the client IP
+  (`remoteIP`), the number of answers (`ansNum`), the latency in ms
+  (`queryTime`), the status, the format and the database, in a daily file
+  `<querylog_path>/YYYYMMDD.log`. The `/api` `query` operation records the
+  statements that ran (a statement that failed is not recorded, as
+  upstream's); the REST endpoints record failed ones too.
 * `accesslog_mode` / `accesslog_path` / `accesslog_days`: one JSON record
-  per `/api` operation with the client IP. Every HTTP request (REST and
+  per `/api` operation (`reasonManage`, `funcudb`, `funquery`, `funreview`
+  included) with the client IP. Every HTTP request (REST and
   `/api`) is also appended to `<db_home>/access.log` — time, method, path,
   user, status and client IP, tab-separated (`GET /accesslog`).
 * The statements are also appended, as text, to `<db_home>/query.log` —

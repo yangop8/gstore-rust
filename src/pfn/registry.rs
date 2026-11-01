@@ -112,6 +112,17 @@ fn query_err(msg: impl Into<String>) -> GStoreError {
     GStoreError::Query(msg.into())
 }
 
+/// Remove a stale source or module file. The entry is already updated, so
+/// a failure only leaves an unused file behind: logged (upstream logs the
+/// files it removes, `SLOG_CORE`), not reported to the client.
+fn remove_stale(f: &Path) {
+    match fs::remove_file(f) {
+        Ok(()) => crate::gs_debug!("PFN: removed '{}'", f.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => crate::gs_warn!("PFN: cannot remove the stale file '{}': {e}", f.display()),
+    }
+}
+
 /// The longest `funDesc` stored, in bytes.
 pub const MAX_DESC_BYTES: usize = 64 * 1024;
 
@@ -227,8 +238,20 @@ impl PfnRegistry {
         Ok(text
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| crate::json::parse(l).ok())
-            .filter_map(|j| PfnInfo::from_json(&j).ok())
+            .filter_map(|l| {
+                let info = crate::json::parse(l)
+                    .ok()
+                    .and_then(|j| PfnInfo::from_json(&j).ok());
+                if info.is_none() {
+                    // Upstream: `SLOG_ERROR("parse function info from json
+                    // error: " + line)`.
+                    crate::gs_error!(
+                        "PFN: skipping an unreadable line of '{}': {l}",
+                        self.data_file(user).display()
+                    );
+                }
+                info
+            })
             .filter(|i| !i.name.is_empty())
             .collect())
     }
@@ -395,7 +418,7 @@ impl PfnRegistry {
         *slot = info.clone();
         self.write_all(user, &all)?;
         for f in self.module_files(user, &info.name) {
-            let _ = fs::remove_file(f);
+            remove_stale(&f);
         }
         self.forget(user, &info.name);
         Ok(info)
@@ -416,9 +439,9 @@ impl PfnRegistry {
             return Err(query_err(format!("function {name} not exists")));
         }
         self.write_all(user, &all)?;
-        let _ = fs::remove_file(self.source_file(user, name));
+        remove_stale(&self.source_file(user, name));
         for f in self.module_files(user, name) {
-            let _ = fs::remove_file(f);
+            remove_stale(&f);
         }
         self.forget(user, name);
         Ok(())
@@ -481,7 +504,7 @@ impl PfnRegistry {
                 crate::db::fsutil::atomic_write(&target, &bytes)?;
                 for f in self.module_files(user, name) {
                     if f != target {
-                        let _ = fs::remove_file(f);
+                        remove_stale(&f);
                     }
                 }
                 info.status = STATUS_COMPILED.to_string();
