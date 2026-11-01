@@ -50,6 +50,15 @@ streaming VS-tree signing only remove work (exactness is tested); the
 round's numbers are re-measured with `gstore-bench` against
 `bench/results/pre-phase6-lubm8.json` after the merge.
 
+`gstore-bench ci` on the merged tree (release build, idle 4 vCPU VM, under
+`flock /tmp/gstore-bench.lock`, against the blessed
+`bench/baselines/smoke.json`): **PASS**, no failing gate. Ratios to the
+baseline: query geomean 0.50 (snapshot) and 0.54 (disk); build 0.42 and
+0.31; warm open 1.01 and 0.38; RSS and directory bytes 0.85–1.02 (bytes
+identical). The query geomean improved by more than 1.5×, so plan §5.6(d)
+(re-bless `smoke.json`) applies; that, and the univ 8 reference re-run of
+§5.6(c), are left to the measure stage.
+
 ## Requests/Not yet
 
 - **R3-SRV / R4-SNAP:** `ConcurrentDb` snapshot and version-view queries
