@@ -124,9 +124,36 @@ fn vstree_entries<S: TripleSource>(store: &S) -> Vec<(EntityLiteralId, Signature
         .collect()
 }
 
+/// [`vstree_entries`] for the in-memory store, from one merged walk of its
+/// subject and object maps (no per-entity lookup or copy). Equal to the
+/// generic version.
+fn memory_vstree_entries(store: &TripleStore) -> Vec<(EntityLiteralId, Signature)> {
+    let mut out = Vec::new();
+    store.for_each_entity_adjacency(|e, outgoing, incoming| {
+        let mut sig = Signature::new();
+        for &(p, o) in outgoing {
+            sig.encode_edge(p, o, EdgeDir::Out);
+        }
+        for &(p, s) in incoming {
+            sig.encode_edge(p, s, EdgeDir::In);
+        }
+        out.push((e, sig));
+    });
+    out
+}
+
+/// [`vstree_entries`] of a [`Backend`], through the in-memory fast path when
+/// it holds a [`TripleStore`].
+fn backend_vstree_entries(store: &Backend) -> Vec<(EntityLiteralId, Signature)> {
+    match store.as_memory() {
+        Some(mem) => memory_vstree_entries(mem),
+        None => vstree_entries(store),
+    }
+}
+
 /// Build an in-memory VS-tree over every entity (see [`vstree_entries`]).
-fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
-    VsTree::build(vstree_entries(store))
+fn build_vstree(store: &Backend) -> VsTree {
+    VsTree::build(backend_vstree_entries(store))
 }
 
 /// On-disk metadata (kept tiny and human-meaningful).
@@ -561,7 +588,7 @@ impl Database {
         }
         // Fresh build: drop any prior node file (and its WAL) at this path.
         remove_file_and_wal(path);
-        self.vstree = VsTree::build_disk(path, vstree_entries(&self.store))?;
+        self.vstree = VsTree::build_disk(path, backend_vstree_entries(&self.store))?;
         self.index_valid = true;
         self.vs_shrink_debt = 0;
         self.query_cache_mut().clear();
@@ -3719,6 +3746,7 @@ mod tests {
         let check = |db: &mut Database, step: usize| {
             assert!(db.stats().index_valid, "step {step}: the index stays valid");
             let truth = vstree_entries(&db.store);
+            assert_eq!(truth, backend_vstree_entries(&db.store), "step {step}: fast path");
             for &(e, sig) in truth.iter().step_by(7) {
                 // A query made of each real edge of `e` must find `e`.
                 for &(p, o) in &db.store.po_by_s(e) {
