@@ -98,10 +98,15 @@ pub fn build(
     };
     let (bytes, files) =
         sys::dir_bytes(&dir).map_err(|e| format!("cannot size {}: {e}", dir.display()))?;
-    res.dir_bytes = bytes;
+    // gbuild's parse_error.log is a log (its first line names the source
+    // path), not database content: listed, but not counted.
+    res.dir_bytes = bytes - files.get(PARSE_LOG).copied().unwrap_or(0);
     res.files = files;
     Ok(res)
 }
+
+/// gbuild's log of statements that did not parse.
+const PARSE_LOG: &str = "parse_error.log";
 
 fn build_cli(
     backend: &str,

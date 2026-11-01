@@ -67,7 +67,8 @@ a crash or a timeout fails the run with exit code 2):
    knows the command lines): `gbuild lubm <data>`, `gbuild --disk …`,
    `gbuild --rocksdb …`, taken from `--bin-dir` (default `target/release`).
    Wall time, `gbuild`'s peak RSS (`getrusage(RUSAGE_CHILDREN)`) and the
-   database directory's apparent size per top-level file.
+   database directory's apparent size (without `gbuild`'s parse log) and
+   the size of each top-level entry.
 2. **open** — `Database::open` once (cold when `--drop-caches` could drop the
    page cache), then `--open-reps` more times, each in a fresh process; the
    warm figure is their median. RSS after the first open; the triple,

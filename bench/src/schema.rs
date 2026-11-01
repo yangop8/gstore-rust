@@ -181,7 +181,8 @@ pub struct BuildResult {
     /// Its peak RSS (`getrusage(RUSAGE_CHILDREN)`).
     #[serde(default)]
     pub peak_rss_mib: Option<f64>,
-    /// Apparent size of the database directory.
+    /// Apparent size of the database directory (without gbuild's
+    /// `parse_error.log`, which names the source path).
     pub dir_bytes: u64,
     /// Size of each top-level entry of the directory.
     #[serde(default)]
