@@ -5667,8 +5667,6 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
     }
 }
 
-/// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
-/// Constants and variables without a candidate set are always allowed.
 /// The candidate set of a variable slot, if it has one.
 fn slot_candidates<'c>(slot: &Slot, cands: &'c Candidates) -> Option<&'c [u32]> {
     match slot {
@@ -5678,7 +5676,7 @@ fn slot_candidates<'c>(slot: &Slot, cands: &'c Candidates) -> Option<&'c [u32]> 
 }
 
 /// Whether `value` passes a (sorted) candidate set; `None` admits anything.
-/// [`cand_ok`] with the set looked up beforehand.
+/// `cand_ok` with the set looked up beforehand.
 fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
     set.is_none_or(|list| list.binary_search(&value).is_ok())
 }
@@ -5687,6 +5685,11 @@ fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
 /// number less than `1 / CANDIDATE_LOOKUP_FACTOR` of the predicate's triples.
 const CANDIDATE_LOOKUP_FACTOR: usize = 8;
 
+/// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
+/// Constants and variables without a candidate set are always allowed. The
+/// executor uses [`slot_candidates`] + [`in_candidates`]; this per-triple
+/// lookup is the tests' reference filter.
+#[cfg(test)]
 fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
     match slot {
         // Candidate lists are sorted; membership is a binary search.

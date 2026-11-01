@@ -584,8 +584,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return STOP;
         }
         let plan = &p.plans[pi];
-        for (s, pr, o) in self.candidate_triples(&binding, plan) {
-            if !cand_ok(&plan.s, s, &p.cands) || !cand_ok(&plan.o, o, &p.cands) {
+        // As `extend`: the candidate sets are looked up once, and a small one
+        // turns a predicate scan into lookups (same triples, same order).
+        let s_cands = slot_candidates(&plan.s, &p.cands);
+        let o_cands = slot_candidates(&plan.o, &p.cands);
+        for (s, pr, o) in self.candidate_triples_in(&binding, plan, s_cands, o_cands) {
+            if !in_candidates(s_cands, s) || !in_candidates(o_cands, o) {
                 continue;
             }
             let mut nb = binding.clone();
@@ -616,8 +620,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 let plan = &p.plans[*i];
                 let empty = vec![None; layout.len()];
-                for (s, pr, o) in self.candidate_triples(&empty, plan) {
-                    if !cand_ok(&plan.s, s, &p.cands) || !cand_ok(&plan.o, o, &p.cands) {
+                let s_cands = slot_candidates(&plan.s, &p.cands);
+                let o_cands = slot_candidates(&plan.o, &p.cands);
+                for (s, pr, o) in self.candidate_triples_in(&empty, plan, s_cands, o_cands) {
+                    if !in_candidates(s_cands, s) || !in_candidates(o_cands, o) {
                         continue;
                     }
                     let mut nb = empty.clone();
@@ -2274,6 +2280,79 @@ mod tests {
                 let pos = ev.solution_positions(&p, &full, layout.len()).unwrap();
                 assert!(pos.windows(2).all(|w| w[0] < w[1]), "{order:?}");
             }
+        }
+    }
+
+    /// The streaming paths answer a `?s p ?o` scan from small candidate sets
+    /// by lookups (as `extend` does): the same solutions, in the same order,
+    /// as scanning the predicate and filtering each triple by the candidates.
+    #[test]
+    fn streaming_candidate_lookups_equal_the_filtered_scan() {
+        let mut state = 0x7095_u64;
+        let mut next = move |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(n)) as u32
+        };
+        let mut store = TripleStore::new();
+        store.bulk_load((0..6000).map(|_| IdTriple::new(next(400), next(3), next(500))));
+        let dict = Dictionary::new();
+        let ev = Evaluator::new(&dict, &store);
+        let layout = VarLayout::build(&bgp("?a :p0 ?b"));
+        assert_eq!(layout.len(), 2);
+        for round in 0..45 {
+            let p = next(3);
+            let plan = PatPlan {
+                s: Slot::Var(0),
+                p: Slot::Const(p),
+                o: Slot::Var(if round % 7 == 0 { 0 } else { 1 }),
+            };
+            let mut set = |n: u32, range: u32| -> Vec<u32> {
+                let mut v: Vec<u32> = (0..n).map(|_| next(range)).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let mut cands = Candidates::default();
+            match round % 3 {
+                0 => {
+                    cands.insert(0, set(20, 400));
+                }
+                1 => {
+                    cands.insert(1, set(15, 500));
+                }
+                _ => {
+                    cands.insert(0, set(30, 400));
+                    cands.insert(1, set(200, 500));
+                }
+            }
+            let empty: Binding = vec![None; 2];
+            let mut want = Vec::new();
+            for (s, pr, o) in ev.candidate_triples(&empty, &plan) {
+                if !cand_ok(&plan.s, s, &cands) || !cand_ok(&plan.o, o, &cands) {
+                    continue;
+                }
+                let mut nb = empty.clone();
+                if unify(&mut nb, &plan.s, s)
+                    && unify(&mut nb, &plan.p, pr)
+                    && unify(&mut nb, &plan.o, o)
+                {
+                    want.push(nb);
+                }
+            }
+            let bp = BgpPlan {
+                plans: copy_plans(std::slice::from_ref(&plan)),
+                cands,
+                exec: ExecPlan {
+                    order: vec![0],
+                    tree: None,
+                },
+            };
+            let left_deep = collect(|sink| ev.stream_left_deep(&bp, 0, empty.clone(), sink));
+            assert_eq!(left_deep, want, "left-deep, round {round}");
+            let tree = collect(|sink| ev.stream_join_tree(&leaf(0), &bp, &layout, sink));
+            assert_eq!(tree, want, "join-tree leaf, round {round}");
         }
     }
 
