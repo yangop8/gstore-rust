@@ -55,6 +55,7 @@
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod disk_triples;
 pub mod format;
 pub mod isarray;
 pub mod ivarray;
@@ -65,6 +66,7 @@ pub mod string_index;
 pub mod vlist;
 
 pub use disk_dict::DiskDict;
+pub use disk_triples::{DiskReadView, DiskSource, DiskTriples, ViewError};
 pub use isarray::IsArray;
 pub use ivarray::IvArray;
 pub use pager::{PageId, Pager, PagerOp, PAGE_SIZE};
