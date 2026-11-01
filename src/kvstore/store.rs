@@ -1765,6 +1765,44 @@ impl TripleSource for DiskStore {
     fn iter_all(&self) -> Vec<IdTriple> {
         self.try_iter_all().unwrap_or_default()
     }
+
+    // C1 counts: the inherent versions count a key prefix (or read the
+    // maintained statistics) instead of materializing the range. Each returns
+    // exactly what the trait default returns over the methods above, and the
+    // `has_*` ones answer `true` on a read error.
+    fn count_po_by_s(&self, s: u32) -> u64 {
+        DiskStore::count_po_by_s(self, s)
+    }
+    fn count_o_by_sp(&self, s: u32, p: u32) -> u64 {
+        DiskStore::count_o_by_sp(self, s, p)
+    }
+    fn count_p_by_so(&self, s: u32, o: u32) -> u64 {
+        DiskStore::count_p_by_so(self, s, o)
+    }
+    fn count_ps_by_o(&self, o: u32) -> u64 {
+        DiskStore::count_ps_by_o(self, o)
+    }
+    fn count_s_by_po(&self, p: u32, o: u32) -> u64 {
+        DiskStore::count_s_by_po(self, p, o)
+    }
+    fn count_so_by_p(&self, p: u32) -> u64 {
+        DiskStore::count_so_by_p(self, p)
+    }
+    fn distinct_p_of_s(&self, s: u32) -> u64 {
+        DiskStore::distinct_p_of_s(self, s)
+    }
+    fn distinct_p_of_o(&self, o: u32) -> u64 {
+        DiskStore::distinct_p_of_o(self, o)
+    }
+    fn has_subject(&self, s: u32) -> bool {
+        DiskStore::has_subject(self, s)
+    }
+    fn has_object(&self, o: u32) -> bool {
+        DiskStore::has_object(self, o)
+    }
+    fn has_predicate(&self, p: u32) -> bool {
+        DiskStore::has_predicate(self, p)
+    }
 }
 
 /// Build a `sp2o_vlist` value record for an encoded VList: inline (tag + bytes)
@@ -2906,6 +2944,54 @@ mod tests {
         assert_eq!(disk_src.distinct_objects(), mem_src.distinct_objects());
         assert_eq!(disk_src.num_predicates(), mem_src.num_predicates());
         assert_eq!(ds.try_num_predicates().unwrap(), mem.num_predicates());
+        assert_c1_overrides_match_defaults(disk_src, mem_src, &ents, &ids, &preds);
+    }
+
+    /// The C1 methods of `impl TripleSource for DiskStore` (which override the
+    /// trait defaults with prefix counts) return exactly what the defaults
+    /// compute over the list methods, and what the in-memory store answers.
+    fn assert_c1_overrides_match_defaults(
+        disk: &dyn TripleSource,
+        mem: &dyn TripleSource,
+        ents: &[u32],
+        ids: &[u32],
+        preds: &[u32],
+    ) {
+        let runs = |v: &[(u32, u32)]| crate::store::distinct_first(v);
+        for &s in ents {
+            assert_eq!(disk.count_po_by_s(s), disk.po_by_s(s).len() as u64, "count_po_by_s({s})");
+            assert_eq!(disk.count_po_by_s(s), mem.count_po_by_s(s));
+            assert_eq!(disk.distinct_p_of_s(s), runs(&disk.po_by_s(s)), "distinct_p_of_s({s})");
+            assert_eq!(disk.distinct_p_of_s(s), mem.distinct_p_of_s(s));
+            assert_eq!(disk.has_subject(s), !disk.po_by_s(s).is_empty(), "has_subject({s})");
+            assert_eq!(disk.has_subject(s), mem.has_subject(s));
+            for &p in preds {
+                assert_eq!(disk.count_o_by_sp(s, p), disk.o_by_sp(s, p).len() as u64);
+                assert_eq!(disk.count_o_by_sp(s, p), mem.count_o_by_sp(s, p));
+            }
+            for &o in ids {
+                assert_eq!(disk.count_p_by_so(s, o), disk.p_by_so(s, o).len() as u64);
+                assert_eq!(disk.count_p_by_so(s, o), mem.count_p_by_so(s, o));
+            }
+        }
+        for &o in ids {
+            assert_eq!(disk.count_ps_by_o(o), disk.ps_by_o(o).len() as u64, "count_ps_by_o({o})");
+            assert_eq!(disk.count_ps_by_o(o), mem.count_ps_by_o(o));
+            assert_eq!(disk.distinct_p_of_o(o), runs(&disk.ps_by_o(o)), "distinct_p_of_o({o})");
+            assert_eq!(disk.distinct_p_of_o(o), mem.distinct_p_of_o(o));
+            assert_eq!(disk.has_object(o), !disk.ps_by_o(o).is_empty(), "has_object({o})");
+            assert_eq!(disk.has_object(o), mem.has_object(o));
+            for &p in preds {
+                assert_eq!(disk.count_s_by_po(p, o), disk.s_by_po(p, o).len() as u64);
+                assert_eq!(disk.count_s_by_po(p, o), mem.count_s_by_po(p, o));
+            }
+        }
+        for &p in preds {
+            assert_eq!(disk.count_so_by_p(p), disk.so_by_p(p).len() as u64, "count_so_by_p({p})");
+            assert_eq!(disk.count_so_by_p(p), mem.count_so_by_p(p));
+            assert_eq!(disk.has_predicate(p), !disk.so_by_p(p).is_empty(), "has_predicate({p})");
+            assert_eq!(disk.has_predicate(p), mem.has_predicate(p));
+        }
     }
 
     #[test]
