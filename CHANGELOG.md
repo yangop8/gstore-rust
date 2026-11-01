@@ -85,7 +85,8 @@ landed; this records what joining them changed.
   rule's and a PFN function's lifecycle through the console, the PFN call
   part with `pfn-wasm`), `config` and `console::commands`. One expectation
   changed intentionally: the fake-server test's `showpfn` third column.
-  The default workspace runs 1,942 tests; the features add their own.
+  The default workspace runs 1,960 tests (with the review fixes below);
+  the features add their own.
 
 #### Review fixes
 
@@ -157,7 +158,11 @@ A review of the merged tree found these; each has a regression test
 - **Docs.** `disablereason`'s printed statement and the query log's record
   of a disable are upstream's nominal `delete where`, not the `DELETE DATA`
   of the ledger that ran (README, `docs/DEPLOY.md`); PFN file names are
-  lower-cased (README, `docs/DEPLOY.md`).
+  lower-cased (README, `docs/DEPLOY.md`); `compilereason` prints
+  `insert_sparql` and `delete_sparql` (the README listed `check_sparql`
+  too); `gserver -r` starts the server with the options given to `-r`,
+  not those of the server it stopped — repeat `--load-dir`, `-p`, … there
+  (README, `gserver -h`).
 
 #### Not yet
 

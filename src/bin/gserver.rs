@@ -17,7 +17,9 @@
 //!   the pid file: in-flight requests finish, open transactions roll back,
 //!   unsaved changes are saved), wait for it to exit, remove the pid file.
 //! - `-r`, `--restart`: stop the running server (if any), then start it again —
-//!   in the background if it had been started with `-b`, as upstream does.
+//!   in the background if it had been started with `-b`, as upstream does. It
+//!   starts with the options given to `-r`, not those of the server it
+//!   stopped: repeat `--load-dir`, `-p`, `--db-home`, … there.
 //! - `-k`, `--kill`: force-stop (`SIGKILL`) the server and its supervisor, remove
 //!   the pid file. Unsaved changes are lost.
 //! - `-S`, `--status`: report whether the server is running (pid, address).
@@ -185,7 +187,7 @@ fn print_help() {
          \t-h,--help\t\tDisplay this message.\n\
          \t-s,--start[default]\tStart gServer.\n\
          \t-t,--stop\t\tSafe shutdown gServer.\n\
-         \t-r,--restart\t\tRestart gServer.\n\
+         \t-r,--restart\t\tRestart gServer (with the options given to -r).\n\
          \t-k,--kill\t\tForce shutdown gServer.\n\
          \t-b,--background\t\tStart gServer in the background.\n\
          \t-S,--status\t\tShow gServer status.\n\

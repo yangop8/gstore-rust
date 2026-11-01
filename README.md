@@ -25,7 +25,7 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 1,940 tests pass** across the workspace (incl. 159 for gNLQA), among them
+* **About 1,960 tests pass** across the workspace (incl. 159 for gNLQA), among them
   ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`, `gzip`,
   `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
   --workspace --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
@@ -206,7 +206,9 @@ gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txn
 gserver                      # the same API server rooted at db_home (./dbhome/)
                              # on port 9000, settings from ./conf/conf.ini
 gserver -b                   # … started in the background (-s: foreground)
-gserver -S | -t | -r | -k    # status / stop / restart / kill it (via its pid file)
+gserver -S | -t | -r | -k    # status / stop / restart / kill it (via its pid file;
+                             # -r starts it with the options given to -r, not
+                             # the stopped server's: repeat --load-dir, -p, …)
 gexport mydb out.nq          # N-Quads (every graph); out.nt: the default graph;
                              # -z / out.zip: zipped (feature zip)
 gbackup [-z] mydb bak        # a backup directory (or bak.zip)
@@ -643,8 +645,8 @@ gStore[lubm]> quit;
   the rule JSON in the file (the `reasonManage` `ruleinfo`) and prints the
   server's message; `listreason` prints `ruleid | rulename | description`;
   `compilereason` / `executereason` / `disablereason <rule>` print the
-  statements the server answers, upstream's: the compiled `insert_sparql` /
-  `delete_sparql` / `check_sparql`, the `insert_sparql` executed — and, for
+  statements the server answers, upstream's: the compiled `insert_sparql` and
+  `delete_sparql`, the `insert_sparql` executed — and, for
   `disablereason`, upstream's nominal `delete where {?x <Rule:label> ?y.}`,
   which is **not** what ran for a rule with a ledger: such a rule retracts
   exactly the triples of its ledger (a `DELETE DATA`; see Reasoning), and
