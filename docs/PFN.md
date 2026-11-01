@@ -472,9 +472,11 @@ engine, and the engine modules are loaded into is replaced after 16 MiB of
 modules, so neither leaks memory however often functions are compiled, and
 a compilation does not hold up other users' calls. Calls of one statement
 are made one argument combination at a time (never all prepared at once),
-and the combinations are counted before any call is made. A trap (`unreachable`, an out-of-bounds memory access, a stack
-overflow, a division by zero, a host function refusing a bad pointer or too
-much output) fails the query with a clean error; the server is unaffected.
+and the combinations are counted before any call is made: a call whose
+variables expand to more than 1 000 000 combinations fails without running.
+A trap (`unreachable`, an out-of-bounds memory access, a stack overflow, a
+division by zero, a host function refusing a bad pointer or too much output)
+fails the query with a clean error; the server is unaffected.
 
 PFN results are never served from the query cache: they depend on the calling
 user and on the function's current version, which the cache key does not

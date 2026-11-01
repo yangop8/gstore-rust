@@ -268,9 +268,9 @@ user, default 100). Upstream's `[system] pfn_base_path` (default here:
 [Reasoning rules](#reasoning-reasonmanage) have no `conf.ini` keys: their
 limits are fixed (1000 rules per database, 1 MiB per rule file, 64
 conditions per rule, 256 patterns and 64 filters per condition, rule names of
-at most 128 characters), and executing or disabling a rule is an ordinary
-update (`check_point`, the `[query]` cache and the CSR behave as for any
-other write).
+at most 128 characters and 240 bytes), and executing or disabling a rule is
+an ordinary update (`check_point`, the `[query]` cache and the CSR behave as
+for any other write).
 
 ### Graph functions in SPARQL
 
@@ -424,8 +424,8 @@ that are already there.
   Reason Rule Fail. …"`). Prefixed names are refused (a rule has no
   `PREFIX`es).
 - Rule names must be safe file names (no `/`, `\`, `..`, leading `.`, control
-  characters; at most 128 characters), at most 1000 rules per database and
-  1 MiB per rule file.
+  characters; at most 128 characters and 240 bytes of UTF-8), at most 1000
+  rules per database and 1 MiB per rule file.
 - Execute runs the statement compiled from the rule's definition, never text
   stored in the file: a rule edited after compiling must be compiled again;
   compiled fields a client sends with `add` are dropped.

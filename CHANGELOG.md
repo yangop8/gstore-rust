@@ -175,7 +175,7 @@ Reasoning rules (also in the README's *Reasoning* section):
   SPARQL verbatim, so a rule could inject SPARQL. Prefixed names are
   refused (a rule has no `PREFIX`es). Rule names must be safe file names
   (no `/`, `\`, `..`, leading `.` or control characters, at most 128
-  characters), and the number and size of rules are bounded.
+  characters and 240 bytes), and the number and size of rules are bounded.
 - Execute runs the statement compiled from the rule's definition, never
   text stored in the file: a rule edited after compiling must be compiled
   again, and compiled fields a client sends with `add` are dropped.

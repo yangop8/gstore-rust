@@ -166,5 +166,6 @@ upload_allow_compress_packages = "zip"
 # <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --
 # at most 1000 rules per database, 1 MiB per rule file, 64 conditions per rule,
 # 256 patterns and 64 filters per condition, 4 KiB per term and 16 KiB per
-# filter, rule names of at most 128 characters. Executing a rule is an update
-# like any other: it obeys check_point and empties the [query] cache.
+# filter, rule names of at most 128 characters (240 bytes). Executing a rule
+# is an update like any other: it obeys check_point and empties the [query]
+# cache.
