@@ -42,8 +42,10 @@
 //!   (c) an `OverlayView` whose overlay adds and removes `--changes` triples
 //!   under *other* keys, (d) `DiskTriples` without a transaction and (e)
 //!   `DiskTriples` with an open transaction holding the changes of (c). The
-//!   sources are timed round-robin; `overlay_*_ratio` is each against (a)
-//!   (acceptance: ≤ 1.1 for (b) and (c)). The answers (sums of list lengths)
+//!   sources are timed round-robin; `overlay_*_ratio` is each against (a),
+//!   the geometric mean over the methods of the median ratios, and
+//!   `overlay_*_ratio_min` the same of the fastest repetitions (steadier on
+//!   a busy machine) — acceptance: ≤ 1.1 for (b) and (c). The answers (sums of list lengths)
 //!   must be equal on every source (`overlay_answers_match`). Finally Q1–Q14
 //!   over (e), whose overlay touches the predicates the queries scan:
 //!   `query_txn_geomean_ms` against `query_plain_geomean_ms`.
@@ -385,14 +387,23 @@ fn run_method(src: &dyn TripleSource, smp: &Sample, m: usize) -> u64 {
     }
 }
 
+/// One method on one source: median and minimum ns per lookup over the
+/// timed repetitions, and the answers' checksum.
+#[derive(Clone, Copy)]
+struct Timing {
+    median: f64,
+    min: f64,
+    sum: u64,
+}
+
 /// Time every method over every source, round-robin; returns
-/// `[source][method] -> (median ns per lookup, checksum)`.
+/// `[source][method] -> Timing`.
 fn time_sources(
     reps: usize,
     smp: &Sample,
     n: usize,
     sources: &[&dyn TripleSource],
-) -> Vec<Vec<(f64, u64)>> {
+) -> Vec<Vec<Timing>> {
     let mut times = vec![vec![Vec::new(); METHODS.len()]; sources.len()];
     let mut sums = vec![vec![0u64; METHODS.len()]; sources.len()];
     for rep in 0..=reps {
@@ -411,7 +422,16 @@ fn time_sources(
     times
         .into_iter()
         .zip(sums)
-        .map(|(ts, ss)| ts.into_iter().map(median).zip(ss).collect())
+        .map(|(ts, ss)| {
+            ts.into_iter()
+                .zip(ss)
+                .map(|(t, sum)| Timing {
+                    min: t.iter().copied().fold(f64::INFINITY, f64::min),
+                    median: median(t),
+                    sum,
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -495,40 +515,54 @@ fn overlay_mode(
 
     let labels = ["base", "empty", "other", "dt_plain"];
     let mut answers_match = true;
-    let mut ratio_logs: Vec<Vec<f64>> = vec![Vec::new(); 5];
+    // [source][method] ln(ratio to the base), of the medians and of the minima.
+    let mut med_logs: Vec<Vec<f64>> = vec![Vec::new(); 5];
+    let mut min_logs: Vec<Vec<f64>> = vec![Vec::new(); 5];
     for (m, name) in METHODS.iter().enumerate() {
-        let base_ns = phase1[0][m].0;
+        let base = phase1[0][m];
         let mut line = String::new();
         for (k, label) in labels.iter().enumerate() {
-            let (ns, sum) = phase1[k][m];
-            answers_match &= sum == phase1[0][m].1;
-            line += &format!("overlay_{name}_{label}_ns={ns:.0} ");
+            let t = phase1[k][m];
+            answers_match &= t.sum == base.sum;
+            line += &format!(
+                "overlay_{name}_{label}_ns={:.0} overlay_{name}_{label}_min_ns={:.0} ",
+                t.median, t.min
+            );
             if k > 0 {
-                ratio_logs[k].push((ns / base_ns).ln());
+                med_logs[k].push((t.median / base.median).ln());
+                min_logs[k].push((t.min / base.min).ln());
             }
         }
-        let (base2, _) = phase2[0][m];
-        let (txn_ns, sum) = phase2[1][m];
-        answers_match &= sum == phase1[0][m].1 && phase2[0][m].1 == phase1[0][m].1;
-        ratio_logs[4].push((txn_ns / base2).ln());
-        line += &format!("overlay_{name}_base2_ns={base2:.0} overlay_{name}_dt_txn_ns={txn_ns:.0}");
+        let (base2, txn) = (phase2[0][m], phase2[1][m]);
+        answers_match &= txn.sum == base.sum && base2.sum == base.sum;
+        med_logs[4].push((txn.median / base2.median).ln());
+        min_logs[4].push((txn.min / base2.min).ln());
+        line += &format!(
+            "overlay_{name}_base2_ns={:.0} overlay_{name}_dt_txn_ns={:.0}",
+            base2.median, txn.median
+        );
         println!("{line}");
     }
-    let g = |k: usize| (ratio_logs[k].iter().sum::<f64>() / ratio_logs[k].len() as f64).exp();
-    let worst = |k: usize| ratio_logs[k].iter().map(|l| l.exp()).fold(0.0f64, f64::max);
-    println!(
-        "overlay_empty_ratio={:.3} overlay_other_ratio={:.3} overlay_dt_plain_ratio={:.3} \
-         overlay_dt_txn_ratio={:.3} (geomeans over the methods; worst: empty {:.3}, other {:.3}, \
-         dt_plain {:.3}, dt_txn {:.3}) overlay_answers_match={answers_match}",
-        g(1),
-        g(2),
-        g(3),
-        g(4),
-        worst(1),
-        worst(2),
-        worst(3),
-        worst(4)
-    );
+    let g = |logs: &[f64]| (logs.iter().sum::<f64>() / logs.len() as f64).exp();
+    let worst = |logs: &[f64]| logs.iter().map(|l| l.exp()).fold(0.0f64, f64::max);
+    for (logs, what) in [(&med_logs, "medians"), (&min_logs, "minima")] {
+        let sfx = if what == "minima" { "_min" } else { "" };
+        println!(
+            "overlay_empty_ratio{sfx}={:.3} overlay_other_ratio{sfx}={:.3} \
+             overlay_dt_plain_ratio{sfx}={:.3} overlay_dt_txn_ratio{sfx}={:.3} \
+             (geomeans over the methods, of the {what}; worst method: empty {:.3}, \
+             other {:.3}, dt_plain {:.3}, dt_txn {:.3})",
+            g(&logs[1]),
+            g(&logs[2]),
+            g(&logs[3]),
+            g(&logs[4]),
+            worst(&logs[1]),
+            worst(&logs[2]),
+            worst(&logs[3]),
+            worst(&logs[4])
+        );
+    }
+    println!("overlay_answers_match={answers_match}");
 
     // Q1–Q14 with the transaction open (its overlay touches the predicates
     // the queries scan) against the same store without it.
