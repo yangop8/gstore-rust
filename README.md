@@ -133,7 +133,8 @@ optimizer and a VS-tree signature filter.
   DP-B enumeration, with exactly the rows of a full evaluation.
 * **RDF input formats** — N-Triples, Turtle, N-Quads, TriG, RDF/XML, and
   (dependency-free, common-subset) **JSON-LD** and **RDFa**; detected by file
-  extension (`parser::parse_file_by_ext`).
+  extension, read by one streaming import pipeline with upstream's tolerant
+  bulk loading (see [Importing RDF](#importing-rdf)).
 * **gStore 1.4's advanced graph functions in SPARQL** (32) — `shortestPath`,
   `kHopReachable`, `kHopEnumerate`, `SSSP`, `bfsCount`, `PR`, `PPR`, `WCC`,
   `louvain`, `labelProp`, `closenessCentrality`, `betweennessCentrality`,
@@ -215,6 +216,37 @@ of racing it — unload it there (or use the server's API) first. The server's
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
 
+### Importing RDF
+
+Every bulk load — `gbuild`, `gadd` / `gsub`, the `/api` `build` /
+`batchInsert` / `batchRemove`, `gconsole`'s `create` / `batchinsert`, and
+SPARQL `LOAD` — reads RDF through one streaming pipeline
+(`parser::import`):
+
+* **Format by extension** (`.nt`, `.ttl`, `.n3`, `.nq`, `.trig`, `.rdf` /
+  `.owl` / `.xml`, `.jsonld`, `.html`; `.gz` with the `gzip` feature).
+  Turtle, TriG, N-Triples and N-Quads stream with bounded memory.
+* **Sources**: files, directories (every RDF file below them, sorted), URLs
+  (`/api` `remote=true`, only where the load policy allows remote sources)
+  and zip packages (feature `zip`).
+* **Tolerant, as upstream**: the server's `build` / `batchInsert` /
+  `batchRemove` skip a statement that does not parse, log it to
+  `<db>.db/parse_error.log` in upstream's format and answer `success_num` /
+  `failed_num`; the CLI tools take `--strict` to stop at the first error.
+  SPARQL `LOAD` is strict and atomic: a statement that does not parse fails
+  it and nothing of it stays (`SILENT` only hides the error).
+* **Named graphs** of N-Quads / TriG are kept in every backend. `LOAD <src>`
+  keeps them too; `LOAD <src> INTO GRAPH <g>` loads the document's default
+  graph into `<g>` and changes no other graph (SPARQL 1.1 Update).
+* **Blank nodes** are scoped per loaded document: two loads never merge their
+  `_:b`s.
+* **Upstream's Turtle leniency**: its extra local-name characters, an IRI
+  ending at a space, and raw line breaks inside `"…"` strings (which W3C
+  Turtle allows only in `"""…"""`). Recovery stays per line: a statement
+  whose string ran across a line break and then failed is reported on the
+  string's line and read again from that line break (a string may run on for
+  at most 256 KiB).
+
 ### Upstream `/api` compatibility and conformance
 
 The multi-DB server speaks upstream gStore 1.4's `/api` protocol (`GET|POST
@@ -275,6 +307,16 @@ snapshots included), and `refreshconf` re-applies it to the loaded ones:
 
 In code: `GStoreConfig::query_settings()`, `ApiServer::with_query_settings`,
 `Server::with_query_settings`, `Database::apply_query_settings`.
+
+Other gstore-rust keys: `[server]` `listen_addr`, `keep_alive_timeout`,
+`keep_alive_max`, `queue_size`, `cors`; `[upload]` `unzip_max_entries`
+(default 10000) and `unzip_max_size` (default 10 GiB), the limits a zip
+package must stay within; `[log]` `log_level`, `log_file`, `log_days`,
+`log_stderr` (below). `refreshconf` re-reads the file: the `[query]`
+settings, the log configuration (as upstream re-runs log4cplus), the IP
+lists, the database and user limits and the upload, backup and query /
+access-log settings take effect at once; the address, the worker pool,
+`check_point` and `db_home` need a restart.
 
 **Logs.** `gserver` writes a diagnostic log (errors, warnings, lifecycle
 events) configured like upstream's: `conf.ini`'s `log_mode` names a log4cplus
@@ -383,9 +425,19 @@ gStore[lubm]> quit;
 ```
 
 * Statements end with `;` and may span lines; `#` starts a comment; several
-  statements may share a line. SPARQL typed directly (`SELECT`, `ASK`,
-  `CONSTRUCT`, `DESCRIBE`, `INSERT`, `DELETE`, `PREFIX`, `BASE`, `LOAD`,
-  `CLEAR`, `WITH`, …) runs on the current database.
+  statements may share a line. SPARQL typed directly runs on the current
+  database: queries (`SELECT`, `ASK`, `CONSTRUCT`, also `CONSTRUCT WHERE`,
+  `DESCRIBE`) and every update form (`INSERT` / `DELETE`, `WITH …`, `LOAD …
+  [INTO GRAPH …]`, `ADD` / `MOVE` / `COPY`, `CREATE` / `DROP` / `CLEAR
+  GRAPH …`), also after a `PREFIX` / `BASE` prologue. As upstream, `drop
+  <db>` drops a database, `create <db> [<file>]` builds one and `clear`
+  clears the screen: SPARQL's `DROP` / `CLEAR` / `CREATE` are recognised in
+  the forms those commands cannot have (`DROP GRAPH <g>`, `DROP SILENT ALL`,
+  `CREATE GRAPH <g>`, …).
+* Results print as upstream's: a table of N-Triples terms whose literals
+  show their lexical form unescaped (a graph function's JSON next to other
+  columns reads `"{"paths":[…]}"`; line breaks and tabs stay escaped), and
+  a lone graph-function answer as indented JSON.
 * Commands (`help;` lists them, `help <command>;` shows one): `create <db>
   [<file|dir|url>]`, `use`, `show [<db>]`, `showdbs`, `pdb`, `unload`, `drop`,
   `backup [<path>]`, `restore <db> <path>`, `export [<path>]`, `batchinsert` /

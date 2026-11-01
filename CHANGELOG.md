@@ -12,6 +12,81 @@ gconsole, zip, logging and packaging) was developed from the Phase 1 head
 and merged after them. The integration sections record what joining them
 changed; the following ones each phase, newest first.
 
+### Integrating Phase 5 with Phases 0–3
+
+- **SPARQL `LOAD` reads through the import pipeline, atomically.** The
+  format follows the extension (N-Triples, Turtle, N-Quads, TriG, RDF/XML,
+  JSON-LD, RDFa), the document streams in, every `LOAD` gets its own
+  blank-node scope, and the `LoadPolicy` still confines local files and
+  refuses remote ones. **Fixed:** Phase 5's streaming `LOAD` kept the
+  batches it had inserted before a parse error, so a `LOAD SILENT` of a
+  broken file reported success over a partial load; a failed `LOAD` now
+  undoes what it inserted, and `SILENT` only hides the error. A `LOAD` is
+  cancelled (`/cancel`, `operationTaskCancel`, shutdown) between import
+  batches and then applies nothing either — `SILENT` does not hide a
+  cancel.
+- **Changed: `LOAD <src> INTO GRAPH <g>` of a dataset.** Without `INTO`, a
+  TriG / N-Quads document keeps its named graphs (Phase 5). With `INTO`,
+  its default graph goes into `<g>` and no other graph changes (SPARQL 1.1
+  Update §3.1.4 inserts "its triples into the specified graph"; Jena does
+  the same): the statements of the document's own named graphs are not
+  loaded, and the diagnostic log says how many were skipped.
+- **Caches stay coherent.** Every write path Phase 5 added or rewrote —
+  `batchInsert` / `batchRemove` from a file, a directory, a URL, an upload
+  or a zip package, `LOAD`, `build` from several files, an upload, a URL or
+  a zip package, `restore` of a zipped backup — invalidates the query cache
+  and the CSR (and the lock-free `csr` status `show` reports) like the
+  other writes (`tests/dt_cross_phase5_api.rs`; no fix was needed).
+- **Configuration.** `conf.ini` holds Phase 3's `[query]` section next to
+  Phase 5's `[log]` keys and `[upload]` zip limits. Databases built,
+  uploaded, downloaded or restored by Phase 5's paths take the `[query]`
+  settings, and `refreshconf` updates them. **New:** `refreshconf` also
+  re-reads the diagnostic-log configuration (`log_mode`'s properties file,
+  `log_level`, `log_file`, `log_days`, `log_stderr`, `GSTORE_LOG`) and
+  re-installs the log when it changed, as upstream's `refreshconf` re-runs
+  log4cplus' `doConfigure` (`Util::configure`). **API:**
+  `ApiServer::with_log_refresh` (gserver uses it; an embedded server leaves
+  the process-wide log alone).
+- **Changed: raw line breaks in Turtle short strings are accepted again.**
+  Phase 5 made a `"…"` / `'…'` string stop at a raw line break (W3C
+  Turtle), but upstream's loader reads one into the value
+  (`TurtleParser::Lexer::lexString`), so files it loads must load here.
+  Evidence: upstream's exporters never write one (`NodeUtil::node2string`
+  escapes `\n`, `\r`, `\t`; neither do ours), and none of the vendored
+  datasets (`testdata/upstream/**`, upstream's `data/**`) holds one.
+  Recovery stays per line: a statement whose short string ran across a line
+  break and then fails (a missing closing quote, usually) is reported on the
+  literal's line and read again from that line break, so the lines after it
+  are not swallowed (upstream loses them); a string reaching the end of the
+  input, or running more than 256 KiB past its first line break, fails its
+  statement the same way. Memory stays bounded by that 256 KiB.
+- **gconsole.** Every SPARQL form the server accepts is sent as SPARQL —
+  `ADD` / `MOVE` / `COPY`, `WITH … DELETE/INSERT`, `LOAD … INTO GRAPH`,
+  `CREATE` / `DROP` / `CLEAR GRAPH`, `CONSTRUCT WHERE`, after a `PREFIX` /
+  `BASE` prologue too — while `drop <db>`, `create <db> <file>` and
+  `clear` stay upstream's commands; `sparql <file>` sends a run of the new
+  update forms as one request. **Changed:** a literal in a result table is
+  printed as upstream's console prints it (its `format=n-triple` cell): the
+  lexical form unescaped, so a graph function's JSON reads
+  `"{"paths":[…]}"`; line breaks and tabs stay escaped to keep the table's
+  rows. A lone answer cell is shown as indented JSON only when it is a plain
+  literal (upstream tests the cell `"{…}"`). Upstream's console has no
+  `loadcsr` command and no `csr` column, so neither does this one.
+- **Logs.** Graph-function queries and the Phase 3 update forms are in the
+  JSON query log like any statement (REST and `/api`). Phases 2 and 3 added
+  no `eprintln!` diagnostics to server paths.
+- **CI.** One feature matrix — `gzip`, `tls`, `zip`, `readline` — builds,
+  clippies and tests each feature; the `rocksdb` job clippies too; the
+  conformance job runs `scripts/conformance.sh`. `docs/DEPLOY.md` documents
+  `[query]` and `loadcsr`.
+- **Tests.** `tests/dt_load_import.rs` (`LOAD` through the pipeline:
+  datasets with and without `INTO`, formats, blank-node scopes, atomic
+  failure, cancel, policy; `ADD` / `MOVE` / `COPY` / `WITH` / `USING` /
+  `GRAPH` / `DROP` on imported named graphs with blank nodes on the memory,
+  disk and RocksDB backends, across a reopen), `tests/dt_cross_phase5_api.rs`,
+  `tests/dt_settings_phase5.rs`, and new cases in `dt_gconsole`,
+  `dt_logging`, `dt_rdf_import` and the Turtle reader's unit tests.
+
 ### Integrating Phases 2 and 3 with the Phase 1 server
 
 - **Security limits cover the new grammar.** The SPARQL parser's nesting
@@ -122,7 +197,9 @@ changed; the following ones each phase, newest first.
 - **Turtle leniency.** Upstream's local-name characters are accepted (loader
   only). An IRI ends at a space or control character, as in upstream's lexer,
   so a missing `>` costs only its own line; so does a short string missing
-  its closing quote (it ends at the line break). After a bad statement in a
+  its closing quote (since the integration a short string may hold raw line
+  breaks, as upstream's lexer allows, and a failed statement is replayed
+  from the first one — see "Integrating Phase 5"). After a bad statement in a
   TriG file, a `{` or `}` on the rest of its line still opens or closes the
   block, so no statement is filed under the wrong graph.
 - **RDF/XML.** Internal DTD entities, with expansion budgets (every expanded
