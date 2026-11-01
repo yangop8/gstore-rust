@@ -1829,6 +1829,83 @@ mod tests {
     }
 
     #[test]
+    fn fixed_shape_trees_read_like_unshaped_ones() {
+        let path = tmp("shaped");
+        let mut pg = Pager::open(&path, 32).unwrap();
+        let shaped = BTree::with_fixed_shape(0, 12, 0);
+        let plain = BTree::new(0); // the same tree, read without the promise
+        let mut rng = Rng(7);
+        let mut keys = Vec::new();
+        for _ in 0..5000 {
+            let mut k = Vec::with_capacity(12);
+            k.extend_from_slice(&be32(rng.below(50) as u32));
+            k.extend_from_slice(&be32(rng.below(6) as u32));
+            k.extend_from_slice(&be32(rng.below(300) as u32));
+            shaped.insert(&mut pg, &k, b"").unwrap();
+            keys.push(k);
+        }
+        for k in keys.iter().step_by(4) {
+            shaped.delete(&mut pg, k).unwrap();
+        }
+        assert!(shaped.insert(&mut pg, b"short", b"").is_err(), "wrong key size");
+        assert!(shaped.insert(&mut pg, &[0u8; 12], b"v").is_err(), "wrong value size");
+        let mut prefixes: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..200 {
+            let mut p = be32(rng.below(52) as u32).to_vec();
+            if rng.below(2) == 0 {
+                p.extend_from_slice(&be32(rng.below(7) as u32));
+            }
+            prefixes.push(p);
+        }
+        prefixes.extend(keys.iter().take(300).cloned());
+        let collect = |t: &BTree, p: &[u8]| {
+            let mut v = Vec::new();
+            t.scan_prefix_with(&pg, p, |k, _| {
+                v.push(k.to_vec());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+            v
+        };
+        for p in &prefixes {
+            let want: Vec<Vec<u8>> = shaped
+                .scan_prefix(&pg, p)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(collect(&shaped, p), want);
+            assert_eq!(collect(&plain, p), want);
+            assert_eq!(shaped.count_prefix(&pg, p).unwrap(), want.len());
+            assert_eq!(shaped.prefix_exists(&pg, p).unwrap(), !want.is_empty());
+            if p.len() == 12 {
+                assert_eq!(shaped.contains(&pg, p).unwrap(), plain.contains(&pg, p).unwrap());
+            }
+        }
+        // A leaf that only looks uniform (a middle entry's key length is
+        // wrong): reads through the shaped tree report corruption.
+        let mut id = shaped.root(&pg);
+        loop {
+            let node = Node::parse(&pg.read_page(id).unwrap());
+            if node.is_leaf {
+                break;
+            }
+            id = node.link;
+        }
+        let mut page = pg.read_page(id).unwrap();
+        let count = u16::from_le_bytes([page[5], page[6]]) as usize;
+        assert!(count > 3);
+        let mid = 7 + (count / 2) * 16;
+        page[mid..mid + 2].copy_from_slice(&11u16.to_le_bytes());
+        pg.write_page(id, &page).unwrap();
+        assert!(shaped
+            .scan_prefix_with(&pg, &[], |_, _| ControlFlow::Continue(()))
+            .is_err());
+        let _ = plain.scan_prefix_with(&pg, &[], |_, _| ControlFlow::Continue(()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn malformed_pages_are_errors_not_panics() {
         let path = tmp("malformed");
         let mut pg = Pager::open(&path, 32).unwrap();

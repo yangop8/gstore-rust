@@ -515,7 +515,7 @@ mod tests {
         // value long enough to need an overflow chain (some span 2+ pages).
         for k in 0..3000u32 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            if (seed >> 33) % 5 == 0 {
+            if (seed >> 33).is_multiple_of(5) {
                 continue; // a hole
             }
             let len = match (seed >> 40) % 7 {

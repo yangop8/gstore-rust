@@ -254,6 +254,6 @@ mod tests {
             assert_eq!(s, i, "slots are assigned densely in registry order");
             assert!(s < NROOTS);
         }
-        assert!(16 + NROOTS * 8 <= super::super::pager::PAGE_SIZE);
+        const { assert!(16 + NROOTS * 8 <= super::super::pager::PAGE_SIZE) };
     }
 }

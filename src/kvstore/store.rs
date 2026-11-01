@@ -1131,7 +1131,7 @@ impl DiskStore {
 
     /// `s p ?` → objects, ascending. When the store has been
     /// [`compact`](Self::compact)ed, this is a point lookup into the VList index
-    /// + a varint decode (following an [`overflow`] page chain for an oversize
+    /// and a varint decode (following an [`overflow`] page chain for an oversize
     /// group), instead of a multi-key prefix scan; it transparently falls back
     /// to the SPO scan for any group not present in the index.
     pub fn try_o_by_sp(&self, s: EntityLiteralId, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
