@@ -591,6 +591,23 @@ mod tests {
             "create silent graph <g>",
             "WITH <g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
             "ADD <a> TO <b>",
+            // Every Phase 3 form, also after a prologue.
+            "add silent default to <g>",
+            "MOVE <a> TO DEFAULT",
+            "move silent <a> to <b>",
+            "COPY DEFAULT TO <g>",
+            "copy <a> to <b>",
+            "LOAD <file:///x.ttl> INTO GRAPH <g>",
+            "load silent <x.trig> into graph <g>",
+            "with <g> insert { ?s ?p 1 } where { ?s ?p ?o }",
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+            "PREFIX ex: <http://e/> ADD ex:a TO ex:b",
+            "PREFIX ex: <http://e/> WITH ex:g DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            "BASE <http://e/> LOAD <x.nt> INTO GRAPH <g>",
+            "prefix ex: <http://e/> drop graph ex:g",
+            "PREFIX ex: <http://e/>\nCLEAR DEFAULT",
+            "BASE <http://e/> CREATE GRAPH <g>",
+            "PREFIX ex: <http://e/> CONSTRUCT WHERE { ?s ?p ?o }",
         ] {
             assert!(is_sparql(s), "{s}");
         }
@@ -650,6 +667,30 @@ mod tests {
         ));
         assert!(!is_update("PREFIX p: <x> SELECT * {}"));
         assert!(!is_update("show"));
+
+        // The Phase 3 update forms join a run too; a CONSTRUCT ends it.
+        let file = "PREFIX ex: <http://ex/>\nCOPY ex:a TO ex:b ;\n\
+                    MOVE SILENT ex:b TO ex:c ;\nADD DEFAULT TO ex:c ;\n\
+                    LOAD <file:///d.trig> INTO GRAPH ex:d ;\n\
+                    WITH ex:c DELETE { ?s ?p ?o } WHERE { ?s ?p ?o } ;\n\
+                    CREATE GRAPH ex:e ; DROP SILENT GRAPH ex:e ; CLEAR SILENT ALL ;\n\
+                    CONSTRUCT WHERE { ?s ?p ?o } ;\n\
+                    DROP ALL ; ADD <x> TO <y>";
+        let requests = group_updates(split_statements(file));
+        assert_eq!(requests.len(), 3, "{requests:#?}");
+        assert!(requests[0].starts_with("PREFIX ex:"), "{requests:#?}");
+        for op in [
+            "MOVE SILENT",
+            "ADD DEFAULT",
+            "LOAD <file:///d.trig> INTO GRAPH",
+            "WITH ex:c",
+        ] {
+            assert!(requests[0].contains(op), "{op}: {requests:#?}");
+        }
+        assert!(requests[0].ends_with("CLEAR SILENT ALL"), "{requests:#?}");
+        assert!(requests[1].starts_with("CONSTRUCT WHERE"));
+        // In a file every statement is SPARQL: `DROP ALL` is the update.
+        assert_eq!(requests[2], "DROP ALL ;\nADD <x> TO <y>");
     }
 
     #[test]

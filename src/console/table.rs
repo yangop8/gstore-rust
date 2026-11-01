@@ -104,13 +104,15 @@ pub fn render_owned(headers: &[String], rows: &[Vec<String>]) -> String {
     render(&h, rows)
 }
 
-/// A literal's lexical form escaped for one line of N-Triples.
-fn escape_literal(value: &str) -> String {
+/// A literal's lexical form as upstream's console shows it in a table cell:
+/// unescaped, as upstream keeps it in a result set and `format=n-triple`
+/// sends it (so a graph function's JSON value reads as JSON, `"{"paths":
+/// …}"`), except that a line break or tab is written `\n` / `\r` / `\t`
+/// — upstream would print it raw and break the table's lines.
+fn cell_literal(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     for c in value.chars() {
         match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -121,8 +123,9 @@ fn escape_literal(value: &str) -> String {
 }
 
 /// A SPARQL-JSON binding (`{"type","value"[,"datatype"][,"xml:lang"|"lang"]}`)
-/// as the N-Triples term upstream's console shows (its `format=n-triple`
-/// cells): `<iri>`, `_:b`, `"lex"`, `"lex"@lang`, `"lex"^^<datatype>`.
+/// as upstream's console shows it (its `format=n-triple` cells): `<iri>`,
+/// `_:b`, `"lex"`, `"lex"@lang`, `"lex"^^<datatype>`, the lexical form
+/// unescaped ([`cell_literal`]).
 pub fn binding_term(b: &Json) -> String {
     let value = b.get("value").and_then(Json::as_str).unwrap_or_default();
     let kind = b.get("type").and_then(Json::as_str).unwrap_or_default();
@@ -137,7 +140,7 @@ pub fn binding_term(b: &Json) -> String {
                 .and_then(Json::as_str)
                 .filter(|l| !l.is_empty());
             let datatype = b.get("datatype").and_then(Json::as_str);
-            let lex = escape_literal(value);
+            let lex = cell_literal(value);
             match (lang, datatype) {
                 (Some(l), _) => format!("\"{lex}\"@{l}"),
                 (None, Some(dt)) => format!("\"{lex}\"^^<{dt}>"),
@@ -244,9 +247,19 @@ mod tests {
             "_:b1"
         );
         assert_eq!(binding_term(&b(r#"{"type":"bnode","value":"b1"}"#)), "_:b1");
+        // Upstream's cell: the lexical form unescaped (a line break kept on
+        // the row's line).
         assert_eq!(
-            binding_term(&b(r#"{"type":"literal","value":"a \"q\"\nb","lang":"en"}"#)),
-            "\"a \\\"q\\\"\\nb\"@en"
+            binding_term(&b(
+                r#"{"type":"literal","value":"a \"q\"\nb\\c","lang":"en"}"#
+            )),
+            "\"a \"q\"\\nb\\c\"@en"
+        );
+        assert_eq!(
+            binding_term(&b(
+                r#"{"type":"literal","value":"{\"paths\":[{\"src\":\"<a>\",\"length\":2}]}"}"#
+            )),
+            r#""{"paths":[{"src":"<a>","length":2}]}""#
         );
         assert_eq!(
             binding_term(&b(

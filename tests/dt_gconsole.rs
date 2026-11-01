@@ -364,6 +364,137 @@ Query ans num 4, use ";
     assert_eq!(harness::int(&j, "AnsNum"), 0);
 }
 
+/// Phases 2 and 3 through the console: every SPARQL form the server
+/// accepts is sent as SPARQL (Phase 3's graph-management and named-graph
+/// updates, `LOAD … INTO GRAPH`, `CONSTRUCT WHERE`, a `PREFIX` / `BASE`
+/// prologue before any of them), while upstream's console commands that
+/// share a first word (`drop <db>`, `create <db> <file>`, `clear`) stay
+/// commands; `sparql <file>` sends a run of the new update forms as one
+/// request; a graph function's JSON is shown as upstream's console shows it.
+#[test]
+fn phase3_update_forms_graph_functions_and_console_commands() {
+    let data_dir = scratch("gc_phase3_data");
+    let _data = DirGuard(data_dir.clone());
+    let base = data_dir.join("base.nt");
+    fs::write(
+        &base,
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n",
+    )
+    .unwrap();
+    let extra = data_dir.join("extra.trig");
+    fs::write(
+        &extra,
+        "<http://ex/x> <http://ex/p> <http://ex/y> .\n<http://ex/n> { <http://ex/q> <http://ex/p> <http://ex/r> . }\n",
+    )
+    .unwrap();
+    let srv = Server::start_with_dir("gc_phase3", Some(&data_dir));
+    ok(&srv.build("gcx", &base));
+    let cwd = scratch("gc_phase3_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    fs::write(
+        cwd.join("updates.sparql"),
+        "PREFIX ex: <http://ex/>\n\
+         COPY ex:g TO ex:f ;\n\
+         MOVE SILENT ex:f TO ex:moved ;\n\
+         WITH ex:moved DELETE { ?s ?p ex:c } WHERE { ?s ?p ex:c } ;\n\
+         CREATE GRAPH ex:e ;\n\
+         DROP SILENT GRAPH ex:e ;\n\
+         SELECT (COUNT(*) AS ?n) WHERE { GRAPH <http://ex/moved> { ?s ?p ?o } }\n",
+    )
+    .unwrap();
+    let extra_s = path_str(&extra);
+    let base_s = path_str(&base);
+    let r = script(
+        &srv,
+        &cwd,
+        &format!(
+            "use gcx;\n\
+             COPY DEFAULT TO <http://ex/g>;\n\
+             ADD <http://ex/g> TO <http://ex/h>;\n\
+             MOVE <http://ex/h> TO <http://ex/m>;\n\
+             WITH <http://ex/m> DELETE {{ ?s ?p <http://ex/c> }} INSERT {{ ?s ?p <http://ex/z> }} WHERE {{ ?s ?p <http://ex/c> }};\n\
+             LOAD <file://{extra_s}> INTO GRAPH <http://ex/l>;\n\
+             CREATE GRAPH <http://ex/e>;\n\
+             PREFIX ex: <http://ex/> ADD ex:l TO ex:k;\n\
+             BASE <http://ex/> CLEAR GRAPH <k>;\n\
+             DROP GRAPH <http://ex/m>;\n\
+             CONSTRUCT WHERE {{ ?s <http://ex/p> <http://ex/b> }};\n\
+             select (shortestPath(<http://ex/a>, <http://ex/c>, true, {{}}) as ?y) where {{}};\n\
+             select ?x (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {{}}) as ?y) where {{ values ?x {{ <http://ex/a> }} }};\n\
+             sparql updates.sparql;\n\
+             unload;\n\
+             create gcy {base_s};\n\
+             clear;\n\
+             drop gcy;\n\
+             showdbs;\n"
+        ),
+    );
+    let out = &r.out;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!out.contains("failed"), "{r:?}");
+    assert!(!out.contains("No such command"), "{r:?}");
+    // Each update answered as an update.
+    assert!(out.matches("Update ans num ").count() >= 9, "{r:?}");
+    // CONSTRUCT WHERE.
+    assert!(
+        out.contains("| <http://ex/a> | <http://ex/p> | <http://ex/b> |"),
+        "{r:?}"
+    );
+    // A lone graph function: its JSON, indented as nlohmann's dump(4).
+    assert!(
+        out.contains("{\n    \"paths\": [\n        {\n"),
+        "the graph function's JSON is pretty-printed: {r:?}"
+    );
+    // Next to another column: the cell is upstream's, the JSON unescaped.
+    assert!(
+        out.contains("| <http://ex/a> | \"{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/c>\",\"length\":2}]}\" |"),
+        "{r:?}"
+    );
+    // `sparql <file>`: the five updates went as one request, then the query.
+    assert!(
+        out.contains("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+        "{r:?}"
+    );
+    // The console commands.
+    assert!(
+        out.contains("Build RDF database gcy successfully!"),
+        "{r:?}"
+    );
+    assert!(
+        out.contains("\x1b[H\x1b[2J"),
+        "clear clears the screen: {r:?}"
+    );
+    assert!(out.contains("Drop database gcy successfully!"), "{r:?}");
+    let dbs = databases(&srv);
+    assert!(
+        dbs.contains(&"gcx".to_string()) && !dbs.contains(&"gcy".to_string()),
+        "{dbs:?}"
+    );
+
+    // The server's graphs after it all.
+    srv.load("gcx");
+    let graph = |g: &str| {
+        let j = srv.query(
+            "gcx",
+            &format!("SELECT ?s ?p ?o WHERE {{ GRAPH <http://ex/{g}> {{ ?s ?p ?o }} }}"),
+        );
+        ok(&j);
+        harness::int(&j, "AnsNum")
+    };
+    assert_eq!(graph("g"), 2, "COPY DEFAULT TO g");
+    assert_eq!(graph("h"), 0, "MOVE emptied h");
+    assert_eq!(graph("m"), 0, "DROP GRAPH m");
+    assert_eq!(graph("l"), 1, "LOAD INTO l: only the file's default graph");
+    assert_eq!(graph("n"), 0, "LOAD INTO l loads no other graph");
+    assert_eq!(graph("k"), 0, "CLEAR GRAPH k (BASE-resolved)");
+    assert_eq!(
+        graph("moved"),
+        1,
+        "COPY g, MOVE, WITH DELETE in one request"
+    );
+    assert_eq!(graph("f"), 0, "moved away");
+}
+
 #[test]
 fn output_redirection() {
     let srv = Server::start("gc_redirect");

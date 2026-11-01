@@ -783,6 +783,16 @@ fn single_literal(j: &Json) -> Option<String> {
         if kind != "literal" && kind != "typed-literal" {
             return None;
         }
+        // Upstream tests the cell `"…"`: a language tag or datatype after
+        // the closing quote keeps it in the table.
+        let tagged = ["datatype", "xml:lang", "lang"].iter().any(|k| {
+            b.get(k)
+                .and_then(Json::as_str)
+                .is_some_and(|v| !v.is_empty())
+        });
+        if tagged {
+            return None;
+        }
         return b.get("value").and_then(Json::as_str).map(str::to_string);
     }
     // Upstream's `n-triple` rows: `"lexical form"` with `\"` escapes.
