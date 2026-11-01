@@ -5471,17 +5471,92 @@ fn join_sets(
     }
 }
 
+/// A fast, deterministic, std-only hasher for the hash join's key table: the
+/// FxHash mixing step (rotate, xor, multiply) over each written word. The
+/// join keys are small tuples of ids, for which SipHash's per-call setup and
+/// rounds dominate. Not DoS-resistant, which is fine for keys made of the
+/// database's own ids. The join's output order never depends on the hasher
+/// (see [`join_sets_hash`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FxHasher {
+    hash: u64,
+}
+
+/// The FxHash multiplier.
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// The [`BuildHasher`](std::hash::BuildHasher) of [`FxHasher`].
+pub(crate) type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+
 /// Hash join on the shared-variable key (gStore `multi_join`): build a hash
 /// table on the right side, then probe it once per left row.
+///
+/// The output is left-major, right-minor — each left row in order, joined with
+/// its matching right rows in their original order — whatever the hasher.
 fn join_sets_hash(left: &[Binding], right: &[Binding], shared: &[usize]) -> Vec<Binding> {
+    join_sets_hash_with::<FxBuildHasher>(left, right, shared)
+}
+
+/// [`join_sets_hash`] with the key table hashed by `H`.
+fn join_sets_hash_with<H: std::hash::BuildHasher + Default>(
+    left: &[Binding],
+    right: &[Binding],
+    shared: &[usize],
+) -> Vec<Binding> {
     let key_of = |b: &Binding| -> Vec<Option<u32>> { shared.iter().map(|&i| b[i]).collect() };
-    let mut index: HashMap<Vec<Option<u32>>, Vec<&Binding>> = HashMap::new();
+    let mut index: HashMap<Vec<Option<u32>>, Vec<&Binding>, H> = HashMap::default();
     for r in right {
         index.entry(key_of(r)).or_default().push(r);
     }
     let mut out = Vec::new();
+    // One probe key buffer, reused for every left row.
+    let mut key: Vec<Option<u32>> = Vec::with_capacity(shared.len());
     for l in left {
-        if let Some(matches) = index.get(&key_of(l)) {
+        key.clear();
+        key.extend(shared.iter().map(|&i| l[i]));
+        if let Some(matches) = index.get(key.as_slice()) {
             for r in matches {
                 if let Some(m) = merge_bindings(l, r) {
                     out.push(m);
@@ -6479,6 +6554,39 @@ mod join_method_tests {
             row[i] = Some(v);
         }
         row
+    }
+
+    /// The hash join's output order does not depend on the hasher: the fast
+    /// deterministic one, randomly keyed SipHash and the nested loop agree
+    /// row for row, with repeated keys on both sides and unbound slots.
+    #[test]
+    fn hash_join_order_does_not_depend_on_the_hasher() {
+        let mut state = 0x1234_5678_u64;
+        let mut next = move |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(n)) as u32
+        };
+        for shared in [vec![0usize], vec![0, 1]] {
+            let mut row = |n: u32| -> Binding {
+                let mut r = vec![None; 4];
+                r[0] = Some(next(n));
+                r[1] = (next(4) != 0).then(|| next(3));
+                r[2 + next(2) as usize] = Some(next(1000));
+                r
+            };
+            let left: Vec<Binding> = (0..400).map(|_| row(25)).collect();
+            let right: Vec<Binding> = (0..300).map(|_| row(25)).collect();
+            let fx = join_sets_hash(&left, &right, &shared);
+            let sip = join_sets_hash_with::<std::collections::hash_map::RandomState>(
+                &left, &right, &shared,
+            );
+            let nested = join_sets_nested(&left, &right, &shared);
+            assert!(!fx.is_empty());
+            assert_eq!(fx, sip);
+            assert_eq!(fx, nested);
+        }
     }
 
     /// Both physical methods produce byte-for-byte identical output on the same
