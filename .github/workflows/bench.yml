@@ -56,7 +56,7 @@ jobs:
         with:
           key: bench-smoke
       - name: release build (gbuild, gstore-bench)
-        run: cargo build --release --locked -p gstore --bin gbuild -p gstore-bench
+        run: cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
       - name: gstore-bench ci
         run: >
           target/release/gstore-bench ci
@@ -128,7 +128,7 @@ jobs:
           key: bench-reference
       - name: release build with RocksDB (gbuild, gstore-bench)
         run: >
-          cargo build --release --locked -p gstore --bin gbuild -p gstore-bench
+          cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
           --features gstore/rocksdb,gstore-bench/rocksdb
       - name: gstore-bench run --profile reference
         run: >

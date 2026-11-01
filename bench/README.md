@@ -6,7 +6,7 @@ binaries and the public API, a result format with checked-in baselines, and
 the gates CI applies to every change.
 
 ```text
-cargo build --release -p gstore --bin gbuild -p gstore-bench
+cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
 target/release/gstore-bench run --profile smoke            # univ 1, snapshot + disk
 target/release/gstore-bench ci                              # smoke, gated against bench/baselines/smoke.json
 target/release/gstore-bench run --profile reference --scale 8 --out r.json
@@ -179,8 +179,8 @@ Snapshot and disk come from a default build, RocksDB from a
 `--features rocksdb` build in its own target directory; `merge` joins them:
 
 ```text
-cargo build --release -p gstore --bin gbuild -p gstore-bench
-CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore --bin gbuild -p gstore-bench \
+cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench \
     --features gstore/rocksdb,gstore-bench/rocksdb
 export GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache
 for s in 8 38; do
