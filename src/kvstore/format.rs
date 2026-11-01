@@ -214,7 +214,10 @@ mod tests {
     #[test]
     fn enable_rules() {
         assert!(check_enable(FEATURE_FREE_IDS, FEATURE_FREE_IDS).is_ok());
-        assert!(check_enable(FEATURE_FREE_IDS, 0).is_err(), "not implemented yet");
+        assert!(
+            check_enable(FEATURE_FREE_IDS, 0).is_err(),
+            "not implemented yet"
+        );
         assert!(check_enable(FEATURE_FREE_IDS | FEATURE_LONG_KEYS, u64::MAX).is_err());
         assert!(check_enable(1 << 9, u64::MAX).is_err(), "undefined bit");
         assert!(check_enable(0, u64::MAX).is_err());

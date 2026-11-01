@@ -16,6 +16,14 @@
 //!                        (default: the whole kvstore.kv file)
 //! ```
 //!
+//! The database the R1-KV numbers use is the univ 8 LUBM-like data built once
+//! with the **base** binaries and read by both builds (the format is the same):
+//!
+//! ```text
+//! gbuild --disk <dir>/lubm8 lubm-like-univ8.nt     # → <dir>/lubm8.db
+//! kv_bench <dir>/lubm8.db --queries testdata/lubm
+//! ```
+//!
 //! Every measurement prints `key=value` lines on stdout (times in ms unless the
 //! key ends in `_ns`; "median" is the median of the timed repetitions after one
 //! untimed warm-up run):
@@ -188,7 +196,10 @@ fn lookup_and_scan(o: &Opts, kv: &Path, lookup: bool, scan: bool) {
     let file_pages = (std::fs::metadata(kv).unwrap().len() as usize).div_ceil(4096);
     let cache = o.cache_pages.unwrap_or(file_pages + 64);
     let ds = DiskStore::open(kv, cache).expect("open");
-    println!("cache_pages={cache} file_pages={file_pages} triples={}", ds.triple_count());
+    println!(
+        "cache_pages={cache} file_pages={file_pages} triples={}",
+        ds.triple_count()
+    );
     // Warm the whole cache: one full scan touches every SPO leaf.
     let triples = api::scan_spo(&ds);
     assert_eq!(triples.len() as u64, ds.triple_count());
@@ -214,7 +225,10 @@ fn lookup_and_scan(o: &Opts, kv: &Path, lookup: bool, scan: bool) {
             "lookup_po_by_s_ns={:.0} lookup_po_by_s_rows={rows}",
             per * 1e6 / o.lookups as f64
         );
-        let rows: usize = pairs.iter().map(|&(s, p)| api::o_by_sp(&ds, s, p).len()).sum();
+        let rows: usize = pairs
+            .iter()
+            .map(|&(s, p)| api::o_by_sp(&ds, s, p).len())
+            .sum();
         let per = timed(o.reps, || {
             pairs
                 .iter()
@@ -286,7 +300,10 @@ fn query(o: &Opts, kv: &Path) {
     let texts: Vec<(usize, String)> = (1..=14)
         .map(|i| {
             let p = o.queries.join(format!("lubm_q{i}.rq"));
-            (i, std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())))
+            (
+                i,
+                std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+            )
         })
         .collect();
     // The memory reference: the Materialize open of the same directory.
