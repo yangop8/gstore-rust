@@ -640,3 +640,108 @@ fn imported_rule_predicates_are_asserted_triples_no_rule_owns() {
     assert_eq!(int(&j, "AnsNum"), 0);
     assert_eq!(rule_pairs(&srv, "tol").len(), 2);
 }
+
+/// One `refreshconf` re-applies the `[query]`, `[pfn]` and diagnostic-log
+/// (`[log]`) sections of the re-read `conf.ini` together — to the loaded
+/// database, the PFN registry and the process's logger — while
+/// `pfn_base_path`, like `db_home`, is read at startup only: the functions
+/// stay where they are.
+#[test]
+fn one_refreshconf_reapplies_query_pfn_and_log_sections() {
+    use gstore::config::GStoreConfig;
+    use gstore::http_api::ApiServer;
+    use gstore::logging::{self, Level, LogConfig};
+    use std::sync::Arc;
+
+    let dir = scratch("m4_refresh");
+    let _dir = DirGuard(dir.clone());
+    let conf = dir.join("conf.ini");
+    let home = dir.join("home");
+    let log = dir.join("diag.log");
+    let write = |division: &str, max_functions: u32, level: &str, pfn_dir: &str| {
+        fs::write(
+            &conf,
+            format!(
+                "[server]\nport=0\nip_deny_path=off\nthread_num=4\n\
+                 [system]\ndb_home={}\npfn_base_path={}\n\
+                 [log]\nlog_mode=none\nlog_level={level}\nlog_file={}\nlog_stderr=off\n\
+                 [query]\ninteger_division={division}\n\
+                 [pfn]\npfn_max_functions={max_functions}\n",
+                home.display(),
+                dir.join(pfn_dir).display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+    };
+    write("decimal", 5, "info", "pfn_a");
+    let mut cfg = GStoreConfig::load(&conf).unwrap();
+    assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+    cfg.listen_addr = "127.0.0.1".into();
+    cfg.root_password = harness::PASSWORD.into();
+    // What gserver does at startup: install the log from conf.ini.
+    let (log_cfg, _) = LogConfig::from_gstore_config(&cfg);
+    logging::init(&log_cfg).unwrap();
+    let server = Arc::new(
+        ApiServer::bind_with_config(cfg)
+            .unwrap()
+            .with_load_policy(gstore::LoadPolicy::restricted().with_allowed_dir(&dir))
+            .with_log_refresh(),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    thread::spawn(move || s2.serve_forever());
+    let op = |operation: &str, params: &[(&str, &str)]| {
+        let mut body = Json::obj()
+            .with("operation", operation)
+            .with("username", harness::USERNAME)
+            .with("password", harness::PASSWORD);
+        for (k, v) in params {
+            body.set(*k, *v);
+        }
+        let (status, text) = harness::http(&addr, "POST", "/api", body.to_string().as_bytes());
+        assert_eq!(status, 200, "{text}");
+        json::parse(&text).unwrap()
+    };
+    let nt = dir.join("d.nt");
+    fs::write(&nt, CHAIN).unwrap();
+    ok(&op("build", &[("db_name", "conf"), ("db_path", &path_str(&nt))]));
+    ok(&op("load", &[("db_name", "conf")]));
+    let div = || {
+        let j = op(
+            "query",
+            &[("db_name", "conf"), ("sparql", "SELECT ((7/2) AS ?x) WHERE {}")],
+        );
+        ok(&j);
+        j.to_string()
+    };
+    assert!(div().contains("3.5"));
+    let registry = server.pfn_registry();
+    assert_eq!(registry.base_dir(), dir.join("pfn_a"));
+    assert_eq!(registry.limits().max_functions, 5);
+    assert!(!logging::enabled(Level::Debug));
+
+    write("truncate", 7, "debug", "pfn_b");
+    ok(&op("refreshconf", &[]));
+    // [query]: the loaded database divides as upstream now.
+    let text = div();
+    assert!(!text.contains("3.5") && text.contains("\"3\""), "{text}");
+    // [pfn]: the registry's limits; its directory stays.
+    let registry = server.pfn_registry();
+    assert_eq!(registry.limits().max_functions, 7);
+    assert_eq!(registry.base_dir(), dir.join("pfn_a"));
+    let info = Json::obj()
+        .with("funName", "kept")
+        .with("funBody", "(i32.const 1)")
+        .to_string();
+    ok(&op("funcudb", &[("type", "1"), ("funInfo", &info)]));
+    assert!(dir.join("pfn_a/src/root/data.json").is_file());
+    assert!(!dir.join("pfn_b").exists());
+    // [log]: the new level reaches the installed logger and its file.
+    assert!(logging::enabled(Level::Debug));
+    gstore::gs_debug!("m4 refreshconf debug record");
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(text.contains("m4 refreshconf debug record"), "{text}");
+    server.shutdown();
+    logging::reset();
+}

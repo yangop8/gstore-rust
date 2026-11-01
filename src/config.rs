@@ -352,7 +352,10 @@ pub struct GStoreConfig {
     /// The `system` user allowed to call `/shutdown` with the per-run password
     /// from the pid file (default `system`).
     pub system_username: String,
-    /// Personalized-function (PFN) base directory (default `./pfn/`).
+    /// Personalized-function (PFN) base directory (default `./pfn/`,
+    /// upstream's). The servers read it only when it is set
+    /// ([`is_set`](Self::is_set)); without it they keep the functions under
+    /// `<db_home>/pfn`. Read at startup: `refreshconf` does not move them.
     pub pfn_base_path: PathBuf,
     /// License type reported by `login` (default `opensource`).
     pub licensetype: String,
@@ -1216,6 +1219,50 @@ upload_allow_compress_packages = "zip"
             c.upload_allow_extensions,
             [upstream.upload_allow_extensions.clone(), vec!["nq".into(), "trig".into()]].concat()
         );
+    }
+
+    /// The shipped example documents every key the code reads, in the
+    /// section the code reads it from — set, or commented out with an
+    /// example value — and every commented-out example parses; in the
+    /// `[query]` and `[pfn]` sections (whose comments say "the values shown
+    /// are the defaults") the example value is the default.
+    #[test]
+    fn the_shipped_example_documents_every_key() {
+        let text = include_str!("../conf/conf.ini.example");
+        let mut section = String::new();
+        let mut documented: Vec<(String, String, String)> = Vec::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if let Some(rest) = line.strip_prefix('[') {
+                section = rest.trim_end_matches(']').trim().to_string();
+                continue;
+            }
+            let line = line.trim_start_matches(['#', ';']).trim();
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let key = k.trim();
+            if KNOWN_KEYS.iter().any(|(_, known)| *known == key) {
+                documented.push((section.clone(), key.to_string(), v.trim().replace('"', "")));
+            }
+        }
+        for (sec, key) in KNOWN_KEYS {
+            let mine: Vec<_> = documented.iter().filter(|(_, k, _)| k == key).collect();
+            assert!(!mine.is_empty(), "[{sec}] {key} is not in conf.ini.example");
+            assert!(
+                mine.iter().all(|(s, _, _)| s == sec),
+                "{key} documented outside [{sec}]: {mine:?}"
+            );
+        }
+        let defaults = GStoreConfig::default();
+        for (sec, key, value) in &documented {
+            let mut c = GStoreConfig::default();
+            c.set(key, value)
+                .unwrap_or_else(|e| panic!("[{sec}] {key}={value}: {e}"));
+            if sec == "query" || sec == "pfn" {
+                assert_eq!(c.value(key), defaults.value(key), "[{sec}] {key}={value}");
+            }
+        }
     }
 
     #[test]

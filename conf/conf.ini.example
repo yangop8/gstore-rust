@@ -76,6 +76,9 @@ system_username="system"
 check_point=on
 # build use multi thread increase efficiency
 build_multi_thread=off
+# the license type login / testConnect / getCoreVersion report: an upstream
+# key upstream's default conf.ini leaves out (default "opensource")
+# licensetype="opensource"
 # where PFN user functions (funcudb / funquery / funreview) are stored: an
 # upstream key upstream's default conf.ini leaves out (upstream default
 # "./pfn/"; gstore-rust's: <db_home>/pfn). Read when gserver starts:

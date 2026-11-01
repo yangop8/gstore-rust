@@ -254,6 +254,19 @@ run on a per-database CSR built on the first such query after a change;
 `/api` `loadcsr` (or `load` with `csr=1`) builds it ahead of time, and
 `show` reports whether it is built (`csr`). Any write discards it.
 
+**PFN functions** (`[pfn]`, a gstore-rust section; see
+[`docs/PFN.md`](PFN.md)): `pfn_fuel_per_call` (instructions per call,
+default 10^9, `0` = unlimited), `pfn_max_memory_pages` (64 KiB pages,
+default 1024), `pfn_max_module_bytes` (default 1 MiB) and
+`pfn_max_functions` (per user, default 100) bound the sandbox; like
+`[query]`, `refreshconf` re-applies them. `[system] pfn_base_path`
+(upstream's key; default `<db_home>/pfn`) is where the functions are kept —
+read at startup only, so moving them needs a restart (and the files moved
+along, see [Backups](#backups)). Compiling and calling functions needs a
+build with the `pfn-wasm` feature (the container image has it, see
+[Docker](#docker)); without it they can still be listed, created, updated
+and deleted. Reasoning rules (`reasonManage`) have no keys.
+
 **Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
 and `batchRemove` read a `.zip` of RDF files (each entry needs an extension
 from `upload_allow_extensions`), `backup
