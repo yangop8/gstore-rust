@@ -423,3 +423,44 @@ fn micro_on_disk() {
         [3, 1, 10, 9, 576, 576, 23, 576, 5, 3, 14, 1, 613, 432]
     );
 }
+
+/// `--bin-dir` relative to the current directory (`gbuild` runs elsewhere).
+#[test]
+fn a_relative_bin_dir_works() {
+    let t = Tmp::new("relative");
+    let b = builder(&t.0, false);
+    let dir = bin_dir();
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let out = Command::new(exe())
+        .args([
+            "run",
+            "--profile",
+            "micro",
+            "--workload",
+            "tiny",
+            "--no-calibrate",
+            "--no-conc",
+            "--no-update",
+            "--bin-dir",
+            &name,
+            "--builder",
+            &b,
+            "--data-dir",
+            &t.path("data"),
+            "--work-dir",
+            &t.path("work"),
+            "--quiet",
+            "--out",
+            &t.path("r.json"),
+        ])
+        .current_dir(dir.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = BenchResult::load(Path::new(&t.path("r.json"))).unwrap();
+    assert_eq!(r.runs[0].open.as_ref().unwrap().triple_num, 285);
+}

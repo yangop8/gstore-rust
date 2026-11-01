@@ -368,6 +368,8 @@ impl Session {
         ));
         fs::create_dir_all(work_root.join("logs"))
             .map_err(|e| format!("cannot create {}: {e}", work_root.display()))?;
+        let work_root =
+            fs::canonicalize(&work_root).map_err(|e| format!("{}: {e}", work_root.display()))?;
         let s = Session {
             opts,
             workload,

@@ -118,6 +118,8 @@ fn build_cli(
             exe.display()
         ));
     }
+    // `gbuild` runs in the work directory: make both paths absolute first.
+    let exe = fs::canonicalize(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let data = fs::canonicalize(data).map_err(|e| format!("{}: {e}", data.display()))?;
     let mut args: Vec<String> = Vec::new();
     if let Some(f) = gbuild_flag(backend) {
