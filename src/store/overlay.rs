@@ -37,8 +37,11 @@
 //!   overlay next changes;
 //! * `iter_all` merges in `(p, s, o)` order;
 //! * a key the overlay does not touch (no added or removed triple under it)
-//!   is answered by the base directly — the untouched-key fast path — so an
-//!   overlay costs one or two in-memory map probes per read.
+//!   is answered by the base directly — the untouched-key fast path: the
+//!   overlay keeps a small Bloom filter of the subjects, objects and
+//!   predicates its changes ever concerned, so reading an untouched key costs
+//!   one bit test on top of the base read (a false positive only takes the
+//!   exact merge path).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -81,12 +84,54 @@ enum DeltaKey {
     PredDistinctObj(PredId),
 }
 
+/// log2 of the bits of a [`KeyFilter`] (8 KiB).
+const FILTER_BITS_LOG2: u32 = 16;
+
+/// A one-hash Bloom filter over ids: "never seen" is exact, "maybe" may be a
+/// false positive (an id that hashes to a set bit, or one whose changes were
+/// undone). It is what makes a read of an untouched key cost one bit test:
+/// the view answers from the base when the key's bit is clear. Allocated at
+/// the first insertion; only cleared with the whole overlay.
+#[derive(Debug, Clone, Default)]
+struct KeyFilter {
+    bits: Vec<u64>,
+}
+
+impl KeyFilter {
+    #[inline]
+    fn slot(id: u32) -> usize {
+        // Multiplicative (Fibonacci) hashing: consecutive ids spread out.
+        (id.wrapping_mul(0x9E37_79B1) >> (32 - FILTER_BITS_LOG2)) as usize
+    }
+
+    fn add(&mut self, id: u32) {
+        if self.bits.is_empty() {
+            self.bits = vec![0; 1 << (FILTER_BITS_LOG2 - 6)];
+        }
+        let i = Self::slot(id);
+        self.bits[i >> 6] |= 1 << (i & 63);
+    }
+
+    #[inline]
+    fn may_contain(&self, id: u32) -> bool {
+        let i = Self::slot(id);
+        self.bits
+            .get(i >> 6)
+            .is_some_and(|w| w & (1 << (i & 63)) != 0)
+    }
+}
+
 /// The changes of one transaction, kept apart from its base (see the module
 /// docs for the invariants).
 #[derive(Debug, Default)]
 pub struct Overlay {
     added: TripleStore,
     removed: TripleStore,
+    /// Subjects / objects / predicates of every triple that ever entered
+    /// `added` or `removed` (since the last clear).
+    subjects: KeyFilter,
+    objects: KeyFilter,
+    predicates: KeyFilter,
     /// Memoized statistic deltas (cleared by every change).
     deltas: Mutex<HashMap<DeltaKey, i64>>,
 }
@@ -96,6 +141,9 @@ impl Clone for Overlay {
         Overlay {
             added: self.added.clone(),
             removed: self.removed.clone(),
+            subjects: self.subjects.clone(),
+            objects: self.objects.clone(),
+            predicates: self.predicates.clone(),
             deltas: Mutex::new(HashMap::new()),
         }
     }
@@ -132,6 +180,31 @@ impl Overlay {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+    }
+
+    /// Record that `t`'s keys are touched (before it enters a store).
+    fn touch(&mut self, t: IdTriple) {
+        self.subjects.add(t.sub);
+        self.objects.add(t.obj);
+        self.predicates.add(t.pred);
+    }
+
+    /// Whether some change may concern subject `s` (no false negative).
+    #[inline]
+    pub fn may_touch_subject(&self, s: EntityLiteralId) -> bool {
+        self.subjects.may_contain(s)
+    }
+
+    /// Whether some change may concern object `o` (no false negative).
+    #[inline]
+    pub fn may_touch_object(&self, o: EntityLiteralId) -> bool {
+        self.objects.may_contain(o)
+    }
+
+    /// Whether some change may concern predicate `p` (no false negative).
+    #[inline]
+    pub fn may_touch_predicate(&self, p: PredId) -> bool {
+        self.predicates.may_contain(p)
     }
 
     /// Insert `t` as seen through the overlay over `base`. Returns `true`
@@ -173,6 +246,7 @@ impl Overlay {
         if self.added.exists(t.sub, t.pred, t.obj) || base_exists(t)? {
             return Ok(false);
         }
+        self.touch(t);
         self.added.insert(t);
         self.changed();
         Ok(true)
@@ -193,6 +267,7 @@ impl Overlay {
         if self.removed.exists(t.sub, t.pred, t.obj) || !base_exists(t)? {
             return Ok(false);
         }
+        self.touch(t);
         self.removed.insert(t);
         self.changed();
         Ok(true)
@@ -214,6 +289,9 @@ impl Overlay {
     pub fn clear(&mut self) {
         self.added = TripleStore::new();
         self.removed = TripleStore::new();
+        self.subjects = KeyFilter::default();
+        self.objects = KeyFilter::default();
+        self.predicates = KeyFilter::default();
         self.changed();
     }
 
@@ -445,13 +523,17 @@ impl<'a, B: TripleSource + ?Sized> OverlayView<'a, B> {
     /// Whether the overlay holds a triple with predicate `p`.
     #[inline]
     fn touches_predicate(&self, p: PredId) -> bool {
-        !self.added().so_by_p(p).is_empty() || !self.removed().so_by_p(p).is_empty()
+        self.overlay.may_touch_predicate(p)
+            && (!self.added().so_by_p(p).is_empty() || !self.removed().so_by_p(p).is_empty())
     }
 }
 
 impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
+    // Each keyed read first asks the overlay's key filters: a key no change
+    // concerns is answered by the base alone (the untouched-key fast path).
+
     fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) {
             return self.base.exists(sub, pred, obj);
         }
         if self.added().exists(sub, pred, obj) {
@@ -464,14 +546,16 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let (a, r) = (self.added().po_by_s(sub), self.removed().po_by_s(sub));
         let base = self.base.po_by_s(sub);
-        merge(base, r, a)
+        if !self.overlay.may_touch_subject(sub) {
+            return base;
+        }
+        merge(base, self.removed().po_by_s(sub), self.added().po_by_s(sub))
     }
 
     fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
         let base = self.base.o_by_sp(sub, pred);
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) {
             return base;
         }
         let (a, r) = (
@@ -483,7 +567,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
         let base = self.base.p_by_so(sub, obj);
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) || !self.overlay.may_touch_object(obj) {
             return base;
         }
         let (a, r) = (
@@ -494,14 +578,16 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        let (a, r) = (self.added().ps_by_o(obj), self.removed().ps_by_o(obj));
         let base = self.base.ps_by_o(obj);
-        merge(base, r, a)
+        if !self.overlay.may_touch_object(obj) {
+            return base;
+        }
+        merge(base, self.removed().ps_by_o(obj), self.added().ps_by_o(obj))
     }
 
     fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
         let base = self.base.s_by_po(pred, obj);
-        if self.plain() {
+        if !self.overlay.may_touch_object(obj) {
             return base;
         }
         let (a, r) = (
@@ -512,14 +598,20 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        let (a, r) = (self.added().so_by_p(pred), self.removed().so_by_p(pred));
         let base = self.base.so_by_p(pred);
-        merge(base, r, a)
+        if !self.overlay.may_touch_predicate(pred) {
+            return base;
+        }
+        merge(
+            base,
+            self.removed().so_by_p(pred),
+            self.added().so_by_p(pred),
+        )
     }
 
     fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
         let base = self.base.subs_by_p(pred);
-        if self.plain() || !self.touches_predicate(pred) {
+        if !self.touches_predicate(pred) {
             return base;
         }
         // A removed `(s, pred, _)` drops `s` only if no `(s, pred, _)` is left.
@@ -532,7 +624,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
         let base = self.base.objs_by_p(pred);
-        if self.plain() || !self.touches_predicate(pred) {
+        if !self.touches_predicate(pred) {
             return base;
         }
         let gone: Vec<u32> = self
@@ -630,7 +722,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn pred_card(&self, pred: PredId) -> usize {
         let base = self.base.pred_card(pred);
-        if self.plain() {
+        if !self.overlay.may_touch_predicate(pred) {
             return base;
         }
         adjust(
@@ -642,7 +734,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn pred_distinct_subj(&self, pred: PredId) -> usize {
         let base = self.base.pred_distinct_subj(pred);
-        if self.plain() || !self.touches_predicate(pred) {
+        if !self.touches_predicate(pred) {
             return base;
         }
         let delta = self.overlay.delta(DeltaKey::PredDistinctSubj(pred), || {
@@ -659,7 +751,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn pred_distinct_obj(&self, pred: PredId) -> usize {
         let base = self.base.pred_distinct_obj(pred);
-        if self.plain() || !self.touches_predicate(pred) {
+        if !self.touches_predicate(pred) {
             return base;
         }
         let delta = self.overlay.delta(DeltaKey::PredDistinctObj(pred), || {
@@ -688,7 +780,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_po_by_s(&self, sub: EntityLiteralId) -> u64 {
         let base = self.base.count_po_by_s(sub);
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) {
             return base;
         }
         adjust(
@@ -700,7 +792,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
         let base = self.base.count_o_by_sp(sub, pred);
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) {
             return base;
         }
         adjust(
@@ -712,7 +804,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
         let base = self.base.count_p_by_so(sub, obj);
-        if self.plain() {
+        if !self.overlay.may_touch_subject(sub) || !self.overlay.may_touch_object(obj) {
             return base;
         }
         adjust(
@@ -724,7 +816,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
         let base = self.base.count_ps_by_o(obj);
-        if self.plain() {
+        if !self.overlay.may_touch_object(obj) {
             return base;
         }
         adjust(
@@ -736,7 +828,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
         let base = self.base.count_s_by_po(pred, obj);
-        if self.plain() {
+        if !self.overlay.may_touch_object(obj) {
             return base;
         }
         adjust(
@@ -748,7 +840,7 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn count_so_by_p(&self, pred: PredId) -> u64 {
         let base = self.base.count_so_by_p(pred);
-        if self.plain() {
+        if !self.overlay.may_touch_predicate(pred) {
             return base;
         }
         adjust(
@@ -760,6 +852,9 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn distinct_p_of_s(&self, sub: EntityLiteralId) -> u64 {
         let base = self.base.distinct_p_of_s(sub);
+        if !self.overlay.may_touch_subject(sub) {
+            return base;
+        }
         let (a, r) = (self.added().po_by_s(sub), self.removed().po_by_s(sub));
         if a.is_empty() && r.is_empty() {
             return base;
@@ -773,6 +868,9 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
 
     fn distinct_p_of_o(&self, obj: EntityLiteralId) -> u64 {
         let base = self.base.distinct_p_of_o(obj);
+        if !self.overlay.may_touch_object(obj) {
+            return base;
+        }
         let (a, r) = (self.added().ps_by_o(obj), self.removed().ps_by_o(obj));
         if a.is_empty() && r.is_empty() {
             return base;
@@ -785,6 +883,9 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn has_subject(&self, sub: EntityLiteralId) -> bool {
+        if !self.overlay.may_touch_subject(sub) {
+            return self.base.has_subject(sub);
+        }
         if self.added().has_subject(sub) {
             return true;
         }
@@ -797,6 +898,9 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn has_object(&self, obj: EntityLiteralId) -> bool {
+        if !self.overlay.may_touch_object(obj) {
+            return self.base.has_object(obj);
+        }
         if self.added().has_object(obj) {
             return true;
         }
@@ -808,6 +912,9 @@ impl<B: TripleSource + ?Sized> TripleSource for OverlayView<'_, B> {
     }
 
     fn has_predicate(&self, pred: PredId) -> bool {
+        if !self.overlay.may_touch_predicate(pred) {
+            return self.base.has_predicate(pred);
+        }
         if self.added().has_predicate(pred) {
             return true;
         }
@@ -868,6 +975,32 @@ mod tests {
         assert!(ov.is_empty());
         assert_eq!(changes.removed, vec![IdTriple::new(2, 0, 2)]);
         assert!(changes.added.is_empty());
+    }
+
+    #[test]
+    fn key_filters_have_no_false_negatives() {
+        let mut f = KeyFilter::default();
+        assert!(!f.may_contain(7), "an empty filter holds nothing");
+        let ids: Vec<u32> = (0..5000).map(|i| i * 7919 + 3).collect();
+        for &id in &ids {
+            f.add(id);
+        }
+        assert!(ids.iter().all(|&id| f.may_contain(id)));
+        // Consecutive ids spread over the bits: few false positives.
+        let fp = (1_000_000..1_010_000)
+            .filter(|&id| f.may_contain(id))
+            .count();
+        assert!(fp < 1_500, "{fp} false positives in 10000");
+
+        let base = store(&[(1, 0, 2), (3, 1, 4)]);
+        let mut ov = Overlay::new();
+        assert!(!ov.may_touch_subject(1));
+        ov.insert(&base, IdTriple::new(5, 2, 6));
+        assert!(ov.may_touch_subject(5) && ov.may_touch_object(6) && ov.may_touch_predicate(2));
+        // An untouched key reads the base alone.
+        assert_eq!(ov.view(&base).po_by_s(1), vec![(0, 2)]);
+        ov.clear();
+        assert!(!ov.may_touch_subject(5));
     }
 
     #[test]
