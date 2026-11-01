@@ -54,10 +54,12 @@ use crate::model::{IdTriple, Term, Triple};
 use crate::parser::nquads::Quad;
 use crate::parser::{import, sparql};
 use crate::query::{Evaluator, QueryResult};
+use crate::store::read_scope::ReadScope;
 use crate::store::{MutableStore, TripleSource, TripleStore};
 
 use super::bptree::{be32, BTree};
 use super::disk_dict::DiskDict;
+use super::disk_triples::DiskSource;
 use super::format::{
     ENTITY2ID, GSPO, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, OSP, POS, PREDICATE2ID,
     PRED_STATS, ROOT_COMPACTED, ROOT_DISTINCT_OBJ, ROOT_DISTINCT_SUBJ, ROOT_ENTITY_COUNT,
@@ -1816,10 +1818,23 @@ impl DiskStore {
     /// alone exceeds RAM can still be queried without a full load (the
     /// [`to_memory`](Self::to_memory) path does materialize). Updates and the
     /// VS-tree filter are not available on this read-only streaming path.
+    ///
+    /// The query runs in its own read scope (contract C2) over a
+    /// [`DiskSource`](super::disk_triples::DiskSource): a read error of the
+    /// triple indexes or of the out-of-core dictionary fails it, instead of
+    /// answering partially.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         let dict = self.lazy_dictionary();
         let q = sparql::parse(sparql)?;
-        Evaluator::new(&dict, self).evaluate(&q)
+        let scope = ReadScope::enter();
+        let source = DiskSource::new(self);
+        let result = Evaluator::new(&dict, &source).evaluate(&q);
+        if let Some(e) = scope.take_error() {
+            return Err(GStoreError::Database(format!(
+                "a read from the store failed while evaluating the query: {e}"
+            )));
+        }
+        result
     }
 }
 
@@ -1827,8 +1842,9 @@ impl DiskStore {
 /// the index ranges each pattern touches through the page cache rather than
 /// materializing the whole graph in memory. Every method delegates to the
 /// matching `try_*` (so answers come in the trait's contract order); a read
-/// error degrades to an empty answer here — the database layer, not this
-/// convenience impl, is where read errors are reported per query.
+/// error degrades to an empty answer here and is *not* reported. Evaluate over
+/// [`DiskSource`](super::disk_triples::DiskSource) (as [`DiskStore::query`]
+/// does) or `DiskTriples` to have read errors fail the statement (C2).
 impl TripleSource for DiskStore {
     fn exists(&self, s: u32, p: u32, o: u32) -> bool {
         self.try_exists(s, p, o).unwrap_or(false)

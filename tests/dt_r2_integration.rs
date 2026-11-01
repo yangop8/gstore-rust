@@ -13,6 +13,8 @@
 //! - Transactions over a bulk-built store: read-your-writes through the
 //!   out-of-core dictionary, nothing on disk before commit, snapshot views
 //!   expire on commit, and the commit survives a reopen.
+//! - `DiskStore::query` fails on a read error of the triple indexes or of the
+//!   out-of-core dictionary instead of answering partially (C2).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use gstore::bulk::{self, BulkInput, BulkOptions, BulkTarget};
 use gstore::dict::{Dictionary, Space};
 use gstore::kvstore::{DiskDict, DiskSource, DiskStore, DiskTriples, ViewError};
-use gstore::parser::import::{ImportOptions, Source};
+use gstore::parser::import::{ImportOptions, RdfFormat, Source};
 use gstore::parser::sparql;
 use gstore::query::Evaluator;
 use gstore::store::read_scope::ReadScope;
@@ -30,6 +32,11 @@ use gstore::{Database, IdTriple, QueryResult};
 const UB: &str = "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#";
 const RDF_TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
 const COURSE0: &str = "<http://www.Department0.University0.edu/GraduateCourse0>";
+
+/// Header root slots (`kvstore::format`, crate-private): the POS tree and the
+/// entity id → key array.
+const SLOT_POS: usize = 1;
+const SLOT_ID2ENTITY: usize = 6;
 
 fn lubm_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/lubm/lubm.nt")
@@ -233,5 +240,79 @@ fn transactions_over_a_bulk_built_store_with_the_out_of_core_dictionary() {
     let lazy = ds.lazy_dictionary();
     assert_eq!(lazy.term(t.sub).as_deref(), Some(student.as_str()));
     drop((lazy, ds));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Overwrite the root page of header slot `slot` with garbage.
+fn corrupt_root(path: &Path, slot: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let off = 16 + slot * 8;
+    let page = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as usize;
+    assert!(page > 0, "slot {slot} has a root page");
+    bytes[page * 4096..(page + 1) * 4096].fill(0xFF);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn disk_store_query_fails_on_a_read_error() {
+    let base = tmp("readerr");
+    let mut text = String::new();
+    for i in 0..300 {
+        text.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p{}> <http://ex/o{i}> .\n",
+            i % 3
+        ));
+        text.push_str(&format!("<http://ex/s{i}> <http://ex/name> \"n{i}\" .\n"));
+    }
+    let build = |name: &str| -> PathBuf {
+        let db = base.join(name);
+        bulk::build(
+            &db,
+            name,
+            BulkInput::Text {
+                text: &text,
+                format: RdfFormat::Turtle,
+                name: "<string>",
+            },
+            &ImportOptions::strict(),
+            &mut (),
+            BulkTarget::Disk,
+            &BulkOptions::default(),
+        )
+        .unwrap();
+        db.join("kvstore.kv")
+    };
+    let by_p = "SELECT ?s ?o WHERE { ?s <http://ex/p1> ?o }";
+    let by_s = "SELECT ?p ?o WHERE { <http://ex/s7> ?p ?o }";
+
+    // Healthy: both queries answer.
+    let kv = build("ok.db");
+    let ds = DiskStore::open(&kv, 64).unwrap();
+    assert_eq!(rows(ds.query(by_p).unwrap()).len(), 100);
+    assert_eq!(rows(ds.query(by_s).unwrap()).len(), 2);
+    drop(ds);
+
+    // A broken triple index fails the query that reads it.
+    let kv = build("pos.db");
+    corrupt_root(&kv, SLOT_POS);
+    let ds = DiskStore::open(&kv, 64).unwrap();
+    let err = ds.query(by_p).unwrap_err().to_string();
+    assert!(err.contains("read from the store failed"), "{err}");
+    drop(ds);
+
+    // A broken out-of-core dictionary fails the query whose rows it names.
+    let kv = build("dict.db");
+    corrupt_root(&kv, SLOT_ID2ENTITY);
+    let ds = DiskStore::open(&kv, 64).unwrap();
+    let err = ds.query(by_p).unwrap_err().to_string();
+    assert!(err.contains("read from the store failed"), "{err}");
+    // The error belonged to that statement only: a later query reading no
+    // broken page answers (a literal-only projection).
+    let lits = rows(
+        ds.query("SELECT ?n WHERE { <http://ex/s7> <http://ex/name> ?n }")
+            .unwrap(),
+    );
+    assert_eq!(lits, vec![vec![Some("\"n7\"".to_string())]]);
+    drop(ds);
     let _ = std::fs::remove_dir_all(&base);
 }
