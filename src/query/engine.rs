@@ -2866,9 +2866,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         out: &mut Vec<Binding>,
     ) {
         let before = out.len();
-        for (s, p, o) in self.candidate_triples(binding, plan) {
+        // The subject's / object's candidate sets, looked up once per call.
+        let s_cands = slot_candidates(&plan.s, cands);
+        let o_cands = slot_candidates(&plan.o, cands);
+        for (s, p, o) in self.candidate_triples_in(binding, plan, s_cands, o_cands) {
             // VS-tree filter: an entity variable's value must be a candidate.
-            if !cand_ok(&plan.s, s, cands) || !cand_ok(&plan.o, o, cands) {
+            if !in_candidates(s_cands, s) || !in_candidates(o_cands, o) {
                 continue;
             }
             let mut nb = binding.clone();
@@ -2880,6 +2883,51 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         self.note_bindings(out.len() - before);
+    }
+
+    /// [`candidate_triples`](Self::candidate_triples) for a caller that keeps
+    /// only triples whose subject is in `s_cands` and object in `o_cands`
+    /// (`None` = unconstrained): a predicate scan (`? p ?`) whose subject or
+    /// object variable has a candidate set much smaller than the predicate is
+    /// answered by looking each candidate up instead of scanning the
+    /// predicate. Exactly the scanned triples that pass the candidate filter
+    /// are returned (possibly with others the caller then drops), in the same
+    /// `(s, o)` order, so solutions and their order are unchanged.
+    fn candidate_triples_in(
+        &self,
+        binding: &Binding,
+        plan: &PatPlan,
+        s_cands: Option<&[u32]>,
+        o_cands: Option<&[u32]>,
+    ) -> Vec<(u32, PredId, u32)> {
+        let known = (
+            slot_known(&plan.s, binding),
+            slot_known(&plan.p, binding),
+            slot_known(&plan.o, binding),
+        );
+        if let (None, Some(p), None) = known {
+            let card = self.store.pred_card(p);
+            let small = |c: &[u32]| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < card;
+            if let Some(subjects) = s_cands.filter(|c| small(c)) {
+                // Ascending subjects, each with its ascending objects: the
+                // `(s, o)` order of `so_by_p`.
+                let mut out = Vec::new();
+                for &s in subjects {
+                    out.extend(self.store.o_by_sp(s, p).into_iter().map(|o| (s, p, o)));
+                }
+                return out;
+            }
+            if let Some(objects) = o_cands.filter(|c| small(c)) {
+                let mut out = Vec::new();
+                for &o in objects {
+                    out.extend(self.store.s_by_po(p, o).into_iter().map(|s| (s, p, o)));
+                }
+                // Back into `so_by_p`'s `(s, o)` order.
+                out.sort_unstable_by_key(|&(s, _, o)| (s, o));
+                return out;
+            }
+        }
+        self.candidate_triples(binding, plan)
     }
 
     /// The `(s, p, o)` triples that may extend `binding` by `plan`, in the
@@ -5621,6 +5669,24 @@ fn slot_known(slot: &Slot, binding: &Binding) -> Option<u32> {
 
 /// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
 /// Constants and variables without a candidate set are always allowed.
+/// The candidate set of a variable slot, if it has one.
+fn slot_candidates<'c>(slot: &Slot, cands: &'c Candidates) -> Option<&'c [u32]> {
+    match slot {
+        Slot::Var(v) => cands.get(v).map(Vec::as_slice),
+        Slot::Const(_) => None,
+    }
+}
+
+/// Whether `value` passes a (sorted) candidate set; `None` admits anything.
+/// [`cand_ok`] with the set looked up beforehand.
+fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
+    set.is_none_or(|list| list.binary_search(&value).is_ok())
+}
+
+/// A predicate scan is replaced by candidate lookups when the candidates
+/// number less than `1 / CANDIDATE_LOOKUP_FACTOR` of the predicate's triples.
+const CANDIDATE_LOOKUP_FACTOR: usize = 8;
+
 fn cand_ok(slot: &Slot, value: u32, cands: &Candidates) -> bool {
     match slot {
         // Candidate lists are sorted; membership is a binary search.
@@ -6559,6 +6625,68 @@ mod join_method_tests {
     /// The hash join's output order does not depend on the hasher: the fast
     /// deterministic one, randomly keyed SipHash and the nested loop agree
     /// row for row, with repeated keys on both sides and unbound slots.
+    #[test]
+    fn candidate_lookups_equal_the_filtered_predicate_scan() {
+        // `extend` answers a `?s p ?o` scan from small candidate sets by
+        // lookups: the same solutions, in the same order, as scanning the
+        // predicate and filtering by the candidates.
+        let mut state = 0xC0FFEE_u64;
+        let mut next = move |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(n)) as u32
+        };
+        let mut store = TripleStore::new();
+        store.bulk_load((0..6000).map(|_| IdTriple::new(next(400), next(3), next(500))));
+        let dict = Dictionary::new();
+        let ev = Evaluator::new(&dict, &store);
+        for round in 0..60 {
+            let p = next(3);
+            let plan = PatPlan {
+                s: Slot::Var(0),
+                p: Slot::Const(p),
+                o: Slot::Var(if round % 7 == 0 { 0 } else { 1 }),
+            };
+            let mut set = |n: u32, range: u32| -> Vec<u32> {
+                let mut v: Vec<u32> = (0..n).map(|_| next(range)).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let mut cands = Candidates::default();
+            match round % 3 {
+                0 => {
+                    cands.insert(0, set(20, 400));
+                }
+                1 => {
+                    cands.insert(1, set(15, 500));
+                }
+                _ => {
+                    cands.insert(0, set(30, 400));
+                    cands.insert(1, set(200, 500));
+                }
+            }
+            let binding: Binding = vec![None; 2];
+            let mut fast = Vec::new();
+            ev.extend(&binding, &plan, &cands, &mut fast);
+            let mut slow = Vec::new();
+            for (s, pr, o) in ev.candidate_triples(&binding, &plan) {
+                if !cand_ok(&plan.s, s, &cands) || !cand_ok(&plan.o, o, &cands) {
+                    continue;
+                }
+                let mut nb = binding.clone();
+                if unify(&mut nb, &plan.s, s)
+                    && unify(&mut nb, &plan.p, pr)
+                    && unify(&mut nb, &plan.o, o)
+                {
+                    slow.push(nb);
+                }
+            }
+            assert_eq!(fast, slow, "round {round}");
+        }
+    }
+
     #[test]
     fn hash_join_order_does_not_depend_on_the_hasher() {
         let mut state = 0x1234_5678_u64;
