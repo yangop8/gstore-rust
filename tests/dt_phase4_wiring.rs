@@ -120,8 +120,8 @@ fn state(srv: &Server, db: &str) -> (String, usize, String, String) {
     seen.pop().unwrap()
 }
 
-/// A server whose `build` may read `data_dir`, with `FAMILY` built and
-/// loaded as `db`.
+/// A server with [`FAMILY`] built (from a file in a scratch directory its
+/// `build` may read) and loaded as `db`.
 fn family_server(tag: &str, db: &str) -> Server {
     let data = scratch(&format!("{tag}_data"));
     let file = data.join("family.nt");
