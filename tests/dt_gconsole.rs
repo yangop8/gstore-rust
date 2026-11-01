@@ -830,75 +830,287 @@ fn help_version_and_unknown_commands() {
     );
 }
 
+/// A `gserver` binary serving `dir` (its `conf/conf.ini` written from
+/// `conf_extra` plus the port and `db_home`), killed when dropped.
+struct Gserver {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for Gserver {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Gserver {
+    fn start(dir: &Path, conf_extra: &str) -> Gserver {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        fs::create_dir_all(dir.join("conf")).unwrap();
+        fs::write(
+            dir.join("conf/conf.ini"),
+            format!(
+                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n{conf_extra}"
+            ),
+        )
+        .unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_gserver"))
+            .current_dir(dir)
+            .args(["--load-dir", &path_str(&data("small"))])
+            .env_remove("GSTORE_GSERVER_BACKGROUND")
+            .env_remove("GSTORE_GSERVER_SUPERVISOR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let srv = Gserver { child, port };
+        wait_for("gserver", || TcpStream::connect(("127.0.0.1", port)).is_ok());
+        srv
+    }
+
+    /// Run a gconsole stdin script as root, from `cwd`.
+    fn script(&self, cwd: &Path, stdin: &str) -> Run {
+        let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
+        let mut cmd = gconsole(&addr, cwd);
+        cmd.args(["-u", "root", "-p", PASSWORD]);
+        run(cmd, stdin)
+    }
+}
+
+/// Whether `hay` holds `lines` in this order (each found after the end of
+/// the previous one): the order a script printed its answers in.
+fn printed_in_order(hay: &str, lines: &[&str]) -> Result<(), String> {
+    let mut at = 0;
+    for line in lines {
+        match hay[at..].find(line) {
+            Some(i) => at += i + line.len(),
+            None => return Err(format!("{line:?} not printed after offset {at}")),
+        }
+    }
+    Ok(())
+}
+
+/// Phase 4 through the console: a reasoning rule's whole lifecycle —
+/// `addreason` from a JSON file, `listreason`, `compilereason`,
+/// `executereason`, `showreason`, a refused `deletereason` of an executed
+/// rule, `disablereason`, `deletereason` — against a `gserver`, each
+/// answer printed as upstream's gconsole prints it, and the inferred
+/// `<Rule:…>` triples visible to SPARQL typed at the prompt in between.
 #[test]
-fn reasoning_and_function_commands_show_the_servers_answer() {
-    let srv = Server::start("gc_reason");
-    ok(&srv.build("small", &data("small/small.nt")));
-    let cwd = scratch("gc_reason_cwd");
-    let _cwd = DirGuard(cwd.clone());
+fn reasoning_commands_run_a_rules_whole_lifecycle() {
+    let dir = scratch("gc_reason_life");
+    let _dir = DirGuard(dir.clone());
+    let srv = Gserver::start(&dir, "");
     fs::write(
-        cwd.join("rule.json"),
-        r#"{"rulename":"r1","description":"d"}"#,
+        dir.join("rule.json"),
+        r#"{"rulename":"holds","description":"a container holds what its nodes own",
+            "isenable":1,"type":1,"logic":1,
+            "conditions":[{"patterns":[
+                {"subject":"?x","predicate":"<contain>","object":"?y"},
+                {"subject":"?y","predicate":"<own>","object":"?z"}],"filters":[]}],
+            "return":{"source":"?x","target":"?z","label":"holds"}}"#,
     )
     .unwrap();
-    fs::write(cwd.join("bad.json"), "{not json").unwrap();
-    fs::write(cwd.join("fun.json"), r#"{"funName":"f1","funBody":"{}"}"#).unwrap();
-    let r = script(
-        &srv,
-        &cwd,
-        "listreason;\n\
-         use small;\n\
-         addreason missing.json;\n\
-         addreason bad.json;\n\
-         addreason rule.json;\n\
-         listreason;\n\
-         compilereason r1;\n\
-         executereason r1;\n\
-         disablereason r1;\n\
-         showreason r1;\n\
-         deletereason r1;\n\
-         showpfn;\n\
-         addpfn fun.json;\n\
-         addpfn missing.json;\n\
-         mdfpfn fun.json;\n\
-         delpfn f1;\n\
-         buildpfn f1;\n",
+    fs::write(dir.join("bad.json"), "{not json").unwrap();
+    let small = path_str(&data("small/small.nt"));
+    let count = "select (count(*) as ?n) where { ?x <Rule:holds> ?z };\n";
+    let r = srv.script(
+        &dir,
+        &format!(
+            "listreason;\n\
+             create small {small};\n\
+             use small;\n\
+             addreason missing.json;\n\
+             addreason bad.json;\n\
+             addreason rule.json;\n\
+             listreason;\n\
+             compilereason holds;\n\
+             executereason holds;\n\
+             {count}\
+             showreason holds;\n\
+             deletereason holds;\n\
+             disablereason holds;\n\
+             {count}\
+             deletereason holds;\n\
+             listreason;\n\
+             compilereason holds;\n"
+        ),
     );
     let out = &r.out;
-    assert!(out.starts_with("Current database not selected."), "{r:?}");
-    assert!(out.contains("File missing.json does not exist.\n"), "{r:?}");
-    assert!(out.contains("failed to parse file bad.json: "), "{r:?}");
-    // Until the server implements these operations, the console shows its
-    // answer (`1100`, "The operation is not defined") cleanly.
-    let reason = srv.op("reasonManage", &[("db_name", "small"), ("type", "2")]);
-    let fun = srv.op("funquery", &[]);
-    if harness::code(&reason) == 1100 {
-        let undefined = "The operation is not defined";
-        for line in [
-            format!("{undefined}\n"),
-            format!("list reasons failed: {undefined}\n"),
-            format!("compile reason r1 failed: {undefined}\n"),
-            format!("execute reason r1 failed: {undefined}\n"),
-            format!("disable reason r1 failed: {undefined}\n"),
-            format!("show reason r1 failed: {undefined}\n"),
-            format!("delete reason r1 failed: {undefined}\n"),
-        ] {
-            assert!(out.contains(&line), "{line:?}: {r:?}");
-        }
+    let insert = "insert { ?x <Rule:holds> ?z. } where { ?x <contain> ?y. ?y <own> ?z.}";
+    let eight = "\"8\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    let zero = "\"0\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    printed_in_order(
+        out,
+        &[
+            "Current database not selected.",
+            "Build RDF database small successfully!",
+            "File missing.json does not exist.\n",
+            "failed to parse file bad.json: ",
+            // addreason: the server's message, naming the rule file.
+            "Add Reason Rule done.Save Successfully! the file path is ",
+            "holds.json\n",
+            "| 1      | holds    | a container holds what its nodes own |\n",
+            "list reasons successfully!\n",
+            // compilereason: both statements in one row.
+            "insert_sparql",
+            "delete_sparql",
+            insert,
+            "compile reason holds successfully!\n",
+            // executereason: the statement it ran.
+            insert,
+            "execute reason holds successfully!\n",
+            eight,
+            "Query ans num 1, use ",
+            // showreason: the number of conditions, then one row per pattern.
+            "1\n",
+            "| holds    | a container holds what its nodes own | <?x,<contain>,?y> |",
+            "| holds    | a container holds what its nodes own | <?y,<own>,?z>     |",
+            "show reason holds successfully!\n",
+            // An executed rule cannot be deleted: disable it first.
+            "delete reason holds failed: ",
+            "disable reason holds successfully!\n",
+            zero,
+            "delete reason holds successfully!\n",
+            "list reasons successfully!\n",
+            "compile reason holds failed: ",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{e}: {r:?}"));
+    // The disable printed the retraction statement.
+    assert!(out.contains("delete_sparql"), "{r:?}");
+    // The last listreason shows the empty table: no rule row left.
+    let last_list = out.rfind("| ruleid | rulename | description").unwrap();
+    assert!(!out[last_list..].contains("| 1 "), "{r:?}");
+    assert!(dir.join("dbhome/small.db/reason_rule_files").is_dir());
+    assert!(!dir.join("dbhome/small.db/reason_rule_files/holds.json").exists());
+    assert_eq!(r.code, 1, "the failing commands set the exit code: {r:?}");
+}
+
+/// A function file for `addpfn` / `mdfpfn`: upstream's `PFNInfo` with a
+/// WebAssembly-text body that emits `{"<key>":<host(…)>}`.
+fn pfn_file(name: &str, key: &str, host: &str) -> String {
+    let open = format!("{{\\\"{key}\\\":");
+    Json::obj()
+        .with("funName", name)
+        .with("funDesc", format!("{host} as JSON"))
+        .with(
+            "funSubs",
+            format!(
+                "(data (i32.const 0) \"{open}\") (data (i32.const 32) \"}}\")",
+            ),
+        )
+        .with(
+            "funBody",
+            format!(
+                "(call $emit (i32.const 0) (i32.const {})) (call $emit_i64 (call ${host})) \
+                 (call $emit (i32.const 32) (i32.const 1)) (i32.const 1)",
+                key.len() + 4
+            ),
+        )
+        .to_string()
+}
+
+/// Phase 4 through the console: a PFN function's lifecycle — `showpfn`,
+/// `addpfn` and `mdfpfn` from a JSON file holding WebAssembly text,
+/// `buildpfn`, a call typed at the prompt, `delpfn` — against a `gserver`
+/// whose functions live under `conf.ini`'s `pfn_base_path`. With the
+/// `pfn-wasm` runtime the call prints the function's JSON and upstream's
+/// `pfn query use … ms.`; without it, building and calling fail with an
+/// error naming the feature, and the rest of the lifecycle still works.
+#[test]
+fn function_commands_run_a_pfn_lifecycle() {
+    let dir = scratch("gc_pfn_life");
+    let _dir = DirGuard(dir.clone());
+    let srv = Gserver::start(&dir, "pfn_base_path=./pfnhome/\n");
+    fs::write(dir.join("vcount.json"), pfn_file("vcount", "n", "vertex_count")).unwrap();
+    fs::write(dir.join("ecount.json"), pfn_file("vcount", "e", "edge_count")).unwrap();
+    let small = path_str(&data("small/small.nt"));
+    let call = r#"select (PFN.vcount({}) AS ?r) where {};"#;
+    let per_var = r#"SELECT ?x (PFN.vcount({"src":"?x"}) AS ?r) WHERE { <root> <contain> ?x };"#;
+    let r = srv.script(
+        &dir,
+        &format!(
+            "create small {small};\n\
+             use small;\n\
+             showpfn;\n\
+             addpfn missing.json;\n\
+             addpfn vcount.json;\n\
+             addpfn vcount.json;\n\
+             showpfn;\n\
+             buildpfn vcount;\n\
+             {call}\n\
+             {per_var}\n\
+             mdfpfn ecount.json;\n\
+             {call}\n\
+             buildpfn vcount;\n\
+             {call}\n\
+             delpfn vcount;\n\
+             delpfn vcount;\n\
+             showpfn;\n"
+        ),
+    );
+    let out = &r.out;
+    let header = "| name | desc | returnType | status | lastBuildTime |";
+    let mut lines = vec![
+        "Build RDF database small successfully!",
+        header,
+        "query custom function successfully!\n",
+        "File missing.json does not exist.\n",
+        "create custom function successfully!\n",
+        "function operation failed: Function create fail: function name vcount already exists\n",
+        "failed to create custom function\n",
+        // The source column names the WebAssembly text the server keeps.
+        "| vcount | vertex_count as JSON | src/root/vcount.wat | 1      |",
+        "query custom function successfully!\n",
+    ];
+    if cfg!(feature = "pfn-wasm") {
+        lines.extend([
+            "custom function build successfully!\n",
+            // small.nt has 14 vertices (entities on entity-to-entity edges).
+            "{\"n\":14}\npfn query use ",
+            // One run per distinct ?x (node0 … node4), an array of outputs.
+            "[{\"n\":14},{\"n\":14},{\"n\":14},{\"n\":14},{\"n\":14}]\npfn query use ",
+            "update custom function successfully!\n",
+            // Updated, the function must be compiled again.
+            "Query failed: ",
+            "not compile yet",
+            "custom function build successfully!\n",
+            "{\"e\":",
+            "pfn query use ",
+        ]);
+    } else {
+        lines.extend([
+            "function operation failed: ",
+            "pfn-wasm",
+            "failed to build custom function\n",
+            "Query failed: ",
+            "update custom function successfully!\n",
+            "Query failed: ",
+            "failed to build custom function\n",
+            "Query failed: ",
+        ]);
     }
-    if harness::code(&fun) == 1100 {
-        let undefined = "The operation is not defined";
-        for line in [
-            format!("failed to query custom function: {undefined}\n"),
-            format!("function operation failed: {undefined}\nfailed to create custom function\n"),
-            format!("function operation failed: {undefined}\nfailed to update custom function\n"),
-            format!("function operation failed: {undefined}\nfailed to delete custom function\n"),
-            format!("function operation failed: {undefined}\nfailed to build custom function\n"),
-        ] {
-            assert!(out.contains(&line), "{line:?}: {r:?}");
-        }
-    }
-    assert_eq!(r.code, 1, "{r:?}");
+    lines.extend([
+        "delete custom function successfully!\n",
+        "function operation failed: Function delete fail: function vcount not exists\n",
+        "failed to delete custom function\n",
+        header,
+        "query custom function successfully!\n",
+    ]);
+    printed_in_order(out, &lines).unwrap_or_else(|e| panic!("{e}: {r:?}"));
+    // The functions live under pfn_base_path, per user; delete removed the
+    // source.
+    assert!(dir.join("pfnhome/src/root/data.json").is_file(), "{r:?}");
+    assert!(!dir.join("pfnhome/src/root/vcount.wat").exists(), "{r:?}");
+    assert!(!out.contains("Update ans num"), "a PFN answer is not an update: {r:?}");
+    assert_eq!(r.code, 1, "the failing commands set the exit code: {r:?}");
 }
 
 #[test]
@@ -1471,7 +1683,8 @@ fn requests_carry_upstreams_operations_and_parameters() {
         "1\n",
         "| r1       | a rule      | <?x,<p>,?y> | ?x != ?y; |\n",
         "delete reason r1 successfully!\n",
-        "| f1   | d    | ./pfn/f1.cpp | 2      | 2024-01-01 00:00:00 |\n",
+        // Upstream shows `./pfn/<name>.cpp`; here the WebAssembly source.
+        "| f1   | d    | src/admin2/f1.wat | 2      | 2024-01-01 00:00:00 |\n",
         "query custom function successfully!\n",
         "create custom function successfully!\n",
         "delete custom function successfully!\n",

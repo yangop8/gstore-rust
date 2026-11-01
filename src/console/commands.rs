@@ -745,6 +745,14 @@ fn raw_sparql(c: &mut Console, sparql: &str) -> CmdResult {
     }
     let ans = r.num("AnsNum");
     let time = r.num("QueryTime");
+    // A projected `PFN.name({…})`: the server's `{"results": <value>}`
+    // document. Upstream's console prints the value's text (its server's
+    // `pfn_type…` cell) and the time alone.
+    if let Some(value) = pfn_value(&r.json) {
+        say!(c, "{}", table::printable(&value, true));
+        say!(c, "pfn query use {time} ms.");
+        return Ok(());
+    }
     let Some((vars, rows)) = result_table(&r.json) else {
         say!(c, "Update ans num {ans}, use {time} ms.");
         return Ok(());
@@ -767,6 +775,22 @@ fn raw_sparql(c: &mut Console, sparql: &str) -> CmdResult {
     let _ = write!(c.out, "{}", table::render_owned(&vars, &rows));
     say!(c, "Query ans num {ans}, use {time} ms.");
     Ok(())
+}
+
+/// The value of a PFN answer — the `/api` `query` document a projected
+/// `PFN.name({…})` gives, `{"results": <value>}` with no `head` (upstream
+/// `ResultSet::to_JSON`) — as upstream's console prints it: a string as
+/// is, any other JSON value as compact JSON with sorted keys (the
+/// `nlohmann::json::dump()` text its server puts after `pfn_type`).
+pub fn pfn_value(j: &Json) -> Option<String> {
+    if j.get("head").is_some() {
+        return None;
+    }
+    match j.get("results")? {
+        Json::Obj(_) if j.get("results")?.get("bindings").is_some() => None,
+        Json::Str(s) => Some(s.clone()),
+        other => Some(other.clone().into_sorted().to_string()),
+    }
 }
 
 /// The lexical form of an answer's only cell, when it has one row of one
@@ -1893,12 +1917,18 @@ fn fun_info(src: &Json) -> Json {
     info
 }
 
+/// `showpfn` (upstream `funquery_handler`): the user's functions, with
+/// upstream's columns. Upstream's third column (headed `returnType`) shows
+/// `./pfn/<name>.cpp`; here it is the WebAssembly source the server keeps,
+/// `src/<user>/<name lower-cased>.wat` under its `pfn_base_path` (see
+/// `crate::pfn::PfnRegistry`).
 fn h_showpfn(c: &mut Console, args: &[String]) -> CmdResult {
     c.argc(args, &[0], "showpfn")?;
     let r = c.request("funquery", vec![("funInfo", fun_info(&Json::obj()))])?;
     if !r.ok() {
         bail!(c, "failed to query custom function: {}", r.msg);
     }
+    let user = c.client.username.clone();
     let rows: Vec<Vec<String>> = r
         .json
         .get("list")
@@ -1910,7 +1940,7 @@ fn h_showpfn(c: &mut Console, args: &[String]) -> CmdResult {
             vec![
                 g("funName"),
                 g("funDesc"),
-                format!("./pfn/{}.cpp", g("funName")),
+                format!("src/{user}/{}.wat", g("funName").to_lowercase()),
                 g("funStatus"),
                 g("lastTime"),
             ]
@@ -1929,11 +1959,16 @@ fn h_showpfn(c: &mut Console, args: &[String]) -> CmdResult {
 }
 
 /// `funcudb` of `kind` (1 create, 2 update from a JSON file; 3 delete, 4
-/// build by name) for command `name`.
+/// build by name) for command `name` (upstream `funcudb_handler`). The file
+/// holds upstream's `PFNInfo` — an object (or a string holding one) with
+/// `funName`, `funDesc`, `funBody`, `funSubs` — sent unchanged: here
+/// `funBody` / `funSubs` are WebAssembly text (upstream: C++), which the
+/// server URL-decodes as upstream does (`+` is a space, `%XX` a byte), so a
+/// literal `+` or `%` in them is written `%2B` / `%25` (see `docs/PFN.md`).
 fn fun_cudb(c: &mut Console, args: &[String], name: &str, kind: &str) -> CmdResult {
     c.argc(args, &[1], name)?;
     let info = if kind == "1" || kind == "2" {
-        fun_info(&read_json_file(c, &args[0])?)
+        fun_info(&json_value(&read_json_file(c, &args[0])?))
     } else {
         fun_info(&Json::obj().with("funName", args[0].as_str()))
     };
@@ -2289,6 +2324,25 @@ mod tests {
         assert_eq!(result_table(&nt).unwrap().1, vec![vec!["<a>".to_string()]]);
         let upd = json::parse(r#"{"StatusCode":0,"AnsNum":1}"#).unwrap();
         assert!(result_table(&upd).is_none());
+    }
+
+    /// A PFN answer (`{"results": <value>}`, no `head`) prints its value
+    /// as upstream's console prints a `pfn_type` cell; a SPARQL result or
+    /// an update answer is not one.
+    #[test]
+    fn pfn_answers_print_their_value() {
+        let v = |s: &str| pfn_value(&json::parse(s).unwrap());
+        assert_eq!(
+            v(r#"{"results":{"z":1,"a":[2,"x"]},"StatusCode":0,"QueryTime":"3"}"#).as_deref(),
+            Some(r#"{"a":[2,"x"],"z":1}"#)
+        );
+        assert_eq!(v(r#"{"results":"plain"}"#).as_deref(), Some("plain"));
+        assert_eq!(v(r#"{"results":[]}"#).as_deref(), Some("[]"));
+        assert_eq!(v(r#"{"results":7}"#).as_deref(), Some("7"));
+        assert!(v(r#"{"head":{"vars":["v"]},"results":{"bindings":[]}}"#).is_none());
+        assert!(v(r#"{"results":{"bindings":[]}}"#).is_none());
+        assert!(v(r#"{"head":["v"],"results":[["x"]]}"#).is_none());
+        assert!(v(r#"{"StatusCode":0,"AnsNum":3}"#).is_none());
     }
 
     #[test]

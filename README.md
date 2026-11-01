@@ -604,8 +604,26 @@ gStore[lubm]> quit;
   `CREATE GRAPH <g>`, …).
 * Results print as upstream's: a table of N-Triples terms whose literals
   show their lexical form unescaped (a graph function's JSON next to other
-  columns reads `"{"paths":[…]}"`; line breaks and tabs stay escaped), and
-  a lone graph-function answer as indented JSON.
+  columns reads `"{"paths":[…]}"`; line breaks and tabs stay escaped), a
+  lone graph-function answer as indented JSON, and a PFN call's
+  `{"results": …}` answer as its value's compact JSON followed by `pfn
+  query use <ms> ms.`, as upstream prints its `pfn_type` answers.
+* Reasoning and functions, as upstream's console: `addreason <file>` sends
+  the rule JSON in the file (the `reasonManage` `ruleinfo`) and prints the
+  server's message; `listreason` prints `ruleid | rulename | description`;
+  `compilereason` / `executereason` / `disablereason <rule>` print the
+  statements compiled, run or used for the retraction; `showreason <rule>`
+  prints the number of conditions and one `rulename | description |
+  patterns | filters` row per pattern (upstream prints the subject twice and
+  no predicate: `<s,o,s>`; here `<s,p,o>`). `addpfn` / `mdfpfn <file>`
+  send upstream's `PFNInfo` JSON from the file — `funName`, `funDesc`,
+  `funBody`, `funSubs` — unchanged; the body is WebAssembly text (upstream:
+  C++; see [`docs/PFN.md`](docs/PFN.md)), which the server URL-decodes as
+  upstream does, so write a literal `+` / `%` as `%2B` / `%25`. `showpfn`
+  prints `name | desc | returnType | status | lastBuildTime` — upstream's
+  headers — with the function's source file `src/<user>/<name>.wat` (under
+  the server's `pfn_base_path`) in the third column, where upstream shows
+  `./pfn/<name>.cpp`. `delpfn` / `buildpfn <name>` delete / compile it.
 * Commands (`help;` lists them, `help <command>;` shows one): `create <db>
   [<file|dir|url>]`, `use`, `show [<db>]`, `showdbs`, `pdb`, `unload`, `drop`,
   `backup [<path>]`, `restore <db> <path>`, `export [<path>]`, `batchinsert` /
