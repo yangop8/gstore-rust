@@ -7,7 +7,8 @@
 //!   non-empty, the update round trip, identical concurrent response bodies.
 //! * **Timing gates** (one-sided, calibration-normalized): per query
 //!   `(m+floor)/(b+floor) > 3.0` fails, the per-backend geomean of the raw
-//!   medians `> 1.5` fails, build `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
+//!   medians `> 1.5` fails (over the queries whose baseline median is at
+//!   least `min_base_ms`), build `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
 //! * **Memory**: `(m+32 MiB)/(b+32 MiB) > 1.5` fails (build peak, after open,
 //!   query high-water mark). **Size**: directory bytes `> 1.25` fails.
 //!
@@ -41,6 +42,12 @@ pub struct GeomeanGate {
     pub max_ratio: f64,
     #[serde(default = "default_eps")]
     pub epsilon_ms: f64,
+    /// Only queries whose baseline median is at least this long enter the
+    /// geomean (all of them when fewer than three qualify): the relative
+    /// jitter of sub-millisecond queries would dominate it, and the
+    /// per-query gate already covers them.
+    #[serde(default)]
+    pub min_base_ms: f64,
 }
 
 fn default_eps() -> f64 {
@@ -451,8 +458,18 @@ pub fn evaluate(
                 Some((be.to_string(), Phase::Query)),
             ));
             let eps = t.geomean.epsilon_ms;
-            logs.push((mm.max(eps) / qb.median_ms.max(eps)).ln());
+            logs.push((qb.median_ms, (mm.max(eps) / qb.median_ms.max(eps)).ln()));
         }
+        let long: Vec<f64> = logs
+            .iter()
+            .filter(|(b, _)| *b >= t.geomean.min_base_ms)
+            .map(|(_, l)| *l)
+            .collect();
+        let logs: Vec<f64> = if long.len() >= 3 {
+            long
+        } else {
+            logs.iter().map(|(_, l)| *l).collect()
+        };
         if !logs.is_empty() {
             let g = (logs.iter().sum::<f64>() / logs.len() as f64).exp();
             out.push(GateOutcome {

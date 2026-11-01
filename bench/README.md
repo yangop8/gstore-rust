@@ -148,7 +148,9 @@ A baseline is the same document with `"kind": "baseline"`;
 * **Timing**, one-sided and calibration-normalized (measured times are
   divided by the calibration ratio, clamped to [0.5, 2]): per query
   `(m + 2 ms) / (b + 2 ms) > 3.0` fails; the per-backend geomean of the raw
-  warm medians `> 1.5` fails; build `> 2.0` (`> 2.5` for disk, 100 ms floor);
+  warm medians `> 1.5` fails (it covers the queries whose baseline median is
+  ≥ 1 ms, all of them when fewer than three are: sub-millisecond jitter
+  would dominate it, and the per-query gate covers those); build `> 2.0` (`> 2.5` for disk, 100 ms floor);
   warm open `> 2.5` (20 ms floor).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
   open, query high-water mark). **Size**: database bytes `> 1.25×` fails.

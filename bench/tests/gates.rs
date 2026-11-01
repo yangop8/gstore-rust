@@ -185,6 +185,19 @@ fn one_slow_query_of_20ms_or_more_fails() {
     let mut r = result(1.0);
     r.runs[0].queries[11].median_ms *= 4.0;
     assert_eq!(check(&b, &r, 1.0).0, Verdict::Pass);
+    // Sub-millisecond jitter (all four of them 5× slower) stays out of the
+    // geomean, which covers the queries of ≥ 1 ms only.
+    let mut r = result(1.0);
+    for i in [0, 2, 10, 11] {
+        r.runs[0].queries[i].median_ms *= 5.0;
+    }
+    let (v, o) = check(&b, &r, 1.0);
+    assert_eq!(v, Verdict::Pass, "{o:#?}");
+    let g = o
+        .iter()
+        .find(|g| g.gate == "time.geomean" && g.subject == "snapshot")
+        .unwrap();
+    assert!((g.ratio.unwrap() - 1.0).abs() < 1e-9);
 }
 
 #[test]

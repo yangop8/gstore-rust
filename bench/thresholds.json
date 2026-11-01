@@ -1,10 +1,10 @@
 {
   "schema": "gstore-bench-gates/1",
-  "about": "Gates of `gstore-bench check` / `compare` / `ci` (see bench/README.md). Exact gates always apply. Timing gates are one-sided and calibration-normalized: a measured time m is divided by clamp(calib_measured / calib_baseline) and compared with the baseline time b as (m + floor_ms) / (b + floor_ms); the per-backend query geomean uses the raw medians. Memory: (m + floor_mib) / (b + floor_mib). Sizes: m / b. A failing timing or memory gate re-runs only the failing phases, up to `retries` times, keeping the minimum of the medians.",
+  "about": "Gates of `gstore-bench check` / `compare` / `ci` (see bench/README.md). Exact gates always apply. Timing gates are one-sided and calibration-normalized: a measured time m is divided by clamp(calib_measured / calib_baseline) and compared with the baseline time b as (m + floor_ms) / (b + floor_ms); the per-backend query geomean uses the raw medians of the queries whose baseline median is at least min_base_ms (all queries when fewer than three are). Memory: (m + floor_mib) / (b + floor_mib). Sizes: m / b. A failing timing or memory gate re-runs only the failing phases, up to `retries` times, keeping the minimum of the medians.",
   "normalize_by_calibration": true,
   "calibration_clamp": [0.5, 2.0],
   "query": { "floor_ms": 2.0, "max_ratio": 3.0 },
-  "geomean": { "max_ratio": 1.5, "epsilon_ms": 0.001 },
+  "geomean": { "max_ratio": 1.5, "epsilon_ms": 0.001, "min_base_ms": 1.0 },
   "build": { "floor_ms": 100.0, "max_ratio": 2.0, "max_ratio_disk": 2.5 },
   "open": { "floor_ms": 20.0, "max_ratio": 2.5 },
   "rss": { "floor_mib": 32.0, "max_ratio": 1.5 },
