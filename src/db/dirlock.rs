@@ -27,7 +27,7 @@
 //! database still opens): exclusion is a safety net, never a reason to refuse
 //! service where it cannot be provided.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -165,6 +165,62 @@ impl Drop for DirLock {
                 let _ = file.unlock();
             }
         }
+    }
+}
+
+/// The directories a bulk build of this process is rebuilding.
+fn building() -> &'static Mutex<HashSet<PathBuf>> {
+    static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// This process's claim on a directory a bulk build is rebuilding
+/// ([`crate::bulk::build`]). The [`DirLock`] keeps other processes out; this
+/// keeps a second build in the same process out (the `DirLock` is shared
+/// within a process). Released when dropped.
+#[derive(Debug)]
+pub struct BuildGuard {
+    dir: PathBuf,
+}
+
+impl BuildGuard {
+    /// Claim directory `dir` (which must exist); fails if a build of this
+    /// process already rebuilds it.
+    pub fn enter(dir: &Path) -> Result<BuildGuard> {
+        let canonical = fs::canonicalize(dir).map_err(|e| {
+            GStoreError::Database(format!(
+                "cannot lock database directory '{}': {e}",
+                dir.display()
+            ))
+        })?;
+        let mut set = building().lock().unwrap_or_else(PoisonError::into_inner);
+        if !set.insert(canonical.clone()) {
+            return Err(GStoreError::Database(format!(
+                "database directory '{}' is being rebuilt by another bulk build of this process",
+                dir.display()
+            )));
+        }
+        Ok(BuildGuard { dir: canonical })
+    }
+
+    /// Whether a build of this process is rebuilding `dir`.
+    pub fn active(dir: &Path) -> bool {
+        let Ok(canonical) = fs::canonicalize(dir) else {
+            return false;
+        };
+        building()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&canonical)
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        building()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.dir);
     }
 }
 

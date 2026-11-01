@@ -261,6 +261,123 @@ impl SigFilter for DiskTree {
     }
 }
 
+/// What [`write_sorted_stream`] wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DiskTreeStats {
+    /// Entities indexed.
+    pub entities: u64,
+    /// Pages of the file, the header included.
+    pub pages: u64,
+}
+
+/// Write a `vstree.kv` at `path` from `entries` **already in clustering
+/// order** (the order [`sort_entries`] gives: signature limbs, then id),
+/// streaming: one leaf is in memory at a time plus the `(union, page)` pair
+/// of each node of the level being built. The file is byte-identical to the
+/// one [`DiskTree::build_sorted`] (and so [`DiskTree::build`]) writes for the
+/// same entries — the same pages in the same order under the same version-1
+/// header — but written directly, without the page cache and its WAL, then
+/// `fsync`ed once. An existing file at `path` is replaced.
+pub(super) fn write_sorted_stream<I>(path: &Path, entries: I) -> Result<DiskTreeStats>
+where
+    I: IntoIterator<Item = Result<(EntityLiteralId, Signature)>>,
+{
+    use crate::kvstore::format;
+    use std::io::{BufWriter, Seek, SeekFrom, Write};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let mut w = BufWriter::with_capacity(1 << 20, file);
+    w.seek(SeekFrom::Start(PAGE_SIZE as u64))?;
+    let mut next: PageId = 1;
+    let mut count = 0u64;
+    // Leaves, as the entries stream in.
+    let mut level: Vec<(Signature, PageId)> = Vec::new();
+    let mut chunk: Vec<(Signature, u32)> = Vec::with_capacity(DISK_FANOUT);
+    let mut emit_leaf = |chunk: &mut Vec<(Signature, u32)>,
+                         w: &mut BufWriter<std::fs::File>,
+                         next: &mut PageId|
+     -> Result<()> {
+        let mut nsig = Signature::new();
+        for (s, _) in chunk.iter() {
+            nsig.union_with(s);
+        }
+        let page = build_node(true, &nsig, chunk.iter().copied());
+        w.write_all(&page)?;
+        level.push((nsig, *next));
+        *next += 1;
+        chunk.clear();
+        Ok(())
+    };
+    for e in entries {
+        let (id, sig) = e?;
+        chunk.push((sig, id));
+        count += 1;
+        if chunk.len() == DISK_FANOUT {
+            emit_leaf(&mut chunk, &mut w, &mut next)?;
+        }
+    }
+    if !chunk.is_empty() {
+        emit_leaf(&mut chunk, &mut w, &mut next)?;
+    }
+    // Internal levels, bottom-up, until a single root remains.
+    while level.len() > 1 {
+        let mut up = Vec::with_capacity(level.len().div_ceil(DISK_FANOUT));
+        for children in level.chunks(DISK_FANOUT) {
+            let mut nsig = Signature::new();
+            for (s, _) in children {
+                nsig.union_with(s);
+            }
+            let page = build_node(false, &nsig, children.iter().copied());
+            w.write_all(&page)?;
+            up.push((nsig, next));
+            next += 1;
+        }
+        level = up;
+    }
+    let root = level.first().map_or(0, |&(_, p)| p);
+    // The header the pager writes for this tree: version 1, no free list,
+    // root and entity count in their slots.
+    let mut hdr = [0u8; PAGE_SIZE];
+    hdr[0..8].copy_from_slice(format::magic_for(0));
+    hdr[8..12].copy_from_slice(&next.to_le_bytes());
+    let slot = |i: usize| 16 + i * 8;
+    hdr[slot(ROOT_SLOT)..slot(ROOT_SLOT) + 8].copy_from_slice(&u64::from(root).to_le_bytes());
+    hdr[slot(COUNT_SLOT)..slot(COUNT_SLOT) + 8].copy_from_slice(&count.to_le_bytes());
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(&hdr)?;
+    w.flush()?;
+    let file = w.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(DiskTreeStats {
+        entities: count,
+        pages: u64::from(next),
+    })
+}
+
+impl super::VsTree {
+    /// Write an out-of-core VS-tree file (`vstree.kv`) at `path` from
+    /// `(entity id, signature)` entries **already in clustering order** —
+    /// ascending by signature limbs, then id, the order the bulk builds sort
+    /// into — streaming, without holding the entries in memory. The file is
+    /// byte-identical to [`build_disk`](Self::build_disk) over the same
+    /// entries; open it with [`open_disk`](Self::open_disk). An error from
+    /// the iterator stops the write and is returned. Returns the number of
+    /// entities written and the file's page count (header included).
+    pub fn write_disk_sorted<P, I>(path: P, entries: I) -> Result<(u64, u64)>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = Result<(EntityLiteralId, Signature)>>,
+    {
+        let st = write_sorted_stream(path.as_ref(), entries)?;
+        Ok((st.entities, st.pages))
+    }
+}
+
 /// Serialize one node page from its kind, union signature, and `(entry_sig,
 /// value)` entries (`value` = entity id for a leaf, child page id for internal).
 fn build_node(
@@ -347,6 +464,51 @@ mod tests {
         let cands2 = t2.candidates(&q).unwrap().unwrap();
         assert!(cands2.contains(&123));
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The streaming writer produces exactly the file `DiskTree::build`
+    /// writes through the pager, for empty, one-leaf, exact-fan-out and
+    /// multi-level trees.
+    #[test]
+    fn streaming_write_is_byte_identical_to_build() {
+        for n in [0u32, 1, 31, 32, 33, 1024, 1025, 40_000] {
+            let mut entries = Vec::new();
+            for i in 0..n {
+                let mut s = Signature::new();
+                s.encode_edge(i % 11, i % 97, EdgeDir::Out);
+                if i % 5 == 0 {
+                    s.encode_edge(i % 3, i, EdgeDir::In);
+                }
+                entries.push((i * 3, s));
+            }
+            let a = tmp(&format!("stream_ref_{n}_{}", std::process::id()));
+            let b = tmp(&format!("stream_new_{n}_{}", std::process::id()));
+            drop(DiskTree::build(&a, entries.clone()).unwrap());
+            let mut sorted = entries;
+            sort_entries(&mut sorted);
+            let (entities, pages) =
+                super::super::VsTree::write_disk_sorted(&b, sorted.into_iter().map(Ok)).unwrap();
+            assert_eq!(entities, u64::from(n));
+            let (ra, rb) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+            assert_eq!(rb.len() as u64, pages * PAGE_SIZE as u64);
+            assert!(ra == rb, "vstree.kv differs for {n} entities");
+            let t = DiskTree::open(&b).unwrap();
+            assert_eq!(t.entity_count(), n as usize);
+            std::fs::remove_file(&a).ok();
+            std::fs::remove_file(&b).ok();
+        }
+    }
+
+    #[test]
+    fn streaming_write_stops_at_an_iterator_error() {
+        let p = tmp(&format!("stream_err_{}", std::process::id()));
+        let items = vec![
+            Ok((1u32, Signature::new())),
+            Err(crate::error::GStoreError::Database("boom".into())),
+        ];
+        let e = super::super::VsTree::write_disk_sorted(&p, items).unwrap_err();
+        assert!(e.to_string().contains("boom"));
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
