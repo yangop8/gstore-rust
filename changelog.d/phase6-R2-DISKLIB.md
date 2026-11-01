@@ -244,7 +244,8 @@ commits against readers running 10-second queries) passes too (60.4 s).
 
 At the final commit: `cargo fmt --all -- --check`; `cargo build --workspace
 --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings`
-clean; `cargo test --workspace` VERIFY-PLACEHOLDER. RocksDB was not built:
+clean; `cargo test --workspace`: 2,094 passed, 0 failed, 2 ignored (one is this
+package's soak test). RocksDB was not built:
 no RocksDB code reaches this package's code (`Backend` is unchanged and
 `src/backend/` does not use the kvstore or the overlay). No feature-gated
 code was touched. No existing test was changed.
