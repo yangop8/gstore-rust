@@ -10,8 +10,10 @@ repository = "https://github.com/yangop8/gstore-rust"
 # The gNLQA natural-language QA orchestrator lives in its own crate so its
 # heavier deps (HTTPS client for the LLM API, JSON) stay out of the lean gStore
 # crate. Cargo isolates per-crate deps, so `cargo build -p gstore` is unaffected.
+# `bench` is gstore-bench, the benchmark harness and its CI gates (see
+# bench/README.md).
 [workspace]
-members = ["gnlqa"]
+members = ["gnlqa", "bench"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

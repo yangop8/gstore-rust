@@ -1,0 +1,31 @@
+[package]
+name = "gstore-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "gstore-bench: the benchmark harness of gstore-rust (LUBM-like data, build/open/query/update/concurrency phases, baselines and CI gates)"
+license = "BSD-3-Clause"
+repository = "https://github.com/yangop8/gstore-rust"
+publish = false
+
+# Only crates Cargo.lock already holds (serde / serde_json come in through
+# gnlqa). The build phase runs the real `gbuild` binary of the gstore package
+# (see `src/runner/backends.rs`); every other phase calls the gstore library.
+[dependencies]
+gstore = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Measure the RocksDB layout too (`--backends rocksdb`): opening and querying a
+# RocksDB database in-process needs the library feature, and the `gbuild` found
+# in `--bin-dir` must be built with `--features rocksdb` as well.
+rocksdb = ["gstore/rocksdb"]
+
+[lib]
+name = "gstore_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gstore-bench"
+path = "src/main.rs"
