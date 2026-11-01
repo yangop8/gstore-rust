@@ -107,6 +107,64 @@ build/open/query/update/并发阶段、闸门与 CI 冒烟)已就绪;pre-Phase-6
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `05be7e3`: R1 merged, review fixes, rustfmt)
+
+The R1 round re-measured with this harness on the idle reference VM (load
+average 1.0; every heavy command under `flock /tmp/gstore-bench.lock`;
+binaries built before measuring). Results:
+`bench/results/phase6-r1-lubm8.json` and `phase6-r1-lubm38.json` (snapshot,
+disk, RocksDB; `run --profile reference --drop-caches --verify-data`,
+RocksDB from a `--features rocksdb` build, joined with `merge`, whose
+cross-backend self-check passed), compared with the pre-Phase-6 files
+(`compare … --markdown`, **PASS, 281 gates** at each scale) in
+`bench/results/phase6-r1-lubm{8,38}-compare.md`. The per-backend tables and
+the package acceptance are in the R1-CORE and R1-KV fragments. Harness
+items re-checked on the branch:
+
+- **Sizes and data:** the cached univ 8 / 38 files re-hash to
+  `ed44da2e7b3bbb98` / `fcd6493725f3c66a` (`--verify-data`), 1,029,275 /
+  5,181,103 unique triples, `triple_num` equal on every layout; univ 1 (smoke)
+  `b45d2e4d786f1a33`, 139,905.
+- **All 14 queries non-empty:** univ 1 (smoke: snapshot, disk), univ 8 and
+  univ 38 (snapshot, disk, RocksDB), rows and row hashes identical to the
+  reference and across layouts, in every one of the 5 query processes.
+- **Generation:** `gstore-bench gen --scale N --out - > /dev/null`: univ 1
+  0.055 s, univ 8 0.435 s, univ 38 2.108 s = 2.61M / 2.45M / 2.54M lines/s
+  (2.54M / 2.37M / 2.46M unique triples/s).
+- **Repeatability on the branch:** a second univ 8 snapshot run (`--backends
+  snapshot --no-update --no-conc`): geomean ratio **1.003** over all 14
+  queries (1.009 over the queries of ≥ 1 ms; per query 0.93–1.07), database
+  bytes identical (85,480,180, also equal to pre). Byte counts:
+  snapshot 85,480,180 / 430,848,180 equal to pre; disk 175,005,701 /
+  889,778,181 and smoke disk 24,006,661 are **one byte below** pre because
+  `dir_bytes` includes the disk layout's `LOCK` file, which holds the
+  builder's pid (5 digits now, 6 then); `kvstore.kv` and `vstree.kv` sizes
+  are equal (a harness wart, harmless under the 1.25× size gate). RocksDB
+  bytes vary between builds (41,162,410 → 41,135,741 at univ 8).
+- **Gates on the new files:** `compare phase6-r1-lubm8.json` against itself
+  with `--self-test-slowdown 1.3` exits 0 (281 gates), `1.6` exits 1 (3
+  geomean gates); `check --from <smoke result> --self-test-slowdown 3` (the
+  canary) exits 1; a copy of `phase6-r1-lubm8.json` with snapshot Q9
+  (42.7 ms) × 4 exits 1 (`time.query` 3.87 > 3.0, the only failure), one
+  with a changed snapshot Q5 row hash exits 1 (`exact.rows` plus two
+  `exact.cross_backend`); `tests/gates.rs` passes.
+- **CI smoke (local):** `gstore-bench ci` **PASS, 193 gates** against
+  `bench/baselines/smoke.json`, 32 s wall. Against the baseline: snapshot
+  build 0.41×, query geomean 0.51× (per query 0.04–0.86×), warm open 0.97×,
+  RSS after open 1.00×, bytes identical; disk build 0.33×, query geomean
+  0.64× (per query 0.06–1.02×), warm open 0.30×, RSS 0.92×. **Not
+  re-blessed:** plan §5.6(d) asks for ≥ 1.5× on every smoke metric, and the
+  snapshot open, RSS, bytes and several queries (disk Q1/Q3/Q12 0.92–1.02×)
+  did not improve that much. The baseline stays `e859f7e`'s, so the gates
+  keep their pre-Phase-6 slack (a return of the snapshot queries to the
+  pre-Phase-6 speed would still pass); the canary checks a run against
+  itself and is unaffected.
+- **Tests:** `cargo test -p gstore-bench` (debug, after compiling): 44
+  passed, 1 ignored, **9.7 s** wall.
+- Wall time of the reference runs on the branch: univ 8 3.5 min (snapshot
+  + disk) + 1.9 min (RocksDB), univ 38 15.0 min + 8.0 min (pre: 7.7 + 4.4
+  and 39.4 + 23.7 min).
+
 ### Quiet measure stage — the pre-Phase-6 reference
 
 Recorded on the reference VM (4 vCPU `Intel Xeon @ 2.10GHz`, 16 GB, Linux),
@@ -347,3 +405,15 @@ layouts. Its provisional smoke baseline is replaced by the one above.
 - **Not yet:** the `/api` concurrency point logs every query to the API
   query log of its scratch root (the real server path, kept on purpose); no
   WatDiv workload (R4-CLOSURE).
+
+From the quiet post-merge stage (`05be7e3`):
+
+- **R4-CLOSURE (owner of `bench/**`):** `build.dir_bytes` counts the disk
+  layout's `LOCK` file, whose size is the builder pid's digit count, so the
+  "identical bytes" comparison of two disk builds can differ by a byte;
+  exclude `LOCK` (and the RocksDB `LOG*` files, if exact RocksDB bytes are
+  ever wanted).
+- **Smoke baseline:** not re-blessed after R1 (not every smoke metric
+  improved ≥ 1.5×; plan §5.6d). Until it is, the smoke gates allow the
+  snapshot queries to fall back to about pre-Phase-6 speed; re-bless when a
+  later round clears the §5.6(d) bar.

@@ -103,6 +103,73 @@ atomic logical writes; the §3.1 registry in `src/kvstore/format.rs`.
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `05be7e3`: R1 merged, review fixes, rustfmt)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), idle apart from this
+stage (load average 1.0 while measuring; four idle debug `gserver`
+processes of another workflow at 0% CPU). Every binary was built before
+measuring; every heavy command ran under `flock /tmp/gstore-bench.lock`.
+Base = `90b92d6` in a temporary detached worktree (release `gbuild`, and
+`examples/kv_bench.rs` with its `api` module switched to the base read API:
+`po_by_s`, `o_by_sp`, `iter_all` for the SPO scan,
+`TripleSource::subject_keys`, no contract-ordered `iter_all`); branch =
+`05be7e3`. Data: `gen_lubm.py --univ 8` (`lubm-like-univ8.nt`, 1,088,422
+statements, 1,052,262 triples), the implementer's data set.
+
+`gbuild --disk` A/B (page cache dropped before each build):
+
+| | base `90b92d6` | branch `05be7e3` | ratio |
+|---|---:|---:|---:|
+| `gbuild --disk` univ 8, wall | 258.8 s | 86.1 s | **0.33×** |
+| `kvstore.kv` / `vstree.kv` | 156,381,184 / 22,716,416 B | `cmp`: byte-identical | |
+| header | | `GSTOREKV` (V1); bytes past `16+24*8` zero | |
+
+`kv_bench <db> --queries testdata/lubm` (defaults: 5 reps, 3 query reps,
+20,000 lookups, seed 42, whole file cached), interleaved base, branch,
+base, branch, all on the database the **base** `gbuild --disk` built:
+
+| key | base (2 runs) | branch (2 runs) | ratio (of the means) | acceptance |
+|---|---:|---:|---:|---|
+| `lookup_po_by_s_ns` | 20,109 / 21,841 | 1,140 / 1,035 | **19.3× faster** | ≥ 3× — met |
+| `lookup_o_by_sp_ns` | 20,476 / 19,641 | 1,082 / 916 | **20.1× faster** | ≥ 3× — met |
+| `scan_spo_ms` (SPO → `Vec<IdTriple>`) | 253.5 / 247.5 | 19.1 / 11.1 | **16.6× faster** | ≥ 3× — met |
+| `scan_iter_all_pso_ms` (branch only) | — | 29.3 / 24.9 | | |
+| `open_to_memory_ms` (warm) | 1,439.3 / 1,363.6 | 481.0 / 333.4 | **0.29×** | ≤ 0.7× — met |
+| `open_load_disk_ms` (warm) | 1,465.3 / 1,381.6 | 329.6 / 327.4 | 0.23× | |
+| `query_geomean_warm_ms` (`DiskStore::query` Q1–Q14) | 55.06 / 52.17 | 5.82 / 6.09 | **9.0× faster** | ≥ 2× — met |
+| `query_all_match` | true / true | true / true | | identical — met |
+
+Per query (`DiskStore::query`, warm ms, first round, base → branch; rows
+8/28/9/10/481/82111/34/11137/1050/8/333/21/87795/62096, equal to the memory
+answer on both builds): Q1 5.64 → 0.21, Q2 81.08 → 2.10, Q3 16.50 → 0.64,
+Q4 72.44 → 0.11, Q5 42.36 → 29.84, Q6 50.89 → 35.98, Q7 117.41 → 49.03,
+Q8 528.52 → 77.47, Q9 1392.86 → 109.06, Q10 81.82 → 39.72, Q11 11.52 →
+0.43, Q12 2.69 → 0.08, Q13 101.70 → 57.31, Q14 89.63 → 50.63. Every query
+is faster. (The branch includes R1-CORE's planner and candidate-lookup work
+and the merge's C1 overrides, hence 9× here against the implementer's 4.2×.)
+
+The same picture from `gstore-bench run --profile reference` (Rust
+`lubm-like/1` data, against `bench/results/pre-phase6-lubm{8,38}.json`;
+full tables in the R1-CORE fragment and
+`bench/results/phase6-r1-lubm{8,38}-compare.md`): disk build 263.7 → 90.1 s
+(0.34×) at univ 8 and 1627.6 → 575.9 s (0.35×) at univ 38, with
+`kvstore.kv` and `vstree.kv` the same size (the directory total differs by
+one byte: the `LOCK` file holds the builder's pid); disk warm open 1447 →
+318 ms (0.22×) and 7673 → 2092 ms (0.27×); disk Q1–Q14 geomean 0.30× and
+0.26×; disk reopen after the update phase 10.0 → 0.68 s and 51.9 → 3.4 s;
+rows and row hashes identical.
+
+**Acceptance (R1-KV), quiet:** hot random `po_by_s` / `o_by_sp` ≥ 3× —
+**met** (19.3× / 20.1×); full SPO scan ≥ 3× — **met** (16.6×); warm
+`to_memory` open ≤ 0.7× — **met** (0.29×); `DiskStore::query` answers
+identical — **met**, warm geomean ≥ 2× faster — **met** (9.0×);
+incremental `gbuild --disk` at univ 8 no slower — **met** (0.33×,
+byte-identical output); no format change — **met** (`cmp`, V1 header); full
+suite — see the R1-CORE fragment's quiet section (`cargo test --workspace`
+at `05be7e3`).
+
+### Implementer run
+
 **Implementer run, noisy (other agents compiling; load average 3.5–4.5 on
 4 vCPUs).** Univ 8 only (LUBM-like, `gen_lubm.py --univ 8`: 1,088,422
 statements, 1,052,262 unique triples, 171,836 entities, 88,738 literals, 17
