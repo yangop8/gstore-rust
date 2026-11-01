@@ -9,8 +9,9 @@
 #       --stop-timeout 120 gstore-rust
 #   curl 'http://127.0.0.1:9000/api?operation=check'
 #
-# Optional cargo features: --build-arg FEATURES="gzip tls zip" (pure Rust);
-# "rocksdb" also works (the builder then installs clang for bindgen).
+# Optional cargo features: --build-arg FEATURES="gzip tls zip readline" (pure
+# Rust; readline only changes gconsole); "rocksdb" also works (the builder
+# then installs clang for bindgen).
 # See docs/DEPLOY.md.
 
 # ---- builder ------------------------------------------------------------------

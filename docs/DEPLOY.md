@@ -37,8 +37,8 @@ user `gstore`.
 
 ```bash
 docker build -t gstore-rust .
-# optional features: gzip / tls / zip are pure Rust; rocksdb makes the
-# builder install clang for bindgen
+# optional features: gzip / tls / zip / readline are pure Rust; rocksdb
+# makes the builder install clang for bindgen
 docker build --build-arg FEATURES="gzip tls zip" -t gstore-rust .
 
 # root's password, read once when the user store is created (the server
@@ -187,6 +187,19 @@ documents every key and the gstore-rust extensions). Command-line flags win
 over it: `-c FILE`, `-p/--port`, `--addr`, `--password`, `--password-file`, `--db-home`,
 `--thread-num`, `--no-checkpoint`, `--load-dir`, … (`gserver -h`).
 
+**Query evaluation** (`[query]`, a gstore-rust section upstream has no keys
+for): `integer_division` (`decimal`, SPARQL 1.1's `7/2` = `3.5`, or
+`truncate`, upstream's `3`), `query_cache_size` (each database's read-query
+cache budget in bytes, `0` = off, default 64 MiB), `early_termination`,
+`topk_bounded_heap`, `topk_dpb` (Top-K evaluation of `LIMIT` / `ORDER BY …
+LIMIT`) and `gfun_max_output_bytes` (the most JSON one graph-function call
+may produce, default 64 MiB). They apply to every database the server
+loads, builds, creates or restores, and `refreshconf` re-applies them to
+the loaded ones. The graph functions (`shortestPath`, `PR`, `louvain`, …)
+run on a per-database CSR built on the first such query after a change;
+`/api` `loadcsr` (or `load` with `csr=1`) builds it ahead of time, and
+`show` reports whether it is built (`csr`). Any write discards it.
+
 **Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
 and `batchRemove` read a `.zip` of RDF files (each entry needs an extension
 from `upload_allow_extensions`, which by default omits `nq`), `backup
@@ -221,6 +234,9 @@ analogue of upstream's log4cplus `SLOG_*` log):
   `YYYY-MM-DD HH:MM:SS.mmm [LEVEL] [module] message`.
 * The startup lines `gserver` prints on standard output (where it listens,
   its pid file, …) are recorded in the log file too.
+* `/api` `refreshconf` re-reads `log_mode`'s file and these keys and
+  reconfigures the log (another file or level takes effect at once), as
+  upstream's `refreshconf` re-runs log4cplus.
 
 **Query and access logs** (as upstream; read with the `/api` operations
 `querylog`, `querylogdate`, `accesslog`, `accesslogdate`):

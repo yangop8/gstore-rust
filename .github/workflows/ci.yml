@@ -45,6 +45,9 @@ jobs:
           key: test
       - run: cargo test --workspace
 
+  # One job per optional feature of the gstore crate: build, clippy and test
+  # with it. (rocksdb has its own job below: its bundled C++ build needs
+  # clang and a longer timeout.)
   features:
     name: test (gstore, --features ${{ matrix.feature }})
     runs-on: ubuntu-latest
@@ -106,7 +109,12 @@ jobs:
       - name: install clang (librocksdb-sys bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: rocksdb
-      - run: cargo test -p gstore --features rocksdb
+      - name: clippy
+        run: cargo clippy -p gstore --all-targets --features rocksdb -- -D warnings
+      - name: test
+        run: cargo test -p gstore --features rocksdb
