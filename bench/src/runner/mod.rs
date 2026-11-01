@@ -77,10 +77,7 @@ pub fn profile(name: &str) -> Option<Profile> {
             open_reps: 1,
             singles: 3,
             update: true,
-            conc: Some(ConcSettings {
-                queries: vec!["q1".into()],
-                ..both(vec![1, 2], 0.3)
-            }),
+            conc: Some(both(vec![1, 2], 0.25)),
             timeout_build_s: 300,
             timeout_s: 300,
             quick_calib: true,

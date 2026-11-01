@@ -184,7 +184,7 @@ impl Vocab {
             publication_author: ub("publicationAuthor"),
             c_university: ub("University"),
             c_department: ub("Department"),
-            c_kind: KINDS.map(|(k, _, _)| ub(k)),
+            c_kind: KINDS.map(|k| ub(k.class)),
             c_undergrad: ub("UndergraduateStudent"),
             c_grad: ub("GraduateStudent"),
             c_course: ub("Course"),
@@ -197,12 +197,34 @@ impl Vocab {
     }
 }
 
-/// Faculty kinds: (class, head-count range, publication range).
-const KINDS: [(&str, (u64, u64), (u64, u64)); 4] = [
-    ("FullProfessor", (7, 10), (15, 20)),
-    ("AssociateProfessor", (10, 14), (10, 18)),
-    ("AssistantProfessor", (8, 11), (5, 10)),
-    ("Lecturer", (5, 7), (0, 5)),
+/// A faculty kind: its class, head-count range and publication range.
+struct Kind {
+    class: &'static str,
+    count: (u64, u64),
+    publications: (u64, u64),
+}
+
+const KINDS: [Kind; 4] = [
+    Kind {
+        class: "FullProfessor",
+        count: (7, 10),
+        publications: (15, 20),
+    },
+    Kind {
+        class: "AssociateProfessor",
+        count: (10, 14),
+        publications: (10, 18),
+    },
+    Kind {
+        class: "AssistantProfessor",
+        count: (8, 11),
+        publications: (5, 10),
+    },
+    Kind {
+        class: "Lecturer",
+        count: (5, 7),
+        publications: (0, 5),
+    },
 ];
 const LECTURER: usize = 3;
 
@@ -309,7 +331,7 @@ impl Lubm {
 
         let counts: Vec<u64> = KINDS
             .iter()
-            .map(|(_, (lo, hi), _)| rng.range_inclusive(*lo, *hi))
+            .map(|k| rng.range_inclusive(k.count.0, k.count.1))
             .collect();
         let mut faculty: Vec<Faculty> = Vec::new();
         let mut professors: Vec<usize> = Vec::new(); // indices into faculty
@@ -321,7 +343,7 @@ impl Lubm {
                 faculty.push(Faculty {
                     kind,
                     idx: i,
-                    local: format!("{}{i}", KINDS[kind].0),
+                    local: format!("{}{i}", KINDS[kind].class),
                 });
             }
         }
@@ -370,7 +392,7 @@ impl Lubm {
             if f.kind == 0 && f.idx == head {
                 out.t(&s, &v.head_of, &diri)?;
             }
-            let (lo, hi) = KINDS[f.kind].2;
+            let (lo, hi) = KINDS[f.kind].publications;
             for k in 0..rng.range_inclusive(lo, hi) {
                 publications.push((fi, k));
             }

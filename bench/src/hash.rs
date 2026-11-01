@@ -85,7 +85,9 @@ pub fn rows_fnv64(rows: &[Vec<Option<String>>]) -> u64 {
     for row in rows {
         sum = sum.wrapping_add(crate::rng::mix64(row_fnv64(row)));
     }
-    crate::rng::mix64(sum ^ (rows.len() as u64).wrapping_mul(crate::rng::GOLDEN_GAMMA))
+    crate::rng::mix64(
+        sum.wrapping_add(FNV_OFFSET) ^ (rows.len() as u64).wrapping_mul(crate::rng::GOLDEN_GAMMA),
+    )
 }
 
 /// A writer that hashes and counts everything written through it.
@@ -165,7 +167,7 @@ mod tests {
         let h2 = rows_fnv64(&[b.clone(), a.clone()]);
         assert_eq!(h1, h2, "order does not matter");
         assert_ne!(h1, rows_fnv64(&[a.clone(), b.clone(), a.clone()]), "duplicates count");
-        assert_ne!(h1, rows_fnv64(&[a.clone()]));
+        assert_ne!(h1, rows_fnv64(std::slice::from_ref(&a)));
         // Unbound differs from the empty string.
         let unbound = vec![None];
         let empty = vec![Some(String::new())];

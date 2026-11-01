@@ -307,6 +307,7 @@ fn calib_factor(t: &Thresholds, base: &BenchResult, b: &BackendRun, m: &BenchRes
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ratio_gate(
     gate: &str,
     subject: String,
