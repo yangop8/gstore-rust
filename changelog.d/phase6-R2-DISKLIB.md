@@ -131,6 +131,96 @@ identical, warm Q1–Q14 geomean 1.24–1.26× the materialized path.
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `0c9bdb6`: R2 merged, review fixes)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), idle apart from this
+stage (load average 1.0, CPU busy 25–27% = the measured process, steal
+≤ 1%); release builds made before measuring; every command under `flock
+/tmp/gstore-bench.lock`. Databases: `gbuild --disk` of this commit (the bulk
+build, `kvstore.kv` 542,609,408 bytes at univ 38 and 107,880,448 at univ 8;
+`vstree.kv` fresh), deleted afterwards. `disk_stream_probe --mode query
+--qreps 5` at univ 38 (`--qreps 7` at univ 8), page cache = the whole file
+(132,537 / 26,402 pages) and again with `--cache-pages 4096` (16 MiB, the
+cache `Database` uses); `--mode overlay --reps 9 --lookups 5000` at univ 38
+(`--lookups 10000` at univ 8).
+
+| query | rows (univ 38) | univ 38: materialized / DiskTriples / view ms | ratio | ratio, 16 MiB cache | univ 8 ratio (whole file / 16 MiB) |
+|---|---:|---|---:|---:|---|
+| Q1 | 3 | 5.66 / 7.06 / 6.88 | 1.25 | 1.21 | 1.51 / 1.47 |
+| Q2 | 115 | 49.20 / 99.61 / 99.59 | **2.02** | **2.19** | 1.91 / **2.23** |
+| Q3 | 10 | 4.57 / 6.96 / 6.98 | 1.52 | 1.53 | **2.04** / **2.08** |
+| Q4 | 9 | 2.01 / 2.10 / 2.11 | 1.04 | 1.06 | 1.12 / 1.11 |
+| Q5 | 576 | 272.76 / 265.73 / 262.82 | 0.97 | 1.07 | 1.11 / 1.06 |
+| Q6 | 404,399 | 203.72 / 215.18 / 210.00 | 1.06 | 1.02 | 0.98 / 1.04 |
+| Q7 | 23 | 409.43 / 472.69 / 421.76 | 1.15 | 1.06 | 1.04 / 1.05 |
+| Q8 | 10,778 | 379.64 / 440.16 / 379.13 | 1.16 | 0.98 | 1.15 / 1.08 |
+| Q9 | 5,507 | 508.69 / 627.41 / 535.29 | 1.23 | 1.16 | 1.68 / 1.35 |
+| Q10 | 3 | 280.94 / 299.00 / 269.98 | 1.06 | 0.96 | 1.11 / 1.02 |
+| Q11 | 325 | 1.45 / 1.42 / 1.28 | 0.97 | 1.23 | 1.40 / 1.38 |
+| Q12 | 21 | 0.54 / 0.57 / 0.56 | 1.05 | 0.99 | 1.16 / 1.17 |
+| Q13 | 432,512 | 271.78 / 310.44 / 306.25 | 1.14 | 1.12 | 0.98 / 1.03 |
+| Q14 | 305,503 | 124.11 / 130.43 / 130.82 | 1.05 | 1.03 | 1.04 / 1.03 |
+| **geomean** | | **43.39 / 50.73 / 48.27** | **1.169** (view 1.112) | **1.158** (view 1.171) | **1.263** (view 1.265) / **1.248** (1.248) |
+
+`query_all_match=true` in all four runs (rows in order, all 14 queries,
+also through `DiskReadView`). For scale, the open costs Stream mode avoids
+at univ 38: `dictionary()` 612–617 ms, materializing the `TripleStore`
+1078–1116 ms (`DiskStore::open` 0.1–0.7 ms).
+
+**Hot spots (for R3-STREAM's default-mode decision):** the geomean passes
+at both scales, but Q2 is 1.9–2.2× and Q3 1.5–2.1× (long `type` posting
+lists decoded key by key from B+tree leaves, plus the re-sort of
+`so_by_p` / `ps_by_o` / `subs_by_p` ranges whose key order is not the
+contract order), Q9 1.2–1.7× (many short probes, a B+tree descent each),
+Q1 1.2–1.5×. Nothing exceeds 3× (G1d's per-query bound); large-result
+queries (Q5–Q8, Q10, Q13, Q14) are at 0.96–1.16×.
+
+Overlay reads on untouched keys (ratios against the store read directly;
+geometric means over `po_by_s`, `o_by_sp`, `ps_by_o`, `s_by_po`,
+`count_po_by_s`, `exists`; the "other keys" overlay holds 9,996 changes):
+
+| source | univ 38 medians (worst method) | univ 38 minima (worst) | univ 8 medians (worst) | univ 8 minima (worst) |
+|---|---:|---:|---:|---:|
+| empty `OverlayView` | 1.024 (1.204) | 0.996 (1.085) | 0.998 (1.246) | 0.998 (1.016) |
+| `OverlayView`, other keys changed | **1.021** (1.233) | **1.020** (1.053) | **1.026** (1.108) | **1.038** (1.069) |
+| `DiskTriples`, no transaction | 1.022 (1.088) | 0.997 (1.140) | 1.026 (1.174) | 1.005 (1.031) |
+| `DiskTriples`, transaction open | 1.031 (1.063) | 1.040 (1.068) | 1.076 (1.272) | 1.023 (1.063) |
+
+The worst single methods by median are noise of the ~1 µs point reads: at
+univ 38 the worst is `o_by_sp` (1,605 / 1,645 ns against 1,334 ns), while
+the probe's second timing of the plain store for the same method
+(`base2`) took 1,779 ns, and the minima are 1,066 / 1,177 against 1,118 ns.
+Answers equal on every source (`overlay_answers_match=true`). Q1–Q14 with
+the 9,996-change transaction open, through its overlay, against the plain
+store (no VS-tree): geomean 1.011× at univ 38 and 1.030× at univ 8, all 14
+`txn_view_match=true`.
+
+**Acceptance (R2-DISKLIB), quiet:**
+- All tests pass: **met** at this commit, by the review stage's
+  verification of `0c9bdb6` itself (`phase6-R2-review.md`: `cargo test
+  --workspace --no-fail-fast` 2,174 passed, 0 failed, 2 ignored — this
+  package's one-minute soak and gstore-bench's `micro_on_disk`; `--features
+  rocksdb` 1,995 passed), which includes `dt_overlay` (seeded overlay
+  model, pager untouched before commit, commit/rollback, broken state,
+  `Drop` flush, `Expired`/`Closed` views, injected read errors, the threaded
+  stress test with its 200 ms commit bound, read-error isolation across
+  threads) and `dt_r2_integration`. The measure stage changed no code and
+  did not re-run the suite (it needs a fresh debug build, and the disk had
+  under 7.5 GiB free while another session was compiling); the soak test
+  last passed in the implementer's run (60.4 s).
+- `disk_stream_probe` at univ 8 and univ 38, answers identical to the
+  materialized path: **met** (all four runs, in order, also through the
+  snapshot view). Warm Q1–Q14 geomean ≤ 1.5× the materialized path:
+  **met** — univ 38 1.169× (16 MiB cache 1.158×), univ 8 1.263× (1.248×);
+  hot spots listed above (Q2 ≈ 2×).
+- Overlay reads on untouched keys ≤ 1.1× base cost: **met** — "other keys"
+  overlay 1.021 / 1.020 (medians / minima) at univ 38, 1.026 / 1.038 at
+  univ 8; empty overlay 0.996–1.024; every single method ≤ 1.085 by minima
+  for both overlays (the medians' 1.10–1.25 single-method values are timing
+  noise of ~1 µs reads, see above).
+
+### Implementer run
+
 **Implementer run, noisy (other agents compiling; load average 3.4–5.5 on 4
 vCPUs during the runs).** Univ 8 only; univ 38 is left to the quiet measure
 stage (commands below). Every heavy command ran under
@@ -308,3 +398,11 @@ materialized side.
   epoch. The overlay's key filters are fixed at 8 KiB per key kind: a
   transaction touching hundreds of thousands of keys saturates them, which
   only costs the (exact) merge path on every read.
+
+From the quiet post-merge stage (`0c9bdb6`; numbers under Measured numbers):
+
+- **R3-STREAM (default-mode decision):** on bulk-built databases the Stream
+  path is 1.17× (univ 38) / 1.26× (univ 8) the materialized path in
+  geomean, worst Q2 2.02–2.23×, Q3 1.52–2.08×, Q9 up to 1.68×; no query
+  above 3× (G1d's per-query bound). With the 16 MiB cache `Database` uses,
+  1.16× / 1.25×. The posting-list items above remain the levers.

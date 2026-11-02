@@ -145,6 +145,75 @@ installs them crash-safely; ids equal the memory build's; univ 8 in ~4–6 s
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `0c9bdb6`: R2 merged, review fixes)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), idle apart from this
+stage: load average 1.0 while measuring, CPU busy 25–27% (the one measured
+process; logged every 10 s from `/proc/stat`, steal ≤ 1%). Release builds
+made before measuring; every heavy command under `flock
+/tmp/gstore-bench.lock`; data from `/tmp/gstore-bench-cache` (univ 8
+`ed44da2e7b3bbb98`, univ 38 `fcd6493725f3c66a`). `gbuild --disk` is the
+bulk path; the `--incremental` A/B uses the same binary in the same
+session. Results: `bench/results/phase6-r2-lubm{8,38}.json` (the disk
+rows; compare files next to them).
+
+| metric | univ 8 bulk | univ 38 bulk | univ 38 `--incremental` (same binary) | pre-Phase-6 univ 38 |
+|---|---:|---:|---:|---:|
+| build wall (gstore-bench) | **4.04 s** | **19.84 s** | 601.26 s | 1627.59 s |
+| gbuild peak RSS | 96.9 MiB | **400.4 MiB** | 407.2 MiB | 738.1 MiB |
+| `kvstore.kv` bytes | 107,880,448 (0.706× pre 152,735,744) | **542,609,408 (0.697× pre)** | 778,428,416 | 778,428,416 |
+| `vstree.kv` bytes | 22,269,952 | 111,349,760 | 111,349,760 | 111,349,760 |
+| directory bytes | 130,150,406 | 653,959,174 (0.735×) | 889,778,182 | 889,778,182 |
+| open first (cold) / warm ms | 294 / 259 | 1654 / **1582** | 5604 / **1632** | 12387 / 7673 |
+| RSS after open / query HWM MiB | 88.2 / 118.3 | 350.1 / 460.2 | 350.2 / 460.3 | 544.0 / 740.6 |
+| Q1–Q14 warm geomean ms | 5.87 | **37.51** | **40.99** | 146.92 |
+| update: single insert median / chunk insert / chunk delete ms | 1.69 / 836 / 878 | 1.53 / 1298 / 1177 | 1.29 / 1021 / 1367 | 2.33 / 4830 / 5024 |
+
+`gbuild --disk` directly (peak RSS from `getrusage` of the child; phases
+from gbuild's own summary):
+
+| run | wall s | peak RSS MiB | parse+encode / spo / index / pos / osp+vstree / dictionary / finish ms | budget peak | term map | spills |
+|---|---:|---:|---|---:|---:|---|
+| univ 38, default | 21.96 | 400.3 | 19760 / 783 / 935 / 461 / 935 / 401 / 457 | 352.2 of 1024 MiB | 155.0 MiB | 0 runs |
+| univ 8, default | 3.63 | 96.8 | 3184 / 167 / 185 / 85 / 185 / 62 / 86 | 80.0 of 1024 MiB | 24.1 MiB | 0 runs |
+| univ 8, `--memory 128` | 3.83 | 76.1 | 3332 / 247 / 158 / 72 / 158 / 69 / 84 | 49.0 of 128 MiB | 24.1 MiB | **3 runs, 47.2 MiB** |
+
+`gstore-bench run --profile reference --scale 8 --backends disk --no-update
+--no-conc --gbuild-arg --memory --gbuild-arg 128`: build 3.77 s, gbuild
+peak **73 MiB**, the same 107,880,448-byte `kvstore.kv`, rows and row hashes
+equal. Parsing is still 90% of the univ 38 build (19.8 of 22.0 s, the
+single Turtle parser thread); everything else takes 4.0 s together.
+
+Bulk vs `--incremental` at univ 38, per query (warm ms, bulk / incremental):
+Q1 4.35/4.33, Q2 48.9/51.9, Q3 4.61/5.27, Q4 2.09/2.25, Q5 242/343, Q6
+153/155, Q7 344/379, Q8 299/331, Q9 453/491, Q10 246/296, Q11 1.00/1.00,
+Q12 0.53/0.57, Q13 215/225, Q14 109/115: ratio 0.71–1.00, none slower; the
+Q5 and Q10 gaps sit inside this harness's per-process spread (Q5's five
+process medians: 242–341 bulk, 343–432 incremental). `gstore-bench compare
+r2-38-incr.json r2-38-bulk(disk) --backends disk`: **PASS, 105 gates**
+(calibration-normalized geomean 0.96, warm open 1.02, build 0.03). The
+cold first open is 3.4× faster because the 90%-fill file is 30% smaller.
+The update chunk insert is 27% slower on the denser tree (1298 vs 1021 ms;
+report-only), its delete 14% faster.
+
+**Acceptance (R2-BULK), quiet:**
+- Build ≤ 15 s at univ 8: **met** — 4.04 s (0.015× pre 263.74 s; R1 90.14
+  s). ≤ 60 s at univ 38: **met** — 19.84 s (0.012× pre 1627.59 s, 0.033×
+  the same-session incremental build).
+- Peak RSS ≤ 1.25 GiB at univ 38 with the default budget: **met** — 400.4
+  MiB. `--memory 128` at univ 8, peak ≤ 400 MiB and ≥ 1 spill: **met** —
+  73 MiB (bench) / 76.1 MiB (direct), 3 runs spilled (47.2 MiB).
+- `kvstore.kv` ≤ 0.75 × pre: **met** — 0.697× at univ 38 (542,609,408 vs
+  778,428,416), 0.706× at univ 8.
+- Open and Q1–Q14 of a bulk-built database within ±10% of an incrementally
+  built one: **met** — warm open 0.97×, geomean 0.915× (bulk faster; no
+  query slower, compare PASS).
+- Identical answers: **met** — rows and row hashes of Q1–Q14 equal to the
+  pre-Phase-6 reference and across all layouts at both scales, bulk and
+  incremental (`compare` exact gates), in every query process.
+
+### Implementer run
+
 **Implementer run, noisy (other agents compiling).** 4 vCPU / 16 GB VM;
 load average 1.2–2.1 at the start of each run; every heavy command under
 `flock /tmp/gstore-bench.lock`; base and branch measured in the same
@@ -314,3 +383,16 @@ Not yet:
 - The 90% default fill makes later inserts into a freshly built database
   split nodes more often (chunk insert +17% at univ 8); `--fill` /
   `build_fill_factor` trade file size for that.
+
+From the quiet post-merge stage (`0c9bdb6`; numbers under Measured numbers):
+
+- univ 38 measured: 19.84 s, 400 MiB peak, `kvstore.kv` 0.697× pre. Parsing
+  is 90% of it (19.8 of 22.0 s on the single Turtle parser thread), so the
+  N-Triples fast path / chunked parallel parse (request 3, parser owner) is
+  the remaining lever for G7's µs/triple.
+- The denser tree's update cost at univ 38: chunk insert 1298 ms against
+  1021 ms into an incrementally built database (+27%; delete −14%),
+  report-only.
+- R4-CLOSURE (request 4 stands): the bench JSON still lacks gbuild's
+  `memory:` / `spills:` summary; this stage read it from a direct `gbuild`
+  run.

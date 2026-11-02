@@ -155,6 +155,125 @@ gates by the measure stage.
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `0c9bdb6`: R2 merged, review fixes)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), idle apart from this
+stage (load average 1.0 while measuring, CPU busy 25–27% = the measured
+process, steal ≤ 1%); release builds made before measuring; every heavy
+command under `flock /tmp/gstore-bench.lock`. Base = main before the branch,
+the prebuilt `aaea9f8` release binaries (`/tmp/gstore-base-aaea9f8/bin`,
+whose `gstore-bench` links the base library), measured in this session and
+alternated with the branch. Databases deleted afterwards.
+
+**Snapshot, `gstore-bench run --profile reference --backends snapshot
+--drop-caches`** — two rounds per side, alternating (branch round 1 = the
+reference run in `phase6-r2-lubm{8,38}.json`; the others `--no-update
+--no-conc`); a query's figure is the harness's minimum over 5 process
+medians, the geomean over all 14 queries:
+
+| metric | univ 8 base (2 rounds) | univ 8 branch | univ 38 base | univ 38 branch | pre-Phase-6 univ 38 |
+|---|---:|---:|---:|---:|---:|
+| RSS after open MiB | 127.4 / 127.4 | **101.7 / 101.5** (0.80×) | 609.0 / 608.9 | **488.6 / 488.5** (0.80×) | 596.4 |
+| open first (cold) / warm ms | 273 / 236, 287 / 291 | 213 / 177, 234 / 177 | 1587 / 1562, 1601 / 1487 | 1149 / 898, 1072 / 1112 | 1588 / 1465 |
+| query HWM MiB | 153.5 / 152.9 | 126.8 / 127.8 | 720.5 / 720.4 | 590.4 / 600.2 | 710.3 |
+| gbuild wall s / peak MiB | 5.73, 6.96 / 138 | 5.80, 5.58 / 112 | 32.33, 31.35 / 670 | 28.32, 29.84 / 550 | 76.82 / 741 |
+| database bytes | 85,480,180 | 85,480,180 | 430,848,180 | 430,848,180 | 430,848,180 |
+| Q1–Q14 geomean ms | 3.229 / 3.390 | 3.293 / 3.323 | 17.871 / 17.878 | 18.278 / 18.728 | 46.648 |
+| geomean branch / base (both rounds) | | **1.000×** | | **1.035×** | |
+
+Per query, branch / base (geometric mean of the two rounds each side):
+univ 38 Q1 0.140 → 0.178 ms (1.27), Q2 1.02, Q3 0.497 → 0.609 ms (1.22),
+Q4 1.06, Q5 1.06, **Q6 1.05**, Q7 1.00, Q8 0.85, Q9 0.98, Q10 1.02, Q11
+1.03, Q12 0.93, **Q13 1.03**, **Q14 1.05**; univ 8 Q1 1.17, Q3 1.26, **Q6
+1.01**, **Q13 1.04**, **Q14 1.07**, the rest 0.82–1.00. Rows and row hashes
+identical in every round on both sides.
+
+Profile of the differences (callgrind, `--toggle-collect` on
+`Database::query`, one run of the base and the branch `gquery` on the same
+univ 8 snapshot): **Q1 397,287 vs 396,648 instructions, Q3 1,048,409 vs
+1,047,516 — the same work.** With `--cache-sim=yes` the branch's Q1 has
+1,349 last-level write misses against 167, 1,216 of them in
+`TripleStore::s_by_po` writing its result `Vec`, which on the branch lands
+on heap memory not touched since the open (0 misses there on the base): a
+glibc heap-layout effect of the leaner open (fresh pages per query after
+heap trimming), worth tens of µs on these sub-millisecond queries, not a
+code path. **Q13 213.2M vs 208.0M instructions (+2.5%)**: the result
+materialization goes through `Evaluator::resolve_string` →
+`Dictionary::resolve` → `TermStr::into_string`, none inlined (9.25M
+instructions for 85,670 cells) where the base's `resolve_string` copied
+the `&str` itself (4.71M) — about 53 instructions more per resolved cell,
+the +3–7% of the large-result queries Q6/Q13/Q14. A diagnostic pair with
+`--env MALLOC_TRIM_THRESHOLD_=4294967295` was inconclusive (setting it also
+pins glibc's mmap threshold, which doubled both sides' Q1/Q3; geomean
+1.07× branch/base there; another agent's unlocked `cargo clippy` overlapped
+the start of the branch run's build phase).
+
+**Out-of-core dictionary, `kv_bench <db> --mode dict-ooc --qreps 5`** on
+this commit's bulk-built `kvstore.kv` (4096-page store cache, 64 MiB term
+cache + 16 MiB key cache):
+
+| | univ 38 | univ 8 |
+|---|---:|---:|
+| resident dictionary bytes after Q1–Q14 × 3 | **60,322,208** (447,195 strings) | 12,990,961 (97,504 strings) |
+| budget (term + key cache) / evictions | 83,886,064 / 0 | 83,886,064 / 0 |
+| Q6 out-of-core / in-memory ms | 210.40 / 148.71 (**1.41×**) | **1.37×** |
+| Q13 | 225.58 / 175.42 (**1.29×**) | **1.42×** |
+| Q14 | 140.44 / 93.26 (**1.51×**) | **1.45×** |
+| Q1–Q14 geomean ms | 26.35 / 25.50 | 4.54 / 3.61 |
+| rows in order equal | 14/14 | 14/14 |
+| process RSS after the runs | 344.8 MiB | 89.7 MiB |
+
+**Second identical CONTAINS (`kv_bench <snapshot> --mode contains --qreps
+3`, query cache off, 3,432 rows at univ 8):** three processes, first
+2073.6 / 2263.0 / 2888.5 ms, second 13.5 / 11.7 / 16.9 ms: **ratio 0.007 /
+0.005 / 0.006**; the kept index is 87,377,701 bytes (RSS 101 → 203 MiB).
+Univ 38 (17,138 rows): first 14,595.7 ms, second 81.7 ms (ratio 0.006), the
+kept index 430,954,544 bytes — RSS 488 → 1006 MiB, i.e. the cached index
+roughly doubles a univ 38 snapshot's memory after the first substring
+query (see Requests).
+
+**`dict.bin`** (`gbuild` snapshot builds of the same file; sha256, first
+16 hex digits):
+
+| build | univ 8 `dict.bin` | univ 38 `dict.bin` |
+|---|---|---|
+| branch #1 | `52504768ccdb14ff` | `784e5c357cb15542` |
+| branch #2 | `52504768ccdb14ff` | `784e5c357cb15542` |
+| base `aaea9f8` | `57ad19f887551438` | `1b61be6d9f173493` |
+| bytes (all) | 36,001,855 | 182,591,287 |
+
+Decoded (a bincode reader of the three interners — `forward` compared as a
+map, `backward` and `free` exactly, `forward` checked to be the inverse of
+`backward`): branch and base **decoded-identical** at both scales (168,432
+/ 86,612 / 17 and 842,657 / 433,389 / 17 terms, no holes, empty free
+stacks); only the serialized order of the `forward` `HashMap` differs, which
+is random per base build and reproducible on the branch. `store.bin`,
+`vstree.bin` and `named.bin` are byte-identical across all builds (`meta.bin`
+records the database path). Cross-binary: the base `gquery` on the branch's
+database and the branch `gquery` on the base's answer Q1–Q14 exactly like
+each binary on its own database (sorted outputs `cmp`-equal, 14/14 at both
+scales).
+
+**Acceptance (R2-DICT), quiet:**
+- Snapshot RSS after open ≤ 0.9 × pre at univ 38: **met** — 488.6 MiB =
+  0.82× pre (596.4), 0.80× the same-session base (609.0); univ 8 101.7 =
+  0.81× pre.
+- Snapshot Q1–Q14 geomean within ±5% of main-before-branch: **met** —
+  1.000× at univ 8, 1.035× at univ 38 (two alternating rounds per side).
+  Q6/Q13/Q14 individually +1–7%; Q1/Q3 +17–27% (sub-ms, same instruction
+  count, heap layout; see the profile above).
+- Out-of-core path at univ 38: **met** — 60,322,208 bytes resident after
+  Q1–Q14 × 3 (≤ 67,108,864), 0 evictions; Q6/Q13/Q14 at 1.41× / 1.29× /
+  1.51× the in-memory dictionary (≤ 2×); rows equal in order.
+- Second identical CONTAINS ≤ 0.25× the first (univ 8 snapshot): **met** —
+  0.005–0.007 (univ 38: 0.006).
+- `dict.bin` identical to pre-Phase-6 for the same input: **met as
+  decoded-identical** (and a base binary opens and answers the new snapshot
+  database); the raw hash cannot match because the base's own `dict.bin` is
+  not reproducible (HashMap order), while the branch's is.
+
+### Implementer run
+
 **Implementer run, noisy (other agents compiling; load average 2.5–5.9 on
 4 vCPUs).** Univ 8 only (lubm-like/1, 1,029,275 triples, data fnv
 `ed44da2e7b3bbb98`, from `/tmp/gstore-bench-cache`). Base = the prebuilt
@@ -348,3 +467,24 @@ Not yet / notes:
   posting lists' growth slack); a compact (front-coded strings, delta-coded
   postings) or persistent index is plan item D5.
 - A backed dictionary has no substring index (D5); substring filters scan.
+
+From the quiet post-merge stage (`0c9bdb6`; numbers under Measured numbers):
+
+- **R4-RECLAIM (owner of `src/dict/mod.rs` in R4):** the in-memory resolve
+  path costs about 53 instructions more per resolved cell than the base
+  (`Dictionary::resolve` and `TermStr::into_string` are not inlined into
+  `Evaluator::resolve_string`; callgrind of univ 8 Q13: 9.25M against
+  4.71M instructions for 85,670 cells, +2.5% of the query). That is the
+  +3–7% of the large-result queries Q6/Q13/Q14 on the memory layout; an
+  inlined in-memory fast path should recover it.
+- **R3-STREAM (owner of `src/db/mod.rs` in R3):** the cached substring
+  index is 430,954,544 bytes at univ 38 and stays for the database's
+  lifetime after one `CONTAINS` query (snapshot RSS 488 → 1006 MiB); the
+  memory gates (G1c, G2) are measured without substring queries. A bound or
+  an opt-out for very large dictionaries belongs with D5.
+- **R4-CLOSURE (report):** the sub-millisecond Q1/Q3 read 17–27% slower than
+  the base in the same session with identical instruction counts: their
+  result buffers land on heap pages untouched since the (smaller) open — a
+  glibc heap-layout effect, not a code path. The univ 38 out-of-core run
+  kept 60.3 MB of the 64 MiB term budget resident (no evictions), so a
+  larger query mix will start evicting at this scale.
