@@ -434,8 +434,9 @@ fn concurrent_db_snapshots_stay_exact_over_reused_spares() {
 /// `GSTORE_COW_BENCH_NT=<file.nt> cargo test --release --test dt_cow_store
 /// -- --ignored --nocapture concurrent_update_latency`). Prints the median,
 /// mean and 90th percentile in milliseconds — with no reader, and with a
-/// reader holding the snapshot of the version before (which keeps the
-/// spare copy from being reused: every write copies the store).
+/// reader holding the snapshots of the last two versions (the older one
+/// shares the spare copy, which then cannot be reused: every write copies
+/// the store, the fallback).
 #[test]
 #[ignore = "a timing driver: needs GSTORE_COW_BENCH_NT"]
 fn concurrent_update_latency() {
@@ -463,11 +464,16 @@ fn concurrent_update_latency() {
     let delete = format!("DELETE DATA {{ {t} }}");
     for hold in [false, true] {
         let mut samples = Vec::with_capacity(rounds * 2);
-        let mut previous = None;
+        // The snapshots of the last two versions: the older one shares the
+        // spare copy, so the next update cannot reuse it.
+        let mut previous = std::collections::VecDeque::new();
         for i in 0..rounds + 2 {
             for q in [&insert, &delete] {
                 if hold {
-                    previous = Some(cdb.snapshot());
+                    previous.push_back(cdb.snapshot());
+                    if previous.len() > 2 {
+                        previous.pop_front();
+                    }
                 }
                 let t0 = Instant::now();
                 let changed = cdb.update(q).expect("update");
@@ -483,7 +489,7 @@ fn concurrent_update_latency() {
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         let p = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
         println!(
-            "concurrent_update_latency (reader holds the previous snapshot: {hold}): n={} \
+            "concurrent_update_latency (a reader holds the last two snapshots: {hold}): n={} \
              median={:.3} ms mean={:.3} ms p90={:.3} ms min={:.3} ms",
             samples.len(),
             p(0.5),
