@@ -159,7 +159,7 @@ fn tolerant_report_and_log_equal_the_sequential_import() {
     let inc = base.join("inc.db");
     fs::create_dir_all(&inc).unwrap();
     let mut log = ParseErrorLog::open(inc.join("parse_error.log")).unwrap();
-    let want = Database::build_disk_from_sources(&inc, &srcs, &opts, &mut log).unwrap();
+    let want = Database::build_disk_from_sources_incremental(&inc, &srcs, &opts, &mut log).unwrap();
     drop(log);
     let want_log = log_lines(&inc.join("parse_error.log"));
     assert!(want.failed >= 9, "{want:?}");
@@ -191,9 +191,10 @@ fn strict_first_error_equals_the_sequential_import() {
     let want = Database::build_from_sources("m", &srcs, &opts, &mut ())
         .unwrap_err()
         .to_string();
-    let inc = Database::build_disk_from_sources(base.join("inc.db"), &srcs, &opts, &mut ())
-        .unwrap_err()
-        .to_string();
+    let inc =
+        Database::build_disk_from_sources_incremental(base.join("inc.db"), &srcs, &opts, &mut ())
+            .unwrap_err()
+            .to_string();
     assert_eq!(inc, want);
     // Only the later sources: a failure in a later file.
     let later = &srcs[1..];

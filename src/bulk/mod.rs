@@ -13,7 +13,7 @@
 //! [`build`] with [`BulkTarget::Disk`] writes a **version-1 `kvstore.kv`**
 //! (the format of [`crate::kvstore`], byte-compatible with every reader and
 //! writer; an older binary opens it too) and a fresh `vstree.kv`, the same
-//! layout as `Database::build_disk_from_sources` — but in one pass over
+//! layout as `Database::build_disk_from_sources_incremental` — but in one pass over
 //! sorted data instead of one B+ tree insert per index and term. Ids are
 //! assigned exactly as the in-memory build assigns them (subject, predicate,
 //! object, then graph, first seen first), so they equal the memory build's;

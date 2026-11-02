@@ -354,13 +354,14 @@ fn main() -> ExitCode {
             }
         }
     } else if disk {
-        let report = match Database::build_disk_from_sources(&dir, &sources, &opts, &mut log) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("disk build failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+        let report =
+            match Database::build_disk_from_sources_incremental(&dir, &sources, &opts, &mut log) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("disk build failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
         // Reopen to report stats.
         match Database::open(&dir) {
             Ok(db) => print_stats(name, &dir, &db, started, "on-disk B+ tree"),

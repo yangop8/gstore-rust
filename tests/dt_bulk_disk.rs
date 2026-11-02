@@ -1,5 +1,5 @@
 //! Data test: the bulk build of the disk layout (`gstore::bulk`, `gbuild
-//! --disk`) against the incremental one (`Database::build_disk_from_sources`)
+//! --disk`) against the incremental one (`Database::build_disk_from_sources_incremental`)
 //! and the in-memory build — logically equal stores, ids equal to the memory
 //! build's, byte-identical `vstree.kv`, identical query answers and order,
 //! deterministic bytes across thread counts and budgets, the same failure for
@@ -195,7 +195,8 @@ fn lubm_bulk_equals_incremental_and_memory() {
     let base = tmp("lubm");
     let sources = vec![Source::File(lubm_nt())];
     let (a, b) = (base.join("inc.db"), base.join("bulk.db"));
-    Database::build_disk_from_sources(&a, &sources, &ImportOptions::strict(), &mut ()).unwrap();
+    Database::build_disk_from_sources_incremental(&a, &sources, &ImportOptions::strict(), &mut ())
+        .unwrap();
     let r = bulk_build(&b, &sources, &bulk_opts(0, 64 << 20));
     assert_eq!(r.triples, 100_543);
     assert_eq!(r.predicates, 17);
@@ -248,7 +249,8 @@ fn nquads_mix_is_logically_equal_and_ids_follow_the_memory_build() {
     write_nquads(&nq);
     let sources = vec![Source::File(lubm_nt()), Source::File(nq.clone())];
     let (a, b) = (base.join("inc.db"), base.join("bulk.db"));
-    Database::build_disk_from_sources(&a, &sources, &ImportOptions::strict(), &mut ()).unwrap();
+    Database::build_disk_from_sources_incremental(&a, &sources, &ImportOptions::strict(), &mut ())
+        .unwrap();
     let r = bulk_build(&b, &sources, &bulk_opts(2, 1 << 20));
     assert!(r.quads > 0);
     assert!(r.spilled_runs > 0, "a 1 MiB budget spills: {r:?}");
@@ -383,7 +385,7 @@ fn an_over_long_term_fails_like_the_incremental_build() {
         )
         .unwrap();
         let sources = vec![Source::File(long)];
-        let inc = Database::build_disk_from_sources(
+        let inc = Database::build_disk_from_sources_incremental(
             base.join(format!("inc_{tag}.db")),
             &sources,
             &ImportOptions::tolerant(),

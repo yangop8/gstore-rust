@@ -915,20 +915,18 @@ impl Database {
     }
 
     /// [`build_disk`](Self::build_disk)'s inputs with explicit
-    /// [`import::ImportOptions`], through the **incremental** build (see
+    /// [`import::ImportOptions`]: the bulk build, as
+    /// [`build_disk_bulk_from_sources`](Self::build_disk_bulk_from_sources)
+    /// (the incremental reference — `gbuild --incremental`, the bulk build's
+    /// comparison tests — is
     /// [`build_disk_from_sources_incremental`](Self::build_disk_from_sources_incremental)).
-    /// `gbuild --incremental` and the bulk build's own comparison tests use it
-    /// as the incremental reference; it becomes the bulk build
-    /// ([`build_disk_bulk_from_sources`](Self::build_disk_bulk_from_sources))
-    /// once those callers name the `_incremental` variant (see
-    /// changelog.d/phase6-R3-STREAM.md).
     pub fn build_disk_from_sources<P: AsRef<Path>>(
         dir: P,
         sources: &[import::Source],
         opts: &import::ImportOptions,
         log: &mut dyn import::ErrorLog,
     ) -> Result<import::ImportReport> {
-        Database::build_disk_from_sources_incremental(dir, sources, opts, log)
+        Database::build_disk_bulk_from_sources(dir, sources, opts, log)
     }
 
     /// [`build_disk_incremental`](Self::build_disk_incremental) from
