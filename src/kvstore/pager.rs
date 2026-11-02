@@ -251,6 +251,10 @@ pub struct Pager {
     op_header: Option<HeaderState>,
     /// A nested operation was aborted: the outermost one must roll back.
     op_failed: bool,
+    /// Bumped by every change of a page's bytes (a write, an operation's
+    /// rollback): what a reader holding a copy of a page checks before it
+    /// trusts the copy ([`write_generation`](Self::write_generation)).
+    write_gen: u64,
     /// Number of committed flushes (tests assert when commits happen).
     #[cfg(test)]
     flushes: u64,
@@ -290,6 +294,7 @@ impl Pager {
             op_undo: Vec::new(),
             op_header: None,
             op_failed: false,
+            write_gen: 0,
             #[cfg(test)]
             flushes: 0,
         };
@@ -449,6 +454,7 @@ impl Pager {
                 "page 0 is reserved for header".into(),
             ));
         }
+        self.write_gen += 1;
         let gen = (self.op_depth > 0).then_some(self.op_gen);
         // `&mut self` ⇒ exclusive access; reach the cache without locking.
         let cache = self.cache.get_mut().unwrap();
@@ -697,6 +703,7 @@ impl Pager {
 
     /// Undo every page write and header change of the current operation.
     fn rollback_op(&mut self) {
+        self.write_gen += 1;
         let undo = std::mem::take(&mut self.op_undo);
         let cache = self.cache.get_mut().unwrap();
         for (id, before) in undo.into_iter().rev() {
@@ -737,6 +744,15 @@ impl Pager {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// A counter that moves whenever the bytes of any page change (every
+    /// [`write_page`](Self::write_page), and an operation's rollback): a
+    /// copy of a page (an `Arc` from [`read_page_shared`](Self::read_page_shared))
+    /// taken at one value is current while the value is unchanged — whoever
+    /// wrote through this pager (every store and dictionary sharing it).
+    pub fn write_generation(&self) -> u64 {
+        self.write_gen
     }
 
     /// Committed flushes since open (tests).

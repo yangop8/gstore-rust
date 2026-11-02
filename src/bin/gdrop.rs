@@ -66,6 +66,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // A database another process serves from `dir` holds its lock: never
+    // pull the directory from under it (the lock is held while it goes).
+    let _lock = match gstore::db::dirlock::DirLock::acquire_existing(std::path::Path::new(&dir)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("failed to drop '{dir}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(e) = std::fs::remove_dir_all(&dir) {
         eprintln!("failed to drop '{dir}': {e}");
         return ExitCode::FAILURE;

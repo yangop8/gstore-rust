@@ -193,12 +193,14 @@ impl Default for RocksTuning {
 impl RocksTuning {
     /// The defaults ([`DEFAULT_BLOCK_CACHE_MB`], [`DEFAULT_BLOOM_BITS`]), with
     /// the block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a
-    /// number of MiB.
+    /// number of MiB. A value that is not one is logged (once per process)
+    /// and ignored.
     pub fn from_env() -> RocksTuning {
-        let mb = std::env::var(BLOCK_CACHE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_BLOCK_CACHE_MB);
+        let (mb, warning) = block_cache_mb(std::env::var(BLOCK_CACHE_ENV).ok().as_deref());
+        if let Some(w) = warning {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| crate::gs_warn!("rocksdb tuning: {w}"));
+        }
         RocksTuning {
             block_cache_bytes: mb.saturating_mul(1 << 20),
             bloom_bits_per_key: DEFAULT_BLOOM_BITS,
@@ -229,6 +231,26 @@ fn shared_cache(bytes: usize) -> Cache {
     let cache = Cache::new_lru_cache(bytes);
     caches.push((bytes, cache.clone()));
     cache
+}
+
+/// The block cache size, in MiB, that [`BLOCK_CACHE_ENV`]'s value `v` asks
+/// for, and a warning when it is set but is not a number of MiB (the default
+/// is used then: an operator capping the cache with `64M` must learn that
+/// the cap was not applied).
+fn block_cache_mb(v: Option<&str>) -> (usize, Option<String>) {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        None => (DEFAULT_BLOCK_CACHE_MB, None),
+        Some(t) => match t.parse::<usize>() {
+            Ok(mb) => (mb, None),
+            Err(_) => (
+                DEFAULT_BLOCK_CACHE_MB,
+                Some(format!(
+                    "{BLOCK_CACHE_ENV}={t:?} is not a number of MiB; \
+                     the default of {DEFAULT_BLOCK_CACHE_MB} MiB is used"
+                )),
+            ),
+        },
+    }
 }
 
 /// The options of column family `name`: LZ4 for the triple orderings, and
@@ -1084,7 +1106,7 @@ impl RocksStore {
     /// The second ids under a tagged pair prefix (the `x|p` subjects, the
     /// `y|p` objects): ascending.
     fn ids_under_pred(&self, tag: u8, pred: PredId, hint: u64) -> Vec<EntityLiteralId> {
-        let mut out = Vec::with_capacity(hint as usize);
+        let mut out = reserved(hint);
         self.scan(CF_STATS, &tag1(tag, pred), |k| out.push(de(&k[5..9])));
         out
     }
@@ -1319,7 +1341,7 @@ impl TripleSource for RocksStore {
         if c.card >= SEEK_RUN.saturating_mul(c.subjects.max(1)) {
             return self.so_by_p_seek(pred);
         }
-        let mut out = Vec::with_capacity(c.card as usize);
+        let mut out = reserved(c.card);
         self.scan(CF_POS, &be(pred), |k| {
             out.push((de(&k[8..12]), de(&k[4..8])))
         });
@@ -1448,17 +1470,27 @@ impl TripleSource for RocksStore {
     }
 }
 
+/// An empty list with room for `hint` items when that much can be had: a
+/// capacity taken from a stored counter must not abort the process (an
+/// allocation failure) when the counter is damaged — the list then grows as
+/// it is read instead.
+fn reserved<T>(hint: u64) -> Vec<T> {
+    let mut v = Vec::new();
+    let _ = v.try_reserve_exact(usize::try_from(hint).unwrap_or(usize::MAX));
+    v
+}
+
 impl RocksStore {
     /// [`so_by_p`](TripleSource::so_by_p) through the `x|p` subjects and SPO
     /// seeks.
     fn so_by_p_seek(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        let mut out = Vec::with_capacity(self.pred_counts(pred).card as usize);
+        let mut out = reserved(self.pred_counts(pred).card);
         if let Some(e) = self.injected_read_failure() {
             note_read_error(format!("rocksdb read ({CF_SPO}): {e}"));
             return out;
         }
         let mut spo = self.raw_iter(CF_SPO, None);
-        self.scan(CF_STATS, &tag1(T_PS, pred), |k| {
+        let res = self.try_scan(CF_STATS, &tag1(T_PS, pred), |k, _| {
             let s = de(&k[5..9]);
             let at = key2(s, pred);
             spo.seek(at);
@@ -1469,9 +1501,17 @@ impl RocksStore {
                 out.push((s, de(&key[8..12])));
                 spo.next();
             }
+            // Checked after every subject's run: the next seek resets the
+            // iterator's status, so an error that ended this run (a bad
+            // block) would be lost — and the list silently short.
+            spo.status()
+                .map(|()| true)
+                .map_err(|e| format!("rocksdb read ({CF_SPO}): {}", e.into_string()))
         });
-        if let Err(e) = spo.status() {
-            note_read_error(format!("rocksdb read ({CF_SPO}): {e}"));
+        match res {
+            Ok(()) => {}
+            Err(ScanError::Read(e)) => note_read_error(format!("rocksdb read ({CF_STATS}): {e}")),
+            Err(ScanError::Visit(e)) => note_read_error(e),
         }
         out
     }
@@ -1486,9 +1526,29 @@ impl RocksStore {
             end: usize,
         }
         // Each predicate's slice starts after the triples of the smaller ones.
+        // The counters only size the result when they add up (without
+        // overflow) to the global triple counter and the space can be had:
+        // a damaged `stats` CF must not abort the process on a huge
+        // allocation (or wrap the sum), so it is read and sorted instead.
+        let total = self
+            .preds
+            .values()
+            .try_fold(0u64, |n, c| n.checked_add(c.card))
+            .filter(|&n| n == self.triple_count)
+            .and_then(|n| usize::try_from(n).ok());
+        let mut out: Vec<IdTriple> = Vec::new();
+        let Some(total) = total.filter(|&n| out.try_reserve_exact(n).is_ok()) else {
+            let mut all: Vec<IdTriple> = reserved(self.triple_count);
+            self.scan(CF_SPO, &[], |k| {
+                all.push(IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12])));
+            });
+            all.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
+            return all;
+        };
         let mut slots: Vec<Slot> = Vec::with_capacity(self.preds.len());
         let mut at = 0usize;
         for (&pred, c) in &self.preds {
+            // In range: the cards add up to `total` without overflow.
             let end = at + c.card as usize;
             slots.push(Slot {
                 pred,
@@ -1498,7 +1558,7 @@ impl RocksStore {
             });
             at = end;
         }
-        let mut out = vec![IdTriple::new(0, 0, 0); at];
+        out.resize(total, IdTriple::new(0, 0, 0));
         let mut spill: Vec<IdTriple> = Vec::new();
         self.scan(CF_SPO, &[], |k| {
             let t = IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
@@ -1821,5 +1881,127 @@ mod tests {
         assert_eq!(counter_value(&7u64.to_be_bytes()), Some(7));
         assert_eq!(counter_value(&[0, 1]), None);
         assert_eq!(counter_value(&[0; 9]), None);
+    }
+
+    /// A fresh scratch directory for one test.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gstore_ut_rocks_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn the_block_cache_variable_warns_unless_it_is_a_number_of_mib() {
+        assert_eq!(block_cache_mb(None), (DEFAULT_BLOCK_CACHE_MB, None));
+        assert_eq!(block_cache_mb(Some("  ")), (DEFAULT_BLOCK_CACHE_MB, None));
+        assert_eq!(block_cache_mb(Some("64")), (64, None));
+        assert_eq!(block_cache_mb(Some(" 32 ")), (32, None));
+        assert_eq!(block_cache_mb(Some("0")), (0, None));
+        for bad in ["64M", "1g", "64 MiB", "-1"] {
+            let (mb, warning) = block_cache_mb(Some(bad));
+            assert_eq!(mb, DEFAULT_BLOCK_CACHE_MB, "{bad}");
+            let w = warning.unwrap_or_else(|| panic!("{bad} was taken silently"));
+            assert!(w.contains(BLOCK_CACHE_ENV) && w.contains(bad), "{w}");
+        }
+    }
+
+    /// A predicate on the seek path of `so_by_p` (many objects per subject)
+    /// whose SPO data block in the middle is damaged on disk: the list must
+    /// not come back short without an error — the seek to the next subject
+    /// resets the iterator's status, so the error has to be seen before it.
+    #[test]
+    fn a_bad_spo_block_fails_so_by_p_instead_of_shortening_it() {
+        let dir = scratch("sobyp_corrupt");
+        const PRED: PredId = 3;
+        let (subjects, objects) = (10u32, 1000u32);
+        {
+            let mut store = RocksStore::open_with(&dir, &RocksTuning::rocksdb_defaults()).unwrap();
+            for s in 0..subjects {
+                for o in 0..objects {
+                    assert!(store.insert(IdTriple::new(100 + s, PRED, 100_000 + o)));
+                }
+            }
+            let c = store.pred_counts(PRED);
+            assert!(c.card >= SEEK_RUN * c.subjects, "not the seek path");
+            store.flush().unwrap();
+        }
+        // The SPO table file: flip bytes a third of the way in (its data
+        // blocks; the index and footer are at its end).
+        let sst = {
+            let db = DB::open_cf(&Options::default(), &dir, ALL_CFS).unwrap();
+            let files = db.live_files().unwrap();
+            let f = files
+                .iter()
+                .find(|f| f.column_family_name == CF_SPO)
+                .expect("an spo table file");
+            dir.join(f.name.trim_start_matches('/'))
+        };
+        let mut bytes = std::fs::read(&sst).unwrap();
+        let at = bytes.len() / 3;
+        for b in &mut bytes[at..at + 8] {
+            *b ^= 0x5A;
+        }
+        std::fs::write(&sst, &bytes).unwrap();
+
+        let store = RocksStore::open_with(&dir, &RocksTuning::rocksdb_defaults()).unwrap();
+        let scope = crate::store::read_scope::ReadScope::enter();
+        let got = TripleSource::so_by_p(&store, PRED);
+        let err = scope.take_error();
+        assert!(
+            err.is_some(),
+            "so_by_p answered {} of {} pairs with no read error",
+            got.len(),
+            subjects * objects
+        );
+        drop(scope);
+        // The same damage seen by a full scan, for comparison.
+        let scope = crate::store::read_scope::ReadScope::enter();
+        let _ = TripleSource::iter_all(&store);
+        assert!(scope.take_error().is_some());
+        drop(scope);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Damaged `c|p` counters (well-formed values that are wrong) make
+    /// `iter_all` read and sort the keys instead: never a huge allocation
+    /// (an abort) or a wrapped sum (an out-of-bounds panic).
+    #[test]
+    fn damaged_card_counters_do_not_size_iter_all() {
+        let dir = scratch("iterall_card");
+        let triples: Vec<IdTriple> = (0..10u32)
+            .flat_map(|i| [IdTriple::new(i, 1, 50 + i), IdTriple::new(i, 2, 70 + i)])
+            .collect();
+        let mut want = triples.clone();
+        want.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
+        {
+            let mut store = RocksStore::open_with(&dir, &RocksTuning::rocksdb_defaults()).unwrap();
+            for t in &triples {
+                assert!(store.insert(*t));
+            }
+            assert_eq!(TripleSource::iter_all(&store), want);
+        }
+        for bad in [1000u64, 0x0000_4000_0000_0000, u64::MAX - 5, u64::MAX] {
+            {
+                let store = RocksStore::open_with(&dir, &RocksTuning::rocksdb_defaults()).unwrap();
+                store
+                    .db
+                    .put_cf(store.cf(CF_STATS), tag1(T_CARD, 1), bad.to_be_bytes())
+                    .unwrap();
+                store
+                    .db
+                    .put_cf(store.cf(CF_STATS), tag1(T_CARD, 2), bad.to_be_bytes())
+                    .unwrap();
+            }
+            let store = RocksStore::open_with(&dir, &RocksTuning::rocksdb_defaults()).unwrap();
+            assert_eq!(store.pred_counts(1).card, bad);
+            let scope = crate::store::read_scope::ReadScope::enter();
+            assert_eq!(TripleSource::iter_all(&store), want, "c|p = {bad:#x}");
+            // The other counter-sized lists are only hints too.
+            assert_eq!(TripleSource::so_by_p(&store, 1).len(), 10, "c|p = {bad:#x}");
+            assert_eq!(scope.take_error(), None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

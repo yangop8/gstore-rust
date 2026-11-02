@@ -90,7 +90,13 @@ pub struct DiskDict {
     /// [`writable`](Self::writable)); a read-only backend answers existing
     /// keys only and refuses new ones.
     writable: bool,
+    /// Asked before every write (see [`with_write_check`](Self::with_write_check)).
+    write_check: Option<WriteCheck>,
 }
+
+/// What a writable [`DiskDict`] asks before it writes a term: `Err` refuses
+/// the write (the store sharing the pager is broken).
+pub type WriteCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 impl DiskDict {
     /// Build a backend sharing `pager` with its `DiskStore`. The `BTree` handles
@@ -126,6 +132,7 @@ impl DiskDict {
             generation: AtomicU64::new(0),
             cache_epoch: AtomicU64::new(0),
             writable: false,
+            write_check: None,
         }
     }
 
@@ -173,6 +180,17 @@ impl DiskDict {
             counts.1,
             counts.2,
         ))
+    }
+
+    /// Ask `check` before every term this backend writes, and refuse the
+    /// write when it fails: the dictionary of a Stream-mode database shares
+    /// its pager with a [`DiskTriples`](super::DiskTriples), and once that
+    /// store is broken (a commit failed part-way, its applied pages still in
+    /// the cache) nothing may write through the pager — ending a write
+    /// operation can flush the cache, making the failed commit durable.
+    pub fn with_write_check(mut self, check: WriteCheck) -> DiskDict {
+        self.write_check = Some(check);
+        self
     }
 
     /// Replace the caches with empty ones of the given byte budgets
@@ -376,6 +394,9 @@ impl DiskTermSource for DiskDict {
                 "this out-of-core dictionary is read-only: cannot intern a new {} term",
                 space.name()
             )));
+        }
+        if let Some(check) = &self.write_check {
+            check()?;
         }
         let (id, new) = {
             let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());

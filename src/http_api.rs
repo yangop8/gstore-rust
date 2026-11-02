@@ -79,8 +79,10 @@
 //!
 //! * **Shared** guards (`DbCell::read`): statement reads (a read statement
 //!   by the transaction's owner included), export, backup, `loadcsr`,
-//!   `monitor` / `schema` when its figures are not cached yet, and the
-//!   reasoning rules' Check. Everything they call on the [`Database`] takes
+//!   `monitor` / `schema` when its figures are not cached yet (only with
+//!   `DbCell::try_read` while it has statistics cached for earlier data:
+//!   a busy database is then reported with those), and the reasoning
+//!   rules' Check. Everything they call on the [`Database`] takes
 //!   `&self` and is synchronized inside it (the query cache, the CSR cache,
 //!   the string-index cache, the PFN registry, the logs).
 //! * **Exclusive** guards (`DbCell::write`): updates, begin / commit /
@@ -88,7 +90,9 @@
 //!   restore / retire, the shutdown's final pass, reasoning Execute /
 //!   Disable, and installing new query settings (only with
 //!   `DbCell::try_write`: a database busy meanwhile takes them the next
-//!   time a request syncs them, see `ApiInner::read_synced`).
+//!   time a request finds it free, see `ApiInner::read_synced`), and
+//!   publishing the figures of a write section that unwound (also only with
+//!   `DbCell::try_write`, see `DbCell::figures`).
 //! * **No guard** — monitoring: `/status`, `/monitor`, `/show`, `/api`
 //!   `show` and `stat`, and `/api` `monitor` / `schema` once their figures
 //!   are cached, read counters each database publishes at the end of every
@@ -644,6 +648,10 @@ pub(crate) struct DbCell {
     /// The database's figures as of the end of its last exclusive section
     /// (and its load), for monitoring without the lock.
     pub(crate) counters: DbCounters,
+    /// A write section unwound (a panic) without publishing: the figures
+    /// may predate a change it applied. [`figures`](Self::figures)
+    /// publishes them the next time the database is free.
+    unpublished: AtomicBool,
 }
 
 thread_local! {
@@ -729,9 +737,14 @@ impl std::ops::DerefMut for SlotWrite<'_> {
 impl Drop for SlotWrite<'_> {
     fn drop(&mut self) {
         // Not while unwinding: the slot may be half-way through a change
-        // (the guard is poisoned; the next writer publishes).
-        if !std::thread::panicking() {
+        // (the guard is poisoned) and reading it here could panic again. It
+        // is marked instead: the next exclusive holder — the next writer, or
+        // monitoring once the database is free — publishes.
+        if std::thread::panicking() {
+            self.cell.unpublished.store(true, Ordering::SeqCst);
+        } else {
             self.cell.publish(&self.guard);
+            self.cell.unpublished.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -744,6 +757,7 @@ impl DbCell {
             name: slot.db.name().to_string(),
             csr: slot.db.csr_status(),
             counters,
+            unpublished: AtomicBool::new(false),
             slot: RwLock::new(slot),
         }
     }
@@ -769,6 +783,19 @@ impl DbCell {
             guard: self.slot.read().unwrap_or_else(PoisonError::into_inner),
             _held: held,
         })
+    }
+
+    /// A shared guard if one can be had right now: `None` while a writer
+    /// holds the exclusive guard or waits for it, or when this thread holds
+    /// a guard of this database (monitoring, which must not wait).
+    pub(crate) fn try_read(&self) -> Option<SlotRead<'_>> {
+        let held = HeldCell::claim(self)?;
+        let guard = match self.slot.try_read() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(SlotRead { guard, _held: held })
     }
 
     /// The exclusive guard (publishes the figures when released).
@@ -805,9 +832,23 @@ impl DbCell {
     }
 
     /// The figures published at the end of the last exclusive section (or
-    /// the load): read without the lock, never waits for a statement.
+    /// the load): read without the lock, never waits for a statement. After
+    /// a write section that unwound without publishing they are published
+    /// first when the database is free right now (else the last ones are
+    /// returned, and a later call or the next writer publishes).
     pub(crate) fn figures(&self) -> CounterSnapshot {
+        if self.unpublished.load(Ordering::SeqCst) {
+            // Dropping the exclusive guard publishes (and clears the mark).
+            drop(self.try_write());
+        }
         self.counters.read()
+    }
+
+    /// Whether the published figures may predate the data (a write section
+    /// unwound since the last publish).
+    #[cfg(test)]
+    pub(crate) fn unpublished(&self) -> bool {
+        self.unpublished.load(Ordering::SeqCst)
     }
 }
 
@@ -1428,6 +1469,9 @@ impl ApiInner {
         if !self.storage_refresh.load(Ordering::SeqCst) {
             return;
         }
+        if let Some(w) = fresh.default_layout_warning() {
+            crate::gs_warn!("refreshconf: {w}");
+        }
         crate::db::set_default_open_options(fresh.open_options());
         let effective = crate::db::default_open_options();
         crate::gs_info!(
@@ -1535,19 +1579,26 @@ impl ApiInner {
         !slot.retired && slot.settings_gen != self.settings_gen.load(Ordering::SeqCst)
     }
 
-    /// A shared guard of `cell` whose database has the `[query]` settings
-    /// installed last: when they are stale, the shared guard is dropped, the
-    /// exclusive one taken once to sync them, and a shared guard taken again
-    /// (never an upgrade while holding the shared guard). Settings installed
-    /// in between wait for the next request.
+    /// A shared guard of `cell`, whose database has the `[query]` settings
+    /// installed last whenever it could sync them: when they are stale, the
+    /// shared guard is dropped, the exclusive one taken once to sync them,
+    /// and a shared guard taken again (never an upgrade while holding the
+    /// shared guard). Settings installed in between wait for the next
+    /// request.
+    ///
+    /// The exclusive guard is only taken when it is free right now: waiting
+    /// for it would wait for every statement in flight (the longest query)
+    /// and, the lock preferring writers, make every later reader of the
+    /// database wait behind it too. A database busy with other readers runs
+    /// this statement with the settings it has, and takes the new ones with
+    /// a later request or its next write section.
     pub(crate) fn read_synced<'a>(&self, cell: &'a DbCell) -> Result<SlotRead<'a>, OpError> {
         let slot = cell.read()?;
         if !self.settings_stale(&slot) {
             return Ok(slot);
         }
         drop(slot);
-        {
-            let mut slot = cell.write()?;
+        if let Some(mut slot) = cell.try_write() {
             self.sync_query_settings(&mut slot);
         }
         cell.read()
@@ -7049,6 +7100,295 @@ mod tests {
             drop(shared);
             writer.join().unwrap();
         }
+        server.shutdown();
+    }
+
+    /// `/api monitor` and `schema` right after a write — their statistics
+    /// cached for the data before it — do not wait for the database either
+    /// while a writer holds it, or waits for it behind a reader: they answer
+    /// with the published figures and the earlier statistics, and with
+    /// fresh ones once the database is free.
+    #[test]
+    fn monitoring_after_a_write_answers_while_the_database_is_held() {
+        let (server, addr) = start("monitor_after_write");
+        build_two(&addr, "monw");
+        let auth = basic("root", "root");
+        let monitor = api_body(r#""operation":"monitor","db_name":"monw""#);
+        let (_, warm) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(warm.contains("\"subjectNum\":2"), "{warm}");
+        let h = served(&server, "monw");
+        h.write()
+            .unwrap()
+            .db
+            .query("INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }")
+            .unwrap();
+        let check = |what: &str| {
+            let second = Duration::from_secs(1);
+            for (body, expect) in [
+                (monitor.clone(), "\"tripleNum\":\"3\""),
+                (
+                    api_body(r#""operation":"schema","db_name":"monw""#),
+                    "\"StatusCode\":0",
+                ),
+            ] {
+                let t0 = Instant::now();
+                let got = request_within(&addr, "POST", "/api", Some(&auth), &body, second);
+                let (s, b) = got.unwrap_or_else(|| panic!("{body} waited ({what})"));
+                assert_eq!(s, 200, "{b}");
+                assert!(b.contains(expect), "{what}: {b}");
+                assert!(t0.elapsed() < second, "{what}: took {:?}", t0.elapsed());
+            }
+        };
+        {
+            let _excl = h.write().unwrap();
+            check("a writer holds it");
+        }
+        {
+            let shared = h.read().unwrap();
+            let h2 = Arc::clone(&h);
+            let writer = std::thread::spawn(move || {
+                let _w = h2.write().unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            check("a reader holds it and a writer waits");
+            drop(shared);
+            writer.join().unwrap();
+        }
+        // Free: the statistics of the current data.
+        let (_, now) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(now.contains("\"subjectNum\":3"), "{now}");
+        server.shutdown();
+    }
+
+    /// `/api monitor` computes its class statistics in a read scope: a read
+    /// error fails it (status 1005) instead of answering — and caching, to
+    /// be served until the next write — the statistics of part of the data.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn monitor_statistics_hit_by_a_read_error_fail_and_are_not_cached() {
+        let (server, addr) = start("monitor_read_error");
+        let dir = locked(&server.inner.state).db_dir("rkm");
+        let data = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+                    <http://ex/a> rdf:type <http://ex/Person> .\n\
+                    <http://ex/b> rdf:type <http://ex/Person> .\n\
+                    <http://ex/u> rdf:type <http://ex/Univ> .\n\
+                    <http://ex/a> <http://ex/worksAt> <http://ex/u> .\n";
+        drop(Database::build_rocksdb_from_str("rkm", &dir, data).unwrap());
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/api",
+            None,
+            &api_body(r#""operation":"load","db_name":"rkm""#),
+        ));
+        assert!(b.contains("\"StatusCode\":0"), "load: {b}");
+        let h = served(&server, "rkm");
+        let monitor = api_body(r#""operation":"monitor","db_name":"rkm""#);
+        let fail = |on: bool| {
+            h.read()
+                .unwrap()
+                .db
+                .backend()
+                .as_rocks()
+                .unwrap()
+                .debug_fail_reads(on);
+        };
+        fail(true);
+        let (_, m) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(
+            m.contains("\"StatusCode\":1005"),
+            "statistics despite a read error: {m}"
+        );
+        fail(false);
+        let (_, m) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(m.contains("\"StatusCode\":0"), "{m}");
+        assert!(
+            m.contains("http://ex/Person"),
+            "partial statistics were cached: {m}"
+        );
+        assert!(m.contains("\"value\":2"), "{m}");
+        server.shutdown();
+    }
+
+    /// A write section that unwinds (a handler panic, which the server
+    /// survives) after changing the data does not leave monitoring on the
+    /// figures from before the change: they are published once the database
+    /// is free.
+    #[test]
+    fn a_write_section_that_unwinds_is_published_later() {
+        let (server, addr) = start("unwind_publish");
+        build_two(&addr, "unw");
+        let monitor = api_body(r#""operation":"monitor","db_name":"unw""#);
+        let (_, warm) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(warm.contains("\"tripleNum\":\"2\""), "{warm}");
+        let h = served(&server, "unw");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut w = h.write().unwrap();
+            w.db.query("INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }")
+                .unwrap();
+            panic!("an engine bug after the first operation");
+        }));
+        assert!(unwound.is_err());
+        assert!(h.unpublished());
+        // Busy: the last figures, still marked.
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let h2 = Arc::clone(&h);
+            let reader = std::thread::spawn(move || {
+                let _r = h2.read().unwrap();
+                held_tx.send(()).unwrap();
+                rx.recv().ok();
+            });
+            held_rx.recv().unwrap();
+            assert_eq!(h.figures().triples, 2);
+            assert!(h.unpublished());
+            tx.send(()).unwrap();
+            reader.join().unwrap();
+        }
+        // Free: published.
+        assert_eq!(h.figures().triples, 3);
+        assert!(!h.unpublished());
+        for (target, expect) in [
+            ("/status", "\"total_triples\":3"),
+            ("/monitor", "\"triples\":3"),
+        ] {
+            let (s, b) = split_status_body(&raw_request(
+                &addr,
+                "GET",
+                target,
+                Some(&basic("root", "root")),
+                "",
+            ));
+            assert_eq!(s, 200, "{b}");
+            assert!(b.contains(expect), "{target}: {b}");
+        }
+        let (_, m) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(m.contains("\"tripleNum\":\"3\""), "{m}");
+        assert!(
+            m.contains("\"subjectNum\":3"),
+            "cached statistics of the old data: {m}"
+        );
+        server.shutdown();
+    }
+
+    /// A read that finds new `[query]` settings while other reads hold the
+    /// database does not wait for them to sync the settings (which, the lock
+    /// preferring writers, would also stall every later reader): it runs
+    /// with the settings the database has, and a read that finds the
+    /// database free syncs them.
+    #[test]
+    fn a_read_with_stale_settings_does_not_wait_for_other_reads() {
+        let (server, addr) = start("settings_no_wait");
+        build_two(&addr, "nw");
+        let h = served(&server, "nw");
+        let old = h.read().unwrap().db.query_settings();
+        let new = QuerySettings {
+            integer_division: IntegerDivision::Truncate,
+            ..old
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let h2 = Arc::clone(&h);
+        let long_read = std::thread::spawn(move || {
+            let _r = h2.read().unwrap();
+            held_tx.send(()).unwrap();
+            // Bounded: a read that waits for this one fails the test below
+            // instead of hanging it.
+            rx.recv_timeout(Duration::from_secs(5)).ok();
+        });
+        held_rx.recv().unwrap();
+        server.inner.apply_query_settings(new);
+        let t0 = Instant::now();
+        {
+            let slot = server.inner.read_synced(&h).unwrap();
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "the read waited {:?} for the other read",
+                t0.elapsed()
+            );
+            assert_eq!(slot.db.query_settings(), old, "busy: not synced yet");
+        }
+        tx.send(()).unwrap();
+        long_read.join().unwrap();
+        assert_eq!(
+            server.inner.read_synced(&h).unwrap().db.query_settings(),
+            new
+        );
+        server.shutdown();
+    }
+
+    /// `/api backup` requests of one database in the same second (the same
+    /// backup name) run one after the other: each answers success with a
+    /// complete backup. They used to delete each other's files mid-write:
+    /// a request arriving while another wrote removed the directory under it.
+    #[test]
+    fn same_second_api_backups_of_one_database_all_succeed() {
+        let (server, addr) = start("backup_same_second");
+        let auth = basic("root", "root");
+        let mut data = String::new();
+        for i in 0..30000 {
+            data.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p{}> <http://ex/o{i}> .\n",
+                i % 7
+            ));
+        }
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=bkp",
+            Some(&auth),
+            &data,
+        ));
+        assert_eq!(s, 200, "build: {b}");
+        let backups = server.inner.backup_dir();
+        for round in 0..3 {
+            // Early in a second, staggered: the later requests arrive while
+            // the first one writes, all under one backup name.
+            let into_second = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_millis();
+            std::thread::sleep(Duration::from_millis(u64::from(
+                1010 - into_second.min(1000),
+            )));
+            let requests: Vec<_> = (0..3u64)
+                .map(|i| {
+                    std::thread::sleep(Duration::from_millis(if i == 0 { 0 } else { 15 }));
+                    std::thread::spawn(move || {
+                        split_status_body(&raw_request(
+                            &addr,
+                            "POST",
+                            "/api",
+                            None,
+                            &api_body(r#""operation":"backup","db_name":"bkp""#),
+                        ))
+                    })
+                })
+                .collect();
+            for r in requests {
+                let (s, b) = r.join().unwrap();
+                assert_eq!(s, 200, "{b}");
+                assert!(b.contains("\"StatusCode\":0"), "round {round}: {b}");
+            }
+        }
+        let mut seen = 0;
+        for e in std::fs::read_dir(&backups).unwrap() {
+            let p = e.unwrap().path();
+            if p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("bkp.db_")
+            {
+                assert_eq!(
+                    Database::read_copy(&p).unwrap().triple_num(),
+                    30000,
+                    "{p:?}"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 1);
         server.shutdown();
     }
 

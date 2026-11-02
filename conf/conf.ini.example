@@ -240,8 +240,10 @@ unzip_max_size = 10737418240
 # vstree.kv was made stale by updates) instead of querying without it until
 # it is rebuilt. Off: opening stays fast; the first queries may be slower
 # vstree_on_open=off
-# the layout new databases are built in: snapshot, disk or rocksdb (unset:
-# each build path's own default)
+# reserved, not effective yet: the layout new databases are to be built in
+# (snapshot, disk or rocksdb). It is read and checked, but no build path uses
+# it yet -- /api build and REST /build still build snapshot databases, and
+# gserver logs a warning when it is set
 # default_layout=disk
 
 # Reasoning rules (/api reasonManage, stored per database in

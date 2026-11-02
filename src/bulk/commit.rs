@@ -183,17 +183,12 @@ pub(crate) fn build_disk(
         )));
     }
     let _lock = DirLock::acquire(dir)?;
-    if let Some(holder) = rocksdb_lock_holder(dir) {
-        // `Database::open` takes the directory lock for the RocksDB layout
-        // too, but an older binary does not (it relies on RocksDB's own
-        // `rocksdb/LOCK`): the lock above cannot see it serving the store.
-        // Replacing its directory under it would lose every write it
-        // acknowledges.
-        return Err(GStoreError::Database(format!(
-            "the RocksDB store in '{}' is in use ({holder}); close it before rebuilding",
-            dir.display()
-        )));
-    }
+    // `Database::open` takes the directory lock for the RocksDB layout too,
+    // but an older binary does not (it relies on RocksDB's own
+    // `rocksdb/LOCK`): the lock above cannot see it serving the store.
+    // Replacing its directory under it would lose every write it
+    // acknowledges. Checked again right before the install.
+    refuse_open_store(dir)?;
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
         // What a crashed build left: never part of a database.
@@ -323,6 +318,23 @@ pub(crate) fn rocksdb_lock_holder(_dir: &Path) -> Option<String> {
     None
 }
 
+/// Refuse to build over `dir` while a RocksDB store in it is open anywhere
+/// ([`rocksdb_lock_holder`]). Checked when the build starts and again right
+/// before its install replaces anything: a process that opened the store
+/// while the input was parsed and sorted — an older binary takes only
+/// `rocksdb/LOCK`, not the directory lock — is seen too, and the old
+/// database is kept (only the few milliseconds of the install itself are
+/// left uncovered).
+pub(crate) fn refuse_open_store(dir: &Path) -> Result<()> {
+    match rocksdb_lock_holder(dir) {
+        None => Ok(()),
+        Some(holder) => Err(GStoreError::Database(format!(
+            "the RocksDB store in '{}' is in use ({holder}); close it before rebuilding",
+            dir.display()
+        ))),
+    }
+}
+
 /// Make the staged `kvstore.kv` newer than any snapshot file in `dir`, so a
 /// snapshot a crash leaves beside it reads as a stale legacy shadow.
 fn newer_than_snapshots(dir: &Path, staged_kv: &Path) -> Result<()> {
@@ -366,6 +378,8 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
     sync_file(&vs_new)?;
     sync_dir(staging)?;
     fp.hit("staged")?;
+    // Again, right before anything is replaced (see `refuse_open_store`).
+    refuse_open_store(dir)?;
 
     let marker = staging.join(COMMIT_MARKER);
     {

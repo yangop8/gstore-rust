@@ -312,6 +312,23 @@ impl Snapshot {
         self.store.exists(s, p, o)
     }
 
+    /// [`contains`](Self::contains), or `None` when a term could not be
+    /// looked up (a read error of an out-of-core dictionary).
+    fn try_contains(&self, t: &Triple) -> Option<bool> {
+        let ids = (|| -> Result<_> {
+            Ok((
+                self.dict.try_entity_id(&t.subject.dict_key())?,
+                self.dict.try_predicate_id(&t.predicate.dict_key())?,
+                self.dict.try_term_id(&t.object)?,
+            ))
+        })()
+        .ok()?;
+        let (Some(s), Some(p), Some(o)) = ids else {
+            return Some(false);
+        };
+        Some(self.store.exists(s, p, o))
+    }
+
     /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot,
     /// inside a [`ReadScope`]: a read error recorded during the evaluation
     /// fails it.
@@ -471,7 +488,18 @@ impl VersionedStore {
     /// Apply every chain's visible state at `version` onto a base `dict`/`store`
     /// (clones of the base snapshot): insert visible triples, remove tombstoned
     /// ones. Keys with no record `<= version` are left to the base untouched.
-    fn materialize_into(&self, version: u64, dict: &mut Dictionary, store: &mut TripleStore) {
+    ///
+    /// A dictionary that fails to intern or look up a term (an out-of-core
+    /// dictionary's read error; an exhausted id space, which the writer
+    /// database would have hit first) fails it: skipping the record would
+    /// answer from a state that never existed (a committed insert missing,
+    /// a deleted triple back).
+    fn materialize_into(
+        &self,
+        version: u64,
+        dict: &mut Dictionary,
+        store: &mut TripleStore,
+    ) -> Result<()> {
         for chain in self.chains.values() {
             let Some(rec) = chain.visible(version) else {
                 continue;
@@ -479,30 +507,23 @@ impl VersionedStore {
             let t = &chain.triple;
             match rec.op {
                 ChainOp::Insert => {
-                    // The writer database interned these terms when the
-                    // version was committed, so this cannot exhaust an id space
-                    // the writer did not; if it somehow does, skip the triple
-                    // rather than panic.
-                    let (Ok(s), Ok(p), Ok(o)) = (
-                        dict.try_intern_entity(&t.subject.dict_key()),
-                        dict.try_intern_predicate(&t.predicate.dict_key()),
-                        dict.try_intern_term(&t.object),
-                    ) else {
-                        continue;
-                    };
+                    let s = dict.try_intern_entity(&t.subject.dict_key())?;
+                    let p = dict.try_intern_predicate(&t.predicate.dict_key())?;
+                    let o = dict.try_intern_term(&t.object)?;
                     store.insert(IdTriple::new(s, p, o));
                 }
                 ChainOp::Tombstone => {
                     if let (Some(s), Some(p), Some(o)) = (
-                        dict.entity_id(&t.subject.dict_key()),
-                        dict.predicate_id(&t.predicate.dict_key()),
-                        dict.term_id(&t.object),
+                        dict.try_entity_id(&t.subject.dict_key())?,
+                        dict.try_predicate_id(&t.predicate.dict_key())?,
+                        dict.try_term_id(&t.object)?,
                     ) {
                         store.remove(IdTriple::new(s, p, o));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Reclaim records no live reader can observe: for each chain keep the latest
@@ -525,7 +546,11 @@ impl VersionedStore {
                 // A single surviving record that agrees with the base snapshot is
                 // redundant (a base fallback yields the same present/absent
                 // answer) and every live reader is at/after it, so drop the entry.
-                [only] => (only.op == ChainOp::Insert) != base.contains(&chain.triple),
+                // A base that cannot be read (an out-of-core dictionary's
+                // read error) cannot tell: keep the record.
+                [only] => base
+                    .try_contains(&chain.triple)
+                    .is_none_or(|present| (only.op == ChainOp::Insert) != present),
                 // Multiple versions are still distinguishable by live readers.
                 _ => true,
             }
@@ -984,13 +1009,25 @@ fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>
     if own_txn {
         db.begin()?;
     }
-    let applied = ops.iter().try_for_each(|op| match op {
-        TxnOp::Insert(t) => db.try_insert_triple(t).map(drop),
-        TxnOp::Delete(t) => {
-            db.remove_triple(t);
-            Ok(())
+    // In a read scope (C2): a delete whose terms cannot be looked up (an
+    // out-of-core dictionary's read error) fails the transaction instead of
+    // silently removing nothing.
+    let scope = ReadScope::enter();
+    let applied = ops.iter().try_for_each(|op| {
+        match op {
+            TxnOp::Insert(t) => {
+                db.try_insert_triple(t)?;
+            }
+            TxnOp::Delete(t) => {
+                db.remove_triple(t);
+            }
+        }
+        match scope.take_error() {
+            Some(e) => Err(read_failure("applying the transaction's writes", e)),
+            None => Ok(()),
         }
     });
+    drop(scope);
     match applied {
         Ok(()) if own_txn => Ok(db.commit().err()),
         Ok(()) => Ok(None),
@@ -1057,16 +1094,24 @@ impl VersionView<'_> {
     /// `<= version` — then evaluates against it (so a graph-function query
     /// builds its CSR from that state). User-defined functions are the ones
     /// of the latest published snapshot: they are not versioned data. The
-    /// evaluation runs inside a [`ReadScope`]: a read error fails it.
+    /// materialization and the evaluation run inside a [`ReadScope`]: a read
+    /// error fails the query.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         self.db.base.check_captured()?;
         let mut dict = self.db.base.dict.clone();
         let mut store = self.db.base.store.clone();
-        self.db
-            .versioned
-            .read()
-            .unwrap()
-            .materialize_into(self.version, &mut dict, &mut store);
+        {
+            let scope = ReadScope::enter();
+            let materialized = self.db.versioned.read().unwrap().materialize_into(
+                self.version,
+                &mut dict,
+                &mut store,
+            );
+            if let Some(e) = scope.take_error() {
+                return Err(read_failure("materializing the version", e));
+            }
+            materialized.map_err(|e| read_failure("materializing the version", e.to_string()))?;
+        }
         let q = sparql::parse(sparql)?;
         let latest = self.db.snapshot();
         let functions = latest.functions.clone();

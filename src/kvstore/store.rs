@@ -180,6 +180,9 @@ pub struct DiskStore {
     /// Bumped by every write operation and refresh: a cached [`SpoRun`] of an
     /// older version is not used.
     version: AtomicU64,
+    /// The statistics were rebuilt when the store was opened (a file
+    /// written before they were maintained) and are not flushed yet.
+    stats_rebuilt: bool,
 }
 
 /// Source of [`DiskStore::instance`] ids.
@@ -219,11 +222,15 @@ impl Floor {
 /// cursor lowers it): while it is low the reads skip stepping and start
 /// fresh cursors at once, trying a step every [`SPO_WALK_RETRY`]th read, so
 /// a thread whose access pattern turns local again picks stepping up within
-/// a few dozen reads. Valid for one store instance and version.
+/// a few dozen reads. Valid for one store instance and version, and for one
+/// [write generation](Pager::write_generation) of the pager: the cursor holds
+/// a copy of its leaf and the link to the next one, which a write through
+/// any store sharing the pager (a read-only view's writer) makes stale.
 #[derive(Default)]
 struct SpoWalk {
     instance: u64,
     version: u64,
+    pager_gen: u64,
     cursor: Option<LeafCursor>,
     floor: Option<Floor>,
     /// The cursor's next entry (`None`: at the end of the tree).
@@ -386,8 +393,18 @@ impl DiskStore {
         let mut store = DiskStore::with_pager(Arc::new(RwLock::new(pager)), false)?;
         if needs_rebuild {
             store.rebuild_stats()?;
+            store.stats_rebuilt = true;
         }
         Ok(store)
+    }
+
+    /// Whether [`open`](Self::open) rebuilt the statistics of a file written
+    /// before they were maintained: they are in the page cache only until
+    /// the next commit, and every open rebuilds them again (a pass over all
+    /// triples) until one is made — a [`DiskTriples`](super::DiskTriples)
+    /// over this store commits them at its first commit point.
+    pub fn stats_rebuilt(&self) -> bool {
+        self.stats_rebuilt
     }
 
     /// A **read-only** view over a pager another `DiskStore` (the writer) owns:
@@ -443,6 +460,7 @@ impl DiskStore {
             read_only,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             version: AtomicU64::new(0),
+            stats_rebuilt: false,
         };
         store.refresh()?;
         Ok(store)
@@ -1352,13 +1370,18 @@ impl DiskStore {
     /// (see there). Equal to a prefix scan of the tree over the same range.
     fn spo_range(&self, pager: &Pager, lo: SpoKey, hi: SpoKey) -> io::Result<Vec<SpoKey>> {
         let version = self.version.load(Ordering::Acquire);
+        let pager_gen = pager.write_generation();
         let mut out = Vec::new();
         let walked = SPO_WALK.try_with(|cell| -> Option<io::Result<()>> {
             let mut walk = cell.try_borrow_mut().ok()?;
-            if walk.instance != self.instance || walk.version != version {
+            if walk.instance != self.instance
+                || walk.version != version
+                || walk.pager_gen != pager_gen
+            {
                 *walk = SpoWalk {
                     instance: self.instance,
                     version,
+                    pager_gen,
                     // Optimistic: the first reads try stepping.
                     score: SPO_WALK_SCORE_ON,
                     ..SpoWalk::default()
@@ -3998,6 +4021,45 @@ mod tests {
             view.try_o_by_sp(a, p).unwrap(),
             ds.try_o_by_sp(a, p).unwrap()
         );
+        cleanup(&path);
+    }
+
+    /// A read-only view's per-thread SPO cursor (`SpoWalk`) holds a copy of
+    /// its leaf: a write through the writer sharing the pager must make it
+    /// start over — stepping the old copy answered without the writer's
+    /// insert, and with its delete undone. (Every number of earlier reads,
+    /// so that some read tries a step whatever the locality score says.)
+    #[test]
+    fn a_view_steps_no_leaf_copy_older_than_the_writers_writes() {
+        let path = tmp("view_spo_walk");
+        let mut ds = DiskStore::build_str(&path, 64, "<a> <p> <b> .\n<c> <p> <d> .\n").unwrap();
+        let a = ds.term_id(&Term::iri("a")).unwrap().unwrap();
+        let c = ds.term_id(&Term::iri("c")).unwrap().unwrap();
+        let p = ds.predicate_id("<p>").unwrap().unwrap();
+        for n in 0..=2 * SPO_WALK_RETRY + 1 {
+            let o = format!("<e{n}>");
+            let view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+            for _ in 0..n {
+                view.try_po_by_s(a).unwrap();
+            }
+            assert!(ds.insert_keys("<c>", "<p>", &o, false).unwrap());
+            assert_eq!(
+                view.try_po_by_s(c).unwrap(),
+                ds.try_po_by_s(c).unwrap(),
+                "after {n} reads: the writer's insert is missing"
+            );
+            let view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+            for _ in 0..n {
+                view.try_po_by_s(a).unwrap();
+            }
+            assert!(ds.delete_keys("<c>", "<p>", &o, false).unwrap());
+            let e = ds.term_id(&Term::iri(format!("e{n}"))).unwrap().unwrap();
+            assert!(!ds.try_exists(c, p, e).unwrap());
+            assert!(
+                !view.try_exists(c, p, e).unwrap(),
+                "after {n} reads: the view still has the deleted triple"
+            );
+        }
         cleanup(&path);
     }
 

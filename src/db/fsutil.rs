@@ -389,7 +389,7 @@ pub(crate) struct DirSwap {
 
 /// The swap names of a store directory inside a database directory
 /// (`rocksdb/` → `rocksdb.tmp` / `rocksdb.new` / `rocksdb.old`).
-const STORE_SWAP: DirSwap = DirSwap {
+pub(crate) const STORE_SWAP: DirSwap = DirSwap {
     tmp: TMP_SUFFIX,
     new: NEW_SUFFIX,
     old: OLD_SUFFIX,
@@ -409,6 +409,22 @@ impl DirSwap {
     /// Where the replacement of `target` is staged.
     pub(crate) fn staging(&self, target: &Path) -> PathBuf {
         with_suffix(target, self.tmp)
+    }
+
+    /// Where the replaced `target` waits to be deleted (during a swap, the
+    /// directory itself, moved aside — its lock file with it).
+    pub(crate) fn moved_aside(&self, target: &Path) -> PathBuf {
+        with_suffix(target, self.old)
+    }
+
+    /// Whether a sibling of a swap of `target` exists: what an interrupted
+    /// swap left — or a swap in progress, in this or another process (the
+    /// same names). [`recover_dir_swap_as`] acts on them only under the lock
+    /// of the directory the swap is about.
+    pub(crate) fn in_progress(&self, target: &Path) -> bool {
+        [self.tmp, self.new, self.old]
+            .iter()
+            .any(|s| with_suffix(target, s).exists())
     }
 }
 

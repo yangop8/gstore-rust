@@ -686,11 +686,15 @@ impl DiskTriples {
                 "DiskTriples needs a writable DiskStore, not a read-only view".into(),
             ));
         }
+        // Statistics the open rebuilt (a file older than them) are written
+        // by the first commit point — `sync`, a checkpoint, the close — so
+        // the next open does not rebuild them again.
+        let dirty = store.stats_rebuilt();
         Ok(DiskTriples {
             store,
             shared: Arc::new(DiskShared::new()),
             txn: None,
-            dirty: AtomicBool::new(false),
+            dirty: AtomicBool::new(dirty),
             error: Mutex::new(None),
             fail_after: AtomicU64::new(NO_INJECTION),
             lists: Mutex::new(ListCache::default()),
@@ -739,6 +743,17 @@ impl DiskTriples {
     /// The first write or flush error, if the store is broken.
     pub fn broken(&self) -> Option<&str> {
         self.shared.broken.get().map(String::as_str)
+    }
+
+    /// A check that fails once this store is broken: for a dictionary
+    /// sharing its pager, which must not write through it then
+    /// ([`DiskDict::with_write_check`](super::DiskDict::with_write_check)).
+    pub fn write_check(&self) -> super::disk_dict::WriteCheck {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || match shared.broken.get() {
+            Some(e) => Err(broken_error(e)),
+            None => Ok(()),
+        })
     }
 
     /// Whether applied writes wait for a [`commit_point`](Self::commit_point).
@@ -1179,7 +1194,11 @@ impl DiskTriples {
     /// (whose result is cached when it is long).
     fn cached_ids(&self, key: ListKey, read: impl FnOnce() -> Vec<u32>) -> Vec<u32> {
         let epoch = self.epoch();
-        if let Some(CachedList::Ids(hit)) = self.list_cache().get(epoch, key) {
+        // The cache's guard is released at the end of this statement: the
+        // hit is copied out of its `Arc` after that, so concurrent readers
+        // of long lists do not queue on the copy.
+        let hit = self.list_cache().get(epoch, key);
+        if let Some(CachedList::Ids(hit)) = hit {
             return hit.to_vec();
         }
         let list = read();
@@ -1197,7 +1216,9 @@ impl DiskTriples {
         read: impl FnOnce() -> Vec<(u32, u32)>,
     ) -> Vec<(u32, u32)> {
         let epoch = self.epoch();
-        if let Some(CachedList::Pairs(hit)) = self.list_cache().get(epoch, key) {
+        // Copied after the guard is released (see `cached_ids`).
+        let hit = self.list_cache().get(epoch, key);
+        if let Some(CachedList::Pairs(hit)) = hit {
             return hit.to_vec();
         }
         let list = read();

@@ -1028,26 +1028,40 @@ fn stats_cache() -> &'static Mutex<HashMap<String, CachedStats>> {
 }
 
 /// The cached statistics of loaded database `db` (handle `h`) for its data
-/// at `mutations`, if computed already.
-fn cached_stats(db: &str, h: &DbHandle, mutations: u64) -> Option<ClassStats> {
+/// at `mutations` (any data when `None`: the last ones computed for this
+/// instance), if computed already.
+fn cached_stats(db: &str, h: &DbHandle, mutations: Option<u64>) -> Option<ClassStats> {
     let this = Arc::downgrade(h);
     let cache = locked(stats_cache());
     let c = cache.get(db)?;
-    (c.mutations == mutations && Weak::ptr_eq(&c.slot, &this))
+    (mutations.is_none_or(|m| c.mutations == m) && Weak::ptr_eq(&c.slot, &this))
         .then(|| (c.subjects, Arc::clone(&c.classes), Arc::clone(&c.graph)))
+}
+
+/// Compute the subject count, class statistics and schema graph of `db` in
+/// a read scope (contract C2): a read error — an on-disk page, a RocksDB
+/// block — fails it instead of answering (and caching) statistics of part
+/// of the data.
+fn compute_stats(db: &Database) -> Result<ClassStats, String> {
+    let scope = crate::store::read_scope::ReadScope::enter();
+    let subjects = db.subject_num();
+    let classes = Arc::new(db.type_statistics());
+    let graph = Arc::new(db.schema_graph());
+    match scope.take_error() {
+        Some(e) => Err(e),
+        None => Ok((subjects, classes, graph)),
+    }
 }
 
 /// The subject count, class statistics and schema graph of loaded database
 /// `db` (`slot`, held — shared suffices — of handle `h`), cached until the
-/// database changes.
-fn class_stats(db: &str, h: &DbHandle, slot: &DbSlot) -> ClassStats {
+/// database changes (never when reading them failed).
+fn class_stats(db: &str, h: &DbHandle, slot: &DbSlot) -> Result<ClassStats, String> {
     let mutations = slot.db.mutation_count();
-    if let Some(hit) = cached_stats(db, h, mutations) {
-        return hit;
+    if let Some(hit) = cached_stats(db, h, Some(mutations)) {
+        return Ok(hit);
     }
-    let subjects = slot.db.subject_num();
-    let classes = Arc::new(slot.db.type_statistics());
-    let graph = Arc::new(slot.db.schema_graph());
+    let (subjects, classes, graph) = compute_stats(&slot.db)?;
     locked(stats_cache()).insert(
         db.to_string(),
         CachedStats {
@@ -1058,7 +1072,15 @@ fn class_stats(db: &str, h: &DbHandle, slot: &DbSlot) -> ClassStats {
             graph: Arc::clone(&graph),
         },
     );
-    (subjects, classes, graph)
+    Ok((subjects, classes, graph))
+}
+
+/// `1005`: the statistics of database `db` could not be read.
+fn unreadable(db: &str, e: impl std::fmt::Display) -> GResp {
+    GResp::error(
+        Status::OperationFailed,
+        format!("database[{db}] could not be read: {e}"),
+    )
 }
 
 /// Inspect database `db`: the loaded instance, else — upstream reads an
@@ -1074,32 +1096,48 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     if let Some(h) = dbh {
         // Without the database lock while the statistics of the data it
         // published last are cached (monitoring never waits for a
-        // statement then); else computed on a shared guard and cached.
+        // statement then); else computed on a shared guard and cached —
+        // when that guard is free right now. A database a writer holds or
+        // waits for (behind a long query) is reported with the published
+        // figures and the statistics computed for its earlier data instead:
+        // waiting would stall monitoring for as long as the statements.
         let f = h.figures();
+        let published = |(subjects, classes, graph): ClassStats| Inspection {
+            triples: f.triples,
+            stats: crate::db::DbStats {
+                name: h.name.clone(),
+                triple_num: f.triples,
+                entity_num: usize::try_from(f.entities).unwrap_or(usize::MAX),
+                literal_num: usize::try_from(f.literals).unwrap_or(usize::MAX),
+                predicate_num: usize::try_from(f.predicates).unwrap_or(usize::MAX),
+                index_valid: f.index_valid,
+                in_transaction: f.in_transaction,
+            },
+            subjects,
+            classes,
+            graph,
+            in_txn: f.in_transaction,
+            status: DbStatus::Loaded,
+        };
         if f.live {
-            if let Some((subjects, classes, graph)) = cached_stats(db, &h, f.generation) {
-                return Ok(Inspection {
-                    triples: f.triples,
-                    stats: crate::db::DbStats {
-                        name: h.name.clone(),
-                        triple_num: f.triples,
-                        entity_num: usize::try_from(f.entities).unwrap_or(usize::MAX),
-                        literal_num: usize::try_from(f.literals).unwrap_or(usize::MAX),
-                        predicate_num: usize::try_from(f.predicates).unwrap_or(usize::MAX),
-                        index_valid: f.index_valid,
-                        in_transaction: f.in_transaction,
-                    },
-                    subjects,
-                    classes,
-                    graph,
-                    in_txn: f.in_transaction,
-                    status: DbStatus::Loaded,
-                });
+            if let Some(hit) = cached_stats(db, &h, Some(f.generation)) {
+                return Ok(published(hit));
             }
         }
-        let slot = h.read().map_err(lock_error)?;
+        let slot = match h.try_read() {
+            Some(slot) => slot,
+            None => {
+                let earlier = f.live.then(|| cached_stats(db, &h, None)).flatten();
+                if let Some(hit) = earlier {
+                    return Ok(published(hit));
+                }
+                // Nothing computed for this instance yet: wait.
+                h.read().map_err(lock_error)?
+            }
+        };
         if !slot.retired {
-            let (subjects, classes, graph) = class_stats(db, &h, &slot);
+            let (subjects, classes, graph) =
+                class_stats(db, &h, &slot).map_err(|e| unreadable(db, e))?;
             return Ok(Inspection {
                 triples: slot.committed_triple_num(),
                 stats: slot.db.stats(),
@@ -1120,18 +1158,14 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     } else {
         Database::open(&dir)
     };
-    let copy = copy.map_err(|e| {
-        GResp::error(
-            Status::OperationFailed,
-            format!("database[{db}] could not be read: {e}"),
-        )
-    })?;
+    let copy = copy.map_err(|e| unreadable(db, e))?;
+    let (subjects, classes, graph) = compute_stats(&copy).map_err(|e| unreadable(db, e))?;
     Ok(Inspection {
         triples: copy.triple_num(),
         stats: copy.stats(),
-        subjects: copy.subject_num(),
-        classes: Arc::new(copy.type_statistics()),
-        graph: Arc::new(copy.schema_graph()),
+        subjects,
+        classes,
+        graph,
         in_txn: false,
         status: DbStatus::AlreadyBuilt,
     })
@@ -1732,6 +1766,11 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let dest = target.join(&name);
     let zip_name = format!("{name}.zip");
     let zip_dest = target.join(&zip_name);
+    // Backups of one second share `dest`: they run one after the other
+    // (before Round 3 the database's exclusive lock ordered them; backups
+    // take a shared guard now), else one's removal of `dest` deletes the
+    // other's files mid-write, and one's failure cleanup the other's backup.
+    let _claim = BackupClaim::new(&dest);
     progress("backing up", 0);
     let written = match dbh {
         Some(h) => {
@@ -1785,6 +1824,47 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     rotate_backups(&target, &db, ctx.inner.config().max_backups);
     GResp::success("Database backup successfully.")
         .with("backupfilepath", ops_file::shown(&shown, &shown_name))
+}
+
+/// One `/api backup` request's claim on its backup directory: requests of
+/// the same database in the same second (the same `<db>.db_<time>` name)
+/// wait for each other, from removing an older backup of the name to
+/// packing and rotating, so each replaces the one before it whole. Taken
+/// before the database's guard and released after it (never the reverse,
+/// so no guard holder waits for a claim).
+struct BackupClaim {
+    dest: PathBuf,
+}
+
+impl BackupClaim {
+    /// The backup directories claimed by the requests in flight.
+    fn registry() -> &'static (Mutex<HashSet<PathBuf>>, std::sync::Condvar) {
+        static CLAIMS: OnceLock<(Mutex<HashSet<PathBuf>>, std::sync::Condvar)> = OnceLock::new();
+        CLAIMS.get_or_init(Default::default)
+    }
+
+    /// Claim `dest`, waiting while another request holds it.
+    fn new(dest: &Path) -> BackupClaim {
+        let (claims, freed) = Self::registry();
+        let mut held = locked(claims);
+        while held.contains(dest) {
+            held = freed
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        held.insert(dest.to_path_buf());
+        BackupClaim {
+            dest: dest.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for BackupClaim {
+    fn drop(&mut self) {
+        let (claims, freed) = Self::registry();
+        locked(claims).remove(&self.dest);
+        freed.notify_all();
+    }
 }
 
 /// `backuppath` — the backups of `db_name` in the server's backup directory

@@ -501,6 +501,9 @@ fn report_config(cfg: &GStoreConfig) {
 /// re-installs the re-read section (the API server is built
 /// `with_storage_refresh`).
 fn install_open_options(cfg: &GStoreConfig) {
+    if let Some(w) = cfg.default_layout_warning() {
+        gstore::gs_warn!("gserver: {w}");
+    }
     gstore::set_default_open_options(cfg.open_options());
     let effective = gstore::default_open_options();
     gs_announce!(

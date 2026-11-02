@@ -472,6 +472,65 @@ fn an_open_rocksdb_database_holds_the_directory_lock() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A RocksDB store opened while a build reads its input — by an older
+/// binary, which takes only `rocksdb/LOCK`, not the directory lock — is seen
+/// again right before the install replaces it: the build is refused and the
+/// old database kept (it used to be checked only when the build started, and
+/// the open store was then replaced under its writer).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_opened_during_the_build_is_not_replaced() {
+    let base = tmp("opened_during");
+    for target in [BulkTarget::RocksDb, BulkTarget::Disk] {
+        let dir = base.join(format!("{target:?}.db"));
+        bulk_text(&dir, "<http://ex/a> <http://ex/p> <http://ex/b> .\n").unwrap();
+        let fifo = base.join(format!("{target:?}-in.nt"));
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let lock = dir.join("rocksdb/LOCK");
+        let feeder = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                // Opening the pipe waits for the build to open it: past the
+                // check at its start.
+                let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                let holder = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock)
+                    .unwrap();
+                holder.try_lock().unwrap();
+                std::io::Write::write_all(&mut w, b"<http://ex/x> <http://ex/p> <http://ex/y> .\n")
+                    .unwrap();
+                drop(w);
+                holder
+            })
+        };
+        let built = bulk::build(
+            &dir,
+            "t",
+            BulkInput::Sources(&[Source::File(fifo.clone())]),
+            &import_opts(),
+            &mut (),
+            target,
+            &bulk_opts(2),
+        );
+        let holder = feeder.join().unwrap();
+        let e = built.expect_err("built over a store opened during the build");
+        assert!(e.to_string().contains("in use"), "{target:?}: {e}");
+        assert!(!dir.join(bulk::STAGING_DIR).exists());
+        drop(holder);
+        let mut db = Database::open(&dir).unwrap();
+        assert_eq!(db.triple_num(), 1, "{target:?}");
+        assert!(matches!(
+            db.query("ASK { <http://ex/a> <http://ex/p> <http://ex/b> }")
+                .unwrap(),
+            QueryResult::Ask(true)
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A failed bulk build — a strict import's bad statement, a database open in
 /// this process — leaves the old database (RocksDB or another layout) as it
 /// was, with no staging area.

@@ -1303,6 +1303,11 @@ impl Dictionary {
         self.id_of(Space::of_term(t), &t.dict_key())
     }
 
+    /// [`term_id`](Self::term_id), with a backend's read error returned.
+    pub fn try_term_id(&self, t: &Term) -> Result<Option<EntityLiteralId>> {
+        self.try_id(Space::of_term(t), &t.dict_key())
+    }
+
     // ---- id → string ------------------------------------------------------------
 
     /// The in-memory string of `id` in `space` (public id).

@@ -445,14 +445,20 @@ impl Database {
                 dir.display()
             )));
         }
-        fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
         // Every layout is locked against other processes before anything is
-        // read (see `dirlock`); a RocksDB store also takes its own
-        // `rocksdb/LOCK` when it opens.
-        let lock = match Database::storage_kind(dir) {
-            None => None,
-            Some(_) => Some(super::dirlock::DirLock::acquire(dir)?),
-        };
+        // read (see `dirlock`), and before a store swap an interrupted
+        // install left is finished: its names are also those of an install
+        // in progress in another process (a bulk build holds the lock), whose
+        // `rocksdb.new` the repair would delete. A RocksDB store also takes
+        // its own `rocksdb/LOCK` when it opens.
+        let rocks = dir.join(ROCKS_SUBDIR);
+        let lock =
+            if Database::storage_kind(dir).is_some() || fsutil::STORE_SWAP.in_progress(&rocks) {
+                Some(super::dirlock::DirLock::acquire(dir)?)
+            } else {
+                None
+            };
+        fsutil::recover_dir_swap(&rocks)?;
         let mut db = match Database::storage_kind(dir) {
             Some(StorageKind::RocksDb) => Database::open_rocks_layout(dir, options),
             Some(StorageKind::Disk) => Database::load_disk_with(dir, options),
@@ -655,6 +661,16 @@ impl Database {
             .home
             .as_deref()
             .is_some_and(|h| fsutil::same_dir(h, dir));
+        // Saving over a database another process has open — replacing its
+        // files, removing its other layouts — would strand every write it
+        // acknowledges later: that directory's lock is taken first (a
+        // database of this process shares it). A directory without a
+        // database has nothing to lock.
+        let _lock = if !at_home && Database::storage_kind(dir).is_some() {
+            Some(super::dirlock::DirLock::acquire(dir)?)
+        } else {
+            None
+        };
         if self.is_disk_backed() {
             self.commit_point()?;
             return if at_home {
@@ -940,6 +956,16 @@ impl Database {
     ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        // Replacing the files of a database another process serves (or one
+        // of this process has open) would strand its later writes: refused,
+        // as the bulk build refuses, and the directory held meanwhile.
+        if super::dirlock::DirLock::held_here(dir) {
+            return Err(GStoreError::Database(format!(
+                "database directory '{}' is open in this process; close it before rebuilding it",
+                dir.display()
+            )));
+        }
+        let _lock = super::dirlock::DirLock::acquire(dir)?;
         remove_other_layouts(dir, StorageKind::Disk)?;
         // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
         // leftover WAL from a crashed earlier build can't replay into the new file.
@@ -1025,6 +1051,7 @@ impl Database {
         let (term_bytes, key_bytes) = options.dict_cache_split();
         let dict = DiskDict::open_shared(dt.shared_pager()?)?
             .with_cache_budgets(term_bytes, key_bytes)
+            .with_write_check(dt.write_check())
             .writable();
         let mut db = Database::new(disk_db_name(dir));
         db.dict = Dictionary::from_backing(Arc::new(dict));
@@ -1373,6 +1400,10 @@ impl Database {
     /// opened, so it is only checked for a RocksDB `CURRENT` file.
     pub fn restore_into<P: AsRef<Path>, Q: AsRef<Path>>(backup: P, target: Q) -> Result<()> {
         let target = target.as_ref();
+        // A database another process serves from `target` (it holds the
+        // directory lock) must not be swapped out from under it: refused,
+        // and the directory held for the whole restore.
+        let _lock = super::dirlock::DirLock::acquire_existing(target)?;
         let staged = Database::stage_restore(backup.as_ref(), target)?;
         Database::install_restore(&staged, target)
     }
@@ -1433,7 +1464,25 @@ impl Database {
     /// `dir` (the staged copy had fully replaced nothing yet, or was half way
     /// through the swap), or remove its leftovers. Run by [`open`](Self::open);
     /// only the restore's own `<dir>.restore-*` siblings are ever touched.
+    ///
+    /// Only under the lock of the directory the swap is about: the names a
+    /// crash leaves are those of a restore in progress in another process
+    /// (which holds that lock), whose staged copy or moved-aside database
+    /// the repair would delete. While `dir` itself is moved aside
+    /// (`<dir>.restore-old`, its lock file with it), that directory's lock is
+    /// taken instead. Fails, touching nothing, while another process holds it.
     pub(crate) fn recover_restore(dir: &Path) -> Result<()> {
+        if !fsutil::RESTORE_SWAP.in_progress(dir) {
+            return Ok(());
+        }
+        let aside = fsutil::RESTORE_SWAP.moved_aside(dir);
+        let _lock = if dir.is_dir() {
+            Some(super::dirlock::DirLock::acquire(dir)?)
+        } else if aside.is_dir() {
+            Some(super::dirlock::DirLock::acquire(&aside)?)
+        } else {
+            None
+        };
         fsutil::recover_dir_swap_as(dir, &fsutil::RESTORE_SWAP)
     }
 
@@ -1929,13 +1978,47 @@ fn validate_restored_copy(dir: &Path, kind: StorageKind) -> Result<()> {
             )))
         };
     }
-    // Materialize mode reads every term and triple of an on-disk copy, so a
-    // truncated or damaged store fails here (a Stream-mode open reads only
-    // the header, the statistics and the named graphs).
-    let options = default_open_options().with_disk_query_mode(DiskQueryMode::Materialize);
+    // An on-disk copy is opened in Stream mode (memory bounded by the caches,
+    // as the server that restores it may serve a database larger than its
+    // RAM) and then read whole — every term and every triple, streamed, as
+    // a Materialize-mode open would read them into memory — so a truncated
+    // or damaged store fails here (the open alone reads only the header,
+    // the statistics and the named graphs).
+    let options = default_open_options().with_disk_query_mode(DiskQueryMode::Stream);
     Database::open_with(dir, &options)
-        .map(drop)
+        .and_then(|db| read_whole_disk_store(&db))
         .map_err(|e| GStoreError::Database(format!("the backup is not a readable database: {e}")))
+}
+
+/// Read every term and every default-graph triple of a Stream-mode
+/// database's on-disk store once, keeping none of them (see
+/// [`validate_restored_copy`]): an error when a page cannot be read or
+/// decoded, or when the triple index disagrees with the header's count.
+/// Nothing to do for another layout (its open read it all).
+fn read_whole_disk_store(db: &Database) -> Result<()> {
+    let Some(dt) = db.store.as_disk() else {
+        return Ok(());
+    };
+    let ds = dt.disk_store()?;
+    let mut triples = 0u64;
+    ds.for_each_entity_adjacency(|_, out, _| {
+        triples += out.len() as u64;
+        std::ops::ControlFlow::Continue(())
+    })?;
+    if triples != ds.triple_count() {
+        return Err(GStoreError::Database(format!(
+            "its triple index holds {triples} triples, its header {}",
+            ds.triple_count()
+        )));
+    }
+    if let Some(terms) = db.dict.backing() {
+        for space in [Space::Entity, Space::Literal, Space::Predicate] {
+            terms.for_each(space, space.first_id(), &mut |_, _| {
+                std::ops::ControlFlow::Continue(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile a legacy shadow snapshot found next to `kvstore.kv` (see the

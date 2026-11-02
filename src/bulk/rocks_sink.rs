@@ -62,7 +62,7 @@ use crate::reason::rules::RULE_DIR;
 use crate::store::TripleSource;
 
 use super::budget::Budget;
-use super::commit::{rocksdb_lock_holder, CRASH_ENV, STAGING_DIR};
+use super::commit::{refuse_open_store, CRASH_ENV, STAGING_DIR};
 use super::encode::{render_key, Dict, Space};
 use super::extsort::{ExtSorter, Sorted};
 use super::scratch::{self, Scratch};
@@ -786,12 +786,7 @@ pub(crate) fn build_rocksdb(
     // Finish a swap a crash interrupted (as every open does) before looking
     // at the store: its `rocksdb.new` may be the committed database.
     fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
-    if let Some(holder) = rocksdb_lock_holder(dir) {
-        return Err(GStoreError::Database(format!(
-            "the RocksDB store in '{}' is in use ({holder}); close it before rebuilding",
-            dir.display()
-        )));
-    }
+    refuse_open_store(dir)?;
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
         // What a crashed build left: never part of a database.
@@ -876,6 +871,10 @@ fn note(warnings: &mut Vec<String>, what: &str, r: Result<()>) {
 fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String>> {
     let staged = staging.join(ROCKS_SUBDIR);
     fp.hit("staged")?;
+    // Again, right before the swap: an older binary that opened the store
+    // while the input was parsed and sorted (it takes no directory lock)
+    // would keep writing to the replaced files and lose every write.
+    refuse_open_store(dir)?;
 
     let target = dir.join(ROCKS_SUBDIR);
     let mut warnings = Vec::new();

@@ -64,6 +64,8 @@ mod hardening_tests;
 mod load_policy;
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod stream_review_tests;
 pub use load_policy::{LoadPolicy, LoadSource};
 mod query_cache;
 use query_cache::QueryCache;
@@ -204,6 +206,19 @@ thread_local! {
 /// Build an in-memory VS-tree over every entity (see [`vstree_entries`]).
 fn build_vstree(store: &Backend) -> VsTree {
     VsTree::build(backend_vstree_entries(store))
+}
+
+/// [`backend_vstree_entries`] in a read scope (C2): a read error fails it
+/// instead of signing an entity with missing edges — a tree built from such
+/// entries is not a superset, and queries filtering through it would
+/// silently lose rows.
+fn checked_vstree_entries(store: &Backend) -> Result<Vec<(EntityLiteralId, Signature)>> {
+    let scope = ReadScope::enter();
+    let entries = backend_vstree_entries(store);
+    match scope.take_error() {
+        Some(e) => Err(read_failure("signing the entities for the VS-tree", e)),
+        None => Ok(entries),
+    }
 }
 
 /// On-disk metadata (kept tiny and human-meaningful).
@@ -541,7 +556,12 @@ impl Database {
     /// CSR-dirty flag is set, GeneralEvaluation.cpp:262-271). A named-graph
     /// mutation also advances the counter and so triggers a (redundant but
     /// harmless) rebuild. Thread-safe: concurrent callers share one build.
+    ///
+    /// A Stream-mode database whose on-disk store is broken (C5) refuses,
+    /// also a CSR cached before the failure (it may hold a failed
+    /// transaction's triples).
     pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
+        self.check_store_readable()?;
         self.csr_cache.get_or_build(self.mutations, || {
             // A read error while building fails the build (nothing is cached).
             let scope = ReadScope::enter();
@@ -561,7 +581,7 @@ impl Database {
 
     /// Whether a CSR for the current data is cached (no rebuild needed).
     pub fn csr_is_cached(&self) -> bool {
-        self.csr_cache.peek(self.mutations).is_some()
+        self.check_store_readable().is_ok() && self.csr_cache.peek(self.mutations).is_some()
     }
 
     /// A view of [`csr_is_cached`](Self::csr_is_cached) that can be read
@@ -575,6 +595,7 @@ impl Database {
     /// The cached CSR if it is current for the data (never builds) — lets a
     /// read snapshot of this database share it instead of rebuilding.
     pub fn cached_csr(&self) -> Option<std::sync::Arc<CsrGraph>> {
+        self.check_store_readable().ok()?;
         self.csr_cache.peek(self.mutations)
     }
 
@@ -706,7 +727,13 @@ impl Database {
     /// transaction ends. Any other database builds its in-memory tree.
     pub fn try_rebuild_index(&mut self) -> Result<()> {
         if self.store.as_disk().is_none() {
-            self.vstree = build_vstree(&self.store);
+            // A RocksDB store can fail a read: the old tree is dropped then
+            // and none is used until a rebuild succeeds.
+            let entries = checked_vstree_entries(&self.store).inspect_err(|_| {
+                self.index_valid = false;
+                self.vstree = VsTree::new();
+            })?;
+            self.vstree = VsTree::build(entries);
             self.index_valid = true;
             self.vs_shrink_debt = 0;
             return Ok(());
@@ -727,6 +754,13 @@ impl Database {
         let Some(dt) = self.store.as_disk_mut() else {
             return Ok(());
         };
+        // The pages the tree is signed from must be durable before it
+        // replaces `vstree.kv`: direct writes not yet at a commit point sit
+        // in the page cache only, and a crash after the rename would leave
+        // a tree of data the store does not hold (deleted edges missing from
+        // it while the store still has them — not a superset, C9) under a
+        // header that says the tree is fresh.
+        dt.commit_point()?;
         let entries = disk_vstree_entries(dt.disk_store()?)?;
         self.vstree = persist::write_vstree_kv(&home.join(VSTREE_KV_FILE), entries)?;
         dt.mark_vstree_fresh();
@@ -790,9 +824,12 @@ impl Database {
                 fs::create_dir_all(parent)?;
             }
         }
+        // Signed first, in a read scope: a read error fails the call and
+        // leaves the current tree (and its file) as they were.
+        let entries = checked_vstree_entries(&self.store)?;
         // Fresh build: drop any prior node file (and its WAL) at this path.
         remove_file_and_wal(path);
-        self.vstree = VsTree::build_disk(path, backend_vstree_entries(&self.store))?;
+        self.vstree = VsTree::build_disk(path, entries)?;
         self.index_valid = true;
         self.vs_shrink_debt = 0;
         self.query_cache_mut().clear();
@@ -980,13 +1017,19 @@ impl Database {
             opts,
             log,
             &mut |batch: &mut Vec<Quad>| {
+                // In a read scope (C2): a term that cannot be looked up must
+                // fail the removal, not read as absent.
+                let scope = ReadScope::enter();
                 for q in batch.drain(..) {
                     let graph = graph_iri(&q.graph);
                     if self.delete_quad(&q.into_triple(), graph.as_deref()) {
                         *applied += 1;
                     }
+                    if let Some(e) = scope.take_error() {
+                        return Err(read_failure("removing statements", e));
+                    }
                 }
-                Ok(())
+                self.check_store_readable()
             },
         )
     }
@@ -1309,9 +1352,12 @@ impl Database {
                     return Err(e);
                 }
                 // The store is broken: the transaction is gone, and so are
-                // its redo records (nothing of it is acknowledged).
+                // its redo records (nothing of it is acknowledged), and the
+                // cached answers and CSR built from its overlay.
                 self.txn = None;
                 self.redo_pending.clear();
+                self.query_cache_mut().clear();
+                self.csr_cache.clear();
                 self.run_deferred_rebuild();
                 return Err(e);
             }
@@ -1774,7 +1820,20 @@ impl Database {
         let before = self.mutations;
         let mut changed = 0;
         for op in ops {
-            match self.exec_update_op(op, cancel.as_ref(), pfn) {
+            // Each operation is applied inside a read scope (C2): an
+            // out-of-core dictionary's read error while a DELETE, CLEAR or
+            // DROP looks up its terms would otherwise read as "no such
+            // term" and the statement succeed with nothing removed. A store
+            // that broke during the operation (a write error inside a
+            // transaction, reported as "not applied") fails it as well.
+            let scope = ReadScope::enter();
+            let applied = self.exec_update_op(op, cancel.as_ref(), pfn);
+            let applied = match scope.take_error() {
+                Some(e) => Err(read_failure("applying the update", e)),
+                None => applied.and_then(|n| self.check_store_readable().map(|()| n)),
+            };
+            drop(scope);
+            match applied {
                 Ok(n) => changed += n,
                 Err(e) => return Err(self.failed_update(e, before)),
             }
