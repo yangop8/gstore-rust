@@ -672,7 +672,9 @@ fn an_injected_read_error_fails_the_query() {
     let dir = tmp("read_error");
     let mut db = Database::build_rocksdb_from_str("re", &dir, SMALL).unwrap();
     let q = "SELECT ?o WHERE { <root> <contain> ?o }";
-    assert_eq!(db.select(q).unwrap().row_count(), 2);
+    // (Not run before the failure: a cached answer would be served without
+    // reading.)
+    assert_eq!(db.triple_num(), 7);
     db.backend().as_rocks().unwrap().debug_fail_reads(true);
     for q in [
         q,

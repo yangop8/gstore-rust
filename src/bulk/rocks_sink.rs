@@ -609,23 +609,23 @@ fn build_store(
         .into_iter()
         .collect::<Result<Vec<TaskOut>>>()?;
     phase(&mut img.phases, "index", t);
-    for (name, out) in ["  pos", "  osp", "  x-counts", "  dictionary"]
+    for (name, task) in ["  pos", "  osp", "  x-counts", "  dictionary"]
         .into_iter()
         .zip(&outs)
     {
         img.phases.push(PhaseTime {
             name,
-            millis: out.millis,
+            millis: task.millis,
         });
     }
-    for out in outs {
-        if let Some(st) = &out.pos_stats {
+    for task in outs {
+        if let Some(st) = &task.pos_stats {
             stats.merge_pos(st);
         }
-        if let Some(n) = out.distinct_obj {
+        if let Some(n) = task.distinct_obj {
             stats.distinct_obj = n;
         }
-        files.extend(out.files);
+        files.extend(task.files);
     }
 
     // 4. The global and per-predicate counters; ingest; check.
