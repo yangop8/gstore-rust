@@ -852,16 +852,21 @@ impl Database {
     /// has `dir` open: unload it first.
     pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
         let sources = import::sources_from_paths(files)?;
-        Database::build_disk_from_sources(dir, &sources, &import::ImportOptions::strict(), &mut ())
-            .map(|_| ())
+        Database::build_disk_bulk_from_sources(
+            dir,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )
+        .map(|_| ())
     }
 
     /// [`build_disk`](Self::build_disk) from `sources` with explicit
     /// [`import::ImportOptions`] (e.g. tolerant, logging skipped statements
-    /// to `log`); returns the import counts. The bulk build (see
-    /// [`build_disk`](Self::build_disk)); call [`crate::bulk::build`] for its
-    /// options and full report.
-    pub fn build_disk_from_sources<P: AsRef<Path>>(
+    /// to `log`); returns the import counts. The bulk build with the default
+    /// [`BulkOptions`](crate::bulk::BulkOptions); call [`crate::bulk::build`]
+    /// for other options and the full report.
+    pub fn build_disk_bulk_from_sources<P: AsRef<Path>>(
         dir: P,
         sources: &[import::Source],
         opts: &import::ImportOptions,
@@ -910,9 +915,25 @@ impl Database {
         .map(|_| ())
     }
 
+    /// [`build_disk`](Self::build_disk)'s inputs with explicit
+    /// [`import::ImportOptions`], through the **incremental** build (see
+    /// [`build_disk_from_sources_incremental`](Self::build_disk_from_sources_incremental)).
+    /// `gbuild --incremental` and the bulk build's own comparison tests use it
+    /// as the incremental reference; it becomes the bulk build
+    /// ([`build_disk_bulk_from_sources`](Self::build_disk_bulk_from_sources))
+    /// once those callers name the `_incremental` variant (see
+    /// changelog.d/phase6-R3-STREAM.md).
+    pub fn build_disk_from_sources<P: AsRef<Path>>(
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<import::ImportReport> {
+        Database::build_disk_from_sources_incremental(dir, sources, opts, log)
+    }
+
     /// [`build_disk_incremental`](Self::build_disk_incremental) from
-    /// `sources` (the pre-Phase-6 body of
-    /// [`build_disk_from_sources`](Self::build_disk_from_sources)).
+    /// `sources` (the pre-Phase-6 body of the disk build).
     #[doc(hidden)]
     pub fn build_disk_from_sources_incremental<P: AsRef<Path>>(
         dir: P,
