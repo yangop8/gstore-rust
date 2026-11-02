@@ -188,7 +188,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::config::GStoreConfig;
 use crate::db::dirlock::DirLock;
-use crate::db::{Database, LoadPolicy, LoadSource, QuerySettings, Statement};
+use crate::db::{Database, LoadPolicy, LoadSource, QuerySettings, Statement, StorageKind};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::gapi::apilog::{ApiLogs, TxnState};
@@ -1643,6 +1643,10 @@ pub(crate) struct ApiInner {
     /// [`ApiServer::with_storage_refresh`]). An embedded server leaves the
     /// process's defaults alone (the default).
     storage_refresh: AtomicBool,
+    /// The options this server opens databases with
+    /// ([`ApiServer::with_open_options`]); `None`: the process defaults
+    /// ([`crate::db::default_open_options`]), the environment included.
+    open_options: RwLock<Option<crate::db::OpenOptions>>,
     /// Every user's PFN functions (`funquery` / `funcudb` / `funreview`,
     /// `PFN.name(…)` in queries): under `conf.ini`'s `pfn_base_path` when it
     /// is set, else `<root>/pfn`. A query calls the functions of the user it
@@ -1718,9 +1722,6 @@ impl ApiInner {
     fn refresh_storage(&self, fresh: &GStoreConfig) {
         if !self.storage_refresh.load(Ordering::SeqCst) {
             return;
-        }
-        if let Some(w) = fresh.default_layout_warning() {
-            crate::gs_warn!("refreshconf: {w}");
         }
         crate::db::set_default_open_options(fresh.open_options());
         let effective = crate::db::default_open_options();
@@ -1898,6 +1899,31 @@ impl ApiInner {
     /// request still holding the handle can neither use nor save it. Returns
     /// whether it was loaded. Must not be called with the state lock held
     /// (nor a guard of the database).
+    /// Open the database at `dir` with this server's open options (see
+    /// [`ApiServer::with_open_options`]).
+    pub(crate) fn open_db(&self, dir: &Path) -> crate::Result<Database> {
+        let options = *self
+            .open_options
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match options {
+            Some(o) => Database::open_with(dir, &o),
+            None => Database::open(dir),
+        }
+    }
+
+    /// The layout of a build that names none: `[storage] default_layout`
+    /// of this server's configuration, else of the process's open options
+    /// (`gserver` installs its `[storage]` section), else the snapshot
+    /// layout (the default disk query mode is Materialize, so the plan's
+    /// rule keeps the snapshot layout).
+    pub(crate) fn default_build_layout(&self) -> StorageKind {
+        self.config()
+            .default_layout
+            .or_else(|| crate::db::default_open_options().default_layout)
+            .unwrap_or(StorageKind::Snapshot)
+    }
+
     pub(crate) fn retire_loaded(&self, name: &str) -> Result<bool, OpError> {
         let handle = locked(&self.state).dbs.remove(name);
         match handle {
@@ -2050,6 +2076,7 @@ impl ApiServer {
                 settings_gen: AtomicU64::new(0),
                 log_refresh: Mutex::new(None),
                 storage_refresh: AtomicBool::new(false),
+                open_options: RwLock::new(None),
                 pfn,
             }),
             listener: Mutex::new(Some(listener)),
@@ -2171,6 +2198,21 @@ impl ApiServer {
     /// patterns may contact remote endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
+        self
+    }
+
+    /// Open the databases this server loads (`/load`, `/api load`, a
+    /// restore, a build in the disk or RocksDB layout) with `options`, as
+    /// given — instead of the process defaults
+    /// ([`crate::db::default_open_options`], which the environment can
+    /// override). For an embedded server that needs one disk query mode
+    /// whatever the process defaults say.
+    pub fn with_open_options(self, options: crate::db::OpenOptions) -> ApiServer {
+        *self
+            .inner
+            .open_options
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(options);
         self
     }
 
@@ -3295,6 +3337,11 @@ impl ApiInner {
                 ),
             ));
         }
+        let layout = match build_layout(req.param("layout").as_deref(), self.default_build_layout())
+        {
+            Ok(layout) => layout,
+            Err(e) => return Dispatch::Done(Resp::fail(400, &e)),
+        };
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
         }
@@ -3313,12 +3360,19 @@ impl ApiInner {
                 inner,
                 name: name.clone(),
             };
-            let built = match path {
+            let source = match path {
                 Some(path) => match build_source(&policy, &path) {
-                    Ok(file) => Database::build_from_files(name.clone(), &[file]),
+                    Ok(file) => RestBuildSource::File(file),
                     Err(r) => return r,
                 },
-                None => Database::build_from_str(name.clone(), &body),
+                None => RestBuildSource::Text(body),
+            };
+            if layout != StorageKind::Snapshot {
+                return inner.rest_build_bulk(&name, &dir, &source, layout, vanished, &creator);
+            }
+            let built = match &source {
+                RestBuildSource::File(file) => Database::build_from_files(name.clone(), &[file]),
+                RestBuildSource::Text(body) => Database::build_from_str(name.clone(), body),
             };
             let db = match built {
                 Ok(db) => db,
@@ -3350,18 +3404,106 @@ impl ApiInner {
                     return Resp::fail(500, &format!("save failed: {e}"));
                 }
             }
-            let triples = db.triple_num();
-            let mut st = locked(&inner.state);
-            let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
-            st.dbs.insert(name.clone(), slot);
-            // Registry bookkeeping (best effort: the registry is reconciled
-            // with the database directories at every start anyway).
-            if vanished {
-                let _ = st.users.forget_database(&name);
-            }
-            let _ = st.sysdb.register(&name, &creator);
-            Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+            inner.serve_built(&name, db, dir, vanished, &creator)
         }))
+    }
+
+    /// Serve database `db` (just built at `dir`) under `name` and register
+    /// it for `creator` (`vanished`: forget the grants of a dropped
+    /// database of that name first). The REST `/build` answer.
+    fn serve_built(
+        &self,
+        name: &str,
+        db: Database,
+        dir: PathBuf,
+        vanished: bool,
+        creator: &str,
+    ) -> Resp {
+        let triples = db.triple_num();
+        let mut st = locked(&self.state);
+        let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+        st.dbs.insert(name.to_string(), slot);
+        // Registry bookkeeping (best effort: the registry is reconciled
+        // with the database directories at every start anyway).
+        if vanished {
+            let _ = st.users.forget_database(name);
+        }
+        let _ = st.sysdb.register(name, creator);
+        Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+    }
+
+    /// REST `/build` in the on-disk or RocksDB `layout`, through the bulk
+    /// loader ([`crate::bulk::build`]), which installs the new database
+    /// crash-safely over `dir` and takes the directory's lock itself. So the
+    /// loaded copy is retired first (closing its files and releasing its
+    /// handle on the directory), and this request's probe of the lock —
+    /// refusing a directory another process holds — is released before the
+    /// build starts. The result is then opened and served. A build that
+    /// fails leaves the previous database in place; a loaded one is served
+    /// again.
+    fn rest_build_bulk(
+        &self,
+        name: &str,
+        dir: &Path,
+        source: &RestBuildSource,
+        layout: StorageKind,
+        vanished: bool,
+        creator: &str,
+    ) -> Resp {
+        let sources = match source {
+            RestBuildSource::File(file) => match crate::parser::import::sources_from_paths(&[file])
+            {
+                Ok(s) => s,
+                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+            },
+            RestBuildSource::Text(_) => Vec::new(),
+        };
+        let input = match source {
+            RestBuildSource::File(_) => crate::bulk::BulkInput::Sources(&sources),
+            RestBuildSource::Text(text) => crate::bulk::BulkInput::Text {
+                text,
+                format: crate::parser::import::RdfFormat::Turtle,
+                name: "request body",
+            },
+        };
+        match DirLock::acquire_existing(dir) {
+            Ok(probe) => drop(probe),
+            Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+        }
+        let was_loaded = match self.retire_loaded(name) {
+            Ok(loaded) => loaded,
+            Err(e) => return e.rest(),
+        };
+        let built = crate::bulk::build(
+            dir,
+            name,
+            input,
+            &crate::parser::import::ImportOptions::strict(),
+            &mut (),
+            bulk_target(layout),
+            &self.config().bulk_options(),
+        );
+        if let Err(e) = built {
+            if was_loaded {
+                // The previous database is intact: serve it again.
+                if let Ok(db) = self.open_db(dir) {
+                    let mut st = locked(&self.state);
+                    let slot = DbSlot::handle(
+                        db,
+                        dir.to_path_buf(),
+                        false,
+                        &st.load_policy,
+                        &st.query_settings,
+                    );
+                    st.dbs.insert(name.to_string(), slot);
+                }
+            }
+            return Resp::fail(400, &format!("build failed: {e}"));
+        }
+        match self.open_db(dir) {
+            Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
+            Err(e) => Resp::fail(500, &format!("built, but opening it failed: {e}")),
+        }
     }
 
     fn handle_load(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
@@ -3391,7 +3533,7 @@ impl ApiInner {
             }
             // Any layout (snapshot, on-disk `kvstore.kv`, RocksDB): an on-disk /
             // RocksDB database keeps writing its updates through to `dir`.
-            match Database::open(&dir) {
+            match inner.open_db(&dir) {
                 Ok(db) => {
                     let mut st = locked(&inner.state);
                     let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
@@ -3459,7 +3601,7 @@ impl ApiInner {
                 Some(h) => h,
                 None => {
                     let (opened, fresh) = if dir.is_dir() {
-                        (Database::open(&dir), false)
+                        (inner.open_db(&dir), false)
                     } else {
                         (Database::build_from_str(name.clone(), ""), true)
                     };
@@ -4447,7 +4589,7 @@ impl ApiInner {
             drop(probe);
             // Serve whatever the directory now holds: the restored copy, or —
             // if the swap failed — the previous database (saved above).
-            let reopened = Database::open(&dir);
+            let reopened = inner.open_db(&dir);
             match (installed, reopened) {
                 (Ok(()), Ok(db)) => {
                     let mut st = locked(&inner.state);
@@ -4997,6 +5139,52 @@ pub(crate) fn backup_name_db(component: &str) -> Option<&str> {
 /// The server-local file a `/build?db_path=` may read: what the server's LOAD
 /// policy allows (the same rules as SPARQL `LOAD`), and only a regular file —
 /// never a device or FIFO that would never end.
+/// Where REST `/build` reads its RDF: a server-local file (`db_path`) or
+/// the request body.
+enum RestBuildSource {
+    File(PathBuf),
+    Text(String),
+}
+
+/// A build's `layout` parameter (REST `/build`, `/api build`):
+/// `snapshot` (also `memory`), `disk` (also `kvstore`) or `rocksdb`
+/// (also `rocks`), case-insensitive; `default` when it is absent or empty.
+/// The RocksDB layout needs a server built with the `rocksdb` feature.
+pub(crate) fn build_layout(
+    param: Option<&str>,
+    default: StorageKind,
+) -> Result<StorageKind, String> {
+    let layout = match param.map(str::trim).filter(|v| !v.is_empty()) {
+        None => default,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "snapshot" | "memory" => StorageKind::Snapshot,
+            "disk" | "kvstore" => StorageKind::Disk,
+            "rocksdb" | "rocks" => StorageKind::RocksDb,
+            _ => {
+                return Err(format!(
+                    "invalid layout '{v}': it can only be snapshot, disk or rocksdb"
+                ))
+            }
+        },
+    };
+    if layout == StorageKind::RocksDb && !cfg!(feature = "rocksdb") {
+        return Err(
+            "the rocksdb layout needs a server built with the rocksdb feature \
+             (--features rocksdb)"
+                .into(),
+        );
+    }
+    Ok(layout)
+}
+
+/// The bulk loader's target for an on-disk or RocksDB build layout.
+pub(crate) fn bulk_target(layout: StorageKind) -> crate::bulk::BulkTarget {
+    match layout {
+        StorageKind::RocksDb => crate::bulk::BulkTarget::RocksDb,
+        _ => crate::bulk::BulkTarget::Disk,
+    }
+}
+
 fn build_source(policy: &LoadPolicy, path: &str) -> Result<PathBuf, Resp> {
     let refused = || {
         Resp::fail(

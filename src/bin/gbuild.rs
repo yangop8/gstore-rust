@@ -3,8 +3,8 @@
 //! Mirrors gStore's `gbuild`:
 //!
 //! ```text
-//! gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<source> ...]
-//! gbuild -db <db_name> [-f <source>] [--disk | --rocksdb] [--strict] [--force]
+//! gbuild [--layout snapshot|disk|rocksdb | --disk | --rocksdb] [--strict] [--force] <db_name> [<source> ...]
+//! gbuild -db <db_name> [-f <source>] [--layout L | --disk | --rocksdb] [--strict] [--force]
 //! gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] …
 //! gbuild --rocksdb [--memory MB] [--threads N] [--tmp-dir DIR] [--incremental] …
 //! ```
@@ -13,8 +13,13 @@
 //! further positional sources may follow it).
 //!
 //! Produces a `<db_name>.db` directory holding the dictionary and indexes.
-//! `--disk` selects the on-disk B+ tree KVstore; `--rocksdb` (requires building
-//! with `--features rocksdb`) selects the persistent RocksDB backend. Without
+//! `--layout` chooses its layout: `snapshot` (in memory, saved as a bincode
+//! snapshot), `disk` (the on-disk B+ tree KVstore; also `--disk`) or
+//! `rocksdb` (the persistent RocksDB backend, which requires building with
+//! `--features rocksdb`; also `--rocksdb`). Without any of them the layout is
+//! `[storage] default_layout` of `./conf/conf.ini` when it is set, else
+//! `snapshot` — the layout the servers' builds (REST `/build`, `/api build`)
+//! default to as well. Without
 //! a source an empty database is built (upstream: "will build an empty
 //! database"). Like upstream, `gbuild` refuses to build over an existing
 //! database directory (exit status 1; remove it with `gdrop` first) unless
@@ -90,8 +95,8 @@ use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gbuild",
-    usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
-            gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]\n\
+    usage: "gbuild [--layout snapshot|disk|rocksdb | --disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
+            gbuild -db <db_name> [-f <file | dir | zip | url>] [--layout L | --disk | --rocksdb] [--strict] [--force]\n\
             \t[--unzip-max-size BYTES] [--unzip-max-entries N]\n\
             gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] ...\n\
             gbuild --rocksdb [--memory MB] [--threads N] [--tmp-dir DIR] [--incremental] ...",
@@ -103,6 +108,8 @@ const TOOL: cli::Tool = cli::Tool {
            \t-f,--file PATH\t\tAn RDF file, a directory of RDF files, a zip package of\n\
            \t\t\t\tRDF files (feature `zip`) or an http(s) URL.\n\
            \t\t\t\tWithout any source an empty database is built.\n\
+           \t--layout L\t\tThe layout: snapshot, disk or rocksdb (default: conf.ini\n\
+           \t\t\t\t[storage] default_layout, else snapshot).\n\
            \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore (built in\n\
            \t\t\t\tbulk: sorted, bottom-up, installed crash-safely).\n\
            \t--memory MB\t\tSort memory of a --disk / --rocksdb build (default:\n\
@@ -150,6 +157,50 @@ const FILL: cli::Opt = cli::Opt {
     short: "",
     long: "fill",
 };
+/// `--layout snapshot|disk|rocksdb`: the database's layout.
+const LAYOUT: cli::Opt = cli::Opt {
+    short: "",
+    long: "layout",
+};
+
+/// The layout `gbuild` builds in: `--layout`, else `--disk` / `--rocksdb`,
+/// else `conf.ini`'s `[storage] default_layout`, else the snapshot layout.
+fn resolve_layout(
+    layout: Option<&str>,
+    disk: bool,
+    rocksdb: bool,
+) -> Result<gstore::StorageKind, String> {
+    use gstore::StorageKind;
+    if disk && rocksdb {
+        return Err("choose at most one of --disk / --rocksdb".into());
+    }
+    let flag = if disk {
+        Some(StorageKind::Disk)
+    } else if rocksdb {
+        Some(StorageKind::RocksDb)
+    } else {
+        None
+    };
+    let Some(v) = layout else {
+        return Ok(flag
+            .or(load_config().default_layout)
+            .unwrap_or(StorageKind::Snapshot));
+    };
+    let chosen = match v.to_ascii_lowercase().as_str() {
+        "snapshot" | "memory" => StorageKind::Snapshot,
+        "disk" | "kvstore" => StorageKind::Disk,
+        "rocksdb" | "rocks" => StorageKind::RocksDb,
+        _ => {
+            return Err(format!(
+                "--layout takes snapshot, disk or rocksdb, not '{v}'"
+            ))
+        }
+    };
+    match flag {
+        Some(f) if f != chosen => Err(format!("--layout {v} contradicts --disk / --rocksdb")),
+        _ => Ok(chosen),
+    }
+}
 
 /// The `[system]` configuration: `./conf/conf.ini` when it exists.
 fn load_config() -> GStoreConfig {
@@ -205,6 +256,7 @@ fn main() -> ExitCode {
             THREADS,
             TMP_DIR,
             FILL,
+            LAYOUT,
         ],
     ) {
         Ok(cli::Parsed::Help) => {
@@ -220,9 +272,12 @@ fn main() -> ExitCode {
     let strict = args.take_flag(&["--strict"]);
     let force = args.take_flag(&["--force"]);
     let incremental = args.take_flag(&["--incremental"]);
-    if disk && rocksdb {
-        return TOOL.usage_error("choose at most one of --disk / --rocksdb");
-    }
+    let layout = match resolve_layout(args.value(8), disk, rocksdb) {
+        Ok(l) => l,
+        Err(e) => return TOOL.usage_error(&e),
+    };
+    let disk = layout == gstore::StorageKind::Disk;
+    let rocksdb = layout == gstore::StorageKind::RocksDb;
     let bulk_flags = (4..7).any(|i| args.value(i).is_some()) || incremental;
     if bulk_flags && !disk && !rocksdb {
         return TOOL.usage_error(

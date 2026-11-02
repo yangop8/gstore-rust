@@ -50,8 +50,8 @@ use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
 use crate::http_api::{
-    may_restore_from, ApiInner, BackupClaim, BusyGuard, DbCell, DbHandle, DbSlot, OpError,
-    OpErrorKind,
+    build_layout, bulk_target, may_restore_from, ApiInner, BackupClaim, BusyGuard, DbCell,
+    DbHandle, DbSlot, OpError, OpErrorKind,
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
@@ -898,7 +898,7 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         name: db.clone(),
     };
     progress("loading", 0);
-    match Database::open(&dir) {
+    match ctx.inner.open_db(&dir) {
         Ok(opened) => {
             let mut st = ctx.state();
             let slot = DbSlot::handle(opened, dir, false, &st.load_policy, &st.query_settings);
@@ -1159,7 +1159,7 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     let copy = if Database::storage_kind(&dir) == Some(crate::StorageKind::Snapshot) {
         Database::read_copy(&dir)
     } else {
-        Database::open(&dir)
+        ctx.inner.open_db(&dir)
     };
     let copy = copy.map_err(|e| unreadable(db, e))?;
     let (subjects, classes, graph) = compute_stats(&copy).map_err(|e| unreadable(db, e))?;
@@ -1264,6 +1264,10 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let started = Instant::now();
     let requested = p.strings("db_path");
     let remote = p.bool("remote", false);
+    let layout = match build_layout(p.str("layout").as_deref(), ctx.inner.default_build_layout()) {
+        Ok(layout) => layout,
+        Err(e) => return GResp::error(Status::ParamIsIllegal, e),
+    };
     let inputs = match source_files(ctx, &requested, "db_path", SourceKind::Build, remote) {
         Ok(f) => f,
         Err(r) => return r,
@@ -1310,6 +1314,47 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return fail(e.to_string()),
     };
     progress(&format!("parsing {} RDF file(s)", inputs.sources.len()), 0);
+    if layout != crate::StorageKind::Snapshot {
+        // The bulk loader writes the staging directory's store (taking its
+        // lock), which is then renamed into place like a snapshot build.
+        let built = crate::bulk::build(
+            &staging,
+            &db,
+            crate::bulk::BulkInput::Sources(&inputs.sources),
+            &load_options(),
+            &mut log,
+            bulk_target(layout),
+            &ctx.inner.config().bulk_options(),
+        );
+        drop(log);
+        drop(inputs);
+        let report = match built {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging);
+                return fail(e.to_string());
+            }
+        };
+        write_cost(
+            &staging,
+            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        );
+        if let Err(e) = fs::rename(&staging, &dir) {
+            let _ = fs::remove_dir_all(&staging);
+            return fail(e.to_string());
+        }
+        if report.import.failed > 0 {
+            crate::gs_warn!(
+                "build '{db}': RDF parse error num {}; see {}",
+                report.import.failed,
+                dir.join(import::PARSE_ERROR_LOG).display()
+            );
+        }
+        register_built(ctx, &db);
+        return GResp::success("Import RDF file to database done.")
+            .with("failed_num", report.import.failed)
+            .with("success_num", report.triples + report.quads);
+    }
     let (built, report) = match Database::build_from_sources(
         db.clone(),
         &inputs.sources,
@@ -1349,23 +1394,27 @@ fn build(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         let _ = fs::remove_dir_all(&staging);
         return fail(e);
     }
-    {
-        let mut st = ctx.state();
-        let creator = ctx.user().to_string();
-        // Still registered although it did not exist (`build` refuses an
-        // existing database): an earlier database of the name, dropped
-        // outside the server (`gdrop`). The new one starts without its grants.
-        if st.sysdb.contains(&db) {
-            let _ = st.users.forget_database(&db);
-        }
-        // Best effort, like the REST endpoints: the registry is reconciled
-        // with the directories at every start.
-        let _ = st.sysdb.register(&db, &creator);
-        let _ = st.users.grant_all_on(&creator, &db);
-    }
+    register_built(ctx, &db);
     GResp::success("Import RDF file to database done.")
         .with("failed_num", report.failed)
         .with("success_num", success_num)
+}
+
+/// Register database `db`, just built, for the caller (its creator, with
+/// every privilege on it).
+fn register_built(ctx: &Ctx<'_>, db: &str) {
+    let mut st = ctx.state();
+    let creator = ctx.user().to_string();
+    // Still registered although it did not exist (`build` refuses an
+    // existing database): an earlier database of the name, dropped
+    // outside the server (`gdrop`). The new one starts without its grants.
+    if st.sysdb.contains(db) {
+        let _ = st.users.forget_database(db);
+    }
+    // Best effort, like the REST endpoints: the registry is reconciled
+    // with the directories at every start.
+    let _ = st.sysdb.register(db, &creator);
+    let _ = st.users.grant_all_on(&creator, db);
 }
 
 /// Where a dropped database's directory goes with `is_backup=true`:
@@ -2049,7 +2098,7 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if let Err(e) = installed {
         Database::discard_staged_restore(&staged);
         if loaded.is_some() {
-            if let Ok(old) = Database::open(&dir) {
+            if let Ok(old) = ctx.inner.open_db(&dir) {
                 let mut st = ctx.state();
                 let slot =
                     DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
@@ -2059,7 +2108,7 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         return fail(e.to_string());
     }
     if loaded.is_some() {
-        match Database::open(&dir) {
+        match ctx.inner.open_db(&dir) {
             Ok(restored) => {
                 let mut st = ctx.state();
                 let slot = DbSlot::handle(
