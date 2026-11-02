@@ -841,11 +841,15 @@ impl Database {
 
     /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
     /// files (and directories / URLs), detecting each file's format by
-    /// extension (as [`build_from_files`](Self::build_from_files) does). The
-    /// input streams in; the triples, named-graph quads (N-Quads / TriG) and
-    /// dictionary are written to `kvstore.kv` through the page cache; the
-    /// out-of-core VS-tree is written to `vstree.kv`. Other layouts' files in
-    /// `dir` are removed (a fresh build). Strict.
+    /// extension (as [`build_from_files`](Self::build_from_files) does): the
+    /// bulk build ([`crate::bulk::build`] with
+    /// [`BulkTarget::Disk`](crate::bulk::BulkTarget::Disk) and the default
+    /// [`BulkOptions`](crate::bulk::BulkOptions)) — the input streams in, is
+    /// sorted under a bounded memory budget and written bottom-up as
+    /// `kvstore.kv` and a fresh `vstree.kv`, and installed crash-safely,
+    /// replacing whatever layout `dir` held. Ids equal the memory build's.
+    /// Strict. Fails while a database of this process (or another process)
+    /// has `dir` open: unload it first.
     pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
         let sources = import::sources_from_paths(files)?;
         Database::build_disk_from_sources(dir, &sources, &import::ImportOptions::strict(), &mut ())
@@ -854,8 +858,63 @@ impl Database {
 
     /// [`build_disk`](Self::build_disk) from `sources` with explicit
     /// [`import::ImportOptions`] (e.g. tolerant, logging skipped statements
-    /// to `log`); returns the import counts.
+    /// to `log`); returns the import counts. The bulk build (see
+    /// [`build_disk`](Self::build_disk)); call [`crate::bulk::build`] for its
+    /// options and full report.
     pub fn build_disk_from_sources<P: AsRef<Path>>(
+        dir: P,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<import::ImportReport> {
+        let dir = dir.as_ref();
+        let name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
+            .unwrap_or_else(|| "disk".to_string());
+        let report = crate::bulk::build(
+            dir,
+            &name,
+            crate::bulk::BulkInput::Sources(sources),
+            opts,
+            log,
+            crate::bulk::BulkTarget::Disk,
+            &crate::bulk::BulkOptions::default(),
+        )?;
+        for w in &report.warnings {
+            crate::gs_warn!(
+                "disk build of '{}': built (the new database is in place), but its install \
+                 did not finish: {w}",
+                dir.display()
+            );
+        }
+        Ok(report.import)
+    }
+
+    /// The pre-Phase-6 incremental disk build (unlike
+    /// [`build_disk`](Self::build_disk): one B+ tree insert per index and term,
+    /// through the page cache); kept for comparisons and `gbuild
+    /// --incremental`.
+    #[doc(hidden)]
+    pub fn build_disk_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
+        dir: P,
+        files: &[Q],
+    ) -> Result<()> {
+        let sources = import::sources_from_paths(files)?;
+        Database::build_disk_from_sources_incremental(
+            dir,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )
+        .map(|_| ())
+    }
+
+    /// [`build_disk_incremental`](Self::build_disk_incremental) from
+    /// `sources` (the pre-Phase-6 body of
+    /// [`build_disk_from_sources`](Self::build_disk_from_sources)).
+    #[doc(hidden)]
+    pub fn build_disk_from_sources_incremental<P: AsRef<Path>>(
         dir: P,
         sources: &[import::Source],
         opts: &import::ImportOptions,
