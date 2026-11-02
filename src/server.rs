@@ -32,7 +32,7 @@
 //!   string-index cache, the PFN registry; the settings change only under
 //!   the exclusive guard).
 //! * `/status` never takes the database lock: it reads counters the server
-//!   publishes after every write ([`DbCounters`]), so it answers while a long
+//!   publishes after every write (`DbCounters`), so it answers while a long
 //!   query or an update runs.
 //! * Lock order: this server's `RwLock` → the database's internals (its
 //!   query / CSR / string-index caches; `persist_lock` → disk sink →
@@ -42,7 +42,7 @@
 //! * No thread ever holds two database guards, takes a guard it already
 //!   holds, or upgrades a shared guard to an exclusive one without dropping
 //!   the shared guard first. The guards are poison-tolerant
-//!   ([`read_locked`] / [`write_locked`]): a request that panicked while
+//!   (`read_locked` / `write_locked`): a request that panicked while
 //!   holding one does not wedge the server.
 //!
 //! **Connections** (shared with [`ApiServer`](crate::http_api::ApiServer), tuned

@@ -77,23 +77,23 @@
 //!
 //! The rules (contract C8 of the Phase 6 plan):
 //!
-//! * **Shared** guards ([`DbCell::read`]): statement reads (a read statement
+//! * **Shared** guards (`DbCell::read`): statement reads (a read statement
 //!   by the transaction's owner included), export, backup, `loadcsr`,
 //!   `monitor` / `schema` when its figures are not cached yet, and the
 //!   reasoning rules' Check. Everything they call on the [`Database`] takes
 //!   `&self` and is synchronized inside it (the query cache, the CSR cache,
 //!   the string-index cache, the PFN registry, the logs).
-//! * **Exclusive** guards ([`DbCell::write`]): updates, begin / commit /
+//! * **Exclusive** guards (`DbCell::write`): updates, begin / commit /
 //!   rollback, checkpoint / save / `wrote`, upload, batch, unload / drop /
 //!   restore / retire, the shutdown's final pass, reasoning Execute /
 //!   Disable, and installing new query settings (only with
-//!   [`DbCell::try_write`]: a database busy meanwhile takes them the next
+//!   `DbCell::try_write`: a database busy meanwhile takes them the next
 //!   time a request syncs them, see `ApiInner::read_synced`).
 //! * **No guard** — monitoring: `/status`, `/monitor`, `/show`, `/api`
 //!   `show` and `stat`, and `/api` `monitor` / `schema` once their figures
 //!   are cached, read counters each database publishes at the end of every
 //!   exclusive section and after it is loaded (see
-//!   [`DbCounters`](crate::server::DbCounters)), so they answer while a long
+//!   `server::DbCounters`), so they answer while a long
 //!   query or a write holds the database.
 //! * Lock order: `ApiState` (never wait for a database while holding it) →
 //!   a database's guard → its rule directory's lock → the database's
@@ -102,7 +102,7 @@
 //! * No thread holds two database guards, takes a guard of a database it
 //!   already holds one of, or upgrades a shared guard to an exclusive one
 //!   without dropping it first. A thread-local registry enforces the second
-//!   rule in every build: a re-entrant [`DbCell::read`] / [`DbCell::write`]
+//!   rule in every build: a re-entrant `DbCell::read` / `DbCell::write`
 //!   returns an error instead of deadlocking.
 //!
 //! **Tasks.** One task manager ([`crate::gapi::tasks::TaskManager`], see
