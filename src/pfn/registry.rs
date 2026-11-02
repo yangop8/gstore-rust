@@ -45,12 +45,28 @@
 //!
 //! Every mutation drops the cached module of the function, so a query never
 //! runs a stale module after an update, a recompilation or a delete.
+//!
+//! # Caches and locks
+//!
+//! * **Entries.** Each user's parsed `data.json` is cached as one shared
+//!   `Arc<[PfnInfo]>` ([`PfnRegistry::list`] and the lookup of every
+//!   `PFN.name(…)` call read it, so concurrent queries share one parse instead
+//!   of each reading and parsing the file). Every registry write replaces or
+//!   drops the user's entry while it holds `data_lock` exclusively, and a
+//!   reader fills it while holding `data_lock` shared, so a reader never
+//!   caches a file a writer is changing.
+//! * **Modules** (feature `pfn-wasm`). Loading a module is single-flight per
+//!   function: concurrent first calls of the same function wait for one load
+//!   and share its module, instead of each reading and instantiating it.
+//! * Lock order: `data_lock` → the entry cache's lock; a function's load
+//!   turn → the module cache's lock. Neither is held while a function runs,
+//!   and no load holds `data_lock`.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use super::{
     generate_source, source_kind, url_decode, valid_name, valid_user, CallOptions, GraphCtx,
@@ -64,6 +80,13 @@ pub struct PfnRegistry {
     /// Upstream's `pfn_data_lock`: readers list / look up, writers change a
     /// `data.json` and the files next to it.
     data_lock: RwLock<()>,
+    /// Each user's parsed `data.json` (see the module's *Caches and locks*):
+    /// filled under `data_lock` shared, replaced or dropped under it
+    /// exclusively.
+    entries: Mutex<HashMap<String, Arc<[PfnInfo]>>>,
+    /// How many times a `data.json` was read and parsed (tests).
+    #[cfg(test)]
+    parses: AtomicU64,
     limits: Mutex<PfnLimits>,
     #[cfg(feature = "pfn-wasm")]
     runtime: super::wasm::Runtime,
@@ -75,6 +98,14 @@ pub struct PfnRegistry {
     /// rewritten meanwhile under the same name (a recompilation stamped
     /// within the same second).
     generation: AtomicU64,
+    /// One load turn per function being loaded (single flight): a first call
+    /// takes the function's turn and loads; concurrent first calls wait for
+    /// the turn and then find the module cached.
+    #[cfg(feature = "pfn-wasm")]
+    loading: Mutex<HashMap<(String, String), Arc<Mutex<()>>>>,
+    /// How many modules were read and loaded (tests).
+    #[cfg(all(test, feature = "pfn-wasm"))]
+    loads: AtomicU64,
     #[cfg(not(feature = "pfn-wasm"))]
     cache: Mutex<HashMap<(String, String), ()>>,
     /// Tests: run once between loading a module and caching it.
@@ -166,11 +197,18 @@ impl PfnRegistry {
         PfnRegistry {
             base: base.into(),
             data_lock: RwLock::new(()),
+            entries: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            parses: AtomicU64::new(0),
             limits: Mutex::new(PfnLimits::default()),
             #[cfg(feature = "pfn-wasm")]
             runtime: super::wasm::Runtime::new(),
             cache: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            #[cfg(feature = "pfn-wasm")]
+            loading: Mutex::new(HashMap::new()),
+            #[cfg(all(test, feature = "pfn-wasm"))]
+            loads: AtomicU64::new(0),
             #[cfg(all(test, feature = "pfn-wasm"))]
             before_cache: Mutex::new(None),
         }
@@ -261,9 +299,24 @@ impl PfnRegistry {
         }
     }
 
-    /// `user`'s entries (no lock taken). A missing file is no entry; an
-    /// unparsable line is skipped, as upstream's `addPFNInfo` does.
+    /// `user`'s entries, shared: from the cache, else read (and cached). The
+    /// caller holds `data_lock` (shared suffices): a writer holding it
+    /// exclusively keeps the cache in step with the file.
+    fn entries(&self, user: &str) -> Result<Arc<[PfnInfo]>> {
+        if let Some(cached) = lock(&self.entries).get(user) {
+            return Ok(Arc::clone(cached));
+        }
+        let parsed: Arc<[PfnInfo]> = self.read_all(user)?.into();
+        lock(&self.entries).insert(user.to_string(), Arc::clone(&parsed));
+        Ok(parsed)
+    }
+
+    /// `user`'s entries, read from `data.json` (no lock taken). A missing file
+    /// is no entry; an unparsable line is skipped, as upstream's `addPFNInfo`
+    /// does.
     fn read_all(&self, user: &str) -> Result<Vec<PfnInfo>> {
+        #[cfg(test)]
+        self.parses.fetch_add(1, Ordering::SeqCst);
         let text = match fs::read_to_string(self.data_file(user)) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -290,8 +343,12 @@ impl PfnRegistry {
             .collect())
     }
 
-    /// Replace `user`'s `data.json` (atomically).
+    /// Replace `user`'s `data.json` (atomically). The caller holds
+    /// `data_lock` exclusively; the user's cached entries are dropped (the
+    /// next reader parses the file it wrote — or, after a failed write, the
+    /// one still in place).
     fn write_all(&self, user: &str, infos: &[PfnInfo]) -> Result<()> {
+        lock(&self.entries).remove(user);
         let mut text = String::new();
         for i in infos {
             i.to_json().into_sorted().write_to(&mut text);
@@ -373,6 +430,7 @@ impl PfnRegistry {
             .data_lock
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        lock(&self.entries).remove(user);
         for dir in [self.src_dir(user), self.lib_dir(user)] {
             match fs::remove_dir_all(&dir) {
                 Ok(()) => {}
@@ -402,10 +460,11 @@ impl PfnRegistry {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         Ok(self
-            .read_all(user)?
-            .into_iter()
+            .entries(user)?
+            .iter()
             .filter(|i| name.is_none_or(|n| i.name == n))
             .filter(|i| status.is_none_or(|s| i.status == s))
+            .cloned()
             .collect())
     }
 
@@ -536,7 +595,7 @@ impl PfnRegistry {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let Some(info) = self.read_all(user)?.into_iter().find(|i| i.name == name) else {
+            let Some(info) = self.entries(user)?.iter().find(|i| i.name == name).cloned() else {
                 return Err(query_err(format!("function {name} not exists")));
             };
             (info, source)
@@ -650,9 +709,10 @@ impl PfnRegistry {
                 .data_lock
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            self.read_all(user)?
-                .into_iter()
+            self.entries(user)?
+                .iter()
                 .find(|i| i.name == name)
+                .cloned()
                 .ok_or_else(missing)?
         };
         #[cfg(not(feature = "pfn-wasm"))]
@@ -695,21 +755,62 @@ impl PfnRegistry {
     }
 
     /// The loaded module of `(user, name)` stamped `last_time`, from the
-    /// cache or its file.
+    /// cache or its file. Single flight: concurrent first calls of a function
+    /// wait for one load (its turn in `loading`) and share its module.
     #[cfg(feature = "pfn-wasm")]
     fn module(&self, user: &str, name: &str, last_time: &str) -> Result<super::wasm::LoadedModule> {
         let file = self.module_file(user, name, last_time);
         let key = (user.to_string(), name.to_string());
-        let generation = {
-            let cache = lock(&self.cache);
-            if let Some((cached_file, m)) = cache.get(&key) {
-                if *cached_file == file {
-                    return Ok(m.clone());
-                }
-            }
-            self.generation.load(Ordering::SeqCst)
+        if let Ok(m) = self.cached_module(&key, &file) {
+            return Ok(m);
+        }
+        let turn = Arc::clone(lock(&self.loading).entry(key.clone()).or_default());
+        let loaded = {
+            let _turn = lock(&turn);
+            self.load_module(&key, &file, name)
         };
-        let bytes = fs::read(&file).map_err(|e| {
+        // The last one out removes the turn (the map holds one reference,
+        // each caller its clone; nobody can take a clone without the map's
+        // lock, held here).
+        let mut loading = lock(&self.loading);
+        if Arc::strong_count(&turn) == 2 && loading.get(&key).is_some_and(|t| Arc::ptr_eq(t, &turn))
+        {
+            loading.remove(&key);
+        }
+        loaded
+    }
+
+    /// The cached module of `key` when it came from `file`, else the cache
+    /// generation to load against.
+    #[cfg(feature = "pfn-wasm")]
+    fn cached_module(
+        &self,
+        key: &(String, String),
+        file: &Path,
+    ) -> std::result::Result<super::wasm::LoadedModule, u64> {
+        let cache = lock(&self.cache);
+        match cache.get(key) {
+            Some((cached_file, m)) if cached_file == file => Ok(m.clone()),
+            _ => Err(self.generation.load(Ordering::SeqCst)),
+        }
+    }
+
+    /// Load `key`'s module from `file` and cache it, unless a caller that had
+    /// the turn before already did (the caller holds the function's turn).
+    #[cfg(feature = "pfn-wasm")]
+    fn load_module(
+        &self,
+        key: &(String, String),
+        file: &Path,
+        name: &str,
+    ) -> Result<super::wasm::LoadedModule> {
+        let generation = match self.cached_module(key, file) {
+            Ok(m) => return Ok(m),
+            Err(generation) => generation,
+        };
+        #[cfg(test)]
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        let bytes = fs::read(file).map_err(|e| {
             query_err(format!(
                 "abort load module file error: {} ({e})",
                 file.display()
@@ -733,9 +834,15 @@ impl PfnRegistry {
         // Not when a function was changed meanwhile (this call still runs
         // what it loaded, as a call that began before the change).
         if self.generation.load(Ordering::SeqCst) == generation {
-            cache.insert(key, (file, module.clone()));
+            cache.insert(key.clone(), (file.to_path_buf(), module.clone()));
         }
         Ok(module)
+    }
+
+    /// How many modules were read and loaded so far (tests).
+    #[cfg(all(test, feature = "pfn-wasm"))]
+    pub(crate) fn module_loads(&self) -> u64 {
+        self.loads.load(Ordering::SeqCst)
     }
 
     /// How many modules are loaded (tests).

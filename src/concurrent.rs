@@ -76,6 +76,19 @@
 //! writer lock; finer-grained per-key write latching is left to a future MVCC
 //! pass.
 //!
+//! Read errors (contract C2): every snapshot and [`VersionView`] query runs
+//! inside a [`ReadScope`]; a read error a backend reports there fails the
+//! query (a snapshot never caches answers). Publishing a snapshot of a
+//! database with no in-RAM store (RocksDB) materializes it inside a scope
+//! too: a read error recorded while copying it makes every query of that
+//! snapshot fail with that error, rather than answer from a partial copy.
+//!
+//! Lock order (contract C8): `writer` → `occ` → `current` / `versioned`;
+//! inside the authoritative [`Database`], its own order (`persist_lock` →
+//! disk sink → `persist_error` → the pager). A reader holds `current` only
+//! long enough to clone the `Arc` and `versioned` only while materializing,
+//! never while evaluating.
+//!
 //! NOT done (see `docs/REFACTOR_BACKLOG.md` E): lock-free reads beyond the
 //! `Arc`-swap / `RwLock`, deadlock detection, and version-chaining the legacy
 //! `update()`/`write()` path.
@@ -90,7 +103,25 @@ use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
+use crate::store::read_scope::ReadScope;
 use crate::store::{TripleSource, TripleStore};
+
+/// The error of a statement whose evaluation recorded a read error `msg`
+/// (contract C2): it fails, and nothing of it is answered.
+fn read_failure(what: &str, msg: String) -> GStoreError {
+    GStoreError::Database(format!("a read from the store failed while {what}: {msg}"))
+}
+
+/// Evaluate `eval` on `q` inside a [`ReadScope`]: a read error recorded
+/// there fails the query.
+fn evaluate_scoped(eval: Evaluator<'_>, q: &sparql::ast::Query) -> Result<QueryResult> {
+    let scope = ReadScope::enter();
+    let result = eval.evaluate(q);
+    if let Some(e) = scope.take_error() {
+        return Err(read_failure("evaluating the query", e));
+    }
+    result
+}
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
 /// form (which round-trips losslessly), used for write-write conflict detection.
@@ -211,6 +242,9 @@ pub struct Snapshot {
     /// published ([`Database::set_pfn_caller`]): `PFN.name(…)` queries on the
     /// snapshot call the same user's functions as the database's own.
     pfn: Option<crate::pfn::PfnCaller>,
+    /// A read error recorded while the store was copied (a backend with no
+    /// in-RAM store): every query of this snapshot fails with it.
+    capture_error: Option<String>,
 }
 
 impl Snapshot {
@@ -219,11 +253,17 @@ impl Snapshot {
     /// explicitly from its triples — O(triples) per published version, but never
     /// a panic.
     fn from_db(db: &Database, version: u64) -> Snapshot {
+        let mut capture_error = None;
         let store = match db.backend().as_memory() {
             Some(mem) => mem.clone(),
             None => {
+                // Materialized inside a read scope (C2): a read error makes
+                // this snapshot fail its queries instead of answering from a
+                // partial copy.
+                let scope = ReadScope::enter();
                 let mut mem = TripleStore::new();
                 mem.bulk_load(db.backend().iter_all());
+                capture_error = scope.take_error();
                 mem
             }
         };
@@ -241,6 +281,16 @@ impl Snapshot {
             allow_service: db.load_policy().allow_remote,
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
             pfn: db.pfn_caller(),
+            capture_error,
+        }
+    }
+
+    /// Fail when the copy this snapshot was published from recorded a read
+    /// error (see [`from_db`](Self::from_db)).
+    fn check_captured(&self) -> Result<()> {
+        match &self.capture_error {
+            Some(e) => Err(read_failure("copying the store for a snapshot", e.clone())),
+            None => Ok(()),
         }
     }
 
@@ -262,8 +312,11 @@ impl Snapshot {
         self.store.exists(s, p, o)
     }
 
-    /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot.
+    /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot,
+    /// inside a [`ReadScope`]: a read error recorded during the evaluation
+    /// fails it.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        self.check_captured()?;
         let q = sparql::parse(sparql)?;
         // The snapshot never changes: one CSR generation for its lifetime.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
@@ -282,7 +335,7 @@ impl Snapshot {
         if let Some(caller) = &self.pfn {
             eval = eval.with_pfn(caller.clone());
         }
-        eval.evaluate(&q)
+        evaluate_scoped(eval, &q)
     }
 }
 
@@ -1003,8 +1056,10 @@ impl VersionView<'_> {
     /// default-graph state on demand — the base snapshot plus chain overrides
     /// `<= version` — then evaluates against it (so a graph-function query
     /// builds its CSR from that state). User-defined functions are the ones
-    /// of the latest published snapshot: they are not versioned data.
+    /// of the latest published snapshot: they are not versioned data. The
+    /// evaluation runs inside a [`ReadScope`]: a read error fails it.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        self.db.base.check_captured()?;
         let mut dict = self.db.base.dict.clone();
         let mut store = self.db.base.store.clone();
         self.db
@@ -1031,7 +1086,7 @@ impl VersionView<'_> {
         if let Some(caller) = &latest.pfn {
             eval = eval.with_pfn(caller.clone());
         }
-        eval.evaluate(&q)
+        evaluate_scoped(eval, &q)
     }
 }
 
