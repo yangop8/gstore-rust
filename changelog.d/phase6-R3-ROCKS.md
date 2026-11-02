@@ -258,6 +258,17 @@ Tests (optimized test profile, this machine): `tests/dt_bulk_rocks.rs` 7
 tests ~13 s, `tests/dt_rocksdb.rs` 10 tests ~1 s (4 new), the
 `rocks_sink` and `rocks` unit tests.
 
+Verification (`CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+CARGO_INCREMENTAL=0`, toolchain 1.99.1): `cargo fmt --all -- --check`;
+`cargo build --workspace --all-targets` and `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace
+--no-fail-fast`: 2,174 passed, 0 failed (run at `be7e47f`; the later
+commits change only `rocksdb`-gated code and this fragment);
+`CARGO_TARGET_DIR=/tmp/p6r3-target-rocks cargo clippy -p gstore
+--all-targets --features rocksdb -- -D warnings` clean and `cargo test -p
+gstore --features rocksdb --no-fail-fast`: 2,011 passed, 0 failed, 2
+ignored (at `fa5a48e`). No other feature-gated code was touched.
+
 ## Requests/Not yet
 
 0. **Edit outside the ownership list (integrator, please accept or redo):**
