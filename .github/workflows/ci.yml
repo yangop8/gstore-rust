@@ -84,14 +84,10 @@ jobs:
         env:
           GSTORE_DISK_QUERY_MODE: memory
         run: cargo test --workspace
-      # dt_bulk_import's tolerant_report_and_log_equal_the_sequential_import
-      # reads an opened disk database through Database::store(), which only
-      # a Materialize-mode database has (it runs in the step above); it is
-      # skipped here until it opens with OpenOptions::materialize().
       - name: test (on-disk databases in Stream mode)
         env:
           GSTORE_DISK_QUERY_MODE: stream
-        run: cargo test --workspace -- --skip tolerant_report_and_log_equal_the_sequential_import
+        run: cargo test --workspace
 
   # The feature matrix: one job per optional feature of the gstore crate,
   # plus the console / zip / PFN features together (gconsole driving the PFN

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use gstore::bulk::{self, BulkInput, BulkOptions, BulkTarget};
 use gstore::parser::import::{BlankNodes, ImportOptions, ImportReport, ParseErrorLog, Source};
-use gstore::Database;
+use gstore::{Database, OpenOptions};
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("gstore_dt_bulkimp_{tag}_{}", std::process::id()));
@@ -174,7 +174,10 @@ fn tolerant_report_and_log_equal_the_sequential_import() {
         let (r, lines) = bulk_into(&dir, &srcs, &opts, threads);
         assert_eq!(r.unwrap(), want, "threads {threads}");
         assert_eq!(lines, want_log, "threads {threads}");
-        let db = Database::open(&dir).unwrap();
+        // Read through the materialized store and dictionary (`content`
+        // uses the in-memory accessors), whatever the process's disk query
+        // mode.
+        let db = Database::open_with(&dir, &OpenOptions::materialize()).unwrap();
         assert_eq!(content(&db), content(&mem), "threads {threads}");
         assert_eq!(db.triple_num(), mem.triple_num());
     }
