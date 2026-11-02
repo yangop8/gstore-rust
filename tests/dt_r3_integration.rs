@@ -28,6 +28,15 @@ use gstore::json::{self, Json};
 use gstore::{default_open_options, set_default_open_options, Database, OpenOptions};
 use harness::{code, int, ok, scratch, string, Server};
 
+/// A scratch directory removed when dropped (also when the test fails).
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Three triples, then five other ones.
 const ONE: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
                    <http://ex/a> <http://ex/p> <http://ex/c> .\n\
@@ -89,6 +98,7 @@ fn served_database_is_rebuilt_only_after_unload(
 #[test]
 fn a_served_disk_database_is_rebuilt_only_after_unload() {
     let data = scratch("r3_build_data");
+    let _data = Scratch(data.clone());
     let (one, two) = (data.join("one.nt"), data.join("two.nt"));
     fs::write(&one, ONE).unwrap();
     fs::write(&two, TWO).unwrap();
@@ -115,7 +125,6 @@ fn a_served_disk_database_is_rebuilt_only_after_unload() {
     srv.unload("dsk");
     assert!(!DirLock::held_here(&dir));
     drop(srv);
-    let _ = fs::remove_dir_all(&data);
 }
 
 #[cfg(feature = "rocksdb")]
@@ -137,6 +146,7 @@ fn a_served_rocksdb_database_is_rebuilt_only_after_unload() {
         .map(|_| ())
     };
     let data = scratch("r3_build_rocks_data");
+    let _data = Scratch(data.clone());
     let (one, two) = (data.join("one.nt"), data.join("two.nt"));
     fs::write(&one, ONE).unwrap();
     fs::write(&two, TWO).unwrap();
@@ -148,7 +158,6 @@ fn a_served_rocksdb_database_is_rebuilt_only_after_unload() {
     assert!(Database::is_rocksdb(&dir));
     srv.unload("dsk");
     drop(srv);
-    let _ = fs::remove_dir_all(&data);
 }
 
 /// The open options `Database::open` uses after `[storage]` of `cfg` is
@@ -191,6 +200,16 @@ fn refreshconf(addr: &std::net::SocketAddr) {
 #[test]
 fn refreshconf_reinstalls_the_storage_section_of_a_server_that_owns_it() {
     let dir = scratch("r3_refresh_storage");
+    let _dir = Scratch(dir.clone());
+    // The process's defaults go back to the built-in ones however the test
+    // ends.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_default_open_options(OpenOptions::default());
+        }
+    }
+    let _reset = Reset;
     let conf = dir.join("conf.ini");
     let write = |home: &str, storage: &str| {
         fs::write(
@@ -229,6 +248,4 @@ fn refreshconf_reinstalls_the_storage_section_of_a_server_that_owns_it() {
 
     owner.shutdown();
     embedded.shutdown();
-    set_default_open_options(OpenOptions::default());
-    let _ = fs::remove_dir_all(&dir);
 }
