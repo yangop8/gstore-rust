@@ -41,7 +41,7 @@ use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::envelope::{GResp, Status};
 use super::ops_file::{self, PathRefusal};
@@ -50,8 +50,8 @@ use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
 use crate::http_api::{
-    build_layout, bulk_target, may_restore_from, ApiInner, BackupClaim, BusyGuard, DbCell,
-    DbHandle, DbSlot, OpError, OpErrorKind,
+    build_layout, bulk_target, dir_size, may_restore_from, ApiInner, BackupClaim, BusyGuard,
+    DbCell, DbHandle, DbSlot, OpError, OpErrorKind,
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
@@ -269,23 +269,6 @@ fn databases_on_disk(root: &Path) -> BTreeMap<String, PathBuf> {
         }
     }
     out
-}
-
-/// The total size of the files under `dir`, in bytes.
-fn dir_size(dir: &Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            match e.file_type() {
-                Ok(t) if t.is_dir() => stack.push(e.path()),
-                Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
-                _ => {}
-            }
-        }
-    }
-    total
 }
 
 /// `<iri>` → `iri`, then without the namespace (upstream
@@ -796,16 +779,23 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             "costTime",
             read_cost(&root.join(crate::db_dir_for(&r.database))),
         );
-        if is_loaded {
+        if let Some(h) = handles.get(&r.database) {
             // Whether the database's CSR (the graph functions' adjacency, see
             // `loadcsr`) is built for its current data — upstream reports
             // `csr != nullptr`. Read without the database's lock, so the
             // list never waits for a statement running on a database (as
             // upstream's, which reads the pointer unlocked). Transactions
             // are always available.
-            let csr = handles.get(&r.database).is_some_and(|h| h.csr.is_built());
-            item.set("csr", csr);
+            item.set("csr", h.csr.is_built());
             item.set("txn", true);
+            // Rust extensions: the layout, and an on-disk database's query
+            // mode (both fixed while it is loaded).
+            item.set("layout", layout_name(h.layout));
+            if let Some(mode) = h.query_mode {
+                item.set("queryMode", mode.name());
+            }
+        } else if let Some(layout) = on_disk.get(&r.database).and_then(Database::storage_kind) {
+            item.set("layout", layout_name(layout));
         }
         body.push(item);
     }
@@ -1006,6 +996,59 @@ struct Inspection {
     graph: Arc<SchemaGraph>,
     in_txn: bool,
     status: DbStatus,
+    /// The layout it persists as.
+    layout: crate::StorageKind,
+    /// An on-disk database's query mode.
+    query_mode: Option<crate::db::DiskQueryMode>,
+    /// The bytes of its directory: as last measured for a loaded database
+    /// (see `DbCell::disk_bytes`), walked for an unloaded one.
+    disk_bytes: Option<u64>,
+}
+
+/// How long `monitor` / `schema` wait for a background refresh of the
+/// statistics before they answer with the earlier ones (well inside the
+/// 100 ms a monitoring request may take).
+const STATS_REFRESH_WAIT: Duration = Duration::from_millis(40);
+
+/// Statistics refreshes running in the background (by the slot's address),
+/// so a database gets at most one at a time.
+fn refreshing() -> &'static Mutex<HashSet<usize>> {
+    static REFRESHING: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    REFRESHING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Recompute loaded database `db`'s statistics (handle `h`) for its current
+/// data off the request path: on a thread of its own, under a shared guard
+/// (it waits for a writer, never for other readers), caching the result for
+/// the next `monitor` / `schema`. At most one refresh per database runs at a
+/// time; a request that finds one running starts none.
+fn refresh_stats_in_background(db: &str, h: &DbHandle) {
+    let key = Arc::as_ptr(h) as usize;
+    if !locked(refreshing()).insert(key) {
+        return;
+    }
+    let (db, h) = (db.to_string(), Arc::clone(h));
+    let spawned = std::thread::Builder::new()
+        .name("gstore-stats-refresh".into())
+        .spawn(move || {
+            /// Ends the refresh, also when computing it panicked.
+            struct Done(usize);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    locked(refreshing()).remove(&self.0);
+                }
+            }
+            let _done = Done(key);
+            if let Ok(slot) = h.read() {
+                if !slot.retired {
+                    // A read error is not cached; the next request retries.
+                    let _ = class_stats(&db, &h, &slot);
+                }
+            }
+        });
+    if spawned.is_err() {
+        locked(refreshing()).remove(&key);
+    }
 }
 
 /// A cached class statistics + schema graph of one loaded database instance
@@ -1099,11 +1142,15 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     if let Some(h) = dbh {
         // Without the database lock while the statistics of the data it
         // published last are cached (monitoring never waits for a
-        // statement then); else computed on a shared guard and cached —
-        // when that guard is free right now. A database a writer holds or
-        // waits for (behind a long query) is reported with the published
-        // figures and the statistics computed for its earlier data instead:
-        // waiting would stall monitoring for as long as the statements.
+        // statement then). After a change they are recomputed off the
+        // request path (a background refresh, see
+        // `refresh_stats_in_background`): the request waits for it at most
+        // `STATS_REFRESH_WAIT` (a small database is done by then), else
+        // reports the statistics computed for the earlier data with the
+        // published figures — computing them here would hold the request
+        // for a pass over the data (and a writer queued behind it). Only a
+        // database whose statistics were never computed for this instance
+        // computes them here, on a shared guard.
         let f = h.figures();
         let published = |(subjects, classes, graph): ClassStats| Inspection {
             triples: f.triples,
@@ -1121,23 +1168,31 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
             graph,
             in_txn: f.in_transaction,
             status: DbStatus::Loaded,
+            layout: h.layout,
+            query_mode: h.query_mode,
+            disk_bytes: Some(h.disk_bytes()),
         };
         if f.live {
             if let Some(hit) = cached_stats(db, &h, Some(f.generation)) {
                 return Ok(published(hit));
             }
-        }
-        let slot = match h.try_read() {
-            Some(slot) => slot,
-            None => {
-                let earlier = f.live.then(|| cached_stats(db, &h, None)).flatten();
-                if let Some(hit) = earlier {
-                    return Ok(published(hit));
+            if let Some(earlier) = cached_stats(db, &h, None) {
+                refresh_stats_in_background(db, &h);
+                // A small database's refresh is done at once: wait for it a
+                // little (polling the cache), then answer with what there is.
+                let deadline = Instant::now() + STATS_REFRESH_WAIT;
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                    if let Some(fresh) = cached_stats(db, &h, Some(f.generation)) {
+                        return Ok(published(fresh));
+                    }
                 }
-                // Nothing computed for this instance yet: wait.
-                h.read().map_err(lock_error)?
+                return Ok(published(earlier));
             }
-        };
+        }
+        // Nothing computed for this instance yet (or its figures were never
+        // published): compute them now.
+        let slot = h.read().map_err(lock_error)?;
         if !slot.retired {
             let (subjects, classes, graph) =
                 class_stats(db, &h, &slot).map_err(|e| unreadable(db, e))?;
@@ -1149,6 +1204,9 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
                 graph,
                 in_txn: slot.txn.is_some(),
                 status: DbStatus::Loaded,
+                layout: h.layout,
+                query_mode: h.query_mode,
+                disk_bytes: Some(h.disk_bytes()),
             });
         }
     }
@@ -1171,7 +1229,19 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
         graph,
         in_txn: false,
         status: DbStatus::AlreadyBuilt,
+        layout: copy.storage(),
+        query_mode: copy.disk_query_mode(),
+        disk_bytes: None,
     })
+}
+
+/// The `layout` field's spelling of a layout (as `/build`'s parameter).
+fn layout_name(layout: crate::StorageKind) -> &'static str {
+    match layout {
+        crate::StorageKind::Snapshot => "snapshot",
+        crate::StorageKind::Disk => "disk",
+        crate::StorageKind::RocksDb => "rocksdb",
+    }
 }
 
 /// `monitor` — statistics of a database (upstream `MessageMonitorResponse`):
@@ -1196,7 +1266,7 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let disk_used = if p.str("disk").as_deref() == Some("0") {
         0
     } else {
-        dir_size(&dir) >> 20
+        ins.disk_bytes.unwrap_or_else(|| dir_size(&dir)) >> 20
     };
     let mut subject_list = Json::arr();
     for (class, n) in ins.classes.iter() {
@@ -1210,7 +1280,7 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         || (ROOT_USER.to_string(), String::new()),
         |r| (r.creator, r.built_time),
     );
-    GResp::success("success")
+    let resp = GResp::success("success")
         .with("database", db.as_str())
         .with("creator", creator)
         .with("builtTime", built_time)
@@ -1225,7 +1295,13 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         .with("costTime", read_cost(&dir))
         .with("status", ins.status.as_str())
         .with("subjectList", subject_list)
-        .with("schema", schema_json(&ins.graph))
+        .with("schema", schema_json(&ins.graph));
+    // Rust extensions: how the database is stored and queried.
+    let mut resp = resp.with("layout", layout_name(ins.layout));
+    if let Some(mode) = ins.query_mode {
+        resp = resp.with("queryMode", mode.name());
+    }
+    resp
 }
 
 /// `schema` — the class / property graph of a database (upstream

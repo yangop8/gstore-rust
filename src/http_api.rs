@@ -78,13 +78,15 @@
 //! The rules (contract C8 of the Phase 6 plan):
 //!
 //! * **Shared** guards (`DbCell::read`): statement reads (a read statement
-//!   by the transaction's owner included), export, backup, `loadcsr`,
-//!   `monitor` / `schema` when its figures are not cached yet (only with
-//!   `DbCell::try_read` while it has statistics cached for earlier data:
-//!   a busy database is then reported with those), and the reasoning
-//!   rules' Check. Everything they call on the [`Database`] takes
-//!   `&self` and is synchronized inside it (the query cache, the CSR cache,
-//!   the string-index cache, the PFN registry, the logs).
+//!   by the transaction's owner included; a read of a transaction's
+//!   snapshot takes it only to find the snapshot, see [`ReadSnapshot`]),
+//!   export, backup, `loadcsr`, `monitor` / `schema` of a database whose
+//!   statistics were never computed (later ones are refreshed by a
+//!   background thread on a shared guard, off the request path, see
+//!   `gapi::ops_db`), and the reasoning rules' Check. Everything they call
+//!   on the [`Database`] takes `&self` and is synchronized inside it (the
+//!   query cache, the CSR cache, the string-index cache, the PFN registry,
+//!   the logs).
 //! * **Exclusive** guards (`DbCell::write`): updates, begin / commit /
 //!   rollback, checkpoint / save / `wrote`, upload, batch, unload / drop /
 //!   restore / retire, the shutdown's final pass, reasoning Execute /
@@ -94,11 +96,14 @@
 //!   publishing the figures of a write section that unwound (also only with
 //!   `DbCell::try_write`, see `DbCell::figures`).
 //! * **No guard** — monitoring: `/status`, `/monitor`, `/show`, `/api`
-//!   `show` and `stat`, and `/api` `monitor` / `schema` once their figures
-//!   are cached, read counters each database publishes at the end of every
-//!   exclusive section and after it is loaded (see
-//!   `server::DbCounters`), so they answer while a long
-//!   query or a write holds the database.
+//!   `show` and `stat`, and `/api` `monitor` / `schema` once statistics
+//!   were computed for the database (the last ones are reported while a
+//!   refresh for newer data runs in the background), read counters each
+//!   database publishes at the end of every exclusive section and after it
+//!   is loaded (see `server::DbCounters`; `diskUsed` is a size measured
+//!   there too, never a directory walk on the request path), so they
+//!   answer while a long query, a write or a save's fsync holds the
+//!   database.
 //! * Lock order: `ApiState` (never wait for a database while holding it) →
 //!   a database's guard → its rule directory's lock → the database's
 //!   internals (`persist_lock` → disk sink → `persist_error` → pager) → the
@@ -908,6 +913,34 @@ pub(crate) struct DbCell {
     /// may predate a change it applied. [`figures`](Self::figures)
     /// publishes them the next time the database is free.
     unpublished: AtomicBool,
+    /// The bytes of the database's directory, measured when it was loaded
+    /// and at the end of every exclusive section (after a write and its
+    /// save), so `/api monitor`'s `diskUsed` never walks the directory on
+    /// its request path (where it would stall behind a save's fsync).
+    disk_bytes: AtomicU64,
+    /// The layout the database persists as (fixed for the slot's life).
+    pub(crate) layout: StorageKind,
+    /// How an on-disk database answers queries (`None` for the other
+    /// layouts; fixed for the slot's life).
+    pub(crate) query_mode: Option<crate::db::DiskQueryMode>,
+}
+
+/// The total size of the files under `dir`, in bytes (`0` when it cannot
+/// be read).
+pub(crate) fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 thread_local! {
@@ -1014,8 +1047,17 @@ impl DbCell {
             csr: slot.db.csr_status(),
             counters,
             unpublished: AtomicBool::new(false),
+            disk_bytes: AtomicU64::new(dir_size(&slot.dir)),
+            layout: slot.db.storage(),
+            query_mode: slot.db.disk_query_mode(),
             slot: RwLock::new(slot),
         }
+    }
+
+    /// The bytes of the database's directory as last measured (see the
+    /// field's docs): read without the lock, never walks the directory.
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        self.disk_bytes.load(Ordering::SeqCst)
     }
 
     /// The error a re-entrant lock request gets (instead of a deadlock).
@@ -1039,19 +1081,6 @@ impl DbCell {
             guard: self.slot.read().unwrap_or_else(PoisonError::into_inner),
             _held: held,
         })
-    }
-
-    /// A shared guard if one can be had right now: `None` while a writer
-    /// holds the exclusive guard or waits for it, or when this thread holds
-    /// a guard of this database (monitoring, which must not wait).
-    pub(crate) fn try_read(&self) -> Option<SlotRead<'_>> {
-        let held = HeldCell::claim(self)?;
-        let guard = match self.slot.try_read() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        Some(SlotRead { guard, _held: held })
     }
 
     /// The exclusive guard (publishes the figures when released).
@@ -1085,6 +1114,9 @@ impl DbCell {
     /// Publish `slot`'s figures (its holder is exclusive, see [`DbCounters`]).
     fn publish(&self, slot: &DbSlot) {
         publish_slot(&self.counters, slot);
+        if !slot.retired {
+            self.disk_bytes.store(dir_size(&slot.dir), Ordering::SeqCst);
+        }
     }
 
     /// The figures published at the end of the last exclusive section (or
@@ -7782,9 +7814,80 @@ mod tests {
             drop(shared);
             writer.join().unwrap();
         }
-        // Free: the statistics of the current data.
-        let (_, now) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
-        assert!(now.contains("\"subjectNum\":3"), "{now}");
+        // Free: the statistics of the current data, once the background
+        // refresh the requests above started has run.
+        settled(&addr, &monitor, "\"subjectNum\":3");
+        server.shutdown();
+    }
+
+    /// Ask `/api` with `body` until the answer contains `expect` (the
+    /// statistics refreshed in the background settled); panics after 10 s.
+    fn settled(addr: &SocketAddr, body: &str, expect: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, b) = split_status_body(&raw_request(addr, "POST", "/api", None, body));
+            if b.contains(expect) {
+                return b;
+            }
+            assert!(Instant::now() < deadline, "never settled on {expect}: {b}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `/api monitor` right after a data change, while a long query holds
+    /// the database and a writer waits behind it, answers at once (within
+    /// the 40 ms it waits for a background refresh) — with the published
+    /// counts and the statistics of the earlier data, never computing them
+    /// on the request path — and settles on the current data's statistics
+    /// once the database is free (the refresh). Its `diskUsed` is the size
+    /// measured at the end of the write (after its save), which is the
+    /// directory's size.
+    #[test]
+    fn monitor_after_a_change_answers_at_once_and_settles() {
+        let (server, addr) = start("monitor_settles");
+        build_two(&addr, "mset");
+        let auth = basic("root", "root");
+        let monitor = api_body(r#""operation":"monitor","db_name":"mset""#);
+        let (_, warm) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(warm.contains("\"subjectNum\":2"), "{warm}");
+        assert!(warm.contains("\"layout\":\"snapshot\""), "{warm}");
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/update?db_name=mset",
+            Some(&auth),
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        ));
+        assert_eq!(s, 200, "{b}");
+        let h = served(&server, "mset");
+        let dir = locked(&server.inner.state).db_dir("mset");
+        assert_eq!(h.disk_bytes(), dir_size(&dir), "measured after the save");
+        // A long query holds the database; a writer queues behind it.
+        let reader = h.read().unwrap();
+        let h2 = Arc::clone(&h);
+        let writer = std::thread::spawn(move || drop(h2.write().unwrap()));
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let got = request_within(
+                &addr,
+                "POST",
+                "/api",
+                Some(&auth),
+                &monitor,
+                Duration::from_secs(1),
+            );
+            let took = t0.elapsed();
+            let (s, b) = got.expect("monitor waited");
+            assert_eq!(s, 200, "{b}");
+            assert!(b.contains("\"tripleNum\":\"3\""), "published counts: {b}");
+            // It waits 40 ms for the refresh at most (generous for CI).
+            assert!(took < Duration::from_millis(250), "took {took:?}");
+        }
+        drop(reader);
+        writer.join().unwrap();
+        let b = settled(&addr, &monitor, "\"subjectNum\":3");
+        assert!(b.contains("\"tripleNum\":\"3\""), "{b}");
         server.shutdown();
     }
 
@@ -7893,10 +7996,9 @@ mod tests {
         }
         let (_, m) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
         assert!(m.contains("\"tripleNum\":\"3\""), "{m}");
-        assert!(
-            m.contains("\"subjectNum\":3"),
-            "cached statistics of the old data: {m}"
-        );
+        // The statistics of the old data are answered at once, and refreshed
+        // in the background: they settle on the current data's.
+        settled(&addr, &monitor, "\"subjectNum\":3");
         server.shutdown();
     }
 
