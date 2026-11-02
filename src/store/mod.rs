@@ -16,6 +16,7 @@
 //! range scans and sort-merge joins in the query engine.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -273,14 +274,16 @@ impl TripleSource for TripleStore {
         TripleStore::po_by_s(self, sub).len() as u64
     }
     fn count_o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> u64 {
-        self.s2po
+        self.data
+            .s2po
             .get(&sub)
             .map_or(0, |v| range_by_first(v, pred).len()) as u64
     }
     fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
         // `(p, o)` pairs are unique per subject, so with `o` fixed every
         // matching pair has its own predicate (the default's `dedup` is a no-op).
-        self.s2po
+        self.data
+            .s2po
             .get(&sub)
             .map_or(0, |v| v.iter().filter(|&&(_, o)| o == obj).count()) as u64
     }
@@ -288,7 +291,8 @@ impl TripleSource for TripleStore {
         TripleStore::ps_by_o(self, obj).len() as u64
     }
     fn count_s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> u64 {
-        self.o2ps
+        self.data
+            .o2ps
             .get(&obj)
             .map_or(0, |v| range_by_first(v, pred).len()) as u64
     }
@@ -319,9 +323,42 @@ impl TripleSource for TripleStore {
 /// the cost model reads them in O(log P) instead of scanning the predicate's
 /// triples on every query. They are derived data: not serialized (`store.bin`
 /// holds exactly the four index fields) and recomputed when a store is read.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(from = "TripleStoreData")]
+///
+/// ## Copy-on-write
+///
+/// The indexes live in one reference-counted `StoreData`: [`Clone`] is O(1)
+/// — the clone shares them — which makes a transaction's read snapshot
+/// (`/begin`) and a [`ConcurrentDb`](crate::concurrent::ConcurrentDb)
+/// publish cheap. The first mutation of a shared store copies the indexes
+/// once (O(triples), like `Arc::make_mut`); later mutations of the now
+/// unshared store are in place. A mutation that changes nothing (inserting a
+/// present triple, removing an absent one, an empty or all-present bulk
+/// load) never copies. A clone never observes a later mutation of the store
+/// it was taken from, nor that store one of the clone's.
+///
+/// A store that is cloned and then mutated over and over (a writer that
+/// publishes a snapshot after every update) can keep the copy it was copied
+/// from as a *spare*, with a journal of the mutations applied since
+/// ([`keep_spare_copies`](Self::keep_spare_copies)): the next time the store
+/// must copy, a spare that no clone holds any more is brought up to date by
+/// replaying the journal — O(changes) instead of O(triples). The price is a
+/// second copy of the indexes in memory. Off by default.
+///
+/// Serialization and [`Debug`](std::fmt::Debug) are those of the fields of
+/// before the indexes were shared, byte for byte.
+#[derive(Default)]
 pub struct TripleStore {
+    data: Arc<StoreData>,
+    /// The spare copy, when enabled (never cloned, never serialized).
+    spare: OnceLock<Box<SpareSlot>>,
+}
+
+/// The indexes of a [`TripleStore`]: its fields of before it was
+/// copy-on-write, in the same order, with the same derives and the same
+/// serialized form.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(from = "TripleStoreData", rename = "TripleStore")]
+struct StoreData {
     /// sub → sorted [(pred, obj)]
     s2po: AdjMap<EntityLiteralId>,
     /// obj → sorted [(pred, sub)]
@@ -347,9 +384,9 @@ struct TripleStoreData {
     triple_count: u64,
 }
 
-impl From<TripleStoreData> for TripleStore {
-    fn from(d: TripleStoreData) -> TripleStore {
-        let mut store = TripleStore {
+impl From<TripleStoreData> for StoreData {
+    fn from(d: TripleStoreData) -> StoreData {
+        let mut store = StoreData {
             s2po: d.s2po,
             o2ps: d.o2ps,
             p2so: d.p2so,
@@ -360,6 +397,69 @@ impl From<TripleStoreData> for TripleStore {
         store
     }
 }
+
+impl Clone for TripleStore {
+    /// O(1): the clone shares the indexes (see the type docs). A spare copy
+    /// stays with the original.
+    fn clone(&self) -> TripleStore {
+        TripleStore {
+            data: Arc::clone(&self.data),
+            spare: OnceLock::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TripleStore {
+    /// The fields of the indexes under the name `TripleStore` (the derived
+    /// `Debug` of before).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = &*self.data;
+        f.debug_struct("TripleStore")
+            .field("s2po", &d.s2po)
+            .field("o2ps", &d.o2ps)
+            .field("p2so", &d.p2so)
+            .field("triple_count", &d.triple_count)
+            .field("pred_stats", &d.pred_stats)
+            .finish()
+    }
+}
+
+impl Serialize for TripleStore {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TripleStore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        StoreData::deserialize(deserializer).map(TripleStore::from_data)
+    }
+}
+
+/// One journaled mutation of a store that keeps a spare copy.
+#[derive(Clone, Copy)]
+enum Change {
+    Insert(IdTriple),
+    Remove(IdTriple),
+}
+
+/// A [`TripleStore`]'s spare copy, when it keeps one (see
+/// [`keep_spare_copies`](TripleStore::keep_spare_copies)).
+#[derive(Default)]
+struct SpareSlot {
+    spare: Option<Spare>,
+}
+
+/// The indexes a store was last copied from and the mutations applied to
+/// the store since: replaying `journal` on `old` gives the store's indexes.
+struct Spare {
+    old: Arc<StoreData>,
+    journal: Vec<Change>,
+}
+
+/// A journal longer than this plus an eighth of the triples is dropped with
+/// its spare: copying the indexes afresh is then about as cheap as a replay.
+const SPARE_JOURNAL_SLACK: usize = 4096;
 
 /// Insert `value` into a sorted vector if absent. Returns `true` if inserted.
 fn sorted_insert(vec: &mut Vec<(u32, u32)>, value: (u32, u32)) -> bool {
@@ -373,10 +473,15 @@ fn sorted_insert(vec: &mut Vec<(u32, u32)>, value: (u32, u32)) -> bool {
 }
 
 /// Remove `value` from a sorted vector if present. Returns `true` if removed.
+/// A list left using less than a quarter of its allocation gives the rest
+/// back.
 fn sorted_remove(vec: &mut Vec<(u32, u32)>, value: (u32, u32)) -> bool {
     match vec.binary_search(&value) {
         Ok(pos) => {
             vec.remove(pos);
+            if vec.len() < vec.capacity() / 4 {
+                vec.shrink_to_fit();
+            }
             true
         }
         Err(_) => false,
@@ -407,24 +512,24 @@ fn range_by_first(vec: &[(u32, u32)], first: u32) -> &[(u32, u32)] {
     &vec[lo..hi]
 }
 
-impl TripleStore {
-    pub fn new() -> TripleStore {
-        TripleStore::default()
+impl StoreData {
+    fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
+        self.s2po
+            .get(&sub)
+            .is_some_and(|v| v.binary_search(&(pred, obj)).is_ok())
     }
 
-    pub fn triple_count(&self) -> u64 {
-        self.triple_count
+    /// Apply one journaled change. It changed the store it was recorded on,
+    /// so it changes this copy of that store's earlier state the same way.
+    fn apply(&mut self, change: Change) {
+        let changed = match change {
+            Change::Insert(t) => self.insert(t),
+            Change::Remove(t) => self.remove(t),
+        };
+        debug_assert!(changed, "a journaled change replays as a change");
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.triple_count == 0
-    }
-
-    // ---- mutation ---------------------------------------------------------
-
-    /// Insert a triple. Returns `false` (and changes nothing) if it already
-    /// exists. Maintains all three indexes in sorted order.
-    pub fn insert(&mut self, t: IdTriple) -> bool {
+    fn insert(&mut self, t: IdTriple) -> bool {
         let IdTriple { sub, pred, obj } = t;
         let po = self.s2po.entry(sub).or_default();
         let inserted = sorted_insert(po, (pred, obj));
@@ -445,8 +550,7 @@ impl TripleStore {
         true
     }
 
-    /// Remove a triple. Returns `false` if it was not present.
-    pub fn remove(&mut self, t: IdTriple) -> bool {
+    fn remove(&mut self, t: IdTriple) -> bool {
         let IdTriple { sub, pred, obj } = t;
         let (existed, last_subject) = match self.s2po.get_mut(&sub) {
             Some(v) => {
@@ -514,12 +618,10 @@ impl TripleStore {
         self.pred_stats = stats;
     }
 
-    /// Bulk-load triples efficiently: push everything, then sort + de-dup each
-    /// adjacency list once. Use this for initial build; ~O(n log n) vs the
-    /// O(n²)-ish cost of repeated [`insert`](Self::insert).
-    pub fn bulk_load(&mut self, triples: impl IntoIterator<Item = IdTriple>) {
+    /// See [`TripleStore::bulk_load`].
+    fn bulk_load(&mut self, triples: Vec<IdTriple>) {
         if self.s2po.is_empty() && self.o2ps.is_empty() && self.p2so.is_empty() {
-            self.bulk_load_into_empty(triples.into_iter().collect());
+            self.bulk_load_into_empty(triples);
             return;
         }
         for t in triples {
@@ -562,24 +664,186 @@ impl TripleStore {
         self.p2so = group_sorted(triples.iter().map(|t| (t.pred, (t.sub, t.obj))));
         self.recompute_pred_stats();
     }
+}
+
+impl TripleStore {
+    pub fn new() -> TripleStore {
+        TripleStore::default()
+    }
+
+    fn from_data(data: StoreData) -> TripleStore {
+        TripleStore {
+            data: Arc::new(data),
+            spare: OnceLock::new(),
+        }
+    }
+
+    pub fn triple_count(&self) -> u64 {
+        self.data.triple_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.triple_count == 0
+    }
+
+    // ---- copy-on-write ----------------------------------------------------
+
+    /// Whether this store and `other` share their indexes (one is a clone of
+    /// the other, and neither was mutated since). For tests of the
+    /// copy-on-write behaviour.
+    #[doc(hidden)]
+    pub fn shares_storage_with(&self, other: &TripleStore) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+    }
+
+    /// Keep a spare copy across copy-on-write copies (see the type docs).
+    /// From now on, when a mutation must copy shared indexes, the indexes it
+    /// copied are kept with a journal of this store's later mutations, and
+    /// the next such copy reuses them — once no clone holds them any more —
+    /// by replaying the journal instead of copying every list. For a writer
+    /// that publishes a clone after each small change and lets the previous
+    /// clone go ([`ConcurrentDb`](crate::concurrent::ConcurrentDb)): a small
+    /// change then costs O(changes), at the price of a second copy of the
+    /// indexes in memory.
+    ///
+    /// Idempotent. It takes `&self` so that the owner of a store it can only
+    /// borrow (inside a [`Database`](crate::Database)) can enable it. Clones
+    /// never inherit it, and a store replaced wholesale (`CLEAR` of an
+    /// in-memory database) loses it.
+    #[doc(hidden)]
+    pub fn keep_spare_copies(&self) {
+        let _ = self.spare.get_or_init(Box::default);
+    }
+
+    /// Whether this store holds a spare copy right now (for tests).
+    #[doc(hidden)]
+    pub fn has_spare_copy(&self) -> bool {
+        self.spare.get().is_some_and(|s| s.spare.is_some())
+    }
+
+    /// The indexes, for a mutation that changes them: copied first when
+    /// they are shared (from the spare, when one can be reused).
+    fn data_mut(&mut self) -> &mut StoreData {
+        if Arc::get_mut(&mut self.data).is_none() {
+            self.unshare();
+        }
+        Arc::get_mut(&mut self.data).expect("indexes unshared just now")
+    }
+
+    /// Give this store indexes of its own (they are shared now).
+    fn unshare(&mut self) {
+        let Some(slot) = self.spare.get_mut() else {
+            self.data = Arc::new(StoreData::clone(&self.data));
+            return;
+        };
+        if let Some(Spare {
+            mut old,
+            mut journal,
+        }) = slot.spare.take()
+        {
+            if let Some(mine) = Arc::get_mut(&mut old) {
+                // No clone reads the spare any more: bring it up to date.
+                for change in journal.drain(..) {
+                    mine.apply(change);
+                }
+                let shared = std::mem::replace(&mut self.data, old);
+                slot.spare = Some(Spare {
+                    old: shared,
+                    journal,
+                });
+                return;
+            }
+            // Still read through a clone, which frees it when it goes.
+        }
+        let copy = Arc::new(StoreData::clone(&self.data));
+        let shared = std::mem::replace(&mut self.data, copy);
+        slot.spare = Some(Spare {
+            old: shared,
+            journal: Vec::new(),
+        });
+    }
+
+    /// Journal `change` (just applied) for the spare copy, if one is kept;
+    /// drop the spare once replaying would cost about as much as a copy.
+    fn journal(&mut self, change: Change) {
+        let Some(slot) = self.spare.get_mut() else {
+            return;
+        };
+        let limit = SPARE_JOURNAL_SLACK.saturating_add((self.data.triple_count / 8) as usize);
+        if let Some(spare) = slot.spare.as_mut() {
+            spare.journal.push(change);
+            if spare.journal.len() > limit {
+                slot.spare = None;
+            }
+        }
+    }
+
+    // ---- mutation ---------------------------------------------------------
+
+    /// Insert a triple. Returns `false` (and changes nothing) if it already
+    /// exists. Maintains all three indexes in sorted order.
+    pub fn insert(&mut self, t: IdTriple) -> bool {
+        // Checked first: a no-op never copies shared indexes.
+        if self.data.exists(t.sub, t.pred, t.obj) {
+            return false;
+        }
+        let inserted = self.data_mut().insert(t);
+        if inserted {
+            self.journal(Change::Insert(t));
+        }
+        inserted
+    }
+
+    /// Remove a triple. Returns `false` if it was not present.
+    pub fn remove(&mut self, t: IdTriple) -> bool {
+        if !self.data.exists(t.sub, t.pred, t.obj) {
+            return false;
+        }
+        let removed = self.data_mut().remove(t);
+        if removed {
+            self.journal(Change::Remove(t));
+        }
+        removed
+    }
+
+    /// Bulk-load triples efficiently: push everything, then sort + de-dup each
+    /// adjacency list once. Use this for initial build; ~O(n log n) vs the
+    /// O(n²)-ish cost of repeated [`insert`](Self::insert).
+    pub fn bulk_load(&mut self, triples: impl IntoIterator<Item = IdTriple>) {
+        let triples: Vec<IdTriple> = triples.into_iter().collect();
+        if triples.is_empty() {
+            return;
+        }
+        // On shared indexes, a load that adds nothing must not copy them.
+        if Arc::get_mut(&mut self.data).is_none()
+            && triples
+                .iter()
+                .all(|t| self.data.exists(t.sub, t.pred, t.obj))
+        {
+            return;
+        }
+        self.data_mut().bulk_load(triples);
+        // Not journaled: the spare (if any, also one just made) is dropped.
+        if let Some(slot) = self.spare.get_mut() {
+            slot.spare = None;
+        }
+    }
 
     // ---- access patterns --------------------------------------------------
 
     /// `s p o` — does this exact triple exist?
     pub fn exists(&self, sub: EntityLiteralId, pred: PredId, obj: EntityLiteralId) -> bool {
-        self.s2po
-            .get(&sub)
-            .is_some_and(|v| v.binary_search(&(pred, obj)).is_ok())
+        self.data.exists(sub, pred, obj)
     }
 
     /// `s ? ?` — all `(pred, obj)` pairs for a subject.
     pub fn po_by_s(&self, sub: EntityLiteralId) -> &[(PredId, EntityLiteralId)] {
-        self.s2po.get(&sub).map_or(&[], Vec::as_slice)
+        self.data.s2po.get(&sub).map_or(&[], Vec::as_slice)
     }
 
     /// `s p ?` — objects of `(sub, pred)`.
     pub fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
-        match self.s2po.get(&sub) {
+        match self.data.s2po.get(&sub) {
             Some(v) => range_by_first(v, pred).iter().map(|&(_, o)| o).collect(),
             None => Vec::new(),
         }
@@ -587,7 +851,7 @@ impl TripleStore {
 
     /// `s ? o` — predicates linking a given subject to a given object (so2p).
     pub fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
-        match self.s2po.get(&sub) {
+        match self.data.s2po.get(&sub) {
             Some(v) => {
                 let mut ps: Vec<PredId> = v
                     .iter()
@@ -603,12 +867,12 @@ impl TripleStore {
 
     /// `? ? o` — all `(pred, sub)` pairs for an object.
     pub fn ps_by_o(&self, obj: EntityLiteralId) -> &[(PredId, EntityLiteralId)] {
-        self.o2ps.get(&obj).map_or(&[], Vec::as_slice)
+        self.data.o2ps.get(&obj).map_or(&[], Vec::as_slice)
     }
 
     /// `? p o` — subjects of `(pred, obj)`.
     pub fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        match self.o2ps.get(&obj) {
+        match self.data.o2ps.get(&obj) {
             Some(v) => range_by_first(v, pred).iter().map(|&(_, s)| s).collect(),
             None => Vec::new(),
         }
@@ -616,7 +880,7 @@ impl TripleStore {
 
     /// `? p ?` — all `(sub, obj)` pairs for a predicate.
     pub fn so_by_p(&self, pred: PredId) -> &[(EntityLiteralId, EntityLiteralId)] {
-        self.p2so.get(&pred).map_or(&[], Vec::as_slice)
+        self.data.p2so.get(&pred).map_or(&[], Vec::as_slice)
     }
 
     /// Distinct subjects appearing with this predicate.
@@ -640,16 +904,16 @@ impl TripleStore {
     }
     /// Out degree: number of triples where `id` is the subject.
     pub fn out_degree(&self, id: EntityLiteralId) -> usize {
-        self.s2po.get(&id).map_or(0, Vec::len)
+        self.data.s2po.get(&id).map_or(0, Vec::len)
     }
     /// In degree: number of triples where `id` is the object.
     pub fn in_degree(&self, id: EntityLiteralId) -> usize {
-        self.o2ps.get(&id).map_or(0, Vec::len)
+        self.data.o2ps.get(&id).map_or(0, Vec::len)
     }
 
     /// `? ? ?` — iterate every triple (driven by the predicate index).
     pub fn iter_all(&self) -> impl Iterator<Item = IdTriple> + '_ {
-        self.p2so.iter().flat_map(|(&pred, pairs)| {
+        self.data.p2so.iter().flat_map(|(&pred, pairs)| {
             pairs
                 .iter()
                 .map(move |&(sub, obj)| IdTriple::new(sub, pred, obj))
@@ -665,8 +929,9 @@ impl TripleStore {
         &self,
         mut f: impl FnMut(EntityLiteralId, &[(PredId, EntityLiteralId)], &[(PredId, EntityLiteralId)]),
     ) {
-        let mut outs = self.s2po.iter().peekable();
+        let mut outs = self.data.s2po.iter().peekable();
         let mut ins = self
+            .data
             .o2ps
             .iter()
             .filter(|(&o, _)| crate::model::id::is_entity_id(o))
@@ -703,34 +968,34 @@ impl TripleStore {
 
     /// All predicate ids that occur in the store (sorted).
     pub fn predicates(&self) -> impl Iterator<Item = PredId> + '_ {
-        self.p2so.keys().copied()
+        self.data.p2so.keys().copied()
     }
 
     /// All ids that appear as a subject (always entities), sorted.
     pub fn subject_keys(&self) -> impl Iterator<Item = EntityLiteralId> + '_ {
-        self.s2po.keys().copied()
+        self.data.s2po.keys().copied()
     }
 
     /// All ids that appear as an object (entities or literals), sorted.
     pub fn object_keys(&self) -> impl Iterator<Item = EntityLiteralId> + '_ {
-        self.o2ps.keys().copied()
+        self.data.o2ps.keys().copied()
     }
 
     // ---- statistics (for the cost-based optimizer) -----------------------
 
     /// Number of distinct subject keys (≈ distinct entities used as subjects).
     pub fn distinct_subjects(&self) -> usize {
-        self.s2po.len()
+        self.data.s2po.len()
     }
 
     /// Number of distinct object keys.
     pub fn distinct_objects(&self) -> usize {
-        self.o2ps.len()
+        self.data.o2ps.len()
     }
 
     /// Number of distinct predicates present.
     pub fn num_predicates(&self) -> usize {
-        self.p2so.len()
+        self.data.p2so.len()
     }
 
     /// Number of triples with predicate `p` (gStore: `pre2num`).
@@ -741,7 +1006,8 @@ impl TripleStore {
     /// Distinct subjects appearing with predicate `p` (gStore: `pre2sub`),
     /// from the maintained statistics: O(log P).
     pub fn pred_distinct_subj(&self, pred: PredId) -> usize {
-        self.pred_stats
+        self.data
+            .pred_stats
             .get(&pred)
             .map_or(0, |&(subjects, _)| subjects)
     }
@@ -749,7 +1015,8 @@ impl TripleStore {
     /// Distinct objects appearing with predicate `p` (gStore: `pre2obj`),
     /// from the maintained statistics: O(log P).
     pub fn pred_distinct_obj(&self, pred: PredId) -> usize {
-        self.pred_stats
+        self.data
+            .pred_stats
             .get(&pred)
             .map_or(0, |&(_, objects)| objects)
     }
@@ -927,19 +1194,19 @@ mod tests {
                     brute(s, p)
                 );
             }
-            let mut fresh = s.clone();
+            let mut fresh = StoreData::clone(&s.data);
             fresh.recompute_pred_stats();
-            assert_eq!(fresh.pred_stats, s.pred_stats);
+            assert_eq!(fresh.pred_stats, s.data.pred_stats);
             let bytes = bincode::serialize(s).unwrap();
             let mirror = Mirror {
-                s2po: &s.s2po,
-                o2ps: &s.o2ps,
-                p2so: &s.p2so,
-                triple_count: s.triple_count,
+                s2po: &s.data.s2po,
+                o2ps: &s.data.o2ps,
+                p2so: &s.data.p2so,
+                triple_count: s.data.triple_count,
             };
             assert_eq!(bytes, bincode::serialize(&mirror).unwrap());
             let back: TripleStore = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(back.pred_stats, s.pred_stats);
+            assert_eq!(back.data.pred_stats, s.data.pred_stats);
             assert_eq!(bincode::serialize(&back).unwrap(), bytes);
         }
         let mut seed = 99u64;
@@ -964,7 +1231,7 @@ mod tests {
             bincode::serialize(&fast).unwrap(),
             bincode::serialize(&general).unwrap()
         );
-        assert_eq!(fast.pred_stats, general.pred_stats);
+        assert_eq!(fast.data.pred_stats, general.data.pred_stats);
         check(&fast);
         let mut store = fast;
         for round in 0..5 {
@@ -982,7 +1249,7 @@ mod tests {
         for t in store.iter_all().collect::<Vec<_>>() {
             store.remove(t);
         }
-        assert!(store.pred_stats.is_empty());
+        assert!(store.data.pred_stats.is_empty());
         check(&store);
     }
 

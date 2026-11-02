@@ -517,7 +517,12 @@ impl ReadSnapshot {
         Ok(ReadSnapshot {
             dict: db.dict().clone(),
             store,
-            named: db.named_graphs().clone(),
+            // Each graph's store is shared (copy-on-write).
+            named: db
+                .named_graphs()
+                .iter()
+                .map(|(&g, s)| (g, s.clone()))
+                .collect(),
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
             topk: db.topk_options(),

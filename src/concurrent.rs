@@ -28,9 +28,26 @@
 //! older than the oldest live transaction's start version are garbage-collected
 //! on every commit/abort, so the history never grows unbounded.
 //!
-//! Cost model: publishing a [`Snapshot`] clones the dictionary + triple indexes
-//! (`O(store)` per commit). That keeps published snapshots immutable and the
-//! `query()`/`snapshot()` read path simple.
+//! Cost model: publishing a [`Snapshot`] of an in-memory database is O(1) in
+//! the data: the dictionary (an `Arc`'d interner), the default graph's
+//! [`TripleStore`] and the named graphs' stores are copy-on-write and shared
+//! with the authoritative [`Database`] until it changes them. The store of
+//! the authoritative database keeps a *spare* copy
+//! ([`TripleStore::keep_spare_copies`]): the first write after a publish
+//! must give the database indexes of its own, and it reuses the copy of the
+//! version before — no longer read once every reader of that older snapshot
+//! let it go — by replaying the changes made since (O(changes)), instead of
+//! copying the whole store (O(triples), the fallback when a reader still
+//! holds that older snapshot). A one-triple update therefore costs about
+//! two triple inserts, not a store copy. Memory: the database's indexes,
+//! the spare and the construction-time base snapshot's (see
+//! [`VersionView`]) — three copies at most, as when every publish cloned
+//! the store. A database with no in-RAM store — a Stream-mode on-disk one
+//! or RocksDB — is still materialized per publish (O(triples), inside a
+//! [`ReadScope`]): a snapshot is a long-lived versioned view (transactions
+//! read their begin-time snapshot, [`VersionView`] falls back to the base
+//! one), which an on-disk read view cannot be — it expires at the next
+//! write (`DiskReadView`, pager MVCC is deferred).
 //!
 //! On top of that clone-published snapshot, a **per-key version-chain** store
 //! provides finer-grained MVCC *without* a per-snapshot copy. Every transactional
@@ -249,9 +266,9 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Capture `db`'s committed state. An in-memory (or on-disk working-set)
-    /// store is cloned; a store with no in-RAM copy (RocksDB) is materialized
-    /// explicitly from its triples — O(triples) per published version, but never
-    /// a panic.
+    /// store is shared (copy-on-write, O(1)); a store with no in-RAM copy
+    /// (Stream-mode disk, RocksDB) is materialized explicitly from its
+    /// triples — O(triples) per published version, but never a panic.
     fn from_db(db: &Database, version: u64) -> Snapshot {
         let mut capture_error = None;
         let store = match db.backend().as_memory() {
@@ -270,7 +287,12 @@ impl Snapshot {
         Snapshot {
             dict: db.dict().clone(),
             store,
-            named: db.named_graphs().clone(),
+            // Each graph's store is shared (copy-on-write).
+            named: db
+                .named_graphs()
+                .iter()
+                .map(|(&g, s)| (g, s.clone()))
+                .collect(),
             version,
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
@@ -579,6 +601,7 @@ pub struct ConcurrentDb {
 impl ConcurrentDb {
     /// Wrap an existing [`Database`].
     pub fn new(db: Database) -> ConcurrentDb {
+        Self::keep_spares(&db);
         let snap = Arc::new(Snapshot::from_db(&db, 1));
         ConcurrentDb {
             base: Arc::clone(&snap),
@@ -661,12 +684,25 @@ impl ConcurrentDb {
     }
 
     /// Publish a fresh snapshot from the writer database (bumping the version),
-    /// returning the new version number.
+    /// returning the new version number. The snapshot it replaces is let go
+    /// after the `current` lock is released (when it was the last holder of
+    /// a materialized store, freeing that takes a while).
     fn publish(&self, db: &Database) -> u64 {
+        Self::keep_spares(db);
         let next = self.version() + 1;
         let snap = Arc::new(Snapshot::from_db(db, next));
-        *self.current.write().unwrap() = snap;
+        let old = std::mem::replace(&mut *self.current.write().unwrap(), snap);
+        drop(old);
         next
+    }
+
+    /// Make the writer database's in-memory store keep a spare copy for the
+    /// next publish (see the module's cost model). Idempotent; again at every
+    /// publish, because a `CLEAR` replaces the store.
+    fn keep_spares(db: &Database) {
+        if let Some(mem) = db.backend().as_memory() {
+            mem.keep_spare_copies();
+        }
     }
 
     // ---- optimistic multi-writer transactions -----------------------------
