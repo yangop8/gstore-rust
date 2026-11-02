@@ -214,9 +214,12 @@ impl Floor {
 /// the query engine probes its sorted candidates that way — step a few
 /// entries forward instead of descending the tree for each read. A read
 /// behind the cursor, or one more than [`SPO_WALK_STEPS`] entries ahead,
-/// starts a fresh cursor (one descent, as a read without it); a thread whose
-/// reads keep doing so stops stepping first (it tries again every
-/// [`SPO_WALK_RETRY`]th time). Valid for one store instance and version.
+/// starts a fresh cursor (one descent, as a read without it). A locality
+/// score follows the recent reads (a step-forward read raises it, a fresh
+/// cursor lowers it): while it is low the reads skip stepping and start
+/// fresh cursors at once, trying a step every [`SPO_WALK_RETRY`]th read, so
+/// a thread whose access pattern turns local again picks stepping up within
+/// a few dozen reads. Valid for one store instance and version.
 #[derive(Default)]
 struct SpoWalk {
     instance: u64,
@@ -225,15 +228,24 @@ struct SpoWalk {
     floor: Option<Floor>,
     /// The cursor's next entry (`None`: at the end of the tree).
     next: Option<SpoKey>,
-    hits: u32,
-    misses: u32,
+    /// Recent locality, `0..=SPO_WALK_SCORE_MAX`.
+    score: u32,
+    /// Reads since the score fell low (for the retries).
+    reads: u32,
 }
 
 /// How many entries a [`SpoWalk`] steps forward before it gives up and
 /// starts a fresh cursor.
 const SPO_WALK_STEPS: u32 = 48;
-/// A thread whose reads keep missing tries stepping again every this-many'th read.
-const SPO_WALK_RETRY: u32 = 32;
+/// While the locality score is low, a read tries stepping every this-many'th time.
+const SPO_WALK_RETRY: u32 = 16;
+/// The locality score's ceiling, what a step-forward read adds and what a
+/// fresh cursor takes away; stepping is tried while it is at least
+/// [`SPO_WALK_SCORE_ON`].
+const SPO_WALK_SCORE_MAX: u32 = 256;
+const SPO_WALK_HIT: u32 = 32;
+const SPO_WALK_MISS: u32 = 16;
+const SPO_WALK_SCORE_ON: u32 = 48;
 
 thread_local! {
     static SPO_WALK: RefCell<SpoWalk> = RefCell::new(SpoWalk::default());
@@ -1347,22 +1359,27 @@ impl DiskStore {
                 *walk = SpoWalk {
                     instance: self.instance,
                     version,
+                    // Optimistic: the first reads try stepping.
+                    score: SPO_WALK_SCORE_ON,
                     ..SpoWalk::default()
                 };
             }
-            let total = walk.hits.saturating_add(walk.misses);
-            let try_step =
-                total < 16 || walk.hits >= walk.misses / 2 || total % SPO_WALK_RETRY == 0;
-            if total > 4096 {
-                walk.hits /= 2;
-                walk.misses /= 2;
-            }
+            let try_step = if walk.score >= SPO_WALK_SCORE_ON {
+                walk.reads = 0;
+                true
+            } else {
+                walk.reads = walk.reads.wrapping_add(1);
+                walk.reads % SPO_WALK_RETRY == 0
+            };
             let stepped = walk.collect(&self.spo, pager, lo, hi, try_step, &mut out);
             Some(io(stepped.map(|stepped| {
-                if stepped {
-                    walk.hits += 1;
-                } else {
-                    walk.misses += 1;
+                // Only a read that tried stepping tells about locality.
+                if try_step {
+                    walk.score = if stepped {
+                        (walk.score + SPO_WALK_HIT).min(SPO_WALK_SCORE_MAX)
+                    } else {
+                        walk.score.saturating_sub(SPO_WALK_MISS)
+                    };
                 }
             })))
         });
