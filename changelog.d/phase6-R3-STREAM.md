@@ -17,18 +17,24 @@ disk build delegation, (7)/(7b) posting lists and point probes, (8) tests,
   with an out-of-core dictionary (`DiskDict` on the same pager, opened once
   per database and shared by every statement). Opening reads nothing
   proportional to the data except the named graphs (kept in memory, D11) and
-  the O(P) predicate statistics: at univ 8 (1.03M triples) the open takes
-  0.6–0.8 ms instead of about 300 ms, RSS after open is 7.1 MiB instead of
-  90 MiB, and the query high-water mark 70 MiB instead of 121 MiB
-  (implementer run, see Measured numbers). `vstree.kv` is used while it is
+  the O(P) predicate statistics: at univ 38 (5.18M triples) the open takes
+  0.6 ms instead of 1.4 s (cold, page cache dropped: 4–11 ms instead of
+  1.5 s), RSS after open is 5.8 MiB instead of 351 MiB, and the query
+  high-water mark 211 MiB instead of 461 MiB, with Q1–Q14 at 1.10–1.11× the
+  Materialize mode's geomean (quiet measure stage, see Measured numbers).
+  `vstree.kv` is used while it is
   fresh and is never rebuilt at open unless `vstree_on_open` is set;
   `rebuild_index()` rewrites it (one streaming pass over SPO/OSP, deferred to
   the end of an open transaction) and marks it fresh in the store's header.
 - **Materialize mode stays the default** (`DiskQueryMode::Materialize`, the
   pre-Phase-6 in-memory working set with write-through by dictionary key).
-  The default is the single constant `gstore::db::DEFAULT_DISK_QUERY_MODE`;
-  the measure stage flips it to Stream with a one-line commit only if every
-  R3-STREAM gate passes at univ 38. Both modes read and write the same
+  The default is the single constant `gstore::db::DEFAULT_DISK_QUERY_MODE`.
+  The quiet measure stage kept it: every R3-STREAM acceptance item passes at
+  univ 38, but gate G1d does not (Stream geomean 2.7× the snapshot layout's,
+  Q1/Q3/Q4 12–41×; Materialize mode misses it by as much), and plan §2 keeps
+  Materialize the default while G1d fails. Stream mode is opt-in
+  (`disk_query_mode=stream`, `GSTORE_DISK_QUERY_MODE=stream`,
+  `OpenOptions`); the flip stays a one-line change. Both modes read and write the same
   version-1 `kvstore.kv` (no feature bit), so a directory can be opened in
   either mode, and by older binaries, in turn. In Materialize mode a
   dictionary whose ids have a gap (a duplicate or missing slot) is now read
@@ -127,10 +133,12 @@ disk build delegation, (7)/(7b) posting lists and point probes, (8) tests,
 §8 row 6 (规模与性能): R3-STREAM done — `Backend::Disk` Stream mode wired into
 `Database` (out-of-core triples and dictionary, writes by id, store-overlay
 transactions, broken-state refusal), open options C7 with `[storage]` and
-environment overrides, `build_disk` on the bulk build; Materialize stays the
-default (flip pending the univ 38 gates). Univ 8 implementer run: open 0.7 ms
-vs 300 ms, RSS after open 7 MiB vs 90 MiB, Q1–Q14 geomean 1.24–1.26× the
-Materialize mode.
+environment overrides, `build_disk` on the bulk build. Quiet univ 38: open
+0.6 ms vs 1.4 s, RSS after open 5.8 MiB vs 351 MiB, query HWM 211 vs 461 MiB,
+Q1–Q14 geomean 1.10–1.11× the Materialize mode (0.30× pre disk); every
+R3-STREAM acceptance item met, G1b/G1c met, G1d not met (2.7× the snapshot
+layout; Materialize misses it too, the on-disk VS-tree probes), so
+Materialize stays the default and Stream ships opt-in (plan §2).
 
 ## Docs notes
 
@@ -165,6 +173,165 @@ Materialize mode.
   `build_disk_incremental` is the old path.
 
 ## Measured numbers
+
+### Quiet post-merge stage (phase6 `4ef1141`: R3 merged, review fixes)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), nothing else running
+(20:17–21:07 UTC): CPU logged every 10 s from `/proc/stat` — busy 23–29%
+while one measured process ran, up to 60% in `gbuild`'s parser threads and
+99% at the 8-client concurrency points; steal ≤ 2%. Release build of
+`4ef1141` (`cargo build --release -p gstore --bins -p gstore-bench`); every
+heavy command under `flock /tmp/gstore-bench.lock`; data from
+`/tmp/gstore-bench-cache` (univ 8 `ed44da2e7b3bbb98`, 1,029,275 triples;
+univ 38 `fcd6493725f3c66a`, 5,181,103 triples). Per scale, in this order:
+`gstore-bench run --profile reference --backends disk --drop-caches --env
+GSTORE_DISK_QUERY_MODE=stream` (Stream a, with the concurrency and update
+phases), the same with `=memory` (Materialize), Stream again with
+`--no-conc` (Stream b), then the snapshot layout (`--backends snapshot`, for
+G1d). Each run bulk-builds the same directory with this commit's `gbuild
+--disk` (653,959,173 / 130,150,405 bytes every time) and deletes it
+afterwards. Stream a is committed as
+`bench/results/phase6-r3-disk-stream-lubm{8,38}.json`; Materialize and the
+snapshot run are in `phase6-r3-lubm{8,38}.json`.
+
+| metric | univ 38 Materialize | univ 38 Stream a | univ 38 Stream b | univ 8 Materialize | univ 8 Stream a | univ 8 Stream b |
+|---|---:|---:|---:|---:|---:|---:|
+| open first (cold, page cache dropped) / warm ms | 1491.2 / 1407.2 | **10.5 / 0.6** | 4.2 / 0.6 | 288.9 / 259.1 | 4.4 / 0.6 | 4.6 / 0.5 |
+| RSS after open MiB | 350.7 | **5.8** | 5.7 | 88.6 | 5.9 | 5.7 |
+| query high-water mark MiB (5 processes) | 460.7 | **210.8** | 210.6 | 119.2 | 69.2 | 69.1 |
+| Q1–Q14 geomean ms | 39.77 | 44.13 (**1.109×**) | 43.70 (**1.099×**) | 5.494 | 6.671 (1.214×) | 6.827 (1.242×) |
+| single INSERT DATA median / p95 ms (100) | 1.35 / 2.35 | 1.05 / 1.82 | 1.47 / 2.63 | 1.42 / 2.44 | 2.03 / 3.40 | 1.43 / 2.29 |
+| single DELETE DATA median / p95 ms | 1.30 / 1.98 | 0.88 / 1.16 | 1.14 / 1.41 | 1.01 / 1.20 | 1.46 / 2.36 | 1.38 / 3.35 |
+| chunk insert / delete ms (6,478 / 5,330 triples) | 1100 / 1042 | 893 / 935 | 1060 / 968 | 606 / 759 | 818 / 1063 | 734 / 737 |
+| reopen after the updates ms | 2816.7 | 0.7 | 0.6 | 568.6 | 1.0 | 0.7 |
+| `gbuild --disk` s | 21.01 | 20.06 | 19.16 | 4.49 | 3.73 | 3.90 |
+
+Per query, univ 38 (warm ms: the minimum over 5 processes of the median of 5
+runs; snapshot = the memory layout of the same commit, for G1d):
+
+| query | rows | Materialize | Stream a (× Mat., Δ ms) | Stream b (× Mat., Δ ms) | snapshot | Stream a / snapshot |
+|---|---:|---:|---:|---:|---:|---:|
+| Q1 | 3 | 4.218 | 4.144 (0.98, −0.07) | 4.284 (1.02, +0.07) | 0.105 | **39.6** |
+| Q2 | 115 | 51.03 | 72.75 (**1.43**, +21.7) | 70.62 (1.38, +19.6) | 38.03 | 1.91 |
+| Q3 | 10 | 4.628 | 4.892 (1.06, +0.26) | 5.110 (1.10, +0.48) | 0.396 | **12.4** |
+| Q4 | 9 | 2.123 | 2.153 (1.01, +0.03) | 2.192 (1.03, +0.07) | 0.096 | **22.4** |
+| Q5 | 576 | 264.4 | 242.7 (0.92) | 239.1 (0.90) | 199.0 | 1.22 |
+| Q6 | 404,399 | 163.7 | 215.6 (1.32) | 212.8 (1.30) | 122.0 | 1.77 |
+| Q7 | 23 | 358.5 | 346.4 (0.97) | 341.0 (0.95) | 263.0 | 1.32 |
+| Q8 | 10,778 | 371.8 | 308.3 (0.83) | 314.2 (0.85) | 217.8 | 1.42 |
+| Q9 | 5,507 | 490.8 | 591.1 (1.20) | 581.0 (1.18) | 307.4 | 1.92 |
+| Q10 | 3 | 278.7 | 263.9 (0.95) | 251.3 (0.90) | 194.1 | 1.36 |
+| Q11 | 325 | 0.961 | 1.330 (1.38, +0.37) | 1.255 (1.31, +0.29) | 1.082 | 1.23 |
+| Q12 | 21 | 0.546 | 0.662 (1.21, +0.12) | 0.655 (1.20, +0.11) | 0.483 | 1.37 |
+| Q13 | 432,512 | 238.1 | 283.4 (1.19) | 274.4 (1.15) | 140.1 | 2.02 |
+| Q14 | 305,503 | 118.8 | 153.7 (1.29) | 152.5 (1.28) | 87.9 | 1.75 |
+| geomean | | 39.77 | 44.13 (1.109) | 43.70 (1.099) | 16.14 | **2.73** |
+
+Univ 8, Stream / Materialize per query (a; b): Q1 1.18; 1.17, Q2 1.31;
+1.34, Q3 1.15; 1.10, Q4 1.20; 1.18, Q5 1.07; 0.98, Q6 1.24; 1.36, Q7 0.99;
+1.14, Q8 1.37; 1.34, Q9 1.38; 1.44, Q10 1.02; 1.07, Q11 1.36; 1.31, Q12
+1.32; 1.39, Q13 1.25; 1.39, Q14 1.25; 1.29 — Q1/Q3/Q4/Q11/Q12 within
++0.11 ms. Stream / snapshot geomean 2.15–2.20× (Q1 12.2×). Rows and row
+hashes of Q1–Q14 are identical in every result file of this stage (both
+modes, the snapshot layout, the RocksDB files of part 1, pre-Phase-6 and
+Round 2), stable in every process; every update round trip `ok`.
+`gstore-bench compare` with Materialize as the base: PASS, 105 gates (Stream
+a, both scales; the gate's calibration-normalized geomean ratio, over the
+queries of ≥ 1 ms, 1.12 at univ 38 and 1.07 at univ 8); Stream b fails only
+`exact.phase disk/conc` (it ran `--no-conc`). Stream a against the
+pre-Phase-6 disk layout (`--backends disk`): PASS, 105 gates at both scales
+(geomean ratio 0.29 at univ 38, 0.25 at univ 8; RSS-after-open gate 0.07 /
+0.23). Both compare reports are in
+`bench/results/phase6-r3-disk-stream-lubm{8,38}-compare.md`.
+
+**Single-triple INSERT DATA, more samples.** The 100-insert medians above
+do not separate the modes (fsync-bound: Stream 1.05 / 1.47 against 1.35 ms
+at univ 38). Three alternating pairs at univ 38 with 500 inserts each
+(`--backends disk --singles 500 --query-procs 1 --reps 1 --open-reps 1
+--no-conc`, Materialize first in each pair): Materialize 1.268 / 1.289 /
+1.287 ms, Stream 1.278 / 1.225 / 1.194 ms — mean of the medians **1.233 vs
+1.281 ms (−3.8%)**, pair by pair +0.8%, −5.0%, −7.2%; p95 1.73–1.84 against
+1.79–1.99 ms; deletes 1.31–1.43 against 1.33–1.61 ms.
+
+**Opens, more samples.** Three more Stream runs per scale (`--open-reps 3
+--query-procs 1 --reps 1 --no-conc --no-update --drop-caches`, scales
+alternating) give five cold first opens each: univ 8 4.4 / 4.6 / 6.1 / 5.1 /
+5.1 ms (median 5.1), univ 38 10.5 / 4.2 / 6.3 / 5.1 / 5.2 ms (median 5.2);
+warm medians of the 15 warm samples 0.62 / 0.62 ms (max 0.83 / 0.71); RSS
+after open 5.7–5.9 MiB at both scales. Ratios univ 38 / univ 8: open warm
+1.00, open cold 1.02 (medians; the single pair a gave 10.5 / 4.4), RSS after
+open 0.98–1.00.
+
+**G4 on Stream-disk databases** (Stream a's concurrency phase: in-process
+servers, query cache off, closed-loop keep-alive clients, 5 s per point;
+bodies identical per endpoint and query):
+
+| scale | endpoint | Q4 qps 1 → 8 clients | Q4 ratio | Q4 mean ms at 8 | Q1 qps 1 → 8 clients | Q1 ratio |
+|---|---|---:|---:|---:|---:|---:|
+| univ 8 | /sparql | 2,294 → 7,694 | **3.35×** | 1.03 | 1,793 → 4,625 | 2.58× |
+| univ 8 | /api | 1,520 → 4,247 | **2.79×** | 1.81 | 1,425 → 4,212 | 2.96× |
+| univ 38 | /sparql | 380 → 954 | 2.51× | 8.38 | 195 → 430 | 2.21× |
+| univ 38 | /api | 355 → 934 | 2.63× | 8.50 | 185 → 444 | 2.40× |
+
+(Materialize, same runs: univ 8 Q4 3.12× / 3.66×, univ 38 2.41× / 2.55×;
+the snapshot layout 5.41× / 4.02× and 5.30× / 4.43×.) Disk databases scale
+less than the snapshot layout in both modes, and their Q1/Q4 cost 2–5 ms
+at univ 38 instead of 0.1 ms. The latency comes from the on-disk VS-tree
+(below); it very likely limits the scaling too, since every query reads its
+pages through one shared 4 MiB cache (not profiled under load).
+
+**Why G1d fails: the on-disk VS-tree (both modes).** Q1, Q3 and Q4 cost
+the same in both disk modes (4.2 / 4.6 / 2.1 ms at univ 38) and 12–41× the
+snapshot layout's. Callgrind of `gquery` Q1 on the univ 38 Stream database
+(first run, 46.8M instructions in all): 62% is `DiskTree::search` over
+`vstree.kv` (`VsTree::candidates`), 49% of the total `Pager::read_page_shared`
+— about 3,800 page reads (zeroing and copying 4 KiB each, `memset` 33% and
+`memcpy` 17%), because the search visits more nodes than `DiskTree`'s
+1,024-page (4 MiB) cache holds, so every run reads them again. The engine
+work itself is small (`candidates::generate` 34%, mostly the `s_by_po` scan
+for the bound object). R2-DISKLIB's probe (`disk_stream_probe --mode query
+--cache-pages 4096`, the same univ 38 database) with and without
+`vstree.kv`: Q1 5.75 → 0.22 ms, Q3 5.64 → 1.04, Q4 2.40 → 0.11, Q11 1.28 →
+0.22, Q12 0.81 → 0.07 ms over `DiskTriples`, geomean 50.99 → 18.05 ms
+(rows equal in order) — but Q2 86 → 315 ms, the one query the VS-tree
+prunes well. Not a regression of this round (Round 2's quiet Materialize
+run had Q1 4.35 ms, pre-Phase-6 39.1 ms) and not specific to Stream mode;
+it needs the planner to skip the VS-tree when a bound constant's posting
+list is short, or a cheaper disk VS-tree probe (Requests 8).
+
+**Default-mode decision: Materialize stays the default.** Every R3-STREAM
+acceptance item passes at univ 38 (table below), and G1b and G1c pass, but
+G1d fails (Stream geomean 2.73× the snapshot layout's, limit 1.5×; Q1 40×,
+Q3 12×, Q4 22×, limit 3×). Plan §2: "If G1d fails, Stream mode ships
+opt-in and Materialize stays the default disk query mode." Materialize
+misses G1d by about as much (2.46×; Q1 40×), so the gap is the disk
+layout's, not Stream mode's; the flip remains the one-line change of
+`DEFAULT_DISK_QUERY_MODE` once G1d passes (R4-SNAP / R4-CLOSURE report it).
+No code changed at this stage.
+
+**Acceptance (R3-STREAM, univ 38) and gates G1b–G1d, quiet:**
+
+| item | target | measured | verdict |
+|---|---|---|---|
+| RSS after open | ≤ 120 MiB | 5.8 / 5.7 MiB (Materialize 350.7) | **met** |
+| RSS after open, univ 38 / univ 8 | ≤ 1.5 | 0.98–1.00 (5.7–5.9 MiB at both scales) | **met** |
+| Open warm | ≤ 0.5 s | 0.6 ms (median of 15; max 0.71 ms) | **met** |
+| Open cold (`--drop-caches` first open) | ≤ 2.0 s | 4.2–10.5 ms (median 5.2 of 5) | **met** |
+| G1b open univ 38 / univ 8 | ≤ 1.5 | warm 1.00, cold 1.02 (medians) | **met** |
+| VmHWM through Q1–Q14 | ≤ 400 MiB | 210.8 / 210.6 MiB (Materialize 460.7) | **met** |
+| Each Q1–Q14 vs Materialize, same directory | ≤ 2.0× | worst Q2 1.43× / 1.38×; all others ≤ 1.38× | **met** |
+| Geomean vs Materialize | ≤ 1.4× | 1.109× / 1.099× | **met** |
+| Q1, Q3, Q4, Q11, Q12 | ≤ Materialize + 5 ms | +0.48 ms at most (Q3, run b) | **met** |
+| Auto-commit single-triple INSERT DATA median | ≤ Materialize | 1.233 vs 1.281 ms (3 alternating pairs × 500; −3.8%); reference runs 1.05 / 1.47 vs 1.35 ms (100 each) | **met** (pair 1: +0.8%, inside its spread) |
+| Identical answers | identical | rows and row hashes equal across both modes, snapshot, RocksDB, pre, Round 2; compare exact gates pass | **met** |
+| G1c (RSS ≤ 120 MiB, HWM ≤ 400 MiB, ratio ≤ 1.5) | | as above | **met** |
+| G1d geomean vs pre disk | ≤ 0.6× | 44.13 vs 146.92 ms = 0.30× | **met** |
+| G1d geomean vs the memory (snapshot) layout | ≤ 1.5× | 44.13 vs 16.14 ms = **2.73×** (Materialize 2.46×) | **not met** |
+| G1d no query > 3× memory | ≤ 3× | Q1 39.6×, Q3 12.4×, Q4 22.4× (others ≤ 2.02×) | **not met** |
+| G4 Q4 8 / 1 clients on a Stream-disk database, univ 8 | ≥ 2.5×, /sparql and /api | 3.35× and 2.79× (≥ 215 qps: 7,694 / 4,247) | **met** (univ 38: 2.51× / 2.63×) |
+| Default flip to Stream | only if every gate passes | not flipped (G1d) | Materialize stays the default |
+
+### Implementer run
 
 **Implementer run, noisy (other agents compiling; load average 1.0–2.7 on 4
 vCPUs during the runs).** Univ 8 only; univ 38 is left to the quiet measure
@@ -351,6 +518,20 @@ Requests (files outside R3-STREAM's list):
    `open_rocksdb_with`) once that test accepts either refusal (or
    `bulk::commit` checks the RocksDB lock first); `http_api`'s
    `hold_dir_lock` skip for RocksDB then goes too.
+8. **Quiet measure stage → R4-SNAP / R4-CLOSURE (the query engine's VS-tree
+   use, `src/query/`; `src/signature/disk_vstree.rs`)**: G1d fails on both
+   disk modes because every LUBM query with a bound constant probes
+   `vstree.kv`, and at univ 38 a Q1 probe reads ~3,800 4 KiB pages through
+   `DiskTree`'s 1,024-page cache (4–5 ms; the snapshot layout's in-memory
+   tree answers Q1 in 0.1 ms). Without `vstree.kv` the Stream-mode geomean
+   drops from 51 to 18 ms in R2-DISKLIB's probe (Q1 0.22 ms), but Q2 rises
+   from 86 to 315 ms. Options: skip the VS-tree when a bound constant's
+   posting list is short (the planner knows the counts, C1), cap a disk
+   probe's page reads, or give the disk tree the in-memory tree's probe
+   refinement. Then re-measure G1d and flip `DEFAULT_DISK_QUERY_MODE` if it
+   passes (every R3-STREAM item already does). The same probes very likely
+   limit Q4's 8-client scaling on disk databases at univ 38 (2.4–2.6×
+   against 5.3× on the snapshot layout; not profiled under load).
 
 Not yet / notes:
 

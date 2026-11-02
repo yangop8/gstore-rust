@@ -145,6 +145,157 @@ No performance measurement at the merge stage (§5.6 (c), the quiet univ 8 /
 38 runs, is the measure stage's, with each package's measure instructions).
 The smoke gate's result is under Verification below.
 
+### Quiet post-merge stage (phase6 `4ef1141`; part 3: reference files, default mode, smoke baseline)
+
+Parts 1 and 2 of the stage are in `phase6-R3-ROCKS.md` and
+`phase6-R3-SRV.md`; R3-STREAM's acceptance, the G1b–G1d evaluation and the
+default-mode decision are in `phase6-R3-STREAM.md`. Reference VM (4 vCPU
+Intel Xeon @ 2.10GHz, 16 GB), nothing else running (20:17–21:07 UTC; CPU
+busy 23–29% with one measured process, up to 99% at the 8-client points,
+steal ≤ 2%). Release build of `4ef1141`; every heavy command under `flock
+/tmp/gstore-bench.lock`; data from `/tmp/gstore-bench-cache` (univ 8
+`ed44da2e7b3bbb98`, univ 38 `fcd6493725f3c66a`). "Base" = the release
+binaries of `0fb8842` (main before this round,
+`/tmp/gstore-base-0fb8842/bin`), measured in this session.
+
+**Reference files.**
+- `bench/results/phase6-r3-lubm{8,38}.json`: `gstore-bench merge` of the
+  snapshot layout (`run --profile reference --backends snapshot
+  --drop-caches`), the disk layout in the default mode, Materialize
+  (`--backends disk --drop-caches --env GSTORE_DISK_QUERY_MODE=memory`),
+  both full reference runs of `4ef1141`, and part 1's RocksDB runs
+  (`--features rocksdb` build of `e1c7131`, `--no-conc`).
+- `bench/results/phase6-r3-disk-stream-lubm{8,38}.json`: the disk layout in
+  the non-default Stream mode (full reference run, concurrency and update
+  phases included).
+- Compare reports next to them: `phase6-r3-lubm{8,38}-compare.md` (against
+  pre-Phase-6), `phase6-r3-lubm{8,38}-compare-r2.md` (against Round 2),
+  `phase6-r3-disk-stream-lubm{8,38}-compare.md` (Stream against Materialize
+  and against the pre-Phase-6 disk layout: PASS, 105 gates each).
+
+`compare` against pre-Phase-6 and against Round 2: **272 of 273 gates pass**
+at both scales. The one failure is `exact.phase rocksdb/conc`: part 1 ran
+RocksDB with `--no-conc`, as its brief said. Every other exact gate passes:
+rows and row hashes of Q1–Q14 on every layout, the update round trips, and
+the concurrent bodies of the snapshot and disk layouts.
+
+To cover the missing RocksDB concurrency phase, a separate run was made
+(`target-rocks` binaries, `--backends rocksdb --query-procs 1 --reps 1
+--open-reps 1 --no-update`; kept out of the reference files, because
+`merge` refuses a backend twice):
+- Bodies are identical per endpoint and query, and the run passes against
+  pre-Phase-6 (`--backends rocksdb`). The only failure is the update phase
+  it skipped.
+- Q4 at univ 8: /sparql 1,370 → 6,504 qps from 1 to 8 clients (4.75×),
+  /api 1,140 → 4,575 (4.01×).
+- Q4 at univ 38: /sparql 536 → 2,334 (4.35×), /api 488 → 1,951 (4.00×).
+  Pre-Phase-6 managed 1.20 → 1.16 qps at univ 38.
+
+| univ 8 | build s | gbuild peak MiB | database bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| snapshot, pre → R2 → R3 | 15.32 → 5.80 → 5.31 | 154 → 112 → 113 | 85,480,180 (all) | 336 / 292 → 213 / 177 → 209 / 187 | 125.8 → 101.7 → 102.0 | 152.5 → 126.8 → 128.8 | 7.91 → 3.29 → **3.11** |
+| disk (Materialize) | 263.74 → 4.04 → 4.49 | 165 → 97 → 99 | 175,005,702 → 130,150,406 → 130,150,405 | 2240 / 1447 → 294 / 259 → 289 / 259 | 129.7 → 88.2 → 88.6 | 167.5 → 118.3 → 119.2 | 18.99 → 5.87 → **5.49** |
+| disk, Stream (R3) | 3.73 | 109 | 130,150,405 | **4.4 / 0.6** | **5.9** | **69.2** | 6.67 |
+| rocksdb | 53.93 → 35.60 → 4.21 | 286 → 262 → 93 | 41,162,410 → 41,140,275 → 31,266,467 | 9959 / 9989 → 202 / 180 → 255 / 184 | 145.8 → 64.5 → 68.3 | 184.9 → 112.5 → 102.6 | 43.27 → 33.28 → **10.56** |
+
+| univ 38 | build s | gbuild peak MiB | database bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| snapshot, pre → R2 → R3 | 76.82 → 28.32 → 28.84 | 741 → 550 → 550 | 430,848,180 (all) | 1588 / 1465 → 1149 / 898 → 1043 / 1015 | 596.4 → 488.6 → 489.0 | 710.3 → 590.4 → 588.5 | 46.65 → 18.28 → **16.14** |
+| disk (Materialize) | 1627.59 → 19.84 → 21.01 | 738 → 400 → 434 | 889,778,182 → 653,959,174 → 653,959,173 | 12387 / 7673 → 1654 / 1582 → 1491 / 1407 | 544.0 → 350.1 → 350.7 | 740.6 → 460.2 → 460.7 | 146.92 → 37.51 → **39.77** |
+| disk, Stream (R3) | 20.06 | 429 | 653,959,173 | **10.5 / 0.6** | **5.8** | **210.8** | 44.13 |
+| rocksdb | 277.76 → 164.35 → 22.25 | 634 → 511 → 402 | 206,253,032 → 206,221,265 → 155,868,540 | 60811 / 59389 → 1444 / 937 → 1006 / 901 | 522.0 → 199.8 → 276.6 | 663.3 → 386.4 → 440.2 | 311.50 → 262.79 → **66.91** |
+
+**No regression against Round 2 beyond the gates: met.**
+
+Gate ratios of `compare-r2` (calibration-normalized):
+
+| backend | geomean univ 8 / 38 | build univ 8 / 38 | warm open univ 8 / 38 |
+|---|---|---|---|
+| snapshot | 1.11 / 0.95 | 1.03 / 1.03 | 1.17 / 1.14 |
+| disk | 1.02 / 1.07 | 1.22 / 1.06 | 1.10 / 0.89 |
+| RocksDB | 0.32 / 0.29 | 0.12 / 0.16 | 1.03 / 1.11 |
+
+All of these are far under the limits (1.5, 2.0/2.5, 2.5). Raw, across
+sessions: snapshot 3.29 → 3.11 ms and 18.28 → 16.14 ms; disk 5.87 → 5.49 ms
+and 37.51 → 39.77 ms.
+
+Same-session A/B against the base binaries (alternating, `--no-conc
+--no-update`):
+- **Snapshot.** Geomean this tree / base is **0.964×** at univ 8 (base
+  3.313 / 3.206 ms, this tree 3.197 / 3.124 / 3.109) and **0.971×** at
+  univ 38 (base 17.19 / 16.70, this tree 16.72 / 16.51 / 16.14). No query
+  is slower than 1.03×. RSS after open, query HWM and the build are
+  unchanged.
+- **Disk, Materialize mode.** Geomean 1.03× at univ 38 (base 38.84 /
+  37.91 ms, this tree 39.80 / 39.17 / 39.77) and 1.01× at univ 8 (base
+  5.563, this tree 5.716 / 5.494). Q5, Q9 and Q13 are +5–9% at univ 38.
+  - Callgrind shows the same code path. Setup: `gquery`,
+    `--toggle-collect` on `Database::read_as`, Materialize mode, the base
+    and this tree's `gquery` on the same univ 8 directory, three runs each.
+  - Q9: base 425.3 / 429.9 / 430.4 M instructions, this tree 432.2 /
+    430.2 / 429.4 M. Q5: 229.9 vs 230.0 M.
+  - Every engine function's count is identical. The only variation is the
+    number of `vstree.kv` page reads: 28,017–28,869 on the base, 28,740–
+    29,200 here. That number depends on the search order (hash seeds)
+    against `DiskTree`'s 1,024-page cache.
+  - So the +3% is run-to-run spread: one query's per-process medians vary
+    by ±10–30% in a run. Not caused by this round; no fix.
+- **Disk build peak RSS.** 400–434 MiB on the base and on this tree alike
+  (402.7 / 434.2 MiB base, 400.6–432.1 here). It depends on `gbuild`'s
+  parser threads; Round 2's 400.4 MiB was one sample.
+
+**G2 (snapshot layout) at univ 38**, for R4-CLOSURE:
+- Build 28.84 s = 0.38× pre (≤ 0.5): **met**.
+- RSS after open 489.0 MiB = 0.82× pre (≤ 0.9): **met**.
+- Q1–Q14 geomean 16.14 ms = 0.35× pre (≤ 0.9): **met**.
+- Q4 0.096 ms (≤ 25 ms): **met**.
+- Latency ratio univ 38 / univ 8 for Q1, Q3, Q4, Q11, Q12 (≤ 2.0): Q4 1.33
+  **met**; Q1 3.05, Q3 5.42, Q11 4.45, Q12 3.63 **not met**. These are
+  sub-millisecond queries whose candidate lists grow with the data. The
+  ratios were the same in Round 1 (3.44 / 5.19 / 4.68 / 3.66) and Round 2
+  (3.80 / 5.25 / 4.48 / 3.49): not a regression.
+
+**Phase 6 gates now, univ 38 (R4-CLOSURE measures them):**
+- G1a: disk build 21.0 s, 0.013× pre; peak 400–434 MiB.
+- G1b and G1c (Stream): met.
+- G1d: not met, on both disk modes (the on-disk VS-tree, R3-STREAM
+  request 8).
+- G2: met except the scaling ratios above.
+- G3: met (part 1).
+- G4: met on the memory layout (part 2) and on a Stream-disk database at
+  univ 8: Q4 3.35× on /sparql, 2.79× on /api. At univ 38 it is 2.51× /
+  2.63× (Materialize 2.41× / 2.55×). Monitoring has part 2's two `/api
+  monitor` exceptions.
+
+**Default disk query mode: Materialize, unchanged.** Every R3-STREAM
+acceptance item passes at univ 38, but G1d fails, and plan §2 keeps
+Materialize the default while G1d fails. The numbers are in
+`phase6-R3-STREAM.md`.
+
+**Smoke baseline (§5.6d; the rule used since Round 2):** re-bless only when
+`gstore-bench ci` passes against the current baseline and at least one
+headline metric (a backend's query geomean or build time) is ≥ 1.5× better.
+- `gstore-bench ci` against `bench/baselines/smoke.json` (`0c9bdb6`, R2's
+  quiet stage): **PASS, 193 gates, 0 failed**. Calibration 55.7 ms against
+  the baseline's 62.3.
+- The canary (`check --self-test-slowdown 3` of the result against itself)
+  exits 1, as required.
+- Ratios to the baseline (calibration-normalized gate values):
+
+  | backend | query geomean | build | warm open | RSS after open / query HWM / build peak | bytes |
+  |---|---:|---:|---:|---:|---:|
+  | snapshot | 1.06 (raw 0.94×) | 1.16 | 1.05 | 1.00 / 1.00 / 1.00 | identical |
+  | disk | 1.06 (raw 0.96×) | 1.19 | 0.88 | 1.01 / 1.01 / 0.93 | identical |
+
+- No headline metric is ≥ 1.5× better (this round's speed-ups are on
+  RocksDB, which the smoke profile does not run, and on Stream mode, which
+  is not the default). So `smoke.json` is **not re-blessed**.
+
+Every database built at this stage was deleted, together with the result
+files that are not committed (their numbers are above and in
+`phase6-R3-STREAM.md`). The RocksDB target directory (`target-rocks`, used
+by parts 1–3) was removed at the end. No code changed at this stage.
+
 ## Verification
 
 Every job of `.github/workflows/ci.yml` and `bench.yml` (smoke and
@@ -235,7 +386,10 @@ Left for Round 4, with their owners:
   6, R1-KV's file).
 - The measure stage: every univ 38 acceptance item of the three packages
   (their fragments' measure instructions), and the Stream-mode default flip
-  only if every R3-STREAM gate passes.
+  only if every R3-STREAM gate passes. Done (quiet post-merge stage, under
+  Measured numbers and in the package fragments): Materialize stays the
+  default because G1d fails on both disk modes (R3-STREAM request 8, for
+  R4-SNAP / R4-CLOSURE).
 - Not in CI: `cargo doc -p gstore` warns about broken or private
   intra-doc links in about 30 files, most of them from before Round 3 and
   a few from it (e.g. `backend/rocks.rs`'s `SEEK_RUN`, `db/persist.rs`'s
