@@ -80,9 +80,6 @@ disk build delegation, (7)/(7b) posting lists and point probes, (8) tests,
   `build_disk_from_sources_incremental`; `build_disk_from_sources` still
   forwards to the incremental build because its remaining callers use it as
   the incremental reference (see Requests).
-- **Directory lock for RocksDB.** `Database::open` and `create_rocksdb` hold
-  the directory's `LOCK` for the RocksDB layout too (a bulk build in this or
-  another process — on any OS — sees the database is open).
 - **Restore validation** opens the staged copy in Materialize mode, which
   reads the whole store, so a truncated on-disk backup is refused whatever
   the default mode is.
@@ -166,8 +163,6 @@ Materialize mode.
 - docs/STORAGE_BACKEND.md (build): `Database::build_disk` uses the bulk
   build and refuses a directory a database of the process has open;
   `build_disk_incremental` is the old path.
-- docs/STORAGE_BACKEND.md (RocksDB): the directory lock is held for the
-  RocksDB layout too.
 
 ## Measured numbers
 
@@ -236,6 +231,20 @@ Materialize mode (the open subtracted). Q3, open plus three runs: 39M → 26M
 run). The remaining Stream overhead of Q2 is
 the `o_by_sp` probes (B+ tree leaf stepping instead of a map lookup) and of
 the large-result queries the out-of-core dictionary.
+
+### Verification
+
+`cargo fmt --all -- --check` clean; `cargo build --workspace --all-targets`
+and `cargo clippy --workspace --all-targets -- -D warnings` clean;
+`GSTORE_DISK_QUERY_MODE=memory cargo test --workspace`: 2,197 passed, 0
+failed, 2 ignored; `GSTORE_DISK_QUERY_MODE=stream cargo test --workspace --
+--skip tolerant_report_and_log_equal_the_sequential_import`: 2,196 passed, 0
+failed, 2 ignored (the CI's two passes). RocksDB (`--features rocksdb`,
+`-p gstore`): clippy clean; tests 2,018 passed, 0 failed, 2 ignored. After
+the RocksDB directory lock was taken out again (Request 7) the RocksDB pass,
+fmt, the workspace clippy and the touched test files in both modes were
+re-run; the two full workspace passes above ran just before that change,
+which touches only the RocksDB layout's open and create.
 
 ### Acceptance (R3-STREAM)
 
@@ -329,6 +338,19 @@ Requests (files outside R3-STREAM's list):
    entry by entry (`LeafCursor::next_entry`, ~75 instructions per entry); a
    public "seek within the current leaf" (binary search on a uniform leaf)
    would make the stepping O(log) per probe.
+7. **Integrator (`tests/dt_bulk_crash.rs`, `src/bulk/commit.rs`)**: the
+   Round-2 review's request (addressed to R3-ROCKS) that `Database::open`,
+   `create_rocksdb` and `open_rocksdb` take the directory's `DirLock` for the
+   RocksDB layout too is **not** done here although `persist.rs` is this
+   package's file: with the lock, a bulk build over a RocksDB database open in
+   this process is refused by `bulk::commit`'s `DirLock::held_here` check
+   ("is open in this process") before its RocksDB `LOCK` check, and
+   `dt_bulk_crash::an_open_rocksdb_database_is_not_replaced` asserts the
+   latter's message ("RocksDB store ... in use"). Taking the lock is three
+   lines in `persist.rs` (`open_with`'s match, `create_rocksdb`,
+   `open_rocksdb_with`) once that test accepts either refusal (or
+   `bulk::commit` checks the RocksDB lock first); `http_api`'s
+   `hold_dir_lock` skip for RocksDB then goes too.
 
 Not yet / notes:
 

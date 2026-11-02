@@ -446,12 +446,10 @@ impl Database {
             )));
         }
         fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
-        // Every layout is locked against other processes before anything is
-        // read (see `dirlock`); RocksDB also locks its own `rocksdb/LOCK`, but
-        // only the directory lock tells a bulk build of this or another
-        // process — on any OS — that the database is open.
+        // The snapshot and on-disk layouts are locked against other processes
+        // before anything is read (see `dirlock`); RocksDB locks itself.
         let lock = match Database::storage_kind(dir) {
-            None => None,
+            Some(StorageKind::RocksDb) | None => None,
             Some(_) => Some(super::dirlock::DirLock::acquire(dir)?),
         };
         let mut db = match Database::storage_kind(dir) {
@@ -1179,10 +1177,6 @@ impl Database {
             named,
         } = acc;
         fs::create_dir_all(dir)?;
-        // Held for the new database's lifetime (see `open_with`): another
-        // process with `dir` open makes the build fail before anything in it
-        // is replaced.
-        let lock = super::dirlock::DirLock::acquire(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
@@ -1209,7 +1203,6 @@ impl Database {
         rocks.flush()?;
         db.store = Backend::Rocks(rocks);
         db.home = Some(dir.to_path_buf());
-        db.dir_lock = Some(lock);
         db.rebuild_index();
         Ok(db)
     }
@@ -1265,7 +1258,6 @@ impl Database {
         if options.vstree_on_open {
             db.rebuild_index();
         }
-        db.dir_lock = Some(super::dirlock::DirLock::acquire(dir)?);
         Ok(db)
     }
 
