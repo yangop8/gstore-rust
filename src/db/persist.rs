@@ -1096,6 +1096,16 @@ impl Database {
     /// under `dir/rocksdb`; reopen it with [`open`](Self::open) /
     /// [`open_rocksdb`](Self::open_rocksdb). The full query engine (optimizer,
     /// VS-tree, analytics) runs over it unchanged via the [`Backend`] seam.
+    ///
+    /// The `build_rocksdb_*` helpers are the **per-triple, small-data**
+    /// builds (one write batch per triple through the live store, plan D15):
+    /// fixtures and small inputs. Large inputs — and `gbuild --rocksdb` — go
+    /// through the bulk build, [`crate::bulk::build`] with
+    /// [`BulkTarget::RocksDb`](crate::bulk::BulkTarget::RocksDb) (sorted SST
+    /// files ingested into a fresh store, installed crash-safely), which
+    /// writes byte-identical column families. The returned database holds
+    /// `dir`'s directory lock; the build fails while a database of this
+    /// process (or another process) has `dir` open.
     #[cfg(feature = "rocksdb")]
     pub fn build_rocksdb_from_str<P: AsRef<Path>>(
         name: impl Into<String>,
@@ -1122,7 +1132,9 @@ impl Database {
     /// Build a RocksDB-backed database in `dir` from RDF files (and
     /// directories / URLs), detecting each file's format by extension (see
     /// [`build_from_files`](Self::build_from_files)). The input streams in;
-    /// N-Quads / TriG statements keep their named graph (the `gspo` CF).
+    /// N-Quads / TriG statements keep their named graph (the `gspo` CF). A
+    /// per-triple small-data helper, see
+    /// [`build_rocksdb_from_str`](Self::build_rocksdb_from_str).
     #[cfg(feature = "rocksdb")]
     pub fn build_rocksdb_from_files<P: AsRef<Path>, Q: AsRef<Path>>(
         name: impl Into<String>,
@@ -2009,17 +2021,16 @@ mod rocks_layout {
 
     use super::{fsutil, Meta, DICT_FILE, LEGACY_SUFFIX, META_FILE, NAMED_FILE};
     use crate::backend::rocks::{RocksStore, TermSpace};
+    // The `meta` CF keys and layout marker, shared with the bulk build's
+    // writer (`bulk::rocks_sink`) so the two can never drift apart.
+    pub(super) use crate::backend::rocks::{
+        LAYOUT_VERSION, META_LAYOUT_KEY as LAYOUT_KEY, META_NAME_KEY as NAME_KEY,
+    };
     use crate::dict::{Dictionary, Space};
     use crate::error::{GStoreError, Result};
     use crate::model::id::{is_literal_id, LITERAL_FIRST_ID};
     use crate::model::IdTriple;
     use crate::store::{MutableStore, TripleSource, TripleStore};
-
-    /// `meta` CF key holding the database name.
-    pub(super) const NAME_KEY: &str = "name";
-    /// `meta` CF key marking that dictionary + named graphs live in their CFs.
-    pub(super) const LAYOUT_KEY: &str = "layout";
-    pub(super) const LAYOUT_VERSION: &[u8] = b"1";
 
     pub(super) fn dir_name(dir: &Path) -> String {
         dir.file_name()
