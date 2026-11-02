@@ -247,6 +247,25 @@ and 780 /api reader rounds, 20 two-operation writes, 19 transactions);
 writes checked after `SIGKILL` for single-db snapshot / single-db disk /
 api snapshot / api disk).
 
+### Verification at the final commit
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --
+  -D warnings` (Rust 1.99.1): clean.
+- `cargo test --workspace --no-fail-fast`: 2,190 passed, 0 failed, 2
+  ignored.
+- `--features pfn-wasm` (the PFN registry's single-flight code is gated on
+  it): clippy clean; `cargo test -p gstore --features pfn-wasm`: 2,009
+  passed, 0 failed, 1 ignored.
+- `--features tls` (`serve_forever_tls` shares the changed request path):
+  clippy clean.
+- `--features rocksdb` (the servers now lock RocksDB directories; the
+  RocksDB crash cases): `CARGO_TARGET_DIR=/tmp/p6r3-target-rocks cargo
+  clippy -p gstore --all-targets --features rocksdb -- -D warnings` clean;
+  `cargo test -p gstore --features rocksdb`: 2,013 passed, 0 failed, 2
+  ignored (including `single_db_rocksdb_…` and `api_rocksdb_…` of
+  `dt_rw_crash`).
+- No new crate, no `Cargo.lock` change.
+
 ## Requests/Not yet
 
 Requests (outside R3-SRV's files):
