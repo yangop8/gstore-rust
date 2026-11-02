@@ -23,9 +23,10 @@ env:
   RUST_TOOLCHAIN: "1.99.1"
   # Dev and test builds keep line tables only (file:line in backtraces), not
   # full debuginfo: about 70 integration-test binaries each link gstore, and
-  # with full debuginfo the `zip pfn-wasm readline` job filled the runner's
-  # disk, so rust-lld died with SIGBUS (signal 7) while writing one of them.
-  # Nothing in Cargo.toml sets `debug` for these profiles.
+  # with full debuginfo the build step of the `zip pfn-wasm readline` job
+  # filled the runner's disk, so rust-lld died with SIGBUS (signal 7) while
+  # writing one of them. Nothing in Cargo.toml sets `debug` for these
+  # profiles.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
@@ -103,7 +104,13 @@ jobs:
           key: feature-${{ strategy.job-index }}
       - name: build
         # --locked, as the Dockerfile builds: Cargo.lock covers every feature.
-        run: cargo build --locked -p gstore --all-targets --features "${{ matrix.feature }}"
+        # --profile test, the profile `cargo test` uses: Cargo.toml's
+        # [profile.test] sets opt-level 1, so a dev-profile build here would
+        # give every unit a different hash, and the test step would compile
+        # and link gstore, its dependencies and about 95 executables a second
+        # time, about doubling the job's disk use. With the same profile the
+        # test step only runs what this step built.
+        run: cargo build --locked --profile test -p gstore --all-targets --features "${{ matrix.feature }}"
       - name: clippy
         run: cargo clippy -p gstore --all-targets --features "${{ matrix.feature }}" -- -D warnings
       - name: test

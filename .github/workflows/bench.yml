@@ -47,8 +47,7 @@ env:
   RUST_BACKTRACE: 1
   # The Rust toolchain, pinned like ci.yml's (keep the two equal: the
   # rocksdb-correctness job shares ci.yml's RocksDB cache, whose key hashes
-  # the rustc version). Bumping the pin means fixing the new version's
-  # clippy and rustfmt findings in the same commit.
+  # the rustc version). Bump together with ci.yml's RUST_TOOLCHAIN.
   RUST_TOOLCHAIN: "1.99.1"
 
 jobs:
