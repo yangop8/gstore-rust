@@ -443,8 +443,7 @@ fn an_open_rocksdb_database_holds_the_directory_lock() {
         &dir,
         "<http://ex/x> <http://ex/p> <http://ex/y> .\n",
     )
-    .err()
-    .expect("refused while open")
+    .expect_err("refused while open")
     .to_string();
     assert!(e.contains("open in this process"), "{e}");
     drop(built);
