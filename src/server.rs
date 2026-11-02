@@ -1669,7 +1669,7 @@ impl DbCounters {
         let mut spins = 0u32;
         loop {
             let before = self.seq.load(Ordering::SeqCst);
-            if before % 2 == 0 {
+            if before.is_multiple_of(2) {
                 let snap = CounterSnapshot {
                     triples: self.triples.load(Ordering::SeqCst),
                     entities: self.entities.load(Ordering::SeqCst),

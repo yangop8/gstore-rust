@@ -293,7 +293,7 @@ fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
 
 /// The REST and `/api` reads a reader alternates between.
 fn api_read(addr: &SocketAddr, n: u64, sparql: &str) -> String {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         let (s, b) = request(addr, "POST", "/sparql?db_name=stress", Some(ROOT), sparql);
         assert_eq!(s, 200, "{b}");
         b
@@ -399,7 +399,7 @@ fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_read
                 let tid = tid_of(&b);
                 let k = cycles;
                 cycles += 1;
-                let commit = k % 2 == 0;
+                let commit = k.is_multiple_of(2);
                 let pred = if commit { "committed" } else { "rolledback" };
                 let tq = |sparql: &str| {
                     let (s, b) =

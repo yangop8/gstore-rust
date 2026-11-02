@@ -3633,7 +3633,7 @@ impl ApiInner {
         };
         if !stmt.is_update() {
             let slot = self.read_synced(dbh)?;
-            if !open_here(&*slot) {
+            if !open_here(&slot) {
                 return Err(not_open());
             }
             return slot
@@ -3642,7 +3642,7 @@ impl ApiInner {
                 .map_err(query_err);
         }
         let mut slot = dbh.write()?;
-        if !open_here(&*slot) {
+        if !open_here(&slot) {
             return Err(not_open());
         }
         self.sync_query_settings(&mut slot);
