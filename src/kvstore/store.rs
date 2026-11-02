@@ -41,10 +41,12 @@
 //! or a term in `entity2id` whose id the count root does not cover (which would
 //! later be handed out twice).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::dict::{Dictionary, DiskTermSource};
@@ -57,7 +59,7 @@ use crate::query::{Evaluator, QueryResult};
 use crate::store::read_scope::ReadScope;
 use crate::store::{MutableStore, TripleSource, TripleStore};
 
-use super::bptree::{be32, BTree};
+use super::bptree::{be32, BTree, LeafCursor};
 use super::disk_dict::DiskDict;
 use super::disk_triples::DiskSource;
 use super::format::{
@@ -172,6 +174,132 @@ pub struct DiskStore {
     /// A view created by [`from_shared_pager`](Self::from_shared_pager): every
     /// write (and commit) is refused.
     read_only: bool,
+    /// This instance's identity for the per-thread [`SpoRun`] (unique per
+    /// process: a view built later at the same address never matches).
+    instance: u64,
+    /// Bumped by every write operation and refresh: a cached [`SpoRun`] of an
+    /// older version is not used.
+    version: AtomicU64,
+}
+
+/// Source of [`DiskStore::instance`] ids.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// A key of the SPO tree as ids.
+type SpoKey = (u32, u32, u32);
+
+/// Where a [`SpoWalk`]'s cursor stands: every key below the bound has been
+/// passed, and the cursor's next entry is the smallest key at or above it.
+#[derive(Clone, Copy)]
+enum Floor {
+    /// Keys `< k` are behind the cursor.
+    AtLeast(SpoKey),
+    /// Keys `<= k` are behind the cursor.
+    After(SpoKey),
+}
+
+impl Floor {
+    /// Whether the cursor can serve a read starting at `lo` (nothing at or
+    /// above `lo` is behind it).
+    fn admits(self, lo: SpoKey) -> bool {
+        match self {
+            Floor::AtLeast(k) => lo >= k,
+            Floor::After(k) => lo > k,
+        }
+    }
+}
+
+/// A forward cursor over the SPO tree kept per thread, so point reads of the
+/// default graph (`exists`, `o_by_sp`, `po_by_s`) in ascending key order —
+/// the query engine probes its sorted candidates that way — step a few
+/// entries forward instead of descending the tree for each read. A read
+/// behind the cursor, or one more than [`SPO_WALK_STEPS`] entries ahead,
+/// starts a fresh cursor (one descent, as a read without it); a thread whose
+/// reads keep doing so stops stepping first (it tries again every
+/// [`SPO_WALK_RETRY`]th time). Valid for one store instance and version.
+#[derive(Default)]
+struct SpoWalk {
+    instance: u64,
+    version: u64,
+    cursor: Option<LeafCursor>,
+    floor: Option<Floor>,
+    /// The cursor's next entry (`None`: at the end of the tree).
+    next: Option<SpoKey>,
+    hits: u32,
+    misses: u32,
+}
+
+/// How many entries a [`SpoWalk`] steps forward before it gives up and
+/// starts a fresh cursor.
+const SPO_WALK_STEPS: u32 = 48;
+/// A thread whose reads keep missing tries stepping again every this-many'th read.
+const SPO_WALK_RETRY: u32 = 32;
+
+thread_local! {
+    static SPO_WALK: RefCell<SpoWalk> = RefCell::new(SpoWalk::default());
+}
+
+/// The next SPO entry of `cursor` as ids.
+fn next_spo(cursor: &mut LeafCursor, pager: &Pager) -> Result<Option<SpoKey>> {
+    match cursor.next_entry(pager)? {
+        None => Ok(None),
+        Some((k, _)) if k.len() == 12 => Ok(Some((id_at(k, 0), id_at(k, 4), id_at(k, 8)))),
+        Some(_) => Err(malformed("an index key has the wrong length")),
+    }
+}
+
+impl SpoWalk {
+    /// Collect the keys in `[lo, hi]` into `out`, stepping the cursor forward
+    /// when it stands at most [`SPO_WALK_STEPS`] entries before `lo` (and
+    /// `try_step`), else from a fresh cursor at `lo`.
+    fn collect(
+        &mut self,
+        tree: &BTree,
+        pager: &Pager,
+        lo: SpoKey,
+        hi: SpoKey,
+        try_step: bool,
+        out: &mut Vec<SpoKey>,
+    ) -> Result<bool> {
+        let mut stepped = false;
+        // Taken out while in use: a read error leaves no cursor behind.
+        let mut cursor = self.cursor.take();
+        if let (true, Some(c), Some(floor)) = (try_step, cursor.as_mut(), self.floor) {
+            if floor.admits(lo) {
+                let mut steps = 0;
+                loop {
+                    match self.next {
+                        Some(k) if k < lo && steps < SPO_WALK_STEPS => {
+                            steps += 1;
+                            self.next = next_spo(c, pager)?;
+                            self.floor = Some(Floor::After(k));
+                        }
+                        Some(k) if k < lo => break,
+                        _ => {
+                            stepped = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut c = match (stepped, cursor) {
+            (true, Some(c)) => c,
+            _ => {
+                let mut c = tree.cursor_ge(pager, &key3(lo.0, lo.1, lo.2))?;
+                self.next = next_spo(&mut c, pager)?;
+                self.floor = Some(Floor::AtLeast(lo));
+                c
+            }
+        };
+        while let Some(k) = self.next.filter(|&k| k <= hi) {
+            out.push(k);
+            self.next = next_spo(&mut c, pager)?;
+            self.floor = Some(Floor::After(k));
+        }
+        self.cursor = Some(c);
+        Ok(stepped)
+    }
 }
 
 /// A store read error as an `io::Error` (I/O errors keep their kind; anything
@@ -301,6 +429,8 @@ impl DiskStore {
             compacted: false,
             disk_dict: Mutex::new(None),
             read_only,
+            instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            version: AtomicU64::new(0),
         };
         store.refresh()?;
         Ok(store)
@@ -350,6 +480,7 @@ impl DiskStore {
         self.stats = stats;
         self.stats_undo.clear();
         *self.disk_dict.lock().unwrap() = None;
+        self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -534,6 +665,8 @@ impl DiskStore {
         f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>,
     ) -> Result<R> {
         self.check_writable()?;
+        // Cached SPO leaves of earlier versions are not used again.
+        self.version.fetch_add(1, Ordering::AcqRel);
         let pager = Arc::clone(&self.pager);
         let mut guard = pager.write().unwrap();
         // Terms a shared dictionary interned since the last operation.
@@ -1203,6 +1336,63 @@ impl DiskStore {
         self.pager.read().unwrap()
     }
 
+    /// The SPO keys in `[lo, hi]`, read through this thread's [`SpoWalk`]
+    /// (see there). Equal to a prefix scan of the tree over the same range.
+    fn spo_range(&self, pager: &Pager, lo: SpoKey, hi: SpoKey) -> io::Result<Vec<SpoKey>> {
+        let version = self.version.load(Ordering::Acquire);
+        let mut out = Vec::new();
+        let walked = SPO_WALK.try_with(|cell| -> Option<io::Result<()>> {
+            let mut walk = cell.try_borrow_mut().ok()?;
+            if walk.instance != self.instance || walk.version != version {
+                *walk = SpoWalk {
+                    instance: self.instance,
+                    version,
+                    ..SpoWalk::default()
+                };
+            }
+            let total = walk.hits.saturating_add(walk.misses);
+            let try_step =
+                total < 16 || walk.hits >= walk.misses / 2 || total % SPO_WALK_RETRY == 0;
+            if total > 4096 {
+                walk.hits /= 2;
+                walk.misses /= 2;
+            }
+            let stepped = walk.collect(&self.spo, pager, lo, hi, try_step, &mut out);
+            Some(io(stepped.map(|stepped| {
+                if stepped {
+                    walk.hits += 1;
+                } else {
+                    walk.misses += 1;
+                }
+            })))
+        });
+        match walked {
+            Ok(Some(done)) => {
+                if done.is_err() {
+                    // A failed read leaves no cursor behind.
+                    let _ = SPO_WALK.try_with(|cell| {
+                        if let Ok(mut walk) = cell.try_borrow_mut() {
+                            *walk = SpoWalk::default();
+                        }
+                    });
+                }
+                done.map(|()| out)
+            }
+            // No thread-local storage (thread teardown) or re-entered: scan.
+            _ => {
+                let mut out = Vec::new();
+                let mut cursor = io(self.spo.cursor_ge(pager, &key3(lo.0, lo.1, lo.2)))?;
+                while let Some(k) = io(next_spo(&mut cursor, pager))? {
+                    if k > hi {
+                        break;
+                    }
+                    out.push(k);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// `s p o` — does this exact triple exist?
     pub fn try_exists(
         &self,
@@ -1210,22 +1400,15 @@ impl DiskStore {
         p: PredId,
         o: EntityLiteralId,
     ) -> io::Result<bool> {
-        io(self.spo.contains(&self.read_pager(), &key3(s, p, o)))
+        let k = (s, p, o);
+        Ok(!self.spo_range(&self.read_pager(), k, k)?.is_empty())
     }
 
     /// `s ? ?` → `(pred, obj)` pairs, sorted.
     pub fn try_po_by_s(&self, s: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
-        let mut out = Vec::new();
-        io(scan_keys(
-            &self.spo,
-            &self.read_pager(),
-            &be32(s),
-            12,
-            |k| {
-                out.push((id_at(k, 4), id_at(k, 8)));
-            },
-        ))?;
-        Ok(out)
+        let (lo, hi) = ((s, 0, 0), (s, u32::MAX, u32::MAX));
+        let keys = self.spo_range(&self.read_pager(), lo, hi)?;
+        Ok(keys.into_iter().map(|(_, p, o)| (p, o)).collect())
     }
 
     /// `s p ?` → objects, ascending. When the store has been
@@ -1244,11 +1427,9 @@ impl DiskStore {
                 return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
             }
         }
-        let mut out = Vec::new();
-        io(scan_keys(&self.spo, &pager, &cat(s, p), 12, |k| {
-            out.push(id_at(k, 8));
-        }))?;
-        Ok(out)
+        let (lo, hi) = ((s, p, 0), (s, p, u32::MAX));
+        let keys = self.spo_range(&pager, lo, hi)?;
+        Ok(keys.into_iter().map(|(_, _, o)| o).collect())
     }
 
     /// `s ? o` → predicates linking subject to object, ascending.
@@ -1270,18 +1451,17 @@ impl DiskStore {
     /// `? ? o` → `(pred, sub)` pairs, sorted.
     pub fn try_ps_by_o(&self, o: EntityLiteralId) -> io::Result<Vec<(PredId, EntityLiteralId)>> {
         // OSP key = (o, s, p): the scan yields (s, p) order; sort to (p, s).
-        let mut out = Vec::new();
+        let mut keys = Vec::new();
         io(scan_keys(
             &self.osp,
             &self.read_pager(),
             &be32(o),
             12,
             |k| {
-                out.push((id_at(k, 8), id_at(k, 4)));
+                keys.push(pack(id_at(k, 8), id_at(k, 4)));
             },
         ))?;
-        out.sort_unstable();
-        Ok(out)
+        Ok(sorted_pairs(keys))
     }
 
     /// `? p o` → subjects, ascending.
@@ -1302,35 +1482,34 @@ impl DiskStore {
     /// `? p ?` → `(sub, obj)` pairs, sorted.
     pub fn try_so_by_p(&self, p: PredId) -> io::Result<Vec<(EntityLiteralId, EntityLiteralId)>> {
         // POS key = (p, o, s): the scan yields (o, s) order; sort to (s, o).
-        let mut out = with_hint(self.stat(p).0.into());
+        let mut keys = with_hint(self.stat(p).0.into());
         io(scan_keys(
             &self.pos,
             &self.read_pager(),
             &be32(p),
             12,
             |k| {
-                out.push((id_at(k, 8), id_at(k, 4)));
+                keys.push(pack(id_at(k, 8), id_at(k, 4)));
             },
         ))?;
-        out.sort_unstable();
-        Ok(out)
+        Ok(sorted_pairs(keys))
     }
 
     /// Distinct subjects of predicate `p`, ascending.
     pub fn try_subs_by_p(&self, p: PredId) -> io::Result<Vec<EntityLiteralId>> {
-        let mut out = with_hint(self.stat(p).1.into());
+        let mut keys: Vec<u64> = with_hint(self.stat(p).0.into());
         io(scan_keys(
             &self.pos,
             &self.read_pager(),
             &be32(p),
             12,
             |k| {
-                out.push(id_at(k, 8));
+                keys.push(u64::from(id_at(k, 8)));
             },
         ))?;
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        radix_sort_u64(&mut keys);
+        keys.dedup();
+        Ok(keys.into_iter().map(|s| s as u32).collect())
     }
 
     /// Distinct objects of predicate `p`, ascending (POS order needs no sort).
@@ -2060,6 +2239,64 @@ fn overflow_head(rec: &[u8]) -> Option<super::pager::PageId> {
 /// records), which a damaged file can make arbitrarily large: a reservation
 /// that fails is skipped, and the vector grows as it fills, instead of the
 /// allocation failure aborting the process.
+/// Lists shorter than this are sorted by comparison; longer ones by radix.
+const RADIX_MIN: usize = 512;
+
+/// Sort `keys` ascending: a least-significant-digit radix sort over bytes,
+/// skipping every byte position all keys share (ids are dense, so most high
+/// bytes are), for long lists; the comparison sort below [`RADIX_MIN`]. The
+/// result is exactly `sort_unstable()`'s. The posting lists `so_by_p`,
+/// `ps_by_o` and `subs_by_p` come out of their index grouped by the other
+/// component and are re-sorted into the contract order with it: linear time
+/// instead of `n log n` comparisons of pairs (Stream mode's long lists).
+fn radix_sort_u64(keys: &mut Vec<u64>) {
+    let n = keys.len();
+    if n < RADIX_MIN {
+        keys.sort_unstable();
+        return;
+    }
+    let mut hist = vec![[0usize; 256]; 8];
+    for &k in keys.iter() {
+        for (d, h) in hist.iter_mut().enumerate() {
+            h[((k >> (d * 8)) & 0xff) as usize] += 1;
+        }
+    }
+    let mut src = std::mem::take(keys);
+    let mut dst = vec![0u64; n];
+    for (d, h) in hist.iter().enumerate() {
+        if h.contains(&n) {
+            continue; // every key has the same byte here
+        }
+        let mut at = [0usize; 256];
+        let mut sum = 0;
+        for (slot, &count) in at.iter_mut().zip(h.iter()) {
+            *slot = sum;
+            sum += count;
+        }
+        for &k in &src {
+            let b = ((k >> (d * 8)) & 0xff) as usize;
+            dst[at[b]] = k;
+            at[b] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    *keys = src;
+}
+
+/// `(a, b)` packed so that the packed order is the pair order.
+#[inline]
+fn pack(a: u32, b: u32) -> u64 {
+    (u64::from(a) << 32) | u64::from(b)
+}
+
+/// The pairs of packed keys sorted by [`radix_sort_u64`].
+fn sorted_pairs(mut keys: Vec<u64>) -> Vec<(u32, u32)> {
+    radix_sort_u64(&mut keys);
+    keys.into_iter()
+        .map(|k| ((k >> 32) as u32, k as u32))
+        .collect()
+}
+
 fn with_hint<T>(hint: u64) -> Vec<T> {
     let mut v = Vec::new();
     if let Ok(n) = usize::try_from(hint) {
@@ -3152,6 +3389,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn radix_sort_equals_the_comparison_sort() {
+        let mut rng = Rng(0x00C0_FFEE);
+        for (n, spread) in [
+            (0usize, 10u64),
+            (5, 10),
+            (511, 1 << 20),
+            (512, 3),
+            (3000, 1 << 20),
+            (20_000, u64::from(u32::MAX)),
+            (20_000, 1 << 31),
+        ] {
+            let mut keys: Vec<u64> = (0..n)
+                .map(|_| {
+                    let hi = u64::from(rng.below(spread));
+                    // Literal-range ids set the top bit.
+                    let lo = u64::from(rng.below(spread)) | (u64::from(rng.below(2)) << 31);
+                    (hi << 32) | lo
+                })
+                .collect();
+            let mut want = keys.clone();
+            want.sort_unstable();
+            radix_sort_u64(&mut keys);
+            assert_eq!(keys, want, "n {n} spread {spread}");
+            let pairs = sorted_pairs(want.clone());
+            let mut tuples: Vec<(u32, u32)> =
+                want.iter().map(|&k| ((k >> 32) as u32, k as u32)).collect();
+            tuples.sort_unstable();
+            assert_eq!(pairs, tuples);
+        }
+    }
+
     /// Build a disk store and an in-memory store holding the same id triples:
     /// `n` random inserts (entities, literals and a few predicates, interned
     /// through the store so ids are the store's), then every `del`-th triple
@@ -3402,6 +3671,55 @@ mod tests {
             assert_same_reads(&ds, &mem);
             cleanup(&path);
         }
+    }
+
+    /// The per-thread SPO leaf ([`SpoRun`]) answers point reads exactly as the
+    /// tree does — in ascending, descending and scattered probe orders, across
+    /// writes (each moves the version) and with a second store instance
+    /// (a read-only view) probed on the same thread in between.
+    #[test]
+    fn spo_point_reads_through_the_cached_leaf_equal_the_tree() {
+        let path = tmp("spo_run");
+        let (mut ds, mut mem) = twin_stores(&path, 21, 3000, 4);
+        let check = |ds: &DiskStore, mem: &TripleStore, order: &[u32]| {
+            let preds: Vec<u32> = mem.predicates().collect();
+            for &s in order {
+                assert_eq!(ds.try_po_by_s(s).unwrap(), mem.po_by_s(s), "po_by_s {s}");
+                for &p in &preds {
+                    let objs = ds.try_o_by_sp(s, p).unwrap();
+                    assert_eq!(objs, mem.o_by_sp(s, p), "o_by_sp {s} {p}");
+                    for &o in objs.iter().take(2) {
+                        assert!(ds.try_exists(s, p, o).unwrap());
+                        assert!(!ds.try_exists(s, p, o.wrapping_add(1_000_000)).unwrap());
+                    }
+                }
+            }
+        };
+        let mut subjects: Vec<u32> = mem.subject_keys().collect();
+        subjects.push(4_000_000); // never a subject
+        check(&ds, &mem, &subjects);
+        let mut rev = subjects.clone();
+        rev.reverse();
+        check(&ds, &mem, &rev);
+        let scattered: Vec<u32> = (0..subjects.len())
+            .map(|i| subjects[(i * 7919) % subjects.len()])
+            .collect();
+        check(&ds, &mem, &scattered);
+        // A view on the same thread, then writes through the store.
+        let view = DiskStore::from_shared_pager(ds.shared_pager()).unwrap();
+        check(&view, &mem, &subjects[..50.min(subjects.len())]);
+        drop(view);
+        let s0 = subjects[0];
+        let t = IdTriple::new(s0, 0, LITERAL_FIRST_ID);
+        assert!(ds.insert_ids(t).unwrap());
+        assert!(mem.insert(t));
+        check(&ds, &mem, &subjects[..20.min(subjects.len())]);
+        let first = mem.iter_all().next().unwrap();
+        assert!(ds.delete_ids(first).unwrap());
+        assert!(mem.remove(first));
+        check(&ds, &mem, &subjects);
+        drop(ds);
+        cleanup(&path);
     }
 
     #[test]
