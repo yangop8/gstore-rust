@@ -829,6 +829,17 @@ mod cancel_bridge {
     }
 }
 
+/// Snapshot reads that expired and were re-run (see [`expired_snapshot_reads`]).
+static EXPIRED_SNAPSHOT_READS: AtomicU64 = AtomicU64::new(0);
+
+/// How many reads of a transaction's on-disk snapshot this process saw
+/// expire under them (the transaction committed meanwhile) and re-ran on the
+/// live database. For tests and diagnostics.
+#[doc(hidden)]
+pub fn expired_snapshot_reads() -> u64 {
+    EXPIRED_SNAPSHOT_READS.load(Ordering::Relaxed)
+}
+
 /// How many times a non-transactional read tries a transaction's on-disk
 /// snapshot that expired under it before it reads holding the database's
 /// guard (see [`ApiInner::read_committed`]).
@@ -2820,7 +2831,11 @@ impl ApiInner {
                 drop(slot);
                 None
             };
-            match snapshot.read_as(stmt, Some(Arc::clone(cancel)), Some(caller)) {
+            let read = snapshot.read_as(stmt, Some(Arc::clone(cancel)), Some(caller));
+            if matches!(read, Err(SnapshotReadError::Expired)) {
+                EXPIRED_SNAPSHOT_READS.fetch_add(1, Ordering::Relaxed);
+            }
+            match read {
                 Ok(result) => return Ok(result),
                 Err(SnapshotReadError::Expired) if !last => {}
                 Err(SnapshotReadError::Failed(e)) => return Err(query_err(e)),
