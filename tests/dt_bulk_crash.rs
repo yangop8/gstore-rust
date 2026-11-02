@@ -315,8 +315,19 @@ fn a_second_build_in_this_process_and_a_stale_staging_area() {
     build_new(&dir).unwrap();
     assert!(!staging.exists());
     assert_eq!(which(&dir, Prior::Disk), Some(true));
-    // A spill directory elsewhere is used and removed.
+    // A spill directory elsewhere is used and removed. What a crashed or
+    // killed build left there (its LOCK file unlocked) is removed by the next
+    // build; a live build's (its LOCK held, whatever its pid) is kept.
     let spill = base.join("spill");
+    let dead = spill.join("gstore-bulk-scratch-1-0-dead");
+    fs::create_dir_all(&dead).unwrap();
+    fs::write(dead.join("LOCK"), b"").unwrap();
+    fs::write(dead.join("spo-0.run"), vec![0u8; 4096]).unwrap();
+    let live = spill.join("gstore-bulk-scratch-1-1-live");
+    fs::create_dir_all(&live).unwrap();
+    let live_lock = fs::File::create(live.join("LOCK")).unwrap();
+    let locked = live_lock.try_lock().is_ok();
+    fs::write(live.join("spo-0.run"), b"live").unwrap();
     let r = bulk::build(
         &dir,
         "x",
@@ -332,6 +343,178 @@ fn a_second_build_in_this_process_and_a_stale_staging_area() {
     )
     .unwrap();
     assert!(r.spilled_runs > 0);
+    if locked {
+        assert!(!dead.exists(), "a dead build's spill directory is swept");
+        assert_eq!(fs::read(live.join("spo-0.run")).unwrap(), b"live");
+        drop(live_lock);
+        fs::remove_dir_all(&live).unwrap();
+    } else {
+        // No advisory locks on this file system: nothing is swept.
+        fs::remove_dir_all(&dead).unwrap();
+        fs::remove_dir_all(&live).unwrap();
+    }
     assert_eq!(fs::read_dir(&spill).unwrap().count(), 0, "scratch removed");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A RocksDB store in use is never replaced: `Database::open` takes no
+/// directory lock for that layout (RocksDB locks its own `rocksdb/LOCK`), so
+/// the build checks that lock itself before staging anything. A held
+/// `rocksdb/LOCK` refuses the build and leaves the store as it was; once
+/// released, the build replaces it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rocksdb_store_in_use_is_not_replaced() {
+    let base = tmp("rocks_in_use");
+    let dir = base.join("r.db");
+    fs::create_dir_all(&dir).unwrap();
+    make_prior(&dir, Prior::RocksDb);
+    let lock_path = dir.join("rocksdb/LOCK");
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    if holder.try_lock().is_err() {
+        // No advisory locks on this file system: nothing to check.
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    let e = build_new(&dir).unwrap_err().to_string();
+    assert!(e.contains("RocksDB store") && e.contains("in use"), "{e}");
+    assert!(dir.join("rocksdb").is_dir(), "the live store is untouched");
+    assert!(!dir.join(bulk::STAGING_DIR).exists());
+    assert_eq!(which(&dir, Prior::RocksDb), Some(false));
+    drop(holder);
+    build_new(&dir).unwrap();
+    assert!(!dir.join("rocksdb").exists());
+    assert_eq!(which(&dir, Prior::RocksDb), Some(true));
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The same with a real, open RocksDB database of this process (RocksDB's
+/// own POSIX lock).
+#[cfg(all(target_os = "linux", feature = "rocksdb"))]
+#[test]
+fn an_open_rocksdb_database_is_not_replaced() {
+    let base = tmp("rocks_open");
+    let dir = base.join("r.db");
+    fs::create_dir_all(&dir).unwrap();
+    make_prior(&dir, Prior::RocksDb);
+    let live = Database::open(&dir).unwrap();
+    let e = build_new(&dir).unwrap_err().to_string();
+    assert!(e.contains("RocksDB store") && e.contains("in use"), "{e}");
+    assert!(dir.join("rocksdb").is_dir());
+    drop(live);
+    assert_eq!(which(&dir, Prior::RocksDb), Some(false));
+    build_new(&dir).unwrap();
+    assert_eq!(which(&dir, Prior::RocksDb), Some(true));
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A committed `kvstore.kv.wal` of the store being replaced is replayed
+/// before it is removed; a replay that fails part-way stops the build with
+/// the log in place (it alone can finish the half-applied batch), never
+/// removing it to go on.
+#[test]
+fn a_failed_replay_of_the_old_wal_keeps_the_log() {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    let base = tmp("wal_replay");
+    let dir = base.join("w.db");
+    fs::create_dir_all(&dir).unwrap();
+    make_prior(&dir, Prior::Disk);
+    let kv = dir.join("kvstore.kv");
+    let before = fs::read(&kv).unwrap();
+    // A committed batch: page 1 as it is (harmless), then a page at the
+    // largest page id, past what the file system can hold (ext4: EFBIG).
+    let mut wal = b"GSTOREWL".to_vec();
+    wal.extend_from_slice(&2u32.to_le_bytes());
+    wal.extend_from_slice(&1u32.to_le_bytes());
+    wal.extend_from_slice(&before[4096..8192]);
+    wal.extend_from_slice(&u32::MAX.to_le_bytes());
+    wal.extend_from_slice(&[0u8; 4096]);
+    let crc = crc32(&wal[8..]);
+    wal.extend_from_slice(&crc.to_le_bytes());
+    wal.extend_from_slice(b"GSTORECM");
+    let wal_path = dir.join("kvstore.kv.wal");
+    fs::write(&wal_path, &wal).unwrap();
+    // Can this file system hold a page at that offset at all?
+    let fits = {
+        use std::io::{Seek, SeekFrom, Write};
+        let probe = base.join("probe");
+        let mut f = fs::File::create(&probe).unwrap();
+        let ok = f.seek(SeekFrom::Start(u64::from(u32::MAX) * 4096)).is_ok()
+            && f.write_all(&[0u8; 4096]).is_ok();
+        drop(f);
+        fs::remove_file(&probe).unwrap();
+        ok
+    };
+    match build_new(&dir) {
+        Ok(_) => {
+            // The replay succeeded, and the log was rightly removed.
+            assert!(fits, "a replay that failed was ignored");
+            assert!(!wal_path.exists());
+            assert_eq!(which(&dir, Prior::Disk), Some(true));
+        }
+        Err(e) => {
+            assert!(!fits, "{e}");
+            let e = e.to_string();
+            assert!(e.contains("write-ahead log"), "{e}");
+            assert!(wal_path.is_file(), "the log is kept for the next open");
+            assert_eq!(fs::read(&wal_path).unwrap(), wal);
+            assert!(!dir.join(bulk::STAGING_DIR).exists());
+            assert_eq!(fs::read(&kv).unwrap(), before, "the old store is in place");
+            // Once the log is dealt with, the old database is there and a
+            // rebuild succeeds.
+            fs::remove_file(&wal_path).unwrap();
+            assert_eq!(which(&dir, Prior::Disk), Some(false));
+            build_new(&dir).unwrap();
+            assert_eq!(which(&dir, Prior::Disk), Some(true));
+        }
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// Once the new `kvstore.kv` is in place (the install's commit point), a
+/// failing cleanup step no longer fails the build — the new database is
+/// live — but is reported as a warning, the remaining steps still run, and
+/// the replaced database's reasoning rules (whose ledgers name the old
+/// data's triples) are removed as part of the install.
+#[test]
+fn cleanup_after_the_commit_point_warns_and_drops_the_old_rules() {
+    let base = tmp("post_commit");
+    let dir = base.join("p.db");
+    fs::create_dir_all(&dir).unwrap();
+    make_prior(&dir, Prior::Disk);
+    let rules = dir.join(gstore::reason::rules::RULE_DIR);
+    fs::create_dir_all(rules.join("inferred")).unwrap();
+    fs::write(rules.join("r.json"), "{}").unwrap();
+    fs::write(
+        rules.join("inferred/r.nt"),
+        "<http://e/s> <http://e/p> <http://e/new1> .\n",
+    )
+    .unwrap();
+    // A snapshot leftover the install cannot remove (a directory where a
+    // file is expected): removing the other layouts fails after the commit.
+    fs::create_dir_all(dir.join("store.bin.tmp/x")).unwrap();
+    let r = build_new(&dir).expect("the new database is installed");
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("other layouts"), "{:?}", r.warnings);
+    assert!(!rules.exists(), "the replaced database's rules are gone");
+    assert!(dir.join("vstree.kv").is_file(), "later steps still ran");
+    assert!(!dir.join(bulk::STAGING_DIR).exists());
+    assert_eq!(which(&dir, Prior::Disk), Some(true));
     let _ = fs::remove_dir_all(&base);
 }

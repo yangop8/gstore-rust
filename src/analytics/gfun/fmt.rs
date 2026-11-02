@@ -316,9 +316,9 @@ pub fn push_path_json(
     path: &GPath,
 ) {
     out.push_str("{\"src\":");
-    push_json_quoted(out, ctx.entity_str(src));
+    push_json_quoted(out, &ctx.entity_str(src));
     out.push_str(",\"dst\":");
-    push_json_quoted(out, ctx.entity_str(dst));
+    push_json_quoted(out, &ctx.entity_str(dst));
     out.push_str(",\"edges\":[");
     for (i, e) in path.edges.iter().enumerate() {
         if i > 0 {
@@ -334,7 +334,7 @@ pub fn push_path_json(
             cxx_int_id(from),
             cxx_int_id(to)
         ));
-        push_json_quoted(out, ctx.pred_str(e.pred));
+        push_json_quoted(out, &ctx.pred_str(e.pred));
         out.push('}');
     }
     out.push_str("],\"nodes\":[");
@@ -348,7 +348,7 @@ pub fn push_path_json(
         }
         let entity = key as i32 as EntityLiteralId;
         out.push_str(&format!("{{\"nodeIndex\":{key},\"nodeIRI\":"));
-        push_json_quoted(out, ctx.entity_str(entity));
+        push_json_quoted(out, &ctx.entity_str(entity));
         out.push('}');
     }
     out.push_str("]}");
@@ -362,7 +362,7 @@ pub fn push_vert_list_json(out: &mut String, ctx: &GFunCtx<'_>, entities: &[Enti
         if i > 0 {
             out.push(',');
         }
-        push_json_quoted(out, ctx.entity_str(e));
+        push_json_quoted(out, &ctx.entity_str(e));
     }
     out.push(']');
 }

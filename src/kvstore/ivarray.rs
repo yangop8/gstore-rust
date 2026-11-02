@@ -233,6 +233,65 @@ impl IvArray {
         Ok(())
     }
 
+    /// Visit the values of `keys` (ascending; a repeated key is visited once)
+    /// in that order: `f(key, value)` for each key that has a value. Only the
+    /// requested slots are decoded — an overflow chain is read for a requested
+    /// key only, and an unrequested neighbour (damaged or not) is never
+    /// touched — while each page-table and directory page is read once per
+    /// run of keys it serves, in file order. Keys at or past [`CAPACITY`]
+    /// hold nothing. Read-only.
+    pub fn for_each_key(
+        &self,
+        pager: &Pager,
+        keys: &[u32],
+        mut f: impl FnMut(u32, &[u8]),
+    ) -> Result<()> {
+        let l0 = pager.root(self.root_slot) as PageId;
+        if l0 == 0 || keys.is_empty() {
+            return Ok(());
+        }
+        let l0buf = pager.read_page_shared(l0)?;
+        // (index, page) of the page-table page and of the directory page last
+        // read; a `None` page is an unallocated span.
+        let mut l1buf: Option<(usize, Option<Arc<Page>>)> = None;
+        let mut dbuf: Option<(usize, Option<Arc<Page>>)> = None;
+        let mut prev = None;
+        for &key in keys {
+            if prev == Some(key) {
+                continue;
+            }
+            prev = Some(key);
+            let k = key as usize;
+            if k >= CAPACITY {
+                break; // ascending: every later key is out of range too
+            }
+            let dir_idx = k / SLOTS_PER_DIR;
+            if dbuf.as_ref().map(|(i, _)| *i) != Some(dir_idx) {
+                let (l0i, l1i) = (dir_idx / PT_FANOUT, dir_idx % PT_FANOUT);
+                if l1buf.as_ref().map(|(i, _)| *i) != Some(l0i) {
+                    let page = match read_u32(&l0buf[..], l0i * 4) {
+                        0 => None,
+                        id => Some(pager.read_page_shared(id)?),
+                    };
+                    l1buf = Some((l0i, page));
+                }
+                let dir = match &l1buf {
+                    Some((_, Some(page))) => read_u32(&page[..], l1i * 4),
+                    _ => 0,
+                };
+                let page = match dir {
+                    0 => None,
+                    id => Some(pager.read_page_shared(id)?),
+                };
+                dbuf = Some((dir_idx, page));
+            }
+            if let Some((_, Some(d))) = &dbuf {
+                Self::with_slot(pager, &d[..], k % SLOTS_PER_DIR, k, |v| f(key, v))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Insert or replace `key → val`. Allocates page-table / directory pages on
     /// demand and frees any previous overflow chain the slot referenced.
     pub fn insert(&self, pager: &mut Pager, key: u32, val: &[u8]) -> Result<()> {
@@ -595,6 +654,59 @@ mod tests {
         assert_eq!(n, 7);
         // An empty array visits nothing.
         assert!(range(&IvArray::new(1), &pg, 0, 100).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `for_each_key` answers what `get` answers for the requested keys, and
+    /// decodes nothing else: an unrequested neighbour's damaged slot (or its
+    /// overflow chain) between two requested keys does not fail the batch.
+    #[test]
+    fn for_each_key_decodes_only_the_requested_slots() {
+        let path = tmp("each_key");
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let a = IvArray::new(0);
+        let long = |k: u32| -> Vec<u8> {
+            (0..INLINE_CAP + 300)
+                .map(|i| (i as u32 ^ k) as u8)
+                .collect()
+        };
+        for k in 0..100u32 {
+            if k % 3 == 0 {
+                a.insert(&mut pg, k, &long(k)).unwrap();
+            } else if k % 7 != 0 {
+                a.insert(&mut pg, k, format!("v{k}").as_bytes()).unwrap();
+            }
+        }
+        a.insert(&mut pg, 5_000_000, b"far").unwrap();
+        let each = |pg: &Pager, keys: &[u32]| {
+            let mut out = Vec::new();
+            a.for_each_key(pg, keys, |k, v| out.push((k, v.to_vec())))
+                .map(|()| out)
+        };
+        let keys = [0u32, 1, 1, 3, 7, 31, 32, 64, 99, 100, 4_999_999, 5_000_000];
+        let want: Vec<(u32, Vec<u8>)> = [0u32, 1, 3, 7, 31, 32, 64, 99, 100, 4_999_999, 5_000_000]
+            .iter()
+            .filter_map(|&k| a.get(&pg, k).unwrap().map(|v| (k, v)))
+            .collect();
+        assert_eq!(each(&pg, &keys).unwrap(), want);
+        assert!(each(&pg, &[]).unwrap().is_empty());
+        assert!(each(&pg, &[CAPACITY as u32, u32::MAX]).unwrap().is_empty());
+        // Damage the tag of key 5 (an overflow value) and the chain head of
+        // key 6 (overflow, it is a multiple of 3): requesting 4 and 7 around
+        // them still succeeds, requesting a damaged key fails.
+        let (l0i, l1i, _) = IvArray::locate(5).unwrap();
+        let dir = a.dir_page(&pg, l0i, l1i).unwrap().unwrap();
+        let mut page = pg.read_page(dir).unwrap();
+        page[5 * SLOT_SIZE] = 238;
+        write_u32(&mut page, 6 * SLOT_SIZE + 5, u32::MAX - 1);
+        pg.write_page(dir, &page).unwrap();
+        let got = each(&pg, &[4, 7]).unwrap();
+        assert_eq!(got.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [4]);
+        assert!(each(&pg, &[4, 5, 7]).is_err());
+        assert!(each(&pg, &[6]).is_err());
+        assert!(a
+            .for_each_range(&pg, 4, 8, |_, _| ControlFlow::Continue(()))
+            .is_err());
         std::fs::remove_file(&path).ok();
     }
 

@@ -434,12 +434,12 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// queries ([`with_string_index_provider`](Self::with_string_index_provider));
     /// without one the evaluator builds its own on first use.
     string_index_provider: Option<&'a StringIndexProvider<'a>>,
-    /// Per-query memo of dictionary id → parsed term and → value (bounded by
-    /// [`MEMO_MAX_ENTRIES`]): FILTER, BIND and ORDER BY see the same ids on
-    /// many rows, and each look-up of an out-of-core dictionary costs a
-    /// cache probe or a page read.
-    term_memo: std::cell::RefCell<HashMap<(u32, bool), Option<Term>, FxBuildHasher>>,
-    value_memo: std::cell::RefCell<HashMap<(u32, bool), Option<Value>, FxBuildHasher>>,
+    /// Per-query memo of dictionary id → parsed term and → value, for an
+    /// out-of-core dictionary only (see [`IdMemo`]): FILTER, BIND and ORDER BY
+    /// see the same ids on many rows, and each look-up there costs a cache
+    /// probe or a page read. Shared with `GRAPH` sub-evaluators (same
+    /// dictionary), so one byte budget bounds the whole query.
+    memo: Rc<std::cell::RefCell<IdMemo>>,
     /// Whether `SERVICE` may contact remote endpoints (see
     /// [`with_service_allowed`](Self::with_service_allowed)).
     allow_service: bool,
@@ -519,8 +519,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
             string_index_provider: None,
-            term_memo: std::cell::RefCell::default(),
-            value_memo: std::cell::RefCell::default(),
+            memo: Rc::default(),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
@@ -550,8 +549,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index: std::cell::RefCell::new(None),
             string_index_tried: std::cell::Cell::new(false),
             string_index_provider: None,
-            term_memo: std::cell::RefCell::default(),
-            value_memo: std::cell::RefCell::default(),
+            memo: Rc::default(),
             allow_service: true,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
@@ -2355,8 +2353,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index: std::cell::RefCell::new(self.string_index.borrow().clone()),
             string_index_tried: std::cell::Cell::new(self.string_index_tried.get()),
             string_index_provider: self.string_index_provider,
-            term_memo: std::cell::RefCell::default(),
-            value_memo: std::cell::RefCell::default(),
+            memo: Rc::clone(&self.memo),
             allow_service: self.allow_service,
             service_denied: Rc::clone(&self.service_denied),
             failed: Rc::clone(&self.failed),
@@ -3118,18 +3115,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Resolve any id (dictionary or synthetic) to a runtime [`Value`].
-    /// Dictionary ids are memoized for the query (see `value_memo`).
+    /// Over an out-of-core dictionary, dictionary ids are memoized for the
+    /// query (see [`IdMemo`]); an in-memory one borrows its strings, so there
+    /// the value is parsed and dropped.
     fn id_to_value(&self, id: u32, is_pred: bool) -> Option<Value> {
         if is_synth(id) {
             return self.extras.borrow().term(id).map(Value::from_term);
         }
-        if let Some(v) = self.value_memo.borrow().get(&(id, is_pred)) {
-            return v.clone();
+        let memo = self.dict.is_disk_backed();
+        if memo {
+            if let Some(v) = self.memo.borrow().values.get(&(id, is_pred)) {
+                return v.clone();
+            }
         }
-        let v = self.id_to_term(id, is_pred).map(|t| Value::from_term(&t));
-        let mut memo = self.value_memo.borrow_mut();
-        if memo.len() < MEMO_MAX_ENTRIES {
-            memo.insert((id, is_pred), v.clone());
+        let (t, len) = self.lookup_term(id, is_pred);
+        let v = t.map(|t| Value::from_term(&t));
+        if memo {
+            let mut m = self.memo.borrow_mut();
+            if m.charge(len) {
+                m.values.insert((id, is_pred), v.clone());
+            }
         }
         v
     }
@@ -3311,25 +3316,40 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// An id resolved back to its RDF term (synthetic, predicate, or
     /// entity/literal — routed by `is_pred` exactly as [`resolve_string`]).
-    /// Dictionary ids are memoized for the query (see `term_memo`).
+    /// Over an out-of-core dictionary, dictionary ids are memoized for the
+    /// query (see [`IdMemo`]).
     fn id_to_term(&self, id: u32, is_pred: bool) -> Option<Term> {
         if is_synth(id) {
             return self.extras.borrow().term(id).cloned();
         }
-        if let Some(t) = self.term_memo.borrow().get(&(id, is_pred)) {
-            return t.clone();
+        let memo = self.dict.is_disk_backed();
+        if memo {
+            if let Some(t) = self.memo.borrow().terms.get(&(id, is_pred)) {
+                return t.clone();
+            }
         }
+        let (t, len) = self.lookup_term(id, is_pred);
+        if memo {
+            let mut m = self.memo.borrow_mut();
+            if m.charge(len) {
+                m.terms.insert((id, is_pred), t.clone());
+            }
+        }
+        t
+    }
+
+    /// A dictionary id parsed into its term, unmemoized, with the length of
+    /// its dictionary key (what [`IdMemo::charge`] charges for it).
+    fn lookup_term(&self, id: u32, is_pred: bool) -> (Option<Term>, usize) {
         let s = if is_pred {
             self.dict.pred(id)
         } else {
             self.dict.term(id)
         };
-        let t = s.and_then(|s| key_term(&s));
-        let mut memo = self.term_memo.borrow_mut();
-        if memo.len() < MEMO_MAX_ENTRIES {
-            memo.insert((id, is_pred), t.clone());
+        match s {
+            Some(s) => (key_term(&s), s.len()),
+            None => (None, 0),
         }
-        t
     }
 
     /// Clone `gp` with each variable bound by `b` replaced by its constant term
@@ -5866,9 +5886,44 @@ const CANDIDATE_LOOKUP_FACTOR: usize = 8;
 /// Result rows materialized per dictionary prefetch (see `eval_select`).
 const MATERIALIZE_CHUNK_ROWS: usize = 4096;
 
-/// At most this many ids are memoized per query in each of the id → term and
-/// id → value memos; later ids are resolved without memoizing.
-const MEMO_MAX_ENTRIES: usize = 1 << 16;
+/// The bytes one query's [`IdMemo`] may hold (charged per entry: the
+/// dictionary key's length plus [`MEMO_ENTRY_OVERHEAD`]); later ids are
+/// resolved without memoizing.
+const MEMO_MAX_BYTES: usize = 8 << 20;
+
+/// What one memo entry costs beyond its key's bytes (the map slot, the
+/// `Term`/`Value` and their heap headers).
+const MEMO_ENTRY_OVERHEAD: usize = 96;
+
+/// A key longer than this is never memoized: one such string would crowd out
+/// thousands of short ones, and its parse is cheap next to its page reads.
+const MEMO_MAX_KEY_BYTES: usize = 16 << 10;
+
+/// The per-query memo of dictionary id → parsed [`Term`] (`id_to_term`) and
+/// id → [`Value`] (`id_to_value`), used over an out-of-core dictionary only.
+/// Bounded by bytes ([`MEMO_MAX_BYTES`]), not entries: each entry is charged
+/// its key's length, so large literals cannot grow it past the budget. Each
+/// map holds an id once; an id needed both as a term and as a value is
+/// charged twice.
+#[derive(Debug, Default)]
+struct IdMemo {
+    terms: HashMap<(u32, bool), Option<Term>, FxBuildHasher>,
+    values: HashMap<(u32, bool), Option<Value>, FxBuildHasher>,
+    bytes: usize,
+}
+
+impl IdMemo {
+    /// Charge an entry for a key of `key_len` bytes: `false` (nothing charged)
+    /// when it is too long to memoize or the budget is spent.
+    fn charge(&mut self, key_len: usize) -> bool {
+        let cost = key_len + MEMO_ENTRY_OVERHEAD;
+        if key_len > MEMO_MAX_KEY_BYTES || self.bytes + cost > MEMO_MAX_BYTES {
+            return false;
+        }
+        self.bytes += cost;
+        true
+    }
+}
 
 /// Is `value` an allowed binding for `slot` under the VS-tree candidate sets?
 /// Constants and variables without a candidate set are always allowed. The
@@ -6866,6 +6921,67 @@ mod builtin_tests {
             count("<http://ex/a> <http://ex/name> ?n FILTER(rs:SSSPLEN(<http://ex/a>, <http://ex/d>) = 3)"),
             1
         );
+    }
+
+    /// The id → term / value memo serves an out-of-core dictionary only and
+    /// is bounded by bytes, not entries: a FILTER and an ORDER BY over more
+    /// large literals than the budget holds answer every row while the memo
+    /// stays within `MEMO_MAX_BYTES`; over an in-memory dictionary nothing is
+    /// memoized (its strings are borrowed).
+    #[test]
+    fn id_memo_is_byte_bounded_and_out_of_core_only() {
+        use crate::kvstore::DiskStore;
+        let path =
+            std::env::temp_dir().join(format!("gstore_engine_id_memo_{}.kv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("kv.wal"));
+        let n = 6000usize;
+        let tail = "x".repeat(1500);
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/d> \"{i} {tail}\" .\n"
+            ));
+        }
+        let ds = DiskStore::build_str(&path, 256, &text).unwrap();
+        let rows = |ev: &Evaluator<'_, DiskStore>, q: &str| match ev.evaluate(&parse(q).unwrap()) {
+            Ok(QueryResult::Select(rs)) => rs.rows.len(),
+            other => panic!("{other:?}"),
+        };
+        let filter = "SELECT ?s WHERE { ?s <http://ex/d> ?d FILTER(STRLEN(?d) > 0) }";
+        let order = "SELECT ?s WHERE { ?s <http://ex/d> ?d } ORDER BY DESC(?d) LIMIT 1";
+
+        let lazy = ds.lazy_dictionary();
+        let ev = Evaluator::new(&lazy, &ds);
+        assert_eq!(rows(&ev, filter), n);
+        assert_eq!(rows(&ev, order), 1);
+        {
+            let m = ev.memo.borrow();
+            assert!(
+                m.bytes > 0 && m.bytes <= MEMO_MAX_BYTES,
+                "{} bytes",
+                m.bytes
+            );
+            assert!(
+                m.values.len() < n,
+                "the byte budget stopped memoizing ({} values)",
+                m.values.len()
+            );
+            let held: usize = m.values.values().flatten().map(|v| v.lexical().len()).sum();
+            assert!(held <= MEMO_MAX_BYTES, "{held} bytes of values");
+        }
+
+        let mem = ds.dictionary().unwrap();
+        let ev = Evaluator::new(&mem, &ds);
+        assert_eq!(rows(&ev, filter), n);
+        assert_eq!(rows(&ev, order), 1);
+        let m = ev.memo.borrow();
+        assert_eq!((m.bytes, m.terms.len(), m.values.len()), (0, 0, 0));
+        drop(m);
+        drop(ev);
+        drop(ds);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     }
 }
 

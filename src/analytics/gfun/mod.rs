@@ -150,7 +150,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::analytics::csr::{CsrGraph, Direction, EdgeDir, Node, PredFilter};
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId, INVALID_ENTITY_LITERAL_ID};
 pub use from_ast::{iri_entity, iri_node, GCall, PredSetArg};
@@ -711,23 +711,32 @@ impl<'a> GFunCtx<'a> {
 
     /// An entity's printed form (`<iri>`, `_:b`, or a literal's key); `""`
     /// for an unknown id, like upstream `getStringByID`.
-    pub fn entity_str(&self, entity: EntityLiteralId) -> &'a str {
-        self.dict.id_to_string(entity).unwrap_or("")
+    ///
+    /// Read through [`Dictionary::term`], so it serves an in-memory dictionary
+    /// (a borrow, no copy) and an out-of-core one (a shared string from its
+    /// cache) alike; a backend's read error is noted in the statement's read
+    /// scope (C2) and prints as `""`.
+    pub fn entity_str(&self, entity: EntityLiteralId) -> TermStr<'a> {
+        if entity == INVALID_ENTITY_LITERAL_ID {
+            return TermStr::Borrowed("");
+        }
+        self.dict.term(entity).unwrap_or(TermStr::Borrowed(""))
     }
 
     /// A CSR node's printed form.
-    pub fn node_str(&self, node: Node) -> &'a str {
+    pub fn node_str(&self, node: Node) -> TermStr<'a> {
         self.entity_str(self.csr.entity_of(node))
     }
 
     /// A [`GNode`]'s printed form (`""` when missing).
-    pub fn gnode_str(&self, n: &GNode) -> &'a str {
+    pub fn gnode_str(&self, n: &GNode) -> TermStr<'a> {
         self.entity_str(n.entity)
     }
 
-    /// A predicate's printed form (`<p>`), `""` if unknown.
-    pub fn pred_str(&self, pred: PredId) -> &'a str {
-        self.dict.predicate_to_string(pred).unwrap_or("")
+    /// A predicate's printed form (`<p>`), `""` if unknown (read through
+    /// [`Dictionary::pred`], as [`entity_str`](Self::entity_str)).
+    pub fn pred_str(&self, pred: PredId) -> TermStr<'a> {
+        self.dict.pred(pred).unwrap_or(TermStr::Borrowed(""))
     }
 }
 

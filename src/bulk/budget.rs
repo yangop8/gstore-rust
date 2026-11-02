@@ -1,13 +1,16 @@
 //! The memory budget of a bulk build: per-phase shares and peak accounting.
 //!
 //! The budget covers the buffers whose size the build chooses — external-sort
-//! run buffers, the signature spool, merge read-ahead. It does **not** cover
-//! the term map (the dictionary under construction, about `L + 26` bytes per
-//! term, reported separately in the [`BulkReport`](super::BulkReport)) nor
-//! the parse pipeline (a few bounded batches per parser thread).
+//! run buffers, the signature spool, and the I/O buffers of writing,
+//! merging and reading back spilled runs and spools (read-ahead). It does
+//! **not** cover the term map (the dictionary under construction, about
+//! `L + 26` bytes per term, reported separately in the
+//! [`BulkReport`](super::BulkReport)) nor the parse pipeline (a few bounded
+//! batches per parser thread).
 //!
 //! A buffer charges its capacity when it grows and releases it when it is
-//! dropped or spilled; the peak of the charged bytes is reported.
+//! dropped or spilled; an I/O buffer is charged while it exists. The peak of
+//! the charged bytes is reported.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -15,8 +18,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// budget usable: every sorter can hold at least this many bytes).
 pub(crate) const MIN_SHARE: usize = 64 << 10;
 
-/// Bytes of read-ahead per run of a k-way merge.
+/// The largest read-ahead per run of a k-way merge (and write buffer of a
+/// run or spool); see [`Budget::io_bytes`].
 pub(crate) const MERGE_READ_BYTES: usize = 256 << 10;
+
+/// The smallest I/O buffer of a run or spool.
+const MIN_IO_BYTES: usize = 4 << 10;
 
 /// The memory budget (see the module docs).
 #[derive(Debug)]
@@ -58,6 +65,15 @@ impl Budget {
     /// `min(64, share / 256 KiB)`, at least 2.
     pub(crate) fn fan_in(share: usize) -> usize {
         (share / MERGE_READ_BYTES).clamp(2, 64)
+    }
+
+    /// The I/O buffer of each run (read-ahead in a merge, the write buffer of
+    /// a run or spool) for a buffer of `share` bytes: a merge's fan-in
+    /// readers and its writer together fit one more share — at most
+    /// [`MERGE_READ_BYTES`] (what any share of 16 MiB or more gets), at
+    /// least 4 KiB.
+    pub(crate) fn io_bytes(share: usize) -> usize {
+        (share / (Self::fan_in(share) + 1)).clamp(MIN_IO_BYTES, MERGE_READ_BYTES)
     }
 
     /// Account `bytes` more in use.
@@ -152,6 +168,14 @@ mod tests {
         assert_eq!(Budget::fan_in(1 << 20), 4);
         assert_eq!(Budget::fan_in(1 << 40), 64);
         assert_eq!(Budget::fan_in(0), 2);
+        assert_eq!(Budget::io_bytes(1 << 30), MERGE_READ_BYTES);
+        assert_eq!(Budget::io_bytes(17 << 20), MERGE_READ_BYTES);
+        assert_eq!(Budget::io_bytes(MIN_SHARE), MIN_SHARE / 3);
+        assert_eq!(Budget::io_bytes(0), MIN_IO_BYTES);
+        for share in [MIN_SHARE, 87_381, 1 << 20, 8 << 20, 64 << 20] {
+            let io = Budget::io_bytes(share);
+            assert!((Budget::fan_in(share) + 1) * io <= share.max(3 * MIN_IO_BYTES));
+        }
         {
             let mut c = Charge::new(&b);
             c.set(100);

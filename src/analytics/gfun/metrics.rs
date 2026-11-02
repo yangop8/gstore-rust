@@ -60,6 +60,7 @@ use super::fmt::{
 use super::output_bound_exceeded;
 use super::traverse::{for_each_nbr, NbrOrder, NodeMarks};
 use super::{CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, Node, PredFilter};
+use crate::dict::TermStr;
 use crate::error::{GStoreError, Result};
 use crate::model::id::EntityLiteralId;
 
@@ -156,7 +157,7 @@ fn named(kind: GFnKind, v: Option<f64>, key: &str) -> Result<f64> {
 }
 
 /// The printed form of a vertex (node) as upstream's `getStringByID(vid)`.
-fn node_name<'a>(ctx: &GFunCtx<'a>, n: Node) -> &'a str {
+fn node_name<'a>(ctx: &GFunCtx<'a>, n: Node) -> TermStr<'a> {
     ctx.node_str(n)
 }
 
@@ -261,14 +262,14 @@ pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         };
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, ctx.gnode_str(&src));
+        push_json_quoted(e, &ctx.gnode_str(&src));
         e.push_str(",\"results\":[");
         for (i, (entity, value)) in top.iter().enumerate() {
             if i > 0 {
                 e.push(',');
             }
             e.push_str("{\"dst\":");
-            push_json_quoted(e, ctx.entity_str(*entity));
+            push_json_quoted(e, &ctx.entity_str(*entity));
             e.push_str(",\"PPR\":");
             e.push_str(&cxx_g(*value));
             e.push('}');
@@ -382,7 +383,7 @@ pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     for (v, x) in idx2val {
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, node_name(ctx, v));
+        push_json_quoted(e, &node_name(ctx, v));
         e.push_str(",\"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
@@ -508,7 +509,7 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         }
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, ctx.gnode_str(&src));
+        push_json_quoted(e, &ctx.gnode_str(&src));
         e.push_str(",\"result\":");
         e.push_str(&cxx_to_string(x));
         e.push('}');
@@ -567,7 +568,7 @@ pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue>
         };
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, ctx.gnode_str(&src));
+        push_json_quoted(e, &ctx.gnode_str(&src));
         e.push_str(", \"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
@@ -782,7 +783,7 @@ pub fn cluster_coeff(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let x = local_cluster_coeff(ctx.csr, &a.preds, src.node, a.directed);
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, ctx.gnode_str(&src));
+        push_json_quoted(e, &ctx.gnode_str(&src));
         e.push_str(",\"result\":");
         e.push_str(&cxx_to_string(x));
         e.push('}');
@@ -1382,7 +1383,7 @@ pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         for (v, js) in jaccard(ctx, &a.preds, u, k, r)? {
             let e = out.item()?;
             e.push_str("{\"dst\":");
-            e.push_str(node_name(ctx, v));
+            e.push_str(&node_name(ctx, v));
             e.push_str(", \"value\":");
             e.push_str(&cxx_g_f32(js));
             e.push('}');
@@ -1592,7 +1593,7 @@ pub fn degree_correlation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         };
         let e = out.item()?;
         e.push_str("{\"src\":");
-        push_json_quoted(e, ctx.gnode_str(&src));
+        push_json_quoted(e, &ctx.gnode_str(&src));
         e.push_str(", \"result\":");
         e.push_str(&cxx_g(x));
         e.push('}');
@@ -1780,7 +1781,7 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             s.push(',');
         }
         s.push('[');
-        push_json_quoted(&mut s, node_name(ctx, v));
+        push_json_quoted(&mut s, &node_name(ctx, v));
         s.push(',');
         s.push_str(&nlohmann_dump_f64(res));
         s.push(']');
@@ -1882,7 +1883,7 @@ fn vertex_list_unquoted(ctx: &GFunCtx<'_>, key: &str, vs: &[i32]) -> String {
         } else {
             ctx.entity_str(v as u32)
         };
-        s.push_str(name);
+        s.push_str(&name);
     }
     s.push_str("]}");
     s

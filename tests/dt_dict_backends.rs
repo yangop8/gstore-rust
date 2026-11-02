@@ -387,6 +387,102 @@ fn out_of_core_queries_match_memory_answers_in_order() {
     remove_store(&path);
 }
 
+/// Graph functions over the out-of-core dictionary (`DiskStore::query`) print
+/// their vertex and predicate labels through `term()` / `pred()`: they answer
+/// what the in-memory dictionary answers over the same store, instead of
+/// failing the statement on the legacy `&str` API (C4 fails that closed).
+#[test]
+fn graph_functions_over_the_out_of_core_dictionary_match_memory() {
+    let path = tmp("gfun").with_extension("kv");
+    remove_store(&path);
+    let ds = DiskStore::build_str(
+        &path,
+        64,
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+         <http://ex/b> <http://ex/p> <http://ex/c> .\n\
+         <http://ex/c> <http://ex/p> <http://ex/d> .\n\
+         <http://ex/c> <http://ex/q> <http://ex/a> .\n\
+         <http://ex/a> <http://ex/name> \"A\" .\n",
+    )
+    .unwrap();
+    let mem_dict = ds.dictionary().unwrap();
+    let queries = [
+        "SELECT (shortestPath(<http://ex/a>, <http://ex/d>, true, {}) AS ?y) WHERE {}",
+        "SELECT (shortestPath(<http://ex/a>, <http://ex/d>, true, {<http://ex/p>}) AS ?y) WHERE {}",
+        "SELECT (shortestPathLen(<http://ex/a>, <http://ex/d>, true, {}) AS ?y) WHERE {}",
+        "SELECT (kHopReachable(<http://ex/a>, <http://ex/d>, true, 3, {}) AS ?y) WHERE {}",
+        "SELECT (kHopReachablePath(<http://ex/a>, <http://ex/d>, true, 3, {}) AS ?y) WHERE {}",
+        "SELECT (kHopNeighbor(<http://ex/a>, true, 2, {}) AS ?y) WHERE {}",
+        "SELECT (cyclePath(<http://ex/a>, <http://ex/c>, true, {}) AS ?y) WHERE {}",
+        "SELECT ?x (shortestPath(?x, <http://ex/d>, true, {}) AS ?y) \
+         WHERE { ?x <http://ex/p> <http://ex/b> }",
+        "SELECT (PR(true, {}, 10, alpha=0.85, maxIter=100, tol=0.0001) AS ?y) WHERE {}",
+        "SELECT (WCC({}) AS ?y) WHERE {}",
+        "SELECT (closenessCentrality(<http://ex/a>, true, {}) AS ?y) WHERE {}",
+    ];
+    for q in queries {
+        let parsed = sparql::parse(q).unwrap();
+        let want = rows(Evaluator::new(&mem_dict, &ds).evaluate(&parsed).unwrap());
+        assert!(
+            want.iter()
+                .flatten()
+                .any(|v| v.as_deref().is_some_and(|s| s.contains("<http://ex/"))),
+            "{q}: the answer prints vertex labels: {want:?}"
+        );
+        let got = ds.query(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(rows(got), want, "{q}");
+    }
+    drop(ds);
+    remove_store(&path);
+}
+
+/// A batched dictionary read (one sorted batch per materialization chunk)
+/// decodes only the ids it was asked for: a damaged slot of an unrequested
+/// literal between two requested ones neither fails the query nor is read.
+#[test]
+fn a_batch_never_reads_an_unrequested_neighbour() {
+    let path = tmp("batch_neighbour").with_extension("kv");
+    remove_store(&path);
+    let tail = "x".repeat(300); // every literal needs an overflow chain
+    let mut text = String::new();
+    for i in 0..64 {
+        text.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p> \"lit {i} {tail}\" .\n"
+        ));
+    }
+    drop(DiskStore::build_str(&path, 64, &text).unwrap());
+    // Literal keys are first-seen: subject i's literal has array key i. Damage
+    // the slot tag of key 5 (header slot 7 = id2literal → L0 → L1 → dir).
+    let mut bytes = std::fs::read(&path).unwrap();
+    let u32_at = |b: &[u8], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let l0 = u64::from_le_bytes(bytes[16 + 7 * 8..16 + 8 * 8].try_into().unwrap()) as usize;
+    let l1 = u32_at(&bytes, l0 * 4096) as usize;
+    let dir = u32_at(&bytes, l1 * 4096) as usize;
+    assert!(l0 > 0 && l1 > 0 && dir > 0);
+    assert_eq!(bytes[dir * 4096 + 5 * 128], 2, "key 5 is an overflow slot");
+    bytes[dir * 4096 + 5 * 128] = 238;
+    std::fs::write(&path, bytes).unwrap();
+
+    let ds = DiskStore::open(&path, 64).unwrap();
+    let one = |i: usize| format!("\"lit {i} {tail}\"");
+    let got = rows(
+        ds.query(
+            "SELECT ?o WHERE { { <http://ex/s4> <http://ex/p> ?o } \
+             UNION { <http://ex/s6> <http://ex/p> ?o } }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(got, vec![vec![Some(one(4))], vec![Some(one(6))]]);
+    // The damaged literal itself still fails the statement that names it.
+    let err = ds
+        .query("SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("corrupt slot tag 238"), "{err}");
+    drop(ds);
+    remove_store(&path);
+}
+
 // ---- dict.bin compatibility ---------------------------------------------------
 
 /// The pre-Phase-6 persisted interner: its derived serde is the old encoding

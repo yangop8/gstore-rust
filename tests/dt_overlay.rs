@@ -269,7 +269,7 @@ fn seeded_store(path: &Path, cache_pages: usize) -> DiskStore {
 }
 
 fn pager_state(dt: &DiskTriples) -> (u32, usize) {
-    let pager = dt.shared_pager();
+    let pager = dt.shared_pager().unwrap();
     let pager = pager.read().unwrap();
     (pager.page_count(), pager.dirty_pages())
 }
@@ -385,7 +385,7 @@ fn disk_transactions_match_the_model_and_never_touch_the_pager() {
                 assert_eq!(dt.epoch(), epoch_before);
                 // The committed state is untouched.
                 check_same(
-                    &DiskSource::new(dt.disk_store()),
+                    &DiskSource::new(dt.disk_store().unwrap()),
                     &committed,
                     "committed state during the transaction",
                 );
@@ -427,9 +427,9 @@ fn commit_applies_named_ops_and_rollback_drops_them() {
     dt.begin().unwrap();
     dt.named_op(true, g, t).unwrap();
     assert_eq!(dt.transaction().unwrap().named_ops().len(), 1);
-    assert!(dt.disk_store().quads().unwrap().is_empty());
+    assert!(dt.disk_store().unwrap().quads().unwrap().is_empty());
     assert!(dt.rollback());
-    assert!(dt.disk_store().quads().unwrap().is_empty());
+    assert!(dt.disk_store().unwrap().quads().unwrap().is_empty());
 
     dt.begin().unwrap();
     dt.named_op(true, g, t).unwrap();
@@ -437,7 +437,7 @@ fn commit_applies_named_ops_and_rollback_drops_them() {
     dt.named_op(false, g, IdTriple::new(2, 2, 4)).unwrap();
     assert!(dt.insert_triple(IdTriple::new(0, 0, 1)).unwrap());
     dt.commit().unwrap();
-    assert_eq!(dt.disk_store().quads().unwrap(), vec![(g, t)]);
+    assert_eq!(dt.disk_store().unwrap().quads().unwrap(), vec![(g, t)]);
     assert_eq!(dt.triple_count(), 1);
 
     // Auto-commit named ops; a no-op leaves the epoch alone.
@@ -446,7 +446,7 @@ fn commit_applies_named_ops_and_rollback_drops_them() {
     assert_eq!(dt.epoch(), e);
     dt.named_op(false, g, t).unwrap();
     assert_eq!(dt.epoch(), e + 1);
-    assert!(dt.disk_store().quads().unwrap().is_empty());
+    assert!(dt.disk_store().unwrap().quads().unwrap().is_empty());
     drop(dt);
     cleanup(&path);
 }
@@ -541,6 +541,11 @@ fn broken_state_refuses_writes_and_reads_until_reopen() {
         dt.read_view().with_base(|_, _| ()),
         Err(ViewError::Io(_))
     ));
+    // ... and so does the raw committed store (the half-applied commit's first
+    // writes are in its page cache: neither the old nor the new state).
+    let refused = dt.disk_store().err().expect("refused").to_string();
+    assert!(refused.contains("broken"), "{refused}");
+    assert!(dt.shared_pager().is_err());
 
     // Dropping a broken store flushes nothing: reopening finds the state of
     // the last commit point, without the half-applied commit.
@@ -617,7 +622,7 @@ fn read_errors_reach_the_scope_and_stay_on_their_thread() {
     }
     // Through an evaluator: the query's scope records it.
     {
-        let dict = dt.disk_store().dictionary().unwrap();
+        let dict = dt.disk_store().unwrap().dictionary().unwrap();
         let q =
             gstore::parser::sparql::parse(&format!("SELECT ?s ?o WHERE {{ ?s {} ?o }}", pred(1)))
                 .unwrap();
@@ -664,6 +669,106 @@ fn read_errors_reach_the_scope_and_stay_on_their_thread() {
         assert_eq!(failing.join().unwrap(), 300);
         assert_eq!(healthy.join().unwrap(), 0, "an error leaked across threads");
     });
+    drop(dt);
+    cleanup(&path);
+}
+
+/// A statistic the overlay memoizes is never computed from a failed base
+/// read: every statement that needs it while the base fails reports the
+/// error (C2: one statement's failure never leaks into another as a silently
+/// wrong value).
+#[test]
+fn an_overlay_statistic_from_a_failed_read_is_not_memoized() {
+    const OSP: usize = 2; // header slot of the OSP tree
+    let path = tmp("deltaerr");
+    let mut dt = DiskTriples::new(seeded_store(&path, 64)).unwrap();
+    assert!(dt.insert_triple(IdTriple::new(1, 0, 2)).unwrap());
+    assert!(dt.insert_triple(IdTriple::new(3, 0, 4)).unwrap());
+    dt.close().unwrap();
+    corrupt_root(&path, OSP);
+    let mut dt = DiskTriples::open(&path, 64).unwrap();
+    dt.begin().unwrap();
+    // The existence probe reads SPO, which is intact.
+    assert!(dt.remove_triple(IdTriple::new(1, 0, 2)).unwrap());
+    for statement in 0..3 {
+        let scope = ReadScope::enter();
+        let _ = dt.distinct_objects();
+        assert!(
+            scope.take_error().is_some(),
+            "statement {statement} read the broken OSP tree and must fail"
+        );
+    }
+    dt.rollback();
+    drop(dt);
+    cleanup(&path);
+}
+
+/// A commit refused because it runs inside one of the store's own snapshot
+/// reads (it would wait for itself) leaves the transaction open and the
+/// store healthy: the caller commits after leaving the view.
+#[test]
+fn a_commit_refused_inside_a_view_keeps_the_transaction() {
+    let path = tmp("commit_reentry");
+    let dt = Arc::new(Mutex::new(
+        DiskTriples::new(seeded_store(&path, 64)).unwrap(),
+    ));
+    let t = IdTriple::new(0, 0, 1);
+    dt.lock().unwrap().begin().unwrap();
+    assert!(dt.lock().unwrap().insert_triple(t).unwrap());
+    let view = dt.lock().unwrap().read_view();
+    let refused = view
+        .with_base(|_, _| dt.lock().unwrap().commit())
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("would wait for itself"), "{refused}");
+    let mut g = dt.lock().unwrap();
+    assert!(
+        g.in_transaction(),
+        "the refused commit kept the transaction"
+    );
+    assert!(g.broken().is_none());
+    assert!(g.exists(0, 0, 1), "read-your-writes still sees it");
+    assert_eq!(g.epoch(), 0);
+    g.commit().unwrap();
+    assert!(!g.in_transaction());
+    assert!(g.exists(0, 0, 1));
+    assert_eq!(g.epoch(), 1);
+    drop(g);
+    drop(dt);
+    cleanup(&path);
+}
+
+/// `vstree_stale` covers what `DiskTriples` reads: while the open
+/// transaction adds triples, a `vstree.kv` built from the committed state
+/// lacks them, so it reads as stale (removals keep it a sound superset).
+#[test]
+fn the_vstree_is_stale_while_a_transaction_adds() {
+    let path = tmp("vstree_txn");
+    let mut dt = DiskTriples::new(seeded_store(&path, 64)).unwrap();
+    assert!(dt.insert_triple(IdTriple::new(1, 0, 2)).unwrap());
+    dt.mark_vstree_fresh();
+    assert!(!dt.vstree_stale());
+    dt.begin().unwrap();
+    assert!(dt.remove_triple(IdTriple::new(1, 0, 2)).unwrap());
+    assert!(
+        !dt.vstree_stale(),
+        "a removal keeps the tree a sound superset"
+    );
+    assert!(dt.insert_triple(IdTriple::new(3, 0, 4)).unwrap());
+    assert!(
+        dt.vstree_stale(),
+        "the transaction's addition is not in the tree"
+    );
+    dt.rollback();
+    assert!(!dt.vstree_stale());
+    dt.begin().unwrap();
+    assert!(dt.insert_triple(IdTriple::new(3, 0, 4)).unwrap());
+    dt.commit().unwrap();
+    assert!(
+        dt.vstree_stale(),
+        "the committed addition is not in the tree"
+    );
     drop(dt);
     cleanup(&path);
 }

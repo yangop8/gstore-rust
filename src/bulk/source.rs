@@ -13,6 +13,16 @@
 //! thread (or a single in-memory document) the import simply runs on the
 //! calling thread. The parser of a lone source still runs beside the encoder,
 //! so parsing and encoding overlap.
+//!
+//! The parser threads batch with the caller's `batch_size` / `batch_bytes`,
+//! exactly as the sequential import, but hand each batch over in parts of at
+//! most [`PIPE_BATCH`] quads / [`PIPE_BATCH_BYTES`] of terms as they are
+//! parsed ([`QuadSink::handoff`]), so the channel stays small and the encoder
+//! keeps up with the parser. The end of each batch travels as its own event.
+//! The encoder (the sink) can refuse a quad (an over-long key, an id-space
+//! bound); such an error is held until the end of its batch, where the
+//! sequential import would have raised it — after the same error-log lines,
+//! and behind a strict parse error that comes first.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
@@ -28,10 +38,11 @@ use super::BulkInput;
 /// The operation named in the error log (as the incremental build).
 pub(crate) const OPERATION: &str = "build";
 
-/// Quads per batch on the parser → encoder channel (smaller batches than a
-/// sequential import uses, so the pipeline overlaps sooner and holds less).
+/// Quads per part of a batch on the parser → encoder channel (smaller than
+/// a sequential import's batches, so the pipeline overlaps sooner and holds
+/// less).
 const PIPE_BATCH: usize = 8192;
-/// Bytes of RDF terms per batch on the channel.
+/// Bytes of RDF terms per part on the channel.
 const PIPE_BATCH_BYTES: usize = 8 << 20;
 /// Messages a source's channel holds before its parser waits.
 const PIPE_DEPTH: usize = 4;
@@ -39,7 +50,10 @@ const PIPE_DEPTH: usize = 4;
 /// What a parser thread produces, in import order.
 enum Event {
     Failed(SyntaxError),
+    /// A part of a batch.
     Batch(Vec<Quad>),
+    /// The end of a (non-empty) batch.
+    BatchEnd,
     Done(Result<ImportReport>),
 }
 
@@ -54,14 +68,22 @@ impl ErrorLog for FwdLog<'_> {
     }
 }
 
-/// Forwards batches to the channel. The consumer sends each batch back once
-/// it is encoded, and the quads are dropped here, on the thread that
-/// allocated them (freeing another thread's allocations is markedly slower),
-/// and the batch's buffer is reused.
+/// Forwards the parts of each batch, and its end, to the channel. The
+/// consumer sends each part back once it is encoded, and the quads are
+/// dropped here, on the thread that allocated them (freeing another
+/// thread's allocations is markedly slower), and the part's buffer is
+/// reused.
 struct FwdSink<'a> {
     tx: &'a SyncSender<Event>,
     back: &'a Receiver<Vec<Quad>>,
-    cap: usize,
+}
+
+impl FwdSink<'_> {
+    fn send(&self, e: Event) -> Result<()> {
+        self.tx
+            .send(e)
+            .map_err(|_| GStoreError::Database("the bulk build stopped reading the input".into()))
+    }
 }
 
 impl QuadSink for FwdSink<'_> {
@@ -69,12 +91,18 @@ impl QuadSink for FwdSink<'_> {
         let mut next = self
             .back
             .try_recv()
-            .unwrap_or_else(|_| Vec::with_capacity(self.cap));
+            .unwrap_or_else(|_| Vec::with_capacity(PIPE_BATCH));
         next.clear();
-        let full = std::mem::replace(batch, next);
-        self.tx
-            .send(Event::Batch(full))
-            .map_err(|_| GStoreError::Database("the bulk build stopped reading the input".into()))
+        let part = std::mem::replace(batch, next);
+        self.send(Event::Batch(part))
+    }
+
+    fn handoff(&self) -> Option<(usize, usize)> {
+        Some((PIPE_BATCH, PIPE_BATCH_BYTES))
+    }
+
+    fn batch_end(&mut self) -> Result<()> {
+        self.send(Event::BatchEnd)
     }
 }
 
@@ -104,10 +132,8 @@ fn parallel(
     threads: usize,
     sink: &mut dyn QuadSink,
 ) -> Result<ImportReport> {
-    let mut popts = opts.clone();
-    popts.batch_size = popts.batch_size.clamp(1, PIPE_BATCH);
-    popts.batch_bytes = popts.batch_bytes.clamp(1, PIPE_BATCH_BYTES);
-    let popts = &popts;
+    // The sequential batching, unchanged (see the module docs).
+    let popts = opts;
     let n = sources.len();
     let mut rxs: Vec<Option<Receiver<Event>>> = Vec::with_capacity(n);
     let mut backs: Vec<Sender<Vec<Quad>>> = Vec::with_capacity(n);
@@ -141,7 +167,6 @@ fn parallel(
                 let mut fsink = FwdSink {
                     tx: &tx,
                     back: &back,
-                    cap: popts.batch_size,
                 };
                 let r = import::import_source(&sources[i], OPERATION, popts, &mut flog, &mut fsink);
                 let _ = tx.send(Event::Done(r));
@@ -170,16 +195,32 @@ fn replay(
         let name = source.name();
         log.begin(OPERATION, &name);
         let rx = rxs[i].take().expect("each source is replayed once");
+        // The sink's error, held until the end of its batch (see the module
+        // docs); nothing more is encoded after it.
+        let mut held: Option<GStoreError> = None;
         loop {
             match rx.recv() {
                 Ok(Event::Failed(e)) => log.failed(&name, &e),
                 Ok(Event::Batch(mut b)) => {
-                    sink.quads(&mut b)?;
+                    if held.is_none() {
+                        held = sink.quads(&mut b).err();
+                    }
                     // Back to the parser, which drops what is left in it.
                     let _ = backs[i].send(b);
                 }
+                Ok(Event::BatchEnd) => {
+                    if let Some(e) = held.take() {
+                        return Err(e);
+                    }
+                }
                 Ok(Event::Done(r)) => {
-                    total.absorb(&r?);
+                    // A failed import (a strict parse error) ends before its
+                    // batch does: its error comes first, as sequentially.
+                    let r = r?;
+                    if let Some(e) = held.take() {
+                        return Err(e);
+                    }
+                    total.absorb(&r);
                     break;
                 }
                 Err(_) => {
@@ -256,6 +297,62 @@ mod tests {
                 }
             }
         }
+        // A sink error surfaces where the sequential import raises it: at the
+        // sequential batch boundary, after the same error-log lines (and a
+        // strict parse error before that boundary wins).
+        let mut text = format!("<http://e/bad{}> <http://e/p> \"v\" .\n", "x".repeat(50));
+        for i in 0..10_000 {
+            text.push_str(&format!("<http://e/s{i}> <http://e/p> \"v{i}\" .\n"));
+        }
+        text.push_str("this is not rdf\n");
+        text.push_str("<http://e/after> <http://e/p> \"v\" .\n");
+        let p = dir.join("sinkerr.nt");
+        std::fs::write(&p, text).unwrap();
+        let one = [Source::File(p)];
+        let failing = |threads: usize, strict: bool| {
+            let opts = if strict {
+                ImportOptions::strict()
+            } else {
+                ImportOptions::tolerant()
+            };
+            let mut log: Vec<(String, SyntaxError)> = Vec::new();
+            let r = import(
+                &BulkInput::Sources(&one),
+                &opts,
+                &mut log,
+                threads,
+                &mut |b: &mut Vec<Quad>| {
+                    if b.iter().any(|q| q.subject.to_string().contains("/bad")) {
+                        Err(GStoreError::Database("key too long".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let log: Vec<String> = log.iter().map(|(s, e)| format!("{s}: {e:?}")).collect();
+            (r.map_err(|e| e.to_string()), log)
+        };
+        for strict in [false, true] {
+            let want = failing(1, strict);
+            assert!(want.0.is_err());
+            if strict {
+                assert!(
+                    want.0.as_ref().unwrap_err().contains("line 10002"),
+                    "{want:?}"
+                );
+            } else {
+                assert!(want.0.as_ref().unwrap_err().contains("key too long"));
+                assert_eq!(want.1.len(), 1, "the bad line is logged first: {want:?}");
+            }
+            for threads in [2, 4] {
+                assert_eq!(
+                    failing(threads, strict),
+                    want,
+                    "threads {threads} strict {strict}"
+                );
+            }
+        }
+
         // A sink error stops everything and is returned as is.
         let e = import(
             &BulkInput::Sources(&sources[..6]),

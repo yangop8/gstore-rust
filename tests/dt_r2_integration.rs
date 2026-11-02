@@ -110,7 +110,7 @@ fn bulk_built_store_serves_the_out_of_core_dictionary_and_stream_queries() {
     let mdict = mem.dict();
 
     let dt = DiskTriples::open(&kv, 4096).unwrap();
-    let lazy = lazy_dict(dt.shared_pager());
+    let lazy = lazy_dict(dt.shared_pager().unwrap());
     assert!(lazy.is_disk_backed());
 
     // Every id of every space names the memory build's term, both ways.
@@ -151,7 +151,7 @@ fn bulk_built_store_serves_the_out_of_core_dictionary_and_stream_queries() {
             .unwrap();
         assert_eq!(snap, want, "{name} DiskReadView vs memory");
         assert_eq!(
-            rows(dt.disk_store().query(&q).unwrap()),
+            rows(dt.disk_store().unwrap().query(&q).unwrap()),
             want,
             "{name} DiskStore::query vs memory"
         );
@@ -178,7 +178,7 @@ fn transactions_over_a_bulk_built_store_with_the_out_of_core_dictionary() {
     let all_grads = format!("SELECT ?X WHERE {{ ?X {RDF_TYPE} <{UB}GraduateStudent> }}");
 
     let mut dt = DiskTriples::open(&kv, 4096).unwrap();
-    let lazy = lazy_dict(dt.shared_pager());
+    let lazy = lazy_dict(dt.shared_pager().unwrap());
     let before = eval(&lazy, &dt, q1);
     assert!(!before.is_empty());
     // A graduate student who does not take GraduateCourse0 yet.
@@ -210,7 +210,7 @@ fn transactions_over_a_bulk_built_store_with_the_out_of_core_dictionary() {
         .with_base(|ds, _| eval(&lazy, &DiskSource::new(ds), q1))
         .unwrap();
     assert_eq!(snap, before);
-    assert_eq!(rows(dt.disk_store().query(q1).unwrap()), before);
+    assert_eq!(rows(dt.disk_store().unwrap().query(q1).unwrap()), before);
     assert!(dt.rollback());
     assert_eq!(eval(&lazy, &dt, q1), before);
     assert_eq!(std::fs::metadata(&kv).unwrap().len(), pages);

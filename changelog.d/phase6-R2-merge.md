@@ -16,9 +16,11 @@ commits after the merges are the integrator's own, listed below.
   bounded per-dictionary pin table (up to 4,096 strings) only because a test in
   `src/kvstore/store.rs`, owned by R2-DISKLIB this round, expected `Some` there;
   that test now uses `term()` / `pred()`, and the pin table and
-  `CacheStats::legacy_pinned` are gone. In-memory dictionaries are unchanged,
-  and no production path reaches the legacy API with a backed dictionary
-  (backed dictionaries exist only on `DiskStore`'s out-of-core query path).
+  `CacheStats::legacy_pinned` are gone. In-memory dictionaries are unchanged.
+  (Corrected by `phase6-R2-review.md`: the graph functions on `DiskStore`'s
+  out-of-core query path still called the legacy API and failed there; they,
+  and PFN's `GraphCtx`, now use `term()` / `pred()`, so no production code
+  calls the legacy API any more.)
   This supersedes the "pin … then fail closed" wording in
   `phase6-R2-DICT.md` (its Changelog bullet and its docs note on the legacy
   API) when the fragments are folded.
@@ -148,11 +150,12 @@ details):
   R2-BULK's install order, the 2,038-byte key limit and
   `VsTree::write_disk_sorted`.
 - **Not in a Phase 6 package:** an N-Triples fast path or chunked parallel
-  parse for `.nt` (parser owner, R2-BULK request 3); `GraphCtx::term_str` /
-  `pred_str` returning `TermStr` (pfn-wasm owner, R2-DICT request 4); the two
-  legacy calls in `src/analytics/gfun/mod.rs` (R2-DICT request 5). Both are
-  over in-memory dictionaries today, so they keep working; with a backed
-  dictionary they would now fail closed instead of pinning strings.
+  parse for `.nt` (parser owner, R2-BULK request 3). (`GraphCtx::term_str` /
+  `pred_str` returning `TermStr` — R2-DICT request 4 — and the two legacy
+  calls in `src/analytics/gfun/mod.rs` — R2-DICT request 5 — were listed
+  here as harmless; the gfun calls were not: `DiskStore::query` runs graph
+  functions over its backed dictionary. Both are done in
+  `phase6-R2-review.md`.)
 - **Engine owners:** long posting lists in Stream mode (Q3 2.4×, Q2 1.8× at
   univ 8, R2-DISKLIB) are input to R3's default-mode decision.
 - **Measure stage:** all univ 38 acceptance items of the three packages and

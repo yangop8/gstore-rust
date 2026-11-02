@@ -308,6 +308,12 @@ impl Overlay {
     }
 
     /// The memoized delta under `key`, computing it with `f` once.
+    ///
+    /// `f` probes the base, whose reads may fail: it runs in a read scope of
+    /// its own, and a delta computed from a failed read (the probe answered
+    /// 0) is reported to the enclosing statement and **not** memoized, so a
+    /// later statement probes again instead of silently using a wrong value
+    /// (C1 exactness, C2 isolation).
     fn delta(&self, key: DeltaKey, f: impl FnOnce() -> i64) -> i64 {
         if let Some(&d) = self
             .deltas
@@ -319,7 +325,14 @@ impl Overlay {
         }
         // Computed outside the lock: `f` reads the base, which may take its
         // own locks. A racing reader computes the same value.
+        let scope = read_scope::ReadScope::enter();
         let d = f();
+        let error = scope.take_error();
+        drop(scope);
+        if let Some(e) = error {
+            read_scope::note_read_error(e);
+            return d;
+        }
         self.deltas
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

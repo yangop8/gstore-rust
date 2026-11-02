@@ -48,7 +48,11 @@
 //!   a busy machine) — acceptance: ≤ 1.1 for (b) and (c). The answers (sums of list lengths)
 //!   must be equal on every source (`overlay_answers_match`). Finally Q1–Q14
 //!   over (e), whose overlay touches the predicates the queries scan:
-//!   `query_txn_geomean_ms` against `query_plain_geomean_ms`.
+//!   `query_txn_geomean_ms` against `query_plain_geomean_ms`. The open
+//!   transaction adds triples, so `vstree.kv` is stale for (e)
+//!   (`DiskTriples::vstree_stale`): both sides then run without it
+//!   (`txn_vstree=off`), and `q{i}_txn_view_match` compares (e) with the
+//!   overlay view evaluated without any VS-tree.
 
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -188,7 +192,13 @@ fn main() {
     let dt = DiskTriples::new(ds).expect("DiskTriples");
     // Warm the page cache: one full scan touches every SPO leaf, and the
     // per-predicate scans below every POS leaf.
-    black_box(dt.disk_store().try_iter_spo().expect("scan").len());
+    black_box(
+        dt.disk_store()
+            .expect("store")
+            .try_iter_spo()
+            .expect("scan")
+            .len(),
+    );
 
     let queries: Vec<(usize, String)> = (1..=14)
         .map(|i| {
@@ -446,7 +456,11 @@ fn overlay_mode(
     vstree: Option<&VsTree>,
     queries: &[(usize, String)],
 ) {
-    let all = dt.disk_store().try_iter_spo().expect("scan");
+    let all = dt
+        .disk_store()
+        .expect("store")
+        .try_iter_spo()
+        .expect("scan");
     let mut rng = Rng(o.seed);
     let smp = Sample::new(&mut rng, &all, o.lookups);
     let (keep_s, keep_o) = (smp.protected_subjects(), smp.protected_objects());
@@ -474,7 +488,7 @@ fn overlay_mode(
     }
     let mut other = Overlay::new();
     {
-        let base = DiskSource::new(dt.disk_store());
+        let base = DiskSource::new(dt.disk_store().expect("store"));
         for &t in &added {
             other.insert(&base, t);
         }
@@ -494,7 +508,7 @@ fn overlay_mode(
     // Phase 1: no transaction.
     let empty = Overlay::new();
     let phase1 = {
-        let base = DiskSource::new(dt.disk_store());
+        let base = DiskSource::new(dt.disk_store().expect("store"));
         let v_empty = OverlayView::new(&base, &empty);
         let v_other = OverlayView::new(&base, &other);
         time_sources(
@@ -513,7 +527,7 @@ fn overlay_mode(
         dt.remove_triple(t).expect("remove");
     }
     let phase2 = {
-        let base = DiskSource::new(dt.disk_store());
+        let base = DiskSource::new(dt.disk_store().expect("store"));
         time_sources(o.reps, &smp, o.lookups, &[&base, &dt as &dyn TripleSource])
     };
 
@@ -577,13 +591,20 @@ fn overlay_mode(
         .expect("open transaction")
         .overlay()
         .clone();
+    // vstree.kv was built from the committed state: while the transaction
+    // adds triples it lacks them, so it is stale for `dt` (C9) and would prune
+    // the transaction's own answers. Both sides then run without it, so the
+    // ratio measures the overlay alone; the reference for the answers is the
+    // overlay view evaluated without any VS-tree.
+    let vstree = if dt.vstree_stale() { None } else { vstree };
+    println!("txn_vstree={}", if vstree.is_some() { "on" } else { "off" });
     for (i, text) in queries {
         let q = sparql::parse(text).expect("parse");
-        let base = DiskSource::new(dt.disk_store());
+        let base = DiskSource::new(dt.disk_store().expect("store"));
         let view = OverlayView::new(&base, &txn_overlay);
         black_box(eval(dict, &dt, vstree, &q));
         black_box(eval(dict, &base, vstree, &q));
-        let same = eval(dict, &dt, vstree, &q) == eval(dict, &view, vstree, &q);
+        let same = eval(dict, &dt, vstree, &q) == eval(dict, &view, None, &q);
         let (mut a, mut b) = (Vec::new(), Vec::new());
         for _ in 0..o.qreps {
             let t = Instant::now();

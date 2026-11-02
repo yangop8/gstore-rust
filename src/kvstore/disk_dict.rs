@@ -13,9 +13,12 @@
 //! * **string → id** (query constants): the `*2id` B+tree
 //!   ([`BTree::get_with`]), kept in a bounded [`KeyCache`] (16 MiB by default).
 //!   Only hits are cached, so a later intern can never be shadowed.
-//! * [`prefetch`](DiskTermSource::prefetch) takes ids sorted ascending and
-//!   reads them run by run with [`IvArray::for_each_range`]: one directory page
-//!   serves 32 consecutive ids and pages are visited in file order.
+//! * [`prefetch`](DiskTermSource::prefetch) and
+//!   [`resolve_sorted`](DiskTermSource::resolve_sorted) take ids sorted
+//!   ascending and read them with [`IvArray::for_each_key`]: one directory
+//!   page serves 32 consecutive ids, pages are visited in file order, and only
+//!   the requested slots are decoded (an unrequested neighbour's overflow chain
+//!   is never read, so its damage cannot fail the batch).
 //!
 //! Both caches are bounded by bytes and evict with CLOCK, so a long-running
 //! reader stays within its budget however many terms it touches; strings are
@@ -42,7 +45,7 @@ use super::format::{
     ENTITY2ID, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, PREDICATE2ID, ROOT_ENTITY_COUNT,
     ROOT_LITERAL_COUNT, ROOT_PRED_COUNT,
 };
-use super::ivarray::{self, IvArray, SLOTS_PER_DIR};
+use super::ivarray::{self, IvArray};
 use super::pager::Pager;
 
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
@@ -184,9 +187,12 @@ impl DiskDict {
             .check_generation(self.generation.load(Ordering::Acquire));
     }
 
-    /// Read the strings of `ids` (ascending, within `arr`'s range) run by run,
-    /// handing each to `f`.
-    fn read_runs(
+    /// Read the strings of `keys` (array keys, ascending, within `arr`'s
+    /// range), handing each to `f` with its public id. Only the requested
+    /// slots are decoded ([`IvArray::for_each_key`]): directory pages are
+    /// visited in file order, once per run of keys they serve, and an
+    /// unrequested neighbour's overflow chain is never read.
+    fn read_keys(
         &self,
         pager: &Pager,
         arr: &IvArray,
@@ -194,29 +200,7 @@ impl DiskDict {
         keys: &[u32],
         f: &mut dyn FnMut(u32, Arc<str>),
     ) -> Result<()> {
-        let mut i = 0;
-        while i < keys.len() {
-            // A run: keys whose gaps stay within one directory page.
-            let mut j = i + 1;
-            while j < keys.len() && keys[j] - keys[j - 1] < SLOTS_PER_DIR as u32 {
-                j += 1;
-            }
-            let run = &keys[i..j];
-            let mut want = run.iter().peekable();
-            arr.for_each_range(pager, run[0], run[run.len() - 1] + 1, |k, v| {
-                while want.next_if(|&&w| w < k).is_some() {}
-                if want.next_if_eq(&&k).is_some() {
-                    f(first + k, decode(v));
-                }
-                if want.peek().is_none() {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })?;
-            i = j;
-        }
-        Ok(())
+        arr.for_each_key(pager, keys, |k, v| f(first + k, decode(v)))
     }
 }
 
@@ -302,7 +286,7 @@ impl DiskTermSource for DiskDict {
             let keys: Vec<u32> = missing.iter().map(|&(_, k)| k).collect();
             let mut at = missing.iter().peekable();
             let pager = self.pager();
-            self.read_runs(&pager, arr, first, &keys, &mut |id, s| {
+            self.read_keys(&pager, arr, first, &keys, &mut |id, s| {
                 while let Some(&&(i, k)) = at.peek() {
                     at.next();
                     if first + k == id {
@@ -334,7 +318,7 @@ impl DiskTermSource for DiskDict {
             return Ok(());
         };
         let pager = self.pager();
-        self.read_runs(&pager, arr, first, &missing, &mut |id, s| {
+        self.read_keys(&pager, arr, first, &missing, &mut |id, s| {
             self.terms.insert(space, id, s)
         })
     }

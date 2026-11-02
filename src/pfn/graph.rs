@@ -23,8 +23,8 @@
 //! linked by two predicates appears twice (upstream's multi-edges).
 
 use crate::analytics::csr::CsrGraph;
-use crate::dict::Dictionary;
-use crate::model::id::PredId;
+use crate::dict::{Dictionary, TermStr};
+use crate::model::id::{PredId, INVALID_ENTITY_LITERAL_ID};
 
 /// Read access to the graph for a PFN function (object safe, so any runtime
 /// can hold a `&dyn GraphCtx`).
@@ -55,15 +55,16 @@ pub trait GraphCtx {
     fn vertex_term(&self, v: u64) -> Option<u64>;
     /// The vertex of term `t`, if it is one.
     fn term_vertex(&self, t: u64) -> Option<u64>;
-    /// The N-Triples string of term `t` (entity or literal).
-    fn term_str(&self, t: u64) -> Option<&str>;
+    /// The N-Triples string of term `t` (entity or literal): borrowed from an
+    /// in-memory dictionary, shared with an out-of-core one's cache.
+    fn term_str(&self, t: u64) -> Option<TermStr<'_>>;
     /// The term id of an N-Triples string (`"…"` → a literal, else an
     /// entity), if the dictionary has it.
     fn term_id(&self, s: &str) -> Option<u64>;
     /// The id of predicate IRI `s` (`<…>`).
     fn pred_id(&self, s: &str) -> Option<PredId>;
-    /// The `<…>` string of predicate `p`.
-    fn pred_str(&self, p: PredId) -> Option<&str>;
+    /// The `<…>` string of predicate `p` (as [`term_str`](Self::term_str)).
+    fn pred_str(&self, p: PredId) -> Option<TermStr<'_>>;
 }
 
 /// [`GraphCtx`] over a database's CSR ([`crate::Database::csr`]) and its
@@ -166,8 +167,12 @@ impl GraphCtx for CsrGraphCtx<'_> {
         self.csr.node_of(t).map(u64::from)
     }
 
-    fn term_str(&self, t: u64) -> Option<&str> {
-        self.dict.id_to_string(u32::try_from(t).ok()?)
+    fn term_str(&self, t: u64) -> Option<TermStr<'_>> {
+        let t = u32::try_from(t).ok()?;
+        if t == INVALID_ENTITY_LITERAL_ID {
+            return None;
+        }
+        self.dict.term(t)
     }
 
     fn term_id(&self, s: &str) -> Option<u64> {
@@ -183,8 +188,8 @@ impl GraphCtx for CsrGraphCtx<'_> {
         self.dict.predicate_id(s)
     }
 
-    fn pred_str(&self, p: PredId) -> Option<&str> {
-        self.dict.predicate_to_string(p)
+    fn pred_str(&self, p: PredId) -> Option<TermStr<'_>> {
+        self.dict.pred(p)
     }
 }
 
@@ -215,7 +220,7 @@ mod tests {
             2,
             "the literal-valued predicate has no edge"
         );
-        assert_eq!(g.pred_str(p), Some("<http://ex/p>"));
+        assert_eq!(g.pred_str(p).as_deref(), Some("<http://ex/p>"));
         let a = g.term_vertex(g.term_id("<http://ex/a>").unwrap()).unwrap();
         let b = g.term_vertex(g.term_id("<http://ex/b>").unwrap()).unwrap();
         assert_eq!(g.out_degree(a, None), Some(3));
@@ -243,9 +248,46 @@ mod tests {
             Some(true)
         );
         let term = g.vertex_term(a).unwrap();
-        assert_eq!(g.term_str(term), Some("<http://ex/a>"));
+        assert_eq!(g.term_str(term).as_deref(), Some("<http://ex/a>"));
         assert!(g.term_id("\"A\"").is_some());
         assert_eq!(g.term_vertex(g.term_id("\"A\"").unwrap()), None);
         assert_eq!(g.term_id("<http://ex/none>"), None);
+        assert_eq!(g.term_str(u64::from(u32::MAX)), None);
+    }
+
+    /// Over an out-of-core dictionary the strings come from its backend
+    /// (`term()` / `pred()`), with no read error, where the legacy `&str` API
+    /// fails closed (C4).
+    #[test]
+    fn csr_context_serves_an_out_of_core_dictionary() {
+        use crate::analytics::csr::CsrGraph;
+        use crate::kvstore::DiskStore;
+        use crate::store::read_scope::ReadScope;
+        let path =
+            std::env::temp_dir().join(format!("gstore_pfn_graph_ooc_{}.kv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("kv.wal"));
+        let ds = DiskStore::build_str(
+            &path,
+            64,
+            "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+             <http://ex/b> <http://ex/p> <http://ex/c> .\n",
+        )
+        .unwrap();
+        let dict = ds.lazy_dictionary();
+        assert!(dict.is_disk_backed());
+        let csr = CsrGraph::build(&ds).unwrap();
+        let g = CsrGraphCtx::new(&csr, &dict);
+        let scope = ReadScope::enter();
+        let p = g.pred_id("<http://ex/p>").unwrap();
+        assert_eq!(g.pred_str(p).as_deref(), Some("<http://ex/p>"));
+        let a = g.term_vertex(g.term_id("<http://ex/a>").unwrap()).unwrap();
+        let t = g.vertex_term(a).unwrap();
+        assert_eq!(g.term_str(t).as_deref(), Some("<http://ex/a>"));
+        assert_eq!(scope.take_error(), None);
+        drop(scope);
+        drop(ds);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     }
 }

@@ -336,6 +336,16 @@ impl From<TermStr<'_>> for String {
     }
 }
 
+/// A borrowed string stays borrowed; a shared one is copied once.
+impl<'a> From<TermStr<'a>> for std::borrow::Cow<'a, str> {
+    fn from(t: TermStr<'a>) -> std::borrow::Cow<'a, str> {
+        match t {
+            TermStr::Borrowed(s) => std::borrow::Cow::Borrowed(s),
+            TermStr::Shared(s) => std::borrow::Cow::Owned(s.to_string()),
+        }
+    }
+}
+
 // ---- out-of-core backend --------------------------------------------------------
 
 /// An *out-of-core* dictionary backend: resolves str↔id against on-disk

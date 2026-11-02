@@ -163,6 +163,11 @@ pub struct BulkReport {
     pub phases: Vec<PhaseTime>,
     /// Wall time of the whole build.
     pub millis: f64,
+    /// Install steps after the commit point that failed (see [`commit`]):
+    /// the new database is in place, but its cleanup did
+    /// not finish (an old layout, the staging area or the replaced
+    /// database's reasoning rules may be left). Empty on a clean install.
+    pub warnings: Vec<String>,
 }
 
 impl BulkReport {
@@ -196,6 +201,9 @@ impl BulkReport {
             mib(self.kv_bytes),
             mib(self.vstree_bytes)
         ));
+        for w in &self.warnings {
+            s.push_str(&format!("\n  warning: the install did not finish: {w}"));
+        }
         s
     }
 }
@@ -210,8 +218,12 @@ impl BulkReport {
 /// strict import's first bad statement, an unreadable source, a term too
 /// long for the disk layout — with the incremental build's error text),
 /// when another process holds the directory, when a database of this
-/// process has it open, or when another bulk build of this process is
-/// rebuilding it.
+/// process has it open, when a RocksDB store in it is open (Linux: its
+/// `rocksdb/LOCK` is held), or when another bulk build of this process is
+/// rebuilding it. The install replaces the database's reasoning rules
+/// (`reason_rule_files/`) too: they belong to the replaced data. Once the
+/// install's commit point is passed the build succeeds, and a cleanup step
+/// that failed after it is listed in [`BulkReport::warnings`].
 pub fn build(
     dir: &Path,
     name: &str,

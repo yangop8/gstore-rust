@@ -278,6 +278,25 @@ impl ImportReport {
 /// Receives valid quads in batches (drain `batch`; it is cleared anyway).
 pub trait QuadSink {
     fn quads(&mut self, batch: &mut Vec<Quad>) -> Result<()>;
+
+    /// Hand each batch over in parts of at most this many quads / bytes of
+    /// RDF terms, as they are parsed, instead of whole at its end; the end of
+    /// each (non-empty) batch is then announced with
+    /// [`batch_end`](Self::batch_end). The batches themselves — where they
+    /// end ([`ImportOptions::batch_size`] / `batch_bytes`) and what the error
+    /// log sees before each end — are unchanged. `None` (the default): whole
+    /// batches.
+    fn handoff(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// The end of a non-empty batch, after its last part (with
+    /// [`handoff`](Self::handoff)): where a sequential import would have
+    /// handed the whole batch over. A sink that defers its own errors to the
+    /// batch boundary returns them here. The default does nothing.
+    fn batch_end(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<F: FnMut(&mut Vec<Quad>) -> Result<()>> QuadSink for F {
@@ -489,9 +508,17 @@ struct Pipeline<'a> {
     source: &'a str,
     log: &'a mut dyn ErrorLog,
     sink: &'a mut dyn QuadSink,
+    /// The quads not yet handed to the sink.
     batch: Vec<Quad>,
-    /// Bytes of RDF terms `batch` holds.
+    /// Quads in the current batch (`batch.len()` unless parts of it were
+    /// handed over early, see [`QuadSink::handoff`]).
+    batch_len: usize,
+    /// Bytes of RDF terms the current batch holds.
     batch_bytes: usize,
+    /// The sink's part size ([`QuadSink::handoff`]), and the bytes of RDF
+    /// terms `batch` holds.
+    handoff: Option<(usize, usize)>,
+    pending_bytes: usize,
     report: ImportReport,
     /// The line of the statement being checked (0 = unknown: documents
     /// parsed whole).
@@ -595,12 +622,19 @@ impl Pipeline<'_> {
         Ok(())
     }
 
+    /// End the current batch: hand over what is left of it and, if it was
+    /// not empty, announce its end.
     fn flush(&mut self) -> Result<()> {
         if !self.batch.is_empty() {
             self.sink.quads(&mut self.batch)?;
             self.batch.clear();
         }
+        if self.batch_len > 0 {
+            self.sink.batch_end()?;
+        }
+        self.batch_len = 0;
         self.batch_bytes = 0;
+        self.pending_bytes = 0;
         Ok(())
     }
 }
@@ -630,12 +664,21 @@ impl StatementSink for Pipeline<'_> {
                 self.report.named += 1;
             }
             self.report.statements += 1;
-            self.batch_bytes = self.batch_bytes.saturating_add(q.heap_bytes());
+            let bytes = q.heap_bytes();
+            self.batch_bytes = self.batch_bytes.saturating_add(bytes);
+            self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+            self.batch_len += 1;
             self.batch.push(q);
-            if self.batch.len() >= self.opts.batch_size.max(1)
+            if self.batch_len >= self.opts.batch_size.max(1)
                 || self.batch_bytes >= self.opts.batch_bytes.max(1)
             {
                 self.flush()?;
+            } else if let Some((n, b)) = self.handoff {
+                if self.batch.len() >= n.max(1) || self.pending_bytes >= b.max(1) {
+                    self.sink.quads(&mut self.batch)?;
+                    self.batch.clear();
+                    self.pending_bytes = 0;
+                }
             }
         }
         Ok(())
@@ -907,13 +950,18 @@ pub fn import_reader<R: BufRead>(
     log: &mut dyn ErrorLog,
     sink: &mut dyn QuadSink,
 ) -> Result<ImportReport> {
+    let handoff = sink.handoff();
+    let part = handoff.map_or(opts.batch_size, |(n, _)| n.min(opts.batch_size));
     let mut pipe = Pipeline {
         opts,
         source: name,
         log,
         sink,
-        batch: Vec::with_capacity(opts.batch_size.clamp(1, DEFAULT_BATCH_SIZE)),
+        batch: Vec::with_capacity(part.clamp(1, DEFAULT_BATCH_SIZE)),
+        batch_len: 0,
         batch_bytes: 0,
+        handoff,
+        pending_bytes: 0,
         report: ImportReport {
             documents: 1,
             ..ImportReport::default()

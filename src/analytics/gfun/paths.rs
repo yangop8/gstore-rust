@@ -419,10 +419,10 @@ fn rev(pred: PredId) -> PathEdge {
 /// `{"src":"‹u›"` + `sep` + `"dst":"‹v›"`.
 fn push_src_dst(s: &mut String, ctx: &GFunCtx<'_>, u: &GNode, sep: &str, v: EntityLiteralId) {
     s.push_str("{\"src\":");
-    push_json_quoted(s, ctx.gnode_str(u));
+    push_json_quoted(s, &ctx.gnode_str(u));
     s.push_str(sep);
     s.push_str("\"dst\":");
-    push_json_quoted(s, ctx.entity_str(v));
+    push_json_quoted(s, &ctx.entity_str(v));
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,7 +2159,7 @@ pub fn k_hop_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let n = k_hop_neighbor_list(ctx, &mut visited, &mut poll, &u, a, k, -1)?.len();
         let s = list.item();
         s.push_str("{\"src\":");
-        push_json_quoted(s, ctx.gnode_str(&u));
+        push_json_quoted(s, &ctx.gnode_str(&u));
         s.push_str(&format!(",\"depth\":{k}, \"count\":{n}}}"));
         guard.emitted(&list)?;
     }
@@ -2197,13 +2197,13 @@ pub fn k_hop_neighbor(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let nbrs = k_hop_neighbor_list(ctx, &mut visited, &mut poll, &u, a, k, ret_num)?;
         let s = list.item();
         s.push_str("{\"src\":");
-        push_json_quoted(s, ctx.gnode_str(&u));
+        push_json_quoted(s, &ctx.gnode_str(&u));
         s.push_str(&format!(",\"depth\":{k}, \"{key}\":["));
         for (i, &n) in nbrs.iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
-            push_json_quoted(s, ctx.node_str(n));
+            push_json_quoted(s, &ctx.node_str(n));
         }
         s.push_str("]}");
         guard.emitted(&list)?;
@@ -2323,7 +2323,7 @@ pub fn k_hop_all_neighbors(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             if i > 0 {
                 s.push(',');
             }
-            push_json_quoted(s, ctx.entity_str(e));
+            push_json_quoted(s, &ctx.entity_str(e));
         }
         s.push_str("]}");
         guard.emitted(&list)?;
@@ -2397,7 +2397,7 @@ pub fn bfs_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         };
         let s = list.item();
         s.push_str("{\"src\":");
-        push_json_quoted(s, ctx.gnode_str(&u));
+        push_json_quoted(s, &ctx.gnode_str(&u));
         s.push_str(",\"results\":[");
         for (d, c) in counts.iter().enumerate() {
             if d > 0 {

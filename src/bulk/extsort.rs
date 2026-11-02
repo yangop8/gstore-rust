@@ -9,6 +9,12 @@
 //! intermediate merge passes when there are more runs than the fan-in
 //! (`min(64, share / 256 KiB)`, see [`Budget::fan_in`]).
 //!
+//! A spilled run keeps **no file descriptor**: its file is closed once
+//! written and reopened by path when it is merged, so a sorter holds at most
+//! fan-in + 1 descriptors (a merge's readers and its writer) however many
+//! runs the input spills. The I/O buffers of writing and merging runs
+//! ([`Budget::io_bytes`] each) are charged to the budget while they exist.
+//!
 //! A [`Spool`] is the unsorted sibling: an append-only sequence kept in
 //! memory up to its share and continued in a scratch file, read back in
 //! append order.
@@ -21,7 +27,7 @@ use std::path::PathBuf;
 
 use crate::error::Result;
 
-use super::budget::{Budget, Charge, MERGE_READ_BYTES};
+use super::budget::{Budget, Charge};
 use super::scratch::Scratch;
 
 /// The largest record encoding (bytes) a sorter supports.
@@ -71,42 +77,54 @@ impl Record for [u32; 4] {
     }
 }
 
-/// A sorted run in a scratch file.
+/// A sorted run in a scratch file. It holds no descriptor: the file is
+/// closed once written and reopened by [`reader`](Run::reader).
 struct Run {
     path: PathBuf,
-    file: File,
     records: u64,
 }
 
-impl Run {
-    /// Write `records` (sorted, unique) to a new scratch file.
-    fn write<R: Record>(scratch: &Scratch, tag: &str, records: &[R]) -> Result<Run> {
-        let (path, file) = scratch.file(tag)?;
-        let mut w = BufWriter::with_capacity(MERGE_READ_BYTES, file);
-        let mut tmp = [0u8; MAX_RECORD_BYTES];
-        for r in records {
-            r.put(&mut tmp);
-            w.write_all(&tmp[..R::BYTES])?;
-        }
-        w.flush()?;
-        let file = w.into_inner().map_err(|e| e.into_error())?;
-        Ok(Run {
-            path,
-            file,
-            records: records.len() as u64,
-        })
-    }
+/// A charge of `bytes` on `budget` (an I/O buffer while it exists).
+fn io_charge(budget: &Budget, bytes: usize) -> Charge<'_> {
+    let mut c = Charge::new(budget);
+    c.set(bytes);
+    c
+}
 
+/// Write `records` (sorted, unique) through a buffer of `io` bytes to a new
+/// scratch file, closed when done.
+fn write_run<R: Record>(
+    scratch: &Scratch,
+    tag: &str,
+    io: usize,
+    records: impl IntoIterator<Item = Result<R>>,
+) -> Result<Run> {
+    let (path, file) = scratch.file(tag)?;
+    let mut w = BufWriter::with_capacity(io, file);
+    let mut tmp = [0u8; MAX_RECORD_BYTES];
+    let mut n = 0u64;
+    for r in records {
+        r?.put(&mut tmp);
+        w.write_all(&tmp[..R::BYTES])?;
+        n += 1;
+    }
+    w.flush()?;
+    // Closes the file (`into_inner` reports a failed final flush).
+    drop(w.into_inner().map_err(|e| e.into_error())?);
+    Ok(Run { path, records: n })
+}
+
+impl Run {
     fn bytes<R: Record>(&self) -> u64 {
         self.records * R::BYTES as u64
     }
 
-    fn reader(mut self) -> Result<RunReader> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let file = self.file.try_clone()?;
+    /// Reopen the run for reading through a buffer of `io` bytes.
+    fn reader(self, io: usize) -> Result<RunReader> {
+        let file = File::open(&self.path)?;
         Ok(RunReader {
             path: Some(self.path),
-            reader: BufReader::with_capacity(MERGE_READ_BYTES, file),
+            reader: BufReader::with_capacity(io, file),
             left: self.records,
         })
     }
@@ -153,6 +171,8 @@ pub(crate) struct ExtSorter<'a, R: Record> {
     /// Records per run.
     cap: usize,
     fan_in: usize,
+    /// Bytes of each run's read-ahead / write buffer.
+    io: usize,
     buf: Vec<R>,
     charge: Charge<'a>,
     runs: Vec<Run>,
@@ -175,6 +195,7 @@ impl<'a, R: Record> ExtSorter<'a, R> {
             scratch,
             cap,
             fan_in: Budget::fan_in(share),
+            io: Budget::io_bytes(share),
             buf: Vec::new(),
             charge: Charge::new(budget),
             runs: Vec::new(),
@@ -222,36 +243,34 @@ impl<'a, R: Record> ExtSorter<'a, R> {
 
     fn spill(&mut self) -> Result<()> {
         sort_dedup(&mut self.buf);
-        let run = Run::write(self.scratch, self.tag, &self.buf)?;
+        let _io = io_charge(self.charge.budget(), self.io);
+        let run = write_run(
+            self.scratch,
+            self.tag,
+            self.io,
+            self.buf.iter().map(|&r| Ok(r)),
+        )?;
         self.charge.budget().note_run(run.bytes::<R>());
         self.runs.push(run);
         self.buf.clear();
         Ok(())
     }
 
-    /// Merge `runs` into one new run.
+    /// Merge `runs` into one new run (their readers and the writer are
+    /// charged while the pass runs).
     fn merge_pass(&self, runs: Vec<Run>) -> Result<Run> {
+        let _io = io_charge(self.charge.budget(), (runs.len() + 1) * self.io);
         let readers = runs
             .into_iter()
-            .map(Run::reader)
+            .map(|r| r.reader(self.io))
             .collect::<Result<Vec<_>>>()?;
         let mut merged = Merger::<R>::new(readers, Vec::new())?;
-        let (path, file) = self.scratch.file(self.tag)?;
-        let mut w = BufWriter::with_capacity(MERGE_READ_BYTES, file);
-        let mut tmp = [0u8; MAX_RECORD_BYTES];
-        let mut records = 0u64;
-        while let Some(r) = merged.next()? {
-            r.put(&mut tmp);
-            w.write_all(&tmp[..R::BYTES])?;
-            records += 1;
-        }
-        w.flush()?;
-        let file = w.into_inner().map_err(|e| e.into_error())?;
-        let run = Run {
-            path,
-            file,
-            records,
-        };
+        let run = write_run(
+            self.scratch,
+            self.tag,
+            self.io,
+            std::iter::from_fn(|| merged.next().transpose()),
+        )?;
         self.charge.budget().note_run(run.bytes::<R>());
         Ok(run)
     }
@@ -261,7 +280,7 @@ impl<'a, R: Record> ExtSorter<'a, R> {
         sort_dedup(&mut self.buf);
         let buf = std::mem::take(&mut self.buf);
         let budget = self.charge.budget();
-        let charge = std::mem::replace(&mut self.charge, Charge::new(budget));
+        let mut charge = std::mem::replace(&mut self.charge, Charge::new(budget));
         if self.runs.is_empty() {
             return Ok(Sorted {
                 inner: Inner::Memory(buf.into_iter()),
@@ -276,9 +295,11 @@ impl<'a, R: Record> ExtSorter<'a, R> {
             let merged = self.merge_pass(group)?;
             runs.push(merged);
         }
+        // The final merge's read-ahead is charged with the buffer it merges.
+        charge.set(buf.capacity() * std::mem::size_of::<R>() + runs.len() * self.io);
         let readers = runs
             .into_iter()
-            .map(Run::reader)
+            .map(|r| r.reader(self.io))
             .collect::<Result<Vec<_>>>()?;
         Ok(Sorted {
             inner: Inner::Merge(Box::new(Merger::new(readers, buf)?)),
@@ -365,6 +386,8 @@ pub(crate) struct Spool<'a, R: Record> {
     tag: &'static str,
     scratch: &'a Scratch,
     cap: usize,
+    /// Bytes of the file's write (then read-ahead) buffer.
+    io: usize,
     buf: Vec<R>,
     charge: Charge<'a>,
     file: Option<(PathBuf, BufWriter<File>)>,
@@ -383,6 +406,7 @@ impl<'a, R: Record> Spool<'a, R> {
             tag,
             scratch,
             cap: (share / std::mem::size_of::<R>()).max(16),
+            io: Budget::io_bytes(share),
             buf: Vec::new(),
             charge: Charge::new(budget),
             file: None,
@@ -412,7 +436,10 @@ impl<'a, R: Record> Spool<'a, R> {
         }
         if self.file.is_none() {
             let (path, file) = self.scratch.file(self.tag)?;
-            self.file = Some((path, BufWriter::with_capacity(MERGE_READ_BYTES, file)));
+            self.file = Some((path, BufWriter::with_capacity(self.io, file)));
+            // The writer's buffer is charged with the spool's own.
+            self.charge
+                .set(self.buf.capacity() * std::mem::size_of::<R>() + self.io);
         }
         let (_, w) = self.file.as_mut().unwrap();
         let mut tmp = [0u8; MAX_RECORD_BYTES];
@@ -436,13 +463,15 @@ impl<'a, R: Record> Spool<'a, R> {
                 file.seek(SeekFrom::Start(0))?;
                 Some(RunReader {
                     path: Some(path),
-                    reader: BufReader::with_capacity(MERGE_READ_BYTES, file),
+                    reader: BufReader::with_capacity(self.io, file),
                     left: self.in_file,
                 })
             }
         };
         let budget = self.charge.budget();
-        let charge = std::mem::replace(&mut self.charge, Charge::new(budget));
+        let mut charge = std::mem::replace(&mut self.charge, Charge::new(budget));
+        let read_ahead = if file.is_some() { self.io } else { 0 };
+        charge.set(self.buf.capacity() * std::mem::size_of::<R>() + read_ahead);
         Ok(SpoolReader {
             file,
             mem: std::mem::take(&mut self.buf).into_iter(),
@@ -532,16 +561,115 @@ mod tests {
             } else {
                 assert!(budget.spilled_runs() > 1, "share {share} must spill");
             }
+            // The run buffer, plus the charged I/O buffers of a merge (its
+            // readers and its writer).
+            let io = (fan_in + 1) * Budget::io_bytes(share);
             assert!(
-                budget.peak() <= share + 4096 * 12,
+                budget.peak() <= share + 4096 * 12 + io,
                 "peak {} share {share}",
                 budget.peak()
             );
         }
-        // Every run file is gone once read.
+        // Every run file is gone once read (the directory's LOCK stays).
         if let Some(d) = sc.dir() {
-            assert_eq!(std::fs::read_dir(d).unwrap().count(), 0);
+            let runs = std::fs::read_dir(d)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "run")
+                })
+                .count();
+            assert_eq!(runs, 0);
         }
+        drop(sc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spilled run holds no file descriptor until it is merged: however
+    /// many runs a sorter spills, its open descriptors stay bounded by the
+    /// merge fan-in, not by the input (an fd per run exhausted
+    /// `RLIMIT_NOFILE` on a large build with a small budget).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spilled_runs_hold_no_descriptor() {
+        let open_fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let (dir, sc) = scratch("fds");
+        let budget = Budget::new(1 << 30);
+        let mut s = ExtSorter::<[u32; 3]>::new("f", &budget, &sc, 4 << 10).with_fan_in(4);
+        let before = open_fds();
+        let mut seed = 3u64;
+        let mut want = Vec::new();
+        for _ in 0..200_000 {
+            let r = [lcg(&mut seed), 1, 2];
+            s.push(r).unwrap();
+            want.push(r);
+        }
+        let runs = budget.spilled_runs();
+        assert!(runs >= 300, "{runs} runs");
+        let during = open_fds();
+        // (Other tests of this binary open files concurrently: a margin.)
+        assert!(
+            during < before + 200,
+            "{runs} spilled runs hold {} descriptors",
+            during.saturating_sub(before)
+        );
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(drain(s.finish().unwrap()), want);
+        drop(sc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The I/O buffers of spilling, merging and reading back are charged to
+    /// the budget while they exist, and a merge's readers plus its writer fit
+    /// one more share (so a 1 MiB budget's buffers stay near it).
+    #[test]
+    fn io_buffers_are_charged_while_they_exist() {
+        let (dir, sc) = scratch("io");
+        let budget = Budget::new(1 << 20);
+        let share = budget.share(3);
+        let io = Budget::io_bytes(share);
+        assert!((Budget::fan_in(share) + 1) * io <= share);
+        let mut s = ExtSorter::<[u32; 3]>::new("io", &budget, &sc, share);
+        let mut seed = 11u64;
+        for _ in 0..100_000 {
+            s.push([lcg(&mut seed), 0, 0]).unwrap();
+        }
+        assert!(budget.spilled_runs() > 4);
+        let buf_bytes = s.buf.capacity() * std::mem::size_of::<[u32; 3]>();
+        assert!(
+            budget.peak() >= buf_bytes + io,
+            "a spill's writer is charged"
+        );
+        let sorted = s.finish().unwrap();
+        // Fan-in 2: one run is left besides the buffer for the final merge.
+        assert_eq!(budget.used(), buf_bytes + io);
+        assert!(
+            budget.peak() >= buf_bytes + 3 * io,
+            "a merge pass's two readers and writer are charged"
+        );
+        assert!(budget.peak() <= 2 * share, "peak {}", budget.peak());
+        drop(sorted);
+        assert_eq!(budget.used(), 0);
+
+        let mut sp = Spool::<[u32; 3]>::new("sp", &budget, &sc, share);
+        for i in 0..100_000u32 {
+            sp.push([i, 0, 0]).unwrap();
+        }
+        let spool_bytes = sp.buf.capacity() * std::mem::size_of::<[u32; 3]>();
+        assert_eq!(budget.used(), spool_bytes + io, "the spool's writer");
+        let mut r = sp.finish().unwrap();
+        assert_eq!(budget.used(), spool_bytes + io, "the spool's read-ahead");
+        let mut n = 0;
+        while r.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 100_000);
+        drop(r);
+        assert_eq!(budget.used(), 0);
         drop(sc);
         let _ = std::fs::remove_dir_all(&dir);
     }

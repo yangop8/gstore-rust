@@ -59,7 +59,10 @@
 //!
 //! A build that fails removes the database directory it created (upstream's
 //! `Util::remove_path` of a failed build), so the same `gbuild` can simply be
-//! run again; a failed `--force` rebuild leaves the directory as it was.
+//! run again; a failed `--force` rebuild leaves the directory as it was. A
+//! bulk build whose install put the new database in place but could not
+//! finish cleaning up (an old layout, the staging area) says so — "built,
+//! but …" — and exits with status 1; the new database is the one served.
 //!
 //! Exit status: 0 built, 1 failed, 2 invalid arguments; `-h`/`--help`.
 
@@ -298,6 +301,8 @@ fn main() -> ExitCode {
         }
         return code;
     }
+    let mut bulk_installed = false;
+    let mut cleanup_incomplete = false;
     let report = if disk && !incremental {
         let built = gstore::bulk::build(
             Path::new(&dir),
@@ -311,6 +316,14 @@ fn main() -> ExitCode {
         match built {
             Ok(r) => {
                 print_bulk(name, &dir, &r, started);
+                bulk_installed = true;
+                for w in &r.warnings {
+                    eprintln!(
+                        "gbuild: built (the new database is in place), but its install \
+                         did not finish: {w}"
+                    );
+                    cleanup_incomplete = true;
+                }
                 r.import
             }
             Err(e) => {
@@ -353,7 +366,12 @@ fn main() -> ExitCode {
     };
     print_report(&report, &log_path);
     created.keep();
-    if existed {
+    if cleanup_incomplete {
+        return ExitCode::FAILURE;
+    }
+    // The bulk install removed the replaced database's rules itself, right
+    // after its commit point.
+    if existed && !bulk_installed {
         return drop_old_rules(&dir);
     }
     ExitCode::SUCCESS

@@ -272,10 +272,9 @@ impl DiskShared {
         self as *const DiskShared as usize
     }
 
-    /// Writer side: mark the gate draining, cancel every reader inside it and
-    /// wait until none is left. The returned guard ends the drain when
-    /// dropped, bumping the epoch first if its `changed` flag is set.
-    fn drain(&self) -> Result<Drain<'_>> {
+    /// `Err` when this thread is inside one of this store's own snapshot
+    /// reads ([`DiskReadView::with_base`]): a drain would wait for itself.
+    fn refuse_reentry(&self) -> Result<()> {
         let me = self.key();
         if READING
             .try_with(|r| r.borrow().contains(&me))
@@ -287,6 +286,14 @@ impl DiskShared {
                     .into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Writer side: mark the gate draining, cancel every reader inside it and
+    /// wait until none is left. The returned guard ends the drain when
+    /// dropped, bumping the epoch first if its `changed` flag is set.
+    fn drain(&self) -> Result<Drain<'_>> {
+        self.refuse_reentry()?;
         let mut g = self.lock();
         g.draining = true;
         let started = Instant::now();
@@ -603,13 +610,20 @@ impl DiskTriples {
     /// The underlying store: the **committed** state (an open transaction's
     /// writes are not in it). Its own [`TripleSource`] impl swallows read
     /// errors; read through `self` (or a [`DiskSource`]) to report them.
-    pub fn disk_store(&self) -> &DiskStore {
-        &self.store
+    ///
+    /// Refused once the store is broken (C5): a commit that failed part-way
+    /// may have left some of its operations in the page cache, so the pages
+    /// hold neither the old nor the new committed state until a reopen.
+    pub fn disk_store(&self) -> Result<&DiskStore> {
+        self.check_open()?;
+        Ok(&self.store)
     }
 
-    /// The pager shared with the dictionary and the views.
-    pub fn shared_pager(&self) -> Arc<RwLock<Pager>> {
-        self.store.shared_pager()
+    /// The pager shared with the dictionary and the views; refused once the
+    /// store is broken, as [`disk_store`](Self::disk_store).
+    pub fn shared_pager(&self) -> Result<Arc<RwLock<Pager>>> {
+        self.check_open()?;
+        Ok(self.store.shared_pager())
     }
 
     /// The current epoch: bumped after every applied change of the contents.
@@ -656,9 +670,17 @@ impl DiskTriples {
         self.txn.as_ref()
     }
 
-    /// Whether a `vstree.kv` built beside the store is stale (passthrough).
+    /// Whether a `vstree.kv` built beside the store is stale for what this
+    /// store reads: stale on disk, or an open transaction adds triples (the
+    /// tree, built from committed data, lacks them; read-your-writes would
+    /// prune them away). A transaction's removals keep the tree a sound
+    /// superset. Use the VS-tree only while this is `false` (C9).
     pub fn vstree_stale(&self) -> bool {
         self.store.vstree_stale()
+            || self
+                .txn
+                .as_ref()
+                .is_some_and(|t| !t.overlay.added().is_empty())
     }
 
     /// Record that `vstree.kv` was rebuilt from the current contents
@@ -880,8 +902,17 @@ impl DiskTriples {
     /// (in order), then its removals, then its additions, each one atomic
     /// pager operation; then the epoch moves (if anything changed). The
     /// changes are durable at the next [`commit_point`](Self::commit_point).
-    /// A failure breaks the store (the transaction is gone either way).
+    ///
+    /// A commit from inside one of this store's own snapshot reads
+    /// ([`DiskReadView::with_base`] on this thread) is refused before anything
+    /// is taken: the transaction stays open, to commit after leaving the
+    /// view. Any other failure breaks the store (the transaction is gone
+    /// either way).
     pub fn commit(&mut self) -> Result<()> {
+        if self.txn.is_none() {
+            return Err(GStoreError::Database("no transaction is open".into()));
+        }
+        self.shared.refuse_reentry()?;
         let txn = self
             .txn
             .take()

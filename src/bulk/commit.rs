@@ -13,10 +13,10 @@
 //! |---|------|-------------------------|
 //! | 1 `staged` | `kvstore.kv` + `vstree.kv` complete and synced in `.bulk-tmp/` | the old database |
 //! | 2 `marked` | `.bulk-tmp/COMMIT` written and synced | the old database |
-//! | 3 `cleared` | a stale `kvstore.kv.wal` replayed into the old file (what any open does) and removed; the old `vstree.kv` and its WAL removed; synced | the old database (a missing `vstree.kv` is rebuilt at open) |
+//! | 3 `cleared` | a stale `kvstore.kv.wal` replayed into the old file (what any open does) and removed — a replay that fails stops the install with the log in place; the old `vstree.kv` and its WAL removed; synced | the old database (a missing `vstree.kv` is rebuilt at open) |
 //! | 4 `kv-renamed` | `.bulk-tmp/kvstore.kv` renamed over `kvstore.kv` | the new database (no `vstree.kv` yet: rebuilt at open), or — under an existing `rocksdb/`, which detection prefers — still the old one |
 //! | 5 `kv-synced` | directory synced | as 4, durably |
-//! | 6 `vstree-placed` | `vstree.kv` renamed into place, synced | as 4, with the new VS-tree |
+//! | 6 `vstree-placed` | the replaced database's reasoning rules (`reason_rule_files/`) removed, synced; `vstree.kv` renamed into place, synced | as 4, with the new VS-tree and without the old rules |
 //! | 7 `layouts-removed` | the other layouts removed (snapshot files; `rocksdb/` renamed aside durably, then deleted) | the new database |
 //! | 8 `cleaned` | `.bulk-tmp/` deleted, synced | the new database |
 //!
@@ -25,7 +25,13 @@
 //! snapshot left beside the new `kvstore.kv` by a crash between 4 and 7 is
 //! older than it (the install makes sure of that), so the open treats it as
 //! a stale legacy shadow and sets it aside. A strict parse failure, or any
-//! other error before step 4, leaves the old database untouched.
+//! other error before step 4, leaves the old database untouched. Step 4 is
+//! the commit point: an error after it does not fail the build (the new
+//! database is live) — the remaining steps still run and the errors come
+//! back as [`BulkReport::warnings`] (a failed step-5 sync stops there: what
+//! follows must not assume the rename durable). The old rules go right after
+//! the new store is durable; a crash in that short window leaves them
+//! beside the new database.
 //!
 //! Crash tests: the `GSTORE_BULK_CRASH=<step>` environment variable aborts
 //! the process right after that step (read once per install, never on the
@@ -39,16 +45,17 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::db::dirlock::{BuildGuard, DirLock};
-use crate::db::fsutil::{remove_file_if_exists, sync_dir};
+use crate::db::fsutil::{remove_dir_if_exists, remove_file_if_exists, sync_dir};
 use crate::db::persist::remove_other_layouts;
 use crate::db::StorageKind;
 use crate::error::{GStoreError, Result};
 use crate::kvstore::Pager;
 use crate::parser::import::{ErrorLog, ImportOptions};
+use crate::reason::rules::RULE_DIR;
 
 use super::budget::Budget;
 use super::pipeline::{self, Ctx};
-use super::scratch::Scratch;
+use super::scratch::{self, Scratch};
 use super::{BulkInput, BulkOptions, BulkReport, PhaseTime};
 
 /// The staging directory inside the database directory.
@@ -176,6 +183,16 @@ pub(crate) fn build_disk(
         )));
     }
     let _lock = DirLock::acquire(dir)?;
+    if let Some(holder) = rocksdb_lock_holder(dir) {
+        // `Database::open` takes no DirLock for the RocksDB layout (RocksDB
+        // locks `rocksdb/LOCK` itself), so the lock above cannot see a
+        // server or another process — or this one — serving it. Replacing
+        // its directory under it would lose every write it acknowledges.
+        return Err(GStoreError::Database(format!(
+            "the RocksDB store in '{}' is in use ({holder}); close it before rebuilding",
+            dir.display()
+        )));
+    }
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
         // What a crashed build left: never part of a database.
@@ -184,6 +201,10 @@ pub(crate) fn build_disk(
     fs::create_dir_all(&staging)?;
     if let Some(t) = &bulk.temp_dir {
         fs::create_dir_all(t)?;
+        // Spill directories that crashed or killed builds left in a shared
+        // temp directory (live builds' are locked and kept; the default
+        // scratch inside the staging area went with it above).
+        scratch::sweep_stale(t);
     }
     let threads = bulk.effective_threads();
     let budget = Budget::new(bulk.memory_budget);
@@ -207,12 +228,15 @@ pub(crate) fn build_disk(
     };
     let t = Instant::now();
     let mut fp = Failpoints::load(dir);
-    if let Err(e) = install(dir, &staging, &mut fp) {
-        if !fp.crashed {
-            let _ = fs::remove_dir_all(&staging);
+    let warnings = match install(dir, &staging, &mut fp) {
+        Ok(w) => w,
+        Err(e) => {
+            if !fp.crashed {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     let mut phases = img.phases;
     phases.push(PhaseTime {
         name: "install",
@@ -236,7 +260,65 @@ pub(crate) fn build_disk(
         threads,
         phases,
         millis: started.elapsed().as_secs_f64() * 1e3,
+        warnings,
     })
+}
+
+/// Who holds the lock of a RocksDB store in `dir` (`rocksdb/LOCK`, or that of
+/// a staged `rocksdb.new/`), if anyone does: RocksDB holds it — a POSIX
+/// record lock — for as long as the store is open, in any process. Read from
+/// the kernel's lock table (`/proc/locks`), so it sees every process on this
+/// host whatever its pid namespace; `None` when there is no such store, its
+/// lock is free, or the table cannot be read (a best-effort safety net, like
+/// the directory lock on a file system without advisory locks).
+#[cfg(target_os = "linux")]
+fn rocksdb_lock_holder(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let locks = ["rocksdb", "rocksdb.new"]
+        .iter()
+        .filter_map(|sub| fs::metadata(dir.join(sub).join("LOCK")).ok())
+        .map(|m| {
+            let dev = m.dev();
+            let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+            let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+            (major, minor, m.ino())
+        })
+        .collect::<Vec<_>>();
+    if locks.is_empty() {
+        return None;
+    }
+    let table = fs::read_to_string("/proc/locks").ok()?;
+    for line in table.lines() {
+        // `1: POSIX  ADVISORY  WRITE 4242 08:01:1234 0 EOF` (a blocked
+        // waiter's line has a `->` before its class).
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(at) = fields.iter().position(|f| f.matches(':').count() == 2) else {
+            continue;
+        };
+        let mut id = fields[at].split(':');
+        let (Some(major), Some(minor), Some(ino)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        let (Ok(major), Ok(minor), Ok(ino)) = (
+            u64::from_str_radix(major, 16),
+            u64::from_str_radix(minor, 16),
+            ino.parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if locks.contains(&(major, minor, ino)) {
+            let pid = fields.get(at.wrapping_sub(1)).copied().unwrap_or("?");
+            return Some(format!("its rocksdb/LOCK is held by process {pid}"));
+        }
+    }
+    None
+}
+
+/// Elsewhere the kernel's lock table is not read: RocksDB's own lock still
+/// refuses a second open, but an open store is not detected here.
+#[cfg(not(target_os = "linux"))]
+fn rocksdb_lock_holder(_dir: &Path) -> Option<String> {
+    None
 }
 
 /// Make the staged `kvstore.kv` newer than any snapshot file in `dir`, so a
@@ -259,8 +341,23 @@ fn newer_than_snapshots(dir: &Path, staged_kv: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The install steps (see the module docs).
-fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<()> {
+/// Record `r`'s error, if any, as a warning about the cleanup step `what`.
+fn note(warnings: &mut Vec<String>, what: &str, r: Result<()>) -> bool {
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            warnings.push(format!("{what}: {e}"));
+            false
+        }
+    }
+}
+
+/// The install steps (see the module docs). An error before the commit
+/// point (step 4, `kv-renamed`) leaves the old database and is returned.
+/// From there on the new database is in place: the remaining steps all run
+/// and their errors come back as warnings, with `Ok` — the caller reports
+/// the new database as built, with its cleanup incomplete.
+fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String>> {
     let kv_new = staging.join(KV_FILE);
     let vs_new = staging.join(VSTREE_KV_FILE);
     sync_file(&kv_new)?;
@@ -283,9 +380,21 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<()> {
     if kv_wal.exists() {
         // A committed batch the old store has not applied yet: replay it, as
         // the next open would, so removing the log loses nothing; a log
-        // beside no store (or one this binary cannot open) is just removed.
+        // beside no store is just removed. A replay that fails part-way
+        // (ENOSPC, EIO, …) may have written some of the batch: only the log
+        // can finish it, so the install stops here with the log in place —
+        // the old database stays recoverable (its next open replays the log
+        // again). A store whose log was replayed but whose header this binary
+        // cannot read is replaced anyway.
         if kv.is_file() {
-            drop(Pager::open(&kv, 8));
+            let opened = Pager::open(&kv, 8).map(drop);
+            if let (Err(e), true) = (opened, kv_wal.exists()) {
+                return Err(GStoreError::Database(format!(
+                    "cannot replay the write-ahead log '{}' of the database being replaced \
+                     (left in place: the old database's next open replays it): {e}",
+                    kv_wal.display()
+                )));
+            }
         }
         remove_file_if_exists(&kv_wal)?;
     }
@@ -297,18 +406,54 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<()> {
     newer_than_snapshots(dir, &kv_new)?;
     fs::rename(&kv_new, &kv)?;
     fp.hit("kv-renamed")?;
-    sync_dir(dir)?;
+
+    // The commit point is passed: the new database is in place.
+    let mut warnings = Vec::new();
+    if !note(
+        &mut warnings,
+        "making the new kvstore.kv durable (the rest of the install was skipped; \
+         the next build cleans up)",
+        sync_dir(dir),
+    ) {
+        // Nothing may assume the rename is durable: placing the new
+        // `vstree.kv` (or dropping the old rules) could otherwise meet the
+        // old store after a crash.
+        return Ok(warnings);
+    }
     fp.hit("kv-synced")?;
 
-    fs::rename(&vs_new, &vs)?;
-    sync_dir(dir)?;
+    // The replaced database's reasoning rules: their ledgers name the old
+    // data's triples, and executing or removing such a rule would delete
+    // triples the new data asserts. Removed as soon as the new store is
+    // durably in place.
+    note(
+        &mut warnings,
+        "removing the replaced database's reasoning rules",
+        remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir)),
+    );
+    note(
+        &mut warnings,
+        "placing the new vstree.kv (it is rebuilt at open)",
+        fs::rename(&vs_new, &vs)
+            .map_err(GStoreError::from)
+            .and_then(|()| sync_dir(dir)),
+    );
     fp.hit("vstree-placed")?;
 
-    remove_other_layouts(dir, StorageKind::Disk)?;
+    note(
+        &mut warnings,
+        "removing the other layouts",
+        remove_other_layouts(dir, StorageKind::Disk),
+    );
     fp.hit("layouts-removed")?;
 
-    fs::remove_dir_all(staging)?;
-    sync_dir(dir)?;
+    note(
+        &mut warnings,
+        "removing the staging area",
+        fs::remove_dir_all(staging)
+            .map_err(GStoreError::from)
+            .and_then(|()| sync_dir(dir)),
+    );
     fp.hit("cleaned")?;
-    Ok(())
+    Ok(warnings)
 }
