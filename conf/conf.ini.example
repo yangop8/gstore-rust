@@ -90,6 +90,14 @@ build_multi_thread=off
 # how full it packs B+ tree nodes, 50-100 percent; the slack takes later
 # inserts without splitting nodes (Rust extension)
 # build_fill_factor=90
+# free the ids of terms a delete leaves unused (no triple or quad refers to
+# them any more) so new terms reuse them, lowest first: on (default) or off
+# (ids are only freed by gcompact --reclaim). A kvstore.kv written before
+# Phase 6 keeps reclamation off until gcompact --enable-reclaim, which makes
+# the file unreadable for older binaries; new on-disk databases are created
+# with it unless this is off. GSTORE_ID_RECLAIM=on|off overrides it
+# (Rust extension)
+# id_reclaim=on
 # the license type login / testConnect / getCoreVersion report: an upstream
 # key upstream's default conf.ini leaves out (default "opensource")
 # licensetype="opensource"
@@ -245,6 +253,13 @@ unzip_max_size = 10737418240
 # it yet -- /api build and REST /build still build snapshot databases, and
 # gserver logs a warning when it is set
 # default_layout=disk
+# MiB of the block cache a RocksDB database shares across its column
+# families, 0 = RocksDB's own default (32 MiB per column family);
+# GSTORE_ROCKS_BLOCK_CACHE_MB overrides it
+# rocksdb_block_cache_mb=256
+# bloom filters of RocksDB's point-lookup column families: bits per key,
+# on (= 10) or off; options only, files open either way
+# rocksdb_bloom=10
 
 # Reasoning rules (/api reasonManage, stored per database in
 # <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --

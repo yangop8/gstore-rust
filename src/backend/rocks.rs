@@ -190,20 +190,52 @@ impl Default for RocksTuning {
     }
 }
 
+/// The tuning installed by [`set_default_rocks_tuning`] (`conf.ini`'s
+/// `[storage]` keys in a server), if any.
+static INSTALLED_TUNING: Mutex<Option<RocksTuning>> = Mutex::new(None);
+
+/// Install the tuning stores of this process open with (a server installs
+/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`); the
+/// environment ([`BLOCK_CACHE_ENV`]) still overrides the block cache.
+pub fn set_default_rocks_tuning(tuning: RocksTuning) {
+    *INSTALLED_TUNING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(tuning);
+}
+
 impl RocksTuning {
-    /// The defaults ([`DEFAULT_BLOCK_CACHE_MB`], [`DEFAULT_BLOOM_BITS`]), with
-    /// the block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a
-    /// number of MiB. A value that is not one is logged (once per process)
-    /// and ignored.
+    /// The defaults — the installed tuning ([`set_default_rocks_tuning`]),
+    /// else [`DEFAULT_BLOCK_CACHE_MB`] and [`DEFAULT_BLOOM_BITS`] — with the
+    /// block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a number
+    /// of MiB (the environment wins, as for the other storage settings). A
+    /// value that is not one is logged (once per process) and ignored.
     pub fn from_env() -> RocksTuning {
-        let (mb, warning) = block_cache_mb(std::env::var(BLOCK_CACHE_ENV).ok().as_deref());
+        let installed = INSTALLED_TUNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let base = installed.unwrap_or(RocksTuning {
+            block_cache_bytes: DEFAULT_BLOCK_CACHE_MB << 20,
+            bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+        });
+        let env = std::env::var(BLOCK_CACHE_ENV).ok();
+        let (mb, warning) = block_cache_mb(env.as_deref());
         if let Some(w) = warning {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| crate::gs_warn!("rocksdb tuning: {w}"));
         }
+        // Only a valid value overrides.
+        let env_set = env
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| v.parse::<usize>().is_ok());
         RocksTuning {
-            block_cache_bytes: mb.saturating_mul(1 << 20),
-            bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+            block_cache_bytes: if env_set {
+                mb.saturating_mul(1 << 20)
+            } else {
+                base.block_cache_bytes
+            },
+            bloom_bits_per_key: base.bloom_bits_per_key,
         }
     }
 

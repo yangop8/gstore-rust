@@ -165,6 +165,25 @@ impl Candidates {
     }
 }
 
+/// The id spaces of a database (see [`Database::id_space_stats`]); each
+/// array is `[entity, literal, predicate]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdSpaceStats {
+    /// Live terms.
+    pub live: [u64; 3],
+    /// Ids free for reuse below the limits (retired ones a pin still holds
+    /// included).
+    pub free: [u64; 3],
+    /// Each space's id limit: one past the highest id allocated (a literal
+    /// limit counts from `LITERAL_FIRST_ID`).
+    pub limits: [u64; 3],
+    /// The reclamation policy.
+    pub policy: IdReclaim,
+    /// Whether the layout can free ids (`false` for a pre-Phase-6
+    /// `kvstore.kv` until `gcompact --enable-reclaim`).
+    pub enabled: bool,
+}
+
 // ---- the Database side ------------------------------------------------------
 
 impl Database {
@@ -339,6 +358,107 @@ impl Database {
         let n = self.free_dead(dead, false);
         self.commit_point()?;
         Ok(n)
+    }
+
+    /// Check the structures id reclamation relies on, reading everything
+    /// once: every term a default-graph triple or a named-graph quad uses
+    /// (graph IRIs included) resolves in the dictionary; the named graphs'
+    /// reference counts equal a recount; and an on-disk store's free-id list
+    /// is sound (each free id below its space's high-water mark names no
+    /// term, the counts match the list, none is the highest). `Err` names the
+    /// first violation. For tests and `gcompact --check`.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let scope = ReadScope::enter();
+        let missing = |what: &str, id: u32| {
+            GStoreError::Database(format!("integrity: {what} id {id} names no term"))
+        };
+        for t in self.store.iter_all() {
+            if self.dict.term(t.sub).is_none() {
+                return Err(missing("subject", t.sub));
+            }
+            if self.dict.pred(t.pred).is_none() {
+                return Err(missing("predicate", t.pred));
+            }
+            if self.dict.term(t.obj).is_none() {
+                return Err(missing("object", t.obj));
+            }
+        }
+        for (&g, graph) in self.named.iter() {
+            if self.dict.term(g).is_none() {
+                return Err(missing("graph", g));
+            }
+            for t in graph.iter_all() {
+                if self.dict.term(t.sub).is_none() || self.dict.term(t.obj).is_none() {
+                    return Err(missing("named-graph node", t.sub));
+                }
+                if self.dict.pred(t.pred).is_none() {
+                    return Err(missing("named-graph predicate", t.pred));
+                }
+            }
+        }
+        self.named
+            .verify_refs()
+            .map_err(|e| GStoreError::Database(format!("integrity: {e}")))?;
+        if let Some(dt) = self.store.as_disk() {
+            dt.disk_store()?.verify_free_list()?;
+        }
+        if let Some(sink) = self.disk_guard().as_ref() {
+            sink.store.verify_free_list()?;
+        }
+        if let Some(e) = scope.take_error() {
+            return Err(GStoreError::Database(format!(
+                "integrity: a read failed: {e}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The number of term ids still allocated in each space `[entity,
+    /// literal, predicate]` that name a term (live terms), the ids that are
+    /// free for reuse, and each space's id limit (high-water mark) — what
+    /// `gmonitor` shows.
+    pub fn id_space_stats(&self) -> IdSpaceStats {
+        let live = [
+            self.dict.entity_num() as u64,
+            self.dict.literal_num() as u64,
+            self.dict.predicate_num() as u64,
+        ];
+        let limits = Space::ALL.map(|s| u64::from(self.dict.id_limit(s) - s.first_id()));
+        let free = if let Some(dt) = self.store.as_disk() {
+            dt.disk_store().map(|s| s.free_counts()).unwrap_or_default()
+        } else {
+            let f = self.dict.free_counts();
+            let r = self.dict.retired_counts();
+            [0, 1, 2].map(|i| (f[i] + r[i]) as u64)
+        };
+        IdSpaceStats {
+            live,
+            free,
+            limits,
+            policy: self.id_reclaim,
+            enabled: self.layout_frees_ids(),
+        }
+    }
+
+    /// Turn id reclamation on for a `kvstore.kv` written before Phase 6
+    /// (`gcompact --enable-reclaim`): the file gets the `FREE_IDS` feature
+    /// and becomes version 2 — **binaries older than Phase 6 refuse it from
+    /// then on** (downgrade: `gexport` with this binary, `gbuild` with the
+    /// old one). Committed durably here. `Ok(false)` when the layout frees
+    /// ids already (every layout but such a file). Refused inside a
+    /// transaction.
+    pub fn enable_id_reclaim(&mut self) -> Result<bool> {
+        if self.txn.is_some() {
+            return Err(GStoreError::Database(
+                "enable_id_reclaim: commit or roll back the open transaction first".into(),
+            ));
+        }
+        if self.layout_frees_ids() {
+            return Ok(false);
+        }
+        self.enable_layout_free_ids()?;
+        self.commit_point()?;
+        Ok(true)
     }
 
     /// Every term id of the dictionary (in memory, or read from the

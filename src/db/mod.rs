@@ -74,7 +74,9 @@ use named::NamedGraphs;
 use query_cache::QueryCache;
 pub use query_cache::DEFAULT_QUERY_CACHE_BYTES;
 use reclaim::Candidates;
-pub use reclaim::{default_id_reclaim, set_default_id_reclaim, IdReclaim, ENV_ID_RECLAIM};
+pub use reclaim::{
+    default_id_reclaim, set_default_id_reclaim, IdReclaim, IdSpaceStats, ENV_ID_RECLAIM,
+};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";

@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::db::{
-    DiskQueryMode, OpenOptions, QuerySettings, StorageKind, DEFAULT_QUERY_CACHE_BYTES,
+    DiskQueryMode, IdReclaim, OpenOptions, QuerySettings, StorageKind, DEFAULT_QUERY_CACHE_BYTES,
 };
 use crate::query::{DpbMode, IntegerDivision, TopKOptions};
 use crate::server::HttpOptions;
@@ -279,6 +279,9 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("storage", "dict_cache_mb"),
     ("storage", "vstree_on_open"),
     ("storage", "default_layout"),
+    ("storage", "rocksdb_block_cache_mb"),
+    ("storage", "rocksdb_bloom"),
+    ("system", "id_reclaim"),
 ];
 
 /// Accepted spellings that map onto a [`KNOWN_KEYS`] entry.
@@ -512,6 +515,21 @@ pub struct GStoreConfig {
     /// checked, but no build path uses it yet (the servers log a warning
     /// when it is set; see [`default_layout_warning`](Self::default_layout_warning)).
     pub default_layout: Option<StorageKind>,
+    /// *(Rust extension)* MiB of the LRU block cache a RocksDB database
+    /// shares across its column families (default 256; `0` = RocksDB's own
+    /// per-column-family default). The `GSTORE_ROCKS_BLOCK_CACHE_MB`
+    /// environment variable overrides it.
+    pub rocksdb_block_cache_mb: usize,
+    /// *(Rust extension)* Bits per key of the bloom filters RocksDB writes for
+    /// its point-lookup column families (default 10; `0` / `off` = none,
+    /// `on` = 10). Options only: files open with or without them.
+    pub rocksdb_bloom: u32,
+    /// *(Rust extension, `[system]`)* Free the ids of terms a delete leaves
+    /// unreferenced, for reuse (`on`, the default), or keep them until an
+    /// explicit `gcompact --reclaim` (`off`). The `GSTORE_ID_RECLAIM`
+    /// environment variable overrides it. A `kvstore.kv` written before
+    /// Phase 6 keeps reclamation off until `gcompact --enable-reclaim`.
+    pub id_reclaim: IdReclaim,
 
     // ---- provenance -----------------------------------------------------
     /// The file this configuration was loaded from, if any.
@@ -590,6 +608,9 @@ impl Default for GStoreConfig {
             dict_cache_mb: crate::db::DEFAULT_DICT_CACHE_BYTES >> 20,
             vstree_on_open: false,
             default_layout: None,
+            rocksdb_block_cache_mb: 256,
+            rocksdb_bloom: 10,
+            id_reclaim: IdReclaim::Immediate,
             source: None,
             explicit: BTreeSet::new(),
             warnings: Vec::new(),
@@ -921,6 +942,27 @@ impl GStoreConfig {
                 self.default_layout =
                     parse_layout(v).ok_or_else(|| bad("snapshot, disk or rocksdb"))?
             }
+            "rocksdb_block_cache_mb" => {
+                self.rocksdb_block_cache_mb = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n <= 1 << 20)
+                    .ok_or_else(|| bad("a number of MiB (0 = RocksDB's default)"))?
+            }
+            "rocksdb_bloom" => {
+                self.rocksdb_bloom = match parse_switch(v) {
+                    Some(true) => 10,
+                    Some(false) => 0,
+                    None => v
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| *n <= 64)
+                        .ok_or_else(|| bad("on, off or bits per key (0..=64)"))?,
+                }
+            }
+            "id_reclaim" => {
+                self.id_reclaim = v.parse::<IdReclaim>().map_err(|_| bad("on or off"))?
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         self.explicit.insert(key.to_string());
@@ -1016,6 +1058,9 @@ impl GStoreConfig {
                 .map(layout_name)
                 .unwrap_or_default()
                 .to_string(),
+            "rocksdb_block_cache_mb" => self.rocksdb_block_cache_mb.to_string(),
+            "rocksdb_bloom" => self.rocksdb_bloom.to_string(),
+            "id_reclaim" => self.id_reclaim.to_string(),
             _ => return None,
         })
     }
@@ -1115,6 +1160,30 @@ impl GStoreConfig {
             dict_cache_bytes: self.dict_cache_mb.saturating_mul(1 << 20),
             vstree_on_open: self.vstree_on_open,
             default_layout: self.default_layout,
+        }
+    }
+
+    /// Install this configuration's process-wide storage defaults that are
+    /// not [`OpenOptions`]: the id-reclamation policy (`[system]
+    /// id_reclaim`, [`crate::db::set_default_id_reclaim`]) and, with the
+    /// `rocksdb` feature, the RocksDB tuning (`[storage]
+    /// rocksdb_block_cache_mb` / `rocksdb_bloom`). The environment
+    /// (`GSTORE_ID_RECLAIM`, `GSTORE_ROCKS_BLOCK_CACHE_MB`) still overrides
+    /// them. A server calls it where it installs
+    /// [`open_options`](Self::open_options); databases opened afterwards use
+    /// them.
+    pub fn install_storage_defaults(&self) {
+        crate::db::set_default_id_reclaim(self.id_reclaim);
+        #[cfg(feature = "rocksdb")]
+        crate::backend::rocks::set_default_rocks_tuning(self.rocks_tuning());
+    }
+
+    /// The RocksDB tuning of the `[storage]` keys (without the environment).
+    #[cfg(feature = "rocksdb")]
+    pub fn rocks_tuning(&self) -> crate::backend::rocks::RocksTuning {
+        crate::backend::rocks::RocksTuning {
+            block_cache_bytes: self.rocksdb_block_cache_mb.saturating_mul(1 << 20),
+            bloom_bits_per_key: f64::from(self.rocksdb_bloom),
         }
     }
 
@@ -1559,7 +1628,7 @@ upload_allow_compress_packages = "zip"
                     resource_check=on\ndb_home=/data/gs\ndb_suffix=.gdb\nroot_username=admin\n\
                     root_password=s3cret\nsystem_username=sys\npfn_base_path=/p\nlicensetype=x\n\
                     check_point=off\nbuild_multi_thread=off\nbuild_memory_mb=128\n\
-                    build_threads=3\nbuild_tmp_dir=/scratch\nbuild_fill_factor=75\n\
+                    build_threads=3\nbuild_tmp_dir=/scratch\nbuild_fill_factor=75\nid_reclaim=off\n\
                     [log]\nlog_mode=l.properties\nquerylog_mode=0\nquerylog_path=q/\n\
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
                     log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
@@ -1573,7 +1642,8 @@ upload_allow_compress_packages = "zip"
                     [pfn]\npfn_fuel_per_call=0\npfn_max_memory_pages=2\n\
                     pfn_max_module_bytes=5000\npfn_max_functions=3\n\
                     [storage]\ndisk_query_mode=stream\ndisk_cache_mb=64\ndict_cache_mb=32\n\
-                    vstree_on_open=on\ndefault_layout=disk\n";
+                    vstree_on_open=on\ndefault_layout=disk\nrocksdb_block_cache_mb=64\n\
+                    rocksdb_bloom=off\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(
@@ -1652,6 +1722,9 @@ upload_allow_compress_packages = "zip"
             }
         );
         assert_eq!(c.value("disk_query_mode").unwrap(), "stream");
+        assert_eq!(c.id_reclaim, IdReclaim::Off);
+        assert_eq!((c.rocksdb_block_cache_mb, c.rocksdb_bloom), (64, 0));
+        assert_eq!(c.value("id_reclaim").unwrap(), "off");
         assert_eq!(c.value("default_layout").unwrap(), "disk");
 
         assert_eq!(

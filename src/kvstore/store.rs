@@ -672,6 +672,62 @@ impl DiskStore {
         Space::ALL.map(|s| disk_dict::space_roots(&pager, s).1)
     }
 
+    /// Check the free-id list (a no-op without the `FREE_IDS` feature):
+    /// every entry is below its space's high-water mark and names no term
+    /// (its `id2*` slot is empty), none is the highest index (the trim keeps
+    /// that allocated), and each space's `FREE_COUNT_*` equals its entries.
+    /// `Err` names the first violation.
+    pub fn verify_free_list(&self) -> Result<()> {
+        let pager = self.read_pager();
+        if !disk_dict::frees_ids(&pager) {
+            return Ok(());
+        }
+        for space in Space::ALL {
+            let (alloc, free) = disk_dict::space_roots(&pager, space);
+            let tag = match space {
+                Space::Entity => b'E',
+                Space::Literal => b'L',
+                Space::Predicate => b'P',
+            };
+            let arr = match space {
+                Space::Entity => &self.id2entity,
+                Space::Literal => &self.id2literal,
+                Space::Predicate => &self.id2predicate,
+            };
+            let mut entries = Vec::new();
+            disk_dict::free_tree().scan_prefix_with(&pager, &[tag], |k, _| {
+                if k.len() == 5 {
+                    entries.push(super::bptree::de32(&k[1..5]));
+                }
+                ControlFlow::Continue(())
+            })?;
+            if entries.len() as u64 != free {
+                return Err(GStoreError::Database(format!(
+                    "integrity: the {} free list holds {} ids, its count says {free}",
+                    space.name(),
+                    entries.len()
+                )));
+            }
+            for index in entries {
+                if u64::from(index) + 1 >= alloc {
+                    return Err(GStoreError::Database(format!(
+                        "integrity: free {} index {index} is not below the highest allocated \
+                         index ({} ids allocated)",
+                        space.name(),
+                        alloc
+                    )));
+                }
+                if arr.get(&pager, index)?.is_some() {
+                    return Err(GStoreError::Database(format!(
+                        "integrity: free {} index {index} still names a term",
+                        space.name()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Each space's high-water mark `[entity, literal, predicate]`: one past
     /// the highest index allocated (holes included; a literal's index is its
     /// id minus `LITERAL_FIRST_ID`).

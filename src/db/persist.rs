@@ -215,7 +215,7 @@ impl DiskOp {
 
 /// Write-through state of an on-disk (`kvstore.kv`) database.
 pub(super) struct DiskSink {
-    store: DiskStore,
+    pub(super) store: DiskStore,
     /// Mutations of the open transaction, applied at commit.
     pending: Vec<DiskOp>,
     /// Set once a write-through failed: the store may no longer match the
@@ -1080,21 +1080,11 @@ impl Database {
 
     /// The Materialize-mode half of [`load_disk_with`](Self::load_disk_with).
     fn load_disk_materialize(dir: &Path, mut ds: DiskStore) -> Result<Database> {
-        let (mut dict, store) = ds.to_memory()?;
-        // `DiskStore::dictionary` interns the stored strings in id order: a
-        // gap (a freed hole) or a duplicate would shift every later id off the
-        // store's. Then read the terms with their ids kept instead, and do
-        // not trust `vstree.kv` (it was built over the store's ids, but its
-        // alignment with this working set cannot be proven).
+        // `DiskStore::dictionary` keeps every id as stored (a freed id is a
+        // free hole, a term stored twice is refused), so the working set's
+        // ids are the store's and `vstree.kv` (built over them) lines up.
+        let (dict, store) = ds.to_memory()?;
         let aligned = dictionary_aligned(&dict, &ds);
-        if !aligned {
-            crate::gs_warn!(
-                "'{}': the dictionary's ids have gaps; loading them with their ids kept and \
-                 rebuilding the VS-tree",
-                dir.display()
-            );
-            dict = ds.lazy_dictionary().materialize()?;
-        }
         let named = ds.named_to_memory()?;
         let name = disk_db_name(dir);
         // Out-of-core VS-tree: open the persisted paged node file, unless an
@@ -2001,6 +1991,20 @@ impl Database {
         true
     }
 
+    /// Turn the free-id list on for an on-disk store (`gcompact
+    /// --enable-reclaim`); nothing to do for the other layouts. Durable at
+    /// the next commit point.
+    pub(super) fn enable_layout_free_ids(&mut self) -> Result<()> {
+        if let Some(dt) = self.store.as_disk_mut() {
+            return dt.enable_reclaim();
+        }
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
+            sink.store.enable_reclaim()?;
+            sink.dirty = true;
+        }
+        Ok(())
+    }
+
     /// Persist the free of the unreferenced terms `dead` before the dictionary
     /// retires them (not for Stream mode, see [`stream_free`](Self::stream_free)),
     /// returning the ones that may be retired:
@@ -2098,18 +2102,19 @@ fn disk_db_name(dir: &Path) -> String {
         .unwrap_or_else(|| "disk".to_string())
 }
 
-/// Whether `dict` — read from `ds` by [`DiskStore::dictionary`], which interns
-/// the stored strings in id order — gave every term the id the store gave it:
-/// each space holds exactly the store's count of ids (a gap or a duplicate
-/// string would leave it short).
+/// Whether `dict` — read from `ds` by [`DiskStore::dictionary`], which keeps
+/// every stored id — holds the store's terms: no id past a space's
+/// high-water mark (trailing free holes are trimmed, so the limit may be
+/// lower) and the live counts equal the store's. A mismatch means a damaged
+/// store; `vstree.kv` is then not trusted.
 fn dictionary_aligned(dict: &Dictionary, ds: &DiskStore) -> bool {
-    [
-        (Space::Entity, ds.entity_num()),
-        (Space::Literal, ds.literal_num()),
-        (Space::Predicate, ds.predicate_num()),
-    ]
-    .into_iter()
-    .all(|(space, n)| u64::from(dict.id_limit(space)) == u64::from(space.first_id()) + n as u64)
+    let limits = ds.term_limits();
+    let live = [ds.entity_num(), ds.literal_num(), ds.predicate_num()];
+    let counts = [dict.entity_num(), dict.literal_num(), dict.predicate_num()];
+    Space::ALL.into_iter().enumerate().all(|(i, space)| {
+        u64::from(dict.id_limit(space)) <= u64::from(space.first_id()) + limits[i]
+            && counts[i] == live[i]
+    })
 }
 
 /// Check that a restored on-disk / RocksDB copy in `dir` opens as a database.

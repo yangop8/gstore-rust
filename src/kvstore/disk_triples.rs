@@ -1060,6 +1060,15 @@ impl DiskTriples {
         self.store.frees_ids()
     }
 
+    /// Turn the free-id list on ([`DiskStore::enable_reclaim`]); written at
+    /// the next commit point.
+    pub fn enable_reclaim(&mut self) -> Result<()> {
+        self.check_open()?;
+        self.store.enable_reclaim()?;
+        self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Free the ids `ids` (terms nothing references) through the dictionary
     /// `dict` sharing this store's pager — its `*2id` entry and `id2*` slot
     /// go, the id joins the free list or lowers the high-water mark — under

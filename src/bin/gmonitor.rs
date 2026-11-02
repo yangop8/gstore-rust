@@ -1,7 +1,9 @@
 //! `gmonitor` — print monitoring information about a database.
 //!
 //! Mirrors gStore's `gmonitor` (`getDBMonitorInfo`): counts, index/transaction
-//! state, storage layout, and on-disk size (including a RocksDB store).
+//! state, storage layout, on-disk size (including a RocksDB store), and the
+//! id spaces: live terms, free ids and id limits per space, and whether ids of
+//! deleted terms are reclaimed.
 //!
 //! ```text
 //! gmonitor <db_name>
@@ -60,8 +62,15 @@ fn main() -> ExitCode {
     let s = db.stats();
     let backend = db.backend();
     let disk = dir_size(&dir);
+    let ids = db.id_space_stats();
+    let space = |i: usize| {
+        format!(
+            "live {} free {} id_limit {}",
+            ids.live[i], ids.free[i], ids.limits[i]
+        )
+    };
 
-    let rows: [(&str, String); 13] = [
+    let rows: [(&str, String); 17] = [
         ("database", s.name.clone()),
         ("directory", dir.clone()),
         ("storage", db.storage().to_string()),
@@ -78,6 +87,21 @@ fn main() -> ExitCode {
         ),
         ("in_transaction", s.in_transaction.to_string()),
         ("disk_used", format!("{disk} bytes")),
+        (
+            "id_reclaim",
+            format!(
+                "{}{}",
+                ids.policy,
+                if ids.enabled {
+                    ""
+                } else {
+                    " (off for this kvstore.kv until gcompact --enable-reclaim)"
+                }
+            ),
+        ),
+        ("entity_ids", space(0)),
+        ("literal_ids", space(1)),
+        ("predicate_ids", space(2)),
     ];
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (k, v) in &rows {

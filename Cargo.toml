@@ -131,6 +131,10 @@ path = "src/bin/gexport.rs"
 name = "gmonitor"
 path = "src/bin/gmonitor.rs"
 
+[[bin]]
+name = "gcompact"
+path = "src/bin/gcompact.rs"
+
 # ---- packaging (see docs/DEPLOY.md) -----------------------------------------
 # `cargo deb` (cargo-deb) and `cargo generate-rpm` (cargo-generate-rpm) build
 # .deb / .rpm packages from a release build: the binaries in /usr/bin, the
@@ -145,7 +149,7 @@ gstore-rust is a Rust rewrite of gStore, an RDF triple store / graph database \
 answering SPARQL queries by subgraph matching. This package provides gserver, \
 an HTTP server speaking upstream gStore 1.4's /api protocol (run as the gserver \
 systemd service), the gconsole client and the command-line tools gbuild, \
-gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor and gnode."""
+gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor, gcompact and gnode."""
 section = "database"
 priority = "optional"
 depends = "$auto, adduser"
@@ -164,6 +168,7 @@ assets = [
     ["target/release/grestore", "usr/bin/", "755"],
     ["target/release/gexport", "usr/bin/", "755"],
     ["target/release/gmonitor", "usr/bin/", "755"],
+    ["target/release/gcompact", "usr/bin/", "755"],
     ["target/release/gnode", "usr/bin/", "755"],
     ["conf/conf.ini.example", "etc/gstore/conf.ini", "640"],
     ["conf/slog.properties.example", "etc/gstore/slog.properties.example", "644"],
@@ -193,6 +198,7 @@ assets = [
     { source = "target/release/grestore", dest = "/usr/bin/grestore", mode = "755" },
     { source = "target/release/gexport", dest = "/usr/bin/gexport", mode = "755" },
     { source = "target/release/gmonitor", dest = "/usr/bin/gmonitor", mode = "755" },
+    { source = "target/release/gcompact", dest = "/usr/bin/gcompact", mode = "755" },
     { source = "target/release/gnode", dest = "/usr/bin/gnode", mode = "755" },
     { source = "conf/conf.ini.example", dest = "/etc/gstore/conf.ini", mode = "640", config = "noreplace" },
     { source = "conf/slog.properties.example", dest = "/etc/gstore/slog.properties.example", mode = "644" },
