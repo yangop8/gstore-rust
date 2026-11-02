@@ -2032,7 +2032,7 @@ impl<'s> Parser<'s> {
                     p.slot.describe()
                 )));
             }
-            args.push(self.parse_gfn_slot(p.slot, argno).map_err(&ctx)?);
+            args.push(self.parse_gfn_slot(p.slot, argno).map_err(ctx)?);
         }
         match self.peek() {
             Token::RParen => {
