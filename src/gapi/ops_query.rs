@@ -19,6 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{auth, required, tasks, Ctx, OpSpec, Registry};
+use crate::db::Statement;
 use crate::http_api::{
     log_query, ApiInner, DbHandle, JobOutput, OpError, OpErrorKind, QueryJob, TxnIsolation,
 };
@@ -94,16 +95,18 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     // `async=true` (an opt_id answered at once, the result fetched later with
     // checkOperationState) is the dispatcher's: this then runs on a task
     // runner, and the statement's task is that operation's (`tasks`).
-    let parsed = crate::parser::sparql::parse(&sparql);
-    let is_update = matches!(parsed, Ok(Query::Update(_)));
+    // Parsed once, with no lock held: the parse classifies the statement
+    // (privilege; a shared guard for a read, the exclusive one for an
+    // update) and is what the job runs.
+    let stmt = Statement::parse(&sparql).ok();
+    let is_update = stmt.as_ref().is_some_and(Statement::is_update);
     // A projected `PFN.name(…)` answers upstream's `{"results": …}` shape.
-    let pfn = parsed
+    let pfn = stmt
         .as_ref()
-        .ok()
-        .and_then(|q| super::ops_pfn::PfnShape::of(q, &sparql));
-    let limit = match &parsed {
-        Ok(Query::Select(q)) => q.limit,
-        Ok(Query::Construct(q)) => q.limit,
+        .and_then(|s| super::ops_pfn::PfnShape::of(s.query(), &sparql));
+    let limit = match stmt.as_ref().map(Statement::query) {
+        Some(Query::Select(q)) => q.limit,
+        Some(Query::Construct(q)) => q.limit,
         _ => None,
     };
     // Reading needs the query privilege (checked by the dispatcher); an
@@ -135,7 +138,7 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             cancel,
             task_id,
             sparql,
-            is_update,
+            stmt,
             fmt: ResultFormat::Json,
             user: ctx.user().to_string(),
         }
@@ -437,9 +440,11 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         ctx.user(),
         &sparql,
     );
+    // Parsed with no lock held; a read then shares the database.
+    let stmt = Statement::parse(&sparql);
     match ctx
         .inner
-        .run_in_txn_task(&dbh, &db, tid, &sparql, ctx.user())
+        .run_in_txn_task(&dbh, &db, tid, &sparql, stmt, ctx.user())
     {
         Ok(QueryResult::Update { changed }) => {
             GResp::success("Transaction query success").with("AnsNum", changed)

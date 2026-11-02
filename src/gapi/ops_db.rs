@@ -55,6 +55,12 @@ use crate::json::Json;
 use crate::parser::import;
 use crate::reason::store::RuleStore;
 use crate::server::locked;
+
+/// The `/api` answer to a database lock this request may not take (a
+/// re-entrant one, see [`DbCell::read`]).
+fn lock_error(e: OpError) -> GResp {
+    GResp::error(Status::OperationFailed, e.msg)
+}
 use crate::sysdb::{clock, DbRecord, DbStatus};
 use crate::zipio::{self, ExportFormat, ScratchDir, ZipError, ZipLimits};
 use crate::{Database, DB_SUFFIX};
@@ -809,8 +815,8 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 /// later graph-function query reuses it until the data changes (any write
 /// invalidates it; the next graph-function query, or `loadcsr`, rebuilds
 /// it). `Ok(true)` when it was already built for the current data. The
-/// database's slot is locked meanwhile (upstream holds its `csr_lock`), the
-/// state lock is not.
+/// database is held shared meanwhile (concurrent builds share one, see
+/// [`Database::csr`]; upstream holds its `csr_lock`), the state lock is not.
 fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
     let handle = ctx.state().dbs.get(db).map(Arc::clone);
     let Some(handle) = handle else {
@@ -819,7 +825,9 @@ fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
             format!("database[{db}] is not loaded yet"),
         ));
     };
-    let slot = locked(&handle);
+    // Shared: building the CSR is a read (the database caches it), so
+    // queries keep running meanwhile.
+    let slot = handle.read().map_err(lock_error)?;
     if slot.retired {
         return Err(GResp::error(
             Status::OperationFailed,
@@ -955,7 +963,10 @@ fn unload(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
         inner: ctx.inner,
         name: db.clone(),
     };
-    let mut slot = locked(&dbh);
+    let mut slot = match dbh.write() {
+        Ok(slot) => slot,
+        Err(e) => return lock_error(e),
+    };
     if slot.retired {
         return not_loaded(&db, true);
     }
@@ -1002,41 +1013,52 @@ struct CachedStats {
     slot: Weak<DbCell>,
     /// [`Database::mutation_count`] at computation: any write invalidates.
     mutations: u64,
+    /// [`Database::subject_num`] (also a pass over the data).
+    subjects: usize,
     classes: Arc<Vec<(String, u64)>>,
     graph: Arc<SchemaGraph>,
 }
+
+/// What [`class_stats`] computes (and caches).
+type ClassStats = (usize, Arc<Vec<(String, u64)>>, Arc<SchemaGraph>);
 
 fn stats_cache() -> &'static Mutex<HashMap<String, CachedStats>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedStats>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The class statistics and schema graph of loaded database `db` (`slot`,
-/// locked, of handle `h`), cached until the database changes.
-fn class_stats(
-    db: &str,
-    h: &DbHandle,
-    slot: &DbSlot,
-) -> (Arc<Vec<(String, u64)>>, Arc<SchemaGraph>) {
-    let mutations = slot.db.mutation_count();
+/// The cached statistics of loaded database `db` (handle `h`) for its data
+/// at `mutations`, if computed already.
+fn cached_stats(db: &str, h: &DbHandle, mutations: u64) -> Option<ClassStats> {
     let this = Arc::downgrade(h);
-    if let Some(c) = locked(stats_cache()).get(db) {
-        if c.mutations == mutations && Weak::ptr_eq(&c.slot, &this) {
-            return (Arc::clone(&c.classes), Arc::clone(&c.graph));
-        }
+    let cache = locked(stats_cache());
+    let c = cache.get(db)?;
+    (c.mutations == mutations && Weak::ptr_eq(&c.slot, &this))
+        .then(|| (c.subjects, Arc::clone(&c.classes), Arc::clone(&c.graph)))
+}
+
+/// The subject count, class statistics and schema graph of loaded database
+/// `db` (`slot`, held — shared suffices — of handle `h`), cached until the
+/// database changes.
+fn class_stats(db: &str, h: &DbHandle, slot: &DbSlot) -> ClassStats {
+    let mutations = slot.db.mutation_count();
+    if let Some(hit) = cached_stats(db, h, mutations) {
+        return hit;
     }
+    let subjects = slot.db.subject_num();
     let classes = Arc::new(slot.db.type_statistics());
     let graph = Arc::new(slot.db.schema_graph());
     locked(stats_cache()).insert(
         db.to_string(),
         CachedStats {
-            slot: this,
+            slot: Arc::downgrade(h),
             mutations,
+            subjects,
             classes: Arc::clone(&classes),
             graph: Arc::clone(&graph),
         },
     );
-    (classes, graph)
+    (subjects, classes, graph)
 }
 
 /// Inspect database `db`: the loaded instance, else — upstream reads an
@@ -1050,13 +1072,38 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
         (st.dbs.get(db).map(Arc::clone), st.db_dir(db))
     };
     if let Some(h) = dbh {
-        let slot = locked(&h);
+        // Without the database lock while the statistics of the data it
+        // published last are cached (monitoring never waits for a
+        // statement then); else computed on a shared guard and cached.
+        let f = h.figures();
+        if f.live {
+            if let Some((subjects, classes, graph)) = cached_stats(db, &h, f.generation) {
+                return Ok(Inspection {
+                    triples: f.triples,
+                    stats: crate::db::DbStats {
+                        name: h.name.clone(),
+                        triple_num: f.triples,
+                        entity_num: usize::try_from(f.entities).unwrap_or(usize::MAX),
+                        literal_num: usize::try_from(f.literals).unwrap_or(usize::MAX),
+                        predicate_num: usize::try_from(f.predicates).unwrap_or(usize::MAX),
+                        index_valid: f.index_valid,
+                        in_transaction: f.in_transaction,
+                    },
+                    subjects,
+                    classes,
+                    graph,
+                    in_txn: f.in_transaction,
+                    status: DbStatus::Loaded,
+                });
+            }
+        }
+        let slot = h.read().map_err(lock_error)?;
         if !slot.retired {
-            let (classes, graph) = class_stats(db, &h, &slot);
+            let (subjects, classes, graph) = class_stats(db, &h, &slot);
             return Ok(Inspection {
                 triples: slot.committed_triple_num(),
                 stats: slot.db.stats(),
-                subjects: slot.db.subject_num(),
+                subjects,
                 classes,
                 graph,
                 in_txn: slot.txn.is_some(),
@@ -1333,7 +1380,10 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return GResp::error(Status::OperationFailed, format!("Drop fail: {e}")),
     };
     if let Some(h) = &loaded {
-        let mut slot = locked(h);
+        let mut slot = match h.write() {
+            Ok(slot) => slot,
+            Err(e) => return lock_error(e),
+        };
         if !slot.retired {
             if let Some(open) = &slot.txn {
                 return in_txn(&db, open.tid);
@@ -1685,7 +1735,7 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     progress("backing up", 0);
     let written = match dbh {
         Some(h) => {
-            let slot = match ApiInner::lock_for_op(&h, &db, "backing up") {
+            let slot = match ApiInner::lock_for_op_read(&h, &db, "backing up") {
                 Ok(s) => s,
                 Err(e) => return op_error(&db, "Backup fail: ", e),
             };
@@ -1913,7 +1963,13 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     };
     let loaded = ctx.state().dbs.get(&db).map(Arc::clone);
     if let Some(h) = &loaded {
-        let mut slot = locked(h);
+        let mut slot = match h.write() {
+            Ok(slot) => slot,
+            Err(e) => {
+                Database::discard_staged_restore(&staged);
+                return lock_error(e);
+            }
+        };
         if !slot.retired {
             if let Some(tid) = slot.txn.as_ref().map(|t| t.tid) {
                 drop(slot);
@@ -2047,7 +2103,7 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if let Err(e) = fs::create_dir_all(&target) {
         return fail(e.to_string());
     }
-    let slot = match ApiInner::lock_for_op(&dbh, &db, "exporting") {
+    let slot = match ApiInner::lock_for_op_read(&dbh, &db, "exporting") {
         Ok(s) => s,
         Err(e) => return op_error(&db, "Export fail: ", e),
     };
@@ -2175,7 +2231,10 @@ fn batch(ctx: &mut Ctx<'_>, p: &Params, insert: bool) -> GResp {
             )
         }
     };
-    let mut slot = locked(&dbh);
+    let mut slot = match dbh.write() {
+        Ok(slot) => slot,
+        Err(e) => return lock_error(e),
+    };
     if slot.retired {
         return GResp::error(
             Status::OperationConditionsAreNotSatisfied,
