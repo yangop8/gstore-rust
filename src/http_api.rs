@@ -1345,6 +1345,13 @@ pub(crate) struct ApiInner {
     /// the log (an embedded server; `gserver` opts in with
     /// [`ApiServer::with_log_refresh`]).
     log_refresh: Mutex<Option<crate::logging::LogConfig>>,
+    /// Whether `refreshconf` re-installs the re-read `conf.ini`'s `[storage]`
+    /// section as the process's default open options
+    /// ([`crate::db::set_default_open_options`]) — for the process that owns
+    /// them (`gserver`, which installed them at startup; see
+    /// [`ApiServer::with_storage_refresh`]). An embedded server leaves the
+    /// process's defaults alone (the default).
+    storage_refresh: AtomicBool,
     /// Every user's PFN functions (`funquery` / `funcudb` / `funreview`,
     /// `PFN.name(…)` in queries): under `conf.ini`'s `pfn_base_path` when it
     /// is set, else `<root>/pfn`. A query calls the functions of the user it
@@ -1377,9 +1384,13 @@ impl ApiInner {
     /// user limits, upload, backup and log settings, `system_username`, …),
     /// the IP allow / deny lists, and the `/api` layer's `max_output_size` and
     /// `licensetype`, the `[query]` evaluation settings (applied to the
-    /// loaded databases too) and — for a server that owns the diagnostic
-    /// log ([`ApiServer::with_log_refresh`]) — the log's `log_mode` / `[log]`
-    /// configuration, as upstream. The address, worker pool, connection settings,
+    /// loaded databases too), the log's `log_mode` / `[log]` configuration
+    /// for a server that owns the diagnostic log
+    /// ([`ApiServer::with_log_refresh`], as upstream), and the `[storage]`
+    /// section for a server that owns the process's open options
+    /// ([`ApiServer::with_storage_refresh`]: databases loaded from then on
+    /// use it; loaded ones keep the mode they were opened in). The address,
+    /// worker pool, connection settings,
     /// `check_point` and the database home stay as they are until a restart.
     /// Without a file (a server configured in code) only the IP list files
     /// are re-read. Returns whether a file was re-read.
@@ -1405,7 +1416,25 @@ impl ApiInner {
         }
         self.apply_query_settings(fresh.query_settings());
         self.refresh_log(&fresh);
+        self.refresh_storage(&fresh);
         Ok(true)
+    }
+
+    /// `refreshconf`'s part for the `[storage]` section (see
+    /// [`ApiServer::with_storage_refresh`]): install it as the process's
+    /// default open options, which every later `Database::open` of this
+    /// process uses (the environment still overrides them).
+    fn refresh_storage(&self, fresh: &GStoreConfig) {
+        if !self.storage_refresh.load(Ordering::SeqCst) {
+            return;
+        }
+        crate::db::set_default_open_options(fresh.open_options());
+        let effective = crate::db::default_open_options();
+        crate::gs_info!(
+            "refreshconf: on-disk databases loaded from now on open in {} mode ({} MiB page cache)",
+            effective.disk_query_mode,
+            (effective.disk_cache_pages * crate::kvstore::PAGE_SIZE) >> 20
+        );
     }
 
     /// `refreshconf`'s part for the diagnostic log (see
@@ -1719,6 +1748,7 @@ impl ApiServer {
                 self_ref: OnceLock::new(),
                 settings_gen: AtomicU64::new(0),
                 log_refresh: Mutex::new(None),
+                storage_refresh: AtomicBool::new(false),
                 pfn,
             }),
             listener: Mutex::new(Some(listener)),
@@ -1840,6 +1870,20 @@ impl ApiServer {
     /// patterns may contact remote endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
+        self
+    }
+
+    /// Let `refreshconf` re-install the re-read `conf.ini`'s `[storage]`
+    /// section (`disk_query_mode`, `disk_cache_mb`, `dict_cache_mb`,
+    /// `vstree_on_open`, `default_layout`) as the process's default open
+    /// options ([`crate::db::set_default_open_options`], contract C7) — for
+    /// the process that owns them (`gserver`, which installed the same
+    /// section at startup). Databases loaded afterwards open with them (the
+    /// environment, `GSTORE_DISK_QUERY_MODE` / `GSTORE_DISK_CACHE_MB`, still
+    /// overrides them); loaded ones keep the mode they were opened in. An
+    /// embedded server leaves the process's defaults alone (the default).
+    pub fn with_storage_refresh(self) -> ApiServer {
+        self.inner.storage_refresh.store(true, Ordering::SeqCst);
         self
     }
 

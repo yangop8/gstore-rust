@@ -497,10 +497,9 @@ fn report_config(cfg: &GStoreConfig) {
 /// options (contract C7): every database this server opens — at startup and
 /// whenever a request loads one — uses them, with the environment
 /// (`GSTORE_DISK_QUERY_MODE`, `GSTORE_DISK_CACHE_MB`) on top. A database
-/// already loaded keeps the mode it was opened in. (`/api refreshconf`
-/// re-reads `conf.ini` inside the server library, `ApiInner::refresh_config`;
-/// re-installing the section there is a one-line follow-up for that file's
-/// owner, listed in changelog.d/phase6-R3-STREAM.md.)
+/// already loaded keeps the mode it was opened in. `/api refreshconf`
+/// re-installs the re-read section (the API server is built
+/// `with_storage_refresh`).
 fn install_open_options(cfg: &GStoreConfig) {
     gstore::set_default_open_options(cfg.open_options());
     let effective = gstore::default_open_options();
@@ -1127,8 +1126,12 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                 return 1;
             }
             let server = match ApiServer::bind_with_config(served) {
-                // gserver owns the diagnostic log: refreshconf re-reads it.
-                Ok(s) => s.with_load_policy(load_policy).with_log_refresh(),
+                // gserver owns the diagnostic log and the process's open
+                // options: refreshconf re-reads both.
+                Ok(s) => s
+                    .with_load_policy(load_policy)
+                    .with_log_refresh()
+                    .with_storage_refresh(),
                 Err(e) => {
                     gs_error!(
                         "failed to start API server at {}:{}: {e}",
