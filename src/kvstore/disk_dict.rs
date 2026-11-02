@@ -26,19 +26,33 @@
 //!
 //! ## Interning (Stream mode)
 //! [`intern`](DiskTermSource::intern) adds a term through the shared pager:
-//! the next id of its space (the header's count root; R4 adds free-list
-//! reuse), written as `id2*`, then `*2id`, then the count root, in **one**
-//! pager operation under the pager write lock — so a crash or an error leaves
-//! the term wholly there or wholly absent, never an id the count does not
-//! cover. It touches neither the triple indexes nor the `DiskTriples` writer
-//! gate (C8: gate → pager is never inverted): a term is written before any
-//! triple that uses it, and one whose triple never comes (a rolled-back
-//! transaction, a crash) is a harmless orphan. Every new term bumps the
-//! [`generation`](DiskTermSource::generation); since an intern only *adds* a
-//! key and an id, nothing cached changes meaning, so both caches are updated
-//! in place (the new term goes in) instead of being emptied — only a change
-//! of meaning (R4's `free`) moves the caches' own epoch. `free` still
-//! refuses.
+//! its id is the lowest free id of its space when the file has the
+//! `FREE_IDS` feature and one is free, else the next id (the header's count
+//! root, the space's high-water mark) — written as `id2*`, then `*2id`, then
+//! the roots, in **one** pager operation under the pager write lock — so a
+//! crash or an error leaves the term wholly there or wholly absent, never an
+//! id the count does not cover. It touches neither the triple indexes nor
+//! the `DiskTriples` writer gate (C8: gate → pager is never inverted): a term
+//! is written before any triple that uses it, and one whose triple never
+//! comes (a rolled-back transaction, a crash) is a harmless orphan. Every new
+//! term bumps the [`generation`](DiskTermSource::generation); since an intern
+//! only *adds* a key and an id, nothing cached changes meaning, so both
+//! caches are updated in place (the new term goes in) instead of being
+//! emptied.
+//!
+//! ## Freeing (R4, `FREE_IDS`)
+//! [`free`](DiskTermSource::free) removes a term — its `*2id` entry and its
+//! `id2*` slot — and releases its id in the same pager operation: into the
+//! `FREE_IDS` tree (header slot 22; keys `space tag ‖ be32(index)`, so the
+//! lowest free id of a space is the tree's first key with its tag) with the
+//! space's `FREE_COUNT_*` root, or, for the space's highest id, by lowering
+//! the count root — and every free id that becomes the highest with it (the
+//! trim cascade). A free changes what an id and a key mean, so it moves both
+//! the generation and the caches' epoch (emptying both caches). A file
+//! without the feature (every pre-Phase-6 file) keeps reclamation off: `free`
+//! answers `Ok(false)` and writes nothing; `gcompact --enable-reclaim`
+//! upgrades it. The caller (`DiskTriples::free_ids`, under the writer gate)
+//! guarantees the term is unreferenced.
 //!
 //! Read errors are returned (`Err`); the [`Dictionary`](crate::dict::Dictionary)
 //! front end notes the ones it cannot return in the running statement's read
@@ -52,13 +66,180 @@ use crate::dict::cache::{KeyCache, TermCache, DEFAULT_KEY_CACHE_BYTES, DEFAULT_T
 use crate::dict::{CacheStats, DiskTermSource, Space};
 use crate::error::{GStoreError, Result};
 
-use super::bptree::{be32, BTree};
+use super::bptree::{be32, de32, BTree};
 use super::format::{
-    ENTITY2ID, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, PREDICATE2ID, ROOT_ENTITY_COUNT,
-    ROOT_LITERAL_COUNT, ROOT_PRED_COUNT,
+    ENTITY2ID, FEATURE_FREE_IDS, FREE_COUNT_E, FREE_COUNT_L, FREE_COUNT_P, FREE_IDS, ID2ENTITY,
+    ID2LITERAL, ID2PREDICATE, LITERAL2ID, PREDICATE2ID, ROOT_ENTITY_COUNT, ROOT_LITERAL_COUNT,
+    ROOT_PRED_COUNT,
 };
 use super::ivarray::{self, IvArray};
 use super::pager::{Pager, PagerOp};
+
+// ---- the free-id list (FREE_IDS, slot 22) ------------------------------------
+
+/// The `FREE_IDS` tree: 5-byte keys `space tag ‖ be32(index)` (index = id
+/// minus the space's first id), empty values.
+pub(crate) fn free_tree() -> BTree {
+    BTree::with_fixed_shape(FREE_IDS, 5, 0)
+}
+
+/// The `FREE_IDS` key tag of `space`.
+fn space_tag(space: Space) -> u8 {
+    match space {
+        Space::Entity => b'E',
+        Space::Literal => b'L',
+        Space::Predicate => b'P',
+    }
+}
+
+fn free_key(space: Space, index: u32) -> [u8; 5] {
+    let mut k = [0u8; 5];
+    k[0] = space_tag(space);
+    k[1..5].copy_from_slice(&be32(index));
+    k
+}
+
+/// The header root holding the number of free ids of `space`.
+pub(crate) fn free_count_root(space: Space) -> usize {
+    match space {
+        Space::Entity => FREE_COUNT_E,
+        Space::Literal => FREE_COUNT_L,
+        Space::Predicate => FREE_COUNT_P,
+    }
+}
+
+/// Whether the file behind `pager` keeps a free-id list (feature
+/// `FREE_IDS`): only then are ids freed and reused.
+pub(crate) fn frees_ids(pager: &Pager) -> bool {
+    pager.features() & FEATURE_FREE_IDS != 0
+}
+
+/// The id-space roots of `space`: `(allocated, free)` — the high-water mark
+/// (one past the highest index ever handed out and not trimmed) and the
+/// number of free indices below it.
+pub(crate) fn space_roots(pager: &Pager, space: Space) -> (u64, u64) {
+    (
+        pager.root(count_root(space)),
+        if frees_ids(pager) {
+            pager.root(free_count_root(space))
+        } else {
+            0
+        },
+    )
+}
+
+/// Hand out the id of a new term of `space`, inside the caller's pager
+/// operation: the lowest free id when the file keeps a free list and one is
+/// free, else the next one (bounded like the in-memory dictionary, and by
+/// the `id2*` array's capacity). The roots are updated; the caller writes
+/// the term.
+pub(crate) fn allocate_id(pager: &mut Pager, space: Space) -> Result<u32> {
+    if frees_ids(pager) && pager.root(free_count_root(space)) > 0 {
+        let tree = free_tree();
+        match tree.first_with_prefix(pager, &[space_tag(space)])? {
+            Some((k, _)) if k.len() == 5 => {
+                let index = de32(&k[1..5]);
+                tree.delete(pager, &k)?;
+                let n = pager.root(free_count_root(space));
+                pager.set_root(free_count_root(space), n.saturating_sub(1));
+                return Ok(space.first_id() + index);
+            }
+            Some(_) => {
+                return Err(GStoreError::Database(
+                    "corrupt free-id list: a key has the wrong length".into(),
+                ))
+            }
+            // The count said "free" but the list is empty: repair the count.
+            None => pager.set_root(free_count_root(space), 0),
+        }
+    }
+    let slot = count_root(space);
+    let next = pager.root(slot);
+    let id = match space {
+        Space::Entity => crate::dict::checked_entity_id(next)?,
+        Space::Literal => crate::dict::checked_literal_id(next)?,
+        Space::Predicate => crate::dict::checked_predicate_id(next)?,
+    };
+    if next >= ivarray::CAPACITY as u64 {
+        return Err(GStoreError::Database(format!(
+            "the on-disk {} dictionary is full ({} ids)",
+            space.name(),
+            ivarray::CAPACITY
+        )));
+    }
+    pager.set_root(slot, next + 1);
+    Ok(id)
+}
+
+/// Release index `index` of `space` (its term already removed), inside the
+/// caller's pager operation: the highest index lowers the high-water mark,
+/// with every free index that becomes the highest (the trim cascade); any
+/// other goes into the free list.
+fn release_index(pager: &mut Pager, space: Space, index: u32) -> Result<()> {
+    let tree = free_tree();
+    let mut alloc = pager.root(count_root(space));
+    let mut free = pager.root(free_count_root(space));
+    if u64::from(index) + 1 == alloc {
+        alloc -= 1;
+        while alloc > 0 {
+            let k = free_key(space, (alloc - 1) as u32);
+            if !tree.delete(pager, &k)? {
+                break;
+            }
+            free = free.saturating_sub(1);
+            alloc -= 1;
+        }
+        pager.set_root(count_root(space), alloc);
+    } else {
+        tree.insert(pager, &free_key(space, index), b"")?;
+        free += 1;
+    }
+    pager.set_root(free_count_root(space), free);
+    Ok(())
+}
+
+/// Remove the term of id `id` in `space` from `key_tree` (`*2id`) and
+/// `array` (`id2*`) and release the id, inside the caller's pager
+/// operation. `Ok(false)` — nothing written — when the file keeps no free
+/// list or `id` names no term.
+pub(crate) fn free_term_in(
+    pager: &mut Pager,
+    space: Space,
+    id: u32,
+    key_tree: &BTree,
+    array: &IvArray,
+) -> Result<bool> {
+    if !frees_ids(pager) {
+        return Ok(false);
+    }
+    let Some(index) = id.checked_sub(space.first_id()) else {
+        return Ok(false);
+    };
+    if u64::from(index) >= pager.root(count_root(space)) {
+        return Ok(false);
+    }
+    let Some(key) = array.get(pager, index)? else {
+        return Ok(false);
+    };
+    key_tree.delete(pager, &key)?;
+    array.delete(pager, index)?;
+    release_index(pager, space, index)?;
+    Ok(true)
+}
+
+/// Turn the free-id list on for the file behind `pager` (a new database, or
+/// `gcompact --enable-reclaim`): the feature bit and `MAGIC_V2` reach the
+/// file with the next committed flush, together with the (empty) list.
+pub(crate) fn enable_free_ids(pager: &mut Pager) -> Result<()> {
+    if frees_ids(pager) {
+        return Ok(());
+    }
+    pager.enable_feature(FEATURE_FREE_IDS)?;
+    for space in Space::ALL {
+        pager.set_root(free_count_root(space), 0);
+    }
+    Ok(())
+}
 
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
 pub struct DiskDict {
@@ -71,12 +252,14 @@ pub struct DiskDict {
     id2entity: IvArray,
     id2literal: IvArray,
     id2predicate: IvArray,
-    /// The allocated term counts (the next id of each space, minus its first
-    /// id); raised by [`intern`](DiskTermSource::intern) once the term is in
-    /// the pages.
+    /// The allocated term counts (the high-water mark of each space, minus
+    /// its first id: holes included); set by [`intern`](DiskTermSource::intern)
+    /// and [`free`](DiskTermSource::free) once the pages hold the change.
     entity_count: AtomicUsize,
     literal_count: AtomicUsize,
     pred_count: AtomicUsize,
+    /// The free ids below each space's high-water mark (`FREE_COUNT_*`).
+    free_counts: [AtomicUsize; 3],
     terms: TermCache,
     keys: KeyCache,
     /// The public generation (see [`DiskTermSource::generation`]): bumped by
@@ -127,6 +310,7 @@ impl DiskDict {
             entity_count: AtomicUsize::new(entity_count),
             literal_count: AtomicUsize::new(literal_count),
             pred_count: AtomicUsize::new(pred_count),
+            free_counts: Default::default(),
             terms: TermCache::new(DEFAULT_TERM_CACHE_BYTES),
             keys: KeyCache::new(DEFAULT_KEY_CACHE_BYTES),
             generation: AtomicU64::new(0),
@@ -150,7 +334,7 @@ impl DiskDict {
     /// `pager` (e.g. [`DiskStore::shared_pager`](super::DiskStore::shared_pager)),
     /// with the term counts read from its header now.
     pub fn open_shared(pager: Arc<RwLock<Pager>>) -> Result<DiskDict> {
-        let counts = {
+        let (counts, free) = {
             let p = pager.read().unwrap_or_else(|e| e.into_inner());
             let dense = |slot: usize, what: &str| -> Result<usize> {
                 let n = p.root(slot);
@@ -162,13 +346,15 @@ impl DiskDict {
                 }
                 Ok(n as usize)
             };
-            (
+            let counts = (
                 dense(ROOT_ENTITY_COUNT, "entity")?,
                 dense(ROOT_LITERAL_COUNT, "literal")?,
                 dense(ROOT_PRED_COUNT, "predicate")?,
-            )
+            );
+            let free = Space::ALL.map(|s| space_roots(&p, s).1 as usize);
+            (counts, free)
         };
-        Ok(DiskDict::new(
+        let dd = DiskDict::new(
             pager,
             BTree::new(ENTITY2ID),
             BTree::new(LITERAL2ID),
@@ -179,7 +365,47 @@ impl DiskDict {
             counts.0,
             counts.1,
             counts.2,
-        ))
+        );
+        for (cell, n) in dd.free_counts.iter().zip(free) {
+            cell.store(n, Ordering::Release);
+        }
+        Ok(dd)
+    }
+
+    /// Set the free-id counts (a store building a backend over its pager
+    /// passes the header's).
+    pub(crate) fn with_free_counts(self, free: [usize; 3]) -> DiskDict {
+        for (cell, n) in self.free_counts.iter().zip(free) {
+            cell.store(n, Ordering::Release);
+        }
+        self
+    }
+
+    /// The index of `space` in per-space arrays.
+    fn space_index(space: Space) -> usize {
+        match space {
+            Space::Entity => 0,
+            Space::Literal => 1,
+            Space::Predicate => 2,
+        }
+    }
+
+    /// The number of free ids of `space` below its high-water mark.
+    pub fn free_count(&self, space: Space) -> usize {
+        self.free_counts[Self::space_index(space)].load(Ordering::Acquire)
+    }
+
+    /// The allocated count (high-water mark) of `space`.
+    fn allocated(&self, space: Space) -> usize {
+        self.count_cell(space).load(Ordering::Acquire)
+    }
+
+    /// Re-read `space`'s roots after a write (under the write guard).
+    fn reload_roots(&self, pager: &Pager, space: Space) {
+        let (alloc, free) = space_roots(pager, space);
+        self.count_cell(space)
+            .store(alloc as usize, Ordering::Release);
+        self.free_counts[Self::space_index(space)].store(free as usize, Ordering::Release);
     }
 
     /// Ask `check` before every term this backend writes, and refuse the
@@ -219,21 +445,27 @@ impl DiskDict {
         }
     }
 
-    /// The term counts as `(entities, literals, predicates)` — what a store
-    /// compares with its header to tell whether this backend is current.
+    /// The allocated counts (high-water marks) as `(entities, literals,
+    /// predicates)`.
     pub fn counts(&self) -> (usize, usize, usize) {
         (
-            self.count(Space::Entity),
-            self.count(Space::Literal),
-            self.count(Space::Predicate),
+            self.allocated(Space::Entity),
+            self.allocated(Space::Literal),
+            self.allocated(Space::Predicate),
         )
+    }
+
+    /// The allocated and free counts of every space — what a store compares
+    /// with its header to tell whether this backend is current.
+    pub fn header_state(&self) -> [(usize, usize); 3] {
+        Space::ALL.map(|s| (self.allocated(s), self.free_count(s)))
     }
 
     /// Write the new term `key` of `space` inside the caller's pager
     /// operation: checked again under the write lock (an existing key answers
-    /// its id and `false`), then the next id — the header's count root,
-    /// bounded by the space's `checked_*_id` — as `id2*`, `*2id` and the count
-    /// root. Returns `(id, new)`.
+    /// its id and `false`), then its id — the lowest free one, else the next
+    /// (see [`allocate_id`]) — as `id2*`, `*2id` and the roots. Returns
+    /// `(id, new)`.
     fn intern_in(&self, pager: &mut Pager, space: Space, key: &str) -> Result<(u32, bool)> {
         let tree = self.tree(space);
         let found = tree.get_with(pager, key.as_bytes(), |v| {
@@ -249,26 +481,12 @@ impl DiskDict {
             }
             None => {}
         }
-        let slot = count_root(space);
-        let next = pager.root(slot);
-        let id = match space {
-            Space::Entity => crate::dict::checked_entity_id(next)?,
-            Space::Literal => crate::dict::checked_literal_id(next)?,
-            Space::Predicate => crate::dict::checked_predicate_id(next)?,
-        };
-        if next >= ivarray::CAPACITY as u64 {
-            return Err(GStoreError::Database(format!(
-                "the on-disk {} dictionary is full ({} ids)",
-                space.name(),
-                ivarray::CAPACITY
-            )));
-        }
+        let id = allocate_id(pager, space)?;
         // The array key is the id relative to the space's first id (literal
         // ids are public ids, offset by LITERAL_FIRST_ID).
         self.array(space)
             .insert(pager, id - space.first_id(), key.as_bytes())?;
         tree.insert(pager, key.as_bytes(), &be32(id))?;
-        pager.set_root(slot, next + 1);
         Ok((id, true))
     }
 
@@ -281,10 +499,11 @@ impl DiskDict {
     }
 
     /// The `id2*` array of `space` and the array key of public id `id`
-    /// (`None` for an id outside the space's allocated range).
+    /// (`None` for an id outside the space's allocated range — bounded by
+    /// the high-water mark, not the live count: freed ids leave holes).
     fn slot(&self, space: Space, id: u32) -> Option<(&IvArray, u32)> {
         let key = id.checked_sub(space.first_id())?;
-        if key as usize >= self.count(space) {
+        if key as usize >= self.allocated(space) {
             return None;
         }
         Some((self.array(space), key))
@@ -415,6 +634,10 @@ impl DiskTermSource for DiskDict {
             match outcome {
                 Ok(r) => {
                     op.commit()?;
+                    if r.1 {
+                        // Visible to readers only now that the pages hold it.
+                        self.reload_roots(&guard, space);
+                    }
                     r
                 }
                 Err(e) => {
@@ -424,10 +647,6 @@ impl DiskTermSource for DiskDict {
             }
         };
         if new {
-            // Visible to readers only now that the pages hold it.
-            let index = (id - space.first_id()) as usize;
-            self.count_cell(space)
-                .fetch_max(index + 1, Ordering::AcqRel);
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
         self.fresh_keys();
@@ -435,6 +654,57 @@ impl DiskTermSource for DiskDict {
         self.fresh_terms();
         self.terms.insert(space, id, Arc::from(key));
         Ok(id)
+    }
+
+    /// Remove the term of `id` and free the id (see the module docs), as one
+    /// pager operation under the write lock; then the generation and the
+    /// caches' epoch move. `Ok(false)` when the file keeps no free list (a
+    /// pre-Phase-6 file: reclamation is off) or `id` names no term. A
+    /// read-only backend, or one whose store is broken, refuses.
+    fn free(&self, space: Space, id: u32) -> Result<bool> {
+        if !self.writable {
+            return Err(GStoreError::Database(format!(
+                "this out-of-core dictionary is read-only: cannot free a {} id",
+                space.name()
+            )));
+        }
+        if let Some(check) = &self.write_check {
+            check()?;
+        }
+        let freed = {
+            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+            if !frees_ids(&guard) {
+                return Ok(false);
+            }
+            let mut op = PagerOp::begin(&mut guard);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                free_term_in(&mut op, space, id, self.tree(space), self.array(space))
+            }))
+            .unwrap_or_else(|_| {
+                Err(GStoreError::Database(
+                    "freeing a dictionary id panicked and was rolled back".into(),
+                ))
+            });
+            match outcome {
+                Ok(freed) => {
+                    op.commit()?;
+                    if freed {
+                        self.reload_roots(&guard, space);
+                    }
+                    freed
+                }
+                Err(e) => {
+                    drop(op); // rolls the pages and the header back
+                    return Err(e);
+                }
+            }
+        };
+        if freed {
+            // An id and a key changed meaning: both caches are emptied.
+            self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(freed)
     }
 
     /// One cache probe per id; the misses are read run by run in id order
@@ -504,7 +774,7 @@ impl DiskTermSource for DiskDict {
         f: &mut dyn FnMut(u32, &str) -> ControlFlow<()>,
     ) -> Result<()> {
         let first = space.first_id();
-        let end = self.count(space) as u32;
+        let end = self.allocated(space) as u32;
         let start = from.saturating_sub(first);
         let Some((arr, _)) = self.slot(space, first + start) else {
             return Ok(());
@@ -516,12 +786,13 @@ impl DiskTermSource for DiskDict {
         })
     }
 
+    /// Live terms: the allocated ids minus the free ones.
     fn count(&self, space: Space) -> usize {
-        self.count_cell(space).load(Ordering::Acquire)
+        self.allocated(space).saturating_sub(self.free_count(space))
     }
 
     fn id_limit(&self, space: Space) -> u32 {
-        space.first_id() + self.count(space) as u32
+        space.first_id() + self.allocated(space) as u32
     }
 
     fn generation(&self) -> u64 {

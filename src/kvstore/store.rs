@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
-use crate::dict::{Dictionary, DiskTermSource};
+use crate::dict::{Dictionary, DiskTermSource, Space};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{is_literal_id, EntityLiteralId, PredId, LITERAL_FIRST_ID};
 use crate::model::{IdTriple, Term, Triple};
@@ -60,7 +60,7 @@ use crate::store::read_scope::ReadScope;
 use crate::store::{MutableStore, TripleSource, TripleStore};
 
 use super::bptree::{be32, BTree, LeafCursor};
-use super::disk_dict::DiskDict;
+use super::disk_dict::{self, DiskDict};
 use super::disk_triples::DiskSource;
 use super::format::{
     ENTITY2ID, GSPO, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, OSP, POS, PREDICATE2ID,
@@ -170,7 +170,7 @@ pub struct DiskStore {
     /// terms ever touched. Invalidated on any write (counts may have changed).
     /// A `Mutex` (not `RefCell`) so `DiskStore` stays `Sync` and many threads can
     /// share it via `Arc` and read concurrently.
-    disk_dict: Mutex<Option<Arc<DiskDict>>>,
+    disk_dict: Mutex<Option<(Arc<DiskDict>, u64)>>,
     /// A view created by [`from_shared_pager`](Self::from_shared_pager): every
     /// write (and commit) is refused.
     read_only: bool,
@@ -381,8 +381,32 @@ fn scan_keys(
 
 impl DiskStore {
     /// Open (or create) a disk store at `path` with a `cache_pages`-page cache.
+    ///
+    /// A store created here keeps a free-id list (feature `FREE_IDS`, a
+    /// version-2 file that binaries older than Phase 6 refuse) when the
+    /// process's id-reclamation policy is on
+    /// ([`default_id_reclaim`](crate::db::default_id_reclaim)); with it off
+    /// (`GSTORE_ID_RECLAIM=off`) it is a version-1 file, as before. An
+    /// existing file is never upgraded here.
     pub fn open<P: AsRef<Path>>(path: P, cache_pages: usize) -> Result<DiskStore> {
-        let pager = Pager::open(path, cache_pages)?;
+        let free_ids = crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate;
+        DiskStore::open_with(path, cache_pages, free_ids)
+    }
+
+    /// [`open`](Self::open), choosing whether a store *created* here keeps a
+    /// free-id list.
+    pub fn open_with<P: AsRef<Path>>(
+        path: P,
+        cache_pages: usize,
+        free_ids_if_new: bool,
+    ) -> Result<DiskStore> {
+        let path = path.as_ref();
+        let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0)
+            && !super::super::db::persist::wal_of(path).exists();
+        let mut pager = Pager::open(path, cache_pages)?;
+        if fresh && free_ids_if_new {
+            disk_dict::enable_free_ids(&mut pager)?;
+        }
         // A file written before the maintained statistics existed has triples but
         // no `pred_stats` array (its root slot is still zero). Detect that and
         // rebuild the stats once, so an old on-disk database still gets O(1)
@@ -608,23 +632,98 @@ impl DiskStore {
         Ok(())
     }
 
-    /// The term counts as the header holds them now. A Stream-mode
-    /// database interns terms through a writable [`DiskDict`] on this store's
-    /// pager (one operation each, which sets the count root), so the header,
-    /// not this struct, is authoritative for them: every use takes the
-    /// larger of the two (counts only grow; R4's free list keeps the
-    /// allocated limit).
+    /// The term counts (each space's high-water mark: freed holes included)
+    /// as the header holds them now. A Stream-mode database interns and
+    /// frees terms through a writable [`DiskDict`] on this store's pager (one
+    /// operation each, which sets the count roots), and every intern of this
+    /// store sets them too, so the header, not this struct, is authoritative:
+    /// with a free list a count can also go down (the trim of the highest
+    /// ids).
     fn header_term_counts(&self, pager: &Pager) -> (u32, u32, u32) {
-        let root = |slot: usize, mine: u32| -> u32 {
-            u32::try_from(pager.root(slot))
-                .unwrap_or(u32::MAX)
-                .max(mine)
-        };
+        let root = |slot: usize| -> u32 { u32::try_from(pager.root(slot)).unwrap_or(u32::MAX) };
         (
-            root(ROOT_ENTITY_COUNT, self.entity_count),
-            root(ROOT_LITERAL_COUNT, self.literal_count),
-            root(ROOT_PRED_COUNT, self.pred_count),
+            root(ROOT_ENTITY_COUNT),
+            root(ROOT_LITERAL_COUNT),
+            root(ROOT_PRED_COUNT),
         )
+    }
+
+    /// Whether this file keeps a free-id list (feature `FREE_IDS`): ids of
+    /// deleted terms are freed and reused only then. New databases start with
+    /// it; a pre-Phase-6 file gets it from [`enable_reclaim`](Self::enable_reclaim).
+    pub fn frees_ids(&self) -> bool {
+        disk_dict::frees_ids(&self.read_pager())
+    }
+
+    /// Turn on id reclamation for this file (`gcompact --enable-reclaim`):
+    /// sets the `FREE_IDS` feature bit and `MAGIC_V2`, written by the next
+    /// [`flush`](Self::flush). Binaries older than Phase 6 refuse the file
+    /// from then on ("not a gStore KV file"). A no-op if it is on already.
+    pub fn enable_reclaim(&mut self) -> Result<()> {
+        self.check_writable()?;
+        let mut pager = self.pager.write().unwrap_or_else(|e| e.into_inner());
+        disk_dict::enable_free_ids(&mut pager)
+    }
+
+    /// The free ids of each space `[entity, literal, predicate]` (all 0
+    /// without the `FREE_IDS` feature).
+    pub fn free_counts(&self) -> [u64; 3] {
+        let pager = self.read_pager();
+        Space::ALL.map(|s| disk_dict::space_roots(&pager, s).1)
+    }
+
+    /// Each space's high-water mark `[entity, literal, predicate]`: one past
+    /// the highest index allocated (holes included; a literal's index is its
+    /// id minus `LITERAL_FIRST_ID`).
+    pub fn term_limits(&self) -> [u64; 3] {
+        let (e, l, p) = self.term_counts();
+        [u64::from(e), u64::from(l), u64::from(p)]
+    }
+
+    /// Remove the term `key` of `space` and free its id, as one atomic
+    /// operation — the Materialize-mode write-through of a reclaimed term.
+    /// `Ok(false)`, writing nothing, without the `FREE_IDS` feature, for an
+    /// unknown key, or when this store still references the term (the working
+    /// set decided it is unused; the store keeps it rather than corrupt
+    /// itself).
+    pub fn free_key(&mut self, space: Space, key: &str) -> Result<bool> {
+        if !self.frees_ids() {
+            return Ok(false);
+        }
+        self.write_op(|st, pg| {
+            let tree = match space {
+                Space::Entity => &st.entity2id,
+                Space::Literal => &st.literal2id,
+                Space::Predicate => &st.predicate2id,
+            };
+            let Some(id) = lookup_id(tree, pg, key.as_bytes())? else {
+                return Ok(false);
+            };
+            let referenced = match space {
+                Space::Predicate => st.pos.prefix_exists(pg, &be32(id))?,
+                _ => {
+                    st.spo.prefix_exists(pg, &be32(id))?
+                        || st.osp.prefix_exists(pg, &be32(id))?
+                        || st.gspo.prefix_exists(pg, &be32(id))?
+                }
+            };
+            if referenced {
+                return Ok(false);
+            }
+            let arr = match space {
+                Space::Entity => st.id2entity,
+                Space::Literal => st.id2literal,
+                Space::Predicate => st.id2predicate,
+            };
+            let tree = match space {
+                Space::Entity => st.entity2id,
+                Space::Literal => st.literal2id,
+                Space::Predicate => st.predicate2id,
+            };
+            let freed = disk_dict::free_term_in(pg, space, id, &tree, &arr)?;
+            st.sync_term_counts(pg);
+            Ok(freed)
+        })
     }
 
     /// Catch this struct's term counters up with the header (see
@@ -729,47 +828,42 @@ impl DiskStore {
         }
     }
 
-    fn intern_entity_in(&mut self, pager: &mut Pager, key: &str) -> Result<EntityLiteralId> {
-        if let Some(id) = lookup_id(&self.entity2id, pager, key.as_bytes())? {
+    /// Intern `key` in `space` inside the caller's operation: an existing
+    /// key answers its id; a new one takes the lowest free id (with the
+    /// `FREE_IDS` feature) or the next one — bounded like the in-memory
+    /// dictionary, so an entity id never spills into the literal range — and
+    /// is written to `*2id` and `id2*` (keyed by the id relative to the
+    /// space's first id, so the literal array stays compact from 0).
+    fn intern_in(&mut self, pager: &mut Pager, space: Space, key: &str) -> Result<u32> {
+        let (tree, arr) = match space {
+            Space::Entity => (self.entity2id, self.id2entity),
+            Space::Literal => (self.literal2id, self.id2literal),
+            Space::Predicate => (self.predicate2id, self.id2predicate),
+        };
+        if let Some(id) = lookup_id(&tree, pager, key.as_bytes())? {
             return Ok(id);
         }
-        // Bounded like the in-memory dictionary: an entity id must never spill
-        // into the literal range [LITERAL_FIRST_ID, ..).
-        let id = crate::dict::checked_entity_id(u64::from(self.entity_count))?;
-        self.entity2id.insert(pager, key.as_bytes(), &be32(id))?;
-        // id2entity is integer-keyed by the dense entity id.
-        self.id2entity.insert(pager, id, key.as_bytes())?;
-        self.entity_count += 1;
-        pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
+        // The counters of this struct catch up with the header first (a
+        // shared dictionary may have interned or freed since), so the
+        // allocation below starts from the header's state.
+        self.sync_term_counts(pager);
+        let id = disk_dict::allocate_id(pager, space)?;
+        tree.insert(pager, key.as_bytes(), &be32(id))?;
+        arr.insert(pager, id - space.first_id(), key.as_bytes())?;
+        self.sync_term_counts(pager);
         Ok(id)
+    }
+
+    fn intern_entity_in(&mut self, pager: &mut Pager, key: &str) -> Result<EntityLiteralId> {
+        self.intern_in(pager, Space::Entity, key)
     }
 
     fn intern_literal_in(&mut self, pager: &mut Pager, key: &str) -> Result<EntityLiteralId> {
-        if let Some(id) = lookup_id(&self.literal2id, pager, key.as_bytes())? {
-            return Ok(id);
-        }
-        let id = crate::dict::checked_literal_id(u64::from(self.literal_count))?;
-        self.literal2id.insert(pager, key.as_bytes(), &be32(id))?;
-        // id2literal is integer-keyed by the *local* literal index (id minus the
-        // LITERAL_FIRST_ID offset) so the dense array stays compact from 0.
-        self.id2literal
-            .insert(pager, id - LITERAL_FIRST_ID, key.as_bytes())?;
-        self.literal_count += 1;
-        pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
-        Ok(id)
+        self.intern_in(pager, Space::Literal, key)
     }
 
     fn intern_predicate_in(&mut self, pager: &mut Pager, key: &str) -> Result<PredId> {
-        if let Some(id) = lookup_id(&self.predicate2id, pager, key.as_bytes())? {
-            return Ok(id);
-        }
-        let id = crate::dict::checked_predicate_id(u64::from(self.pred_count))?;
-        self.predicate2id.insert(pager, key.as_bytes(), &be32(id))?;
-        // id2predicate is integer-keyed by the dense predicate id.
-        self.id2predicate.insert(pager, id, key.as_bytes())?;
-        self.pred_count += 1;
-        pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
-        Ok(id)
+        self.intern_in(pager, Space::Predicate, key)
     }
 
     /// Intern an object key in the literal or the entity space.
@@ -1184,12 +1278,9 @@ impl DiskStore {
         let shared = Arc::clone(&self.pager);
         let mut guard = shared.write().unwrap();
         let pager = &mut *guard;
-        // Never write back term counts lower than a shared dictionary's.
+        // The term counts are the header's (every intern and free sets them).
         self.sync_term_counts(pager);
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
-        pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
-        pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
-        pager.set_root(ROOT_PRED_COUNT, self.pred_count as u64);
         pager.set_root(ROOT_DISTINCT_SUBJ, self.distinct_subj as u64);
         pager.set_root(ROOT_DISTINCT_OBJ, self.distinct_obj as u64);
         pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
@@ -1202,17 +1293,23 @@ impl DiskStore {
     pub fn triple_count(&self) -> u64 {
         self.triple_count
     }
-    /// Interned entities (terms a shared [`DiskDict`] interned included).
+    /// Live entities: the ids allocated minus the free ones (terms a shared
+    /// [`DiskDict`] interned or freed included).
     pub fn entity_num(&self) -> usize {
-        self.term_counts().0 as usize
+        self.live_terms(Space::Entity)
     }
-    /// Interned literals (see [`entity_num`](Self::entity_num)).
+    /// Live literals (see [`entity_num`](Self::entity_num)).
     pub fn literal_num(&self) -> usize {
-        self.term_counts().1 as usize
+        self.live_terms(Space::Literal)
     }
-    /// Interned predicates (see [`entity_num`](Self::entity_num)).
+    /// Live predicates (see [`entity_num`](Self::entity_num)).
     pub fn predicate_num(&self) -> usize {
-        self.term_counts().2 as usize
+        self.live_terms(Space::Predicate)
+    }
+
+    fn live_terms(&self, space: Space) -> usize {
+        let (alloc, free) = disk_dict::space_roots(&self.read_pager(), space);
+        alloc.saturating_sub(free) as usize
     }
 
     // ---- degree / cardinality statistics (gStore KVstore degree APIs) -----
@@ -1975,6 +2072,24 @@ impl DiskStore {
         self.pager.read().unwrap().page_count()
     }
 
+    /// Test aid: set the header's term counts (and this struct's), e.g. to
+    /// pretend a space is full. Not flushed by itself.
+    #[cfg(test)]
+    fn set_term_counts_for_test(&mut self, e: Option<u32>, l: Option<u32>, p: Option<u32>) {
+        let shared = Arc::clone(&self.pager);
+        let mut pager = shared.write().unwrap();
+        for (slot, v) in [
+            (ROOT_ENTITY_COUNT, e),
+            (ROOT_LITERAL_COUNT, l),
+            (ROOT_PRED_COUNT, p),
+        ] {
+            if let Some(v) = v {
+                pager.set_root(slot, u64::from(v));
+            }
+        }
+        self.sync_term_counts(&pager);
+    }
+
     /// Logical (delta+varint) byte length of the stored VList value for `(s, p)`
     /// in the compressed index, or `None` if absent (not compacted / empty
     /// group). This is the encoded payload size whether the value is stored
@@ -2013,19 +2128,14 @@ impl DiskStore {
     /// line up with the on-disk triple indexes). One sequential pass over each
     /// `id2*` array (a directory page serves 32 ids).
     pub fn dictionary(&self) -> Result<Dictionary> {
-        let mut dict = Dictionary::new();
         let pager = self.pager.read().unwrap();
         let (entities, literals, preds) = self.header_term_counts(&pager);
-        load_terms(&self.id2entity, &pager, entities, |s| {
-            dict.try_intern_entity(s)
-        })?;
-        load_terms(&self.id2literal, &pager, literals, |s| {
-            dict.try_intern_literal(s)
-        })?;
-        load_terms(&self.id2predicate, &pager, preds, |s| {
-            dict.try_intern_predicate(s)
-        })?;
-        Ok(dict)
+        // Every id keeps its value: a freed id is a hole (free again in the
+        // dictionary), so the terms line up with the triple indexes.
+        let ent = load_slots(&self.id2entity, &pager, entities)?;
+        let lit = load_slots(&self.id2literal, &pager, literals)?;
+        let pred = load_slots(&self.id2predicate, &pager, preds)?;
+        Dictionary::from_slots(ent, lit, pred)
     }
 
     /// Get (building once, then reusing) the out-of-core, read-only
@@ -2037,26 +2147,43 @@ impl DiskStore {
     /// [`generation`](DiskTermSource::generation) — moves the header's count
     /// root, and the backend is rebuilt.
     fn disk_backing(&self) -> Arc<DiskDict> {
-        let (entities, literals, preds) = self.term_counts();
+        let (state, generation, frees) = {
+            let pager = self.read_pager();
+            (
+                Space::ALL.map(|s| {
+                    let (a, f) = disk_dict::space_roots(&pager, s);
+                    (a as usize, f as usize)
+                }),
+                pager.write_generation(),
+                disk_dict::frees_ids(&pager),
+            )
+        };
         let mut cached = self.disk_dict.lock().unwrap();
-        if let Some(d) = cached.as_ref() {
-            if d.counts() == (entities as usize, literals as usize, preds as usize) {
+        if let Some((d, g)) = cached.as_ref() {
+            // Current while the counts are the header's — ids only get added
+            // then — and, on a file whose ids are freed and reused (where a
+            // free and a reuse can leave the counts as they were), while no
+            // page changed since it was built.
+            if d.header_state() == state && (!frees || *g == generation) {
                 return Arc::clone(d);
             }
         }
-        let d = Arc::new(DiskDict::new(
-            Arc::clone(&self.pager),
-            self.entity2id,
-            self.literal2id,
-            self.predicate2id,
-            self.id2entity,
-            self.id2literal,
-            self.id2predicate,
-            entities as usize,
-            literals as usize,
-            preds as usize,
-        ));
-        *cached = Some(Arc::clone(&d));
+        let d = Arc::new(
+            DiskDict::new(
+                Arc::clone(&self.pager),
+                self.entity2id,
+                self.literal2id,
+                self.predicate2id,
+                self.id2entity,
+                self.id2literal,
+                self.id2predicate,
+                state[0].0,
+                state[1].0,
+                state[2].0,
+            )
+            .with_free_counts(state.map(|s| s.1)),
+        );
+        *cached = Some((Arc::clone(&d), generation));
         d
     }
 
@@ -2077,7 +2204,7 @@ impl DiskStore {
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(0, |d| d.resident_string_count())
+            .map_or(0, |(d, _)| d.resident_string_count())
     }
 
     /// Answer a SPARQL read query (SELECT/ASK/CONSTRUCT/DESCRIBE) by *streaming*
@@ -2345,23 +2472,16 @@ fn with_hint<T>(hint: u64) -> Vec<T> {
     v
 }
 
-fn load_terms(
-    arr: &IvArray,
-    pager: &Pager,
-    n: u32,
-    mut intern: impl FnMut(&str) -> Result<u32>,
-) -> Result<()> {
-    let mut failed = None;
-    arr.for_each_range(pager, 0, n, |_, b| {
-        match intern(&String::from_utf8_lossy(b)) {
-            Ok(_) => ControlFlow::Continue(()),
-            Err(e) => {
-                failed = Some(e);
-                ControlFlow::Break(())
-            }
-        }
+/// The strings of `arr`'s keys `0..n`, by key (`None` for an empty slot).
+fn load_slots(arr: &IvArray, pager: &Pager, n: u32) -> Result<Vec<Option<String>>> {
+    let mut out: Vec<Option<String>> = Vec::new();
+    let _ = out.try_reserve_exact(n as usize);
+    arr.for_each_range(pager, 0, n, |k, b| {
+        out.resize(k as usize, None);
+        out.push(Some(String::from_utf8_lossy(b).into_owned()));
+        ControlFlow::Continue(())
     })?;
-    failed.map_or(Ok(()), Err)
+    Ok(out)
 }
 
 /// Decode a `(num, distinct_subj, distinct_obj)` stats record.
@@ -3394,9 +3514,11 @@ mod tests {
         let mut ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
         // Pretend each space is full: a *new* term must be refused (before
         // anything is written), while already-interned terms still resolve.
-        ds.entity_count = ENTITY_ID_LIMIT;
-        ds.literal_count = LITERAL_INDEX_LIMIT;
-        ds.pred_count = PREDICATE_ID_LIMIT;
+        ds.set_term_counts_for_test(
+            Some(ENTITY_ID_LIMIT),
+            Some(LITERAL_INDEX_LIMIT),
+            Some(PREDICATE_ID_LIMIT),
+        );
         let e = ds.intern_entity("<brand-new>").unwrap_err().to_string();
         assert!(e.contains("entity id space exhausted"), "{e}");
         let e = ds.intern_literal("\"brand-new\"").unwrap_err().to_string();
@@ -3829,11 +3951,11 @@ mod tests {
         let pages = ds.page_count_for_test();
         // The predicate space is full, so the insert fails *after* interning
         // its new subject: the whole operation is rolled back.
-        ds.pred_count = crate::dict::PREDICATE_ID_LIMIT;
+        ds.set_term_counts_for_test(None, None, Some(crate::dict::PREDICATE_ID_LIMIT));
         assert!(ds
             .insert_keys("<brand-new>", "<rel>", "<x>", false)
             .is_err());
-        ds.pred_count = preds as u32;
+        ds.set_term_counts_for_test(None, None, Some(preds as u32));
         assert_eq!(ds.entity_num(), ents, "the subject term was rolled back");
         assert_eq!(ds.term_id(&Term::iri("brand-new")).unwrap(), None);
         assert_eq!(ds.page_count_for_test(), pages);
@@ -4148,12 +4270,88 @@ mod tests {
 
     #[test]
     fn a_store_written_by_this_build_keeps_the_v1_header() {
+        // Without a free-id list (reclamation off when it was created) the
+        // header is a pre-Phase-6 one, byte for byte.
         let path = tmp("v1_header");
-        let ds = DiskStore::build_str(&path, 64, SMALL).unwrap();
+        let mut ds = DiskStore::open_with(&path, 64, false).unwrap();
+        ds.insert_keys("<a>", "<p>", "\"x\"", true).unwrap();
+        ds.flush().unwrap();
         drop(ds);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[0..8], super::super::format::MAGIC_V1);
         assert!(bytes[16 + 24 * 8..PAGE_SIZE].iter().all(|&b| b == 0));
+        cleanup(&path);
+    }
+
+    // ---- Phase 6 R4: the free-id list ---------------------------------------
+
+    #[test]
+    fn a_new_store_keeps_a_free_list_and_v2_header() {
+        use super::super::format::{FEATURES, FEATURE_FREE_IDS, MAGIC_V2};
+        let path = tmp("v2_header");
+        let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+        assert!(ds.frees_ids());
+        ds.insert_keys("<a>", "<p>", "\"x\"", true).unwrap();
+        ds.flush().unwrap();
+        drop(ds);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..8], MAGIC_V2);
+        let off = 16 + FEATURES * 8;
+        assert_eq!(&bytes[off..off + 8], &FEATURE_FREE_IDS.to_le_bytes());
+        // Reopened: still on; an existing V1 file is never upgraded by open.
+        assert!(DiskStore::open(&path, 64).unwrap().frees_ids());
+        cleanup(&path);
+        let v1 = tmp("v1_stays");
+        drop(DiskStore::open_with(&v1, 64, false).unwrap());
+        assert!(!DiskStore::open_with(&v1, 64, true).unwrap().frees_ids());
+        cleanup(&v1);
+    }
+
+    #[test]
+    fn free_key_reuses_lowest_first_and_trims() {
+        let path = tmp("free_key");
+        let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+        for i in 0..5 {
+            ds.insert_keys(&format!("<s{i}>"), "<p>", &format!("<o{i}>"), false)
+                .unwrap();
+        }
+        // Entities: s0=0 o0=1 s1=2 o1=3 ... s4=8 o4=9.
+        assert_eq!(ds.term_limits()[0], 10);
+        // A referenced term is kept.
+        assert!(!ds.free_key(Space::Entity, "<s1>").unwrap());
+        ds.delete_keys("<s1>", "<p>", "<o1>", false).unwrap();
+        ds.delete_keys("<s4>", "<p>", "<o4>", false).unwrap();
+        assert!(ds.free_key(Space::Entity, "<o1>").unwrap());
+        assert!(ds.free_key(Space::Entity, "<s1>").unwrap());
+        assert_eq!(ds.free_counts(), [2, 0, 0]);
+        assert_eq!(ds.entity_num(), 8);
+        // Freeing the two highest ids trims them instead.
+        assert!(ds.free_key(Space::Entity, "<o4>").unwrap());
+        assert!(ds.free_key(Space::Entity, "<s4>").unwrap());
+        assert_eq!(ds.term_limits()[0], 8);
+        assert_eq!(ds.free_counts(), [2, 0, 0]);
+        assert!(!ds.free_key(Space::Entity, "<s4>").unwrap(), "gone");
+        // New terms take 2, then 3, then extend.
+        ds.insert_keys("<n0>", "<p>", "<n1>", false).unwrap();
+        assert_eq!(ds.term_id(&Term::iri("n0")).unwrap(), Some(2));
+        assert_eq!(ds.term_id(&Term::iri("n1")).unwrap(), Some(3));
+        ds.insert_keys("<n2>", "<p>", "<n3>", false).unwrap();
+        assert_eq!(ds.term_id(&Term::iri("n2")).unwrap(), Some(8));
+        assert_eq!(ds.free_counts(), [0, 0, 0]);
+        // The dictionary keeps ids with holes and survives a reopen.
+        ds.delete_keys("<s0>", "<p>", "<o0>", false).unwrap();
+        assert!(ds.free_key(Space::Entity, "<o0>").unwrap());
+        ds.flush().unwrap();
+        drop(ds);
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.free_counts(), [1, 0, 0]);
+        let dict = ds.dictionary().unwrap();
+        assert_eq!(dict.entity_id("<o0>"), None);
+        assert_eq!(dict.entity_id("<n2>"), Some(8));
+        assert_eq!(dict.entity_num(), ds.entity_num());
+        let lazy = ds.lazy_dictionary();
+        assert_eq!(lazy.term(1), None, "a hole resolves to nothing");
+        assert_eq!(lazy.entity_num(), ds.entity_num());
         cleanup(&path);
     }
 }

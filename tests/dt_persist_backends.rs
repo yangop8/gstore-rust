@@ -1051,8 +1051,13 @@ mod rocks {
         let dir = tmp("rocks_reclaim");
         {
             let mut db = rocks_db(&dir);
+            // The explicit pass (immediate reclamation would free at the delete).
+            db.set_id_reclaim(gstore::db::IdReclaim::Off);
             db.remove_triple(&triple("b", "p", "c"));
-            assert!(db.reclaim_unused() > 0, "<c> is no longer referenced");
+            assert!(
+                db.reclaim_unused().unwrap() > 0,
+                "<c> is no longer referenced"
+            );
             // A new term reuses the freed id.
             db.insert_triple(&triple("reuse", "p", "fresh"));
             db.save(&dir).unwrap();

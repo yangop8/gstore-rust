@@ -22,10 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::csr::{CsrCache, CsrGraph};
-use crate::dict::{Dictionary, TermStr};
+use crate::dict::{Dictionary, TermId, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
-use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
+use crate::model::id::{is_entity_id, EntityLiteralId};
 use crate::model::term::export_key;
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::import;
@@ -62,14 +62,19 @@ pub use persist::StorageKind;
 #[cfg(test)]
 mod hardening_tests;
 mod load_policy;
+pub mod named;
+pub mod reclaim;
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
 mod stream_review_tests;
 pub use load_policy::{LoadPolicy, LoadSource};
 mod query_cache;
+use named::NamedGraphs;
 use query_cache::QueryCache;
 pub use query_cache::DEFAULT_QUERY_CACHE_BYTES;
+use reclaim::Candidates;
+pub use reclaim::{default_id_reclaim, set_default_id_reclaim, IdReclaim, ENV_ID_RECLAIM};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -232,13 +237,23 @@ struct Meta {
 }
 
 /// One pending/serialized redo-log record: an applied mutation in surface form.
-/// `op` is `b'I'` (insert) or `b'D'` (delete); `graph` is the named-graph IRI
-/// (`None` ⇒ default graph); `triple` is the N-Triples `s p o .` text.
+/// `op` is `b'I'` (insert), `b'D'` (delete), `b'C'` (clear the graph:
+/// `DEFAULT` without a graph, else the named graph) or `b'N'` (clear every
+/// named graph); `graph` is the named-graph IRI (`None` ⇒ default graph);
+/// `triple` is the N-Triples `s p o .` text (empty for the clears).
 #[derive(Debug, Clone)]
 struct RedoRec {
     op: u8,
     graph: Option<String>,
     triple: String,
+}
+
+/// What a `CLEAR` redo record clears (see [`RedoRec`]).
+#[derive(Debug, Clone, Copy)]
+enum RedoClear {
+    Default,
+    Named(u32),
+    AllNamed,
 }
 
 /// An RDF database: a dictionary, the six-way triple index, and a VS-tree.
@@ -255,7 +270,7 @@ pub struct Database {
     /// Named graphs: graph-IRI entity id → its triple store. The default graph
     /// is `store`; `GRAPH` patterns and quad updates target this map. Named
     /// graphs stay in-memory (DESIGN §"Phase 2").
-    named: BTreeMap<u32, TripleStore>,
+    named: NamedGraphs,
     /// Signature index for query-time candidate pruning.
     vstree: VsTree,
     /// Whether `vstree` is consistent with `store`. Cleared on update; the
@@ -351,6 +366,14 @@ pub struct Database {
     /// Default-graph deletes applied since the VS-tree was last built, while
     /// it stayed valid (see [`vs_shrink_debt`](Self::vs_shrink_debt)).
     vs_shrink_debt: u64,
+    /// When deleted terms' ids are freed (see the `reclaim` module).
+    id_reclaim: IdReclaim,
+    /// Reclamation candidates of the running statement, or of the open
+    /// transaction (freed at its commit).
+    reclaim: Candidates,
+    /// Stream mode: candidates whose free waits for the dictionary's pins
+    /// (a clone sharing the on-disk dictionary is alive).
+    reclaim_deferred: Vec<TermId>,
     /// The per-predicate CSR of the default graph used by the advanced graph
     /// functions (upstream `GeneralEvaluation::csr`), built lazily and keyed
     /// by [`mutations`](Self::mutations) so any data change invalidates it
@@ -501,7 +524,7 @@ impl Database {
             name: name.into(),
             dict: Dictionary::new(),
             store: Backend::Memory(TripleStore::new()),
-            named: BTreeMap::new(),
+            named: NamedGraphs::new(),
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
@@ -526,6 +549,9 @@ impl Database {
             load_policy: LoadPolicy::default(),
             mutations: 0,
             vs_shrink_debt: 0,
+            id_reclaim: reclaim::default_id_reclaim(),
+            reclaim: Candidates::default(),
+            reclaim_deferred: Vec::new(),
             csr_cache: CsrCache::new(),
             string_index: StringIndexCache::default(),
             #[cfg(feature = "rocksdb")]
@@ -1026,9 +1052,12 @@ impl Database {
                         *applied += 1;
                     }
                     if let Some(e) = scope.take_error() {
+                        self.flush_reclaim();
                         return Err(read_failure("removing statements", e));
                     }
                 }
+                // Each batch frees the ids it left unreferenced.
+                self.flush_reclaim();
                 self.check_store_readable()
             },
         )
@@ -1231,17 +1260,26 @@ impl Database {
     fn vstree_index_insert(&mut self, id: IdTriple) {
         let mut out = Signature::new();
         out.encode_edge(id.pred, id.obj, EdgeDir::Out);
-        if !self.vstree.union_into(id.sub, &out) {
+        // An entity whose first edge this is — new, or a reclaimed id reused
+        // for a new term — gets its exact signature: the tree may still hold
+        // the stale entry of the term its id named before.
+        if self.is_first_edge(id.sub) || !self.vstree.union_into(id.sub, &out) {
             self.upsert_entity_signature(id.sub);
         }
         // Literal objects are not VS-tree entities (see `build_vstree`).
         if is_entity_id(id.obj) {
             let mut inc = Signature::new();
             inc.encode_edge(id.pred, id.sub, EdgeDir::In);
-            if !self.vstree.union_into(id.obj, &inc) {
+            if self.is_first_edge(id.obj) || !self.vstree.union_into(id.obj, &inc) {
                 self.upsert_entity_signature(id.obj);
             }
         }
+    }
+
+    /// Whether entity `e` has exactly one edge in the default graph (O(1)
+    /// on the in-memory store, the only one whose tree is updated in place).
+    fn is_first_edge(&self, e: u32) -> bool {
+        self.store.count_po_by_s(e) + self.store.count_ps_by_o(e) == 1
     }
 
     /// Recompute entity `e`'s full signature from its current in/out edges and
@@ -1265,6 +1303,15 @@ impl Database {
     /// Remove one triple. Returns `true` if it existed. Does not intern: if any
     /// term is unknown, the triple cannot exist.
     pub fn remove_triple(&mut self, t: &Triple) -> bool {
+        let removed = self.remove_triple_quiet(t);
+        // Outside a transaction, a delete frees the ids it left unreferenced.
+        self.flush_reclaim();
+        removed
+    }
+
+    /// [`remove_triple`](Self::remove_triple) without the reclamation at its
+    /// end (the statement that calls it reclaims once, when it is done).
+    fn remove_triple_quiet(&mut self, t: &Triple) -> bool {
         let (Some(sub), Some(pred), Some(obj)) = (
             self.dict.entity_id(&t.subject.dict_key()),
             self.dict.predicate_id(&t.predicate.dict_key()),
@@ -1317,6 +1364,7 @@ impl Database {
             }
             self.record_redo(b'D', None, id);
             self.persist_mutation(false, None, id);
+            self.note_removed(None, id);
         }
         changed
     }
@@ -1346,6 +1394,11 @@ impl Database {
             dt.begin()?;
         }
         self.txn = Some(Vec::new());
+        // The terms this transaction interns new are freed again if it rolls
+        // back (see the `reclaim` module).
+        if self.id_reclaim == IdReclaim::Immediate {
+            self.dict.track_allocations(true);
+        }
         Ok(())
     }
 
@@ -1375,15 +1428,26 @@ impl Database {
                 self.redo_pending.clear();
                 self.query_cache_mut().clear();
                 self.csr_cache.clear();
+                self.dict.track_allocations(false);
+                self.reclaim.clear();
                 self.run_deferred_rebuild();
                 return Err(e);
             }
         }
         self.txn = None;
+        self.dict.track_allocations(false);
         self.disk_commit_pending();
         let redo = self.flush_redo();
-        // RocksDB: deleting the undo journal is what commits the transaction.
-        let journal = self.rocks_commit_journal();
+        // The transaction's frees, as one batch, after its writes and redo
+        // records: the ids its deletes left unreferenced in the committed
+        // state.
+        let dead = self.committed_dead();
+        // RocksDB: deleting the undo journal is what commits the transaction;
+        // the freed terms leave the `dict` CF in the same atomic batch.
+        let journal = self.rocks_commit_journal_with(&dead);
+        if journal.is_ok() {
+            self.free_dead(dead, true);
+        }
         let point = self.commit_point();
         self.run_deferred_rebuild();
         redo.and(journal).and(point)
@@ -1395,6 +1459,11 @@ impl Database {
         let Some(log) = self.txn.take() else {
             return Err(GStoreError::Database("no active transaction".into()));
         };
+        // Its deletes are undone (nothing to free); the terms it minted are
+        // freed once its inserts are gone.
+        let minted = self.dict.take_allocations();
+        self.dict.track_allocations(false);
+        self.reclaim.clear();
         // The transaction's mutations are being undone, so its buffered redo
         // records must never reach the log, nor its queued write-through the
         // on-disk store (which never saw them).
@@ -1428,15 +1497,14 @@ impl Database {
                     }
                 }
                 UndoOp::Add(Some(gid), id) => {
-                    if self.named.entry(gid).or_default().insert(id) && !journaled {
+                    if self.named.insert(gid, id) && !journaled {
                         self.persist_named_quad(true, gid, id);
                     }
                 }
                 UndoOp::Del(Some(gid), id) => {
-                    if self.named.get_mut(&gid).is_some_and(|s| s.remove(id)) && !journaled {
+                    if self.named.remove(gid, id) && !journaled {
                         self.persist_named_quad(false, gid, id);
                     }
-                    self.drop_if_empty(gid);
                 }
             }
         }
@@ -1455,6 +1523,12 @@ impl Database {
             }
         }
         self.touched();
+        if replayed.is_ok() && self.id_reclaim == IdReclaim::Immediate {
+            for t in minted {
+                self.reclaim.note(t);
+            }
+            self.flush_reclaim();
+        }
         self.run_deferred_rebuild();
         replayed
     }
@@ -1497,7 +1571,7 @@ impl Database {
         if present || !self.persist_named_quad(true, gid, id) {
             return Ok(None);
         }
-        self.named.entry(gid).or_default().insert(id);
+        self.named.insert(gid, id);
         self.touched();
         if let Some(log) = self.txn.as_mut() {
             log.push(UndoOp::Del(Some(gid), id));
@@ -1511,7 +1585,7 @@ impl Database {
     /// `true` if it existed.
     fn delete_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
         let Some(g) = graph else {
-            return self.remove_triple(t);
+            return self.remove_triple_quiet(t);
         };
         let (Some(gid), Some(sub), Some(pred), Some(obj)) = (
             self.dict.entity_id(&Term::iri(g).dict_key()),
@@ -1534,26 +1608,17 @@ impl Database {
         if !present || !self.persist_named_quad(false, gid, id) {
             return false;
         }
-        if let Some(s) = self.named.get_mut(&gid) {
-            s.remove(id);
-        }
-        self.drop_if_empty(gid);
+        // An emptied graph is dropped: this store keeps no empty named
+        // graphs (`GRAPH ?g` never finds one, and none survives a reopen).
+        self.named.remove(gid, id);
         self.touched();
         if let Some(log) = self.txn.as_mut() {
             log.push(UndoOp::Add(Some(gid), id));
         }
         self.record_redo(b'D', Some(gid), id);
         self.persist_mutation(false, Some(gid), id);
+        self.note_removed(Some(gid), id);
         true
-    }
-
-    /// Forget named graph `gid` once it holds no statement: this store keeps
-    /// no empty named graphs (`GRAPH ?g` never finds one, and none survives
-    /// a reopen).
-    fn drop_if_empty(&mut self, gid: u32) {
-        if self.named.get(&gid).is_some_and(|s| s.triple_count() == 0) {
-            self.named.remove(&gid);
-        }
     }
 
     /// Apply `INSERT DATA`. Returns the number of triples newly added. A triple
@@ -1584,10 +1649,12 @@ impl Database {
 
     /// Apply `DELETE DATA`. Returns the number of triples actually removed.
     pub fn delete_data(&mut self, triples: &[GroundTriple]) -> usize {
-        triples
+        let n = triples
             .iter()
             .filter(|g| self.delete_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
-            .count()
+            .count();
+        self.flush_reclaim();
+        n
     }
 
     /// Materialize the RDFS closure over the current data (gStore `src/Reason`):
@@ -1850,6 +1917,10 @@ impl Database {
                 None => applied.and_then(|n| self.check_store_readable().map(|()| n)),
             };
             drop(scope);
+            // The ids the operation's deletes left unreferenced are freed
+            // after its redo records and write-through (deferred to the
+            // commit inside a transaction) — also when it failed part-way.
+            self.flush_reclaim();
             match applied {
                 Ok(n) => changed += n,
                 Err(e) => return Err(self.failed_update(e, before)),
@@ -2094,12 +2165,16 @@ impl Database {
                 // Persistent backend: delete every triple through the seam so the
                 // change is durable (don't swap in a Memory store, which would
                 // strand the data on disk).
-                for t in removed {
+                for &t in &removed {
                     self.store.remove(t);
                 }
             }
             self.index_valid = false;
             self.touched();
+            self.record_redo_clear(RedoClear::Default);
+            for &t in &removed {
+                self.note_removed(None, t);
+            }
         }
         Ok(n)
     }
@@ -2132,6 +2207,10 @@ impl Database {
         };
         if n > 0 {
             self.touched();
+            self.record_redo_clear(RedoClear::Default);
+            for &t in &removed {
+                self.note_removed(None, t);
+            }
         }
         Ok(n)
     }
@@ -2153,10 +2232,11 @@ impl Database {
                     }
                 }
             }
-            if let Some(removed) = self.named.remove(&gid) {
+            if let Some(removed) = self.named.remove_graph(gid) {
                 self.persist_cleared_graph(gid, removed);
             }
             self.touched();
+            self.record_redo_clear(RedoClear::Named(gid));
         }
         n
     }
@@ -2166,16 +2246,17 @@ impl Database {
         let total: usize = self.named.values().map(|s| s.triple_count() as usize).sum();
         if total > 0 {
             if let Some(log) = self.txn.as_mut() {
-                for (&gid, s) in &self.named {
+                for (&gid, s) in self.named.iter() {
                     for t in s.iter_all() {
                         log.push(UndoOp::Add(Some(gid), t));
                     }
                 }
             }
-            for (gid, removed) in std::mem::take(&mut self.named) {
+            for (gid, removed) in self.named.take_all() {
                 self.persist_cleared_graph(gid, removed);
             }
             self.touched();
+            self.record_redo_clear(RedoClear::AllNamed);
         }
         total
     }
@@ -2184,17 +2265,45 @@ impl Database {
     /// [`named`](Self::named)) whose quads were `removed`. A quad RocksDB could
     /// not delete is put back into the in-memory graph, so memory never claims
     /// a deletion the store did not make (the error is reported at the next
-    /// commit point).
+    /// commit point). The terms of the quads removed are reclamation
+    /// candidates.
     fn persist_cleared_graph(&mut self, gid: u32, removed: TripleStore) {
-        let mut kept = TripleStore::new();
+        let mut kept = Vec::new();
         for t in removed.iter_all() {
             self.persist_mutation(false, Some(gid), t);
-            if !self.persist_named_quad(false, gid, t) {
-                kept.insert(t);
+            if self.persist_named_quad(false, gid, t) {
+                self.note_removed(Some(gid), t);
+            } else {
+                kept.push(t);
             }
         }
-        if kept.triple_count() > 0 {
-            self.named.insert(gid, kept);
+        if !kept.is_empty() {
+            self.named.bulk_load(gid, kept);
+        }
+    }
+
+    /// Record a `CLEAR` (also `DROP`, and the clears of `MOVE` / `COPY`) in
+    /// the redo log, so replaying the log reproduces it: one record per
+    /// cleared target, not one per triple.
+    fn record_redo_clear(&mut self, target: RedoClear) {
+        if self.redo_log.is_none() {
+            return;
+        }
+        let (op, graph) = match target {
+            RedoClear::Default => (b'C', None),
+            RedoClear::Named(gid) => match self.dict.term(gid) {
+                Some(g) => (b'C', Some(strip_angle(&g).to_owned())),
+                None => return,
+            },
+            RedoClear::AllNamed => (b'N', None),
+        };
+        self.redo_pending.push(RedoRec {
+            op,
+            graph,
+            triple: String::new(),
+        });
+        if self.txn.is_none() {
+            let _ = self.flush_redo();
         }
     }
 
@@ -2855,6 +2964,31 @@ impl Database {
             } else {
                 None
             };
+            match op {
+                // CLEAR / DROP (and the clears of MOVE / COPY).
+                'C' => {
+                    match graph_opt {
+                        None => {
+                            self.clear_default()?;
+                        }
+                        Some(g) => {
+                            self.clear_named(g);
+                        }
+                    }
+                    self.flush_reclaim();
+                    applied += 1;
+                    pos = (tend + 1).min(bytes.len());
+                    continue;
+                }
+                'N' => {
+                    self.clear_all_named();
+                    self.flush_reclaim();
+                    applied += 1;
+                    pos = (tend + 1).min(bytes.len());
+                    continue;
+                }
+                _ => {}
+            }
             // N-Triples (verbatim blank labels: the record names stored nodes).
             for t in crate::parser::ntriples::parse_str(triple_str)? {
                 match op {
@@ -2871,55 +3005,14 @@ impl Database {
                     }
                 }
             }
+            self.flush_reclaim();
             applied += 1;
             pos = (tend + 1).min(bytes.len());
         }
         Ok(applied)
     }
 
-    // ---- id freelist reclamation (gStore freeEntityID etc.) ----------------
-
-    /// Conservative id-reclamation pass (gStore's `freelist` rebuild): free the
-    /// dictionary id of every term that no longer appears anywhere — neither in
-    /// the default graph nor any named graph — so those ids can be reused by
-    /// future interns. Returns the number of ids reclaimed.
-    ///
-    /// "Referenced" means: an id used as a subject or object (entity/literal
-    /// space), as a predicate (predicate space), or as a named-graph IRI. Only
-    /// truly-unreferenced ids are freed, so the store stays consistent.
-    pub fn reclaim_unused(&mut self) -> usize {
-        if self.dict.is_disk_backed() {
-            // An out-of-core dictionary cannot free ids yet (R4 frees them by
-            // id inside the on-disk store).
-            return 0;
-        }
-        let mut ent_lit: HashSet<EntityLiteralId> = HashSet::new();
-        let mut preds: HashSet<PredId> = HashSet::new();
-
-        // Default graph.
-        for id in self.store.subject_keys() {
-            ent_lit.insert(id);
-        }
-        for id in self.store.object_keys() {
-            ent_lit.insert(id);
-        }
-        for p in self.store.predicates() {
-            preds.insert(p);
-        }
-        // Named graphs, plus their graph-IRI entity ids.
-        for (&gid, s) in &self.named {
-            ent_lit.insert(gid);
-            ent_lit.extend(s.subject_keys());
-            ent_lit.extend(s.object_keys());
-            preds.extend(s.predicates());
-        }
-
-        let freed = self.dict.reclaim_unused(&ent_lit, &preds);
-        if freed > 0 {
-            self.persist_dictionary_rewrite();
-        }
-        freed
-    }
+    // (Id reclamation lives in the `reclaim` module.)
 
     // ---- user-defined reasoning rules (gStore ReasonHelper) ----------------
 
@@ -3642,7 +3735,7 @@ impl BuildAccumulator {
     pub(crate) fn finish(self, db: &mut Database) {
         db.store.bulk_load(self.default);
         for (gid, ids) in self.named {
-            db.named.entry(gid).or_default().bulk_load(ids);
+            db.named.bulk_load(gid, ids);
         }
         db.rebuild_index();
     }
@@ -4722,6 +4815,9 @@ mod tests {
     #[test]
     fn reclaim_unused_reuses_deleted_term_ids() {
         let mut db = Database::build_from_str("rc", SMALL).unwrap();
+        // The explicit pass: with immediate reclamation off (R4) nothing is
+        // freed by the delete itself.
+        db.set_id_reclaim(IdReclaim::Off);
         let before_entities = db.entity_num();
         let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
 
@@ -4733,7 +4829,7 @@ mod tests {
             .entity_id(&Term::iri("node0").dict_key())
             .is_some());
 
-        let freed = db.reclaim_unused();
+        let freed = db.reclaim_unused().unwrap();
         assert_eq!(freed, 1, "only <node0> became unreferenced");
         assert_eq!(db.entity_num(), before_entities - 1);
         assert!(
@@ -4750,6 +4846,31 @@ mod tests {
             db.dict().entity_id(&Term::iri("fresh").dict_key()),
             Some(node0_id),
             "the freed id is reused"
+        );
+    }
+
+    #[test]
+    fn a_delete_frees_its_unreferenced_ids_immediately() {
+        let mut db = Database::build_from_str("rci", SMALL).unwrap();
+        assert_eq!(db.id_reclaim(), IdReclaim::Immediate);
+        let before_entities = db.entity_num();
+        let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
+        assert_eq!(
+            db.dict().entity_id(&Term::iri("node0").dict_key()),
+            None,
+            "freed by the delete"
+        );
+        assert_eq!(db.entity_num(), before_entities - 1);
+        // <root> and <contain> are still used: kept.
+        assert!(db.dict().entity_id(&Term::iri("root").dict_key()).is_some());
+        assert_eq!(db.reclaim_unused().unwrap(), 0, "nothing left to free");
+        db.query("INSERT DATA { <root> <contain> <fresh> }")
+            .unwrap();
+        assert_eq!(
+            db.dict().entity_id(&Term::iri("fresh").dict_key()),
+            Some(node0_id)
         );
     }
 

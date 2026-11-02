@@ -80,7 +80,7 @@ pub fn db_dir_for(name: &str) -> String {
 
 pub use concurrent::{ConcurrentDb, IsolationLevel};
 pub use db::{
-    default_open_options, set_default_open_options, Database, DiskQueryMode, LoadPolicy,
+    default_open_options, set_default_open_options, Database, DiskQueryMode, IdReclaim, LoadPolicy,
     OpenOptions, QuerySettings, Statement, StorageKind,
 };
 pub use error::{GStoreError, Result};

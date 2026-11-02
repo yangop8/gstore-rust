@@ -1538,8 +1538,8 @@ mod tests {
         {
             let mut pg = Pager::open(&path, 16).unwrap();
             assert!(
-                pg.enable_feature(format::FEATURE_FREE_IDS).is_err(),
-                "not implemented by this binary yet"
+                pg.enable_feature(format::FEATURE_LONG_KEYS).is_err(),
+                "not implemented by this binary (FREE_IDS is, since R4)"
             );
             assert!(
                 pg.enable_feature_with(1 << 20, u64::MAX).is_err(),
@@ -1547,7 +1547,7 @@ mod tests {
             );
             let a = pg.alloc().unwrap();
             pg.write_page(a, &page_with(5)).unwrap();
-            pg.enable_feature_with(format::FEATURE_FREE_IDS, format::DEFINED_FEATURES)
+            pg.enable_feature_with(format::FEATURE_LONG_KEYS, format::DEFINED_FEATURES)
                 .unwrap();
             assert_eq!(pg.magic(), format::MAGIC_V2);
             assert!(pg.require_supported().is_err());
@@ -1556,7 +1556,7 @@ mod tests {
         assert_eq!(&std::fs::read(&path).unwrap()[0..8], format::MAGIC_V1);
         {
             let mut pg = Pager::open(&path, 16).unwrap();
-            pg.enable_feature_with(format::FEATURE_FREE_IDS, format::DEFINED_FEATURES)
+            pg.enable_feature_with(format::FEATURE_LONG_KEYS, format::DEFINED_FEATURES)
                 .unwrap();
             pg.flush().unwrap();
         }
@@ -1569,7 +1569,7 @@ mod tests {
         let feat_off = 16 + format::FEATURES * 8;
         assert_eq!(
             &bytes[feat_off..feat_off + 8],
-            &format::FEATURE_FREE_IDS.to_le_bytes()
+            &format::FEATURE_LONG_KEYS.to_le_bytes()
         );
         assert!(
             Pager::open(&path, 16).is_err(),

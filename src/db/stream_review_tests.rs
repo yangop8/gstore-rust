@@ -181,7 +181,10 @@ fn a_broken_stream_store_interns_no_terms() {
     let small = stream().with_disk_cache_pages(16);
     {
         let mut db = Database::open_with(&dir, &small).unwrap();
-        // The transaction's terms interned (and durable) beforehand.
+        // The transaction's terms interned (and durable) beforehand — kept
+        // by the delete below (R4: with immediate reclamation it would free
+        // them, and the transaction would intern them again).
+        db.set_id_reclaim(crate::db::IdReclaim::Off);
         let data = "<http://ex/x1> <http://ex/q> <http://ex/y1> . \
                     <http://ex/x2> <http://ex/q> <http://ex/y2>";
         db.query(&format!("INSERT DATA {{ {data} }}")).unwrap();

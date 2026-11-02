@@ -698,15 +698,40 @@ pub(crate) fn write_ivarray<'v>(
 
 // ---- header and free list ----------------------------------------------------
 
-/// The header page of a version-1 file (the pager's `header_bytes`).
+/// The header page of a new file (the pager's `header_bytes`). A bulk image
+/// is a *new* database, so — like a `DiskStore` created by `open` — it keeps
+/// a free-id list when the process's id-reclamation policy is on
+/// ([`crate::db::default_id_reclaim`]): the `FREE_IDS` feature bit and
+/// `MAGIC_V2`, with the list empty (its root and the `FREE_COUNT_*` roots
+/// are 0). With the policy off it is a version-1 file, as before.
 pub(crate) fn header_page(page_count: PageId, free_head: PageId, roots: &[u64; NROOTS]) -> Page {
+    let free_ids = crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate;
+    header_page_with(page_count, free_head, roots, free_ids)
+}
+
+/// [`header_page`] with the free-id list chosen explicitly.
+pub(crate) fn header_page_with(
+    page_count: PageId,
+    free_head: PageId,
+    roots: &[u64; NROOTS],
+    free_ids: bool,
+) -> Page {
     debug_assert_eq!(
         roots[format::FEATURES],
         0,
-        "the bulk build writes version 1"
+        "the image writers set no feature themselves"
     );
+    let mut roots = *roots;
+    if free_ids {
+        // An empty list: no tree, no free id in any space.
+        roots[format::FEATURES] = format::FEATURE_FREE_IDS;
+        roots[format::FREE_IDS] = 0;
+        roots[format::FREE_COUNT_E] = 0;
+        roots[format::FREE_COUNT_L] = 0;
+        roots[format::FREE_COUNT_P] = 0;
+    }
     let mut h = [0u8; PAGE_SIZE];
-    h[0..8].copy_from_slice(format::magic_for(0));
+    h[0..8].copy_from_slice(format::magic_for(roots[format::FEATURES]));
     put_u32(&mut h, 8, page_count);
     put_u32(&mut h, 12, free_head);
     for (i, r) in roots.iter().enumerate() {

@@ -3241,7 +3241,7 @@ mod tests {
         d.intern_entity("<b>");
         assert!(d.take_allocations().is_empty());
         // `try_intern_new` tells new from known.
-        assert_eq!(d.try_intern_new(Space::Entity, "<b>").unwrap().1, false);
+        assert!(!d.try_intern_new(Space::Entity, "<b>").unwrap().1);
         assert!(d.try_intern_new(Space::Entity, "<c>").unwrap().1);
     }
 
