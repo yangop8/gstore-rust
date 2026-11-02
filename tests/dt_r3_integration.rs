@@ -3,6 +3,12 @@
 //! and the `[storage]` open options (R3-STREAM, contract C7), and bulk builds
 //! of the disk and RocksDB layouts (R2-BULK, R3-ROCKS, contract C6).
 //!
+//! - A server holds the directory of every database it serves (all layouts,
+//!   RocksDB included). `/api build` refuses a loaded database and leaves it
+//!   serving; a bulk build of the served directory in the same process is
+//!   refused (`DirLock::held_here`) until the server releases the handle
+//!   (`unload`), and the rebuilt directory is served again after `load`.
+//!   REST `/build` replaces a loaded on-disk database in place.
 //! - `refreshconf` re-installs the `[storage]` section as the process's
 //!   default open options on a server that owns them (`gserver`), and leaves
 //!   them alone on an embedded one.
@@ -16,10 +22,134 @@ use std::sync::Arc;
 use std::thread;
 
 use gstore::config::GStoreConfig;
+use gstore::db::dirlock::DirLock;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
-use gstore::{default_open_options, set_default_open_options, OpenOptions};
-use harness::{ok, scratch};
+use gstore::{default_open_options, set_default_open_options, Database, OpenOptions};
+use harness::{code, int, ok, scratch, string, Server};
+
+/// Three triples, then five other ones.
+const ONE: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+                   <http://ex/a> <http://ex/p> <http://ex/c> .\n\
+                   <http://ex/b> <http://ex/q> \"one\" .\n";
+const TWO: &str = "<http://ex/x> <http://ex/p> <http://ex/y> .\n\
+                   <http://ex/x> <http://ex/p> <http://ex/z> .\n\
+                   <http://ex/y> <http://ex/q> \"two\" .\n\
+                   <http://ex/z> <http://ex/q> \"two\" .\n\
+                   <http://ex/x> <http://ex/r> <http://ex/a> .\n";
+
+/// The number of answers of `SELECT * { ?s ?p ?o }` on loaded `db`.
+fn answers(srv: &Server, db: &str) -> i64 {
+    let j = srv.query(db, "SELECT * WHERE { ?s ?p ?o }");
+    ok(&j);
+    int(&j, "AnsNum")
+}
+
+/// What every layout's lifecycle shares: `dir` (`<root>/dsk.db`) holds a
+/// database built from `one` by `bulk_build`; the server serves it, refuses
+/// `/api build` over it, and a bulk build of its directory waits for
+/// `unload`.
+fn served_database_is_rebuilt_only_after_unload(
+    srv: &Server,
+    dir: &Path,
+    two: &Path,
+    bulk_build: &dyn Fn(&Path, &Path) -> gstore::Result<()>,
+) {
+    srv.load("dsk");
+    assert_eq!(answers(srv, "dsk"), 3);
+    assert!(
+        DirLock::held_here(dir),
+        "the served database holds its directory"
+    );
+
+    // `/api build` of a loaded database: refused, the database untouched.
+    let j = srv.build("dsk", two);
+    assert_eq!(code(&j), 1004, "{j}");
+    assert_eq!(string(&j, "StatusMsg"), "database already built.");
+    assert!(!dir.with_extension("db.build-tmp").exists());
+    assert_eq!(answers(srv, "dsk"), 3);
+
+    // A bulk build of the served directory: refused before anything is
+    // staged, while the server holds it.
+    let e = bulk_build(dir, two).unwrap_err().to_string();
+    assert!(e.contains("open in this process"), "{e}");
+    assert!(!dir.join(gstore::bulk::STAGING_DIR).exists());
+    assert_eq!(answers(srv, "dsk"), 3);
+
+    // Released by `unload`: the build replaces the directory, and `load`
+    // serves the new database.
+    srv.unload("dsk");
+    assert!(!DirLock::held_here(dir), "unload releases the directory");
+    bulk_build(dir, two).unwrap();
+    srv.load("dsk");
+    assert_eq!(answers(srv, "dsk"), 5);
+    assert!(DirLock::held_here(dir));
+}
+
+#[test]
+fn a_served_disk_database_is_rebuilt_only_after_unload() {
+    let data = scratch("r3_build_data");
+    let (one, two) = (data.join("one.nt"), data.join("two.nt"));
+    fs::write(&one, ONE).unwrap();
+    fs::write(&two, TWO).unwrap();
+    let root = scratch("r3_build_disk");
+    let dir = root.join("dsk.db");
+    Database::build_disk(&dir, &[&one]).unwrap();
+    let srv = Server::start_at(root, Some(&data));
+    served_database_is_rebuilt_only_after_unload(&srv, &dir, &two, &|dir, file| {
+        Database::build_disk(dir, &[file])
+    });
+    assert!(Database::is_disk(&dir));
+
+    // REST `/build` rebuilds a loaded database in place: the loaded copy is
+    // retired first (its directory handle released), the new one is served.
+    let (status, body) = srv.rest(
+        "POST",
+        "/build?db_name=dsk",
+        "<http://ex/n> <http://ex/p> <http://ex/m> .",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(answers(&srv, "dsk"), 1);
+    assert!(!Database::is_disk(&dir), "replaced by the rebuilt snapshot");
+    assert!(DirLock::held_here(&dir));
+    srv.unload("dsk");
+    assert!(!DirLock::held_here(&dir));
+    drop(srv);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn a_served_rocksdb_database_is_rebuilt_only_after_unload() {
+    use gstore::bulk::{self, BulkInput, BulkOptions, BulkTarget};
+    use gstore::parser::import::{self, ImportOptions};
+
+    let bulk_rocks = |dir: &Path, file: &Path| -> gstore::Result<()> {
+        bulk::build(
+            dir,
+            "dsk",
+            BulkInput::Sources(&import::sources_from_paths(&[file])?),
+            &ImportOptions::strict(),
+            &mut (),
+            BulkTarget::RocksDb,
+            &BulkOptions::default(),
+        )
+        .map(|_| ())
+    };
+    let data = scratch("r3_build_rocks_data");
+    let (one, two) = (data.join("one.nt"), data.join("two.nt"));
+    fs::write(&one, ONE).unwrap();
+    fs::write(&two, TWO).unwrap();
+    let root = scratch("r3_build_rocks");
+    let dir = root.join("dsk.db");
+    bulk_rocks(&dir, &one).unwrap();
+    let srv = Server::start_at(root, Some(&data));
+    served_database_is_rebuilt_only_after_unload(&srv, &dir, &two, &bulk_rocks);
+    assert!(Database::is_rocksdb(&dir));
+    srv.unload("dsk");
+    drop(srv);
+    let _ = fs::remove_dir_all(&data);
+}
 
 /// The open options `Database::open` uses after `[storage]` of `cfg` is
 /// installed: the section with the environment on top.
