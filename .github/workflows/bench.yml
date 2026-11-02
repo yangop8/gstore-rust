@@ -45,6 +45,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The Rust toolchain, pinned like ci.yml's (keep the two equal: the
+  # rocksdb-correctness job shares ci.yml's RocksDB cache, whose key hashes
+  # the rustc version). Bumping the pin means fixing the new version's
+  # clippy and rustfmt findings in the same commit.
+  RUST_TOOLCHAIN: "1.99.1"
 
 jobs:
   smoke:
@@ -54,7 +59,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench-smoke
@@ -98,13 +105,20 @@ jobs:
     runs-on: ubuntu-latest
     # The bundled librocksdb C++ build dominates; allow for a cold cache.
     timeout-minutes: 90
+    # ci.yml's debuginfo settings (workflow env there): the shared cache's key
+    # hashes every CARGO*/RUST* variable, and the cached build must match.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - name: install clang (librocksdb-sys bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       # The same cache as ci.yml's rocksdb job (both build the test profile
-      # with RocksDB).
+      # with RocksDB, on the same toolchain and debuginfo settings).
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rocksdb
@@ -127,7 +141,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: install clang (librocksdb-sys bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: bench-reference

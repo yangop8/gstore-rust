@@ -70,7 +70,7 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes()); // MD5 uses little-endian length
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
             *w = u32::from_le_bytes([
@@ -124,7 +124,7 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([
@@ -282,14 +282,10 @@ impl Sha256 {
             sha256_compress(&mut self.h, &block);
             self.buf_len = 0;
         }
-        let mut blocks = data.chunks_exact(64);
-        for block in &mut blocks {
-            let block: &[u8; 64] = block
-                .try_into()
-                .expect("chunks_exact yields 64-byte blocks");
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
             sha256_compress(&mut self.h, block);
         }
-        let rest = blocks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.buf_len = rest.len();
     }
@@ -435,7 +431,9 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     };
-    b.chunks_exact(2)
+    b.as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| Some((nib(p[0])? << 4) | nib(p[1])?))
         .collect()
 }
@@ -480,7 +478,7 @@ fn sha512_core(input: &[u8], mut h: [u64; 8]) -> [u64; 8] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(128) {
+    for chunk in msg.as_chunks::<128>().0 {
         let mut w = [0u64; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let mut b = [0u8; 8];

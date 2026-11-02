@@ -604,7 +604,7 @@ fn parse_patterns(s: &str) -> Result<Vec<TriplePattern>> {
         )));
     }
     let mut patterns = Vec::with_capacity(toks.len() / 3);
-    for chunk in toks.chunks_exact(3) {
+    for chunk in toks.as_chunks::<3>().0 {
         patterns.push(TriplePattern {
             subject: chunk[0].clone(),
             predicate: chunk[1].clone(),

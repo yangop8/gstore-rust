@@ -15,6 +15,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The Rust toolchain of every job, pinned so that a new stable release
+  # cannot turn CI red without a code change. Bumping the pin means fixing
+  # the new version's clippy and rustfmt findings in the same commit.
+  # bench.yml pins the same version: its rocksdb-correctness job shares the
+  # rocksdb job's cache, whose key hashes the rustc version.
+  RUST_TOOLCHAIN: "1.99.1"
+  # Dev and test builds keep line tables only (file:line in backtraces), not
+  # full debuginfo: about 70 integration-test binaries each link gstore, and
+  # with full debuginfo the `zip pfn-wasm readline` job filled the runner's
+  # disk, so rust-lld died with SIGBUS (signal 7) while writing one of them.
+  # Nothing in Cargo.toml sets `debug` for these profiles.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 # Benchmarks (gstore-bench smoke gate, RocksDB correctness through the
 # harness, the weekly reference run) are in bench.yml.
@@ -28,8 +41,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -39,8 +53,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -53,7 +68,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
@@ -77,8 +94,9 @@ jobs:
         feature: [gzip, tls, zip, readline, pfn-wasm, "zip pfn-wasm readline"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -101,7 +119,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: install curl, wget, python3-requests
         run: sudo apt-get update && sudo apt-get install -y curl wget python3 python3-requests
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: conformance
@@ -128,11 +148,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: install clang (librocksdb-sys bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       # One cache for every job that compiles librocksdb-sys (this one and
-      # bench.yml's rocksdb-correctness): the C++ build dominates both.
+      # bench.yml's rocksdb-correctness): the C++ build dominates both. The
+      # key hashes the rustc version and every CARGO*/RUST* variable, so
+      # bench.yml's job sets the same toolchain and debuginfo as this file.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rocksdb
