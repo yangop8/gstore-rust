@@ -2575,6 +2575,148 @@ mod tests {
         http(addr, &raw)
     }
 
+    /// Two `/sparql` reads each call a function that waits for a second
+    /// caller (15 s at most): both answer `1` only if they ran at the same
+    /// time (one exclusive lock would make the first time out with `0`).
+    #[test]
+    fn two_sparql_reads_run_at_once() {
+        #[derive(Default)]
+        struct Latch {
+            n: Mutex<usize>,
+            cv: std::sync::Condvar,
+        }
+        let latch = Arc::new(Latch::default());
+        let l2 = Arc::clone(&latch);
+        let mut db = Database::build_from_str("latch", DATA).unwrap();
+        db.register_function("http://ex/latch", move |_| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut n = l2.n.lock().unwrap();
+            *n += 1;
+            l2.cv.notify_all();
+            while *n < 2 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Some(crate::query::Value::Int(0));
+                }
+                n = l2.cv.wait_timeout(n, left).unwrap().0;
+            }
+            Some(crate::query::Value::Int(1))
+        });
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        thread::spawn(move || s2.serve_forever());
+        let reads: Vec<_> = (0..2)
+            .map(|_| {
+                thread::spawn(move || {
+                    post(
+                        &addr,
+                        "/sparql",
+                        "SELECT (<http://ex/latch>(1) AS ?x) WHERE {}",
+                    )
+                })
+            })
+            .collect();
+        for r in reads {
+            let resp = r.join().unwrap();
+            assert!(resp.contains("200 OK"), "{resp}");
+            assert!(resp.contains("\"value\":\"1\""), "{resp}");
+        }
+        server.shutdown();
+    }
+
+    /// `/status` answers at once while a statement holds the database —
+    /// shared or exclusive — with the figures of the last write; a
+    /// statement that does not parse is answered `400` without the lock.
+    #[test]
+    fn status_and_syntax_errors_do_not_wait_for_the_database() {
+        let (srv, addr) = start();
+        let upd = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        );
+        assert!(upd.contains("\"changed\":1"), "{upd}");
+        let within = |raw: String| {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(http(&addr, &raw));
+            });
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("answered within a second")
+        };
+        let status = || within("GET /status HTTP/1.1\r\nConnection: close\r\n\r\n".into());
+        let bad = || {
+            let body = "SELEKT nothing";
+            within(format!(
+                "POST /sparql HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+        };
+        {
+            let _shared = read_locked(&srv.inner.db);
+            let s = status();
+            assert!(
+                s.contains("\"triples\":3") && s.contains("\"name\":\"srv\""),
+                "{s}"
+            );
+            assert!(bad().contains("400 Bad Request"));
+        }
+        {
+            let _excl = write_locked(&srv.inner.db);
+            let s = status();
+            assert!(s.contains("\"triples\":3"), "{s}");
+            assert!(bad().contains("400 Bad Request"));
+        }
+        srv.shutdown();
+    }
+
+    /// The counters' sequence lock never shows half of one publish and half
+    /// of the next.
+    #[test]
+    fn counters_are_read_whole() {
+        let c = Arc::new(DbCounters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (c, stop) = (Arc::clone(&c), Arc::clone(&stop));
+                thread::spawn(move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        let s = c.read();
+                        // Every publish stores the same value everywhere.
+                        assert_eq!(s.triples, s.entities);
+                        assert_eq!(s.triples, s.literals);
+                        assert_eq!(s.triples, s.predicates);
+                        assert_eq!(s.triples, s.generation);
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        // Publish for a while, with every reader running meanwhile.
+        let t0 = Instant::now();
+        let mut v = 0u64;
+        while t0.elapsed() < Duration::from_millis(150) {
+            v += 1;
+            c.store(CounterSnapshot {
+                triples: v,
+                entities: v,
+                literals: v,
+                predicates: v,
+                generation: v,
+                live: true,
+                ..CounterSnapshot::default()
+            });
+        }
+        stop.store(true, Ordering::SeqCst);
+        for r in readers {
+            assert!(r.join().unwrap() > 0);
+        }
+        assert_eq!(c.read().generation, v);
+    }
+
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let d =
             std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));

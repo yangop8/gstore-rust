@@ -941,6 +941,75 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Readers share one parse of a user's `data.json` until a write
+    /// replaces it; every write (and dropping the user) is seen at once.
+    #[test]
+    fn entries_are_parsed_once_until_a_write() {
+        let base = tmp("entries");
+        let r = PfnRegistry::new(&base);
+        let parses = || r.parses.load(Ordering::SeqCst);
+        r.create("alice", info("deg", "(i32.const 1)")).unwrap();
+        let p0 = parses();
+        assert_eq!(r.list("alice", None, None).unwrap().len(), 1);
+        assert_eq!(parses(), p0 + 1, "the first read parses");
+        for _ in 0..5 {
+            assert_eq!(r.list("alice", Some("deg"), None).unwrap().len(), 1);
+            assert!(r.get("alice", "deg").unwrap().is_some());
+            assert!(r.resolve("alice", "missing").is_err());
+        }
+        assert_eq!(parses(), p0 + 1, "later reads share it");
+        // A write is seen by the next read.
+        r.create("alice", info("other", "(i32.const 1)")).unwrap();
+        assert_eq!(r.list("alice", None, None).unwrap().len(), 2);
+        r.delete("alice", "deg").unwrap();
+        let left = r.list("alice", None, None).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "other");
+        r.drop_user("alice").unwrap();
+        assert!(r.list("alice", None, None).unwrap().is_empty());
+        // Users are cached apart.
+        r.create("bob", info("deg", "(i32.const 1)")).unwrap();
+        assert!(r.list("alice", None, None).unwrap().is_empty());
+        assert_eq!(r.list("bob", None, None).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Concurrent first calls of one function load its module once (single
+    /// flight) and share it.
+    #[cfg(feature = "pfn-wasm")]
+    #[test]
+    fn concurrent_first_resolves_load_the_module_once() {
+        let base = tmp("single_flight");
+        let r = std::sync::Arc::new(PfnRegistry::new(&base));
+        r.create(
+            "u",
+            info("f", "(call $emit_i64 (i64.const 5)) (i32.const 1)"),
+        )
+        .unwrap();
+        r.compile("u", "f").unwrap().unwrap();
+        // The first load lingers, so the other callers arrive meanwhile.
+        *lock(&r.before_cache) = Some(Box::new(|_: &PfnRegistry| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (r, start) = (std::sync::Arc::clone(&r), std::sync::Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    r.resolve("u", "f").map(|_| ())
+                })
+            })
+            .collect();
+        for c in callers {
+            c.join().unwrap().unwrap();
+        }
+        assert_eq!(r.module_loads(), 1, "one load for eight first calls");
+        assert_eq!(r.cached_modules(), 1);
+        assert!(lock(&r.loading).is_empty(), "no load turn is left behind");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn limits_bound_functions_and_sources() {
         let base = tmp("limits");

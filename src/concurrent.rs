@@ -1175,6 +1175,34 @@ mod tests {
     /// query error), and a snapshot's graph-function reads share one CSR — the
     /// writer database's cached one when it had one.
     #[test]
+    fn a_read_error_fails_snapshot_and_version_view_queries() {
+        // A user function that reports a read error, as a failing backend
+        // does (contract C2): the query fails instead of answering.
+        const Q: &str = "SELECT (<http://ex/fn/fail>(1) AS ?v) WHERE {}";
+        let c = cdb();
+        c.write(|db| {
+            db.register_function("http://ex/fn/fail", |_| {
+                crate::store::read_scope::note_read_error("injected: torn page");
+                Some(crate::query::Value::Int(1))
+            });
+        });
+        for e in [
+            c.query(Q).unwrap_err(),
+            c.snapshot().query(Q).unwrap_err(),
+            c.begin().query(Q).unwrap_err(),
+            c.version_view().query(Q).unwrap_err(),
+        ] {
+            let e = e.to_string();
+            assert!(
+                e.contains("torn page") && e.contains("read from the store"),
+                "{e}"
+            );
+        }
+        // Nothing leaks into the next statement.
+        assert!(count(&c, "SELECT ?s WHERE { ?s ?p ?o }") > 0);
+    }
+
+    #[test]
     fn snapshots_see_user_functions_and_share_one_csr() {
         const FN: &str = "SELECT (<http://ex/fn/double>(21) AS ?v) WHERE {}";
         const SP: &str = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) \
