@@ -1531,6 +1531,18 @@ impl Dictionary {
         self.pins.oldest().is_some()
     }
 
+    /// A clone that takes **no** pin, even of an out-of-core dictionary —
+    /// only for a reader every free waits for by other means: one that reads
+    /// inside a `DiskReadView` (the store's writer gate drains it before any
+    /// id is freed, and its next read expires). A plain [`Clone`] pins an
+    /// out-of-core dictionary for as long as it lives, which defers every
+    /// free of a Stream-mode database meanwhile.
+    pub fn clone_unpinned(&self) -> Dictionary {
+        let mut d = self.clone();
+        d.clone_pin = None;
+        d
+    }
+
     /// Remove the term of `id` (in `space`) from an in-memory dictionary:
     /// neither its key nor its id resolves any more, and the id waits to be
     /// [released](Self::release) for reuse. `false` if `id` names no term

@@ -2515,6 +2515,10 @@ impl Database {
                 // data did change.
                 return Err(e);
             }
+            // The terms the LOAD minted are unreferenced again: free them
+            // now (outside a transaction; inside one at its commit), so the
+            // dictionary is back where it was too — part of the no-change.
+            self.flush_reclaim();
             // Nothing changed. No cached answer can be keyed by the counts
             // the inserts and their undo went through: the database was not
             // readable in between.
