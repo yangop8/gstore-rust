@@ -217,7 +217,9 @@ unzip_max_size = 10737418240
 
 # ---- gstore-rust extension (not in upstream conf.ini) ----
 # How databases are opened. gserver installs these as the defaults when it
-# starts; the environment overrides them (GSTORE_DISK_QUERY_MODE=stream|memory,
+# starts and again on /api refreshconf (databases loaded from then on use
+# them; loaded ones keep the mode they were opened in); the environment
+# overrides them (GSTORE_DISK_QUERY_MODE=stream|memory,
 # GSTORE_DISK_CACHE_MB). Every mode reads and writes the same files: a
 # directory may be opened in either mode, and by older binaries, in turn.
 # The values shown are the defaults (default_layout is unset by default).
