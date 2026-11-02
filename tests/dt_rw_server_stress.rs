@@ -13,13 +13,17 @@
 //! * after a graceful shutdown the reopened database holds exactly the
 //!   acknowledged writes (the ledger the clients kept).
 //!
+//! Each server runs over an in-memory (snapshot) database and over an
+//! on-disk (`kvstore.kv`) one in Stream mode, whose shared reads go straight
+//! to `DiskTriples` and the out-of-core dictionary.
+//!
 //! Each test runs `GSTORE_RW_STRESS_SECS` seconds of load (default 2) under
 //! a 120 s watchdog that aborts the process if the servers wedge.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -28,7 +32,7 @@ use std::time::Duration;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::server::Server;
-use gstore::{Database, QueryResult};
+use gstore::{Database, OpenOptions, QueryResult};
 
 const BASE: &str = "<http://ex/base> <http://ex/p> <http://ex/o> .\n";
 const PAIR: &str = "http://ex/pair";
@@ -227,10 +231,39 @@ fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
         .unwrap()
         .save(&dir.0)
         .unwrap();
+    single_db_stress(&dir.0, &OpenOptions::default(), "single-db");
+}
+
+/// The same over an on-disk (`kvstore.kv`) database served in Stream mode:
+/// the shared-read paths run straight over `DiskTriples` and the out-of-core
+/// dictionary (whose writer interns new terms under the exclusive guard).
+#[test]
+fn single_db_server_on_a_stream_disk_database_keeps_writes_whole() {
+    let _dog = watchdog("single_db_server_on_a_stream_disk_database_keeps_writes_whole");
+    let dir = TmpDir::new("single_stream");
+    build_disk_base(&dir.0);
+    single_db_stress(&dir.0, &OpenOptions::stream(), "single-db (stream disk)");
+}
+
+/// An on-disk (`kvstore.kv`) database holding [`BASE`] in `dir` (the bulk
+/// build).
+fn build_disk_base(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let nt = dir.with_extension("base.nt");
+    std::fs::write(&nt, BASE).unwrap();
+    Database::build_disk(dir, &[&nt]).unwrap();
+    std::fs::remove_file(&nt).unwrap();
+    assert!(Database::is_disk(dir));
+}
+
+/// Serve the database in `dir` (opened with `options`) on a single-database
+/// server under eight readers and a writer of pairs; then check the
+/// reopened database against the writer's ledger.
+fn single_db_stress(dir: &Path, options: &OpenOptions, label: &str) {
     let server = Arc::new(
-        Server::bind(Database::load(&dir.0).unwrap(), "127.0.0.1:0")
+        Server::bind(Database::open_with(dir, options).unwrap(), "127.0.0.1:0")
             .unwrap()
-            .with_db_dir(&dir.0),
+            .with_db_dir(dir),
     );
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
@@ -263,7 +296,7 @@ fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
     let ledger = writer.join().unwrap();
     let reads = reads.load(Ordering::Relaxed);
     eprintln!(
-        "single-db: {reads} reads, {} pairs acknowledged",
+        "{label}: {reads} reads, {} pairs acknowledged",
         ledger.len()
     );
     assert!(reads > 0);
@@ -272,7 +305,7 @@ fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
     serving.join().unwrap();
     drop(server);
 
-    let mut db = Database::load(&dir.0).unwrap();
+    let mut db = Database::open_with(dir, options).unwrap();
     let on_disk = reopened(&mut db, PAIR);
     let expected: BTreeSet<String> = ledger.iter().map(u64::to_string).collect();
     assert_eq!(on_disk, expected, "the reopened database is the ledger");
@@ -331,11 +364,37 @@ fn tid_of(body: &str) -> u64 {
 fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_reads() {
     let _dog = watchdog("api_server_isolates_transactions");
     let root = TmpDir::new("api");
-    let server = Arc::new(ApiServer::bind(&root.0, "root", "127.0.0.1:0").unwrap());
+    api_stress(&root.0, false, "api");
+}
+
+/// The same over an on-disk (`kvstore.kv`) database, which the server opens
+/// in the process's disk query mode: Stream unless `GSTORE_DISK_QUERY_MODE`
+/// says otherwise (this test binary installs Stream as its default; CI's
+/// test job runs it in both modes). Transactions run in the store's overlay;
+/// `/begin` copies the committed triples for the readers' snapshot.
+#[test]
+fn api_server_on_a_disk_database_isolates_transactions_and_keeps_writes_whole() {
+    let _dog = watchdog("api_server_on_a_disk_database");
+    gstore::set_default_open_options(OpenOptions::stream());
+    let root = TmpDir::new("api_disk");
+    build_disk_base(&root.0.join("stress.db"));
+    api_stress(&root.0, true, "api (disk)");
+}
+
+/// Serve database `stress` from root `root` on an `ApiServer` — built there
+/// with REST `/build`, or (`on_disk`) already built there and loaded —
+/// under eight readers, a writer of pairs and a transaction cycle; then
+/// check the reopened database against the clients' ledgers.
+fn api_stress(root: &Path, on_disk: bool, label: &str) {
+    let server = Arc::new(ApiServer::bind(root, "root", "127.0.0.1:0").unwrap());
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     let serving = thread::spawn(move || s2.serve_forever());
-    let (s, b) = request(&addr, "POST", "/build?db_name=stress", Some(ROOT), BASE);
+    let (s, b) = if on_disk {
+        request(&addr, "POST", "/load?db_name=stress", Some(ROOT), "")
+    } else {
+        request(&addr, "POST", "/build?db_name=stress", Some(ROOT), BASE)
+    };
     assert_eq!(s, 200, "{b}");
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -442,7 +501,7 @@ fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_read
     let (committed, cycles) = cycler.join().unwrap();
     let reads = reads.load(Ordering::Relaxed);
     eprintln!(
-        "api: {reads} reader rounds, {} pairs acknowledged, {cycles} transactions",
+        "{label}: {reads} reader rounds, {} pairs acknowledged, {cycles} transactions",
         ledger.len()
     );
     assert!(reads > 0);
@@ -459,7 +518,8 @@ fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_read
     serving.join().unwrap();
     drop(server);
 
-    let mut db = Database::load(root.0.join("stress.db")).unwrap();
+    let mut db = Database::load(root.join("stress.db")).unwrap();
+    assert_eq!(Database::is_disk(root.join("stress.db")), on_disk);
     let expected: BTreeSet<String> = ledger.iter().map(u64::to_string).collect();
     assert_eq!(reopened(&mut db, PAIR), expected, "pairs: the ledger");
     assert_eq!(
