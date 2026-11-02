@@ -107,10 +107,25 @@ fn int_lit(v: &str) -> String {
 
 #[test]
 fn transaction_test_script() {
-    let srv = Server::start("txn");
+    transaction_test_script_in("snapshot");
+}
+
+/// [`transaction_test_script`] over a database built in the disk layout
+/// (`/api build` with `layout=disk`; served in the process's disk query
+/// mode, which CI runs as both Materialize and Stream).
+#[test]
+fn transaction_test_script_disk() {
+    transaction_test_script_in("disk");
+}
+
+fn transaction_test_script_in(layout: &str) {
+    let srv = Server::start(&format!("txn_{layout}"));
     let db = "txn_test";
     // [1/8] build an empty database (db_path ""), [2/8] load it.
-    let j = srv.op("build", &[("db_name", db), ("db_path", "")]);
+    let j = srv.op(
+        "build",
+        &[("db_name", db), ("db_path", ""), ("layout", layout)],
+    );
     ok(&j);
     assert_eq!(int(&j, "success_num"), 0);
     srv.load(db);
@@ -251,9 +266,29 @@ fn transaction_test_script() {
 
 #[test]
 fn transaction_ids_are_numbered_per_loaded_database() {
-    let srv = Server::start("txnids");
+    transaction_ids_are_numbered_per_loaded_database_in("snapshot");
+}
+
+/// [`transaction_ids_are_numbered_per_loaded_database`] over databases built
+/// in the disk layout.
+#[test]
+fn transaction_ids_are_numbered_per_loaded_database_disk() {
+    transaction_ids_are_numbered_per_loaded_database_in("disk");
+}
+
+fn transaction_ids_are_numbered_per_loaded_database_in(layout: &str) {
+    let srv = Server::start(&format!("txnids_{layout}"));
     for db in ["alpha", "beta"] {
-        ok(&srv.op("build", &[("db_name", db), ("db_path", "")]));
+        ok(&srv.op(
+            "build",
+            &[("db_name", db), ("db_path", ""), ("layout", layout)],
+        ));
+        let kv = srv
+            .root
+            .join(format!("{db}.db"))
+            .join("kvstore.kv")
+            .is_file();
+        assert_eq!(kv, layout == "disk", "the {layout} layout");
         srv.load(db);
     }
     // Each database counts from 1, whatever the other one did.
