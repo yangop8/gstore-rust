@@ -783,8 +783,8 @@ impl TripleStore {
     /// Insert a triple. Returns `false` (and changes nothing) if it already
     /// exists. Maintains all three indexes in sorted order.
     pub fn insert(&mut self, t: IdTriple) -> bool {
-        // Checked first: a no-op never copies shared indexes.
-        if self.data.exists(t.sub, t.pred, t.obj) {
+        // On shared indexes, checked first: a no-op never copies them.
+        if Arc::get_mut(&mut self.data).is_none() && self.data.exists(t.sub, t.pred, t.obj) {
             return false;
         }
         let inserted = self.data_mut().insert(t);
@@ -796,7 +796,7 @@ impl TripleStore {
 
     /// Remove a triple. Returns `false` if it was not present.
     pub fn remove(&mut self, t: IdTriple) -> bool {
-        if !self.data.exists(t.sub, t.pred, t.obj) {
+        if Arc::get_mut(&mut self.data).is_none() && !self.data.exists(t.sub, t.pred, t.obj) {
             return false;
         }
         let removed = self.data_mut().remove(t);
