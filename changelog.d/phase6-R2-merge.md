@@ -309,3 +309,21 @@ After it, `clippy -D warnings` on 1.99.1 is clean for every CI scope
 pfn-wasm, "zip pfn-wasm readline" and rocksdb; gstore-bench all-targets with
 rocksdb), and rustfmt `--check` on 1.99.1 and 1.97.0 and workspace clippy on
 1.97.0 are clean too. No `#[allow]` was added.
+
+The 1.97.0 checks were first run as `cargo +stable ...`: `stable` is the
+same rustc 1.97.0 build (2d8144b78), but the named `1.97.0` toolchain on
+this machine had no clippy or rustfmt component, so `cargo +1.97.0 clippy` /
+`fmt` stopped with "not installed". After
+`rustup component add --toolchain 1.97.0 clippy rustfmt`, the commands as
+written (`cargo +1.97.0 clippy --workspace --all-targets -- -D warnings`,
+`cargo +1.97.0 fmt --all -- --check`) are clean as well.
+
+Tests on 1.99.1: the lint fix itself was checked with `gstore --lib` (1,120
+passed) and the `dt_bulk_crash`, `dt_bulk_disk`, `dt_bulk_import`,
+`dt_r2_integration`, `dt_reason` and `dt_reason_manage` tests. A separate
+run of the full CI matrix on the same commit (df37cbf) passed:
+`cargo test --workspace` (2,174 passed, 0 failed); the six feature entries
+(build `--profile test`, clippy, test); rocksdb (clippy, `cargo test -p
+gstore --features rocksdb`, and bench.yml's rocksdb-correctness job);
+`scripts/conformance.sh`; and bench.yml's smoke gate (`gstore-bench ci`,
+plus the canary, which failed with exit 1 as intended).
