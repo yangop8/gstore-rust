@@ -21,7 +21,11 @@
 //!   (`gapi::ops_db`) follow too. Two REST semantics differ from upstream's
 //!   `/api` ones and are kept as Rust extensions: `/build` rebuilds an
 //!   existing database (`/api` `build` refuses it) and `/drop` deletes the
-//!   directory (`/api` `drop` keeps a `<db>.db.bak` by default).
+//!   directory (`/api` `drop` keeps a `<db>.db.bak` by default). `/build`
+//!   and `/api` `build` take a `layout` (`snapshot`, `disk` or `rocksdb`;
+//!   default `[storage] default_layout`, else `snapshot`): the on-disk and
+//!   RocksDB layouts are built in bulk ([`crate::bulk::build`]), RocksDB
+//!   only by a server built with the `rocksdb` feature.
 //! * **Backup / restore / export** — `/backup`, `/restore`, `/export`. Backups
 //!   are written only inside the server's backup directory (`<root>/backups`,
 //!   or `conf.ini`'s `backup_path`) and never over another database's files;
@@ -107,7 +111,15 @@
 //! * Lock order: `ApiState` (never wait for a database while holding it) →
 //!   a database's guard → its rule directory's lock → the database's
 //!   internals (`persist_lock` → disk sink → `persist_error` → pager) → the
-//!   `DiskTriples` gate → the pager. Never the reverse.
+//!   `DiskTriples` gate → the pager. Never the reverse. A non-transactional
+//!   read of a transaction's on-disk snapshot takes the database's guard
+//!   only to find the snapshot and releases it before it enters the gate
+//!   (so a `/commit` — exclusive guard, then the gate's drain — never waits
+//!   for it: the drain cancels it, see [`ReadSnapshot`]).
+//! * Leaf locks, held for a few instructions with nothing called under
+//!   them: the cancel bridge's registry (forwarding a request's cancel flag
+//!   to an on-disk snapshot read's gate flag) and `gapi::ops_db`'s registry
+//!   of running statistics refreshes.
 //! * No thread holds two database guards, takes a guard of a database it
 //!   already holds one of, or upgrades a shared guard to an exclusive one
 //!   without dropping it first. A thread-local registry enforces the second
@@ -129,9 +141,14 @@
 //! database (`/update`, `/batch*`, `/upload`, …) is rejected with `409` rather
 //! than silently joining the transaction, and every non-transactional read is
 //! answered from a snapshot of the committed state taken at `/begin`, so no
-//! client ever observes uncommitted data. The snapshot clones the dictionary
-//! and triple indexes — an open transaction roughly doubles its database's
-//! memory footprint until it ends. `/begin` accepts gStore's `isolevel`
+//! client ever observes uncommitted data. `/begin` copies no triple (see
+//! [`ReadSnapshot`]): an in-memory database's snapshot shares its
+//! copy-on-write indexes, which the transaction's first write copies once
+//! (an open transaction that wrote holds the begin-time copy until it ends);
+//! a Stream-mode on-disk database's snapshot is a read view of its store,
+//! which the commit expires (reads in flight are cancelled and re-run on the
+//! committed state); a RocksDB database is still copied whole. `/begin`
+//! accepts gStore's `isolevel`
 //! (`1` SERIALIZABLE — the default, `2` SNAPSHOT, `3` READ_COMMITTED, see
 //! [`TxnIsolation`]); with a single writer every level is honoured. Like
 //! upstream, transaction ids are numbered per loaded database, starting at 1
