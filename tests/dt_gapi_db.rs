@@ -38,6 +38,7 @@ struct Srv {
     server: Arc<ApiServer>,
     addr: SocketAddr,
     root: PathBuf,
+    serving: Option<thread::JoinHandle<()>>,
 }
 
 impl Srv {
@@ -61,8 +62,14 @@ impl Srv {
 }
 
 impl Drop for Srv {
+    /// Stop the server, wait for it (bounded by its shutdown grace), and
+    /// remove its root directory — also when the test failed.
     fn drop(&mut self) {
         self.server.shutdown();
+        if let Some(serving) = self.serving.take() {
+            let _ = serving.join();
+        }
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -70,10 +77,15 @@ fn serve(server: ApiServer, root: PathBuf) -> Srv {
     let server = Arc::new(server);
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
-    thread::spawn(move || {
+    let serving = thread::spawn(move || {
         s2.serve_forever();
     });
-    Srv { server, addr, root }
+    Srv {
+        server,
+        addr,
+        root,
+        serving: Some(serving),
+    }
 }
 
 fn start(tag: &str) -> Srv {
@@ -744,9 +756,19 @@ fn build_counts_parse_failures_and_refuses_bad_sources() {
     assert_eq!(code(&j), 1003);
 }
 
+/// A directory removed when dropped (also when the test fails).
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn a_load_policy_directory_is_a_source_root() {
     let data = tmp_root("loaddir_data");
+    let _cleanup = RemoveOnDrop(data.clone());
     fs::write(data.join("lubm.nt"), LUBM).unwrap();
     let dir = data.clone();
     let srv = start_with(

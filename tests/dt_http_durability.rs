@@ -23,7 +23,24 @@ use gstore::{Database, QueryResult};
 const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n";
 const NEW_TRIPLE: &str = "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }";
 
-/// A unique temp directory per test.
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// A unique temp directory per test, removed when the test ends.
 fn tmp_dir(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
@@ -32,6 +49,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&p);
+    TMP_DIRS.with(|d| d.0.borrow_mut().push(p.clone()));
     p
 }
 
