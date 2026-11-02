@@ -306,9 +306,10 @@ tail from the same call (stable since 1.88, within the 1.89 MSRV). The hash
 is unchanged (old and new agree on all 5,810 slices of lengths 0–299 tried).
 After it, `clippy -D warnings` on 1.99.1 is clean for every CI scope
 (workspace all-targets; gstore all-targets with gzip, tls, zip, readline,
-pfn-wasm, "zip pfn-wasm readline" and rocksdb; gstore-bench all-targets with
-rocksdb), and rustfmt `--check` on 1.99.1 and 1.97.0 and workspace clippy on
-1.97.0 are clean too. No `#[allow]` was added.
+pfn-wasm, "zip pfn-wasm readline" and rocksdb) and, checked in addition
+(CI does not lint it), for gstore-bench all-targets with rocksdb; rustfmt
+`--check` on 1.99.1 and 1.97.0 and workspace clippy on 1.97.0 are clean
+too. No `#[allow]` was added.
 
 The 1.97.0 checks were first run as `cargo +stable ...`: `stable` is the
 same rustc 1.97.0 build (2d8144b78), but the named `1.97.0` toolchain on
