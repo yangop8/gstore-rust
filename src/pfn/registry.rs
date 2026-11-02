@@ -102,7 +102,7 @@ pub struct PfnRegistry {
     /// takes the function's turn and loads; concurrent first calls wait for
     /// the turn and then find the module cached.
     #[cfg(feature = "pfn-wasm")]
-    loading: Mutex<HashMap<(String, String), Arc<Mutex<()>>>>,
+    loading: Mutex<LoadTurns>,
     /// How many modules were read and loaded (tests).
     #[cfg(all(test, feature = "pfn-wasm"))]
     loads: AtomicU64,
@@ -112,6 +112,11 @@ pub struct PfnRegistry {
     #[cfg(all(test, feature = "pfn-wasm"))]
     before_cache: Mutex<Option<BeforeCache>>,
 }
+
+/// The load turns of the functions being loaded, by `(user, name)` (see
+/// `PfnRegistry::loading`).
+#[cfg(feature = "pfn-wasm")]
+type LoadTurns = HashMap<(String, String), Arc<Mutex<()>>>;
 
 /// A test hook of [`PfnRegistry`] (`before_cache`).
 #[cfg(all(test, feature = "pfn-wasm"))]

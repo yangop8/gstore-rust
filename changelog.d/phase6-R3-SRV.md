@@ -95,6 +95,9 @@ for — `examples/srv_mixed_load.rs` (new).
     for and apply with the next request; the re-entrancy guard; the counter
     sequence lock; snapshot read errors; the PFN entry cache; concurrent
     first PFN calls load the module once (`pfn-wasm`).
+  - Existing tests changed only mechanically (the per-database lock API:
+    `locked(h)` → `h.read()` / `h.write()` in `http_api`'s unit tests,
+    `ReadSnapshot::capture(..)` → `.unwrap()`); no assertion changed.
   - Temp directories: `tests/dt_gapi_db.rs` removes each server root when
     its `Srv` drops (it joins the server first; also on a failed test),
     `tests/dt_http_durability.rs` (`gstore_durability_*`) and the
