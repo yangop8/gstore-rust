@@ -295,3 +295,17 @@ details):
   `the_upstream_api_test_script_runs_unmodified` leaves about 26 MB (LUBM
   export and backup) per run, and 164 such directories (4.1 GB) had piled up
   in `/tmp` on this machine. Removing the root when `Srv` drops would fix it.
+
+## Rust 1.99.1 lints
+
+`phase6` merged `ci-fix-snapshot` (e3439d0, the CI pin to Rust 1.99.1;
+`ci-toolchain-pin.md`) in 632a3ff. Round 2 code had one more 1.99.1
+finding, `clippy::chunks_exact_to_as_chunks` in `hash_key`
+(`src/bulk/termmap.rs`): it now iterates `as_chunks::<16>()` and takes the
+tail from the same call (stable since 1.88, within the 1.89 MSRV). The hash
+is unchanged (old and new agree on all 5,810 slices of lengths 0–299 tried).
+After it, `clippy -D warnings` on 1.99.1 is clean for every CI scope
+(workspace all-targets; gstore all-targets with gzip, tls, zip, readline,
+pfn-wasm, "zip pfn-wasm readline" and rocksdb; gstore-bench all-targets with
+rocksdb), and rustfmt `--check` on 1.99.1 and 1.97.0 and workspace clippy on
+1.97.0 are clean too. No `#[allow]` was added.

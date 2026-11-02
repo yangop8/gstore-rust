@@ -21,13 +21,12 @@ pub(crate) fn hash_key(b: &[u8]) -> u64 {
         (m as u64) ^ ((m >> 64) as u64)
     }
     let mut h = (b.len() as u64) ^ P0;
-    let mut chunks = b.chunks_exact(16);
-    for c in &mut chunks {
+    let (chunks, rem) = b.as_chunks::<16>();
+    for c in chunks {
         let w0 = u64::from_le_bytes(c[0..8].try_into().unwrap());
         let w1 = u64::from_le_bytes(c[8..16].try_into().unwrap());
         h = fold(w0 ^ P1 ^ h, w1 ^ P0);
     }
-    let rem = chunks.remainder();
     if !rem.is_empty() {
         let mut t = [0u8; 16];
         t[..rem.len()].copy_from_slice(rem);
