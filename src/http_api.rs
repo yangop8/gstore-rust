@@ -5237,13 +5237,32 @@ mod tests {
 
     use std::net::TcpStream;
 
-    /// A unique temp directory for one server's databases + logs + user store.
+    /// The temp roots the current test thread made, removed when the thread
+    /// ends — also when the test fails (a thread-local's destructor runs
+    /// after the unwinding).
+    struct TmpRoots(std::cell::RefCell<Vec<PathBuf>>);
+
+    impl Drop for TmpRoots {
+        fn drop(&mut self) {
+            for p in self.0.borrow().iter() {
+                let _ = fs::remove_dir_all(p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_ROOTS: TmpRoots = const { TmpRoots(std::cell::RefCell::new(Vec::new())) };
+    }
+
+    /// A unique temp directory for one server's databases + logs + user
+    /// store, removed when the test ends (see [`TmpRoots`]).
     fn tmp_root(tag: &str) -> PathBuf {
         use std::sync::atomic::AtomicU64;
         static CTR: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         p.push(format!("gstore_api_unit_{tag}_{}_{n}", std::process::id()));
+        TMP_ROOTS.with(|r| r.0.borrow_mut().push(p.clone()));
         p
     }
 
@@ -6711,6 +6730,368 @@ mod tests {
                 .expect("created"),
         );
         assert_eq!(h.read().unwrap().db.query_settings(), new);
+    }
+
+    // --- R3: shared reads, re-entrancy, lock-free monitoring -------------
+
+    /// A two-party latch with a timeout: [`arrive`](Self::arrive) returns
+    /// `true` once two callers arrived, `false` if `timeout` passed first —
+    /// so a query calling it proves another query ran *at the same time*.
+    #[derive(Default)]
+    struct Latch {
+        n: Mutex<usize>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Latch {
+        fn arrive(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            self.cv.notify_all();
+            while *n < 2 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                n = self.cv.wait_timeout(n, left).unwrap().0;
+            }
+            true
+        }
+    }
+
+    /// A gate readers wait at (holding their database guard) until it opens.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(usize, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Gate {
+        /// Count in, wait until open (or 20 s), return 1.
+        fn pass(&self) -> i64 {
+            let mut st = self.state.lock().unwrap();
+            st.0 += 1;
+            self.cv.notify_all();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !st.1 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return 0;
+                }
+                st = self.cv.wait_timeout(st, left).unwrap().0;
+            }
+            1
+        }
+
+        fn wait_entered(&self, n: usize) {
+            let mut st = self.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while st.0 < n {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "only {} of {n} readers arrived", st.0);
+                st = self.cv.wait_timeout(st, left).unwrap().0;
+            }
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// The served handle of database `name`.
+    fn served(server: &ApiServer, name: &str) -> DbHandle {
+        Arc::clone(
+            locked(&server.inner.state)
+                .dbs
+                .get(name)
+                .expect("the database is loaded"),
+        )
+    }
+
+    /// Build database `name` (two triples) through REST `/build`.
+    fn build_two(addr: &SocketAddr, name: &str) {
+        let auth = basic("root", "root");
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .";
+        let (s, b) = split_status_body(&raw_request(
+            addr,
+            "POST",
+            &format!("/build?db_name={name}"),
+            Some(&auth),
+            data,
+        ));
+        assert_eq!(s, 200, "build: {b}");
+    }
+
+    /// An `/api` request body for root.
+    fn api_body(fields: &str) -> String {
+        format!(r#"{{"username":"root","password":"root",{fields}}}"#)
+    }
+
+    /// Two reads of the same database through REST `/sparql`, and two through
+    /// the `/api` `query` operation, each calling a function that waits for a
+    /// second caller: both answer `1` only if the two ran at the same time
+    /// (under one exclusive lock the first would time out with `0`).
+    #[test]
+    fn two_reads_of_one_database_run_at_once() {
+        let (server, addr) = start("latch");
+        build_two(&addr, "lat");
+        let h = served(&server, "lat");
+        let rest_latch = Arc::new(Latch::default());
+        let api_latch = Arc::new(Latch::default());
+        {
+            let mut slot = h.write().unwrap();
+            for (iri, latch) in [
+                ("http://ex/latch-rest", Arc::clone(&rest_latch)),
+                ("http://ex/latch-api", Arc::clone(&api_latch)),
+            ] {
+                slot.db.register_function(iri, move |_| {
+                    Some(crate::query::Value::Int(i64::from(
+                        latch.arrive(Duration::from_secs(15)),
+                    )))
+                });
+            }
+        }
+        let auth = basic("root", "root");
+        let rest: Vec<_> = (0..2)
+            .map(|_| {
+                let auth = auth.clone();
+                std::thread::spawn(move || {
+                    split_status_body(&raw_request(
+                        &addr,
+                        "POST",
+                        "/sparql?db_name=lat",
+                        Some(&auth),
+                        "SELECT (<http://ex/latch-rest>(1) AS ?x) WHERE {}",
+                    ))
+                })
+            })
+            .collect();
+        for t in rest {
+            let (s, body) = t.join().unwrap();
+            assert_eq!(s, 200, "{body}");
+            assert!(body.contains("\"value\":\"1\""), "REST /sparql: {body}");
+        }
+        let api: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let body = api_body(
+                        r#""operation":"query","db_name":"lat","sparql":"SELECT (<http://ex/latch-api>(1) AS ?x) WHERE {}""#,
+                    );
+                    split_status_body(&raw_request(&addr, "POST", "/api", None, &body)).1
+                })
+            })
+            .collect();
+        for t in api {
+            let body = t.join().unwrap();
+            assert!(body.contains("\"StatusCode\":0"), "{body}");
+            assert!(body.contains("\"value\":\"1\""), "/api query: {body}");
+        }
+        server.shutdown();
+    }
+
+    /// A database guard taken twice by one thread is an error (in every
+    /// build), not a deadlock; other threads are not affected.
+    #[test]
+    fn a_reentrant_database_guard_is_refused() {
+        let cell = DbSlot::handle(
+            Database::build_from_str("re", "<http://ex/a> <http://ex/p> <http://ex/b> .").unwrap(),
+            tmp_root("reentrant"),
+            false,
+            &LoadPolicy::restricted(),
+            &QuerySettings::default(),
+        );
+        let shared = cell.read().unwrap();
+        let e = cell
+            .read()
+            .err()
+            .expect("a second shared guard on one thread");
+        assert_eq!(e.kind, OpErrorKind::Failed);
+        assert!(e.msg.contains("re"), "{}", e.msg);
+        assert!(e.msg.contains("deadlock"), "{}", e.msg);
+        assert!(
+            cell.write().is_err(),
+            "no upgrade while holding the shared guard"
+        );
+        assert!(cell.try_write().is_none());
+        // Another thread shares it.
+        let c2 = Arc::clone(&cell);
+        let other = std::thread::spawn(move || c2.read().map(|s| s.db.triple_num()).unwrap());
+        assert_eq!(other.join().unwrap(), 1);
+        drop(shared);
+        let excl = cell.write().unwrap();
+        assert!(cell.read().is_err());
+        assert!(cell.write().is_err());
+        drop(excl);
+        // Released: usable again, and the registry forgot both.
+        assert_eq!(cell.read().unwrap().db.triple_num(), 1);
+        assert!(cell.try_write().is_some());
+    }
+
+    /// `/status`, `/monitor`, `/show` and the `/api` `show`, `monitor` and
+    /// `stat` answer within a second while a statement holds the database —
+    /// shared, exclusive, and shared with a writer queued behind it (which
+    /// makes new shared guards wait too).
+    #[test]
+    fn monitoring_answers_while_the_database_is_held() {
+        let (server, addr) = start("monitor_held");
+        build_two(&addr, "mon");
+        let auth = basic("root", "root");
+        // Computes and caches the class statistics for the current data.
+        let (_, warm) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/api",
+            None,
+            &api_body(r#""operation":"monitor","db_name":"mon""#),
+        ));
+        assert!(warm.contains("\"tripleNum\":\"2\""), "{warm}");
+        let h = served(&server, "mon");
+        let check = |what: &str| {
+            let second = Duration::from_secs(1);
+            for (method, target, body, expect) in [
+                ("GET", "/status", String::new(), "\"total_triples\":2"),
+                ("GET", "/monitor", String::new(), "\"triples\":2"),
+                ("GET", "/show", String::new(), "\"triples\":2"),
+                (
+                    "POST",
+                    "/api",
+                    api_body(r#""operation":"monitor","db_name":"mon""#),
+                    "\"tripleNum\":\"2\"",
+                ),
+                (
+                    "POST",
+                    "/api",
+                    api_body(r#""operation":"show""#),
+                    "\"database\":\"mon\"",
+                ),
+                (
+                    "POST",
+                    "/api",
+                    api_body(r#""operation":"stat""#),
+                    "\"StatusCode\":0",
+                ),
+            ] {
+                let t0 = Instant::now();
+                let got = request_within(&addr, method, target, Some(&auth), &body, second);
+                let (s, b) =
+                    got.unwrap_or_else(|| panic!("{method} {target} {body} waited ({what})"));
+                assert_eq!(s, 200, "{target}: {b}");
+                assert!(b.contains(expect), "{target} ({what}): {b}");
+                assert!(
+                    t0.elapsed() < second,
+                    "{target} took {:?} ({what})",
+                    t0.elapsed()
+                );
+            }
+        };
+        {
+            let _shared = h.read().unwrap();
+            check("a reader holds it");
+        }
+        {
+            let _excl = h.write().unwrap();
+            check("a writer holds it");
+        }
+        {
+            let shared = h.read().unwrap();
+            let h2 = Arc::clone(&h);
+            let writer = std::thread::spawn(move || {
+                let _w = h2.write().unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            check("a reader holds it and a writer waits");
+            drop(shared);
+            writer.join().unwrap();
+        }
+        server.shutdown();
+    }
+
+    /// New `[query]` settings installed while two reads hold a database are
+    /// not waited for: the database takes them with its next request.
+    #[test]
+    fn query_settings_installed_while_reads_run_apply_next() {
+        let (server, addr) = start("settings_readers");
+        build_two(&addr, "set");
+        let h = served(&server, "set");
+        let gate = Arc::new(Gate::default());
+        {
+            let g = Arc::clone(&gate);
+            h.write()
+                .unwrap()
+                .db
+                .register_function("http://ex/gate", move |_| {
+                    Some(crate::query::Value::Int(g.pass()))
+                });
+        }
+        let auth = basic("root", "root");
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let auth = auth.clone();
+                std::thread::spawn(move || {
+                    split_status_body(&raw_request(
+                        &addr,
+                        "POST",
+                        "/sparql?db_name=set",
+                        Some(&auth),
+                        "SELECT (<http://ex/gate>(1) AS ?x) WHERE {}",
+                    ))
+                })
+            })
+            .collect();
+        gate.wait_entered(2);
+        let old = h.read().unwrap().db.query_settings();
+        let new = QuerySettings {
+            integer_division: IntegerDivision::Truncate,
+            ..old
+        };
+        let t0 = Instant::now();
+        server.inner.apply_query_settings(new);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "installing settings waited for the readers ({:?})",
+            t0.elapsed()
+        );
+        assert_eq!(h.read().unwrap().db.query_settings(), old, "not yet: busy");
+        gate.open();
+        for r in readers {
+            let (s, b) = r.join().unwrap();
+            assert_eq!(s, 200, "{b}");
+            assert!(b.contains("\"value\":\"1\""), "{b}");
+        }
+        // The next read syncs them (dropping its shared guard to do so).
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/sparql?db_name=set",
+            Some(&auth),
+            "SELECT (7/2 AS ?x) WHERE {}",
+        ));
+        assert_eq!(s, 200, "{b}");
+        assert!(b.contains("\"value\":\"3\""), "truncating division: {b}");
+        assert_eq!(h.read().unwrap().db.query_settings(), new);
+        server.shutdown();
+    }
+
+    /// A read error recorded while a transaction's snapshot evaluates fails
+    /// the read (contract C2).
+    #[test]
+    fn a_read_error_fails_a_snapshot_read() {
+        let mut db =
+            Database::build_from_str("snap_err", "<http://ex/a> <http://ex/p> <http://ex/b> .")
+                .unwrap();
+        db.register_function("http://ex/fail", |_| {
+            crate::store::read_scope::note_read_error("injected: page 7 checksum");
+            Some(crate::query::Value::Int(1))
+        });
+        let snap = ReadSnapshot::capture(&db).unwrap();
+        let e = snap
+            .query("SELECT (<http://ex/fail>(1) AS ?x) WHERE {}", None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("page 7 checksum"), "{e}");
+        assert!(snap.query("ASK { ?s ?p ?o }", None).is_ok());
     }
 
     #[test]
