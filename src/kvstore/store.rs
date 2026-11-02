@@ -447,6 +447,47 @@ impl DiskStore {
         Ok(())
     }
 
+    /// The term counts as the header holds them now. A Stream-mode
+    /// database interns terms through a writable [`DiskDict`] on this store's
+    /// pager (one operation each, which sets the count root), so the header,
+    /// not this struct, is authoritative for them: every use takes the
+    /// larger of the two (counts only grow; R4's free list keeps the
+    /// allocated limit).
+    fn header_term_counts(&self, pager: &Pager) -> (u32, u32, u32) {
+        let root = |slot: usize, mine: u32| -> u32 {
+            u32::try_from(pager.root(slot))
+                .unwrap_or(u32::MAX)
+                .max(mine)
+        };
+        (
+            root(ROOT_ENTITY_COUNT, self.entity_count),
+            root(ROOT_LITERAL_COUNT, self.literal_count),
+            root(ROOT_PRED_COUNT, self.pred_count),
+        )
+    }
+
+    /// Catch this struct's term counters up with the header (see
+    /// [`header_term_counts`](Self::header_term_counts)).
+    fn sync_term_counts(&mut self, pager: &Pager) {
+        let (e, l, p) = self.header_term_counts(pager);
+        self.entity_count = e;
+        self.literal_count = l;
+        self.pred_count = p;
+    }
+
+    /// The current term counts `(entities, literals, predicates)`, terms
+    /// interned through a shared [`DiskDict`] included.
+    fn term_counts(&self) -> (u32, u32, u32) {
+        let pager = self.pager.read().unwrap_or_else(|e| e.into_inner());
+        self.header_term_counts(&pager)
+    }
+
+    /// One past the highest predicate id with a statistics record: every
+    /// predicate with a triple is below it.
+    pub fn predicate_stat_limit(&self) -> PredId {
+        self.stats.len() as PredId
+    }
+
     fn counters(&self) -> Counters {
         Counters {
             triple_count: self.triple_count,
@@ -493,10 +534,12 @@ impl DiskStore {
         f: impl FnOnce(&mut DiskStore, &mut Pager) -> Result<R>,
     ) -> Result<R> {
         self.check_writable()?;
-        let before = self.counters();
-        self.stats_undo.clear();
         let pager = Arc::clone(&self.pager);
         let mut guard = pager.write().unwrap();
+        // Terms a shared dictionary interned since the last operation.
+        self.sync_term_counts(&guard);
+        let before = self.counters();
+        self.stats_undo.clear();
         let mut op = PagerOp::begin(&mut guard);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, &mut op)))
             .unwrap_or_else(|panic| {
@@ -975,8 +1018,11 @@ impl DiskStore {
     /// Persist counters and flush all dirty pages (see [`commit`](Self::commit)).
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
-        let mut guard = self.pager.write().unwrap();
+        let shared = Arc::clone(&self.pager);
+        let mut guard = shared.write().unwrap();
         let pager = &mut *guard;
+        // Never write back term counts lower than a shared dictionary's.
+        self.sync_term_counts(pager);
         pager.set_root(ROOT_TRIPLE_COUNT, self.triple_count);
         pager.set_root(ROOT_ENTITY_COUNT, self.entity_count as u64);
         pager.set_root(ROOT_LITERAL_COUNT, self.literal_count as u64);
@@ -993,14 +1039,17 @@ impl DiskStore {
     pub fn triple_count(&self) -> u64 {
         self.triple_count
     }
+    /// Interned entities (terms a shared [`DiskDict`] interned included).
     pub fn entity_num(&self) -> usize {
-        self.entity_count as usize
+        self.term_counts().0 as usize
     }
+    /// Interned literals (see [`entity_num`](Self::entity_num)).
     pub fn literal_num(&self) -> usize {
-        self.literal_count as usize
+        self.term_counts().1 as usize
     }
+    /// Interned predicates (see [`entity_num`](Self::entity_num)).
     pub fn predicate_num(&self) -> usize {
-        self.pred_count as usize
+        self.term_counts().2 as usize
     }
 
     // ---- degree / cardinality statistics (gStore KVstore degree APIs) -----
@@ -1079,7 +1128,7 @@ impl DiskStore {
     pub fn rebuild_stats(&mut self) -> Result<()> {
         // 1. Aggregate from the authoritative triples (one SPO scan).
         let all = self.try_iter_spo().map_err(GStoreError::Io)?;
-        let np = self.pred_count as usize;
+        let np = self.term_counts().2 as usize;
         let mut num = vec![0u32; np];
         let mut psub: Vec<HashSet<u32>> = vec![HashSet::new(); np];
         let mut pobj: Vec<HashSet<u32>> = vec![HashSet::new(); np];
@@ -1747,29 +1796,32 @@ impl DiskStore {
     pub fn dictionary(&self) -> Result<Dictionary> {
         let mut dict = Dictionary::new();
         let pager = self.pager.read().unwrap();
-        load_terms(&self.id2entity, &pager, self.entity_count, |s| {
+        let (entities, literals, preds) = self.header_term_counts(&pager);
+        load_terms(&self.id2entity, &pager, entities, |s| {
             dict.try_intern_entity(s)
         })?;
-        load_terms(&self.id2literal, &pager, self.literal_count, |s| {
+        load_terms(&self.id2literal, &pager, literals, |s| {
             dict.try_intern_literal(s)
         })?;
-        load_terms(&self.id2predicate, &pager, self.pred_count, |s| {
+        load_terms(&self.id2predicate, &pager, preds, |s| {
             dict.try_intern_predicate(s)
         })?;
         Ok(dict)
     }
 
-    /// Get (building once, then reusing) the out-of-core dictionary backend that
-    /// shares this store's pager/page-cache. Rebuilt only if the term counts have
-    /// changed since it was last built (i.e. new terms were interned), so reads
-    /// keep reusing one materialized-string cache.
+    /// Get (building once, then reusing) the out-of-core, read-only
+    /// dictionary backend that shares this store's pager/page-cache, so reads
+    /// keep reusing one materialized-string cache. It is current while its
+    /// term counts equal the header's: a term interned since — by this store
+    /// (`insert_keys`) or through a writable [`DiskDict`] on the same pager
+    /// (Stream mode), which only bumps *that* backend's
+    /// [`generation`](DiskTermSource::generation) — moves the header's count
+    /// root, and the backend is rebuilt.
     fn disk_backing(&self) -> Arc<DiskDict> {
+        let (entities, literals, preds) = self.term_counts();
         let mut cached = self.disk_dict.lock().unwrap();
         if let Some(d) = cached.as_ref() {
-            if d.entity_num() == self.entity_count as usize
-                && d.literal_num() == self.literal_count as usize
-                && d.predicate_num() == self.pred_count as usize
-            {
+            if d.counts() == (entities as usize, literals as usize, preds as usize) {
                 return Arc::clone(d);
             }
         }
@@ -1781,9 +1833,9 @@ impl DiskStore {
             self.id2entity,
             self.id2literal,
             self.id2predicate,
-            self.entity_count as usize,
-            self.literal_count as usize,
-            self.pred_count as usize,
+            entities as usize,
+            literals as usize,
+            preds as usize,
         ));
         *cached = Some(Arc::clone(&d));
         d

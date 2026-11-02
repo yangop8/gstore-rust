@@ -683,6 +683,27 @@ impl DiskTriples {
                 .is_some_and(|t| !t.overlay.added().is_empty())
     }
 
+    /// Whether the open transaction adds default-graph triples (which a
+    /// `vstree.kv` built from committed data lacks; see
+    /// [`vstree_stale`](Self::vstree_stale)).
+    pub fn transaction_adds(&self) -> bool {
+        self.txn
+            .as_ref()
+            .is_some_and(|t| !t.overlay.added().is_empty())
+    }
+
+    /// The predicates with at least one triple in what this store reads
+    /// (the committed state and an open transaction's changes), ascending.
+    pub fn predicates(&self) -> Vec<PredId> {
+        let mut limit = self.store.predicate_stat_limit();
+        if let Some(o) = self.overlay() {
+            if let Some(p) = o.added().predicates().last() {
+                limit = limit.max(p + 1);
+            }
+        }
+        (0..limit).filter(|&p| self.pred_card(p) > 0).collect()
+    }
+
     /// Record that `vstree.kv` was rebuilt from the current contents
     /// (passthrough; persisted at the next commit point).
     pub fn mark_vstree_fresh(&mut self) {
@@ -847,6 +868,42 @@ impl DiskTriples {
         self.under_gate(|dt| {
             for &t in &fresh {
                 n += u64::from(dt.apply(|st| st.insert_ids(t))?);
+            }
+            Ok(n > 0)
+        })?;
+        Ok(n)
+    }
+
+    /// Remove many triples; returns how many existed. Outside a transaction
+    /// the present ones are removed under **one** drain of the gate (one
+    /// epoch step) — `CLEAR DEFAULT` of a Stream-mode database.
+    pub fn remove_many(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> Result<u64> {
+        self.check_open()?;
+        if self.txn.is_some() {
+            let mut n = 0;
+            for t in triples {
+                n += u64::from(self.remove_triple(t)?);
+            }
+            return Ok(n);
+        }
+        let mut todo: Vec<IdTriple> = triples.into_iter().collect();
+        todo.sort_unstable();
+        todo.dedup();
+        let mut present = Vec::with_capacity(todo.len());
+        for t in todo {
+            match self.store.try_exists(t.sub, t.pred, t.obj) {
+                Ok(true) => present.push(t),
+                Ok(false) => {}
+                Err(e) => return Err(self.fail(GStoreError::Io(e))),
+            }
+        }
+        if present.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u64;
+        self.under_gate(|dt| {
+            for &t in &present {
+                n += u64::from(dt.apply(|st| st.delete_ids(t))?);
             }
             Ok(n > 0)
         })?;
