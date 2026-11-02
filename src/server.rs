@@ -14,10 +14,36 @@
 //! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
 //! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
 //! query parameter; CONSTRUCT/DESCRIBE return N-Triples. Connections run
-//! concurrently (on the worker pool), but the [`Database`] is shared behind a
-//! [`Mutex`] so the actual query/update execution is serialized (correctness
-//! over throughput); everything up to and after that — parsing, auth,
+//! concurrently (on the worker pool), and so do reads: the [`Database`] is
+//! shared behind a [`RwLock`] (see *Locking* below), so any number of
+//! SELECT/ASK/CONSTRUCT/DESCRIBE requests evaluate at once while an UPDATE
+//! runs alone. Everything around the statement itself — parsing it, auth,
 //! serialization, response compression — runs off the lock.
+//!
+//! **Locking** (contract C8 of the Phase 6 plan):
+//!
+//! * A request is parsed into a [`Statement`] **before** any lock is taken
+//!   (a syntax error is answered `400` without touching the database). A read
+//!   then takes a **shared** guard and runs through [`Database::read_as`]; an
+//!   UPDATE takes the **exclusive** guard and runs through
+//!   [`Database::execute_as`], and its check_point save happens before that
+//!   guard is released. Everything a read reaches inside the database is
+//!   `&self` and synchronized there (the query cache, the CSR cache, the
+//!   string-index cache, the PFN registry; the settings change only under
+//!   the exclusive guard).
+//! * `/status` never takes the database lock: it reads counters the server
+//!   publishes after every write ([`DbCounters`]), so it answers while a long
+//!   query or an update runs.
+//! * Lock order: this server's `RwLock` → the database's internals (its
+//!   query / CSR / string-index caches; `persist_lock` → disk sink →
+//!   `persist_error` → the pager) → the `DiskTriples` gate → the pager. Never
+//!   the reverse: nothing inside the database ever waits for the server's
+//!   lock.
+//! * No thread ever holds two database guards, takes a guard it already
+//!   holds, or upgrades a shared guard to an exclusive one without dropping
+//!   the shared guard first. The guards are poison-tolerant
+//!   ([`read_locked`] / [`write_locked`]): a request that panicked while
+//!   holding one does not wedge the server.
 //!
 //! **Connections** (shared with [`ApiServer`](crate::http_api::ApiServer), tuned
 //! by [`HttpOptions`] — gStore's `thread_num` and friends, see
@@ -52,7 +78,7 @@
 //!   `serve_forever` return a [`ShutdownReport`]. The same machinery drives
 //!   [`ApiServer`](crate::http_api::ApiServer).
 //! * **Panic isolation** — each request is routed under `catch_unwind`: a
-//!   panicking handler answers `500` with a JSON error, and the poisoned
+//!   panicking handler answers `500` with a JSON error, and a poisoned
 //!   database lock is recovered so later requests keep working.
 //! * **HTTP Basic auth** — optional, via [`Server::with_basic_auth`]. When
 //!   configured, every request must carry a valid `Authorization: Basic` header
@@ -84,13 +110,13 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::db::{Database, LoadPolicy};
+use crate::db::{Database, LoadPolicy, Statement};
 use crate::query::{QueryResult, ResultSet};
 use crate::sparql_results::{self, json_str, ResultFormat};
 
@@ -255,11 +281,16 @@ pub struct Server {
 }
 
 /// The part of a [`Server`] shared across connection worker threads (behind an
-/// `Arc`): the [`Database`] (serialized by its `Mutex`) and the optional Basic
-/// credentials. Kept separate from the non-`Send` bookkeeping so a worker only
-/// needs to clone this `Arc`.
+/// `Arc`): the [`Database`] (shared by readers, exclusive to an UPDATE — see
+/// the module's *Locking*) and the optional Basic credentials. Kept separate
+/// from the non-`Send` bookkeeping so a worker only needs to clone this `Arc`.
 struct ServerInner {
-    db: Mutex<Database>,
+    db: RwLock<Database>,
+    /// The served database's name (fixed: the server never renames it).
+    name: String,
+    /// The database's figures as of its last write, for `/status` (read
+    /// without the database lock).
+    counters: DbCounters,
     /// Set (under the `db` lock) when the in-memory database has changes that
     /// are not yet saved to [`dir`](Self::dir); cleared by a successful save.
     dirty: AtomicBool,
@@ -292,9 +323,13 @@ impl Server {
         db.set_load_policy(LoadPolicy::restricted());
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
+        let counters = DbCounters::default();
+        counters.publish(&db);
         Ok(Server {
             inner: Arc::new(ServerInner {
-                db: Mutex::new(db),
+                name: db.name().to_string(),
+                db: RwLock::new(db),
+                counters,
                 dirty: AtomicBool::new(false),
                 auth: None,
                 dir: None,
@@ -346,7 +381,7 @@ impl Server {
     /// also decides whether federated `SERVICE` patterns may contact remote
     /// endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> Server {
-        locked(&self.inner.db).set_load_policy(policy);
+        write_locked(&self.inner.db).set_load_policy(policy);
         self
     }
 
@@ -357,7 +392,7 @@ impl Server {
     /// `[query]` section ([`crate::config::GStoreConfig::query_settings`]);
     /// without this call the database keeps the settings it was given.
     pub fn with_query_settings(self, settings: crate::db::QuerySettings) -> Server {
-        locked(&self.inner.db).apply_query_settings(&settings);
+        write_locked(&self.inner.db).apply_query_settings(&settings);
         self
     }
 
@@ -427,8 +462,8 @@ impl Server {
 
     /// Accept connections until [`shutdown`](Self::shutdown), serving them on
     /// the bounded worker pool (see [`HttpOptions`]) so a slow query on one
-    /// connection does not block the others (the [`Database`] itself is still
-    /// serialized behind its `Mutex`). On shutdown the listener is closed, idle
+    /// connection does not block the others (reads share the [`Database`],
+    /// an UPDATE has it to itself — see the module's *Locking*). On shutdown the listener is closed, idle
     /// kept-alive connections are closed, in-flight requests are given up to the
     /// grace period to finish (statements still running then are cancelled),
     /// unsaved changes are saved, and a [`ShutdownReport`] is returned.
@@ -498,7 +533,8 @@ impl Server {
             self.inner.cancel.store(true, Ordering::SeqCst);
         }
         if self.inner.dirty.load(Ordering::SeqCst) {
-            let db = locked(&self.inner.db);
+            // Exclusive: no update runs while the final save does.
+            let db = write_locked(&self.inner.db);
             // Re-checked under the lock: the update may have saved itself.
             if self.inner.dirty.load(Ordering::SeqCst) {
                 match self.inner.save_locked(&db) {
@@ -1519,7 +1555,146 @@ pub(crate) const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// none). Reads/writes after a recovered panic may see partial state, but the
 /// server stays available.
 pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A shared guard of `l`, tolerating poisoning as [`locked`] does (a writer
+/// that panicked while holding it does not make every later reader panic).
+pub(crate) fn read_locked<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The exclusive guard of `l`, tolerating poisoning as [`locked`] does.
+pub(crate) fn write_locked<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One database's figures as of its last write — triples, entities,
+/// literals, predicates, its [`mutation_count`](Database::mutation_count)
+/// (the *generation*), when it was last saved and a few flags — published by
+/// whoever holds the database exclusively (after a load and at the end of
+/// every write section) and read by monitoring (`/status`, `/monitor`,
+/// `show`) **without the database lock**, so monitoring answers while a long
+/// query or an update holds it.
+///
+/// Publishing is a sequence lock: the (single) publisher makes the sequence
+/// odd, stores the figures, and makes it even again; a reader retries until
+/// it read the same even sequence on both sides, so it never sees half of
+/// one write and half of the next. Only the holder of the database's
+/// exclusive guard publishes, which is what keeps the publisher single.
+#[derive(Debug, Default)]
+pub(crate) struct DbCounters {
+    seq: AtomicU64,
+    triples: AtomicU64,
+    entities: AtomicU64,
+    literals: AtomicU64,
+    predicates: AtomicU64,
+    generation: AtomicU64,
+    last_save: AtomicU64,
+    index_valid: AtomicBool,
+    in_transaction: AtomicBool,
+    dirty: AtomicBool,
+}
+
+/// The figures [`DbCounters::read`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CounterSnapshot {
+    /// Triples (the committed ones while a transaction is open, when the
+    /// publisher says so).
+    pub(crate) triples: u64,
+    pub(crate) entities: u64,
+    pub(crate) literals: u64,
+    pub(crate) predicates: u64,
+    /// The database's [`mutation_count`](Database::mutation_count).
+    pub(crate) generation: u64,
+    /// Unix milliseconds of the last successful save; `0` = none yet.
+    pub(crate) last_save: u64,
+    pub(crate) index_valid: bool,
+    pub(crate) in_transaction: bool,
+    pub(crate) dirty: bool,
+}
+
+impl DbCounters {
+    /// Publish `db`'s current figures (the caller holds `db` exclusively);
+    /// the last save time and the dirty flag are kept.
+    pub(crate) fn publish(&self, db: &Database) {
+        let s = db.stats();
+        let prev = self.read();
+        self.store(CounterSnapshot {
+            triples: s.triple_num,
+            entities: s.entity_num as u64,
+            literals: s.literal_num as u64,
+            predicates: s.predicate_num as u64,
+            generation: db.mutation_count(),
+            index_valid: s.index_valid,
+            in_transaction: s.in_transaction,
+            ..prev
+        });
+    }
+
+    /// Publish `snap` (the caller is the single publisher, see the type docs).
+    pub(crate) fn store(&self, snap: CounterSnapshot) {
+        self.seq.fetch_add(1, Ordering::SeqCst);
+        self.triples.store(snap.triples, Ordering::SeqCst);
+        self.entities.store(snap.entities, Ordering::SeqCst);
+        self.literals.store(snap.literals, Ordering::SeqCst);
+        self.predicates.store(snap.predicates, Ordering::SeqCst);
+        self.generation.store(snap.generation, Ordering::SeqCst);
+        self.last_save.store(snap.last_save, Ordering::SeqCst);
+        self.index_valid.store(snap.index_valid, Ordering::SeqCst);
+        self.in_transaction
+            .store(snap.in_transaction, Ordering::SeqCst);
+        self.dirty.store(snap.dirty, Ordering::SeqCst);
+        self.seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record a successful save, now (the caller is the single publisher).
+    pub(crate) fn note_saved(&self) {
+        let snap = self.read();
+        self.store(CounterSnapshot {
+            last_save: unix_millis(),
+            ..snap
+        });
+    }
+
+    /// The figures last published. Never waits for the database (only, very
+    /// briefly, for a publish in progress).
+    pub(crate) fn read(&self) -> CounterSnapshot {
+        let mut spins = 0u32;
+        loop {
+            let before = self.seq.load(Ordering::SeqCst);
+            if before % 2 == 0 {
+                let snap = CounterSnapshot {
+                    triples: self.triples.load(Ordering::SeqCst),
+                    entities: self.entities.load(Ordering::SeqCst),
+                    literals: self.literals.load(Ordering::SeqCst),
+                    predicates: self.predicates.load(Ordering::SeqCst),
+                    generation: self.generation.load(Ordering::SeqCst),
+                    last_save: self.last_save.load(Ordering::SeqCst),
+                    index_valid: self.index_valid.load(Ordering::SeqCst),
+                    in_transaction: self.in_transaction.load(Ordering::SeqCst),
+                    dirty: self.dirty.load(Ordering::SeqCst),
+                };
+                if self.seq.load(Ordering::SeqCst) == before {
+                    return snap;
+                }
+            }
+            // A publish is a handful of stores: spin briefly, then yield.
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch (`0` if the clock is before it).
+pub(crate) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The message returned (as HTTP 500) when a request handler panics; the panic
@@ -1636,10 +1811,10 @@ impl ServerInner {
                 CONSOLE_HTML.as_bytes().to_vec(),
             ),
             // Test-only trigger for the panic-isolation tests: panics while
-            // holding the database lock (poisoning it).
+            // holding the database's exclusive guard (poisoning it).
             #[cfg(test)]
             ("GET", "/__test/panic") => {
-                let _db = locked(&self.db);
+                let _db = write_locked(&self.db);
                 panic!("test-triggered handler panic");
             }
             ("GET" | "POST", _) => Reply::plain(404, "text/plain", b"not found"),
@@ -1649,8 +1824,8 @@ impl ServerInner {
 
     /// Run a `/sparql` request: negotiate a result format, then answer with a
     /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
-    /// The [`Database`] lock is released before any serialization or network
-    /// write, so it is held only for the query itself.
+    /// The [`Database`] guard is released before any serialization or network
+    /// write, so it is held only for the statement itself.
     fn handle_sparql(&self, req: &Request) -> Reply {
         let q = match req.query_string() {
             Some(q) => q,
@@ -1698,18 +1873,30 @@ impl ServerInner {
         }
     }
 
-    /// Run `sparql` under the database lock. An UPDATE that changed data marks
-    /// the database dirty and — under the check_point policy, or once a
-    /// shutdown has begun — saves it before the lock is released, so the
-    /// on-disk copy never lags an acknowledged write. That includes an UPDATE
-    /// that failed part-way: its operations before the failing one stay
-    /// applied (and visible), so they are saved too. A failed save does not
-    /// undo the (applied) update: it is reported as a warning and the database
-    /// stays dirty, to be retried on shutdown.
+    /// Run `sparql`: parsed first, with no lock held (a syntax error is
+    /// answered without touching the database). A read then runs on a shared
+    /// guard ([`Database::read_as`]), concurrently with other reads. An
+    /// UPDATE takes the exclusive guard ([`Database::execute_as`]); one that
+    /// changed data marks the database dirty and — under the check_point
+    /// policy, or once a shutdown has begun — saves it before the guard is
+    /// released, so the on-disk copy never lags an acknowledged write. That
+    /// includes an UPDATE that failed part-way: its operations before the
+    /// failing one stay applied (and visible), so they are saved too. A
+    /// failed save does not undo the (applied) update: it is reported as a
+    /// warning and the database stays dirty, to be retried on shutdown.
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
-        let mut db = locked(&self.db);
+        let stmt = match Statement::parse(sparql) {
+            Ok(stmt) => stmt,
+            Err(e) => return (Err(e), None),
+        };
+        let cancel = Some(Arc::clone(&self.cancel));
+        if !stmt.is_update() {
+            let db = read_locked(&self.db);
+            return (db.read_as(&stmt, cancel, None), None);
+        }
+        let mut db = write_locked(&self.db);
         let before = db.mutation_count();
-        let mut result = db.query_cancellable(sparql, Arc::clone(&self.cancel));
+        let mut result = db.execute_as(stmt, cancel, None);
         let mut warning = None;
         if db.mutation_count() != before {
             self.dirty.store(true, Ordering::SeqCst);
@@ -1730,12 +1917,14 @@ impl ServerInner {
                 };
                 result = Err(crate::GStoreError::Query(format!("{e} ({note})")));
             }
+            self.counters.publish(&db);
         }
         (result, warning)
     }
 
-    /// Save `db` (whose lock the caller holds) to the attached directory and
-    /// clear the dirty flag. `Ok(None)` when no directory is attached.
+    /// Save `db` (whose exclusive guard the caller holds) to the attached
+    /// directory and clear the dirty flag. `Ok(None)` when no directory is
+    /// attached.
     fn save_locked(&self, db: &Database) -> Result<Option<PathBuf>, (PathBuf, String)> {
         let Some(dir) = &self.dir else {
             return Ok(None);
@@ -1743,26 +1932,29 @@ impl ServerInner {
         match db.save(dir) {
             Ok(()) => {
                 self.dirty.store(false, Ordering::SeqCst);
+                self.counters.note_saved();
                 Ok(Some(dir.clone()))
             }
             Err(e) => Err((dir.clone(), e.to_string())),
         }
     }
 
+    /// `/status`: the figures published after the last write
+    /// ([`DbCounters`]). It never waits for the database lock, so it answers
+    /// while a long query or an update runs.
     fn status_json(&self) -> Reply {
-        let db = locked(&self.db);
-        let s = db.stats();
+        let s = self.counters.read();
         let dir = match &self.dir {
             Some(d) => json_str(&d.to_string_lossy()),
             None => "null".to_string(),
         };
         let body = format!(
             "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{},\"db_dir\":{dir},\"check_point\":{},\"dirty\":{}}}",
-            json_str(&s.name),
-            s.triple_num,
-            s.entity_num,
-            s.literal_num,
-            s.predicate_num,
+            json_str(&self.name),
+            s.triples,
+            s.entities,
+            s.literals,
+            s.predicates,
             s.index_valid,
             s.in_transaction,
             self.check_point,
