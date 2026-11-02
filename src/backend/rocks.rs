@@ -1305,6 +1305,15 @@ impl TripleSource for RocksStore {
     /// the predicate's subjects (its `x|p` counter keys, ascending), each
     /// followed by its objects from an SPO seek to `(s, p)`.
     fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+        static SORT: OnceLock<bool> = OnceLock::new();
+        if *SORT.get_or_init(|| std::env::var("GSTORE_ROCKS_SO_BY_P").as_deref() == Ok("sort")) {
+            let mut out = Vec::with_capacity(self.pred_counts(pred).card as usize);
+            self.scan(CF_POS, &be(pred), |k| {
+                out.push((de(&k[8..12]), de(&k[4..8])))
+            });
+            out.sort_unstable();
+            return out;
+        }
         self.so_by_p_seek(pred)
     }
 

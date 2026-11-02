@@ -6,6 +6,7 @@
 //! gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<source> ...]
 //! gbuild -db <db_name> [-f <source>] [--disk | --rocksdb] [--strict] [--force]
 //! gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] …
+//! gbuild --rocksdb [--memory MB] [--threads N] [--tmp-dir DIR] [--incremental] …
 //! ```
 //!
 //! (the second form is upstream 1.3's: `-db`/`--database`, `-f`/`--file`;
@@ -52,6 +53,14 @@
 //! and term), for comparisons. The `[system]` keys are read from
 //! `./conf/conf.ini` when it exists.
 //!
+//! `--rocksdb` builds in bulk too: the same sorted streams are written as
+//! SST files, one set per column family, ingested into a fresh store and
+//! installed crash-safely (the RocksDB layout `"1"`, every key and value as
+//! the one-write-per-triple path stores them). `--memory`, `--threads` and
+//! `--tmp-dir` apply as for `--disk` (`--fill` does not), and
+//! `--incremental` selects the previous path (one write batch per triple,
+//! then a reopen to print the counts).
+//!
 //! Like upstream, a statement that does not parse is skipped, counted and
 //! logged to `<db_name>.db/parse_error.log` (see
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
@@ -84,7 +93,8 @@ const TOOL: cli::Tool = cli::Tool {
     usage: "gbuild [--disk | --rocksdb] [--strict] [--force] <db_name> [<file | dir | zip | url> ...]\n\
             gbuild -db <db_name> [-f <file | dir | zip | url>] [--disk | --rocksdb] [--strict] [--force]\n\
             \t[--unzip-max-size BYTES] [--unzip-max-entries N]\n\
-            gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] ...",
+            gbuild --disk [--memory MB] [--threads N] [--tmp-dir DIR] [--fill PCT] [--incremental] ...\n\
+            gbuild --rocksdb [--memory MB] [--threads N] [--tmp-dir DIR] [--incremental] ...",
     help: "build a database from RDF files\n\
            \n\
            Options:\n\
@@ -95,15 +105,18 @@ const TOOL: cli::Tool = cli::Tool {
            \t\t\t\tWithout any source an empty database is built.\n\
            \t--disk\t\t\tStore the database in the on-disk B+ tree KVstore (built in\n\
            \t\t\t\tbulk: sorted, bottom-up, installed crash-safely).\n\
-           \t--memory MB\t\tSort memory of the --disk build (default: conf.ini\n\
-           \t\t\t\tbuild_memory_mb, else 1024); the dictionary comes on top.\n\
-           \t--threads N\t\tThreads of the --disk build (default: conf.ini\n\
+           \t--memory MB\t\tSort memory of a --disk / --rocksdb build (default:\n\
+           \t\t\t\tconf.ini build_memory_mb, else 1024); the dictionary comes\n\
+           \t\t\t\ton top.\n\
+           \t--threads N\t\tThreads of a --disk / --rocksdb build (default: conf.ini\n\
            \t\t\t\tbuild_threads; 0 = every core).\n\
-           \t--tmp-dir DIR\t\tWhere the --disk build spills sorted runs (default:\n\
-           \t\t\t\tinside the database directory).\n\
+           \t--tmp-dir DIR\t\tWhere a --disk / --rocksdb build spills sorted runs\n\
+           \t\t\t\t(default: inside the database directory).\n\
            \t--fill PCT\t\tB+ tree node fill of the --disk build, 50-100 (default 90).\n\
-           \t--incremental\t\tBuild --disk the previous way, one insert at a time.\n\
-           \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`).\n\
+           \t--incremental\t\tBuild --disk / --rocksdb the previous way, one insert at\n\
+           \t\t\t\ta time.\n\
+           \t--rocksdb\t\tStore the database in RocksDB (feature `rocksdb`; built in\n\
+           \t\t\t\tbulk: SST files ingested, installed crash-safely).\n\
            \t--strict\t\tStop at the first statement that does not parse.\n\
            \t--force\t\t\tReplace an existing database (else gbuild refuses).\n\
            \t--unzip-max-size BYTES\tThe most a zip package may unpack to (default\n\
@@ -210,11 +223,14 @@ fn main() -> ExitCode {
     if disk && rocksdb {
         return TOOL.usage_error("choose at most one of --disk / --rocksdb");
     }
-    let bulk_flags = (4..8).any(|i| args.value(i).is_some()) || incremental;
-    if bulk_flags && !disk {
+    let bulk_flags = (4..7).any(|i| args.value(i).is_some()) || incremental;
+    if bulk_flags && !disk && !rocksdb {
         return TOOL.usage_error(
-            "--memory, --threads, --tmp-dir, --fill and --incremental apply to --disk builds",
+            "--memory, --threads, --tmp-dir and --incremental apply to --disk and --rocksdb builds",
         );
+    }
+    if args.value(7).is_some() && !disk {
+        return TOOL.usage_error("--fill applies to --disk builds");
     }
     let bulk = match bulk_options(&args) {
         Ok(b) => b,
@@ -291,7 +307,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if rocksdb {
+    if rocksdb && (incremental || !cfg!(feature = "rocksdb")) {
         let code = build_rocksdb(name, &dir, &sources, &opts, &mut log, started);
         if code == ExitCode::SUCCESS {
             created.keep();
@@ -303,19 +319,24 @@ fn main() -> ExitCode {
     }
     let mut bulk_installed = false;
     let mut cleanup_incomplete = false;
-    let report = if disk && !incremental {
+    let report = if (disk || rocksdb) && !incremental {
+        let target = if rocksdb {
+            BulkTarget::RocksDb
+        } else {
+            BulkTarget::Disk
+        };
         let built = gstore::bulk::build(
             Path::new(&dir),
             name,
             BulkInput::Sources(&sources),
             &opts,
             &mut log,
-            BulkTarget::Disk,
+            target,
             &bulk,
         );
         match built {
             Ok(r) => {
-                print_bulk(name, &dir, &r, started);
+                print_bulk(name, &dir, &r, target, started);
                 bulk_installed = true;
                 for w in &r.warnings {
                     eprintln!(
@@ -327,7 +348,8 @@ fn main() -> ExitCode {
                 r.import
             }
             Err(e) => {
-                eprintln!("disk build failed: {e}");
+                let what = if rocksdb { "rocksdb" } else { "disk" };
+                eprintln!("{what} build failed: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -490,9 +512,13 @@ fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: 
     gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
 }
 
-fn print_bulk(name: &str, dir: &str, r: &BulkReport, started: Instant) {
-    gstore::outln!("Built database '{name}' in {dir} (on-disk B+ tree, bulk build)");
-    gstore::outln!("{}", r.summary());
+fn print_bulk(name: &str, dir: &str, r: &BulkReport, target: BulkTarget, started: Instant) {
+    let backend = match target {
+        BulkTarget::Disk => "on-disk B+ tree",
+        BulkTarget::RocksDb => "RocksDB",
+    };
+    gstore::outln!("Built database '{name}' in {dir} ({backend}, bulk build)");
+    gstore::outln!("{}", r.summary_for(target));
     gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
 }
 
