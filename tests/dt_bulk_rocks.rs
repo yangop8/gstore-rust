@@ -413,6 +413,66 @@ fn updates_after_a_bulk_build_keep_the_stats_exact() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// An open database holds its directory's lock for the RocksDB layout too
+/// (as for the others): released when it is dropped. A store whose
+/// `rocksdb/LOCK` alone is held — what an older binary serving it holds —
+/// still refuses the bulk build (Linux reads the lock from the kernel's
+/// table), and the store is replaced once it is free.
+#[test]
+fn an_open_rocksdb_database_holds_the_directory_lock() {
+    use gstore::db::dirlock::DirLock;
+    let base = tmp("dirlock");
+    let dir = base.join("l.db");
+    bulk_text(&dir, "<http://ex/a> <http://ex/p> <http://ex/b> .\n").unwrap();
+    assert!(!DirLock::held_here(&dir));
+    let db = Database::open(&dir).unwrap();
+    assert!(db.holds_dir_lock() && DirLock::held_here(&dir));
+    drop(db);
+    assert!(!DirLock::held_here(&dir));
+    // The per-triple helper's database holds it as well.
+    let built = Database::build_rocksdb_from_str(
+        "l",
+        &dir,
+        "<http://ex/a> <http://ex/p> <http://ex/c> .\n",
+    )
+    .unwrap();
+    assert!(built.holds_dir_lock() && DirLock::held_here(&dir));
+    // ... and refuses to rebuild a directory a database of this process serves.
+    let e = Database::build_rocksdb_from_str(
+        "l",
+        &dir,
+        "<http://ex/x> <http://ex/p> <http://ex/y> .\n",
+    )
+    .err()
+    .expect("refused while open")
+    .to_string();
+    assert!(e.contains("open in this process"), "{e}");
+    drop(built);
+    assert_eq!(Database::open(&dir).unwrap().triple_num(), 1);
+
+    if cfg!(target_os = "linux") {
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("rocksdb/LOCK"))
+            .unwrap();
+        if holder.try_lock().is_ok() {
+            let e = bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n").unwrap_err();
+            assert!(e.to_string().contains("in use"), "{e}");
+            assert!(!dir.join(bulk::STAGING_DIR).exists());
+            drop(holder);
+            bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n").unwrap();
+            let mut db = Database::open(&dir).unwrap();
+            assert!(matches!(
+                db.query("ASK { <http://ex/x> <http://ex/p> <http://ex/y> }")
+                    .unwrap(),
+                QueryResult::Ask(true)
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A failed bulk build — a strict import's bad statement, a database open in
 /// this process — leaves the old database (RocksDB or another layout) as it
 /// was, with no staging area.
@@ -435,13 +495,11 @@ fn a_failed_build_leaves_the_old_database() {
         let mut db = Database::open(&dir).unwrap();
         assert_eq!(db.triple_num(), 1);
         assert!(matches!(db.query(ask).unwrap(), QueryResult::Ask(true)));
-        // While it is open here, a rebuild is refused (Linux reads RocksDB's
-        // lock from the kernel's table) and changes nothing.
-        if cfg!(target_os = "linux") {
-            let e = bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n").unwrap_err();
-            assert!(e.to_string().contains("in use"), "{e}");
-            assert!(!dir.join(bulk::STAGING_DIR).exists());
-        }
+        // While it is open here (it holds the directory lock), a rebuild is
+        // refused and changes nothing.
+        let e = bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n").unwrap_err();
+        assert!(e.to_string().contains("open in this process"), "{e}");
+        assert!(!dir.join(bulk::STAGING_DIR).exists());
         assert!(matches!(db.query(ask).unwrap(), QueryResult::Ask(true)));
         db.query("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
             .unwrap();

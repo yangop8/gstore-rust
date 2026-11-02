@@ -6,12 +6,13 @@
 //! one side's updates. [`Database::open`](super::Database::open) therefore
 //! takes an exclusive advisory lock on `<dir>/LOCK` ([`LOCK_FILE`], an
 //! operating-system file lock — `flock` on Unix, `LockFileEx` on Windows — so
-//! it is released by the kernel even when the holder crashes) for the
-//! snapshot and on-disk layouts, and holds it for as long as the
-//! [`Database`](super::Database) lives. A second process opening the same
-//! directory gets a clear error naming the holder's pid
-//! ([`GStoreError::Database`], "… is locked by another process …"). RocksDB
-//! stores are not locked here: RocksDB locks its own `rocksdb/LOCK`.
+//! it is released by the kernel even when the holder crashes) for every
+//! layout, and holds it for as long as the [`Database`](super::Database)
+//! lives. A second process opening the same directory gets a clear error
+//! naming the holder's pid ([`GStoreError::Database`], "… is locked by
+//! another process …"). A RocksDB database holds both this lock and the
+//! store's own `rocksdb/LOCK` (which RocksDB takes; older binaries take only
+//! that one, which is why a bulk build also checks it).
 //!
 //! **The rule within one process.** The lock excludes *other processes*. Within
 //! a process the lock is reference-counted per (canonical) directory: opening

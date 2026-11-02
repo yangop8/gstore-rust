@@ -62,7 +62,7 @@ use crate::reason::rules::RULE_DIR;
 use crate::store::TripleSource;
 
 use super::budget::Budget;
-use super::commit::{CRASH_ENV, STAGING_DIR};
+use super::commit::{rocksdb_lock_holder, CRASH_ENV, STAGING_DIR};
 use super::encode::{render_key, Dict, Space};
 use super::extsort::{ExtSorter, Sorted};
 use super::scratch::{self, Scratch};
@@ -779,8 +779,9 @@ pub(crate) fn build_rocksdb(
         )));
     }
     // Another process holding the directory (a server, a tool) is refused
-    // here; one serving its RocksDB store is refused below, through the
-    // store's own lock (the RocksDB layout's open takes no `DirLock` yet).
+    // here; an older binary serving the RocksDB store (it takes only the
+    // store's own lock, not the directory's) is refused below, through
+    // that lock.
     let _lock = DirLock::acquire(dir)?;
     // Finish a swap a crash interrupted (as every open does) before looking
     // at the store: its `rocksdb.new` may be the committed database.
@@ -927,61 +928,6 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
     );
     fp.hit("cleaned")?;
     Ok(warnings)
-}
-
-/// Who holds the lock of a RocksDB store in `dir` (`rocksdb/LOCK`, or that of
-/// a staged `rocksdb.new/`), if anyone does: RocksDB holds it — a POSIX
-/// record lock — for as long as the store is open, in any process. Read from
-/// the kernel's lock table (`/proc/locks`); `None` when there is no such
-/// store, its lock is free, or the table cannot be read. (The same check as
-/// the disk install's.)
-#[cfg(target_os = "linux")]
-fn rocksdb_lock_holder(dir: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let locks = [ROCKS_SUBDIR, "rocksdb.new"]
-        .iter()
-        .filter_map(|sub| fs::metadata(dir.join(sub).join("LOCK")).ok())
-        .map(|m| {
-            let dev = m.dev();
-            let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-            let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-            (major, minor, m.ino())
-        })
-        .collect::<Vec<_>>();
-    if locks.is_empty() {
-        return None;
-    }
-    let table = fs::read_to_string("/proc/locks").ok()?;
-    for line in table.lines() {
-        // `1: POSIX  ADVISORY  WRITE 4242 08:01:1234 0 EOF`.
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let Some(at) = fields.iter().position(|f| f.matches(':').count() == 2) else {
-            continue;
-        };
-        let mut id = fields[at].split(':');
-        let (Some(major), Some(minor), Some(ino)) = (id.next(), id.next(), id.next()) else {
-            continue;
-        };
-        let (Ok(major), Ok(minor), Ok(ino)) = (
-            u64::from_str_radix(major, 16),
-            u64::from_str_radix(minor, 16),
-            ino.parse::<u64>(),
-        ) else {
-            continue;
-        };
-        if locks.contains(&(major, minor, ino)) {
-            let pid = fields.get(at.wrapping_sub(1)).copied().unwrap_or("?");
-            return Some(format!("its rocksdb/LOCK is held by process {pid}"));
-        }
-    }
-    None
-}
-
-/// Elsewhere the kernel's lock table is not read: RocksDB's own lock still
-/// refuses a second open, but an open store is not detected here.
-#[cfg(not(target_os = "linux"))]
-fn rocksdb_lock_holder(_dir: &Path) -> Option<String> {
-    None
 }
 
 #[cfg(test)]

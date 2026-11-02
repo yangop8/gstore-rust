@@ -184,10 +184,11 @@ pub(crate) fn build_disk(
     }
     let _lock = DirLock::acquire(dir)?;
     if let Some(holder) = rocksdb_lock_holder(dir) {
-        // `Database::open` takes no DirLock for the RocksDB layout (RocksDB
-        // locks `rocksdb/LOCK` itself), so the lock above cannot see a
-        // server or another process — or this one — serving it. Replacing
-        // its directory under it would lose every write it acknowledges.
+        // `Database::open` takes the directory lock for the RocksDB layout
+        // too, but an older binary does not (it relies on RocksDB's own
+        // `rocksdb/LOCK`): the lock above cannot see it serving the store.
+        // Replacing its directory under it would lose every write it
+        // acknowledges.
         return Err(GStoreError::Database(format!(
             "the RocksDB store in '{}' is in use ({holder}); close it before rebuilding",
             dir.display()
@@ -270,9 +271,10 @@ pub(crate) fn build_disk(
 /// the kernel's lock table (`/proc/locks`), so it sees every process on this
 /// host whatever its pid namespace; `None` when there is no such store, its
 /// lock is free, or the table cannot be read (a best-effort safety net, like
-/// the directory lock on a file system without advisory locks).
+/// the directory lock on a file system without advisory locks). Shared by
+/// the disk and the RocksDB installs.
 #[cfg(target_os = "linux")]
-fn rocksdb_lock_holder(dir: &Path) -> Option<String> {
+pub(crate) fn rocksdb_lock_holder(dir: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let locks = ["rocksdb", "rocksdb.new"]
         .iter()
@@ -317,7 +319,7 @@ fn rocksdb_lock_holder(dir: &Path) -> Option<String> {
 /// Elsewhere the kernel's lock table is not read: RocksDB's own lock still
 /// refuses a second open, but an open store is not detected here.
 #[cfg(not(target_os = "linux"))]
-fn rocksdb_lock_holder(_dir: &Path) -> Option<String> {
+pub(crate) fn rocksdb_lock_holder(_dir: &Path) -> Option<String> {
     None
 }
 

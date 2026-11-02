@@ -446,10 +446,11 @@ impl Database {
             )));
         }
         fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
-        // The snapshot and on-disk layouts are locked against other processes
-        // before anything is read (see `dirlock`); RocksDB locks itself.
+        // Every layout is locked against other processes before anything is
+        // read (see `dirlock`); a RocksDB store also takes its own
+        // `rocksdb/LOCK` when it opens.
         let lock = match Database::storage_kind(dir) {
-            Some(StorageKind::RocksDb) | None => None,
+            None => None,
             Some(_) => Some(super::dirlock::DirLock::acquire(dir)?),
         };
         let mut db = match Database::storage_kind(dir) {
@@ -1177,6 +1178,17 @@ impl Database {
             named,
         } = acc;
         fs::create_dir_all(dir)?;
+        // A database of this process serving `dir` would lose its files below
+        // (and a RocksDB one its store) — refused, like a bulk build; another
+        // process holding `dir` is refused by the lock, which the new database
+        // then keeps for as long as it lives (as `open` does).
+        if super::dirlock::DirLock::held_here(dir) {
+            return Err(GStoreError::Database(format!(
+                "database directory '{}' is open in this process; close it before rebuilding it",
+                dir.display()
+            )));
+        }
+        let lock = super::dirlock::DirLock::acquire(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
@@ -1203,6 +1215,7 @@ impl Database {
         rocks.flush()?;
         db.store = Backend::Rocks(rocks);
         db.home = Some(dir.to_path_buf());
+        db.dir_lock = Some(lock);
         db.rebuild_index();
         Ok(db)
     }
@@ -1226,6 +1239,16 @@ impl Database {
         use crate::backend::rocks::RocksStore;
         let dir = dir.as_ref();
         let rocks_dir = dir.join(ROCKS_SUBDIR);
+        if !dir.is_dir() {
+            return Err(GStoreError::Database(format!(
+                "no RocksDB store at '{}'",
+                rocks_dir.display()
+            )));
+        }
+        // The directory's inter-process lock (see `dirlock`) before anything
+        // is read or a swap is finished, as `open` takes it for every layout
+        // (shared with `open`'s own when it calls this).
+        let lock = super::dirlock::DirLock::acquire(dir)?;
         fsutil::recover_dir_swap(&rocks_dir)?;
         if !rocks_dir.is_dir() {
             return Err(GStoreError::Database(format!(
@@ -1250,6 +1273,7 @@ impl Database {
         db.store = Backend::Rocks(rocks);
         db.named = named;
         db.home = Some(dir.to_path_buf());
+        db.dir_lock = Some(lock);
         // The VS-tree is not rebuilt at open (it walks every entity's edges
         // in RocksDB): queries evaluate without it until `rebuild_index()`.
         // `vstree_on_open` (`[storage]`, or `GSTORE_VSTREE_ON_OPEN=1` through

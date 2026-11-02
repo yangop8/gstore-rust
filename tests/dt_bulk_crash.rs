@@ -357,11 +357,12 @@ fn a_second_build_in_this_process_and_a_stale_staging_area() {
     let _ = fs::remove_dir_all(&base);
 }
 
-/// A RocksDB store in use is never replaced: `Database::open` takes no
-/// directory lock for that layout (RocksDB locks its own `rocksdb/LOCK`), so
-/// the build checks that lock itself before staging anything. A held
-/// `rocksdb/LOCK` refuses the build and leaves the store as it was; once
-/// released, the build replaces it.
+/// A RocksDB store in use is never replaced. `Database::open` takes the
+/// directory lock for that layout too, but an older binary relies on
+/// RocksDB's own `rocksdb/LOCK` alone, so the build checks that lock itself
+/// before staging anything. A held `rocksdb/LOCK` (and no directory lock)
+/// refuses the build and leaves the store as it was; once released, the
+/// build replaces it.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_rocksdb_store_in_use_is_not_replaced() {
@@ -394,8 +395,9 @@ fn a_rocksdb_store_in_use_is_not_replaced() {
     let _ = fs::remove_dir_all(&base);
 }
 
-/// The same with a real, open RocksDB database of this process (RocksDB's
-/// own POSIX lock).
+/// The same with a real, open RocksDB database of this process: it holds
+/// the directory lock (refused as open in this process) as well as RocksDB's
+/// own POSIX lock.
 #[cfg(all(target_os = "linux", feature = "rocksdb"))]
 #[test]
 fn an_open_rocksdb_database_is_not_replaced() {
@@ -405,7 +407,7 @@ fn an_open_rocksdb_database_is_not_replaced() {
     make_prior(&dir, Prior::RocksDb);
     let live = Database::open(&dir).unwrap();
     let e = build_new(&dir).unwrap_err().to_string();
-    assert!(e.contains("RocksDB store") && e.contains("in use"), "{e}");
+    assert!(e.contains("open in this process"), "{e}");
     assert!(dir.join("rocksdb").is_dir());
     drop(live);
     assert_eq!(which(&dir, Prior::RocksDb), Some(false));
