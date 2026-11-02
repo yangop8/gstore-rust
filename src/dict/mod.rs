@@ -70,6 +70,7 @@ pub mod prefix;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::{ControlFlow, Deref};
@@ -217,6 +218,7 @@ pub enum TermStr<'a> {
 
 impl<'a> TermStr<'a> {
     /// The text.
+    #[inline]
     pub fn as_str(&self) -> &str {
         match self {
             TermStr::Borrowed(s) => s,
@@ -225,6 +227,7 @@ impl<'a> TermStr<'a> {
     }
 
     /// The text as an owned `String` (one copy).
+    #[inline]
     pub fn into_string(self) -> String {
         self.as_str().to_owned()
     }
@@ -245,6 +248,7 @@ impl<'a> TermStr<'a> {
 
 impl Deref for TermStr<'_> {
     type Target = str;
+    #[inline]
     fn deref(&self) -> &str {
         self.as_str()
     }
@@ -537,6 +541,32 @@ impl IdTable {
         self.len += 1;
     }
 
+    /// Add `s` at vector slot `slot` unless an equal string is already
+    /// indexed (`false` then): one probe of the run does both.
+    fn insert_unique(&mut self, s: &str, slot: u32, strings: &[Option<Arc<str>>]) -> bool {
+        if (self.len + 1) * TABLE_LOAD_DEN > self.slots.len() * TABLE_LOAD_NUM {
+            self.grow();
+        }
+        let h = self.hash(s);
+        let mask = self.mask();
+        let mut i = h as usize & mask;
+        loop {
+            let e = self.slots[i];
+            if e == 0 {
+                self.slots[i] = (u64::from(h) << 32) | (u64::from(slot) + 1);
+                self.len += 1;
+                return true;
+            }
+            if (e >> 32) as u32 == h {
+                let other = (e as u32).wrapping_sub(1);
+                if strings.get(other as usize).and_then(Option::as_deref) == Some(s) {
+                    return false;
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
     fn place(&mut self, h: u32, slot: u32) {
         let mask = self.mask();
         let mut i = h as usize & mask;
@@ -592,12 +622,22 @@ impl IdTable {
 /// The shared state of one interner (see [`Interner`]).
 #[derive(Clone, Default)]
 struct InternerData {
-    /// `index - base → Some(string)`; a `None` slot is a reclaimed (freed) hole.
+    /// `index - base → Some(string)`; a `None` slot is a freed (or retired)
+    /// hole. Never ends in a free hole: freeing the last index trims the
+    /// vector (and every free hole that becomes last with it).
     strings: Vec<Option<Arc<str>>>,
     /// `string → index - base`, by reference into `strings`.
     table: IdTable,
-    /// Reclaimed indices available for reuse (gStore's `freelist`), LIFO.
-    free: Vec<u32>,
+    /// Reclaimed indices available for reuse (gStore's `freelist`), reused
+    /// **lowest first**. Persisted as the same `seq` of `u32` the former LIFO
+    /// stack used (ascending now).
+    free: BTreeSet<u32>,
+    /// Indices whose term was removed but which may not be reused yet: a
+    /// [`DictPin`] older than the retirement still holds them (see
+    /// [`Dictionary::retire`]). `(index, retire stamp)`. Not persisted as
+    /// such: a saved dictionary lists them with the free indices (no pin
+    /// survives a reopen).
+    retired: Vec<(u32, u64)>,
     /// The index stored at `strings[0]`. Always `0` except in a dictionary whose
     /// counters a test advanced with [`Dictionary::debug_advance_id_counters`]
     /// to exercise the id-space bounds without allocating billions of strings.
@@ -606,21 +646,26 @@ struct InternerData {
 }
 
 impl InternerData {
+    #[inline]
     fn get(&self, s: &str) -> Option<u32> {
         self.table
             .find(s, &self.strings)
             .map(|slot| self.base + slot)
     }
 
+    #[inline]
     fn resolve(&self, idx: u32) -> Option<&Arc<str>> {
         let slot = idx.checked_sub(self.base)? as usize;
         self.strings.get(slot).and_then(Option::as_ref)
     }
 
-    /// Intern `s` (known to be absent): reuse a freed index, else extend.
+    /// Intern `s` (known to be absent): reuse the lowest freed index, else
+    /// extend.
     fn insert_new(&mut self, s: &str, check: impl Fn(u64) -> Result<u32>) -> Result<u32> {
-        // A free entry that does not name a hole (a damaged dict.bin) is skipped.
-        while let Some(reused) = self.free.pop() {
+        // Every free index names a hole below the end (the invariant the
+        // normalization at load and `release` keep); one that does not is
+        // dropped rather than overwriting a term.
+        while let Some(reused) = self.free.pop_first() {
             let Some(slot) = reused.checked_sub(self.base) else {
                 continue;
             };
@@ -637,12 +682,50 @@ impl InternerData {
         Ok(id)
     }
 
-    fn free(&mut self, s: &str) -> Option<u32> {
-        let slot = self.table.remove(s, &self.strings)?;
+    /// Remove the term at `idx` and park the index as retired (stamp
+    /// `stamp`); `false` if `idx` names no term.
+    fn retire(&mut self, idx: u32, stamp: u64) -> bool {
+        let Some(slot) = idx.checked_sub(self.base) else {
+            return false;
+        };
+        let Some(s) = self.strings.get(slot as usize).cloned().flatten() else {
+            return false;
+        };
+        self.table.remove(&s, &self.strings);
         self.strings[slot as usize] = None;
-        let idx = self.base + slot;
-        self.free.push(idx);
-        Some(idx)
+        self.retired.push((idx, stamp));
+        true
+    }
+
+    /// Move every retired index no pin holds (`oldest_pin`: the stamp of the
+    /// oldest live pin) to the free set, trimming the end. Returns how many.
+    fn release(&mut self, oldest_pin: Option<u64>) -> usize {
+        let before = self.retired.len();
+        let mut freed = Vec::new();
+        self.retired.retain(|&(idx, stamp)| {
+            if oldest_pin.is_some_and(|p| p < stamp) {
+                return true;
+            }
+            freed.push(idx);
+            false
+        });
+        for idx in freed {
+            self.free.insert(idx);
+        }
+        self.trim();
+        before - self.retired.len()
+    }
+
+    /// Drop trailing free holes (the cascade: each trimmed hole may expose
+    /// another free one). A retired hole stops it: its index is still held.
+    fn trim(&mut self) {
+        while let Some(None) = self.strings.last() {
+            let idx = self.base + (self.strings.len() as u32 - 1);
+            if !self.free.remove(&idx) {
+                break;
+            }
+            self.strings.pop();
+        }
     }
 
     /// Live `(index, string)` pairs (skips freed holes), in id order.
@@ -654,12 +737,23 @@ impl InternerData {
             .filter_map(move |(i, s)| s.as_ref().map(|s| (base + i as u32, s)))
     }
 
+    /// The persisted free list: the free and the retired indices, ascending.
+    fn persisted_free(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.free.iter().copied().collect();
+        if !self.retired.is_empty() {
+            v.extend(self.retired.iter().map(|&(i, _)| i));
+            v.sort_unstable();
+        }
+        v
+    }
+
     /// Bytes this interner holds on the heap (strings counted with their
     /// `Arc` header).
     fn heap_bytes(&self) -> usize {
         self.strings.capacity() * std::mem::size_of::<Option<Arc<str>>>()
             + self.table.heap_bytes()
-            + self.free.capacity() * 4
+            + self.free.len() * 8
+            + self.retired.capacity() * 16
             + self
                 .strings
                 .iter()
@@ -670,13 +764,15 @@ impl InternerData {
 }
 
 /// One space of an in-memory dictionary: `string → index` and `index →
-/// string`, indices dense in insertion order, each string stored once.
+/// string`, each string stored once.
 ///
 /// Freed ids are *reclaimed*: removing a string leaves a hole (`None`) and
-/// pushes the index onto a `free` stack, mirroring gStore's per-space
-/// `freelist` + `limitID`. The next [`try_intern`](Self::try_intern) of a
-/// brand-new string pops a freed index before extending, so ids of deleted
-/// terms are reused instead of growing the id space unbounded.
+/// puts the index in a free set, mirroring gStore's per-space `freelist` +
+/// `limitID`. The next [`try_intern`](Self::try_intern) of a brand-new
+/// string takes the **lowest** freed index before extending; freeing the
+/// highest index shrinks the space instead (with every free hole below it
+/// that becomes the end). A removed term's index may first be *retired*:
+/// held until no [`DictPin`] older than the removal remains.
 ///
 /// Copy-on-write: clones share one `InternerData`; a mutation of a shared
 /// interner copies it first (`Arc::make_mut`). Look-ups and re-interning an
@@ -687,11 +783,11 @@ struct Interner {
 }
 
 impl Interner {
-    /// Intern `s`, returning its dense index and whether it is new.
+    /// Intern `s`, returning its index and whether it is new.
     /// Re-interning is idempotent (and never copies a shared interner);
-    /// otherwise a freed index is reused before the id space is extended.
-    /// `check` validates (and may reject) a brand-new index against the owning
-    /// space's bound; a reused index is always in range.
+    /// otherwise the lowest freed index is reused before the id space is
+    /// extended. `check` validates (and may reject) a brand-new index against
+    /// the owning space's bound; a reused index is always in range.
     fn try_intern(&mut self, s: &str, check: impl Fn(u64) -> Result<u32>) -> Result<(u32, bool)> {
         if let Some(id) = self.data.get(s) {
             return Ok((id, false));
@@ -700,26 +796,54 @@ impl Interner {
         Ok((id, true))
     }
 
-    /// Look up the dense index for `s`, if interned.
+    /// Look up the index for `s`, if interned.
+    #[inline]
     fn get(&self, s: &str) -> Option<u32> {
         self.data.get(s)
     }
 
-    /// Resolve a dense index back to its string (`None` for a freed hole).
+    /// Resolve an index back to its string (`None` for a hole).
+    #[inline]
     fn resolve(&self, idx: u32) -> Option<&str> {
         self.data.resolve(idx).map(|s| &**s)
     }
 
-    /// Free `s`'s index for reuse, returning it if `s` was interned. A shared
-    /// interner is copied only when `s` is present.
-    fn free(&mut self, s: &str) -> Option<u32> {
-        self.data.get(s)?;
-        Arc::make_mut(&mut self.data).free(s)
+    /// Retire index `idx` (see [`InternerData::retire`]). A shared interner
+    /// is copied only when `idx` names a term.
+    fn retire(&mut self, idx: u32, stamp: u64) -> bool {
+        if self.data.resolve(idx).is_none() {
+            return false;
+        }
+        Arc::make_mut(&mut self.data).retire(idx, stamp)
+    }
+
+    /// Release the retired indices no pin holds; copies a shared interner
+    /// only when one is releasable.
+    fn release(&mut self, oldest_pin: Option<u64>) -> usize {
+        let releasable = self
+            .data
+            .retired
+            .iter()
+            .any(|&(_, stamp)| oldest_pin.is_none_or(|p| p >= stamp));
+        if !releasable {
+            return 0;
+        }
+        Arc::make_mut(&mut self.data).release(oldest_pin)
     }
 
     /// Number of *live* (non-freed) strings.
     fn len(&self) -> usize {
         self.data.table.len
+    }
+
+    /// Number of free (reusable) indices.
+    fn free_len(&self) -> usize {
+        self.data.free.len()
+    }
+
+    /// Number of retired indices (waiting for a pin).
+    fn retired_len(&self) -> usize {
+        self.data.retired.len()
     }
 
     /// All live interned strings (skips freed holes), in id order.
@@ -732,7 +856,7 @@ impl Interner {
         self.data.entries().map(|(i, s)| (i, &**s))
     }
 
-    /// One past the highest index ever allocated (holes included).
+    /// One past the highest index allocated (interior holes included).
     fn index_limit(&self) -> u64 {
         u64::from(self.data.base) + self.data.strings.len() as u64
     }
@@ -750,6 +874,73 @@ impl Interner {
         }
     }
 
+    /// Build an interner holding exactly `slots` (index → term; `None` is a
+    /// hole): holes become free, trailing holes are trimmed, a term stored
+    /// twice is refused.
+    fn from_slots<S: AsRef<str>>(slots: Vec<Option<S>>) -> std::result::Result<Interner, String> {
+        let mut strings: Vec<Option<Arc<str>>> = Vec::with_capacity(slots.len());
+        let mut live = 0usize;
+        for s in slots {
+            if s.is_some() {
+                live += 1;
+            }
+            strings.push(s.map(|s| Arc::from(s.as_ref())));
+        }
+        Interner::assemble(strings, live, &[])
+    }
+
+    /// The common tail of loading: index the strings, check them and the
+    /// persisted free list, and normalize (every hole free, trailing holes
+    /// trimmed).
+    fn assemble(
+        mut strings: Vec<Option<Arc<str>>>,
+        live: usize,
+        persisted_free: &[u32],
+    ) -> std::result::Result<Interner, String> {
+        // A free list naming an index twice is corrupt (no writer ever
+        // produced one); entries naming a live index or one past the end
+        // are ignored, as the former reader skipped them.
+        if !persisted_free.windows(2).all(|w| w[0] < w[1]) {
+            let mut sorted = persisted_free.to_vec();
+            sorted.sort_unstable();
+            if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+                return Err(format!(
+                    "corrupt dictionary: index {} is listed as free twice",
+                    w[0]
+                ));
+            }
+        }
+        while let Some(None) = strings.last() {
+            strings.pop();
+        }
+        strings.shrink_to_fit();
+        let mut table = IdTable::with_capacity(live);
+        let mut free = BTreeSet::new();
+        for (slot, s) in strings.iter().enumerate() {
+            match s {
+                Some(s) => {
+                    if !table.insert_unique(s, slot as u32, &strings) {
+                        return Err(format!(
+                            "corrupt dictionary: term {s:?} is stored under two ids"
+                        ));
+                    }
+                }
+                None => {
+                    free.insert(slot as u32);
+                }
+            }
+        }
+        Ok(Interner {
+            data: Arc::new(InternerData {
+                strings,
+                table,
+                free,
+                retired: Vec::new(),
+                base: 0,
+            }),
+        })
+    }
+
     /// Whether two interners share their data (no copy happened).
     #[cfg(test)]
     fn shares_with(&self, other: &Interner) -> bool {
@@ -763,6 +954,7 @@ impl fmt::Debug for Interner {
             .field("live", &self.len())
             .field("allocated", &self.data.strings.len())
             .field("free", &self.data.free.len())
+            .field("retired", &self.data.retired.len())
             .finish()
     }
 }
@@ -801,7 +993,7 @@ impl Serialize for Interner {
         let mut st = ser.serialize_struct("Interner", 3)?;
         st.serialize_field("forward", &Forward(d))?;
         st.serialize_field("backward", &Backward(d))?;
-        st.serialize_field("free", &d.free)?;
+        st.serialize_field("free", &d.persisted_free())?;
         st.end()
     }
 }
@@ -865,7 +1057,11 @@ impl Assembler {
         }
     }
 
-    fn finish(mut self, free: Vec<u32>) -> std::result::Result<Interner, String> {
+    /// Normalize on the way in (`serde(from)` semantics): every hole is free
+    /// whatever the persisted list says, trailing holes are trimmed, a free
+    /// list naming an index twice or a term stored under two indices is
+    /// refused.
+    fn finish(self, free: Vec<u32>) -> std::result::Result<Interner, String> {
         if self.pos != self.forward.len() {
             return Err(format!(
                 "corrupt dictionary: index {} is mapped but past the end ({})",
@@ -873,21 +1069,8 @@ impl Assembler {
                 self.strings.len()
             ));
         }
-        self.strings.shrink_to_fit();
-        let mut table = IdTable::with_capacity(self.forward.len());
-        for (slot, s) in self.strings.iter().enumerate() {
-            if let Some(s) = s {
-                table.insert_new(s, slot as u32);
-            }
-        }
-        Ok(Interner {
-            data: Arc::new(InternerData {
-                strings: self.strings,
-                table,
-                free,
-                base: 0,
-            }),
-        })
+        let live = self.forward.len();
+        Interner::assemble(self.strings, live, &free)
     }
 }
 
@@ -1052,10 +1235,98 @@ impl<'de> Deserialize<'de> for Interner {
 /// Process-wide source of dictionary generations: every mutation of an
 /// in-memory dictionary takes a fresh value, so equal generations mean equal
 /// contents (clones share it; a fresh empty dictionary has generation 0).
+/// Pin and retirement stamps are drawn from the same clock, so they order
+/// with each other.
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---- term ids and pins ----------------------------------------------------------
+
+/// A dictionary id together with its space (literal ids are public ids,
+/// offset by [`LITERAL_FIRST_ID`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TermId {
+    /// The id space.
+    pub space: Space,
+    /// The public id within it.
+    pub id: u32,
+}
+
+impl TermId {
+    /// An entity or literal id (the space follows from the id's range).
+    pub fn node(id: EntityLiteralId) -> TermId {
+        TermId {
+            space: Space::of_id(id),
+            id,
+        }
+    }
+
+    /// A predicate id.
+    pub fn predicate(id: PredId) -> TermId {
+        TermId {
+            space: Space::Predicate,
+            id,
+        }
+    }
+}
+
+/// The live pins of one dictionary and its clones: pin stamp → count.
+#[derive(Default)]
+struct PinSet(std::sync::Mutex<std::collections::BTreeMap<u64, usize>>);
+
+impl PinSet {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<u64, usize>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn oldest(&self) -> Option<u64> {
+        self.lock().keys().next().copied()
+    }
+}
+
+impl fmt::Debug for PinSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PinSet({} live)", self.lock().values().sum::<usize>())
+    }
+}
+
+/// A reader's hold on the meaning of every id of a dictionary (see
+/// [`Dictionary::pin`]): while it lives, no id retired after it was taken is
+/// handed out again, so an id the reader saw keeps resolving to the same
+/// term — or to none — for as long as it reads. Dropping it releases the
+/// hold (the ids wait for the next [`Dictionary::release`]).
+#[derive(Debug)]
+pub struct DictPin {
+    pins: Arc<PinSet>,
+    stamp: u64,
+}
+
+impl DictPin {
+    fn new(pins: &Arc<PinSet>) -> DictPin {
+        let stamp = next_generation();
+        *pins.lock().entry(stamp).or_insert(0) += 1;
+        DictPin {
+            pins: Arc::clone(pins),
+            stamp,
+        }
+    }
+}
+
+impl Drop for DictPin {
+    fn drop(&mut self) {
+        let mut g = self.pins.lock();
+        if let Some(n) = g.get_mut(&self.stamp) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&self.stamp);
+            }
+        }
+    }
 }
 
 // ---- the dictionary --------------------------------------------------------------
@@ -1071,7 +1342,18 @@ fn next_generation() -> u64 {
 ///   `DiskStore` so a disk query never materializes the whole dictionary.
 ///
 /// `Send + Sync` and cheap to clone (the interners are shared until written).
-#[derive(Clone, Default, Serialize, Deserialize)]
+///
+/// ## Reclamation and pins
+///
+/// A removed term's id is first *retired* ([`retire`](Self::retire)): the
+/// term no longer resolves either way, but the id is not reused until
+/// [`release`](Self::release) finds no [`DictPin`] older than the retirement.
+/// Pins are shared by a dictionary and its clones. A clone of an
+/// **out-of-core** dictionary holds a pin of its own for as long as it lives
+/// (it shares the backend, so an id reused through the original would change
+/// meaning under it); a clone of an in-memory dictionary does not need one
+/// (it owns its copy-on-write version of every id).
+#[derive(Default, Serialize, Deserialize)]
 pub struct Dictionary {
     entities: Interner,
     literals: Interner,
@@ -1084,6 +1366,37 @@ pub struct Dictionary {
     /// Content generation (see [`generation`](Self::generation)); not persisted.
     #[serde(skip, default = "next_generation")]
     generation: u64,
+    /// The pins of this dictionary and its clones (see [`pin`](Self::pin)).
+    #[serde(skip)]
+    pins: Arc<PinSet>,
+    /// The pin a clone of an out-of-core dictionary holds while it lives
+    /// (held for its `Drop`).
+    #[serde(skip)]
+    #[allow(dead_code)]
+    clone_pin: Option<Arc<DictPin>>,
+    /// Ids interned new while tracking is on (see
+    /// [`track_allocations`](Self::track_allocations)).
+    #[serde(skip)]
+    allocations: Option<Vec<TermId>>,
+}
+
+impl Clone for Dictionary {
+    fn clone(&self) -> Dictionary {
+        Dictionary {
+            entities: self.entities.clone(),
+            literals: self.literals.clone(),
+            predicates: self.predicates.clone(),
+            backing: self.backing.clone(),
+            generation: self.generation,
+            pins: Arc::clone(&self.pins),
+            // A clone sharing a backend pins it (see the type docs).
+            clone_pin: self
+                .backing
+                .as_ref()
+                .map(|_| Arc::new(DictPin::new(&self.pins))),
+            allocations: None,
+        }
+    }
 }
 
 impl fmt::Debug for Dictionary {
@@ -1113,6 +1426,47 @@ impl Dictionary {
             backing: Some(backing),
             ..Dictionary::default()
         }
+    }
+
+    /// An in-memory dictionary holding exactly the given terms at their ids:
+    /// `ent[i]` is entity `i`, `lit[i]` literal `LITERAL_FIRST_ID + i`,
+    /// `pred[i]` predicate `i`; `None` is a hole. Holes become free ids
+    /// (reused lowest first), trailing holes are dropped, and a term listed
+    /// twice in one space is refused. The loader of every layout that keeps
+    /// ids with gaps (RocksDB's `dict` CF, a `kvstore.kv` with freed ids).
+    pub fn from_slots<S: AsRef<str>>(
+        ent: Vec<Option<S>>,
+        lit: Vec<Option<S>>,
+        pred: Vec<Option<S>>,
+    ) -> Result<Dictionary> {
+        let bound = |space: Space, n: usize| -> Result<()> {
+            let ok = match space {
+                Space::Entity => n as u64 <= u64::from(ENTITY_ID_LIMIT),
+                Space::Literal => n as u64 <= u64::from(LITERAL_INDEX_LIMIT),
+                Space::Predicate => n as u64 <= u64::from(PREDICATE_ID_LIMIT),
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(GStoreError::Database(format!(
+                    "{} id space exhausted: {n} ids",
+                    space.name()
+                )))
+            }
+        };
+        bound(Space::Entity, ent.len())?;
+        bound(Space::Literal, lit.len())?;
+        bound(Space::Predicate, pred.len())?;
+        let build =
+            |slots: Vec<Option<S>>| Interner::from_slots(slots).map_err(GStoreError::Database);
+        let mut d = Dictionary {
+            entities: build(ent)?,
+            literals: build(lit)?,
+            predicates: build(pred)?,
+            ..Dictionary::default()
+        };
+        d.touched();
+        Ok(d)
     }
 
     /// Whether this dictionary resolves lookups from disk on demand.
@@ -1149,13 +1503,149 @@ impl Dictionary {
         }
     }
 
+    fn interner_mut(&mut self, space: Space) -> &mut Interner {
+        match space {
+            Space::Entity => &mut self.entities,
+            Space::Literal => &mut self.literals,
+            Space::Predicate => &mut self.predicates,
+        }
+    }
+
+    /// The interner index of public id `id` of `space`.
+    fn index_of(space: Space, id: u32) -> Option<u32> {
+        id.checked_sub(space.first_id())
+    }
+
+    // ---- pins and reclamation ---------------------------------------------------
+
+    /// Pin the current meaning of every id (see [`DictPin`]): ids retired
+    /// from now on are not reused until the pin is dropped. Shared with every
+    /// clone of this dictionary.
+    pub fn pin(&self) -> DictPin {
+        DictPin::new(&self.pins)
+    }
+
+    /// Whether any pin of this dictionary (or of a clone) is alive — an
+    /// out-of-core dictionary's clones hold one each.
+    pub fn is_pinned(&self) -> bool {
+        self.pins.oldest().is_some()
+    }
+
+    /// Remove the term of `id` (in `space`) from an in-memory dictionary:
+    /// neither its key nor its id resolves any more, and the id waits to be
+    /// [released](Self::release) for reuse. `false` if `id` names no term
+    /// (or the dictionary is out-of-core: its backend frees ids itself).
+    /// The caller guarantees the term is unreferenced.
+    pub fn retire(&mut self, space: Space, id: u32) -> bool {
+        if self.backing.is_some() {
+            return false;
+        }
+        let Some(idx) = Self::index_of(space, id) else {
+            return false;
+        };
+        let stamp = next_generation();
+        let done = self.interner_mut(space).retire(idx, stamp);
+        if done {
+            self.touched();
+        }
+        done
+    }
+
+    /// Make every retired id that no pin older than its retirement holds
+    /// free for reuse (lowest first; freeing the highest ids shrinks the
+    /// space). Returns how many ids were released.
+    pub fn release(&mut self) -> usize {
+        if self.backing.is_some() {
+            return 0;
+        }
+        let oldest = self.pins.oldest();
+        let n = self.entities.release(oldest)
+            + self.literals.release(oldest)
+            + self.predicates.release(oldest);
+        if n > 0 {
+            self.touched();
+        }
+        n
+    }
+
+    /// Retire `id` and release what no pin holds — the id is reusable at once
+    /// unless pinned. `false` if `id` named no term.
+    pub fn free_id(&mut self, space: Space, id: u32) -> bool {
+        let done = self.retire(space, id);
+        if done {
+            self.release();
+        }
+        done
+    }
+
+    /// Ids retired but still held by a pin, per space `[entity, literal,
+    /// predicate]`.
+    pub fn retired_counts(&self) -> [usize; 3] {
+        [
+            self.entities.retired_len(),
+            self.literals.retired_len(),
+            self.predicates.retired_len(),
+        ]
+    }
+
+    /// Free (reusable) ids below the id limits, per space `[entity,
+    /// literal, predicate]`. In memory only (0 for an out-of-core
+    /// dictionary, whose backend reports its own).
+    pub fn free_counts(&self) -> [usize; 3] {
+        [
+            self.entities.free_len(),
+            self.literals.free_len(),
+            self.predicates.free_len(),
+        ]
+    }
+
+    /// [`id_limit`](Self::id_limit) of each space `[entity, literal,
+    /// predicate]`.
+    pub fn id_limits(&self) -> [u32; 3] {
+        [
+            self.id_limit(Space::Entity),
+            self.id_limit(Space::Literal),
+            self.id_limit(Space::Predicate),
+        ]
+    }
+
+    /// Start (`true`) or stop recording the ids this dictionary interns new
+    /// (a transaction's minted terms, freed again at its rollback). Starting
+    /// clears the record.
+    pub fn track_allocations(&mut self, on: bool) {
+        self.allocations = on.then(Vec::new);
+    }
+
+    /// The ids interned new since tracking started or since the last call
+    /// (empty when tracking is off). Tracking stays on.
+    pub fn take_allocations(&mut self) -> Vec<TermId> {
+        match self.allocations.as_mut() {
+            Some(v) => std::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
     // ---- interning ----------------------------------------------------------
 
-    /// Intern `key` in `space`: through the backend for a backed dictionary
-    /// (a read-only backend refuses), else in memory with the space's bound.
-    fn try_intern_in(&mut self, space: Space, key: &str) -> Result<u32> {
+    /// Intern `key` in `space`, returning its id and whether it is new:
+    /// through the backend for a backed dictionary (a read-only backend
+    /// refuses), else in memory with the space's bound. Releases retired ids
+    /// first when some wait (so a dropped pin is honoured by the next
+    /// intern).
+    pub fn try_intern_new(&mut self, space: Space, key: &str) -> Result<(u32, bool)> {
         if let Some(b) = &self.backing {
-            return b.intern(space, key);
+            // A backend's generation moves exactly when it writes a new term
+            // (the dictionary has one writer: the `&mut` caller).
+            let before = b.generation();
+            let id = b.intern(space, key)?;
+            let new = b.generation() != before;
+            if let (true, Some(log)) = (new, self.allocations.as_mut()) {
+                log.push(TermId { space, id });
+            }
+            return Ok((id, new));
+        }
+        if self.interner(space).retired_len() > 0 && self.interner(space).get(key).is_none() {
+            self.release();
         }
         let (id, new) = match space {
             Space::Entity => self.entities.try_intern(key, checked_entity_id)?,
@@ -1169,10 +1659,19 @@ impl Dictionary {
         };
         if new {
             self.touched();
+            if let Some(log) = self.allocations.as_mut() {
+                log.push(TermId { space, id });
+            }
         }
-        Ok(id)
+        Ok((id, new))
     }
 
+    /// Intern `key` in `space`: through the backend for a backed dictionary
+    /// (a read-only backend refuses), else in memory with the space's bound.
+    #[inline]
+    fn try_intern_in(&mut self, space: Space, key: &str) -> Result<u32> {
+        self.try_intern_new(space, key).map(|(id, _)| id)
+    }
     /// Intern an entity (IRI or blank node), returning its entity id in
     /// `[0, LITERAL_FIRST_ID)`, or an error once the entity space is exhausted
     /// (see the module docs). Build and insert paths use this checked form.
@@ -1311,6 +1810,7 @@ impl Dictionary {
     // ---- id → string ------------------------------------------------------------
 
     /// The in-memory string of `id` in `space` (public id).
+    #[inline]
     fn mem_resolve(&self, space: Space, id: u32) -> Option<&str> {
         match space {
             Space::Entity | Space::Predicate => self.interner(space).resolve(id),
@@ -1332,10 +1832,19 @@ impl Dictionary {
 
     /// Id → string in `space`; a backend's read error is noted (C2) and reads
     /// as absent.
+    #[inline]
     pub fn resolve(&self, space: Space, id: u32) -> Option<TermStr<'_>> {
         if self.backing.is_none() {
+            // The in-memory fast path, inlined into the evaluator's per-cell
+            // resolution.
             return self.mem_resolve(space, id).map(TermStr::Borrowed);
         }
+        self.resolve_backed(space, id)
+    }
+
+    /// [`resolve`](Self::resolve) for a backed dictionary (out of line).
+    #[inline(never)]
+    fn resolve_backed(&self, space: Space, id: u32) -> Option<TermStr<'_>> {
         self.try_resolve(space, id).unwrap_or_else(|e| {
             note_read_error(format_args!("dictionary {} id {id}: {e}", space.name()));
             None
@@ -1345,11 +1854,13 @@ impl Dictionary {
     /// Entity-or-literal id → its dictionary key (routed by id range, like
     /// gStore's `getStringByID`). A backend's read error is noted (C2) and
     /// reads as absent.
+    #[inline]
     pub fn term(&self, id: EntityLiteralId) -> Option<TermStr<'_>> {
         self.resolve(Space::of_id(id), id)
     }
 
     /// Predicate id → its key. A backend's read error is noted (C2).
+    #[inline]
     pub fn pred(&self, id: PredId) -> Option<TermStr<'_>> {
         if id == INVALID_PRED_ID {
             return None;
@@ -1542,21 +2053,19 @@ impl Dictionary {
         }
         let mut out = Dictionary::new();
         for space in Space::ALL {
-            let mut data = InternerData::default();
+            let mut strings: Vec<Option<Arc<str>>> = Vec::new();
+            let mut live = 0usize;
             let first = space.first_id();
             let mut failed = None;
             self.for_each_term(space, first, |id, key| {
                 let idx = id - first;
-                while (data.strings.len() as u32) < idx {
-                    data.free.push(data.strings.len() as u32);
-                    data.strings.push(None);
-                }
-                if (data.strings.len() as u32) != idx {
+                if (strings.len() as u32) > idx {
                     failed = Some(id);
                     return ControlFlow::Break(());
                 }
-                data.strings.push(Some(Arc::from(key)));
-                data.table.insert_new(key, idx);
+                strings.resize(idx as usize, None);
+                strings.push(Some(Arc::from(key)));
+                live += 1;
                 ControlFlow::Continue(())
             })?;
             if let Some(id) = failed {
@@ -1565,9 +2074,7 @@ impl Dictionary {
                     space.name()
                 )));
             }
-            let interner = Interner {
-                data: Arc::new(data),
-            };
+            let interner = Interner::assemble(strings, live, &[]).map_err(GStoreError::Database)?;
             match space {
                 Space::Entity => out.entities = interner,
                 Space::Literal => out.literals = interner,
@@ -1727,23 +2234,14 @@ impl Dictionary {
                 None
             });
         }
-        let freed = match space {
-            Space::Entity => self.entities.free(key),
-            Space::Literal => self
-                .literals
-                .free(key)
-                .and_then(|i| i.checked_add(LITERAL_FIRST_ID)),
-            Space::Predicate => self.predicates.free(key),
-        };
-        if freed.is_some() {
-            self.touched();
-        }
-        freed
+        let id = self.id_of(space, key)?;
+        self.free_id(space, id).then_some(id)
     }
 
     /// Free an entity term's id for reuse, returning it if it was interned.
     /// The caller must ensure the term is no longer referenced (see
-    /// [`Database::reclaim_unused`](crate::Database::reclaim_unused)).
+    /// [`Database::reclaim_unused`](crate::Database::reclaim_unused)). The id
+    /// is reused at once unless a [pin](Self::pin) holds it.
     pub fn free_entity(&mut self, key: &str) -> Option<EntityLiteralId> {
         self.free_in(Space::Entity, key)
     }
@@ -1774,51 +2272,35 @@ impl Dictionary {
         if self.backing.is_some() {
             return 0;
         }
-        let mut freed = 0usize;
-
-        // Entities: dense index is the public id.
-        let dead_ent: Vec<String> = self
-            .entities
-            .entries()
-            .filter(|&(id, _)| !referenced_ent_lit.contains(&id))
-            .map(|(_, s)| s.to_owned())
-            .collect();
-        for key in dead_ent {
-            if self.entities.free(&key).is_some() {
-                freed += 1;
-            }
-        }
-
-        // Literals: public id = internal index + LITERAL_FIRST_ID.
-        let dead_lit: Vec<String> = self
-            .literals
-            .entries()
-            .filter(|&(i, _)| !referenced_ent_lit.contains(&i.wrapping_add(LITERAL_FIRST_ID)))
-            .map(|(_, s)| s.to_owned())
-            .collect();
-        for key in dead_lit {
-            if self.literals.free(&key).is_some() {
-                freed += 1;
-            }
-        }
-
-        // Predicates: dense index is the predicate id.
-        let dead_pred: Vec<String> = self
-            .predicates
-            .entries()
-            .filter(|&(id, _)| !referenced_pred.contains(&id))
-            .map(|(_, s)| s.to_owned())
-            .collect();
-        for key in dead_pred {
-            if self.predicates.free(&key).is_some() {
-                freed += 1;
-            }
-        }
-
-        if freed > 0 {
-            self.touched();
-        }
+        let dead = self.unreferenced(|t| match t.space {
+            Space::Predicate => referenced_pred.contains(&t.id),
+            _ => referenced_ent_lit.contains(&t.id),
+        });
+        let freed = dead.iter().filter(|t| self.retire(t.space, t.id)).count();
+        self.release();
         freed
+    }
+
+    /// Every live term id of an in-memory dictionary for which `referenced`
+    /// answers `false` (empty for an out-of-core dictionary).
+    pub fn unreferenced(&self, mut referenced: impl FnMut(TermId) -> bool) -> Vec<TermId> {
+        if self.backing.is_some() {
+            return Vec::new();
+        }
+        let mut dead = Vec::new();
+        for space in Space::ALL {
+            let first = space.first_id();
+            for (i, _) in self.interner(space).entries() {
+                let Some(id) = i.checked_add(first) else {
+                    continue;
+                };
+                let t = TermId { space, id };
+                if !referenced(t) {
+                    dead.push(t);
+                }
+            }
+        }
+        dead
     }
 
     /// **Testing aid — not for production use.** Move each id space's
@@ -2167,7 +2649,7 @@ mod tests {
                 .collect()
         }
         fn free_vec(&self) -> Vec<u32> {
-            self.data.free.clone()
+            self.data.persisted_free()
         }
     }
 
@@ -2186,10 +2668,13 @@ mod tests {
         }
     }
 
-    /// The interner exactly as it was before the copy-on-write rewrite: its
-    /// derived serde *is* the pre-Phase-6 `dict.bin` encoding, and its
-    /// `intern` / `free` are the former algorithm (the model the new code is
-    /// checked against).
+    /// The interner in its persisted field layout: its derived serde *is* the
+    /// pre-Phase-6 `dict.bin` encoding. `intern` / `free` model the Phase 6
+    /// reclamation (lowest free index first; freeing the last index trims
+    /// the vector and every free hole that becomes last; the free list kept
+    /// ascending), which the new code is checked against;
+    /// [`legacy_intern`](Self::legacy_intern) / [`legacy_free`](Self::legacy_free)
+    /// are the former LIFO algorithm (the files older binaries wrote).
     #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
     struct ModelInterner {
         forward: HashMap<String, u32>,
@@ -2199,6 +2684,39 @@ mod tests {
 
     impl ModelInterner {
         fn intern(&mut self, s: &str) -> u32 {
+            if let Some(&id) = self.forward.get(s) {
+                return id;
+            }
+            let id = if self.free.is_empty() {
+                self.backward.push(Some(s.to_owned()));
+                self.backward.len() as u32 - 1
+            } else {
+                let reused = self.free.remove(0);
+                self.backward[reused as usize] = Some(s.to_owned());
+                reused
+            };
+            self.forward.insert(s.to_owned(), id);
+            id
+        }
+        fn free(&mut self, s: &str) -> Option<u32> {
+            let idx = self.forward.remove(s)?;
+            self.backward[idx as usize] = None;
+            let at = self.free.binary_search(&idx).unwrap_err();
+            self.free.insert(at, idx);
+            // Trim the end: the last hole and every free hole before it.
+            while let Some(None) = self.backward.last() {
+                let last = self.backward.len() as u32 - 1;
+                match self.free.binary_search(&last) {
+                    Ok(at) => {
+                        self.free.remove(at);
+                        self.backward.pop();
+                    }
+                    Err(_) => break,
+                }
+            }
+            Some(idx)
+        }
+        fn legacy_intern(&mut self, s: &str) -> u32 {
             if let Some(&id) = self.forward.get(s) {
                 return id;
             }
@@ -2212,7 +2730,7 @@ mod tests {
             self.forward.insert(s.to_owned(), id);
             id
         }
-        fn free(&mut self, s: &str) -> Option<u32> {
+        fn legacy_free(&mut self, s: &str) -> Option<u32> {
             let idx = self.forward.remove(s)?;
             self.backward[idx as usize] = None;
             self.free.push(idx);
@@ -2540,5 +3058,202 @@ mod tests {
         assert!(bytes >= strings);
         // One copy of the strings plus Arc headers, the id vector and the table.
         assert!(bytes < strings + 1000 * (16 + 16) + 4096 * 8, "{bytes}");
+    }
+
+    // ---- Phase 6 R4: reclamation ------------------------------------------
+
+    #[test]
+    fn freed_ids_are_reused_lowest_first() {
+        let mut d = Dictionary::new();
+        for i in 0..6 {
+            assert_eq!(d.intern_entity(&format!("<e{i}>")), i);
+        }
+        // Free 4, 1, 3 (in that order): reuse is 1, 3, 4 — not LIFO.
+        for k in ["<e4>", "<e1>", "<e3>"] {
+            assert!(d.free_entity(k).is_some());
+        }
+        assert_eq!(d.free_counts()[0], 3);
+        assert_eq!(d.intern_entity("<n0>"), 1);
+        assert_eq!(d.intern_entity("<n1>"), 3);
+        assert_eq!(d.intern_entity("<n2>"), 4);
+        assert_eq!(d.intern_entity("<n3>"), 6, "then the space extends");
+        // Literals reuse by public id as well.
+        let a = d.intern_literal("\"a\"");
+        let b = d.intern_literal("\"b\"");
+        let _c = d.intern_literal("\"c\"");
+        d.free_literal("\"b\"");
+        d.free_literal("\"a\"");
+        assert_eq!(d.intern_literal("\"x\""), a);
+        assert_eq!(d.intern_literal("\"y\""), b);
+    }
+
+    #[test]
+    fn freeing_the_end_trims_with_a_cascade() {
+        let mut d = Dictionary::new();
+        for i in 0..5 {
+            d.intern_entity(&format!("<e{i}>"));
+        }
+        d.free_entity("<e1>");
+        d.free_entity("<e3>");
+        assert_eq!(d.id_limit(Space::Entity), 5);
+        // Freeing the last id trims it and the free hole before it (3), but
+        // stops at the live 2.
+        d.free_entity("<e4>");
+        assert_eq!(d.id_limit(Space::Entity), 3);
+        assert_eq!(d.free_counts()[0], 1, "only 1 stays free");
+        d.free_entity("<e2>");
+        assert_eq!(d.id_limit(Space::Entity), 1, "2 then 1 trimmed");
+        assert_eq!(d.free_counts()[0], 0);
+        assert_eq!(d.intern_entity("<z>"), 1);
+        // A trimmed dictionary still encodes as the model does.
+        let bytes = bincode::serialize(&d).unwrap();
+        let back: Dictionary = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(bincode::serialize(&back).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_pin_holds_retired_ids_until_released() {
+        let mut d = Dictionary::new();
+        for i in 0..4 {
+            d.intern_entity(&format!("<e{i}>"));
+        }
+        let early = d.pin();
+        assert!(d.retire(Space::Entity, 1));
+        // Retired: gone both ways, but not reusable while the pin lives.
+        assert_eq!(d.entity_id("<e1>"), None);
+        assert_eq!(d.term(1), None);
+        assert_eq!(d.entity_num(), 3);
+        assert_eq!(d.release(), 0);
+        assert_eq!(d.retired_counts(), [1, 0, 0]);
+        assert_eq!(d.intern_entity("<new>"), 4, "the pinned id is not reused");
+        // A pin taken after the retirement does not hold it.
+        let late = d.pin();
+        drop(early);
+        assert_eq!(d.release(), 1);
+        assert_eq!(d.retired_counts(), [0, 0, 0]);
+        assert_eq!(d.intern_entity("<again>"), 1);
+        drop(late);
+        // The next intern releases what a dropped pin held.
+        let p = d.pin();
+        d.retire(Space::Entity, 2);
+        drop(p);
+        assert_eq!(d.intern_entity("<third>"), 2);
+        // A retired id is saved as free (no pin survives a reopen).
+        let p = d.pin();
+        d.retire(Space::Entity, 0);
+        let back: Dictionary = bincode::deserialize(&bincode::serialize(&d).unwrap()).unwrap();
+        assert_eq!(back.free_counts()[0], 1);
+        assert_eq!(back.retired_counts(), [0, 0, 0]);
+        drop(p);
+    }
+
+    #[test]
+    fn retire_on_a_shared_clone_copies_and_keeps_the_clone() {
+        let mut a = Dictionary::new();
+        a.intern_entity("<x>");
+        a.intern_entity("<y>");
+        let b = a.clone();
+        assert!(a.free_id(Space::Entity, 0));
+        assert_eq!(a.entity_id("<x>"), None);
+        assert_eq!(b.entity_id("<x>"), Some(0), "the clone keeps its version");
+        assert_eq!(a.intern_entity("<z>"), 0);
+        assert_eq!(b.term(0).as_deref(), Some("<x>"));
+        // Retiring an id that names nothing copies nothing.
+        let c = a.clone();
+        assert!(!a.retire(Space::Entity, 99));
+        assert!(a.entities.shares_with(&c.entities));
+    }
+
+    #[test]
+    fn from_slots_keeps_ids_and_normalizes() {
+        let some = |s: &str| Some(s.to_string());
+        let d = Dictionary::from_slots(
+            vec![some("<a>"), None, some("<c>"), None, None],
+            vec![None, some("\"l\"")],
+            vec![some("<p>")],
+        )
+        .unwrap();
+        assert_eq!(d.entity_id("<c>"), Some(2));
+        assert_eq!(d.literal_id("\"l\""), Some(LITERAL_FIRST_ID + 1));
+        assert_eq!(
+            d.id_limits(),
+            [3, LITERAL_FIRST_ID + 2, 1],
+            "trailing holes trimmed"
+        );
+        assert_eq!(d.free_counts(), [1, 1, 0]);
+        assert_eq!(
+            (d.entity_num(), d.literal_num(), d.predicate_num()),
+            (2, 1, 1)
+        );
+        let mut d = d;
+        assert_eq!(d.intern_entity("<b>"), 1);
+        assert_eq!(d.intern_literal("\"k\""), LITERAL_FIRST_ID);
+        // A term stored twice is refused.
+        assert!(Dictionary::from_slots(vec![some("<a>"), some("<a>")], vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn legacy_files_are_normalized_on_load() {
+        // An older binary's file: LIFO free stack, trailing holes, and a hole
+        // the free stack does not name.
+        let mut old = ModelDictionary::default();
+        for i in 0..8 {
+            old.entities.legacy_intern(&format!("<e{i}>"));
+        }
+        for k in ["<e2>", "<e6>", "<e7>", "<e4>"] {
+            old.entities.legacy_free(k);
+        }
+        old.entities.backward.push(None); // an unlisted trailing hole
+        old.entities.free.retain(|&i| i != 4); // an unlisted interior hole
+        let bytes = bincode::serialize(&old).unwrap();
+        let mut d: Dictionary = bincode::deserialize(&bytes).unwrap();
+        // Holes 2 and 4 are free, 6.. are trimmed.
+        assert_eq!(d.id_limit(Space::Entity), 6);
+        assert_eq!(d.free_counts()[0], 2);
+        assert_eq!(d.entity_num(), 4);
+        assert_eq!(d.intern_entity("<n0>"), 2);
+        assert_eq!(d.intern_entity("<n1>"), 4);
+        assert_eq!(d.intern_entity("<n2>"), 6);
+        // A free list naming an index twice is refused.
+        let mut dup = ModelDictionary::default();
+        dup.entities.legacy_intern("<a>");
+        dup.entities.legacy_intern("<b>");
+        dup.entities.legacy_free("<a>");
+        dup.entities.free.push(0);
+        assert!(bincode::deserialize::<Dictionary>(&bincode::serialize(&dup).unwrap()).is_err());
+    }
+
+    #[test]
+    fn allocations_are_tracked_on_demand() {
+        let mut d = Dictionary::new();
+        d.intern_entity("<old>");
+        assert!(d.take_allocations().is_empty(), "off by default");
+        d.track_allocations(true);
+        let a = d.intern_entity("<a>");
+        d.intern_entity("<old>");
+        let p = d.intern_predicate("<p>");
+        assert_eq!(
+            d.take_allocations(),
+            vec![TermId::node(a), TermId::predicate(p)]
+        );
+        assert!(d.take_allocations().is_empty());
+        d.track_allocations(false);
+        d.intern_entity("<b>");
+        assert!(d.take_allocations().is_empty());
+        // `try_intern_new` tells new from known.
+        assert_eq!(d.try_intern_new(Space::Entity, "<b>").unwrap().1, false);
+        assert!(d.try_intern_new(Space::Entity, "<c>").unwrap().1);
+    }
+
+    #[test]
+    fn unreferenced_lists_dead_terms_by_space() {
+        let mut d = Dictionary::new();
+        let a = d.intern_entity("<a>");
+        let _b = d.intern_entity("<b>");
+        let l = d.intern_literal("\"l\"");
+        let p = d.intern_predicate("<p>");
+        let keep = [TermId::node(a), TermId::node(l)];
+        let dead = d.unreferenced(|t| keep.contains(&t));
+        assert_eq!(dead, vec![TermId::node(1), TermId::predicate(p)]);
     }
 }
