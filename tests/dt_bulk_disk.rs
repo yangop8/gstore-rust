@@ -599,22 +599,25 @@ fn bulk_image_survives_10k_random_mutations() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The RocksDB target is not available yet; an invalid fill factor is
-/// refused before anything is touched.
+/// Without the `rocksdb` feature the RocksDB target is refused (with it, it
+/// is tested in `dt_bulk_rocks.rs`); an invalid fill factor is refused
+/// before anything is touched.
 #[test]
 fn unsupported_target_and_bad_options() {
     let base = tmp("opts");
-    let e = bulk::build(
-        &base.join("r.db"),
-        "r",
-        BulkInput::Sources(&[]),
-        &ImportOptions::strict(),
-        &mut (),
-        BulkTarget::RocksDb,
-        &BulkOptions::default(),
-    )
-    .unwrap_err();
-    assert!(e.to_string().contains("RocksDB"), "{e}");
+    if !cfg!(feature = "rocksdb") {
+        let e = bulk::build(
+            &base.join("r.db"),
+            "r",
+            BulkInput::Sources(&[]),
+            &ImportOptions::strict(),
+            &mut (),
+            BulkTarget::RocksDb,
+            &BulkOptions::default(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("RocksDB"), "{e}");
+    }
     let e = bulk::build(
         &base.join("f.db"),
         "f",
