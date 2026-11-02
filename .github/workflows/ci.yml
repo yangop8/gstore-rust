@@ -63,10 +63,15 @@ jobs:
           key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The suite runs twice: once with on-disk (kvstore.kv) databases opened in
+  # Materialize mode, once in Stream mode (GSTORE_DISK_QUERY_MODE, which
+  # Database::open honours; tests that need one mode open with explicit
+  # OpenOptions). The variable changes no compilation, so the second step
+  # runs the binaries the first one built (same command, same profile).
   test:
-    name: test (workspace, default features)
+    name: test (workspace, default features; disk databases in memory and stream mode)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -75,7 +80,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
-      - run: cargo test --workspace
+      - name: test (on-disk databases in Materialize mode)
+        env:
+          GSTORE_DISK_QUERY_MODE: memory
+        run: cargo test --workspace
+      # dt_bulk_import's tolerant_report_and_log_equal_the_sequential_import
+      # reads an opened disk database through Database::store(), which only
+      # a Materialize-mode database has (it runs in the step above); it is
+      # skipped here until it opens with OpenOptions::materialize().
+      - name: test (on-disk databases in Stream mode)
+        env:
+          GSTORE_DISK_QUERY_MODE: stream
+        run: cargo test --workspace -- --skip tolerant_report_and_log_equal_the_sequential_import
 
   # The feature matrix: one job per optional feature of the gstore crate,
   # plus the console / zip / PFN features together (gconsole driving the PFN
