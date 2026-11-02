@@ -108,9 +108,9 @@ Phase 6 R3-ROCKS (RocksDB): done — `gbuild --rocksdb` bulk-builds by SST
 ingest (layout `"1"`, byte-equal to the per-triple build, crash-safe
 install); RocksDB reads are bounded raw-iterator scans with exact C1 counts,
 a `c|/u|/v|` mirror, contract order and per-query read errors; shared block
-cache + bloom filters. Univ 8 (implementer run, noisy): build 5–6 s (was
-34–35 s), 31 MB (0.76× pre), Q1–Q14 geomean 0.30× the base / 0.25× pre;
-univ 38 left to the measure stage.
+cache + bloom filters. Quiet post-merge stage, univ 38: build 22 s (was
+175 s; pre 278 s), 402 MiB peak, 156 MB (0.76× pre), open 0.9 s, Q1–Q14
+geomean 0.21× pre / 0.26× the base (univ 8: 4.2 s, 0.24× pre).
 
 ## Docs notes
 
@@ -137,6 +137,169 @@ univ 38 left to the measure stage.
 - **CHANGELOG.md**: fold the Changelog section above.
 
 ## Measured numbers
+
+### Quiet post-merge stage (phase6 `e1c7131`: R3 merged, review fixes)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), nothing else running:
+CPU busy 24–37% while measuring (the one measured process; logged every 10
+s from `/proc/stat`), steal ≤ 2%, load average ≤ 1.3. Branch = release
+build of `e1c7131` with `--features rocksdb` (`target-rocks`); base = the
+prebuilt release binaries of `0fb8842` with `--features rocksdb`
+(`/tmp/gstore-base-0fb8842/bin-rocks`: per-triple `gbuild --rocksdb`, old
+read code in its harness), measured in the same session, each harness with
+its own `--bin-dir` (the base results' `git_commit` field names the working
+tree, `e1c7131`; their `config.bin_dir` names the base binaries). Every
+heavy command under `flock /tmp/gstore-bench.lock`; data from
+`/tmp/gstore-bench-cache` (univ 8 `ed44da2e7b3bbb98`, 1,029,275 triples;
+univ 38 `fcd6493725f3c66a`, 5,181,103 triples). `gstore-bench run --profile
+reference --scale {8,38} --backends rocksdb --no-conc --drop-caches
+--verify-data`, in the order base 8, branch 8, branch 8 `--gbuild-arg
+--incremental`, base 38, branch 38, branch 38 `--incremental` (18:34–18:52
+UTC, 18 min). The two branch runs feed the RocksDB rows of the round's
+result files (a later part of this measure stage joins them).
+
+| univ 8 | build s | gbuild peak MiB | `rocksdb/` bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| pre-Phase-6 | 53.93 | 285.5 | 41,162,410 | 9959 / 9989 | 145.8 | 184.9 | 43.27 |
+| R2 quiet (`0c9bdb6`) | 35.60 | 261.5 | 41,140,275 | 202 / 180 | 64.5 | 112.5 | 33.28 |
+| base `0fb8842` | 32.30 | 261.5 | 41,141,324 | 262 / 205 | 64.3 | 113.8 | 32.90 |
+| **`e1c7131` bulk** | **4.21** | **93.4** | **31,266,467** | 255 / **184** | 68.3 | 102.6 | **10.56** |
+| `e1c7131` `--incremental` | 29.89 | 276.8 | 44,017,197 | 246 / 214 | 68.2 | 102.4 | 10.82 |
+
+| univ 38 | build s | gbuild peak MiB | `rocksdb/` bytes | open first (cold) / warm ms | RSS after open MiB | query HWM MiB | Q1–Q14 geomean ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| pre-Phase-6 | 277.76 | 634.2 | 206,253,032 | 60811 / 59389 | 522.0 | 663.3 | 311.50 |
+| R2 quiet (`0c9bdb6`) | 164.35 | 510.6 | 206,221,265 | 1444 / 937 | 199.8 | 386.4 | 262.79 |
+| base `0fb8842` | 174.70 | 548.9 | 206,232,710 | 939 / 970 | 199.7 | 387.0 | 261.58 |
+| **`e1c7131` bulk** | **22.25** | **401.6** | **155,868,540** | 1006 / **901** | 276.6 | 440.2 | **66.91** |
+| `e1c7131` `--incremental` | 162.76 | 653.3 | 220,659,064 | 937 / 874 | 276.4 | 440.5 | 71.31 |
+
+| query (univ 38) | rows | pre ms | R2 ms | base ms | bulk ms | `--incremental` ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Q1 | 3 | 60.72 | 62.72 | 64.24 | 9.43 | 10.41 |
+| Q2 | 115 | 729.49 | 1152.14 | 1090.01 | 589.62 | 715.02 |
+| Q3 | 10 | 195.54 | 185.81 | 182.92 | 30.74 | 34.56 |
+| Q4 | 9 | 989.95 | 438.05 | 437.28 | 1.53 | 1.81 |
+| Q5 | 576 | 537.67 | 465.94 | 397.01 | 355.15 | 355.57 |
+| Q6 | 404,399 | 468.29 | 346.18 | 324.34 | 239.14 | 229.17 |
+| Q7 | 23 | 977.60 | 763.28 | 751.73 | 379.34 | 385.56 |
+| Q8 | 10,778 | 904.88 | 733.13 | 645.73 | 403.36 | 409.99 |
+| Q9 | 5,507 | 2125.90 | 1900.32 | 1911.56 | 740.81 | 875.07 |
+| Q10 | 3 | 594.89 | 436.99 | 485.77 | 381.82 | 350.61 |
+| Q11 | 325 | 16.79 | 16.99 | 17.28 | 2.15 | 2.37 |
+| Q12 | 21 | 10.19 | 10.85 | 11.61 | 0.31 | 0.39 |
+| Q13 | 432,512 | 511.89 | 347.93 | 373.68 | 266.48 | 268.39 |
+| Q14 | 305,503 | 382.71 | 264.89 | 288.15 | 208.40 | 191.24 |
+
+Univ 8 per query (warm median ms, base → bulk): Q1 9.68 → 1.89, Q2 37.15 →
+5.80, Q3 29.37 → 6.02, Q4 59.39 → 0.47, Q5 51.71 → 38.84, Q6 48.89 → 39.45,
+Q7 102.37 → 46.14, Q8 133.83 → 93.06, Q9 212.94 → 106.81, Q10 48.76 →
+38.30, Q11 2.49 → 1.04, Q12 1.41 → 0.19, Q13 53.25 → 42.35, Q14 41.23 →
+30.65. Every query is faster than the base and than pre-Phase-6 at both
+scales.
+
+`gstore-bench compare … --backends rocksdb` (ratios as `compare` prints
+them: times calibration-normalized, memory as `(m+32)/(b+32)`):
+
+- against `pre-phase6-lubm{8,38}.json`: 97 gates, **1 failed, `exact.phase
+  rocksdb/conc`** (the pre file ran the concurrency phase; the brief's runs
+  use `--no-conc`); every other exact gate passes (triple count, rows and
+  row hashes of all 14 queries, the update round trip). Univ 38: geomean
+  ratio **0.21**, build 0.08, warm open 0.01, `rocksdb/` bytes 0.76, build
+  peak 0.65, RSS after open 0.56, query HWM 0.68. Univ 8: geomean 0.24,
+  build 0.08, open 0.02.
+- against R2's quiet `phase6-r2-lubm{8,38}.json`: the same single `conc`
+  failure. Univ 38: geomean 0.29, build 0.16, open 1.11, RSS after open
+  1.33, query HWM 1.13. Univ 8: geomean 0.32, build 0.12, open 1.03.
+- against the same-session base: **PASS, 96 gates** at both scales. Univ
+  38: geomean 0.24, build 0.12, open 0.87, bytes 0.76, build peak 0.75, RSS
+  after open 1.33, query HWM 1.13. Univ 8: geomean 0.30, build 0.13, open
+  0.87, build peak 0.43.
+- bulk against `--incremental` (same binary, same session): every exact
+  gate passes at both scales (identical rows and row hashes); only the
+  incremental build's own gates fail (build 6.40× / 7.54×, peak 2.46× /
+  1.58×, bytes 1.41× / 1.42× at univ 8 / 38: the per-triple path, with
+  bloom filters written by compaction). Query geomean of the incrementally
+  built store 0.94× (univ 8) and 1.09× (univ 38) the bulk-built one's, warm
+  open 1.06× / 1.00×: the layout is not what made queries faster.
+
+Update phase (report-only), univ 38, base → bulk: single insert / delete
+median 0.24 / 0.20 → 0.22 / 0.21 ms, 6,478-triple chunk insert 189.6 →
+153.3 ms, chunk delete 135.7 → **191.7 ms** (the incrementally built store
+133.3 ms; univ 8: 149.8 → 103.8 ms; one sample each, not investigated
+further), checkpoint 30.8 → 37.2 ms, reopen 870.6 → 730.3 ms. Every round
+trip ok (singles, chunk delta, answers unchanged, reopen count).
+
+`gbuild --rocksdb` directly (same session, `flock`; wall from the shell):
+
+| build | wall s | phases (gbuild's summary) | budget peak | term map | `rocksdb/` bytes |
+|---|---:|---|---:|---:|---:|
+| univ 38, bulk | 21.79 | parse+encode 18532 ms (85%), spo 1726, index 1410 (pos 1046, osp 975, x-counts 910, dictionary 230, in parallel), ingest 89, install 1 | 314.7 MiB of 1024 | 155.0 MiB | 155,868,508 |
+| univ 8, bulk | 4.54 | parse+encode 3875 ms (85%), spo 368, index 246, ingest 47, install 1 | 60.0 MiB of 1024 | 24.1 MiB | 31,266,380 |
+| univ 8, base per-triple | 31.85 | — | — | — | 41,140,606 |
+
+0 spills at either scale. Everything RocksDB-specific (SST writes, the four
+parallel index tasks, ingest, the counter check) takes about 3.2 s at univ
+38; the single Turtle parser thread is the rest (R2-BULK request 3).
+
+**Old binary on a bulk-built store** (univ 8, by hand): this branch's
+`gbuild --rocksdb` built `n8.db`, the base's built `o8.db` (per-triple).
+For each of `testdata/lubm/lubm_q{1..14}.rq`, the base `gquery`
+(`/tmp/gstore-base-0fb8842/bin-rocks/gquery`) printed on `n8` exactly what
+it printed on `o8` (**14/14 byte-identical, same order**, timing stripped;
+5 to 85,672 lines), and this branch's `gquery` printed the same on both
+stores.
+
+**RSS after open** (not an acceptance item): 276.6 MiB at univ 38 against
+the base's 199.7 MiB (+77 MiB, 1.38×; the memory gate's `(m+32)/(b+32)` is
+1.33 ≤ 1.5; 0.53× pre), the same on the incrementally built store (276.4),
++4 MiB at univ 8. `gquery` with a query that matches nothing, on the univ 38
+bulk store, peak RSS: 314 MiB with the default 256 MiB shared block cache,
+252 MiB with `GSTORE_ROCKS_BLOCK_CACHE_MB=32` or `0`, base `gquery` 237
+MiB. So about 62 MiB is blocks read during open that stay in the larger
+shared cache (`RocksTuning`, as designed; a config key is request 4), and
+about 15 MiB the bloom filters and the rest.
+
+**Acceptance (R3-ROCKS), quiet:**
+- Build ≤ 10 s at univ 8: **met** — 4.21 s (0.078× pre 53.93 s, 0.13× the
+  same-session base 32.30 s); 4.54 s direct.
+- Build ≤ 45 s at univ 38: **met** — 22.25 s (21.79 s direct; 0.080× pre
+  277.76 s, 0.13× the base 174.70 s).
+- Peak RSS ≤ 1.25 GiB at univ 38: **met** — 401.6 MiB (budget peak 314.7
+  MiB + term map 155.0 MiB; no spills).
+- On-disk size ≤ 1.1 × pre: **met** — 0.756× at univ 38 (155,868,540 vs
+  206,253,032 bytes), 0.760× at univ 8 (31,266,467 vs 41,162,410).
+- Q1–Q14 geomean ≤ 0.8 × pre: **met** — univ 38 66.91 vs 311.50 ms
+  (**0.215×**; compare 0.21), univ 8 10.56 vs 43.27 ms (0.244×); 0.256× /
+  0.321× the same-session base.
+- Open ≤ 10 s at univ 38: **met** — warm 0.90 s, cold first 1.01 s (pre
+  59.4 / 60.8 s; base 0.97 / 0.94 s).
+- Identical answers: **met** — rows and row hashes of Q1–Q14 equal to
+  pre-Phase-6 (its RocksDB and snapshot rows) and to R2's snapshot and disk
+  rows at both scales, in every one of the 5 query processes and after the
+  update round trip; the bulk-built and the incrementally built store
+  answer identically at both scales; the base `gquery` answers identically
+  on a bulk-built univ 8 store.
+- Stats exactness and the bulk build's DirLock: **met** — `cargo test
+  --release -p gstore --features rocksdb --test dt_rocksdb --test
+  dt_bulk_rocks --test dt_bulk_crash` and the `rocks` lib tests pass at
+  `e1c7131` (see the verification line below); the update phase's exact
+  checks pass on bulk-built stores at both scales.
+
+**G3 (RocksDB), univ 38: met** — build 22.25 s ≤ 0.25 × pre (69.4 s; the
+plan's ≈ 50 s); open 0.90 s warm ≤ 10 s; Q1–Q14 geomean 0.215× pre ≤ 0.8×.
+G3 holds without a VS-tree at open: Q2 (589.6 ms, the slowest-scaling query:
+5.80 ms at univ 8, ×102 for 5× the data; base ×29) is still 0.54× the base
+and 0.81× pre.
+
+Verification at `e1c7131` (this stage, release profile in `target-rocks`):
+`cargo test --release --locked -p gstore --features rocksdb --test
+dt_rocksdb --test dt_bulk_rocks --test dt_bulk_crash`: 10 + 9 + 9 passed, 0
+failed; `cargo test … --lib -- rocks` (the `backend::rocks` and
+`bulk::rocks_sink` unit tests): 16 passed, 0 failed. No code changed at
+this stage; every database it built was deleted.
+
+### Implementer run
 
 **Implementer run, noisy (other agents compiling).** 4 vCPU / 16 GB VM,
 load average 3.7–8.6 at the starts of the runs; every heavy command under
@@ -308,7 +471,7 @@ ignored (at `fa5a48e`). No other feature-gated code was touched.
 
 Not yet:
 - univ 38 numbers (build, peak RSS, size, open, geomean) — the measure
-  stage.
+  stage (done; see below).
 - The 256 MiB SST cut is not reached below roughly 20M triples per column
   family; the multi-file ingest is tested through the doc-hidden
   `GSTORE_BULK_SST_SPLIT_BYTES` hook (`gbuild_rocksdb_uses_the_bulk_build`
@@ -318,3 +481,23 @@ Not yet:
 - A RocksDB database still opens without a VS-tree (R1-CORE's note); at
   univ 8 Q2 is now 5.9 ms (base 35 ms), so the univ 38 Q2 of the measure
   stage decides whether `vstree_on_open` matters for G3.
+
+From the quiet post-merge stage (`e1c7131`; numbers under Measured numbers):
+
+- univ 38 measured: every acceptance item and G3 met (build 22.25 s, peak
+  401.6 MiB, 0.756× pre bytes, open 0.90 s warm, geomean 0.215× pre).
+  `vstree_on_open` is not needed for G3. Q2 is the query that scales worst
+  on RocksDB (5.80 → 589.6 ms from univ 8 to 38, ×102 for 5× the data; the
+  base ×29), still 0.54× the base and 0.81× pre: a candidate for R4-CLOSURE
+  to look at.
+- Parsing is 85% of the bulk build at both scales (18.5 of 21.8 s at univ
+  38); R2-BULK request 3 (parser owner) stands.
+- RSS after open is 77 MiB above the base at univ 38 (276.6 vs 199.7 MiB,
+  inside the memory gate): mostly blocks read during open kept by the 256
+  MiB shared block cache (about 62 MiB; 252 MiB peak with
+  `GSTORE_ROCKS_BLOCK_CACHE_MB=32`). Request 4's `[storage]` key lets a
+  deployment size it.
+- Chunk delete on the bulk-built store at univ 38: 191.7 ms against the
+  base's 135.7 ms (one sample, report-only; 133.3 ms on the incrementally
+  built store, and faster than the base at univ 8). G5 (R4-RECLAIM)
+  measures delete overhead.
