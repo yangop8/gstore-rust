@@ -22,7 +22,7 @@
 //!
 //! Both caches are bounded by bytes and evict with CLOCK, so a long-running
 //! reader stays within its budget however many terms it touches; strings are
-//! handed out as `Arc<str>` (no `Box::leak`). They belong to one
+//! handed out as `Arc<str>` (nothing is leaked). They belong to one
 //! [`generation`](DiskTermSource::generation): a change of generation empties
 //! them. This backend is read-only (`intern` answers existing keys only,
 //! `free` refuses); the store that owns the pager rebuilds it when its term counts

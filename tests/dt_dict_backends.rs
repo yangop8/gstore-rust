@@ -555,7 +555,8 @@ fn dict_bin_reads_both_ways_and_is_reproducible() {
 #[test]
 fn no_box_leak_in_the_dictionary_or_the_kvstore() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let needle = ["Box", "::leak("].concat();
+    // Not even in a comment: the plan's check is a plain grep.
+    let needle = ["Box", "::leak"].concat();
     for sub in ["dict", "kvstore"] {
         for entry in std::fs::read_dir(root.join(sub)).unwrap() {
             let path = entry.unwrap().path();
