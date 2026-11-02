@@ -48,7 +48,6 @@ use crate::http_api::{DbHandle, TaskGuard};
 use crate::json::{self, Json};
 use crate::reason::manage::{self, ReasonError, ReasonErrorKind};
 use crate::reason::store::RuleStore;
-use crate::server::locked;
 
 pub(super) fn register(reg: &mut Registry) {
     // Root-only through the default privilege mapping
@@ -260,7 +259,43 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
         ctx.inner.register_task(&mut st, db, &sparql, ctx.user())
     };
     let mut task = TaskGuard::new(ctx.inner, task_id);
-    let mut slot = locked(&handle);
+    if matches!(op, DataOp::Check) {
+        // Check only reads the data: a shared guard, so queries keep
+        // running meanwhile (the rule directory's lock orders it with the
+        // other rule operations).
+        let slot = match ctx.inner.read_synced(&handle) {
+            Ok(slot) => slot,
+            Err(e) => {
+                task.set_ok(false);
+                return GResp::error(Status::OperationFailed, e.msg);
+            }
+        };
+        if slot.retired {
+            drop(slot);
+            return not_loaded(db, dir.is_dir());
+        }
+        let mut store = RuleStore::dir(slot.dir.clone());
+        let checked = manage::check(&mut store, name, |s| {
+            slot.read_cancellable(s, Some(Arc::clone(&cancel)))
+        });
+        drop(slot);
+        let resp = match checked {
+            Ok(c) => GResp::success("ok")
+                .with("check_sparql", c.check_sparql)
+                .with("effectNum", c.effect_num),
+            Err(e) => reason_error(e),
+        };
+        task.set_ok(resp.is_ok());
+        query_log.finish(ctx, &resp);
+        return resp;
+    }
+    let mut slot = match handle.write() {
+        Ok(slot) => slot,
+        Err(e) => {
+            task.set_ok(false);
+            return GResp::error(Status::OperationFailed, e.msg);
+        }
+    };
     if slot.retired {
         drop(slot);
         return not_loaded(db, dir.is_dir());
@@ -268,25 +303,7 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
     ctx.inner.sync_query_settings(&mut slot);
     let mut store = RuleStore::dir(slot.dir.clone());
     let resp = match op {
-        DataOp::Check => {
-            let checked = {
-                let slot = &mut *slot;
-                manage::check(&mut store, name, |s| {
-                    if slot.txn.is_some() {
-                        slot.read(s)
-                    } else {
-                        slot.db.query_cancellable(s, Arc::clone(&cancel))
-                    }
-                })
-            };
-            drop(slot);
-            match checked {
-                Ok(c) => GResp::success("ok")
-                    .with("check_sparql", c.check_sparql)
-                    .with("effectNum", c.effect_num),
-                Err(e) => reason_error(e),
-            }
-        }
+        DataOp::Check => unreachable!("answered above"),
         DataOp::Execute | DataOp::Disable => {
             if let Some(open) = &slot.txn {
                 let tid = open.tid;

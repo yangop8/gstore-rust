@@ -1594,6 +1594,7 @@ pub(crate) struct DbCounters {
     index_valid: AtomicBool,
     in_transaction: AtomicBool,
     dirty: AtomicBool,
+    live: AtomicBool,
 }
 
 /// The figures [`DbCounters::read`] returns.
@@ -1612,6 +1613,9 @@ pub(crate) struct CounterSnapshot {
     pub(crate) index_valid: bool,
     pub(crate) in_transaction: bool,
     pub(crate) dirty: bool,
+    /// Published from a served database (`false` before the first publish
+    /// and once it is retired: the other figures are then zero).
+    pub(crate) live: bool,
 }
 
 impl DbCounters {
@@ -1628,6 +1632,7 @@ impl DbCounters {
             generation: db.mutation_count(),
             index_valid: s.index_valid,
             in_transaction: s.in_transaction,
+            live: true,
             ..prev
         });
     }
@@ -1645,6 +1650,7 @@ impl DbCounters {
         self.in_transaction
             .store(snap.in_transaction, Ordering::SeqCst);
         self.dirty.store(snap.dirty, Ordering::SeqCst);
+        self.live.store(snap.live, Ordering::SeqCst);
         self.seq.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -1674,6 +1680,7 @@ impl DbCounters {
                     index_valid: self.index_valid.load(Ordering::SeqCst),
                     in_transaction: self.in_transaction.load(Ordering::SeqCst),
                     dirty: self.dirty.load(Ordering::SeqCst),
+                    live: self.live.load(Ordering::SeqCst),
                 };
                 if self.seq.load(Ordering::SeqCst) == before {
                     return snap;
