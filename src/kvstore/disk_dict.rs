@@ -405,7 +405,8 @@ impl DiskTermSource for DiskDict {
         if new {
             // Visible to readers only now that the pages hold it.
             let index = (id - space.first_id()) as usize;
-            self.count_cell(space).fetch_max(index + 1, Ordering::AcqRel);
+            self.count_cell(space)
+                .fetch_max(index + 1, Ordering::AcqRel);
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
         self.fresh_keys();
@@ -693,14 +694,21 @@ mod tests {
         assert_eq!(d.term(l).as_deref(), Some("\"fresh\""));
         assert_eq!(d.pred(p).as_deref(), Some("<http://ex/pnew>"));
         assert_eq!(d.entity_num(), e0 + 1);
-        assert_eq!(dd.cache_stats().invalidations, 0, "caches kept, not emptied");
+        assert_eq!(
+            dd.cache_stats().invalidations,
+            0,
+            "caches kept, not emptied"
+        );
 
         // The store sees the header's counts: its own next intern does not
         // reuse the id, and its lazy dictionary is rebuilt to include them.
         assert_eq!(ds.entity_num(), e0 + 1);
         let mine = ds.intern_entity("<http://ex/by-store>").unwrap();
         assert_eq!(mine as usize, e0 + 1, "no id handed out twice");
-        assert_eq!(dd.lookup(Space::Entity, "<http://ex/by-store>").unwrap(), Some(mine));
+        assert_eq!(
+            dd.lookup(Space::Entity, "<http://ex/by-store>").unwrap(),
+            Some(mine)
+        );
         let lazy = ds.lazy_dictionary();
         assert_eq!(lazy.term(e).as_deref(), Some("<http://ex/new>"));
         assert_eq!(lazy.term(mine).as_deref(), Some("<http://ex/by-store>"));

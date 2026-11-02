@@ -48,8 +48,8 @@ pub(crate) mod persist;
 mod statement;
 pub use open_options::{
     default_open_options, set_default_open_options, DiskQueryMode, OpenOptions,
-    DEFAULT_DICT_CACHE_BYTES, DEFAULT_DISK_CACHE_PAGES, DEFAULT_DISK_QUERY_MODE,
-    ENV_DISK_CACHE_MB, ENV_DISK_QUERY_MODE, ENV_VSTREE_ON_OPEN,
+    DEFAULT_DICT_CACHE_BYTES, DEFAULT_DISK_CACHE_PAGES, DEFAULT_DISK_QUERY_MODE, ENV_DISK_CACHE_MB,
+    ENV_DISK_QUERY_MODE, ENV_VSTREE_ON_OPEN,
 };
 pub use statement::Statement;
 
@@ -750,11 +750,7 @@ impl Database {
     /// Stream-mode database, no open transaction adds triples the tree (built
     /// from committed data) lacks (C9; `DiskTriples::vstree_stale`).
     fn vstree_usable(&self) -> bool {
-        self.index_valid
-            && self
-                .store
-                .as_disk()
-                .is_none_or(|dt| !dt.transaction_adds())
+        self.index_valid && self.store.as_disk().is_none_or(|dt| !dt.transaction_adds())
     }
 
     /// Fail a statement up front when the on-disk store of a Stream-mode

@@ -287,10 +287,7 @@ mod tests {
             (DEFAULT_TERM_CACHE_BYTES, DEFAULT_KEY_CACHE_BYTES)
         );
         assert!(!o.vstree_on_open && o.default_layout.is_none());
-        assert_eq!(
-            OpenOptions::stream().disk_query_mode,
-            DiskQueryMode::Stream
-        );
+        assert_eq!(OpenOptions::stream().disk_query_mode, DiskQueryMode::Stream);
         assert_eq!(
             OpenOptions::materialize().disk_query_mode,
             DiskQueryMode::Materialize

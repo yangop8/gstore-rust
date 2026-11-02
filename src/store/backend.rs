@@ -24,6 +24,9 @@ use super::{MutableStore, TripleSource, TripleStore};
 /// **Materialize** mode evaluates over a `Memory` working set and writes every
 /// committed mutation through to its [`DiskStore`](crate::kvstore::DiskStore)
 /// (see [`DiskQueryMode`](crate::db::DiskQueryMode)).
+// One `Backend` per database: the on-disk variant's size (its store handles and
+// counters inline) costs nothing worth a heap indirection on every read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Backend {
     /// In-memory triple store (the default; three sorted adjacency maps).
