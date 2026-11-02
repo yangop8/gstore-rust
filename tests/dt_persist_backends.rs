@@ -825,6 +825,60 @@ fn cli_backup_restore_of_a_disk_database() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// `gbackup` holds the database's lock for the whole backup: a database
+/// another process has open — here one with a save in progress over it (a
+/// `gbuild --force` staging its snapshot, which holds the lock) — is
+/// refused, its staged files left alone. It used to copy the directory
+/// regardless and "repair" the save's staged files away; the save then
+/// committed a snapshot without them and removed the old store, leaving no
+/// database at all.
+#[test]
+fn gbackup_refuses_a_database_another_process_holds() {
+    let base = tmp("gbackup_locked");
+    fs::create_dir_all(&base).unwrap();
+    let nt = base.join("d.nt");
+    write(&nt, BASE_NT);
+    let name = base.join("held");
+    let dir = base.join("held.db");
+    let bak = base.join("bak");
+    let built = Command::new(env!("CARGO_BIN_EXE_gbuild"))
+        .args(["--disk", name.to_str().unwrap(), nt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{built:?}");
+    let staged = dir.join("dict.bin.tmp");
+    fs::write(&staged, b"staged by the save in progress").unwrap();
+    // This test process stands for the writer: gbackup is another process.
+    let lock = gstore::db::dirlock::DirLock::acquire(&dir).unwrap();
+    let gbackup = || {
+        Command::new(env!("CARGO_BIN_EXE_gbackup"))
+            .args([name.to_str().unwrap(), bak.to_str().unwrap()])
+            .output()
+            .unwrap()
+    };
+    let out = gbackup();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "backed up a held database: {out:?}");
+    assert!(stderr.contains("locked by another process"), "{stderr}");
+    assert!(staged.is_file(), "the save's staged file was deleted");
+    assert!(!bak.join("kvstore.kv").exists());
+    drop(lock);
+    // Free: backed up, the leftovers of the (now interrupted) save cleaned.
+    let out = gbackup();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!staged.exists());
+    let mut copy = Database::open(&bak).unwrap();
+    assert_eq!(
+        col0(
+            &mut copy,
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"
+        ),
+        ["<http://ex/b>"]
+    );
+    drop(copy);
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn concurrent_db_over_a_disk_database() {
     // ConcurrentDb snapshots the working set; updates still write through.

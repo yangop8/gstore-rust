@@ -3981,10 +3981,13 @@ impl ApiInner {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
         Dispatch::Deferred(Box::new(move |inner| {
-            let path = match backup_target(&inner.backup_dir(), &name, requested.as_deref()) {
-                Ok(path) => path,
-                Err(r) => return r,
-            };
+            // Claimed before it is checked and before the database's guard
+            // is taken: backups into one directory run one after the other.
+            let (path, _claim) =
+                match backup_target(&inner.backup_dir(), &name, requested.as_deref()) {
+                    Ok(target) => target,
+                    Err(r) => return r,
+                };
             // A backup of the live database would capture uncommitted writes.
             let slot = match Self::lock_for(&dbh, &name, "backing up") {
                 Ok(slot) => slot,
@@ -4023,8 +4026,9 @@ impl ApiInner {
     /// corrupt backup changes nothing; only then is the loaded database retired
     /// (its unsaved changes saved first, so a failed swap loses nothing) and
     /// the copy swapped in — with the directory's inter-process lock held
-    /// ([`DirLock::acquire_existing`]; `409` while another process has the
-    /// database open), as the `/api` `restore` does.
+    /// from before the backup is staged until the swap is done
+    /// ([`Database::lock_restore_target`]; `409` while another process has
+    /// the database open), as the `/api` `restore` does.
     ///
     /// REST-specific: `path` is required and the restored database is left
     /// loaded; the `/api` `restore` defaults to the newest backup in the
@@ -4085,21 +4089,20 @@ impl ApiInner {
                     ),
                 );
             }
+            // No other process may open the database while the backup is
+            // staged beside it (its open would repair the staged copy away)
+            // or swapped in: the directory is locked first and held through
+            // the swap (as the `/api` restore; shares a loaded copy's lock).
+            let probe = match Database::lock_restore_target(&dir) {
+                Ok(lock) => lock,
+                Err(e) => return Resp::fail(409, &format!("restore failed: {e}")),
+            };
             // Copy the backup beside the database's own directory and validate
             // the copy — never open the backup in place, or later writes would
             // land in the backup. The loaded database is untouched so far.
             let staged = match Database::stage_restore(&path, &dir) {
                 Ok(staged) => staged,
                 Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
-            };
-            // No other process may have the database open while it is swapped
-            // (as the `/api` restore; shares a loaded copy's lock).
-            let probe = match DirLock::acquire_existing(&dir) {
-                Ok(lock) => lock,
-                Err(e) => {
-                    Database::discard_staged_restore(&staged);
-                    return Resp::fail(409, &format!("restore failed: {e}"));
-                }
             };
             let loaded = locked(&inner.state).dbs.get(&name).map(Arc::clone);
             if let Some(h) = &loaded {
@@ -4231,12 +4234,15 @@ impl ApiInner {
     /// parameter or the raw body) are *parsed as RDF* (N-Triples by default;
     /// Turtle with `format=ttl` or when the payload declares `@prefix`/`PREFIX`;
     /// see [`parse_batch_payload`]) and the ground triples are applied directly
-    /// through [`Database::insert_triple`] / [`Database::remove_triple`]. No
-    /// SPARQL text is ever built from the payload, so it cannot smuggle in other
-    /// update operations: a malformed payload is a `400` parse error and
+    /// through [`Database::try_insert_triple`] / [`Database::try_remove_triple`].
+    /// No SPARQL text is ever built from the payload, so it cannot smuggle in
+    /// other update operations: a malformed payload is a `400` parse error and
     /// nothing is applied. Reports `parsed`, `applied` (= `changed`) and
     /// `failed` (parsed but not applied: duplicates on insert, absent triples on
-    /// remove, or a literal/blank in a position RDF does not allow).
+    /// remove, or a literal/blank in a position RDF does not allow). A triple
+    /// that cannot be applied — an id space exhausted, a read error looking up
+    /// its terms (C2), a broken store — stops the batch with a `500` naming
+    /// how many were applied before it.
     fn handle_batch(&self, st: &mut ApiState, req: &Request, user: &str, insert: bool) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
@@ -4292,7 +4298,7 @@ impl ApiInner {
                 let changed = if insert {
                     slot.db.try_insert_triple(t)
                 } else {
-                    Ok(slot.db.remove_triple(t))
+                    slot.db.try_remove_triple(t)
                 };
                 match changed {
                     Ok(true) => applied += 1,
@@ -4601,6 +4607,73 @@ pub(crate) fn mark_backup(dir: &Path, db: &str) -> crate::Result<()> {
     crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())
 }
 
+/// One backup request's claim on its destination directory: backups into
+/// one directory — REST `/backup`s of a database into its `<db>.backup`,
+/// `/api backup`s of a database in the same second (one `<db>.db_<time>`
+/// name), or one of each — run one after the other, from checking or
+/// clearing the destination to writing and recording (and packing,
+/// rotating) the backup. Backups hold only the database's shared guard, so
+/// without the claim they wrote each other's files: one's owner record or
+/// staged copy was replaced or removed under the other mid-write. Taken
+/// before the database's guard and released after it (never the reverse,
+/// so no guard holder waits for a claim). Keyed by the resolved path (its
+/// deepest existing ancestor canonicalized), so two spellings of one
+/// directory are one claim.
+pub(crate) struct BackupClaim {
+    dest: PathBuf,
+}
+
+impl BackupClaim {
+    /// The backup directories claimed by the requests in flight.
+    fn registry() -> &'static (Mutex<HashSet<PathBuf>>, std::sync::Condvar) {
+        static CLAIMS: OnceLock<(Mutex<HashSet<PathBuf>>, std::sync::Condvar)> = OnceLock::new();
+        CLAIMS.get_or_init(Default::default)
+    }
+
+    /// Claim `dest`, waiting while another request holds it.
+    pub(crate) fn new(dest: &Path) -> BackupClaim {
+        let dest = resolved_path(dest).unwrap_or_else(|| dest.to_path_buf());
+        let (claims, freed) = Self::registry();
+        let mut held = locked(claims);
+        while held.contains(&dest) {
+            held = freed
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        held.insert(dest.clone());
+        BackupClaim { dest }
+    }
+}
+
+impl Drop for BackupClaim {
+    fn drop(&mut self) {
+        let (claims, freed) = Self::registry();
+        locked(claims).remove(&self.dest);
+        freed.notify_all();
+    }
+}
+
+/// `path` with its deepest existing ancestor canonicalized (so symlinks are
+/// resolved) and the rest — plain names, nothing left to resolve —
+/// re-appended; `None` when no ancestor resolves.
+fn resolved_path(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    let mut resolved = loop {
+        match fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(_) => {
+                rest.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?;
+            }
+        }
+    };
+    for part in rest.iter().rev() {
+        resolved.push(part);
+    }
+    Some(resolved)
+}
+
 /// Whether `user` may restore database `db` from the backup at `source`:
 /// `root` and `admin` users any backup; anyone else — who holds the restore
 /// privilege on `db` only — only a backup this server recorded as one of `db`
@@ -4665,25 +4738,7 @@ fn confined_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
         return Err("empty path".into());
     }
     let base = fs::canonicalize(base).map_err(|e| e.to_string())?;
-    // Canonicalize the deepest existing ancestor; re-append the rest (plain
-    // names, so nothing left to resolve).
-    let mut rest = Vec::new();
-    let mut existing = joined.as_path();
-    let mut target = loop {
-        match fs::canonicalize(existing) {
-            Ok(c) => break c,
-            Err(_) => match (existing.file_name(), existing.parent()) {
-                (Some(f), Some(p)) => {
-                    rest.push(f.to_os_string());
-                    existing = p;
-                }
-                _ => return Err("unresolvable path".into()),
-            },
-        }
-    };
-    for part in rest.iter().rev() {
-        target.push(part);
-    }
+    let target = resolved_path(&joined).ok_or("unresolvable path")?;
     if target.starts_with(&base) && target != base {
         Ok(target)
     } else {
@@ -4694,8 +4749,15 @@ fn confined_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
 /// Where a `/backup` of database `name` may write: `requested` (default
 /// `<name>.backup`) confined to `backup_dir`, not nested inside a directory
 /// holding a database (another backup), and either new, empty, or an earlier
-/// backup of `name` itself (see [`BACKUP_OWNER_FILE`]).
-fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Result<PathBuf, Resp> {
+/// backup of `name` itself (see [`BACKUP_OWNER_FILE`]). The destination is
+/// [claimed](BackupClaim) before it is checked, and the claim returned with
+/// it: a concurrent backup into it must neither be seen half-written by the
+/// check nor write beside this one.
+fn backup_target(
+    backup_dir: &Path,
+    name: &str,
+    requested: Option<&str>,
+) -> Result<(PathBuf, BackupClaim), Resp> {
     if let Err(e) = fs::create_dir_all(backup_dir) {
         return Err(Resp::fail(
             500,
@@ -4714,6 +4776,7 @@ fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Resu
             ),
         )
     })?;
+    let claim = BackupClaim::new(&target);
     let conflict = |what: &str| {
         Resp::fail(
             409,
@@ -4745,14 +4808,14 @@ fn backup_target(backup_dir: &Path, name: &str, requested: Option<&str>) -> Resu
         ancestor = dir.parent();
     }
     match fs::symlink_metadata(&target) {
-        Err(_) => Ok(target),
+        Err(_) => Ok((target, claim)),
         Ok(m) if m.is_dir() => {
             let owner = fs::read_to_string(target.join(BACKUP_OWNER_FILE)).ok();
             let empty = fs::read_dir(&target)
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(false);
             if empty || owner.as_deref() == Some(name) {
-                Ok(target)
+                Ok((target, claim))
             } else {
                 Err(conflict(&format!(
                     "already holds data that is not a backup of '{name}'"
@@ -7389,6 +7452,161 @@ mod tests {
             }
         }
         assert!(seen >= 1);
+        server.shutdown();
+    }
+
+    /// Concurrent REST `/backup`s of one database into its default
+    /// destination (`<db>.backup`) all succeed: they run one after the other
+    /// (the per-destination claim the `/api` backup takes). Under the shared
+    /// guard they checked and wrote the destination's owner record at the
+    /// same time — a request saw another's half-written record (`409 …
+    /// already holds data that is not a backup`) or lost the race to rename
+    /// it (`500 … No such file or directory`).
+    #[test]
+    fn concurrent_rest_backups_of_one_database_all_succeed() {
+        let (server, addr) = start("rest_backup_race");
+        let auth = basic("root", "root");
+        let mut data = String::new();
+        for i in 0..20000 {
+            data.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p{}> <http://ex/o{i}> .\n",
+                i % 7
+            ));
+        }
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=rbk",
+            Some(&auth),
+            &data,
+        ));
+        assert_eq!(s, 200, "build: {b}");
+        let mut failures = Vec::new();
+        for round in 0..6 {
+            let requests: Vec<_> = (0..4)
+                .map(|_| {
+                    let auth = auth.clone();
+                    std::thread::spawn(move || {
+                        split_status_body(&raw_request(
+                            &addr,
+                            "POST",
+                            "/backup?db_name=rbk",
+                            Some(&auth),
+                            "",
+                        ))
+                    })
+                })
+                .collect();
+            for r in requests {
+                let (s, b) = r.join().unwrap();
+                if s != 200 {
+                    failures.push(format!("round {round}: {s} {b}"));
+                }
+            }
+            let copy = server.inner.backup_dir().join("rbk.backup");
+            assert_eq!(Database::read_copy(&copy).unwrap().triple_num(), 20000);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        server.shutdown();
+    }
+
+    /// A REST `/batchRemove` whose terms cannot be looked up (a damaged
+    /// dictionary page of a Stream-mode database) fails: it used to read the
+    /// error as "no such term" and answer `200 batch removed` with the
+    /// triple counted as absent — while it stayed stored (C2).
+    #[test]
+    fn rest_batch_remove_fails_on_a_dictionary_read_error() {
+        use crate::db::{DiskQueryMode, OpenOptions};
+        let (server, addr) = start("batch_remove_read_error");
+        let dir = locked(&server.inner.state).db_dir("brm");
+        let nt = dir.with_extension("nt");
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::write(
+            &nt,
+            "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n",
+        )
+        .unwrap();
+        Database::build_disk(&dir, &[&nt]).unwrap();
+        // Overwrite the root page of the entity dictionary.
+        let kv = dir.join("kvstore.kv");
+        let page = crate::kvstore::Pager::open(&kv, 8)
+            .unwrap()
+            .root(crate::kvstore::format::ENTITY2ID);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut f = fs::OpenOptions::new().write(true).open(&kv).unwrap();
+            f.seek(SeekFrom::Start(page * crate::kvstore::PAGE_SIZE as u64))
+                .unwrap();
+            f.write_all(&[0xAB; crate::kvstore::PAGE_SIZE]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let stream = OpenOptions::new().with_disk_query_mode(DiskQueryMode::Stream);
+        let db = Database::open_with(&dir, &stream).unwrap();
+        assert_eq!(db.disk_query_mode(), Some(DiskQueryMode::Stream));
+        {
+            let mut st = locked(&server.inner.state);
+            let slot = DbSlot::handle(db, dir.clone(), false, &st.load_policy, &st.query_settings);
+            st.dbs.insert("brm".into(), slot);
+        }
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/batchRemove?db_name=brm",
+            Some(&basic("root", "root")),
+            "<http://ex/a> <http://ex/p> <http://ex/b> .",
+        ));
+        assert_eq!(s, 500, "answered {s} {b} despite a read error");
+        assert!(b.contains("batchRemove stopped"), "{b}");
+        assert_eq!(served(&server, "brm").read().unwrap().db.triple_num(), 2);
+        server.shutdown();
+    }
+
+    /// REST `/restore` and `/api restore` of a database the server has not
+    /// loaded lock its directory before the backup is staged beside it and
+    /// hold it through the swap: another process opening it meanwhile — whose
+    /// open repairs the staged copy away — is refused. Both used to stage
+    /// first and take the lock only for the swap.
+    #[test]
+    fn restores_of_an_unloaded_database_hold_it_while_staging() {
+        use crate::db::persist::restore_probe;
+        let (server, addr) = start("restore_lock_staging");
+        build_two(&addr, "rsl");
+        let auth = basic("root", "root");
+        let rest =
+            |target: &str| split_status_body(&raw_request(&addr, "POST", target, Some(&auth), ""));
+        let (s, b) = rest("/backup?db_name=rsl");
+        assert_eq!(s, 200, "backup: {b}");
+        let dir = locked(&server.inner.state).db_dir("rsl");
+        let (s, b) = rest("/unload?db_name=rsl");
+        assert_eq!(s, 200, "unload: {b}");
+        restore_probe::watch(&dir);
+        let (s, b) = rest("/restore?db_name=rsl&path=rsl.backup");
+        assert_eq!(s, 200, "REST restore: {b}");
+        assert_eq!(
+            restore_probe::lock_was_free(&dir),
+            [false],
+            "REST /restore: the directory was free while the backup was staged"
+        );
+        let (s, b) = rest("/unload?db_name=rsl");
+        assert_eq!(s, 200, "unload: {b}");
+        restore_probe::watch(&dir);
+        let backup = server.inner.backup_dir().join("rsl.backup");
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/api",
+            None,
+            &api_body(&format!(
+                r#""operation":"restore","db_name":"rsl","backup_path":{}"#,
+                json_str(&backup.to_string_lossy())
+            )),
+        ));
+        assert!(b.contains("\"StatusCode\":0"), "/api restore: {b}");
+        assert_eq!(
+            restore_probe::lock_was_free(&dir),
+            [false],
+            "/api restore: the directory was free while the backup was staged"
+        );
         server.shutdown();
     }
 

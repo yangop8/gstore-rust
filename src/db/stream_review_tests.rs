@@ -269,6 +269,17 @@ fn stream_deletes_fail_on_a_dictionary_read_error() {
         removed.is_err(),
         "a removal answered {removed:?} despite a read error"
     );
+    // REST /batchRemove's single-triple removal.
+    let t = Triple::new(
+        Term::iri("http://ex/a"),
+        Term::iri("http://ex/p"),
+        Term::iri("http://ex/b"),
+    );
+    let removed = db.try_remove_triple(&t);
+    assert!(
+        removed.is_err(),
+        "a removal answered {removed:?} despite a read error"
+    );
     assert_eq!(db.triple_num(), 2);
     drop(db);
     let _ = std::fs::remove_dir_all(&base);
@@ -596,6 +607,87 @@ fn saves_builds_and_restores_over_a_locked_directory_are_refused() {
     )
     .unwrap();
     Database::restore_into(&backup, &dir).unwrap();
+    let mut db = Database::open(&dir).unwrap();
+    assert!(ask(
+        &mut db,
+        "ASK { <http://ex/k> <http://ex/p> <http://ex/j> }"
+    ));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A file-level backup (`gbackup`, the `/api` backup of an unloaded
+/// database) repairs an interrupted save in its source only under the
+/// source's lock: with another process holding it — a `gbuild --force`
+/// staging its snapshot, a bulk install between its renames — it fails and
+/// leaves the staged files alone. It used to delete the staged snapshot
+/// members (the save then committed without them and removed the old
+/// store) or move the staged store into place under the installer.
+#[test]
+fn a_file_backup_repairs_no_save_another_process_holds() {
+    let base = tmp_dir("backup_dir_locked");
+    let dir = build_disk(
+        &base,
+        "s.db",
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n",
+    );
+    let member = dir.join("dict.bin.tmp");
+    std::fs::write(&member, b"staged").unwrap();
+    let store_new = dir.join("rocksdb.new");
+    std::fs::create_dir_all(&store_new).unwrap();
+    std::fs::write(store_new.join("CURRENT"), b"new").unwrap();
+    let copy = base.join("copy");
+    let held = foreign_lock(&dir);
+    let e = Database::backup_dir(&dir, &copy).expect_err("repaired a held directory");
+    assert!(e.to_string().contains("locked by another process"), "{e}");
+    assert!(member.is_file(), "the staged snapshot member was deleted");
+    assert!(store_new.is_dir(), "the staged store was moved");
+    assert!(!dir.join("rocksdb").exists());
+    drop(held);
+    // Free: the leftovers of the (now interrupted) saves are repaired.
+    Database::backup_dir(&dir, &copy).unwrap();
+    assert!(!member.exists());
+    assert!(dir.join("rocksdb/CURRENT").is_file());
+    assert!(copy.join("rocksdb/CURRENT").is_file());
+    assert!(copy.join(KV_FILE).is_file());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A restore into a directory an interrupted earlier restore moved aside
+/// holds the directory that finishing the earlier one recreates, from then
+/// until the swap: another process opening it while the backup is staged
+/// (it used to be free then) is refused instead of being served — and
+/// acknowledging writes to — a database the swap replaces.
+#[test]
+fn a_restore_after_an_interrupted_one_holds_the_recreated_directory() {
+    let base = tmp_dir("restore_recreated");
+    let dir = base.join("t.db");
+    let aside = fsutil::with_suffix(&dir, ".restore-old");
+    let waiting = fsutil::with_suffix(&dir, ".restore-new");
+    // The crash state: the database moved aside, its replacement complete.
+    build_disk(
+        &base,
+        "t.db.restore-old",
+        "<http://ex/old> <http://ex/p> <http://ex/o> .\n",
+    );
+    build_disk(
+        &base,
+        "t.db.restore-new",
+        "<http://ex/new> <http://ex/p> <http://ex/o> .\n",
+    );
+    let backup = build_disk(
+        &base,
+        "bak.db",
+        "<http://ex/k> <http://ex/p> <http://ex/j> .\n",
+    );
+    persist::restore_probe::watch(&dir);
+    Database::restore_into(&backup, &dir).unwrap();
+    assert_eq!(
+        persist::restore_probe::lock_was_free(&dir),
+        [false],
+        "another process could open the directory while the backup was staged"
+    );
+    assert!(!aside.exists() && !waiting.exists());
     let mut db = Database::open(&dir).unwrap();
     assert!(ask(
         &mut db,

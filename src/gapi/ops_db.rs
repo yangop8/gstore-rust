@@ -24,7 +24,9 @@
 //! it open ([`crate::db::dirlock`]); `drop`, `rename`, `restore` and the
 //! backup of an unloaded database take that lock first, so they never pull a
 //! directory from under another process (the REST `/build`, `/drop` and
-//! `/restore` do the same, through the same `DirLock::acquire_existing`).
+//! `/restore` do the same, through the same `DirLock::acquire_existing`; a
+//! restore — either — locks before it stages the backup beside the
+//! directory, `Database::lock_restore_target`, and holds it through the swap).
 //! `build` and the REST `/build` share the `max_database_num` count
 //! (`ApiState::database_limit_reached`).
 //!
@@ -48,7 +50,8 @@ use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
 use crate::http_api::{
-    may_restore_from, ApiInner, BusyGuard, DbCell, DbHandle, DbSlot, OpError, OpErrorKind,
+    may_restore_from, ApiInner, BackupClaim, BusyGuard, DbCell, DbHandle, DbSlot, OpError,
+    OpErrorKind,
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
@@ -1770,6 +1773,8 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     // (before Round 3 the database's exclusive lock ordered them; backups
     // take a shared guard now), else one's removal of `dest` deletes the
     // other's files mid-write, and one's failure cleanup the other's backup.
+    // The claim is the REST `/backup`'s too, so one of each into the same
+    // directory are ordered as well.
     let _claim = BackupClaim::new(&dest);
     progress("backing up", 0);
     let written = match dbh {
@@ -1824,47 +1829,6 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     rotate_backups(&target, &db, ctx.inner.config().max_backups);
     GResp::success("Database backup successfully.")
         .with("backupfilepath", ops_file::shown(&shown, &shown_name))
-}
-
-/// One `/api backup` request's claim on its backup directory: requests of
-/// the same database in the same second (the same `<db>.db_<time>` name)
-/// wait for each other, from removing an older backup of the name to
-/// packing and rotating, so each replaces the one before it whole. Taken
-/// before the database's guard and released after it (never the reverse,
-/// so no guard holder waits for a claim).
-struct BackupClaim {
-    dest: PathBuf,
-}
-
-impl BackupClaim {
-    /// The backup directories claimed by the requests in flight.
-    fn registry() -> &'static (Mutex<HashSet<PathBuf>>, std::sync::Condvar) {
-        static CLAIMS: OnceLock<(Mutex<HashSet<PathBuf>>, std::sync::Condvar)> = OnceLock::new();
-        CLAIMS.get_or_init(Default::default)
-    }
-
-    /// Claim `dest`, waiting while another request holds it.
-    fn new(dest: &Path) -> BackupClaim {
-        let (claims, freed) = Self::registry();
-        let mut held = locked(claims);
-        while held.contains(dest) {
-            held = freed
-                .wait(held)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        held.insert(dest.to_path_buf());
-        BackupClaim {
-            dest: dest.to_path_buf(),
-        }
-    }
-}
-
-impl Drop for BackupClaim {
-    fn drop(&mut self) {
-        let (claims, freed) = Self::registry();
-        locked(claims).remove(&self.dest);
-        freed.notify_all();
-    }
 }
 
 /// `backuppath` — the backups of `db_name` in the server's backup directory
@@ -1995,6 +1959,14 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         inner: ctx.inner,
         name: db.clone(),
     };
+    // No other process may open the database while the backup is staged
+    // beside it (its open would repair the staged copy away) or swapped in:
+    // the directory is locked first and held through the swap (shares a
+    // loaded copy's lock).
+    let probe = match Database::lock_restore_target(&dir) {
+        Ok(l) => l,
+        Err(e) => return fail(e.to_string()),
+    };
     // A zipped backup is unpacked beside the database first (removed once
     // staged); the name is reserved meanwhile, so no other restore of it
     // shares the scratch directory.
@@ -2032,14 +2004,6 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let staged = match staged {
         Ok(s) => s,
         Err(e) => return fail(e.to_string()),
-    };
-    // No other process may have the database open while it is swapped.
-    let probe = match DirLock::acquire_existing(&dir) {
-        Ok(l) => l,
-        Err(e) => {
-            Database::discard_staged_restore(&staged);
-            return fail(e.to_string());
-        }
     };
     let loaded = ctx.state().dbs.get(&db).map(Arc::clone);
     if let Some(h) = &loaded {

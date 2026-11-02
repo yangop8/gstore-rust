@@ -319,6 +319,16 @@ fn finish_snapshot_commit(dir: &Path, names: &[String]) -> Result<()> {
     sync_dir(dir)
 }
 
+/// Whether [`recover_snapshot`] would act on `dir`: a commit record or a
+/// member's temp file is there — what an interrupted snapshot write left, or
+/// one in progress (in this or another process; the same names).
+pub(crate) fn snapshot_in_progress(dir: &Path, members: &[&str]) -> bool {
+    dir.join(SNAPSHOT_COMMIT_FILE).exists()
+        || members
+            .iter()
+            .any(|name| tmp_path(&dir.join(name)).exists())
+}
+
 /// Finish (roll forward) a snapshot commit interrupted after its commit record
 /// was written, or discard the temp files of one interrupted before it. Only
 /// names listed in `members` are ever touched.

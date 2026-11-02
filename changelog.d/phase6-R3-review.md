@@ -3,7 +3,11 @@
 Fixes for the confirmed findings of the Round 3 review (lenses rocks,
 srv-locks, srv-semantics, stream-core, stream-persist, cross-lock-order,
 cross-cutting), on `phase6` from `4b8c3e0`. Each fix has a regression test
-that fails on `4b8c3e0` (see Measured numbers) unless noted there.
+that fails on `4b8c3e0` (see Measured numbers) unless noted there. A second
+pass (lenses fix-correctness, fix-regressions) over those fixes, from
+`b502624`, found six more (two of them one finding); their fixes are the
+"Second pass" entries below, each with a regression test that fails with the
+fix reverted.
 
 ## Changelog
 
@@ -147,6 +151,62 @@ that fails on `4b8c3e0` (see Measured numbers) unless noted there.
   checked, but no build path uses it until R4-SNAP): `conf.ini.example` and
   the `GStoreConfig` field say so, and `gserver` (at startup and on
   `refreshconf`) logs a warning while it is set.
+- **Second pass:**
+  - **REST `/batchRemove` fails on a read error.** It removed each triple
+    with `Database::remove_triple` outside any read scope: a dictionary read
+    error (Stream mode, a damaged dictionary page) reached only the
+    process-wide counter and the log, and the triple counted as absent —
+    `200 batch removed` with `failed: 1` while the triple stayed stored
+    (C2; the first pass fixed `/api batchRemove` and `gsub`, not this
+    path). New `Database::try_remove_triple` removes in a read scope and
+    fails on a recorded read error or a broken store; the batch stops with
+    `500 batchRemove stopped after applying N triple(s): …`, as
+    `/batchInsert` does.
+  - **A file-level backup repairs its source only under the source's
+    lock.** `Database::backup_dir` (`gbackup`, the `/api` backup of an
+    unloaded database, a restore's staging copy) finished an interrupted
+    snapshot commit or store swap in the directory it copied without that
+    directory's lock — and those names are also a save's in progress in
+    another process. A `gbackup` during a `gbuild --force` over an on-disk
+    database deleted the staged snapshot members; the save then committed
+    without them and removed `kvstore.kv`, leaving no database while
+    `gbuild` reported success. During a bulk RocksDB install it moved the
+    staged `rocksdb.new` into place under the installer, which then deleted
+    both stores. It now takes the lock first when there is something to
+    repair, and fails, touching nothing, while another process holds it.
+  - **`gbackup` holds the database's lock for the whole backup**, as the
+    `/api` backup of an unloaded database does: a database another process
+    has open (a `gserver` serving it, a `gbuild` writing it) is refused
+    with "… is locked by another process (pid N)" — as it already was for
+    the snapshot layout and, with the `rocksdb` feature, RocksDB, which
+    `gbackup` opens. The on-disk layout (and RocksDB without the feature)
+    used to be copied mid-write.
+  - **Restores lock their target before anything is staged and hold it
+    through the swap** (new `Database::lock_restore_target`: the target's
+    lock, then the repair of an interrupted earlier restore, then the lock
+    of a target that repair recreated). `restore_into` (`grestore`) locked
+    only a target that existed beforehand: after a crash had moved the
+    target aside, the directory the repair recreated stayed unlocked
+    through the staging and the swap, so a `gserver` could load it
+    meanwhile and acknowledge writes that the swap then lost. REST
+    `/restore` and `/api restore` staged before they locked (the lock only
+    covered the swap): another process opening a database the server had
+    not loaded while its backup was staged deleted the staged copy, and the
+    restore failed (`500` / `1005 … No such file or directory`). Both now
+    lock first (the `/api` restore before unpacking a zipped backup):
+    `409` / `1005 … locked by another process` while another process holds
+    the directory.
+  - **REST `/backup` takes the `/api backup`'s per-destination claim**
+    (`BackupClaim`, moved to `http_api` and keyed by the resolved path),
+    before it checks the destination and before the database guard.
+    Concurrent REST backups of one database into its `<db>.backup` — all
+    under the shared guard since Round 3 — checked and wrote the
+    destination's owner record at once: all but one answered `409 …
+    already holds data that is not a backup` or `500 … No such file or
+    directory` (a Round-3 regression; the exclusive guard ordered them
+    before). A REST and an `/api` backup into one directory are ordered too.
+    (No acknowledged backup was torn: the per-database persist lock already
+    serialized the copy itself.)
 
 ## GAP_PLAN status line
 
@@ -168,6 +228,19 @@ none
 - docs/ARCHITECTURE (server): `/api monitor` / `schema` report the earlier
   class statistics of a database busy with a writer; same-second `/api
   backup`s of one database are serialized.
+- Second pass — docs/ARCHITECTURE (locking): `backup_dir` repairs its
+  source only under the source's lock; `gbackup` holds the lock for the
+  whole backup, every layout; every restore (`grestore`, REST `/restore`,
+  `/api restore`) locks the target before it stages the backup and holds
+  it through the swap. docs/ARCHITECTURE (server): backups into one
+  directory, REST or `/api`, run one after the other.
+- Second pass — docs/DEPLOY.md (Backups): `gbackup` refuses a database
+  another process has open; back up a served database through the server
+  (`/api backup`, REST `/backup`, `gconsole`'s `backup`). README's lock
+  paragraph already lists `gbackup` among the tools refused while
+  `gserver` has a database loaded; it is now true of every layout.
+- Second pass — REST API docs: `/batchRemove` answers `500` (and stops)
+  when a triple's terms cannot be read, like `/batchInsert`.
 
 ## Measured numbers
 
@@ -206,6 +279,24 @@ pass here:
 | gbuild / save / restore unlocked | `db::stream_review_tests::saves_builds_and_restores_over_a_locked_directory_are_refused` | snapshot saved over the locked directory |
 | default_layout | `config::tests::storage_defaults_and_bad_values` (the warning) | (new method) |
 
+Second pass: each regression test was run against `b502624`'s code paths —
+the fixes reverted in place, the tests and the test-only restore probe
+(`db::persist::restore_probe`, which records whether another process could
+have locked a watched restore target while its backup was staged) kept —
+and failed there; all pass here:
+
+| finding | test | with the fix reverted |
+|---|---|---|
+| REST batchRemove unscoped | `http_api::tests::rest_batch_remove_fails_on_a_dictionary_read_error` (a Stream-mode database with its `ENTITY2ID` root page overwritten) | `200 batch removed`, `failed: 1`, triple kept |
+| backup_dir repairs unlocked | `db::stream_review_tests::a_file_backup_repairs_no_save_another_process_holds` (staged `dict.bin.tmp` and `rocksdb.new`, the lock held) | `Ok` (repaired without the lock) |
+| gbackup unlocked | `dt_persist_backends::gbackup_refuses_a_database_another_process_holds` (the test process holds the lock; `gbackup` is a child) | exit 0, "Backed up …" |
+| restore_into after a crash | `db::stream_review_tests::a_restore_after_an_interrupted_one_holds_the_recreated_directory` | target lock free while staged: `[true]` |
+| server restores stage first | `http_api::tests::restores_of_an_unloaded_database_hold_it_while_staging` (REST, then `/api` with REST's fix kept) | `[true]` for each |
+| REST backups unclaimed | `http_api::tests::concurrent_rest_backups_of_one_database_all_succeed` (4 concurrent requests, 6 rounds) | 18 of 24 failed: `409 … not a backup of 'rbk'` (round 0), `500 … No such file or directory` |
+
+`db::stream_review_tests::stream_deletes_fail_on_a_dictionary_read_error`
+also checks `Database::try_remove_triple` now (new method).
+
 No test for the posting-list lock hold (not observable without
 instrumentation; the existing list-cache tests cover the unchanged
 results) or for the restore validation's memory (the existing
@@ -226,6 +317,23 @@ CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`, rustc 1.99.1):
   rerun alone).
 - No other feature-gated code was touched.
 
+Verification of the second pass (same VM and settings):
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+  -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast` with `GSTORE_DISK_QUERY_MODE=memory`:
+  2,237 passed, 0 failed, 2 ignored; with `GSTORE_DISK_QUERY_MODE=stream`:
+  2,237 passed, 0 failed, 2 ignored.
+- `--features rocksdb` (`CARGO_TARGET_DIR=target-rocks`; the backup,
+  restore and server paths changed are compiled there too): `cargo clippy
+  -p gstore --all-targets --features rocksdb -- -D warnings` clean; `cargo
+  test -p gstore --features rocksdb --no-fail-fast`: 2,084 passed, 0
+  failed, 2 ignored.
+- `--features zip` (the `/api` restore's zipped-backup path now runs under
+  the lock): `cargo clippy -p gstore --all-targets --features zip -- -D
+  warnings` clean; `cargo test -p gstore --features zip --no-fail-fast`:
+  2,050 passed, 0 failed, 1 ignored. No `cfg(feature)` code was changed.
+
 ## Requests/Not yet
 
 - By design, not a gap: `read_synced` leaves a database's new `[query]`
@@ -239,3 +347,14 @@ CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`, rustc 1.99.1):
 - `/api monitor` / `schema` of a database whose statistics were never
   computed for this instance still wait for a writer (there is nothing
   earlier to report); every later call does not.
+- Second pass, not closed: a restore that creates its database (no
+  `<dir>` and nothing moved aside) has no directory to lock while it
+  stages. Another process opening the not-yet-existing `<dir>` meanwhile
+  still removes `<dir>.restore-tmp` (its repair has no lock to take), and
+  the restore fails; nothing is lost (there was no database, the backup is
+  untouched). Closing it needs a lock that lives beside the directory
+  rather than in it — an R4 item.
+- Second pass, a behaviour change to note in the docs: `gbackup` of an
+  on-disk database (or RocksDB without the feature) another process has
+  open is now refused, as `gbackup` of the other layouts already was;
+  back up a served database through the server.

@@ -19,7 +19,11 @@
 //! [`Database::backup_dir`], without loading the data. For a RocksDB database
 //! (built with `--features rocksdb`) it writes a RocksDB checkpoint, a
 //! consistent copy of every column family; without the feature the store
-//! directory is copied file by file (only safe while no process has it open).
+//! directory is copied file by file.
+//!
+//! The database directory's lock is held for the whole backup: a database
+//! another process has open (a `gserver` serving it — back it up through the
+//! server's `backup` instead — or a `gbuild` writing it) is refused.
 //!
 //! `-z` / `--zip` (upstream's `gbackup -z 1`), or a destination ending in
 //! `.zip`, packs the backup into a zip archive instead (feature `zip`):
@@ -34,6 +38,7 @@ mod cli;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use gstore::db::dirlock::DirLock;
 use gstore::db::StorageKind;
 use gstore::{db_dir_for, zipio, Database};
 
@@ -154,6 +159,18 @@ fn main() -> ExitCode {
         eprintln!("database '{dir}' does not exist");
         return ExitCode::FAILURE;
     }
+    // The database is held for the whole backup, as the `/api` backup holds
+    // an unloaded one: the files of a database another process writes (a
+    // gserver serving it, a `gbuild --force` saving over it) are neither
+    // copied mid-write nor — an interrupted save's names are also those of
+    // one in progress — repaired away. Refused while another process has it.
+    let _lock = match DirLock::acquire(std::path::Path::new(&dir)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("backup of '{dir}' failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let result = match Database::storage_kind(&dir) {
         // On-disk store: copy the files directly (no in-RAM materialization).

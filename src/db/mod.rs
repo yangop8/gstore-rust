@@ -1275,6 +1275,23 @@ impl Database {
         self.remove_default_id(IdTriple::new(sub, pred, obj))
     }
 
+    /// [`remove_triple`](Self::remove_triple), failing when the removal cannot
+    /// be read through (REST `/batchRemove`): it runs in a read scope (C2), so
+    /// a term whose lookup failed (an out-of-core dictionary's read error) is
+    /// an error rather than "no such term" — which reads as an absent
+    /// triple — and so is a store broken by a write error. `Ok(true)` if the
+    /// triple existed.
+    pub fn try_remove_triple(&mut self, t: &Triple) -> Result<bool> {
+        let scope = ReadScope::enter();
+        let removed = self.remove_triple(t);
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("removing a triple", e));
+        }
+        drop(scope);
+        self.check_store_readable()?;
+        Ok(removed)
+    }
+
     /// Remove the default-graph triple `id`; `true` if it existed. (Stream
     /// mode: a write error breaks the store, answers `false` and is reported
     /// by the next commit point.)

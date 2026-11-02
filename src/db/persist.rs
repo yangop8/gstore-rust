@@ -1329,9 +1329,17 @@ impl Database {
     /// KVstore and VS-tree files **with their WALs**, the `rocksdb/` store
     /// (recursively), and the update/redo logs — without loading anything into
     /// memory. Database files of `dst` that `src` lacks are removed, so `dst`
-    /// mirrors `src`. Intended for a database no process is writing; for a live
-    /// database prefer [`backup`](Self::backup) (a RocksDB checkpoint or a
-    /// committed copy).
+    /// mirrors `src`. Intended for a database no process is writing (callers
+    /// that copy a database directory hold its lock, as `gbackup` and the
+    /// `/api` backup of an unloaded database do); for a live database prefer
+    /// [`backup`](Self::backup) (a RocksDB checkpoint or a committed copy).
+    ///
+    /// An interrupted save in `src` (a snapshot commit, a store swap) is
+    /// finished first, so the copy is coherent — only under `src`'s lock:
+    /// those names are also those of a save in progress in another process
+    /// (a `gbuild --force`, a bulk install, which hold the lock), whose staged
+    /// files the repair would delete. Fails, touching nothing, while another
+    /// process holds it.
     pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
         let (src, dst) = (src.as_ref(), dst.as_ref());
         if !src.is_dir() {
@@ -1340,9 +1348,17 @@ impl Database {
                 src.display()
             )));
         }
-        // Finish any interrupted save in the source so the copy is coherent.
-        fsutil::recover_snapshot(src, SNAPSHOT_FILES)?;
-        fsutil::recover_dir_swap(&src.join(ROCKS_SUBDIR))?;
+        let rocks = src.join(ROCKS_SUBDIR);
+        let _lock = if fsutil::snapshot_in_progress(src, SNAPSHOT_FILES)
+            || fsutil::STORE_SWAP.in_progress(&rocks)
+        {
+            let lock = super::dirlock::DirLock::acquire(src)?;
+            fsutil::recover_snapshot(src, SNAPSHOT_FILES)?;
+            fsutil::recover_dir_swap(&rocks)?;
+            Some(lock)
+        } else {
+            None
+        };
         fs::create_dir_all(dst)?;
 
         let kv = Path::new(KV_FILE);
@@ -1403,16 +1419,39 @@ impl Database {
         // A database another process serves from `target` (it holds the
         // directory lock) must not be swapped out from under it: refused,
         // and the directory held for the whole restore.
-        let _lock = super::dirlock::DirLock::acquire_existing(target)?;
+        let _lock = Database::lock_restore_target(target)?;
         let staged = Database::stage_restore(backup.as_ref(), target)?;
         Database::install_restore(&staged, target)
+    }
+
+    /// Lock directory `target` for a restore into it, before anything is
+    /// staged beside it. [`restore_into`](Self::restore_into) and the
+    /// server's restores hold the lock until the staged copy is installed
+    /// ([`install_restore`](Self::install_restore)), so no other process opens
+    /// `target` meanwhile: its open would repair the staged copy away (see
+    /// [`recover_restore`](Self::recover_restore)), or serve — and acknowledge
+    /// writes to — a database the swap then replaces. An interrupted earlier
+    /// restore of `target` is finished here (under the lock of the directory
+    /// it concerns), so a `target` that this repair recreates — moved aside
+    /// by the crash — is locked too. `None` when there is no `target`
+    /// directory to lock (a restore that creates the database). Fails,
+    /// staging nothing, while another process holds the lock.
+    pub(crate) fn lock_restore_target(target: &Path) -> Result<Option<super::dirlock::DirLock>> {
+        let held = super::dirlock::DirLock::acquire_existing(target)?;
+        Database::recover_restore(target)?;
+        match held {
+            Some(lock) => Ok(Some(lock)),
+            None => super::dirlock::DirLock::acquire_existing(target),
+        }
     }
 
     /// The first half of [`restore_into`](Self::restore_into): copy `backup`
     /// into the staging directory of `target` and validate the copy, without
     /// touching `target` itself. Returns the staged directory, to be passed to
     /// [`install_restore`](Self::install_restore) (or
-    /// [`discard_staged_restore`](Self::discard_staged_restore)).
+    /// [`discard_staged_restore`](Self::discard_staged_restore)). The caller
+    /// holds `target`'s lock from before this call until then
+    /// ([`lock_restore_target`](Self::lock_restore_target)).
     pub(crate) fn stage_restore(backup: &Path, target: &Path) -> Result<PathBuf> {
         let Some(kind) = Database::storage_kind(backup) else {
             return Err(GStoreError::Database(format!(
@@ -1445,6 +1484,8 @@ impl Database {
             let _ = fsutil::remove_dir_if_exists(&staged);
             return Err(e);
         }
+        #[cfg(test)]
+        restore_probe::staged(target);
         Ok(staged)
     }
 
@@ -2091,6 +2132,69 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
         ds.insert_quad_keys(g, s, p, o, *lit)?;
     }
     Ok(())
+}
+
+/// Test-only instrument of a restore's staging: for a watched target,
+/// whether another process could have locked it (and so opened it) while a
+/// backup was staged beside it — the window in which its open repairs the
+/// staged copy away, or serves a database the swap then replaces.
+#[cfg(test)]
+pub(crate) mod restore_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::db::dirlock::LOCK_FILE;
+
+    /// The watched targets, and for each staging of one: whether its lock was
+    /// free to another process then.
+    static WATCHED: Mutex<Vec<(PathBuf, Vec<bool>)>> = Mutex::new(Vec::new());
+
+    /// Watch the restores into `target`.
+    pub(crate) fn watch(target: &Path) {
+        let mut w = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        w.retain(|(t, _)| t != target);
+        w.push((target.to_path_buf(), Vec::new()));
+    }
+
+    /// For each restore into `target` staged since [`watch`]: whether
+    /// another process could have taken `target`'s lock then.
+    pub(crate) fn lock_was_free(target: &Path) -> Vec<bool> {
+        let w = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        w.iter()
+            .find(|(t, _)| t == target)
+            .map(|(_, seen)| seen.clone())
+            .unwrap_or_default()
+    }
+
+    /// Called by `stage_restore` once a backup is staged for `target`.
+    pub(super) fn staged(target: &Path) {
+        let mut w = WATCHED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, seen)) = w.iter_mut().find(|(t, _)| t == target) {
+            seen.push(free_to_another_process(target));
+        }
+    }
+
+    /// Whether `<dir>/LOCK` can be locked through a new open file
+    /// description — as another process would take it — right now (released
+    /// at once). `true` when there is no directory: nothing holds it.
+    fn free_to_another_process(dir: &Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILE))
+        else {
+            return true;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// RocksDB layout helpers: dictionary (de)serialization into the `dict` CF and
