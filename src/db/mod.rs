@@ -43,8 +43,14 @@ use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 mod admin;
 pub mod dirlock;
 pub(crate) mod fsutil;
+mod open_options;
 pub(crate) mod persist;
 mod statement;
+pub use open_options::{
+    default_open_options, set_default_open_options, DiskQueryMode, OpenOptions,
+    DEFAULT_DICT_CACHE_BYTES, DEFAULT_DISK_CACHE_PAGES, DEFAULT_DISK_QUERY_MODE,
+    ENV_DISK_CACHE_MB, ENV_DISK_QUERY_MODE, ENV_VSTREE_ON_OPEN,
+};
 pub use statement::Statement;
 
 #[cfg(test)]
