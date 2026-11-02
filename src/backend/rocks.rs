@@ -97,11 +97,16 @@
 //! per-predicate counters `c|`/`u|`/`v|` are mirrored in memory (loaded at
 //! open after the journal replay, changed only after a successful write
 //! batch, reloaded after every journal replay), so `pred_card` and friends
-//! never touch RocksDB. The contract order comes without sorting whole
-//! ranges: `so_by_p` walks the `x|p` subjects with SPO seeks, `subs_by_p` /
-//! `objs_by_p` read the `x|p` / `y|p` keys, and `iter_all` places every SPO
-//! triple straight into its predicate's slice (sized by the exact `c|p`), in
-//! `(p, s, o)` order.
+//! never touch RocksDB. The contract order mostly comes without sorting:
+//! `subs_by_p` / `objs_by_p` read the `x|p` / `y|p` keys, and `iter_all`
+//! places every SPO triple straight into its predicate's slice (sized by the
+//! exact `c|p`), in `(p, s, o)` order. `so_by_p` chooses by the mirrored
+//! counters: a predicate whose subjects have long object runs (`c|p` ≥
+//! [`SEEK_RUN`] × `u|p`) walks its `x|p` subjects with one SPO seek each;
+//! any other reads its POS range and sorts it (a seek costs about as much
+//! as reading tens of keys, so for short runs — LUBM's predicates average
+//! 1–3 objects per subject — the scan and sort is faster; measured at univ
+//! 8).
 //!
 //! ## Tuning (options only; the format is unchanged)
 //!
@@ -418,6 +423,10 @@ impl ScanError {
 /// After how many keys of one predicate `distinct_p_of_s` seeks past it
 /// instead of stepping on.
 const SKIP_AFTER: u32 = 8;
+
+/// `so_by_p` walks a predicate's subjects with SPO seeks when it has at
+/// least this many triples per distinct subject (see the module docs).
+pub(crate) const SEEK_RUN: u64 = 32;
 
 impl RocksStore {
     /// Open (creating if absent) a RocksDB triple store at directory `path`,
@@ -1301,20 +1310,21 @@ impl TripleSource for RocksStore {
         out
     }
 
-    /// `? p ?` → `(sub, obj)` pairs in `(sub, obj)` order, without sorting:
-    /// the predicate's subjects (its `x|p` counter keys, ascending), each
-    /// followed by its objects from an SPO seek to `(s, p)`.
+    /// `? p ?` → `(sub, obj)` pairs in `(sub, obj)` order: for long object
+    /// runs the predicate's subjects (its `x|p` counter keys, ascending),
+    /// each followed by its objects from an SPO seek to `(s, p)`; otherwise
+    /// the POS range sorted (see the module docs). Both give the same list.
     fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        static SORT: OnceLock<bool> = OnceLock::new();
-        if *SORT.get_or_init(|| std::env::var("GSTORE_ROCKS_SO_BY_P").as_deref() == Ok("sort")) {
-            let mut out = Vec::with_capacity(self.pred_counts(pred).card as usize);
-            self.scan(CF_POS, &be(pred), |k| {
-                out.push((de(&k[8..12]), de(&k[4..8])))
-            });
-            out.sort_unstable();
-            return out;
+        let c = self.pred_counts(pred);
+        if c.card >= SEEK_RUN.saturating_mul(c.subjects.max(1)) {
+            return self.so_by_p_seek(pred);
         }
-        self.so_by_p_seek(pred)
+        let mut out = Vec::with_capacity(c.card as usize);
+        self.scan(CF_POS, &be(pred), |k| {
+            out.push((de(&k[8..12]), de(&k[4..8])))
+        });
+        out.sort_unstable();
+        out
     }
 
     /// Distinct subjects of a predicate: its `x|p` counter keys, ascending.

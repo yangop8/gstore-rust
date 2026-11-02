@@ -585,6 +585,52 @@ fn counts_and_order_equal_the_defaults_and_the_memory_store() {
     }
 }
 
+/// `so_by_p` answers a predicate with long object runs per subject (SPO
+/// seeks over its `x|p` subjects) and one with short runs (its POS range,
+/// sorted) in the same contract order as the in-memory store.
+#[test]
+fn so_by_p_orders_long_and_short_runs_alike() {
+    let dir = tmp("so_by_p");
+    let mut rocks = RocksStore::open(&dir).unwrap();
+    let mut mem = TripleStore::new();
+    let mut triples = Vec::new();
+    // Predicate 0: 3 subjects × 100 objects (long runs).
+    for s in [9u32, 2, 5] {
+        for i in 0..100u32 {
+            triples.push(IdTriple::new(s, 0, (i * 37) % 101 + 1000));
+        }
+    }
+    // Predicate 1: 300 subjects with 1–2 objects each (short runs), objects
+    // falling as subjects rise; predicate 2: one object for every subject.
+    for s in 0..300u32 {
+        triples.push(IdTriple::new(s, 1, 5000 - s));
+        if s % 3 == 0 {
+            triples.push(IdTriple::new(s, 1, 2_000_000_000 + s % 7));
+        }
+        triples.push(IdTriple::new(s, 2, 77));
+    }
+    for t in triples.iter().rev() {
+        assert_eq!(rocks.insert(*t), mem.insert(*t));
+    }
+    for p in 0..4u32 {
+        assert_eq!(rocks.so_by_p(p), mem.so_by_p(p).to_vec(), "so_by_p({p})");
+        assert_eq!(
+            TripleSource::subs_by_p(&rocks, p),
+            mem.subs_by_p(p),
+            "subs_by_p({p})"
+        );
+        assert_eq!(TripleSource::objs_by_p(&rocks, p), mem.objs_by_p(p));
+    }
+    assert_eq!(
+        TripleSource::iter_all(&rocks),
+        TripleSource::iter_all(&mem),
+        "iter_all in (p, s, o) order"
+    );
+    rocks.check_stats().unwrap();
+    drop(rocks);
+    cleanup(&dir);
+}
+
 /// Apply `n` random inserts / removes to `rocks` (and to `mem`, checking
 /// that both report the same changes).
 fn churn(
