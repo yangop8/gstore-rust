@@ -218,11 +218,19 @@ headline metric (a backend's query geomean or build time) is ≥ 1.5× better.
 after open 0.85 / 0.74; disk directory 0.75× (18,083,846 bytes), snapshot
 bytes identical. Four headline metrics clear 1.5×, so `smoke.json` is
 **re-blessed**, in a separate commit. The fresh `bless` run made right
-after that check recorded a calibration of 71.3 ms (61–65 ms in every
-other run of this stage) and 25% slower disk queries, so it was discarded;
-the new baseline is `bless --from` the smoke result of the next `gstore-bench
-ci` run of the same commit (calibration 62.3 ms; its query medians match
-the first check's within a few percent).
+after that check measured the disk queries 25% slower than the check
+before it and the run after it (geomean 1.10 against 0.86 ms) with a
+calibration of 71.3 ms, so it was discarded; the new baseline is `bless
+--from` the smoke result of the next `gstore-bench ci` run of the same
+commit (calibration 62.3 ms; its query medians match the first check's
+within a few percent). `gstore-bench ci` against the re-blessed
+`bench/baselines/smoke.json`: **PASS, 193 gates, 0 failed** (calibration
+73.6 ms in that run; normalized query geomeans 0.92 snapshot / 0.82 disk,
+builds 1.12 / 1.30, warm opens 0.99 / 0.86). The new baseline holds the
+round's speed: a return of the queries to the pre-Phase-6 level now reads
+about 2.0× (snapshot) / 1.8× (disk) in the smoke geomean gate, which fails
+above 1.5, and the disk build gate fails at 2.5 × 0.5 s instead of
+2.5 × 32 s.
 
 **Environment note.** All reference, A/B and package runs above ran on the
 idle machine. From 02:44 another session started compiling in
