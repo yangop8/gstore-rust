@@ -198,7 +198,9 @@ use crate::gapi::GapiConfig;
 use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
+use crate::kvstore::{DiskReadView, DiskSource, ViewError};
 use crate::model::{Term, Triple};
+use crate::query::engine::CsrProvider;
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::reason::rules::RULE_DIR;
 use crate::reason::store::RuleStore;
@@ -455,24 +457,33 @@ pub(crate) struct Txn {
 /// `/commit` or `/rollback` gets a precise "already committed" error.
 const ENDED_TXN_MEMORY: usize = 1024;
 
-/// An immutable copy of a database's committed state, taken at `/begin`.
-/// While a transaction is open every *non-transactional* read of that database
-/// is answered from here, so other clients never observe its uncommitted
-/// writes (no dirty reads).
+/// A database's committed state, taken at `/begin`. While a transaction is
+/// open every *non-transactional* read of that database is answered from
+/// here, so other clients never observe its uncommitted writes (no dirty
+/// reads).
 ///
-/// Memory cost: the dictionary, the default-graph triple indexes and the named
-/// graphs are cloned, so an open transaction roughly doubles its database's
-/// in-memory footprint until it commits or rolls back. The VS-tree is not
-/// part of the snapshot (it is only a candidate-pruning accelerator, so
-/// results are unchanged). The user-defined functions registered at `/begin`
-/// are shared with it (the registry is reference-counted), and the advanced
-/// graph functions run on one CSR of the snapshot — the database's cached one
-/// when it had one for this data, otherwise built on the first graph-function
-/// read — shared by every read until the transaction ends.
+/// Cost (see [`SnapStore`]): `/begin` copies no triple of an in-memory or a
+/// Stream-mode on-disk database. The dictionary is shared (its interner is
+/// copy-on-write; an on-disk dictionary is shared with the database: terms
+/// a transaction interns are visible to it, but no snapshot triple uses
+/// them), the default graph is a copy-on-write clone or an on-disk read
+/// view, and each named graph's store is a copy-on-write clone. The first
+/// write of the transaction to an in-memory store copies its indexes once,
+/// so an open transaction that wrote holds the begin-time copy until it
+/// ends; a RocksDB database is still copied whole at `/begin`. The VS-tree
+/// is not part of the snapshot (it is only a candidate-pruning accelerator,
+/// so results are unchanged). The user-defined functions registered at
+/// `/begin` are shared with it (the registry is reference-counted), and the
+/// advanced graph functions run on one CSR of the snapshot — the
+/// database's cached one when it had one for this data, otherwise built on
+/// the first graph-function read — shared by every read until the
+/// transaction ends.
 pub(crate) struct ReadSnapshot {
     dict: Dictionary,
-    store: TripleStore,
+    store: SnapStore,
     named: BTreeMap<u32, TripleStore>,
+    /// The committed triple count at `/begin`.
+    triples: u64,
     functions: FunctionRegistry,
     /// The database's integer-division mode at `/begin`.
     integer_division: IntegerDivision,
@@ -489,30 +500,100 @@ pub(crate) struct ReadSnapshot {
     pfn_limits: crate::pfn::PfnLimits,
     /// The database's own PFN caller ([`Database::set_pfn_caller`]; a served
     /// database has none — the server passes the user per read, see
-    /// [`query_as`](Self::query_as)).
+    /// [`read_as`](Self::read_as)).
     pfn: Option<crate::pfn::PfnCaller>,
 }
 
-impl ReadSnapshot {
-    /// Copy `db`'s committed state. A persistent backend with no in-RAM store
-    /// is materialized inside a [`ReadScope`]: a read error it reports fails
-    /// the capture (and so the `/begin`) instead of yielding a partial copy.
-    fn capture(db: &Database) -> crate::Result<ReadSnapshot> {
-        let store = match db.backend().as_memory() {
-            Some(mem) => mem.clone(),
-            None => {
-                // A persistent backend has no in-RAM store to clone: materialize it.
-                let scope = ReadScope::enter();
-                let mut s = TripleStore::new();
-                s.bulk_load(db.backend().iter_all());
-                if let Some(e) = scope.take_error() {
-                    return Err(GStoreError::Database(format!(
-                        "a read from the store failed while copying the database for a \
-                         transaction's read snapshot: {e}"
-                    )));
-                }
-                s
+/// The default graph of a [`ReadSnapshot`].
+pub(crate) enum SnapStore {
+    /// An in-memory store (also a Materialize-mode on-disk database's
+    /// working set, and a RocksDB database's materialized copy): a
+    /// copy-on-write clone, O(1) at `/begin`.
+    Mem(TripleStore),
+    /// A Stream-mode on-disk store: a read view of its committed state at
+    /// `/begin` (no triple copied). Each read runs inside
+    /// [`DiskReadView::with_base`], under the store's writer gate: the
+    /// transaction's commit (or any other write to the pages) cancels the
+    /// reads in flight and expires the view, and a read that finds it
+    /// expired answers [`SnapshotReadError::Expired`] — its caller re-runs
+    /// it on the live database (see `ApiInner::run_query_job`).
+    Disk(DiskReadView),
+}
+
+/// Why a [`ReadSnapshot`] could not answer a read.
+#[derive(Debug)]
+pub(crate) enum SnapshotReadError {
+    /// The database's committed state changed since `/begin` (the
+    /// transaction committed, or the view was otherwise invalidated): the
+    /// read must run on the live database (or a newer snapshot) instead.
+    Expired,
+    /// The on-disk store was closed (the database was unloaded).
+    Closed,
+    /// The read itself failed (a query error, a read error, a cancel).
+    Failed(GStoreError),
+}
+
+impl From<GStoreError> for SnapshotReadError {
+    fn from(e: GStoreError) -> SnapshotReadError {
+        SnapshotReadError::Failed(e)
+    }
+}
+
+impl std::fmt::Display for SnapshotReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotReadError::Failed(e) => write!(f, "{e}"),
+            SnapshotReadError::Expired => f.write_str("the snapshot expired"),
+            SnapshotReadError::Closed => f.write_str("the database was closed"),
+        }
+    }
+}
+
+impl SnapshotReadError {
+    /// As a [`GStoreError`], for a caller that holds the database's guard
+    /// (the transaction cannot end under it, so the snapshot does not
+    /// expire; see [`DbSlot::read_cancellable`]).
+    fn into_error(self) -> GStoreError {
+        match self {
+            SnapshotReadError::Failed(e) => e,
+            SnapshotReadError::Expired => GStoreError::Database(
+                "the transaction's read snapshot expired: the database changed".into(),
+            ),
+            SnapshotReadError::Closed => {
+                GStoreError::Database("the database is no longer loaded".into())
             }
+        }
+    }
+}
+
+impl ReadSnapshot {
+    /// Take `db`'s committed state (see [`SnapStore`]). A persistent backend
+    /// with no in-RAM store and no read view (RocksDB) is materialized
+    /// inside a [`ReadScope`]: a read error it reports fails the capture
+    /// (and so the `/begin`) instead of yielding a partial copy.
+    fn capture(db: &Database) -> crate::Result<ReadSnapshot> {
+        let store = if let Some(mem) = db.backend().as_memory() {
+            SnapStore::Mem(mem.clone())
+        } else if let Some(disk) = db.backend().as_disk() {
+            SnapStore::Disk(disk.read_view())
+        } else {
+            // A persistent backend with no in-RAM store: materialize it.
+            let scope = ReadScope::enter();
+            let mut s = TripleStore::new();
+            s.bulk_load(db.backend().iter_all());
+            if let Some(e) = scope.take_error() {
+                return Err(GStoreError::Database(format!(
+                    "a read from the store failed while copying the database for a \
+                     transaction's read snapshot: {e}"
+                )));
+            }
+            SnapStore::Mem(s)
+        };
+        // The CSR generation: the view's epoch (an on-disk snapshot), else
+        // one generation for the snapshot's lifetime.
+        let generation = match &store {
+            SnapStore::Disk(view) => view.begin_epoch(),
+            SnapStore::Mem(_) => 0,
         };
         Ok(ReadSnapshot {
             dict: db.dict().clone(),
@@ -523,12 +604,13 @@ impl ReadSnapshot {
                 .iter()
                 .map(|(&g, s)| (g, s.clone()))
                 .collect(),
+            triples: db.triple_num(),
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
             topk: db.topk_options(),
             csr: db
                 .cached_csr()
-                .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
+                .map_or_else(CsrCache::new, |g| CsrCache::seeded(generation, g)),
             allow_service: db.load_policy().allow_remote,
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
             pfn_limits: db.pfn_limits(),
@@ -536,34 +618,97 @@ impl ReadSnapshot {
         })
     }
 
+    /// The default graph.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &SnapStore {
+        &self.store
+    }
+
     /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE). Updates are refused:
     /// the snapshot is read-only by construction.
-    fn query(&self, sparql: &str, cancel: Option<Arc<AtomicBool>>) -> crate::Result<QueryResult> {
+    fn query(
+        &self,
+        sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<QueryResult, SnapshotReadError> {
         self.read_as(&Statement::parse(sparql)?, cancel, None)
     }
 
     /// Run the parsed read `stmt` on behalf of `pfn` (the requesting user's
     /// PFN functions, under the snapshot's PFN limits; `None` falls back to
     /// the database's own caller, if any). The evaluation runs inside a
-    /// [`ReadScope`]: a read error recorded there fails the statement.
+    /// [`ReadScope`]: a read error recorded there fails the statement. On an
+    /// on-disk snapshot it runs inside the view's gate, with the gate's
+    /// cancel flag wired into the evaluator (and `cancel` forwarded to it):
+    /// a writer that needs the pages stops it, and it answers
+    /// [`SnapshotReadError::Expired`] (or fails with
+    /// [`GStoreError::Cancelled`] when `cancel` was raised).
     fn read_as(
         &self,
         stmt: &Statement,
         cancel: Option<Arc<AtomicBool>>,
         pfn: Option<&crate::pfn::PfnCaller>,
-    ) -> crate::Result<QueryResult> {
+    ) -> Result<QueryResult, SnapshotReadError> {
         if stmt.is_update() {
-            return Err(GStoreError::Query(
+            return Err(SnapshotReadError::Failed(GStoreError::Query(
                 "updates cannot run against a transaction's read snapshot".into(),
-            ));
+            )));
         }
         let q = stmt.query();
-        // The snapshot never changes, so its CSR is cached under one
-        // generation for the transaction's lifetime.
-        let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
-        let mut eval = Evaluator::new(&self.dict, &self.store)
+        match &self.store {
+            SnapStore::Mem(store) => {
+                // The snapshot never changes, so its CSR is cached under one
+                // generation for the transaction's lifetime.
+                let csr = || self.csr.get_or_build(0, || CsrGraph::build(store));
+                let mut eval = self.configure(Evaluator::new(&self.dict, store), &csr, pfn);
+                if let Some(c) = cancel {
+                    eval = eval.with_cancel(c);
+                }
+                Ok(evaluate_in_scope(eval, q)?)
+            }
+            SnapStore::Disk(view) => {
+                let epoch = view.begin_epoch();
+                let outcome = view.with_base(|base, gate_cancel| {
+                    // A cancel of the request reaches the evaluator through
+                    // the gate's flag (the one a writer raises).
+                    let _forward = cancel
+                        .as_ref()
+                        .map(|c| cancel_bridge::forward(c, gate_cancel));
+                    let src = DiskSource::new(base);
+                    let csr = || self.csr.get_or_build(epoch, || CsrGraph::build(&src));
+                    let eval = self
+                        .configure(Evaluator::new(&self.dict, &src), &csr, pfn)
+                        .with_cancel(Arc::clone(gate_cancel));
+                    evaluate_in_scope(eval, q)
+                });
+                let cancelled = cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+                match outcome {
+                    Ok(result) => Ok(result?),
+                    // Stopped by the request's own flag (forwarded to the
+                    // gate's): a cancel, not an expiry.
+                    Err(ViewError::Expired) if cancelled => {
+                        Err(SnapshotReadError::Failed(GStoreError::Cancelled))
+                    }
+                    Err(ViewError::Expired) => Err(SnapshotReadError::Expired),
+                    Err(ViewError::Closed) => Err(SnapshotReadError::Closed),
+                    Err(ViewError::Io(e)) => Err(SnapshotReadError::Failed(GStoreError::Database(
+                        format!("a read from the store failed while evaluating the query: {e}"),
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// The snapshot's evaluation settings, applied to `eval`.
+    fn configure<'a, S: TripleSource>(
+        &'a self,
+        eval: Evaluator<'a, S>,
+        csr: &'a CsrProvider<'a>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Evaluator<'a, S> {
+        let mut eval = eval
             .with_service_allowed(self.allow_service)
-            .with_csr_provider(&csr)
+            .with_csr_provider(csr)
             .with_integer_division(self.integer_division)
             .with_topk_options(self.topk)
             .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
@@ -576,23 +721,118 @@ impl ReadSnapshot {
         if let Some(caller) = pfn.or(self.pfn.as_ref()) {
             eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
         }
-        if let Some(c) = cancel {
-            eval = eval.with_cancel(c);
-        }
-        let scope = ReadScope::enter();
-        let result = eval.evaluate(q);
-        if let Some(e) = scope.take_error() {
-            return Err(GStoreError::Database(format!(
-                "a read from the store failed while evaluating the query: {e}"
-            )));
-        }
-        result
+        eval
     }
 
     fn triple_num(&self) -> u64 {
-        self.store.triple_count()
+        self.triples
     }
 }
+
+/// Evaluate `q` with `eval` inside a [`ReadScope`]: a read error recorded
+/// there fails the statement.
+fn evaluate_in_scope<S: TripleSource>(
+    eval: Evaluator<'_, S>,
+    q: &crate::parser::sparql::ast::Query,
+) -> crate::Result<QueryResult> {
+    let scope = ReadScope::enter();
+    let result = eval.evaluate(q);
+    if let Some(e) = scope.take_error() {
+        return Err(GStoreError::Database(format!(
+            "a read from the store failed while evaluating the query: {e}"
+        )));
+    }
+    result
+}
+
+/// Forwarding one cancel flag to another, for an evaluator that watches
+/// only one: an on-disk snapshot read watches its gate's flag (which a
+/// writer raises), and the request's own flag (`/cancel`, a shutdown past
+/// its grace period) is forwarded to it by one shared, lazily started
+/// thread. It polls the registered pairs every few milliseconds, and sleeps
+/// while none is registered. Its lock is a leaf: nothing is called under it.
+mod cancel_bridge {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+    use std::time::Duration;
+
+    /// How often the registered flags are polled.
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// One registered forwarding: its id, the watched flag, the raised one.
+    type Pair = (u64, Arc<AtomicBool>, Arc<AtomicBool>);
+
+    #[derive(Default)]
+    struct Links {
+        next: u64,
+        pairs: Vec<Pair>,
+        started: bool,
+    }
+
+    fn bridge() -> &'static (Mutex<Links>, Condvar) {
+        static BRIDGE: OnceLock<(Mutex<Links>, Condvar)> = OnceLock::new();
+        BRIDGE.get_or_init(|| (Mutex::new(Links::default()), Condvar::new()))
+    }
+
+    fn run() {
+        let (links, wake) = bridge();
+        let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            while g.pairs.is_empty() {
+                g = wake.wait(g).unwrap_or_else(PoisonError::into_inner);
+            }
+            for (_, from, to) in &g.pairs {
+                if from.load(Ordering::SeqCst) {
+                    to.store(true, Ordering::SeqCst);
+                }
+            }
+            drop(g);
+            std::thread::sleep(POLL);
+            g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Raise `to` (within a few milliseconds) once `from` is raised, until
+    /// the returned guard is dropped.
+    pub(super) fn forward(from: &Arc<AtomicBool>, to: &Arc<AtomicBool>) -> Forward {
+        if from.load(Ordering::SeqCst) {
+            to.store(true, Ordering::SeqCst);
+        }
+        let (links, wake) = bridge();
+        let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        if !g.started {
+            // Without the thread a cancel is honoured only when the read
+            // ends (the caller checks its flag then): later, not wrong.
+            g.started = std::thread::Builder::new()
+                .name("gstore-cancel-bridge".into())
+                .spawn(run)
+                .is_ok();
+        }
+        let id = g.next;
+        g.next += 1;
+        g.pairs.push((id, Arc::clone(from), Arc::clone(to)));
+        wake.notify_all();
+        Forward { id }
+    }
+
+    /// A registered forwarding, removed when dropped.
+    pub(super) struct Forward {
+        id: u64,
+    }
+
+    impl Drop for Forward {
+        fn drop(&mut self) {
+            let (links, _) = bridge();
+            let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+            g.pairs.retain(|(id, _, _)| *id != self.id);
+        }
+    }
+}
+
+/// How many times a non-transactional read tries a transaction's on-disk
+/// snapshot that expired under it before it reads holding the database's
+/// guard (see [`ApiInner::read_committed`]).
+const SNAPSHOT_READ_ATTEMPTS: usize = 3;
 
 /// The open transaction on a database, kept *inside* the per-db lock so a
 /// request that already holds the lock can tell, race-free, whether a
@@ -1021,7 +1261,12 @@ impl DbSlot {
         cancel: Option<Arc<AtomicBool>>,
     ) -> crate::Result<QueryResult> {
         match &self.txn {
-            Some(open) => open.snapshot.query(sparql, cancel),
+            // The caller holds this slot's guard: the transaction cannot end
+            // (nor its snapshot expire) meanwhile.
+            Some(open) => open
+                .snapshot
+                .query(sparql, cancel)
+                .map_err(SnapshotReadError::into_error),
             None => self.db.query_read(sparql, cancel, None),
         }
     }
@@ -2443,24 +2688,9 @@ impl ApiInner {
             });
         };
         if !stmt.is_update() {
-            // A read shares the database with other reads.
-            let slot = self.read_synced(&job.db)?;
-            if slot.retired {
-                return Err(unloaded());
-            }
-            if let Some(open) = &slot.txn {
-                // Released before evaluating: the snapshot is immutable,
-                // and the owner's `/tquery`s must not wait for it.
-                let snapshot = Arc::clone(&open.snapshot);
-                drop(slot);
-                return snapshot
-                    .read_as(&stmt, Some(job.cancel), Some(&caller))
-                    .map(JobOutput::Read)
-                    .map_err(query_err);
-            }
-            let result = slot.db.read_as(&stmt, Some(job.cancel), Some(&caller));
-            drop(slot);
-            return result.map(JobOutput::Read).map_err(query_err);
+            return self
+                .read_committed(&job.db, &job.name, &stmt, &job.cancel, &caller)
+                .map(JobOutput::Read);
         }
         let mut slot = job.db.write()?;
         if slot.retired {
@@ -2498,6 +2728,74 @@ impl ApiInner {
                 Err(OpError::new(OpErrorKind::Query, msg))
             }
         }
+    }
+
+    /// Run the non-transactional read `stmt` of database `dbh` (its task's
+    /// `cancel` flag, the user's PFN `caller`): on a shared guard of the
+    /// live database, or — while a transaction is open — on its begin-time
+    /// snapshot, released from the guard first (the snapshot is immutable,
+    /// and the owner's `/tquery`s and `/commit` must not wait for it).
+    ///
+    /// An on-disk snapshot read that ends [`Expired`](SnapshotReadError::Expired)
+    /// (the transaction committed meanwhile: its commit cancelled the read)
+    /// is re-run on the database as it is then — re-checking under the
+    /// guard that it is still served and whether a transaction is open —
+    /// so it answers the committed state, never an uncommitted one. The last
+    /// of [`SNAPSHOT_READ_ATTEMPTS`] runs keeps the guard while it reads,
+    /// which no commit can pass. `Closed` (and a database no longer served)
+    /// is answered as `Closed`: the caller reports it as not loaded.
+    pub(crate) fn read_committed(
+        &self,
+        dbh: &DbHandle,
+        name: &str,
+        stmt: &Statement,
+        cancel: &Arc<AtomicBool>,
+        caller: &crate::pfn::PfnCaller,
+    ) -> Result<QueryResult, OpError> {
+        let unloaded = || {
+            OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' was unloaded while this request waited"),
+            )
+        };
+        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        for attempt in 1..=SNAPSHOT_READ_ATTEMPTS {
+            let slot = self.read_synced(dbh)?;
+            if slot.retired {
+                return Err(unloaded());
+            }
+            let Some(open) = &slot.txn else {
+                return slot
+                    .db
+                    .read_as(stmt, Some(Arc::clone(cancel)), Some(caller))
+                    .map_err(query_err);
+            };
+            let snapshot = Arc::clone(&open.snapshot);
+            let last = attempt == SNAPSHOT_READ_ATTEMPTS;
+            let held = if last {
+                Some(slot)
+            } else {
+                drop(slot);
+                None
+            };
+            match snapshot.read_as(stmt, Some(Arc::clone(cancel)), Some(caller)) {
+                Ok(result) => return Ok(result),
+                Err(SnapshotReadError::Expired) if !last => {}
+                Err(SnapshotReadError::Failed(e)) => return Err(query_err(e)),
+                Err(SnapshotReadError::Closed) => return Err(unloaded()),
+                Err(SnapshotReadError::Expired) => {
+                    drop(held);
+                    return Err(OpError::new(
+                        OpErrorKind::Failed,
+                        format!(
+                            "database '{name}': the transaction's read snapshot kept expiring \
+                             while it was read"
+                        ),
+                    ));
+                }
+            }
+        }
+        unreachable!("the last attempt returns")
     }
 
     /// Resolve the caller's identity from Basic auth (`basic`: the user and
@@ -5357,7 +5655,7 @@ mod tests {
                           WHERE {}";
         const SP_JSON: &str =
             r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/c>\",\"length\":2}]}""#;
-        fn cell(r: crate::Result<QueryResult>) -> String {
+        fn cell(r: Result<QueryResult, SnapshotReadError>) -> String {
             match r.unwrap() {
                 QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
                 other => panic!("expected Select, got {other:?}"),
@@ -6196,6 +6494,65 @@ mod tests {
             !body.contains("http://a"),
             "a rolled-back tquery insert must not persist: {body}"
         );
+    }
+
+    /// `/begin` copies no triple of an in-memory database: the snapshot shares
+    /// the live store until the transaction's first write (a read, and a write
+    /// that changes nothing, keep it shared); that write copies it once, and
+    /// the snapshot keeps answering the begin-time state.
+    #[test]
+    fn begin_shares_the_store_until_the_first_tquery_write() {
+        let (server, addr) = start("tq_cow");
+        build_two(&addr, "c");
+        let root = basic("root", "root");
+        let post = |target: &str, body: &str| -> (u16, String) {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&root), body))
+        };
+        let (s, body) = post("/begin?db_name=c", "");
+        assert_eq!(s, 200, "{body}");
+        let tid = tid_of(&body);
+        let dbh = served(&server, "c");
+        let shared = || {
+            let slot = dbh.read().unwrap();
+            let open = slot.txn.as_ref().expect("a transaction is open");
+            match open.snapshot.store() {
+                SnapStore::Mem(snap) => snap.shares_storage_with(slot.db.store()),
+                SnapStore::Disk(_) => panic!("an in-memory database"),
+            }
+        };
+        assert!(shared(), "/begin shares the store");
+        let tq = |sparql: &str| post(&format!("/tquery?db_name=c&tid={tid}"), sparql);
+        assert_eq!(tq("SELECT ?s WHERE { ?s ?p ?o }").0, 200);
+        // Already present: changes nothing, copies nothing.
+        assert_eq!(
+            tq("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }").0,
+            200
+        );
+        assert!(shared(), "reads and no-op writes keep it shared");
+        assert_eq!(
+            tq("INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }").0,
+            200
+        );
+        assert!(!shared(), "the first write copies the store");
+        // Everyone else still reads the begin-time state.
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "GET",
+            "/sparql?db_name=c",
+            Some(&root),
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ));
+        assert_eq!(s, 200);
+        assert!(!b.contains("http://ex/x"), "uncommitted data leaked: {b}");
+        assert_eq!(post(&format!("/commit?db_name=c&tid={tid}"), "").0, 200);
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "GET",
+            "/sparql?db_name=c",
+            Some(&root),
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ));
+        assert!(b.contains("http://ex/x"), "committed data: {b}");
     }
 
     /// A `/tquery` is a task like any other query: `/tasklist` lists it and
