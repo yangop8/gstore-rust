@@ -60,7 +60,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::db::{QuerySettings, DEFAULT_QUERY_CACHE_BYTES};
+use crate::db::{
+    DiskQueryMode, OpenOptions, QuerySettings, StorageKind, DEFAULT_QUERY_CACHE_BYTES,
+};
 use crate::query::{DpbMode, IntegerDivision, TopKOptions};
 use crate::server::HttpOptions;
 
@@ -272,6 +274,11 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("pfn", "pfn_max_memory_pages"),
     ("pfn", "pfn_max_module_bytes"),
     ("pfn", "pfn_max_functions"),
+    ("storage", "disk_query_mode"),
+    ("storage", "disk_cache_mb"),
+    ("storage", "dict_cache_mb"),
+    ("storage", "vstree_on_open"),
+    ("storage", "default_layout"),
 ];
 
 /// Accepted spellings that map onto a [`KNOWN_KEYS`] entry.
@@ -483,6 +490,27 @@ pub struct GStoreConfig {
     /// 100).
     pub pfn_max_functions: usize,
 
+    // ---- [storage] (Rust extension) -------------------------------------
+    /// *(Rust extension)* How an on-disk (`kvstore.kv`) database answers
+    /// queries: `stream` (straight off the B+ trees, out-of-core dictionary)
+    /// or `memory` (load the dictionary and triples at open). Default
+    /// [`DEFAULT_DISK_QUERY_MODE`](crate::db::DEFAULT_DISK_QUERY_MODE); the
+    /// `GSTORE_DISK_QUERY_MODE` environment variable overrides it.
+    pub disk_query_mode: DiskQueryMode,
+    /// *(Rust extension)* MiB of an on-disk store's page cache (default 16;
+    /// `GSTORE_DISK_CACHE_MB` overrides it).
+    pub disk_cache_mb: usize,
+    /// *(Rust extension)* MiB a Stream-mode dictionary may keep in its
+    /// id → string and string → id caches (default 80).
+    pub dict_cache_mb: usize,
+    /// *(Rust extension)* Build the VS-tree at open when none is persisted
+    /// fresh (RocksDB always; a Stream-mode disk database whose `vstree.kv`
+    /// is stale) instead of evaluating without it (default off).
+    pub vstree_on_open: bool,
+    /// *(Rust extension)* The layout new databases are built in: `snapshot`,
+    /// `disk` or `rocksdb` (default unset: each build path's own default).
+    pub default_layout: Option<StorageKind>,
+
     // ---- provenance -----------------------------------------------------
     /// The file this configuration was loaded from, if any.
     source: Option<PathBuf>,
@@ -555,6 +583,11 @@ impl Default for GStoreConfig {
             pfn_max_memory_pages: crate::pfn::DEFAULT_MAX_MEMORY_PAGES,
             pfn_max_module_bytes: crate::pfn::DEFAULT_MAX_MODULE_BYTES,
             pfn_max_functions: crate::pfn::DEFAULT_MAX_FUNCTIONS,
+            disk_query_mode: crate::db::DEFAULT_DISK_QUERY_MODE,
+            disk_cache_mb: (crate::db::DEFAULT_DISK_CACHE_PAGES * crate::kvstore::PAGE_SIZE) >> 20,
+            dict_cache_mb: crate::db::DEFAULT_DICT_CACHE_BYTES >> 20,
+            vstree_on_open: false,
+            default_layout: None,
             source: None,
             explicit: BTreeSet::new(),
             warnings: Vec::new(),
@@ -861,6 +894,31 @@ impl GStoreConfig {
             "pfn_max_functions" => {
                 self.pfn_max_functions = parse_num(v).ok_or_else(|| bad("an integer"))?
             }
+            "disk_query_mode" => {
+                self.disk_query_mode =
+                    DiskQueryMode::parse(v).ok_or_else(|| bad("stream or memory"))?
+            }
+            "disk_cache_mb" => {
+                self.disk_cache_mb = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=(1 << 20)).contains(n))
+                    .ok_or_else(|| bad("a positive number of MiB"))?
+            }
+            "dict_cache_mb" => {
+                self.dict_cache_mb = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n <= 1 << 20)
+                    .ok_or_else(|| bad("a number of MiB"))?
+            }
+            "vstree_on_open" => {
+                self.vstree_on_open = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "default_layout" => {
+                self.default_layout =
+                    parse_layout(v).ok_or_else(|| bad("snapshot, disk or rocksdb"))?
+            }
             _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         self.explicit.insert(key.to_string());
@@ -947,6 +1005,15 @@ impl GStoreConfig {
             "pfn_max_memory_pages" => self.pfn_max_memory_pages.to_string(),
             "pfn_max_module_bytes" => self.pfn_max_module_bytes.to_string(),
             "pfn_max_functions" => self.pfn_max_functions.to_string(),
+            "disk_query_mode" => self.disk_query_mode.name().to_string(),
+            "disk_cache_mb" => self.disk_cache_mb.to_string(),
+            "dict_cache_mb" => self.dict_cache_mb.to_string(),
+            "vstree_on_open" => switch(self.vstree_on_open),
+            "default_layout" => self
+                .default_layout
+                .map(layout_name)
+                .unwrap_or_default()
+                .to_string(),
             _ => return None,
         })
     }
@@ -1032,6 +1099,23 @@ impl GStoreConfig {
         }
     }
 
+    /// The open options of the `[storage]` section (contract C7), which
+    /// `gserver` installs as the process defaults
+    /// ([`set_default_open_options`](crate::db::set_default_open_options));
+    /// the environment still overrides them when a database is opened.
+    pub fn open_options(&self) -> OpenOptions {
+        OpenOptions {
+            disk_query_mode: self.disk_query_mode,
+            disk_cache_pages: self
+                .disk_cache_mb
+                .saturating_mul((1 << 20) / crate::kvstore::PAGE_SIZE)
+                .max(16),
+            dict_cache_bytes: self.dict_cache_mb.saturating_mul(1 << 20),
+            vstree_on_open: self.vstree_on_open,
+            default_layout: self.default_layout,
+        }
+    }
+
     /// Whether an upload named `file_name` has an allowed extension
     /// (`upload_allow_extensions` or `upload_allow_compress_packages`,
     /// compared case-insensitively).
@@ -1053,6 +1137,27 @@ fn canonical_key(key: &str) -> &str {
         .find(|(alias, _)| *alias == key)
         .map(|(_, k)| *k)
         .unwrap_or(key)
+}
+
+/// `default_layout`: `snapshot` (also `memory`), `disk` or `rocksdb`; an
+/// empty value or `auto` / `none` means unset (`Some(None)`).
+fn parse_layout(v: &str) -> Option<Option<StorageKind>> {
+    match v.to_ascii_lowercase().as_str() {
+        "" | "auto" | "none" => Some(None),
+        "snapshot" | "memory" => Some(Some(StorageKind::Snapshot)),
+        "disk" | "kvstore" => Some(Some(StorageKind::Disk)),
+        "rocksdb" | "rocks" => Some(Some(StorageKind::RocksDb)),
+        _ => None,
+    }
+}
+
+/// The `default_layout` spelling of a layout.
+fn layout_name(kind: StorageKind) -> &'static str {
+    match kind {
+        StorageKind::Snapshot => "snapshot",
+        StorageKind::Disk => "disk",
+        StorageKind::RocksDb => "rocksdb",
+    }
 }
 
 /// `topk_dpb`: `auto`, `always`, or `off` (`never` / `0` / `false` too).
@@ -1302,6 +1407,28 @@ upload_allow_compress_packages = "zip"
     }
 
     #[test]
+    fn storage_defaults_and_bad_values() {
+        let c = GStoreConfig::default();
+        assert_eq!(c.open_options(), OpenOptions::default());
+        assert_eq!(c.value("default_layout").unwrap(), "");
+        let mut d = GStoreConfig::default();
+        assert!(d.set("disk_query_mode", "fast").is_err());
+        assert!(d.set("disk_cache_mb", "0").is_err());
+        assert!(d.set("default_layout", "tape").is_err());
+        assert!(d.set("vstree_on_open", "maybe").is_err());
+        d.set("disk_query_mode", "Materialize").unwrap();
+        d.set("default_layout", "rocksdb").unwrap();
+        assert_eq!(d.disk_query_mode, DiskQueryMode::Materialize);
+        assert_eq!(d.value("disk_query_mode").unwrap(), "memory");
+        assert_eq!(d.default_layout, Some(StorageKind::RocksDb));
+        d.set("default_layout", "none").unwrap();
+        assert_eq!(d.default_layout, None);
+        // A tiny cache still gets a usable number of pages.
+        d.set("disk_cache_mb", "1").unwrap();
+        assert_eq!(d.open_options().disk_cache_pages, 256);
+    }
+
+    #[test]
     fn upstream_conf_ini_parses_without_warnings() {
         let c = GStoreConfig::from_ini_str(UPSTREAM_CONF);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
@@ -1419,7 +1546,9 @@ upload_allow_compress_packages = "zip"
                     early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
                     gfun_max_output_bytes=4096\n\
                     [pfn]\npfn_fuel_per_call=0\npfn_max_memory_pages=2\n\
-                    pfn_max_module_bytes=5000\npfn_max_functions=3\n";
+                    pfn_max_module_bytes=5000\npfn_max_functions=3\n\
+                    [storage]\ndisk_query_mode=stream\ndisk_cache_mb=64\ndict_cache_mb=32\n\
+                    vstree_on_open=on\ndefault_layout=disk\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(
@@ -1487,6 +1616,18 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.value("deamon").unwrap(), "on");
         assert!(c.upload_allowed("data.TTL") && c.upload_allowed("x.tar"));
         assert!(!c.upload_allowed("x.exe") && !c.upload_allowed("noext"));
+        assert_eq!(
+            c.open_options(),
+            OpenOptions {
+                disk_query_mode: DiskQueryMode::Stream,
+                disk_cache_pages: 64 * 256,
+                dict_cache_bytes: 32 << 20,
+                vstree_on_open: true,
+                default_layout: Some(StorageKind::Disk),
+            }
+        );
+        assert_eq!(c.value("disk_query_mode").unwrap(), "stream");
+        assert_eq!(c.value("default_layout").unwrap(), "disk");
 
         assert_eq!(
             c.query_settings(),

@@ -1,7 +1,8 @@
 //! The runtime-selectable storage backend a [`Database`](crate::Database)
 //! holds, and its static dispatch over the [`TripleSource`] /
-//! [`MutableStore`] seam (moved here from `store/mod.rs`, unchanged; re-exported
-//! as `crate::store::Backend`).
+//! [`MutableStore`] seam (re-exported as `crate::store::Backend`): the
+//! in-memory store, the on-disk [`DiskTriples`](crate::kvstore::DiskTriples)
+//! of a Stream-mode database, and RocksDB (feature `rocksdb`).
 
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
@@ -17,13 +18,24 @@ use super::{MutableStore, TripleSource, TripleStore};
 ///
 /// The default is `Memory` — every existing constructor wraps a fresh
 /// [`TripleStore`], so behaviour with the `rocksdb` feature *off* is identical.
-/// An on-disk (`kvstore.kv`) database also evaluates over a `Memory` working
-/// set: the `Database` facade writes every committed mutation through to its
-/// [`DiskStore`](crate::kvstore::DiskStore), which stays the source of truth.
+/// An on-disk (`kvstore.kv`) database opened in **Stream** mode evaluates over
+/// [`Backend::Disk`] — the B+ trees read on demand, through the reporting
+/// [`DiskTriples`](crate::kvstore::DiskTriples) — while one opened in
+/// **Materialize** mode evaluates over a `Memory` working set and writes every
+/// committed mutation through to its [`DiskStore`](crate::kvstore::DiskStore)
+/// (see [`DiskQueryMode`](crate::db::DiskQueryMode)).
+// One `Backend` per database: the on-disk variant's size (its store handles and
+// counters inline) costs nothing worth a heap indirection on every read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Backend {
     /// In-memory triple store (the default; three sorted adjacency maps).
     Memory(TripleStore),
+    /// The on-disk `kvstore.kv` store of a Stream-mode database: reads go to
+    /// the B+ trees through the page cache (a read error fails the running
+    /// statement, contract C2), writes by id with a transaction overlay
+    /// (contract C5).
+    Disk(crate::kvstore::DiskTriples),
     /// Persistent RocksDB triple store (feature `rocksdb`).
     #[cfg(feature = "rocksdb")]
     Rocks(crate::backend::rocks::RocksStore),
@@ -35,6 +47,7 @@ macro_rules! backend_dispatch {
     ($self:expr, $inner:ident, $body:expr) => {
         match $self {
             Backend::Memory($inner) => $body,
+            Backend::Disk($inner) => $body,
             #[cfg(feature = "rocksdb")]
             Backend::Rocks($inner) => $body,
         }
@@ -48,8 +61,24 @@ impl Backend {
     pub fn as_memory(&self) -> Option<&TripleStore> {
         match self {
             Backend::Memory(s) => Some(s),
-            #[cfg(feature = "rocksdb")]
-            Backend::Rocks(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The on-disk store of a Stream-mode database, if this is the `Disk`
+    /// variant.
+    pub fn as_disk(&self) -> Option<&crate::kvstore::DiskTriples> {
+        match self {
+            Backend::Disk(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the on-disk store, if this is the `Disk` variant.
+    pub fn as_disk_mut(&mut self) -> Option<&mut crate::kvstore::DiskTriples> {
+        match self {
+            Backend::Disk(d) => Some(d),
+            _ => None,
         }
     }
 
@@ -58,7 +87,7 @@ impl Backend {
     pub fn as_rocks(&self) -> Option<&crate::backend::rocks::RocksStore> {
         match self {
             Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
+            _ => None,
         }
     }
 
@@ -67,16 +96,18 @@ impl Backend {
     pub fn as_rocks_mut(&mut self) -> Option<&mut crate::backend::rocks::RocksStore> {
         match self {
             Backend::Rocks(r) => Some(r),
-            Backend::Memory(_) => None,
+            _ => None,
         }
     }
 
     /// Collect (and clear) a write error a persistent variant recorded because
     /// [`MutableStore`]'s `bool` results cannot carry one. Always `None` for the
-    /// in-memory store, whose writes cannot fail.
+    /// in-memory store, whose writes cannot fail; for the on-disk store it is
+    /// [`DiskTriples::take_error`](crate::kvstore::DiskTriples::take_error).
     pub fn take_write_error(&self) -> Option<String> {
         match self {
             Backend::Memory(_) => None,
+            Backend::Disk(d) => d.take_error(),
             #[cfg(feature = "rocksdb")]
             Backend::Rocks(r) => r.take_error(),
         }
@@ -88,6 +119,7 @@ impl Backend {
     pub fn predicates(&self) -> Vec<PredId> {
         match self {
             Backend::Memory(s) => s.predicates().collect(),
+            Backend::Disk(d) => d.predicates(),
             #[cfg(feature = "rocksdb")]
             Backend::Rocks(r) => r.predicates(),
         }

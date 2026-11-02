@@ -215,6 +215,33 @@ unzip_max_size = 10737418240
 # the most functions one user may own
 # pfn_max_functions=100
 
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# How databases are opened. gserver installs these as the defaults when it
+# starts; the environment overrides them (GSTORE_DISK_QUERY_MODE=stream|memory,
+# GSTORE_DISK_CACHE_MB). Every mode reads and writes the same files: a
+# directory may be opened in either mode, and by older binaries, in turn.
+# The values shown are the defaults (default_layout is unset by default).
+[storage]
+# how an on-disk (kvstore.kv, gbuild --disk) database answers queries:
+# memory = load its dictionary and triples into memory when it is opened
+# (fast queries, memory and open time grow with the data); stream = read the
+# B+ trees and the dictionary from disk on demand (opens in well under a
+# second whatever the size, memory bounded by the caches below)
+# disk_query_mode=memory
+# MiB of page cache per on-disk database
+# disk_cache_mb=16
+# MiB a stream-mode database's dictionary may cache (four fifths id -> term,
+# one fifth term -> id)
+# dict_cache_mb=80
+# build the VS-tree index when a database is opened without a fresh one
+# (RocksDB databases, which persist none; a stream-mode database whose
+# vstree.kv was made stale by updates) instead of querying without it until
+# it is rebuilt. Off: opening stays fast; the first queries may be slower
+# vstree_on_open=off
+# the layout new databases are built in: snapshot, disk or rocksdb (unset:
+# each build path's own default)
+# default_layout=disk
+
 # Reasoning rules (/api reasonManage, stored per database in
 # <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --
 # at most 1000 rules per database, 1 MiB per rule file, 64 conditions per rule,

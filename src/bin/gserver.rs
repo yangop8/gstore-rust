@@ -493,6 +493,24 @@ fn report_config(cfg: &GStoreConfig) {
     }
 }
 
+/// Install `conf.ini`'s `[storage]` section as the process's default open
+/// options (contract C7): every database this server opens — at startup and
+/// whenever a request loads one — uses them, with the environment
+/// (`GSTORE_DISK_QUERY_MODE`, `GSTORE_DISK_CACHE_MB`) on top. A database
+/// already loaded keeps the mode it was opened in. (`/api refreshconf`
+/// re-reads `conf.ini` inside the server library, `ApiInner::refresh_config`;
+/// re-installing the section there is a one-line follow-up for that file's
+/// owner, listed in changelog.d/phase6-R3-STREAM.md.)
+fn install_open_options(cfg: &GStoreConfig) {
+    gstore::set_default_open_options(cfg.open_options());
+    let effective = gstore::default_open_options();
+    gs_announce!(
+        "gserver: on-disk databases open in {} mode ({} MiB page cache)",
+        effective.disk_query_mode,
+        (effective.disk_cache_pages * gstore::kvstore::PAGE_SIZE) >> 20
+    );
+}
+
 /// Set up the diagnostic log of a starting server (`conf.ini`'s `log_mode`
 /// properties file and `[log]` keys, then `GSTORE_LOG`; see
 /// [`gstore::logging`]) and record the startup.
@@ -1083,6 +1101,7 @@ fn supervise(cli: &Cli) -> u8 {
 /// Serve in this process until a graceful shutdown; then remove the pid file
 /// (or, for `/restart`, re-execute in place) and exit.
 fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 {
+    install_open_options(cfg);
     let load_policy = load_policy_for(&cli.load_dirs, cli.allow_service);
     let background = std::env::var_os(ENV_BACKGROUND).is_some();
     let addr = (cfg.listen_addr.as_str(), cfg.port);

@@ -591,7 +591,15 @@ fn saving_another_layout_replaces_the_old_one() {
         ["<http://ex/m>"]
     );
 
-    // A disk build over it replaces the snapshot.
+    // A disk build over it replaces the snapshot — once nothing has it open:
+    // `build_disk` is the bulk build since R3, which refuses a directory a
+    // database of this process holds (as `gbuild --disk` always did).
+    let nt = dir.with_extension("nt");
+    write(&nt, BASE_NT);
+    let refused = Database::build_disk(&dir, &[&nt]).unwrap_err().to_string();
+    assert!(refused.contains("open in this process"), "{refused}");
+    assert_eq!(Database::storage_kind(&dir), Some(StorageKind::Snapshot));
+    drop(db);
     disk_db(&dir);
     assert_eq!(Database::storage_kind(&dir), Some(StorageKind::Disk));
     assert!(!dir.join("store.bin").exists());

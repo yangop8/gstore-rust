@@ -22,31 +22,43 @@
 //!
 //! Both caches are bounded by bytes and evict with CLOCK, so a long-running
 //! reader stays within its budget however many terms it touches; strings are
-//! handed out as `Arc<str>` (nothing is leaked). They belong to one
-//! [`generation`](DiskTermSource::generation): a change of generation empties
-//! them. This backend is read-only (`intern` answers existing keys only,
-//! `free` refuses); the store that owns the pager rebuilds it when its term counts
-//! change, which starts fresh caches.
+//! handed out as `Arc<str>` (nothing is leaked).
+//!
+//! ## Interning (Stream mode)
+//! [`intern`](DiskTermSource::intern) adds a term through the shared pager:
+//! the next id of its space (the header's count root; R4 adds free-list
+//! reuse), written as `id2*`, then `*2id`, then the count root, in **one**
+//! pager operation under the pager write lock — so a crash or an error leaves
+//! the term wholly there or wholly absent, never an id the count does not
+//! cover. It touches neither the triple indexes nor the `DiskTriples` writer
+//! gate (C8: gate → pager is never inverted): a term is written before any
+//! triple that uses it, and one whose triple never comes (a rolled-back
+//! transaction, a crash) is a harmless orphan. Every new term bumps the
+//! [`generation`](DiskTermSource::generation); since an intern only *adds* a
+//! key and an id, nothing cached changes meaning, so both caches are updated
+//! in place (the new term goes in) instead of being emptied — only a change
+//! of meaning (R4's `free`) moves the caches' own epoch. `free` still
+//! refuses.
 //!
 //! Read errors are returned (`Err`); the [`Dictionary`](crate::dict::Dictionary)
 //! front end notes the ones it cannot return in the running statement's read
 //! scope (contract C2).
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::dict::cache::{KeyCache, TermCache, DEFAULT_KEY_CACHE_BYTES, DEFAULT_TERM_CACHE_BYTES};
 use crate::dict::{CacheStats, DiskTermSource, Space};
 use crate::error::{GStoreError, Result};
 
-use super::bptree::BTree;
+use super::bptree::{be32, BTree};
 use super::format::{
     ENTITY2ID, ID2ENTITY, ID2LITERAL, ID2PREDICATE, LITERAL2ID, PREDICATE2ID, ROOT_ENTITY_COUNT,
     ROOT_LITERAL_COUNT, ROOT_PRED_COUNT,
 };
 use super::ivarray::{self, IvArray};
-use super::pager::Pager;
+use super::pager::{Pager, PagerOp};
 
 /// Out-of-core dictionary: resolves str↔id from the on-disk B+trees on demand.
 pub struct DiskDict {
@@ -59,15 +71,25 @@ pub struct DiskDict {
     id2entity: IvArray,
     id2literal: IvArray,
     id2predicate: IvArray,
-    entity_count: usize,
-    literal_count: usize,
-    pred_count: usize,
+    /// The allocated term counts (the next id of each space, minus its first
+    /// id); raised by [`intern`](DiskTermSource::intern) once the term is in
+    /// the pages.
+    entity_count: AtomicUsize,
+    literal_count: AtomicUsize,
+    pred_count: AtomicUsize,
     terms: TermCache,
     keys: KeyCache,
-    /// The cache generation (see the module docs). Constant for this
-    /// read-only backend; a writer bumps it whenever an id or key changes
-    /// meaning.
+    /// The public generation (see [`DiskTermSource::generation`]): bumped by
+    /// every term interned through this backend.
     generation: AtomicU64,
+    /// The caches' epoch: moves only when a cached key or id may have
+    /// changed meaning (a freed id, R4), which empties both caches. An intern
+    /// only adds, so it leaves this alone and updates the caches in place.
+    cache_epoch: AtomicU64,
+    /// Whether [`intern`](DiskTermSource::intern) may write new terms (see
+    /// [`writable`](Self::writable)); a read-only backend answers existing
+    /// keys only and refuses new ones.
+    writable: bool,
 }
 
 impl DiskDict {
@@ -96,13 +118,25 @@ impl DiskDict {
             id2entity,
             id2literal,
             id2predicate,
-            entity_count,
-            literal_count,
-            pred_count,
+            entity_count: AtomicUsize::new(entity_count),
+            literal_count: AtomicUsize::new(literal_count),
+            pred_count: AtomicUsize::new(pred_count),
             terms: TermCache::new(DEFAULT_TERM_CACHE_BYTES),
             keys: KeyCache::new(DEFAULT_KEY_CACHE_BYTES),
             generation: AtomicU64::new(0),
+            cache_epoch: AtomicU64::new(0),
+            writable: false,
         }
+    }
+
+    /// Let this backend intern new terms through the shared pager (Stream
+    /// mode: the dictionary of a database whose store is a
+    /// [`DiskTriples`](super::DiskTriples) over the same pager). A backend is
+    /// read-only by default — [`DiskStore::lazy_dictionary`](super::DiskStore::lazy_dictionary)
+    /// and views must never write.
+    pub fn writable(mut self) -> DiskDict {
+        self.writable = true;
+        self
     }
 
     /// A backend over the dictionary structures of the `kvstore.kv` behind
@@ -149,6 +183,77 @@ impl DiskDict {
         self
     }
 
+    /// The `id2*` array of `space`.
+    fn array(&self, space: Space) -> &IvArray {
+        match space {
+            Space::Entity => &self.id2entity,
+            Space::Literal => &self.id2literal,
+            Space::Predicate => &self.id2predicate,
+        }
+    }
+
+    /// The allocated-count cell of `space`.
+    fn count_cell(&self, space: Space) -> &AtomicUsize {
+        match space {
+            Space::Entity => &self.entity_count,
+            Space::Literal => &self.literal_count,
+            Space::Predicate => &self.pred_count,
+        }
+    }
+
+    /// The term counts as `(entities, literals, predicates)` — what a store
+    /// compares with its header to tell whether this backend is current.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.count(Space::Entity),
+            self.count(Space::Literal),
+            self.count(Space::Predicate),
+        )
+    }
+
+    /// Write the new term `key` of `space` inside the caller's pager
+    /// operation: checked again under the write lock (an existing key answers
+    /// its id and `false`), then the next id — the header's count root,
+    /// bounded by the space's `checked_*_id` — as `id2*`, `*2id` and the count
+    /// root. Returns `(id, new)`.
+    fn intern_in(&self, pager: &mut Pager, space: Space, key: &str) -> Result<(u32, bool)> {
+        let tree = self.tree(space);
+        let found = tree.get_with(pager, key.as_bytes(), |v| {
+            <[u8; 4]>::try_from(v).map(u32::from_be_bytes)
+        })?;
+        match found {
+            Some(Ok(id)) => return Ok((id, false)),
+            Some(Err(_)) => {
+                return Err(GStoreError::Database(format!(
+                    "corrupt {} dictionary entry for key {key:?}",
+                    space.name()
+                )))
+            }
+            None => {}
+        }
+        let slot = count_root(space);
+        let next = pager.root(slot);
+        let id = match space {
+            Space::Entity => crate::dict::checked_entity_id(next)?,
+            Space::Literal => crate::dict::checked_literal_id(next)?,
+            Space::Predicate => crate::dict::checked_predicate_id(next)?,
+        };
+        if next >= ivarray::CAPACITY as u64 {
+            return Err(GStoreError::Database(format!(
+                "the on-disk {} dictionary is full ({} ids)",
+                space.name(),
+                ivarray::CAPACITY
+            )));
+        }
+        // The array key is the id relative to the space's first id (literal
+        // ids are public ids, offset by LITERAL_FIRST_ID).
+        self.array(space)
+            .insert(pager, id - space.first_id(), key.as_bytes())?;
+        tree.insert(pager, key.as_bytes(), &be32(id))?;
+        pager.set_root(slot, next + 1);
+        Ok((id, true))
+    }
+
     fn tree(&self, space: Space) -> &BTree {
         match space {
             Space::Entity => &self.entity2id,
@@ -164,12 +269,7 @@ impl DiskDict {
         if key as usize >= self.count(space) {
             return None;
         }
-        let arr = match space {
-            Space::Entity => &self.id2entity,
-            Space::Literal => &self.id2literal,
-            Space::Predicate => &self.id2predicate,
-        };
-        Some((arr, key))
+        Some((self.array(space), key))
     }
 
     fn pager(&self) -> std::sync::RwLockReadGuard<'_, Pager> {
@@ -179,12 +279,12 @@ impl DiskDict {
 
     fn fresh_terms(&self) {
         self.terms
-            .check_generation(self.generation.load(Ordering::Acquire));
+            .check_generation(self.cache_epoch.load(Ordering::Acquire));
     }
 
     fn fresh_keys(&self) {
         self.keys
-            .check_generation(self.generation.load(Ordering::Acquire));
+            .check_generation(self.cache_epoch.load(Ordering::Acquire));
     }
 
     /// Read the strings of `keys` (array keys, ascending, within `arr`'s
@@ -201,6 +301,15 @@ impl DiskDict {
         f: &mut dyn FnMut(u32, Arc<str>),
     ) -> Result<()> {
         arr.for_each_key(pager, keys, |k, v| f(first + k, decode(v)))
+    }
+}
+
+/// The header root holding the allocated count of `space`.
+fn count_root(space: Space) -> usize {
+    match space {
+        Space::Entity => ROOT_ENTITY_COUNT,
+        Space::Literal => ROOT_LITERAL_COUNT,
+        Space::Predicate => ROOT_PRED_COUNT,
     }
 }
 
@@ -253,14 +362,58 @@ impl DiskTermSource for DiskDict {
         Ok(s)
     }
 
-    /// Read-only: an existing key answers its id, a new one is refused.
+    /// An existing key answers its id (no write). A new one is written
+    /// through the shared pager as one operation under its write lock (see
+    /// the module docs), then cached and counted, and the generation moves.
+    /// An error (an exhausted id space, an over-long key, a write failure)
+    /// rolls the operation back: nothing of the term stays in the pages.
     fn intern(&self, space: Space, key: &str) -> Result<u32> {
-        self.lookup(space, key)?.ok_or_else(|| {
-            GStoreError::Database(format!(
+        if let Some(id) = self.lookup(space, key)? {
+            return Ok(id);
+        }
+        if !self.writable {
+            return Err(GStoreError::Database(format!(
                 "this out-of-core dictionary is read-only: cannot intern a new {} term",
                 space.name()
-            ))
-        })
+            )));
+        }
+        let (id, new) = {
+            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+            let mut op = PagerOp::begin(&mut guard);
+            // A panic (a bug) is rolled back like an error instead of
+            // unwinding through the write guard, which would poison the
+            // pager for every reader sharing it.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.intern_in(&mut op, space, key)
+            }))
+            .unwrap_or_else(|_| {
+                Err(GStoreError::Database(
+                    "interning a dictionary term panicked and was rolled back".into(),
+                ))
+            });
+            match outcome {
+                Ok(r) => {
+                    op.commit()?;
+                    r
+                }
+                Err(e) => {
+                    drop(op); // rolls the pages and the header back
+                    return Err(e);
+                }
+            }
+        };
+        if new {
+            // Visible to readers only now that the pages hold it.
+            let index = (id - space.first_id()) as usize;
+            self.count_cell(space)
+                .fetch_max(index + 1, Ordering::AcqRel);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.fresh_keys();
+        self.keys.insert(space, key, id);
+        self.fresh_terms();
+        self.terms.insert(space, id, Arc::from(key));
+        Ok(id)
     }
 
     /// One cache probe per id; the misses are read run by run in id order
@@ -343,11 +496,7 @@ impl DiskTermSource for DiskDict {
     }
 
     fn count(&self, space: Space) -> usize {
-        match space {
-            Space::Entity => self.entity_count,
-            Space::Literal => self.literal_count,
-            Space::Predicate => self.pred_count,
-        }
+        self.count_cell(space).load(Ordering::Acquire)
     }
 
     fn id_limit(&self, space: Space) -> u32 {
@@ -379,9 +528,9 @@ impl DiskTermSource for DiskDict {
 impl std::fmt::Debug for DiskDict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiskDict")
-            .field("entity_count", &self.entity_count)
-            .field("literal_count", &self.literal_count)
-            .field("pred_count", &self.pred_count)
+            .field("entity_count", &self.count(Space::Entity))
+            .field("literal_count", &self.count(Space::Literal))
+            .field("pred_count", &self.count(Space::Predicate))
             .field("resident_strings", &self.terms.cache().len())
             .field("resident_bytes", &self.terms.cache().bytes())
             .finish()
@@ -511,5 +660,91 @@ mod tests {
         assert_eq!(d.free_entity("<http://ex/s1>"), None);
         assert!(scope.take_error().is_some(), "a refused free is reported");
         std::fs::remove_file(&path).ok();
+    }
+
+    fn wal(path: &std::path::Path) -> std::path::PathBuf {
+        let mut w = path.as_os_str().to_owned();
+        w.push(".wal");
+        std::path::PathBuf::from(w)
+    }
+
+    #[test]
+    fn a_writable_backend_interns_through_the_shared_pager() {
+        let (path, mut ds) = store("intern", 10);
+        let (e0, l0, p0) = (ds.entity_num(), ds.literal_num(), ds.predicate_num());
+        let dd = Arc::new(DiskDict::open_shared(ds.shared_pager()).unwrap().writable());
+        let mut d = Dictionary::from_backing(dd.clone());
+        let g0 = d.generation();
+
+        // An existing key answers its id and writes nothing.
+        let s1 = d.try_intern_entity("<http://ex/s1>").unwrap();
+        assert_eq!(Some(s1), d.entity_id("<http://ex/s1>"));
+        assert_eq!(d.generation(), g0);
+
+        // New terms take the next id of their space and are readable at once
+        // (cached in place), and the generation moves.
+        let e = d.try_intern_entity("<http://ex/new>").unwrap();
+        let l = d.try_intern_literal("\"fresh\"").unwrap();
+        let p = d.try_intern_predicate("<http://ex/pnew>").unwrap();
+        assert_eq!(e as usize, e0);
+        assert_eq!(l as usize, LITERAL_FIRST_ID as usize + l0);
+        assert_eq!(p as usize, p0);
+        assert_ne!(d.generation(), g0);
+        assert_eq!(d.term(e).as_deref(), Some("<http://ex/new>"));
+        assert_eq!(d.term(l).as_deref(), Some("\"fresh\""));
+        assert_eq!(d.pred(p).as_deref(), Some("<http://ex/pnew>"));
+        assert_eq!(d.entity_num(), e0 + 1);
+        assert_eq!(
+            dd.cache_stats().invalidations,
+            0,
+            "caches kept, not emptied"
+        );
+
+        // The store sees the header's counts: its own next intern does not
+        // reuse the id, and its lazy dictionary is rebuilt to include them.
+        assert_eq!(ds.entity_num(), e0 + 1);
+        let mine = ds.intern_entity("<http://ex/by-store>").unwrap();
+        assert_eq!(mine as usize, e0 + 1, "no id handed out twice");
+        assert_eq!(
+            dd.lookup(Space::Entity, "<http://ex/by-store>").unwrap(),
+            Some(mine)
+        );
+        let lazy = ds.lazy_dictionary();
+        assert_eq!(lazy.term(e).as_deref(), Some("<http://ex/new>"));
+        assert_eq!(lazy.term(mine).as_deref(), Some("<http://ex/by-store>"));
+
+        // Durable with the store's commit; an explicit flush keeps the counts.
+        ds.flush().unwrap();
+        drop((d, dd, lazy, ds));
+        let ds = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(ds.entity_num(), e0 + 2);
+        assert_eq!((ds.literal_num(), ds.predicate_num()), (l0 + 1, p0 + 1));
+        let eager = ds.dictionary().unwrap();
+        assert_eq!(eager.entity_id("<http://ex/new>"), Some(e));
+        assert_eq!(eager.literal_id("\"fresh\""), Some(l));
+        assert_eq!(eager.predicate_id("<http://ex/pnew>"), Some(p));
+        drop(ds);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal(&path)).ok();
+    }
+
+    #[test]
+    fn a_failed_intern_leaves_no_trace() {
+        let (path, ds) = store("intern_fail", 5);
+        let dd = DiskDict::open_shared(ds.shared_pager()).unwrap().writable();
+        let before = (dd.counts(), dd.generation());
+        // Longer than a B+ tree key may be: the whole operation rolls back
+        // (the id2entity slot it wrote first included).
+        let huge = format!("<http://ex/{}>", "x".repeat(64 * 1024));
+        assert!(dd.intern(Space::Entity, &huge).is_err());
+        assert_eq!((dd.counts(), dd.generation()), before);
+        assert_eq!(ds.entity_num(), before.0 .0);
+        assert_eq!(dd.resolve(Space::Entity, before.0 .0 as u32).unwrap(), None);
+        // The next term takes the id the failed one would have had.
+        let id = dd.intern(Space::Entity, "<http://ex/ok>").unwrap();
+        assert_eq!(id as usize, before.0 .0);
+        drop((dd, ds));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(wal(&path)).ok();
     }
 }

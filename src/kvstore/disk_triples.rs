@@ -51,6 +51,7 @@
 //! the same database gets an error instead of waiting for itself.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -212,6 +213,97 @@ impl TripleSource for DiskSource<'_> {
     }
     fn has_predicate(&self, pred: PredId) -> bool {
         or_true(self.store.try_has_predicate(pred))
+    }
+}
+
+// ---- long posting lists --------------------------------------------------------
+
+/// Lists with at least this many entries are kept in the [`ListCache`].
+const LIST_CACHE_MIN_LEN: usize = 2048;
+/// The byte budget of the [`ListCache`] (entries are charged 4 or 8 bytes
+/// each, plus [`LIST_ENTRY_OVERHEAD`]).
+const LIST_CACHE_BYTES: usize = 32 << 20;
+/// Bytes charged per cached list on top of its entries.
+const LIST_ENTRY_OVERHEAD: usize = 64;
+
+/// Which long posting list a [`ListCache`] entry holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ListKey {
+    SByPo(PredId, EntityLiteralId),
+    PsByO(EntityLiteralId),
+    SoByP(PredId),
+    SubsByP(PredId),
+    ObjsByP(PredId),
+}
+
+/// A cached posting list.
+#[derive(Clone)]
+enum CachedList {
+    Ids(Arc<[u32]>),
+    Pairs(Arc<[(u32, u32)]>),
+}
+
+impl CachedList {
+    fn bytes(&self) -> usize {
+        LIST_ENTRY_OVERHEAD
+            + match self {
+                CachedList::Ids(v) => v.len() * 4,
+                CachedList::Pairs(v) => v.len() * 8,
+            }
+    }
+}
+
+/// The long posting lists of the committed store (a class's members, a
+/// predicate's pairs), decoded once from their B+ tree leaves and kept until
+/// the store changes: the epoch they were read at is checked on every
+/// lookup, and a write moves it. Bounded by [`LIST_CACHE_BYTES`] (the oldest
+/// entries go first); lists shorter than [`LIST_CACHE_MIN_LEN`] are never
+/// cached (a point read of them is cheap). An answer from the cache is the
+/// very list the decode gave, so results and their order do not change.
+#[derive(Default)]
+struct ListCache {
+    epoch: u64,
+    bytes: usize,
+    order: VecDeque<ListKey>,
+    lists: HashMap<ListKey, CachedList>,
+}
+
+impl ListCache {
+    /// The cached list of `key` at `epoch` (emptying a cache of an older one).
+    fn get(&mut self, epoch: u64, key: ListKey) -> Option<CachedList> {
+        if self.epoch != epoch {
+            self.clear(epoch);
+            return None;
+        }
+        self.lists.get(&key).cloned()
+    }
+
+    fn put(&mut self, epoch: u64, key: ListKey, list: CachedList) {
+        if self.epoch != epoch {
+            self.clear(epoch);
+        }
+        let cost = list.bytes();
+        if cost > LIST_CACHE_BYTES || self.lists.contains_key(&key) {
+            return;
+        }
+        while self.bytes + cost > LIST_CACHE_BYTES {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(gone) = self.lists.remove(&old) {
+                self.bytes -= gone.bytes();
+            }
+        }
+        self.bytes += cost;
+        self.order.push_back(key);
+        self.lists.insert(key, list);
+    }
+
+    fn clear(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        self.bytes = 0;
+        self.order.clear();
+        self.lists.clear();
     }
 }
 
@@ -569,6 +661,8 @@ pub struct DiskTriples {
     error: Mutex<Option<String>>,
     /// Debug: the number of pager writes to let through before failing one.
     fail_after: AtomicU64,
+    /// Long posting lists of the committed store (see [`ListCache`]).
+    lists: Mutex<ListCache>,
 }
 
 impl fmt::Debug for DiskTriples {
@@ -599,6 +693,7 @@ impl DiskTriples {
             dirty: AtomicBool::new(false),
             error: Mutex::new(None),
             fail_after: AtomicU64::new(NO_INJECTION),
+            lists: Mutex::new(ListCache::default()),
         })
     }
 
@@ -681,6 +776,27 @@ impl DiskTriples {
                 .txn
                 .as_ref()
                 .is_some_and(|t| !t.overlay.added().is_empty())
+    }
+
+    /// Whether the open transaction adds default-graph triples (which a
+    /// `vstree.kv` built from committed data lacks; see
+    /// [`vstree_stale`](Self::vstree_stale)).
+    pub fn transaction_adds(&self) -> bool {
+        self.txn
+            .as_ref()
+            .is_some_and(|t| !t.overlay.added().is_empty())
+    }
+
+    /// The predicates with at least one triple in what this store reads
+    /// (the committed state and an open transaction's changes), ascending.
+    pub fn predicates(&self) -> Vec<PredId> {
+        let mut limit = self.store.predicate_stat_limit();
+        if let Some(o) = self.overlay() {
+            if let Some(p) = o.added().predicates().last() {
+                limit = limit.max(p + 1);
+            }
+        }
+        (0..limit).filter(|&p| self.pred_card(p) > 0).collect()
     }
 
     /// Record that `vstree.kv` was rebuilt from the current contents
@@ -853,6 +969,42 @@ impl DiskTriples {
         Ok(n)
     }
 
+    /// Remove many triples; returns how many existed. Outside a transaction
+    /// the present ones are removed under **one** drain of the gate (one
+    /// epoch step) — `CLEAR DEFAULT` of a Stream-mode database.
+    pub fn remove_many(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> Result<u64> {
+        self.check_open()?;
+        if self.txn.is_some() {
+            let mut n = 0;
+            for t in triples {
+                n += u64::from(self.remove_triple(t)?);
+            }
+            return Ok(n);
+        }
+        let mut todo: Vec<IdTriple> = triples.into_iter().collect();
+        todo.sort_unstable();
+        todo.dedup();
+        let mut present = Vec::with_capacity(todo.len());
+        for t in todo {
+            match self.store.try_exists(t.sub, t.pred, t.obj) {
+                Ok(true) => present.push(t),
+                Ok(false) => {}
+                Err(e) => return Err(self.fail(GStoreError::Io(e))),
+            }
+        }
+        if present.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u64;
+        self.under_gate(|dt| {
+            for &t in &present {
+                n += u64::from(dt.apply(|st| st.delete_ids(t))?);
+            }
+            Ok(n > 0)
+        })?;
+        Ok(n)
+    }
+
     /// Persist a named-graph operation: queued in the open transaction
     /// (applied first at commit, in order), or applied at once. The
     /// in-memory named graphs decide whether something changed; a no-op here
@@ -1019,6 +1171,43 @@ impl DiskTriples {
         }
     }
 
+    fn list_cache(&self) -> MutexGuard<'_, ListCache> {
+        self.lists.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// An id list of the committed store: from the [`ListCache`], or `read`
+    /// (whose result is cached when it is long).
+    fn cached_ids(&self, key: ListKey, read: impl FnOnce() -> Vec<u32>) -> Vec<u32> {
+        let epoch = self.epoch();
+        if let Some(CachedList::Ids(hit)) = self.list_cache().get(epoch, key) {
+            return hit.to_vec();
+        }
+        let list = read();
+        if list.len() >= LIST_CACHE_MIN_LEN {
+            self.list_cache()
+                .put(epoch, key, CachedList::Ids(Arc::from(list.as_slice())));
+        }
+        list
+    }
+
+    /// A pair list of the committed store (see [`cached_ids`](Self::cached_ids)).
+    fn cached_pairs(
+        &self,
+        key: ListKey,
+        read: impl FnOnce() -> Vec<(u32, u32)>,
+    ) -> Vec<(u32, u32)> {
+        let epoch = self.epoch();
+        if let Some(CachedList::Pairs(hit)) = self.list_cache().get(epoch, key) {
+            return hit.to_vec();
+        }
+        let list = read();
+        if list.len() >= LIST_CACHE_MIN_LEN {
+            self.list_cache()
+                .put(epoch, key, CachedList::Pairs(Arc::from(list.as_slice())));
+        }
+        list
+    }
+
     /// The transaction overlay to read through, if it holds anything.
     #[inline]
     fn overlay(&self) -> Option<&Overlay> {
@@ -1041,6 +1230,28 @@ impl Drop for DiskTriples {
             let _ = self.store.commit();
         }
     }
+}
+
+/// A long-list read: through the overlay when a transaction holds changes,
+/// else from the [`ListCache`] or the store (`$cache` is `cached_ids` or
+/// `cached_pairs`); a broken store answers empty after reporting.
+macro_rules! read_list {
+    ($self:ident, $cache:ident, $key:expr, |$src:ident| $body:expr) => {{
+        if !$self.readable() {
+            return Vec::new();
+        }
+        let base = DiskSource::new(&$self.store);
+        match $self.overlay() {
+            Some(overlay) => {
+                let $src = OverlayView::new(&base, overlay);
+                $body
+            }
+            None => $self.$cache($key, || {
+                let $src = base;
+                $body
+            }),
+        }
+    }};
 }
 
 /// Read through the overlay when a transaction holds changes, else straight
@@ -1078,19 +1289,23 @@ impl TripleSource for DiskTriples {
         read!(self, Vec::new(), |s| s.p_by_so(sub, obj))
     }
     fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
-        read!(self, Vec::new(), |s| s.ps_by_o(obj))
+        read_list!(self, cached_pairs, ListKey::PsByO(obj), |s| s.ps_by_o(obj))
     }
     fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
-        read!(self, Vec::new(), |s| s.s_by_po(pred, obj))
+        read_list!(self, cached_ids, ListKey::SByPo(pred, obj), |s| s
+            .s_by_po(pred, obj))
     }
     fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
-        read!(self, Vec::new(), |s| s.so_by_p(pred))
+        read_list!(self, cached_pairs, ListKey::SoByP(pred), |s| s
+            .so_by_p(pred))
     }
     fn subs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        read!(self, Vec::new(), |s| s.subs_by_p(pred))
+        read_list!(self, cached_ids, ListKey::SubsByP(pred), |s| s
+            .subs_by_p(pred))
     }
     fn objs_by_p(&self, pred: PredId) -> Vec<EntityLiteralId> {
-        read!(self, Vec::new(), |s| s.objs_by_p(pred))
+        read_list!(self, cached_ids, ListKey::ObjsByP(pred), |s| s
+            .objs_by_p(pred))
     }
     fn subject_keys(&self) -> Vec<EntityLiteralId> {
         read!(self, Vec::new(), |s| s.subject_keys())
@@ -1256,6 +1471,40 @@ mod tests {
         });
         let inner = r.expect("the view itself stays valid");
         assert!(inner.unwrap_err().contains("wait for itself"));
+        drop(dt);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn long_lists_are_cached_until_the_store_changes() {
+        let p = tmp("lists");
+        let mut dt = seeded(&p, 4);
+        let n = LIST_CACHE_MIN_LEN as u32 + 10;
+        for i in 0..n {
+            let e = dt.store.intern_entity(&format!("<m{i}>")).unwrap();
+            dt.insert_triple(IdTriple::new(e, 1, 2)).unwrap();
+        }
+        let first = dt.s_by_po(1, 2);
+        assert_eq!(first.len(), n as usize);
+        assert_eq!(dt.list_cache().lists.len(), 1, "a long list is cached");
+        assert_eq!(dt.s_by_po(1, 2), first, "served from the cache");
+        assert_eq!(dt.so_by_p(1).len(), n as usize);
+        // A short list is not cached.
+        assert!(dt.s_by_po(0, 1).is_empty());
+        assert_eq!(dt.list_cache().lists.len(), 2);
+
+        // A write moves the epoch: the cached lists are not used again.
+        assert!(dt.insert_triple(IdTriple::new(3, 1, 2)).unwrap());
+        let after = dt.s_by_po(1, 2);
+        assert_eq!(after.len(), first.len() + 1);
+        assert!(after.windows(2).all(|w| w[0] < w[1]), "ascending");
+        assert!(after.contains(&3));
+        // A transaction's changes read through the overlay, not the cache.
+        dt.begin().unwrap();
+        assert!(dt.remove_triple(IdTriple::new(3, 1, 2)).unwrap());
+        assert_eq!(dt.s_by_po(1, 2), first);
+        dt.rollback();
+        assert_eq!(dt.s_by_po(1, 2), after);
         drop(dt);
         cleanup(&p);
     }
