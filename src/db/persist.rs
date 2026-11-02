@@ -27,23 +27,42 @@
 //! shadow is ignored. Either way the shadow files are then renamed to
 //! `<file>.legacy` so the decision is made once and the data is never deleted.
 //!
-//! ## Write-through (disk) and commit points
+//! ## On-disk databases: Stream and Materialize mode, commit points
 //!
-//! An on-disk database keeps an in-memory working set (dictionary, default and
-//! named graphs, as a [`Backend::Memory`]) for query evaluation — streaming
-//! evaluation straight off the B+ trees is a later step — and writes every
-//! mutation through to its [`DiskStore`] by *dictionary key*, so the working
-//! set's ids never have to line up with the store's. Inside a transaction the
-//! mutations are queued and only reach the store at [`Database::commit`] (a
-//! rollback discards them). The store's dirty pages are committed to
-//! `kvstore.kv` (through its WAL) at every **commit point**: the end of each
-//! auto-commit SPARQL UPDATE, `commit()`, `save()`/[`checkpoint`](Database::checkpoint),
-//! and — best effort — when the database is dropped. If a write-through ever
-//! fails, the working set and the store may have diverged, so every later
-//! commit point reports the failure instead of claiming durability. (Each pager
-//! commit is atomic; a transaction whose dirty pages overflow the page cache is
-//! committed in several such batches, so it is durable but not crash-atomic as
-//! a whole — see `DiskStore::insert_ids`.)
+//! An on-disk database opens in one of two modes ([`DiskQueryMode`], chosen by
+//! the [`OpenOptions`] of [`Database::open_with`]); both read and write the
+//! same version-1 `kvstore.kv`, so a directory can be opened in either, in
+//! turn:
+//!
+//! * **Stream** — queries evaluate straight off the B+ trees: the default
+//!   graph is a [`Backend::Disk`] ([`DiskTriples`]) and the dictionary an
+//!   out-of-core [`DiskDict`] on the same pager (one id space). Open reads
+//!   nothing proportional to the data except the named graphs (kept in
+//!   memory, D11) and the O(P) predicate statistics; `vstree.kv` is used while
+//!   it is fresh and never rebuilt at open unless
+//!   [`vstree_on_open`](OpenOptions::vstree_on_open). Writes go by id: a new
+//!   term is interned through the shared pager first (an orphan if its triple
+//!   never comes), the triple through [`DiskTriples`] — inside a transaction
+//!   into its overlay, so **no triple reaches the pager before commit** —
+//!   and named-graph quads through `DiskTriples::named_op`.
+//! * **Materialize** — the pre-Phase-6 path: an in-memory working set
+//!   (dictionary, default and named graphs, as a [`Backend::Memory`]) for
+//!   query evaluation, and every mutation written through to the
+//!   [`DiskStore`] by *dictionary key*, so the working set's ids never have to
+//!   line up with the store's. Inside a transaction the mutations are queued
+//!   and only reach the store at [`Database::commit`] (a rollback discards
+//!   them).
+//!
+//! The store's dirty pages are committed to `kvstore.kv` (through its WAL) at
+//! every **commit point**: the end of each auto-commit SPARQL UPDATE,
+//! `commit()`, `save()`/[`checkpoint`](Database::checkpoint), and — best
+//! effort — when the database is dropped. If a write ever fails, memory and the
+//! store may have diverged (Stream: the store is *broken*, refusing reads and
+//! writes until reopened), so every later commit point reports the failure
+//! instead of claiming durability. (Each pager commit is atomic; a transaction
+//! whose dirty pages overflow the page cache is committed in several such
+//! batches, so it is durable but not crash-atomic as a whole — see
+//! `DiskStore::insert_ids` and plan item D12.)
 //!
 //! A RocksDB database evaluates directly over RocksDB. New dictionary terms are
 //! written to the `dict` CF before the first triple that uses them (also those
@@ -69,21 +88,23 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::fsutil::{self, SnapshotWriter};
+use super::open_options::{default_open_options, DiskQueryMode, OpenOptions};
 use super::{
     build_vstree, disk_vstree_entries, memory_vstree_entries, Database, Meta, BACKUP_OFFSET_FILE,
     DICT_FILE, DISK_CACHE_PAGES, KV_FILE, META_FILE, NAMED_FILE, REDO_LOG_FILE, ROCKS_SUBDIR,
     STORE_FILE, UPDATE_LOG_FILE, VSTREE_FILE, VSTREE_KV_FILE,
 };
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, Space};
 use crate::error::{GStoreError, Result};
-use crate::kvstore::DiskStore;
+use crate::kvstore::{DiskDict, DiskStore, DiskTriples};
 use crate::model::id::is_literal_id;
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::import;
 use crate::signature::VsTree;
+use crate::store::read_scope::ReadScope;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 
 /// The members of a bincode snapshot, in the order they are staged (`meta.bin`
@@ -110,10 +131,12 @@ const LEGACY_SUFFIX: &str = ".legacy";
 /// [`Database::commit`], [`Database::sync`], [`Database::save`] /
 /// [`Database::checkpoint`], and (best effort) dropping the database make the
 /// updates applied so far durable; a persistence failure is reported by the
-/// next commit point. An on-disk database still evaluates queries over an
-/// in-memory working set loaded at open; inside a transaction its writes reach
-/// the store only at `commit`. A RocksDB transaction writes through but is
-/// journaled, so a crash before `commit` undoes it on the next open.
+/// next commit point. An on-disk database evaluates queries either straight
+/// off its B+ trees (Stream mode) or over an in-memory working set loaded at
+/// open (Materialize mode; see [`DiskQueryMode`]); either way a transaction's
+/// triples reach the store only at `commit`. A RocksDB transaction writes
+/// through but is journaled, so a crash before `commit` undoes it on the next
+/// open.
 ///
 /// **Legacy shadow snapshots.** Builds before this layout handling `save()`d an
 /// updated on-disk database as a bincode snapshot next to the untouched
@@ -350,7 +373,7 @@ pub(crate) fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> 
 /// Build the out-of-core VS-tree file at `path` from `entries`, atomically:
 /// built under a temp name, then renamed over `path` (after removing any stale
 /// WAL that would otherwise replay into the new file), then reopened.
-fn write_vstree_kv(
+pub(super) fn write_vstree_kv(
     path: &Path,
     entries: Vec<(u32, crate::signature::Signature)>,
 ) -> Result<VsTree> {
@@ -400,8 +423,20 @@ impl Database {
     /// (`rocksdb/`, which needs the `rocksdb` feature — without it this returns
     /// a clear error rather than misreading the directory). The returned
     /// database remembers `dir` as its [`home`](Self::home): for the persistent
-    /// layouts every committed update is written back there.
+    /// layouts every committed update is written back there. Uses the
+    /// process's [`default_open_options`](super::default_open_options) (an
+    /// on-disk database opens in their [`DiskQueryMode`]); see
+    /// [`open_with`](Self::open_with).
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        Database::open_with(dir, &default_open_options())
+    }
+
+    /// [`open`](Self::open) with explicit [`OpenOptions`] (contract C7): the
+    /// disk query mode and page cache of an on-disk database, its dictionary
+    /// cache budget in Stream mode, and whether a missing or stale VS-tree is
+    /// built at open. Taken as given: neither the installed defaults nor the
+    /// environment change them.
+    pub fn open_with<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> Result<Database> {
         let dir = dir.as_ref();
         Database::recover_restore(dir)?;
         if !dir.is_dir() {
@@ -411,15 +446,17 @@ impl Database {
             )));
         }
         fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
-        // The snapshot and on-disk layouts are locked against other processes
-        // before anything is read (see `dirlock`); RocksDB locks itself.
+        // Every layout is locked against other processes before anything is
+        // read (see `dirlock`); RocksDB also locks its own `rocksdb/LOCK`, but
+        // only the directory lock tells a bulk build of this or another
+        // process — on any OS — that the database is open.
         let lock = match Database::storage_kind(dir) {
-            Some(StorageKind::RocksDb) | None => None,
+            None => None,
             Some(_) => Some(super::dirlock::DirLock::acquire(dir)?),
         };
         let mut db = match Database::storage_kind(dir) {
-            Some(StorageKind::RocksDb) => Database::open_rocks_layout(dir),
-            Some(StorageKind::Disk) => Database::load_disk(dir),
+            Some(StorageKind::RocksDb) => Database::open_rocks_layout(dir, options),
+            Some(StorageKind::Disk) => Database::load_disk_with(dir, options),
             Some(StorageKind::Snapshot) => Database::load_snapshot(dir),
             None => Err(GStoreError::Database(format!(
                 "'{}' does not contain a gStore database (no meta.bin snapshot, \
@@ -461,12 +498,12 @@ impl Database {
     }
 
     #[cfg(feature = "rocksdb")]
-    fn open_rocks_layout(dir: &Path) -> Result<Database> {
-        Database::open_rocksdb(dir)
+    fn open_rocks_layout(dir: &Path, options: &OpenOptions) -> Result<Database> {
+        Database::open_rocksdb_with(dir, options)
     }
 
     #[cfg(not(feature = "rocksdb"))]
-    fn open_rocks_layout(dir: &Path) -> Result<Database> {
+    fn open_rocks_layout(dir: &Path, _options: &OpenOptions) -> Result<Database> {
         Err(GStoreError::Database(format!(
             "'{}' is a RocksDB-backed database, but this build of gstore was compiled \
              without the `rocksdb` feature; rebuild with `--features rocksdb` to open it",
@@ -491,6 +528,19 @@ impl Database {
             return StorageKind::RocksDb;
         }
         StorageKind::Snapshot
+    }
+
+    /// How this on-disk database answers queries — [`DiskQueryMode::Stream`]
+    /// (off the B+ trees) or [`DiskQueryMode::Materialize`] (an in-memory
+    /// working set) — or `None` for the other layouts.
+    pub fn disk_query_mode(&self) -> Option<DiskQueryMode> {
+        if self.store.as_disk().is_some() {
+            Some(DiskQueryMode::Stream)
+        } else if self.has_disk_sink() {
+            Some(DiskQueryMode::Materialize)
+        } else {
+            None
+        }
     }
 
     /// Persist the database to its own [`home`](Self::home) directory: commits
@@ -529,6 +579,13 @@ impl Database {
     /// [`set_reason_db_dir`](Self::set_reason_db_dir), which is kept), so
     /// they stay manageable and [`backup`](Self::backup) carries them.
     pub fn into_memory(mut self) -> Result<Database> {
+        if self.store.as_disk().is_some() && self.txn.is_some() {
+            return Err(GStoreError::Database(
+                "into_memory: commit or roll back the open transaction first (a Stream-mode \
+                 transaction lives in the on-disk store's overlay)"
+                    .into(),
+            ));
+        }
         self.commit_point()?;
         if self.reason_home.dir.is_none() {
             if let Some(home) = &self.home {
@@ -540,6 +597,22 @@ impl Database {
             let mut mem = TripleStore::new();
             crate::store::MutableStore::bulk_load(&mut mem, self.store.iter_all());
             self.store = Backend::Memory(mem);
+        }
+        if let Some(dt) = self.store.as_disk() {
+            // Stream mode: read the triples and every term (ids kept) into
+            // memory; a read error fails the detach.
+            let scope = ReadScope::enter();
+            let all = dt.iter_all();
+            if let Some(e) = scope.take_error() {
+                return Err(super::read_failure("detaching the on-disk store", e));
+            }
+            drop(scope);
+            let dict = self.dict.materialize()?;
+            let mut mem = TripleStore::new();
+            mem.bulk_load(all);
+            // Dropping the store closes it (its writes were just committed).
+            self.store = Backend::Memory(mem);
+            self.dict = dict;
         }
         // Dropping the sink closes the disk store (nothing left to flush).
         *sink_mut(&mut self.disk) = None;
@@ -652,10 +725,14 @@ impl Database {
                 "on-disk database has no home directory".into(),
             ));
         };
-        let stale = self
-            .disk_guard()
-            .as_ref()
-            .is_none_or(|s| s.store.vstree_stale());
+        let stale = match self.store.as_disk() {
+            // The committed state's flag (an open transaction is not copied).
+            Some(dt) => dt.disk_store().map_or(true, |s| s.vstree_stale()),
+            None => self
+                .disk_guard()
+                .as_ref()
+                .is_none_or(|s| s.store.vstree_stale()),
+        };
         let kv_dst = dir.join(KV_FILE);
         // A stale WAL beside the destination would replay into the new copy.
         fsutil::remove_file_if_exists(&wal_of(&kv_dst))?;
@@ -809,13 +886,33 @@ impl Database {
         dir.as_ref().join(KV_FILE).is_file()
     }
 
-    /// Open an on-disk database. The `kvstore.kv` B+ trees are the source of
-    /// truth; their content (dictionary, default graph, named graphs) is
-    /// materialized as the in-memory working set queries evaluate over, and
-    /// every later committed mutation is written through to the store (see the
-    /// [`StorageKind`] docs). The out-of-core VS-tree (`vstree.kv`) is opened —
-    /// or rebuilt first if an update made it stale.
+    /// Open an on-disk database without taking the directory lock (see
+    /// [`open`](Self::open), which does), in the mode of the process's
+    /// [`default_open_options`](super::default_open_options); see
+    /// [`load_disk_with`](Self::load_disk_with).
     pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        Database::load_disk_with(dir, &default_open_options())
+    }
+
+    /// Open an on-disk database in `options`' [`DiskQueryMode`]. The
+    /// `kvstore.kv` B+ trees are the source of truth either way:
+    ///
+    /// * **Stream**: the default graph is read from them on demand
+    ///   ([`Backend::Disk`]) and the dictionary through an out-of-core,
+    ///   writable [`DiskDict`] on the same pager, opened once here and shared
+    ///   by every statement; only the named graphs are loaded. `vstree.kv` is
+    ///   used if it is fresh; a stale or missing one is rebuilt (a streaming
+    ///   pass) only with [`vstree_on_open`](OpenOptions::vstree_on_open),
+    ///   else queries evaluate without the VS-tree until
+    ///   [`rebuild_index`](Self::rebuild_index).
+    /// * **Materialize**: their content (dictionary, default graph, named
+    ///   graphs) is materialized as the in-memory working set queries evaluate
+    ///   over, and every later committed mutation is written through to the
+    ///   store (see the [`StorageKind`] docs). The out-of-core VS-tree
+    ///   (`vstree.kv`) is opened — or rebuilt first if an update made it stale,
+    ///   or if the dictionary's ids had a gap (its entries are keyed by the
+    ///   store's ids).
+    pub fn load_disk_with<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> Result<Database> {
         let dir = dir.as_ref();
         let kv = dir.join(KV_FILE);
         if !kv.is_file() {
@@ -824,19 +921,68 @@ impl Database {
                 kv.display()
             )));
         }
-        let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+        let mut ds = DiskStore::open(&kv, options.disk_cache_pages)?;
         reconcile_legacy_shadow(dir, &mut ds)?;
-        let (dict, store) = ds.to_memory()?;
+        match options.disk_query_mode {
+            DiskQueryMode::Stream => Database::load_disk_stream(dir, ds, options),
+            DiskQueryMode::Materialize => Database::load_disk_materialize(dir, ds),
+        }
+    }
+
+    /// The Stream-mode half of [`load_disk_with`](Self::load_disk_with).
+    fn load_disk_stream(dir: &Path, ds: DiskStore, options: &OpenOptions) -> Result<Database> {
         let named = ds.named_to_memory()?;
-        let name = dir
-            .file_name()
-            .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
-            .unwrap_or_else(|| "disk".to_string());
+        let vskv = dir.join(VSTREE_KV_FILE);
+        let fresh = vskv.is_file() && !ds.vstree_stale();
+        let mut dt = DiskTriples::new(ds)?;
+        let (vstree, index_valid) = if fresh {
+            (VsTree::open_disk(&vskv)?, true)
+        } else if options.vstree_on_open {
+            let tree = write_vstree_kv(&vskv, disk_vstree_entries(dt.disk_store()?)?)?;
+            dt.mark_vstree_fresh();
+            dt.commit_point()?;
+            (tree, true)
+        } else {
+            (VsTree::new(), false)
+        };
+        let (term_bytes, key_bytes) = options.dict_cache_split();
+        let dict = DiskDict::open_shared(dt.shared_pager()?)?
+            .with_cache_budgets(term_bytes, key_bytes)
+            .writable();
+        let mut db = Database::new(disk_db_name(dir));
+        db.dict = Dictionary::from_backing(Arc::new(dict));
+        db.store = Backend::Disk(dt);
+        db.named = named;
+        db.vstree = vstree;
+        db.index_valid = index_valid;
+        db.home = Some(dir.to_path_buf());
+        Ok(db)
+    }
+
+    /// The Materialize-mode half of [`load_disk_with`](Self::load_disk_with).
+    fn load_disk_materialize(dir: &Path, mut ds: DiskStore) -> Result<Database> {
+        let (mut dict, store) = ds.to_memory()?;
+        // `DiskStore::dictionary` interns the stored strings in id order: a
+        // gap (a freed hole) or a duplicate would shift every later id off the
+        // store's. Then read the terms with their ids kept instead, and do
+        // not trust `vstree.kv` (it was built over the store's ids, but its
+        // alignment with this working set cannot be proven).
+        let aligned = dictionary_aligned(&dict, &ds);
+        if !aligned {
+            crate::gs_warn!(
+                "'{}': the dictionary's ids have gaps; loading them with their ids kept and \
+                 rebuilding the VS-tree",
+                dir.display()
+            );
+            dict = ds.lazy_dictionary().materialize()?;
+        }
+        let named = ds.named_to_memory()?;
+        let name = disk_db_name(dir);
         // Out-of-core VS-tree: open the persisted paged node file, unless an
         // update since it was built made it stale (or it is missing) — then
         // rebuild it from the just-loaded store, whose ids are the store's.
         let vskv = dir.join(VSTREE_KV_FILE);
-        let vstree = if vskv.is_file() && !ds.vstree_stale() {
+        let vstree = if aligned && vskv.is_file() && !ds.vstree_stale() {
             VsTree::open_disk(&vskv)?
         } else {
             let tree = write_vstree_kv(&vskv, memory_vstree_entries(&store))?;
@@ -953,6 +1099,10 @@ impl Database {
             named,
         } = acc;
         fs::create_dir_all(dir)?;
+        // Held for the new database's lifetime (see `open_with`): another
+        // process with `dir` open makes the build fail before anything in it
+        // is replaced.
+        let lock = super::dirlock::DirLock::acquire(dir)?;
         // Fresh build: replace any previous database in `dir`.
         remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
@@ -979,6 +1129,7 @@ impl Database {
         rocks.flush()?;
         db.store = Backend::Rocks(rocks);
         db.home = Some(dir.to_path_buf());
+        db.dir_lock = Some(lock);
         db.rebuild_index();
         Ok(db)
     }
@@ -991,6 +1142,14 @@ impl Database {
     /// which case it cannot be opened safely and an error says so.
     #[cfg(feature = "rocksdb")]
     pub fn open_rocksdb<P: AsRef<Path>>(dir: P) -> Result<Database> {
+        Database::open_rocksdb_with(dir, &default_open_options())
+    }
+
+    /// [`open_rocksdb`](Self::open_rocksdb) with explicit [`OpenOptions`]:
+    /// [`vstree_on_open`](OpenOptions::vstree_on_open) builds the VS-tree at
+    /// open (it is not persisted for RocksDB).
+    #[cfg(feature = "rocksdb")]
+    pub fn open_rocksdb_with<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> Result<Database> {
         use crate::backend::rocks::RocksStore;
         let dir = dir.as_ref();
         let rocks_dir = dir.join(ROCKS_SUBDIR);
@@ -1020,11 +1179,13 @@ impl Database {
         db.home = Some(dir.to_path_buf());
         // The VS-tree is not rebuilt at open (it walks every entity's edges
         // in RocksDB): queries evaluate without it until `rebuild_index()`.
-        // `GSTORE_VSTREE_ON_OPEN=1` restores the rebuild at open.
+        // `vstree_on_open` (`[storage]`, or `GSTORE_VSTREE_ON_OPEN=1` through
+        // the default options) restores the rebuild at open.
         db.index_valid = false;
-        if vstree_on_open() {
+        if options.vstree_on_open {
             db.rebuild_index();
         }
+        db.dir_lock = Some(super::dirlock::DirLock::acquire(dir)?);
         Ok(db)
     }
 
@@ -1239,7 +1400,6 @@ impl Database {
     // ---- write-through hooks (called by the mutation paths) ----------------
 
     /// Record a persistence failure to report at the next commit point.
-    #[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
     pub(super) fn note_persist_error(&self, e: impl fmt::Display) {
         let mut slot = self.persist_error_slot();
         if slot.is_none() {
@@ -1252,8 +1412,19 @@ impl Database {
     /// transaction). The other layouts persist elsewhere: RocksDB default-graph
     /// triples go to RocksDB through the [`Backend`], and named-graph quads
     /// through [`persist_named_quad`](Self::persist_named_quad) *before* the
-    /// in-memory graph is changed. In-memory: nothing to do.
+    /// in-memory graph is changed. In-memory: nothing to do. Stream mode:
+    /// default-graph triples were written by id through the [`Backend::Disk`]
+    /// already; a named-graph quad goes to `DiskTriples::named_op` (queued in
+    /// the store's transaction, applied first at its commit).
     pub(super) fn persist_mutation(&mut self, insert: bool, graph: Option<u32>, id: IdTriple) {
+        if let Some(dt) = self.store.as_disk_mut() {
+            if let Some(g) = graph {
+                if let Err(e) = dt.named_op(insert, g, id) {
+                    self.note_persist_error(e);
+                }
+            }
+            return;
+        }
         let in_txn = self.txn.is_some();
         if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
             match DiskOp::resolve(&self.dict, insert, graph, id) {
@@ -1342,8 +1513,14 @@ impl Database {
         }
     }
 
-    /// Whether mutations are written through to an on-disk store.
+    /// Whether this is an on-disk (`kvstore.kv`) database, in either mode.
     pub(super) fn is_disk_backed(&self) -> bool {
+        self.store.as_disk().is_some() || self.has_disk_sink()
+    }
+
+    /// Whether mutations are written through to an on-disk store by key
+    /// (Materialize mode).
+    pub(super) fn has_disk_sink(&self) -> bool {
         self.disk_guard().is_some()
     }
 
@@ -1383,6 +1560,13 @@ impl Database {
                 if let Err(e) = sink.flush() {
                     failure = Some(e);
                 }
+            }
+        }
+        // Stream mode: one WAL-protected flush of the applied writes (and of
+        // the terms interned for them); refused once the store is broken.
+        if let Some(dt) = self.store.as_disk() {
+            if let Err(e) = dt.commit_point() {
+                failure.get_or_insert(e);
             }
         }
         #[cfg(feature = "rocksdb")]
@@ -1519,7 +1703,8 @@ impl Database {
     /// triples through to an on-disk store (RocksDB already persisted them,
     /// terms first, see [`infer`](Self::infer)).
     pub(super) fn persist_inferred(&mut self, added: &[IdTriple]) {
-        if self.is_disk_backed() {
+        // Stream mode: the reasoner inserted them through the on-disk store.
+        if self.has_disk_sink() {
             for &t in added {
                 self.persist_mutation(true, None, t);
             }
@@ -1601,16 +1786,26 @@ impl Database {
     }
 }
 
-/// Whether the environment asks for the pre-Phase-6 VS-tree rebuild when a
-/// RocksDB database is opened (`GSTORE_VSTREE_ON_OPEN=1`).
-#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
-fn vstree_on_open() -> bool {
-    std::env::var("GSTORE_VSTREE_ON_OPEN").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// The name of the on-disk database in `dir`: the directory name without its
+/// `.db` suffix.
+fn disk_db_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
+        .unwrap_or_else(|| "disk".to_string())
+}
+
+/// Whether `dict` — read from `ds` by [`DiskStore::dictionary`], which interns
+/// the stored strings in id order — gave every term the id the store gave it:
+/// each space holds exactly the store's count of ids (a gap or a duplicate
+/// string would leave it short).
+fn dictionary_aligned(dict: &Dictionary, ds: &DiskStore) -> bool {
+    [
+        (Space::Entity, ds.entity_num()),
+        (Space::Literal, ds.literal_num()),
+        (Space::Predicate, ds.predicate_num()),
+    ]
+    .into_iter()
+    .all(|(space, n)| u64::from(dict.id_limit(space)) == u64::from(space.first_id()) + n as u64)
 }
 
 /// Check that a restored on-disk / RocksDB copy in `dir` opens as a database.
@@ -1628,7 +1823,11 @@ fn validate_restored_copy(dir: &Path, kind: StorageKind) -> Result<()> {
             )))
         };
     }
-    Database::open(dir)
+    // Materialize mode reads every term and triple of an on-disk copy, so a
+    // truncated or damaged store fails here (a Stream-mode open reads only
+    // the header, the statistics and the named graphs).
+    let options = default_open_options().with_disk_query_mode(DiskQueryMode::Materialize);
+    Database::open_with(dir, &options)
         .map(drop)
         .map_err(|e| GStoreError::Database(format!("the backup is not a readable database: {e}")))
 }

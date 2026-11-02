@@ -175,12 +175,23 @@ fn disk_vstree_entries(
 }
 
 /// [`vstree_entries`] of a [`Backend`], through the in-memory fast path when
-/// it holds a [`TripleStore`].
+/// it holds a [`TripleStore`], and the streaming pass over the committed
+/// on-disk store when it holds a [`DiskTriples`](crate::kvstore::DiskTriples)
+/// without an open transaction (a read error there is reported to the
+/// thread's read scope and the generic signing runs instead).
 fn backend_vstree_entries(store: &Backend) -> Vec<(EntityLiteralId, Signature)> {
-    match store.as_memory() {
-        Some(mem) => memory_vstree_entries(mem),
-        None => vstree_entries(store),
+    if let Some(mem) = store.as_memory() {
+        return memory_vstree_entries(mem);
     }
+    if let Some(dt) = store.as_disk().filter(|dt| !dt.in_transaction()) {
+        match dt.disk_store().and_then(disk_vstree_entries) {
+            Ok(entries) => return entries,
+            Err(e) => crate::store::read_scope::note_read_error(format_args!(
+                "signing the on-disk store's entities: {e}"
+            )),
+        }
+    }
+    vstree_entries(store)
 }
 
 #[cfg(test)]
@@ -221,7 +232,8 @@ pub struct Database {
     name: String,
     dict: Dictionary,
     /// The live default-graph store, selected at construction: in-memory
-    /// ([`Backend::Memory`], the default) or persistent RocksDB
+    /// ([`Backend::Memory`], the default), the on-disk B+ trees of a
+    /// Stream-mode database ([`Backend::Disk`]) or persistent RocksDB
     /// ([`Backend::Rocks`], feature `rocksdb`). All reads/writes go through the
     /// [`TripleSource`]/[`MutableStore`] seam, so the engine is backend-agnostic.
     store: Backend,
@@ -236,8 +248,13 @@ pub struct Database {
     /// or `rebuild_index`. (A stale tree is never used, preserving correctness.)
     index_valid: bool,
     /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
-    /// the inverse of a triple mutation, applied in reverse on rollback.
+    /// the inverse of a triple mutation, applied in reverse on rollback. A
+    /// Stream-mode database records only its named-graph changes here: its
+    /// default graph's transaction is the on-disk store's overlay.
     txn: Option<Vec<UndoOp>>,
+    /// Stream mode: [`rebuild_index`](Self::rebuild_index) was called inside a
+    /// transaction; the rebuild runs when the transaction ends.
+    vstree_rebuild_pending: bool,
     /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
     /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
     /// any store mutation. Behind a lock so concurrent `&self` reads
@@ -473,6 +490,7 @@ impl Database {
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
+            vstree_rebuild_pending: false,
             query_cache: Mutex::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
             integer_division: IntegerDivision::default(),
             topk: TopKOptions::default(),
@@ -670,10 +688,86 @@ impl Database {
     }
 
     /// Rebuild the VS-tree from the current store and mark the index valid.
+    /// A Stream-mode database rewrites its `vstree.kv` (see
+    /// [`try_rebuild_index`](Self::try_rebuild_index)); a failure there is
+    /// logged and leaves the index unused.
     pub fn rebuild_index(&mut self) {
-        self.vstree = build_vstree(&self.store);
+        if let Err(e) = self.try_rebuild_index() {
+            crate::gs_warn!("rebuilding the VS-tree of '{}' failed: {e}", self.name);
+        }
+    }
+
+    /// [`rebuild_index`](Self::rebuild_index), reporting a failure. A
+    /// Stream-mode database signs every entity in one streaming pass over its
+    /// committed store ([`DiskStore::for_each_entity_adjacency`](crate::kvstore::DiskStore::for_each_entity_adjacency)),
+    /// writes `vstree.kv` beside it (built under a temporary name, then renamed
+    /// over the old one), marks it fresh in the store's header and makes that
+    /// durable; inside a transaction the rebuild is deferred until the
+    /// transaction ends. Any other database builds its in-memory tree.
+    pub fn try_rebuild_index(&mut self) -> Result<()> {
+        if self.store.as_disk().is_none() {
+            self.vstree = build_vstree(&self.store);
+            self.index_valid = true;
+            self.vs_shrink_debt = 0;
+            return Ok(());
+        }
+        if self.txn.is_some() {
+            self.vstree_rebuild_pending = true;
+            return Ok(());
+        }
+        self.vstree_rebuild_pending = false;
+        let Some(home) = self.home.clone() else {
+            return Err(GStoreError::Database(
+                "an on-disk database without a home directory cannot rebuild vstree.kv".into(),
+            ));
+        };
+        // Never filter through the old tree again, whatever happens below.
+        self.index_valid = false;
+        self.vstree = VsTree::new();
+        let Some(dt) = self.store.as_disk_mut() else {
+            return Ok(());
+        };
+        let entries = disk_vstree_entries(dt.disk_store()?)?;
+        self.vstree = persist::write_vstree_kv(&home.join(VSTREE_KV_FILE), entries)?;
+        dt.mark_vstree_fresh();
+        dt.commit_point()?;
         self.index_valid = true;
         self.vs_shrink_debt = 0;
+        self.query_cache_mut().clear();
+        Ok(())
+    }
+
+    /// Stream mode: run a [`rebuild_index`](Self::rebuild_index) deferred by
+    /// the transaction that just ended.
+    fn run_deferred_rebuild(&mut self) {
+        if self.vstree_rebuild_pending && self.txn.is_none() {
+            self.rebuild_index();
+        }
+    }
+
+    /// Whether queries may filter through the VS-tree now: it is consistent
+    /// with the store ([`index_valid`](Self::index_valid)) and, on a
+    /// Stream-mode database, no open transaction adds triples the tree (built
+    /// from committed data) lacks (C9; `DiskTriples::vstree_stale`).
+    fn vstree_usable(&self) -> bool {
+        self.index_valid
+            && self
+                .store
+                .as_disk()
+                .is_none_or(|dt| !dt.transaction_adds())
+    }
+
+    /// Fail a statement up front when the on-disk store of a Stream-mode
+    /// database is broken by an earlier write error (C5): it must be reopened.
+    /// (Reads report the same error through the read scope; this also covers
+    /// a statement that would read nothing from the store.)
+    fn check_store_readable(&self) -> Result<()> {
+        match self.store.as_disk().and_then(|dt| dt.broken()) {
+            Some(e) => Err(GStoreError::Database(format!(
+                "the on-disk store is broken by an earlier write error ({e}); reopen the database"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Opt this database into an **out-of-core** (streaming) VS-tree, even while
@@ -924,10 +1018,14 @@ impl Database {
         &self.dict
     }
     /// The in-memory default-graph store. Available for the default
-    /// [`Backend::Memory`] backend — which an on-disk database also uses for its
-    /// working set (used by snapshot MVCC and tests); panics for a
-    /// RocksDB-backed database, which has no in-RAM store — query it through
-    /// [`query`](Self::query)/[`select`](Self::select) or use
+    /// [`Backend::Memory`] backend — which an on-disk database opened in
+    /// Materialize mode also uses for its working set (used by snapshot MVCC
+    /// and tests).
+    ///
+    /// # Panics
+    /// For a database with no in-RAM store: a Stream-mode on-disk database
+    /// ([`Backend::Disk`]) or a RocksDB-backed one. Query those through
+    /// [`query`](Self::query)/[`select`](Self::select) or read
     /// [`backend`](Self::backend) instead.
     pub fn store(&self) -> &TripleStore {
         self.store
@@ -1048,7 +1146,12 @@ impl Database {
         let Some((_, id)) = self.intern_for_insert(t, None)? else {
             return Ok(None);
         };
-        let changed = self.store.insert(id);
+        // Stream mode: by id, into the open transaction's overlay or at once;
+        // a write error breaks the store and fails this insert.
+        let (changed, disk) = match self.store.as_disk_mut() {
+            Some(dt) => (dt.insert_triple(id)?, true),
+            None => (self.store.insert(id), false),
+        };
         if changed {
             // While the index is consistent, keep it consistent *incrementally*:
             // the inserted edge only changes the signatures of its subject (and
@@ -1067,7 +1170,7 @@ impl Database {
                 }
             }
             self.touched();
-            if let Some(log) = self.txn.as_mut() {
+            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
                 log.push(UndoOp::Del(None, id)); // rollback removes what we added
             }
             self.record_redo(b'I', None, id);
@@ -1133,8 +1236,11 @@ impl Database {
         self.remove_default_id(IdTriple::new(sub, pred, obj))
     }
 
-    /// Remove the default-graph triple `id`; `true` if it existed.
+    /// Remove the default-graph triple `id`; `true` if it existed. (Stream
+    /// mode: a write error breaks the store, answers `false` and is reported
+    /// by the next commit point.)
     fn remove_default_id(&mut self, id: IdTriple) -> bool {
+        let disk = self.store.as_disk().is_some();
         let changed = self.store.remove(id);
         if changed {
             // A delete leaves the VS-tree alone, valid: the removed edge only
@@ -1150,7 +1256,7 @@ impl Database {
                 self.vs_shrink_debt += 1;
             }
             self.touched();
-            if let Some(log) = self.txn.as_mut() {
+            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
                 log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
             }
             self.record_redo(b'D', None, id);
@@ -1169,7 +1275,10 @@ impl Database {
     ///
     /// On a RocksDB database the transaction's writes are journaled so that it
     /// stays atomic across a crash: uncommitted writes are undone on the next
-    /// open (see [`crate::backend::rocks`]).
+    /// open (see [`crate::backend::rocks`]). On a Stream-mode on-disk database
+    /// its default-graph writes collect in the store's overlay (no triple
+    /// reaches the pager before [`commit`](Self::commit)) and its named-graph
+    /// quads are queued there too.
     pub fn begin(&mut self) -> Result<()> {
         if self.txn.is_some() {
             return Err(GStoreError::Database(
@@ -1177,6 +1286,9 @@ impl Database {
             ));
         }
         self.rocks_begin_journal()?;
+        if let Some(dt) = self.store.as_disk_mut() {
+            dt.begin()?;
+        }
         self.txn = Some(Vec::new());
         Ok(())
     }
@@ -1188,14 +1300,33 @@ impl Database {
     /// On a persistent layout this is a commit point: the transaction's queued
     /// write-through reaches the store and is made durable (see [`StorageKind`]).
     pub fn commit(&mut self) -> Result<()> {
-        if self.txn.take().is_none() {
+        if self.txn.is_none() {
             return Err(GStoreError::Database("no active transaction".into()));
         }
+        // Stream mode: apply the overlay (named-graph operations, removals,
+        // additions) under the store's writer gate.
+        if let Some(dt) = self.store.as_disk_mut() {
+            if let Err(e) = dt.commit() {
+                if dt.in_transaction() {
+                    // Refused before anything was taken (from inside one of
+                    // the store's own snapshot reads): still open.
+                    return Err(e);
+                }
+                // The store is broken: the transaction is gone, and so are
+                // its redo records (nothing of it is acknowledged).
+                self.txn = None;
+                self.redo_pending.clear();
+                self.run_deferred_rebuild();
+                return Err(e);
+            }
+        }
+        self.txn = None;
         self.disk_commit_pending();
         let redo = self.flush_redo();
         // RocksDB: deleting the undo journal is what commits the transaction.
         let journal = self.rocks_commit_journal();
         let point = self.commit_point();
+        self.run_deferred_rebuild();
         redo.and(journal).and(point)
     }
 
@@ -1210,6 +1341,11 @@ impl Database {
         // on-disk store (which never saw them).
         self.redo_pending.clear();
         self.disk_discard_pending();
+        // Stream mode: the overlay (default graph and queued quads) is just
+        // dropped; only the in-memory named graphs are undone below.
+        if let Some(dt) = self.store.as_disk_mut() {
+            dt.rollback();
+        }
         // A RocksDB store is rolled back by replaying its undo journal (which
         // also covers the named-graph quads in RocksDB); only the in-memory
         // named-graph map is undone here.
@@ -1260,6 +1396,7 @@ impl Database {
             }
         }
         self.touched();
+        self.run_deferred_rebuild();
         replayed
     }
 
@@ -1412,8 +1549,10 @@ impl Database {
         if n > 0 {
             self.index_valid = false;
             self.touched();
-            // Record inferred triples so reasoning inside a transaction rolls back.
-            if let Some(log) = self.txn.as_mut() {
+            // Record inferred triples so reasoning inside a transaction rolls
+            // back (Stream mode: they are in the store's overlay).
+            let disk = self.store.as_disk().is_some();
+            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
                 for t in &added {
                     log.push(UndoOp::Del(None, *t));
                 }
@@ -1532,6 +1671,7 @@ impl Database {
                     .into(),
             ));
         }
+        self.check_store_readable()?;
         let (sparql, q) = (stmt.text(), stmt.query());
         // Serve from the query cache when the same request was already
         // answered against the current (unchanged) store. Only
@@ -1553,7 +1693,7 @@ impl Database {
         let string_index = || self.string_index();
         // Use the VS-tree as a candidate filter only while it is
         // consistent with the store; otherwise evaluate without it.
-        let mut eval = if self.index_valid {
+        let mut eval = if self.vstree_usable() {
             Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
         } else {
             Evaluator::new(&self.dict, &self.store)
@@ -1623,6 +1763,8 @@ impl Database {
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<QueryResult> {
+        // A broken on-disk store refuses every statement until reopened.
+        self.check_store_readable()?;
         // Reject a statically invalid request (an unknown IRI
         // function, a graph function in FILTER/BIND, …) before any of
         // its operations is applied.
@@ -1737,8 +1879,8 @@ impl Database {
                 Err(e) => Err(e),
             },
             UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
-                GraphTarget::Default => Ok(self.clear_default()),
-                GraphTarget::All => Ok(self.clear_default() + self.clear_all_named()),
+                GraphTarget::Default => self.clear_default(),
+                GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
                 GraphTarget::AllNamed => Ok(self.clear_all_named()),
                 GraphTarget::Named(g) => Ok(self.clear_named(&g)),
             },
@@ -1777,7 +1919,7 @@ impl Database {
         if from == to {
             return Ok(0);
         }
-        let Some(triples) = self.graph_triples(from.as_deref()) else {
+        let Some(triples) = self.graph_triples(from.as_deref())? else {
             if silent {
                 return Ok(0);
             }
@@ -1792,7 +1934,7 @@ impl Database {
         let mut changed = 0;
         if matches!(op, GraphTransfer::Copy | GraphTransfer::Move) {
             changed += match to.as_deref() {
-                None => self.clear_default(),
+                None => self.clear_default()?,
                 Some(g) => self.clear_named(g),
             };
         }
@@ -1803,7 +1945,7 @@ impl Database {
         }
         if op == GraphTransfer::Move {
             changed += match from.as_deref() {
-                None => self.clear_default(),
+                None => self.clear_default()?,
                 Some(g) => self.clear_named(g),
             };
         }
@@ -1811,8 +1953,19 @@ impl Database {
     }
 
     /// Every triple of the default graph (`None`) or of a named graph, as
-    /// terms; `None` for a named graph that holds no triples.
-    fn graph_triples(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
+    /// terms; `Ok(None)` for a named graph that holds no triples. Reads in a
+    /// read scope: a store or dictionary read error fails it (C2).
+    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<Triple>>> {
+        let scope = ReadScope::enter();
+        let triples = self.graph_triples_unscoped(graph);
+        match scope.take_error() {
+            Some(e) => Err(read_failure("reading the source graph", e)),
+            None => Ok(triples),
+        }
+    }
+
+    /// [`graph_triples`](Self::graph_triples) without the read scope.
+    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
         let ids = match graph {
             None => self.store.iter_all(),
             Some(g) => {
@@ -1838,8 +1991,14 @@ impl Database {
         )
     }
 
-    /// Clear the default graph, returning the count cleared.
-    fn clear_default(&mut self) -> usize {
+    /// Clear the default graph, returning the count cleared. Stream mode:
+    /// every triple is read (in a read scope: a read error fails the clear
+    /// before anything is removed) and removed by id — under one drain of the
+    /// store's writer gate, or into the open transaction's overlay.
+    fn clear_default(&mut self) -> Result<usize> {
+        if self.store.as_disk().is_some() {
+            return self.clear_default_disk();
+        }
         let n = self.store.triple_count() as usize;
         if n > 0 {
             // Snapshot the triples once: needed for undo, and (for a persistent
@@ -1854,7 +2013,7 @@ impl Database {
                 // In-memory: discard and replace (cheaper than per-triple delete).
                 self.store = Backend::Memory(TripleStore::new());
                 // An on-disk database must still delete them from its store.
-                if self.is_disk_backed() {
+                if self.has_disk_sink() {
                     for &t in &removed {
                         self.persist_mutation(false, None, t);
                     }
@@ -1870,7 +2029,39 @@ impl Database {
             self.index_valid = false;
             self.touched();
         }
-        n
+        Ok(n)
+    }
+
+    /// [`clear_default`](Self::clear_default) of a Stream-mode database.
+    fn clear_default_disk(&mut self) -> Result<usize> {
+        let scope = ReadScope::enter();
+        let removed = self.store.iter_all();
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("reading the default graph to clear it", e));
+        }
+        drop(scope);
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let Some(dt) = self.store.as_disk_mut() else {
+            return Ok(0);
+        };
+        let result = dt.remove_many(removed.iter().copied());
+        // Whatever happened, the tree may name deleted edges: rebuild before
+        // filtering through it again (as for the other layouts).
+        self.index_valid = false;
+        let n = match result {
+            Ok(n) => n as usize,
+            Err(e) => {
+                // Part of it may be applied (the store is broken now).
+                self.touched();
+                return Err(e);
+            }
+        };
+        if n > 0 {
+            self.touched();
+        }
+        Ok(n)
     }
 
     /// Clear one named graph, returning the count cleared.
@@ -2625,6 +2816,11 @@ impl Database {
     /// space), as a predicate (predicate space), or as a named-graph IRI. Only
     /// truly-unreferenced ids are freed, so the store stays consistent.
     pub fn reclaim_unused(&mut self) -> usize {
+        if self.dict.is_disk_backed() {
+            // An out-of-core dictionary cannot free ids yet (R4 frees them by
+            // id inside the on-disk store).
+            return 0;
+        }
         let mut ent_lit: HashSet<EntityLiteralId> = HashSet::new();
         let mut preds: HashSet<PredId> = HashSet::new();
 
@@ -4587,33 +4783,52 @@ mod tests {
 
     /// Mutating a disk-loaded database invalidates the out-of-core index (it
     /// can't be updated in place), and queries stay correct afterwards.
+    /// (A rebuild gives a Materialize-mode database an in-memory tree and a
+    /// Stream-mode one a rewritten `vstree.kv`, fresh in the store's header,
+    /// so the next open uses it.)
     #[test]
     fn disk_database_mutation_invalidates_then_stays_correct() {
-        let dir = temp_dir("disk_vstree_mut");
-        let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
-        let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
-        fs::write(&rdf, content).unwrap();
-        Database::build_disk(&dir, &[&rdf]).unwrap();
-        let mut db = Database::load_disk(&dir).unwrap();
-        assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
+        for mode in [DiskQueryMode::Materialize, DiskQueryMode::Stream] {
+            let dir = temp_dir(&format!("disk_vstree_mut_{mode}"));
+            let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
+            let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
+            fs::write(&rdf, content).unwrap();
+            Database::build_disk(&dir, &[&rdf]).unwrap();
+            let options = OpenOptions::new().with_disk_query_mode(mode);
+            let mut db = Database::load_disk_with(&dir, &options).unwrap();
+            assert_eq!(db.disk_query_mode(), Some(mode));
+            assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
 
-        // An insert can't update the on-disk tree in place ⇒ index invalidates.
-        assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
-        assert!(
-            !db.stats().index_valid,
-            "mutation invalidates the disk-backed index"
-        );
+            // An insert can't update the on-disk tree in place ⇒ index invalidates.
+            assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
+            assert!(
+                !db.stats().index_valid,
+                "mutation invalidates the disk-backed index"
+            );
 
-        // Query still correct (evaluates without the stale tree).
-        let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
-        got.sort();
-        assert_eq!(got, vec![vec![Some("<d>".to_string())]]);
+            // Query still correct (evaluates without the stale tree).
+            let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
+            got.sort();
+            assert_eq!(got, vec![vec![Some("<d>".to_string())]]);
 
-        // A rebuild restores a valid (now in-memory) index.
-        db.rebuild_index();
-        assert!(db.stats().index_valid && !db.vstree.is_disk_backed());
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_file(&rdf);
+            db.rebuild_index();
+            assert!(db.stats().index_valid);
+            match mode {
+                // A rebuild restores a valid (now in-memory) index.
+                DiskQueryMode::Materialize => assert!(!db.vstree.is_disk_backed()),
+                // A rebuild rewrites vstree.kv; a reopen trusts it again.
+                DiskQueryMode::Stream => {
+                    assert!(db.vstree.is_disk_backed());
+                    let rows = db.select("SELECT ?s WHERE { ?s <p> <d> }").unwrap().rows;
+                    assert_eq!(rows, vec![vec![Some("<c>".to_string())]]);
+                    drop(db);
+                    let db = Database::load_disk_with(&dir, &options).unwrap();
+                    assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_file(&rdf);
+        }
     }
 
     /// An **in-memory** database can opt into an out-of-core (streaming) VS-tree
