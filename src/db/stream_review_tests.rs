@@ -656,6 +656,65 @@ fn a_file_backup_repairs_no_save_another_process_holds() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A restore that creates its database (no directory to lock yet) holds
+/// the lock file beside it, `<dir>.restore-lock`, from before it stages
+/// until the swap — and removes it afterwards; another process's repair of
+/// the directory (its `open`) takes that lock too, so it cannot remove the
+/// staged copy of a restore in progress (R3 review, second pass).
+#[test]
+fn a_restore_creating_its_database_holds_the_lock_beside_it() {
+    let base = tmp_dir("restore_creates");
+    let dir = base.join("n.db");
+    let side = fsutil::with_suffix(&dir, ".restore-lock");
+    let backup = build_disk(
+        &base,
+        "bak.db",
+        "<http://ex/k> <http://ex/p> <http://ex/j> .\n",
+    );
+    persist::restore_probe::watch(&dir);
+    Database::restore_into(&backup, &dir).unwrap();
+    assert_eq!(
+        persist::restore_probe::lock_was_free(&dir),
+        [false],
+        "another process could repair the staged copy away"
+    );
+    assert!(!side.exists(), "the lock file is removed with the lock");
+    let mut db = Database::open(&dir).unwrap();
+    assert!(ask(
+        &mut db,
+        "ASK { <http://ex/k> <http://ex/p> <http://ex/j> }"
+    ));
+    drop(db);
+
+    // Another process restoring into a new `m.db` holds the lock beside it
+    // while its copy is staged: an open of `m.db` here is refused, the
+    // staged copy untouched; once it is gone, the leftovers are repaired.
+    let other = base.join("m.db");
+    let staged = fsutil::with_suffix(&other, ".restore-tmp");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("x"), b"staged").unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(fsutil::with_suffix(&other, ".restore-lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let e = Database::open(&other).expect_err("repaired a staged restore in progress");
+    assert!(e.to_string().contains("locked by another process"), "{e}");
+    assert!(staged.join("x").is_file(), "the staged copy was removed");
+    let e = Database::lock_restore_target(&other).expect_err("two restores of one database");
+    assert!(e.to_string().contains("locked by another process"), "{e}");
+    drop(held);
+    Database::recover_restore(&other).unwrap();
+    assert!(
+        !staged.exists(),
+        "the leftovers of an ended restore are removed"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A restore into a directory an interrupted earlier restore moved aside
 /// holds the directory that finishing the earlier one recreates, from then
 /// until the swap: another process opening it while the backup is staged

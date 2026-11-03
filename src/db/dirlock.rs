@@ -169,6 +169,142 @@ impl Drop for DirLock {
     }
 }
 
+/// The side locks this process holds, by lock-file path.
+fn side_registry() -> &'static Mutex<HashMap<PathBuf, Held>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Held>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Exclusive (per process) ownership of the lock file *beside* a directory
+/// that need not exist yet, `<dir><suffix>` — for an operation that creates
+/// the directory, which has no `LOCK` of its own to take meanwhile (a
+/// restore into a new database stages its copy beside a `<dir>` that does
+/// not exist). Shared within a process like a [`DirLock`]. The last holder
+/// removes the file while it still holds the lock (on Unix): a contender
+/// that opened the old file can lock it only after that, sees that the path
+/// no longer names it, and starts over on the current one. Released when
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct SideLock {
+    path: PathBuf,
+}
+
+impl SideLock {
+    /// Lock `<dir><suffix>` (`dir`'s parent must exist), failing with a
+    /// [`GStoreError::Database`] naming the holder when another process has
+    /// it.
+    pub(crate) fn acquire(dir: &Path, suffix: &str) -> Result<SideLock> {
+        let cannot = |e: &dyn std::fmt::Display| {
+            GStoreError::Database(format!(
+                "cannot take the lock beside '{}': {e}",
+                dir.display()
+            ))
+        };
+        let parent = dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = dir.file_name().ok_or_else(|| cannot(&"no file name"))?;
+        let mut file_name = name.to_os_string();
+        file_name.push(suffix);
+        let path = fs::canonicalize(parent)
+            .map_err(|e| cannot(&e))?
+            .join(file_name);
+        let mut reg = side_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = reg.get_mut(&path) {
+            held.holders += 1;
+            return Ok(SideLock { path });
+        }
+        // A few rounds: the last holder may remove the file between our open
+        // and our lock (the path then names another file, or none).
+        for _ in 0..8 {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| cannot(&e))?;
+            let file = match file.try_lock() {
+                Ok(()) if !still_named_by(&file, &path) => continue,
+                Ok(()) => {
+                    let _ = record_pid(&mut file);
+                    Some(file)
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let holder = read_pid(&mut file)
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default();
+                    return Err(GStoreError::Database(format!(
+                        "'{}' is locked by another process{holder}: another gStore tool is \
+                         creating or restoring the database there; retry when it is done",
+                        dir.display()
+                    )));
+                }
+                // No advisory locks on this file system: proceed without one.
+                Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => None,
+                Err(TryLockError::Error(e)) => return Err(cannot(&e)),
+            };
+            reg.insert(path.clone(), Held { file, holders: 1 });
+            return Ok(SideLock { path });
+        }
+        Err(cannot(&"its lock file keeps being replaced"))
+    }
+
+    /// The lock file.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Whether `path` still names the file `file` has open (always `true` where
+/// that cannot be told; the last holder then leaves the file in place).
+fn still_named_by(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), fs::metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+
+impl Drop for SideLock {
+    fn drop(&mut self) {
+        let mut reg = side_registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let last = match reg.get_mut(&self.path) {
+            Some(held) => {
+                held.holders = held.holders.saturating_sub(1);
+                held.holders == 0
+            }
+            None => false,
+        };
+        if last {
+            if let Some(Held {
+                file: Some(file), ..
+            }) = reg.remove(&self.path)
+            {
+                // Removed while still locked (see the type docs), then
+                // released. Elsewhere the file stays.
+                #[cfg(unix)]
+                let _ = fs::remove_file(&self.path);
+                let _ = file.unlock();
+            }
+        }
+    }
+}
+
 /// The directories a bulk build of this process is rebuilding.
 fn building() -> &'static Mutex<HashSet<PathBuf>> {
     static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -297,5 +433,55 @@ mod tests {
         let here = DirLock::acquire_existing(d.parent().unwrap()).unwrap();
         assert!(here.is_some_and(|l| DirLock::held_here(l.dir())));
         let _ = fs::remove_dir_all(d.parent().unwrap());
+    }
+
+    #[test]
+    fn a_side_lock_is_shared_refused_elsewhere_and_removed_by_its_last_holder() {
+        let d = tmp("side");
+        let target = d.join("new.db");
+        let a = SideLock::acquire(&target, ".restore-lock").unwrap();
+        let file = a.path().to_path_buf();
+        assert_eq!(
+            file,
+            fs::canonicalize(&d).unwrap().join("new.db.restore-lock")
+        );
+        assert!(!target.exists(), "the directory itself is not created");
+        let b = SideLock::acquire(&target, ".restore-lock").unwrap();
+        // Another process (an independent open) cannot take it ...
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(a);
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(b);
+        // ... and once the last holder is gone the file is gone too: a
+        // contender that had opened it locks a file no path names, which
+        // `acquire` would see and start over.
+        #[cfg(unix)]
+        {
+            assert!(!file.exists());
+            other.try_lock().expect("released");
+            assert!(!still_named_by(&other, &file));
+        }
+        drop(other);
+        // Refused while another process holds it.
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&file)
+            .unwrap();
+        held.try_lock().unwrap();
+        let e = SideLock::acquire(&target, ".restore-lock")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("locked by another process"), "{e}");
+        drop(held);
+        drop(SideLock::acquire(&target, ".restore-lock").unwrap());
+        let _ = fs::remove_dir_all(&d);
     }
 }

@@ -90,6 +90,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::dirlock::{DirLock, SideLock};
 use super::fsutil::{self, SnapshotWriter};
 use super::open_options::{default_open_options, DiskQueryMode, OpenOptions};
 use super::{
@@ -113,6 +114,20 @@ const SNAPSHOT_FILES: &[&str] = &[DICT_FILE, STORE_FILE, NAMED_FILE, VSTREE_FILE
 
 /// Suffix legacy shadow-snapshot files are renamed to (see the module docs).
 const LEGACY_SUFFIX: &str = ".legacy";
+
+/// The lock file beside a database directory that a restore creating the
+/// database holds ([`Database::lock_restore_target`]).
+const RESTORE_LOCK_SUFFIX: &str = ".restore-lock";
+
+/// What a restore holds from before it stages a backup until the staged copy
+/// is installed ([`Database::lock_restore_target`]): the target directory's
+/// lock, and — for a restore that creates the database — the lock file
+/// beside it. Released when dropped.
+#[derive(Debug)]
+pub(crate) struct RestoreLock {
+    _dir: Option<DirLock>,
+    _side: Option<SideLock>,
+}
 
 /// Which persistent layout a database directory holds.
 ///
@@ -1451,16 +1466,26 @@ impl Database {
     /// writes to — a database the swap then replaces. An interrupted earlier
     /// restore of `target` is finished here (under the lock of the directory
     /// it concerns), so a `target` that this repair recreates — moved aside
-    /// by the crash — is locked too. `None` when there is no `target`
-    /// directory to lock (a restore that creates the database). Fails,
-    /// staging nothing, while another process holds the lock.
-    pub(crate) fn lock_restore_target(target: &Path) -> Result<Option<super::dirlock::DirLock>> {
+    /// by the crash — is locked too. A restore that creates the database
+    /// (no `target` directory to lock) holds the lock file beside it
+    /// instead, `<target>.restore-lock` ([`SideLock`]), which another
+    /// process's repair of `target` takes too. Fails, staging nothing,
+    /// while another process holds either lock.
+    pub(crate) fn lock_restore_target(target: &Path) -> Result<RestoreLock> {
         let held = super::dirlock::DirLock::acquire_existing(target)?;
+        let side = match held {
+            Some(_) => None,
+            None => Some(SideLock::acquire(target, RESTORE_LOCK_SUFFIX)?),
+        };
         Database::recover_restore(target)?;
-        match held {
-            Some(lock) => Ok(Some(lock)),
-            None => super::dirlock::DirLock::acquire_existing(target),
-        }
+        let dir = match held {
+            Some(lock) => Some(lock),
+            None => super::dirlock::DirLock::acquire_existing(target)?,
+        };
+        Ok(RestoreLock {
+            _dir: dir,
+            _side: side,
+        })
     }
 
     /// The first half of [`restore_into`](Self::restore_into): copy `backup`
@@ -1535,12 +1560,15 @@ impl Database {
             return Ok(());
         }
         let aside = fsutil::RESTORE_SWAP.moved_aside(dir);
+        // With neither (a restore creating the database staged or is
+        // installing its copy), the lock beside `dir` that such a restore
+        // holds ([`lock_restore_target`](Self::lock_restore_target)).
         let _lock = if dir.is_dir() {
-            Some(super::dirlock::DirLock::acquire(dir)?)
+            (Some(super::dirlock::DirLock::acquire(dir)?), None)
         } else if aside.is_dir() {
-            Some(super::dirlock::DirLock::acquire(&aside)?)
+            (Some(super::dirlock::DirLock::acquire(&aside)?), None)
         } else {
-            None
+            (None, Some(SideLock::acquire(dir, RESTORE_LOCK_SUFFIX)?))
         };
         fsutil::recover_dir_swap_as(dir, &fsutil::RESTORE_SWAP)
     }
@@ -2289,15 +2317,25 @@ pub(crate) mod restore_probe {
 
     /// Whether `<dir>/LOCK` can be locked through a new open file
     /// description — as another process would take it — right now (released
-    /// at once). `true` when there is no directory: nothing holds it.
+    /// at once). When there is no directory, the lock file beside it that a
+    /// restore creating the database holds (`true` when there is none).
     fn free_to_another_process(dir: &Path) -> bool {
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(LOCK_FILE))
-        else {
+        let opened = if dir.is_dir() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(LOCK_FILE))
+        } else {
+            let mut side = dir.as_os_str().to_owned();
+            side.push(super::RESTORE_LOCK_SUFFIX);
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(side)
+        };
+        let Ok(file) = opened else {
             return true;
         };
         match file.try_lock() {
