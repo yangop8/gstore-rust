@@ -285,6 +285,10 @@ impl Snapshot {
             }
         };
         Snapshot {
+            // A Stream database's snapshot resolves the ids of its
+            // materialized store through the shared on-disk dictionary,
+            // after later writes and outside any read view: its clone must
+            // keep the ids it may read from being reused while it lives.
             dict: db.dict().clone(),
             store,
             // Each graph's store is shared (copy-on-write).
