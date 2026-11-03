@@ -210,9 +210,28 @@ fn check_same<A: TripleSource, B: TripleSource>(got: &A, want: &B, ctx: &str) {
     }
 }
 
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
 /// A scratch `kvstore.kv` path unique to this process and tag.
 fn tmp(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("gstore_dt_overlay_{tag}_{}.kv", std::process::id()));
+    TMP_DIRS.with(|t| t.0.borrow_mut().extend([p.clone(), wal(&p)]));
     cleanup(&p);
     p
 }

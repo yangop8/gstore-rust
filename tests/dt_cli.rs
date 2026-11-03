@@ -6,6 +6,29 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The temp directories (or files) the current test thread made, removed
+/// when the thread ends — also when the test fails (a thread-local's
+/// destructor runs after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 fn small_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/small/small.nt")
 }
@@ -17,6 +40,7 @@ fn db_name() -> PathBuf {
 #[test]
 fn gbuild_then_gquery_roundtrip() {
     let name = db_name();
+    remove_when_done(format!("{}.db", name.display()));
     let _ = std::fs::remove_dir_all(format!("{}.db", name.display()));
 
     // gbuild <name> small.nt
@@ -52,6 +76,7 @@ fn gbuild_then_gquery_roundtrip() {
 fn gquery_update_persists_to_disk() {
     let name = std::env::temp_dir().join("gstore_dt_cli_update");
     let dir = format!("{}.db", name.display());
+    remove_when_done(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 
     Command::new(env!("CARGO_BIN_EXE_gbuild"))
@@ -105,6 +130,7 @@ fn run_with_closed_stdout(cmd: &mut Command) -> (std::process::ExitStatus, Strin
 #[test]
 fn a_closed_stdout_pipe_ends_the_output_quietly() {
     let work = std::env::temp_dir().join(format!("gstore_dt_cli_epipe_{}", std::process::id()));
+    remove_when_done(work.clone());
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).unwrap();
     let name = work.join("epipe");

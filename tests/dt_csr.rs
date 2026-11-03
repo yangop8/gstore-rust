@@ -14,6 +14,29 @@ use gstore::analytics::csr::{CsrCache, CsrGraph, Direction, EdgeDir, Node, PredF
 use gstore::analytics::gfun::{cxx, fmt, metrics, ArgSlot, GFnKind, GFunCtx, GFunValue, GNode};
 use gstore::{Database, QueryResult};
 
+/// The temp directories (or files) the current test thread made, removed
+/// when the thread ends — also when the test fails (a thread-local's
+/// destructor runs after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 const SOCIAL: &str = "
 <Alice> <focus> <Bob> .
 <Alice> <like> <Bob> .
@@ -332,6 +355,7 @@ fn rollback_and_commit_invalidate() {
 fn load_and_clear_invalidate_and_named_graphs_stay_out() {
     let mut db = social();
     let dir = std::env::temp_dir().join(format!("gstore_dt_csr_{}", std::process::id()));
+    remove_when_done(dir.clone());
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("extra.nt");
     std::fs::write(&file, "<Zoe> <like> <Alice> .\n<Zoe> <age> \"30\" .\n").unwrap();

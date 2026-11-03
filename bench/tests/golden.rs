@@ -11,6 +11,29 @@ use gstore_bench::lubm::{Lubm, QUERIES, QUERY_TEXT_FNV64, VERSION};
 use gstore_bench::rng::{stream_seed, SplitMix64};
 use gstore_bench::workload::{generate_to, GenStats, Workload, WorkloadSpec};
 
+/// The temp directories (or files) the current test thread made, removed
+/// when the thread ends — also when the test fails (a thread-local's
+/// destructor runs after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 /// A sink that only hashes.
 struct Sink(Fnv64, u64);
 
@@ -185,6 +208,7 @@ fn build(w: &dyn Workload) -> Database {
         w.file_stem(),
         std::process::id()
     ));
+    remove_when_done(dir.clone());
     std::fs::create_dir_all(&dir).unwrap();
     let f = dir.join("data.nt");
     std::fs::write(&f, &data).unwrap();

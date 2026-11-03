@@ -28,12 +28,31 @@ const DATA: &str = "@prefix : <http://ex/> .\n\
 :a :knows _:x .\n\
 _:x :name \"Bob\" .\n";
 
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
 /// A unique, empty server root (a leftover of an earlier run with the same
 /// pid is removed first: pids are reused).
 fn tmp_root(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!("gstore_gapi_{tag}_{}_{n}", std::process::id()));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
     let _ = std::fs::remove_dir_all(&p);
     p
 }

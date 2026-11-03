@@ -14,11 +14,35 @@ fn small_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/small/small.nt")
 }
 
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 /// A scratch path unique to this test process, so concurrent runs of the
 /// suite (e.g. from two checkouts sharing `/tmp`) never clobber each other's
 /// on-disk databases.
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("gstore_dt_disk_{tag}_{}.db", std::process::id()));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -51,6 +75,8 @@ fn disk_streaming_query_off_disk() {
     // DiskStore::query streams matches straight from the on-disk indexes — only
     // the dictionary is loaded into memory, the triples stay on disk.
     let path = std::env::temp_dir().join(format!("gstore_dt_stream_{}.kv", std::process::id()));
+    remove_when_done(path.clone());
+    remove_when_done(format!("{}.wal", path.display()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     let ds = DiskStore::build_files(&path, 256, &[small_nt()]).unwrap();
@@ -117,6 +143,8 @@ fn disk_lubm_matches_memory() {
 fn disk_reads_follow_the_memory_order_at_lubm_scale() {
     use gstore::TripleSource;
     let path = std::env::temp_dir().join(format!("gstore_dt_order_{}.kv", std::process::id()));
+    remove_when_done(path.clone());
+    remove_when_done(format!("{}.wal", path.display()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     let ds = DiskStore::build_files(&path, 512, &[lubm_nt()]).unwrap();
@@ -191,6 +219,8 @@ fn disk_reads_follow_the_memory_order_at_lubm_scale() {
 fn disk_streaming_query_matches_memory_rows_on_lubm() {
     let path =
         std::env::temp_dir().join(format!("gstore_dt_stream_lubm_{}.kv", std::process::id()));
+    remove_when_done(path.clone());
+    remove_when_done(format!("{}.wal", path.display()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("kv.wal"));
     let ds = DiskStore::build_files(&path, 1024, &[lubm_nt()]).unwrap();

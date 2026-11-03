@@ -4,6 +4,29 @@
 use gstore::{Database, QueryResult};
 use std::io::Write;
 
+/// The temp directories (or files) the current test thread made, removed
+/// when the thread ends — also when the test fails (a thread-local's
+/// destructor runs after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 const DATA: &str = r#"
 @prefix : <http://ex/> .
 :alice :age 30 ; :city :paris .
@@ -140,6 +163,7 @@ fn load_reads_local_turtle_file() {
     let mut db = db();
     let dir = std::env::temp_dir();
     let path = dir.join("gstore_load_test.ttl");
+    remove_when_done(path.clone());
     {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "@prefix : <http://ex/> .\n:eve :age 22 .").unwrap();

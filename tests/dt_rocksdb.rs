@@ -28,8 +28,27 @@ const DATA: &[(u32, u32, u32)] = &[
     (1, 0, 2_000_000_001), // node0 name "lit2"
 ];
 
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
 fn tmp(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("gstore_rocks_ut_{tag}"));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(dir.clone()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
