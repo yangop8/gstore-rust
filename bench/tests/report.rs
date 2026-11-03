@@ -307,6 +307,57 @@ fn marked_tables_are_spliced_byte_for_byte() {
     assert_eq!(String::from_utf8(out.stdout).unwrap(), GOLDEN_OVERVIEW);
 }
 
+/// Text that shows the marker syntax — in a code span, a table cell, a
+/// fenced example — is not a marked region: `--check` and `--update` leave
+/// it alone (they used to read `ARGS` as a file name and fail, or replace
+/// the prose between an inline example's two markers with a table). The
+/// changelog fragment's own bullets and bench/README.md hold such text.
+#[test]
+fn marker_syntax_in_prose_and_examples_is_not_a_region() {
+    let tmp = Tmp::new("splice_prose");
+    let (fin, _) = final_and_pre();
+    let f = tmp.path("final.json");
+    fin.save(Path::new(&f)).unwrap();
+    let prose = format!(
+        "# Doc\n\n- Tables live between `<!-- gstore-bench report ARGS -->` and \
+         `{END}`; run `report --update`.\n\
+         | cmd | what |\n| --- | --- |\n| `report --check` | `<!-- gstore-bench report ARGS -->` |\n\n\
+         ```markdown\n<!-- gstore-bench report --table overview {f} -->\nexample row\n{END}\n```\n\n\
+         ~~~\n<!-- gstore-bench report --table overview {f} -->\n{END}\n~~~\n\nEnd.\n"
+    );
+    let mut render =
+        |a: &[String]| -> Result<String, String> { render_args(a, &Thresholds::default()) };
+    let (fresh, changed) = splice(&prose, &mut render).unwrap();
+    assert_eq!(fresh, prose, "nothing to regenerate");
+    assert!(changed.is_empty());
+
+    // A real region after the examples is still regenerated; an indented
+    // marker counts too.
+    let doc =
+        format!("{prose}\n  <!-- gstore-bench report --table overview {f} -->\nold\n  {END}\n");
+    let (fresh, changed) = splice(&doc, &mut render).unwrap();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(fresh.starts_with(&prose), "the examples are untouched");
+    assert!(!fresh.contains("\nold\n"));
+
+    // Through the binary: `--check` passes on the prose alone.
+    let exe = env!("CARGO_BIN_EXE_gstore-bench");
+    let md = tmp.path("PROSE.md");
+    std::fs::write(&md, &prose).unwrap();
+    let st = Command::new(exe)
+        .args(["report", "--check", &md])
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{st:?}");
+    // And on the committed bench/README.md, which shows the marker syntax.
+    let readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let st = Command::new(exe)
+        .args(["report", "--check", &readme.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{st:?}");
+}
+
 #[test]
 fn committed_results_still_load_and_compare() {
     // Every result and baseline of earlier rounds (schema gstore-bench/1)

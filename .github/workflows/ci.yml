@@ -88,6 +88,13 @@ jobs:
         env:
           GSTORE_DISK_QUERY_MODE: stream
         run: cargo test --workspace
+      # The tables between `<!-- gstore-bench report … -->` markers must be
+      # what `gstore-bench report` makes of the committed results (fix with
+      # `gstore-bench report --update README.md CHANGELOG.md`). Here, with
+      # no paths-ignore, a docs-only change is checked too (bench.yml's
+      # smoke job skips those).
+      - name: generated documentation tables are current
+        run: cargo run --locked -q -p gstore-bench --bin gstore-bench -- report --check README.md CHANGELOG.md
 
   # The feature matrix: one job per optional feature of the gstore crate,
   # plus the console / zip / PFN features together (gconsole driving the PFN

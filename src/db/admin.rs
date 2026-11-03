@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::Database;
+use crate::dict::Dictionary;
 use crate::error::Result;
 use crate::model::id::{is_entity_id, is_literal_id, EntityLiteralId, PredId};
 use crate::model::{IdTriple, Term, Triple};
@@ -87,108 +88,136 @@ impl Database {
         self.store.distinct_subjects()
     }
 
-    /// The `rdf:type` id, if the database uses it.
-    fn type_pred(&self) -> Option<PredId> {
-        self.dict.predicate_id(&Term::iri(RDF_TYPE).dict_key())
-    }
-
     /// How many subjects have each `rdf:type` class (upstream `monitor`'s
     /// `subjectList`, from `Database::getStatisticsInfo`): `(class in
     /// N-Triples form, count)`, sorted by class.
     pub fn type_statistics(&self) -> Vec<(String, u64)> {
-        let Some(tp) = self.type_pred() else {
-            return Vec::new();
-        };
-        let mut counts: HashMap<EntityLiteralId, u64> = HashMap::new();
-        for (_s, o) in self.store.so_by_p(tp) {
-            if is_entity_id(o) {
-                *counts.entry(o).or_default() += 1;
-            }
-        }
-        let mut out: Vec<(String, u64)> = counts
-            .into_iter()
-            .filter_map(|(o, n)| self.dict.term(o).map(|s| (s.into_string(), n)))
-            .collect();
-        out.sort();
-        out
+        type_statistics_of(&self.dict, &self.store)
     }
 
     /// The schema graph (see [`SchemaGraph`]).
     pub fn schema_graph(&self) -> SchemaGraph {
-        let mut graph = SchemaGraph::default();
-        let Some(tp) = self.type_pred() else {
-            return graph;
-        };
-        // Class → its instances.
-        let mut instances: HashMap<EntityLiteralId, Vec<EntityLiteralId>> = HashMap::new();
-        for (s, o) in self.store.so_by_p(tp) {
-            if is_entity_id(o) {
-                instances.entry(o).or_default().push(s);
-            }
+        schema_graph_of(&self.dict, &self.store)
+    }
+}
+
+/// What [`class_stats_of`] answers: the subject count, the class statistics
+/// and the schema graph.
+pub(crate) type ClassStats = (usize, Vec<(String, u64)>, SchemaGraph);
+
+/// The subject count, `rdf:type` class statistics and schema graph of the
+/// default graph `store` (with its dictionary `dict`) — what
+/// [`Database::subject_num`], [`Database::type_statistics`] and
+/// [`Database::schema_graph`] answer, for any store (a server's transaction
+/// snapshot of the committed state among them).
+pub(crate) fn class_stats_of<S: TripleSource + ?Sized>(dict: &Dictionary, store: &S) -> ClassStats {
+    (
+        store.distinct_subjects(),
+        type_statistics_of(dict, store),
+        schema_graph_of(dict, store),
+    )
+}
+
+/// The `rdf:type` id, if `dict` knows it.
+fn type_pred(dict: &Dictionary) -> Option<PredId> {
+    dict.predicate_id(&Term::iri(RDF_TYPE).dict_key())
+}
+
+/// [`Database::type_statistics`] of `store`.
+fn type_statistics_of<S: TripleSource + ?Sized>(
+    dict: &Dictionary,
+    store: &S,
+) -> Vec<(String, u64)> {
+    let Some(tp) = type_pred(dict) else {
+        return Vec::new();
+    };
+    let mut counts: HashMap<EntityLiteralId, u64> = HashMap::new();
+    for (_s, o) in store.so_by_p(tp) {
+        if is_entity_id(o) {
+            *counts.entry(o).or_default() += 1;
         }
-        let mut classes: Vec<(String, EntityLiteralId)> = instances
-            .keys()
-            .filter_map(|&c| self.dict.term(c).map(|s| (s.into_string(), c)))
-            .collect();
-        classes.sort();
-        let class_ids: HashMap<EntityLiteralId, u32> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, (_, c))| (*c, i as u32 + 1))
-            .collect();
-        let mut next_id = classes.len() as u32 + 1;
-        let mut relations: Vec<SchemaEdge> = Vec::new();
-        for (label, class) in &classes {
-            let id = class_ids[class];
-            graph.nodes.push(SchemaNode {
-                id,
-                label: label.clone(),
-                property: false,
-            });
-            let mut props: BTreeSet<String> = BTreeSet::new();
-            let mut rels: BTreeMap<(String, String), u32> = BTreeMap::new();
-            for &s in &instances[class] {
-                for (p, o) in self.store.po_by_s(s) {
-                    let Some(pname) = self.dict.pred(p) else {
-                        continue;
-                    };
-                    if is_literal_id(o) {
-                        props.insert(pname.to_string());
-                    } else if p != tp {
-                        for c2 in self.store.o_by_sp(o, tp) {
-                            if let (Some(&target), Some(cname)) =
-                                (class_ids.get(&c2), self.dict.term(c2))
-                            {
-                                rels.insert((pname.to_string(), cname.to_string()), target);
-                            }
+    }
+    let mut out: Vec<(String, u64)> = counts
+        .into_iter()
+        .filter_map(|(o, n)| dict.term(o).map(|s| (s.into_string(), n)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`Database::schema_graph`] of `store`.
+fn schema_graph_of<S: TripleSource + ?Sized>(dict: &Dictionary, store: &S) -> SchemaGraph {
+    let mut graph = SchemaGraph::default();
+    let Some(tp) = type_pred(dict) else {
+        return graph;
+    };
+    // Class → its instances.
+    let mut instances: HashMap<EntityLiteralId, Vec<EntityLiteralId>> = HashMap::new();
+    for (s, o) in store.so_by_p(tp) {
+        if is_entity_id(o) {
+            instances.entry(o).or_default().push(s);
+        }
+    }
+    let mut classes: Vec<(String, EntityLiteralId)> = instances
+        .keys()
+        .filter_map(|&c| dict.term(c).map(|s| (s.into_string(), c)))
+        .collect();
+    classes.sort();
+    let class_ids: HashMap<EntityLiteralId, u32> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, (_, c))| (*c, i as u32 + 1))
+        .collect();
+    let mut next_id = classes.len() as u32 + 1;
+    let mut relations: Vec<SchemaEdge> = Vec::new();
+    for (label, class) in &classes {
+        let id = class_ids[class];
+        graph.nodes.push(SchemaNode {
+            id,
+            label: label.clone(),
+            property: false,
+        });
+        let mut props: BTreeSet<String> = BTreeSet::new();
+        let mut rels: BTreeMap<(String, String), u32> = BTreeMap::new();
+        for &s in &instances[class] {
+            for (p, o) in store.po_by_s(s) {
+                let Some(pname) = dict.pred(p) else {
+                    continue;
+                };
+                if is_literal_id(o) {
+                    props.insert(pname.to_string());
+                } else if p != tp {
+                    for c2 in store.o_by_sp(o, tp) {
+                        if let (Some(&target), Some(cname)) = (class_ids.get(&c2), dict.term(c2)) {
+                            rels.insert((pname.to_string(), cname.to_string()), target);
                         }
                     }
                 }
             }
-            for p in props {
-                graph.nodes.push(SchemaNode {
-                    id: next_id,
-                    label: p,
-                    property: true,
-                });
-                graph.edges.push(SchemaEdge {
-                    source: id,
-                    target: next_id,
-                    label: None,
-                });
-                next_id += 1;
-            }
-            for ((p, _), target) in rels {
-                relations.push(SchemaEdge {
-                    source: id,
-                    target,
-                    label: Some(p),
-                });
-            }
         }
-        graph.edges.extend(relations);
-        graph
+        for p in props {
+            graph.nodes.push(SchemaNode {
+                id: next_id,
+                label: p,
+                property: true,
+            });
+            graph.edges.push(SchemaEdge {
+                source: id,
+                target: next_id,
+                label: None,
+            });
+            next_id += 1;
+        }
+        for ((p, _), target) in rels {
+            relations.push(SchemaEdge {
+                source: id,
+                target,
+                label: Some(p),
+            });
+        }
     }
+    graph.edges.extend(relations);
+    graph
 }
 
 #[cfg(test)]

@@ -227,6 +227,30 @@ fn every_template_binds_parses_and_answers_at_scale_1() {
 
 const GOLDEN_BOUND_SCALE1: &str = "3c59ad915698caa6";
 
+/// The ASK walk binds every template however far `--shrink` shrinks the
+/// data: the entities the guarantees name always exist (from `--shrink 126`
+/// on, one `Product` was left and `F1` failed the run).
+#[test]
+fn every_template_binds_at_any_shrink() {
+    for shrink in [126, 501, 100_000] {
+        let t = Tmp::new(&format!("shrink{shrink}"));
+        let w = scale(1, Some(shrink));
+        let (_, data) = gen(&w, false);
+        let (_, mut db) = build(&t.0, &data);
+        let bound = bind(&w, &mut db);
+        assert_eq!(bound.len(), 20, "shrink {shrink}");
+        for b in &bound {
+            let (rows, _) = answer(&mut db, &b.text);
+            assert!(
+                rows > 0,
+                "shrink {shrink}: {} is empty:\n{}",
+                b.name,
+                b.text
+            );
+        }
+    }
+}
+
 #[test]
 fn snapshot_and_disk_answer_alike() {
     let t = Tmp::new("layouts");

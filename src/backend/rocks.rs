@@ -735,10 +735,12 @@ impl RocksStore {
         self.heal_journal()
     }
 
-    /// The dictionary ids the journal replay at open (an interrupted
-    /// transaction undone) left possibly unreferenced — the terms of the
-    /// triples and quads it removed — taken once: the database frees the
-    /// ones nothing references.
+    /// The dictionary ids completed journal replays left possibly
+    /// unreferenced — the terms of the triples and quads they removed — since
+    /// the last call: the replay at open (an interrupted transaction undone),
+    /// a rollback, or the retry that finished a replay cut short. The
+    /// database takes them at open, after every statement and at every
+    /// commit, and frees the ones nothing references.
     pub fn take_replayed(&self) -> Vec<(TermSpace, u32)> {
         std::mem::take(&mut *self.replayed.lock().unwrap_or_else(PoisonError::into_inner))
     }
@@ -867,22 +869,23 @@ impl RocksStore {
     }
 
     fn replay_records(&mut self, records: Vec<(u8, Option<u32>, IdTriple)>) -> Result<()> {
-        {
-            // Undoing an insert may leave its terms unreferenced.
-            let mut replayed = self.replayed.lock().unwrap_or_else(PoisonError::into_inner);
-            for (op, graph, t) in &records {
-                if *op == UNDO_REMOVE {
-                    let obj = if is_literal_id(t.obj) {
-                        TermSpace::Literal
-                    } else {
-                        TermSpace::Entity
-                    };
-                    replayed.push((TermSpace::Entity, t.sub));
-                    replayed.push((TermSpace::Predicate, t.pred));
-                    replayed.push((obj, t.obj));
-                    if let Some(g) = graph {
-                        replayed.push((TermSpace::Entity, *g));
-                    }
+        // Undoing an insert may leave its terms unreferenced. They are handed
+        // over (`take_replayed`) only once the whole replay has run: a replay
+        // cut short adds nothing, and the retry that completes it adds them
+        // once.
+        let mut terms = Vec::new();
+        for (op, graph, t) in &records {
+            if *op == UNDO_REMOVE {
+                let obj = if is_literal_id(t.obj) {
+                    TermSpace::Literal
+                } else {
+                    TermSpace::Entity
+                };
+                terms.push((TermSpace::Entity, t.sub));
+                terms.push((TermSpace::Predicate, t.pred));
+                terms.push((obj, t.obj));
+                if let Some(g) = graph {
+                    terms.push((TermSpace::Entity, *g));
                 }
             }
         }
@@ -904,6 +907,10 @@ impl RocksStore {
                 }
             }
         }
+        self.replayed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(terms);
         Ok(())
     }
 

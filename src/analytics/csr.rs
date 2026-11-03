@@ -367,10 +367,51 @@ impl CsrGraph {
         CsrGraph::from_id_triples(src.iter_all())
     }
 
+    /// [`build`](Self::build) that a raised `cancel` stops with
+    /// [`GStoreError::Cancelled`] — for a reader a writer must be able to
+    /// stop (a snapshot read inside an on-disk store's gate, which a commit
+    /// drains). The store is read one predicate at a time (`so_by_p` of each
+    /// id of `preds`, which must cover every predicate `src` holds: the same
+    /// triples as one `iter_all`), the flag checked between predicates and
+    /// between the build's phases. The graph is the one `build` returns.
+    pub fn build_cancellable<S: TripleSource + ?Sized>(
+        src: &S,
+        preds: impl IntoIterator<Item = PredId>,
+        cancel: &AtomicBool,
+    ) -> Result<CsrGraph> {
+        let check = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(GStoreError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        let mut triples = Vec::new();
+        for p in preds {
+            check()?;
+            triples.extend(
+                src.so_by_p(p)
+                    .into_iter()
+                    .filter(|&(s, o)| is_entity_id(s) && is_entity_id(o))
+                    .map(|(s, o)| IdTriple::new(s, p, o)),
+            );
+        }
+        CsrGraph::from_id_triples_checked(triples, &check)
+    }
+
     /// Build the CSR from raw id-triples (literal-object triples are skipped,
     /// duplicates collapsed). The building block of [`build`](Self::build),
     /// public for tests and for callers holding triples already.
-    pub fn from_id_triples(mut triples: Vec<IdTriple>) -> Result<CsrGraph> {
+    pub fn from_id_triples(triples: Vec<IdTriple>) -> Result<CsrGraph> {
+        CsrGraph::from_id_triples_checked(triples, &|| Ok(()))
+    }
+
+    /// [`from_id_triples`](Self::from_id_triples), calling `check` between
+    /// its phases (each sort and fill) and failing with what it returns.
+    fn from_id_triples_checked(
+        mut triples: Vec<IdTriple>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<CsrGraph> {
         triples.retain(|t| is_entity_id(t.sub) && is_entity_id(t.obj));
         if triples.is_empty() {
             return Ok(CsrGraph::empty());
@@ -392,6 +433,7 @@ impl CsrGraph {
         entities.sort_unstable();
         entities.dedup();
         entities.shrink_to_fit();
+        check()?;
         let n = entities.len();
         // Entity → node lookup for the build: a direct table when the ids are
         // reasonably dense (the usual case: ids are allocated sequentially),
@@ -415,6 +457,7 @@ impl CsrGraph {
         // entity id, so this is also (node(sub), pred, node(obj)) order.
         triples.sort_unstable();
         triples.dedup();
+        check()?;
         let m = triples.len();
         let mut out = Adjacency {
             off: vec![0u32; n + 1],
@@ -432,8 +475,10 @@ impl CsrGraph {
             out.off[i + 1] += out.off[i];
         }
 
+        check()?;
         // In-adjacency: sorted by (obj, pred, sub).
         triples.sort_unstable_by_key(|t| (t.obj, t.pred, t.sub));
+        check()?;
         let mut inc = Adjacency {
             off: vec![0u32; n + 1],
             pred: Vec::with_capacity(m),
@@ -889,6 +934,119 @@ mod tests {
 
     fn t(s: u32, p: u32, o: u32) -> IdTriple {
         IdTriple::new(s, p, o)
+    }
+
+    /// The cancellable build reads predicate by predicate and gives the
+    /// graph `build` gives; a raised flag stops it (between predicates or
+    /// phases) with `Cancelled` — a commit's drain then waits for one
+    /// predicate's read, not for the whole build.
+    #[test]
+    fn the_cancellable_build_equals_build_and_stops_when_cancelled() {
+        let lit = crate::model::id::LITERAL_FIRST_ID + 1;
+        let mut store = crate::store::TripleStore::new();
+        store.bulk_load(vec![
+            t(1, 0, 2),
+            t(2, 0, 3),
+            t(3, 2, 1),
+            t(1, 2, lit),
+            t(4, 5, 1),
+            t(2, 5, 4),
+        ]);
+        let whole = CsrGraph::build(&store).unwrap();
+        let flag = AtomicBool::new(false);
+        let parts = CsrGraph::build_cancellable(&store, 0..8, &flag).unwrap();
+        assert_eq!(parts.entities, whole.entities);
+        for (a, b) in [(&parts.out, &whole.out), (&parts.inc, &whole.inc)] {
+            assert_eq!((&a.off, &a.pred, &a.nbr), (&b.off, &b.pred, &b.nbr));
+        }
+        assert_eq!(parts.preds, whole.preds);
+        assert_eq!(parts.pred_edges, whole.pred_edges);
+        assert_eq!(parts.num_edges, whole.num_edges);
+
+        // Raised while the store is read: stops at the next predicate.
+        struct Raising<'a> {
+            inner: &'a crate::store::TripleStore,
+            flag: &'a AtomicBool,
+            reads: std::cell::Cell<usize>,
+        }
+        impl TripleSource for Raising<'_> {
+            fn so_by_p(&self, pred: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+                self.reads.set(self.reads.get() + 1);
+                self.flag.store(true, Ordering::SeqCst);
+                TripleSource::so_by_p(self.inner, pred)
+            }
+            fn exists(&self, s: u32, p: u32, o: u32) -> bool {
+                TripleSource::exists(self.inner, s, p, o)
+            }
+            fn po_by_s(&self, s: u32) -> Vec<(PredId, EntityLiteralId)> {
+                TripleSource::po_by_s(self.inner, s)
+            }
+            fn o_by_sp(&self, s: u32, p: u32) -> Vec<EntityLiteralId> {
+                TripleSource::o_by_sp(self.inner, s, p)
+            }
+            fn p_by_so(&self, s: u32, o: u32) -> Vec<PredId> {
+                TripleSource::p_by_so(self.inner, s, o)
+            }
+            fn ps_by_o(&self, o: u32) -> Vec<(PredId, EntityLiteralId)> {
+                TripleSource::ps_by_o(self.inner, o)
+            }
+            fn s_by_po(&self, p: u32, o: u32) -> Vec<EntityLiteralId> {
+                TripleSource::s_by_po(self.inner, p, o)
+            }
+            fn subs_by_p(&self, p: u32) -> Vec<EntityLiteralId> {
+                TripleSource::subs_by_p(self.inner, p)
+            }
+            fn objs_by_p(&self, p: u32) -> Vec<EntityLiteralId> {
+                TripleSource::objs_by_p(self.inner, p)
+            }
+            fn subject_keys(&self) -> Vec<EntityLiteralId> {
+                TripleSource::subject_keys(self.inner)
+            }
+            fn object_keys(&self) -> Vec<EntityLiteralId> {
+                TripleSource::object_keys(self.inner)
+            }
+            fn triple_count(&self) -> u64 {
+                TripleSource::triple_count(self.inner)
+            }
+            fn distinct_subjects(&self) -> usize {
+                TripleSource::distinct_subjects(self.inner)
+            }
+            fn distinct_objects(&self) -> usize {
+                TripleSource::distinct_objects(self.inner)
+            }
+            fn num_predicates(&self) -> usize {
+                TripleSource::num_predicates(self.inner)
+            }
+            fn pred_card(&self, p: u32) -> usize {
+                TripleSource::pred_card(self.inner, p)
+            }
+            fn pred_distinct_subj(&self, p: u32) -> usize {
+                TripleSource::pred_distinct_subj(self.inner, p)
+            }
+            fn pred_distinct_obj(&self, p: u32) -> usize {
+                TripleSource::pred_distinct_obj(self.inner, p)
+            }
+            fn iter_all(&self) -> Vec<IdTriple> {
+                TripleSource::iter_all(self.inner)
+            }
+        }
+        let flag = AtomicBool::new(false);
+        let src = Raising {
+            inner: &store,
+            flag: &flag,
+            reads: std::cell::Cell::new(0),
+        };
+        let r = CsrGraph::build_cancellable(&src, 0..8, &flag);
+        assert!(
+            matches!(r, Err(GStoreError::Cancelled)),
+            "{:?}",
+            r.map(|_| ())
+        );
+        assert_eq!(src.reads.get(), 1, "stopped after the first predicate");
+        // Raised before: nothing is read.
+        let r = CsrGraph::build_cancellable(&src, 0..8, &flag);
+        assert!(matches!(r, Err(GStoreError::Cancelled)));
+        assert_eq!(src.reads.get(), 1);
     }
 
     #[test]

@@ -946,6 +946,12 @@ impl Interner {
     fn shares_with(&self, other: &Interner) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
     }
+
+    /// The address of the data (a copy-on-write copy moves it).
+    #[cfg(test)]
+    fn data_addr(&self) -> usize {
+        Arc::as_ptr(&self.data) as usize
+    }
 }
 
 impl fmt::Debug for Interner {
@@ -1529,6 +1535,25 @@ impl Dictionary {
     /// out-of-core dictionary's clones hold one each.
     pub fn is_pinned(&self) -> bool {
         self.pins.oldest().is_some()
+    }
+
+    /// The addresses of the three interners' data `[entity, literal,
+    /// predicate]`: a copy-on-write copy of a shared one changes its address.
+    #[cfg(test)]
+    pub(crate) fn interner_addrs(&self) -> [usize; 3] {
+        Space::ALL.map(|s| self.interner(s).data_addr())
+    }
+
+    /// The stamp of the oldest live pin of this dictionary (or of a clone),
+    /// if any — comparable with [`pin_clock`](Self::pin_clock).
+    pub(crate) fn oldest_pin(&self) -> Option<u64> {
+        self.pins.oldest()
+    }
+
+    /// A fresh stamp of the clock pins are stamped with: every pin taken
+    /// before this call has a smaller stamp, every one taken after a larger.
+    pub(crate) fn pin_clock(&self) -> u64 {
+        next_generation()
     }
 
     /// A clone that takes **no** pin, even of an out-of-core dictionary —

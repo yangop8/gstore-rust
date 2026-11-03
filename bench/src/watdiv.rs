@@ -768,12 +768,42 @@ pub fn entity(c: usize, i: u64) -> String {
     format!("<{WSDBM}{}{i}>", CLASSES[c].name)
 }
 
+/// The fewest entities of class `c` any scale and shrink keep: one past
+/// the highest index [`GUARANTEED`] names in it — as a subject with
+/// triples of its own (`Product1`) or as an object (`wsdbm:User1`) — so
+/// the guarantees hold however far a test shrinks the data (one `Product`
+/// left made `F1` unanswerable, one `User` broke `S2`'s fallback).
+fn min_count(c: usize) -> u64 {
+    static MIN: std::sync::OnceLock<[u64; CLASSES.len()]> = std::sync::OnceLock::new();
+    MIN.get_or_init(|| {
+        let mut min = [1; CLASSES.len()];
+        for &(gc, i, _, obj) in GUARANTEED {
+            min[gc] = min[gc].max(i + 1);
+            let Some(local) = obj.strip_prefix("wsdbm:") else {
+                continue;
+            };
+            for (k, class) in CLASSES.iter().enumerate() {
+                let index = local
+                    .strip_prefix(class.name)
+                    .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|d| d.parse::<u64>().ok());
+                if let Some(index) = index {
+                    min[k] = min[k].max(index + 1);
+                }
+            }
+        }
+        min
+    })[c]
+}
+
 impl WatDiv {
-    /// The number of entities of class `c`.
+    /// The number of entities of class `c` (a scalable class never has
+    /// fewer than the [`GUARANTEED`] entities need).
     pub fn count(&self, c: usize) -> u64 {
         let k = &CLASSES[c];
         if k.scalable {
-            (k.base * u64::from(self.scale) / u64::from(self.shrink.unwrap_or(1).max(1))).max(1)
+            (k.base * u64::from(self.scale) / u64::from(self.shrink.unwrap_or(1).max(1)))
+                .max(min_count(c))
         } else {
             k.base
         }
@@ -1215,5 +1245,16 @@ mod tests {
         };
         assert_eq!(s.count(RETAILER), 1);
         assert_eq!(s.count(USER), 10);
+        // Shrunk to nothing: the guaranteed entities (`Product1`, `User1`)
+        // still exist.
+        let tiny = WatDiv {
+            scale: 1,
+            seed: 0,
+            shrink: Some(100_000),
+        };
+        assert_eq!(tiny.count(PRODUCT), 2);
+        assert_eq!(tiny.count(USER), 2);
+        assert_eq!(tiny.count(RETAILER), 1);
+        assert_eq!(tiny.count(REVIEW), 1);
     }
 }

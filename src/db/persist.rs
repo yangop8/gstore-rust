@@ -1323,24 +1323,16 @@ impl Database {
         } else {
             rocks_layout::migrate_legacy(dir, &rocks)?
         };
-        // A transaction a crash interrupted was undone by the open: the terms
-        // of what it had inserted are reclamation candidates.
-        let replayed = rocks.take_replayed();
         let mut db = Database::new(name);
         db.dict = dict;
         db.store = Backend::Rocks(rocks);
         db.named = named.into();
         db.home = Some(dir.to_path_buf());
         db.dir_lock = Some(lock);
-        if !replayed.is_empty() && db.reclaims_ids() {
-            for (space, id) in replayed {
-                let space = match space {
-                    crate::backend::rocks::TermSpace::Entity => Space::Entity,
-                    crate::backend::rocks::TermSpace::Literal => Space::Literal,
-                    crate::backend::rocks::TermSpace::Predicate => Space::Predicate,
-                };
-                db.reclaim.note(crate::dict::TermId { space, id });
-            }
+        // A transaction a crash interrupted was undone by the open: the terms
+        // of what it had inserted are reclamation candidates.
+        db.note_rocks_replayed();
+        if !db.reclaim.is_empty() && db.reclaims_ids() {
             db.flush_reclaim();
             db.commit_point()?;
         }
@@ -2085,6 +2077,27 @@ impl Database {
         dead
     }
 
+    /// RocksDB: the terms of the inserts a completed journal replay undid
+    /// (a rollback, or the retry finishing one a failure cut short — see
+    /// `RocksStore::take_replayed`) become reclamation candidates. Taken
+    /// at every call, so the store's buffer never holds more than the
+    /// replays since the last statement; dropped under
+    /// [`IdReclaim::Off`](super::IdReclaim::Off).
+    pub(super) fn note_rocks_replayed(&mut self) {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks() {
+            let replayed = rocks.take_replayed();
+            if self.id_reclaim == super::IdReclaim::Immediate {
+                for (space, id) in replayed {
+                    self.reclaim.note(crate::dict::TermId {
+                        space: rocks_layout::dict_space(space),
+                        id,
+                    });
+                }
+            }
+        }
+    }
+
     /// Stream mode: free the unreferenced terms `dead` inside the on-disk
     /// store, by id, under its writer gate ([`DiskTriples::free_ids`]); returns
     /// how many were freed. A refusal or a write error breaks the store and is
@@ -2451,6 +2464,15 @@ mod rocks_layout {
             Space::Entity => TermSpace::Entity,
             Space::Literal => TermSpace::Literal,
             Space::Predicate => TermSpace::Predicate,
+        }
+    }
+
+    /// The dictionary space of a RocksDB term space.
+    pub(super) fn dict_space(space: TermSpace) -> Space {
+        match space {
+            TermSpace::Entity => Space::Entity,
+            TermSpace::Literal => Space::Literal,
+            TermSpace::Predicate => Space::Predicate,
         }
     }
 

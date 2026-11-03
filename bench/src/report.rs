@@ -758,26 +758,60 @@ pub const END: &str = "<!-- /gstore-bench report -->";
 /// Regenerate every marked region of `doc` with `render` (which receives the
 /// region's arguments). Returns the new document and the arguments of the
 /// regions whose content changed.
+///
+/// A marker counts only where it starts a line (after optional spaces) and
+/// outside a fenced code block (```` ``` ```` or `~~~`): text that shows
+/// the marker syntax — in a code span, a table cell, a fenced example — is
+/// left alone. The closing marker is the first one that starts a line
+/// after the opening one (or follows it on the same line).
 pub fn splice(
     doc: &str,
     render: &mut dyn FnMut(&[String]) -> Result<String, String>,
 ) -> Result<(String, Vec<String>), String> {
     let mut out = String::with_capacity(doc.len());
     let mut changed = Vec::new();
-    let mut rest = doc;
-    while let Some(start) = rest.find(BEGIN) {
-        let open_end = rest[start..]
+    // `doc[..copied]` is in `out` already.
+    let mut copied = 0;
+    let mut fence: Option<&str> = None;
+    let mut lines = line_offsets(doc);
+    while let Some((at, line)) = lines.next() {
+        let trimmed = line.trim_start();
+        if let Some(f) = fence {
+            if trimmed.starts_with(f) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(f) = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f)) {
+            fence = Some(f);
+            continue;
+        }
+        if !trimmed.starts_with(BEGIN) {
+            continue;
+        }
+        let start = at + (line.len() - trimmed.len());
+        let open_end = trimmed
             .find("-->")
             .map(|e| start + e + 3)
             .ok_or("an unterminated `<!-- gstore-bench report` marker")?;
-        let args_text = rest[start + BEGIN.len()..open_end - 3].trim().to_string();
-        let close = rest[open_end..]
-            .find(END)
-            .map(|e| open_end + e)
-            .ok_or_else(|| format!("no `{END}` after `{BEGIN}{args_text} -->`"))?;
-        if rest[open_end..close].contains(BEGIN) {
-            return Err(format!("nested markers after `{BEGIN}{args_text} -->`"));
-        }
+        let args_text = doc[start + BEGIN.len()..open_end - 3].trim().to_string();
+        let line_end = at + line.len();
+        let close = match doc[open_end..line_end].find(END) {
+            Some(e) => Some(open_end + e),
+            None => loop {
+                let Some((at2, line2)) = lines.next() else {
+                    break None;
+                };
+                let t2 = line2.trim_start();
+                if t2.starts_with(END) {
+                    break Some(at2 + (line2.len() - t2.len()));
+                }
+                if t2.starts_with(BEGIN) {
+                    return Err(format!("nested markers after `{BEGIN}{args_text} -->`"));
+                }
+            },
+        };
+        let close = close.ok_or_else(|| format!("no `{END}` after `{BEGIN}{args_text} -->`"))?;
         let args: Vec<String> = args_text.split_whitespace().map(str::to_string).collect();
         let mut body = render(&args)?;
         while body.ends_with("\n\n") {
@@ -787,14 +821,23 @@ pub fn splice(
             body.push('\n');
         }
         let fresh = format!("\n{body}");
-        if rest[open_end..close] != fresh {
+        if doc[open_end..close] != fresh {
             changed.push(args_text.clone());
         }
-        out.push_str(&rest[..open_end]);
+        out.push_str(&doc[copied..open_end]);
         out.push_str(&fresh);
         out.push_str(END);
-        rest = &rest[close + END.len()..];
+        copied = close + END.len();
     }
-    out.push_str(rest);
+    out.push_str(&doc[copied..]);
     Ok((out, changed))
+}
+
+/// The lines of `doc` (each with its line break) and their byte offsets.
+fn line_offsets(doc: &str) -> impl Iterator<Item = (usize, &str)> {
+    doc.split_inclusive('\n').scan(0, |at, line| {
+        let here = *at;
+        *at += line.len();
+        Some((here, line))
+    })
 }

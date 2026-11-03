@@ -526,6 +526,25 @@ pub(crate) struct ReadSnapshot {
     pfn: Option<crate::pfn::PfnCaller>,
 }
 
+impl ReadSnapshot {
+    /// The subject count, class statistics and schema graph of the
+    /// snapshot's default graph (`/api monitor` and `schema` while a
+    /// transaction is open), in a read scope: `Err` on a read error.
+    pub(crate) fn class_stats(&self) -> Result<crate::db::ClassStats, String> {
+        let scope = ReadScope::enter();
+        let stats = match &self.store {
+            SnapStore::Mem(store) => crate::db::class_stats_of(&self.dict, store),
+            SnapStore::Disk(view) => view
+                .with_base(|base, _| crate::db::class_stats_of(&self.dict, &DiskSource::new(base)))
+                .map_err(|e| format!("reading the transaction's snapshot: {e:?}"))?,
+        };
+        match scope.take_error() {
+            Some(e) => Err(e),
+            None => Ok(stats),
+        }
+    }
+}
+
 /// The default graph of a [`ReadSnapshot`].
 pub(crate) enum SnapStore {
     /// An in-memory store (also a Materialize-mode on-disk database's
@@ -709,7 +728,25 @@ impl ReadSnapshot {
                         .as_ref()
                         .map(|c| cancel_bridge::forward(c, gate_cancel));
                     let src = DiskSource::new(base);
-                    let csr = || self.csr.get_or_build(epoch, || CsrGraph::build(&src));
+                    let preds = crate::dict::Space::Predicate.first_id()
+                        ..self.dict.id_limit(crate::dict::Space::Predicate);
+                    // The graph functions' CSR, built once for the snapshot:
+                    // a commit's drain stops the build (the gate's flag) as
+                    // it stops the evaluation, and a read error fails it —
+                    // nothing is cached then (C2), the statement fails.
+                    let csr = || {
+                        self.csr.get_or_build(epoch, || {
+                            let scope = ReadScope::enter();
+                            let graph =
+                                CsrGraph::build_cancellable(&src, preds.clone(), gate_cancel);
+                            match scope.take_error() {
+                                Some(e) => Err(GStoreError::Database(format!(
+                                    "a read from the store failed while building the CSR: {e}"
+                                ))),
+                                None => graph,
+                            }
+                        })
+                    };
                     let eval = self
                         .configure(Evaluator::new(&self.dict, &src), &csr, pfn)
                         .with_cancel(Arc::clone(gate_cancel));
@@ -889,6 +926,11 @@ pub(crate) struct OpenTxn {
     /// Whether a `/tquery` update changed data — if so, the commit marks the
     /// database dirty (and saves it under the check_point policy).
     pub(crate) changed: bool,
+    /// The database's figures and mutation count at `/begin` — what
+    /// monitoring reports while the transaction is open (its writes are
+    /// visible to no other client).
+    pub(crate) begin_stats: crate::db::DbStats,
+    pub(crate) begin_generation: u64,
 }
 
 /// One loaded database plus its HTTP-layer bookkeeping, behind the per-db
@@ -943,15 +985,31 @@ pub(crate) struct DbCell {
     /// publishes them the next time the database is free.
     unpublished: AtomicBool,
     /// The bytes of the database's directory, measured when it was loaded
-    /// and at the end of every exclusive section (after a write and its
-    /// save), so `/api monitor`'s `diskUsed` never walks the directory on
-    /// its request path (where it would stall behind a save's fsync).
+    /// and after each exclusive section that changed the data or saved it
+    /// (once its guard is released: never while readers wait), so `/api
+    /// monitor`'s `diskUsed` never walks the directory on its request path
+    /// (where it would stall behind a save's fsync). A change no write
+    /// makes (a RocksDB background compaction) shows after the next one.
     disk_bytes: AtomicU64,
+    /// Which state of the slot `disk_bytes` was last asked to measure (see
+    /// [`publish`](Self::publish)).
+    disk_measured: Mutex<DiskMeasure>,
     /// The layout the database persists as (fixed for the slot's life).
     pub(crate) layout: StorageKind,
     /// How an on-disk database answers queries (`None` for the other
     /// layouts; fixed for the slot's life).
     pub(crate) query_mode: Option<crate::db::DiskQueryMode>,
+}
+
+/// What a [`DbCell`]'s directory size was measured for.
+struct DiskMeasure {
+    /// The slot's mutation count and last save when the latest measurement
+    /// was asked for.
+    asked: (u64, u64),
+    /// The number of that request (they are numbered in the order asked).
+    seq: u64,
+    /// The number of the request whose result `disk_bytes` holds.
+    stored: u64,
 }
 
 /// The total size of the files under `dir`, in bytes (`0` when it cannot
@@ -1033,7 +1091,8 @@ impl std::ops::Deref for SlotRead<'_> {
 /// released, the database's figures are published for monitoring
 /// ([`DbCell::counters`]): every write section ends with a publish.
 pub(crate) struct SlotWrite<'a> {
-    guard: RwLockWriteGuard<'a, DbSlot>,
+    /// `Some` until dropped (released before the directory is measured).
+    guard: Option<RwLockWriteGuard<'a, DbSlot>>,
     cell: &'a DbCell,
     _held: HeldCell,
 }
@@ -1042,27 +1101,36 @@ impl std::ops::Deref for SlotWrite<'_> {
     type Target = DbSlot;
 
     fn deref(&self) -> &DbSlot {
-        &self.guard
+        self.guard.as_ref().expect("held until dropped")
     }
 }
 
 impl std::ops::DerefMut for SlotWrite<'_> {
     fn deref_mut(&mut self) -> &mut DbSlot {
-        &mut self.guard
+        self.guard.as_mut().expect("held until dropped")
     }
 }
 
 impl Drop for SlotWrite<'_> {
     fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
         // Not while unwinding: the slot may be half-way through a change
         // (the guard is poisoned) and reading it here could panic again. It
         // is marked instead: the next exclusive holder — the next writer, or
         // monitoring once the database is free — publishes.
         if std::thread::panicking() {
             self.cell.unpublished.store(true, Ordering::SeqCst);
-        } else {
-            self.cell.publish(&self.guard);
-            self.cell.unpublished.store(false, Ordering::SeqCst);
+            return;
+        }
+        let remeasure = self.cell.publish(&guard);
+        self.cell.unpublished.store(false, Ordering::SeqCst);
+        // The directory walk (a readdir and a stat per file) runs with the
+        // guard released.
+        drop(guard);
+        if let Some((dir, seq)) = remeasure {
+            self.cell.measure_dir(&dir, seq);
         }
     }
 }
@@ -1077,6 +1145,11 @@ impl DbCell {
             counters,
             unpublished: AtomicBool::new(false),
             disk_bytes: AtomicU64::new(dir_size(&slot.dir)),
+            disk_measured: Mutex::new(DiskMeasure {
+                asked: (slot.db.mutation_count(), slot.last_save),
+                seq: 0,
+                stored: 0,
+            }),
             layout: slot.db.storage(),
             query_mode: slot.db.disk_query_mode(),
             slot: RwLock::new(slot),
@@ -1118,7 +1191,7 @@ impl DbCell {
     pub(crate) fn write(&self) -> Result<SlotWrite<'_>, OpError> {
         let held = HeldCell::claim(self).ok_or_else(|| self.reentrant())?;
         Ok(SlotWrite {
-            guard: self.slot.write().unwrap_or_else(PoisonError::into_inner),
+            guard: Some(self.slot.write().unwrap_or_else(PoisonError::into_inner)),
             cell: self,
             _held: held,
         })
@@ -1134,17 +1207,45 @@ impl DbCell {
             Err(TryLockError::WouldBlock) => return None,
         };
         Some(SlotWrite {
-            guard,
+            guard: Some(guard),
             cell: self,
             _held: held,
         })
     }
 
-    /// Publish `slot`'s figures (its holder is exclusive, see [`DbCounters`]).
-    fn publish(&self, slot: &DbSlot) {
+    /// Publish `slot`'s figures (its holder is exclusive, see
+    /// [`DbCounters`]). Returns the directory to measure again (and what
+    /// for) when the data changed or was saved since it was last measured:
+    /// the caller walks it once the guard is released.
+    fn publish(&self, slot: &DbSlot) -> Option<(PathBuf, u64)> {
         publish_slot(&self.counters, slot);
-        if !slot.retired {
-            self.disk_bytes.store(dir_size(&slot.dir), Ordering::SeqCst);
+        if slot.retired {
+            return None;
+        }
+        let key = (slot.db.mutation_count(), slot.last_save);
+        let mut m = self
+            .disk_measured
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if m.asked == key {
+            return None;
+        }
+        m.asked = key;
+        m.seq += 1;
+        Some((slot.dir.clone(), m.seq))
+    }
+
+    /// Measure `dir` for request `seq` (see [`publish`](Self::publish)); a
+    /// measurement a later request's overtook is not stored.
+    fn measure_dir(&self, dir: &Path, seq: u64) {
+        let bytes = dir_size(dir);
+        let mut m = self
+            .disk_measured
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if seq > m.stored {
+            m.stored = seq;
+            self.disk_bytes.store(bytes, Ordering::SeqCst);
         }
     }
 
@@ -1175,13 +1276,13 @@ fn publish_slot(counters: &DbCounters, slot: &DbSlot) {
         counters.store(CounterSnapshot::default());
         return;
     }
-    let s = slot.db.stats();
+    let s = slot.committed_stats();
     counters.store(CounterSnapshot {
         triples: slot.committed_triple_num(),
         entities: s.entity_num as u64,
         literals: s.literal_num as u64,
         predicates: s.predicate_num as u64,
-        generation: slot.db.mutation_count(),
+        generation: slot.committed_generation(),
         last_save: slot.last_save,
         index_valid: s.index_valid,
         in_transaction: slot.txn.is_some(),
@@ -1348,6 +1449,29 @@ impl DbSlot {
         match &self.txn {
             Some(open) => open.snapshot.triple_num(),
             None => self.db.triple_num(),
+        }
+    }
+
+    /// The database's figures ([`Database::stats`]) of its committed state:
+    /// as of `/begin` while a transaction is open (whose writes no other
+    /// client may observe).
+    pub(crate) fn committed_stats(&self) -> crate::db::DbStats {
+        match &self.txn {
+            Some(open) => crate::db::DbStats {
+                in_transaction: true,
+                ..open.begin_stats.clone()
+            },
+            None => self.db.stats(),
+        }
+    }
+
+    /// The mutation count ([`Database::mutation_count`]) of the committed
+    /// state: as of `/begin` while a transaction is open — what statistics
+    /// of the committed state are cached under.
+    pub(crate) fn committed_generation(&self) -> u64 {
+        match &self.txn {
+            Some(open) => open.begin_generation,
+            None => self.db.mutation_count(),
         }
     }
 }
@@ -2011,6 +2135,32 @@ impl ApiInner {
             }
             None => Ok(false),
         }
+    }
+
+    /// [`retire_loaded`](Self::retire_loaded), saving the loaded copy first
+    /// when it holds writes not yet saved (check_point off): a rebuild that
+    /// then fails serves it again, from its directory, with every write it
+    /// acknowledged. A failed save keeps it loaded (and fails the request).
+    fn retire_loaded_saved(&self, name: &str) -> Result<bool, Resp> {
+        let Some(h) = locked(&self.state).dbs.remove(name) else {
+            return Ok(false);
+        };
+        let mut slot = match h.write() {
+            Ok(slot) => slot,
+            Err(e) => return Err(e.rest()),
+        };
+        if slot.dirty && !slot.retired {
+            if let Err(e) = slot.save() {
+                drop(slot);
+                locked(&self.state).dbs.insert(name.to_string(), h);
+                return Err(Resp::fail(
+                    500,
+                    &format!("build failed: saving the loaded database first failed: {e}"),
+                ));
+            }
+        }
+        slot.retire();
+        Ok(true)
     }
 }
 
@@ -3518,11 +3668,19 @@ impl ApiInner {
     /// loader ([`crate::bulk::build`]), which installs the new database
     /// crash-safely over `dir` and takes the directory's lock itself. So the
     /// loaded copy is retired first (closing its files and releasing its
-    /// handle on the directory), and this request's probe of the lock —
-    /// refusing a directory another process holds — is released before the
-    /// build starts. The result is then opened and served. A build that
-    /// fails leaves the previous database in place; a loaded one is served
-    /// again.
+    /// handle on the directory) — saved first when it holds acknowledged
+    /// writes not yet saved (check_point off) — and this request's probe of
+    /// the lock — refusing a directory another process holds — is released
+    /// before the build starts. The rule-directory lock is held through the
+    /// build (no `reasonManage` file operation runs while the install
+    /// replaces the rules). The result is then opened and served.
+    ///
+    /// A build that fails leaves the previous database in place (a loaded
+    /// one is served again, with every write it acknowledged) or, for a new
+    /// name, no directory. A build whose install committed but could not
+    /// finish its cleanup ([`BulkReport::warnings`](crate::bulk::BulkReport)
+    /// — the replaced layout or rules still there) is reported as failed and
+    /// not served: opening it might read what was left behind.
     fn rest_build_bulk(
         &self,
         name: &str,
@@ -3548,39 +3706,72 @@ impl ApiInner {
                 name: "request body",
             },
         };
+        // A body keeps its blank-node labels, as the snapshot layout's
+        // `Database::build_from_str` does (a file is scoped per document in
+        // both layouts): the same request stores the same terms whatever
+        // the layout.
+        let opts = match source {
+            RestBuildSource::File(_) => crate::parser::import::ImportOptions::strict(),
+            RestBuildSource::Text(_) => crate::parser::import::ImportOptions {
+                blank_nodes: crate::parser::import::BlankNodes::Keep,
+                ..crate::parser::import::ImportOptions::strict()
+            },
+        };
         match DirLock::acquire_existing(dir) {
             Ok(probe) => drop(probe),
             Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
         }
-        let was_loaded = match self.retire_loaded(name) {
+        let existed = dir.exists();
+        let was_loaded = match self.retire_loaded_saved(name) {
             Ok(loaded) => loaded,
-            Err(e) => return e.rest(),
+            Err(r) => return r,
         };
-        let built = crate::bulk::build(
-            dir,
-            name,
-            input,
-            &crate::parser::import::ImportOptions::strict(),
-            &mut (),
-            bulk_target(layout),
-            &self.config().bulk_options(),
-        );
-        if let Err(e) = built {
-            if was_loaded {
-                // The previous database is intact: serve it again.
-                if let Ok(db) = self.open_db(dir) {
-                    let mut st = locked(&self.state);
-                    let slot = DbSlot::handle(
-                        db,
-                        dir.to_path_buf(),
-                        false,
-                        &st.load_policy,
-                        &st.query_settings,
-                    );
-                    st.dbs.insert(name.to_string(), slot);
+        let built = {
+            let _rules = RuleStore::dir(dir).lock();
+            crate::bulk::build(
+                dir,
+                name,
+                input,
+                &opts,
+                &mut (),
+                bulk_target(layout),
+                &self.config().bulk_options(),
+            )
+        };
+        let report = match built {
+            Ok(report) => report,
+            Err(e) => {
+                if was_loaded {
+                    // The previous database is intact: serve it again.
+                    if let Ok(db) = self.open_db(dir) {
+                        let mut st = locked(&self.state);
+                        let slot = DbSlot::handle(
+                            db,
+                            dir.to_path_buf(),
+                            false,
+                            &st.load_policy,
+                            &st.query_settings,
+                        );
+                        st.dbs.insert(name.to_string(), slot);
+                    }
+                } else if !existed {
+                    // A new name: the build made the directory (and its
+                    // lock file); a failed build leaves none behind, as the
+                    // snapshot layout's and `/api build` do.
+                    let _ = fs::remove_dir_all(dir);
                 }
+                return Resp::fail(400, &format!("build failed: {e}"));
             }
-            return Resp::fail(400, &format!("build failed: {e}"));
+        };
+        if !report.warnings.is_empty() {
+            let warnings = report.warnings.join("; ");
+            crate::gs_warn!("REST /build of '{name}': the install did not finish: {warnings}");
+            return Resp::fail(
+                500,
+                &format!(
+                    "database '{name}' was built, but its install did not finish ({warnings});                      it is not loaded: remove what was left behind, then load it"
+                ),
+            );
         }
         match self.open_db(dir) {
             Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
@@ -4058,6 +4249,8 @@ impl ApiInner {
                 ))
             }
         };
+        let begin_stats = slot.db.stats();
+        let begin_generation = slot.db.mutation_count();
         if let Err(e) = slot.db.begin() {
             return Err(OpError::new(
                 OpErrorKind::Failed,
@@ -4104,6 +4297,8 @@ impl ApiInner {
             tid,
             snapshot,
             changed: false,
+            begin_stats,
+            begin_generation,
         });
         drop(slot);
         append_log(
@@ -4358,12 +4553,17 @@ impl ApiInner {
         };
         let result = match slot.as_mut().filter(|s| !s.retired) {
             Some(slot) => {
-                let open = slot.txn.take();
+                // Let the begin-time snapshot go first: an in-memory one
+                // shares the dictionary's interners, and a commit that frees
+                // a term would copy a shared interner whole just to drop the
+                // copy right after (readers holding the snapshot keep their
+                // own reference).
+                let changed = slot.txn.take().is_some_and(|o| o.changed);
                 Some(if commit {
                     // `Database::commit` keeps the writes even when flushing
                     // its redo log fails, so the data changed either way.
                     let committed = slot.db.commit();
-                    let warning = if open.is_some_and(|o| o.changed) {
+                    let warning = if changed {
                         slot.wrote(self.save_writes())
                     } else {
                         None
@@ -8396,6 +8596,282 @@ mod tests {
             .to_string();
         assert!(e.contains("page 7 checksum"), "{e}");
         assert!(snap.query("ASK { ?s ?p ?o }", None).is_ok());
+    }
+
+    // ---- Round 4 review ---------------------------------------------------
+
+    /// Start an `ApiServer` with the check_point policy `check_point`.
+    fn start_cp(tag: &str, check_point: bool) -> (Arc<ApiServer>, SocketAddr) {
+        let root = tmp_root(tag);
+        let server = Arc::new(
+            ApiServer::bind(&root, "root", "127.0.0.1:0")
+                .expect("bind")
+                .with_check_point(check_point),
+        );
+        let addr = server.local_addr().expect("addr");
+        let s2 = Arc::clone(&server);
+        std::thread::spawn(move || s2.serve_forever());
+        (server, addr)
+    }
+
+    /// A REST `/build` in the disk or RocksDB layout that fails (a body that
+    /// does not parse) keeps every write the loaded database acknowledged
+    /// but had not saved yet (check_point off): it is saved before it is
+    /// retired, so the copy served again has them. They used to be lost.
+    /// A failed build of a new name leaves no directory behind.
+    #[test]
+    fn a_failed_rest_bulk_build_keeps_the_acknowledged_writes() {
+        let (server, addr) = start_cp("bulk_build_keeps", false);
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let ask = "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }";
+        assert_eq!(
+            post(
+                "/build?db_name=x",
+                "<http://ex/a> <http://ex/p> <http://ex/b> ."
+            )
+            .0,
+            200
+        );
+        let (s, b) = post(
+            "/update?db_name=x",
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        );
+        assert_eq!(s, 200, "{b}");
+        assert!(post("/sparql?db_name=x", ask).1.contains("true"));
+        let (s, b) = post("/build?db_name=x&layout=disk", "this is not rdf");
+        assert_eq!(s, 400, "{b}");
+        let (s, b) = post("/sparql?db_name=x", ask);
+        assert_eq!(s, 200, "{b}");
+        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+
+        let (s, b) = post("/build?db_name=fresh&layout=disk", "this is not rdf");
+        assert_eq!(s, 400, "{b}");
+        assert!(
+            !server.root_dir().join("fresh.db").exists(),
+            "a failed build of a new name leaves no directory"
+        );
+        server.shutdown();
+    }
+
+    /// A REST `/build` from a request body stores its blank-node labels as
+    /// written in every layout (the disk layout used to rewrite `_:alice`
+    /// to `_:<scope>_alice`, the snapshot layout keeping it).
+    #[test]
+    fn rest_builds_from_a_body_keep_blank_node_labels_in_every_layout() {
+        let (server, addr) = start("bulk_build_bnodes");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        for layout in ["snapshot", "disk"] {
+            let (s, b) = post(
+                &format!("/build?db_name=b_{layout}&layout={layout}"),
+                "_:alice <http://ex/p> \"x\" .",
+            );
+            assert_eq!(s, 200, "{layout}: {b}");
+            let (s, b) = post(
+                &format!("/sparql?db_name=b_{layout}"),
+                "SELECT ?s WHERE { ?s ?p ?o }",
+            );
+            assert_eq!(s, 200, "{layout}: {b}");
+            assert!(b.contains("\"value\":\"alice\""), "{layout}: {b}");
+        }
+        server.shutdown();
+    }
+
+    /// A REST bulk rebuild whose install committed but could not finish its
+    /// cleanup (here: the old rules cannot be removed) is reported as failed
+    /// and not served — it used to answer `200 built` and serve whatever
+    /// the leftovers made of it.
+    #[test]
+    fn a_rest_bulk_build_with_an_unfinished_install_is_not_served() {
+        let (server, addr) = start("bulk_build_warnings");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        assert_eq!(post("/build?db_name=w&layout=disk", data).0, 200);
+        // A file where the rule directory belongs cannot be removed as one.
+        fs::write(
+            server.root_dir().join("w.db").join(RULE_DIR),
+            "not a directory",
+        )
+        .unwrap();
+        let (s, b) = post("/build?db_name=w&layout=disk", data);
+        assert_eq!(s, 500, "{b}");
+        assert!(b.contains("install did not finish"), "{b}");
+        assert!(
+            !locked(&server.inner.state).dbs.contains_key("w"),
+            "not served"
+        );
+        server.shutdown();
+    }
+
+    /// `/api monitor` while a transaction is open reports the committed
+    /// state: none of the transaction's classes, subjects or terms (they
+    /// used to show — to any client allowed to monitor — and a rollback
+    /// then took back classes that had never existed). (Its own database
+    /// name: the statistics cache is keyed by name, process-wide.)
+    #[test]
+    fn monitoring_shows_no_uncommitted_writes() {
+        const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+        let (server, addr) = start("monitor_txn");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let monitor = || {
+            post(
+                "/api",
+                &api_body(r#""operation":"monitor","db_name":"montxn""#),
+            )
+            .1
+        };
+        assert_eq!(
+            post(
+                "/build?db_name=montxn",
+                &format!("<http://ex/a> {TYPE} <http://ex/C> .")
+            )
+            .0,
+            200
+        );
+        let before = monitor();
+        assert!(before.contains("\"entityNum\":2"), "{before}");
+        let (_, b) = post("/begin?db_name=montxn", "");
+        let tid = tid_of(&b);
+        let (s, b) = post(
+            &format!("/tquery?tid={tid}"),
+            &format!("INSERT DATA {{ <http://ex/b> {TYPE} <http://ex/D> . <http://ex/c> {TYPE} <http://ex/D> }}"),
+        );
+        assert_eq!(s, 200, "{b}");
+        for _ in 0..3 {
+            let during = monitor();
+            assert!(during.contains("\"entityNum\":2"), "{during}");
+            assert!(during.contains("\"subjectNum\":1"), "{during}");
+            assert!(!during.contains("http://ex/D"), "{during}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (_, schema) = post(
+            "/api",
+            &api_body(r#""operation":"schema","db_name":"montxn""#),
+        );
+        assert!(!schema.contains("http://ex/D"), "{schema}");
+        assert_eq!(post(&format!("/commit?tid={tid}"), "").0, 200);
+        let after = monitor();
+        assert!(after.contains("\"entityNum\":5"), "{after}");
+        assert!(after.contains("http://ex/D"), "{after}");
+        server.shutdown();
+    }
+
+    /// The commit of a transaction that frees a term of an in-memory
+    /// database lets the begin-time snapshot go first: the dictionary's
+    /// interners are no longer shared, so the free copies none of them (it
+    /// used to copy the whole entity interner, then drop the snapshot).
+    #[test]
+    fn a_commit_that_frees_terms_copies_no_interner() {
+        let (server, addr) = start_cp("commit_no_copy", false);
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/x> .\n<http://ex/b> <http://ex/p> <http://ex/c> .";
+        assert_eq!(post("/build?db_name=m", data).0, 200);
+        let h = served(&server, "m");
+        let (_, b) = post("/begin?db_name=m", "");
+        let tid = tid_of(&b);
+        let (s, b) = post(
+            &format!("/tquery?tid={tid}"),
+            "DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/x> }",
+        );
+        assert_eq!(s, 200, "{b}");
+        let before = h.read().unwrap().db.dict().interner_addrs();
+        let entities = h.read().unwrap().db.stats().entity_num;
+        assert_eq!(post(&format!("/commit?tid={tid}"), "").0, 200);
+        let slot = h.read().unwrap();
+        assert_eq!(slot.db.stats().entity_num, entities - 2, "a and x freed");
+        assert_eq!(
+            slot.db.dict().interner_addrs()[0],
+            before[0],
+            "the entity interner was not copied"
+        );
+        drop(slot);
+        server.shutdown();
+    }
+
+    /// An exclusive section that changed nothing does not walk the
+    /// database's directory (it used to, at the end of every one, with the
+    /// guard held); one that changes the data measures it again.
+    #[test]
+    fn only_a_section_that_changes_the_data_measures_the_directory() {
+        let (server, addr) = start("disk_measure");
+        build_two(&addr, "dm");
+        let h = served(&server, "dm");
+        let dir = locked(&server.inner.state).db_dir("dm");
+        let measured = h.disk_bytes();
+        // Grow the directory behind the server's back.
+        fs::write(dir.join("extra.bin"), vec![0u8; 4096]).unwrap();
+        drop(h.write().unwrap());
+        assert_eq!(h.disk_bytes(), measured, "nothing changed: not measured");
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/update?db_name=dm",
+            Some(&basic("root", "root")),
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        ));
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(h.disk_bytes(), dir_size(&dir), "measured after the change");
+        assert!(h.disk_bytes() >= measured + 4096);
+        server.shutdown();
+    }
+
+    /// A graph-function read on an on-disk snapshot whose CSR build hits a
+    /// read error fails — and caches nothing, so the next one fails too (it
+    /// used to cache the partial graph and answer the next read from it).
+    #[test]
+    fn a_disk_snapshot_caches_no_csr_built_from_a_failed_read() {
+        use crate::db::{DiskQueryMode, OpenOptions};
+        let root = tmp_root("snap_csr_error");
+        fs::create_dir_all(&root).unwrap();
+        let nt = root.join("d.nt");
+        fs::write(
+            &nt,
+            "<http://ex/a> <http://ex/p> <http://ex/b> .\n<http://ex/b> <http://ex/p> <http://ex/c> .\n",
+        )
+        .unwrap();
+        let dir = root.join("d.db");
+        Database::build_disk(&dir, &[&nt]).unwrap();
+        let kv = dir.join("kvstore.kv");
+        let pager = crate::kvstore::Pager::open(&kv, 8).unwrap();
+        let pages = [
+            pager.root(crate::kvstore::format::SPO),
+            pager.root(crate::kvstore::format::POS),
+        ];
+        drop(pager);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut f = fs::OpenOptions::new().write(true).open(&kv).unwrap();
+            for page in pages {
+                f.seek(SeekFrom::Start(page * crate::kvstore::PAGE_SIZE as u64))
+                    .unwrap();
+                f.write_all(&[0xAB; crate::kvstore::PAGE_SIZE]).unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+        let stream = OpenOptions::new().with_disk_query_mode(DiskQueryMode::Stream);
+        let db = Database::open_with(&dir, &stream).unwrap();
+        let snap = ReadSnapshot::capture(&db).unwrap();
+        assert!(matches!(snap.store, SnapStore::Disk(_)));
+        let q = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/c>, true, {}) AS ?l) WHERE {}";
+        for attempt in 0..2 {
+            let r = snap.query(q, None);
+            assert!(r.is_err(), "attempt {attempt}: {r:?}");
+            assert!(snap.csr.cached_generation().is_none(), "nothing cached");
+        }
     }
 
     #[test]

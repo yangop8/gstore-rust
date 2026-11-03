@@ -10,7 +10,7 @@ use crate::gates::{evaluate, retry_targets, self_check, verdict, Thresholds, Ver
 use crate::hash::hex;
 use crate::report;
 use crate::runner::conc::{ConcSettings, MixedSettings};
-use crate::runner::{profile, run_child, ChildRequest, RunOptions, Runner};
+use crate::runner::{profile, run_child, ChildRequest, Profile, RunOptions, Runner};
 use crate::schema::BenchResult;
 use crate::workload::{generate_to, WorkloadSpec};
 
@@ -688,21 +688,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         };
         let mut o = usage(run_options(a, &default_profile))?;
         if !has_profile && !explicit_spec {
-            o.profile.spec = baseline.workload.spec.clone();
-        }
-        if !has_profile && !explicit_spec && !explicit_extra {
-            for x in &baseline.extra_workloads {
-                let spec = &x.workload.spec;
-                match o
-                    .profile
-                    .extra
-                    .iter_mut()
-                    .find(|s| s.family() == spec.family())
-                {
-                    Some(s) => *s = spec.clone(),
-                    None => o.profile.extra.push(spec.clone()),
-                }
-            }
+            baseline_workloads(&mut o.profile, &baseline, explicit_extra);
         }
         if !has_profile && !explicit_backends {
             o.profile.backends = backends_of(&baseline.runs);
@@ -1034,9 +1020,59 @@ fn cmd_calibrate(a: &mut Args) -> CmdResult {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The workloads a `check` measures when its options name none: the
+/// baseline's main workload and, unless `--extra` chose them,
+/// its extra ones plus the profile's extras of the families the baseline
+/// lacks (measured as new). A profile extra of the main workload's family
+/// goes: a result holds each workload once (a baseline whose main workload
+/// is the WatDiv-like one used to be refused as "measured twice").
+fn baseline_workloads(p: &mut Profile, baseline: &BenchResult, explicit_extra: bool) {
+    p.spec = baseline.workload.spec.clone();
+    if explicit_extra {
+        return;
+    }
+    let main = p.spec.family().to_string();
+    p.extra.retain(|s| s.family() != main);
+    for x in &baseline.extra_workloads {
+        let spec = &x.workload.spec;
+        match p.extra.iter_mut().find(|s| s.family() == spec.family()) {
+            Some(s) => *s = spec.clone(),
+            None => p.extra.push(spec.clone()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A baseline whose main workload is the WatDiv-like one is measured
+    /// as such, without the profile's WatDiv-like extra; a LUBM-like one
+    /// keeps the profile's extra (new) and takes the baseline's extras.
+    #[test]
+    fn check_measures_the_baseline_workloads_once_each() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut base = BenchResult::load(&root.join("baselines/smoke.json")).unwrap();
+        let smoke = profile("smoke").unwrap();
+        assert_eq!(smoke.extra, vec![WorkloadSpec::watdiv(1, 0)]);
+
+        let mut p = smoke.clone();
+        baseline_workloads(&mut p, &base, false);
+        assert_eq!(p.spec.family(), "lubm");
+        assert_eq!(p.extra.len(), 1);
+        assert_eq!(p.extra[0].family(), "watdiv");
+
+        base.workload.spec = WorkloadSpec::watdiv(1, 0);
+        base.extra_workloads.clear();
+        let mut p = smoke.clone();
+        baseline_workloads(&mut p, &base, false);
+        assert_eq!(p.spec, WorkloadSpec::watdiv(1, 0));
+        assert!(p.extra.is_empty(), "{:?}", p.extra);
+        // `--extra` given: the caller's choice stands.
+        let mut p = smoke.clone();
+        baseline_workloads(&mut p, &base, true);
+        assert_eq!(p.extra, vec![WorkloadSpec::watdiv(1, 0)]);
+    }
 
     #[test]
     fn args_scanner() {

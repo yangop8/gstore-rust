@@ -835,6 +835,35 @@ impl ConcurrentDb {
     }
 }
 
+impl Drop for ConcurrentDb {
+    /// A Stream-mode database defers each free while a dictionary pin older
+    /// than its candidacy lives, and this wrapper's own snapshots (`base`
+    /// above all) pin it for the wrapper's whole life: let them go, then run
+    /// the frees nothing holds any more and make them durable. A snapshot a
+    /// reader still holds keeps its ids; their frees are then lost with the
+    /// database, as at a restart (`gcompact --reclaim` finds them).
+    fn drop(&mut self) {
+        let Ok(db) = self.writer.get_mut() else {
+            // A writer panicked mid-change: touch nothing more.
+            return;
+        };
+        if !db.has_deferred_frees() {
+            return;
+        }
+        let empty = Arc::new(Snapshot::from_db(&Database::new(db.name()), 0));
+        if let Ok(current) = self.current.get_mut() {
+            *current = Arc::clone(&empty);
+        }
+        self.base = empty;
+        if let Err(e) = db.retry_deferred_frees() {
+            crate::gs_warn!(
+                "database '{}': freeing deferred term ids failed: {e}",
+                db.name()
+            );
+        }
+    }
+}
+
 /// An optimistic transaction handle. Buffers writes against a captured snapshot
 /// and applies them atomically on [`commit`](Txn::commit), or discards them if
 /// dropped/aborted.

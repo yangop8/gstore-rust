@@ -750,3 +750,59 @@ fn gbuild_disk_uses_the_bulk_build() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `gbuild` honours `[system] id_reclaim` of `./conf/conf.ini`: with `off`
+/// a new disk database is version 1 (`GSTOREKV`, which binaries older than
+/// Phase 6 open), bulk or incremental, by `--disk` or by `default_layout`;
+/// with `on` (the default) version 2 (`GSTOREK2`). It used to apply only
+/// `GSTORE_ID_RECLAIM`, and built version 2 regardless of conf.ini.
+#[test]
+fn gbuild_honours_the_id_reclaim_of_conf_ini() {
+    let base = tmp("cli_reclaim_conf");
+    let gbuild = env!("CARGO_BIN_EXE_gbuild");
+    std::fs::write(
+        base.join("d.nt"),
+        "<http://e/s> <http://e/p> <http://e/o> .\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(base.join("conf")).unwrap();
+    let conf = |text: &str| std::fs::write(base.join("conf/conf.ini"), text).unwrap();
+    let build = |args: &[&str]| {
+        let out = Command::new(gbuild)
+            .args(args)
+            .current_dir(&base)
+            .env_remove("GSTORE_ID_RECLAIM")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    let magic = |db: &str| {
+        let bytes = std::fs::read(base.join(format!("{db}.db/kvstore.kv"))).unwrap();
+        String::from_utf8_lossy(&bytes[0..8]).into_owned()
+    };
+    conf("[system]\nid_reclaim=off\n[storage]\ndefault_layout=disk\n");
+    build(&["--disk", "bulk_off", "d.nt"]);
+    build(&["--disk", "--incremental", "inc_off", "d.nt"]);
+    build(&["layout_off", "d.nt"]);
+    for db in ["bulk_off", "inc_off", "layout_off"] {
+        assert_eq!(
+            magic(db),
+            "GSTOREKV",
+            "{db}: id_reclaim=off gives version 1"
+        );
+        assert_eq!(
+            Database::open(base.join(format!("{db}.db")))
+                .unwrap()
+                .triple_num(),
+            1
+        );
+    }
+    conf("[system]\nid_reclaim=on\n");
+    build(&["--disk", "bulk_on", "d.nt"]);
+    assert_eq!(
+        magic("bulk_on"),
+        "GSTOREK2",
+        "id_reclaim=on gives version 2"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -36,6 +36,7 @@
 //! `[system] id_reclaim`), with the environment variable [`ENV_ID_RECLAIM`]
 //! (`on` / `off`) on top.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -165,6 +166,74 @@ impl Candidates {
     }
 }
 
+/// Candidates whose free waits (see [`Database::ready_frees`]): on a
+/// Stream-mode database, for the dictionary's pins; on any layout, after a
+/// read error stopped the check of whether they are still referenced. Each
+/// carries the stamp of its latest candidacy, from the dictionary's pin
+/// clock ([`Dictionary::pin_clock`](crate::dict::Dictionary::pin_clock)): a
+/// pin taken before that stamp may have read the id while a triple still
+/// used it, one taken after cannot. Kept ordered by stamp, so finding the
+/// ones no live pin predates reads nothing else.
+#[derive(Debug, Default)]
+pub(crate) struct Deferred {
+    stamp_of: HashMap<TermId, u64>,
+    by_stamp: BTreeSet<(u64, TermId)>,
+}
+
+impl Deferred {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.stamp_of.is_empty()
+    }
+
+    /// How many candidates wait.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.stamp_of.len()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.stamp_of.clear();
+        self.by_stamp.clear();
+    }
+
+    /// `t` is a candidate again as of `stamp` (a later candidacy replaces an
+    /// earlier one: the id may have been used again in between).
+    fn defer(&mut self, t: TermId, stamp: u64) {
+        if let Some(old) = self.stamp_of.insert(t, stamp) {
+            self.by_stamp.remove(&(old, t));
+        }
+        self.by_stamp.insert((stamp, t));
+    }
+
+    /// Put back candidates [`take_ready`](Self::take_ready) handed out whose
+    /// check could not finish: they stay ready (no pin taken since can
+    /// predate them), unless a newer candidacy is already recorded.
+    fn requeue(&mut self, ids: Vec<TermId>) {
+        for t in ids {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.stamp_of.entry(t) {
+                e.insert(0);
+                self.by_stamp.insert((0, t));
+            }
+        }
+    }
+
+    /// Take the candidates stamped before `oldest_pin` (every one when no
+    /// pin is alive), sorted.
+    fn take_ready(&mut self, oldest_pin: Option<u64>) -> Vec<TermId> {
+        let mut ready = Vec::new();
+        while let Some(&(stamp, t)) = self.by_stamp.first() {
+            if oldest_pin.is_some_and(|p| stamp >= p) {
+                break;
+            }
+            self.by_stamp.pop_first();
+            self.stamp_of.remove(&t);
+            ready.push(t);
+        }
+        ready.sort_unstable();
+        ready
+    }
+}
+
 /// The id spaces of a database (see [`Database::id_space_stats`]); each
 /// array is `[entity, literal, predicate]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +295,11 @@ impl Database {
     /// candidates nothing references any more (inside one they wait for the
     /// commit). A persistence failure is reported at the next commit point.
     pub(super) fn flush_reclaim(&mut self) {
-        if self.txn.is_some() || (self.reclaim.is_empty() && self.reclaim_deferred.is_empty()) {
+        if self.txn.is_some() {
+            return;
+        }
+        self.note_rocks_replayed();
+        if self.reclaim.is_empty() && self.reclaim_deferred.is_empty() {
             return;
         }
         if !self.reclaims_ids() {
@@ -234,35 +307,100 @@ impl Database {
             self.reclaim_deferred.clear();
             return;
         }
-        let mut cands = self.reclaim.take();
-        if !self.reclaim_deferred.is_empty() {
-            cands.append(&mut self.reclaim_deferred);
-            cands.sort_unstable();
-            cands.dedup();
+        let cands = self.reclaim.take();
+        let ready = self.ready_frees(cands);
+        if let Some(dead) = self.dead_or_requeue(ready) {
+            self.free_dead(dead, false);
         }
-        let dead = self.dead_of(cands);
-        self.free_dead(dead, false);
     }
 
     /// At commit (the transaction just closed): the transaction's candidates
     /// that nothing references in the committed state.
     pub(super) fn committed_dead(&mut self) -> Vec<TermId> {
+        self.note_rocks_replayed();
         if !self.reclaims_ids() {
             self.reclaim.clear();
+            self.reclaim_deferred.clear();
             return Vec::new();
         }
-        let mut cands = self.reclaim.take();
-        if !self.reclaim_deferred.is_empty() {
-            cands.append(&mut self.reclaim_deferred);
-            cands.sort_unstable();
-            cands.dedup();
+        let cands = self.reclaim.take();
+        let ready = self.ready_frees(cands);
+        self.dead_or_requeue(ready).unwrap_or_default()
+    }
+
+    /// Whether frees wait (see [`Deferred`]): for the dictionary's pins, or
+    /// to be checked again after a read error.
+    pub(crate) fn has_deferred_frees(&self) -> bool {
+        !self.reclaim_deferred.is_empty()
+    }
+
+    /// Run the frees that wait and nothing holds any more (see
+    /// [`Deferred`]), then a commit point — what a `ConcurrentDb` does when
+    /// it is dropped, its snapshots' pins gone. Nothing inside a
+    /// transaction.
+    pub(crate) fn retry_deferred_frees(&mut self) -> Result<()> {
+        if self.txn.is_some() || self.reclaim_deferred.is_empty() {
+            return Ok(());
         }
-        self.dead_of(cands)
+        self.flush_reclaim();
+        self.commit_point()
+    }
+
+    /// The candidates whose check and free may run now, from the
+    /// statement's (or transaction's) `cands` and the deferred ones.
+    ///
+    /// A Stream-mode database frees an id in the on-disk dictionary every
+    /// clone shares, so the free must wait for each pin taken before the
+    /// id's candidacy: such a reader may have seen the id in use. `cands`
+    /// join the deferred ones, stamped now, and come back those no live pin
+    /// predates — found without reading the store, so a database held by a
+    /// long-lived pin (a `ConcurrentDb`'s snapshots) pays per statement for
+    /// its own candidates only, not for the backlog. A pin taken after a
+    /// candidacy does not hold it back: that reader never saw the id used
+    /// (any later use would have to be deleted again — a newer candidacy).
+    ///
+    /// Other layouts keep a pinned id retired in the in-memory dictionary
+    /// instead (see [`free_dead`](Self::free_dead)): every candidate is
+    /// ready, with any put back after a read error.
+    fn ready_frees(&mut self, cands: Vec<TermId>) -> Vec<TermId> {
+        let oldest_pin = if self.store.as_disk().is_some() {
+            self.dict.oldest_pin()
+        } else {
+            None
+        };
+        if self.reclaim_deferred.is_empty() && oldest_pin.is_none() {
+            return cands;
+        }
+        if !cands.is_empty() {
+            let stamp = self.dict.pin_clock();
+            for t in cands {
+                self.reclaim_deferred.defer(t, stamp);
+            }
+        }
+        self.reclaim_deferred.take_ready(oldest_pin)
+    }
+
+    /// [`dead_of`](Self::dead_of) `ready`; when a read failed, `None`, and
+    /// the candidates wait for the next statement's check instead of being
+    /// dropped (they would stay allocated until `gcompact --reclaim`).
+    fn dead_or_requeue(&mut self, ready: Vec<TermId>) -> Option<Vec<TermId>> {
+        if ready.is_empty() {
+            return Some(ready);
+        }
+        match self.dead_of(&ready) {
+            Some(dead) => Some(dead),
+            None => {
+                self.reclaim_deferred.requeue(ready);
+                None
+            }
+        }
     }
 
     /// Whether term `t` is still used: by the default graph (the `has_*`
     /// probes answer `true` on a read error) or the named graphs.
     fn term_referenced(&self, t: TermId) -> bool {
+        #[cfg(test)]
+        test_hooks::probed();
         match t.space {
             Space::Predicate => self.named.pred_refs(t.id) > 0 || self.store.has_predicate(t.id),
             Space::Entity | Space::Literal => {
@@ -274,22 +412,25 @@ impl Database {
     }
 
     /// The candidates nothing references (and, in memory, that still name a
-    /// term). Read in a scope of its own: a read error keeps the id.
-    pub(super) fn dead_of(&self, cands: Vec<TermId>) -> Vec<TermId> {
+    /// term). Read in a scope of its own: `None` when a read failed — some
+    /// probe answered "referenced", but be strict and free nothing of this
+    /// batch.
+    pub(super) fn dead_of(&self, cands: &[TermId]) -> Option<Vec<TermId>> {
         let scope = ReadScope::enter();
         let backed = self.dict.is_disk_backed();
         let dead: Vec<TermId> = cands
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|&t| {
                 (backed || self.dict.resolve(t.space, t.id).is_some()) && !self.term_referenced(t)
             })
             .collect();
+        #[cfg(test)]
+        test_hooks::maybe_fail_read();
         if scope.take_error().is_some() {
-            // Some probe failed: it answered "referenced", but be strict and
-            // free nothing of this batch.
-            return Vec::new();
+            return None;
         }
-        dead
+        Some(dead)
     }
 
     /// Free the unreferenced ids `dead` on this database's layout (see the
@@ -300,14 +441,9 @@ impl Database {
         if dead.is_empty() {
             return 0;
         }
-        // Stream mode: the backend frees by id. A clone sharing the on-disk
-        // dictionary (a snapshot) pins it: wait until it is gone, so an id it
-        // read never changes meaning under it.
+        // Stream mode: the backend frees by id; the candidates waited for
+        // the pins taken before them (see `ready_frees`).
         if self.store.as_disk().is_some() {
-            if self.dict.is_pinned() {
-                self.reclaim_deferred.extend(dead);
-                return 0;
-            }
             let n = self.stream_free(&dead);
             if n > 0 {
                 self.touched();
@@ -354,8 +490,19 @@ impl Database {
             ));
         }
         let cands = self.all_terms()?;
-        let dead = self.dead_of(cands);
-        let n = self.free_dead(dead, false);
+        let dead = self.dead_of(&cands).unwrap_or_default();
+        let n = if self.store.as_disk().is_some() && self.dict.is_pinned() {
+            // A clone sharing the on-disk dictionary may still read these
+            // ids (when they died is not known): they wait for every pin
+            // alive now.
+            let stamp = self.dict.pin_clock();
+            for t in dead {
+                self.reclaim_deferred.defer(t, stamp);
+            }
+            0
+        } else {
+            self.free_dead(dead, false)
+        };
         self.commit_point()?;
         Ok(n)
     }
@@ -475,6 +622,39 @@ impl Database {
             })?;
         }
         Ok(out)
+    }
+}
+
+/// Test-only instrumentation of the reclamation check: a count of the
+/// reference probes (`term_referenced`) this thread ran, and a one-shot
+/// injected read error in the next [`Database::dead_of`].
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn probed() {
+        PROBES.with(|p| p.set(p.get() + 1));
+    }
+
+    /// Reference probes run on this thread so far.
+    pub(crate) fn probes() -> u64 {
+        PROBES.with(Cell::get)
+    }
+
+    /// Make the next check of this thread record a read error.
+    pub(crate) fn fail_next_check() {
+        FAIL_NEXT.with(|f| f.set(true));
+    }
+
+    pub(super) fn maybe_fail_read() {
+        if FAIL_NEXT.with(|f| f.replace(false)) {
+            crate::store::read_scope::note_read_error("injected reference-probe read error");
+        }
     }
 }
 

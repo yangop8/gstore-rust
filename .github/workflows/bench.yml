@@ -7,7 +7,8 @@ name: bench
 #   workload or query the baseline does not have yet is reported as new, not
 #   gated — plus the canary (a 3x slowdown of the same result must fail) and
 #   a check that the tables generated from committed results into README.md
-#   and CHANGELOG.md are current;
+#   and CHANGELOG.md are current (ci.yml's test job runs that check too, on
+#   every push and PR: this workflow skips the ones changing only docs);
 # * rocksdb-correctness — every push / PR: the harness's tests with RocksDB
 #   (every backend must answer alike), sharing ci.yml's RocksDB build cache;
 # * reference — manual or weekly, report-only: the `reference` profile

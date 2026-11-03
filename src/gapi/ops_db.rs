@@ -1101,13 +1101,21 @@ fn compute_stats(db: &Database) -> Result<ClassStats, String> {
 
 /// The subject count, class statistics and schema graph of loaded database
 /// `db` (`slot`, held — shared suffices — of handle `h`), cached until the
-/// database changes (never when reading them failed).
+/// database changes (never when reading them failed). While a transaction
+/// is open, those of the committed state (its snapshot): no other client
+/// may observe its writes.
 fn class_stats(db: &str, h: &DbHandle, slot: &DbSlot) -> Result<ClassStats, String> {
-    let mutations = slot.db.mutation_count();
+    let mutations = slot.committed_generation();
     if let Some(hit) = cached_stats(db, h, Some(mutations)) {
         return Ok(hit);
     }
-    let (subjects, classes, graph) = compute_stats(&slot.db)?;
+    let (subjects, classes, graph) = match &slot.txn {
+        Some(open) => {
+            let (subjects, classes, graph) = open.snapshot.class_stats()?;
+            (subjects, Arc::new(classes), Arc::new(graph))
+        }
+        None => compute_stats(&slot.db)?,
+    };
     locked(stats_cache()).insert(
         db.to_string(),
         CachedStats {
@@ -1198,7 +1206,7 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
                 class_stats(db, &h, &slot).map_err(|e| unreadable(db, e))?;
             return Ok(Inspection {
                 triples: slot.committed_triple_num(),
-                stats: slot.db.stats(),
+                stats: slot.committed_stats(),
                 subjects,
                 classes,
                 graph,

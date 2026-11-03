@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::csr::{CsrCache, CsrGraph};
-use crate::dict::{Dictionary, TermId, TermStr};
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
 use crate::model::id::{is_entity_id, EntityLiteralId};
@@ -56,6 +56,7 @@ pub use statement::Statement;
 #[cfg(test)]
 mod concurrency_tests;
 
+pub(crate) use admin::{class_stats_of, ClassStats};
 pub use admin::{SchemaEdge, SchemaGraph, SchemaNode};
 pub use persist::StorageKind;
 
@@ -63,6 +64,8 @@ pub use persist::StorageKind;
 mod hardening_tests;
 mod load_policy;
 pub mod named;
+#[cfg(test)]
+mod r4_review_tests;
 pub mod reclaim;
 #[cfg(test)]
 mod review_tests;
@@ -73,10 +76,10 @@ mod query_cache;
 use named::NamedGraphs;
 use query_cache::QueryCache;
 pub use query_cache::DEFAULT_QUERY_CACHE_BYTES;
-use reclaim::Candidates;
 pub use reclaim::{
     default_id_reclaim, set_default_id_reclaim, IdReclaim, IdSpaceStats, ENV_ID_RECLAIM,
 };
+use reclaim::{Candidates, Deferred};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -373,9 +376,10 @@ pub struct Database {
     /// Reclamation candidates of the running statement, or of the open
     /// transaction (freed at its commit).
     reclaim: Candidates,
-    /// Stream mode: candidates whose free waits for the dictionary's pins
-    /// (a clone sharing the on-disk dictionary is alive).
-    reclaim_deferred: Vec<TermId>,
+    /// Candidates whose free waits: Stream mode, for the dictionary's pins
+    /// (a clone sharing the on-disk dictionary is alive); any layout, after
+    /// a read error stopped their check (see [`Deferred`]).
+    reclaim_deferred: Deferred,
     /// The per-predicate CSR of the default graph used by the advanced graph
     /// functions (upstream `GeneralEvaluation::csr`), built lazily and keyed
     /// by [`mutations`](Self::mutations) so any data change invalidates it
@@ -553,7 +557,7 @@ impl Database {
             vs_shrink_debt: 0,
             id_reclaim: reclaim::default_id_reclaim(),
             reclaim: Candidates::default(),
-            reclaim_deferred: Vec::new(),
+            reclaim_deferred: Deferred::default(),
             csr_cache: CsrCache::new(),
             string_index: StringIndexCache::default(),
             #[cfg(feature = "rocksdb")]
@@ -2358,12 +2362,15 @@ impl Database {
             // Snapshot the triples once: needed for undo, and (for a persistent
             // backend) to delete them so the on-disk store is actually cleared.
             let removed = self.store.iter_all();
+            let total = removed.len();
             if let Some(log) = self.txn.as_mut() {
                 for t in &removed {
                     log.push(UndoOp::Add(None, *t));
                 }
             }
-            if self.store.as_memory().is_some() {
+            // The triples the store no longer holds (all of them unless a
+            // persistent backend refused a delete).
+            let gone = if self.store.as_memory().is_some() {
                 // In-memory: discard and replace (cheaper than per-triple delete).
                 self.store = Backend::Memory(TripleStore::new());
                 // An on-disk database must still delete them from its store.
@@ -2372,18 +2379,32 @@ impl Database {
                         self.persist_mutation(false, None, t);
                     }
                 }
+                removed
             } else {
                 // Persistent backend: delete every triple through the seam so the
                 // change is durable (don't swap in a Memory store, which would
-                // strand the data on disk).
+                // strand the data on disk). A refused delete (RocksDB: reported
+                // at the next commit point) leaves its triple stored.
+                let mut gone = Vec::with_capacity(removed.len());
                 for &t in &removed {
-                    self.store.remove(t);
+                    if self.store.remove(t) {
+                        gone.push(t);
+                    }
                 }
-            }
+                gone
+            };
             self.index_valid = false;
             self.touched();
-            self.record_redo_clear(RedoClear::Default);
-            for &t in &removed {
+            if gone.len() == total {
+                self.record_redo_clear(RedoClear::Default);
+            } else {
+                // Part of the graph stays: the log names exactly what went, so
+                // replaying it reproduces this state (not an empty graph).
+                for &t in &gone {
+                    self.record_redo(b'D', None, t);
+                }
+            }
+            for &t in &gone {
                 self.note_removed(None, t);
             }
         }
@@ -2443,11 +2464,14 @@ impl Database {
                     }
                 }
             }
-            if let Some(removed) = self.named.remove_graph(gid) {
-                self.persist_cleared_graph(gid, removed);
-            }
+            let complete = match self.named.remove_graph(gid) {
+                Some(removed) => self.persist_cleared_graph(gid, removed),
+                None => true,
+            };
             self.touched();
-            self.record_redo_clear(RedoClear::Named(gid));
+            if complete {
+                self.record_redo_clear(RedoClear::Named(gid));
+            }
         }
         n
     }
@@ -2463,11 +2487,26 @@ impl Database {
                     }
                 }
             }
+            // Each graph's clear is logged by itself when RocksDB refused a
+            // quad delete (the graph keeps that quad): then the log may not
+            // claim that every named graph was emptied.
+            let mut cleared = Vec::new();
+            let mut complete = true;
             for (gid, removed) in self.named.take_all() {
-                self.persist_cleared_graph(gid, removed);
+                if self.persist_cleared_graph(gid, removed) {
+                    cleared.push(gid);
+                } else {
+                    complete = false;
+                }
             }
             self.touched();
-            self.record_redo_clear(RedoClear::AllNamed);
+            if complete {
+                self.record_redo_clear(RedoClear::AllNamed);
+            } else {
+                for gid in cleared {
+                    self.record_redo_clear(RedoClear::Named(gid));
+                }
+            }
         }
         total
     }
@@ -2477,20 +2516,29 @@ impl Database {
     /// not delete is put back into the in-memory graph, so memory never claims
     /// a deletion the store did not make (the error is reported at the next
     /// commit point). The terms of the quads removed are reclamation
-    /// candidates.
-    fn persist_cleared_graph(&mut self, gid: u32, removed: TripleStore) {
+    /// candidates. `true` when every quad went; otherwise each quad that
+    /// did is logged by itself (redo `D`), and the caller logs no clear of
+    /// the graph.
+    fn persist_cleared_graph(&mut self, gid: u32, removed: TripleStore) -> bool {
         let mut kept = Vec::new();
+        let mut gone = Vec::new();
         for t in removed.iter_all() {
             self.persist_mutation(false, Some(gid), t);
             if self.persist_named_quad(false, gid, t) {
                 self.note_removed(Some(gid), t);
+                gone.push(t);
             } else {
                 kept.push(t);
             }
         }
-        if !kept.is_empty() {
-            self.named.bulk_load(gid, kept);
+        if kept.is_empty() {
+            return true;
         }
+        self.named.bulk_load(gid, kept);
+        for t in gone {
+            self.record_redo(b'D', Some(gid), t);
+        }
+        false
     }
 
     /// Record a `CLEAR` (also `DROP`, and the clears of `MOVE` / `COPY`) in
