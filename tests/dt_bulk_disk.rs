@@ -188,7 +188,8 @@ fn select_rows(db: &mut Database, q: &str) -> Vec<Vec<Option<String>>> {
 
 /// LUBM: the bulk store equals the incremental one id for id (the ids are
 /// first-seen in both), `vstree.kv` is byte-identical, the header is
-/// version 1, and the 14 queries answer the same rows in the same order as
+/// version 2 with an empty free-id list (R4: a new database keeps one), and
+/// the 14 queries answer the same rows in the same order as
 /// the incremental and the in-memory builds.
 #[test]
 fn lubm_bulk_equals_incremental_and_memory() {
@@ -217,7 +218,10 @@ fn lubm_bulk_equals_incremental_and_memory() {
         "vstree.kv must be byte-identical"
     );
     let kv = std::fs::read(b.join("kvstore.kv")).unwrap();
-    assert_eq!(&kv[0..8], b"GSTOREKV");
+    // A new database (R4): version 2, the FREE_IDS feature, an empty list.
+    assert_eq!(&kv[0..8], b"GSTOREK2");
+    assert_eq!(kv[16 + 21 * 8..16 + 22 * 8], 1u64.to_le_bytes());
+    assert!(kv[16 + 22 * 8..16 + 26 * 8].iter().all(|&x| x == 0));
     assert!(kv[16 + 24 * 8..4096].iter().all(|&x| x == 0));
     let inc_size = std::fs::metadata(a.join("kvstore.kv")).unwrap().len();
     assert!(

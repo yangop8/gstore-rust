@@ -44,7 +44,7 @@
 //! ## Feature bits
 //! | Bit | Feature | Status |
 //! |---|---|---|
-//! | 0 | [`FEATURE_FREE_IDS`] | R4-RECLAIM (not supported by this binary yet) |
+//! | 0 | [`FEATURE_FREE_IDS`] | implemented (R4-RECLAIM): the free-id list of slots 22–25 |
 //! | 1 | [`FEATURE_IVARRAY_WIDE`] | reserved (lifts the 33.5M IvArray cap) |
 //! | 2 | [`FEATURE_LONG_KEYS`] | reserved (dictionary keys > 4 KB) |
 //! | 3–63 | — | reserved |
@@ -112,16 +112,12 @@ pub(crate) const ROOT_VSTREE_STALE: usize = 20;
 /// through `set_root`.
 pub const FEATURES: usize = 21;
 /// Free-id B+tree root (R4-RECLAIM, behind [`FEATURE_FREE_IDS`]).
-#[allow(dead_code)] // reserved: R4-RECLAIM
 pub(crate) const FREE_IDS: usize = 22;
 /// Number of free entity ids (R4-RECLAIM).
-#[allow(dead_code)] // reserved: R4-RECLAIM
 pub(crate) const FREE_COUNT_E: usize = 23;
 /// Number of free literal ids (R4-RECLAIM).
-#[allow(dead_code)] // reserved: R4-RECLAIM
 pub(crate) const FREE_COUNT_L: usize = 24;
 /// Number of free predicate ids (R4-RECLAIM).
-#[allow(dead_code)] // reserved: R4-RECLAIM
 pub(crate) const FREE_COUNT_P: usize = 25;
 
 // ---- feature bits -----------------------------------------------------------
@@ -134,9 +130,9 @@ pub const FEATURE_IVARRAY_WIDE: u64 = 1 << 1;
 pub const FEATURE_LONG_KEYS: u64 = 1 << 2;
 /// Every bit the registry defines (implemented or reserved).
 pub const DEFINED_FEATURES: u64 = FEATURE_FREE_IDS | FEATURE_IVARRAY_WIDE | FEATURE_LONG_KEYS;
-/// The bits this binary implements and may therefore open or enable. Empty
-/// until R4-RECLAIM implements [`FEATURE_FREE_IDS`].
-pub const SUPPORTED_FEATURES: u64 = 0;
+/// The bits this binary implements and may therefore open or enable:
+/// [`FEATURE_FREE_IDS`] (R4-RECLAIM). `vstree.kv` never uses a feature.
+pub const SUPPORTED_FEATURES: u64 = FEATURE_FREE_IDS;
 
 /// The magic a header with `features` must carry.
 pub fn magic_for(features: u64) -> &'static [u8; 8] {

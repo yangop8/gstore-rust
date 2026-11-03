@@ -59,6 +59,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::dict::{DiskTermSource, Space, TermId};
 use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
@@ -1049,6 +1050,73 @@ impl DiskTriples {
             })
         })?;
         Ok(())
+    }
+
+    // ---- id reclamation (R4) ---------------------------------------------------
+
+    /// Whether the store keeps a free-id list (feature `FREE_IDS`): ids are
+    /// freed and reused only then.
+    pub fn frees_ids(&self) -> bool {
+        self.store.frees_ids()
+    }
+
+    /// Turn the free-id list on ([`DiskStore::enable_reclaim`]); written at
+    /// the next commit point.
+    pub fn enable_reclaim(&mut self) -> Result<()> {
+        self.check_open()?;
+        self.store.enable_reclaim()?;
+        self.dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Free the ids `ids` (terms nothing references) through the dictionary
+    /// `dict` sharing this store's pager — its `*2id` entry and `id2*` slot
+    /// go, the id joins the free list or lowers the high-water mark — under
+    /// **one** drain of the writer gate, so no snapshot reader is inside the
+    /// store while an id changes meaning (the epoch moves). Each id is checked
+    /// again first against the committed triple indexes (SPO / OSP prefixes,
+    /// the predicate statistics); the named graphs are the caller's to check
+    /// (their `GSPO` index is keyed graph-first). A term that is still
+    /// referenced — or whose check cannot be read — is refused, and the
+    /// store is marked broken rather than corrupted. Returns how many ids
+    /// were freed (0 without the `FREE_IDS` feature). Refused inside a
+    /// transaction: its frees belong to its commit.
+    pub fn free_ids(&mut self, ids: &[TermId], dict: &dyn DiskTermSource) -> Result<usize> {
+        self.check_open()?;
+        if self.txn.is_some() {
+            return Err(GStoreError::Database(
+                "free_ids inside a transaction: frees run at its commit".into(),
+            ));
+        }
+        if ids.is_empty() || !self.frees_ids() {
+            return Ok(0);
+        }
+        let mut n = 0usize;
+        self.under_gate(|dt| {
+            for &t in ids {
+                let referenced = match t.space {
+                    Space::Predicate => {
+                        dt.store.pred_num(t.id) > 0 || dt.store.try_has_predicate(t.id)?
+                    }
+                    Space::Entity | Space::Literal => {
+                        dt.store.try_has_subject(t.id)? || dt.store.try_has_object(t.id)?
+                    }
+                };
+                if referenced {
+                    return Err(GStoreError::Database(format!(
+                        "refusing to free {} id {}: the store still references it",
+                        t.space.name(),
+                        t.id
+                    )));
+                }
+                dt.injected()?;
+                if dict.free(t.space, t.id)? {
+                    n += 1;
+                }
+            }
+            Ok(n > 0)
+        })?;
+        Ok(n)
     }
 
     // ---- transactions ----------------------------------------------------------

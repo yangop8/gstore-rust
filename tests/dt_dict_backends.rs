@@ -506,11 +506,13 @@ fn dict_bin_reads_both_ways_and_is_reproducible() {
     let dir = tmp("dictbin");
     let mut db = Database::build_from_files("lubm", &[lubm_nt()]).unwrap();
     // Holes and a free stack: delete some data and reclaim its terms.
+    // The explicit pass frees them (immediate reclamation would at the delete).
+    db.set_id_reclaim(gstore::db::IdReclaim::Off);
     db.query(
         "DELETE WHERE { <http://www.Department0.University0.edu/UndergraduateStudent1> ?p ?o }",
     )
     .unwrap();
-    assert!(db.reclaim_unused() > 0);
+    assert!(db.reclaim_unused().unwrap() > 0);
     db.save(&dir).unwrap();
     let bytes = std::fs::read(dir.join("dict.bin")).unwrap();
 

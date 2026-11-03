@@ -174,14 +174,20 @@ pub(crate) fn wal_of(path: &Path) -> PathBuf {
 
 /// One mutation, in dictionary-key form, destined for the on-disk store.
 #[derive(Debug, Clone)]
-pub(super) struct DiskOp {
-    insert: bool,
-    /// Named graph IRI key (`None` ⇒ default graph).
-    graph: Option<String>,
-    s: String,
-    p: String,
-    o: String,
-    o_is_literal: bool,
+pub(super) enum DiskOp {
+    /// Insert or delete a triple (or a quad).
+    Quad {
+        insert: bool,
+        /// Named graph IRI key (`None` ⇒ default graph).
+        graph: Option<String>,
+        s: String,
+        p: String,
+        o: String,
+        o_is_literal: bool,
+    },
+    /// Free the id of a term the working set reclaimed (R4; a store without
+    /// the `FREE_IDS` feature keeps the term).
+    Free { space: Space, key: String },
 }
 
 impl DiskOp {
@@ -196,7 +202,7 @@ impl DiskOp {
             Some(g) => Some(dict.term(g)?.into_string()),
             None => None,
         };
-        Some(DiskOp {
+        Some(DiskOp::Quad {
             insert,
             graph,
             s: dict.term(id.sub)?.into_string(),
@@ -209,7 +215,7 @@ impl DiskOp {
 
 /// Write-through state of an on-disk (`kvstore.kv`) database.
 pub(super) struct DiskSink {
-    store: DiskStore,
+    pub(super) store: DiskStore,
     /// Mutations of the open transaction, applied at commit.
     pending: Vec<DiskOp>,
     /// Set once a write-through failed: the store may no longer match the
@@ -252,12 +258,21 @@ impl DiskSink {
             return;
         }
         self.dirty = true;
-        let (s, p, o, lit) = (op.s.as_str(), op.p.as_str(), op.o.as_str(), op.o_is_literal);
-        let res = match (&op.graph, op.insert) {
-            (None, true) => self.store.insert_keys(s, p, o, lit),
-            (None, false) => self.store.delete_keys(s, p, o, lit),
-            (Some(g), true) => self.store.insert_quad_keys(g, s, p, o, lit),
-            (Some(g), false) => self.store.delete_quad_keys(g, s, p, o, lit),
+        let res = match op {
+            DiskOp::Quad {
+                insert,
+                graph,
+                s,
+                p,
+                o,
+                o_is_literal: lit,
+            } => match (graph, insert) {
+                (None, true) => self.store.insert_keys(s, p, o, *lit),
+                (None, false) => self.store.delete_keys(s, p, o, *lit),
+                (Some(g), true) => self.store.insert_quad_keys(g, s, p, o, *lit),
+                (Some(g), false) => self.store.delete_quad_keys(g, s, p, o, *lit),
+            },
+            DiskOp::Free { space, key } => self.store.free_key(*space, key),
         };
         if let Err(e) = res {
             self.fail(e.to_string());
@@ -845,7 +860,7 @@ impl Database {
         let mut db = Database::new(meta.name);
         db.dict = dict;
         db.store = Backend::Memory(store);
-        db.named = named;
+        db.named = named.into();
         db.vstree = vstree;
         db.index_valid = true;
         db.home = Some(dir.to_path_buf());
@@ -1056,7 +1071,7 @@ impl Database {
         let mut db = Database::new(disk_db_name(dir));
         db.dict = Dictionary::from_backing(Arc::new(dict));
         db.store = Backend::Disk(dt);
-        db.named = named;
+        db.named = named.into();
         db.vstree = vstree;
         db.index_valid = index_valid;
         db.home = Some(dir.to_path_buf());
@@ -1065,21 +1080,11 @@ impl Database {
 
     /// The Materialize-mode half of [`load_disk_with`](Self::load_disk_with).
     fn load_disk_materialize(dir: &Path, mut ds: DiskStore) -> Result<Database> {
-        let (mut dict, store) = ds.to_memory()?;
-        // `DiskStore::dictionary` interns the stored strings in id order: a
-        // gap (a freed hole) or a duplicate would shift every later id off the
-        // store's. Then read the terms with their ids kept instead, and do
-        // not trust `vstree.kv` (it was built over the store's ids, but its
-        // alignment with this working set cannot be proven).
+        // `DiskStore::dictionary` keeps every id as stored (a freed id is a
+        // free hole, a term stored twice is refused), so the working set's
+        // ids are the store's and `vstree.kv` (built over them) lines up.
+        let (dict, store) = ds.to_memory()?;
         let aligned = dictionary_aligned(&dict, &ds);
-        if !aligned {
-            crate::gs_warn!(
-                "'{}': the dictionary's ids have gaps; loading them with their ids kept and \
-                 rebuilding the VS-tree",
-                dir.display()
-            );
-            dict = ds.lazy_dictionary().materialize()?;
-        }
         let named = ds.named_to_memory()?;
         let name = disk_db_name(dir);
         // Out-of-core VS-tree: open the persisted paged node file, unless an
@@ -1097,7 +1102,7 @@ impl Database {
         let mut db = Database::new(name);
         db.dict = dict;
         db.store = Backend::Memory(store);
-        db.named = named;
+        db.named = named.into();
         db.vstree = vstree;
         // The disk-backed tree is consistent with the just-loaded store, so
         // the query path may use it as a candidate filter.
@@ -1243,9 +1248,7 @@ impl Database {
             for &id in &quads {
                 rocks.insert_quad(gid, id)?;
             }
-            let mut graph = TripleStore::new();
-            graph.bulk_load(quads);
-            db.named.insert(gid, graph);
+            db.named.bulk_load(gid, quads);
         }
         rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
         rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
@@ -1305,12 +1308,27 @@ impl Database {
         } else {
             rocks_layout::migrate_legacy(dir, &rocks)?
         };
+        // A transaction a crash interrupted was undone by the open: the terms
+        // of what it had inserted are reclamation candidates.
+        let replayed = rocks.take_replayed();
         let mut db = Database::new(name);
         db.dict = dict;
         db.store = Backend::Rocks(rocks);
-        db.named = named;
+        db.named = named.into();
         db.home = Some(dir.to_path_buf());
         db.dir_lock = Some(lock);
+        if !replayed.is_empty() && db.reclaims_ids() {
+            for (space, id) in replayed {
+                let space = match space {
+                    crate::backend::rocks::TermSpace::Entity => Space::Entity,
+                    crate::backend::rocks::TermSpace::Literal => Space::Literal,
+                    crate::backend::rocks::TermSpace::Predicate => Space::Predicate,
+                };
+                db.reclaim.note(crate::dict::TermId { space, id });
+            }
+            db.flush_reclaim();
+            db.commit_point()?;
+        }
         // The VS-tree is not rebuilt at open (it walks every entity's edges
         // in RocksDB): queries evaluate without it until `rebuild_index()`.
         // `vstree_on_open` (`[storage]`, or `GSTORE_VSTREE_ON_OPEN=1` through
@@ -1677,15 +1695,6 @@ impl Database {
         false
     }
 
-    /// Commit the journaled transaction (delete its undo journal).
-    pub(super) fn rocks_commit_journal(&mut self) -> Result<()> {
-        #[cfg(feature = "rocksdb")]
-        if let Some(rocks) = self.store.as_rocks_mut() {
-            return rocks.commit_journal();
-        }
-        Ok(())
-    }
-
     /// Roll back the journaled transaction (replay its undo journal).
     pub(super) fn rocks_rollback_journal(&mut self) -> Result<()> {
         #[cfg(feature = "rocksdb")]
@@ -1967,18 +1976,121 @@ impl Database {
         })
     }
 
-    /// After id reclamation: rewrite RocksDB's stored dictionary so freed ids
-    /// cannot resurface on reopen (no-op for other layouts, which key their
-    /// persistent state by term string).
-    pub(super) fn persist_dictionary_rewrite(&mut self) {
+    // ---- id reclamation (see the `reclaim` module) --------------------------
+
+    /// Whether this database's layout can persist a freed id: every layout
+    /// but a `kvstore.kv` without the `FREE_IDS` feature (a pre-Phase-6 file
+    /// keeps reclamation off until `gcompact --enable-reclaim`).
+    pub(super) fn layout_frees_ids(&self) -> bool {
+        if let Some(dt) = self.store.as_disk() {
+            return dt.frees_ids();
+        }
+        if let Some(sink) = self.disk_guard().as_ref() {
+            return sink.store.frees_ids();
+        }
+        true
+    }
+
+    /// Turn the free-id list on for an on-disk store (`gcompact
+    /// --enable-reclaim`); nothing to do for the other layouts. Durable at
+    /// the next commit point.
+    pub(super) fn enable_layout_free_ids(&mut self) -> Result<()> {
+        if let Some(dt) = self.store.as_disk_mut() {
+            return dt.enable_reclaim();
+        }
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
+            sink.store.enable_reclaim()?;
+            sink.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Persist the free of the unreferenced terms `dead` before the dictionary
+    /// retires them (not for Stream mode, see [`stream_free`](Self::stream_free)),
+    /// returning the ones that may be retired:
+    ///
+    /// * Materialize: a key-level [`DiskOp::Free`] each (the store frees the
+    ///   term's id in its own id space);
+    /// * RocksDB: one `dict` CF delete batch after the triple batches (a
+    ///   crash in between leaves an orphan term, which is harmless) — unless
+    ///   `rocks_persisted` (the commit's journal batch deleted them). If it
+    ///   fails, nothing is retired (memory keeps the terms RocksDB keeps) and
+    ///   the error is reported at the next commit point;
+    /// * a snapshot database: nothing now (written by the next save).
+    #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
+    pub(super) fn persist_frees(
+        &mut self,
+        dead: Vec<crate::dict::TermId>,
+        rocks_persisted: bool,
+    ) -> Vec<crate::dict::TermId> {
+        let dict = &self.dict;
+        if let Some(sink) = sink_mut(&mut self.disk).as_mut() {
+            for t in &dead {
+                if let Some(key) = dict.resolve(t.space, t.id) {
+                    let op = DiskOp::Free {
+                        space: t.space,
+                        key: key.into_string(),
+                    };
+                    sink.record(op, false);
+                }
+            }
+            return dead;
+        }
         #[cfg(feature = "rocksdb")]
         if let Some(rocks) = self.store.as_rocks() {
-            match rocks.replace_dictionary(rocks_layout::dict_entries(&self.dict)) {
-                // Every live term is stored now.
-                Ok(()) => self.unpersisted_terms.clear(),
-                Err(e) => self.note_persist_error(e),
+            use crate::backend::rocks::TermSpace;
+            if !rocks_persisted {
+                let terms: Vec<(TermSpace, u32)> = dead
+                    .iter()
+                    .map(|t| (rocks_layout::term_space(t.space), t.id))
+                    .collect();
+                if let Err(e) = rocks.delete_terms(&terms) {
+                    self.note_persist_error(e);
+                    return Vec::new();
+                }
+            }
+            for t in &dead {
+                self.unpersisted_terms
+                    .remove(&(rocks_layout::term_space(t.space), t.id));
             }
         }
+        dead
+    }
+
+    /// Stream mode: free the unreferenced terms `dead` inside the on-disk
+    /// store, by id, under its writer gate ([`DiskTriples::free_ids`]); returns
+    /// how many were freed. A refusal or a write error breaks the store and is
+    /// reported at the next commit point.
+    pub(super) fn stream_free(&mut self, dead: &[crate::dict::TermId]) -> usize {
+        let Some(backing) = self.dict.backing().cloned() else {
+            return 0;
+        };
+        let Some(dt) = self.store.as_disk_mut() else {
+            return 0;
+        };
+        match dt.free_ids(dead, &*backing) {
+            Ok(n) => n,
+            Err(e) => {
+                self.note_persist_error(e);
+                0
+            }
+        }
+    }
+
+    /// RocksDB: commit the journaled transaction, deleting the `dict` CF
+    /// entries of the terms it freed (`dead`) in the same atomic batch as the
+    /// journal. Other layouts: nothing to do.
+    #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
+    pub(super) fn rocks_commit_journal_with(&mut self, dead: &[crate::dict::TermId]) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            let terms: Vec<_> = dead
+                .iter()
+                .map(|t| (rocks_layout::term_space(t.space), t.id))
+                .collect();
+            return rocks.commit_journal_with(&terms);
+        }
+        Ok(())
     }
 }
 
@@ -1990,18 +2102,19 @@ fn disk_db_name(dir: &Path) -> String {
         .unwrap_or_else(|| "disk".to_string())
 }
 
-/// Whether `dict` — read from `ds` by [`DiskStore::dictionary`], which interns
-/// the stored strings in id order — gave every term the id the store gave it:
-/// each space holds exactly the store's count of ids (a gap or a duplicate
-/// string would leave it short).
+/// Whether `dict` — read from `ds` by [`DiskStore::dictionary`], which keeps
+/// every stored id — holds the store's terms: no id past a space's
+/// high-water mark (trailing free holes are trimmed, so the limit may be
+/// lower) and the live counts equal the store's. A mismatch means a damaged
+/// store; `vstree.kv` is then not trusted.
 fn dictionary_aligned(dict: &Dictionary, ds: &DiskStore) -> bool {
-    [
-        (Space::Entity, ds.entity_num()),
-        (Space::Literal, ds.literal_num()),
-        (Space::Predicate, ds.predicate_num()),
-    ]
-    .into_iter()
-    .all(|(space, n)| u64::from(dict.id_limit(space)) == u64::from(space.first_id()) + n as u64)
+    let limits = ds.term_limits();
+    let live = [ds.entity_num(), ds.literal_num(), ds.predicate_num()];
+    let counts = [dict.entity_num(), dict.literal_num(), dict.predicate_num()];
+    Space::ALL.into_iter().enumerate().all(|(i, space)| {
+        u64::from(dict.id_limit(space)) <= u64::from(space.first_id()) + limits[i]
+            && counts[i] == live[i]
+    })
 }
 
 /// Check that a restored on-disk / RocksDB copy in `dir` opens as a database.
@@ -2294,50 +2407,46 @@ mod rocks_layout {
         out
     }
 
+    /// The RocksDB term space of a dictionary space.
+    pub(super) fn term_space(space: Space) -> TermSpace {
+        match space {
+            Space::Entity => TermSpace::Entity,
+            Space::Literal => TermSpace::Literal,
+            Space::Predicate => TermSpace::Predicate,
+        }
+    }
+
     /// Rebuild the in-memory dictionary from the `dict` CF, keeping every id
-    /// exactly as stored. Gaps (ids freed by reclamation, or interned but never
-    /// used by a persisted triple) become free-list holes, as they were.
+    /// exactly as stored ([`Dictionary::from_slots`]). Gaps (ids freed by
+    /// reclamation, or interned but never used by a persisted triple) become
+    /// free ids; a term stored under two ids is refused.
     pub(super) fn dictionary_from_terms(
         terms: Vec<(TermSpace, u32, String)>,
     ) -> Result<Dictionary> {
-        let mut dict = Dictionary::new();
-        let mut holes: Vec<(TermSpace, String)> = Vec::new();
-        let mut next_entity = 0u32;
-        let mut next_literal = LITERAL_FIRST_ID;
-        let mut next_pred = 0u32;
+        let mut slots: [Vec<Option<String>>; 3] = Default::default();
         for (space, id, key) in terms {
-            let next = match space {
-                TermSpace::Entity => &mut next_entity,
-                TermSpace::Literal => &mut next_literal,
-                TermSpace::Predicate => &mut next_pred,
+            let (i, first) = match space {
+                TermSpace::Entity => (0, 0),
+                TermSpace::Literal => (1, LITERAL_FIRST_ID),
+                TermSpace::Predicate => (2, 0),
             };
-            if id < *next {
+            let Some(index) = id.checked_sub(first) else {
+                return Err(GStoreError::Database(format!(
+                    "corrupt RocksDB dictionary: literal id {id} below the literal range"
+                )));
+            };
+            let v = &mut slots[i];
+            if (index as usize) < v.len() {
                 return Err(GStoreError::Database(format!(
                     "corrupt RocksDB dictionary: id {id} stored out of order"
                 )));
             }
-            while *next < id {
-                let hole = format!("\u{0}gstore-free-slot-{}", *next);
-                intern(&mut dict, space, &hole)?;
-                holes.push((space, hole));
-                *next += 1;
-            }
-            let got = intern(&mut dict, space, &key)?;
-            if got != id {
-                return Err(GStoreError::Database(format!(
-                    "corrupt RocksDB dictionary: term {key} stored under two ids"
-                )));
-            }
-            *next = id + 1;
+            v.resize(index as usize, None);
+            v.push(Some(key));
         }
-        for (space, hole) in holes {
-            match space {
-                TermSpace::Entity => dict.free_entity(&hole),
-                TermSpace::Literal => dict.free_literal(&hole),
-                TermSpace::Predicate => dict.free_predicate(&hole),
-            };
-        }
-        Ok(dict)
+        let [ent, lit, pred] = slots;
+        Dictionary::from_slots(ent, lit, pred)
+            .map_err(|e| GStoreError::Database(format!("corrupt RocksDB dictionary: {e}")))
     }
 
     /// Intern `key` in `space`, erring (instead of corrupting ids) once that

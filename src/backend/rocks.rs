@@ -128,7 +128,7 @@ use rocksdb::{
 };
 
 use crate::error::{GStoreError, Result};
-use crate::model::id::{EntityLiteralId, PredId};
+use crate::model::id::{is_literal_id, EntityLiteralId, PredId};
 use crate::model::IdTriple;
 use crate::store::read_scope::note_read_error;
 use crate::store::{MutableStore, TripleSource};
@@ -190,20 +190,52 @@ impl Default for RocksTuning {
     }
 }
 
+/// The tuning installed by [`set_default_rocks_tuning`] (`conf.ini`'s
+/// `[storage]` keys in a server), if any.
+static INSTALLED_TUNING: Mutex<Option<RocksTuning>> = Mutex::new(None);
+
+/// Install the tuning stores of this process open with (a server installs
+/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`); the
+/// environment ([`BLOCK_CACHE_ENV`]) still overrides the block cache.
+pub fn set_default_rocks_tuning(tuning: RocksTuning) {
+    *INSTALLED_TUNING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(tuning);
+}
+
 impl RocksTuning {
-    /// The defaults ([`DEFAULT_BLOCK_CACHE_MB`], [`DEFAULT_BLOOM_BITS`]), with
-    /// the block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a
-    /// number of MiB. A value that is not one is logged (once per process)
-    /// and ignored.
+    /// The defaults — the installed tuning ([`set_default_rocks_tuning`]),
+    /// else [`DEFAULT_BLOCK_CACHE_MB`] and [`DEFAULT_BLOOM_BITS`] — with the
+    /// block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a number
+    /// of MiB (the environment wins, as for the other storage settings). A
+    /// value that is not one is logged (once per process) and ignored.
     pub fn from_env() -> RocksTuning {
-        let (mb, warning) = block_cache_mb(std::env::var(BLOCK_CACHE_ENV).ok().as_deref());
+        let installed = INSTALLED_TUNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let base = installed.unwrap_or(RocksTuning {
+            block_cache_bytes: DEFAULT_BLOCK_CACHE_MB << 20,
+            bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+        });
+        let env = std::env::var(BLOCK_CACHE_ENV).ok();
+        let (mb, warning) = block_cache_mb(env.as_deref());
         if let Some(w) = warning {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| crate::gs_warn!("rocksdb tuning: {w}"));
         }
+        // Only a valid value overrides.
+        let env_set = env
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| v.parse::<usize>().is_ok());
         RocksTuning {
-            block_cache_bytes: mb.saturating_mul(1 << 20),
-            bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+            block_cache_bytes: if env_set {
+                mb.saturating_mul(1 << 20)
+            } else {
+                base.block_cache_bytes
+            },
+            bloom_bits_per_key: base.bloom_bits_per_key,
         }
     }
 
@@ -368,6 +400,9 @@ pub struct RocksStore {
     error: Mutex<Option<String>>,
     /// The transaction undo journal (see the module docs).
     journal: Mutex<Journal>,
+    /// Terms of the triples and quads a journal replay removed (see
+    /// [`take_replayed`](Self::take_replayed)).
+    replayed: Mutex<Vec<(TermSpace, u32)>>,
     /// Every read fails (see [`RocksStore::debug_fail_reads`]).
     fail_reads: AtomicBool,
     /// Test-only failpoints (see [`RocksStore::inject_failures`]).
@@ -480,6 +515,7 @@ impl RocksStore {
             preds: BTreeMap::new(),
             error: Mutex::new(None),
             journal: Mutex::new(Journal::Off),
+            replayed: Mutex::new(Vec::new()),
             fail_reads: AtomicBool::new(false),
             #[cfg(test)]
             failpoints: Failpoints::default(),
@@ -652,14 +688,59 @@ impl RocksStore {
     /// batch. On failure the journal stays stale (writes are refused) until a
     /// later [`heal_journal`](Self::heal_journal) deletes it.
     pub fn commit_journal(&mut self) -> Result<()> {
+        self.commit_journal_with(&[])
+    }
+
+    /// [`commit_journal`](Self::commit_journal), deleting the dictionary
+    /// terms `frees` (the ids the transaction freed) in the same atomic batch
+    /// as the journal: either the transaction is committed with its frees or
+    /// (a crash before the batch) it is undone at the next open with its
+    /// terms still stored. Without a journal the terms are deleted alone.
+    pub fn commit_journal_with(&mut self, frees: &[(TermSpace, u32)]) -> Result<()> {
         if !self.journaling() {
-            return Ok(());
+            return self.delete_terms(frees);
+        }
+        if !frees.is_empty() {
+            #[cfg(test)]
+            Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
+            let mut wb = WriteBatch::default();
+            wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
+            let cf = self.cf(CF_DICT);
+            for (space, id) in frees {
+                wb.delete_cf(cf, tag1(space.tag(), *id));
+            }
+            match self.db.write(wb) {
+                Ok(()) => {
+                    *self.journal_state() = Journal::Off;
+                    return Ok(());
+                }
+                Err(e) => {
+                    // As a failed journal clear: stale until a retry deletes
+                    // it (the frees are then not made; the terms stay as
+                    // orphans).
+                    *self.journal_state() = Journal::Stale {
+                        replay: false,
+                        why: e.to_string(),
+                    };
+                    return Err(GStoreError::Database(format!(
+                        "rocksdb: a transaction's undo journal could not be cleared: {e}"
+                    )));
+                }
+            }
         }
         *self.journal_state() = Journal::Stale {
             replay: false,
             why: String::new(),
         };
         self.heal_journal()
+    }
+
+    /// The dictionary ids the journal replay at open (an interrupted
+    /// transaction undone) left possibly unreferenced — the terms of the
+    /// triples and quads it removed — taken once: the database frees the
+    /// ones nothing references.
+    pub fn take_replayed(&self) -> Vec<(TermSpace, u32)> {
+        std::mem::take(&mut *self.replayed.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Roll back the journaled transaction: replay its undo journal newest
@@ -786,6 +867,25 @@ impl RocksStore {
     }
 
     fn replay_records(&mut self, records: Vec<(u8, Option<u32>, IdTriple)>) -> Result<()> {
+        {
+            // Undoing an insert may leave its terms unreferenced.
+            let mut replayed = self.replayed.lock().unwrap_or_else(PoisonError::into_inner);
+            for (op, graph, t) in &records {
+                if *op == UNDO_REMOVE {
+                    let obj = if is_literal_id(t.obj) {
+                        TermSpace::Literal
+                    } else {
+                        TermSpace::Entity
+                    };
+                    replayed.push((TermSpace::Entity, t.sub));
+                    replayed.push((TermSpace::Predicate, t.pred));
+                    replayed.push((obj, t.obj));
+                    if let Some(g) = graph {
+                        replayed.push((TermSpace::Entity, *g));
+                    }
+                }
+            }
+        }
         for (op, graph, t) in records.into_iter().rev() {
             let insert = op == UNDO_INSERT;
             match graph {
@@ -841,6 +941,26 @@ impl RocksStore {
         let mut wb = WriteBatch::default();
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), *id), key.as_bytes());
+        }
+        self.db
+            .write(wb)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
+    }
+
+    /// Delete the dictionary terms `(space, id)` in one atomic batch: ids
+    /// freed by reclamation (a gap in the `dict` CF is a free id). Written
+    /// after the triple batches that left them unreferenced, so a crash in
+    /// between only leaves orphan terms.
+    pub fn delete_terms(&self, terms: &[(TermSpace, u32)]) -> Result<()> {
+        if terms.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        Failpoints::hit(&self.failpoints.side_writes, "dictionary")?;
+        let cf = self.cf(CF_DICT);
+        let mut wb = WriteBatch::default();
+        for (space, id) in terms {
+            wb.delete_cf(cf, tag1(space.tag(), *id));
         }
         self.db
             .write(wb)
