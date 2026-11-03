@@ -272,6 +272,25 @@ struct BitClass {
     card: u64,
 }
 
+/// Keep the members of `set` that `members` holds (both sorted, distinct):
+/// a binary search per member of a set much smaller than `members`, else
+/// one merge pass over both.
+fn retain_sorted(set: &mut Vec<u32>, members: &[u32]) {
+    let (n, m) = (set.len(), members.len());
+    let log_m = (usize::BITS - m.leading_zeros()) as usize;
+    if n.saturating_mul(log_m) < n + m {
+        set.retain(|x| members.binary_search(x).is_ok());
+        return;
+    }
+    let mut j = 0;
+    set.retain(|&x| {
+        while j < m && members[j] < x {
+            j += 1;
+        }
+        j < m && members[j] == x
+    });
+}
+
 /// Whether to merge a bit class's posting lists (`true`) rather than look
 /// the candidates up, given the two estimated costs (both give the same set).
 fn prefer_lists(lists: u64, lookups: u64) -> bool {
@@ -3028,7 +3047,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 vs.sort_unstable();
                 vs.dedup();
                 match candidates.get_mut(&vidx) {
-                    Some(existing) => existing.retain(|x| vs.binary_search(x).is_ok()),
+                    Some(existing) => retain_sorted(existing, &vs),
                     None => {
                         candidates.insert(vidx, vs);
                     }
@@ -3146,7 +3165,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             };
             if prefer_lists(class.card, lookups) {
                 let members = self.bit_class_members(class);
-                set.retain(|x| members.binary_search(x).is_ok());
+                retain_sorted(set, &members);
                 continue;
             }
             match class.dir {

@@ -356,3 +356,27 @@ fn an_empty_tree_filters_nothing_under_any_policy() {
         }
     }
 }
+
+#[test]
+fn retain_sorted_equals_a_binary_search_filter() {
+    let mut rng = Rng(4242);
+    for _ in 0..300 {
+        let mut members: Vec<u32> = (0..rng.below(400))
+            .map(|_| rng.below(1000) as u32)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        let mut set: Vec<u32> = (0..rng.below(400))
+            .map(|_| rng.below(1000) as u32)
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        let want: Vec<u32> = set
+            .iter()
+            .copied()
+            .filter(|x| members.binary_search(x).is_ok())
+            .collect();
+        retain_sorted(&mut set, &members);
+        assert_eq!(set, want);
+    }
+}
