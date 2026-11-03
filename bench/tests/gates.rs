@@ -5,7 +5,7 @@
 
 use gstore_bench::calib::Calibration;
 use gstore_bench::gates::{
-    evaluate, retry_targets, self_check, verdict, Phase, Thresholds, Verdict,
+    evaluate, retry_targets, self_check, verdict, Phase, RetryTarget, Thresholds, Verdict,
 };
 use gstore_bench::schema::*;
 use gstore_bench::workload::WorkloadSpec;
@@ -19,10 +19,13 @@ fn result(scale: f64) -> BenchResult {
         .map(|i| QueryInfo {
             name: format!("q{i}"),
             text_fnv64: format!("{:016x}", gstore_bench::lubm::QUERY_TEXT_FNV64[i - 1].1),
+            bindings: Vec::new(),
+            tries: None,
         })
         .collect();
     let run = |backend: &str| BackendRun {
         backend: backend.into(),
+        label: None,
         config: RunConfig::default(),
         build: Some(BuildResult {
             wall_ms: 12_000.0 * scale,
@@ -80,6 +83,7 @@ fn result(scale: f64) -> BenchResult {
             bodies_equal: true,
             hwm_mib: None,
         }),
+        mixed: None,
         attempts: Default::default(),
     };
     BenchResult {
@@ -111,6 +115,7 @@ fn result(scale: f64) -> BenchResult {
             gen_ms: None,
         },
         runs: vec![run("snapshot"), run("disk")],
+        extra_workloads: Vec::new(),
     }
 }
 
@@ -149,10 +154,10 @@ fn the_canary_slowdown_fails() {
     let (v, o) = check(&b, &b, 3.0);
     assert_eq!(v, Verdict::PerfFail);
     let targets = retry_targets(&o);
-    assert!(targets.contains(&("snapshot".to_string(), Phase::Query)));
+    assert!(targets.contains(&RetryTarget::main("snapshot", Phase::Query)));
     assert!(
-        targets.contains(&("disk".to_string(), Phase::Build))
-            || targets.contains(&("disk".to_string(), Phase::Open))
+        targets.contains(&RetryTarget::main("disk", Phase::Build))
+            || targets.contains(&RetryTarget::main("disk", Phase::Open))
     );
 }
 
@@ -179,7 +184,7 @@ fn one_slow_query_of_20ms_or_more_fails() {
         );
         assert_eq!(
             retry_targets(&o),
-            vec![("snapshot".to_string(), Phase::Query)]
+            vec![RetryTarget::main("snapshot", Phase::Query)]
         );
     }
     // A sub-millisecond query slowed 4× stays under the 2 ms floor.
@@ -262,7 +267,7 @@ fn memory_and_size_gates() {
     assert!(o.iter().any(|g| !g.pass && g.gate == "rss.after_open"));
     assert_eq!(
         retry_targets(&o),
-        vec![("snapshot".to_string(), Phase::Open)]
+        vec![RetryTarget::main("snapshot", Phase::Open)]
     );
 
     let mut r = result(1.0);

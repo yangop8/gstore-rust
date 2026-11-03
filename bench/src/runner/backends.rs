@@ -11,7 +11,9 @@
 //! the backend's work directory as its current directory, so it creates
 //! `<work>/<name>.db`. `--gbuild-arg X` values go before the database name.
 //! The child that runs it does nothing else, so `getrusage(RUSAGE_CHILDREN)`
-//! afterwards is `gbuild`'s own peak RSS.
+//! afterwards is `gbuild`'s own peak RSS. Its output goes to
+//! `<work>/gbuild.log`; a bulk build's report there (phases, memory budget
+//! and peak, term map, spills) becomes the result's `build.summary`.
 //!
 //! The `lib` builder calls the library's build functions in-process instead.
 //! It exists for the harness's own tests when the gstore binaries are not
@@ -23,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use crate::schema::BuildResult;
+use crate::schema::{BuildResult, BuildSummary};
 use crate::sys;
 use crate::workload::Workload;
 
@@ -98,15 +100,87 @@ pub fn build(
     };
     let (bytes, files) =
         sys::dir_bytes(&dir).map_err(|e| format!("cannot size {}: {e}", dir.display()))?;
-    // gbuild's parse_error.log is a log (its first line names the source
-    // path), not database content: listed, but not counted.
-    res.dir_bytes = bytes - files.get(PARSE_LOG).copied().unwrap_or(0);
+    res.dir_bytes = bytes.saturating_sub(uncounted_bytes(&dir, &files));
     res.files = files;
     Ok(res)
 }
 
 /// gbuild's log of statements that did not parse.
 const PARSE_LOG: &str = "parse_error.log";
+
+/// Bytes of a database directory that are not database content, so that two
+/// builds of the same data count the same: gbuild's `parse_error.log` (its
+/// first line names the source path), the disk layout's `LOCK` (it holds
+/// the builder's pid, whose digit count varies) and RocksDB's info logs
+/// (`rocksdb/LOG*`). They stay listed in `files`.
+pub fn uncounted_bytes(dir: &Path, files: &std::collections::BTreeMap<String, u64>) -> u64 {
+    let mut n =
+        files.get(PARSE_LOG).copied().unwrap_or(0) + files.get("LOCK").copied().unwrap_or(0);
+    if let Ok(rd) = fs::read_dir(dir.join("rocksdb")) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("LOG") {
+                n += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    n
+}
+
+/// gbuild's bulk-build report (`phases:`, `memory:` and `spills:` lines of
+/// its output; see `gstore::bulk::BulkReport::summary_for`), if `log` has
+/// one.
+pub fn parse_summary(log: &str) -> Option<BuildSummary> {
+    let num = |s: &str| s.trim().parse::<f64>().ok();
+    let mut out = BuildSummary::default();
+    let mut found = false;
+    for line in log.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("phases:") {
+            found = true;
+            for item in rest.split_whitespace() {
+                if let Some((name, ms)) = item.split_once('=') {
+                    if let Some(v) = ms.strip_suffix("ms").and_then(num) {
+                        out.phases_ms.push((name.to_string(), v));
+                    }
+                }
+            }
+        } else if let Some(rest) = l.strip_prefix("memory:") {
+            // "budget 1024 MiB, peak 380.2 MiB; term map 55.1 MiB; threads 2"
+            found = true;
+            for part in rest.split([';', ',']) {
+                let p = part.trim();
+                let mib = |prefix: &str| {
+                    p.strip_prefix(prefix)
+                        .and_then(|x| x.trim().strip_suffix("MiB"))
+                        .and_then(num)
+                };
+                if let Some(v) = mib("budget") {
+                    out.budget_mib = Some(v);
+                } else if let Some(v) = mib("peak") {
+                    out.budget_peak_mib = Some(v);
+                } else if let Some(v) = mib("term map") {
+                    out.term_map_mib = Some(v);
+                } else if let Some(t) = p.strip_prefix("threads") {
+                    out.threads = t.trim().parse().ok();
+                }
+            }
+        } else if let Some(rest) = l.strip_prefix("spills:") {
+            // "3 run(s), 120.5 MiB; kvstore.kv …"
+            found = true;
+            let head = rest.split(';').next().unwrap_or("");
+            let mut it = head.split(',');
+            out.spilled_runs = it
+                .next()
+                .and_then(|x| x.split_whitespace().next())
+                .and_then(|x| x.parse().ok());
+            out.spilled_mib = it
+                .next()
+                .and_then(|x| x.trim().strip_suffix("MiB"))
+                .and_then(num);
+        }
+    }
+    found.then_some(out)
+}
 
 fn build_cli(
     backend: &str,
@@ -176,10 +250,14 @@ fn build_cli(
     }
     let mut command = vec![exe.to_string_lossy().into_owned()];
     command.extend(args);
+    let summary = fs::read_to_string(&log_path)
+        .ok()
+        .and_then(|t| parse_summary(&t));
     Ok(BuildResult {
         wall_ms,
         peak_rss_mib,
         command,
+        summary,
         ..BuildResult::default()
     })
 }

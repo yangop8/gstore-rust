@@ -17,9 +17,10 @@ use std::process::ExitCode;
 use serde::{Deserialize, Serialize};
 
 use crate::runner::conc::ConcSettings;
+use crate::runner::conc::MixedSettings;
 use crate::runner::phases::Expected;
 use crate::runner::{backends, conc, phases};
-use crate::workload::WorkloadSpec;
+use crate::workload::{bind, BoundQuery, WorkloadSpec};
 
 /// The marker that starts the result line.
 pub const RESULT_MARKER: &str = "GSTORE_BENCH_RESULT ";
@@ -68,6 +69,12 @@ pub struct ChildRequest {
     /// Shrink the calibration (tests).
     #[serde(default)]
     pub quick: bool,
+    /// The workload's bound queries (WatDiv), which replace its templates.
+    #[serde(default)]
+    pub queries: Vec<BoundQuery>,
+    /// The mixed-workload settings (the `mixed` phase).
+    #[serde(default)]
+    pub mixed: Option<MixedSettings>,
 }
 
 #[derive(Serialize)]
@@ -106,6 +113,18 @@ fn to_value<T: Serialize>(v: T) -> Result<serde_json::Value, String> {
 
 fn run(req: &ChildRequest) -> Result<serde_json::Value, String> {
     let w = req.workload.instantiate()?;
+    if req.phase == "instantiate" {
+        // Bind the templates against the data (an in-memory database).
+        return to_value(w.bind_queries(&req.data_file)?);
+    }
+    if w.needs_binding() && req.queries.is_empty() {
+        return Err(format!(
+            "the {} phase needs the bound queries of the {} workload",
+            req.phase,
+            w.id()
+        ));
+    }
+    let w = bind(w, &req.queries);
     let db_dir = backends::db_dir(&req.work_dir, w.as_ref());
     match req.phase.as_str() {
         "calibrate" => to_value(crate::calib::calibrate(
@@ -128,6 +147,10 @@ fn run(req: &ChildRequest) -> Result<serde_json::Value, String> {
         "conc" => {
             let s = req.conc.as_ref().ok_or("the conc phase needs settings")?;
             to_value(conc::conc_phase(&db_dir, w.as_ref(), s)?)
+        }
+        "mixed" => {
+            let s = req.mixed.as_ref().ok_or("the mixed phase needs settings")?;
+            to_value(conc::mixed_phase(&db_dir, w.as_ref(), s)?)
         }
         "update" => {
             let chunk = req

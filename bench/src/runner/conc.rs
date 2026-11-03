@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hash::{fnv64, hex};
 use crate::runner::phases::percentile;
-use crate::schema::{ConcPoint, ConcResult};
+use crate::schema::{ConcPoint, ConcResult, MixedPoint, MixedResult};
 use crate::sys;
 use crate::workload::{QuerySpec, Workload};
 
@@ -450,9 +450,365 @@ pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<Conc
     })
 }
 
+// ---------------------------------------------------------------------------
+// The mixed workload
+// ---------------------------------------------------------------------------
+
+/// What the mixed-workload phase drives: `readers` closed-loop readers of one
+/// query while one writer sends a single-triple `INSERT DATA` every
+/// `write_ms`, for `secs` per endpoint and `check_point` setting. (It
+/// replaces the R3-SRV `examples/srv_mixed_load.rs`.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixedSettings {
+    pub readers: usize,
+    pub write_ms: u64,
+    pub secs: f64,
+    /// `check_point` off (`false`) and/or on (`true`), in this order.
+    pub check_point: Vec<bool>,
+    /// `sparql`, `api`.
+    pub endpoints: Vec<String>,
+    /// The readers' query (`None` = the last of the workload's concurrency
+    /// queries, LUBM `q4`).
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+/// The first single-insert number the mixed writer uses (the update phase
+/// uses `0..singles`); each point starts `POINT_STRIDE` further.
+const MIXED_FIRST: usize = 1_000_000;
+const POINT_STRIDE: usize = 100_000;
+
+fn post(path: &str, body: &str, content_type: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// Whether an update answer acknowledges exactly one changed triple
+/// (`/update`'s `"changed":1`, the `/api` query's `"AnsNum":1`).
+fn acknowledged_one(body: &[u8]) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(v) => {
+            v.get("changed").and_then(|x| x.as_u64()) == Some(1)
+                || v.get("AnsNum").and_then(|x| x.as_u64()) == Some(1)
+        }
+        Err(_) => false,
+    }
+}
+
+/// One raw request on a fresh connection.
+fn send_once(addr: SocketAddr, raw: &str) -> io::Result<(u16, Vec<u8>)> {
+    let s = TcpStream::connect(addr)?;
+    s.set_read_timeout(Some(Duration::from_secs(600)))?;
+    let mut r = BufReader::new(s);
+    r.get_mut().write_all(raw.as_bytes())?;
+    match read_response(&mut r)? {
+        Some((st, body, _)) => Ok((st, body)),
+        None => Err(io::ErrorKind::UnexpectedEof.into()),
+    }
+}
+
+struct Writes {
+    ok: u64,
+    errors: u64,
+    lat_ms: Vec<f64>,
+}
+
+/// The writer: `insert(i)` every `every` until `stop`, through `request`.
+fn write_loop(
+    addr: SocketAddr,
+    every: Duration,
+    stop: Arc<AtomicBool>,
+    statements: Vec<String>,
+    request: impl Fn(&str) -> String,
+) -> Writes {
+    let mut w = Writes {
+        ok: 0,
+        errors: 0,
+        lat_ms: Vec::new(),
+    };
+    let mut next = Instant::now();
+    for st in statements {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        next += every;
+        let started = Instant::now();
+        match send_once(addr, &request(&st)) {
+            Ok((200, body)) if acknowledged_one(&body) => {
+                w.ok += 1;
+                w.lat_ms.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            _ => w.errors += 1,
+        }
+        if let Some(wait) = next.checked_duration_since(Instant::now()) {
+            // Sleep in short steps so a stop is seen promptly.
+            let until = Instant::now() + wait;
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now >= until {
+                    break;
+                }
+                std::thread::sleep((until - now).min(Duration::from_millis(20)));
+            }
+        }
+    }
+    w
+}
+
+/// A running in-process server.
+struct Running {
+    addr: SocketAddr,
+    stop: gstore::server::ShutdownHandle,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Running {
+    fn finish(self) {
+        self.stop.shutdown();
+        let _ = self.thread.join();
+    }
+}
+
+fn api_cred(dir: &Path) -> Result<(std::path::PathBuf, String, String), String> {
+    let root = dir
+        .parent()
+        .ok_or("the database has no parent directory")?
+        .to_path_buf();
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".db"))
+        .ok_or("the database directory is not <name>.db")?
+        .to_string();
+    let cred = format!(
+        "username={API_USER}&password={API_PASSWORD}&db_name={}",
+        urlencode(&name)
+    );
+    Ok((root, name, cred))
+}
+
+fn start_server(endpoint: &str, dir: &Path, check_point: bool) -> Result<Running, String> {
+    match endpoint {
+        "sparql" => {
+            let mut db = Database::open(dir).map_err(|e| format!("open {}: {e}", dir.display()))?;
+            db.set_query_cache_size(0);
+            let server = Server::bind(db, "127.0.0.1:0")
+                .map_err(|e| format!("bind: {e}"))?
+                .with_db_dir(dir)
+                .with_check_point(check_point);
+            let addr = server.local_addr().map_err(|e| e.to_string())?;
+            let stop = server.shutdown_handle();
+            let thread = std::thread::spawn(move || {
+                server.serve_forever();
+            });
+            Ok(Running { addr, stop, thread })
+        }
+        "api" => {
+            let (root, _, cred) = api_cred(dir)?;
+            let settings = QuerySettings {
+                query_cache_bytes: 0,
+                ..QuerySettings::default()
+            };
+            let api = ApiServer::bind(&root, API_PASSWORD, "127.0.0.1:0")
+                .map_err(|e| format!("bind: {e}"))?
+                .with_check_point(check_point)
+                .with_query_settings(settings);
+            let addr = api.local_addr().map_err(|e| e.to_string())?;
+            let stop = api.shutdown_handle();
+            let thread = std::thread::spawn(move || {
+                api.serve_forever();
+            });
+            let running = Running { addr, stop, thread };
+            let loaded = get_once(
+                addr,
+                &format!("/api?operation=load&{cred}"),
+                "application/json",
+            )
+            .map_err(|e| format!("api load: {e}"))
+            .and_then(|(st, body)| {
+                let text = String::from_utf8_lossy(&body);
+                if st == 200 && text.contains("\"StatusCode\":0") {
+                    Ok(())
+                } else {
+                    Err(format!("api load failed: HTTP {st}: {text}"))
+                }
+            });
+            match loaded {
+                Ok(()) => Ok(running),
+                Err(e) => {
+                    running.finish();
+                    Err(e)
+                }
+            }
+        }
+        other => Err(format!("unknown endpoint '{other}' (sparql, api)")),
+    }
+}
+
+/// Run the mixed-workload phase on the database in `dir`. It writes, so it
+/// runs after every other phase.
+pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<MixedResult, String> {
+    let name = match &s.query {
+        Some(q) => q.clone(),
+        None => w
+            .conc_queries()
+            .last()
+            .cloned()
+            .ok_or("the workload has no concurrency query")?,
+    };
+    let query = w
+        .queries()
+        .into_iter()
+        .find(|q| q.name == name)
+        .ok_or_else(|| format!("unknown query '{name}'"))?;
+    let readers = s.readers.max(1);
+    let mut points = Vec::new();
+    let (mut bodies_equal, mut writes_ok) = (true, true);
+    let mut point = 0usize;
+    for endpoint in &s.endpoints {
+        for &cp in &s.check_point {
+            let first = MIXED_FIRST + point * POINT_STRIDE;
+            point += 1;
+            let server = start_server(endpoint, dir, cp)?;
+            let r = mixed_point(&server, endpoint, dir, w, s, &query, readers, cp, first);
+            server.finish();
+            let p = r?;
+            bodies_equal &= p.distinct_bodies == 1 && p.read_errors == 0;
+            writes_ok &= p.write_errors == 0 && p.writes > 0;
+            points.push(p);
+        }
+    }
+    Ok(MixedResult {
+        points,
+        bodies_equal,
+        writes_ok,
+        hwm_mib: sys::hwm_mib(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mixed_point(
+    server: &Running,
+    endpoint: &str,
+    dir: &Path,
+    w: &dyn Workload,
+    s: &MixedSettings,
+    query: &QuerySpec,
+    readers: usize,
+    check_point: bool,
+    first: usize,
+) -> Result<MixedPoint, String> {
+    let (path, accept) = match endpoint {
+        "sparql" => (
+            format!("/sparql?query={}", urlencode(&query.text)),
+            "text/tab-separated-values",
+        ),
+        _ => {
+            let (_, _, cred) = api_cred(dir)?;
+            (
+                format!(
+                    "/api?operation=query&{cred}&format=json&sparql={}",
+                    urlencode(&query.text)
+                ),
+                "application/json",
+            )
+        }
+    };
+    // The reference body (and a warm-up).
+    let (st, body) = get_once(server.addr, &path, accept)
+        .map_err(|e| format!("{endpoint} {}: {e}", query.name))?;
+    if st != 200 {
+        return Err(format!(
+            "{endpoint} {}: HTTP {st}: {}",
+            query.name,
+            String::from_utf8_lossy(&body[..body.len().min(500)])
+        ));
+    }
+    let reference = body_hash(endpoint, &body);
+    // Enough statements for the whole point; the writer stops early.
+    let every = Duration::from_millis(s.write_ms.max(1));
+    let n = (s.secs * 1000.0 / s.write_ms.max(1) as f64).ceil() as usize + 16;
+    let statements: Vec<String> = (first..first + n).map(|i| w.single_insert(i)).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (stop, addr) = (Arc::clone(&stop), server.addr);
+        let api = endpoint != "sparql";
+        let db_name = api_cred(dir).map(|(_, n, _)| n).unwrap_or_default();
+        std::thread::spawn(move || {
+            write_loop(addr, every, stop, statements, move |st: &str| {
+                if api {
+                    post(
+                        "/api",
+                        &format!(
+                            "{{\"username\":\"{API_USER}\",\"password\":\"{API_PASSWORD}\",\
+                             \"operation\":\"query\",\"db_name\":{},\"sparql\":{}}}",
+                            json_string(&db_name),
+                            json_string(st)
+                        ),
+                        "application/json",
+                    )
+                } else {
+                    post("/update", st, "application/sparql-update")
+                }
+            })
+        })
+    };
+    let driven = drive(server.addr, endpoint, &path, accept, readers, s.secs);
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.join().map_err(|_| "the writer panicked")?;
+    let (load, secs) = driven?;
+    let mut distinct = load.hashes.clone();
+    distinct.insert(reference);
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    Ok(MixedPoint {
+        endpoint: endpoint.into(),
+        query: query.name.clone(),
+        readers,
+        check_point,
+        write_every_ms: s.write_ms,
+        secs,
+        reads: load.ok,
+        read_errors: load.errors,
+        reconnects: load.reconnects,
+        qps: load.ok as f64 / secs.max(1e-9),
+        mean_ms: mean(&load.lat_ms),
+        p95_ms: percentile(&load.lat_ms, 95.0),
+        writes: writes.ok,
+        write_errors: writes.errors,
+        write_mean_ms: mean(&writes.lat_ms),
+        write_p95_ms: percentile(&writes.lat_ms, 95.0),
+        distinct_bodies: distinct.len(),
+        body_fnv64: hex(reference),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_acknowledgements() {
+        assert!(acknowledged_one(br#"{"changed":1,"x":2}"#));
+        assert!(acknowledged_one(br#"{"StatusCode":0,"AnsNum":1}"#));
+        assert!(!acknowledged_one(br#"{"changed":0}"#));
+        assert!(!acknowledged_one(br#"{"changed":11}"#));
+        assert!(!acknowledged_one(b"not json"));
+        assert_eq!(json_string("a\"b\n"), r#""a\"b\n""#);
+    }
 
     #[test]
     fn urlencode_keeps_unreserved() {

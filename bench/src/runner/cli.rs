@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::gates::{evaluate, retry_targets, self_check, verdict, Thresholds, Verdict};
 use crate::hash::hex;
 use crate::report;
-use crate::runner::conc::ConcSettings;
-use crate::runner::{profile, run_child, ChildRequest, RunOptions, Session};
+use crate::runner::conc::{ConcSettings, MixedSettings};
+use crate::runner::{profile, run_child, ChildRequest, RunOptions, Runner};
 use crate::schema::BenchResult;
 use crate::workload::{generate_to, WorkloadSpec};
 
@@ -18,26 +18,37 @@ const USAGE: &str = "\
 gstore-bench — the gstore-rust benchmark harness (see bench/README.md)
 
 usage:
-  gstore-bench gen [--workload lubm|tiny] [--scale N] [--seed S] [--departments D] [--chunk] [--out FILE|-]
+  gstore-bench gen [--workload lubm|watdiv|tiny] [--scale N] [--seed S] [--departments D] [--shrink K]
+                   [--chunk] [--out FILE|-]
+  gstore-bench queries [--workload watdiv] [--scale N] [--seed S] [--shrink K] [--data-dir DIR]
   gstore-bench run [--profile micro|smoke|reference] [RUN OPTIONS] [--out FILE]
   gstore-bench check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X]
                      [--summary FILE] [RUN OPTIONS] [--out FILE]
   gstore-bench ci [--baseline bench/baselines/smoke.json] [--summary FILE] [RUN OPTIONS] [--out FILE]
   gstore-bench compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b]
                        [--markdown] [--summary FILE]
-  gstore-bench report RESULT [--markdown] [--compare BASELINE]
+  gstore-bench report RESULT... [--markdown] [--table KIND] [--compare BASELINE]...
+  gstore-bench report --update DOC... | --check DOC...
 
   check / compare: --backends also limits which of the baseline's backends are gated.
+  report --table: overview, queries, build, update, conc, mixed, gates, full (default); one
+  --compare for all results or one per result. --update / --check regenerate / verify the
+  tables between `<!-- gstore-bench report ARGS -->` and `<!-- /gstore-bench report -->`.
   gstore-bench bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]
   gstore-bench merge --out FILE RESULT RESULT...
   gstore-bench calibrate [--quick]
 
 run options:
-  --profile P            micro (tests), smoke (CI: univ 1, snapshot+disk), reference (univ 8/38)
-  --workload W --scale N --seed S --departments D
+  --profile P            micro (tests), smoke (CI: univ 1 + WatDiv-like 1, snapshot+disk),
+                         reference (univ 8/38 + WatDiv-like 10)
+  --workload W --scale N --seed S --departments D --shrink K
+  --extra none|watdiv:10[,…]  the profile's further workloads (an explicit --workload drops them)
+  --label L              key every run as backend@L (e.g. one backend in two modes, then merge)
   --backends a,b         snapshot, disk, rocksdb (rocksdb needs --features rocksdb)
   --reps N --query-procs N --open-reps N --singles N --no-update
   --no-conc --conc-clients 1,8 --conc-secs S --conc-queries q1,q4 --conc-endpoints sparql,api
+  --no-mixed --mixed-readers N --mixed-write-ms MS --mixed-secs S --mixed-checkpoint off,on
+  --mixed-endpoints sparql,api --mixed-query Q   (--no-conc drops the mixed phase too)
   --timeout-s N          per-phase timeout (default from the profile)
   --bin-dir DIR          where gbuild is (default target/release)
   --data-dir DIR         generated-data cache (default $GSTORE_BENCH_CACHE or target/gstore-bench/data)
@@ -125,21 +136,32 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Apply the workload options to `spec`.
-fn workload_options(a: &mut Args, spec: &mut WorkloadSpec) -> Result<(), String> {
+/// Apply the workload options to `spec`. A `--workload` other than `spec`'s
+/// family starts from `default_of(family)` (a profile's own spec of that
+/// family, e.g. the reference profile's WatDiv scale 10).
+fn workload_options(
+    a: &mut Args,
+    spec: &mut WorkloadSpec,
+    default_of: &dyn Fn(&str) -> Option<WorkloadSpec>,
+) -> Result<(), String> {
     if let Some(w) = a.value("--workload")? {
-        let w = if w == "lubm-like" {
-            "lubm".to_string()
-        } else {
-            w
+        let w = match w.as_str() {
+            "lubm-like" => "lubm".to_string(),
+            "watdiv-like" => "watdiv".to_string(),
+            _ => w,
         };
-        if w != spec.kind {
-            *spec = if w == "tiny" {
-                WorkloadSpec::tiny()
-            } else {
-                WorkloadSpec::lubm(1, 0)
+        if w != spec.family() {
+            *spec = match default_of(&w) {
+                Some(s) => s,
+                None => match w.as_str() {
+                    "tiny" => WorkloadSpec::tiny(),
+                    "lubm" => WorkloadSpec::lubm(1, 0),
+                    "watdiv" => WorkloadSpec::watdiv(1, 0),
+                    other => {
+                        return Err(format!("unknown workload '{other}' (lubm, watdiv, tiny)"))
+                    }
+                },
             };
-            spec.kind = w;
         }
     }
     if let Some(n) = a.parsed::<u32>("--scale")? {
@@ -151,6 +173,9 @@ fn workload_options(a: &mut Args, spec: &mut WorkloadSpec) -> Result<(), String>
     if let Some(d) = a.parsed::<u32>("--departments")? {
         spec.departments = Some(d);
     }
+    if let Some(k) = a.parsed::<u32>("--shrink")? {
+        spec.shrink = Some(k);
+    }
     Ok(())
 }
 
@@ -161,7 +186,21 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         .unwrap_or_else(|| default_profile.to_string());
     let mut p = profile(&pname)
         .ok_or_else(|| format!("unknown profile '{pname}' (micro, smoke, reference)"))?;
-    workload_options(a, &mut p.spec)?;
+    let explicit_workload = a
+        .items
+        .iter()
+        .any(|x| x == "--workload" || x.starts_with("--workload="));
+    let extras = p.extra.clone();
+    workload_options(a, &mut p.spec, &|fam| {
+        extras.iter().find(|s| s.family() == fam).cloned()
+    })?;
+    if explicit_workload {
+        // `--workload X` measures X alone (unless --extra says otherwise).
+        p.extra.clear();
+    }
+    if let Some(list) = a.list("--extra")? {
+        p.extra = parse_extra(&list)?;
+    }
     if let Some(b) = a.list("--backends")? {
         p.backends = b;
     }
@@ -217,6 +256,57 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         }
         p.conc = Some(c);
     }
+    let no_mixed = a.flag("--no-mixed");
+    let readers: Option<usize> = a.parsed("--mixed-readers")?;
+    let write_ms: Option<u64> = a.parsed("--mixed-write-ms")?;
+    let msecs: Option<f64> = a.parsed("--mixed-secs")?;
+    let cps = a.list("--mixed-checkpoint")?;
+    let mends = a.list("--mixed-endpoints")?;
+    let mquery = a.value("--mixed-query")?;
+    if no_conc || no_mixed {
+        p.mixed = None;
+    } else if readers.is_some()
+        || write_ms.is_some()
+        || msecs.is_some()
+        || cps.is_some()
+        || mends.is_some()
+        || mquery.is_some()
+    {
+        let mut m = p.mixed.clone().unwrap_or(MixedSettings {
+            readers: 8,
+            write_ms: 100,
+            secs: 5.0,
+            check_point: vec![false, true],
+            endpoints: vec!["sparql".into(), "api".into()],
+            query: None,
+        });
+        if let Some(r) = readers {
+            m.readers = r.max(1);
+        }
+        if let Some(w) = write_ms {
+            m.write_ms = w.max(1);
+        }
+        if let Some(s) = msecs {
+            m.secs = s;
+        }
+        if let Some(c) = cps {
+            m.check_point = c
+                .iter()
+                .map(|x| match x.as_str() {
+                    "off" => Ok(false),
+                    "on" => Ok(true),
+                    other => Err(format!("--mixed-checkpoint: '{other}' (off, on)")),
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(e) = mends {
+            m.endpoints = e;
+        }
+        if mquery.is_some() {
+            m.query = mquery;
+        }
+        p.mixed = Some(m);
+    }
     if let Some(t) = a.parsed::<u64>("--timeout-s")? {
         p.timeout_s = t;
         p.timeout_build_s = t;
@@ -250,7 +340,41 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
     o.verify_data = a.flag("--verify-data");
     o.quiet = a.flag("--quiet");
     o.inject = a.value("--inject")?;
+    o.label = a.value("--label")?;
+    if let Some(l) = &o.label {
+        if l.is_empty() || l.contains(['@', '/', '|', ' ', ':']) {
+            return Err(format!(
+                "--label '{l}': use a short word (no '@', '/', '|', ':' or spaces)"
+            ));
+        }
+    }
     Ok(o)
+}
+
+/// `--extra none` or `family:scale` items (`watdiv:10`).
+fn parse_extra(list: &[String]) -> Result<Vec<WorkloadSpec>, String> {
+    if list.len() == 1 && list[0] == "none" {
+        return Ok(Vec::new());
+    }
+    list.iter()
+        .map(|item| {
+            let (fam, scale) = item.split_once(':').unwrap_or((item.as_str(), "1"));
+            let scale: u32 = scale
+                .parse()
+                .map_err(|_| format!("--extra: invalid scale in '{item}'"))?;
+            let spec = match fam {
+                "watdiv" | "watdiv-like" => WorkloadSpec::watdiv(scale, 0),
+                "lubm" | "lubm-like" => WorkloadSpec::lubm(scale, 0),
+                "tiny" => WorkloadSpec {
+                    scale,
+                    ..WorkloadSpec::tiny()
+                },
+                other => return Err(format!("--extra: unknown workload '{other}'")),
+            };
+            spec.instantiate()?;
+            Ok(spec)
+        })
+        .collect()
 }
 
 fn default_out(o: &RunOptions) -> PathBuf {
@@ -304,6 +428,7 @@ pub fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         "gen" => cmd_gen(&mut a),
+        "queries" => cmd_queries(&mut a),
         "run" => cmd_run(&mut a),
         "check" => cmd_check(&mut a, false),
         "ci" => cmd_check(&mut a, true),
@@ -336,9 +461,13 @@ fn failed<T>(r: Result<T, String>) -> Result<T, Error> {
     r.map_err(Error::Failed)
 }
 
+fn no_default(_: &str) -> Option<WorkloadSpec> {
+    None
+}
+
 fn cmd_gen(a: &mut Args) -> CmdResult {
     let mut spec = WorkloadSpec::lubm(1, 0);
-    usage(workload_options(a, &mut spec))?;
+    usage(workload_options(a, &mut spec, &no_default))?;
     let chunk = a.flag("--chunk");
     let out = usage(a.value("--out"))?.unwrap_or_else(|| "-".into());
     usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
@@ -372,6 +501,50 @@ fn cmd_gen(a: &mut Args) -> CmdResult {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `queries`: the workload's queries as the runs use them (WatDiv templates
+/// bound against the cached data, generating and binding when needed).
+fn cmd_queries(a: &mut Args) -> CmdResult {
+    let mut spec = WorkloadSpec::watdiv(1, 0);
+    usage(workload_options(a, &mut spec, &no_default))?;
+    let mut o = RunOptions::new(usage(
+        profile("micro").ok_or_else(|| "no micro profile".to_string()),
+    )?);
+    o.profile.spec = spec;
+    o.profile.backends = Vec::new();
+    o.calibrate = false;
+    if let Some(d) = usage(a.value("--data-dir"))? {
+        o.data_dir = PathBuf::from(d);
+    }
+    if let Some(d) = usage(a.value("--work-dir"))? {
+        o.work_dir = PathBuf::from(d);
+    }
+    o.verify_data = a.flag("--verify-data");
+    o.quiet = a.flag("--quiet");
+    usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    let runner = failed(Runner::prepare(o))?;
+    let s = runner.main();
+    let mut out = String::new();
+    for q in s.workload.queries() {
+        let b = s.bound.iter().find(|b| b.name == q.name);
+        out.push_str(&format!("# {}", q.name));
+        if let Some(b) = b {
+            for (var, value) in &b.bindings {
+                out.push_str(&format!(" {var}={value}"));
+            }
+            out.push_str(&format!(" (ASK tries: {})", b.tries));
+        }
+        out.push('\n');
+        out.push_str(&q.text);
+        if !q.text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    runner.finish(true);
+    print!("{out}");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn print_self_check(result: &BenchResult) -> Verdict {
     let outcomes = self_check(result);
     let v = verdict(&outcomes);
@@ -388,30 +561,17 @@ fn cmd_run(a: &mut Args) -> CmdResult {
         .unwrap_or_else(|| default_out(&o));
     let note = usage(a.value("--note"))?;
     usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
-    let mut s = failed(Session::prepare(o))?;
-    let r = s.run_all(false);
-    finish_session(&s, r.is_ok());
+    let mut runner = failed(Runner::prepare(o))?;
+    let r = runner.run_all(false);
+    runner.finish(r.is_ok());
     let mut result = failed(r)?;
     result.note = note;
     failed(result.save(&out))?;
-    if !s.opts.quiet {
+    if !runner.main().opts.quiet {
         print!("{}", report::markdown(&result, None));
     }
     eprintln!("[gstore-bench] wrote {}", out.display());
     Ok(exit_for(print_self_check(&result)))
-}
-
-/// Remove the work directory after a run (keeping the phase logs when it
-/// failed, and everything with `--keep-db`).
-fn finish_session(s: &Session, ok: bool) {
-    if s.opts.keep_db {
-        return;
-    }
-    if ok {
-        s.cleanup();
-    } else {
-        s.cleanup_keep_logs();
-    }
 }
 
 fn thresholds(a: &mut Args) -> Result<Thresholds, Error> {
@@ -426,6 +586,17 @@ fn thresholds(a: &mut Args) -> Result<Thresholds, Error> {
             }
         }
     }
+}
+
+/// The distinct backends of `runs`, in order.
+fn backends_of(runs: &[crate::schema::BackendRun]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for r in runs {
+        if !v.contains(&r.backend) {
+            v.push(r.backend.clone());
+        }
+    }
+    v
 }
 
 fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
@@ -450,7 +621,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
                 .collect()
         });
     if let Some(keep) = &backends_arg {
-        baseline.runs.retain(|r| keep.contains(&r.backend));
+        baseline.retain_runs(keep);
     }
     let summary = usage(a.value("--summary"))?
         .or_else(|| {
@@ -471,6 +642,8 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         (r, o)
     } else {
         // Measure what the baseline measured, unless options say otherwise.
+        // The profile's extra workloads the baseline lacks are measured too
+        // and reported as new (not gated).
         let given = |keys: &[&str]| {
             a.items.iter().any(|x| {
                 keys.iter()
@@ -478,7 +651,14 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
             })
         };
         let has_profile = given(&["--profile"]);
-        let explicit_spec = given(&["--workload", "--scale", "--seed", "--departments"]);
+        let explicit_spec = given(&[
+            "--workload",
+            "--scale",
+            "--seed",
+            "--departments",
+            "--shrink",
+        ]);
+        let explicit_extra = given(&["--extra"]);
         let explicit_backends = given(&["--backends"]);
         let default_profile = if profile(&baseline.profile).is_some() {
             baseline.profile.clone()
@@ -489,15 +669,29 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         if !has_profile && !explicit_spec {
             o.profile.spec = baseline.workload.spec.clone();
         }
+        if !has_profile && !explicit_spec && !explicit_extra {
+            for x in &baseline.extra_workloads {
+                let spec = &x.workload.spec;
+                match o
+                    .profile
+                    .extra
+                    .iter_mut()
+                    .find(|s| s.family() == spec.family())
+                {
+                    Some(s) => *s = spec.clone(),
+                    None => o.profile.extra.push(spec.clone()),
+                }
+            }
+        }
         if !has_profile && !explicit_backends {
-            o.profile.backends = baseline.runs.iter().map(|r| r.backend.clone()).collect();
+            o.profile.backends = backends_of(&baseline.runs);
         }
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
-        let mut s = failed(Session::prepare(o))?;
-        let mut result = match s.run_all(true) {
+        let mut runner = failed(Runner::prepare(o))?;
+        let mut result = match runner.run_all(true) {
             Ok(r) => r,
             Err(e) => {
-                finish_session(&s, false);
+                runner.finish(false);
                 return Err(Error::Failed(e));
             }
         };
@@ -505,21 +699,19 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         let mut attempt = 0;
         while verdict(&outcomes) == Verdict::PerfFail && attempt < t.retries {
             attempt += 1;
-            for (backend, phase) in retry_targets(&outcomes) {
-                if let Some(run) = result.run_mut(&backend) {
-                    if let Err(e) = s.rerun(run, phase) {
-                        finish_session(&s, false);
-                        return Err(Error::Failed(e));
-                    }
+            for target in retry_targets(&outcomes) {
+                if let Err(e) = runner.rerun(&mut result, &target) {
+                    runner.finish(false);
+                    return Err(Error::Failed(e));
                 }
             }
             outcomes = evaluate(&baseline, &result, &t, slowdown);
         }
-        finish_session(&s, true);
+        runner.finish(true);
         let out = out_arg
             .clone()
             .map(PathBuf::from)
-            .unwrap_or_else(|| default_out(&s.opts));
+            .unwrap_or_else(|| default_out(&runner.main().opts));
         failed(result.save(&out))?;
         eprintln!("[gstore-bench] wrote {}", out.display());
         (result, outcomes)
@@ -558,8 +750,8 @@ fn cmd_compare(a: &mut Args) -> CmdResult {
     let mut base = failed(BenchResult::load(Path::new(base)))?;
     let mut res = failed(BenchResult::load(Path::new(res)))?;
     if let Some(keep) = &only {
-        base.runs.retain(|r| keep.contains(&r.backend));
-        res.runs.retain(|r| keep.contains(&r.backend));
+        base.retain_runs(keep);
+        res.retain_runs(keep);
     }
     let outcomes = evaluate(&base, &res, &t, slowdown);
     let mut text = report::markdown(&res, Some(&base));
@@ -569,25 +761,71 @@ fn cmd_compare(a: &mut Args) -> CmdResult {
     Ok(exit_for(verdict(&outcomes)))
 }
 
+/// `report`: Markdown of results (`--table KIND` for one compact table over
+/// several results), or the regeneration (`--update`) / verification
+/// (`--check`) of the marked tables of documents.
 fn cmd_report(a: &mut Args) -> CmdResult {
-    let _ = a.flag("--markdown");
-    let cmp = usage(a.value("--compare"))?;
     let t = thresholds(a)?;
-    let pos = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
-    let [res] = pos.as_slice() else {
-        return Err(Error::Usage("report needs one RESULT".into()));
-    };
-    let res = failed(BenchResult::load(Path::new(res)))?;
-    let base = match cmp {
-        Some(p) => Some(failed(BenchResult::load(Path::new(&p)))?),
-        None => None,
-    };
-    let mut text = report::markdown(&res, base.as_ref());
-    if let Some(b) = &base {
-        text.push_str(&report::gates_markdown(&evaluate(b, &res, &t, 1.0), false));
+    let update = usage(a.values("--update"))?;
+    let check = usage(a.values("--check"))?;
+    if !update.is_empty() || !check.is_empty() {
+        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        let mut stale = Vec::new();
+        for (doc, write) in update
+            .iter()
+            .map(|d| (d, true))
+            .chain(check.iter().map(|d| (d, false)))
+        {
+            let text = failed(std::fs::read_to_string(doc).map_err(|e| format!("{doc}: {e}")))?;
+            let (fresh, changed) = failed(report::splice(&text, &mut |args: &[String]| {
+                report::render_args(args, &t)
+            }))
+            .map_err(|e| match e {
+                Error::Failed(m) => Error::Failed(format!("{doc}: {m}")),
+                other => other,
+            })?;
+            if write {
+                if fresh != text {
+                    failed(std::fs::write(doc, &fresh).map_err(|e| format!("{doc}: {e}")))?;
+                }
+                eprintln!(
+                    "[gstore-bench] {doc}: {} table(s) regenerated",
+                    changed.len()
+                );
+            } else if !changed.is_empty() {
+                for c in &changed {
+                    eprintln!("[gstore-bench] {doc}: stale table `{c}`");
+                }
+                stale.push(doc.clone());
+            }
+        }
+        return Ok(if stale.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!(
+                "[gstore-bench] regenerate with: gstore-bench report --update {}",
+                stale.join(" ")
+            );
+            ExitCode::from(1)
+        });
     }
+    // Everything else is `report`'s own argument list (also what a marker
+    // holds), handed over in order.
+    let args = std::mem::take(&mut a.items);
+    let text = usage_or_failed(report::render_args(&args, &t))?;
     print!("{text}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// A usage error for a malformed argument list, a failure otherwise.
+fn usage_or_failed<T>(r: Result<T, String>) -> Result<T, Error> {
+    r.map_err(|m| {
+        if m.starts_with("report") || m.contains("needs a value") {
+            Error::Usage(m)
+        } else {
+            Error::Failed(m)
+        }
+    })
 }
 
 fn cmd_bless(a: &mut Args) -> CmdResult {
@@ -601,9 +839,9 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
     } else {
         let o = usage(run_options(a, "smoke"))?;
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
-        let mut s = failed(Session::prepare(o))?;
-        let r = s.run_all(false);
-        finish_session(&s, r.is_ok());
+        let mut runner = failed(Runner::prepare(o))?;
+        let r = runner.run_all(false);
+        runner.finish(r.is_ok());
         failed(r)?
     };
     let outcomes = self_check(&result);
@@ -625,6 +863,37 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Sort runs by backend (reporting order), then label.
+fn sort_runs(runs: &mut [crate::schema::BackendRun]) {
+    runs.sort_by_key(|r| {
+        (
+            crate::runner::backends::ALL
+                .iter()
+                .position(|b| *b == r.backend)
+                .unwrap_or(usize::MAX),
+            r.label.clone(),
+        )
+    });
+}
+
+/// Append `runs` to `into`, refusing a key it already has.
+fn merge_runs(
+    into: &mut Vec<crate::schema::BackendRun>,
+    runs: Vec<crate::schema::BackendRun>,
+    what: &str,
+) -> Result<(), Error> {
+    for run in runs {
+        if into.iter().any(|r| r.key() == run.key()) {
+            return Err(Error::Failed(format!(
+                "{what}: run {} appears twice (give one of them a --label)",
+                run.key()
+            )));
+        }
+        into.push(run);
+    }
+    Ok(())
+}
+
 fn cmd_merge(a: &mut Args) -> CmdResult {
     let out =
         usage(a.value("--out"))?.ok_or_else(|| Error::Usage("merge needs --out FILE".into()))?;
@@ -632,12 +901,19 @@ fn cmd_merge(a: &mut Args) -> CmdResult {
     if pos.len() < 2 {
         return Err(Error::Usage("merge needs at least two results".into()));
     }
+    let same = |wa: &crate::schema::WorkloadInfo, wb: &crate::schema::WorkloadInfo| {
+        wa.spec == wb.spec && wa.version == wb.version && wa.data_fnv64 == wb.data_fnv64
+    };
     let mut merged: Option<BenchResult> = None;
     for p in &pos {
         let mut r = failed(BenchResult::load(Path::new(p)))?;
         // Keep each run's own calibration for normalization.
         let score = r.calibration.as_ref().map(|c| c.score_ms);
-        for run in &mut r.runs {
+        for run in r
+            .runs
+            .iter_mut()
+            .chain(r.extra_workloads.iter_mut().flat_map(|x| x.runs.iter_mut()))
+        {
             if run.config.calib_score_ms.is_none() {
                 run.config.calib_score_ms = score;
             }
@@ -645,35 +921,50 @@ fn cmd_merge(a: &mut Args) -> CmdResult {
         match merged.as_mut() {
             None => merged = Some(r),
             Some(m) => {
-                let (wa, wb) = (&m.workload, &r.workload);
-                if wa.spec != wb.spec || wa.version != wb.version || wa.data_fnv64 != wb.data_fnv64
-                {
+                if !same(&m.workload, &r.workload) {
                     return Err(Error::Failed(format!(
                         "{p}: a different workload than {}",
                         pos[0]
                     )));
                 }
-                for run in r.runs {
-                    if m.run(&run.backend).is_some() {
-                        return Err(Error::Failed(format!(
-                            "{p}: backend {} appears twice",
-                            run.backend
-                        )));
+                merge_runs(&mut m.runs, r.runs, p)?;
+                for x in r.extra_workloads {
+                    match m
+                        .extra_workloads
+                        .iter_mut()
+                        .find(|y| y.workload.id == x.workload.id)
+                    {
+                        Some(y) => {
+                            if !same(&y.workload, &x.workload) {
+                                return Err(Error::Failed(format!(
+                                    "{p}: its {} workload differs from {}'s",
+                                    x.workload.id, pos[0]
+                                )));
+                            }
+                            merge_runs(&mut y.runs, x.runs, p)?;
+                        }
+                        None => m.extra_workloads.push(x),
                     }
-                    m.runs.push(run);
                 }
             }
         }
     }
     let mut m = merged.expect("two inputs");
-    m.runs.sort_by_key(|r| {
-        crate::runner::backends::ALL
-            .iter()
-            .position(|b| *b == r.backend)
-            .unwrap_or(usize::MAX)
-    });
+    m.schema = crate::schema::SCHEMA.into();
+    sort_runs(&mut m.runs);
+    for x in &mut m.extra_workloads {
+        sort_runs(&mut x.runs);
+    }
     failed(m.save(Path::new(&out)))?;
-    eprintln!("[gstore-bench] wrote {out} ({} backends)", m.runs.len());
+    eprintln!(
+        "[gstore-bench] wrote {out} ({} runs{})",
+        m.runs.len(),
+        if m.extra_workloads.is_empty() {
+            String::new()
+        } else {
+            format!(", {} extra workload(s)", m.extra_workloads.len())
+        }
+    );
     Ok(exit_for(print_self_check(&m)))
 }
 
@@ -699,6 +990,8 @@ fn cmd_calibrate(a: &mut Args) -> CmdResult {
         expected: Vec::new(),
         inject: None,
         quick,
+        queries: Vec::new(),
+        mixed: None,
     };
     let log = dir.join(format!("gstore-bench-calibrate-{}.log", std::process::id()));
     let v = failed(run_child(

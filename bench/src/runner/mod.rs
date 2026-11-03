@@ -1,11 +1,16 @@
 //! The benchmark runner: profiles, the data cache, the per-phase child
 //! processes and the targeted retries of `check`.
 //!
-//! A run, per backend: build (`gbuild` via [`backends`]) → first open (cold
-//! when the page cache could be dropped) → `open_reps` warm opens → the query
-//! phase → the concurrency phase → the update phase (last, because it writes).
-//! Each step is one child process ([`child`]); the database is deleted after
-//! the backend unless `--keep-db`.
+//! A run, per workload (the profile's main one, then each of its `extra`
+//! ones — the WatDiv-like workload in `smoke` and `reference`): the data is
+//! generated (or taken from the cache) and, for a workload of query
+//! templates, the templates are bound against it (the `instantiate` child,
+//! cached next to the data). Then per backend: build (`gbuild` via
+//! [`backends`]) → first open (cold when the page cache could be dropped) →
+//! `open_reps` warm opens → the query phase → the concurrency phase → the
+//! update phase → the mixed-workload phase (the last two write). Each step
+//! is one child process ([`child`]); the database is deleted after the
+//! backend unless `--keep-db`.
 
 pub mod backends;
 pub mod child;
@@ -25,15 +30,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::calib::Calibration;
-use crate::gates::Phase;
-use crate::hash::{file_fnv64, hex};
+use crate::gates::{Phase, RetryTarget};
+use crate::hash::{file_fnv64, hex, Fnv64};
 use crate::schema::{
     BackendRun, BenchResult, ChunkInfo, EnvInfo, OpenResult, QueryInfo, RunConfig, WorkloadInfo,
-    SCHEMA,
+    WorkloadSection, SCHEMA,
 };
-use crate::workload::{generate_to, GenStats, Workload, WorkloadSpec};
+use crate::workload::{bind, generate_to, BoundQuery, GenStats, Workload, WorkloadSpec};
 use child::{ChildRequest, CHILD_COMMAND, RESULT_MARKER};
-use conc::ConcSettings;
+use conc::{ConcSettings, MixedSettings};
 use phases::{median, OpenSample, QueryPhase};
 
 /// A named set of run settings.
@@ -54,6 +59,13 @@ pub struct Profile {
     pub singles: usize,
     pub update: bool,
     pub conc: Option<ConcSettings>,
+    /// Readers plus a paced writer, after the update phase.
+    #[serde(default)]
+    pub mixed: Option<MixedSettings>,
+    /// Further workloads, each measured on the same backends into its own
+    /// section of the result (`extra_workloads`).
+    #[serde(default)]
+    pub extra: Vec<WorkloadSpec>,
     pub timeout_build_s: u64,
     pub timeout_s: u64,
     /// Shrink the calibration (tests).
@@ -73,6 +85,14 @@ pub fn profile(name: &str) -> Option<Profile> {
         queries: Vec::new(),
         endpoints: vec!["sparql".into(), "api".into()],
     };
+    let mixed = |readers: usize, secs: f64| MixedSettings {
+        readers,
+        write_ms: 100,
+        secs,
+        check_point: vec![false, true],
+        endpoints: vec!["sparql".into(), "api".into()],
+        query: None,
+    };
     Some(match name {
         "micro" => Profile {
             name: name.into(),
@@ -87,6 +107,11 @@ pub fn profile(name: &str) -> Option<Profile> {
             singles: 3,
             update: true,
             conc: Some(both(vec![1, 2], 0.25)),
+            mixed: Some(MixedSettings {
+                write_ms: 50,
+                ..mixed(2, 0.25)
+            }),
+            extra: Vec::new(),
             timeout_build_s: 300,
             timeout_s: 300,
             quick_calib: true,
@@ -101,6 +126,8 @@ pub fn profile(name: &str) -> Option<Profile> {
             singles: 20,
             update: true,
             conc: Some(both(vec![1, 2], 1.0)),
+            mixed: Some(mixed(2, 1.0)),
+            extra: vec![WorkloadSpec::watdiv(1, 0)],
             timeout_build_s: 1800,
             timeout_s: 900,
             quick_calib: false,
@@ -115,6 +142,8 @@ pub fn profile(name: &str) -> Option<Profile> {
             singles: 100,
             update: true,
             conc: Some(both(vec![1, 8], 5.0)),
+            mixed: Some(mixed(8, 5.0)),
+            extra: vec![WorkloadSpec::watdiv(10, 0)],
             timeout_build_s: 4 * 3600,
             timeout_s: 2 * 3600,
             quick_calib: false,
@@ -144,6 +173,8 @@ pub struct RunOptions {
     pub calibrate: bool,
     pub verify_data: bool,
     pub quiet: bool,
+    /// `--label`: recorded on every run, whose key becomes `backend@label`.
+    pub label: Option<String>,
 }
 
 impl RunOptions {
@@ -166,6 +197,7 @@ impl RunOptions {
             calibrate: true,
             verify_data: false,
             quiet: false,
+            label: None,
         }
     }
 }
@@ -339,22 +371,52 @@ fn tail(path: &Path, lines: usize) -> String {
     v[v.len().saturating_sub(lines)..].join("\n")
 }
 
-/// A prepared run: data generated, work directory chosen.
+/// The bound-queries cache `<stem>.queries.json` next to a data file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct QueriesSidecar {
+    schema: String,
+    version: String,
+    spec: WorkloadSpec,
+    data_fnv64: String,
+    templates_fnv64: String,
+    queries: Vec<BoundQuery>,
+}
+
+const QUERIES_SCHEMA: &str = "gstore-bench-queries/1";
+
+/// FNV-1a 64 over a workload's query templates (names and texts).
+fn templates_fnv64(w: &dyn Workload) -> String {
+    let mut h = Fnv64::new();
+    for q in w.queries() {
+        h.update(q.name.as_bytes());
+        h.update(&[0]);
+        h.update(q.text.as_bytes());
+        h.update(&[0]);
+    }
+    hex(h.finish())
+}
+
+/// A prepared run of one workload: data generated, queries bound, work
+/// directory chosen.
 pub struct Session {
     pub opts: RunOptions,
+    /// The workload, with its queries bound when it has templates.
     pub workload: Box<dyn Workload>,
     pub data: DataFile,
     pub chunk: DataFile,
+    /// The bound queries (empty for a workload without templates).
+    pub bound: Vec<BoundQuery>,
     work_root: PathBuf,
     calib_score: Option<f64>,
     seq: Cell<u32>,
-    /// Backends whose database the update phase has changed since it was
-    /// built (see [`rerun`](Self::rerun)).
+    /// Backends whose database the update or mixed phase has changed since
+    /// it was built (see [`rerun`](Self::rerun)).
     updated: RefCell<BTreeSet<String>>,
 }
 
 impl Session {
-    /// Generate (or reuse) the data and set up the work directory.
+    /// Generate (or reuse) the data, set up the work directory and bind the
+    /// query templates.
     pub fn prepare(opts: RunOptions) -> Result<Session, String> {
         let workload = opts.profile.spec.instantiate()?;
         for b in &opts.profile.backends {
@@ -384,11 +446,12 @@ impl Session {
             .map_err(|e| format!("cannot create {}: {e}", work_root.display()))?;
         let work_root =
             fs::canonicalize(&work_root).map_err(|e| format!("{}: {e}", work_root.display()))?;
-        let s = Session {
+        let mut s = Session {
             opts,
             workload,
             data,
             chunk,
+            bound: Vec::new(),
             work_root,
             calib_score: None,
             seq: Cell::new(0),
@@ -403,7 +466,84 @@ impl Session {
                 ms / 1e3
             ));
         }
+        if s.workload.needs_binding() {
+            if let Err(e) = s.bind_queries() {
+                s.cleanup_keep_logs();
+                return Err(e);
+            }
+        }
         Ok(s)
+    }
+
+    /// Bind the workload's templates: from the cache next to the data file
+    /// when it matches (generator version, parameters, data hash and
+    /// templates), else by an `instantiate` child, whose answer is cached.
+    /// With `--verify-data` a cached binding is recomputed and must match.
+    fn bind_queries(&mut self) -> Result<(), String> {
+        let path = self
+            .opts
+            .data_dir
+            .join(format!("{}.queries.json", self.workload.file_stem()));
+        let want = QueriesSidecar {
+            schema: QUERIES_SCHEMA.into(),
+            version: self.workload.version().into(),
+            spec: self.opts.profile.spec.clone(),
+            data_fnv64: hex(self.data.stats.fnv64),
+            templates_fnv64: templates_fnv64(self.workload.as_ref()),
+            queries: Vec::new(),
+        };
+        let cached = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<QueriesSidecar>(&t).ok())
+            .filter(|c| {
+                QueriesSidecar {
+                    queries: Vec::new(),
+                    ..c.clone()
+                } == want
+            });
+        let bound = match cached {
+            Some(c) if !self.opts.verify_data => c.queries,
+            cached => {
+                let req = self.request("instantiate", "", self.work_root.clone());
+                let started = Instant::now();
+                let fresh: Vec<BoundQuery> = self.child(&req)?;
+                self.say(&format!(
+                    "bound {} query templates of {} in {:.1} s ({} ASK tries)",
+                    fresh.len(),
+                    self.opts.profile.spec.label(),
+                    started.elapsed().as_secs_f64(),
+                    fresh.iter().map(|q| q.tries).sum::<u32>()
+                ));
+                if let Some(c) = cached {
+                    if c.queries != fresh {
+                        return Err(format!(
+                            "the bound queries cached in {} differ from a fresh ASK walk \
+                             over the same data: the engine answers an ASK differently",
+                            path.display()
+                        ));
+                    }
+                }
+                let side = QueriesSidecar {
+                    queries: fresh.clone(),
+                    ..want
+                };
+                let tmp = self.opts.data_dir.join(format!(
+                    ".{}.queries.tmp{}",
+                    self.workload.file_stem(),
+                    std::process::id()
+                ));
+                fs::write(
+                    &tmp,
+                    serde_json::to_string_pretty(&side).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{}: {e}", tmp.display()))?;
+                fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+                fresh
+            }
+        };
+        self.workload = bind(self.opts.profile.spec.instantiate()?, &bound);
+        self.bound = bound;
+        Ok(())
     }
 
     fn say(&self, msg: &str) {
@@ -443,6 +583,8 @@ impl Session {
             expected: Vec::new(),
             inject: self.opts.inject.clone(),
             quick: self.opts.profile.quick_calib,
+            queries: self.bound.clone(),
+            mixed: self.opts.profile.mixed.clone(),
         }
     }
 
@@ -478,9 +620,40 @@ impl Session {
         Ok(c)
     }
 
+    /// The workload part of a result.
+    pub fn workload_info(&self) -> WorkloadInfo {
+        let w = self.workload.as_ref();
+        WorkloadInfo {
+            spec: self.opts.profile.spec.clone(),
+            id: w.id().into(),
+            version: w.version().into(),
+            lines: self.data.stats.lines,
+            unique_triples: self.data.stats.unique_triples,
+            bytes: self.data.stats.bytes,
+            data_fnv64: hex(self.data.stats.fnv64),
+            queries: w
+                .queries()
+                .iter()
+                .map(|q| {
+                    let b = self.bound.iter().find(|b| b.name == q.name);
+                    QueryInfo {
+                        name: q.name.clone(),
+                        text_fnv64: hex(q.text_fnv64()),
+                        bindings: b.map(|b| b.bindings.clone()).unwrap_or_default(),
+                        tries: b.map(|b| b.tries),
+                    }
+                })
+                .collect(),
+            chunk: Some(ChunkInfo {
+                unique_triples: self.chunk.stats.unique_triples,
+                fnv64: hex(self.chunk.stats.fnv64),
+            }),
+            gen_ms: self.data.gen_ms,
+        }
+    }
+
     /// The result skeleton: environment and workload, no runs.
     pub fn result(&self, calibration: Option<Calibration>) -> BenchResult {
-        let w = self.workload.as_ref();
         BenchResult {
             schema: SCHEMA.into(),
             kind: "result".into(),
@@ -490,29 +663,9 @@ impl Session {
             created_unix: now_unix(),
             env: env_info(),
             calibration,
-            workload: WorkloadInfo {
-                spec: self.opts.profile.spec.clone(),
-                id: w.id().into(),
-                version: w.version().into(),
-                lines: self.data.stats.lines,
-                unique_triples: self.data.stats.unique_triples,
-                bytes: self.data.stats.bytes,
-                data_fnv64: hex(self.data.stats.fnv64),
-                queries: w
-                    .queries()
-                    .iter()
-                    .map(|q| QueryInfo {
-                        name: q.name.clone(),
-                        text_fnv64: hex(q.text_fnv64()),
-                    })
-                    .collect(),
-                chunk: Some(ChunkInfo {
-                    unique_triples: self.chunk.stats.unique_triples,
-                    fnv64: hex(self.chunk.stats.fnv64),
-                }),
-                gen_ms: self.data.gen_ms,
-            },
+            workload: self.workload_info(),
             runs: Vec::new(),
+            extra_workloads: Vec::new(),
         }
     }
 
@@ -554,6 +707,7 @@ impl Session {
         }
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut run = BackendRun::new(backend);
+        run.label = self.opts.label.clone();
         run.config = self.run_config();
 
         let build =
@@ -640,16 +794,37 @@ impl Session {
             ));
             run.update = Some(u);
         }
+
+        if p.mixed.is_some() {
+            self.updated.borrow_mut().insert(backend.to_string());
+            let m: crate::schema::MixedResult =
+                self.child(&self.request("mixed", backend, dir.clone()))?;
+            let pts: Vec<String> = m
+                .points
+                .iter()
+                .map(|x| {
+                    format!(
+                        "{}/cp-{} {:.0} qps + {} writes",
+                        x.endpoint,
+                        if x.check_point { "on" } else { "off" },
+                        x.qps,
+                        x.writes
+                    )
+                })
+                .collect();
+            self.say(&format!("{backend}: mixed: {}", pts.join(", ")));
+            run.mixed = Some(m);
+        }
         Ok(run)
     }
 
     /// Re-run `phase` of `run`'s backend and keep the minimum of the
     /// medians (`check`'s targeted retries). Answers must not change. The
-    /// update phase has already run (gates are evaluated after the whole
-    /// run) and its inserts and deletes leave the database larger (ids are
-    /// not reclaimed), so a retried open or query phase first rebuilds it:
-    /// a retry measures the database the first attempt and the baseline
-    /// measured.
+    /// update and mixed phases have already run (gates are evaluated after
+    /// the whole run) and leave a database that differs from the built one
+    /// (more triples, other ids, another file layout), so a retried open or
+    /// query phase first rebuilds it: a retry measures the database the
+    /// first attempt and the baseline measured.
     pub fn rerun(&self, run: &mut BackendRun, phase: Phase) -> Result<(), String> {
         let backend = run.backend.clone();
         let key = match phase {
@@ -757,27 +932,126 @@ impl Session {
         );
     }
 
-    /// Calibrate, then measure every backend of the profile. Databases are
-    /// deleted after each backend unless `keep` (or `--keep-db`).
-    pub fn run_all(&mut self, keep: bool) -> Result<BenchResult, String> {
-        let calib = if self.opts.calibrate {
-            Some(self.calibrate()?)
-        } else {
-            None
-        };
-        let mut result = self.result(calib);
+    /// Measure every backend of the profile. Databases are deleted after
+    /// each backend unless `keep` (or `--keep-db`).
+    pub fn run_backends(&self, keep: bool) -> Result<Vec<BackendRun>, String> {
+        let mut runs = Vec::new();
         for b in self.opts.profile.backends.clone() {
             let r = self.run_backend(&b);
             if !keep && !self.opts.keep_db {
                 self.cleanup_backend(&b);
             }
-            result.runs.push(r?);
+            runs.push(r?);
         }
-        Ok(result)
+        Ok(runs)
     }
 
     pub fn work_root(&self) -> &Path {
         &self.work_root
+    }
+}
+
+/// A run of a profile: one [`Session`] for its main workload and one for
+/// each extra workload, measured in that order into one result (the extra
+/// ones into `extra_workloads`).
+pub struct Runner {
+    /// The main workload's session first.
+    pub sessions: Vec<Session>,
+}
+
+impl Runner {
+    /// Prepare every workload of `opts`'s profile. The concurrency and
+    /// mixed-workload query choices (`--conc-queries`, `--mixed-query`)
+    /// apply to the main workload; the extra ones use their defaults.
+    pub fn prepare(opts: RunOptions) -> Result<Runner, String> {
+        let extras = opts.profile.extra.clone();
+        let mut main = opts.clone();
+        main.profile.extra.clear();
+        let mut sessions = vec![Session::prepare(main)?];
+        for spec in extras {
+            let mut o = opts.clone();
+            o.profile.spec = spec;
+            o.profile.extra.clear();
+            if let Some(c) = o.profile.conc.as_mut() {
+                c.queries.clear();
+            }
+            if let Some(m) = o.profile.mixed.as_mut() {
+                m.query = None;
+            }
+            match Session::prepare(o) {
+                Ok(s) => sessions.push(s),
+                Err(e) => {
+                    for s in &sessions {
+                        s.cleanup();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Runner { sessions })
+    }
+
+    /// The main workload's session.
+    pub fn main(&self) -> &Session {
+        &self.sessions[0]
+    }
+
+    /// Calibrate, then measure every backend of every workload. Databases
+    /// are deleted after each backend unless `keep` (or `--keep-db`).
+    pub fn run_all(&mut self, keep: bool) -> Result<BenchResult, String> {
+        let calib = if self.sessions[0].opts.calibrate {
+            Some(self.sessions[0].calibrate()?)
+        } else {
+            None
+        };
+        let score = calib.as_ref().map(|c| c.score_ms);
+        for s in &mut self.sessions[1..] {
+            s.calib_score = score;
+        }
+        let mut result = self.sessions[0].result(calib);
+        result.runs = self.sessions[0].run_backends(keep)?;
+        for s in &self.sessions[1..] {
+            let runs = s.run_backends(keep)?;
+            result.extra_workloads.push(WorkloadSection {
+                workload: s.workload_info(),
+                runs,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Re-run the phase `t` names in `result` (`check`'s targeted retries).
+    pub fn rerun(&self, result: &mut BenchResult, t: &RetryTarget) -> Result<(), String> {
+        let session = match &t.section {
+            None => &self.sessions[0],
+            Some(id) => self.sessions[1..]
+                .iter()
+                .find(|s| s.workload.id() == id)
+                .ok_or_else(|| format!("no session measured the {id} workload"))?,
+        };
+        let runs = result
+            .runs_mut(t.section.as_deref())
+            .ok_or("the result lacks the retried workload")?;
+        let run = runs
+            .iter_mut()
+            .find(|r| r.key() == t.run)
+            .ok_or_else(|| format!("the result lacks the retried run {}", t.run))?;
+        session.rerun(run, t.phase)
+    }
+
+    /// Remove the work directories (keeping the phase logs when the run
+    /// failed, and everything with `--keep-db`).
+    pub fn finish(&self, ok: bool) {
+        for s in &self.sessions {
+            if s.opts.keep_db {
+                continue;
+            }
+            if ok {
+                s.cleanup();
+            } else {
+                s.cleanup_keep_logs();
+            }
+        }
     }
 }
 
