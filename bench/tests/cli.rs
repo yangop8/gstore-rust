@@ -448,6 +448,20 @@ fn gen_usage_and_calibrate() {
         2
     );
     assert_eq!(bench(&args(&["run", "--no-such-option"])).0, 2);
+    // One section per workload: the main workload again as an extra one is
+    // refused before anything is generated.
+    let r = bench(&args(&[
+        "run",
+        "--workload",
+        "watdiv",
+        "--extra",
+        "watdiv:2",
+        "--data-dir",
+        &t.path("d"),
+    ]));
+    assert_eq!(r.0, 2, "{}", r.2);
+    assert!(r.2.contains("measured twice"), "{}", r.2);
+    assert!(!Path::new(&t.path("d")).exists());
     assert_eq!(bench(&args(&["compare", "only-one.json"])).0, 2);
     let r = bench(&args(&["calibrate", "--quick"]));
     ok(&r, "calibrate");

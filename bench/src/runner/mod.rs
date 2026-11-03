@@ -967,6 +967,18 @@ impl Runner {
     /// apply to the main workload; the extra ones use their defaults.
     pub fn prepare(opts: RunOptions) -> Result<Runner, String> {
         let extras = opts.profile.extra.clone();
+        // A result holds one section per workload.
+        let mut families = vec![opts.profile.spec.family().to_string()];
+        for e in &extras {
+            if families.iter().any(|f| f == e.family()) {
+                return Err(format!(
+                    "the {} workload is measured twice (main workload and --extra, or \
+                     --extra twice); a result holds each workload once",
+                    e.family()
+                ));
+            }
+            families.push(e.family().to_string());
+        }
         let mut main = opts.clone();
         main.profile.extra.clear();
         let mut sessions = vec![Session::prepare(main)?];

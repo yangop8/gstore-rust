@@ -168,6 +168,56 @@ One SplitMix64 stream per university and per department; output through a
 
 The update chunk is Department0 of `University<univ>` without its
 University typing lines, so none of its triples is in the data set.
+
+**watdiv-like** (`src/watdiv.rs`, version `watdiv-like/1`) follows the
+Waterloo SPARQL Diversity Test Suite (WatDiv) in vocabulary, schema shape
+and query shapes, but is its own generator (its data is not WatDiv's). The
+prefixes are WatDiv's (`wsdbm:`, `sorg:`, `gr:`, `rev:`, `foaf:`, `og:`,
+`mo:`, `gn:`, `dc:`); the classes and their sizes at scale `s`:
+
+| class | entities | | class | entities |
+|---|---:|---|---|---:|
+| User | 1000·s | | City | 240 |
+| Product | 250·s | | Country | 25 |
+| Review | 1500·s | | Language | 25 |
+| Offer | 900·s | | Topic | 250 |
+| Purchase | 1500·s | | Genre / SubGenre | 21 / 145 |
+| Retailer | 12·s | | ProductCategory | 15 |
+| Website | 50·s | | Role / AgeGroup / Gender | 3 / 9 / 2 |
+
+Each class's properties have a probability and a count range
+(`watdiv::props`); `Retailer gr:offers Offer`, `Product rev:hasReview
+Review` and `User wsdbm:makesPurchase Purchase` give every child exactly
+one parent. `wsdbm:friendOf` and `wsdbm:follows` (71% of the triples, as in
+WatDiv) and most references pick their target from a Zipf distribution
+with integer weights (`2^40/k`, `2^48/isqrt(k·2^32)`), so the data is the
+same on every platform; `Product0` is the most liked product. Entity 0 of
+each class carries the triples that make every template answerable with
+its placeholder bound to that entity (`watdiv::GUARANTEED`), which also
+creates the templates' fixed constants (`Product0`, `Role2`, `Country1`,
+`Country5`, `Language0`, `ProductCategory2`). Every line is a distinct
+triple, written subject by subject. The update chunk is 100 users after the
+last one (`User{n}`…), with references into the data: every chunk triple
+has a new subject.
+
+| scale | triples | data fnv64 |
+|---|---:|---|
+| 1 (`smoke`) | 105,620 | `70c039a88063c158` (golden) |
+| 10 (`reference`) | 1,056,… (see the fragment) | |
+
+The 20 templates `queries/watdiv/{L1-5,S1-7,F1-5,C1-3}.rq` (linear, star,
+snowflake and complex shapes after WatDiv's basic testing set) start with a
+`#mapping vN wsdbm:Class uniform` line per `%vN%` placeholder (`#mapping
+none` for C1–C3). **ASK walk:** per template, up to 32 candidate bindings
+come from the template's own SplitMix64 stream (uniform over the class's
+entities; the 32nd is entity 0); the first whose `ASK` form is true against
+the generated data (an in-memory database, the `instantiate` child) binds
+the template. The walk is deterministic, so the bound queries are a
+function of the workload parameters; they are cached as
+`<stem>.queries.json` next to the data file and recorded in results (each
+query's `bindings` and `tries`). A template no candidate answers fails the
+run. `gstore-bench queries --workload watdiv --scale N` prints them.
+
 `tiny` is a 285-triple toy graph with five queries for the harness's tests.
 
 Generated files are cached in the data directory as `<stem>.nt` with a
@@ -176,13 +226,18 @@ missing, stale or mismatching sidecar regenerates the file.
 
 ## Results and baselines
 
-`gstore-bench/1` JSON (`src/schema.rs`): environment (commit, host, CPU,
-memory, load), calibration, workload (generator version, data hash, query
-text hashes, chunk), and per backend the build, open, query, query memory,
-update and concurrency figures, plus the binaries and options that measured
-it (`config`). Times are ms, memory MiB, sizes bytes, hashes 16 hex digits.
-A baseline is the same document with `"kind": "baseline"`;
-`"provisional": true` marks one recorded on a busy machine.
+`gstore-bench/2` JSON (`src/schema.rs`; every `gstore-bench/1` file reads
+as a `/2` document without the newer fields): environment (commit, host,
+CPU, memory, load), calibration, workload (generator version, data hash,
+query text hashes and, for bound templates, bindings, chunk), and per run
+the build (with `gbuild`'s bulk-build `summary`), open, query, query
+memory, update, concurrency and mixed-workload figures (with the `/api`
+`begin` point), plus the binaries and options that measured it (`config`).
+Further workloads of the run follow in `extra_workloads`, each with its own
+workload and runs. A run is keyed by its backend, or `backend@label` with
+`--label` (`BackendRun::key`). Times are ms, memory MiB, sizes bytes,
+hashes 16 hex digits. A baseline is the same document with `"kind":
+"baseline"`; `"provisional": true` marks one recorded on a busy machine.
 
 * `bench/baselines/smoke.json` — the CI baseline (re-bless it when a change
   makes things ≥ 1.5× faster, or after an intended format change).
@@ -205,22 +260,64 @@ A baseline is the same document with `"kind": "baseline"`;
   warm open `> 2.5` (20 ms floor).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
   open, query high-water mark). **Size**: database bytes `> 1.25×` fails.
-* Concurrency throughput and update times are report-only.
+* Concurrency and mixed-workload throughput, `/begin` latency and update
+  times are report-only (`info.*`); the mixed phase's identical answers and
+  acknowledged writes are exact.
+* **New entries are reported, not gated** (`info.new`): a workload the
+  baseline does not have (the WatDiv-like section of a smoke run against a
+  baseline blessed before it existed), a run whose key and backend the
+  baseline lacks, a query the baseline run lacks. A workload, run, query or
+  phase the baseline has and the result lacks still fails.
+
+Each workload is gated on its own against the baseline's workload of the
+same id; an extra workload's subjects start with its id
+(`watdiv-like:snapshot/L1`). Runs are matched by key; an unlabelled
+baseline run is compared with every labelled run of its backend, so
+`disk@stream` and `disk@materialize` are both gated against a pre-Phase-6
+`disk` run.
 
 A failing timing or memory gate re-runs only the failing phases of that
-backend, up to `retries` (2) times, keeping the minimum of the medians. The
-gates run after the update phase, so a retried open or query phase first
-rebuilds the database that phase changed (and a retried open must see the
-first attempt's term counts).
+run (of that workload), up to `retries` (2) times, keeping the minimum of
+the medians. The gates run after the update and mixed phases, so a retried
+open or query phase first rebuilds the database those phases changed (and
+a retried open must see the first attempt's term counts).
 `--self-test-slowdown X` multiplies every measured time by X: CI checks that
 the run's own result, slowed 3× and checked against itself, fails (exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
 ≥ 20 ms slowed 4× fails, and a row-hash change fails without a retry
 (`tests/gates.rs`).
 
+## Reports and documentation tables
+
+`report RESULT` prints the full Markdown report of a result (every
+workload, every phase; `--compare BASELINE` adds ratios and the gate
+table). `report --table KIND RESULT... [--compare BASELINE]...` prints one
+compact table over several results — `overview` (build, size, open, memory,
+geomean, and ratios), `queries` (one table per workload), `build` (gbuild's
+bulk-build summary), `update`, `conc`, `mixed` (with the `/begin` point),
+`gates` or `full` — with a `workload` column; give no `--compare`, one for
+all results, or one per result in order. The output is a pure function of
+the JSON files: the same files give the same bytes.
+
+Documents embed generated tables between markers whose first line holds
+`report`'s arguments (paths relative to the workspace root):
+
+```text
+<!-- gstore-bench report --table overview bench/results/phase6-final-lubm38.json --compare bench/results/pre-phase6-lubm38.json -->
+| workload | backend | build s | … |
+<!-- /gstore-bench report -->
+```
+
+`gstore-bench report --update README.md CHANGELOG.md` regenerates every
+marked table from the committed results; `report --check …` exits 1 when
+one is stale (the smoke CI job runs it).
+
 ## CI (`.github/workflows/bench.yml`)
 
-* `smoke` (push, PR): release build, `gstore-bench ci`, the canary, results
-  and phase logs as an artifact.
+* `smoke` (push, PR): release build, the documentation-table check
+  (`report --check README.md CHANGELOG.md`), `gstore-bench ci` (LUBM-like
+  univ 1 and WatDiv-like scale 1; the WatDiv-like workload is reported as
+  new until `smoke.json` is re-blessed with it), the canary, results and
+  phase logs as an artifact.
 * `rocksdb-correctness` (push, PR): `cargo test -p gstore-bench --features
   rocksdb` after building `gbuild` with RocksDB; the RocksDB build cache is
   shared with ci.yml's rocksdb job.
@@ -254,15 +351,37 @@ build alone 27 min) and 24 min (RocksDB: 9 opens of about 60 s, each in a
 fresh process, plus 5 query processes) at univ 38. Run the long ones in the
 background and nothing else meanwhile.
 
+The disk layout in both query modes goes into one file with labels (the
+environment variable selects the mode, the label keys the run); the
+WatDiv-like workload rides along once (`--extra none` elsewhere):
+
+```text
+B=target/release/gstore-bench
+flock /tmp/gstore-bench.lock $B run --profile reference --scale 8 --backends snapshot --out s.json
+flock /tmp/gstore-bench.lock $B run --profile reference --scale 8 --extra none --backends disk \
+    --env GSTORE_DISK_QUERY_MODE=stream --label stream --out ds.json
+flock /tmp/gstore-bench.lock $B run --profile reference --scale 8 --extra none --backends disk \
+    --env GSTORE_DISK_QUERY_MODE=memory --label materialize --out dm.json
+$B merge --out final-lubm8.json s.json ds.json dm.json
+$B compare bench/results/pre-phase6-lubm8.json final-lubm8.json --markdown   # disk@stream and disk@materialize vs pre disk
+```
+
 ## Tests
 
-`cargo test -p gstore-bench` (about 10 s in a debug build, after compiling): golden values of
-the generator stream, the hashes and the univ-1 data; all 14 queries
-non-empty at univ 1 and the micro row counts; the chunk's disjointness; the
-gates on synthetic results; and the binary end to end with the `micro`
-profile (bless → check, the canary, an injected crash and timeout exiting 2,
-the data cache, merging, every backend answering alike). The end-to-end
-tests use the `gbuild` next to the test binary when it exists (`cargo test
+`cargo test -p gstore-bench` (about 15 s in a debug build, after compiling): golden values of
+the generator stream, the hashes, the univ-1 LUBM data and the scale-1
+WatDiv-like data and bound queries; all 14 LUBM queries non-empty at univ 1
+and the micro row counts; the WatDiv-like composition (each class's triples
+within ±10% of the design at scales 1 and 2), every template parsing,
+binding and answering non-empty at scale 1, and snapshot and disk answering
+alike; the chunks' disjointness; the gates on synthetic results (new
+workloads, labelled runs, `/1` files); the reports (a golden table, marker
+splicing, every committed result still loading and comparing); and the
+binary end to end with the `micro` profile (bless → check, the canary, an
+injected crash and timeout exiting 2, the data cache, merging, every backend
+answering alike, a WatDiv-like run on snapshot and disk with the mixed phase,
+a check that reports a new workload and passes). The end-to-end tests use
+the `gbuild` next to the test binary when it exists (`cargo test
 --workspace` builds it) and otherwise the library build, and say so;
 `GSTORE_BENCH_TEST_BUILDER=cli|lib` forces one. The LUBM micro run on the
 disk layout is `#[ignore]` (slow in a debug build).
