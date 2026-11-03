@@ -4,13 +4,27 @@
 //! * **Exact gates** (never retried): the generator version and data hash, the
 //!   query text hashes, `triple_num == unique_triples`, every query's rows and
 //!   row hash equal to the baseline and across backends, stable across runs and
-//!   non-empty, the update round trip, identical concurrent response bodies.
+//!   non-empty, the update round trip, identical concurrent response bodies
+//!   (and, in the mixed workload, identical reader bodies and acknowledged
+//!   writes).
 //! * **Timing gates** (one-sided, calibration-normalized): per query
 //!   `(m+floor)/(b+floor) > 3.0` fails, the per-backend geomean of the raw
 //!   medians `> 1.5` fails (over the queries whose baseline median is at
 //!   least `min_base_ms`), build `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
 //! * **Memory**: `(m+32 MiB)/(b+32 MiB) > 1.5` fails (build peak, after open,
 //!   query high-water mark). **Size**: directory bytes `> 1.25` fails.
+//! * **Report-only** (`info.*`, never fail): concurrency and mixed-workload
+//!   throughput, and what the result has that the baseline lacks — a whole
+//!   extra workload (the WatDiv-like section before a baseline has one), a
+//!   run, or a query (`info.new`).
+//!
+//! Every workload of a result (the main one and each of `extra_workloads`)
+//! is gated on its own against the baseline's workload of the same id; the
+//! subjects of an extra workload's gates start with its id
+//! (`watdiv-like:snapshot/L1`). Runs are matched by key
+//! ([`BackendRun::key`]); an unlabelled baseline run is compared with every
+//! labelled run of its backend (`disk` with `disk@stream` and
+//! `disk@materialize`).
 //!
 //! [`self_check`] runs the exact gates that need no baseline; `run` applies it
 //! to every result.
@@ -20,7 +34,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::hex;
-use crate::schema::{BackendRun, BenchResult, SCHEMA};
+use crate::schema::{
+    matching_runs, BackendRun, BenchResult, Section, WorkloadInfo, READABLE_SCHEMAS,
+};
 
 pub const GATES_SCHEMA: &str = "gstore-bench-gates/1";
 
@@ -129,12 +145,34 @@ pub enum Phase {
     Query,
 }
 
+/// What a retry re-runs: a phase of one run of one workload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RetryTarget {
+    /// `None` for the main workload, else the extra workload's id.
+    pub section: Option<String>,
+    /// The run's key ([`BackendRun::key`]).
+    pub run: String,
+    pub phase: Phase,
+}
+
+impl RetryTarget {
+    /// A phase of a run of the main workload.
+    pub fn main(run: &str, phase: Phase) -> RetryTarget {
+        RetryTarget {
+            section: None,
+            run: run.to_string(),
+            phase,
+        }
+    }
+}
+
 /// One evaluated gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateOutcome {
     /// What was checked (`exact.rows`, `time.query`, `rss.open`, …).
     pub gate: String,
-    /// Where (`snapshot/q4`, `disk`, `workload`).
+    /// Where (`snapshot/q4`, `disk`, `workload`; an extra workload's
+    /// subjects start with its id, `watdiv-like:snapshot/L1`).
     pub subject: String,
     pub class: GateClass,
     #[serde(default)]
@@ -148,9 +186,9 @@ pub struct GateOutcome {
     pub pass: bool,
     #[serde(default)]
     pub detail: String,
-    /// The backend and phase a retry re-runs (timing and memory gates).
+    /// What a retry re-runs (timing and memory gates).
     #[serde(default)]
-    pub retry: Option<(String, Phase)>,
+    pub retry: Option<RetryTarget>,
 }
 
 impl GateOutcome {
@@ -171,6 +209,13 @@ impl GateOutcome {
             pass,
             detail: detail.into(),
             retry: None,
+        }
+    }
+
+    fn info(gate: &str, subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        GateOutcome {
+            class: GateClass::Info,
+            ..GateOutcome::exact(gate, subject, true, detail)
         }
     }
 }
@@ -198,9 +243,9 @@ pub fn verdict(outcomes: &[GateOutcome]) -> Verdict {
     }
 }
 
-/// The (backend, phase) pairs failing timing or memory gates name.
-pub fn retry_targets(outcomes: &[GateOutcome]) -> Vec<(String, Phase)> {
-    let mut v: Vec<(String, Phase)> = outcomes
+/// The phases failing timing or memory gates name, each once.
+pub fn retry_targets(outcomes: &[GateOutcome]) -> Vec<RetryTarget> {
+    let mut v: Vec<RetryTarget> = outcomes
         .iter()
         .filter(|o| !o.pass)
         .filter_map(|o| o.retry.clone())
@@ -210,25 +255,43 @@ pub fn retry_targets(outcomes: &[GateOutcome]) -> Vec<(String, Phase)> {
     v
 }
 
-/// The exact gates of one result that need no baseline.
+/// The exact gates of one result that need no baseline, for every workload
+/// of it.
 pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
-    let mut out = Vec::new();
-    out.push(GateOutcome::exact(
+    let mut out = vec![GateOutcome::exact(
         "exact.schema",
         "result",
-        r.schema == SCHEMA,
+        READABLE_SCHEMAS.contains(&r.schema.as_str()),
         format!("schema {}", r.schema),
-    ));
+    )];
+    let mut seen = Vec::new();
+    for s in r.sections() {
+        if let Some(id) = s.id {
+            out.push(GateOutcome::exact(
+                "exact.section",
+                format!("{id}:workload"),
+                id != r.workload.id && !seen.contains(&id),
+                "one section per workload, other than the main one",
+            ));
+            seen.push(id);
+        }
+        self_check_section(&s, &mut out);
+    }
+    out
+}
+
+fn self_check_section(s: &Section<'_>, out: &mut Vec<GateOutcome>) {
+    let pre = s.prefix();
     // The tool's pinned query texts (LUBM).
-    if r.workload.id == "lubm-like" {
-        for q in &r.workload.queries {
+    if s.workload.id == "lubm-like" {
+        for q in &s.workload.queries {
             let pinned = crate::lubm::QUERY_TEXT_FNV64
                 .iter()
                 .find(|(n, _)| *n == q.name)
                 .map(|(_, h)| hex(*h));
             out.push(GateOutcome::exact(
                 "exact.query_text",
-                format!("workload/{}", q.name),
+                format!("{pre}workload/{}", q.name),
                 pinned.as_deref() == Some(q.text_fnv64.as_str()),
                 format!(
                     "text fnv {} (pinned {})",
@@ -238,37 +301,48 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
             ));
         }
     }
-    let mut by_query: BTreeMap<&str, Vec<(&str, u64, &str)>> = BTreeMap::new();
-    for run in &r.runs {
-        let b = run.backend.as_str();
+    let mut keys: Vec<String> = Vec::new();
+    let mut by_query: BTreeMap<&str, Vec<(String, u64, &str)>> = BTreeMap::new();
+    for run in s.runs {
+        let b = run.key();
+        if keys.contains(&b) {
+            out.push(GateOutcome::exact(
+                "exact.run_key",
+                format!("{pre}{b}"),
+                false,
+                "a run key appears twice in one workload",
+            ));
+        }
+        keys.push(b.clone());
         if let Some(open) = &run.open {
             out.push(GateOutcome::exact(
                 "exact.triple_num",
-                b,
-                open.triple_num == r.workload.unique_triples,
+                format!("{pre}{b}"),
+                open.triple_num == s.workload.unique_triples,
                 format!(
                     "triple_num {} vs generated unique triples {}",
-                    open.triple_num, r.workload.unique_triples
+                    open.triple_num, s.workload.unique_triples
                 ),
             ));
         }
         for q in &run.queries {
             out.push(GateOutcome::exact(
                 "exact.stable",
-                format!("{b}/{}", q.name),
+                format!("{pre}{b}/{}", q.name),
                 q.stable,
                 "same rows in every run",
             ));
             out.push(GateOutcome::exact(
                 "exact.nonempty",
-                format!("{b}/{}", q.name),
+                format!("{pre}{b}/{}", q.name),
                 q.rows > 0,
                 format!("{} rows", q.rows),
             ));
-            by_query
-                .entry(q.name.as_str())
-                .or_default()
-                .push((b, q.rows, q.rows_fnv64.as_str()));
+            by_query.entry(q.name.as_str()).or_default().push((
+                b.clone(),
+                q.rows,
+                q.rows_fnv64.as_str(),
+            ));
         }
         if let Some(u) = &run.update {
             let mut why = Vec::new();
@@ -286,7 +360,7 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
             }
             out.push(GateOutcome::exact(
                 "exact.update_round_trip",
-                b,
+                format!("{pre}{b}"),
                 u.round_trip_ok(),
                 if why.is_empty() {
                     "ok".into()
@@ -298,9 +372,20 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
         if let Some(c) = &run.conc {
             out.push(GateOutcome::exact(
                 "exact.conc_bodies",
-                b,
+                format!("{pre}{b}"),
                 c.bodies_equal,
                 "identical response bodies per endpoint and query",
+            ));
+        }
+        if let Some(m) = &run.mixed {
+            out.push(GateOutcome::exact(
+                "exact.mixed",
+                format!("{pre}{b}"),
+                m.bodies_equal && m.writes_ok,
+                format!(
+                    "reader bodies identical: {}, every write acknowledged: {}",
+                    m.bodies_equal, m.writes_ok
+                ),
             ));
         }
     }
@@ -308,17 +393,16 @@ pub fn self_check(r: &BenchResult) -> Vec<GateOutcome> {
         if seen.len() < 2 {
             continue;
         }
-        let (b0, rows0, h0) = seen[0];
-        for &(b, rows, h) in &seen[1..] {
+        let (b0, rows0, h0) = &seen[0];
+        for (b, rows, h) in &seen[1..] {
             out.push(GateOutcome::exact(
                 "exact.cross_backend",
-                format!("{b}/{name}"),
+                format!("{pre}{b}/{name}"),
                 rows == rows0 && h == h0,
                 format!("{rows} rows {h} vs {b0}: {rows0} rows {h0}"),
             ));
         }
     }
-    out
 }
 
 /// The calibration factor (measured machine time / baseline machine time,
@@ -348,7 +432,7 @@ fn ratio_gate(
     measured: f64,
     floor: f64,
     limit: f64,
-    retry: Option<(String, Phase)>,
+    retry: Option<RetryTarget>,
 ) -> GateOutcome {
     let ratio = (measured + floor) / (base + floor).max(f64::MIN_POSITIVE);
     GateOutcome {
@@ -374,56 +458,176 @@ pub fn evaluate(
     slowdown: f64,
 ) -> Vec<GateOutcome> {
     let mut out = self_check(m);
-    // Workload identity.
-    let wb = &base.workload;
-    let wm = &m.workload;
-    out.push(GateOutcome::exact(
-        "exact.workload",
-        "workload",
-        wb.spec == wm.spec && wb.version == wm.version,
+    let ctx = Ctx {
+        t,
+        slowdown,
+        base,
+        m,
+    };
+    let bs = base.sections();
+    let ms = m.sections();
+    // The main workloads are always compared (a different workload fails
+    // the identity gates).
+    ctx.section(&bs[0], &ms[0], &mut out);
+    for sm in &ms[1..] {
+        match bs[1..].iter().find(|sb| sb.id == sm.id) {
+            Some(sb) => ctx.section(sb, sm, &mut out),
+            None => new_section(sm, &mut out),
+        }
+    }
+    for sb in &bs[1..] {
+        if !ms[1..].iter().any(|sm| sm.id == sb.id) {
+            out.push(GateOutcome::exact(
+                "exact.section",
+                format!("{}workload", sb.prefix()),
+                false,
+                "the baseline has this workload; the result does not",
+            ));
+        }
+    }
+    out
+}
+
+/// A workload the baseline lacks: reported, not gated.
+fn new_section(sm: &Section<'_>, out: &mut Vec<GateOutcome>) {
+    let pre = sm.prefix();
+    out.push(GateOutcome::info(
+        "info.new",
+        format!("{pre}workload"),
         format!(
-            "{} {} vs baseline {} {}",
-            wm.version,
-            wm.spec.label(),
-            wb.version,
-            wb.spec.label()
+            "{} ({} queries) is new: the baseline has no {} workload",
+            sm.workload.spec.label(),
+            sm.workload.queries.len(),
+            sm.id.unwrap_or_default()
         ),
     ));
-    out.push(GateOutcome::exact(
-        "exact.data_hash",
-        "workload",
-        wb.data_fnv64 == wm.data_fnv64 && wb.unique_triples == wm.unique_triples,
-        format!(
-            "data {} ({} triples) vs baseline {} ({} triples)",
-            wm.data_fnv64, wm.unique_triples, wb.data_fnv64, wb.unique_triples
-        ),
-    ));
-    for qb in &wb.queries {
-        let qm = wm.queries.iter().find(|q| q.name == qb.name);
+    for r in sm.runs {
+        out.push(GateOutcome {
+            measured: crate::report::geomean_ms(r),
+            ..GateOutcome::info(
+                "info.new",
+                format!("{pre}{}", r.key()),
+                format!(
+                    "new run of {} queries (measured: their geomean ms); not gated until \
+                     the baseline has it",
+                    r.queries.len()
+                ),
+            )
+        });
+    }
+}
+
+struct Ctx<'a> {
+    t: &'a Thresholds,
+    slowdown: f64,
+    base: &'a BenchResult,
+    m: &'a BenchResult,
+}
+
+impl Ctx<'_> {
+    fn identity(
+        &self,
+        wb: &WorkloadInfo,
+        wm: &WorkloadInfo,
+        pre: &str,
+        out: &mut Vec<GateOutcome>,
+    ) {
         out.push(GateOutcome::exact(
-            "exact.query_text",
-            format!("baseline/{}", qb.name),
-            qm.is_some_and(|q| q.text_fnv64 == qb.text_fnv64),
+            "exact.workload",
+            format!("{pre}workload"),
+            wb.spec == wm.spec && wb.version == wm.version,
             format!(
-                "text fnv {} vs baseline {}",
-                qm.map(|q| q.text_fnv64.as_str()).unwrap_or("missing"),
-                qb.text_fnv64
+                "{} {} vs baseline {} {}",
+                wm.version,
+                wm.spec.label(),
+                wb.version,
+                wb.spec.label()
             ),
         ));
-    }
-    for b in &base.runs {
-        let be = b.backend.as_str();
-        let Some(r) = m.run(be) else {
+        out.push(GateOutcome::exact(
+            "exact.data_hash",
+            format!("{pre}workload"),
+            wb.data_fnv64 == wm.data_fnv64 && wb.unique_triples == wm.unique_triples,
+            format!(
+                "data {} ({} triples) vs baseline {} ({} triples)",
+                wm.data_fnv64, wm.unique_triples, wb.data_fnv64, wb.unique_triples
+            ),
+        ));
+        for qb in &wb.queries {
+            let qm = wm.queries.iter().find(|q| q.name == qb.name);
             out.push(GateOutcome::exact(
-                "exact.backend",
-                be,
-                false,
-                "the baseline has this backend; the result does not",
+                "exact.query_text",
+                format!("{pre}baseline/{}", qb.name),
+                qm.is_some_and(|q| q.text_fnv64 == qb.text_fnv64),
+                format!(
+                    "text fnv {} vs baseline {}",
+                    qm.map(|q| q.text_fnv64.as_str()).unwrap_or("missing"),
+                    qb.text_fnv64
+                ),
             ));
-            continue;
+        }
+        for qm in &wm.queries {
+            if !wb.queries.iter().any(|q| q.name == qm.name) {
+                out.push(GateOutcome::info(
+                    "info.new",
+                    format!("{pre}workload/{}", qm.name),
+                    "new query: not in the baseline",
+                ));
+            }
+        }
+    }
+
+    fn section(&self, sb: &Section<'_>, sm: &Section<'_>, out: &mut Vec<GateOutcome>) {
+        let pre = sm.prefix();
+        self.identity(sb.workload, sm.workload, &pre, out);
+        let section = sm.id.map(str::to_string);
+        let mut compared: Vec<String> = Vec::new();
+        for b in sb.runs {
+            let matched = matching_runs(sm.runs, b);
+            if matched.is_empty() {
+                out.push(GateOutcome::exact(
+                    "exact.backend",
+                    format!("{pre}{}", b.key()),
+                    false,
+                    "the baseline has this run; the result does not",
+                ));
+            }
+            for r in matched {
+                compared.push(r.key());
+                self.run(b, r, &pre, &section, out);
+            }
+        }
+        for r in sm.runs {
+            if !compared.contains(&r.key()) {
+                out.push(GateOutcome::info(
+                    "info.new",
+                    format!("{pre}{}", r.key()),
+                    "new run: the baseline has no run of this key or backend",
+                ));
+            }
+        }
+    }
+
+    fn run(
+        &self,
+        b: &BackendRun,
+        r: &BackendRun,
+        pre: &str,
+        section: &Option<String>,
+        out: &mut Vec<GateOutcome>,
+    ) {
+        let t = self.t;
+        let key = r.key();
+        let subj = format!("{pre}{key}");
+        let retry = |phase| {
+            Some(RetryTarget {
+                section: section.clone(),
+                run: key.clone(),
+                phase,
+            })
         };
-        let c = calib_factor(t, base, b, m, r);
-        let norm = |x: f64| x * slowdown / c;
+        let c = calib_factor(t, self.base, b, self.m, r);
+        let norm = |x: f64| x * self.slowdown / c;
 
         // Queries: exact answers, then timing.
         let mut logs = Vec::new();
@@ -431,7 +635,7 @@ pub fn evaluate(
             let Some(qm) = r.query(&qb.name) else {
                 out.push(GateOutcome::exact(
                     "exact.query",
-                    format!("{be}/{}", qb.name),
+                    format!("{subj}/{}", qb.name),
                     false,
                     "query missing from the result",
                 ));
@@ -439,7 +643,7 @@ pub fn evaluate(
             };
             out.push(GateOutcome::exact(
                 "exact.rows",
-                format!("{be}/{}", qb.name),
+                format!("{subj}/{}", qb.name),
                 qm.rows == qb.rows && qm.rows_fnv64 == qb.rows_fnv64,
                 format!(
                     "{} rows {} vs baseline {} rows {}",
@@ -449,16 +653,28 @@ pub fn evaluate(
             let mm = norm(qm.median_ms);
             out.push(ratio_gate(
                 "time.query",
-                format!("{be}/{}", qb.name),
+                format!("{subj}/{}", qb.name),
                 GateClass::Timing,
                 qb.median_ms,
                 mm,
                 t.query.floor_ms,
                 t.query.max_ratio,
-                Some((be.to_string(), Phase::Query)),
+                retry(Phase::Query),
             ));
             let eps = t.geomean.epsilon_ms;
             logs.push((qb.median_ms, (mm.max(eps) / qb.median_ms.max(eps)).ln()));
+        }
+        for qm in &r.queries {
+            if b.query(&qm.name).is_none() {
+                out.push(GateOutcome {
+                    measured: Some(qm.median_ms),
+                    ..GateOutcome::info(
+                        "info.new",
+                        format!("{subj}/{}", qm.name),
+                        "new query: not in the baseline run",
+                    )
+                });
+            }
         }
         let long: Vec<f64> = logs
             .iter()
@@ -474,7 +690,7 @@ pub fn evaluate(
             let g = (logs.iter().sum::<f64>() / logs.len() as f64).exp();
             out.push(GateOutcome {
                 gate: "time.geomean".into(),
-                subject: be.to_string(),
+                subject: subj.clone(),
                 class: GateClass::Timing,
                 base: None,
                 measured: None,
@@ -482,20 +698,20 @@ pub fn evaluate(
                 limit: Some(t.geomean.max_ratio),
                 pass: g <= t.geomean.max_ratio,
                 detail: format!("geomean of {} warm-median ratios", logs.len()),
-                retry: Some((be.to_string(), Phase::Query)),
+                retry: retry(Phase::Query),
             });
         }
         if let (Some(mb), Some(mm)) = (&b.query_mem, &r.query_mem) {
             if let (Some(x), Some(y)) = (mb.hwm_mib, mm.hwm_mib) {
                 out.push(ratio_gate(
                     "rss.query_hwm",
-                    be.to_string(),
+                    subj.clone(),
                     GateClass::Memory,
                     x,
                     y,
                     t.rss.floor_mib,
                     t.rss.max_ratio,
-                    Some((be.to_string(), Phase::Query)),
+                    retry(Phase::Query),
                 ));
             }
         }
@@ -503,36 +719,36 @@ pub fn evaluate(
         // Build.
         match (&b.build, &r.build) {
             (Some(bb), Some(mb)) => {
-                let limit = if be == "disk" {
+                let limit = if r.backend == "disk" {
                     t.build.max_ratio_disk.unwrap_or(t.build.max_ratio)
                 } else {
                     t.build.max_ratio
                 };
                 out.push(ratio_gate(
                     "time.build",
-                    be.to_string(),
+                    subj.clone(),
                     GateClass::Timing,
                     bb.wall_ms,
                     norm(mb.wall_ms),
                     t.build.floor_ms,
                     limit,
-                    Some((be.to_string(), Phase::Build)),
+                    retry(Phase::Build),
                 ));
                 if let (Some(x), Some(y)) = (bb.peak_rss_mib, mb.peak_rss_mib) {
                     out.push(ratio_gate(
                         "rss.build_peak",
-                        be.to_string(),
+                        subj.clone(),
                         GateClass::Memory,
                         x,
                         y,
                         t.rss.floor_mib,
                         t.rss.max_ratio,
-                        Some((be.to_string(), Phase::Build)),
+                        retry(Phase::Build),
                     ));
                 }
                 let mut g = ratio_gate(
                     "bytes.dir",
-                    be.to_string(),
+                    subj.clone(),
                     GateClass::Size,
                     bb.dir_bytes as f64,
                     mb.dir_bytes as f64,
@@ -548,7 +764,7 @@ pub fn evaluate(
             }
             (Some(_), None) => out.push(GateOutcome::exact(
                 "exact.phase",
-                format!("{be}/build"),
+                format!("{subj}/build"),
                 false,
                 "the baseline measured the build; the result did not",
             )),
@@ -560,74 +776,104 @@ pub fn evaluate(
             (Some(ob), Some(om)) => {
                 out.push(ratio_gate(
                     "time.open",
-                    be.to_string(),
+                    subj.clone(),
                     GateClass::Timing,
                     ob.warm_ms,
                     norm(om.warm_ms),
                     t.open.floor_ms,
                     t.open.max_ratio,
-                    Some((be.to_string(), Phase::Open)),
+                    retry(Phase::Open),
                 ));
                 if let (Some(x), Some(y)) = (ob.rss_after_open_mib, om.rss_after_open_mib) {
                     out.push(ratio_gate(
                         "rss.after_open",
-                        be.to_string(),
+                        subj.clone(),
                         GateClass::Memory,
                         x,
                         y,
                         t.rss.floor_mib,
                         t.rss.max_ratio,
-                        Some((be.to_string(), Phase::Open)),
+                        retry(Phase::Open),
                     ));
                 }
             }
             (Some(_), None) => out.push(GateOutcome::exact(
                 "exact.phase",
-                format!("{be}/open"),
+                format!("{subj}/open"),
                 false,
                 "the baseline measured the open; the result did not",
             )),
             _ => {}
         }
-        if b.update.is_some() && r.update.is_none() {
-            out.push(GateOutcome::exact(
-                "exact.phase",
-                format!("{be}/update"),
-                false,
-                "the baseline ran the update phase; the result did not",
-            ));
+        for (what, had, has) in [
+            ("update", b.update.is_some(), r.update.is_some()),
+            ("conc", b.conc.is_some(), r.conc.is_some()),
+            ("mixed", b.mixed.is_some(), r.mixed.is_some()),
+        ] {
+            if had && !has {
+                out.push(GateOutcome::exact(
+                    "exact.phase",
+                    format!("{subj}/{what}"),
+                    false,
+                    format!("the baseline ran the {what} phase; the result did not"),
+                ));
+            }
         }
-        if b.conc.is_some() && r.conc.is_none() {
-            out.push(GateOutcome::exact(
-                "exact.phase",
-                format!("{be}/conc"),
-                false,
-                "the baseline ran the concurrency phase; the result did not",
-            ));
-        }
-        // Report-only: concurrency throughput.
+        // Report-only: concurrency and mixed-workload throughput.
         if let (Some(cb), Some(cm)) = (&b.conc, &r.conc) {
             for pb in &cb.points {
                 if let Some(pm) = cm.points.iter().find(|p| {
                     p.endpoint == pb.endpoint && p.query == pb.query && p.clients == pb.clients
                 }) {
                     out.push(GateOutcome {
-                        gate: "info.conc_qps".into(),
-                        subject: format!("{be}/{}/{}/c{}", pb.endpoint, pb.query, pb.clients),
-                        class: GateClass::Info,
                         base: Some(pb.qps),
                         measured: Some(pm.qps),
                         ratio: (pb.qps > 0.0).then(|| pm.qps / pb.qps),
-                        limit: None,
-                        pass: true,
-                        detail: "report-only".into(),
-                        retry: None,
+                        ..GateOutcome::info(
+                            "info.conc_qps",
+                            format!("{subj}/{}/{}/c{}", pb.endpoint, pb.query, pb.clients),
+                            "report-only",
+                        )
+                    });
+                }
+            }
+        }
+        if let (Some(xb), Some(xm)) = (&b.mixed, &r.mixed) {
+            if let (Some(bb), Some(bm)) = (&xb.begin, &xm.begin) {
+                out.push(GateOutcome {
+                    base: Some(bb.median_ms),
+                    measured: Some(bm.median_ms),
+                    ratio: (bb.median_ms > 0.0).then(|| bm.median_ms / bb.median_ms),
+                    ..GateOutcome::info("info.begin_ms", format!("{subj}/api/begin"), "report-only")
+                });
+            }
+            for pb in &xb.points {
+                if let Some(pm) = xm.points.iter().find(|p| {
+                    p.endpoint == pb.endpoint
+                        && p.query == pb.query
+                        && p.readers == pb.readers
+                        && p.check_point == pb.check_point
+                }) {
+                    out.push(GateOutcome {
+                        base: Some(pb.qps),
+                        measured: Some(pm.qps),
+                        ratio: (pb.qps > 0.0).then(|| pm.qps / pb.qps),
+                        ..GateOutcome::info(
+                            "info.mixed_qps",
+                            format!(
+                                "{subj}/{}/{}/r{}/cp-{}",
+                                pb.endpoint,
+                                pb.query,
+                                pb.readers,
+                                if pb.check_point { "on" } else { "off" }
+                            ),
+                            "report-only",
+                        )
                     });
                 }
             }
         }
     }
-    out
 }
 
 #[cfg(test)]

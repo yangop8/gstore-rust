@@ -1,12 +1,22 @@
-//! The result and baseline format `gstore-bench/1`.
+//! The result and baseline format `gstore-bench/2` (reads `gstore-bench/1`).
 //!
 //! A run writes one [`BenchResult`]: the environment, the machine
 //! calibration, the workload (generator version, data hash, query text
 //! hashes) and one [`BackendRun`] per storage layout with the build, open,
-//! query, update and concurrency phases. A baseline is the same document with
-//! `kind = "baseline"` (see `gstore-bench bless`). Times are milliseconds,
-//! memory MiB, sizes bytes; content hashes are 16 hex digits. Fields a phase
-//! did not measure are `null`.
+//! query, update, concurrency and mixed-workload phases; further workloads
+//! measured by the same run (the `smoke` and `reference` profiles add the
+//! WatDiv-like one) follow in `extra_workloads`, each with its own workload
+//! and runs. A baseline is the same document with `kind = "baseline"` (see
+//! `gstore-bench bless`). Times are milliseconds, memory MiB, sizes bytes;
+//! content hashes are 16 hex digits. Fields a phase did not measure are
+//! `null`.
+//!
+//! Version 2 only adds optional fields to version 1, so every `/1` file
+//! reads as a `/2` document without them: `extra_workloads`, a run's
+//! `label` (one backend measured twice, e.g. the disk layout in both query
+//! modes, is keyed `disk@stream` / `disk@materialize`, see
+//! [`BackendRun::key`]), its `mixed` phase, the build's `summary` (gbuild's
+//! bulk-build report) and a query's `bindings` (bound templates).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +26,11 @@ use serde::{Deserialize, Serialize};
 use crate::calib::Calibration;
 use crate::workload::WorkloadSpec;
 
-pub const SCHEMA: &str = "gstore-bench/1";
+/// The schema this harness writes.
+pub const SCHEMA: &str = "gstore-bench/2";
+
+/// Every schema this harness reads (each version adds optional fields only).
+pub const READABLE_SCHEMAS: [&str; 2] = ["gstore-bench/1", SCHEMA];
 
 /// A complete result (or baseline) file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +52,38 @@ pub struct BenchResult {
     pub calibration: Option<Calibration>,
     pub workload: WorkloadInfo,
     pub runs: Vec<BackendRun>,
+    /// Further workloads of the same run, each with its own runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_workloads: Vec<WorkloadSection>,
+}
+
+/// One more workload of a run: what was generated and how each backend did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkloadSection {
+    pub workload: WorkloadInfo,
+    pub runs: Vec<BackendRun>,
+}
+
+/// A read-only view of one workload of a result: the main one (`id` =
+/// `None`) or an extra one (`id` = its workload id, `watdiv-like`).
+#[derive(Debug, Clone, Copy)]
+pub struct Section<'a> {
+    pub id: Option<&'a str>,
+    pub workload: &'a WorkloadInfo,
+    pub runs: &'a [BackendRun],
+}
+
+impl Section<'_> {
+    /// The run with key `key` ([`BackendRun::key`]).
+    pub fn run(&self, key: &str) -> Option<&BackendRun> {
+        self.runs.iter().find(|r| r.key() == key)
+    }
+
+    /// `prefix` for subjects of gates and report rows: empty for the main
+    /// workload, `watdiv-like:` for an extra one.
+    pub fn prefix(&self) -> String {
+        self.id.map(|i| format!("{i}:")).unwrap_or_default()
+    }
 }
 
 /// Where and how the run happened.
@@ -89,6 +135,12 @@ pub struct WorkloadInfo {
 pub struct QueryInfo {
     pub name: String,
     pub text_fnv64: String,
+    /// A bound template's (placeholder, value) pairs (WatDiv).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<(String, String)>,
+    /// The ASK walk's tries until the binding answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tries: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +190,10 @@ pub struct RunConfig {
 pub struct BackendRun {
     /// `snapshot`, `disk` or `rocksdb`.
     pub backend: String,
+    /// Tells two runs of one backend apart (`--label`; e.g. `stream` and
+    /// `materialize` for the disk layout's two query modes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     pub config: RunConfig,
     #[serde(default)]
@@ -153,6 +209,9 @@ pub struct BackendRun {
     pub update: Option<UpdateResult>,
     #[serde(default)]
     pub conc: Option<ConcResult>,
+    /// Readers plus a paced writer (after the update phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed: Option<MixedResult>,
     /// Retry attempts per phase (`check`'s targeted retries); absent = 1.
     #[serde(default)]
     pub attempts: BTreeMap<String, u32>,
@@ -162,6 +221,7 @@ impl BackendRun {
     pub fn new(backend: &str) -> BackendRun {
         BackendRun {
             backend: backend.to_string(),
+            label: None,
             config: RunConfig::default(),
             build: None,
             open: None,
@@ -169,13 +229,47 @@ impl BackendRun {
             query_mem: None,
             update: None,
             conc: None,
+            mixed: None,
             attempts: BTreeMap::new(),
+        }
+    }
+
+    /// The run's key in its workload: the backend, or `backend@label`.
+    pub fn key(&self) -> String {
+        match &self.label {
+            Some(l) => format!("{}@{l}", self.backend),
+            None => self.backend.clone(),
         }
     }
 
     pub fn query(&self, name: &str) -> Option<&QueryMeasure> {
         self.queries.iter().find(|q| q.name == name)
     }
+}
+
+/// The baseline run `run` is compared with: the one with the same key, else
+/// (for a labelled run) the baseline's unlabelled run of the same backend.
+pub fn matching_run<'a>(base: &'a [BackendRun], run: &BackendRun) -> Option<&'a BackendRun> {
+    let key = run.key();
+    base.iter().find(|b| b.key() == key).or_else(|| {
+        base.iter()
+            .find(|b| b.label.is_none() && b.backend == run.backend && run.label.is_some())
+    })
+}
+
+/// The measured runs baseline run `base` is compared with: the one with the
+/// same key, else (for an unlabelled baseline run) every labelled run of the
+/// same backend.
+pub fn matching_runs<'a>(measured: &'a [BackendRun], base: &BackendRun) -> Vec<&'a BackendRun> {
+    let key = base.key();
+    let same: Vec<&BackendRun> = measured.iter().filter(|r| r.key() == key).collect();
+    if !same.is_empty() || base.label.is_some() {
+        return same;
+    }
+    measured
+        .iter()
+        .filter(|r| r.backend == base.backend && r.label.is_some())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -194,6 +288,34 @@ pub struct BuildResult {
     /// The command line (program and arguments).
     #[serde(default)]
     pub command: Vec<String>,
+    /// gbuild's bulk-build report (disk and RocksDB builds), from its log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BuildSummary>,
+}
+
+/// What `gbuild` reports about a bulk build (`phases:`, `memory:` and
+/// `spills:` lines of its output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BuildSummary {
+    /// Each phase's wall time, in order (`parse`, `encode`, …).
+    #[serde(default)]
+    pub phases_ms: Vec<(String, f64)>,
+    /// The memory budget of the sort buffers and spools.
+    #[serde(default)]
+    pub budget_mib: Option<f64>,
+    /// Its peak use.
+    #[serde(default)]
+    pub budget_peak_mib: Option<f64>,
+    /// The term maps (outside the budget).
+    #[serde(default)]
+    pub term_map_mib: Option<f64>,
+    #[serde(default)]
+    pub threads: Option<u64>,
+    /// Sorted runs spilled to disk, and their size.
+    #[serde(default)]
+    pub spilled_runs: Option<u64>,
+    #[serde(default)]
+    pub spilled_mib: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -323,26 +445,131 @@ pub struct ConcPoint {
     pub body_fnv64: String,
 }
 
+/// The mixed workload: `readers` closed-loop readers of one query while one
+/// writer sends a single-triple `INSERT DATA` every `write_every_ms`, per
+/// endpoint and `check_point` setting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MixedResult {
+    pub points: Vec<MixedPoint>,
+    /// Within each point every reader's body was identical (the writes do
+    /// not touch the query's answer) and no read failed.
+    pub bodies_equal: bool,
+    /// Every write was acknowledged as one changed triple.
+    pub writes_ok: bool,
+    #[serde(default)]
+    pub hwm_mib: Option<f64>,
+    /// `/api` `operation=begin` (each rolled back) on the loaded database,
+    /// before the mixed load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begin: Option<BeginPoint>,
+}
+
+/// The cost of starting an HTTP transaction (`/api` `operation=begin`): its
+/// latency and how much the server process's RSS grows while the
+/// transaction's snapshot is held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BeginPoint {
+    pub samples: usize,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    /// RSS after the first `begin` minus RSS before it.
+    #[serde(default)]
+    pub rss_growth_first_mib: Option<f64>,
+    /// The largest such growth over all samples.
+    #[serde(default)]
+    pub rss_growth_max_mib: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MixedPoint {
+    /// `sparql` (`GET /sparql`, writes `POST /update`) or `api` (`GET /api`
+    /// `operation=query`, writes `POST /api` `operation=query`).
+    pub endpoint: String,
+    pub query: String,
+    pub readers: usize,
+    /// The server saves after every acknowledged update.
+    pub check_point: bool,
+    pub write_every_ms: u64,
+    pub secs: f64,
+    /// Reader answers (HTTP 200) and failures.
+    pub reads: u64,
+    pub read_errors: u64,
+    pub reconnects: u64,
+    pub qps: f64,
+    pub mean_ms: f64,
+    pub p95_ms: f64,
+    /// Acknowledged writes and failed ones.
+    pub writes: u64,
+    pub write_errors: u64,
+    pub write_mean_ms: f64,
+    pub write_p95_ms: f64,
+    pub distinct_bodies: usize,
+    pub body_fnv64: String,
+}
+
 impl BenchResult {
-    pub fn run(&self, backend: &str) -> Option<&BackendRun> {
-        self.runs.iter().find(|r| r.backend == backend)
+    /// The main workload's run with key `key` ([`BackendRun::key`]).
+    pub fn run(&self, key: &str) -> Option<&BackendRun> {
+        self.runs.iter().find(|r| r.key() == key)
     }
 
-    pub fn run_mut(&mut self, backend: &str) -> Option<&mut BackendRun> {
-        self.runs.iter_mut().find(|r| r.backend == backend)
+    pub fn run_mut(&mut self, key: &str) -> Option<&mut BackendRun> {
+        self.runs.iter_mut().find(|r| r.key() == key)
     }
 
-    /// Read and validate a result or baseline file.
+    /// The main workload, then each extra one.
+    pub fn sections(&self) -> Vec<Section<'_>> {
+        let mut v = vec![Section {
+            id: None,
+            workload: &self.workload,
+            runs: &self.runs,
+        }];
+        for x in &self.extra_workloads {
+            v.push(Section {
+                id: Some(x.workload.id.as_str()),
+                workload: &x.workload,
+                runs: &x.runs,
+            });
+        }
+        v
+    }
+
+    /// The runs of section `id` (`None` = the main workload).
+    pub fn runs_mut(&mut self, id: Option<&str>) -> Option<&mut Vec<BackendRun>> {
+        match id {
+            None => Some(&mut self.runs),
+            Some(id) => self
+                .extra_workloads
+                .iter_mut()
+                .find(|x| x.workload.id == id)
+                .map(|x| &mut x.runs),
+        }
+    }
+
+    /// Keep only the runs whose backend or key is in `keep`, in every
+    /// workload.
+    pub fn retain_runs(&mut self, keep: &[String]) {
+        let wanted = |r: &BackendRun| keep.contains(&r.backend) || keep.contains(&r.key());
+        self.runs.retain(wanted);
+        for x in &mut self.extra_workloads {
+            x.runs.retain(wanted);
+        }
+    }
+
+    /// Read and validate a result or baseline file (any of
+    /// [`READABLE_SCHEMAS`]).
     pub fn load(path: &Path) -> Result<BenchResult, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let r: BenchResult = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a gstore-bench result: {e}", path.display()))?;
-        if r.schema != SCHEMA {
+        if !READABLE_SCHEMAS.contains(&r.schema.as_str()) {
             return Err(format!(
-                "{}: schema '{}' is not {SCHEMA}",
+                "{}: schema '{}' is not one of {}",
                 path.display(),
-                r.schema
+                r.schema,
+                READABLE_SCHEMAS.join(", ")
             ));
         }
         Ok(r)

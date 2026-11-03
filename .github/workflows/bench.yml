@@ -1,14 +1,19 @@
 name: bench
 
 # gstore-bench (bench/README.md):
-# * smoke — every push / PR: the `smoke` profile (LUBM-like univ 1, snapshot
-#   and disk layouts) gated against bench/baselines/smoke.json, plus the
-#   canary (a 3x slowdown of the same result must fail);
+# * smoke — every push / PR: the `smoke` profile (LUBM-like univ 1 and
+#   WatDiv-like scale 1, snapshot and disk layouts, with the concurrency and
+#   mixed-workload phases) gated against bench/baselines/smoke.json — a
+#   workload or query the baseline does not have yet is reported as new, not
+#   gated — plus the canary (a 3x slowdown of the same result must fail) and
+#   a check that the tables generated from committed results into README.md
+#   and CHANGELOG.md are current;
 # * rocksdb-correctness — every push / PR: the harness's tests with RocksDB
 #   (every backend must answer alike), sharing ci.yml's RocksDB build cache;
 # * reference — manual or weekly, report-only: the `reference` profile
-#   (univ 8 by default) on every layout, compared with
-#   bench/results/pre-phase6-lubm<scale>.json when it exists.
+#   (LUBM-like univ 8 by default, plus WatDiv-like scale 10) on every
+#   layout, compared with bench/results/pre-phase6-lubm<scale>.json when it
+#   exists (which has no WatDiv-like section: reported as new).
 
 on:
   push:
@@ -66,6 +71,11 @@ jobs:
           key: bench-smoke
       - name: release build (gbuild, gstore-bench)
         run: cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+      # The tables between `<!-- gstore-bench report … -->` markers must be
+      # what `gstore-bench report` makes of the committed results (fix with
+      # `gstore-bench report --update README.md CHANGELOG.md`).
+      - name: generated documentation tables are current
+        run: target/release/gstore-bench report --check README.md CHANGELOG.md
       - name: gstore-bench ci
         run: >
           target/release/gstore-bench ci

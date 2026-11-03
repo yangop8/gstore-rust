@@ -2,11 +2,14 @@
 //!
 //! A workload is fully described by a serializable [`WorkloadSpec`], which the
 //! runner hands to every child process; [`WorkloadSpec::instantiate`] turns it
-//! back into the [`Workload`]. Two are built in: [`crate::lubm::Lubm`] (the
-//! LUBM-like reference workload) and [`Tiny`] (a few hundred triples, for the
-//! harness's own tests).
+//! back into the [`Workload`]. Three are built in: [`crate::lubm::Lubm`] (the
+//! LUBM-like reference workload), [`crate::watdiv::WatDiv`] (the WatDiv-like
+//! workload, whose query templates are bound against the generated data
+//! first, see [`Workload::needs_binding`]) and [`Tiny`] (a few hundred
+//! triples, for the harness's own tests).
 
 use std::io::{self, BufWriter, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,14 +70,101 @@ pub trait Workload: Send + Sync {
     /// The statement that deletes [`single_insert`](Self::single_insert)'s
     /// triple again.
     fn single_delete(&self, i: usize) -> String;
+    /// Whether [`queries`](Self::queries) are templates that must be bound
+    /// against the generated data ([`bind_queries`](Self::bind_queries))
+    /// before they can run. The runner binds them once per data file and
+    /// hands the bound texts to every phase ([`bind`]).
+    fn needs_binding(&self) -> bool {
+        false
+    }
+    /// Bind the query templates against `data`, this workload's generated
+    /// N-Triples file.
+    fn bind_queries(&self, data: &Path) -> Result<Vec<BoundQuery>, String> {
+        let _ = data;
+        Err(format!("the {} workload has no query templates", self.id()))
+    }
+}
+
+/// A query template bound to the generated data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundQuery {
+    /// The template's name (`L1` …).
+    pub name: String,
+    /// The query text with every placeholder substituted.
+    pub text: String,
+    /// (placeholder, value) pairs.
+    #[serde(default)]
+    pub bindings: Vec<(String, String)>,
+    /// The ASK walk's tries until a binding answered.
+    #[serde(default)]
+    pub tries: u32,
+}
+
+/// A workload whose templates are bound: [`Workload::queries`] returns the
+/// bound texts, everything else is the inner workload's.
+struct Bound {
+    inner: Box<dyn Workload>,
+    queries: Vec<QuerySpec>,
+}
+
+/// `w` with its queries replaced by `bound` (unchanged when `bound` is
+/// empty).
+pub fn bind(w: Box<dyn Workload>, bound: &[BoundQuery]) -> Box<dyn Workload> {
+    if bound.is_empty() {
+        return w;
+    }
+    Box::new(Bound {
+        inner: w,
+        queries: bound
+            .iter()
+            .map(|b| QuerySpec {
+                name: b.name.clone(),
+                text: b.text.clone(),
+            })
+            .collect(),
+    })
+}
+
+impl Workload for Bound {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn version(&self) -> &'static str {
+        self.inner.version()
+    }
+    fn file_stem(&self) -> String {
+        self.inner.file_stem()
+    }
+    fn db_name(&self) -> &'static str {
+        self.inner.db_name()
+    }
+    fn generate(&self, out: &mut dyn Write) -> io::Result<GenStats> {
+        self.inner.generate(out)
+    }
+    fn generate_chunk(&self, out: &mut dyn Write) -> io::Result<GenStats> {
+        self.inner.generate_chunk(out)
+    }
+    fn queries(&self) -> Vec<QuerySpec> {
+        self.queries.clone()
+    }
+    fn conc_queries(&self) -> Vec<String> {
+        self.inner.conc_queries()
+    }
+    fn single_insert(&self, i: usize) -> String {
+        self.inner.single_insert(i)
+    }
+    fn single_delete(&self, i: usize) -> String {
+        self.inner.single_delete(i)
+    }
 }
 
 /// A serializable description of a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadSpec {
-    /// `lubm` or `tiny`.
+    /// `lubm`, `watdiv` or `tiny`.
     pub kind: String,
-    /// LUBM: the number of universities. Tiny: the number of people / 50.
+    /// LUBM: the number of universities. WatDiv: the scale factor (about 100K
+    /// triples each). Tiny: the number of people / 50.
     pub scale: u32,
     /// The generator seed.
     #[serde(default)]
@@ -83,6 +173,9 @@ pub struct WorkloadSpec {
     /// profile uses 1). `None` = UBA's 15–25.
     #[serde(default)]
     pub departments: Option<u32>,
+    /// WatDiv only: divide the scalable entity counts by this (tests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shrink: Option<u32>,
 }
 
 impl WorkloadSpec {
@@ -92,6 +185,17 @@ impl WorkloadSpec {
             scale,
             seed,
             departments: None,
+            shrink: None,
+        }
+    }
+
+    pub fn watdiv(scale: u32, seed: u64) -> WorkloadSpec {
+        WorkloadSpec {
+            kind: "watdiv".into(),
+            scale,
+            seed,
+            departments: None,
+            shrink: None,
         }
     }
 
@@ -101,6 +205,16 @@ impl WorkloadSpec {
             scale: 1,
             seed: 0,
             departments: None,
+            shrink: None,
+        }
+    }
+
+    /// The workload family: `lubm`, `watdiv` or `tiny` (aliases folded).
+    pub fn family(&self) -> &str {
+        match self.kind.as_str() {
+            "lubm-like" => "lubm",
+            "watdiv-like" => "watdiv",
+            k => k,
         }
     }
 
@@ -120,17 +234,35 @@ impl WorkloadSpec {
                     departments: self.departments,
                 }))
             }
+            "watdiv" | "watdiv-like" => {
+                if self.scale == 0 {
+                    return Err("watdiv needs --scale >= 1".into());
+                }
+                if self.shrink == Some(0) {
+                    return Err("watdiv needs --shrink >= 1".into());
+                }
+                Ok(Box::new(crate::watdiv::WatDiv {
+                    scale: self.scale,
+                    seed: self.seed,
+                    shrink: self.shrink,
+                }))
+            }
             "tiny" => Ok(Box::new(Tiny {
                 scale: self.scale.max(1),
             })),
-            other => Err(format!("unknown workload '{other}' (lubm, tiny)")),
+            other => Err(format!("unknown workload '{other}' (lubm, watdiv, tiny)")),
         }
     }
 
-    /// A short human label (`lubm-like u8`, `tiny`).
+    /// A short human label (`lubm-like univ 8`, `watdiv-like scale 10`,
+    /// `tiny x1`).
     pub fn label(&self) -> String {
         match self.kind.as_str() {
             "tiny" => format!("tiny x{}", self.scale),
+            "watdiv" | "watdiv-like" => match self.shrink {
+                Some(k) if k > 1 => format!("watdiv-like scale {} (÷{k})", self.scale),
+                _ => format!("watdiv-like scale {}", self.scale),
+            },
             _ => match self.departments {
                 Some(d) => format!("lubm-like univ {} (≤{d} dept)", self.scale),
                 None => format!("lubm-like univ {}", self.scale),
