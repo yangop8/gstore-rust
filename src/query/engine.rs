@@ -254,12 +254,11 @@ const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 /// `refine_candidates_with_vstree`).
 const PROBE_MIN_CANDIDATES: usize = 1024;
 
-/// The cost of one store lookup in posting-list entries, for the choice
-/// between looking candidates up and merging posting lists when the
-/// VS-tree's predicate bits are tested against the store
-/// (`retain_with_classes`): a B+ tree descent or a map probe against
-/// stepping through (or copying) list entries.
-const LOOKUP_COST: u64 = 64;
+// The cost of one store lookup in posting-list entries (see
+// `candidates::LOOKUP_COST`), for the choice between looking candidates up
+// and merging posting lists when the VS-tree's predicate bits are tested
+// against the store (`retain_with_classes`).
+use candidates::LOOKUP_COST;
 
 /// One predicate bit of a query signature, in one direction, with the
 /// store's predicates (those with a triple) whose edges set it: an entity's

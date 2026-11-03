@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::kvstore::StringIndex;
+use crate::model::id::PredId;
 use crate::store::TripleSource;
 
 use super::engine::{FxBuildHasher, PatPlan, Slot};
@@ -23,28 +24,134 @@ use super::engine::{FxBuildHasher, PatPlan, Slot};
 /// up for every triple it tests.
 pub(crate) type Candidates = HashMap<usize, Vec<u32>, FxBuildHasher>;
 
+/// The cost of one membership test (a store lookup) in list entries read,
+/// for the choice between testing a candidate set's members and reading a
+/// whole list (here and in the engine's VS-tree refinement): a B+ tree descent
+/// or a map probe against stepping through (or copying) list entries.
+pub(crate) const LOOKUP_COST: u64 = 64;
+
+/// One constant-neighbour edge of a variable (pass 1): the exact store list
+/// of the values it allows.
+#[derive(Clone, Copy)]
+enum ConstEdge {
+    /// `?v p o`: the subjects of `(p, o)`.
+    SubjOf(PredId, u32),
+    /// `?v ?x o`: the subjects of `o`, any predicate.
+    SubjOfAny(u32),
+    /// `s p ?v`: the objects of `(s, p)`.
+    ObjOf(u32, PredId),
+    /// `s ?x ?v`: the objects of `s`, any predicate.
+    ObjOfAny(u32),
+}
+
+impl ConstEdge {
+    /// The length of the store's list (C1 counts; for the "any predicate"
+    /// edges before removing duplicates).
+    fn len(self, store: &impl TripleSource) -> u64 {
+        match self {
+            ConstEdge::SubjOf(p, o) => store.count_s_by_po(p, o),
+            ConstEdge::SubjOfAny(o) => store.count_ps_by_o(o),
+            ConstEdge::ObjOf(s, p) => store.count_o_by_sp(s, p),
+            ConstEdge::ObjOfAny(s) => store.count_po_by_s(s),
+        }
+    }
+
+    /// The list, sorted and distinct.
+    fn list(self, store: &impl TripleSource) -> Vec<u32> {
+        let mut list = match self {
+            ConstEdge::SubjOf(p, o) => store.s_by_po(p, o),
+            ConstEdge::SubjOfAny(o) => distinct_seconds(&store.ps_by_o(o)),
+            ConstEdge::ObjOf(s, p) => store.o_by_sp(s, p),
+            ConstEdge::ObjOfAny(s) => distinct_seconds(&store.po_by_s(s)),
+        };
+        // The contract orders these lists ascending; check rather than sort.
+        if !list.windows(2).all(|w| w[0] < w[1]) {
+            list.sort_unstable();
+            list.dedup();
+        }
+        list
+    }
+
+    /// Whether `x` is in the list.
+    fn holds(self, store: &impl TripleSource, x: u32) -> bool {
+        match self {
+            ConstEdge::SubjOf(p, o) => store.exists(x, p, o),
+            ConstEdge::SubjOfAny(o) => store.count_p_by_so(x, o) > 0,
+            ConstEdge::ObjOf(s, p) => store.exists(s, p, x),
+            ConstEdge::ObjOfAny(s) => store.count_p_by_so(s, x) > 0,
+        }
+    }
+}
+
+/// Whether to test the `members` of a set against an edge whose list has
+/// `len` entries rather than read the list (both give the same set).
+fn test_members(members: usize, len: u64) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_MEMBER_TESTS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    (members as u64).saturating_mul(LOOKUP_COST) < len
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests force either way of [`test_members`] on this thread.
+    static FORCE_MEMBER_TESTS: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Generate candidate id sets for the BGP's variables.
 pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidates {
     let mut cand = Candidates::default();
 
-    // Pass 1 — constant-neighbour edges give an exact list per variable.
+    // Pass 1 — constant-neighbour edges give an exact list per variable: the
+    // intersection of the lists of its edges. Shortest list first; a list much
+    // longer than the set so far is not read — the set's members are tested
+    // against the store instead (the same set: `x` is in a list iff its
+    // edge exists). The result does not depend on the order.
+    let mut edges: Vec<(usize, ConstEdge)> = Vec::new();
     for plan in plans {
         // subject variable with a constant object: `?s (p|?) o`
         if let (Slot::Var(sv), Slot::Const(o)) = (&plan.s, &plan.o) {
-            let list = match plan.p {
-                Slot::Const(p) => store.s_by_po(p, *o),
-                Slot::Var(_) => distinct_seconds(&store.ps_by_o(*o)), // subjects of o (any pred)
+            let edge = match plan.p {
+                Slot::Const(p) => ConstEdge::SubjOf(p, *o),
+                Slot::Var(_) => ConstEdge::SubjOfAny(*o),
             };
-            intersect_into(&mut cand, *sv, list);
+            edges.push((*sv, edge));
         }
         // object variable with a constant subject: `s (p|?) ?o`
         if let (Slot::Const(s), Slot::Var(ov)) = (&plan.s, &plan.o) {
-            let list = match plan.p {
-                Slot::Const(p) => store.o_by_sp(*s, p),
-                Slot::Var(_) => distinct_seconds(&store.po_by_s(*s)), // objects of s (any pred)
+            let edge = match plan.p {
+                Slot::Const(p) => ConstEdge::ObjOf(*s, p),
+                Slot::Var(_) => ConstEdge::ObjOfAny(*s),
             };
-            intersect_into(&mut cand, *ov, list);
+            edges.push((*ov, edge));
         }
+    }
+    let mut vars: Vec<usize> = edges.iter().map(|&(v, _)| v).collect();
+    vars.sort_unstable();
+    vars.dedup();
+    for var in vars {
+        // (length, pattern order, edge): ties keep the pattern order.
+        let mut mine: Vec<(u64, usize, ConstEdge)> = edges
+            .iter()
+            .filter(|&&(v, _)| v == var)
+            .enumerate()
+            .map(|(i, &(_, e))| (e.len(store), i, e))
+            .collect();
+        mine.sort_unstable_by_key(|&(len, i, _)| (len, i));
+        let mut set = mine[0].2.list(store);
+        for &(len, _, edge) in &mine[1..] {
+            if set.is_empty() {
+                break;
+            }
+            if test_members(set.len(), len) {
+                set.retain(|&x| edge.holds(store, x));
+            } else {
+                set = sorted_intersect(&set, &edge.list(store));
+            }
+        }
+        cand.insert(var, set);
     }
 
     // Pass 2 — propagation: for a variable that already has candidates, a
@@ -151,8 +258,10 @@ fn distinct_seconds(pairs: &[(u32, u32)]) -> Vec<u32> {
 
 /// Intersect `list` into the candidate set of `var` (creating it if absent).
 fn intersect_into(cand: &mut Candidates, var: usize, mut list: Vec<u32>) {
-    list.sort_unstable();
-    list.dedup();
+    if !list.windows(2).all(|w| w[0] < w[1]) {
+        list.sort_unstable();
+        list.dedup();
+    }
     match cand.get_mut(&var) {
         None => {
             cand.insert(var, list);
@@ -163,8 +272,18 @@ fn intersect_into(cand: &mut Candidates, var: usize, mut list: Vec<u32>) {
     }
 }
 
-/// Intersection of two sorted, de-duplicated slices.
+/// Intersection of two sorted, de-duplicated slices: a binary search of each
+/// member of the much shorter one in the other, else one merge pass.
 fn sorted_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let log = (usize::BITS - large.len().leading_zeros()) as usize;
+    if small.len().saturating_mul(log) < small.len() + large.len() {
+        return small
+            .iter()
+            .copied()
+            .filter(|x| large.binary_search(x).is_ok())
+            .collect();
+    }
     let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -265,6 +384,107 @@ mod tests {
         let mut cand_t: Candidates = [(2usize, vec![10, 11])].into_iter().collect();
         refine_with_substrings(&mut cand_t, &cons, &idx, &plans);
         assert_eq!(cand_t.get(&2), Some(&vec![10]));
+    }
+
+    /// The pass-1 algorithm before the shortest-first ordering and member
+    /// tests: every list read, sorted and intersected in pattern order; pass
+    /// 2 as in `generate`.
+    fn reference(plans: &[PatPlan], store: &impl TripleSource) -> Candidates {
+        let mut cand = Candidates::default();
+        for plan in plans {
+            if let (Slot::Var(sv), Slot::Const(o)) = (&plan.s, &plan.o) {
+                let list = match plan.p {
+                    Slot::Const(p) => store.s_by_po(p, *o),
+                    Slot::Var(_) => distinct_seconds(&store.ps_by_o(*o)),
+                };
+                intersect_into(&mut cand, *sv, list);
+            }
+            if let (Slot::Const(s), Slot::Var(ov)) = (&plan.s, &plan.o) {
+                let list = match plan.p {
+                    Slot::Const(p) => store.o_by_sp(*s, p),
+                    Slot::Var(_) => distinct_seconds(&store.po_by_s(*s)),
+                };
+                intersect_into(&mut cand, *ov, list);
+            }
+        }
+        for plan in plans {
+            if let Slot::Const(p) = plan.p {
+                if let (Slot::Var(sv), Slot::Var(_)) = (&plan.s, &plan.o) {
+                    if should_propagate(&cand, *sv, store.pred_card(p)) {
+                        intersect_into(&mut cand, *sv, store.subs_by_p(p));
+                    }
+                }
+                if let (Slot::Var(_), Slot::Var(ov)) = (&plan.s, &plan.o) {
+                    if should_propagate(&cand, *ov, store.pred_card(p)) {
+                        intersect_into(&mut cand, *ov, store.objs_by_p(p));
+                    }
+                }
+            }
+        }
+        cand
+    }
+
+    #[test]
+    fn generate_equals_reading_every_list() {
+        // xorshift64*
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u32| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_f491_4f6c_dd1d) % u64::from(n)) as u32
+        };
+        for round in 0..20 {
+            // Skewed: a few objects and predicates carry most triples.
+            let mut triples = Vec::new();
+            for _ in 0..600 {
+                let o = if next(3) == 0 { next(60) } else { next(4) };
+                let bound = 1 + next(8);
+                triples.push(IdTriple::new(next(60), next(bound), o));
+            }
+            let mut s = TripleStore::new();
+            s.bulk_load(triples);
+            for _ in 0..60 {
+                let slot = |next: &mut dyn FnMut(u32) -> u32, consts: u32| {
+                    if next(2) == 0 {
+                        Slot::Var(next(3) as usize)
+                    } else {
+                        Slot::Const(next(consts))
+                    }
+                };
+                let plans: Vec<PatPlan> = (0..1 + next(4))
+                    .map(|_| {
+                        let s_ = slot(&mut next, 60);
+                        let p = if next(5) == 0 {
+                            Slot::Var(10 + next(2) as usize)
+                        } else {
+                            Slot::Const(next(8))
+                        };
+                        let o = slot(&mut next, 60);
+                        pp(s_, p, o)
+                    })
+                    .collect();
+                let want = reference(&plans, &s);
+                for forced in [None, Some(true), Some(false)] {
+                    FORCE_MEMBER_TESTS.with(|f| f.set(forced));
+                    let got = generate(&plans, &s);
+                    FORCE_MEMBER_TESTS.with(|f| f.set(None));
+                    assert_eq!(got, want, "round {round}, member tests {forced:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_intersect_takes_either_route() {
+        let a: Vec<u32> = (0..1000).filter(|x| x % 3 == 0).collect();
+        let b: Vec<u32> = (0..1000).filter(|x| x % 5 == 0).collect();
+        let want: Vec<u32> = (0..1000).filter(|x| x % 15 == 0).collect();
+        assert_eq!(sorted_intersect(&a, &b), want);
+        let small = vec![0, 15, 16, 990, 999];
+        assert_eq!(sorted_intersect(&small, &a), vec![0, 15, 990, 999]);
+        assert_eq!(sorted_intersect(&a, &small), vec![0, 15, 990, 999]);
+        assert!(sorted_intersect(&[], &a).is_empty());
     }
 
     #[test]

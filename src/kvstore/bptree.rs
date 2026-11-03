@@ -312,6 +312,17 @@ impl<'a> NodeView<'a> {
         }
     }
 
+    /// Whether the last key of a uniform node is `< key` (`None` for an
+    /// empty or variable-layout node, where finding the last key is a walk).
+    fn last_key_below(&self, key: &[u8]) -> Result<Option<bool>> {
+        match self.layout {
+            Layout::Uniform { stride, klen, .. } if self.count > 0 => {
+                Ok(Some(self.ukey(stride, klen, self.count - 1)? < key))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Leaf: the position of the first key `>= key`.
     fn lower_bound(&self, key: &[u8]) -> Result<Pos> {
         self.search(key, false)
@@ -996,6 +1007,10 @@ impl BTree {
                     Pos { idx: 0, off: 7 }
                 };
                 let to = match &upper {
+                    // Past the first leaf of a long run most leaves lie
+                    // wholly inside it: one comparison with the last key
+                    // instead of a binary search.
+                    Some(u) if !first && view.last_key_below(u)? == Some(true) => view.len(),
                     Some(u) => view.lower_bound(u)?.idx,
                     None => view.len(),
                 };
