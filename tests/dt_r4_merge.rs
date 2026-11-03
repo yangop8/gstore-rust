@@ -95,7 +95,11 @@ fn agree(mem: &mut Database, disk: &mut Database, step: &str) {
     assert_eq!(mem.triple_num(), disk.triple_num(), "{step}: triples");
     assert_eq!(mem.entity_num(), disk.entity_num(), "{step}: entities");
     assert_eq!(mem.literal_num(), disk.literal_num(), "{step}: literals");
-    assert_eq!(mem.predicate_num(), disk.predicate_num(), "{step}: predicates");
+    assert_eq!(
+        mem.predicate_num(),
+        disk.predicate_num(),
+        "{step}: predicates"
+    );
     mem.verify_integrity().unwrap();
     disk.verify_integrity().unwrap();
 }
@@ -204,7 +208,9 @@ fn batched_memory_writes_answer_like_the_one_by_one_stream_path() {
     let del = delete_block(0, 40);
     both(&mut mem, &mut disk, "delete data", |db| update(db, &del));
     let reuse = format!("INSERT DATA {{\n{}}}", fresh_block("c", 0, 40));
-    both(&mut mem, &mut disk, "reusing insert", |db| update(db, &reuse));
+    both(&mut mem, &mut disk, "reusing insert", |db| {
+        update(db, &reuse)
+    });
 
     // DELETE/INSERT WHERE: deletes before inserts, both batched.
     let retype = "DELETE { ?s <http://ex/type> <http://ex/C1> } \
@@ -247,7 +253,10 @@ fn batched_memory_writes_answer_like_the_one_by_one_stream_path() {
     let bad = tmp.path().join("bad.nt");
     std::fs::write(
         &bad,
-        format!("{}<http://ex/broken> <http://ex/p> .\n", fresh_block("f", 0, 30)),
+        format!(
+            "{}<http://ex/broken> <http://ex/p> .\n",
+            fresh_block("f", 0, 30)
+        ),
     )
     .unwrap();
     let before = (mem.entity_num(), mem.literal_num(), mem.triple_num());
@@ -264,9 +273,17 @@ fn batched_memory_writes_answer_like_the_one_by_one_stream_path() {
     let snapshot_before = rows(&mut mem, QUERIES[0]);
     for db in [&mut mem, &mut disk] {
         db.begin().unwrap();
-        update(db, &format!("INSERT DATA {{\n{}}}", fresh_block("g", 0, 15))).unwrap();
+        update(
+            db,
+            &format!("INSERT DATA {{\n{}}}", fresh_block("g", 0, 15)),
+        )
+        .unwrap();
         update(db, &delete_block(50, 70)).unwrap();
-        update(db, &format!("INSERT DATA {{\n{}}}", fresh_block("h", 0, 10))).unwrap();
+        update(
+            db,
+            &format!("INSERT DATA {{\n{}}}", fresh_block("h", 0, 10)),
+        )
+        .unwrap();
         db.rollback().unwrap();
     }
     agree(&mut mem, &mut disk, "rollback");
@@ -274,7 +291,11 @@ fn batched_memory_writes_answer_like_the_one_by_one_stream_path() {
     for db in [&mut mem, &mut disk] {
         db.begin().unwrap();
         update(db, &delete_block(70, 90)).unwrap();
-        update(db, &format!("INSERT DATA {{\n{}}}", fresh_block("i", 0, 20))).unwrap();
+        update(
+            db,
+            &format!("INSERT DATA {{\n{}}}", fresh_block("i", 0, 20)),
+        )
+        .unwrap();
         db.commit().unwrap();
     }
     agree(&mut mem, &mut disk, "commit");
@@ -342,10 +363,7 @@ fn concurrent_snapshots_keep_their_terms_while_ids_are_reused() {
             panic!("select")
         };
         assert!(rs.rows.is_empty(), "{layout}: the snapshot predates x");
-        let QueryResult::Select(rs) = cdb
-            .query("SELECT ?s ?o WHERE { ?s ?p ?o }")
-            .unwrap()
-        else {
+        let QueryResult::Select(rs) = cdb.query("SELECT ?s ?o WHERE { ?s ?p ?o }").unwrap() else {
             panic!("select")
         };
         assert_eq!(
@@ -468,7 +486,10 @@ fn a_server_built_disk_database_frees_at_commit_despite_its_begin_snapshot() {
         "/sparql?db_name=r4",
         "SELECT ?s WHERE { ?s <http://ex/p> ?o }",
     );
-    assert!(!b.contains("http://ex/a") && b.contains("http://ex/c"), "{b}");
+    assert!(
+        !b.contains("http://ex/a") && b.contains("http://ex/c"),
+        "{b}"
+    );
     // The commit freed <a> and <b> on disk: the snapshot it ended took no
     // pin (a deferred free would be lost with the unload).
     srv.ok("POST", "/unload?db_name=r4", "");

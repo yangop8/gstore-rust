@@ -1683,7 +1683,11 @@ impl Database {
                         ops.next();
                     }
                     let added = self.store.insert_many(&run);
-                    readded.extend(run.into_iter().zip(added).filter_map(|(t, a)| a.then_some(t)));
+                    readded.extend(
+                        run.into_iter()
+                            .zip(added)
+                            .filter_map(|(t, a)| a.then_some(t)),
+                    );
                 }
                 UndoOp::Del(None, id) if batched => {
                     let mut run = vec![id];
@@ -1691,7 +1695,12 @@ impl Database {
                         run.push(next);
                         ops.next();
                     }
-                    let gone = self.store.remove_many(&run).into_iter().filter(|&g| g).count();
+                    let gone = self
+                        .store
+                        .remove_many(&run)
+                        .into_iter()
+                        .filter(|&g| g)
+                        .count();
                     if self.index_valid {
                         self.vs_shrink_debt += gone as u64;
                     }
