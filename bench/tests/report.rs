@@ -269,6 +269,35 @@ fn marked_tables_are_spliced_byte_for_byte() {
         .output()
         .unwrap();
     assert!(st.status.success(), "{st:?}");
+    // Several documents at once: a stale second one fails the check.
+    let changelog = tmp.path("CHANGELOG.md");
+    std::fs::write(&changelog, &doc).unwrap();
+    let st = Command::new(exe)
+        .args(["report", "--check", &readme, &changelog])
+        .output()
+        .unwrap();
+    assert_eq!(st.status.code(), Some(1), "{st:?}");
+    assert!(String::from_utf8_lossy(&st.stderr).contains("CHANGELOG.md: stale table"));
+    let st = Command::new(exe)
+        .args(["report", "--update", &readme, &changelog])
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{st:?}");
+    assert_eq!(std::fs::read_to_string(&changelog).unwrap(), fresh);
+    let st = Command::new(exe)
+        .args(["report", "--check", &readme, &changelog])
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{st:?}");
+    assert_eq!(
+        Command::new(exe)
+            .args(["report", "--check"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(2)
+    );
     // `report ARGS` prints exactly the marked table.
     let out = Command::new(exe)
         .args(["report", "--table", "overview", &f, "--compare", &p])

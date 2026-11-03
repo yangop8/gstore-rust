@@ -787,16 +787,23 @@ fn cmd_compare(a: &mut Args) -> CmdResult {
 /// (`--check`) of the marked tables of documents.
 fn cmd_report(a: &mut Args) -> CmdResult {
     let t = thresholds(a)?;
-    let update = usage(a.values("--update"))?;
-    let check = usage(a.values("--check"))?;
-    if !update.is_empty() || !check.is_empty() {
-        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    let update_flag = a.flag("--update");
+    let check_flag = a.flag("--check");
+    if update_flag || check_flag {
+        // `--update DOC...` / `--check DOC...`: every positional is a
+        // document.
+        if update_flag && check_flag {
+            return Err(Error::Usage("give --update or --check, not both".into()));
+        }
+        let docs = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        if docs.is_empty() {
+            return Err(Error::Usage(
+                "report --update / --check needs at least one document".into(),
+            ));
+        }
+        let write = update_flag;
         let mut stale = Vec::new();
-        for (doc, write) in update
-            .iter()
-            .map(|d| (d, true))
-            .chain(check.iter().map(|d| (d, false)))
-        {
+        for doc in &docs {
             let text = failed(std::fs::read_to_string(doc).map_err(|e| format!("{doc}: {e}")))?;
             let (fresh, changed) = failed(report::splice(&text, &mut |args: &[String]| {
                 report::render_args(args, &t)
