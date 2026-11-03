@@ -288,17 +288,32 @@ an in-run control.
 
 ### Verification
 
-`cargo fmt --all -- --check`, `cargo build --workspace --all-targets`,
-`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
---workspace` with `GSTORE_DISK_QUERY_MODE=memory` and `=stream`, and with
-`CARGO_TARGET_DIR=/tmp/p6r4-target-rocks` `cargo clippy -p gstore
---all-targets --features rocksdb -- -D warnings` and `cargo test -p gstore
---features rocksdb`: see the results recorded below.
+At `f684af7` (the code of the final commit; later commits touch this
+fragment only): `cargo fmt --all -- --check` clean; `cargo build
+--workspace --all-targets` and `cargo clippy --workspace --all-targets --
+-D warnings` clean; `GSTORE_DISK_QUERY_MODE=memory cargo test --workspace`:
+2,255 passed, 0 failed, 2 ignored; `GSTORE_DISK_QUERY_MODE=stream cargo
+test --workspace --no-fail-fast`: 2,255 passed, 0 failed, 2 ignored (a
+first stream pass stopped at `dt_bulk_crash::a_rocksdb_store_in_use_is_not_replaced`,
+"rocksdb/LOCK is held by process <the test's own pid>" after the holder
+was dropped; it passed in the memory pass, in three reruns of that file in
+Stream mode and in the full rerun — a flake of that test, which no code of
+this package reaches); with `CARGO_TARGET_DIR=/tmp/p6r4-target-rocks`:
+`cargo clippy -p gstore --all-targets --features rocksdb -- -D warnings`
+clean, `cargo test -p gstore --features rocksdb`: 2,102 passed, 0 failed,
+2 ignored. No feature-gated code and no bench code changed. Two existing
+lib tests (`db::tests::disk_database_filters_via_on_disk_vstree`,
+`streaming_vstree_matches_in_memory_path`) assert that a query paged
+`vstree.kv`: they pass because the library's unit tests default to `Tree`
+(see Changelog and Requests 5); no existing test was changed.
 
-VERIFICATION_RESULTS
-
-A trial merge of `p6/r4-reclaim` and then `p6/r4-snap` onto this branch (a
-throwaway worktree) merges without conflicts.
+A trial merge of `p6/r4-reclaim` (`f83ece6`) and then `p6/r4-snap`
+(`a011b07`) onto `f684af7` (a throwaway worktree) merges without conflicts;
+on the merged tree `cargo test -p gstore --lib -- signature:: query::
+kvstore::bptree db::tests` (255 tests, among them
+`a_vstree_file_with_feature_bits_is_refused` with R4-RECLAIM's
+`SUPPORTED_FEATURES = FEATURE_FREE_IDS`, where the pager itself accepts
+the bit) and `--test dt_vs_policy` pass.
 
 ## Requests/Not yet
 
