@@ -92,6 +92,7 @@ pub fn profile(name: &str) -> Option<Profile> {
         check_point: vec![false, true],
         endpoints: vec!["sparql".into(), "api".into()],
         query: None,
+        begins: 20,
     };
     Some(match name {
         "micro" => Profile {
@@ -109,6 +110,7 @@ pub fn profile(name: &str) -> Option<Profile> {
             conc: Some(both(vec![1, 2], 0.25)),
             mixed: Some(MixedSettings {
                 write_ms: 50,
+                begins: 3,
                 ..mixed(2, 0.25)
             }),
             extra: Vec::new(),

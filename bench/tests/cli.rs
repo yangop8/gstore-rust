@@ -508,6 +508,9 @@ fn watdiv_micro_on_snapshot_and_disk() {
         assert!(m.bodies_equal && m.writes_ok, "{}: {m:?}", run.backend);
         assert_eq!(m.points.len(), 4, "2 endpoints × check_point off/on");
         assert!(m.points.iter().all(|p| p.writes > 0 && p.reads > 0));
+        let b = m.begin.as_ref().expect("the /api begin point");
+        assert_eq!(b.samples, 3);
+        assert!(b.median_ms > 0.0 && b.max_ms >= b.median_ms);
     }
     // The bound queries are cached next to the data.
     assert!(Path::new(&t.path("data/watdiv-like1-x1-s0-k10.queries.json")).is_file());

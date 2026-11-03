@@ -86,6 +86,14 @@ fn run(backend: &str, label: Option<&str>, f: f64) -> BackendRun {
         bodies_equal: true,
         writes_ok: true,
         hwm_mib: None,
+        begin: Some(BeginPoint {
+            samples: 20,
+            median_ms: 1.5 * f,
+            p95_ms: 2.0 * f,
+            max_ms: 3.0 * f,
+            rss_growth_first_mib: Some(0.5),
+            rss_growth_max_mib: Some(1.0),
+        }),
     });
     r
 }

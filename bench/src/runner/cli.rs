@@ -48,7 +48,8 @@ run options:
   --reps N --query-procs N --open-reps N --singles N --no-update
   --no-conc --conc-clients 1,8 --conc-secs S --conc-queries q1,q4 --conc-endpoints sparql,api
   --no-mixed --mixed-readers N --mixed-write-ms MS --mixed-secs S --mixed-checkpoint off,on
-  --mixed-endpoints sparql,api --mixed-query Q   (--no-conc drops the mixed phase too)
+  --mixed-endpoints sparql,api --mixed-query Q --mixed-begins N (/api begin samples)
+                         (--no-conc drops the mixed phase too)
   --timeout-s N          per-phase timeout (default from the profile)
   --bin-dir DIR          where gbuild is (default target/release)
   --data-dir DIR         generated-data cache (default $GSTORE_BENCH_CACHE or target/gstore-bench/data)
@@ -263,6 +264,7 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
     let cps = a.list("--mixed-checkpoint")?;
     let mends = a.list("--mixed-endpoints")?;
     let mquery = a.value("--mixed-query")?;
+    let begins: Option<usize> = a.parsed("--mixed-begins")?;
     if no_conc || no_mixed {
         p.mixed = None;
     } else if readers.is_some()
@@ -271,6 +273,7 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         || cps.is_some()
         || mends.is_some()
         || mquery.is_some()
+        || begins.is_some()
     {
         let mut m = p.mixed.clone().unwrap_or(MixedSettings {
             readers: 8,
@@ -279,6 +282,7 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
             check_point: vec![false, true],
             endpoints: vec!["sparql".into(), "api".into()],
             query: None,
+            begins: 20,
         });
         if let Some(r) = readers {
             m.readers = r.max(1);
@@ -304,6 +308,9 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         }
         if mquery.is_some() {
             m.query = mquery;
+        }
+        if let Some(b) = begins {
+            m.begins = b;
         }
         p.mixed = Some(m);
     }

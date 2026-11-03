@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hash::{fnv64, hex};
 use crate::runner::phases::percentile;
-use crate::schema::{ConcPoint, ConcResult, MixedPoint, MixedResult};
+use crate::schema::{BeginPoint, ConcPoint, ConcResult, MixedPoint, MixedResult};
 use crate::sys;
 use crate::workload::{QuerySpec, Workload};
 
@@ -509,6 +509,10 @@ pub struct MixedSettings {
     /// queries, LUBM `q4`).
     #[serde(default)]
     pub query: Option<String>,
+    /// `/api` `operation=begin` samples (each rolled back) taken on the
+    /// first `/api` server before its mixed load; 0 = none.
+    #[serde(default)]
+    pub begins: usize,
 }
 
 /// The first single-insert number the mixed writer uses (the update phase
@@ -709,6 +713,7 @@ pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<Mi
         .ok_or_else(|| format!("unknown query '{name}'"))?;
     let readers = s.readers.max(1);
     let mut points = Vec::new();
+    let mut begin = None;
     let (mut bodies_equal, mut writes_ok) = (true, true);
     let mut point = 0usize;
     for endpoint in &s.endpoints {
@@ -716,7 +721,12 @@ pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<Mi
             let first = MIXED_FIRST + point * POINT_STRIDE;
             point += 1;
             let server = start_server(endpoint, dir, cp)?;
-            let r = mixed_point(&server, endpoint, dir, w, s, &query, readers, cp, first);
+            let r = (|| {
+                if endpoint == "api" && begin.is_none() && s.begins > 0 {
+                    begin = Some(begin_point(server.addr, dir, s.begins)?);
+                }
+                mixed_point(&server, endpoint, dir, w, s, &query, readers, cp, first)
+            })();
             server.finish();
             let p = r?;
             bodies_equal &= p.distinct_bodies == 1 && p.read_errors == 0;
@@ -729,6 +739,67 @@ pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<Mi
         bodies_equal,
         writes_ok,
         hwm_mib: sys::hwm_mib(),
+        begin,
+    })
+}
+
+/// `n` HTTP transaction starts (`/api` `operation=begin`, each rolled back)
+/// on the loaded database: latency, and the RSS of this process (which
+/// serves them) right before and after each `begin`.
+fn begin_point(addr: SocketAddr, dir: &Path, n: usize) -> Result<BeginPoint, String> {
+    let (_, _, cred) = api_cred(dir)?;
+    let mut lat = Vec::with_capacity(n);
+    let mut growth = Vec::with_capacity(n);
+    for _ in 0..n {
+        let before = sys::rss_mib();
+        let started = Instant::now();
+        let (st, body) = get_once(
+            addr,
+            &format!("/api?operation=begin&{cred}&isolevel=1"),
+            "application/json",
+        )
+        .map_err(|e| format!("api begin: {e}"))?;
+        lat.push(started.elapsed().as_secs_f64() * 1e3);
+        let after = sys::rss_mib();
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+            format!(
+                "api begin: HTTP {st}: {e}: {}",
+                String::from_utf8_lossy(&body)
+            )
+        })?;
+        let tid = v
+            .get("TID")
+            .and_then(|t| {
+                t.as_str()
+                    .map(str::to_string)
+                    .or_else(|| Some(t.to_string()))
+            })
+            .filter(|t| st == 200 && !t.is_empty() && t != "null")
+            .ok_or_else(|| format!("api begin: HTTP {st}: {v}"))?;
+        if let (Some(a), Some(b)) = (before, after) {
+            growth.push(b - a);
+        }
+        let (st, body) = get_once(
+            addr,
+            &format!("/api?operation=rollback&{cred}&tid={}", urlencode(&tid)),
+            "application/json",
+        )
+        .map_err(|e| format!("api rollback: {e}"))?;
+        if st != 200 || !String::from_utf8_lossy(&body).contains("\"StatusCode\":0") {
+            return Err(format!(
+                "api rollback: HTTP {st}: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+    }
+    let max = lat.iter().copied().fold(0.0, f64::max);
+    Ok(BeginPoint {
+        samples: lat.len(),
+        median_ms: crate::runner::phases::median(&lat),
+        p95_ms: percentile(&lat, 95.0),
+        max_ms: max,
+        rss_growth_first_mib: growth.first().copied(),
+        rss_growth_max_mib: growth.iter().copied().reduce(f64::max),
     })
 }
 

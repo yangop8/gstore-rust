@@ -458,6 +458,27 @@ pub struct MixedResult {
     pub writes_ok: bool,
     #[serde(default)]
     pub hwm_mib: Option<f64>,
+    /// `/api` `operation=begin` (each rolled back) on the loaded database,
+    /// before the mixed load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begin: Option<BeginPoint>,
+}
+
+/// The cost of starting an HTTP transaction (`/api` `operation=begin`): its
+/// latency and how much the server process's RSS grows while the
+/// transaction's snapshot is held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BeginPoint {
+    pub samples: usize,
+    pub median_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    /// RSS after the first `begin` minus RSS before it.
+    #[serde(default)]
+    pub rss_growth_first_mib: Option<f64>,
+    /// The largest such growth over all samples.
+    #[serde(default)]
+    pub rss_growth_max_mib: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

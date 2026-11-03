@@ -555,6 +555,11 @@ fn version_1_files_read_and_mixed_results_are_checked() {
         bodies_equal: true,
         writes_ok: true,
         hwm_mib: None,
+        begin: Some(BeginPoint {
+            samples: 3,
+            median_ms: 2.0,
+            ..BeginPoint::default()
+        }),
     };
     let mut base = result(1.0);
     base.runs[0].mixed = Some(mixed.clone());

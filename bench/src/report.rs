@@ -491,6 +491,52 @@ fn mixed_table(rows: &[Row<'_>], cmp: bool) -> String {
         }
     }
     s.push('\n');
+    let begins: Vec<(&Row<'_>, &crate::schema::BeginPoint)> = rows
+        .iter()
+        .filter_map(|r| {
+            r.run
+                .mixed
+                .as_ref()
+                .and_then(|m| m.begin.as_ref())
+                .map(|b| (r, b))
+        })
+        .collect();
+    if !begins.is_empty() {
+        let _ = writeln!(
+            s,
+            "{h} /api begin samples | median ms | p95 ms | max ms | RSS growth first / max MiB |{}",
+            if cmp { " median vs base |" } else { "" }
+        );
+        let _ = writeln!(
+            s,
+            "{d}---:|---:|---:|---:|---:|{}",
+            if cmp { "---:|" } else { "" }
+        );
+        for (row, b) in begins {
+            let base = row
+                .base
+                .and_then(|x| x.mixed.as_ref())
+                .and_then(|m| m.begin.as_ref())
+                .map(|x| x.median_ms);
+            let _ = writeln!(
+                s,
+                "{} {} | {} | {} | {} | {} / {} |{}",
+                row.lead(),
+                b.samples,
+                f2(b.median_ms),
+                f2(b.p95_ms),
+                f2(b.max_ms),
+                opt(b.rss_growth_first_mib, f1),
+                opt(b.rss_growth_max_mib, f1),
+                if cmp {
+                    format!(" {} |", ratio_cell(b.median_ms, base))
+                } else {
+                    String::new()
+                }
+            );
+        }
+        s.push('\n');
+    }
     s
 }
 

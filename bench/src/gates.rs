@@ -839,6 +839,14 @@ impl Ctx<'_> {
             }
         }
         if let (Some(xb), Some(xm)) = (&b.mixed, &r.mixed) {
+            if let (Some(bb), Some(bm)) = (&xb.begin, &xm.begin) {
+                out.push(GateOutcome {
+                    base: Some(bb.median_ms),
+                    measured: Some(bm.median_ms),
+                    ratio: (bb.median_ms > 0.0).then(|| bm.median_ms / bb.median_ms),
+                    ..GateOutcome::info("info.begin_ms", format!("{subj}/api/begin"), "report-only")
+                });
+            }
             for pb in &xb.points {
                 if let Some(pm) = xm.points.iter().find(|p| {
                     p.endpoint == pb.endpoint
