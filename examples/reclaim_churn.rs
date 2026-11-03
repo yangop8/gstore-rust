@@ -2,12 +2,12 @@
 //! is split by university; a database holding universities `0..8` then runs
 //! ten rounds of "delete university `r`, insert university `8 + r`", with
 //! immediate reclamation (`on`) and without it (`off`, the control), on the
-//! memory, Stream-disk or RocksDB layout.
+//! memory, Stream-disk, Materialize-disk or RocksDB layout.
 //!
 //! ```text
 //! cargo run --release --example reclaim_churn -- \
 //!     --data /tmp/gstore-bench-cache/lubm-like1-u38-s0.nt \
-//!     [--layout memory|stream|rocksdb] [--policy on|off|both] \
+//!     [--layout memory|stream|materialize|rocksdb] [--policy on|off|both] \
 //!     [--base 8] [--rounds 10] [--scratch DIR]
 //! ```
 //!
@@ -24,7 +24,7 @@
 //! terms the data uses, `limit` the sum of the id spaces' high-water marks.
 //! Then `SUMMARY` lines with the acceptance checks: live = referenced in
 //! every round and within ±5% of round 0, limit ≤ 1.05 × peak live, RSS ≤
-//! 1.15 × round 0 (memory), kvstore.kv ≤ 1.2 × round 0 (stream), and the
+//! 1.15 × round 0 (memory), kvstore.kv ≤ 1.2 × round 0 (stream, materialize), and the
 //! delete throughput ratio on / off.
 
 use std::collections::HashSet;
@@ -139,6 +139,7 @@ fn live(db: &Database) -> usize {
 fn open(layout: &str, dir: &Path) -> Database {
     match layout {
         "stream" => Database::open_with(dir, &OpenOptions::stream()).unwrap(),
+        "materialize" => Database::open_with(dir, &OpenOptions::materialize()).unwrap(),
         _ => Database::open(dir).unwrap(),
     }
 }
@@ -146,7 +147,7 @@ fn open(layout: &str, dir: &Path) -> Database {
 fn build(layout: &str, dir: &Path, files: &[PathBuf]) -> Database {
     match layout {
         "memory" => Database::build_from_files("churn", files).unwrap(),
-        "stream" => {
+        "stream" | "materialize" => {
             Database::build_disk(dir, files).unwrap();
             open(layout, dir)
         }
@@ -165,7 +166,9 @@ fn build(layout: &str, dir: &Path, files: &[PathBuf]) -> Database {
             .unwrap();
             open(layout, dir)
         }
-        other => panic!("unknown layout {other} (memory, stream, rocksdb with --features rocksdb)"),
+        other => panic!(
+            "unknown layout {other} (memory, stream, materialize, rocksdb with --features rocksdb)"
+        ),
     }
 }
 
