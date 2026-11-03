@@ -5,6 +5,7 @@
 //! pipeline and `docs/DESIGN.md` §6.
 
 pub mod candidates;
+mod count_memo;
 pub mod engine;
 pub mod functions;
 pub mod hash;

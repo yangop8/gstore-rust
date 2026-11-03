@@ -190,6 +190,7 @@ use crate::store::read_scope::note_read_error;
 use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
+use super::count_memo::CountMemo;
 use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
@@ -2691,7 +2692,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // Exact per-variable candidate sets from constant edges (gStore's
         // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
-        let mut candidates = candidates::generate(&plans, self.store);
+        // Counts the optimizer asks for again come from one memo.
+        let counts = CountMemo::new(self.store);
+        let mut candidates = candidates::generate(&plans, &counts);
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
         // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
         // plain REGEX) prune or seed candidate sets — a sound superset, so only
@@ -2710,7 +2713,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .plan_cache
             .borrow_mut()
             .entry(key)
-            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
+            .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
             .clone();
         PreparedBgp::Plan(topk::BgpPlan {
             plans,
