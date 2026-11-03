@@ -32,6 +32,24 @@ Package R4-SNAP of `docs/PHASE6_PLAN.md` §6 (Round 4). Base: `d702463`
   (O(triples)). A bulk load drops the spare; so does a journal longer than
   4096 + triples/8 changes. The price is a second copy of the indexes in
   memory, so only `ConcurrentDb` enables it.
+- **Batched sorted-merge writes: `TripleStore::insert_many` /
+  `remove_many`** (also `MutableStore::insert_many` / `remove_many`, whose
+  default does one triple at a time). A batch (any order, repeats allowed)
+  is sorted once per index order and merged into each touched list in one
+  pass: only the tail after the list's first new entry moves, once — where
+  one `insert` per triple moves that tail once per triple. Removal likewise
+  compacts each touched list once. Element `i` of the result is what
+  `insert` / `remove` of the `i`-th triple returns after the earlier ones,
+  and the store ends up exactly as after them (triples, statistics,
+  pruning, serialized bytes); a batch that changes nothing never copies
+  shared indexes. It answers R4-RECLAIM's request: with lowest-first id
+  reuse a reused low id lands at the front of long per-predicate
+  (`p2so`) and per-class (`o2ps`) lists, and per-triple inserts then move
+  most of each list per triple (4.7× slower inserts in its churn). A
+  spare copy's journal now replays each run of inserts (or removes) as one
+  batch. The database's write paths still insert one triple at a time:
+  they belong to R4-RECLAIM's `db/mod.rs`, and the integrator wires them
+  (Requests).
 - **`ConcurrentDb` publishes in O(1)** for an in-memory database: a
   snapshot shares the dictionary (copy-on-write since Round 2), the default
   graph's store and every named graph's store; the authoritative database's
@@ -110,7 +128,13 @@ Package R4-SNAP of `docs/PHASE6_PLAN.md` §6 (Round 4). Base: `d702463`
   published / held / dropped clones checked byte for byte), a clone read on
   another thread while the original takes 20,000 writes, `ConcurrentDb`
   snapshots over reused spares with concurrent readers, and the latency
-  driver (ignored). New `tests/dt_snapshot_disk.rs` (servers forced to
+  driver (ignored); the batched operations against repeated single ones
+  (random batches with repeats, present and absent triples, held and
+  published clones, with and without spares), batches before, inside and
+  after long lists and emptying a predicate, no-op batches never copying,
+  and the `batch_of_low_ids_latency` micro-benchmark (ignored); a unit test
+  of the merge and the one-pass removal over every split of a small
+  universe. New `tests/dt_snapshot_disk.rs` (servers forced to
   Stream mode): eight readers see only the begin-time count while a
   transaction inserts pairs and converge after the commit, a rollback is
   never visible; `/commit` takes under a second while a long snapshot query
@@ -128,11 +152,16 @@ Package R4-SNAP of `docs/PHASE6_PLAN.md` §6 (Round 4). Base: `d702463`
   per write; the snapshot layout keeps the old expectation); in
   `http_api`'s unit tests, two `/api monitor` checks after a change poll
   until the statistics settle instead of expecting them in the first
-  answer.
+  answer. (`dt_snapshot_disk`'s reader test, new in this package, was
+  itself fixed during the package: it expected the committed count from the
+  moment `/commit` was sent, so a read that finished before the commit
+  applied — correctly answering the begin-time count — failed it about one
+  run in ten; the readers now accept the count committed when the read
+  starts or the one being committed when it ends.)
 
 ## GAP_PLAN status line
 
-R4-SNAP: copy-on-write TripleStore (O(1) clones, bytes and Debug unchanged), O(1) `/begin` on memory and Stream-disk databases (disk snapshot reads under the writer gate, expired reads re-run), `ConcurrentDb` O(1) publishes with spare copies, `layout=` for REST `/build`, `/api build` and `gbuild`, `/api monitor` statistics and `diskUsed` off the request path — done; check_point saves of the snapshot layout still run under the exclusive guard (follow-up below).
+R4-SNAP: copy-on-write TripleStore (O(1) clones, bytes and Debug unchanged), O(1) `/begin` on memory and Stream-disk databases (disk snapshot reads under the writer gate, expired reads re-run), `ConcurrentDb` O(1) publishes with spare copies, `layout=` for REST `/build`, `/api build` and `gbuild`, `/api monitor` statistics and `diskUsed` off the request path (≤ 47 ms in every measured case at univ 8 and 38, base up to 1.08 s), batched `TripleStore::insert_many` / `remove_many` for R4-RECLAIM's id reuse (70× faster for a 5,330-triple low-id batch at univ 8; wiring by the integrator) — done; check_point saves of the snapshot layout still run under the exclusive guard (follow-up below).
 
 ## Docs notes
 
@@ -160,6 +189,9 @@ R4-SNAP: copy-on-write TripleStore (O(1) clones, bytes and Debug unchanged), O(1
   `/build`, `/api build` and `gbuild` (see Requests: the config docs and
   `gserver`'s warning still call it reserved).
 - `ApiServer::with_open_options` (embedded servers).
+- docs/STORAGE_BACKEND.md (in-memory store): `insert_many` / `remove_many`
+  merge a batch into each list in one pass (the write paths that use them,
+  once wired); why it matters with lowest-first id reuse.
 
 ## Measured numbers
 
@@ -267,7 +299,55 @@ be reported under G4 at closure. The disk layout, whose commit point is
 incremental, is now buildable from the servers (`layout=disk`), which is
 option (c) of that request.
 
-**`/api monitor` latency (R3-SRV request 6)** — MONITOR
+**`/api monitor` latency (R3-SRV request 6)** — `gserver --api`,
+check_point on, snapshot layout, `POST /api {"operation":"monitor"}` timed
+with curl (`time_total`); two alternating rounds per side at univ 8, one
+at univ 38; the long query is a never-matching streamed cross product of
+`ub:advisor` pairs (it runs for minutes):
+
+| case | univ 8 base | univ 8 branch | univ 38 base | univ 38 branch |
+|---|---:|---:|---:|---:|
+| first call after the load (computes the statistics; both sides) | 169–173 ms | 196–235 ms | 948 ms | 877 ms |
+| warm (median of 5) | 0.91–0.96 ms | 0.94–0.96 ms | 1.73 ms | 0.98 ms |
+| right after an acknowledged update | **172–220 ms** | **41–47 ms** | **0.99–1.08 s** | **41–43 ms** |
+| the call after that, at once | 0.8–1.1 ms | 41–43 ms (the refresh still runs) | 0.8–1.1 ms | 41–42 ms |
+| during an update's check_point save (0.15 s in; univ 38 also 0.6–1.3 s in) | 0.8–1.2 ms | 0.8–42 ms | 0.8–0.9 ms, **177 ms** at 1.3 s | 0.8–43 ms |
+| during a long query (first call after a change) | **184–230 ms** | 41 ms | **1.02 s** | 43 ms |
+| during a long query (later calls) | 0.9–1.5 ms | 0.8–20 ms | 0.9–1.3 ms | 1.0–42 ms |
+
+Every branch answer is ≤ 47 ms (the request waits at most 40 ms for the
+background refresh, then answers with the statistics of the data before
+the change and the current counts); the base computes the statistics on
+the request path after every change (0.2 s at univ 8, 1 s at univ 38) and
+once stalled 177 ms in a save's fsync tail. G4's monitoring item (≤ 100
+ms while a long query runs, right after a change, during a save):
+**met** in this noisy run at both scales; the quiet stage re-checks it at
+univ 38 (command 5).
+
+**Batched inserts / removes of low ids** (`dt_cow_store`'s
+`batch_of_low_ids_latency`, release build, same binary: one `insert` /
+`remove` per triple — what the database does today — vs `insert_many` /
+`remove_many`; median of 5). The batch is the triples of the lowest
+subject ids — what lowest-first reuse produces — removed first, then
+inserted back:
+
+| store | batch | insert one by one | `insert_many` | remove one by one | `remove_many` |
+|---|---:|---:|---:|---:|---:|
+| LUBM univ 8 (1,029,275 triples) | 5,330 (a chunk insert) | 334 ms | **4.7 ms** (71×) | 336 ms | **4.0 ms** (85×) |
+| LUBM univ 8 | 130,000 (≈ one university) | 6.61 s | **34 ms** (194×) | 7.06 s | **60 ms** (117×) |
+| synthetic, 1,000,000 triples, 20 classes | 5,330 | 491 ms | **7.4 ms** | 484 ms | **5.4 ms** |
+| synthetic | 50,000 | 4.22 s | **28 ms** | 4.22 s | **33 ms** |
+
+The one-by-one figure for a university (6.6 s) is R4-RECLAIM's measured
+6.7 s churn insert; batching brings it below its no-reuse 0.87 s once the
+write paths use it (Requests). Batches of high ids (appended at the end of
+the lists) were already cheap one by one.
+
+**`ConcurrentDb` update latency, re-run in this session** after the
+batched-operation change (the spare's journal replay): base 67.8 ms median
+(p90 73.6 ms; the machine was busier than in the first session), branch
+0.089–0.096 ms (p90 0.11–0.16 ms), the copy fallback 19.3–20.9 ms.
+Acceptance (≥ 1.7× lower): **met**.
 
 ### Measure-stage commands
 
@@ -304,10 +384,23 @@ command under `flock /tmp/gstore-bench.lock`, base and branch alternating.
    --conc-queries q4 --conc-clients 1,8 --bin-dir <side>`.
 5. `/api monitor` latency (univ 38, memory): `POST /api
    {"operation":"monitor",…}` once warm, right after each of three
-   `/update` INSERT DATA, during a long query (a streamed cross product
-   that never matches, e.g. `ASK { ?a ub:advisor ?x . ?b ub:advisor ?y
-   FILTER(STRLEN(STR(?x)) + STRLEN(STR(?y)) < 0) }`), and 150 ms into a
-   check_point `/update` (whose save runs about 1.2 s at univ 38).
+   `/api` `query` operations with an INSERT DATA (check_point on), during
+   a long query (a streamed cross product that never matches, e.g. `ASK {
+   ?a ub:advisor ?x . ?b ub:advisor ?y FILTER(STRLEN(STR(?x)) +
+   STRLEN(STR(?y)) < 0) }`), and 150 ms into a
+   check_point update (whose save runs about 1.2 s at univ 38; also
+   0.6, 0.9, 1.1 and 1.3 s in, to reach the save's fsync tail). The
+   long query never ends: stop the server after it (an update would wait
+   for it on the snapshot layout).
+6. Batched writes: `cargo test --release -p gstore --test dt_cow_store
+   --no-run`, then `GSTORE_COW_BENCH_NT=/tmp/gstore-bench-cache/lubm-like1-u8-s0.nt
+   GSTORE_COW_BENCH_BATCH=5330 <dt_cow_store binary> --ignored --nocapture
+   batch_of_low_ids_latency` (also `GSTORE_COW_BENCH_BATCH=130000`, and
+   univ 38). Base and branch are the two columns of the same run. Once the
+   integrator wired the write paths, R4-RECLAIM's
+   `examples/reclaim_churn.rs --layout snapshot --policy immediate` is the
+   end-to-end check (its insert time should drop from ~6.7 s per
+   university to below the Off policy's ~0.9 s).
 
 ## Requests/Not yet
 
@@ -343,7 +436,52 @@ Requests (outside this package's files):
 4. **`gapi/ops_sys.rs` (`/api stat`):** report a loaded on-disk database's
    query mode and dictionary cache counters (`Dictionary::cache_stats`) if
    wanted; `show` and `monitor` report `layout` / `queryMode` now.
-5. **R4-CLOSURE (`bench/**`):** `bench/src/runner/conc.rs` is unchanged
+5. **Integrator, after R4-RECLAIM's merge — batched writes
+   (`src/db/mod.rs`, `src/store/backend.rs`; R4-RECLAIM request 6).**
+   (a) `src/store/backend.rs`, `impl MutableStore for Backend`: dispatch
+   the two new methods, so a memory database reaches the batched merge
+   (UFCS, because `DiskTriples` has inherent `insert_many` / `remove_many`
+   of another signature; Disk and RocksDB keep the trait's one-by-one
+   default):
+   `fn insert_many(&mut self, t: &[IdTriple]) -> Vec<bool> {
+   backend_dispatch!(self, s, MutableStore::insert_many(s, t)) }` and the
+   same for `remove_many`. (b) `src/db/mod.rs`: in each batch write path,
+   intern the batch's default-graph triples first (terms before triples, as
+   now), call `self.store.insert_many(&ids)` (or `remove_many`) once, then
+   run, for each triple whose result is `true` and in input order, exactly
+   the bookkeeping `try_insert_triple_id` / `remove_default_id` run after
+   `changed` today (VS-tree upsert or shrink debt, `touched()`, undo log,
+   `record_redo`, `persist_mutation`, the reclaim candidates). The VS-tree
+   upserts after the whole batch stay sound: a new entity is signed from a
+   store that already holds all its batch triples, and the later unions add
+   bits it already has. Call sites, by symbol: `Database::insert_sources`
+   (its batch closure; `/api batchInsert`, `gadd`), `try_insert_data`
+   (`INSERT DATA`), `delete_data` (`DELETE DATA`), `remove_sources` (`gsub`,
+   `/api batchRemove`), the `UpdateOp::Modify` arm of `run_update` (the
+   `dels` / `ins` of `modify_changes`), LOAD's batch closure (the function
+   with `"LOAD"` in its `import_sources` call) and `undo_inserts`;
+   `rollback`'s undo loop can batch each run of consecutive `UndoOp::Add` /
+   `UndoOp::Del` of the default graph (order matters across runs only).
+   Named-graph quads keep their own path. Keep the per-triple results:
+   `applied` counters and `Ok(n)` counts are the number of `true`s.
+6. **Integrator, after R4-RECLAIM's merge — unpinned dictionary clones
+   (R4-RECLAIM request 2).** Switch exactly one call site:
+   `src/http_api.rs`, `ReadSnapshot::capture`, the `dict: db.dict().clone()`
+   field initializer — to `if matches!(store, SnapStore::Disk(_)) {
+   db.dict().clone_unpinned() } else { db.dict().clone() }` (the comment
+   there says why: an on-disk snapshot reads its dictionary only inside
+   `DiskReadView::with_base`, in `ReadSnapshot::read_as`, and a writer
+   drains those reads and expires the view before any free). **Do not**
+   switch `src/concurrent.rs`, `Snapshot::from_db` (`dict:
+   db.dict().clone()`): a `ConcurrentDb` snapshot of a Stream database
+   materializes its store and resolves those ids after later writes,
+   outside any read view, so an unpinned clone could resolve a freed and
+   reused id to the wrong term. Consequence (unchanged): a `ConcurrentDb`
+   over a Stream database defers its frees while a snapshot lives, and its
+   construction-time base snapshot lives as long as it does. A versioned
+   read view (D2) or an in-memory dictionary copy per publish (O(terms))
+   would lift that; the servers do not use `ConcurrentDb`.
+7. **R4-CLOSURE (`bench/**`):** `bench/src/runner/conc.rs` is unchanged
    and still compiles (`Server::bind`, `shutdown_handle`, `serve_forever`,
    `ApiServer::bind`, `with_query_settings`, `QuerySettings` untouched).
    A `/begin` latency point and a mixed-workload point on a disk database
