@@ -211,6 +211,28 @@ the work. Further figures of the same runs (report-only):
 all passing, 15–33 s wall depending on the load (the WatDiv end-to-end run
 on snapshot and disk, mixed phase included, is the longest at ~12 s).
 
+**Verification** (pinned toolchain 1.99.1, `CARGO_PROFILE_{DEV,TEST}_DEBUG=0`,
+on the final code of this package; only `bench/**`, `bench.yml` and this
+fragment changed, so the gstore crate's RocksDB and feature-matrix jobs are
+unaffected):
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo build --workspace --all-targets`; `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+- `GSTORE_DISK_QUERY_MODE=memory cargo test --workspace`: 2,259 passed, 0
+  failed, 2 ignored; `GSTORE_DISK_QUERY_MODE=stream cargo test
+  --workspace`: 2,259 passed, 0 failed, 2 ignored.
+- bench.yml rocksdb-correctness, in a private copy of the shared RocksDB
+  target directory: `cargo build --profile test --locked -p gstore --bin
+  gbuild --features rocksdb`, `cargo clippy -p gstore-bench --all-targets
+  --features rocksdb -- -D warnings` (clean), `cargo test -p gstore-bench
+  --features rocksdb`: 66 passed, 0 failed, 1 ignored (the tiny workload on
+  snapshot, disk and RocksDB with the mixed phase, through the real
+  `gbuild`).
+- bench.yml smoke, locally: `report --check README.md CHANGELOG.md` exits 0
+  (no markers yet); `gstore-bench ci` PASS (above); the canary exits 1.
+- No new crate, no `Cargo.lock` change.
+
 **For the quiet measure / closure stage** (after R4-RECLAIM, R4-SNAP and
 R4-VS are merged; `B=target/release/gstore-bench`, `export
 GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache`, every run under `flock
@@ -272,7 +294,13 @@ Requests (outside this package's files):
    (`info.new`, not gated) and still gates LUBM univ 1 against the R1
    baseline. After the re-bless the baseline is `gstore-bench/2`, which a
    pre-R4 harness refuses (by design: it cannot read labels or sections).
-4. **R4-SNAP / server owners (note, no change needed):** besides the
+4. **Integrator / `ci.yml` owner (optional):** bench.yml ignores
+   `**/*.md` changes (`paths-ignore`), so its `report --check README.md
+   CHANGELOG.md` step guards the generated tables only when code or result
+   files change. A docs-only edit of a marked table is caught on the next
+   such push; running the same step in a ci.yml job (it needs only the
+   `gstore-bench` binary) would catch it at once.
+5. **R4-SNAP / server owners (note, no change needed):** besides the
    constructors R1-BENCH listed (`Server::bind`, `shutdown_handle`,
    `serve_forever`, `ApiServer::bind`, `with_query_settings`,
    `QuerySettings`), the mixed phase uses `Server::with_db_dir`,
