@@ -621,10 +621,16 @@ impl ReadSnapshot {
             // An on-disk snapshot shares the database's dictionary and reads
             // it only inside the view's gate (`read_as`), which a writer
             // drains — expiring the view — before it frees any id: such a
-            // clone need not keep freed ids from being reused (it may be an
-            // unpinned one). An in-memory dictionary's clone is
-            // copy-on-write: it keeps the terms it was taken with.
-            dict: db.dict().clone(),
+            // clone need not keep freed ids from being reused, so it takes
+            // no pin (a pinned clone would defer every free of a Stream-mode
+            // database while the transaction is open). An in-memory
+            // dictionary's clone is copy-on-write: it keeps the terms it was
+            // taken with, whatever the live dictionary frees and reuses.
+            dict: if matches!(store, SnapStore::Disk(_)) {
+                db.dict().clone_unpinned()
+            } else {
+                db.dict().clone()
+            },
             store,
             // Each graph's store is shared (copy-on-write).
             named: db
