@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gstore::db::OpenOptions;
 use gstore::http_api::ApiServer;
 use gstore::server::{Server, ShutdownReport};
 use gstore::{Database, QueryResult};
@@ -125,9 +126,24 @@ fn json_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Whether the database saved at `dir` contains `<s> <p> <o>` (full IRIs).
-/// Read as a detached copy: a `gserver` child may hold the directory's lock.
+/// Read as a detached copy: a server (or a `gserver` child) may hold the
+/// directory's lock. An on-disk database's files are copied first (the
+/// store and its write-ahead log as they are on disk), and the copy is
+/// opened.
 fn on_disk_has(dir: &Path, s: &str, p: &str, o: &str) -> bool {
-    let mut db = Database::read_copy(dir).expect("read saved database");
+    let mut db = if dir.join("kvstore.kv").is_file() {
+        let copy = tmp_dir("disk_copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != "LOCK" {
+                std::fs::copy(entry.path(), copy.join(entry.file_name())).unwrap();
+            }
+        }
+        Database::open_with(&copy, &OpenOptions::materialize()).expect("open the copy")
+    } else {
+        Database::read_copy(dir).expect("read saved database")
+    };
     match db.query(&format!("ASK {{ <{s}> <{p}> <{o}> }}")).unwrap() {
         QueryResult::Ask(b) => b,
         other => panic!("unexpected {other:?}"),
@@ -368,21 +384,53 @@ fn single_server_shutdown_cancels_a_running_query_and_saves() {
 
 // ---- multi-database ApiServer ----------------------------------------------
 
+/// The layout an [`Api`] test's databases are built in (REST `/build`'s
+/// `layout`); every contract test of the multi-database server runs over
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// An in-memory database saved as a snapshot.
+    Snapshot,
+    /// An on-disk (`kvstore.kv`) database, served in Stream mode: its
+    /// writes go through to the store at once (a commit point per write
+    /// with check_point off too), and a transaction's snapshot is a read
+    /// view of the store.
+    Disk,
+}
+
+impl Layout {
+    fn param(self) -> &'static str {
+        match self {
+            Layout::Snapshot => "snapshot",
+            Layout::Disk => "disk",
+        }
+    }
+
+    /// Whether an acknowledged non-transactional write is on disk without a
+    /// save (with check_point off).
+    fn writes_through(self) -> bool {
+        self == Layout::Disk
+    }
+}
+
 struct Api {
     server: Arc<ApiServer>,
     addr: SocketAddr,
     root_dir: PathBuf,
+    layout: Layout,
     serving: Option<thread::JoinHandle<ShutdownReport>>,
 }
 
 impl Api {
-    fn start(tag: &str, check_point: bool) -> Api {
-        let root_dir = tmp_dir(tag);
-        let server = Arc::new(
-            ApiServer::bind(&root_dir, "root", "127.0.0.1:0")
-                .expect("bind")
-                .with_check_point(check_point),
-        );
+    fn start(tag: &str, check_point: bool, layout: Layout) -> Api {
+        let root_dir = tmp_dir(&format!("{tag}_{}", layout.param()));
+        let server = ApiServer::bind(&root_dir, "root", "127.0.0.1:0")
+            .expect("bind")
+            .with_check_point(check_point);
+        let server = Arc::new(match layout {
+            Layout::Snapshot => server,
+            Layout::Disk => server.with_open_options(OpenOptions::stream()),
+        });
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         let serving = Some(thread::spawn(move || s2.serve_forever()));
@@ -390,6 +438,7 @@ impl Api {
             server,
             addr,
             root_dir,
+            layout,
             serving,
         }
     }
@@ -412,10 +461,16 @@ impl Api {
         self.root_dir.join(format!("{name}.db"))
     }
 
-    /// Build database `name` from `DATA`.
+    /// Build database `name` from `DATA` in this test's layout.
     fn build(&self, name: &str) {
-        let (s, body) = self.root("POST", &format!("/build?db_name={name}"), DATA);
+        let (s, body) = self.root(
+            "POST",
+            &format!("/build?db_name={name}&layout={}", self.layout.param()),
+            DATA,
+        );
         assert_eq!(s, 200, "build: {body}");
+        let kv = self.db_dir(name).join("kvstore.kv").is_file();
+        assert_eq!(kv, self.layout == Layout::Disk, "{:?}", self.layout);
     }
 
     fn add_user(&self, name: &str, privileges: &str) {
@@ -449,10 +504,26 @@ impl Api {
 
 #[test]
 fn api_unload_saves_a_dirty_database() {
-    let api = Api::start("api_unload", false);
+    api_unload_saves_a_dirty_database_in(Layout::Snapshot);
+}
+
+/// [`api_unload_saves_a_dirty_database`] over the disk layout (Stream mode).
+#[test]
+fn api_unload_saves_a_dirty_database_disk() {
+    api_unload_saves_a_dirty_database_in(Layout::Disk);
+}
+
+fn api_unload_saves_a_dirty_database_in(layout: Layout) {
+    let api = Api::start("api_unload", false, layout);
     api.build("u");
     assert_eq!(api.root("POST", "/update?db_name=u", NEW_TRIPLE).0, 200);
-    assert!(!on_disk_has_new_triple(&api.db_dir("u")), "check_point off");
+    // check_point off: a snapshot database saves later, an on-disk one
+    // writes through (and commits) at once.
+    assert_eq!(
+        on_disk_has_new_triple(&api.db_dir("u")),
+        layout.writes_through(),
+        "check_point off"
+    );
     let (s, body) = api.root("GET", "/show", "");
     assert_eq!(s, 200);
     assert!(body.contains("\"dirty\":true"), "{body}");
@@ -476,19 +547,34 @@ fn api_unload_saves_a_dirty_database() {
 
 #[test]
 fn api_check_point_off_saves_only_on_checkpoint() {
-    let api = Api::start("api_cp_off", false);
+    api_check_point_off_saves_only_on_checkpoint_in(Layout::Snapshot);
+}
+
+/// [`api_check_point_off_saves_only_on_checkpoint`] over the disk layout (Stream mode).
+#[test]
+fn api_check_point_off_saves_only_on_checkpoint_disk() {
+    api_check_point_off_saves_only_on_checkpoint_in(Layout::Disk);
+}
+
+fn api_check_point_off_saves_only_on_checkpoint_in(layout: Layout) {
+    let api = Api::start("api_cp_off", false, layout);
     assert!(!api.server.check_point());
     api.build("k");
     assert_eq!(api.root("POST", "/update?db_name=k", NEW_TRIPLE).0, 200);
     let batch = "<http://ex/x> <http://ex/p> <http://ex/y> .\n";
     assert_eq!(api.root("POST", "/batchInsert?db_name=k", batch).0, 200);
-    assert!(!on_disk_has_new_triple(&api.db_dir("k")));
-    assert!(!on_disk_has(
-        &api.db_dir("k"),
-        "http://ex/x",
-        "http://ex/p",
-        "http://ex/y"
-    ));
+    // Saved only by the checkpoint below — unless the layout writes through.
+    let early = layout.writes_through();
+    assert_eq!(on_disk_has_new_triple(&api.db_dir("k")), early);
+    assert_eq!(
+        on_disk_has(
+            &api.db_dir("k"),
+            "http://ex/x",
+            "http://ex/p",
+            "http://ex/y"
+        ),
+        early
+    );
 
     let (s, body) = api.root("POST", "/checkpoint?db_name=k", "");
     assert_eq!(s, 200, "checkpoint: {body}");
@@ -503,7 +589,17 @@ fn api_check_point_off_saves_only_on_checkpoint() {
 
 #[test]
 fn api_check_point_on_saves_every_write() {
-    let api = Api::start("api_cp_on", true);
+    api_check_point_on_saves_every_write_in(Layout::Snapshot);
+}
+
+/// [`api_check_point_on_saves_every_write`] over the disk layout (Stream mode).
+#[test]
+fn api_check_point_on_saves_every_write_disk() {
+    api_check_point_on_saves_every_write_in(Layout::Disk);
+}
+
+fn api_check_point_on_saves_every_write_in(layout: Layout) {
+    let api = Api::start("api_cp_on", true, layout);
     assert!(api.server.check_point());
     api.build("w");
     let dir = api.db_dir("w");
@@ -553,7 +649,17 @@ fn api_check_point_on_saves_every_write() {
 
 #[test]
 fn api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions() {
-    let mut api = Api::start("api_shutdown", false);
+    api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions_in(Layout::Snapshot);
+}
+
+/// [`api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions`] over the disk layout (Stream mode).
+#[test]
+fn api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions_disk() {
+    api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions_in(Layout::Disk);
+}
+
+fn api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions_in(layout: Layout) {
+    let mut api = Api::start("api_shutdown", false, layout);
     api.build("s");
     api.build("clean");
     assert_eq!(api.root("POST", "/update?db_name=s", NEW_TRIPLE).0, 200);
@@ -587,7 +693,17 @@ fn api_shutdown_saves_dirty_databases_and_rolls_back_open_transactions() {
 
 #[test]
 fn api_transaction_is_owned_by_its_user() {
-    let api = Api::start("api_owner", true);
+    api_transaction_is_owned_by_its_user_in(Layout::Snapshot);
+}
+
+/// [`api_transaction_is_owned_by_its_user`] over the disk layout (Stream mode).
+#[test]
+fn api_transaction_is_owned_by_its_user_disk() {
+    api_transaction_is_owned_by_its_user_in(Layout::Disk);
+}
+
+fn api_transaction_is_owned_by_its_user_in(layout: Layout) {
+    let api = Api::start("api_owner", true, layout);
     api.build("o");
     api.add_user("alice", "query,update");
     api.add_user("bob", "query,update");
@@ -621,7 +737,17 @@ fn api_transaction_is_owned_by_its_user() {
 
 #[test]
 fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open() {
-    let api = Api::start("api_reject", true);
+    api_non_transactional_writes_are_rejected_while_a_transaction_is_open_in(Layout::Snapshot);
+}
+
+/// [`api_non_transactional_writes_are_rejected_while_a_transaction_is_open`] over the disk layout (Stream mode).
+#[test]
+fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open_disk() {
+    api_non_transactional_writes_are_rejected_while_a_transaction_is_open_in(Layout::Disk);
+}
+
+fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open_in(layout: Layout) {
+    let api = Api::start("api_reject", true, layout);
     api.build("r");
     let tid = api.begin("root", "r");
     let batch = "<http://ex/x> <http://ex/p> <http://ex/y> .\n";
@@ -664,7 +790,17 @@ fn api_non_transactional_writes_are_rejected_while_a_transaction_is_open() {
 
 #[test]
 fn api_other_clients_never_read_uncommitted_data() {
-    let api = Api::start("api_dirty", true);
+    api_other_clients_never_read_uncommitted_data_in(Layout::Snapshot);
+}
+
+/// [`api_other_clients_never_read_uncommitted_data`] over the disk layout (Stream mode).
+#[test]
+fn api_other_clients_never_read_uncommitted_data_disk() {
+    api_other_clients_never_read_uncommitted_data_in(Layout::Disk);
+}
+
+fn api_other_clients_never_read_uncommitted_data_in(layout: Layout) {
+    let api = Api::start("api_dirty", true, layout);
     api.build("d");
     api.add_user("alice", "query,update");
     api.add_user("bob", "query,export");
@@ -724,7 +860,17 @@ fn api_other_clients_never_read_uncommitted_data() {
 
 #[test]
 fn api_rolled_back_writes_are_never_visible() {
-    let api = Api::start("api_rb", true);
+    api_rolled_back_writes_are_never_visible_in(Layout::Snapshot);
+}
+
+/// [`api_rolled_back_writes_are_never_visible`] over the disk layout (Stream mode).
+#[test]
+fn api_rolled_back_writes_are_never_visible_disk() {
+    api_rolled_back_writes_are_never_visible_in(Layout::Disk);
+}
+
+fn api_rolled_back_writes_are_never_visible_in(layout: Layout) {
+    let api = Api::start("api_rb", true, layout);
     api.build("b");
     let tid = api.begin("root", "b");
     let (s, _) = api.root(
@@ -753,7 +899,17 @@ fn api_rolled_back_writes_are_never_visible() {
 
 #[test]
 fn api_isolevel_is_validated_and_reported() {
-    let api = Api::start("api_iso", true);
+    api_isolevel_is_validated_and_reported_in(Layout::Snapshot);
+}
+
+/// [`api_isolevel_is_validated_and_reported`] over the disk layout (Stream mode).
+#[test]
+fn api_isolevel_is_validated_and_reported_disk() {
+    api_isolevel_is_validated_and_reported_in(Layout::Disk);
+}
+
+fn api_isolevel_is_validated_and_reported_in(layout: Layout) {
+    let api = Api::start("api_iso", true, layout);
     api.build("i");
     // Default: SERIALIZABLE (1), upstream's Txn_manager::Begin default.
     let (s, body) = api.root("POST", "/begin?db_name=i", "");
@@ -789,7 +945,17 @@ fn api_isolevel_is_validated_and_reported() {
 
 #[test]
 fn api_unknown_and_finished_transactions_are_clean_errors() {
-    let api = Api::start("api_tid", true);
+    api_unknown_and_finished_transactions_are_clean_errors_in(Layout::Snapshot);
+}
+
+/// [`api_unknown_and_finished_transactions_are_clean_errors`] over the disk layout (Stream mode).
+#[test]
+fn api_unknown_and_finished_transactions_are_clean_errors_disk() {
+    api_unknown_and_finished_transactions_are_clean_errors_in(Layout::Disk);
+}
+
+fn api_unknown_and_finished_transactions_are_clean_errors_in(layout: Layout) {
+    let api = Api::start("api_tid", true, layout);
     api.build("t");
     let (s, body) = api.root("POST", "/commit?tid=123456789", "");
     assert_eq!(s, 404, "{body}");
@@ -820,7 +986,17 @@ fn api_unknown_and_finished_transactions_are_clean_errors() {
 
 #[test]
 fn api_batch_injection_payload_is_a_parse_error_and_data_is_intact() {
-    let api = Api::start("api_inject", true);
+    api_batch_injection_payload_is_a_parse_error_and_data_is_intact_in(Layout::Snapshot);
+}
+
+/// [`api_batch_injection_payload_is_a_parse_error_and_data_is_intact`] over the disk layout (Stream mode).
+#[test]
+fn api_batch_injection_payload_is_a_parse_error_and_data_is_intact_disk() {
+    api_batch_injection_payload_is_a_parse_error_and_data_is_intact_in(Layout::Disk);
+}
+
+fn api_batch_injection_payload_is_a_parse_error_and_data_is_intact_in(layout: Layout) {
+    let api = Api::start("api_inject", true, layout);
     api.build("j");
     let payload = "<a> <b> <c> } ; DROP ALL ; INSERT DATA { <x> <y> <z>";
     for op in ["/batchInsert", "/batchRemove"] {
@@ -855,7 +1031,17 @@ fn api_batch_injection_payload_is_a_parse_error_and_data_is_intact() {
 
 #[test]
 fn api_batch_reports_counts_and_accepts_turtle() {
-    let api = Api::start("api_batch", true);
+    api_batch_reports_counts_and_accepts_turtle_in(Layout::Snapshot);
+}
+
+/// [`api_batch_reports_counts_and_accepts_turtle`] over the disk layout (Stream mode).
+#[test]
+fn api_batch_reports_counts_and_accepts_turtle_disk() {
+    api_batch_reports_counts_and_accepts_turtle_in(Layout::Disk);
+}
+
+fn api_batch_reports_counts_and_accepts_turtle_in(layout: Layout) {
+    let api = Api::start("api_batch", true, layout);
     api.build("c");
     // One new triple and one that already exists.
     let nt = "<http://ex/n1> <http://ex/p> <http://ex/o1> .\n\
@@ -915,7 +1101,17 @@ fn api_batch_reports_counts_and_accepts_turtle() {
 
 #[test]
 fn api_load_of_a_loaded_database_keeps_unsaved_changes() {
-    let api = Api::start("api_reload", false);
+    api_load_of_a_loaded_database_keeps_unsaved_changes_in(Layout::Snapshot);
+}
+
+/// [`api_load_of_a_loaded_database_keeps_unsaved_changes`] over the disk layout (Stream mode).
+#[test]
+fn api_load_of_a_loaded_database_keeps_unsaved_changes_disk() {
+    api_load_of_a_loaded_database_keeps_unsaved_changes_in(Layout::Disk);
+}
+
+fn api_load_of_a_loaded_database_keeps_unsaved_changes_in(layout: Layout) {
+    let api = Api::start("api_reload", false, layout);
     api.build("l");
     assert_eq!(api.root("POST", "/update?db_name=l", NEW_TRIPLE).0, 200);
     let (s, body) = api.root("POST", "/load?db_name=l", "");

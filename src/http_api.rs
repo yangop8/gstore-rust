@@ -21,7 +21,11 @@
 //!   (`gapi::ops_db`) follow too. Two REST semantics differ from upstream's
 //!   `/api` ones and are kept as Rust extensions: `/build` rebuilds an
 //!   existing database (`/api` `build` refuses it) and `/drop` deletes the
-//!   directory (`/api` `drop` keeps a `<db>.db.bak` by default).
+//!   directory (`/api` `drop` keeps a `<db>.db.bak` by default). `/build`
+//!   and `/api` `build` take a `layout` (`snapshot`, `disk` or `rocksdb`;
+//!   default `[storage] default_layout`, else `snapshot`): the on-disk and
+//!   RocksDB layouts are built in bulk ([`crate::bulk::build`]), RocksDB
+//!   only by a server built with the `rocksdb` feature.
 //! * **Backup / restore / export** — `/backup`, `/restore`, `/export`. Backups
 //!   are written only inside the server's backup directory (`<root>/backups`,
 //!   or `conf.ini`'s `backup_path`) and never over another database's files;
@@ -78,13 +82,15 @@
 //! The rules (contract C8 of the Phase 6 plan):
 //!
 //! * **Shared** guards (`DbCell::read`): statement reads (a read statement
-//!   by the transaction's owner included), export, backup, `loadcsr`,
-//!   `monitor` / `schema` when its figures are not cached yet (only with
-//!   `DbCell::try_read` while it has statistics cached for earlier data:
-//!   a busy database is then reported with those), and the reasoning
-//!   rules' Check. Everything they call on the [`Database`] takes
-//!   `&self` and is synchronized inside it (the query cache, the CSR cache,
-//!   the string-index cache, the PFN registry, the logs).
+//!   by the transaction's owner included; a read of a transaction's
+//!   snapshot takes it only to find the snapshot, see [`ReadSnapshot`]),
+//!   export, backup, `loadcsr`, `monitor` / `schema` of a database whose
+//!   statistics were never computed (later ones are refreshed by a
+//!   background thread on a shared guard, off the request path, see
+//!   `gapi::ops_db`), and the reasoning rules' Check. Everything they call
+//!   on the [`Database`] takes `&self` and is synchronized inside it (the
+//!   query cache, the CSR cache, the string-index cache, the PFN registry,
+//!   the logs).
 //! * **Exclusive** guards (`DbCell::write`): updates, begin / commit /
 //!   rollback, checkpoint / save / `wrote`, upload, batch, unload / drop /
 //!   restore / retire, the shutdown's final pass, reasoning Execute /
@@ -94,15 +100,26 @@
 //!   publishing the figures of a write section that unwound (also only with
 //!   `DbCell::try_write`, see `DbCell::figures`).
 //! * **No guard** — monitoring: `/status`, `/monitor`, `/show`, `/api`
-//!   `show` and `stat`, and `/api` `monitor` / `schema` once their figures
-//!   are cached, read counters each database publishes at the end of every
-//!   exclusive section and after it is loaded (see
-//!   `server::DbCounters`), so they answer while a long
-//!   query or a write holds the database.
+//!   `show` and `stat`, and `/api` `monitor` / `schema` once statistics
+//!   were computed for the database (the last ones are reported while a
+//!   refresh for newer data runs in the background), read counters each
+//!   database publishes at the end of every exclusive section and after it
+//!   is loaded (see `server::DbCounters`; `diskUsed` is a size measured
+//!   there too, never a directory walk on the request path), so they
+//!   answer while a long query, a write or a save's fsync holds the
+//!   database.
 //! * Lock order: `ApiState` (never wait for a database while holding it) →
 //!   a database's guard → its rule directory's lock → the database's
 //!   internals (`persist_lock` → disk sink → `persist_error` → pager) → the
-//!   `DiskTriples` gate → the pager. Never the reverse.
+//!   `DiskTriples` gate → the pager. Never the reverse. A non-transactional
+//!   read of a transaction's on-disk snapshot takes the database's guard
+//!   only to find the snapshot and releases it before it enters the gate
+//!   (so a `/commit` — exclusive guard, then the gate's drain — never waits
+//!   for it: the drain cancels it, see [`ReadSnapshot`]).
+//! * Leaf locks, held for a few instructions with nothing called under
+//!   them: the cancel bridge's registry (forwarding a request's cancel flag
+//!   to an on-disk snapshot read's gate flag) and `gapi::ops_db`'s registry
+//!   of running statistics refreshes.
 //! * No thread holds two database guards, takes a guard of a database it
 //!   already holds one of, or upgrades a shared guard to an exclusive one
 //!   without dropping it first. A thread-local registry enforces the second
@@ -124,9 +141,14 @@
 //! database (`/update`, `/batch*`, `/upload`, …) is rejected with `409` rather
 //! than silently joining the transaction, and every non-transactional read is
 //! answered from a snapshot of the committed state taken at `/begin`, so no
-//! client ever observes uncommitted data. The snapshot clones the dictionary
-//! and triple indexes — an open transaction roughly doubles its database's
-//! memory footprint until it ends. `/begin` accepts gStore's `isolevel`
+//! client ever observes uncommitted data. `/begin` copies no triple (see
+//! [`ReadSnapshot`]): an in-memory database's snapshot shares its
+//! copy-on-write indexes, which the transaction's first write copies once
+//! (an open transaction that wrote holds the begin-time copy until it ends);
+//! a Stream-mode on-disk database's snapshot is a read view of its store,
+//! which the commit expires (reads in flight are cancelled and re-run on the
+//! committed state); a RocksDB database is still copied whole. `/begin`
+//! accepts gStore's `isolevel`
 //! (`1` SERIALIZABLE — the default, `2` SNAPSHOT, `3` READ_COMMITTED, see
 //! [`TxnIsolation`]); with a single writer every level is honoured. Like
 //! upstream, transaction ids are numbered per loaded database, starting at 1
@@ -188,7 +210,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::config::GStoreConfig;
 use crate::db::dirlock::DirLock;
-use crate::db::{Database, LoadPolicy, LoadSource, QuerySettings, Statement};
+use crate::db::{Database, LoadPolicy, LoadSource, QuerySettings, Statement, StorageKind};
 use crate::dict::Dictionary;
 use crate::error::GStoreError;
 use crate::gapi::apilog::{ApiLogs, TxnState};
@@ -198,7 +220,9 @@ use crate::gapi::GapiConfig;
 use crate::http_users::{
     CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
+use crate::kvstore::{DiskReadView, DiskSource, ViewError};
 use crate::model::{Term, Triple};
+use crate::query::engine::CsrProvider;
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::reason::rules::RULE_DIR;
 use crate::reason::store::RuleStore;
@@ -455,24 +479,33 @@ pub(crate) struct Txn {
 /// `/commit` or `/rollback` gets a precise "already committed" error.
 const ENDED_TXN_MEMORY: usize = 1024;
 
-/// An immutable copy of a database's committed state, taken at `/begin`.
-/// While a transaction is open every *non-transactional* read of that database
-/// is answered from here, so other clients never observe its uncommitted
-/// writes (no dirty reads).
+/// A database's committed state, taken at `/begin`. While a transaction is
+/// open every *non-transactional* read of that database is answered from
+/// here, so other clients never observe its uncommitted writes (no dirty
+/// reads).
 ///
-/// Memory cost: the dictionary, the default-graph triple indexes and the named
-/// graphs are cloned, so an open transaction roughly doubles its database's
-/// in-memory footprint until it commits or rolls back. The VS-tree is not
-/// part of the snapshot (it is only a candidate-pruning accelerator, so
-/// results are unchanged). The user-defined functions registered at `/begin`
-/// are shared with it (the registry is reference-counted), and the advanced
-/// graph functions run on one CSR of the snapshot — the database's cached one
-/// when it had one for this data, otherwise built on the first graph-function
-/// read — shared by every read until the transaction ends.
+/// Cost (see [`SnapStore`]): `/begin` copies no triple of an in-memory or a
+/// Stream-mode on-disk database. The dictionary is shared (its interner is
+/// copy-on-write; an on-disk dictionary is shared with the database: terms
+/// a transaction interns are visible to it, but no snapshot triple uses
+/// them), the default graph is a copy-on-write clone or an on-disk read
+/// view, and each named graph's store is a copy-on-write clone. The first
+/// write of the transaction to an in-memory store copies its indexes once,
+/// so an open transaction that wrote holds the begin-time copy until it
+/// ends; a RocksDB database is still copied whole at `/begin`. The VS-tree
+/// is not part of the snapshot (it is only a candidate-pruning accelerator,
+/// so results are unchanged). The user-defined functions registered at
+/// `/begin` are shared with it (the registry is reference-counted), and the
+/// advanced graph functions run on one CSR of the snapshot — the
+/// database's cached one when it had one for this data, otherwise built on
+/// the first graph-function read — shared by every read until the
+/// transaction ends.
 pub(crate) struct ReadSnapshot {
     dict: Dictionary,
-    store: TripleStore,
+    store: SnapStore,
     named: BTreeMap<u32, TripleStore>,
+    /// The committed triple count at `/begin`.
+    triples: u64,
     functions: FunctionRegistry,
     /// The database's integer-division mode at `/begin`.
     integer_division: IntegerDivision,
@@ -489,41 +522,123 @@ pub(crate) struct ReadSnapshot {
     pfn_limits: crate::pfn::PfnLimits,
     /// The database's own PFN caller ([`Database::set_pfn_caller`]; a served
     /// database has none — the server passes the user per read, see
-    /// [`query_as`](Self::query_as)).
+    /// [`read_as`](Self::read_as)).
     pfn: Option<crate::pfn::PfnCaller>,
 }
 
-impl ReadSnapshot {
-    /// Copy `db`'s committed state. A persistent backend with no in-RAM store
-    /// is materialized inside a [`ReadScope`]: a read error it reports fails
-    /// the capture (and so the `/begin`) instead of yielding a partial copy.
-    fn capture(db: &Database) -> crate::Result<ReadSnapshot> {
-        let store = match db.backend().as_memory() {
-            Some(mem) => mem.clone(),
-            None => {
-                // A persistent backend has no in-RAM store to clone: materialize it.
-                let scope = ReadScope::enter();
-                let mut s = TripleStore::new();
-                s.bulk_load(db.backend().iter_all());
-                if let Some(e) = scope.take_error() {
-                    return Err(GStoreError::Database(format!(
-                        "a read from the store failed while copying the database for a \
-                         transaction's read snapshot: {e}"
-                    )));
-                }
-                s
+/// The default graph of a [`ReadSnapshot`].
+pub(crate) enum SnapStore {
+    /// An in-memory store (also a Materialize-mode on-disk database's
+    /// working set, and a RocksDB database's materialized copy): a
+    /// copy-on-write clone, O(1) at `/begin`.
+    Mem(TripleStore),
+    /// A Stream-mode on-disk store: a read view of its committed state at
+    /// `/begin` (no triple copied). Each read runs inside
+    /// [`DiskReadView::with_base`], under the store's writer gate: the
+    /// transaction's commit (or any other write to the pages) cancels the
+    /// reads in flight and expires the view, and a read that finds it
+    /// expired answers [`SnapshotReadError::Expired`] — its caller re-runs
+    /// it on the live database (see `ApiInner::run_query_job`).
+    Disk(DiskReadView),
+}
+
+/// Why a [`ReadSnapshot`] could not answer a read.
+#[derive(Debug)]
+pub(crate) enum SnapshotReadError {
+    /// The database's committed state changed since `/begin` (the
+    /// transaction committed, or the view was otherwise invalidated): the
+    /// read must run on the live database (or a newer snapshot) instead.
+    Expired,
+    /// The on-disk store was closed (the database was unloaded).
+    Closed,
+    /// The read itself failed (a query error, a read error, a cancel).
+    Failed(GStoreError),
+}
+
+impl From<GStoreError> for SnapshotReadError {
+    fn from(e: GStoreError) -> SnapshotReadError {
+        SnapshotReadError::Failed(e)
+    }
+}
+
+impl std::fmt::Display for SnapshotReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotReadError::Failed(e) => write!(f, "{e}"),
+            SnapshotReadError::Expired => f.write_str("the snapshot expired"),
+            SnapshotReadError::Closed => f.write_str("the database was closed"),
+        }
+    }
+}
+
+impl SnapshotReadError {
+    /// As a [`GStoreError`], for a caller that holds the database's guard
+    /// (the transaction cannot end under it, so the snapshot does not
+    /// expire; see [`DbSlot::read_cancellable`]).
+    fn into_error(self) -> GStoreError {
+        match self {
+            SnapshotReadError::Failed(e) => e,
+            SnapshotReadError::Expired => GStoreError::Database(
+                "the transaction's read snapshot expired: the database changed".into(),
+            ),
+            SnapshotReadError::Closed => {
+                GStoreError::Database("the database is no longer loaded".into())
             }
+        }
+    }
+}
+
+impl ReadSnapshot {
+    /// Take `db`'s committed state (see [`SnapStore`]). A persistent backend
+    /// with no in-RAM store and no read view (RocksDB) is materialized
+    /// inside a [`ReadScope`]: a read error it reports fails the capture
+    /// (and so the `/begin`) instead of yielding a partial copy.
+    fn capture(db: &Database) -> crate::Result<ReadSnapshot> {
+        let store = if let Some(mem) = db.backend().as_memory() {
+            SnapStore::Mem(mem.clone())
+        } else if let Some(disk) = db.backend().as_disk() {
+            SnapStore::Disk(disk.read_view())
+        } else {
+            // A persistent backend with no in-RAM store: materialize it.
+            let scope = ReadScope::enter();
+            let mut s = TripleStore::new();
+            s.bulk_load(db.backend().iter_all());
+            if let Some(e) = scope.take_error() {
+                return Err(GStoreError::Database(format!(
+                    "a read from the store failed while copying the database for a \
+                     transaction's read snapshot: {e}"
+                )));
+            }
+            SnapStore::Mem(s)
+        };
+        // The CSR generation: the view's epoch (an on-disk snapshot), else
+        // one generation for the snapshot's lifetime.
+        let generation = match &store {
+            SnapStore::Disk(view) => view.begin_epoch(),
+            SnapStore::Mem(_) => 0,
         };
         Ok(ReadSnapshot {
+            // An on-disk snapshot shares the database's dictionary and reads
+            // it only inside the view's gate (`read_as`), which a writer
+            // drains — expiring the view — before it frees any id: such a
+            // clone need not keep freed ids from being reused (it may be an
+            // unpinned one). An in-memory dictionary's clone is
+            // copy-on-write: it keeps the terms it was taken with.
             dict: db.dict().clone(),
             store,
-            named: db.named_graphs().clone(),
+            // Each graph's store is shared (copy-on-write).
+            named: db
+                .named_graphs()
+                .iter()
+                .map(|(&g, s)| (g, s.clone()))
+                .collect(),
+            triples: db.triple_num(),
             functions: db.functions().clone(),
             integer_division: db.integer_division(),
             topk: db.topk_options(),
             csr: db
                 .cached_csr()
-                .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
+                .map_or_else(CsrCache::new, |g| CsrCache::seeded(generation, g)),
             allow_service: db.load_policy().allow_remote,
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
             pfn_limits: db.pfn_limits(),
@@ -531,34 +646,97 @@ impl ReadSnapshot {
         })
     }
 
+    /// The default graph.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &SnapStore {
+        &self.store
+    }
+
     /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE). Updates are refused:
     /// the snapshot is read-only by construction.
-    fn query(&self, sparql: &str, cancel: Option<Arc<AtomicBool>>) -> crate::Result<QueryResult> {
+    fn query(
+        &self,
+        sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<QueryResult, SnapshotReadError> {
         self.read_as(&Statement::parse(sparql)?, cancel, None)
     }
 
     /// Run the parsed read `stmt` on behalf of `pfn` (the requesting user's
     /// PFN functions, under the snapshot's PFN limits; `None` falls back to
     /// the database's own caller, if any). The evaluation runs inside a
-    /// [`ReadScope`]: a read error recorded there fails the statement.
+    /// [`ReadScope`]: a read error recorded there fails the statement. On an
+    /// on-disk snapshot it runs inside the view's gate, with the gate's
+    /// cancel flag wired into the evaluator (and `cancel` forwarded to it):
+    /// a writer that needs the pages stops it, and it answers
+    /// [`SnapshotReadError::Expired`] (or fails with
+    /// [`GStoreError::Cancelled`] when `cancel` was raised).
     fn read_as(
         &self,
         stmt: &Statement,
         cancel: Option<Arc<AtomicBool>>,
         pfn: Option<&crate::pfn::PfnCaller>,
-    ) -> crate::Result<QueryResult> {
+    ) -> Result<QueryResult, SnapshotReadError> {
         if stmt.is_update() {
-            return Err(GStoreError::Query(
+            return Err(SnapshotReadError::Failed(GStoreError::Query(
                 "updates cannot run against a transaction's read snapshot".into(),
-            ));
+            )));
         }
         let q = stmt.query();
-        // The snapshot never changes, so its CSR is cached under one
-        // generation for the transaction's lifetime.
-        let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
-        let mut eval = Evaluator::new(&self.dict, &self.store)
+        match &self.store {
+            SnapStore::Mem(store) => {
+                // The snapshot never changes, so its CSR is cached under one
+                // generation for the transaction's lifetime.
+                let csr = || self.csr.get_or_build(0, || CsrGraph::build(store));
+                let mut eval = self.configure(Evaluator::new(&self.dict, store), &csr, pfn);
+                if let Some(c) = cancel {
+                    eval = eval.with_cancel(c);
+                }
+                Ok(evaluate_in_scope(eval, q)?)
+            }
+            SnapStore::Disk(view) => {
+                let epoch = view.begin_epoch();
+                let outcome = view.with_base(|base, gate_cancel| {
+                    // A cancel of the request reaches the evaluator through
+                    // the gate's flag (the one a writer raises).
+                    let _forward = cancel
+                        .as_ref()
+                        .map(|c| cancel_bridge::forward(c, gate_cancel));
+                    let src = DiskSource::new(base);
+                    let csr = || self.csr.get_or_build(epoch, || CsrGraph::build(&src));
+                    let eval = self
+                        .configure(Evaluator::new(&self.dict, &src), &csr, pfn)
+                        .with_cancel(Arc::clone(gate_cancel));
+                    evaluate_in_scope(eval, q)
+                });
+                let cancelled = cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+                match outcome {
+                    Ok(result) => Ok(result?),
+                    // Stopped by the request's own flag (forwarded to the
+                    // gate's): a cancel, not an expiry.
+                    Err(ViewError::Expired) if cancelled => {
+                        Err(SnapshotReadError::Failed(GStoreError::Cancelled))
+                    }
+                    Err(ViewError::Expired) => Err(SnapshotReadError::Expired),
+                    Err(ViewError::Closed) => Err(SnapshotReadError::Closed),
+                    Err(ViewError::Io(e)) => Err(SnapshotReadError::Failed(GStoreError::Database(
+                        format!("a read from the store failed while evaluating the query: {e}"),
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// The snapshot's evaluation settings, applied to `eval`.
+    fn configure<'a, S: TripleSource>(
+        &'a self,
+        eval: Evaluator<'a, S>,
+        csr: &'a CsrProvider<'a>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Evaluator<'a, S> {
+        let mut eval = eval
             .with_service_allowed(self.allow_service)
-            .with_csr_provider(&csr)
+            .with_csr_provider(csr)
             .with_integer_division(self.integer_division)
             .with_topk_options(self.topk)
             .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
@@ -571,23 +749,129 @@ impl ReadSnapshot {
         if let Some(caller) = pfn.or(self.pfn.as_ref()) {
             eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
         }
-        if let Some(c) = cancel {
-            eval = eval.with_cancel(c);
-        }
-        let scope = ReadScope::enter();
-        let result = eval.evaluate(q);
-        if let Some(e) = scope.take_error() {
-            return Err(GStoreError::Database(format!(
-                "a read from the store failed while evaluating the query: {e}"
-            )));
-        }
-        result
+        eval
     }
 
     fn triple_num(&self) -> u64 {
-        self.store.triple_count()
+        self.triples
     }
 }
+
+/// Evaluate `q` with `eval` inside a [`ReadScope`]: a read error recorded
+/// there fails the statement.
+fn evaluate_in_scope<S: TripleSource>(
+    eval: Evaluator<'_, S>,
+    q: &crate::parser::sparql::ast::Query,
+) -> crate::Result<QueryResult> {
+    let scope = ReadScope::enter();
+    let result = eval.evaluate(q);
+    if let Some(e) = scope.take_error() {
+        return Err(GStoreError::Database(format!(
+            "a read from the store failed while evaluating the query: {e}"
+        )));
+    }
+    result
+}
+
+/// Forwarding one cancel flag to another, for an evaluator that watches
+/// only one: an on-disk snapshot read watches its gate's flag (which a
+/// writer raises), and the request's own flag (`/cancel`, a shutdown past
+/// its grace period) is forwarded to it by one shared, lazily started
+/// thread. It polls the registered pairs every few milliseconds, and sleeps
+/// while none is registered. Its lock is a leaf: nothing is called under it.
+mod cancel_bridge {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+    use std::time::Duration;
+
+    /// How often the registered flags are polled.
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// One registered forwarding: its id, the watched flag, the raised one.
+    type Pair = (u64, Arc<AtomicBool>, Arc<AtomicBool>);
+
+    #[derive(Default)]
+    struct Links {
+        next: u64,
+        pairs: Vec<Pair>,
+        started: bool,
+    }
+
+    fn bridge() -> &'static (Mutex<Links>, Condvar) {
+        static BRIDGE: OnceLock<(Mutex<Links>, Condvar)> = OnceLock::new();
+        BRIDGE.get_or_init(|| (Mutex::new(Links::default()), Condvar::new()))
+    }
+
+    fn run() {
+        let (links, wake) = bridge();
+        let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            while g.pairs.is_empty() {
+                g = wake.wait(g).unwrap_or_else(PoisonError::into_inner);
+            }
+            for (_, from, to) in &g.pairs {
+                if from.load(Ordering::SeqCst) {
+                    to.store(true, Ordering::SeqCst);
+                }
+            }
+            drop(g);
+            std::thread::sleep(POLL);
+            g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Raise `to` (within a few milliseconds) once `from` is raised, until
+    /// the returned guard is dropped.
+    pub(super) fn forward(from: &Arc<AtomicBool>, to: &Arc<AtomicBool>) -> Forward {
+        if from.load(Ordering::SeqCst) {
+            to.store(true, Ordering::SeqCst);
+        }
+        let (links, wake) = bridge();
+        let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        if !g.started {
+            // Without the thread a cancel is honoured only when the read
+            // ends (the caller checks its flag then): later, not wrong.
+            g.started = std::thread::Builder::new()
+                .name("gstore-cancel-bridge".into())
+                .spawn(run)
+                .is_ok();
+        }
+        let id = g.next;
+        g.next += 1;
+        g.pairs.push((id, Arc::clone(from), Arc::clone(to)));
+        wake.notify_all();
+        Forward { id }
+    }
+
+    /// A registered forwarding, removed when dropped.
+    pub(super) struct Forward {
+        id: u64,
+    }
+
+    impl Drop for Forward {
+        fn drop(&mut self) {
+            let (links, _) = bridge();
+            let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+            g.pairs.retain(|(id, _, _)| *id != self.id);
+        }
+    }
+}
+
+/// Snapshot reads that expired and were re-run (see [`expired_snapshot_reads`]).
+static EXPIRED_SNAPSHOT_READS: AtomicU64 = AtomicU64::new(0);
+
+/// How many reads of a transaction's on-disk snapshot this process saw
+/// expire under them (the transaction committed meanwhile) and re-ran on the
+/// live database. For tests and diagnostics.
+#[doc(hidden)]
+pub fn expired_snapshot_reads() -> u64 {
+    EXPIRED_SNAPSHOT_READS.load(Ordering::Relaxed)
+}
+
+/// How many times a non-transactional read tries a transaction's on-disk
+/// snapshot that expired under it before it reads holding the database's
+/// guard (see [`ApiInner::read_committed`]).
+const SNAPSHOT_READ_ATTEMPTS: usize = 3;
 
 /// The open transaction on a database, kept *inside* the per-db lock so a
 /// request that already holds the lock can tell, race-free, whether a
@@ -652,6 +936,34 @@ pub(crate) struct DbCell {
     /// may predate a change it applied. [`figures`](Self::figures)
     /// publishes them the next time the database is free.
     unpublished: AtomicBool,
+    /// The bytes of the database's directory, measured when it was loaded
+    /// and at the end of every exclusive section (after a write and its
+    /// save), so `/api monitor`'s `diskUsed` never walks the directory on
+    /// its request path (where it would stall behind a save's fsync).
+    disk_bytes: AtomicU64,
+    /// The layout the database persists as (fixed for the slot's life).
+    pub(crate) layout: StorageKind,
+    /// How an on-disk database answers queries (`None` for the other
+    /// layouts; fixed for the slot's life).
+    pub(crate) query_mode: Option<crate::db::DiskQueryMode>,
+}
+
+/// The total size of the files under `dir`, in bytes (`0` when it cannot
+/// be read).
+pub(crate) fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 thread_local! {
@@ -758,8 +1070,17 @@ impl DbCell {
             csr: slot.db.csr_status(),
             counters,
             unpublished: AtomicBool::new(false),
+            disk_bytes: AtomicU64::new(dir_size(&slot.dir)),
+            layout: slot.db.storage(),
+            query_mode: slot.db.disk_query_mode(),
             slot: RwLock::new(slot),
         }
+    }
+
+    /// The bytes of the database's directory as last measured (see the
+    /// field's docs): read without the lock, never walks the directory.
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        self.disk_bytes.load(Ordering::SeqCst)
     }
 
     /// The error a re-entrant lock request gets (instead of a deadlock).
@@ -783,19 +1104,6 @@ impl DbCell {
             guard: self.slot.read().unwrap_or_else(PoisonError::into_inner),
             _held: held,
         })
-    }
-
-    /// A shared guard if one can be had right now: `None` while a writer
-    /// holds the exclusive guard or waits for it, or when this thread holds
-    /// a guard of this database (monitoring, which must not wait).
-    pub(crate) fn try_read(&self) -> Option<SlotRead<'_>> {
-        let held = HeldCell::claim(self)?;
-        let guard = match self.slot.try_read() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
-        Some(SlotRead { guard, _held: held })
     }
 
     /// The exclusive guard (publishes the figures when released).
@@ -829,6 +1137,9 @@ impl DbCell {
     /// Publish `slot`'s figures (its holder is exclusive, see [`DbCounters`]).
     fn publish(&self, slot: &DbSlot) {
         publish_slot(&self.counters, slot);
+        if !slot.retired {
+            self.disk_bytes.store(dir_size(&slot.dir), Ordering::SeqCst);
+        }
     }
 
     /// The figures published at the end of the last exclusive section (or
@@ -1016,7 +1327,12 @@ impl DbSlot {
         cancel: Option<Arc<AtomicBool>>,
     ) -> crate::Result<QueryResult> {
         match &self.txn {
-            Some(open) => open.snapshot.query(sparql, cancel),
+            // The caller holds this slot's guard: the transaction cannot end
+            // (nor its snapshot expire) meanwhile.
+            Some(open) => open
+                .snapshot
+                .query(sparql, cancel)
+                .map_err(SnapshotReadError::into_error),
             None => self.db.query_read(sparql, cancel, None),
         }
     }
@@ -1393,6 +1709,10 @@ pub(crate) struct ApiInner {
     /// [`ApiServer::with_storage_refresh`]). An embedded server leaves the
     /// process's defaults alone (the default).
     storage_refresh: AtomicBool,
+    /// The options this server opens databases with
+    /// ([`ApiServer::with_open_options`]); `None`: the process defaults
+    /// ([`crate::db::default_open_options`]), the environment included.
+    open_options: RwLock<Option<crate::db::OpenOptions>>,
     /// Every user's PFN functions (`funquery` / `funcudb` / `funreview`,
     /// `PFN.name(…)` in queries): under `conf.ini`'s `pfn_base_path` when it
     /// is set, else `<root>/pfn`. A query calls the functions of the user it
@@ -1468,9 +1788,6 @@ impl ApiInner {
     fn refresh_storage(&self, fresh: &GStoreConfig) {
         if !self.storage_refresh.load(Ordering::SeqCst) {
             return;
-        }
-        if let Some(w) = fresh.default_layout_warning() {
-            crate::gs_warn!("refreshconf: {w}");
         }
         crate::db::set_default_open_options(fresh.open_options());
         let effective = crate::db::default_open_options();
@@ -1648,6 +1965,31 @@ impl ApiInner {
     /// request still holding the handle can neither use nor save it. Returns
     /// whether it was loaded. Must not be called with the state lock held
     /// (nor a guard of the database).
+    /// Open the database at `dir` with this server's open options (see
+    /// [`ApiServer::with_open_options`]).
+    pub(crate) fn open_db(&self, dir: &Path) -> crate::Result<Database> {
+        let options = *self
+            .open_options
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match options {
+            Some(o) => Database::open_with(dir, &o),
+            None => Database::open(dir),
+        }
+    }
+
+    /// The layout of a build that names none: `[storage] default_layout`
+    /// of this server's configuration, else of the process's open options
+    /// (`gserver` installs its `[storage]` section), else the snapshot
+    /// layout (the default disk query mode is Materialize, so the plan's
+    /// rule keeps the snapshot layout).
+    pub(crate) fn default_build_layout(&self) -> StorageKind {
+        self.config()
+            .default_layout
+            .or_else(|| crate::db::default_open_options().default_layout)
+            .unwrap_or(StorageKind::Snapshot)
+    }
+
     pub(crate) fn retire_loaded(&self, name: &str) -> Result<bool, OpError> {
         let handle = locked(&self.state).dbs.remove(name);
         match handle {
@@ -1800,6 +2142,7 @@ impl ApiServer {
                 settings_gen: AtomicU64::new(0),
                 log_refresh: Mutex::new(None),
                 storage_refresh: AtomicBool::new(false),
+                open_options: RwLock::new(None),
                 pfn,
             }),
             listener: Mutex::new(Some(listener)),
@@ -1921,6 +2264,21 @@ impl ApiServer {
     /// patterns may contact remote endpoints (not by default).
     pub fn with_load_policy(self, policy: LoadPolicy) -> ApiServer {
         locked(&self.inner.state).load_policy = policy;
+        self
+    }
+
+    /// Open the databases this server loads (`/load`, `/api load`, a
+    /// restore, a build in the disk or RocksDB layout) with `options`, as
+    /// given — instead of the process defaults
+    /// ([`crate::db::default_open_options`], which the environment can
+    /// override). For an embedded server that needs one disk query mode
+    /// whatever the process defaults say.
+    pub fn with_open_options(self, options: crate::db::OpenOptions) -> ApiServer {
+        *self
+            .inner
+            .open_options
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(options);
         self
     }
 
@@ -2438,24 +2796,9 @@ impl ApiInner {
             });
         };
         if !stmt.is_update() {
-            // A read shares the database with other reads.
-            let slot = self.read_synced(&job.db)?;
-            if slot.retired {
-                return Err(unloaded());
-            }
-            if let Some(open) = &slot.txn {
-                // Released before evaluating: the snapshot is immutable,
-                // and the owner's `/tquery`s must not wait for it.
-                let snapshot = Arc::clone(&open.snapshot);
-                drop(slot);
-                return snapshot
-                    .read_as(&stmt, Some(job.cancel), Some(&caller))
-                    .map(JobOutput::Read)
-                    .map_err(query_err);
-            }
-            let result = slot.db.read_as(&stmt, Some(job.cancel), Some(&caller));
-            drop(slot);
-            return result.map(JobOutput::Read).map_err(query_err);
+            return self
+                .read_committed(&job.db, &job.name, &stmt, &job.cancel, &caller)
+                .map(JobOutput::Read);
         }
         let mut slot = job.db.write()?;
         if slot.retired {
@@ -2493,6 +2836,78 @@ impl ApiInner {
                 Err(OpError::new(OpErrorKind::Query, msg))
             }
         }
+    }
+
+    /// Run the non-transactional read `stmt` of database `dbh` (its task's
+    /// `cancel` flag, the user's PFN `caller`): on a shared guard of the
+    /// live database, or — while a transaction is open — on its begin-time
+    /// snapshot, released from the guard first (the snapshot is immutable,
+    /// and the owner's `/tquery`s and `/commit` must not wait for it).
+    ///
+    /// An on-disk snapshot read that ends [`Expired`](SnapshotReadError::Expired)
+    /// (the transaction committed meanwhile: its commit cancelled the read)
+    /// is re-run on the database as it is then — re-checking under the
+    /// guard that it is still served and whether a transaction is open —
+    /// so it answers the committed state, never an uncommitted one. The last
+    /// of [`SNAPSHOT_READ_ATTEMPTS`] runs keeps the guard while it reads,
+    /// which no commit can pass. `Closed` (and a database no longer served)
+    /// is answered as `Closed`: the caller reports it as not loaded.
+    pub(crate) fn read_committed(
+        &self,
+        dbh: &DbHandle,
+        name: &str,
+        stmt: &Statement,
+        cancel: &Arc<AtomicBool>,
+        caller: &crate::pfn::PfnCaller,
+    ) -> Result<QueryResult, OpError> {
+        let unloaded = || {
+            OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' was unloaded while this request waited"),
+            )
+        };
+        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        for attempt in 1..=SNAPSHOT_READ_ATTEMPTS {
+            let slot = self.read_synced(dbh)?;
+            if slot.retired {
+                return Err(unloaded());
+            }
+            let Some(open) = &slot.txn else {
+                return slot
+                    .db
+                    .read_as(stmt, Some(Arc::clone(cancel)), Some(caller))
+                    .map_err(query_err);
+            };
+            let snapshot = Arc::clone(&open.snapshot);
+            let last = attempt == SNAPSHOT_READ_ATTEMPTS;
+            let held = if last {
+                Some(slot)
+            } else {
+                drop(slot);
+                None
+            };
+            let read = snapshot.read_as(stmt, Some(Arc::clone(cancel)), Some(caller));
+            if matches!(read, Err(SnapshotReadError::Expired)) {
+                EXPIRED_SNAPSHOT_READS.fetch_add(1, Ordering::Relaxed);
+            }
+            match read {
+                Ok(result) => return Ok(result),
+                Err(SnapshotReadError::Expired) if !last => {}
+                Err(SnapshotReadError::Failed(e)) => return Err(query_err(e)),
+                Err(SnapshotReadError::Closed) => return Err(unloaded()),
+                Err(SnapshotReadError::Expired) => {
+                    drop(held);
+                    return Err(OpError::new(
+                        OpErrorKind::Failed,
+                        format!(
+                            "database '{name}': the transaction's read snapshot kept expiring \
+                             while it was read"
+                        ),
+                    ));
+                }
+            }
+        }
+        unreachable!("the last attempt returns")
     }
 
     /// Resolve the caller's identity from Basic auth (`basic`: the user and
@@ -2992,6 +3407,11 @@ impl ApiInner {
                 ),
             ));
         }
+        let layout = match build_layout(req.param("layout").as_deref(), self.default_build_layout())
+        {
+            Ok(layout) => layout,
+            Err(e) => return Dispatch::Done(Resp::fail(400, &e)),
+        };
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
         }
@@ -3010,12 +3430,19 @@ impl ApiInner {
                 inner,
                 name: name.clone(),
             };
-            let built = match path {
+            let source = match path {
                 Some(path) => match build_source(&policy, &path) {
-                    Ok(file) => Database::build_from_files(name.clone(), &[file]),
+                    Ok(file) => RestBuildSource::File(file),
                     Err(r) => return r,
                 },
-                None => Database::build_from_str(name.clone(), &body),
+                None => RestBuildSource::Text(body),
+            };
+            if layout != StorageKind::Snapshot {
+                return inner.rest_build_bulk(&name, &dir, &source, layout, vanished, &creator);
+            }
+            let built = match &source {
+                RestBuildSource::File(file) => Database::build_from_files(name.clone(), &[file]),
+                RestBuildSource::Text(body) => Database::build_from_str(name.clone(), body),
             };
             let db = match built {
                 Ok(db) => db,
@@ -3047,18 +3474,106 @@ impl ApiInner {
                     return Resp::fail(500, &format!("save failed: {e}"));
                 }
             }
-            let triples = db.triple_num();
-            let mut st = locked(&inner.state);
-            let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
-            st.dbs.insert(name.clone(), slot);
-            // Registry bookkeeping (best effort: the registry is reconciled
-            // with the database directories at every start anyway).
-            if vanished {
-                let _ = st.users.forget_database(&name);
-            }
-            let _ = st.sysdb.register(&name, &creator);
-            Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+            inner.serve_built(&name, db, dir, vanished, &creator)
         }))
+    }
+
+    /// Serve database `db` (just built at `dir`) under `name` and register
+    /// it for `creator` (`vanished`: forget the grants of a dropped
+    /// database of that name first). The REST `/build` answer.
+    fn serve_built(
+        &self,
+        name: &str,
+        db: Database,
+        dir: PathBuf,
+        vanished: bool,
+        creator: &str,
+    ) -> Resp {
+        let triples = db.triple_num();
+        let mut st = locked(&self.state);
+        let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+        st.dbs.insert(name.to_string(), slot);
+        // Registry bookkeeping (best effort: the registry is reconciled
+        // with the database directories at every start anyway).
+        if vanished {
+            let _ = st.users.forget_database(name);
+        }
+        let _ = st.sysdb.register(name, creator);
+        Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+    }
+
+    /// REST `/build` in the on-disk or RocksDB `layout`, through the bulk
+    /// loader ([`crate::bulk::build`]), which installs the new database
+    /// crash-safely over `dir` and takes the directory's lock itself. So the
+    /// loaded copy is retired first (closing its files and releasing its
+    /// handle on the directory), and this request's probe of the lock —
+    /// refusing a directory another process holds — is released before the
+    /// build starts. The result is then opened and served. A build that
+    /// fails leaves the previous database in place; a loaded one is served
+    /// again.
+    fn rest_build_bulk(
+        &self,
+        name: &str,
+        dir: &Path,
+        source: &RestBuildSource,
+        layout: StorageKind,
+        vanished: bool,
+        creator: &str,
+    ) -> Resp {
+        let sources = match source {
+            RestBuildSource::File(file) => match crate::parser::import::sources_from_paths(&[file])
+            {
+                Ok(s) => s,
+                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+            },
+            RestBuildSource::Text(_) => Vec::new(),
+        };
+        let input = match source {
+            RestBuildSource::File(_) => crate::bulk::BulkInput::Sources(&sources),
+            RestBuildSource::Text(text) => crate::bulk::BulkInput::Text {
+                text,
+                format: crate::parser::import::RdfFormat::Turtle,
+                name: "request body",
+            },
+        };
+        match DirLock::acquire_existing(dir) {
+            Ok(probe) => drop(probe),
+            Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+        }
+        let was_loaded = match self.retire_loaded(name) {
+            Ok(loaded) => loaded,
+            Err(e) => return e.rest(),
+        };
+        let built = crate::bulk::build(
+            dir,
+            name,
+            input,
+            &crate::parser::import::ImportOptions::strict(),
+            &mut (),
+            bulk_target(layout),
+            &self.config().bulk_options(),
+        );
+        if let Err(e) = built {
+            if was_loaded {
+                // The previous database is intact: serve it again.
+                if let Ok(db) = self.open_db(dir) {
+                    let mut st = locked(&self.state);
+                    let slot = DbSlot::handle(
+                        db,
+                        dir.to_path_buf(),
+                        false,
+                        &st.load_policy,
+                        &st.query_settings,
+                    );
+                    st.dbs.insert(name.to_string(), slot);
+                }
+            }
+            return Resp::fail(400, &format!("build failed: {e}"));
+        }
+        match self.open_db(dir) {
+            Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
+            Err(e) => Resp::fail(500, &format!("built, but opening it failed: {e}")),
+        }
     }
 
     fn handle_load(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
@@ -3088,7 +3603,7 @@ impl ApiInner {
             }
             // Any layout (snapshot, on-disk `kvstore.kv`, RocksDB): an on-disk /
             // RocksDB database keeps writing its updates through to `dir`.
-            match Database::open(&dir) {
+            match inner.open_db(&dir) {
                 Ok(db) => {
                     let mut st = locked(&inner.state);
                     let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
@@ -3156,7 +3671,7 @@ impl ApiInner {
                 Some(h) => h,
                 None => {
                     let (opened, fresh) = if dir.is_dir() {
-                        (Database::open(&dir), false)
+                        (inner.open_db(&dir), false)
                     } else {
                         (Database::build_from_str(name.clone(), ""), true)
                     };
@@ -4144,7 +4659,7 @@ impl ApiInner {
             drop(probe);
             // Serve whatever the directory now holds: the restored copy, or —
             // if the swap failed — the previous database (saved above).
-            let reopened = Database::open(&dir);
+            let reopened = inner.open_db(&dir);
             match (installed, reopened) {
                 (Ok(()), Ok(db)) => {
                     let mut st = locked(&inner.state);
@@ -4694,6 +5209,52 @@ pub(crate) fn backup_name_db(component: &str) -> Option<&str> {
 /// The server-local file a `/build?db_path=` may read: what the server's LOAD
 /// policy allows (the same rules as SPARQL `LOAD`), and only a regular file —
 /// never a device or FIFO that would never end.
+/// Where REST `/build` reads its RDF: a server-local file (`db_path`) or
+/// the request body.
+enum RestBuildSource {
+    File(PathBuf),
+    Text(String),
+}
+
+/// A build's `layout` parameter (REST `/build`, `/api build`):
+/// `snapshot` (also `memory`), `disk` (also `kvstore`) or `rocksdb`
+/// (also `rocks`), case-insensitive; `default` when it is absent or empty.
+/// The RocksDB layout needs a server built with the `rocksdb` feature.
+pub(crate) fn build_layout(
+    param: Option<&str>,
+    default: StorageKind,
+) -> Result<StorageKind, String> {
+    let layout = match param.map(str::trim).filter(|v| !v.is_empty()) {
+        None => default,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "snapshot" | "memory" => StorageKind::Snapshot,
+            "disk" | "kvstore" => StorageKind::Disk,
+            "rocksdb" | "rocks" => StorageKind::RocksDb,
+            _ => {
+                return Err(format!(
+                    "invalid layout '{v}': it can only be snapshot, disk or rocksdb"
+                ))
+            }
+        },
+    };
+    if layout == StorageKind::RocksDb && !cfg!(feature = "rocksdb") {
+        return Err(
+            "the rocksdb layout needs a server built with the rocksdb feature \
+             (--features rocksdb)"
+                .into(),
+        );
+    }
+    Ok(layout)
+}
+
+/// The bulk loader's target for an on-disk or RocksDB build layout.
+pub(crate) fn bulk_target(layout: StorageKind) -> crate::bulk::BulkTarget {
+    match layout {
+        StorageKind::RocksDb => crate::bulk::BulkTarget::RocksDb,
+        _ => crate::bulk::BulkTarget::Disk,
+    }
+}
+
 fn build_source(policy: &LoadPolicy, path: &str) -> Result<PathBuf, Resp> {
     let refused = || {
         Resp::fail(
@@ -5352,7 +5913,7 @@ mod tests {
                           WHERE {}";
         const SP_JSON: &str =
             r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/c>\",\"length\":2}]}""#;
-        fn cell(r: crate::Result<QueryResult>) -> String {
+        fn cell(r: Result<QueryResult, SnapshotReadError>) -> String {
             match r.unwrap() {
                 QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
                 other => panic!("expected Select, got {other:?}"),
@@ -6191,6 +6752,65 @@ mod tests {
             !body.contains("http://a"),
             "a rolled-back tquery insert must not persist: {body}"
         );
+    }
+
+    /// `/begin` copies no triple of an in-memory database: the snapshot shares
+    /// the live store until the transaction's first write (a read, and a write
+    /// that changes nothing, keep it shared); that write copies it once, and
+    /// the snapshot keeps answering the begin-time state.
+    #[test]
+    fn begin_shares_the_store_until_the_first_tquery_write() {
+        let (server, addr) = start("tq_cow");
+        build_two(&addr, "c");
+        let root = basic("root", "root");
+        let post = |target: &str, body: &str| -> (u16, String) {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&root), body))
+        };
+        let (s, body) = post("/begin?db_name=c", "");
+        assert_eq!(s, 200, "{body}");
+        let tid = tid_of(&body);
+        let dbh = served(&server, "c");
+        let shared = || {
+            let slot = dbh.read().unwrap();
+            let open = slot.txn.as_ref().expect("a transaction is open");
+            match open.snapshot.store() {
+                SnapStore::Mem(snap) => snap.shares_storage_with(slot.db.store()),
+                SnapStore::Disk(_) => panic!("an in-memory database"),
+            }
+        };
+        assert!(shared(), "/begin shares the store");
+        let tq = |sparql: &str| post(&format!("/tquery?db_name=c&tid={tid}"), sparql);
+        assert_eq!(tq("SELECT ?s WHERE { ?s ?p ?o }").0, 200);
+        // Already present: changes nothing, copies nothing.
+        assert_eq!(
+            tq("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }").0,
+            200
+        );
+        assert!(shared(), "reads and no-op writes keep it shared");
+        assert_eq!(
+            tq("INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }").0,
+            200
+        );
+        assert!(!shared(), "the first write copies the store");
+        // Everyone else still reads the begin-time state.
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "GET",
+            "/sparql?db_name=c",
+            Some(&root),
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ));
+        assert_eq!(s, 200);
+        assert!(!b.contains("http://ex/x"), "uncommitted data leaked: {b}");
+        assert_eq!(post(&format!("/commit?db_name=c&tid={tid}"), "").0, 200);
+        let (_, b) = split_status_body(&raw_request(
+            &addr,
+            "GET",
+            "/sparql?db_name=c",
+            Some(&root),
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ));
+        assert!(b.contains("http://ex/x"), "committed data: {b}");
     }
 
     /// A `/tquery` is a task like any other query: `/tasklist` lists it and
@@ -7217,9 +7837,80 @@ mod tests {
             drop(shared);
             writer.join().unwrap();
         }
-        // Free: the statistics of the current data.
-        let (_, now) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
-        assert!(now.contains("\"subjectNum\":3"), "{now}");
+        // Free: the statistics of the current data, once the background
+        // refresh the requests above started has run.
+        settled(&addr, &monitor, "\"subjectNum\":3");
+        server.shutdown();
+    }
+
+    /// Ask `/api` with `body` until the answer contains `expect` (the
+    /// statistics refreshed in the background settled); panics after 10 s.
+    fn settled(addr: &SocketAddr, body: &str, expect: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, b) = split_status_body(&raw_request(addr, "POST", "/api", None, body));
+            if b.contains(expect) {
+                return b;
+            }
+            assert!(Instant::now() < deadline, "never settled on {expect}: {b}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `/api monitor` right after a data change, while a long query holds
+    /// the database and a writer waits behind it, answers at once (within
+    /// the 40 ms it waits for a background refresh) — with the published
+    /// counts and the statistics of the earlier data, never computing them
+    /// on the request path — and settles on the current data's statistics
+    /// once the database is free (the refresh). Its `diskUsed` is the size
+    /// measured at the end of the write (after its save), which is the
+    /// directory's size.
+    #[test]
+    fn monitor_after_a_change_answers_at_once_and_settles() {
+        let (server, addr) = start("monitor_settles");
+        build_two(&addr, "mset");
+        let auth = basic("root", "root");
+        let monitor = api_body(r#""operation":"monitor","db_name":"mset""#);
+        let (_, warm) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
+        assert!(warm.contains("\"subjectNum\":2"), "{warm}");
+        assert!(warm.contains("\"layout\":\"snapshot\""), "{warm}");
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/update?db_name=mset",
+            Some(&auth),
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        ));
+        assert_eq!(s, 200, "{b}");
+        let h = served(&server, "mset");
+        let dir = locked(&server.inner.state).db_dir("mset");
+        assert_eq!(h.disk_bytes(), dir_size(&dir), "measured after the save");
+        // A long query holds the database; a writer queues behind it.
+        let reader = h.read().unwrap();
+        let h2 = Arc::clone(&h);
+        let writer = std::thread::spawn(move || drop(h2.write().unwrap()));
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let got = request_within(
+                &addr,
+                "POST",
+                "/api",
+                Some(&auth),
+                &monitor,
+                Duration::from_secs(1),
+            );
+            let took = t0.elapsed();
+            let (s, b) = got.expect("monitor waited");
+            assert_eq!(s, 200, "{b}");
+            assert!(b.contains("\"tripleNum\":\"3\""), "published counts: {b}");
+            // It waits 40 ms for the refresh at most (generous for CI).
+            assert!(took < Duration::from_millis(250), "took {took:?}");
+        }
+        drop(reader);
+        writer.join().unwrap();
+        let b = settled(&addr, &monitor, "\"subjectNum\":3");
+        assert!(b.contains("\"tripleNum\":\"3\""), "{b}");
         server.shutdown();
     }
 
@@ -7328,10 +8019,9 @@ mod tests {
         }
         let (_, m) = split_status_body(&raw_request(&addr, "POST", "/api", None, &monitor));
         assert!(m.contains("\"tripleNum\":\"3\""), "{m}");
-        assert!(
-            m.contains("\"subjectNum\":3"),
-            "cached statistics of the old data: {m}"
-        );
+        // The statistics of the old data are answered at once, and refreshed
+        // in the background: they settle on the current data's.
+        settled(&addr, &monitor, "\"subjectNum\":3");
         server.shutdown();
     }
 
