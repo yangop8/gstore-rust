@@ -35,7 +35,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::Result;
+use crate::error::{GStoreError, Result};
 use crate::kvstore::pager::{PageId, Pager, PAGE_SIZE};
 use crate::model::id::EntityLiteralId;
 
@@ -111,6 +111,7 @@ impl DiskTree {
     ) -> Result<DiskTree> {
         let entity_count = entries.len();
         let mut pager = Pager::open(path, CACHE_PAGES)?;
+        no_features(&pager, path)?;
 
         if entries.is_empty() {
             pager.set_root(ROOT_SLOT, 0);
@@ -166,8 +167,10 @@ impl DiskTree {
     }
 
     /// Open a previously-[`build`](Self::build)t out-of-core VS-tree at `path`.
+    /// A file using a pager feature bit is refused (see [`no_features`]).
     pub(super) fn open(path: &Path) -> Result<DiskTree> {
         let pager = Pager::open(path, CACHE_PAGES)?;
+        no_features(&pager, path)?;
         let root = pager.root(ROOT_SLOT) as PageId;
         let entity_count = pager.root(COUNT_SLOT) as usize;
         Ok(DiskTree {
@@ -236,6 +239,20 @@ impl DiskTree {
             }
         }
         Ok(())
+    }
+}
+
+/// Refuse a `vstree.kv` whose pager header has feature bits: the format
+/// registry (docs/PHASE6_PLAN.md §3.1) keeps `vstree.kv` at `FEATURES == 0`,
+/// whatever bits the pager itself supports for `kvstore.kv` (the free-id list
+/// of `kvstore.kv` is one), so such a file was not written as a VS-tree.
+fn no_features(pager: &Pager, path: &Path) -> Result<()> {
+    match pager.features() {
+        0 => Ok(()),
+        bits => Err(GStoreError::Database(format!(
+            "{} is not a VS-tree file: it uses pager feature bits {bits:#x} (a VS-tree file has none)",
+            path.display()
+        ))),
     }
 }
 
@@ -418,6 +435,62 @@ mod tests {
             s.encode_edge(p, n, d);
         }
         s
+    }
+
+    /// Set feature bit `bit` in the header of the pager file at `path`, with
+    /// the version-2 magic the registry pairs it with (a consistent header).
+    fn set_feature_bit(path: &Path, bit: u64) {
+        use crate::kvstore::format;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut hdr = [0u8; PAGE_SIZE];
+        f.read_exact(&mut hdr).unwrap();
+        hdr[0..8].copy_from_slice(format::MAGIC_V2);
+        let off = 16 + format::FEATURES * 8;
+        let bits = u64::from_le_bytes(hdr[off..off + 8].try_into().unwrap()) | bit;
+        hdr[off..off + 8].copy_from_slice(&bits.to_le_bytes());
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&hdr).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn a_vstree_file_with_feature_bits_is_refused() {
+        use crate::kvstore::format;
+        // Every defined bit, the one kvstore.kv supports from Round 4 on
+        // (`FREE_IDS`) included: whether or not the pager accepts the bit,
+        // a VS-tree file must not carry it (format registry: FEATURES == 0).
+        for bit in [
+            format::FEATURE_FREE_IDS,
+            format::FEATURE_IVARRAY_WIDE,
+            format::FEATURE_LONG_KEYS,
+        ] {
+            let path = tmp(&format!("features_{bit}_{}", std::process::id()));
+            // Removed also when an assertion fails.
+            struct Rm(std::path::PathBuf);
+            impl Drop for Rm {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                    let mut wal = self.0.clone().into_os_string();
+                    wal.push(".wal");
+                    let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+                }
+            }
+            let _rm = Rm(path.clone());
+            let mut sig = Signature::new();
+            sig.encode_edge(1, 2, EdgeDir::Out);
+            DiskTree::build(&path, vec![(2, sig)]).unwrap();
+            assert!(DiskTree::open(&path).is_ok(), "a plain file opens");
+            set_feature_bit(&path, bit);
+            assert!(DiskTree::open(&path).is_err(), "bit {bit:#x} accepted");
+            assert!(super::super::VsTree::open_disk(&path).is_err());
+            // Nor is a tree built over it (its header would keep the bit).
+            assert!(DiskTree::build(&path, vec![(2, sig)]).is_err());
+        }
     }
 
     #[test]

@@ -164,7 +164,7 @@
 //! solution; the [`Database`](crate::Database) chooses the WHERE dataset
 //! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -179,6 +179,7 @@ use crate::analytics::GraphView;
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
+use crate::model::id::is_entity_id;
 use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
@@ -189,6 +190,7 @@ use crate::store::read_scope::note_read_error;
 use crate::store::{TripleSource, TripleStore};
 
 use super::candidates::{self, Candidates};
+use super::count_memo::CountMemo;
 use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
@@ -198,6 +200,7 @@ use super::value::{
     parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
     IntegerDivision, NumericFn, Value, XSD_FLOAT,
 };
+use super::vs_policy::{self, VsPolicy};
 
 /// The term a dictionary key names ([`Term::from_dict_key`]: verbatim, so a
 /// term a lenient reader let in — an IRI holding `>` — is never lost on its
@@ -251,6 +254,58 @@ const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 /// `max(PROBE_MIN_CANDIDATES, indexed entities / 32)` ids (see
 /// `refine_candidates_with_vstree`).
 const PROBE_MIN_CANDIDATES: usize = 1024;
+
+// The cost of one store lookup in posting-list entries (see
+// `candidates::LOOKUP_COST`), for the choice between looking candidates up
+// and merging posting lists when the VS-tree's predicate bits are tested
+// against the store (`retain_with_classes`).
+use candidates::LOOKUP_COST;
+
+/// One predicate bit of a query signature, in one direction, with the
+/// store's predicates (those with a triple) whose edges set it: an entity's
+/// signature has the bit iff the entity has an edge in `dir` with one of
+/// `preds` (several predicates can share a bit).
+struct BitClass {
+    dir: EdgeDir,
+    preds: Vec<PredId>,
+    /// The triples of `preds`: the length of their posting lists.
+    card: u64,
+}
+
+/// Keep the members of `set` that `members` holds (both sorted, distinct):
+/// a binary search per member of a set much smaller than `members`, else
+/// one merge pass over both.
+fn retain_sorted(set: &mut Vec<u32>, members: &[u32]) {
+    let (n, m) = (set.len(), members.len());
+    let log_m = (usize::BITS - m.leading_zeros()) as usize;
+    if n.saturating_mul(log_m) < n + m {
+        set.retain(|x| members.binary_search(x).is_ok());
+        return;
+    }
+    let mut j = 0;
+    set.retain(|&x| {
+        while j < m && members[j] < x {
+            j += 1;
+        }
+        j < m && members[j] == x
+    });
+}
+
+/// Whether to merge a bit class's posting lists (`true`) rather than look
+/// the candidates up, given the two estimated costs (both give the same set).
+fn prefer_lists(lists: u64, lookups: u64) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_LISTS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    lists <= lookups
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests force either way of [`prefer_lists`] on this thread.
+    static FORCE_LISTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
@@ -391,6 +446,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     store: &'a S,
     /// Optional VS-tree for entity-candidate pre-filtering.
     vstree: Option<&'a VsTree>,
+    /// How `vstree` is used ([`with_vs_policy`](Self::with_vs_policy));
+    /// `None` = the thread's / process's policy
+    /// ([`current_vs_policy`](super::vs_policy::current_vs_policy)).
+    vs_policy: Option<VsPolicy>,
     /// Named graphs (graph-IRI entity id → its store), for `GRAPH` patterns.
     named: Option<&'a BTreeMap<u32, TripleStore>>,
     /// Interner for computed terms produced during evaluation. Shared (`Rc`) with
@@ -509,6 +568,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict,
             store,
             vstree: None,
+            vs_policy: None,
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -539,6 +599,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict,
             store,
             vstree: Some(vstree),
+            vs_policy: None,
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -561,6 +622,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
             pfn: None,
         }
+    }
+
+    /// Use the VS-tree under `policy` (see [`VsPolicy`]) instead of the
+    /// thread's / process's policy
+    /// ([`current_vs_policy`](super::vs_policy::current_vs_policy)).
+    pub fn with_vs_policy(mut self, policy: VsPolicy) -> Evaluator<'a, S> {
+        self.vs_policy = Some(policy);
+        self
     }
 
     /// Attach named graphs so `GRAPH` patterns can be evaluated.
@@ -2342,6 +2411,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict: self.dict,
             store: gstore,
             vstree: None,
+            vs_policy: self.vs_policy,
             named: Some(named),
             extras: Rc::clone(&self.extras),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -2622,7 +2692,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // Exact per-variable candidate sets from constant edges (gStore's
         // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
-        let mut candidates = candidates::generate(&plans, self.store);
+        // Counts the optimizer asks for again come from one memo.
+        let counts = CountMemo::new(self.store);
+        let mut candidates =
+            candidates::generate_noting(&plans, &counts, &mut |edge, len| counts.note(edge, len));
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
         // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
         // plain REGEX) prune or seed candidate sets — a sound superset, so only
@@ -2636,13 +2709,23 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
         // tree when one is strictly cheaper. Memoised so a structurally-identical
         // BGP reuses the enumeration (gStore `plan_cache`).
-        let key = plans_key(&plans);
-        let plan = self
-            .plan_cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| optimizer::optimize(&plans, self.store, &candidates, layout.len()))
-            .clone();
+        let plan = if plans.len() <= 3 && constant_star(&plans) && !plain_plans() {
+            // A star of constant edges: its solutions are the variable's
+            // candidates in ascending order whatever the join order (see
+            // `constant_star`), so it needs no plan search — nor the counts
+            // the search asks for.
+            ExecPlan {
+                order: (0..plans.len()).collect(),
+                tree: None,
+            }
+        } else {
+            let key = plans_key(&plans);
+            self.plan_cache
+                .borrow_mut()
+                .entry(key)
+                .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
+                .clone()
+        };
         PreparedBgp::Plan(topk::BgpPlan {
             plans,
             cands: candidates,
@@ -2843,7 +2926,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Intersect the VS-tree's signature candidates into the exact candidate
     /// sets (both are sound supersets, so the intersection stays sound and only
-    /// tightens). Applies to subject variables (always entities).
+    /// tightens), or seed a variable without a set with them. Applies to
+    /// subject variables (always entities). How the tree is consulted follows
+    /// the [`VsPolicy`]: `Auto` computes the very sets `Tree` computes, more
+    /// cheaply where that is provably exact (see [`vs_policy`]); `Off` leaves
+    /// the sets alone.
     fn refine_candidates_with_vstree(
         &self,
         candidates: &mut Candidates,
@@ -2853,32 +2940,97 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let Some(vstree) = self.vstree else {
             return;
         };
-        let mut subj_vars: HashSet<usize> = HashSet::new();
+        let policy = self.vs_policy.unwrap_or_else(vs_policy::current_vs_policy);
+        // Ascending, so the decisions (and their counts) come in a fixed order;
+        // each variable's refinement only reads and writes its own set.
+        let mut subj_vars: BTreeSet<usize> = BTreeSet::new();
         for tp in tps {
             if let PatternTerm::Var(v) = &tp.subject {
                 subj_vars.insert(layout.index[v]);
             }
         }
         for &vidx in &subj_vars {
+            // The query signature, and `cut`: the bits of the edges with a
+            // known neighbour. `candidates::generate` cut the variable's set
+            // from exactly those edges (its pass 1 intersects the store's list
+            // of every one of them), so every candidate has those edges — and,
+            // the tree holding a superset of each entity's current signature,
+            // its entry has their bits. A variable without such an edge has no
+            // set after pass 1 (pass 2 only narrows existing sets).
             let mut sig = Signature::new();
+            let mut cut = Signature::new();
             for tp in tps {
                 if matches!(&tp.subject, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    sig.encode_query_edge(
+                    let (p, n) = (
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.object),
-                        EdgeDir::Out,
                     );
+                    sig.encode_query_edge(p, n, EdgeDir::Out);
+                    if n.is_some() {
+                        cut.encode_query_edge(p, n, EdgeDir::Out);
+                    }
                 }
                 if matches!(&tp.object, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    sig.encode_query_edge(
+                    let (p, n) = (
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.subject),
-                        EdgeDir::In,
                     );
+                    sig.encode_query_edge(p, n, EdgeDir::In);
+                    if n.is_some() {
+                        cut.encode_query_edge(p, n, EdgeDir::In);
+                    }
                 }
             }
             if sig.is_empty() {
                 continue;
+            }
+            if policy == VsPolicy::Off {
+                vs_policy::count(|s| s.off += 1);
+                continue;
+            }
+            if policy == VsPolicy::Auto {
+                // The bits a candidate's entry may lack: predicate bits of the
+                // edges whose neighbour is a variable (`cut` holds every
+                // neighbour and combined bit of the query).
+                let residual = sig.and_not(&cut);
+                debug_assert!(residual.only_predicate_bits());
+                match candidates.get_mut(&vidx) {
+                    Some(existing) if residual.is_empty() => {
+                        // Every entity candidate's entry contains the query; a
+                        // non-entity (a literal object) has no entry. An empty
+                        // tree filters nothing (as a walk of it).
+                        if !vstree.is_empty() {
+                            existing.retain(|&x| is_entity_id(x));
+                        }
+                        vs_policy::count(|s| s.skipped += 1);
+                        continue;
+                    }
+                    Some(existing) if !vstree.can_probe() => {
+                        // An out-of-core tree cannot probe, and its walk reads
+                        // every page whose union holds the query: test the
+                        // predicate bits against the store instead.
+                        if !vstree.is_empty() {
+                            existing.retain(|&x| is_entity_id(x));
+                            self.retain_with_predicate_bits(existing, &residual);
+                        }
+                        vs_policy::count(|s| s.store_checked += 1);
+                        continue;
+                    }
+                    None if !vstree.can_probe() => {
+                        // No set and an out-of-core tree: `sig` holds predicate
+                        // bits only (no edge has a known neighbour, see above);
+                        // the entities with those bits come from the posting
+                        // lists.
+                        debug_assert!(cut.is_empty());
+                        if !vstree.is_empty() {
+                            let set = self.entities_with_predicate_bits(&sig);
+                            candidates.insert(vidx, set);
+                        }
+                        vs_policy::count(|s| s.listed += 1);
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             // Probe refinement: when the variable already has a small exact
             // candidate set and the tree is in memory, test each candidate's
@@ -2892,19 +3044,165 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     if !vstree.is_empty() {
                         existing.retain(|&x| vstree.probe(x, &sig));
                     }
+                    vs_policy::count(|s| s.probed += 1);
                     continue;
                 }
             }
+            let seeded = !candidates.contains_key(&vidx);
+            vs_policy::count(|s| {
+                if seeded {
+                    s.seeded += 1;
+                } else {
+                    s.walked += 1;
+                }
+            });
             if let Some(mut vs) = vstree.candidates(&sig) {
                 vs.sort_unstable();
                 vs.dedup();
                 match candidates.get_mut(&vidx) {
-                    Some(existing) => existing.retain(|x| vs.binary_search(x).is_ok()),
+                    Some(existing) => retain_sorted(existing, &vs),
                     None => {
                         candidates.insert(vidx, vs);
                     }
                 }
             }
+        }
+    }
+
+    /// The bit classes of the predicate bits in `bits` (see
+    /// [`BitClass`]), with the store's predicates behind each; `None` when
+    /// some bit has no predicate with a triple, so no entity has it.
+    fn predicate_bit_classes(&self, bits: &Signature) -> Option<Vec<BitClass>> {
+        let limit = self.dict.id_limit(Space::Predicate);
+        let mut classes = Vec::new();
+        for dir in [EdgeDir::Out, EdgeDir::In] {
+            for bit in bits.predicate_bits(dir).set_bits() {
+                let mut preds = Vec::new();
+                let mut card = 0u64;
+                for p in Signature::predicates_with_bit(bit, dir, limit) {
+                    let c = self.store.pred_card(p) as u64;
+                    if c > 0 {
+                        preds.push(p);
+                        card += c;
+                    }
+                }
+                if preds.is_empty() {
+                    return None;
+                }
+                classes.push(BitClass { dir, preds, card });
+            }
+        }
+        // Cheapest lists first (ties in the fixed bit order above).
+        classes.sort_by_key(|c| c.card);
+        Some(classes)
+    }
+
+    /// The members of one bit class: the entities with an edge in the
+    /// class's direction whose predicate is one of the class's (sorted,
+    /// distinct).
+    fn bit_class_members(&self, class: &BitClass) -> Vec<u32> {
+        let mut members: Vec<u32> = Vec::new();
+        for &p in &class.preds {
+            members.extend(match class.dir {
+                EdgeDir::Out => self.store.subs_by_p(p),
+                EdgeDir::In => self.store.objs_by_p(p),
+            });
+        }
+        members.retain(|&x| is_entity_id(x));
+        if class.preds.len() > 1 {
+            members.sort_unstable();
+            members.dedup();
+        }
+        members
+    }
+
+    /// The entities whose signature, as the store's edges give it, has every
+    /// bit of `bits` — predicate bits only. On a VS-tree consistent with the
+    /// store that is exactly what a walk of the tree reports for `bits` (a
+    /// predicate bit is set in an entry iff its entity has an edge in that
+    /// direction whose predicate encodes to the bit; the tree holds an entry
+    /// for every entity with an edge). Sorted, distinct.
+    fn entities_with_predicate_bits(&self, bits: &Signature) -> Vec<u32> {
+        let Some(classes) = self.predicate_bit_classes(bits) else {
+            return Vec::new();
+        };
+        let Some((first, rest)) = classes.split_first() else {
+            return Vec::new();
+        };
+        let mut set = self.bit_class_members(first);
+        self.retain_with_classes(&mut set, rest);
+        set
+    }
+
+    /// Keep the entity candidates whose signature holds every bit of
+    /// `residual` — predicate bits only (see
+    /// [`Signature::predicate_bits`]): an entity's signature holds the bit of
+    /// predicate `p` in direction `d` iff the entity has an edge in direction
+    /// `d` whose predicate encodes to the same bit. The store answers that
+    /// exactly, so on a VS-tree consistent with the store this keeps exactly
+    /// the candidates a walk keeps (after deletes the tree's entries can hold
+    /// stale bits; this then keeps a subset of the walk's, still a superset
+    /// of the true matches). `existing` holds entities only.
+    fn retain_with_predicate_bits(&self, existing: &mut Vec<u32>, residual: &Signature) {
+        if existing.is_empty() {
+            return;
+        }
+        match self.predicate_bit_classes(residual) {
+            Some(classes) => self.retain_with_classes(existing, &classes),
+            None => existing.clear(),
+        }
+    }
+
+    /// Keep the members of `set` (sorted entity ids) that belong to every
+    /// class of `classes`. Per class it either looks each member's edges up
+    /// or merges the class's posting lists, whichever the store's exact
+    /// counts make cheaper; both give the same set, so the choice only
+    /// changes the work. The out-direction classes left for lookups are
+    /// tested together, one `po_by_s` per member.
+    fn retain_with_classes(&self, set: &mut Vec<u32>, classes: &[BitClass]) {
+        // Out-direction bits still to be tested by looking members up.
+        let mut out_bits = Signature::new();
+        // Average out-degree, for the cost of one `po_by_s`.
+        let subjects = (self.store.distinct_subjects() as u64).max(1);
+        let out_degree = self.store.triple_count() / subjects;
+        for class in classes {
+            if set.is_empty() {
+                return;
+            }
+            let n = set.len() as u64;
+            let lookups = match class.dir {
+                // One `po_by_s` per member covers every out-direction class.
+                EdgeDir::Out => n.saturating_mul(LOOKUP_COST + out_degree),
+                // One `count_s_by_po` per member and predicate of the class.
+                EdgeDir::In => n.saturating_mul(LOOKUP_COST * class.preds.len() as u64),
+            };
+            if prefer_lists(class.card, lookups) {
+                let members = self.bit_class_members(class);
+                retain_sorted(set, &members);
+                continue;
+            }
+            match class.dir {
+                EdgeDir::Out => {
+                    let mut bit = Signature::new();
+                    bit.encode_query_edge(Some(class.preds[0]), None, EdgeDir::Out);
+                    out_bits.union_with(&bit);
+                }
+                EdgeDir::In => set.retain(|&x| {
+                    class
+                        .preds
+                        .iter()
+                        .any(|&p| self.store.count_s_by_po(p, x) > 0)
+                }),
+            }
+        }
+        if !out_bits.is_empty() && !set.is_empty() {
+            set.retain(|&x| {
+                let mut have = Signature::new();
+                for (p, _) in self.store.po_by_s(x) {
+                    have.encode_query_edge(Some(p), None, EdgeDir::Out);
+                }
+                have.contains(&out_bits)
+            });
         }
     }
 
@@ -3007,6 +3305,37 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             slot_known(&plan.p, binding),
             slot_known(&plan.o, binding),
         );
+        // One constant end and a variable end with few candidates: test each
+        // candidate (ascending) instead of reading the list — the same
+        // triples in the same (ascending) order, the list filtered by the
+        // candidates. "Few": a lookup per candidate (`LOOKUP_COST` list
+        // entries each) costs less than the predicate's average list. Only
+        // for an end that is a constant of the pattern: then the variable is
+        // unbound once per scan, not once per row of an outer binding.
+        match (known, &plan.s, &plan.o) {
+            _ if plain_plans() => {}
+            ((None, Some(p), Some(o)), _, Slot::Const(_)) if s_cands.is_some() => {
+                let avg = self.store.pred_card(p) / self.store.pred_distinct_obj(p).max(1);
+                if let Some(subjects) = s_cands.filter(|c| few_candidates(c.len(), avg)) {
+                    return subjects
+                        .iter()
+                        .filter(|&&s| self.store.exists(s, p, o))
+                        .map(|&s| (s, p, o))
+                        .collect();
+                }
+            }
+            ((Some(s), Some(p), None), Slot::Const(_), _) if o_cands.is_some() => {
+                let avg = self.store.pred_card(p) / self.store.pred_distinct_subj(p).max(1);
+                if let Some(objects) = o_cands.filter(|c| few_candidates(c.len(), avg)) {
+                    return objects
+                        .iter()
+                        .filter(|&&o| self.store.exists(s, p, o))
+                        .map(|&o| (s, p, o))
+                        .collect();
+                }
+            }
+            _ => {}
+        }
         if let (None, Some(p), None) = known {
             let card = self.store.pred_card(p);
             let small = |c: &[u32]| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < card;
@@ -5879,6 +6208,73 @@ fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
     set.is_none_or(|list| list.binary_search(&value).is_ok())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests turn the constant-star plan and the candidate tests of
+    /// `candidate_triples_in` off on this thread, to compare with the plain
+    /// optimizer and scans.
+    static PLAIN_PLANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests make `candidate_triples_in` look every candidate up.
+    static ALWAYS_LOOK_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `n` candidates are few enough to be looked up one by one rather
+/// than reading a list of about `avg` entries (see `candidate_triples_in`).
+/// The average misjudges skewed predicates (a small class of `rdf:type`
+/// has a far shorter list), and a backend's lookups can cost more than
+/// `LOOKUP_COST` list entries (a RocksDB point read), so at most
+/// [`MAX_CANDIDATE_LOOKUPS`] lookups are traded for a list.
+fn few_candidates(n: usize, avg: usize) -> bool {
+    #[cfg(test)]
+    if PLAIN_PLANS.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(test)]
+    if ALWAYS_LOOK_UP.with(std::cell::Cell::get) {
+        return true;
+    }
+    n <= MAX_CANDIDATE_LOOKUPS && (n as u64).saturating_mul(LOOKUP_COST) < avg as u64
+}
+
+/// See [`few_candidates`].
+const MAX_CANDIDATE_LOOKUPS: usize = 64;
+
+#[inline]
+fn plain_plans() -> bool {
+    #[cfg(test)]
+    {
+        PLAIN_PLANS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Whether every pattern binds the same single variable, at its subject or
+/// its object, with the other two positions constant (`?x p o`, `s p ?x`): a
+/// star of constant edges. Candidate generation intersects all of them into
+/// the variable's set, so in a left-deep pipeline the first pattern yields
+/// the set's members (its list in ascending order, filtered by the set) and
+/// every later one keeps them all (an `exists` test): the solutions are the
+/// set in ascending order whichever pattern comes first. (From four patterns
+/// on the optimizer may choose a bushy hash-join tree, whose output order
+/// differs; callers apply this to at most three.)
+fn constant_star(plans: &[PatPlan]) -> bool {
+    let mut var = None;
+    for plan in plans {
+        let v = match (&plan.s, &plan.p, &plan.o) {
+            (Slot::Var(v), Slot::Const(_), Slot::Const(_))
+            | (Slot::Const(_), Slot::Const(_), Slot::Var(v)) => *v,
+            _ => return false,
+        };
+        if *var.get_or_insert(v) != v {
+            return false;
+        }
+    }
+    var.is_some()
+}
+
 /// A predicate scan is replaced by candidate lookups when the candidates
 /// number less than `1 / CANDIDATE_LOOKUP_FACTOR` of the predicate's triples.
 const CANDIDATE_LOOKUP_FACTOR: usize = 8;
@@ -7593,3 +7989,7 @@ mod gfun_engine_tests {
         assert_eq!(XsdCast::from_iri(&format!("{XSD_NS}Integer")), None);
     }
 }
+
+#[cfg(test)]
+#[path = "vs_policy_tests.rs"]
+mod vs_policy_tests;
