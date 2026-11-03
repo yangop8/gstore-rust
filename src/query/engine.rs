@@ -164,7 +164,7 @@
 //! solution; the [`Database`](crate::Database) chooses the WHERE dataset
 //! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -184,6 +184,7 @@ use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
 use crate::parser::sparql::{builtins, rs_function_name, RS_NAMESPACE};
+use crate::model::id::is_entity_id;
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::note_read_error;
 use crate::store::{TripleSource, TripleStore};
@@ -193,6 +194,7 @@ use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
 use super::results::{QueryResult, ResultSet};
+use super::vs_policy::{self, VsPolicy};
 use super::value::{
     format_xsd_datetime_utc, is_decimal_lexical, is_integer_lexical, order_key,
     parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
@@ -251,6 +253,12 @@ const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 /// `max(PROBE_MIN_CANDIDATES, indexed entities / 32)` ids (see
 /// `refine_candidates_with_vstree`).
 const PROBE_MIN_CANDIDATES: usize = 1024;
+
+/// The fixed cost of one store lookup, in index entries read, for the choice
+/// between per-candidate lookups and posting lists in
+/// `retain_with_predicate_bits` (a B+ tree descent or a map probe against
+/// stepping through entries).
+const PER_LOOKUP_COST: u64 = 16;
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
@@ -391,6 +399,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     store: &'a S,
     /// Optional VS-tree for entity-candidate pre-filtering.
     vstree: Option<&'a VsTree>,
+    /// How `vstree` is used ([`with_vs_policy`](Self::with_vs_policy));
+    /// `None` = the thread's / process's policy
+    /// ([`current_vs_policy`](super::vs_policy::current_vs_policy)).
+    vs_policy: Option<VsPolicy>,
     /// Named graphs (graph-IRI entity id → its store), for `GRAPH` patterns.
     named: Option<&'a BTreeMap<u32, TripleStore>>,
     /// Interner for computed terms produced during evaluation. Shared (`Rc`) with
@@ -509,6 +521,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict,
             store,
             vstree: None,
+            vs_policy: None,
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -539,6 +552,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict,
             store,
             vstree: Some(vstree),
+            vs_policy: None,
             named: None,
             extras: Rc::new(std::cell::RefCell::new(Extras::default())),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -561,6 +575,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
             pfn: None,
         }
+    }
+
+    /// Use the VS-tree under `policy` (see [`VsPolicy`]) instead of the
+    /// thread's / process's policy
+    /// ([`current_vs_policy`](super::vs_policy::current_vs_policy)).
+    pub fn with_vs_policy(mut self, policy: VsPolicy) -> Evaluator<'a, S> {
+        self.vs_policy = Some(policy);
+        self
     }
 
     /// Attach named graphs so `GRAPH` patterns can be evaluated.
@@ -2342,6 +2364,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             dict: self.dict,
             store: gstore,
             vstree: None,
+            vs_policy: self.vs_policy,
             named: Some(named),
             extras: Rc::clone(&self.extras),
             plan_cache: std::cell::RefCell::new(HashMap::new()),
@@ -2843,7 +2866,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Intersect the VS-tree's signature candidates into the exact candidate
     /// sets (both are sound supersets, so the intersection stays sound and only
-    /// tightens). Applies to subject variables (always entities).
+    /// tightens). Applies to subject variables (always entities). How the
+    /// tree is consulted follows the [`VsPolicy`]: `Auto` computes the same
+    /// sets as `Tree` more cheaply where that is provably exact (see
+    /// [`vs_policy`]), `Off` leaves the sets alone.
     fn refine_candidates_with_vstree(
         &self,
         candidates: &mut Candidates,
@@ -2853,31 +2879,50 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let Some(vstree) = self.vstree else {
             return;
         };
-        let mut subj_vars: HashSet<usize> = HashSet::new();
+        let policy = self.vs_policy.unwrap_or_else(vs_policy::current_vs_policy);
+        // Ascending, so the decisions (and their counts) come in a fixed order;
+        // each variable's refinement only reads and writes its own set.
+        let mut subj_vars: BTreeSet<usize> = BTreeSet::new();
         for tp in tps {
             if let PatternTerm::Var(v) = &tp.subject {
                 subj_vars.insert(layout.index[v]);
             }
         }
         for &vidx in &subj_vars {
+            // The query signature, and `cut`: the bits of the edges with a
+            // known neighbour. `candidates::generate` cut the variable's set
+            // from exactly those edges (its pass 1 intersects every one of
+            // them), so every candidate has them — and, the tree holding a
+            // superset of each entity's current signature, so does its entry.
             let mut sig = Signature::new();
+            let mut cut = Signature::new();
             for tp in tps {
                 if matches!(&tp.subject, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    sig.encode_query_edge(
+                    let (p, n) = (
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.object),
-                        EdgeDir::Out,
                     );
+                    sig.encode_query_edge(p, n, EdgeDir::Out);
+                    if n.is_some() {
+                        cut.encode_query_edge(p, n, EdgeDir::Out);
+                    }
                 }
                 if matches!(&tp.object, PatternTerm::Var(v) if layout.index[v] == vidx) {
-                    sig.encode_query_edge(
+                    let (p, n) = (
                         self.pred_id_of(&tp.predicate),
                         self.neighbor_id_of(&tp.subject),
-                        EdgeDir::In,
                     );
+                    sig.encode_query_edge(p, n, EdgeDir::In);
+                    if n.is_some() {
+                        cut.encode_query_edge(p, n, EdgeDir::In);
+                    }
                 }
             }
             if sig.is_empty() {
+                continue;
+            }
+            if policy == VsPolicy::Off {
+                vs_policy::count(|s| s.off += 1);
                 continue;
             }
             // Probe refinement: when the variable already has a small exact
@@ -2888,13 +2933,48 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // query (every ancestor contains its descendants' signatures).
             let probe_limit = PROBE_MIN_CANDIDATES.max(vstree.entity_count() / 32);
             if let Some(existing) = candidates.get_mut(&vidx) {
+                if policy == VsPolicy::Auto {
+                    // Only predicate bits of edges whose neighbour is a
+                    // variable can be missing from a candidate's entry.
+                    let residual = sig.and_not(&cut);
+                    debug_assert!(residual.only_predicate_bits());
+                    if residual.is_empty() {
+                        // Every entity candidate passes; a non-entity (a
+                        // literal object) has no entry. An empty tree filters
+                        // nothing (as below).
+                        if !vstree.is_empty() {
+                            existing.retain(|&x| is_entity_id(x));
+                        }
+                        vs_policy::count(|s| s.skipped += 1);
+                        continue;
+                    }
+                    if !vstree.can_probe() {
+                        // An out-of-core tree cannot probe, and a walk reads
+                        // every page whose union holds the query: ask the
+                        // store which candidates have the predicate bits.
+                        if !vstree.is_empty() {
+                            self.retain_with_predicate_bits(existing, &residual);
+                        }
+                        vs_policy::count(|s| s.store_checked += 1);
+                        continue;
+                    }
+                }
                 if vstree.can_probe() && existing.len() <= probe_limit {
                     if !vstree.is_empty() {
                         existing.retain(|&x| vstree.probe(x, &sig));
                     }
+                    vs_policy::count(|s| s.probed += 1);
                     continue;
                 }
             }
+            let seeded = !candidates.contains_key(&vidx);
+            vs_policy::count(|s| {
+                if seeded {
+                    s.seeded += 1;
+                } else {
+                    s.walked += 1;
+                }
+            });
             if let Some(mut vs) = vstree.candidates(&sig) {
                 vs.sort_unstable();
                 vs.dedup();
@@ -2902,6 +2982,109 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(existing) => existing.retain(|x| vs.binary_search(x).is_ok()),
                     None => {
                         candidates.insert(vidx, vs);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the entity candidates whose signature holds every bit of
+    /// `residual` — predicate bits only (see
+    /// [`Signature::predicate_bits`]): an entity's signature holds the bit of
+    /// predicate `p` in direction `d` iff the entity has an edge in direction
+    /// `d` whose predicate encodes to the same bit. The store answers that
+    /// exactly, so on a VS-tree consistent with the store this keeps exactly
+    /// the candidates a walk keeps (after deletes the tree's entries can hold
+    /// stale bits; this then keeps a subset of the walk's, still a superset
+    /// of the true matches).
+    ///
+    /// Per direction it either reads each candidate's edges or merges the
+    /// posting lists of the predicates that set a wanted bit, whichever the
+    /// store's exact counts make cheaper; both give the same set.
+    fn retain_with_predicate_bits(&self, existing: &mut Vec<u32>, residual: &Signature) {
+        existing.retain(|&x| is_entity_id(x));
+        let limit = self.dict.id_limit(Space::Predicate);
+        for dir in [EdgeDir::Out, EdgeDir::In] {
+            let want = residual.predicate_bits(dir);
+            if want.is_empty() || existing.is_empty() {
+                continue;
+            }
+            // The store's predicates that set a wanted bit, grouped by bit.
+            let mut classes: Vec<(Signature, Vec<PredId>)> = Vec::new();
+            for p in 0..limit {
+                let mut bit = Signature::new();
+                bit.encode_query_edge(Some(p), None, dir);
+                if !want.contains(&bit) || self.store.pred_card(p) == 0 {
+                    continue;
+                }
+                match classes.iter_mut().find(|(b, _)| *b == bit) {
+                    Some((_, ps)) => ps.push(p),
+                    None => classes.push((bit, vec![p])),
+                }
+            }
+            if classes.len() < want.popcount() as usize {
+                // A wanted bit no edge of the store sets: nobody has it.
+                existing.clear();
+                return;
+            }
+            let n = existing.len() as u64;
+            let (lists, per_candidate) = match dir {
+                EdgeDir::Out => {
+                    // One `po_by_s` per candidate: its out-degree.
+                    let triples = self.store.triple_count();
+                    let avg = triples / (self.store.distinct_subjects() as u64).max(1);
+                    let lists = classes
+                        .iter()
+                        .flat_map(|(_, ps)| ps)
+                        .map(|&p| self.store.pred_card(p) as u64)
+                        .sum::<u64>();
+                    (lists, n.saturating_mul(PER_LOOKUP_COST + avg))
+                }
+                EdgeDir::In => {
+                    // One `count_s_by_po` per candidate and class predicate:
+                    // the subjects per object of that predicate.
+                    let mut lists = 0u64;
+                    let mut per = 0u64;
+                    for &p in classes.iter().flat_map(|(_, ps)| ps) {
+                        let card = self.store.pred_card(p) as u64;
+                        let objs = (self.store.pred_distinct_obj(p) as u64).max(1);
+                        lists += card;
+                        per = per.saturating_add(n.saturating_mul(PER_LOOKUP_COST + card / objs));
+                    }
+                    (lists, per)
+                }
+            };
+            if per_candidate <= lists {
+                match dir {
+                    EdgeDir::Out => existing.retain(|&x| {
+                        let mut have = Signature::new();
+                        for (p, _) in self.store.po_by_s(x) {
+                            have.encode_query_edge(Some(p), None, EdgeDir::Out);
+                        }
+                        have.contains(&want)
+                    }),
+                    EdgeDir::In => existing.retain(|&x| {
+                        classes.iter().all(|(_, ps)| {
+                            ps.iter().any(|&p| self.store.count_s_by_po(p, x) > 0)
+                        })
+                    }),
+                }
+            } else {
+                for (_, ps) in &classes {
+                    let mut members: Vec<u32> = Vec::new();
+                    for &p in ps {
+                        members.extend(match dir {
+                            EdgeDir::Out => self.store.subs_by_p(p),
+                            EdgeDir::In => self.store.objs_by_p(p),
+                        });
+                    }
+                    if ps.len() > 1 {
+                        members.sort_unstable();
+                        members.dedup();
+                    }
+                    existing.retain(|x| members.binary_search(x).is_ok());
+                    if existing.is_empty() {
+                        return;
                     }
                 }
             }

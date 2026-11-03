@@ -94,6 +94,30 @@ const LIMB_MASK: [u64; LIMBS] = {
     m
 };
 
+/// The bits of the half-open bit range `[lo, hi)`, as limbs.
+const fn range_mask(lo: usize, hi: usize) -> [u64; LIMBS] {
+    let mut m = [0u64; LIMBS];
+    let mut b = lo;
+    while b < hi {
+        m[b / 64] |= 1u64 << (b % 64);
+        b += 1;
+    }
+    m
+}
+
+/// The predicate bits an in-edge sets ([`Signature::encode_predicate`] with
+/// [`EdgeDir::In`]): seeds `0..EDGE_SIG_INTERVAL_NUM_HALF`.
+const PRED_IN_MASK: [u64; LIMBS] = range_mask(
+    STR_SIG_LENGTH,
+    STR_SIG_LENGTH + EDGE_SIG_INTERVAL_BASE * EDGE_SIG_INTERVAL_NUM_HALF,
+);
+
+/// The predicate bits an out-edge sets: the upper half of the edge region.
+const PRED_OUT_MASK: [u64; LIMBS] = range_mask(
+    STR_SIG_LENGTH + EDGE_SIG_INTERVAL_BASE * EDGE_SIG_INTERVAL_NUM_HALF,
+    STR_SIG_LENGTH + EDGE_SIG_LENGTH,
+);
+
 /// Raw byte width of a signature's limbs (`LIMBS × 8` = 120). Used by the
 /// out-of-core VS-tree ([`vstree`]/[`disk_vstree`]) to (de)serialize a signature
 /// into a fixed slot inside a paged node.
@@ -156,6 +180,41 @@ impl Signature {
 
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|&w| w == 0)
+    }
+
+    /// The bits of `self` that `other` does not have (`self & !other`).
+    pub fn and_not(&self, other: &Signature) -> Signature {
+        let mut bits = self.bits;
+        for (w, o) in bits.iter_mut().zip(&other.bits) {
+            *w &= !o;
+        }
+        Signature { bits }
+    }
+
+    /// The predicate bits of `self` that edges in direction `dir` set (see
+    /// [`encode_query_edge`](Self::encode_query_edge) with a predicate and
+    /// no neighbour). The two directions' predicate bits are disjoint, and
+    /// no neighbour or combined bit falls among them, so an entity's
+    /// signature holds such a bit iff the entity has an edge in direction
+    /// `dir` whose predicate encodes to it.
+    pub fn predicate_bits(&self, dir: EdgeDir) -> Signature {
+        let mask = match dir {
+            EdgeDir::In => &PRED_IN_MASK,
+            EdgeDir::Out => &PRED_OUT_MASK,
+        };
+        let mut bits = self.bits;
+        for (w, m) in bits.iter_mut().zip(mask) {
+            *w &= m;
+        }
+        Signature { bits }
+    }
+
+    /// Whether every bit of `self` is a predicate bit (of either direction).
+    pub fn only_predicate_bits(&self) -> bool {
+        self.bits
+            .iter()
+            .zip(PRED_IN_MASK.iter().zip(&PRED_OUT_MASK))
+            .all(|(w, (i, o))| w & !(i | o) == 0)
     }
 
     /// Compare the raw limbs, low limb first (each limb as a number, so bit
