@@ -30,10 +30,16 @@ pub(crate) type Candidates = HashMap<usize, Vec<u32>, FxBuildHasher>;
 /// or a map probe against stepping through (or copying) list entries.
 pub(crate) const LOOKUP_COST: u64 = 64;
 
+/// Lists estimated at most this long are counted exactly before a
+/// variable's edges are ordered; longer ones are ordered by the estimate
+/// ([`ConstEdge::estimate`]): counting a long key range of an on-disk store
+/// reads one B+ tree leaf per few hundred entries.
+const COUNT_LIMIT: u64 = 8192;
+
 /// One constant-neighbour edge of a variable (pass 1): the exact store list
 /// of the values it allows.
-#[derive(Clone, Copy)]
-enum ConstEdge {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConstEdge {
     /// `?v p o`: the subjects of `(p, o)`.
     SubjOf(PredId, u32),
     /// `?v ?x o`: the subjects of `o`, any predicate.
@@ -56,14 +62,31 @@ impl ConstEdge {
         }
     }
 
-    /// The list, sorted and distinct.
-    fn list(self, store: &impl TripleSource) -> Vec<u32> {
+    /// The average length of such lists, from the store's O(1) statistics
+    /// (only the work done depends on it, never a result).
+    fn estimate(self, store: &impl TripleSource) -> u64 {
+        let avg = |n: u64, keys: usize| n / (keys as u64).max(1);
+        match self {
+            ConstEdge::SubjOf(p, _) => avg(store.pred_card(p) as u64, store.pred_distinct_obj(p)),
+            ConstEdge::ObjOf(_, p) => avg(store.pred_card(p) as u64, store.pred_distinct_subj(p)),
+            ConstEdge::SubjOfAny(_) => avg(store.triple_count(), store.distinct_objects()),
+            ConstEdge::ObjOfAny(_) => avg(store.triple_count(), store.distinct_subjects()),
+        }
+    }
+
+    /// The list, sorted and distinct; `note` hears the exact count of a
+    /// `(p, o)` / `(s, p)` list read whole.
+    fn list(self, store: &impl TripleSource, note: &mut dyn FnMut(ConstEdge, u64)) -> Vec<u32> {
         let mut list = match self {
             ConstEdge::SubjOf(p, o) => store.s_by_po(p, o),
             ConstEdge::SubjOfAny(o) => distinct_seconds(&store.ps_by_o(o)),
             ConstEdge::ObjOf(s, p) => store.o_by_sp(s, p),
             ConstEdge::ObjOfAny(s) => distinct_seconds(&store.po_by_s(s)),
         };
+        if matches!(self, ConstEdge::SubjOf(..) | ConstEdge::ObjOf(..)) {
+            // These lists are exactly the counted ranges (C1).
+            note(self, list.len() as u64);
+        }
         // The contract orders these lists ascending; check rather than sort.
         if !list.windows(2).all(|w| w[0] < w[1]) {
             list.sort_unstable();
@@ -100,15 +123,28 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Generate candidate id sets for the BGP's variables.
+/// Generate candidate id sets for the BGP's variables (the engine uses
+/// [`generate_noting`]).
+#[cfg(test)]
 pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidates {
+    generate_noting(plans, store, &mut |_, _| {})
+}
+
+/// [`generate`], telling `note` the exact length of every `(p, o)` / `(s, p)`
+/// list it reads whole (its C1 count, for a caller that memoizes counts).
+pub(crate) fn generate_noting(
+    plans: &[PatPlan],
+    store: &impl TripleSource,
+    note: &mut dyn FnMut(ConstEdge, u64),
+) -> Candidates {
     let mut cand = Candidates::default();
 
     // Pass 1 — constant-neighbour edges give an exact list per variable: the
-    // intersection of the lists of its edges. Shortest list first; a list much
-    // longer than the set so far is not read — the set's members are tested
-    // against the store instead (the same set: `x` is in a list iff its
-    // edge exists). The result does not depend on the order.
+    // intersection of the lists of its edges. Shortest list first (exact
+    // counts for lists estimated short, the estimate for the others); a list
+    // much longer than the set so far is not read — the set's members are
+    // tested against the store instead (the same set: `x` is in a list iff
+    // its edge exists). The result does not depend on the order.
     let mut edges: Vec<(usize, ConstEdge)> = Vec::new();
     for plan in plans {
         // subject variable with a constant object: `?s (p|?) o`
@@ -132,15 +168,24 @@ pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidat
     vars.sort_unstable();
     vars.dedup();
     for var in vars {
-        // (length, pattern order, edge): ties keep the pattern order.
+        // (length or estimate, pattern order, edge): ties keep the pattern
+        // order.
         let mut mine: Vec<(u64, usize, ConstEdge)> = edges
             .iter()
             .filter(|&&(v, _)| v == var)
             .enumerate()
-            .map(|(i, &(_, e))| (e.len(store), i, e))
+            .map(|(i, &(_, e))| {
+                let estimate = e.estimate(store);
+                let len = if estimate <= COUNT_LIMIT {
+                    e.len(store)
+                } else {
+                    estimate
+                };
+                (len, i, e)
+            })
             .collect();
         mine.sort_unstable_by_key(|&(len, i, _)| (len, i));
-        let mut set = mine[0].2.list(store);
+        let mut set = mine[0].2.list(store, note);
         for &(len, _, edge) in &mine[1..] {
             if set.is_empty() {
                 break;
@@ -148,7 +193,7 @@ pub(crate) fn generate(plans: &[PatPlan], store: &impl TripleSource) -> Candidat
             if test_members(set.len(), len) {
                 set.retain(|&x| edge.holds(store, x));
             } else {
-                set = sorted_intersect(&set, &edge.list(store));
+                set = sorted_intersect(&set, &edge.list(store, note));
             }
         }
         cand.insert(var, set);

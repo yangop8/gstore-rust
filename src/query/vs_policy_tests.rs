@@ -380,3 +380,71 @@ fn retain_sorted_equals_a_binary_search_filter() {
         assert_eq!(set, want);
     }
 }
+
+/// A star of constant edges on `?a` (`?a p o` / `s p ?a`), its constants
+/// taken from triples of the store so that it often has solutions.
+fn star(rng: &mut Rng, triples: &[IdTriple], d: &Dictionary) -> Vec<TriplePattern> {
+    let term = |id: u32| d.term(id).map(|t| t.to_string()).unwrap();
+    let parse_term = |s: String| crate::parser::ntriples::parse_term(&s).unwrap();
+    let pred = |id: u32| d.pred(id).map(|t| t.to_string()).unwrap();
+    let n = 1 + rng.below(3);
+    let anchor = triples[rng.below(triples.len())];
+    (0..n)
+        .map(|_| {
+            // Mostly edges of the anchor's subject (non-empty stars).
+            let t = if rng.chance(70) {
+                let own: Vec<&IdTriple> = triples.iter().filter(|t| t.sub == anchor.sub).collect();
+                *own[rng.below(own.len())]
+            } else {
+                triples[rng.below(triples.len())]
+            };
+            let p = PatternTerm::Term(Term::iri(pred(t.pred).trim_matches(['<', '>']).to_string()));
+            if rng.chance(75) {
+                TriplePattern {
+                    subject: PatternTerm::Var("a".into()),
+                    predicate: p,
+                    object: PatternTerm::Term(parse_term(term(t.obj))),
+                }
+            } else {
+                TriplePattern {
+                    subject: PatternTerm::Term(parse_term(term(t.sub))),
+                    predicate: p,
+                    object: PatternTerm::Var("a".into()),
+                }
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn shortcuts_give_the_plain_plans_rows_in_order() {
+    for seed in 11..=14u64 {
+        let (d, store) = graph(seed);
+        let triples: Vec<IdTriple> = TripleSource::iter_all(&store);
+        let tmp = TempDir::new("plain");
+        let mem = VsTree::build(entries(&store));
+        let disk = VsTree::build_disk(tmp.0.join("vstree.kv"), entries(&store)).unwrap();
+        let mut rng = Rng(seed * 31 + 7);
+        let mut stars = 0;
+        for i in 0..200 {
+            let tps = if i % 2 == 0 {
+                star(&mut rng, &triples, &d)
+            } else {
+                bgp(&mut rng)
+            };
+            for tree in [&mem, &disk] {
+                for policy in [VsPolicy::Auto, VsPolicy::Tree, VsPolicy::Off] {
+                    PLAIN_PLANS.with(|f| f.set(true));
+                    let want = rows_under(&d, &store, tree, &tps, policy);
+                    PLAIN_PLANS.with(|f| f.set(false));
+                    let got = rows_under(&d, &store, tree, &tps, policy);
+                    assert_eq!(got, want, "seed {seed} query {i}: {}", select_text(&tps));
+                    if i % 2 == 0 && !got.is_empty() {
+                        stars += 1;
+                    }
+                }
+            }
+        }
+        assert!(stars > 50, "too few stars with solutions: {stars}");
+    }
+}

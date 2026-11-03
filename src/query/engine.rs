@@ -2694,7 +2694,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // FilterPlan/CompleteCandidate), optionally refined by the VS-tree.
         // Counts the optimizer asks for again come from one memo.
         let counts = CountMemo::new(self.store);
-        let mut candidates = candidates::generate(&plans, &counts);
+        let mut candidates =
+            candidates::generate_noting(&plans, &counts, &mut |edge, len| counts.note(edge, len));
         self.refine_candidates_with_vstree(&mut candidates, tps, layout);
         // StringIndex: mandatory-substring filters (CONTAINS/STRSTARTS/STRENDS/
         // plain REGEX) prune or seed candidate sets — a sound superset, so only
@@ -2708,13 +2709,23 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // Cost-based plan: optimal left-deep order, plus a binary-join (bushy)
         // tree when one is strictly cheaper. Memoised so a structurally-identical
         // BGP reuses the enumeration (gStore `plan_cache`).
-        let key = plans_key(&plans);
-        let plan = self
-            .plan_cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
-            .clone();
+        let plan = if plans.len() <= 3 && constant_star(&plans) && !plain_plans() {
+            // A star of constant edges: its solutions are the variable's
+            // candidates in ascending order whatever the join order (see
+            // `constant_star`), so it needs no plan search — nor the counts
+            // the search asks for.
+            ExecPlan {
+                order: (0..plans.len()).collect(),
+                tree: None,
+            }
+        } else {
+            let key = plans_key(&plans);
+            self.plan_cache
+                .borrow_mut()
+                .entry(key)
+                .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
+                .clone()
+        };
         PreparedBgp::Plan(topk::BgpPlan {
             plans,
             cands: candidates,
@@ -3294,6 +3305,38 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             slot_known(&plan.p, binding),
             slot_known(&plan.o, binding),
         );
+        // One constant end and a variable end with few candidates: test each
+        // candidate (ascending) instead of reading the list — the same
+        // triples in the same (ascending) order, the list filtered by the
+        // candidates. "Few" against the predicate's average list length.
+        match known {
+            _ if plain_plans() => {}
+            (None, Some(p), Some(o)) => {
+                let avg = self.store.pred_card(p) / self.store.pred_distinct_obj(p).max(1);
+                if let Some(subjects) =
+                    s_cands.filter(|c| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < avg)
+                {
+                    return subjects
+                        .iter()
+                        .filter(|&&s| self.store.exists(s, p, o))
+                        .map(|&s| (s, p, o))
+                        .collect();
+                }
+            }
+            (Some(s), Some(p), None) => {
+                let avg = self.store.pred_card(p) / self.store.pred_distinct_subj(p).max(1);
+                if let Some(objects) =
+                    o_cands.filter(|c| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < avg)
+                {
+                    return objects
+                        .iter()
+                        .filter(|&&o| self.store.exists(s, p, o))
+                        .map(|&o| (s, p, o))
+                        .collect();
+                }
+            }
+            _ => {}
+        }
         if let (None, Some(p), None) = known {
             let card = self.store.pred_card(p);
             let small = |c: &[u32]| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < card;
@@ -6164,6 +6207,50 @@ fn slot_candidates<'c>(slot: &Slot, cands: &'c Candidates) -> Option<&'c [u32]> 
 /// `cand_ok` with the set looked up beforehand.
 fn in_candidates(set: Option<&[u32]>, value: u32) -> bool {
     set.is_none_or(|list| list.binary_search(&value).is_ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests turn the constant-star plan and the candidate tests of
+    /// `candidate_triples_in` off on this thread, to compare with the plain
+    /// optimizer and scans.
+    static PLAIN_PLANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn plain_plans() -> bool {
+    #[cfg(test)]
+    {
+        PLAIN_PLANS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Whether every pattern binds the same single variable, at its subject or
+/// its object, with the other two positions constant (`?x p o`, `s p ?x`): a
+/// star of constant edges. Candidate generation intersects all of them into
+/// the variable's set, so in a left-deep pipeline the first pattern yields
+/// the set's members (its list in ascending order, filtered by the set) and
+/// every later one keeps them all (an `exists` test): the solutions are the
+/// set in ascending order whichever pattern comes first. (From four patterns
+/// on the optimizer may choose a bushy hash-join tree, whose output order
+/// differs; callers apply this to at most three.)
+fn constant_star(plans: &[PatPlan]) -> bool {
+    let mut var = None;
+    for plan in plans {
+        let v = match (&plan.s, &plan.p, &plan.o) {
+            (Slot::Var(v), Slot::Const(_), Slot::Const(_))
+            | (Slot::Const(_), Slot::Const(_), Slot::Var(v)) => *v,
+            _ => return false,
+        };
+        if *var.get_or_insert(v) != v {
+            return false;
+        }
+    }
+    var.is_some()
 }
 
 /// A predicate scan is replaced by candidate lookups when the candidates

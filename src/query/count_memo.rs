@@ -19,6 +19,7 @@ use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 use crate::store::TripleSource;
 
+use super::candidates::ConstEdge;
 use super::engine::FxBuildHasher;
 
 /// Which count a memo entry holds.
@@ -47,6 +48,17 @@ impl<'s, S: TripleSource> CountMemo<'s, S> {
             inner,
             counts: RefCell::new(HashMap::default()),
         }
+    }
+
+    /// Record the exact length of a list read whole (its C1 count).
+    pub(crate) fn note(&self, edge: ConstEdge, len: u64) {
+        let key = match edge {
+            ConstEdge::SubjOf(p, o) => (Count::SByPo, p, o),
+            ConstEdge::ObjOf(s, p) => (Count::OBySp, s, p),
+            // Distinct values, not the counted pairs.
+            ConstEdge::SubjOfAny(_) | ConstEdge::ObjOfAny(_) => return,
+        };
+        self.counts.borrow_mut().insert(key, len);
     }
 
     fn memo(&self, key: (Count, u32, u32), count: impl FnOnce() -> u64) -> u64 {
@@ -258,6 +270,10 @@ mod tests {
             assert_eq!(memo.count_s_by_po(1, 4), 0);
         }
         assert_eq!(src.asked.get(), 3, "each count asked once");
+        // A noted list length answers without asking.
+        memo.note(ConstEdge::SubjOf(0, 7), 0);
+        assert_eq!(memo.count_s_by_po(0, 7), 0);
+        assert_eq!(src.asked.get(), 3);
         // The other counts and every list equal the store's.
         let st = &src.store;
         for x in 0..10 {
