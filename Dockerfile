@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p gstore --bins ${FEATURES:+--features "$FEATURES"} \
     && mkdir -p /out \
-    && for b in gserver gconsole gbuild gquery gadd gsub gdrop gshow gbackup grestore gexport gmonitor gnode; do \
+    && for b in gserver gconsole gbuild gquery gadd gsub gdrop gshow gbackup grestore gexport gmonitor gcompact gnode; do \
          cp "target/release/$b" /out/; \
        done
 
