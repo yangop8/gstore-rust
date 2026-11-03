@@ -14,6 +14,10 @@
 //!   answer `true` on a read error — never free an id when in doubt) or the
 //!   named graphs count it (`NamedGraphs::node_refs`, which includes graph
 //!   IRIs); a predicate while `has_predicate` or `NamedGraphs::pred_refs`.
+//!   Each candidate is decided on its own probes: one a read error left in
+//!   doubt is neither freed nor dropped but checked again at the next
+//!   statement, up to [`CHECK_ATTEMPTS`] checks (then `gcompact --reclaim`
+//!   finds it), and holds back no other candidate's free.
 //! * **Sequence.** The free is persisted first (Materialize: a key-level
 //!   `DiskOp::Free`; Stream: `DiskTriples::free_ids` under the writer gate;
 //!   RocksDB: a `dict` CF delete batch after the triple batch, or in the
@@ -166,18 +170,27 @@ impl Candidates {
     }
 }
 
+/// How many checks a candidate whose reference probe keeps failing gets
+/// before it is given up — left allocated, for `gcompact --reclaim`: a
+/// transient read error is retried, an unreadable index page does not make
+/// every later statement probe it again.
+pub(crate) const CHECK_ATTEMPTS: u32 = 4;
+
 /// Candidates whose free waits (see [`Database::ready_frees`]): on a
 /// Stream-mode database, for the dictionary's pins; on any layout, after a
-/// read error stopped the check of whether they are still referenced. Each
-/// carries the stamp of its latest candidacy, from the dictionary's pin
-/// clock ([`Dictionary::pin_clock`](crate::dict::Dictionary::pin_clock)): a
-/// pin taken before that stamp may have read the id while a triple still
-/// used it, one taken after cannot. Kept ordered by stamp, so finding the
-/// ones no live pin predates reads nothing else.
+/// read error stopped the check of whether one of them is still referenced
+/// (up to [`CHECK_ATTEMPTS`] checks). Each carries the stamp of its latest
+/// candidacy, from the dictionary's pin clock
+/// ([`Dictionary::pin_clock`](crate::dict::Dictionary::pin_clock)): a pin
+/// taken before that stamp may have read the id while a triple still used
+/// it, one taken after cannot. Kept ordered by stamp, so finding the ones no
+/// live pin predates reads nothing else.
 #[derive(Debug, Default)]
 pub(crate) struct Deferred {
     stamp_of: HashMap<TermId, u64>,
     by_stamp: BTreeSet<(u64, TermId)>,
+    /// The checks in a row whose probe of the candidate failed.
+    failures: HashMap<TermId, u32>,
 }
 
 impl Deferred {
@@ -194,6 +207,7 @@ impl Deferred {
     pub(crate) fn clear(&mut self) {
         self.stamp_of.clear();
         self.by_stamp.clear();
+        self.failures.clear();
     }
 
     /// `t` is a candidate again as of `stamp` (a later candidacy replaces an
@@ -205,16 +219,35 @@ impl Deferred {
         self.by_stamp.insert((stamp, t));
     }
 
-    /// Put back candidates [`take_ready`](Self::take_ready) handed out whose
-    /// check could not finish: they stay ready (no pin taken since can
-    /// predate them), unless a newer candidacy is already recorded.
-    fn requeue(&mut self, ids: Vec<TermId>) {
-        for t in ids {
+    /// Record the check of `checked` (handed out by
+    /// [`take_ready`](Self::take_ready)) whose probes of `failed` (sorted)
+    /// could not be read: those are put back, ready (no pin taken since can
+    /// predate them) unless a newer candidacy is already recorded — except
+    /// the ones whose probe failed [`CHECK_ATTEMPTS`] times in a row, which
+    /// are returned, given up. The others' failure counts are forgotten.
+    fn record_check(&mut self, checked: &[TermId], failed: Vec<TermId>) -> Vec<TermId> {
+        if !self.failures.is_empty() {
+            for t in checked {
+                if failed.binary_search(t).is_err() {
+                    self.failures.remove(t);
+                }
+            }
+        }
+        let mut given_up = Vec::new();
+        for t in failed {
+            let n = self.failures.entry(t).or_insert(0);
+            *n += 1;
+            if *n >= CHECK_ATTEMPTS {
+                self.failures.remove(&t);
+                given_up.push(t);
+                continue;
+            }
             if let std::collections::hash_map::Entry::Vacant(e) = self.stamp_of.entry(t) {
                 e.insert(0);
                 self.by_stamp.insert((0, t));
             }
         }
+        given_up
     }
 
     /// Take the candidates stamped before `oldest_pin` (every one when no
@@ -251,6 +284,17 @@ pub struct IdSpaceStats {
     /// Whether the layout can free ids (`false` for a pre-Phase-6
     /// `kvstore.kv` until `gcompact --enable-reclaim`).
     pub enabled: bool,
+}
+
+/// The outcome of [`Database::dead_of`].
+#[derive(Debug, Default)]
+pub(super) struct RefCheck {
+    /// The candidates nothing references.
+    pub(super) dead: Vec<TermId>,
+    /// The candidates whose probe a read error stopped (sorted).
+    pub(super) failed: Vec<TermId>,
+    /// The first of those read errors.
+    pub(super) error: Option<String>,
 }
 
 // ---- the Database side ------------------------------------------------------
@@ -309,9 +353,8 @@ impl Database {
         }
         let cands = self.reclaim.take();
         let ready = self.ready_frees(cands);
-        if let Some(dead) = self.dead_or_requeue(ready) {
-            self.free_dead(dead, false);
-        }
+        let dead = self.dead_or_requeue(ready);
+        self.free_dead(dead, false);
     }
 
     /// At commit (the transaction just closed): the transaction's candidates
@@ -325,7 +368,7 @@ impl Database {
         }
         let cands = self.reclaim.take();
         let ready = self.ready_frees(cands);
-        self.dead_or_requeue(ready).unwrap_or_default()
+        self.dead_or_requeue(ready)
     }
 
     /// Whether frees wait (see [`Deferred`]): for the dictionary's pins, or
@@ -361,7 +404,7 @@ impl Database {
     ///
     /// Other layouts keep a pinned id retired in the in-memory dictionary
     /// instead (see [`free_dead`](Self::free_dead)): every candidate is
-    /// ready, with any put back after a read error.
+    /// ready, with any whose probe a read error stopped put back.
     fn ready_frees(&mut self, cands: Vec<TermId>) -> Vec<TermId> {
         let oldest_pin = if self.store.as_disk().is_some() {
             self.dict.oldest_pin()
@@ -380,27 +423,34 @@ impl Database {
         self.reclaim_deferred.take_ready(oldest_pin)
     }
 
-    /// [`dead_of`](Self::dead_of) `ready`; when a read failed, `None`, and
-    /// the candidates wait for the next statement's check instead of being
-    /// dropped (they would stay allocated until `gcompact --reclaim`).
-    fn dead_or_requeue(&mut self, ready: Vec<TermId>) -> Option<Vec<TermId>> {
+    /// The candidates of `ready` nothing references ([`dead_of`](Self::dead_of)).
+    /// One whose probe a read error stopped waits for the next statement's
+    /// check instead of being dropped — the others' are decided on their own
+    /// probes, so it holds back no other free — for [`CHECK_ATTEMPTS`]
+    /// checks; then it is left allocated (`gcompact --reclaim` frees it), so
+    /// an unreadable page does not make every later statement probe it.
+    fn dead_or_requeue(&mut self, ready: Vec<TermId>) -> Vec<TermId> {
         if ready.is_empty() {
-            return Some(ready);
+            return ready;
         }
-        match self.dead_of(&ready) {
-            Some(dead) => Some(dead),
-            None => {
-                self.reclaim_deferred.requeue(ready);
-                None
-            }
+        let check = self.dead_of(&ready);
+        let given_up = self.reclaim_deferred.record_check(&ready, check.failed);
+        if !given_up.is_empty() {
+            crate::gs_warn!(
+                "id reclamation: the reference check of {} deleted term(s) failed {CHECK_ATTEMPTS} \
+                 times ({}); their ids stay allocated until `gcompact --reclaim`",
+                given_up.len(),
+                check.error.as_deref().unwrap_or("a read error")
+            );
         }
+        check.dead
     }
 
     /// Whether term `t` is still used: by the default graph (the `has_*`
     /// probes answer `true` on a read error) or the named graphs.
     fn term_referenced(&self, t: TermId) -> bool {
         #[cfg(test)]
-        test_hooks::probed();
+        test_hooks::probed(t);
         match t.space {
             Space::Predicate => self.named.pred_refs(t.id) > 0 || self.store.has_predicate(t.id),
             Space::Entity | Space::Literal => {
@@ -411,26 +461,36 @@ impl Database {
         }
     }
 
-    /// The candidates nothing references (and, in memory, that still name a
-    /// term). Read in a scope of its own: `None` when a read failed — some
-    /// probe answered "referenced", but be strict and free nothing of this
-    /// batch.
-    pub(super) fn dead_of(&self, cands: &[TermId]) -> Option<Vec<TermId>> {
-        let scope = ReadScope::enter();
+    /// Check `cands` (sorted): the ones nothing references (and, in memory,
+    /// that still name a term), and the ones a read error left undecided.
+    /// Each probe reads in a scope of its own, so a failed one decides
+    /// nothing but its own candidate (its answer, "referenced", may be
+    /// wrong: be strict and neither free it nor drop it).
+    pub(super) fn dead_of(&self, cands: &[TermId]) -> RefCheck {
         let backed = self.dict.is_disk_backed();
-        let dead: Vec<TermId> = cands
-            .iter()
-            .copied()
-            .filter(|&t| {
-                (backed || self.dict.resolve(t.space, t.id).is_some()) && !self.term_referenced(t)
-            })
-            .collect();
         #[cfg(test)]
-        test_hooks::maybe_fail_read();
-        if scope.take_error().is_some() {
-            return None;
+        let fail_all = test_hooks::take_fail_next();
+        let mut check = RefCheck::default();
+        for &t in cands {
+            if !backed && self.dict.resolve(t.space, t.id).is_none() {
+                continue;
+            }
+            let scope = ReadScope::enter();
+            let referenced = self.term_referenced(t);
+            #[cfg(test)]
+            if fail_all {
+                crate::store::read_scope::note_read_error("injected reference-probe read error");
+            }
+            match scope.take_error() {
+                Some(e) => {
+                    check.error.get_or_insert(e);
+                    check.failed.push(t);
+                }
+                None if !referenced => check.dead.push(t),
+                None => {}
+            }
         }
-        Some(dead)
+        check
     }
 
     /// Free the unreferenced ids `dead` on this database's layout (see the
@@ -490,7 +550,15 @@ impl Database {
             ));
         }
         let cands = self.all_terms()?;
-        let dead = self.dead_of(&cands).unwrap_or_default();
+        let check = self.dead_of(&cands);
+        if !check.failed.is_empty() {
+            crate::gs_warn!(
+                "reclaim_unused: {} term(s) not checked ({}); left allocated",
+                check.failed.len(),
+                check.error.as_deref().unwrap_or("a read error")
+            );
+        }
+        let dead = check.dead;
         let n = if self.store.as_disk().is_some() && self.dict.is_pinned() {
             // A clone sharing the on-disk dictionary may still read these
             // ids (when they died is not known): they wait for every pin
@@ -626,19 +694,34 @@ impl Database {
 }
 
 /// Test-only instrumentation of the reclamation check: a count of the
-/// reference probes (`term_referenced`) this thread ran, and a one-shot
-/// injected read error in the next [`Database::dead_of`].
+/// reference probes (`term_referenced`) this thread ran, a one-shot injected
+/// read error in every probe of the next [`Database::dead_of`], and a term
+/// every probe of fails.
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::cell::Cell;
 
+    use crate::dict::TermId;
+
     thread_local! {
         static PROBES: Cell<u64> = const { Cell::new(0) };
         static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+        static UNREADABLE: Cell<Option<TermId>> = const { Cell::new(None) };
     }
 
-    pub(super) fn probed() {
+    /// A reference probe of `t`: counted, and failing (a read error) while
+    /// `t` is [unreadable](set_unreadable).
+    pub(super) fn probed(t: TermId) {
         PROBES.with(|p| p.set(p.get() + 1));
+        if UNREADABLE.with(Cell::get) == Some(t) {
+            crate::store::read_scope::note_read_error("injected unreadable index page");
+        }
+    }
+
+    /// Make every reference probe of `t` on this thread record a read error
+    /// (an unreadable index page under its key), or none with `None`.
+    pub(crate) fn set_unreadable(t: Option<TermId>) {
+        UNREADABLE.with(|u| u.set(t));
     }
 
     /// Reference probes run on this thread so far.
@@ -646,15 +729,14 @@ pub(crate) mod test_hooks {
         PROBES.with(Cell::get)
     }
 
-    /// Make the next check of this thread record a read error.
+    /// Make every probe of the next check of this thread record a read
+    /// error.
     pub(crate) fn fail_next_check() {
         FAIL_NEXT.with(|f| f.set(true));
     }
 
-    pub(super) fn maybe_fail_read() {
-        if FAIL_NEXT.with(|f| f.replace(false)) {
-            crate::store::read_scope::note_read_error("injected reference-probe read error");
-        }
+    pub(super) fn take_fail_next() -> bool {
+        FAIL_NEXT.with(|f| f.replace(false))
     }
 }
 

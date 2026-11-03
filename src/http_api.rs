@@ -2164,6 +2164,52 @@ impl ApiInner {
     }
 }
 
+/// The registry's bookkeeping for a database a REST `/build` built under
+/// `name` for `creator` (`vanished`: a registered name whose directory was
+/// removed outside the server — the new database must not inherit its
+/// grants). Best effort: the registry is reconciled with the database
+/// directories at every start anyway.
+fn register_built(st: &mut ApiState, name: &str, vanished: bool, creator: &str) {
+    if vanished {
+        let _ = st.users.forget_database(name);
+    }
+    let _ = st.sysdb.register(name, creator);
+}
+
+/// Test-only: work a test arms to run inside the REST bulk build of a
+/// directory, right before the bulk loader starts (the request has sampled
+/// whether the directory existed and retired a loaded copy).
+#[cfg(test)]
+pub(crate) mod build_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` in the next REST bulk build of `dir`.
+    pub(crate) fn set(dir: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.to_path_buf(), Box::new(hook)));
+    }
+
+    pub(super) fn run(dir: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+            hooks
+                .iter()
+                .position(|(d, _)| d == dir)
+                .map(|i| hooks.remove(i).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Releases a [`ApiState::busy`] reservation when dropped (also on a panic).
 pub(crate) struct BusyGuard<'a> {
     pub(crate) inner: &'a ApiInner,
@@ -3618,23 +3664,31 @@ impl ApiInner {
             };
             // A rebuilt database replaces the loaded one: retire it (closing
             // its files and releasing its handle on the directory) before its
-            // directory is rewritten, as a drop does; the new one is served
-            // below.
-            if let Err(e) = inner.retire_loaded(&name) {
-                return e.rest();
-            }
-            {
+            // directory is rewritten, as a drop does — saved first when it
+            // holds acknowledged writes not yet saved (check_point off); the
+            // new one is served below.
+            let was_loaded = match inner.retire_loaded_saved(&name) {
+                Ok(loaded) => loaded,
+                Err(r) => return r,
+            };
+            let installed = {
                 // No `reasonManage` file operation is half-way through the
                 // rule directory meanwhile. A rebuild replaces the database,
                 // as a drop and a build do: the old one's rules (executed,
                 // with ledgers naming triples the new data asserts) go.
                 let _rules = RuleStore::dir(&dir).lock();
-                if let Err(e) = crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR)) {
-                    return Resp::fail(500, &format!("build failed: {e}"));
+                crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR))
+                    .map_err(|e| format!("build failed: {e}"))
+                    .and_then(|()| db.save(&dir).map_err(|e| format!("save failed: {e}")))
+            };
+            if let Err(msg) = installed {
+                // The snapshot set is replaced atomically: the directory
+                // holds the previous database (saved above), served again
+                // with every write it acknowledged.
+                if was_loaded {
+                    inner.serve_again(&name, &dir);
                 }
-                if let Err(e) = db.save(&dir) {
-                    return Resp::fail(500, &format!("save failed: {e}"));
-                }
+                return Resp::fail(500, &msg);
             }
             inner.serve_built(&name, db, dir, vanished, &creator)
         }))
@@ -3655,13 +3709,26 @@ impl ApiInner {
         let mut st = locked(&self.state);
         let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
         st.dbs.insert(name.to_string(), slot);
-        // Registry bookkeeping (best effort: the registry is reconciled
-        // with the database directories at every start anyway).
-        if vanished {
-            let _ = st.users.forget_database(name);
-        }
-        let _ = st.sysdb.register(name, creator);
+        register_built(&mut st, name, vanished, creator);
         Resp::ok(&format!("database '{name}' built ({triples} triples)"))
+    }
+
+    /// Serve the database at `dir` again under `name`: a rebuild that failed
+    /// after it retired the loaded copy left the previous database there
+    /// (saved before it was retired). Best effort: one that does not open
+    /// stays unloaded.
+    fn serve_again(&self, name: &str, dir: &Path) {
+        if let Ok(db) = self.open_db(dir) {
+            let mut st = locked(&self.state);
+            let slot = DbSlot::handle(
+                db,
+                dir.to_path_buf(),
+                false,
+                &st.load_policy,
+                &st.query_settings,
+            );
+            st.dbs.insert(name.to_string(), slot);
+        }
     }
 
     /// REST `/build` in the on-disk or RocksDB `layout`, through the bulk
@@ -3671,16 +3738,21 @@ impl ApiInner {
     /// handle on the directory) — saved first when it holds acknowledged
     /// writes not yet saved (check_point off) — and this request's probe of
     /// the lock — refusing a directory another process holds — is released
-    /// before the build starts. The rule-directory lock is held through the
-    /// build (no `reasonManage` file operation runs while the install
-    /// replaces the rules). The result is then opened and served.
+    /// before the build starts. No rule-directory lock is held while it
+    /// loads (a `reasonManage` request would wait for the whole build): the
+    /// install takes it to remove the replaced rules. The result is then
+    /// opened and served.
     ///
     /// A build that fails leaves the previous database in place (a loaded
     /// one is served again, with every write it acknowledged) or, for a new
-    /// name, no directory. A build whose install committed but could not
-    /// finish its cleanup ([`BulkReport::warnings`](crate::bulk::BulkReport)
-    /// — the replaced layout or rules still there) is reported as failed and
-    /// not served: opening it might read what was left behind.
+    /// name, no directory (removed under its lock, and only when it holds no
+    /// database: one another process created meanwhile is left alone). A
+    /// build whose install committed but could not finish its cleanup
+    /// ([`BulkReport::warnings`](crate::bulk::BulkReport) — the replaced
+    /// layout or rules still there) is reported as failed and not served:
+    /// opening it might read what was left behind (the registry is updated
+    /// all the same). A staging area left behind is only logged: no open
+    /// reads it.
     fn rest_build_bulk(
         &self,
         name: &str,
@@ -3726,39 +3798,36 @@ impl ApiInner {
             Ok(loaded) => loaded,
             Err(r) => return r,
         };
-        let built = {
-            let _rules = RuleStore::dir(dir).lock();
-            crate::bulk::build(
-                dir,
-                name,
-                input,
-                &opts,
-                &mut (),
-                bulk_target(layout),
-                &self.config().bulk_options(),
-            )
-        };
+        #[cfg(test)]
+        build_hooks::run(dir);
+        let built = crate::bulk::build(
+            dir,
+            name,
+            input,
+            &opts,
+            &mut (),
+            bulk_target(layout),
+            &self.config().bulk_options(),
+        );
         let report = match built {
             Ok(report) => report,
             Err(e) => {
                 if was_loaded {
                     // The previous database is intact: serve it again.
-                    if let Ok(db) = self.open_db(dir) {
-                        let mut st = locked(&self.state);
-                        let slot = DbSlot::handle(
-                            db,
-                            dir.to_path_buf(),
-                            false,
-                            &st.load_policy,
-                            &st.query_settings,
-                        );
-                        st.dbs.insert(name.to_string(), slot);
-                    }
+                    self.serve_again(name, dir);
                 } else if !existed {
                     // A new name: the build made the directory (and its
                     // lock file); a failed build leaves none behind, as the
-                    // snapshot layout's and `/api build` do.
-                    let _ = fs::remove_dir_all(dir);
+                    // snapshot layout's and `/api build` do. Under its lock
+                    // (the build released its own), and only when it holds
+                    // no database: another process (a `gbuild` of the same
+                    // name) may have created it meanwhile — the reason this
+                    // build failed, maybe — and is left alone.
+                    if let Ok(Some(_lock)) = DirLock::acquire_existing(dir) {
+                        if Database::storage_kind(dir).is_none() {
+                            let _ = fs::remove_dir_all(dir);
+                        }
+                    }
                 }
                 return Resp::fail(400, &format!("build failed: {e}"));
             }
@@ -3766,16 +3835,26 @@ impl ApiInner {
         if !report.warnings.is_empty() {
             let warnings = report.warnings.join("; ");
             crate::gs_warn!("REST /build of '{name}': the install did not finish: {warnings}");
+        }
+        if !report.opens_as_built() {
+            let warnings = report.warnings.join("; ");
+            // Not served, but built: the registry's bookkeeping still runs
+            // (a dropped database's grants must not reach the new data).
+            register_built(&mut locked(&self.state), name, vanished, creator);
             return Resp::fail(
                 500,
                 &format!(
-                    "database '{name}' was built, but its install did not finish ({warnings});                      it is not loaded: remove what was left behind, then load it"
+                    "database '{name}' was built, but its install did not finish ({warnings}); \
+                     it is not loaded: remove what was left behind, then load it"
                 ),
             );
         }
         match self.open_db(dir) {
             Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
-            Err(e) => Resp::fail(500, &format!("built, but opening it failed: {e}")),
+            Err(e) => {
+                register_built(&mut locked(&self.state), name, vanished, creator);
+                Resp::fail(500, &format!("built, but opening it failed: {e}"))
+            }
         }
     }
 
@@ -8708,6 +8787,182 @@ mod tests {
             !locked(&server.inner.state).dbs.contains_key("w"),
             "not served"
         );
+        server.shutdown();
+    }
+
+    /// A snapshot-layout REST rebuild that fails after the loaded database
+    /// was retired (here: the old rules cannot be removed) keeps every write
+    /// the loaded copy acknowledged but had not saved (check_point off): it
+    /// is saved before it is retired and served again from its directory.
+    /// The writes used to be lost, and the database left unloaded.
+    #[test]
+    fn a_failed_snapshot_rebuild_keeps_the_acknowledged_writes() {
+        let (server, addr) = start_cp("snap_build_keeps", false);
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        let ask = "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }";
+        assert_eq!(post("/build?db_name=x&layout=snapshot", data).0, 200);
+        let (s, b) = post(
+            "/update?db_name=x",
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        );
+        assert_eq!(s, 200, "{b}");
+        // A file where the rule directory belongs cannot be removed as one.
+        fs::write(
+            server.root_dir().join("x.db").join(RULE_DIR),
+            "not a directory",
+        )
+        .unwrap();
+        let (s, b) = post("/build?db_name=x&layout=snapshot", data);
+        assert_eq!(s, 500, "{b}");
+        let (s, b) = post("/sparql?db_name=x", ask);
+        assert_eq!(s, 200, "served again: {b}");
+        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+        server.shutdown();
+    }
+
+    /// A REST bulk build does not hold the rule directory's lock while it
+    /// loads: a `reasonManage` check of the database answers at once (it
+    /// used to wait for the whole build — every such request a worker
+    /// thread held for the build's duration).
+    #[test]
+    fn a_rest_bulk_build_holds_no_rule_lock_while_it_loads() {
+        let (server, addr) = start("bulk_build_rule_lock");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        assert_eq!(post("/build?db_name=big&layout=disk", data).0, 200);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        build_hooks::set(&server.root_dir().join("big.db"), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let builder = {
+            let auth = auth.clone();
+            std::thread::spawn(move || {
+                split_status_body(&raw_request(
+                    &addr,
+                    "POST",
+                    "/build?db_name=big&layout=disk",
+                    Some(&auth),
+                    data,
+                ))
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the build started");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let body = api_body(
+                r#""operation":"reasonManage","db_name":"big","type":"8","rulename":"r1""#,
+            );
+            let _ = tx.send(split_status_body(&raw_request(
+                &addr, "POST", "/api", None, &body,
+            )));
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        let (s, b) = builder.join().unwrap();
+        assert_eq!(s, 200, "{b}");
+        let (_, b) = answered.expect("reasonManage answered while the build loads");
+        assert!(b.contains("not exist"), "{b}");
+        server.shutdown();
+    }
+
+    /// A failed REST bulk build of a new name removes the directory it made
+    /// only under the directory's lock: one another process created and
+    /// locked meanwhile (a `gbuild` of the same name) is left alone — it
+    /// used to be deleted under that process.
+    #[test]
+    fn a_failed_rest_bulk_build_leaves_a_directory_another_process_locked() {
+        let (server, addr) = start("bulk_build_foreign_lock");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let dir = server.root_dir().join("race.db");
+        let held = Arc::new(Mutex::new(None::<fs::File>));
+        {
+            let (dir, held) = (dir.clone(), Arc::clone(&held));
+            build_hooks::set(&dir.clone(), move || {
+                // The other process: its own descriptor of `LOCK`, locked.
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("other-process-work"), "x").unwrap();
+                let f = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(dir.join(crate::db::dirlock::LOCK_FILE))
+                    .unwrap();
+                f.try_lock().unwrap();
+                *held.lock().unwrap() = Some(f);
+            });
+        }
+        let (s, b) = post(
+            "/build?db_name=race&layout=disk",
+            "<http://ex/a> <http://ex/p> <http://ex/b> .",
+        );
+        assert_eq!(s, 400, "{b}");
+        assert!(b.contains("locked by another process"), "{b}");
+        assert!(
+            dir.join("other-process-work").is_file(),
+            "the other process's directory is left alone"
+        );
+        drop(held.lock().unwrap().take());
+        server.shutdown();
+    }
+
+    /// A REST bulk build whose install did not finish (not served) still
+    /// does the registry's bookkeeping: a name dropped outside the server
+    /// loses its old grants — the new data must not inherit them — and a
+    /// new name is registered. Neither happened: the old grants applied to
+    /// the new data once it was loaded.
+    #[test]
+    fn an_unfinished_rest_bulk_build_still_updates_the_registry() {
+        let (server, addr) = start("bulk_build_registry");
+        let auth = basic("root", "root");
+        let post = |target: &str, body: &str| {
+            split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        assert_eq!(post("/build?db_name=x&layout=disk", data).0, 200);
+        {
+            let mut st = locked(&server.inner.state);
+            st.users.add("bob", "bob-pw", BTreeSet::new()).unwrap();
+            st.users
+                .grant_on("bob", "x", &BTreeSet::from([Privilege::Query]))
+                .unwrap();
+        }
+        assert_eq!(post("/unload?db_name=x", "").0, 200);
+        // Dropped outside the server (`gdrop`): still registered.
+        fs::remove_dir_all(server.root_dir().join("x.db")).unwrap();
+        for name in ["x", "fresh"] {
+            let dir = server.root_dir().join(format!("{name}.db"));
+            // The install cannot remove the rule directory: a file there.
+            build_hooks::set(&dir.clone(), move || {
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join(RULE_DIR), "not a directory").unwrap();
+            });
+            let (s, b) = post(&format!("/build?db_name={name}&layout=disk"), data);
+            assert_eq!(s, 500, "{name}: {b}");
+            assert!(b.contains("install did not finish"), "{name}: {b}");
+        }
+        let st = locked(&server.inner.state);
+        assert!(
+            !st.users.get("bob").unwrap().has_on(Privilege::Query, "x"),
+            "the dropped database's grant is gone"
+        );
+        assert!(st.sysdb.contains("fresh"), "the new name is registered");
+        assert!(!st.dbs.contains_key("x") && !st.dbs.contains_key("fresh"));
+        drop(st);
         server.shutdown();
     }
 

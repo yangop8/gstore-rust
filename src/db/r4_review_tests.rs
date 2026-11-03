@@ -12,6 +12,7 @@ use super::open_options::{DiskQueryMode, OpenOptions};
 use super::reclaim::test_hooks;
 use super::*;
 use crate::concurrent::ConcurrentDb;
+use crate::dict::TermId;
 
 /// The temp directories the current test thread made, removed when the
 /// thread ends — also when the test fails (a thread-local's destructor runs
@@ -206,6 +207,70 @@ fn a_read_error_in_the_reference_check_keeps_the_candidates() {
             0,
             "no orphan (stream={stream})"
         );
+    }
+}
+
+/// One candidate whose reference probe keeps failing (an unreadable index
+/// page under its key) holds back no other free: every candidate is decided
+/// on its own probe, only the failing one waits — for a few checks, then it
+/// is left allocated for `gcompact --reclaim` — so a statement's check costs
+/// its own candidates, not a backlog growing with every delete (the whole
+/// batch used to wait, and every later statement re-probed it all: 3, 5,
+/// 7, …, 81 probes for 40 single deletes, none freed).
+#[test]
+fn an_unreadable_candidate_holds_back_no_other_free() {
+    let n = 40;
+    let data = format!(
+        "{}<http://ex/bad> <http://ex/q> <http://ex/badobj> .\n",
+        pairs(n)
+    );
+    let base = tmp_dir("unreadable_id");
+    for stream in [false, true] {
+        let mut db = if stream {
+            open_stream(&build_disk(&base, "d", &data))
+        } else {
+            Database::build_from_str("m", &data).unwrap()
+        };
+        let bad = TermId::node(db.dict().entity_id(&iri("bad").dict_key()).unwrap());
+        test_hooks::set_unreadable(Some(bad));
+        assert!(db.remove_triple(&Triple::new(iri("bad"), iri("q"), iri("badobj"))));
+        assert!(
+            known(&db, "bad"),
+            "its probe failed: kept (stream={stream})"
+        );
+        assert!(
+            !known(&db, "badobj"),
+            "the rest of its batch is freed (stream={stream})"
+        );
+        let mut probes = Vec::new();
+        for i in 0..n {
+            let before = test_hooks::probes();
+            assert!(db.remove_triple(&pair(i)));
+            probes.push(test_hooks::probes() - before);
+            for t in [format!("s{i}"), format!("o{i}")] {
+                assert!(!known(&db, &t), "{t} freed at once (stream={stream})");
+            }
+        }
+        assert!(
+            probes.iter().all(|&p| p <= 4),
+            "s_i, p, o_i and at most the failing one per statement: {probes:?} \
+             (stream={stream})"
+        );
+        assert_eq!(
+            probes.last(),
+            Some(&3),
+            "the failing one is given up after a few checks (stream={stream})"
+        );
+        assert!(!db.has_deferred_frees(), "stream={stream}");
+        assert!(known(&db, "bad"), "never freed while unreadable");
+        test_hooks::set_unreadable(None);
+        assert_eq!(
+            db.reclaim_unused().unwrap(),
+            1,
+            "left for gcompact --reclaim (stream={stream})"
+        );
+        assert_eq!(db.id_space_stats().live, [0, 0, 0], "stream={stream}");
+        db.verify_integrity().unwrap();
     }
 }
 

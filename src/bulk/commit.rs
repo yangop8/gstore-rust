@@ -60,6 +60,10 @@ use super::{BulkInput, BulkOptions, BulkReport, PhaseTime};
 
 /// The staging directory inside the database directory.
 pub const STAGING_DIR: &str = ".bulk-tmp";
+/// The install step whose warning leaves nothing an open reads (see
+/// [`BulkReport::opens_as_built`]): the staging area not removed — no
+/// layout detection reads it, and the next build removes it.
+pub(crate) const STAGING_CLEANUP: &str = "removing the staging area";
 /// The commit marker inside the staging directory.
 const COMMIT_MARKER: &str = "COMMIT";
 /// The disk layout's files (`db::KV_FILE`, `db::VSTREE_KV_FILE`).
@@ -148,6 +152,16 @@ impl Failpoints {
         }
         Ok(())
     }
+}
+
+/// Remove the replaced database's reasoning rules from `dir` (durably),
+/// under the rule directory's lock: no `reasonManage` file operation of
+/// this process (a server's) is half-way through it meanwhile. Only this
+/// step holds it — not the whole build, which a `reasonManage` request
+/// would otherwise wait for.
+pub(crate) fn remove_rule_dir(dir: &Path) -> Result<()> {
+    let _rules = crate::reason::store::RuleStore::dir(dir).lock();
+    remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir))
 }
 
 /// `<path>.wal`, the pager's write-ahead log beside a paged file.
@@ -445,7 +459,7 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
     note(
         &mut warnings,
         "removing the replaced database's reasoning rules",
-        remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir)),
+        remove_rule_dir(dir),
     );
     note(
         &mut warnings,
@@ -465,7 +479,7 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
 
     note(
         &mut warnings,
-        "removing the staging area",
+        STAGING_CLEANUP,
         fs::remove_dir_all(staging)
             .map_err(GStoreError::from)
             .and_then(|()| sync_dir(dir)),

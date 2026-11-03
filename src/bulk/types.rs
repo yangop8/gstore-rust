@@ -135,6 +135,17 @@ pub struct BulkReport {
 }
 
 impl BulkReport {
+    /// Whether the database the build installed opens as built: every one
+    /// of its [`warnings`](Self::warnings) is about a leftover no open reads
+    /// (the staging area). Otherwise the replaced layout or rules may still
+    /// be there, or the new store may not be durably in place: opening it
+    /// might read what was left behind.
+    pub fn opens_as_built(&self) -> bool {
+        self.warnings
+            .iter()
+            .all(|w| w.starts_with(super::commit::STAGING_CLEANUP))
+    }
+
     /// A short multi-line summary (counts, phases, memory, spills) of a disk
     /// build, as `gbuild` prints it; [`summary_for`](Self::summary_for)
     /// names the files of either target.
@@ -181,5 +192,35 @@ impl BulkReport {
             s.push_str(&format!("\n  warning: the install did not finish: {w}"));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a staging area left behind lets the installed database be
+    /// opened as built; any other unfinished step (old rules or layouts, a
+    /// rename not yet durable) does not.
+    #[test]
+    fn only_a_left_staging_area_opens_as_built() {
+        let with = |w: &[&str]| BulkReport {
+            warnings: w.iter().map(|s| s.to_string()).collect(),
+            ..BulkReport::default()
+        };
+        assert!(with(&[]).opens_as_built());
+        assert!(with(&["removing the staging area: I/O error"]).opens_as_built());
+        for other in [
+            "removing the replaced database's reasoning rules: Not a directory",
+            "removing the other layouts: I/O error",
+            "making the new kvstore.kv durable (the rest of the install was skipped; the next \
+             build cleans up): I/O error",
+        ] {
+            assert!(!with(&[other]).opens_as_built(), "{other}");
+            assert!(
+                !with(&["removing the staging area: x", other]).opens_as_built(),
+                "{other}"
+            );
+        }
     }
 }

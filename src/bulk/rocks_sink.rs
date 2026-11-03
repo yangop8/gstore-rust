@@ -58,11 +58,10 @@ use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::Term;
 use crate::parser::import::{ErrorLog, ImportOptions, ImportReport, BNODE_GRAPH_PREFIX};
 use crate::parser::nquads::Quad;
-use crate::reason::rules::RULE_DIR;
 use crate::store::TripleSource;
 
 use super::budget::Budget;
-use super::commit::{refuse_open_store, CRASH_ENV, STAGING_DIR};
+use super::commit::{refuse_open_store, remove_rule_dir, CRASH_ENV, STAGING_CLEANUP, STAGING_DIR};
 use super::encode::{render_key, Dict, Space};
 use super::extsort::{ExtSorter, Sorted};
 use super::scratch::{self, Scratch};
@@ -907,7 +906,7 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
     note(
         &mut warnings,
         "removing the replaced database's reasoning rules",
-        remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir)),
+        remove_rule_dir(dir),
     );
     fp.hit("rules-removed")?;
 
@@ -920,7 +919,7 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
 
     note(
         &mut warnings,
-        "removing the staging area",
+        STAGING_CLEANUP,
         fs::remove_dir_all(staging)
             .map_err(GStoreError::from)
             .and_then(|()| sync_dir(dir)),

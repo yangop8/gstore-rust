@@ -70,8 +70,8 @@ snapshot CSR build and gbuild's `id_reclaim` twice each) are fixed once.
   - A build whose install committed but could not finish its cleanup (the
     replaced layout or rules still there: `BulkReport::warnings`) answers
     `500` and is not served — opening it might read what was left behind;
-    it used to answer `200 built`. The rule-directory lock is held through
-    the build, as the snapshot layout holds it.
+    it used to answer `200 built`. The install removes the replaced rules
+    under the rule-directory lock (see the second pass below).
 - **Snapshot reads of a Stream-mode transaction (`/begin`):** the graph
   functions' CSR is built predicate by predicate with the gate's cancel
   flag checked between predicates and between the build's phases
@@ -118,6 +118,38 @@ snapshot CSR build and gbuild's `id_reclaim` twice each) are fixed once.
   CHANGELOG.md` too (bench.yml ignores pushes that change only Markdown,
   so a docs-only edit of a generated table was caught only by the next
   code push). R4-CLOSURE-A request 4.
+- **Second pass (the review of the fixes above, on `5105d3d`):**
+  - **Id reclamation:** each candidate is decided on its own reference
+    probe (a read scope per probe). A candidate whose probe failed waits
+    for the next check alone — the rest of its batch is freed — and after
+    `CHECK_ATTEMPTS` (4) failed checks it is given up with a warning, left
+    for `gcompact --reclaim`. The first version of the read-error fix put
+    the whole batch back: one unreadable index page under one deleted
+    term's key stopped every later free, and every deleting statement
+    re-probed the growing backlog (the review measured 3, 5, …, 81 probes
+    for 40 single deletes, nothing freed). `reclaim_unused` frees what it could check
+    and logs the rest.
+  - **REST `/build` in the snapshot layout** saves a loaded database with
+    acknowledged writes not yet saved (check_point off) before it retires
+    it, and serves it again when removing the old rules or saving the new
+    snapshot fails (the writes were lost and the database left unloaded).
+  - **REST `/build` in the disk or RocksDB layout** no longer holds the
+    rule-directory lock through the build: the bulk install (`bulk`
+    `commit` / `rocks_sink`, so `gbuild` too) takes it only to remove the
+    replaced rules. A `reasonManage` execute / disable / check (types 4,
+    5, 8) of the database waited for the whole build, an HTTP worker held
+    meanwhile; a few such requests stalled every database of the server.
+  - A failed REST bulk build of a new name removes the directory it made
+    only under the directory's lock, and only when it holds no database:
+    one another process (a `gbuild` of the name) created and locked
+    meanwhile was deleted under it.
+  - A REST bulk build whose install did not finish (or whose result does
+    not open) still updates the registry: the grants of a database dropped
+    outside the server are forgotten — the new data no longer inherits
+    them once loaded — and a new name is registered for its creator. A
+    staging area left behind is only logged and the database is served
+    (`BulkReport::opens_as_built`): no open reads `.bulk-tmp/`, and the
+    next build removes it.
 
 ## GAP_PLAN status line
 
@@ -128,8 +160,10 @@ none
 - docs/ARCHITECTURE (id reclamation): a Stream-mode free waits for the
   pins older than its candidacy only; deferred candidates are checked
   once, when no such pin is left (or after a read error, at the next
-  check). This replaces R4-RECLAIM's request 2 wording ("retried by every
-  later statement"). A `ConcurrentDb` over a Stream database frees its
+  check: each candidate is decided on its own probe, and one whose probe
+  keeps failing is given up after 4 checks, for `gcompact --reclaim`).
+  This replaces R4-RECLAIM's request 2 wording ("retried by every later
+  statement"). A `ConcurrentDb` over a Stream database frees its
   deferred ids when it is dropped; while it lives its base snapshot holds
   them (R4-RECLAIM's "today it never frees ids" stays true while it
   lives). Frees a pin still holds at a restart (or at the drop of a plain
@@ -139,10 +173,12 @@ none
 - conf/conf.ini.example (done) and docs/CONFIG: `[system] id_reclaim` is
   read by gserver and gbuild; gadd, gsub, gquery and the other tools follow
   `GSTORE_ID_RECLAIM` only.
-- REST API docs (`/build`): with `layout=disk|rocksdb` a loaded database is
-  saved before it is replaced; a build whose install did not finish
-  answers `500` and leaves the database unloaded until its leftovers are
-  removed; a body's blank-node labels are kept in every layout.
+- REST API docs (`/build`): in every layout a loaded database is saved
+  before it is replaced, and served again when the rebuild fails; with
+  `layout=disk|rocksdb` a build whose install did not finish answers `500`
+  and leaves the database unloaded until its leftovers are removed (a
+  staging area left behind does not count), registered all the same; a
+  body's blank-node labels are kept in every layout.
 - docs/ARCHITECTURE (server): `/api monitor` and `schema` report the
   committed state while a transaction is open; `diskUsed` is measured
   after a change or a save, outside the lock.
@@ -183,7 +219,22 @@ accessor they use) grafted on — all fail there, and pass here:
 | report markers in prose | `report::marker_syntax_in_prose_and_examples_is_not_a_region` (gstore-bench) | `cannot read ARGS` |
 | WatDiv-like shrink ≥ 126 | `watdiv::every_template_binds_at_any_shrink` (gstore-bench) | `template F1: no binding answered in 32 tries` |
 
+Second-pass regression tests, each run against `5105d3d` with only the
+tests (and the test hooks they use: a probe that fails for one term, a
+hook run right before the REST bulk loader starts) grafted on — all fail
+there, and pass here:
+
+| finding | test | on `5105d3d` |
+|---|---|---|
+| one unreadable candidate stops every free | `db::r4_review_tests::an_unreadable_candidate_holds_back_no_other_free` (memory and Stream) | the rest of its batch kept (`badobj`) |
+| snapshot rebuild failing after the retire | `http_api::tests::a_failed_snapshot_rebuild_keeps_the_acknowledged_writes` | `404 not loaded` |
+| rule lock held through the bulk build | `http_api::tests::a_rest_bulk_build_holds_no_rule_lock_while_it_loads` | `reasonManage` check unanswered after 5 s |
+| unlocked cleanup of a new name | `http_api::tests::a_failed_rest_bulk_build_leaves_a_directory_another_process_locked` | the other process's directory deleted |
+| registry skipped on an unfinished install | `http_api::tests::an_unfinished_rest_bulk_build_still_updates_the_registry` | the dropped database's grant kept |
+
 New mechanisms with unit tests only (their API did not exist before):
+`bulk::types::tests::only_a_left_staging_area_opens_as_built` (second
+pass);
 `analytics::csr::tests::the_cancellable_build_equals_build_and_stops_when_cancelled`
 (the per-predicate build equals `build`; a flag raised during the first
 predicate's read stops it before the second) and
@@ -214,3 +265,10 @@ wiring into the gate's flag are what changed.
   whole before the flag is seen).
 - `gadd`, `gsub`, `gquery` and the other tools that open databases do not
   read `conf.ini`; they follow `GSTORE_ID_RECLAIM` (now documented).
+- Second pass: no test serves a REST bulk build whose only unfinished
+  step is the staging area's removal end to end (failing that removal
+  needs an I/O fault the suite cannot inject; the review used an
+  `LD_PRELOAD` shim) — `BulkReport::opens_as_built` has a unit test.
+- Second pass: `gbuild`'s own cleanup of a directory it created
+  (`CreatedDir`) still removes it without the directory's lock (it
+  predates this round; its `holds_data` check keeps a built database).
