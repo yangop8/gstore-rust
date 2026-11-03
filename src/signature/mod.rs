@@ -217,6 +217,57 @@ impl Signature {
             .all(|(w, (i, o))| w & !(i | o) == 0)
     }
 
+    /// The positions of the set bits, ascending.
+    pub fn set_bits(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(i, &w)| {
+            let mut w = w;
+            std::iter::from_fn(move || {
+                if w == 0 {
+                    return None;
+                }
+                let b = w.trailing_zeros() as usize;
+                w &= w - 1;
+                Some(i * 64 + b)
+            })
+        })
+    }
+
+    /// The bit an edge with predicate `pre_id` in direction `dir` sets
+    /// ([`encode_query_edge`](Self::encode_query_edge) with a predicate and
+    /// no neighbour sets exactly this bit).
+    pub fn predicate_bit(pre_id: PredId, dir: EdgeDir) -> usize {
+        let id = pre_id as i64;
+        let mut seed_num = (id % EDGE_SIG_INTERVAL_NUM_HALF as i64) as usize;
+        if dir == EdgeDir::Out {
+            seed_num += EDGE_SIG_INTERVAL_NUM_HALF;
+        }
+        let seed = id * 5003 % 49957;
+        (seed as usize % EDGE_SIG_INTERVAL_BASE)
+            + STR_SIG_LENGTH
+            + EDGE_SIG_INTERVAL_BASE * seed_num
+    }
+
+    /// The predicate ids below `limit` whose edges in direction `dir` set
+    /// `bit` ([`predicate_bit`](Self::predicate_bit)), ascending: the
+    /// predicates an entity's signature can have that bit from. Empty for a
+    /// bit that is not a predicate bit of `dir`. Visits a tenth of the ids
+    /// (the bit fixes the id modulo [`EDGE_SIG_INTERVAL_NUM_HALF`]).
+    pub fn predicates_with_bit(bit: usize, dir: EdgeDir, limit: PredId) -> Vec<PredId> {
+        let half = EDGE_SIG_INTERVAL_BASE * EDGE_SIG_INTERVAL_NUM_HALF;
+        let base = match dir {
+            EdgeDir::In => STR_SIG_LENGTH,
+            EdgeDir::Out => STR_SIG_LENGTH + half,
+        };
+        if bit < base || bit >= base + half {
+            return Vec::new();
+        }
+        let first = ((bit - base) / EDGE_SIG_INTERVAL_BASE) as PredId;
+        (first..limit)
+            .step_by(EDGE_SIG_INTERVAL_NUM_HALF)
+            .filter(|&p| Signature::predicate_bit(p, dir) == bit)
+            .collect()
+    }
+
     /// Compare the raw limbs, low limb first (each limb as a number, so bit
     /// 63 of a limb weighs most within it), ignoring the padding bits past
     /// [`ENTITY_SIG_LENGTH`] — the clustering order of the VS-tree bulk builds
@@ -282,16 +333,7 @@ impl Signature {
 
     /// Encode a predicate bit (gStore `encodePredicate2Entity`, method 1).
     fn encode_predicate(&mut self, pre_id: PredId, dir: EdgeDir) {
-        let id = pre_id as i64;
-        let mut seed_num = (id % EDGE_SIG_INTERVAL_NUM_HALF as i64) as usize;
-        if dir == EdgeDir::Out {
-            seed_num += EDGE_SIG_INTERVAL_NUM_HALF;
-        }
-        let seed = id * 5003 % 49957;
-        let pos = (seed as usize % EDGE_SIG_INTERVAL_BASE)
-            + STR_SIG_LENGTH
-            + EDGE_SIG_INTERVAL_BASE * seed_num;
-        self.set(pos);
+        self.set(Signature::predicate_bit(pre_id, dir));
     }
 
     /// Encode a neighbour bit (gStore `encodeStr2Entity`).
@@ -417,6 +459,62 @@ mod tests {
         ponly.encode_query_edge(Some(7), None, EdgeDir::Out);
         assert!(full.contains(&ponly));
         assert!(ponly.popcount() < full.popcount());
+    }
+
+    #[test]
+    fn predicate_bits_are_exactly_the_predicate_encodings() {
+        for dir in [EdgeDir::In, EdgeDir::Out] {
+            let other = match dir {
+                EdgeDir::In => EdgeDir::Out,
+                EdgeDir::Out => EdgeDir::In,
+            };
+            for p in 0..500u32 {
+                let mut s = Signature::new();
+                s.encode_query_edge(Some(p), None, dir);
+                assert_eq!(
+                    s.set_bits().collect::<Vec<_>>(),
+                    [Signature::predicate_bit(p, dir)]
+                );
+                assert_eq!(s.predicate_bits(dir), s);
+                assert!(s.predicate_bits(other).is_empty());
+                assert!(s.only_predicate_bits());
+                // A full edge adds neighbour and combined bits, none of them a
+                // predicate bit.
+                let mut full = Signature::new();
+                full.encode_edge(p, p * 7 + 3, dir);
+                full.encode_edge(p, LITERAL_FIRST_ID + p, dir);
+                assert_eq!(full.predicate_bits(dir), s);
+                assert!(full.predicate_bits(other).is_empty());
+                assert!(!full.only_predicate_bits());
+                assert!(full.and_not(&s).predicate_bits(dir).is_empty());
+                assert_eq!(full.and_not(&s).popcount(), full.popcount() - 1);
+            }
+            // The inverse visits a tenth of the ids but finds them all.
+            let limit = 1000;
+            for bit in 0..ENTITY_SIG_LENGTH {
+                let brute: Vec<PredId> = (0..limit)
+                    .filter(|&p| Signature::predicate_bit(p, dir) == bit)
+                    .collect();
+                assert_eq!(
+                    Signature::predicates_with_bit(bit, dir, limit),
+                    brute,
+                    "bit {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_bits_lists_every_set_bit_ascending() {
+        let mut s = Signature::new();
+        for b in [0, 1, 63, 64, 600, 799, 943] {
+            s.set(b);
+        }
+        assert_eq!(
+            s.set_bits().collect::<Vec<_>>(),
+            [0, 1, 63, 64, 600, 799, 943]
+        );
+        assert_eq!(Signature::new().set_bits().count(), 0);
     }
 
     #[test]

@@ -179,12 +179,12 @@ use crate::analytics::GraphView;
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
+use crate::model::id::is_entity_id;
 use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::parse_term;
 use crate::parser::sparql::ast::*;
 use crate::parser::sparql::{builtins, rs_function_name, RS_NAMESPACE};
-use crate::model::id::is_entity_id;
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::note_read_error;
 use crate::store::{TripleSource, TripleStore};
@@ -194,12 +194,12 @@ use super::functions::FunctionRegistry;
 use super::hash;
 use super::optimizer::{self, ExecPlan, JoinMethod, JoinTree};
 use super::results::{QueryResult, ResultSet};
-use super::vs_policy::{self, VsPolicy};
 use super::value::{
     format_xsd_datetime_utc, is_decimal_lexical, is_integer_lexical, order_key,
     parse_datetime_parts, parse_xsd_double, to_f32_precision, xsd_float_lexical, DateTimeParts,
     IntegerDivision, NumericFn, Value, XSD_FLOAT,
 };
+use super::vs_policy::{self, VsPolicy};
 
 /// The term a dictionary key names ([`Term::from_dict_key`]: verbatim, so a
 /// term a lenient reader let in — an IRI holding `>` — is never lost on its
@@ -254,11 +254,23 @@ const PRED_ALIAS_PREFIX: &str = "\u{0}pred:";
 /// `refine_candidates_with_vstree`).
 const PROBE_MIN_CANDIDATES: usize = 1024;
 
-/// The fixed cost of one store lookup, in index entries read, for the choice
-/// between per-candidate lookups and posting lists in
-/// `retain_with_predicate_bits` (a B+ tree descent or a map probe against
-/// stepping through entries).
-const PER_LOOKUP_COST: u64 = 16;
+/// The cost of one store lookup in posting-list entries, for the choice
+/// between looking candidates up and merging posting lists when the
+/// VS-tree's predicate bits are tested against the store
+/// (`retain_with_classes`): a B+ tree descent or a map probe against
+/// stepping through (or copying) list entries.
+const LOOKUP_COST: u64 = 64;
+
+/// One predicate bit of a query signature, in one direction, with the
+/// store's predicates (those with a triple) whose edges set it: an entity's
+/// signature has the bit iff the entity has an edge in `dir` with one of
+/// `preds` (several predicates can share a bit).
+struct BitClass {
+    dir: EdgeDir,
+    preds: Vec<PredId>,
+    /// The triples of `preds`: the length of their posting lists.
+    card: u64,
+}
 
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
@@ -2866,10 +2878,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Intersect the VS-tree's signature candidates into the exact candidate
     /// sets (both are sound supersets, so the intersection stays sound and only
-    /// tightens). Applies to subject variables (always entities). How the
-    /// tree is consulted follows the [`VsPolicy`]: `Auto` computes the same
-    /// sets as `Tree` more cheaply where that is provably exact (see
-    /// [`vs_policy`]), `Off` leaves the sets alone.
+    /// tightens), or seed a variable without a set with them. Applies to
+    /// subject variables (always entities). How the tree is consulted follows
+    /// the [`VsPolicy`]: `Auto` computes the very sets `Tree` computes, more
+    /// cheaply where that is provably exact (see [`vs_policy`]); `Off` leaves
+    /// the sets alone.
     fn refine_candidates_with_vstree(
         &self,
         candidates: &mut Candidates,
@@ -2891,9 +2904,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for &vidx in &subj_vars {
             // The query signature, and `cut`: the bits of the edges with a
             // known neighbour. `candidates::generate` cut the variable's set
-            // from exactly those edges (its pass 1 intersects every one of
-            // them), so every candidate has them — and, the tree holding a
-            // superset of each entity's current signature, so does its entry.
+            // from exactly those edges (its pass 1 intersects the store's list
+            // of every one of them), so every candidate has those edges — and,
+            // the tree holding a superset of each entity's current signature,
+            // its entry has their bits. A variable without such an edge has no
+            // set after pass 1 (pass 2 only narrows existing sets).
             let mut sig = Signature::new();
             let mut cut = Signature::new();
             for tp in tps {
@@ -2925,6 +2940,50 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 vs_policy::count(|s| s.off += 1);
                 continue;
             }
+            if policy == VsPolicy::Auto {
+                // The bits a candidate's entry may lack: predicate bits of the
+                // edges whose neighbour is a variable (`cut` holds every
+                // neighbour and combined bit of the query).
+                let residual = sig.and_not(&cut);
+                debug_assert!(residual.only_predicate_bits());
+                match candidates.get_mut(&vidx) {
+                    Some(existing) if residual.is_empty() => {
+                        // Every entity candidate's entry contains the query; a
+                        // non-entity (a literal object) has no entry. An empty
+                        // tree filters nothing (as a walk of it).
+                        if !vstree.is_empty() {
+                            existing.retain(|&x| is_entity_id(x));
+                        }
+                        vs_policy::count(|s| s.skipped += 1);
+                        continue;
+                    }
+                    Some(existing) if !vstree.can_probe() => {
+                        // An out-of-core tree cannot probe, and its walk reads
+                        // every page whose union holds the query: test the
+                        // predicate bits against the store instead.
+                        if !vstree.is_empty() {
+                            existing.retain(|&x| is_entity_id(x));
+                            self.retain_with_predicate_bits(existing, &residual);
+                        }
+                        vs_policy::count(|s| s.store_checked += 1);
+                        continue;
+                    }
+                    None if !vstree.can_probe() => {
+                        // No set and an out-of-core tree: `sig` holds predicate
+                        // bits only (no edge has a known neighbour, see above);
+                        // the entities with those bits come from the posting
+                        // lists.
+                        debug_assert!(cut.is_empty());
+                        if !vstree.is_empty() {
+                            let set = self.entities_with_predicate_bits(&sig);
+                            candidates.insert(vidx, set);
+                        }
+                        vs_policy::count(|s| s.listed += 1);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             // Probe refinement: when the variable already has a small exact
             // candidate set and the tree is in memory, test each candidate's
             // stored signature (O(1) each through the tree's locator) instead
@@ -2933,32 +2992,6 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // query (every ancestor contains its descendants' signatures).
             let probe_limit = PROBE_MIN_CANDIDATES.max(vstree.entity_count() / 32);
             if let Some(existing) = candidates.get_mut(&vidx) {
-                if policy == VsPolicy::Auto {
-                    // Only predicate bits of edges whose neighbour is a
-                    // variable can be missing from a candidate's entry.
-                    let residual = sig.and_not(&cut);
-                    debug_assert!(residual.only_predicate_bits());
-                    if residual.is_empty() {
-                        // Every entity candidate passes; a non-entity (a
-                        // literal object) has no entry. An empty tree filters
-                        // nothing (as below).
-                        if !vstree.is_empty() {
-                            existing.retain(|&x| is_entity_id(x));
-                        }
-                        vs_policy::count(|s| s.skipped += 1);
-                        continue;
-                    }
-                    if !vstree.can_probe() {
-                        // An out-of-core tree cannot probe, and a walk reads
-                        // every page whose union holds the query: ask the
-                        // store which candidates have the predicate bits.
-                        if !vstree.is_empty() {
-                            self.retain_with_predicate_bits(existing, &residual);
-                        }
-                        vs_policy::count(|s| s.store_checked += 1);
-                        continue;
-                    }
-                }
                 if vstree.can_probe() && existing.len() <= probe_limit {
                     if !vstree.is_empty() {
                         existing.retain(|&x| vstree.probe(x, &sig));
@@ -2988,6 +3021,71 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
+    /// The bit classes of the predicate bits in `bits` (see
+    /// [`BitClass`]), with the store's predicates behind each; `None` when
+    /// some bit has no predicate with a triple, so no entity has it.
+    fn predicate_bit_classes(&self, bits: &Signature) -> Option<Vec<BitClass>> {
+        let limit = self.dict.id_limit(Space::Predicate);
+        let mut classes = Vec::new();
+        for dir in [EdgeDir::Out, EdgeDir::In] {
+            for bit in bits.predicate_bits(dir).set_bits() {
+                let mut preds = Vec::new();
+                let mut card = 0u64;
+                for p in Signature::predicates_with_bit(bit, dir, limit) {
+                    let c = self.store.pred_card(p) as u64;
+                    if c > 0 {
+                        preds.push(p);
+                        card += c;
+                    }
+                }
+                if preds.is_empty() {
+                    return None;
+                }
+                classes.push(BitClass { dir, preds, card });
+            }
+        }
+        // Cheapest lists first (ties in the fixed bit order above).
+        classes.sort_by_key(|c| c.card);
+        Some(classes)
+    }
+
+    /// The members of one bit class: the entities with an edge in the
+    /// class's direction whose predicate is one of the class's (sorted,
+    /// distinct).
+    fn bit_class_members(&self, class: &BitClass) -> Vec<u32> {
+        let mut members: Vec<u32> = Vec::new();
+        for &p in &class.preds {
+            members.extend(match class.dir {
+                EdgeDir::Out => self.store.subs_by_p(p),
+                EdgeDir::In => self.store.objs_by_p(p),
+            });
+        }
+        members.retain(|&x| is_entity_id(x));
+        if class.preds.len() > 1 {
+            members.sort_unstable();
+            members.dedup();
+        }
+        members
+    }
+
+    /// The entities whose signature, as the store's edges give it, has every
+    /// bit of `bits` — predicate bits only. On a VS-tree consistent with the
+    /// store that is exactly what a walk of the tree reports for `bits` (a
+    /// predicate bit is set in an entry iff its entity has an edge in that
+    /// direction whose predicate encodes to the bit; the tree holds an entry
+    /// for every entity with an edge). Sorted, distinct.
+    fn entities_with_predicate_bits(&self, bits: &Signature) -> Vec<u32> {
+        let Some(classes) = self.predicate_bit_classes(bits) else {
+            return Vec::new();
+        };
+        let Some((first, rest)) = classes.split_first() else {
+            return Vec::new();
+        };
+        let mut set = self.bit_class_members(first);
+        self.retain_with_classes(&mut set, rest);
+        set
+    }
+
     /// Keep the entity candidates whose signature holds every bit of
     /// `residual` — predicate bits only (see
     /// [`Signature::predicate_bits`]): an entity's signature holds the bit of
@@ -2996,98 +3094,67 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// exactly, so on a VS-tree consistent with the store this keeps exactly
     /// the candidates a walk keeps (after deletes the tree's entries can hold
     /// stale bits; this then keeps a subset of the walk's, still a superset
-    /// of the true matches).
-    ///
-    /// Per direction it either reads each candidate's edges or merges the
-    /// posting lists of the predicates that set a wanted bit, whichever the
-    /// store's exact counts make cheaper; both give the same set.
+    /// of the true matches). `existing` holds entities only.
     fn retain_with_predicate_bits(&self, existing: &mut Vec<u32>, residual: &Signature) {
-        existing.retain(|&x| is_entity_id(x));
-        let limit = self.dict.id_limit(Space::Predicate);
-        for dir in [EdgeDir::Out, EdgeDir::In] {
-            let want = residual.predicate_bits(dir);
-            if want.is_empty() || existing.is_empty() {
-                continue;
-            }
-            // The store's predicates that set a wanted bit, grouped by bit.
-            let mut classes: Vec<(Signature, Vec<PredId>)> = Vec::new();
-            for p in 0..limit {
-                let mut bit = Signature::new();
-                bit.encode_query_edge(Some(p), None, dir);
-                if !want.contains(&bit) || self.store.pred_card(p) == 0 {
-                    continue;
-                }
-                match classes.iter_mut().find(|(b, _)| *b == bit) {
-                    Some((_, ps)) => ps.push(p),
-                    None => classes.push((bit, vec![p])),
-                }
-            }
-            if classes.len() < want.popcount() as usize {
-                // A wanted bit no edge of the store sets: nobody has it.
-                existing.clear();
+        if existing.is_empty() {
+            return;
+        }
+        match self.predicate_bit_classes(residual) {
+            Some(classes) => self.retain_with_classes(existing, &classes),
+            None => existing.clear(),
+        }
+    }
+
+    /// Keep the members of `set` (sorted entity ids) that belong to every
+    /// class of `classes`. Per class it either looks each member's edges up
+    /// or merges the class's posting lists, whichever the store's exact
+    /// counts make cheaper; both give the same set, so the choice only
+    /// changes the work. The out-direction classes left for lookups are
+    /// tested together, one `po_by_s` per member.
+    fn retain_with_classes(&self, set: &mut Vec<u32>, classes: &[BitClass]) {
+        // Out-direction bits still to be tested by looking members up.
+        let mut out_bits = Signature::new();
+        // Average out-degree, for the cost of one `po_by_s`.
+        let subjects = (self.store.distinct_subjects() as u64).max(1);
+        let out_degree = self.store.triple_count() / subjects;
+        for class in classes {
+            if set.is_empty() {
                 return;
             }
-            let n = existing.len() as u64;
-            let (lists, per_candidate) = match dir {
-                EdgeDir::Out => {
-                    // One `po_by_s` per candidate: its out-degree.
-                    let triples = self.store.triple_count();
-                    let avg = triples / (self.store.distinct_subjects() as u64).max(1);
-                    let lists = classes
-                        .iter()
-                        .flat_map(|(_, ps)| ps)
-                        .map(|&p| self.store.pred_card(p) as u64)
-                        .sum::<u64>();
-                    (lists, n.saturating_mul(PER_LOOKUP_COST + avg))
-                }
-                EdgeDir::In => {
-                    // One `count_s_by_po` per candidate and class predicate:
-                    // the subjects per object of that predicate.
-                    let mut lists = 0u64;
-                    let mut per = 0u64;
-                    for &p in classes.iter().flat_map(|(_, ps)| ps) {
-                        let card = self.store.pred_card(p) as u64;
-                        let objs = (self.store.pred_distinct_obj(p) as u64).max(1);
-                        lists += card;
-                        per = per.saturating_add(n.saturating_mul(PER_LOOKUP_COST + card / objs));
-                    }
-                    (lists, per)
-                }
+            let n = set.len() as u64;
+            let lookups = match class.dir {
+                // One `po_by_s` per member covers every out-direction class.
+                EdgeDir::Out => n.saturating_mul(LOOKUP_COST + out_degree),
+                // One `count_s_by_po` per member and predicate of the class.
+                EdgeDir::In => n.saturating_mul(LOOKUP_COST * class.preds.len() as u64),
             };
-            if per_candidate <= lists {
-                match dir {
-                    EdgeDir::Out => existing.retain(|&x| {
-                        let mut have = Signature::new();
-                        for (p, _) in self.store.po_by_s(x) {
-                            have.encode_query_edge(Some(p), None, EdgeDir::Out);
-                        }
-                        have.contains(&want)
-                    }),
-                    EdgeDir::In => existing.retain(|&x| {
-                        classes.iter().all(|(_, ps)| {
-                            ps.iter().any(|&p| self.store.count_s_by_po(p, x) > 0)
-                        })
-                    }),
-                }
-            } else {
-                for (_, ps) in &classes {
-                    let mut members: Vec<u32> = Vec::new();
-                    for &p in ps {
-                        members.extend(match dir {
-                            EdgeDir::Out => self.store.subs_by_p(p),
-                            EdgeDir::In => self.store.objs_by_p(p),
-                        });
-                    }
-                    if ps.len() > 1 {
-                        members.sort_unstable();
-                        members.dedup();
-                    }
-                    existing.retain(|x| members.binary_search(x).is_ok());
-                    if existing.is_empty() {
-                        return;
-                    }
-                }
+            if class.card <= lookups {
+                let members = self.bit_class_members(class);
+                set.retain(|x| members.binary_search(x).is_ok());
+                continue;
             }
+            match class.dir {
+                EdgeDir::Out => {
+                    let mut bit = Signature::new();
+                    bit.encode_query_edge(Some(class.preds[0]), None, EdgeDir::Out);
+                    out_bits.union_with(&bit);
+                }
+                EdgeDir::In => set.retain(|&x| {
+                    class
+                        .preds
+                        .iter()
+                        .any(|&p| self.store.count_s_by_po(p, x) > 0)
+                }),
+            }
+        }
+        if !out_bits.is_empty() && !set.is_empty() {
+            set.retain(|&x| {
+                let mut have = Signature::new();
+                for (p, _) in self.store.po_by_s(x) {
+                    have.encode_query_edge(Some(p), None, EdgeDir::Out);
+                }
+                have.contains(&out_bits)
+            });
         }
     }
 

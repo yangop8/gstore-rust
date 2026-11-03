@@ -128,9 +128,7 @@ pub fn set_default_vs_policy(policy: VsPolicy) {
 /// The policy queries evaluated on this thread use unless their evaluator
 /// sets one: the innermost [`scoped_vs_policy`], else the process default.
 pub fn current_vs_policy() -> VsPolicy {
-    OVERRIDE
-        .with(Cell::get)
-        .unwrap_or_else(default_vs_policy)
+    OVERRIDE.with(Cell::get).unwrap_or_else(default_vs_policy)
 }
 
 /// Use `policy` for the queries evaluated on this thread until the guard is
@@ -165,6 +163,8 @@ pub struct VsStats {
     pub skipped: u64,
     /// Candidate set tested against the store (out-of-core tree).
     pub store_checked: u64,
+    /// First set taken from the store's posting lists (out-of-core tree).
+    pub listed: u64,
     /// Candidate set probed entry by entry in an in-memory tree.
     pub probed: u64,
     /// Tree walked and intersected into an existing candidate set.
@@ -179,6 +179,7 @@ impl VsStats {
     const ZERO: VsStats = VsStats {
         skipped: 0,
         store_checked: 0,
+        listed: 0,
         probed: 0,
         walked: 0,
         seeded: 0,
@@ -187,7 +188,13 @@ impl VsStats {
 
     /// Total decisions.
     pub fn total(&self) -> u64 {
-        self.skipped + self.store_checked + self.probed + self.walked + self.seeded + self.off
+        self.skipped
+            + self.store_checked
+            + self.listed
+            + self.probed
+            + self.walked
+            + self.seeded
+            + self.off
     }
 
     /// Decisions that read the tree (probes and walks).
@@ -251,7 +258,10 @@ mod tests {
         count(|s| s.skipped += 1);
         count(|s| s.seeded += 2);
         let s = vs_stats();
-        assert_eq!((s.skipped, s.seeded, s.total(), s.tree_reads()), (1, 2, 3, 2));
+        assert_eq!(
+            (s.skipped, s.seeded, s.total(), s.tree_reads()),
+            (1, 2, 3, 2)
+        );
         std::thread::spawn(|| assert_eq!(vs_stats(), VsStats::default()))
             .join()
             .unwrap();
