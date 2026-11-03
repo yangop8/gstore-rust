@@ -539,3 +539,308 @@ fn concurrent_update_latency() {
         );
     }
 }
+
+/// A batch for the batched-operation tests: `n` triples, a mix of present
+/// ones (drawn from `model`), random ones and repeats of earlier entries.
+fn mixed_batch(rng: &mut Rng, model: &BTreeSet<IdTriple>, n: u32) -> Vec<IdTriple> {
+    let mut batch: Vec<IdTriple> = Vec::new();
+    for _ in 0..n {
+        let t = match rng.next(10) {
+            0..=3 if !model.is_empty() => *model
+                .iter()
+                .nth(rng.next(model.len() as u32) as usize)
+                .unwrap(),
+            4 if !batch.is_empty() => batch[rng.next(batch.len() as u32) as usize],
+            _ => rng.triple(),
+        };
+        batch.push(t);
+    }
+    batch
+}
+
+/// `insert_many` / `remove_many` against `insert` / `remove` of each triple
+/// in order, on random data: the same per-triple results, the same triples,
+/// statistics and serialized bytes — with clones taken, held and dropped
+/// (once without and once with spare copies, whose journals then replay
+/// batched runs).
+#[test]
+fn batched_inserts_and_removes_equal_repeated_singles() {
+    for (seed, spares) in [(31u64, false), (32, true), (33, true), (34, false)] {
+        let mut rng = Rng(seed);
+        let mut single = TripleStore::new();
+        let mut batched = TripleStore::new();
+        if spares {
+            batched.keep_spare_copies();
+        }
+        let mut model: BTreeSet<IdTriple> = BTreeSet::new();
+        let mut held: Vec<(TripleStore, BTreeSet<IdTriple>)> = Vec::new();
+        let mut published: Option<TripleStore> = None;
+        let mut changes = 0usize;
+        let mut reused = 0usize;
+        for step in 0..1500 {
+            let n = rng.next(48);
+            let batch = mixed_batch(&mut rng, &model, n);
+            let insert = rng.next(100) < 55;
+            let expected: Vec<bool> = if insert {
+                batch.iter().map(|&t| single.insert(t)).collect()
+            } else {
+                batch.iter().map(|&t| single.remove(t)).collect()
+            };
+            let got = if insert {
+                batched.insert_many(&batch)
+            } else {
+                batched.remove_many(&batch)
+            };
+            assert_eq!(got, expected, "seed {seed} step {step}: per-triple results");
+            for (&t, &changed) in batch.iter().zip(&expected) {
+                if changed {
+                    changes += 1;
+                    if insert {
+                        model.insert(t);
+                    } else {
+                        model.remove(&t);
+                    }
+                }
+            }
+            match rng.next(10) {
+                0..=3 => {
+                    reused += usize::from(batched.has_spare_copy());
+                    published = Some(batched.clone());
+                }
+                4 => held.push((batched.clone(), model.clone())),
+                5 if !held.is_empty() => {
+                    let (clone, expected) = held.swap_remove(rng.next(held.len() as u32) as usize);
+                    assert_holds(&clone, &expected, "a held clone when dropped");
+                }
+                _ => {}
+            }
+            if step % 50 == 0 {
+                assert_holds(&batched, &model, "the batched store");
+                assert_holds(&single, &model, "the single-step store");
+            }
+        }
+        drop(published);
+        assert_holds(&batched, &model, "the batched store at the end");
+        for (clone, expected) in &held {
+            assert_holds(clone, expected, "a held clone at the end");
+        }
+        assert!(changes > 1000, "seed {seed}: the batches changed the store");
+        assert_eq!(reused > 0, spares, "seed {seed}: spare copies in use");
+    }
+}
+
+/// Lists of very different lengths: batches landing before, inside and
+/// after a long list, emptying lists and predicates, and whole batches of
+/// one subject / object / predicate — the merge and the one-pass removal
+/// against single steps.
+#[test]
+fn batches_into_long_lists_equal_repeated_singles() {
+    let mut base: Vec<IdTriple> = Vec::new();
+    // One predicate with a long list, one class object with many subjects.
+    for s in (100..2100).step_by(2) {
+        base.push(IdTriple::new(s, 0, 5000));
+        base.push(IdTriple::new(s, 1, s + 7));
+    }
+    let mut set = set_of(&base);
+    let mut single = TripleStore::new();
+    single.bulk_load(base.clone());
+    let mut batched = single.clone();
+    let batches: Vec<(bool, Vec<IdTriple>)> = vec![
+        // Low ids at the front of the long lists (a reused id).
+        (true, (1..40).map(|s| IdTriple::new(s, 0, 5000)).collect()),
+        // Interleaved with the existing entries.
+        (
+            true,
+            (101..2101)
+                .step_by(20)
+                .map(|s| IdTriple::new(s, 0, 5000))
+                .collect(),
+        ),
+        // Past the end, and new keys.
+        (true, (3000..3050).map(|s| IdTriple::new(s, 2, s)).collect()),
+        // Remove a prefix, a scattered set and a suffix.
+        (false, (1..20).map(|s| IdTriple::new(s, 0, 5000)).collect()),
+        (
+            false,
+            (100..2100)
+                .step_by(10)
+                .map(|s| IdTriple::new(s, 1, s + 7))
+                .collect(),
+        ),
+        // Empty a predicate entirely (its statistics go too).
+        (
+            false,
+            (3000..3050).map(|s| IdTriple::new(s, 2, s)).collect(),
+        ),
+        // Everything of the long list, plus absent triples.
+        (
+            false,
+            (0..2200).map(|s| IdTriple::new(s, 0, 5000)).collect(),
+        ),
+    ];
+    for (i, (insert, batch)) in batches.iter().enumerate() {
+        let expected: Vec<bool> = if *insert {
+            batch.iter().map(|&t| single.insert(t)).collect()
+        } else {
+            batch.iter().map(|&t| single.remove(t)).collect()
+        };
+        let got = if *insert {
+            batched.insert_many(batch)
+        } else {
+            batched.remove_many(batch)
+        };
+        assert_eq!(got, expected, "batch {i}");
+        for (t, changed) in batch.iter().zip(expected) {
+            if changed {
+                if *insert {
+                    set.insert(*t);
+                } else {
+                    set.remove(t);
+                }
+            }
+        }
+        assert_holds(&batched, &set, &format!("after batch {i}"));
+        assert_holds(&single, &set, &format!("single steps after batch {i}"));
+    }
+    assert!(
+        !set.iter().any(|t| t.pred == 0),
+        "the long predicate emptied"
+    );
+}
+
+/// A batch that changes nothing never copies shared indexes; a real one
+/// copies once.
+#[test]
+fn a_batch_that_changes_nothing_never_copies() {
+    let mut rng = Rng(41);
+    let triples: Vec<IdTriple> = (0..300).map(|_| rng.triple()).collect();
+    let mut a = TripleStore::new();
+    a.bulk_load(triples.clone());
+    let b = a.clone();
+    let present = vec![triples[1], triples[2], triples[1], triples[7]];
+    let absent = vec![IdTriple::new(900, 1, 1), IdTriple::new(901, 2, 2)];
+    assert_eq!(a.insert_many(&present), vec![false; 4]);
+    assert_eq!(a.remove_many(&absent), vec![false; 2]);
+    assert!(a.insert_many(&[]).is_empty());
+    assert!(a.remove_many(&[]).is_empty());
+    assert_eq!(a.insert_many(&present[..1]), vec![false]);
+    assert_eq!(a.remove_many(&absent[..1]), vec![false]);
+    assert!(a.shares_storage_with(&b), "no-op batches must not copy");
+    a.keep_spare_copies();
+    assert_eq!(a.insert_many(&present), vec![false; 4]);
+    assert_eq!(a.remove_many(&absent), vec![false; 2]);
+    assert!(a.shares_storage_with(&b));
+    assert!(!a.has_spare_copy());
+    // A real batch copies once (the shared indexes become the spare).
+    assert_eq!(a.insert_many(&absent), vec![true, true]);
+    assert!(!a.shares_storage_with(&b));
+    assert!(a.has_spare_copy());
+    assert_holds(&b, &set_of(&triples), "the clone");
+    let mut expected = set_of(&triples);
+    expected.extend(absent.iter().copied());
+    assert_holds(&a, &expected, "the store");
+}
+
+/// Batched against one-by-one inserts and removes of a batch whose ids are
+/// low — the lowest-first id reuse of R4-RECLAIM: new triples land at the
+/// front of long per-predicate and per-class lists (a micro-benchmark; run
+/// with `cargo test --release --test dt_cow_store -- --ignored --nocapture
+/// batch_of_low_ids_latency`, optionally with
+/// `GSTORE_COW_BENCH_NT=<file.nt>`; without it, a synthetic store of
+/// 1,000,000 triples). The batch is the triples of the lowest subject ids
+/// (`GSTORE_COW_BENCH_BATCH` triples, default 5,330: the reference
+/// profile's chunk insert). Prints the median of 5 runs of each, in ms.
+#[test]
+#[ignore = "a timing driver"]
+fn batch_of_low_ids_latency() {
+    let full: TripleStore = match std::env::var("GSTORE_COW_BENCH_NT") {
+        Ok(path) => {
+            let db = Database::build_from_files("cow-batch", &[&path]).expect("build");
+            db.backend().as_memory().expect("in memory").clone()
+        }
+        Err(_) => {
+            // 200,000 subjects of 20 classes, five triples each.
+            let mut rng = Rng(5);
+            let mut triples = Vec::with_capacity(1_000_000);
+            for s in 1..=200_000u32 {
+                triples.push(IdTriple::new(s, 0, 300_000 + s % 20));
+                for p in 1..5 {
+                    triples.push(IdTriple::new(s, p, 400_000 + rng.next(100_000)));
+                }
+            }
+            let mut store = TripleStore::new();
+            store.bulk_load(triples);
+            store
+        }
+    };
+    let size: usize = std::env::var("GSTORE_COW_BENCH_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5330);
+    let mut all: Vec<IdTriple> = full.iter_all().collect();
+    all.sort_unstable_by_key(|t| (t.sub, t.pred, t.obj));
+    let batch: Vec<IdTriple> = all[..size.min(all.len())].to_vec();
+    drop(all);
+    // The store without the batch (the batch's ids then come back).
+    let mut without = full.clone();
+    without.remove_many(&batch);
+    // An unshared copy of `from` (the copy is not timed).
+    let own = |from: &TripleStore| {
+        let mut s = from.clone();
+        let t = batch[0];
+        if s.remove(t) {
+            s.insert(t);
+        } else {
+            s.insert(t);
+            s.remove(t);
+        }
+        s
+    };
+    let time = |f: &mut dyn FnMut()| {
+        let t0 = Instant::now();
+        f();
+        t0.elapsed().as_secs_f64() * 1e3
+    };
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (mut ins1, mut insb, mut rem1, mut remb) = (vec![], vec![], vec![], vec![]);
+    for _ in 0..5 {
+        let mut a = own(&without);
+        ins1.push(time(&mut || {
+            for &t in &batch {
+                a.insert(t);
+            }
+        }));
+        let mut b = own(&without);
+        insb.push(time(&mut || {
+            b.insert_many(&batch);
+        }));
+        assert_eq!(a.triple_count(), full.triple_count());
+        assert_eq!(
+            bincode::serialize(&a).unwrap(),
+            bincode::serialize(&b).unwrap()
+        );
+        rem1.push(time(&mut || {
+            for &t in &batch {
+                a.remove(t);
+            }
+        }));
+        remb.push(time(&mut || {
+            b.remove_many(&batch);
+        }));
+        assert_eq!(a.triple_count(), without.triple_count());
+        assert_eq!(b.triple_count(), without.triple_count());
+    }
+    println!(
+        "batch_of_low_ids_latency: {} triples into a store of {}: insert one by one {:.2} ms, \
+         insert_many {:.2} ms; remove one by one {:.2} ms, remove_many {:.2} ms",
+        batch.len(),
+        full.triple_count(),
+        median(ins1),
+        median(insb),
+        median(rem1),
+        median(remb)
+    );
+}

@@ -185,6 +185,20 @@ pub trait MutableStore {
     fn remove(&mut self, t: IdTriple) -> bool;
     /// Bulk-load many id-triples (de-duplicated), rebuilding indexes once.
     fn bulk_load(&mut self, triples: Vec<IdTriple>);
+    /// Insert each of `triples`, as [`insert`](Self::insert) of each in
+    /// order would: element `i` of the result is what that insert of
+    /// `triples[i]` returns (a repeated triple is new at most once), and the
+    /// store ends up the same. The default inserts them one by one; a
+    /// backend may merge the batch into its indexes at once
+    /// ([`TripleStore::insert_many`]).
+    fn insert_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        triples.iter().map(|&t| self.insert(t)).collect()
+    }
+    /// Remove each of `triples`, as [`remove`](Self::remove) of each in order
+    /// would (see [`insert_many`](Self::insert_many)).
+    fn remove_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        triples.iter().map(|&t| self.remove(t)).collect()
+    }
 }
 
 /// A complete, writable storage backend: queryable ([`TripleSource`]) and
@@ -206,6 +220,12 @@ impl MutableStore for TripleStore {
     }
     fn bulk_load(&mut self, triples: Vec<IdTriple>) {
         TripleStore::bulk_load(self, triples)
+    }
+    fn insert_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        TripleStore::insert_many(self, triples)
+    }
+    fn remove_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        TripleStore::remove_many(self, triples)
     }
 }
 
@@ -445,6 +465,18 @@ enum Change {
     Remove(IdTriple),
 }
 
+impl Change {
+    fn triple(self) -> IdTriple {
+        match self {
+            Change::Insert(t) | Change::Remove(t) => t,
+        }
+    }
+
+    fn is_insert(self) -> bool {
+        matches!(self, Change::Insert(_))
+    }
+}
+
 /// A [`TripleStore`]'s spare copy, when it keeps one (see
 /// [`keep_spare_copies`](TripleStore::keep_spare_copies)).
 #[derive(Default)]
@@ -490,6 +522,67 @@ fn sorted_remove(vec: &mut Vec<(u32, u32)>, value: (u32, u32)) -> bool {
     }
 }
 
+/// Merge `run` — sorted, without repeats, none of its values in `vec` — into
+/// the sorted `vec`. Only the values of `vec` after `run`'s first value
+/// move, each once, in one block copy per value of `run`; inserting the
+/// values one by one ([`sorted_insert`]) would move that tail once per
+/// value.
+fn merge_sorted_into(vec: &mut Vec<(u32, u32)>, run: &[(u32, u32)]) {
+    let Some(&first) = run.first() else {
+        return;
+    };
+    if vec.last().is_none_or(|&last| last < first) {
+        vec.extend_from_slice(run);
+        return;
+    }
+    let old_len = vec.len();
+    vec.resize(old_len + run.len(), (0, 0));
+    // `vec[..hi]` holds the old values not placed yet, `vec[dst..]` the
+    // merged tail; `dst - hi` values of `run` are left to place.
+    let mut hi = old_len;
+    let mut dst = vec.len();
+    for (left, &value) in run.iter().enumerate().rev() {
+        let pos = vec[..hi].partition_point(|&e| e < value);
+        debug_assert!(pos == hi || vec[pos] != value, "a merged value is new");
+        let moved = hi - pos;
+        vec.copy_within(pos..hi, dst - moved);
+        dst -= moved + 1;
+        hi = pos;
+        vec[dst] = value;
+        if hi == 0 {
+            // Every old value is placed: the rest of `run` comes first.
+            vec[..left].copy_from_slice(&run[..left]);
+            return;
+        }
+    }
+}
+
+/// Remove `run` — sorted, without repeats, every value in `vec` — from the
+/// sorted `vec` in one pass: only the values after `run`'s first value
+/// move, each once. A list left using less than a quarter of its allocation
+/// gives the rest back (as [`sorted_remove`]).
+fn remove_sorted_from(vec: &mut Vec<(u32, u32)>, run: &[(u32, u32)]) {
+    let Some(&first) = run.first() else {
+        return;
+    };
+    // `vec[..write]` is final; `vec[read..]` is still to be scanned.
+    let mut read = vec.partition_point(|&e| e < first);
+    let mut write = read;
+    for &value in run {
+        let pos = read + vec[read..].partition_point(|&e| e < value);
+        debug_assert_eq!(vec.get(pos), Some(&value), "a removed value is present");
+        vec.copy_within(read..pos, write);
+        write += pos - read;
+        read = pos + 1;
+    }
+    let len = vec.len();
+    vec.copy_within(read..len, write);
+    vec.truncate(write + (len - read));
+    if vec.len() < vec.capacity() / 4 {
+        vec.shrink_to_fit();
+    }
+}
+
 /// An adjacency map from `(key, value)` pairs sorted by key, then value, and
 /// free of duplicates: one exactly sized list per run of equal keys.
 fn group_sorted(pairs: impl Iterator<Item = (u32, (u32, u32))> + Clone) -> AdjMap<u32> {
@@ -504,6 +597,11 @@ fn group_sorted(pairs: impl Iterator<Item = (u32, (u32, u32))> + Clone) -> AdjMa
     }
     // Sorted, unique keys: the map is built in one pass.
     runs.into_iter().collect()
+}
+
+/// The `(sub, pred, obj)` order of a triple.
+fn spo_key(t: &IdTriple) -> (u32, u32, u32) {
+    (t.sub, t.pred, t.obj)
 }
 
 /// Return the slice of `vec` whose first component equals `first`.
@@ -521,14 +619,36 @@ impl StoreData {
             .is_some_and(|v| v.binary_search(&(pred, obj)).is_ok())
     }
 
-    /// Apply one journaled change. It changed the store it was recorded on,
-    /// so it changes this copy of that store's earlier state the same way.
-    fn apply(&mut self, change: Change) {
-        let changed = match change {
-            Change::Insert(t) => self.insert(t),
-            Change::Remove(t) => self.remove(t),
-        };
-        debug_assert!(changed, "a journaled change replays as a change");
+    /// Replay `journal`, the changes made (in order) to the store whose
+    /// earlier state this is. Each change changed that store, so it changes
+    /// this copy the same way; a run of inserts (or of removes) is applied
+    /// as one batch — its triples are distinct, each absent (present) when
+    /// the run starts.
+    fn replay(&mut self, journal: &[Change]) {
+        let mut batch: Vec<IdTriple> = Vec::new();
+        let mut rest = journal;
+        while let Some(&first) = rest.first() {
+            let insert = first.is_insert();
+            let n = rest.iter().take_while(|c| c.is_insert() == insert).count();
+            if n == 1 {
+                let changed = if insert {
+                    self.insert(first.triple())
+                } else {
+                    self.remove(first.triple())
+                };
+                debug_assert!(changed, "a journaled change replays as a change");
+            } else {
+                batch.clear();
+                batch.extend(rest[..n].iter().map(|c| c.triple()));
+                batch.sort_unstable_by_key(spo_key);
+                if insert {
+                    self.insert_new(&mut batch);
+                } else {
+                    self.remove_present(&mut batch);
+                }
+            }
+            rest = &rest[n..];
+        }
     }
 
     fn insert(&mut self, t: IdTriple) -> bool {
@@ -579,6 +699,110 @@ impl StoreData {
         self.prune_empty(sub, pred, obj);
         self.triple_count -= 1;
         true
+    }
+
+    /// Insert `triples` — sorted by `(sub, pred, obj)`, distinct, none in
+    /// the store — merging each touched list's new entries in one pass
+    /// ([`merge_sorted_into`]). The result, statistics included, is that of
+    /// [`insert`](Self::insert) of each. `triples` is left sorted by
+    /// `(pred, sub, obj)`.
+    fn insert_new(&mut self, triples: &mut [IdTriple]) {
+        let mut run: Vec<(u32, u32)> = Vec::new();
+        for group in triples.chunk_by(|a, b| a.sub == b.sub) {
+            let list = self.s2po.entry(group[0].sub).or_default();
+            // A predicate the subject did not have gains a distinct subject.
+            for same in group.chunk_by(|a, b| a.pred == b.pred) {
+                if range_by_first(list, same[0].pred).is_empty() {
+                    self.pred_stats.entry(same[0].pred).or_default().0 += 1;
+                }
+            }
+            run.clear();
+            run.extend(group.iter().map(|t| (t.pred, t.obj)));
+            merge_sorted_into(list, &run);
+        }
+        triples.sort_unstable_by_key(|t| (t.obj, t.pred, t.sub));
+        for group in triples.chunk_by(|a, b| a.obj == b.obj) {
+            let list = self.o2ps.entry(group[0].obj).or_default();
+            for same in group.chunk_by(|a, b| a.pred == b.pred) {
+                if range_by_first(list, same[0].pred).is_empty() {
+                    self.pred_stats.entry(same[0].pred).or_default().1 += 1;
+                }
+            }
+            run.clear();
+            run.extend(group.iter().map(|t| (t.pred, t.sub)));
+            merge_sorted_into(list, &run);
+        }
+        triples.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
+        for group in triples.chunk_by(|a, b| a.pred == b.pred) {
+            run.clear();
+            run.extend(group.iter().map(|t| (t.sub, t.obj)));
+            merge_sorted_into(self.p2so.entry(group[0].pred).or_default(), &run);
+        }
+        self.triple_count += triples.len() as u64;
+    }
+
+    /// Remove `triples` — sorted by `(sub, pred, obj)`, distinct, all in the
+    /// store — from each touched list in one pass ([`remove_sorted_from`]).
+    /// The result, statistics and pruning included, is that of
+    /// [`remove`](Self::remove) of each. `triples` is left sorted by
+    /// `(pred, sub, obj)`.
+    fn remove_present(&mut self, triples: &mut [IdTriple]) {
+        let mut run: Vec<(u32, u32)> = Vec::new();
+        for group in triples.chunk_by(|a, b| a.sub == b.sub) {
+            let sub = group[0].sub;
+            let Some(list) = self.s2po.get_mut(&sub) else {
+                continue;
+            };
+            run.clear();
+            run.extend(group.iter().map(|t| (t.pred, t.obj)));
+            remove_sorted_from(list, &run);
+            // A predicate the subject no longer has loses a distinct subject.
+            for same in group.chunk_by(|a, b| a.pred == b.pred) {
+                if range_by_first(list, same[0].pred).is_empty() {
+                    if let Some(stat) = self.pred_stats.get_mut(&same[0].pred) {
+                        stat.0 -= 1;
+                    }
+                }
+            }
+            if list.is_empty() {
+                self.s2po.remove(&sub);
+            }
+        }
+        triples.sort_unstable_by_key(|t| (t.obj, t.pred, t.sub));
+        for group in triples.chunk_by(|a, b| a.obj == b.obj) {
+            let obj = group[0].obj;
+            let Some(list) = self.o2ps.get_mut(&obj) else {
+                continue;
+            };
+            run.clear();
+            run.extend(group.iter().map(|t| (t.pred, t.sub)));
+            remove_sorted_from(list, &run);
+            for same in group.chunk_by(|a, b| a.pred == b.pred) {
+                if range_by_first(list, same[0].pred).is_empty() {
+                    if let Some(stat) = self.pred_stats.get_mut(&same[0].pred) {
+                        stat.1 -= 1;
+                    }
+                }
+            }
+            if list.is_empty() {
+                self.o2ps.remove(&obj);
+            }
+        }
+        triples.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
+        for group in triples.chunk_by(|a, b| a.pred == b.pred) {
+            let pred = group[0].pred;
+            let Some(list) = self.p2so.get_mut(&pred) else {
+                continue;
+            };
+            run.clear();
+            run.extend(group.iter().map(|t| (t.sub, t.obj)));
+            remove_sorted_from(list, &run);
+            if list.is_empty() {
+                self.p2so.remove(&pred);
+                self.pred_stats.remove(&pred);
+            }
+        }
+        self.triple_count -= triples.len() as u64;
     }
 
     /// Drop now-empty adjacency entries so key-iteration stays tight.
@@ -745,9 +969,8 @@ impl TripleStore {
         {
             if let Some(mine) = Arc::get_mut(&mut old) {
                 // No clone reads the spare any more: bring it up to date.
-                for change in journal.drain(..) {
-                    mine.apply(change);
-                }
+                mine.replay(&journal);
+                journal.clear();
                 let shared = std::mem::replace(&mut self.data, old);
                 slot.spare = Some(Spare {
                     old: shared,
@@ -806,6 +1029,80 @@ impl TripleStore {
             self.journal(Change::Remove(t));
         }
         removed
+    }
+
+    /// Insert each of `triples` (in any order, repeats allowed), merging
+    /// the new ones into every touched list in one pass. Element `i` of the
+    /// result is what [`insert`](Self::insert) of `triples[i]` returns after
+    /// the inserts of `triples[..i]`, and the store ends up exactly as after
+    /// them (statistics and serialized bytes included).
+    ///
+    /// Cost: O(b log b) to sort the batch, plus one pass over the tail of
+    /// each touched list from its first new entry — where one insert per
+    /// triple moves that tail once per triple. That matters when new
+    /// triples land at the front of long lists: a reused low id joining a
+    /// predicate's `(sub, obj)` list or a class's `(pred, sub)` list. A
+    /// batch that adds nothing never copies shared indexes.
+    pub fn insert_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        if let [t] = triples {
+            return vec![self.insert(*t)];
+        }
+        let (results, mut new) = self.plan_batch(triples, false);
+        if !new.is_empty() {
+            self.data_mut().insert_new(&mut new);
+            self.journal_many(&new, Change::Insert);
+        }
+        results
+    }
+
+    /// Remove each of `triples` (in any order, repeats allowed) from every
+    /// touched list in one pass. Element `i` of the result is what
+    /// [`remove`](Self::remove) of `triples[i]` returns after the removes of
+    /// `triples[..i]`, and the store ends up exactly as after them. Cost as
+    /// [`insert_many`](Self::insert_many); a batch that removes nothing
+    /// never copies shared indexes.
+    pub fn remove_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        if let [t] = triples {
+            return vec![self.remove(*t)];
+        }
+        let (results, mut present) = self.plan_batch(triples, true);
+        if !present.is_empty() {
+            self.data_mut().remove_present(&mut present);
+            self.journal_many(&present, Change::Remove);
+        }
+        results
+    }
+
+    /// The triples of a batch that change the store — the first occurrence
+    /// of each triple whose presence in the store is `present`, sorted by
+    /// `(sub, pred, obj)` — and, per input position, whether it is one.
+    fn plan_batch(&self, triples: &[IdTriple], present: bool) -> (Vec<bool>, Vec<IdTriple>) {
+        let mut order: Vec<(IdTriple, usize)> = triples.iter().copied().zip(0..).collect();
+        order.sort_unstable_by_key(|&(t, i)| (spo_key(&t), i));
+        let mut results = vec![false; triples.len()];
+        let mut chosen = Vec::new();
+        let mut last = None;
+        for (t, i) in order {
+            if last == Some(t) {
+                continue;
+            }
+            last = Some(t);
+            if self.data.exists(t.sub, t.pred, t.obj) == present {
+                results[i] = true;
+                chosen.push(t);
+            }
+        }
+        (results, chosen)
+    }
+
+    /// [`journal`](Self::journal) each of `triples` as `change`.
+    fn journal_many(&mut self, triples: &[IdTriple], change: fn(IdTriple) -> Change) {
+        if self.spare.get().is_none() {
+            return;
+        }
+        for &t in triples {
+            self.journal(change(t));
+        }
     }
 
     /// Bulk-load triples efficiently: push everything, then sort + de-dup each
@@ -1262,5 +1559,38 @@ mod tests {
         assert_eq!(s.in_degree(0), 0);
         assert_eq!(s.in_degree(1), 1); // node0 is object once
         assert_eq!(s.degree(2), 2 + 1); // node1: 2 out (own), 1 in (contain)
+    }
+
+    /// The one-pass merge and removal against a sorted set, for every split
+    /// of a small universe into "in the list" and "in the run".
+    #[test]
+    fn merge_and_one_pass_removal_equal_a_sorted_set() {
+        let universe: Vec<(u32, u32)> = (0..9).map(|i| (i / 3, i % 3)).collect();
+        for mask in 0u32..(1 << universe.len()) {
+            for run_mask in [mask, !mask, 0b1_0101_0101, 0b0_1111_0000] {
+                let list: Vec<(u32, u32)> = (0..universe.len())
+                    .filter(|&i| mask & (1 << i) != 0)
+                    .map(|i| universe[i])
+                    .collect();
+                let run: Vec<(u32, u32)> = (0..universe.len())
+                    .filter(|&i| run_mask & (1 << i) != 0 && mask & (1 << i) == 0)
+                    .map(|i| universe[i])
+                    .collect();
+                let mut merged = list.clone();
+                merge_sorted_into(&mut merged, &run);
+                let mut expected: Vec<(u32, u32)> = list.iter().chain(&run).copied().collect();
+                expected.sort_unstable();
+                assert_eq!(merged, expected, "merge of {run:?} into {list:?}");
+                // Removing what was merged gives the list back; removing
+                // part of the list leaves the rest.
+                remove_sorted_from(&mut merged, &run);
+                assert_eq!(merged, list, "removal of {run:?}");
+                let gone: Vec<(u32, u32)> = list.iter().copied().step_by(2).collect();
+                let mut rest = list.clone();
+                remove_sorted_from(&mut rest, &gone);
+                let kept: Vec<(u32, u32)> = list.iter().copied().skip(1).step_by(2).collect();
+                assert_eq!(rest, kept, "removal of {gone:?} from {list:?}");
+            }
+        }
     }
 }
