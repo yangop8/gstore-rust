@@ -3308,14 +3308,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // One constant end and a variable end with few candidates: test each
         // candidate (ascending) instead of reading the list — the same
         // triples in the same (ascending) order, the list filtered by the
-        // candidates. "Few" against the predicate's average list length.
+        // candidates. "Few": a lookup per candidate (`LOOKUP_COST` list
+        // entries each) costs less than the predicate's average list.
         match known {
             _ if plain_plans() => {}
             (None, Some(p), Some(o)) => {
                 let avg = self.store.pred_card(p) / self.store.pred_distinct_obj(p).max(1);
-                if let Some(subjects) =
-                    s_cands.filter(|c| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < avg)
-                {
+                if let Some(subjects) = s_cands.filter(|c| few_candidates(c.len(), avg)) {
                     return subjects
                         .iter()
                         .filter(|&&s| self.store.exists(s, p, o))
@@ -3325,9 +3324,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             (Some(s), Some(p), None) => {
                 let avg = self.store.pred_card(p) / self.store.pred_distinct_subj(p).max(1);
-                if let Some(objects) =
-                    o_cands.filter(|c| c.len().saturating_mul(CANDIDATE_LOOKUP_FACTOR) < avg)
-                {
+                if let Some(objects) = o_cands.filter(|c| few_candidates(c.len(), avg)) {
                     return objects
                         .iter()
                         .filter(|&&o| self.store.exists(s, p, o))
@@ -6215,6 +6212,22 @@ thread_local! {
     /// `candidate_triples_in` off on this thread, to compare with the plain
     /// optimizer and scans.
     static PLAIN_PLANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests make `candidate_triples_in` look every candidate up.
+    static ALWAYS_LOOK_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `n` candidates are few enough to be looked up one by one rather
+/// than reading a list of `avg` entries (see `candidate_triples_in`).
+fn few_candidates(n: usize, avg: usize) -> bool {
+    #[cfg(test)]
+    if PLAIN_PLANS.with(std::cell::Cell::get) {
+        return false;
+    }
+    #[cfg(test)]
+    if ALWAYS_LOOK_UP.with(std::cell::Cell::get) {
+        return true;
+    }
+    (n as u64).saturating_mul(LOOKUP_COST) < avg as u64
 }
 
 #[inline]

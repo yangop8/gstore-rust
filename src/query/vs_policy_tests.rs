@@ -439,6 +439,11 @@ fn shortcuts_give_the_plain_plans_rows_in_order() {
                     PLAIN_PLANS.with(|f| f.set(false));
                     let got = rows_under(&d, &store, tree, &tps, policy);
                     assert_eq!(got, want, "seed {seed} query {i}: {}", select_text(&tps));
+                    // Candidate lookups wherever a candidate set exists.
+                    ALWAYS_LOOK_UP.with(|f| f.set(true));
+                    let looked_up = rows_under(&d, &store, tree, &tps, policy);
+                    ALWAYS_LOOK_UP.with(|f| f.set(false));
+                    assert_eq!(looked_up, want, "seed {seed} query {i} (lookups)");
                     if i % 2 == 0 && !got.is_empty() {
                         stars += 1;
                     }

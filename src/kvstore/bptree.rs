@@ -487,6 +487,50 @@ impl LeafCursor {
         }
     }
 
+    /// Move forward, within the current leaf, to its first remaining entry
+    /// whose key is `>= key`, by a binary search (a uniform leaf; the per-
+    /// thread SPO cursor of a disk store can use it instead of stepping
+    /// entry by entry). `Ok(true)`: the next [`next_entry`](Self::next_entry)
+    /// returns that entry (the cursor never moves backwards: if its next
+    /// entry is already `>= key` it stays). `Ok(false)`: the leaf cannot
+    /// answer — every remaining entry is `< key`, the cursor is exhausted or
+    /// the leaf is not uniform — and the cursor is unchanged; the caller
+    /// seeks from the root ([`BTree::cursor_ge`]).
+    pub fn seek_in_leaf(&mut self, key: &[u8]) -> Result<bool> {
+        let (Some(page), Layout::Uniform { stride, klen, .. }) =
+            (self.page.as_deref(), self.layout)
+        else {
+            return Ok(false);
+        };
+        if self.left == 0 {
+            return Ok(false);
+        }
+        let page = &page[..];
+        let key_at = |i: usize| -> Result<&[u8]> {
+            let at = self.off + i * stride;
+            if u16_in(page, at) != klen {
+                return Err(corrupt("entry size differs from its node's layout"));
+            }
+            Ok(&page[at + 2..at + 2 + klen])
+        };
+        if key_at(self.left - 1)? < key {
+            return Ok(false);
+        }
+        // The first remaining entry `>= key` (the last one is).
+        let (mut lo, mut hi) = (0, self.left - 1);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if key_at(mid)? < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        self.off += lo * stride;
+        self.left -= lo;
+        Ok(true)
+    }
+
     /// The next `(key, value)` in key order, or `None` at the end of the tree.
     pub fn next_entry<'s>(&'s mut self, pager: &Pager) -> Result<Option<(&'s [u8], &'s [u8])>> {
         while self.left == 0 {
@@ -2002,6 +2046,80 @@ mod tests {
         }
         assert_eq!(walked, all);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn seek_in_leaf_lands_where_a_fresh_cursor_would() {
+        let path = tmp(&format!("seek_in_leaf_{}", std::process::id()));
+        // Removed also when an assertion fails.
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let mut wal = self.0.clone().into_os_string();
+                wal.push(".wal");
+                let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+            }
+        }
+        let _rm = Rm(path.clone());
+        let mut pg = Pager::open(&path, 64).unwrap();
+        let t = BTree::with_fixed_shape(0, 12, 0);
+        let mut rng = Rng(11);
+        for _ in 0..6000 {
+            let mut k = Vec::with_capacity(12);
+            k.extend_from_slice(&be32(rng.below(400) as u32));
+            k.extend_from_slice(&be32(rng.below(5) as u32));
+            k.extend_from_slice(&be32(rng.below(50) as u32));
+            t.insert(&mut pg, &k, b"").unwrap();
+        }
+        let all: Vec<Vec<u8>> = t
+            .scan_prefix(&pg, &[])
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        // Ascending probe keys (as the SPO cursor sees them), some present,
+        // some between keys, some far ahead.
+        let mut probes: Vec<Vec<u8>> = (0..3000)
+            .map(|_| {
+                let mut k = Vec::with_capacity(12);
+                k.extend_from_slice(&be32(rng.below(420) as u32));
+                k.extend_from_slice(&be32(rng.below(6) as u32));
+                k.extend_from_slice(&be32(rng.below(60) as u32));
+                k
+            })
+            .collect();
+        probes.sort();
+        let mut cur = t.cursor_ge(&pg, &[]).unwrap();
+        let (mut hits, mut misses) = (0, 0);
+        for key in &probes {
+            if cur.seek_in_leaf(key).unwrap() {
+                hits += 1;
+            } else {
+                misses += 1;
+                cur = t.cursor_ge(&pg, key).unwrap();
+            }
+            let want = all.iter().find(|k| k.as_slice() >= key.as_slice());
+            let got = {
+                // Peek without consuming: a copy of the cursor's position.
+                let mut probe = LeafCursor {
+                    page: cur.page.clone(),
+                    layout: cur.layout,
+                    shape: cur.shape,
+                    off: cur.off,
+                    left: cur.left,
+                    next_leaf: cur.next_leaf,
+                    hops: cur.hops,
+                };
+                probe.next_entry(&pg).unwrap().map(|(k, _)| k.to_vec())
+            };
+            assert_eq!(got.as_ref(), want, "probe {key:?}");
+        }
+        assert!(hits > 1000 && misses > 10, "{hits} hits, {misses} misses");
+        // A variable-layout or exhausted cursor never answers.
+        let mut end = t.cursor_ge(&pg, &[0xff; 12]).unwrap();
+        assert!(!end.seek_in_leaf(&[0xff; 12]).unwrap());
+        assert!(!LeafCursor::empty().seek_in_leaf(b"x").unwrap());
     }
 
     #[test]
