@@ -15,19 +15,27 @@
 //!     would test (all its edges with a known predicate also have a known
 //!     neighbour, so the set was cut from exactly those edges) keeps its set
 //!     minus non-entities, without touching the tree (*skipped*);
-//!   - an out-of-core tree (`vstree.kv`, which cannot probe) with a
-//!     candidate set to refine tests the remaining predicate bits against
-//!     the store instead of walking the paged file (*store-checked*): a
-//!     candidate's signature has a predicate bit iff it has an edge with a
-//!     predicate hashing to it, which the store answers exactly;
-//!   - everything else as `Tree`.
+//!   - an out-of-core tree (`vstree.kv`, which cannot probe, and whose walk
+//!     reads every page whose union holds the query) is not read at all: a
+//!     candidate set to refine has the remaining predicate bits tested
+//!     against the store (*store-checked*), and a variable without a set
+//!     (all its edges' neighbours are variables, so its query signature is
+//!     predicate bits only) gets the entities with those bits from the
+//!     store's posting lists (*listed*). An entity's signature has the bit
+//!     of predicate `p` in direction `d` iff the entity has an edge in `d`
+//!     whose predicate encodes to that bit, which the store answers exactly
+//!     (looking candidates up or merging posting lists, whichever its exact
+//!     counts make cheaper);
+//!   - everything else (an in-memory tree's probes and walks) as `Tree`.
 //!
 //!   On a tree consistent with the store the sets equal `Tree`'s, so plans,
 //!   answers and their order are identical. After deletes the stored
-//!   signatures are a superset (the tree is not shrunk); a store check is
-//!   then exact against the current data and may keep fewer candidates than
-//!   the stale entries would — the same answers, the order as a freshly
-//!   rebuilt tree would give it.
+//!   signatures are a superset (the tree is not shrunk): an in-memory tree
+//!   gives the same sets as `Tree`; for an out-of-core tree the store's
+//!   answer is exact against the current data and may keep fewer candidates
+//!   than the stale entries would — the same answers, the order a freshly
+//!   rebuilt tree would give (a reopened database drops a stale `vstree.kv`
+//!   altogether).
 //! * [`VsPolicy::Off`] — never consult the tree (as without one): the same
 //!   answers, but plans — and so the order of solutions without `ORDER BY` —
 //!   may differ.
