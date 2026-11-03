@@ -195,31 +195,34 @@ fn readers_see_the_begin_time_state_and_converge_after_commit() {
     let base = srv.count("r").unwrap();
     assert_eq!(base, 600);
     let tid = srv.begin("r");
-    let committed = Arc::new(AtomicU64::new(base));
-    let in_txn = Arc::new(AtomicBool::new(true));
+    // The counts a read may answer: `lo` is the committed count once the
+    // commit answered, `hi` the count it commits from the moment it is sent
+    // (while it runs, either is right).
+    let lo = Arc::new(AtomicU64::new(base));
+    let hi = Arc::new(AtomicU64::new(base));
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicUsize::new(0));
     let readers: Vec<_> = (0..8)
         .map(|_| {
-            let (srv, committed, in_txn, stop, reads) = (
+            let (srv, lo, hi, stop, reads) = (
                 Arc::clone(&srv),
-                Arc::clone(&committed),
-                Arc::clone(&in_txn),
+                Arc::clone(&lo),
+                Arc::clone(&hi),
                 Arc::clone(&stop),
                 Arc::clone(&reads),
             );
             thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    // Read the expectation before the query: a commit may
-                    // land while it runs (then either count is right).
-                    let before = committed.load(Ordering::SeqCst);
-                    let txn_open = in_txn.load(Ordering::SeqCst);
+                    // The oldest state the read may see is the one committed
+                    // when it starts, the newest the one being committed
+                    // when it ends.
+                    let oldest = lo.load(Ordering::SeqCst);
                     let n = srv.count("r").expect("a reader failed");
-                    let after = committed.load(Ordering::SeqCst);
+                    let newest = hi.load(Ordering::SeqCst);
                     assert_eq!(n % 2, 0, "half a pair is visible: {n}");
                     assert!(
-                        n == before || n == after,
-                        "saw {n}, committed {before} then {after} (in txn: {txn_open})"
+                        n == oldest || n == newest,
+                        "saw {n}, committed {oldest} (at the start) or {newest} (at the end)"
                     );
                     reads.fetch_add(1, Ordering::SeqCst);
                 }
@@ -232,12 +235,12 @@ fn readers_see_the_begin_time_state_and_converge_after_commit() {
         srv.tquery("r", &tid, &format!("INSERT DATA {{ {pair} }}"));
     }
     thread::sleep(Duration::from_millis(200));
-    // The expectation moves just before the commit (both counts are right
-    // while it runs).
-    committed.store(base + 100, Ordering::SeqCst);
+    // While the commit runs, both counts are right; once it answered, only
+    // the committed one.
+    hi.store(base + 100, Ordering::SeqCst);
     let (s, b) = srv.req("POST", &format!("/commit?db_name=r&tid={tid}"), "");
     assert_eq!(s, 200, "commit: {b}");
-    in_txn.store(false, Ordering::SeqCst);
+    lo.store(base + 100, Ordering::SeqCst);
     // Converged: every reader now sees the committed count.
     let deadline = Instant::now() + Duration::from_secs(10);
     while srv.count("r").unwrap() != base + 100 {
