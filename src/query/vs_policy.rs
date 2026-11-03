@@ -113,8 +113,19 @@ thread_local! {
     static STATS: Cell<VsStats> = const { Cell::new(VsStats::ZERO) };
 }
 
+/// The built-in default: [`VsPolicy::Auto`] — for the binaries, the
+/// integration tests and every user of the library. The library's own unit
+/// tests run under [`VsPolicy::Tree`], the behaviour some of their
+/// assertions were written against (`db::tests` checks that a query paged
+/// `vstree.kv` nodes); the policy's own tests set it explicitly.
+#[cfg(not(test))]
+const BUILT_IN_DEFAULT: VsPolicy = VsPolicy::Auto;
+#[cfg(test)]
+const BUILT_IN_DEFAULT: VsPolicy = VsPolicy::Tree;
+
 /// The process default: [`set_default_vs_policy`]'s value, else
-/// `GSTORE_VS_POLICY` (an unknown value is ignored), else [`VsPolicy::Auto`].
+/// `GSTORE_VS_POLICY` (an unknown value is ignored), else [`VsPolicy::Auto`]
+/// (see `BUILT_IN_DEFAULT` for the library's unit tests).
 pub fn default_vs_policy() -> VsPolicy {
     if let Some(p) = VsPolicy::from_code(DEFAULT.load(Ordering::Relaxed)) {
         return p;
@@ -122,7 +133,7 @@ pub fn default_vs_policy() -> VsPolicy {
     let p = std::env::var(VS_POLICY_ENV)
         .ok()
         .and_then(|v| VsPolicy::parse(&v))
-        .unwrap_or_default();
+        .unwrap_or(BUILT_IN_DEFAULT);
     // A concurrent `set_default_vs_policy` wins over the environment.
     let _ = DEFAULT.compare_exchange(UNSET, p.code(), Ordering::Relaxed, Ordering::Relaxed);
     VsPolicy::from_code(DEFAULT.load(Ordering::Relaxed)).unwrap_or(p)

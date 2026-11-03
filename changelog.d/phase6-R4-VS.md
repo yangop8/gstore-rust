@@ -18,7 +18,13 @@ Rounds 1–3 merged). Files: `src/query/{engine,candidates,mod}.rs`,
   Switches, in order of precedence: `Evaluator::with_vs_policy`,
   `query::scoped_vs_policy(policy)` (per thread, a guard),
   `query::set_default_vs_policy`, and the environment variable
-  `GSTORE_VS_POLICY=auto|tree|off` (read once). Per-thread decision counts:
+  `GSTORE_VS_POLICY=auto|tree|off` (read once). The library's own unit
+  tests (`cargo test --lib`) default to `Tree`: two of `db::tests`
+  (`disk_database_filters_via_on_disk_vstree`,
+  `streaming_vstree_matches_in_memory_path`, in `src/db/mod.rs`, not this
+  package's file) assert that a query paged `vstree.kv` nodes, which
+  `Auto` no longer does (see Requests); integration tests and binaries get
+  `Auto`. Per-thread decision counts:
   `query::vs_stats()` / `reset_vs_stats()` (`skipped`, `store_checked`,
   `listed`, `probed`, `walked`, `seeded`, `off`).
 - **What `Auto` does.** A query signature's bits are those of the edges
@@ -324,5 +330,15 @@ throwaway worktree) merges without conflicts.
    without `ORDER BY` relative to the base — not done; a `Database`-side
    signal that the tree is exact (`vs_shrink_debt() == 0`, `src/db`) would
    make it safe.
-5. Not yet: RocksDB Q2's scaling (×95 from univ 8 to 38) is unchanged — it
+5. **`src/db/mod.rs` owner (R4-RECLAIM this round)**: the tests
+   `db::tests::disk_database_filters_via_on_disk_vstree` and
+   `streaming_vstree_matches_in_memory_path` assert
+   `db.vstree.disk_pages_read() > 0` after their queries — true only under
+   `VsPolicy::Tree`. Run those queries inside
+   `let _g = crate::query::scoped_vs_policy(VsPolicy::Tree);` (they test
+   the out-of-core tree's walk) and assert the same answers once more under
+   `Auto` with `disk_pages_read()` unchanged; then `BUILT_IN_DEFAULT` in
+   `src/query/vs_policy.rs` can drop its `cfg(test)` case (`Tree` for the
+   library's unit tests).
+6. Not yet: RocksDB Q2's scaling (×95 from univ 8 to 38) is unchanged — it
    opens without a VS-tree and its Q2 join is dominated by `s_by_po` reads.
