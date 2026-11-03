@@ -1016,13 +1016,14 @@ impl Database {
             opts,
             log,
             &mut |batch: &mut Vec<Quad>| {
-                for q in batch.drain(..) {
+                let mut added = Vec::new();
+                let quads = batch.drain(..).map(|q| {
                     let graph = graph_iri(&q.graph);
-                    if self.insert_quad(&q.into_triple(), graph.as_deref())? {
-                        *applied += 1;
-                    }
-                }
-                Ok(())
+                    (q.into_triple(), graph)
+                });
+                let result = self.insert_statements(quads, &mut added);
+                *applied += added.len() as u64;
+                result
             },
         )
     }
@@ -1048,15 +1049,15 @@ impl Database {
                 // In a read scope (C2): a term that cannot be looked up must
                 // fail the removal, not read as absent.
                 let scope = ReadScope::enter();
-                for q in batch.drain(..) {
+                let quads = batch.drain(..).map(|q| {
                     let graph = graph_iri(&q.graph);
-                    if self.delete_quad(&q.into_triple(), graph.as_deref()) {
-                        *applied += 1;
-                    }
-                    if let Some(e) = scope.take_error() {
-                        self.flush_reclaim();
-                        return Err(read_failure("removing statements", e));
-                    }
+                    (q.into_triple(), graph)
+                });
+                let (removed, err) = self.remove_statements(quads, Some(&scope));
+                *applied += removed as u64;
+                if let Some(e) = err {
+                    self.flush_reclaim();
+                    return Err(read_failure("removing statements", e));
                 }
                 // Each batch frees the ids it left unreferenced.
                 self.flush_reclaim();
@@ -1239,14 +1240,131 @@ impl Database {
                     self.vstree_index_insert(id);
                 }
             }
-            self.touched();
-            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
-                log.push(UndoOp::Del(None, id)); // rollback removes what we added
-            }
-            self.record_redo(b'I', None, id);
-            self.persist_mutation(true, None, id);
+            self.inserted_default(id, disk);
         }
         Ok(changed.then_some(id))
+    }
+
+    /// The book-keeping of a newly added default-graph triple, the VS-tree
+    /// aside: caches, the undo log (Stream mode: the store's overlay undoes
+    /// it), the redo log and the write-through.
+    fn inserted_default(&mut self, id: IdTriple, disk: bool) {
+        self.touched();
+        if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
+            log.push(UndoOp::Del(None, id)); // rollback removes what we added
+        }
+        self.record_redo(b'I', None, id);
+        self.persist_mutation(true, None, id);
+    }
+
+    /// Insert statements (`None` graph = the default graph), as
+    /// [`insert_quad_id`](Self::insert_quad_id) of each in order would,
+    /// pushing each newly added one to `applied`. On an in-memory store the
+    /// default-graph triples are interned first (terms before triples, as
+    /// one by one) and merged into the store as one batch
+    /// ([`MutableStore::insert_many`]): a new term reusing a low id lands
+    /// near the front of long adjacency lists, which one insert per triple
+    /// would move once per triple. Their book-keeping then runs per added
+    /// triple, in input order; they are pushed to `applied` after the batch
+    /// (the named-graph ones as they are applied — the graphs are
+    /// independent, so only the order within one graph matters). On an
+    /// error (an id space exhausted) the statements before the failing one
+    /// stay inserted, as one by one, and the error is returned.
+    fn insert_statements<T, G>(
+        &mut self,
+        items: impl IntoIterator<Item = (T, Option<G>)>,
+        applied: &mut Vec<(Option<u32>, IdTriple)>,
+    ) -> Result<()>
+    where
+        T: std::borrow::Borrow<Triple>,
+        G: AsRef<str>,
+    {
+        let batched = self.store.as_memory().is_some();
+        let mut pending: Vec<IdTriple> = Vec::new();
+        let mut result = Ok(());
+        for (t, g) in items {
+            let (t, g) = (t.borrow(), g.as_ref().map(AsRef::as_ref));
+            let step = if batched && g.is_none() {
+                self.intern_for_insert(t, None)
+                    .map(|r| pending.extend(r.map(|(_, id)| id)))
+            } else {
+                self.insert_quad_id(t, g).map(|r| applied.extend(r))
+            };
+            if let Err(e) = step {
+                result = Err(e);
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            let added = self.insert_default_batch(&pending);
+            applied.extend(added.into_iter().map(|id| (None, id)));
+        }
+        result
+    }
+
+    /// Insert the interned default-graph triples `ids` into the in-memory
+    /// store as one batch and run each added triple's book-keeping, in input
+    /// order. Returns the added triples. The VS-tree is kept incrementally
+    /// as one by one would ([`vstree_index_insert`](Self::vstree_index_insert)),
+    /// reading no edge from the store for an entity with no default-graph
+    /// edge before the batch (a new term, or a reclaimed id reused for one):
+    /// its exact signature is the union of its batch edges, so its entry —
+    /// possibly the stale one of the term its id named before — is replaced
+    /// by its first batch edge's signature and the later ones are ORed in.
+    fn insert_default_batch(&mut self, ids: &[IdTriple]) -> Vec<IdTriple> {
+        // Entity -> FRESH (no edge before the batch, entry not yet replaced),
+        // SIGNED (fresh, entry replaced), or OLD (had edges: its entry is
+        // folded into, as one by one).
+        const OLD: u8 = 0;
+        const FRESH: u8 = 1;
+        const SIGNED: u8 = 2;
+        let fold = self.index_valid && !self.vstree.is_disk_backed();
+        let mut state: HashMap<u32, u8> = HashMap::new();
+        if fold {
+            for id in ids {
+                let obj = is_entity_id(id.obj).then_some(id.obj);
+                for e in std::iter::once(id.sub).chain(obj) {
+                    if let std::collections::hash_map::Entry::Vacant(v) = state.entry(e) {
+                        let edges = self.store.count_po_by_s(e) + self.store.count_ps_by_o(e);
+                        v.insert(if edges == 0 { FRESH } else { OLD });
+                    }
+                }
+            }
+        }
+        let results = self.store.insert_many(ids);
+        let mut added = Vec::new();
+        for (&id, new) in ids.iter().zip(results) {
+            if !new {
+                continue;
+            }
+            if self.index_valid {
+                if self.vstree.is_disk_backed() {
+                    self.index_valid = false;
+                } else {
+                    let mut out = Signature::new();
+                    out.encode_edge(id.pred, id.obj, EdgeDir::Out);
+                    // Literal objects are not VS-tree entities.
+                    let inc = is_entity_id(id.obj).then(|| {
+                        let mut inc = Signature::new();
+                        inc.encode_edge(id.pred, id.sub, EdgeDir::In);
+                        (id.obj, inc)
+                    });
+                    for (e, sig) in std::iter::once((id.sub, out)).chain(inc) {
+                        if state.get(&e) == Some(&FRESH) {
+                            state.insert(e, SIGNED);
+                            if !self.vstree.update(e, sig) {
+                                self.vstree.insert(e, sig);
+                            }
+                        } else if !self.vstree.union_into(e, &sig) {
+                            self.upsert_entity_signature(e);
+                        }
+                    }
+                }
+            }
+            self.inserted_default(id, false);
+            added.push(id);
+        }
+        added
     }
 
     /// Fold a just-inserted default-graph triple into the VS-tree incrementally
@@ -1314,14 +1432,20 @@ impl Database {
     /// [`remove_triple`](Self::remove_triple) without the reclamation at its
     /// end (the statement that calls it reclaims once, when it is done).
     fn remove_triple_quiet(&mut self, t: &Triple) -> bool {
-        let (Some(sub), Some(pred), Some(obj)) = (
-            self.dict.entity_id(&t.subject.dict_key()),
-            self.dict.predicate_id(&t.predicate.dict_key()),
-            self.dict.term_id(&t.object),
-        ) else {
-            return false;
-        };
-        self.remove_default_id(IdTriple::new(sub, pred, obj))
+        match self.known_ids(t) {
+            Some(id) => self.remove_default_id(id),
+            None => false,
+        }
+    }
+
+    /// The ids of a default-graph triple whose terms are all known (looked
+    /// up, never interned: with an unknown term the triple cannot exist).
+    fn known_ids(&self, t: &Triple) -> Option<IdTriple> {
+        Some(IdTriple::new(
+            self.dict.entity_id(&t.subject.dict_key())?,
+            self.dict.predicate_id(&t.predicate.dict_key())?,
+            self.dict.term_id(&t.object)?,
+        ))
     }
 
     /// [`remove_triple`](Self::remove_triple), failing when the removal cannot
@@ -1348,27 +1472,89 @@ impl Database {
         let disk = self.store.as_disk().is_some();
         let changed = self.store.remove(id);
         if changed {
-            // A delete leaves the VS-tree alone, valid: the removed edge only
-            // *shrinks* the subject/object signatures, so their stored entries
-            // stay sound supersets (an entity left with no edge at all is a
-            // harmless phantom — the joins check every candidate against the
-            // store). A freed id that `reclaim_unused` later reuses is either
-            // re-signed exactly by the insert that uses it, or has no
-            // default-graph edge, so its entry is a superset too. This holds
-            // for the read-only out-of-core tree as well. The cost is some
-            // pruning power, counted in `vs_shrink_debt`.
-            if self.index_valid {
-                self.vs_shrink_debt += 1;
-            }
-            self.touched();
-            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
-                log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
-            }
-            self.record_redo(b'D', None, id);
-            self.persist_mutation(false, None, id);
-            self.note_removed(None, id);
+            self.removed_default(id, disk);
         }
         changed
+    }
+
+    /// The book-keeping of a removed default-graph triple.
+    fn removed_default(&mut self, id: IdTriple, disk: bool) {
+        // A delete leaves the VS-tree alone, valid: the removed edge only
+        // *shrinks* the subject/object signatures, so their stored entries
+        // stay sound supersets (an entity left with no edge at all is a
+        // harmless phantom — the joins check every candidate against the
+        // store). A freed id that `reclaim_unused` later reuses is either
+        // re-signed exactly by the insert that uses it, or has no
+        // default-graph edge, so its entry is a superset too. This holds
+        // for the read-only out-of-core tree as well. The cost is some
+        // pruning power, counted in `vs_shrink_debt`.
+        if self.index_valid {
+            self.vs_shrink_debt += 1;
+        }
+        self.touched();
+        if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
+            log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
+        }
+        self.record_redo(b'D', None, id);
+        self.persist_mutation(false, None, id);
+        self.note_removed(None, id);
+    }
+
+    /// Remove statements (`None` graph = the default graph), as
+    /// [`delete_quad`](Self::delete_quad) of each in order would; returns
+    /// how many existed. On an in-memory store the default-graph triples
+    /// are removed as one batch ([`MutableStore::remove_many`]) after the
+    /// lookups, then their book-keeping runs per removed triple in input
+    /// order (see [`insert_statements`](Self::insert_statements)). With
+    /// `scope`, a read error it notes stops the removal after the statement
+    /// that hit it (the ones before it stay removed) and is returned. Frees
+    /// nothing: the caller reclaims at the end of its statement.
+    fn remove_statements<T, G>(
+        &mut self,
+        items: impl IntoIterator<Item = (T, Option<G>)>,
+        scope: Option<&ReadScope>,
+    ) -> (usize, Option<String>)
+    where
+        T: std::borrow::Borrow<Triple>,
+        G: AsRef<str>,
+    {
+        let batched = self.store.as_memory().is_some();
+        let mut pending: Vec<IdTriple> = Vec::new();
+        let mut n = 0;
+        let mut err = None;
+        for (t, g) in items {
+            let (t, g) = (t.borrow(), g.as_ref().map(AsRef::as_ref));
+            if batched && g.is_none() {
+                pending.extend(self.known_ids(t));
+            } else if self.delete_quad(t, g) {
+                n += 1;
+            }
+            if let Some(e) = scope.and_then(ReadScope::take_error) {
+                err = Some(e);
+                break;
+            }
+        }
+        n += self.remove_default_batch(&pending);
+        let err = err.or_else(|| scope.and_then(ReadScope::take_error));
+        (n, err)
+    }
+
+    /// Remove the default-graph triples `ids` from the in-memory store as
+    /// one batch and run each removed triple's book-keeping, in input order.
+    /// Returns how many existed.
+    fn remove_default_batch(&mut self, ids: &[IdTriple]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let results = self.store.remove_many(ids);
+        let mut n = 0;
+        for (&id, gone) in ids.iter().zip(results) {
+            if gone {
+                self.removed_default(id, false);
+                n += 1;
+            }
+        }
+        n
     }
 
     // ---- transactions -----------------------------------------------------
@@ -1484,8 +1670,32 @@ impl Database {
         // into the tree once the store holds them again (below), O(height)
         // each.
         let mut readded: Vec<IdTriple> = Vec::new();
-        for op in log.into_iter().rev() {
+        // An in-memory store undoes each run of consecutive default-graph
+        // re-adds (or removals) as one batch: same result as one by one.
+        let batched = !journaled && self.store.as_memory().is_some();
+        let mut ops = log.into_iter().rev().peekable();
+        while let Some(op) = ops.next() {
             match op {
+                UndoOp::Add(None, id) if batched => {
+                    let mut run = vec![id];
+                    while let Some(&UndoOp::Add(None, next)) = ops.peek() {
+                        run.push(next);
+                        ops.next();
+                    }
+                    let added = self.store.insert_many(&run);
+                    readded.extend(run.into_iter().zip(added).filter_map(|(t, a)| a.then_some(t)));
+                }
+                UndoOp::Del(None, id) if batched => {
+                    let mut run = vec![id];
+                    while let Some(&UndoOp::Del(None, next)) = ops.peek() {
+                        run.push(next);
+                        ops.next();
+                    }
+                    let gone = self.store.remove_many(&run).into_iter().filter(|&g| g).count();
+                    if self.index_valid {
+                        self.vs_shrink_debt += gone as u64;
+                    }
+                }
                 UndoOp::Add(None, id) => {
                     if journaled || self.store.insert(id) {
                         readded.push(id);
@@ -1640,21 +1850,20 @@ impl Database {
     /// exhausted (triples before the failing one stay inserted, as with any
     /// mid-update failure; wrap in a transaction to make it atomic).
     pub fn try_insert_data(&mut self, triples: &[GroundTriple]) -> Result<usize> {
-        let mut n = 0;
-        for g in triples {
-            if self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        let mut added = Vec::new();
+        let quads = triples
+            .iter()
+            .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
+        self.insert_statements(quads, &mut added)?;
+        Ok(added.len())
     }
 
     /// Apply `DELETE DATA`. Returns the number of triples actually removed.
     pub fn delete_data(&mut self, triples: &[GroundTriple]) -> usize {
-        let n = triples
+        let quads = triples
             .iter()
-            .filter(|g| self.delete_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
-            .count();
+            .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
+        let (n, _) = self.remove_statements(quads, None);
         self.flush_reclaim();
         n
     }
@@ -1999,18 +2208,11 @@ impl Database {
                 // A template triple outside `GRAPH { … }` targets the WITH
                 // graph, else the default graph.
                 let target = |g: &Option<String>| g.clone().or_else(|| with.clone());
-                let mut changed = 0;
-                for (g, t) in &dels {
-                    if self.delete_quad(t, target(g).as_deref()) {
-                        changed += 1;
-                    }
-                }
-                for (g, t) in &ins {
-                    if self.insert_quad(t, target(g).as_deref())? {
-                        changed += 1;
-                    }
-                }
-                Ok(changed)
+                let (removed, _) =
+                    self.remove_statements(dels.iter().map(|(g, t)| (t, target(g))), None);
+                let mut added = Vec::new();
+                self.insert_statements(ins.iter().map(|(g, t)| (t, target(g))), &mut added)?;
+                Ok(removed + added.len())
             }
             UpdateOp::Load {
                 source,
@@ -2083,11 +2285,9 @@ impl Database {
                 Some(g) => self.clear_named(g),
             };
         }
-        for t in &triples {
-            if self.insert_quad(t, to.as_deref())? {
-                changed += 1;
-            }
-        }
+        let mut added = Vec::new();
+        self.insert_statements(triples.iter().map(|t| (t, to.as_deref())), &mut added)?;
+        changed += added.len();
         if op == GraphTransfer::Move {
             changed += match from.as_deref() {
                 None => self.clear_default()?,
@@ -2492,20 +2692,18 @@ impl Database {
                 if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                     return Err(GStoreError::Cancelled);
                 }
-                for q in batch.drain(..) {
+                let quads = batch.drain(..).filter_map(|q| {
                     let graph = match (into, graph_iri(&q.graph)) {
                         (None, g) => g,
                         (Some(target), None) => Some(target.to_string()),
                         (Some(_), Some(_)) => {
                             skipped += 1;
-                            continue;
+                            return None;
                         }
                     };
-                    if let Some(done) = self.insert_quad_id(&q.into_triple(), graph.as_deref())? {
-                        applied.push(done);
-                    }
-                }
-                Ok(())
+                    Some((q.into_triple(), graph))
+                });
+                self.insert_statements(quads, &mut applied)
             },
         );
         if let Err(e) = result {
@@ -2554,13 +2752,21 @@ impl Database {
     /// when a statement could not be removed (a persistence failure).
     fn undo_inserts(&mut self, applied: Vec<(Option<u32>, IdTriple)>) -> bool {
         let mut all = true;
+        // An in-memory store removes the default-graph ones as one batch
+        // (the graphs are independent: only the order within one matters).
+        let batched = self.store.as_memory().is_some();
+        let mut default: Vec<IdTriple> = Vec::new();
         for (graph, id) in applied.into_iter().rev() {
             all &= match graph {
+                None if batched => {
+                    default.push(id);
+                    true
+                }
                 None => self.remove_default_id(id),
                 Some(gid) => self.remove_named_id(gid, id),
             };
         }
-        all
+        all && self.remove_default_batch(&default) == default.len()
     }
 
     /// Convenience: parse + ensure a SELECT result.

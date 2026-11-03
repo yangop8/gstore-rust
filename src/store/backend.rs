@@ -232,6 +232,16 @@ impl MutableStore for Backend {
     fn bulk_load(&mut self, triples: Vec<IdTriple>) {
         backend_dispatch!(self, s, MutableStore::bulk_load(s, triples))
     }
+    // UFCS: `DiskTriples` has inherent `insert_many` / `remove_many` of
+    // another signature (counts, by id); through the trait it keeps the
+    // one-by-one default, and so does RocksDB. The in-memory store merges a
+    // batch into each touched list in one pass.
+    fn insert_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        backend_dispatch!(self, s, MutableStore::insert_many(s, triples))
+    }
+    fn remove_many(&mut self, triples: &[IdTriple]) -> Vec<bool> {
+        backend_dispatch!(self, s, MutableStore::remove_many(s, triples))
+    }
 }
 
 impl Default for Backend {
