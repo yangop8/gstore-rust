@@ -5,7 +5,8 @@
 
 use gstore_bench::calib::Calibration;
 use gstore_bench::gates::{
-    evaluate, retry_targets, self_check, verdict, Phase, RetryTarget, Thresholds, Verdict,
+    evaluate, retry_targets, self_check, verdict, GateClass, Phase, RetryTarget, Thresholds,
+    Verdict,
 };
 use gstore_bench::schema::*;
 use gstore_bench::workload::WorkloadSpec;
@@ -365,4 +366,207 @@ fn results_round_trip_through_json() {
     std::fs::write(&p, r#"{"schema":"other"}"#).unwrap();
     assert!(BenchResult::load(&p).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `r` with a WatDiv-like section (its runs copied from the main ones).
+fn with_watdiv(mut r: BenchResult) -> BenchResult {
+    let mut w = r.workload.clone();
+    w.spec = WorkloadSpec::watdiv(1, 0);
+    w.id = "watdiv-like".into();
+    w.version = "watdiv-like/1".into();
+    w.data_fnv64 = "00000000000000cc".into();
+    for q in &mut w.queries {
+        q.text_fnv64 = "0000000000000abc".into();
+    }
+    r.extra_workloads.push(WorkloadSection {
+        workload: w,
+        runs: r.runs.clone(),
+    });
+    r
+}
+
+#[test]
+fn an_extra_workload_the_baseline_lacks_is_reported_as_new() {
+    // The CI case between this change and the re-bless: the smoke run
+    // measures the WatDiv-like workload, bench/baselines/smoke.json has none.
+    let base = result(1.0);
+    let m = with_watdiv(result(1.0));
+    assert_eq!(verdict(&self_check(&m)), Verdict::Pass);
+    let (v, o) = check(&base, &m, 1.0);
+    assert_eq!(v, Verdict::Pass, "{o:#?}");
+    let new: Vec<&str> = o
+        .iter()
+        .filter(|g| g.gate == "info.new")
+        .map(|g| g.subject.as_str())
+        .collect();
+    assert_eq!(
+        new,
+        [
+            "watdiv-like:workload",
+            "watdiv-like:snapshot",
+            "watdiv-like:disk"
+        ]
+    );
+    // New entries pass, are report-only and never retried.
+    assert!(o
+        .iter()
+        .filter(|g| g.gate == "info.new")
+        .all(|g| g.pass && g.class == GateClass::Info && g.retry.is_none()));
+    // Even a slow new workload does not fail (it is not gated yet).
+    let mut slow = with_watdiv(result(1.0));
+    for q in &mut slow.extra_workloads[0].runs[0].queries {
+        q.median_ms *= 100.0;
+    }
+    assert_eq!(check(&base, &slow, 1.0).0, Verdict::Pass);
+    // Its exact self-checks still apply: an empty answer fails.
+    let mut empty = with_watdiv(result(1.0));
+    empty.extra_workloads[0].runs[1].queries[0].rows = 0;
+    let (v, o) = check(&base, &empty, 1.0);
+    assert_eq!(v, Verdict::ExactFail);
+    assert!(o
+        .iter()
+        .any(|g| !g.pass && g.subject == "watdiv-like:disk/q1"));
+}
+
+#[test]
+fn an_extra_workload_in_both_is_gated_on_its_own() {
+    let base = with_watdiv(result(1.0));
+    let m = with_watdiv(result(1.0));
+    let (v, o) = check(&base, &m, 1.0);
+    assert_eq!(v, Verdict::Pass, "{o:#?}");
+    assert!(o
+        .iter()
+        .any(|g| g.gate == "time.geomean" && g.subject == "watdiv-like:snapshot"));
+    // A slow extra workload fails and names its section for the retry.
+    let mut slow = with_watdiv(result(1.0));
+    for q in &mut slow.extra_workloads[0].runs[0].queries {
+        q.median_ms *= 3.0;
+    }
+    let (v, o) = check(&base, &slow, 1.0);
+    assert_eq!(v, Verdict::PerfFail);
+    assert_eq!(
+        retry_targets(&o),
+        vec![RetryTarget {
+            section: Some("watdiv-like".into()),
+            run: "snapshot".into(),
+            phase: Phase::Query
+        }]
+    );
+    // A changed row hash in the extra workload fails exactly.
+    let mut wrong = with_watdiv(result(1.0));
+    wrong.extra_workloads[0].runs[0].queries[2].rows_fnv64 = "ffffffffffffffff".into();
+    let (v, o) = check(&base, &wrong, 1.0);
+    assert_eq!(v, Verdict::ExactFail);
+    assert!(o
+        .iter()
+        .any(|g| !g.pass && g.gate == "exact.rows" && g.subject == "watdiv-like:snapshot/q3"));
+    // A baseline workload missing from the result fails.
+    let (v, o) = check(&base, &result(1.0), 1.0);
+    assert_eq!(v, Verdict::ExactFail);
+    assert!(o
+        .iter()
+        .any(|g| !g.pass && g.gate == "exact.section" && g.subject == "watdiv-like:workload"));
+    // Two sections of one workload are refused by the self-check.
+    let mut twice = with_watdiv(result(1.0));
+    twice.extra_workloads.push(twice.extra_workloads[0].clone());
+    assert_eq!(verdict(&self_check(&twice)), Verdict::ExactFail);
+}
+
+#[test]
+fn labelled_runs_are_compared_with_their_backend() {
+    // disk@stream and disk@materialize (one file, two query modes) against
+    // the baseline's unlabelled disk run; new queries and runs are reported.
+    let base = result(1.0);
+    let mut m = result(1.0);
+    let mut stream = m.runs[1].clone();
+    stream.label = Some("stream".into());
+    let mut mat = m.runs[1].clone();
+    mat.label = Some("materialize".into());
+    mat.queries[4].median_ms *= 4.0;
+    m.runs = vec![m.runs[0].clone(), stream, mat];
+    let (v, o) = check(&base, &m, 1.0);
+    assert_eq!(v, Verdict::PerfFail);
+    let failing: Vec<&str> = o
+        .iter()
+        .filter(|g| !g.pass)
+        .map(|g| g.subject.as_str())
+        .collect();
+    assert_eq!(failing, ["disk@materialize/q5"]);
+    assert_eq!(
+        retry_targets(&o),
+        vec![RetryTarget::main("disk@materialize", Phase::Query)]
+    );
+    assert!(o
+        .iter()
+        .any(|g| g.gate == "time.geomean" && g.subject == "disk@stream" && g.pass));
+    // Labelled runs of one backend may differ only in timing; their answers
+    // are cross-checked like any two runs.
+    let mut odd = m.clone();
+    odd.runs[2].queries[4].median_ms /= 4.0;
+    odd.runs[2].queries[0].rows_fnv64 = "ffffffffffffffff".into();
+    assert_eq!(verdict(&self_check(&odd)), Verdict::ExactFail);
+    // A key twice in one workload is refused.
+    let mut dup = result(1.0);
+    dup.runs.push(dup.runs[0].clone());
+    assert_eq!(verdict(&self_check(&dup)), Verdict::ExactFail);
+    // A run or query the baseline lacks is new, not a failure.
+    let mut more = result(1.0);
+    let mut rocks = more.runs[0].clone();
+    rocks.backend = "rocksdb".into();
+    more.runs.push(rocks);
+    let q15 = QueryMeasure {
+        name: "q15".into(),
+        ..more.runs[0].queries[0].clone()
+    };
+    more.runs[0].queries.push(q15);
+    let (v, o) = check(&base, &more, 1.0);
+    assert_eq!(v, Verdict::Pass, "{o:#?}");
+    assert!(o
+        .iter()
+        .any(|g| g.gate == "info.new" && g.subject == "rocksdb"));
+    assert!(o
+        .iter()
+        .any(|g| g.gate == "info.new" && g.subject == "snapshot/q15"));
+}
+
+#[test]
+fn version_1_files_read_and_mixed_results_are_checked() {
+    // A gstore-bench/1 document (no extra workloads, labels or mixed
+    // phase) reads and compares with a /2 one.
+    let mut old = result(1.0);
+    old.schema = "gstore-bench/1".into();
+    let text = serde_json::to_string(&old).unwrap();
+    assert!(!text.contains("extra_workloads") && !text.contains("\"label\""));
+    let back: BenchResult = serde_json::from_str(&text).unwrap();
+    assert_eq!(check(&back, &result(1.0), 1.0).0, Verdict::Pass);
+    // The mixed phase: identical reader bodies and acknowledged writes are
+    // exact; a baseline phase the result lacks fails; throughput is info.
+    let mixed = MixedResult {
+        points: vec![MixedPoint {
+            endpoint: "api".into(),
+            query: "q4".into(),
+            readers: 8,
+            check_point: true,
+            qps: 100.0,
+            writes: 50,
+            distinct_bodies: 1,
+            ..MixedPoint::default()
+        }],
+        bodies_equal: true,
+        writes_ok: true,
+        hwm_mib: None,
+    };
+    let mut base = result(1.0);
+    base.runs[0].mixed = Some(mixed.clone());
+    let mut m = base.clone();
+    m.runs[0].mixed.as_mut().unwrap().points[0].qps = 10.0;
+    let (v, o) = check(&base, &m, 1.0);
+    assert_eq!(v, Verdict::Pass);
+    assert!(o
+        .iter()
+        .any(|g| g.gate == "info.mixed_qps" && g.ratio == Some(0.1)));
+    m.runs[0].mixed.as_mut().unwrap().writes_ok = false;
+    assert_eq!(check(&base, &m, 1.0).0, Verdict::ExactFail);
+    m.runs[0].mixed = None;
+    assert_eq!(check(&base, &m, 1.0).0, Verdict::ExactFail);
 }

@@ -178,7 +178,44 @@ struct Load {
     hashes: BTreeSet<u64>,
 }
 
-/// Drive `path` with `clients` closed-loop keep-alive clients for `secs`.
+/// The body hash of the mixed workload: independent of the row order. A
+/// write between two reads changes the triple counts the planner costs
+/// joins with, so the same answer can come back in another order: TSV rows
+/// (after the header) and `/api` `bindings` are hashed as multisets.
+fn unordered_body_hash(endpoint: &str, body: &[u8]) -> u64 {
+    fn canon(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.remove("QueryTime");
+                m.remove("ThreadId");
+                for (k, x) in m.iter_mut() {
+                    if k == "bindings" {
+                        if let serde_json::Value::Array(a) = x {
+                            a.sort_by_cached_key(|e| e.to_string());
+                        }
+                    }
+                    canon(x);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(canon),
+            _ => {}
+        }
+    }
+    if endpoint == "api" {
+        if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(body) {
+            canon(&mut v);
+            return fnv64(&serde_json::to_vec(&v).unwrap_or_default());
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or("");
+    let rows: Vec<Vec<Option<String>>> = lines.map(|l| vec![Some(l.to_string())]).collect();
+    fnv64(header.as_bytes()) ^ crate::hash::rows_fnv64(&rows)
+}
+
+/// Drive `path` with `clients` closed-loop keep-alive clients for `secs`;
+/// each body is hashed with `hash`.
 fn drive(
     addr: SocketAddr,
     endpoint: &str,
@@ -186,6 +223,7 @@ fn drive(
     accept: &str,
     clients: usize,
     secs: f64,
+    hash: fn(&str, &[u8]) -> u64,
 ) -> Result<(Load, f64), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(Mutex::new(Load {
@@ -233,7 +271,7 @@ fn drive(
                         if status == 200 {
                             mine.ok += 1;
                             mine.lat_ms.push(t.elapsed().as_secs_f64() * 1e3);
-                            mine.hashes.insert(body_hash(&endpoint, &body));
+                            mine.hashes.insert(hash(&endpoint, &body));
                         } else {
                             mine.errors += 1;
                         }
@@ -308,7 +346,7 @@ fn measure(
         }
         let reference = body_hash(endpoint, &body);
         for &c in &s.clients {
-            let (load, secs) = drive(addr, endpoint, path, accept, c, s.secs)?;
+            let (load, secs) = drive(addr, endpoint, path, accept, c, s.secs, body_hash)?;
             let mut distinct = load.hashes.clone();
             distinct.insert(reference);
             equal &= distinct.len() == 1 && load.errors == 0;
@@ -732,7 +770,7 @@ fn mixed_point(
             String::from_utf8_lossy(&body[..body.len().min(500)])
         ));
     }
-    let reference = body_hash(endpoint, &body);
+    let reference = unordered_body_hash(endpoint, &body);
     // Enough statements for the whole point; the writer stops early.
     let every = Duration::from_millis(s.write_ms.max(1));
     let n = (s.secs * 1000.0 / s.write_ms.max(1) as f64).ceil() as usize + 16;
@@ -761,7 +799,15 @@ fn mixed_point(
             })
         })
     };
-    let driven = drive(server.addr, endpoint, &path, accept, readers, s.secs);
+    let driven = drive(
+        server.addr,
+        endpoint,
+        &path,
+        accept,
+        readers,
+        s.secs,
+        unordered_body_hash,
+    );
     stop.store(true, Ordering::Relaxed);
     let writes = writer.join().map_err(|_| "the writer panicked")?;
     let (load, secs) = driven?;
@@ -799,6 +845,21 @@ fn mixed_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_bodies_compare_as_multisets() {
+        let h = |e: &str, b: &str| unordered_body_hash(e, b.as_bytes());
+        assert_eq!(h("sparql", "?x\n<a>\n<b>\n"), h("sparql", "?x\n<b>\n<a>\n"));
+        assert_ne!(h("sparql", "?x\n<a>\n<b>\n"), h("sparql", "?x\n<a>\n<a>\n"));
+        assert_ne!(h("sparql", "?x\n<a>\n"), h("sparql", "?y\n<a>\n"));
+        let a =
+            r#"{"head":{"vars":["x"]},"results":{"bindings":[{"x":1},{"x":2}]},"QueryTime":"3"}"#;
+        let b =
+            r#"{"results":{"bindings":[{"x":2},{"x":1}]},"head":{"vars":["x"]},"QueryTime":"9"}"#;
+        let c = r#"{"results":{"bindings":[{"x":2},{"x":2}]},"head":{"vars":["x"]}}"#;
+        assert_eq!(h("api", a), h("api", b));
+        assert_ne!(h("api", a), h("api", c));
+    }
 
     #[test]
     fn update_acknowledgements() {
