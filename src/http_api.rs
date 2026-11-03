@@ -1790,17 +1790,23 @@ impl ApiInner {
     /// `refreshconf`'s part for the `[storage]` section (see
     /// [`ApiServer::with_storage_refresh`]): install it as the process's
     /// default open options, which every later `Database::open` of this
-    /// process uses (the environment still overrides them).
+    /// process uses (the environment still overrides them), together with
+    /// the storage defaults that are not open options (`[system]
+    /// id_reclaim`, the RocksDB tuning keys:
+    /// [`GStoreConfig::install_storage_defaults`]).
     fn refresh_storage(&self, fresh: &GStoreConfig) {
         if !self.storage_refresh.load(Ordering::SeqCst) {
             return;
         }
         crate::db::set_default_open_options(fresh.open_options());
+        fresh.install_storage_defaults();
         let effective = crate::db::default_open_options();
         crate::gs_info!(
-            "refreshconf: on-disk databases loaded from now on open in {} mode ({} MiB page cache)",
+            "refreshconf: on-disk databases loaded from now on open in {} mode ({} MiB page \
+             cache); databases loaded from now on use id reclamation {}",
             effective.disk_query_mode,
-            (effective.disk_cache_pages * crate::kvstore::PAGE_SIZE) >> 20
+            (effective.disk_cache_pages * crate::kvstore::PAGE_SIZE) >> 20,
+            crate::db::default_id_reclaim()
         );
     }
 

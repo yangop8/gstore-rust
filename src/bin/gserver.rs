@@ -497,19 +497,21 @@ fn report_config(cfg: &GStoreConfig) {
 /// options (contract C7): every database this server opens — at startup and
 /// whenever a request loads one — uses them, with the environment
 /// (`GSTORE_DISK_QUERY_MODE`, `GSTORE_DISK_CACHE_MB`) on top. A database
-/// already loaded keeps the mode it was opened in. `/api refreshconf`
-/// re-installs the re-read section (the API server is built
+/// already loaded keeps the mode it was opened in. So do the storage
+/// defaults that are not open options: `[system] id_reclaim` and the
+/// RocksDB keys `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`
+/// (`GSTORE_ID_RECLAIM` / `GSTORE_ROCKS_BLOCK_CACHE_MB` on top). `/api
+/// refreshconf` re-installs both (the API server is built
 /// `with_storage_refresh`).
 fn install_open_options(cfg: &GStoreConfig) {
-    if let Some(w) = cfg.default_layout_warning() {
-        gstore::gs_warn!("gserver: {w}");
-    }
     gstore::set_default_open_options(cfg.open_options());
+    cfg.install_storage_defaults();
     let effective = gstore::default_open_options();
     gs_announce!(
-        "gserver: on-disk databases open in {} mode ({} MiB page cache)",
+        "gserver: on-disk databases open in {} mode ({} MiB page cache), id reclamation {}",
         effective.disk_query_mode,
-        (effective.disk_cache_pages * gstore::kvstore::PAGE_SIZE) >> 20
+        (effective.disk_cache_pages * gstore::kvstore::PAGE_SIZE) >> 20,
+        gstore::db::default_id_reclaim()
     );
 }
 

@@ -860,6 +860,62 @@ mod binary {
         assert_eq!(code, 0);
     }
 
+    /// `[system] id_reclaim` and `[storage] default_layout` reach the
+    /// databases the server builds — at startup and after `refreshconf`
+    /// (gserver installs the storage defaults in both places): with
+    /// reclamation off a new disk database is version 1 (`GSTOREKV`, no
+    /// free-id list), with it on version 2 (`GSTOREK2`).
+    #[test]
+    fn conf_ini_storage_defaults_reach_served_databases() {
+        let dir = tmp_dir("bin_storage_conf");
+        let home = dir.join("dbhome");
+        let pid_file = home.join("gserver.pid");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let port = free_port();
+        let ini = dir.join("s.ini");
+        let write = |reclaim: &str| {
+            std::fs::write(
+                &ini,
+                format!(
+                    "[server]\nport={port}\n[system]\ndb_home=\"{}\"\nroot_password=\"pw\"\n\
+                     id_reclaim={reclaim}\n[storage]\ndefault_layout=disk\n",
+                    home.display()
+                ),
+            )
+            .unwrap();
+        };
+        write("off");
+        let ini_s = ini.to_string_lossy().into_owned();
+        let (code, out, err) = gserver(&dir, &["-b", "-c", &ini_s]);
+        assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let auth = [("Authorization", "Basic cm9vdDpwdw==")]; // root:pw
+        let magic = |db: &str| {
+            let kv = home.join(format!("{db}.db")).join("kvstore.kv");
+            let bytes = std::fs::read(&kv)
+                .unwrap_or_else(|e| panic!("{db}: default_layout=disk builds a disk db: {e}"));
+            String::from_utf8_lossy(&bytes[0..8]).into_owned()
+        };
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .";
+        let (s, body) = request_h(&addr, "POST", "/build?db_name=off", &auth, data);
+        assert_eq!(s, 200, "{body}");
+        assert_eq!(magic("off"), "GSTOREKV", "id_reclaim=off: version 1");
+
+        write("on");
+        let refresh = r#"{"operation":"refreshconf","username":"root","password":"pw"}"#;
+        let (s, body) = request_h(&addr, "POST", "/api", &auth, refresh);
+        assert_eq!(s, 200, "{body}");
+        assert!(body.contains("\"StatusCode\":0"), "{body}");
+        let (s, body) = request_h(&addr, "POST", "/build?db_name=on", &auth, data);
+        assert_eq!(s, 200, "{body}");
+        assert_eq!(magic("on"), "GSTOREK2", "id_reclaim=on: version 2");
+        let (code, _, _) = gserver(&dir, &["-t", "-c", &ini_s]);
+        assert_eq!(code, 0);
+    }
+
     #[test]
     fn kill_and_restart_commands() {
         let dir = tmp_dir("bin_kill");

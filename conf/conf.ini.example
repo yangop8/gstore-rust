@@ -248,10 +248,10 @@ unzip_max_size = 10737418240
 # vstree.kv was made stale by updates) instead of querying without it until
 # it is rebuilt. Off: opening stays fast; the first queries may be slower
 # vstree_on_open=off
-# reserved, not effective yet: the layout new databases are to be built in
-# (snapshot, disk or rocksdb). It is read and checked, but no build path uses
-# it yet -- /api build and REST /build still build snapshot databases, and
-# gserver logs a warning when it is set
+# the layout a build that names none creates (snapshot, disk or rocksdb;
+# unset = snapshot): REST /build and /api build (their layout parameter
+# overrides it) and gbuild (--layout, --disk, --rocksdb override it). A new
+# disk database keeps a free-id list (id_reclaim above) unless id_reclaim=off
 # default_layout=disk
 # MiB of the block cache a RocksDB database shares across its column
 # families, 0 = RocksDB's own default (32 MiB per column family);

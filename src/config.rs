@@ -510,10 +510,10 @@ pub struct GStoreConfig {
     /// fresh (RocksDB always; a Stream-mode disk database whose `vstree.kv`
     /// is stale) instead of evaluating without it (default off).
     pub vstree_on_open: bool,
-    /// *(Rust extension, reserved)* The layout new databases are to be
-    /// built in: `snapshot`, `disk` or `rocksdb` (default unset). Read and
-    /// checked, but no build path uses it yet (the servers log a warning
-    /// when it is set; see [`default_layout_warning`](Self::default_layout_warning)).
+    /// *(Rust extension)* The layout a build that names none creates:
+    /// `snapshot`, `disk` or `rocksdb` (default unset = `snapshot`). Used by
+    /// REST `/build`, `/api build` (a `layout` parameter overrides it) and
+    /// `gbuild` (`--layout` / `--disk` / `--rocksdb` override it).
     pub default_layout: Option<StorageKind>,
     /// *(Rust extension)* MiB of the LRU block cache a RocksDB database
     /// shares across its column families (default 256; `0` = RocksDB's own
@@ -1187,19 +1187,6 @@ impl GStoreConfig {
         }
     }
 
-    /// The warning a server logs when `[storage] default_layout` is set: the
-    /// key is read and checked, but no build path uses it yet (`/api build`
-    /// and REST `/build` build snapshot databases whatever it says).
-    pub fn default_layout_warning(&self) -> Option<String> {
-        self.default_layout.map(|layout| {
-            format!(
-                "[storage] default_layout={} has no effect yet: new databases are built in \
-                 each build path's own layout (snapshot for /api build and REST /build)",
-                layout_name(layout)
-            )
-        })
-    }
-
     /// Whether an upload named `file_name` has an allowed extension
     /// (`upload_allow_extensions` or `upload_allow_compress_packages`,
     /// compared case-insensitively).
@@ -1501,22 +1488,14 @@ upload_allow_compress_packages = "zip"
         assert!(d.set("default_layout", "tape").is_err());
         assert!(d.set("vstree_on_open", "maybe").is_err());
         d.set("disk_query_mode", "Materialize").unwrap();
-        assert_eq!(d.default_layout_warning(), None);
         d.set("default_layout", "rocksdb").unwrap();
         assert_eq!(d.disk_query_mode, DiskQueryMode::Materialize);
         assert_eq!(d.value("disk_query_mode").unwrap(), "memory");
         assert_eq!(d.default_layout, Some(StorageKind::RocksDb));
-        // Reserved: no build path uses it yet, and a server says so.
-        let w = d
-            .default_layout_warning()
-            .expect("a warning while it is set");
-        assert!(
-            w.contains("default_layout=rocksdb") && w.contains("no effect"),
-            "{w}"
-        );
+        // The build paths read it through the installed open options.
+        assert_eq!(d.open_options().default_layout, Some(StorageKind::RocksDb));
         d.set("default_layout", "none").unwrap();
         assert_eq!(d.default_layout, None);
-        assert_eq!(d.default_layout_warning(), None);
         // A tiny cache still gets a usable number of pages.
         d.set("disk_cache_mb", "1").unwrap();
         assert_eq!(d.open_options().disk_cache_pages, 256);
