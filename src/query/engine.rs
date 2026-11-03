@@ -3309,10 +3309,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // candidate (ascending) instead of reading the list — the same
         // triples in the same (ascending) order, the list filtered by the
         // candidates. "Few": a lookup per candidate (`LOOKUP_COST` list
-        // entries each) costs less than the predicate's average list.
-        match known {
+        // entries each) costs less than the predicate's average list. Only
+        // for an end that is a constant of the pattern: then the variable is
+        // unbound once per scan, not once per row of an outer binding.
+        match (known, &plan.s, &plan.o) {
             _ if plain_plans() => {}
-            (None, Some(p), Some(o)) => {
+            ((None, Some(p), Some(o)), _, Slot::Const(_)) if s_cands.is_some() => {
                 let avg = self.store.pred_card(p) / self.store.pred_distinct_obj(p).max(1);
                 if let Some(subjects) = s_cands.filter(|c| few_candidates(c.len(), avg)) {
                     return subjects
@@ -3322,7 +3324,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         .collect();
                 }
             }
-            (Some(s), Some(p), None) => {
+            ((Some(s), Some(p), None), Slot::Const(_), _) if o_cands.is_some() => {
                 let avg = self.store.pred_card(p) / self.store.pred_distinct_subj(p).max(1);
                 if let Some(objects) = o_cands.filter(|c| few_candidates(c.len(), avg)) {
                     return objects
