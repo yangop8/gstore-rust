@@ -1,16 +1,19 @@
 # gstore-bench
 
-The benchmark harness of gstore-rust: a deterministic LUBM-like data
-generator, a runner that measures every storage layout through the real
-binaries and the public API, a result format with checked-in baselines, and
-the gates CI applies to every change.
+The benchmark harness of gstore-rust: deterministic LUBM-like and
+WatDiv-like data generators, a runner that measures every storage layout
+through the real binaries and the public API, a result format with
+checked-in baselines, the gates CI applies to every change, and reports that
+regenerate documentation tables from committed results.
 
 ```text
 cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
-target/release/gstore-bench run --profile smoke            # univ 1, snapshot + disk
+target/release/gstore-bench run --profile smoke            # LUBM univ 1 + WatDiv-like 1, snapshot + disk
 target/release/gstore-bench ci                              # smoke, gated against bench/baselines/smoke.json
-target/release/gstore-bench run --profile reference --scale 8 --out r.json
+target/release/gstore-bench run --profile reference --scale 8 --extra none --out r.json
+target/release/gstore-bench run --profile reference --workload watdiv --out w.json   # WatDiv-like scale 10
 target/release/gstore-bench report r.json --markdown --compare bench/results/pre-phase6-lubm8.json
+target/release/gstore-bench report --check README.md        # are the generated tables current?
 ```
 
 Run it from the workspace root: the defaults (`target/release` for `gbuild`,
@@ -21,54 +24,81 @@ for data, databases and results) are relative paths.
 
 | command | what it does | exit code |
 |---|---|---|
-| `gen [--workload lubm\|tiny] [--scale N] [--seed S] [--departments D] [--chunk] [--out FILE\|-]` | write a data set (or its update chunk) as N-Triples; prints lines, unique triples, bytes, FNV-1a hash and triples/s | 0 |
+| `gen [--workload lubm\|watdiv\|tiny] [--scale N] [--seed S] [--departments D] [--shrink K] [--chunk] [--out FILE\|-]` | write a data set (or its update chunk) as N-Triples; prints lines, unique triples, bytes, FNV-1a hash and triples/s | 0 |
+| `queries [--workload watdiv] [--scale N] [--seed S] [--shrink K] [--data-dir DIR] [--verify-data]` | print the workload's queries as the runs use them: the WatDiv-like templates bound against the (cached) data, with each binding and its ASK tries | 0 |
 | `run [--profile P] [RUN OPTIONS] [--out FILE] [--note TEXT]` | measure a profile, write the result JSON, print a Markdown report | 0, or 1 when the result fails its own exact checks |
-| `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians); `--backends` also limits which baseline backends are gated | 0 pass, 1 fail |
+| `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians); `--backends` also limits which baseline backends are gated; workloads, runs and queries the baseline lacks are reported as **new**, not gated | 0 pass, 1 fail |
 | `ci [same options]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY` | 0 pass, 1 fail |
-| `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b] [--markdown] [--summary FILE]` | gate two existing files (`--backends`: only those backends) | 0 pass, 1 fail |
-| `report RESULT [--markdown] [--compare BASELINE]` | Markdown tables (and ratios plus gate table against BASELINE) | 0 |
+| `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b] [--markdown] [--summary FILE]` | gate two existing files (`--backends`: only those backends or run keys) | 0 pass, 1 fail |
+| `report RESULT... [--markdown] [--table KIND] [--compare BASELINE]...` | Markdown: the full report of one result (ratios and the gate table against BASELINE), or with `--table` one compact table over several results (see [Reports](#reports-and-documentation-tables)) | 0 |
+| `report --update DOC... \| --check DOC...` | regenerate (`--update`) or verify (`--check`) the tables between `<!-- gstore-bench report ARGS -->` and `<!-- /gstore-bench report -->` in documents | 0, or 1 when `--check` finds a stale table |
 | `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks | 0, or 1 when refused |
-| `merge --out FILE RESULT RESULT...` | join results of the same workload measured by different binaries (e.g. RocksDB from a `--features rocksdb` build) | 0, or 1 on a failed self-check |
+| `merge --out FILE RESULT RESULT...` | join results of the same workloads measured by different binaries or settings (RocksDB from a `--features rocksdb` build; the disk layout in both query modes under two `--label`s); a run key may appear once per workload | 0, or 1 on a failed self-check |
 | `calibrate [--quick]` | print this machine's calibration | 0 |
 
 Every command exits **2** on a usage error, a crashed or timed-out phase, or
 an unreadable file — never 0.
 
-Run options: `--profile micro|smoke|reference`, `--workload`, `--scale`,
-`--seed`, `--departments`, `--backends snapshot,disk,rocksdb`, `--reps N`,
-`--query-procs N`, `--open-reps N`, `--singles N`, `--no-update`, `--no-conc`,
-`--conc-clients 1,8`, `--conc-secs S`, `--conc-queries q1,q4`,
-`--conc-endpoints sparql,api`, `--timeout-s N`, `--bin-dir DIR`,
+Run options: `--profile micro|smoke|reference`, `--workload lubm|watdiv|tiny`
+(alone: drops the profile's extra workloads), `--scale`, `--seed`,
+`--departments` (LUBM), `--shrink K` (WatDiv: divide the scalable classes by
+K, for tests), `--extra none|watdiv:10[,…]` (the profile's further workloads;
+`watdiv:1/10` also shrinks), `--label L` (every run's key becomes
+`backend@L`), `--backends snapshot,disk,rocksdb`, `--reps N`,
+`--query-procs N`, `--open-reps N`, `--singles N`, `--no-update`, `--no-conc`
+(also drops the mixed phase), `--conc-clients 1,8`, `--conc-secs S`,
+`--conc-queries q1,q4`, `--conc-endpoints sparql,api`, `--no-mixed`,
+`--mixed-readers N`, `--mixed-write-ms MS`, `--mixed-secs S`,
+`--mixed-checkpoint off,on`, `--mixed-endpoints sparql,api`,
+`--mixed-query Q`, `--timeout-s N`, `--bin-dir DIR`,
 `--data-dir DIR` (default `$GSTORE_BENCH_CACHE` or
 `target/gstore-bench/data`), `--work-dir DIR` (default `$GSTORE_BENCH_WORK`
 or `target/gstore-bench/work`), `--keep-db`, `--env K=V` (repeatable; set
 for every phase, e.g. `--env GSTORE_DISK_QUERY_MODE=stream`),
 `--gbuild-arg X` (repeatable; passed to `gbuild` before the database
 name), `--drop-caches` (drop the page cache before the first open; needs
-root), `--no-calibrate`, `--verify-data` (re-hash a cached data file),
-`--quiet`.
+root), `--no-calibrate`, `--verify-data` (re-hash a cached data file and
+re-run the ASK walk of cached WatDiv bindings), `--quiet`. The concurrency
+and mixed-workload query choices apply to the main workload; extra
+workloads use their own defaults.
 
 ## Profiles
 
-| profile | workload | backends | reps × query processes | conc | use |
-|---|---|---|---|---|---|
-| `micro` | LUBM-like univ 1, one department (7.5K triples) | snapshot | 2 × 2 | 1, 2 clients × 0.25 s | the harness's own tests |
-| `smoke` | LUBM-like univ 1 (140K triples) | snapshot, disk | 3 × 3 | 1, 2 clients × 1 s (report-only) | CI gate |
-| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) | snapshot, disk, rocksdb if compiled | 5 × 5 | 1, 8 clients × 5 s | Phase 6 measurements |
+| profile | workloads | backends | reps × query processes | conc | mixed (readers × s per point) | use |
+|---|---|---|---|---|---|---|
+| `micro` | LUBM-like univ 1, one department (7.5K triples) | snapshot | 2 × 2 | 1, 2 clients × 0.25 s | 2 × 0.25 s, a write every 50 ms | the harness's own tests |
+| `smoke` | LUBM-like univ 1 (140K triples) **+ WatDiv-like scale 1** (106K) | snapshot, disk | 3 × 3 | 1, 2 clients × 1 s (report-only) | 2 × 1 s | CI gate |
+| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) **+ WatDiv-like scale 10** (1.06M) | snapshot, disk, rocksdb if compiled | 5 × 5 | 1, 8 clients × 5 s | 8 × 5 s | Phase 6 measurements |
+
+The extra workload is measured after the main one, on the same backends,
+into its own section of the result (`extra_workloads`). `--extra none`
+skips it (e.g. for a second LUBM scale), `--workload watdiv` measures the
+WatDiv-like workload alone at the profile's scale for it.
 
 ## What a run measures
 
-For each backend, every step in a **fresh child process** (`gstore-bench
-__child`: one JSON request on standard input, exactly one
-`GSTORE_BENCH_RESULT {json}` line on standard output, a per-phase timeout;
-a crash or a timeout fails the run with exit code 2):
+Per workload, first the data: generated into the data directory (or taken
+from it when its sidecar matches) and, for the WatDiv-like workload, the
+query templates bound against it by an `instantiate` child (an in-memory
+database and the ASK walk; cached next to the data as
+`<stem>.queries.json`, keyed by the generator version, the parameters, the
+data hash and the templates). Then for each backend, every step in a
+**fresh child process** (`gstore-bench __child`: one JSON request on
+standard input, exactly one `GSTORE_BENCH_RESULT {json}` line on standard
+output, a per-phase timeout; a crash or a timeout fails the run with exit
+code 2):
 
 1. **build** — the real CLI (`src/runner/backends.rs` is the only place that
    knows the command lines): `gbuild lubm <data>`, `gbuild --disk …`,
    `gbuild --rocksdb …`, taken from `--bin-dir` (default `target/release`).
-   Wall time, `gbuild`'s peak RSS (`getrusage(RUSAGE_CHILDREN)`) and the
-   database directory's apparent size (without `gbuild`'s parse log) and
-   the size of each top-level entry.
+   Wall time, `gbuild`'s peak RSS (`getrusage(RUSAGE_CHILDREN)`), the
+   database directory's apparent size and the size of each top-level
+   entry. The size leaves out what is not database content and varies
+   between identical builds: `gbuild`'s parse log, the disk layout's `LOCK`
+   (it holds the builder's pid) and RocksDB's info logs (`rocksdb/LOG*`).
+   A bulk build's report (`gbuild --disk` / `--rocksdb`: the phase times,
+   the memory budget and its peak, the term map, the threads and the
+   spilled runs) is read from `gbuild`'s output into `build.summary`.
 2. **open** — `Database::open` once (cold when `--drop-caches` could drop the
    page cache), then `--open-reps` more times, each in a fresh process; the
    warm figure is their median. RSS after the first open; the triple,
@@ -101,6 +131,18 @@ a crash or a timeout fails the run with exit code 2):
    deleted again; every query re-run (answers must be unchanged); a
    checkpoint; a reopen (the triple count must match). Dictionary growth is
    reported only.
+6. **mixed** (it writes too) — readers plus a paced writer on the bundled
+   servers, per endpoint (`/sparql`, `/api`) and `check_point` setting (off,
+   on): `readers` closed-loop keep-alive clients run one query (the
+   workload's second concurrency query, LUBM `q4`) for `secs` while one
+   writer sends a single-triple `INSERT DATA` (`POST /update`, or `POST
+   /api` `operation=query`) every `write_ms` (100 ms). Reader qps, mean and
+   p95 latency; writes acknowledged (each must report one changed triple)
+   and their latency. Every reader body of a point must hold the same
+   answer — compared as a multiset of rows, since a write changes the
+   triple counts the planner costs joins with and so the row order. This
+   replaces R3-SRV's `examples/srv_mixed_load.rs` (same servers, writer and
+   settings) and runs on every layout, disk included.
 
 The database is deleted after each backend (`--keep-db` keeps it); phase
 logs are kept when a run fails. Calibration (`calib/1`: sorting 2 Mi `u64`,

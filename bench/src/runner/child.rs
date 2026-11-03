@@ -31,7 +31,8 @@ pub const CHILD_COMMAND: &str = "__child";
 /// One phase to run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChildRequest {
-    /// `calibrate`, `build`, `open`, `query`, `conc` or `update`.
+    /// `calibrate`, `instantiate` (bind query templates), `build`, `open`,
+    /// `query`, `conc`, `update` or `mixed`.
     pub phase: String,
     #[serde(default)]
     pub backend: String,

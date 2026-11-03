@@ -351,7 +351,8 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
     Ok(o)
 }
 
-/// `--extra none` or `family:scale` items (`watdiv:10`).
+/// `--extra none` or `family:scale` items (`watdiv:10`; `watdiv:1/10` also
+/// shrinks the WatDiv-like workload by 10, for tests).
 fn parse_extra(list: &[String]) -> Result<Vec<WorkloadSpec>, String> {
     if list.len() == 1 && list[0] == "none" {
         return Ok(Vec::new());
@@ -359,11 +360,24 @@ fn parse_extra(list: &[String]) -> Result<Vec<WorkloadSpec>, String> {
     list.iter()
         .map(|item| {
             let (fam, scale) = item.split_once(':').unwrap_or((item.as_str(), "1"));
+            let (scale, shrink) = match scale.split_once('/') {
+                Some((s, k)) => (
+                    s,
+                    Some(
+                        k.parse::<u32>()
+                            .map_err(|_| format!("--extra: invalid shrink in '{item}'"))?,
+                    ),
+                ),
+                None => (scale, None),
+            };
             let scale: u32 = scale
                 .parse()
                 .map_err(|_| format!("--extra: invalid scale in '{item}'"))?;
             let spec = match fam {
-                "watdiv" | "watdiv-like" => WorkloadSpec::watdiv(scale, 0),
+                "watdiv" | "watdiv-like" => WorkloadSpec {
+                    shrink,
+                    ..WorkloadSpec::watdiv(scale, 0)
+                },
                 "lubm" | "lubm-like" => WorkloadSpec::lubm(scale, 0),
                 "tiny" => WorkloadSpec {
                     scale,
@@ -1044,7 +1058,66 @@ mod tests {
         assert_eq!(o.profile.reps, 2);
         assert_eq!(o.profile.query_procs, 3);
         assert!(o.profile.conc.is_none());
+        assert!(o.profile.mixed.is_none(), "--no-conc drops the mixed phase");
         assert_eq!(o.env, vec![("A".to_string(), "b".to_string())]);
+        // --scale changes the main workload; the WatDiv-like one stays.
+        assert_eq!(o.profile.extra, vec![WorkloadSpec::watdiv(10, 0)]);
         assert!(a.finish().unwrap().is_empty());
+    }
+
+    fn parse(line: &str) -> RunOptions {
+        let mut a = Args {
+            items: line.split(' ').map(String::from).collect(),
+        };
+        let o = run_options(&mut a, "smoke").unwrap();
+        assert!(a.finish().unwrap().is_empty());
+        o
+    }
+
+    #[test]
+    fn workloads_labels_and_mixed_options() {
+        // The profiles' extra workloads.
+        let smoke = parse("--profile smoke");
+        assert_eq!(smoke.profile.extra, vec![WorkloadSpec::watdiv(1, 0)]);
+        assert!(smoke.profile.mixed.is_some());
+        // An explicit --workload measures that workload alone, at the
+        // profile's scale for it.
+        let w = parse("--profile reference --workload watdiv");
+        assert_eq!(w.profile.spec, WorkloadSpec::watdiv(10, 0));
+        assert!(w.profile.extra.is_empty());
+        let w = parse("--profile smoke --workload watdiv --scale 3 --shrink 2");
+        assert_eq!((w.profile.spec.scale, w.profile.spec.shrink), (3, Some(2)));
+        // --extra replaces the list.
+        assert!(parse("--profile reference --extra none")
+            .profile
+            .extra
+            .is_empty());
+        let x = parse("--profile micro --extra watdiv:2,watdiv:1/10");
+        assert_eq!(x.profile.extra[0], WorkloadSpec::watdiv(2, 0));
+        assert_eq!(x.profile.extra[1].shrink, Some(10));
+        // Labels.
+        assert_eq!(parse("--label stream").label.as_deref(), Some("stream"));
+        let mut bad = Args {
+            items: vec!["--label".into(), "a@b".into()],
+        };
+        assert!(run_options(&mut bad, "smoke").is_err());
+        // Mixed-workload settings.
+        let m = parse(
+            "--mixed-readers 4 --mixed-write-ms 50 --mixed-secs 2 --mixed-checkpoint on \
+             --mixed-endpoints api --mixed-query q1",
+        )
+        .profile
+        .mixed
+        .unwrap();
+        assert_eq!(
+            (m.readers, m.write_ms, m.secs, m.check_point, m.endpoints),
+            (4, 50, 2.0, vec![true], vec!["api".to_string()])
+        );
+        assert_eq!(m.query.as_deref(), Some("q1"));
+        assert!(parse("--no-mixed").profile.mixed.is_none());
+        let mut bad = Args {
+            items: vec!["--mixed-checkpoint".into(), "maybe".into()],
+        };
+        assert!(run_options(&mut bad, "smoke").is_err());
     }
 }

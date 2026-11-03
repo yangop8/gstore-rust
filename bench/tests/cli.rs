@@ -454,6 +454,166 @@ fn gen_usage_and_calibrate() {
     assert!(r.1.contains("calib/1"), "{}", r.1);
 }
 
+/// The WatDiv-like workload through the harness: the templates are bound
+/// by an `instantiate` child (and cached next to the data), every phase runs
+/// the bound queries, snapshot and disk answer alike, and the mixed phase
+/// writes while readers read.
+#[test]
+fn watdiv_micro_on_snapshot_and_disk() {
+    let t = Tmp::new("watdiv");
+    let c = common(&t, &builder(&t.0, false));
+    let out = t.path("w.json");
+    let mut a = args(&[
+        "run",
+        "--profile",
+        "micro",
+        "--workload",
+        "watdiv",
+        "--shrink",
+        "10",
+        "--backends",
+        "snapshot,disk",
+        "--no-calibrate",
+        "--query-procs",
+        "1",
+        "--reps",
+        "1",
+        "--conc-clients",
+        "2",
+        "--out",
+        &out,
+    ]);
+    a.extend(c.clone());
+    ok(&bench(&a), "watdiv run");
+    let r = BenchResult::load(Path::new(&out)).unwrap();
+    assert_eq!(r.workload.id, "watdiv-like");
+    assert!(r.extra_workloads.is_empty(), "--workload drops the extras");
+    assert_eq!(r.workload.queries.len(), 20);
+    assert!(r.workload.queries.iter().all(|q| q.tries.is_some()));
+    assert!(r
+        .workload
+        .queries
+        .iter()
+        .filter(|q| !q.name.starts_with('C'))
+        .all(|q| q.bindings.len() == 1));
+    let outcomes = self_check(&r);
+    assert_eq!(verdict(&outcomes), Verdict::Pass, "{outcomes:#?}");
+    assert!(outcomes
+        .iter()
+        .any(|o| o.gate == "exact.cross_backend" && o.subject == "disk/C3"));
+    for run in &r.runs {
+        assert_eq!(run.queries.len(), 20, "{}", run.backend);
+        assert!(run.update.as_ref().unwrap().round_trip_ok());
+        let m = run.mixed.as_ref().unwrap();
+        assert!(m.bodies_equal && m.writes_ok, "{}: {m:?}", run.backend);
+        assert_eq!(m.points.len(), 4, "2 endpoints × check_point off/on");
+        assert!(m.points.iter().all(|p| p.writes > 0 && p.reads > 0));
+    }
+    // The bound queries are cached next to the data.
+    assert!(Path::new(&t.path("data/watdiv-like1-x1-s0-k10.queries.json")).is_file());
+    // `queries` prints them from the cache.
+    let q = bench(&args(&[
+        "queries",
+        "--workload",
+        "watdiv",
+        "--shrink",
+        "10",
+        "--data-dir",
+        &t.path("data"),
+        "--work-dir",
+        &t.path("work"),
+        "--quiet",
+    ]));
+    ok(&q, "queries");
+    assert_eq!(q.1.matches("SELECT").count(), 20, "{}", q.1);
+    let left: Vec<_> = std::fs::read_dir(t.path("work")).unwrap().collect();
+    assert!(left.is_empty(), "work directory not cleaned: {left:?}");
+}
+
+/// The CI case before the smoke baseline is re-blessed: a run that measures
+/// a workload the baseline lacks reports it as new and passes. Labelled
+/// runs merge into one file and compare with the unlabelled baseline run.
+#[test]
+fn new_workloads_pass_check_and_labelled_runs_merge() {
+    let t = Tmp::new("newwl");
+    let c = common(&t, &builder(&t.0, false));
+    let relaxed = t.path("relaxed.json");
+    std::fs::write(&relaxed, RELAXED).unwrap();
+    let quick = [
+        "--profile",
+        "micro",
+        "--workload",
+        "tiny",
+        "--no-calibrate",
+        "--no-conc",
+        "--no-update",
+        "--query-procs",
+        "1",
+    ];
+    let base = t.path("base.json");
+    let mut a = args(&["bless", "--to", &base]);
+    a.extend(args(&quick));
+    a.extend(c.clone());
+    ok(&bench(&a), "bless");
+    let res = t.path("res.json");
+    let mut a = args(&[
+        "check",
+        "--baseline",
+        &base,
+        "--thresholds",
+        &relaxed,
+        "--extra",
+        "watdiv:1/10",
+        "--out",
+        &res,
+    ]);
+    a.extend(args(&quick));
+    a.extend(c.clone());
+    let r = bench(&a);
+    ok(&r, "check with a new workload");
+    assert!(r.1.contains("### Gates: PASS"), "{}", r.1);
+    assert!(
+        r.1.contains("new workload(s) not in the baseline"),
+        "{}",
+        r.1
+    );
+    assert!(
+        r.1.contains("| new | info.new | watdiv-like:workload |"),
+        "{}",
+        r.1
+    );
+    assert!(r.1.contains("### watdiv-like scale 1 (÷10)"), "{}", r.1);
+    let m = BenchResult::load(Path::new(&res)).unwrap();
+    assert_eq!(m.extra_workloads.len(), 1);
+    assert_eq!(m.extra_workloads[0].runs[0].queries.len(), 20);
+
+    // Two labelled runs of one backend share a file.
+    let run_labelled = |label: &str| {
+        let out = t.path(&format!("{label}.json"));
+        let mut a = args(&["run", "--label", label, "--out", &out]);
+        a.extend(args(&quick));
+        a.extend(c.clone());
+        ok(&bench(&a), label);
+        out
+    };
+    let (x, y) = (run_labelled("x"), run_labelled("y"));
+    let both = t.path("both.json");
+    ok(&bench(&args(&["merge", "--out", &both, &x, &y])), "merge");
+    let merged = BenchResult::load(Path::new(&both)).unwrap();
+    let keys: Vec<String> = merged.runs.iter().map(|r| r.key()).collect();
+    assert_eq!(keys, ["snapshot@x", "snapshot@y"]);
+    // Both are gated against the baseline's unlabelled snapshot run.
+    let r = bench(&args(&["compare", &base, &both, "--thresholds", &relaxed]));
+    ok(&r, "compare labelled");
+    assert!(
+        r.1.contains("snapshot@x/t1") && r.1.contains("snapshot@y/t1"),
+        "{}",
+        r.1
+    );
+    // The same label twice is refused.
+    assert_eq!(bench(&args(&["merge", "--out", &both, &x, &x])).0, 2);
+}
+
 /// The LUBM micro data on the disk layout (slow in a debug build).
 #[test]
 #[ignore]
