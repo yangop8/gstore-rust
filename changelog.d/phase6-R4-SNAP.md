@@ -512,3 +512,14 @@ Not yet / notes:
   queued meanwhile waits for it, as it would for any read.
 - Test temp directories: the new and changed test files remove theirs
   (also on failure); the other files R3-SRV listed are not this package's.
+- Verified at the final code (`ddad582`, the fragment edits after it touch
+  nothing else): `cargo fmt --all -- --check`; `cargo clippy --workspace
+  --all-targets -- -D warnings`; `cargo build --workspace --all-targets`;
+  `cargo test --workspace --no-fail-fast` with
+  `GSTORE_DISK_QUERY_MODE=memory` and `=stream` (107 test binaries each,
+  2,268 passed, 0 failed, 6 ignored); `cargo clippy -p gstore --all-targets
+  --features rocksdb -- -D warnings` and `cargo test -p gstore --features
+  rocksdb` (98 binaries, 2,115 passed, 0 failed). The gzip / tls / zip /
+  readline / pfn-wasm matrix was not run: no code of this package is
+  behind those features (the RocksDB layout checks are `cfg!`
+  expressions, compiled in both configurations, and covered above).
