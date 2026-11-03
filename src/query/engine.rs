@@ -272,6 +272,22 @@ struct BitClass {
     card: u64,
 }
 
+/// Whether to merge a bit class's posting lists (`true`) rather than look
+/// the candidates up, given the two estimated costs (both give the same set).
+fn prefer_lists(lists: u64, lookups: u64) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_LISTS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    lists <= lookups
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests force either way of [`prefer_lists`] on this thread.
+    static FORCE_LISTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl VarLayout {
     fn build(pattern: &GraphPattern) -> VarLayout {
         // All variables the pattern can bind (BGP, BIND, VALUES, sub-SELECT, …).
@@ -3128,7 +3144,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // One `count_s_by_po` per member and predicate of the class.
                 EdgeDir::In => n.saturating_mul(LOOKUP_COST * class.preds.len() as u64),
             };
-            if class.card <= lookups {
+            if prefer_lists(class.card, lookups) {
                 let members = self.bit_class_members(class);
                 set.retain(|x| members.binary_search(x).is_ok());
                 continue;
@@ -7843,3 +7859,7 @@ mod gfun_engine_tests {
         assert_eq!(XsdCast::from_iri(&format!("{XSD_NS}Integer")), None);
     }
 }
+
+#[cfg(test)]
+#[path = "vs_policy_tests.rs"]
+mod vs_policy_tests;
