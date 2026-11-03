@@ -6219,7 +6219,11 @@ thread_local! {
 }
 
 /// Whether `n` candidates are few enough to be looked up one by one rather
-/// than reading a list of `avg` entries (see `candidate_triples_in`).
+/// than reading a list of about `avg` entries (see `candidate_triples_in`).
+/// The average misjudges skewed predicates (a small class of `rdf:type`
+/// has a far shorter list), and a backend's lookups can cost more than
+/// `LOOKUP_COST` list entries (a RocksDB point read), so at most
+/// [`MAX_CANDIDATE_LOOKUPS`] lookups are traded for a list.
 fn few_candidates(n: usize, avg: usize) -> bool {
     #[cfg(test)]
     if PLAIN_PLANS.with(std::cell::Cell::get) {
@@ -6229,8 +6233,11 @@ fn few_candidates(n: usize, avg: usize) -> bool {
     if ALWAYS_LOOK_UP.with(std::cell::Cell::get) {
         return true;
     }
-    (n as u64).saturating_mul(LOOKUP_COST) < avg as u64
+    n <= MAX_CANDIDATE_LOOKUPS && (n as u64).saturating_mul(LOOKUP_COST) < avg as u64
 }
+
+/// See [`few_candidates`].
+const MAX_CANDIDATE_LOOKUPS: usize = 64;
 
 #[inline]
 fn plain_plans() -> bool {
