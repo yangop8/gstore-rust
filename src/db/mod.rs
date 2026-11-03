@@ -5152,35 +5152,52 @@ mod tests {
 
         // In-memory baseline over the same data (full VS-tree rebuild).
         let mut base = Database::build_from_str("base", &content).unwrap();
-        for q in [
+        let queries = [
             "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
             "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
             "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
             "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
-        ] {
-            let mut a = db.select(q).unwrap().rows;
-            let mut b = base.select(q).unwrap().rows;
-            a.sort();
-            b.sort();
-            assert_eq!(
-                a, b,
-                "disk-vstree query {q:?} diverged from in-memory baseline"
+        ];
+        let mut expected = Vec::new();
+        {
+            // The tree's own walk (the `Tree` policy pages its nodes; `Auto`,
+            // the default, computes an out-of-core tree's sets from the store).
+            let _tree = crate::query::scoped_vs_policy(crate::query::VsPolicy::Tree);
+            for q in queries {
+                let mut a = db.select(q).unwrap().rows;
+                let mut b = base.select(q).unwrap().rows;
+                a.sort();
+                b.sort();
+                assert_eq!(
+                    a, b,
+                    "disk-vstree query {q:?} diverged from in-memory baseline"
+                );
+                expected.push(b);
+            }
+
+            // The distinctive marker query returns exactly the special subject —
+            // and the candidate filter that produced it ran against on-disk nodes.
+            let rs = db
+                .select("SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }")
+                .unwrap();
+            assert_eq!(rs.row_count(), 1);
+            assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
+            // Running the query touched only some VS-tree node pages, not the
+            // whole tree — proving it need not be fully resident.
+            assert!(
+                db.vstree.disk_pages_read() > 0,
+                "the disk VS-tree was actually traversed"
             );
         }
-
-        // The distinctive marker query returns exactly the special subject — and
-        // the candidate filter that produced it ran against on-disk nodes.
-        let rs = db
-            .select("SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }")
-            .unwrap();
-        assert_eq!(rs.row_count(), 1);
-        assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
-        // Running the query touched only some VS-tree node pages, not the whole
-        // tree — proving it need not be fully resident.
-        assert!(
-            db.vstree.disk_pages_read() > 0,
-            "the disk VS-tree was actually traversed"
-        );
+        // Under the default policy the answers are the same, and no page of
+        // the tree is read.
+        let pages = db.vstree.disk_pages_read();
+        for (q, b) in queries.into_iter().zip(&expected) {
+            let mut a = db.select(q).unwrap().rows;
+            a.sort();
+            assert_eq!(&a, b, "query {q:?} under the default policy");
+        }
+        assert_eq!(db.vstree.disk_pages_read(), pages);
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&rdf);
@@ -5270,23 +5287,38 @@ mod tests {
         // The store stayed in memory; only the filter went out-of-core.
         assert!(matches!(streamed.store, Backend::Memory(_)));
 
-        for q in [
+        let queries = [
             "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
             "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
             "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
             "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
-        ] {
-            let mut a = streamed.select(q).unwrap().rows;
-            let mut b = base.select(q).unwrap().rows;
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "streaming-vstree query {q:?} diverged from in-memory");
+        ];
+        let mut expected = Vec::new();
+        {
+            // The tree's own walk (see `disk_database_filters_via_on_disk_vstree`).
+            let _tree = crate::query::scoped_vs_policy(crate::query::VsPolicy::Tree);
+            for q in queries {
+                let mut a = streamed.select(q).unwrap().rows;
+                let mut b = base.select(q).unwrap().rows;
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "streaming-vstree query {q:?} diverged from in-memory");
+                expected.push(b);
+            }
+            // The candidate filter actually paged VS-tree nodes off disk.
+            assert!(
+                streamed.vstree.disk_pages_read() > 0,
+                "streaming VS-tree was traversed on disk"
+            );
         }
-        // The candidate filter actually paged VS-tree nodes off disk.
-        assert!(
-            streamed.vstree.disk_pages_read() > 0,
-            "streaming VS-tree was traversed on disk"
-        );
+        // The default policy: the same answers, no page of the tree read.
+        let pages = streamed.vstree.disk_pages_read();
+        for (q, b) in queries.into_iter().zip(&expected) {
+            let mut a = streamed.select(q).unwrap().rows;
+            a.sort();
+            assert_eq!(&a, b, "query {q:?} under the default policy");
+        }
+        assert_eq!(streamed.vstree.disk_pages_read(), pages);
         let _ = fs::remove_dir_all(&dir);
     }
 
