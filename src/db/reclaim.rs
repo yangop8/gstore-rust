@@ -131,42 +131,101 @@ pub fn default_id_reclaim() -> IdReclaim {
 }
 
 /// The candidate ids of a statement or transaction (see the module docs).
-#[derive(Debug, Default)]
+///
+/// Each is kept packed into a `u64` ([`pack`]: the space's rank above the
+/// id), so [`take`](Self::take) sorts plain integers in [`TermId`] order;
+/// and a triple's term equal to the one the previous triple had in the same
+/// position (subject, predicate, object, graph) is not pushed again — the
+/// removed triples of a statement mostly come grouped by subject, so this
+/// keeps most repeats out of the sort. (Sorting one `TermId` per position
+/// of every removed triple was half the cost of reclamation on an
+/// in-memory database: the quiet R4 measure stage's churn.)
+#[derive(Debug)]
 pub(crate) struct Candidates {
-    ids: Vec<TermId>,
+    keys: Vec<u64>,
+    /// The key each position of [`note_triple`](Self::note_triple) pushed
+    /// last ([`NO_KEY`] when none since the last `take` / `clear`).
+    last: [u64; 4],
+}
+
+/// No candidate: above every [`pack`]ed key.
+const NO_KEY: u64 = u64::MAX;
+
+/// `t` as an integer that orders like `t` (space, then id).
+fn pack(t: TermId) -> u64 {
+    let rank: u64 = match t.space {
+        Space::Entity => 0,
+        Space::Literal => 1,
+        Space::Predicate => 2,
+    };
+    rank << 32 | u64::from(t.id)
+}
+
+/// The inverse of [`pack`].
+fn unpack(key: u64) -> TermId {
+    let space = match key >> 32 {
+        0 => Space::Entity,
+        1 => Space::Literal,
+        _ => Space::Predicate,
+    };
+    TermId {
+        space,
+        id: key as u32,
+    }
+}
+
+impl Default for Candidates {
+    fn default() -> Candidates {
+        Candidates {
+            keys: Vec::new(),
+            last: [NO_KEY; 4],
+        }
+    }
 }
 
 impl Candidates {
+    /// Push `t` as position `pos`'s candidate unless it was that position's
+    /// last one.
+    fn note_at(&mut self, pos: usize, t: TermId) {
+        let key = pack(t);
+        if self.last[pos] != key {
+            self.last[pos] = key;
+            self.keys.push(key);
+        }
+    }
+
     /// The terms of a removed triple (and its graph IRI).
     pub(crate) fn note_triple(&mut self, graph: Option<u32>, t: IdTriple) {
-        self.ids.push(TermId::node(t.sub));
-        self.ids.push(TermId::predicate(t.pred));
-        self.ids.push(TermId::node(t.obj));
+        self.note_at(0, TermId::node(t.sub));
+        self.note_at(1, TermId::predicate(t.pred));
+        self.note_at(2, TermId::node(t.obj));
         if let Some(g) = graph {
-            self.ids.push(TermId::node(g));
+            self.note_at(3, TermId::node(g));
         }
     }
 
     /// One more candidate.
     pub(crate) fn note(&mut self, t: TermId) {
-        self.ids.push(t);
+        self.keys.push(pack(t));
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.keys.is_empty()
     }
 
     /// Forget every candidate.
     pub(crate) fn clear(&mut self) {
-        self.ids.clear();
+        self.keys.clear();
+        self.last = [NO_KEY; 4];
     }
 
     /// Take the candidates, sorted and de-duplicated.
     pub(crate) fn take(&mut self) -> Vec<TermId> {
-        let mut v = std::mem::take(&mut self.ids);
-        v.sort_unstable();
-        v.dedup();
-        v
+        let mut keys = std::mem::take(&mut self.keys);
+        self.last = [NO_KEY; 4];
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter().map(unpack).collect()
     }
 }
 
@@ -761,5 +820,98 @@ mod tests {
         let v = c.take();
         assert_eq!(v.len(), 4, "{v:?}"); // nodes 1, 3, 9 and predicate 2
         assert!(c.is_empty());
+    }
+
+    /// The packed, repeat-skipping candidate set takes exactly what sorting
+    /// and de-duplicating every noted `TermId` gives — across all three
+    /// spaces, id 0, the largest ids, graphs, `note`, and notes after a
+    /// `take` or a `clear` (a term noted again then is not skipped).
+    #[test]
+    fn candidates_take_the_sorted_set_of_every_noted_term() {
+        use crate::model::LITERAL_FIRST_ID;
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u32| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % u64::from(n)) as u32
+        };
+        let mut c = Candidates::default();
+        for round in 0..20 {
+            let mut want = BTreeSet::new();
+            // Runs of one subject (the usual order), repeated predicates.
+            let triples = 50 + next(400);
+            let mut sub = next(30);
+            for _ in 0..triples {
+                if next(4) == 0 {
+                    sub = match next(3) {
+                        0 => 0,
+                        1 => LITERAL_FIRST_ID - 1,
+                        _ => next(30),
+                    };
+                }
+                let pred = [0, 1, u32::MAX, next(5)][next(4) as usize];
+                let obj = match next(4) {
+                    0 => LITERAL_FIRST_ID + next(20),
+                    1 => u32::MAX,
+                    2 => 0,
+                    _ => next(30),
+                };
+                let graph = (next(3) == 0).then(|| next(4));
+                let t = IdTriple::new(sub, pred, obj);
+                c.note_triple(graph, t);
+                want.insert(TermId::node(sub));
+                want.insert(TermId::predicate(pred));
+                want.insert(TermId::node(obj));
+                if let Some(g) = graph {
+                    want.insert(TermId::node(g));
+                }
+                if next(50) == 0 {
+                    let extra = TermId::node(next(40));
+                    c.note(extra);
+                    want.insert(extra);
+                }
+            }
+            if round % 5 == 4 {
+                c.clear();
+                assert!(c.is_empty());
+                continue;
+            }
+            let got = c.take();
+            let want: Vec<TermId> = want.into_iter().collect();
+            assert_eq!(got, want, "round {round}");
+            assert!(c.is_empty());
+        }
+        // A term noted right before a `take` / `clear` is noted again after.
+        let t = IdTriple::new(7, 3, LITERAL_FIRST_ID);
+        c.note_triple(None, t);
+        assert_eq!(c.take().len(), 3);
+        c.note_triple(None, t);
+        assert_eq!(c.take().len(), 3);
+        c.note_triple(None, t);
+        c.clear();
+        c.note_triple(None, t);
+        assert_eq!(c.take().len(), 3);
+    }
+
+    #[test]
+    fn packed_candidates_order_like_term_ids() {
+        use crate::model::LITERAL_FIRST_ID;
+        let ids = [
+            TermId::node(0),
+            TermId::node(5),
+            TermId::node(LITERAL_FIRST_ID - 1),
+            TermId::node(LITERAL_FIRST_ID),
+            TermId::node(u32::MAX),
+            TermId::predicate(0),
+            TermId::predicate(u32::MAX),
+        ];
+        for a in ids {
+            assert_eq!(unpack(pack(a)), a);
+            assert!(pack(a) < NO_KEY);
+            for b in ids {
+                assert_eq!(pack(a).cmp(&pack(b)), a.cmp(&b), "{a:?} {b:?}");
+            }
+        }
     }
 }
