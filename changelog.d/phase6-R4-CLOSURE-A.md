@@ -22,7 +22,7 @@ the re-blessed smoke baseline and the docs are the closure stage's.
   pick their targets from a Zipf distribution with integer weights (so the
   output is identical on every platform; `Product0` is the most liked
   product). Scale 1 = 105,620 triples (golden FNV `70c039a88063c158`),
-  scale 10 = about 1.06M; 71% are social edges, as in WatDiv. Every line is
+  scale 10 = 995,333 (`19b2d2742cc622ad`); 70–71% are social edges, as in WatDiv. Every line is
   a distinct triple. The templates' fixed constants (`Product0`, `Role2`,
   `Country1`, `Country5`, `Language0`, `ProductCategory2`) always exist,
   and entity 0 of each class carries the triples that make every template
@@ -106,7 +106,7 @@ the re-blessed smoke baseline and the docs are the closure stage's.
   shapes, the ASK walk (32 tries, entity-0 guarantee, the cache next to the
   data), and that it is **not** WatDiv's generator (no byte or answer
   compatibility with WatDiv data; only the shapes and the vocabulary
-  follow it). Sizes: scale 1 105,620 triples, scale 10 ≈ 1.06M (see
+  follow it). Sizes: scale 1 105,620 triples, scale 10 995,333 (see
   Measured numbers).
 - `docs/BENCHMARKS.md`: the result schema `/2` (labels, `extra_workloads`,
   build summary, mixed phase, `/begin` point) and that the gates report new
@@ -124,7 +124,132 @@ the re-blessed smoke baseline and the docs are the closure stage's.
 
 ## Measured numbers
 
-(to be filled)
+**Implementer run, noisy.** 4 vCPU VM shared with another implementer
+(its univ 38 base runs held the bench lock in between; load average 1.3–2.5
+at the starts of the smoke runs, up to 8.8 during the scale-10 runs while
+this package's own workspace tests compiled). Every run under `flock
+/tmp/gstore-bench.lock`; release builds of `gbuild` and `gstore-bench`;
+data in this package's scratch directory (deleted afterwards), databases
+deleted by the harness. Base = `d702463` (`/tmp/gstore-base-d702463/bin`).
+The gstore library is unchanged by this package, so engine numbers are not
+an A/B; the A/B is the harness's own cost.
+
+**Generator and binding** (release):
+
+| workload | triples | bytes | generation | binding (ASK walk, in-memory db) | tries |
+|---|---:|---:|---:|---:|---:|
+| WatDiv-like scale 1 | 105,620 | 14,399,328 | 0.1 s | 0.6 s | 81 (S4 27, F4 15, F1 10, F2 7) |
+| WatDiv-like scale 10 | 995,333 | 137,160,546 | 0.9 s (1.1M triples/s) | 6.0 s | 34 (S4 13) |
+
+Composition: at scale 1 every class is within ±10% of the design (the
+test; users +5% from the friendOf draw), at scale 10 within 2% (User
+785,617 / 790,000, Offer 60,915 / 60,750, Review 55,462 / 55,500, Product
+43,908 / 43,625, Purchase 37,606 / 37,500, Retailer 9,224 / 9,210, Website
+1,719 / 1,750); social edges 71.0% (scale 1) and 69.9% (scale 10).
+
+**Smoke profile, wall time of `gstore-bench run --profile smoke`** (base:
+LUBM univ 1 on snapshot + disk with the concurrency phase; branch: the same
+plus the WatDiv-like workload at scale 1 and the mixed phase with its
+`/begin` point on every run), alternating:
+
+| run | base `d702463` | this branch |
+|---|---:|---:|
+| 1 | 25.6 s | 66.2 s |
+| 2 | 25.0 s | 65.0 s |
+
+`gstore-bench ci --baseline bench/baselines/smoke.json` with this branch:
+**PASS, 307 gates, 0 failed, "1 new workload(s) not in the baseline"** (the
+WatDiv-like section, its two runs reported as `info.new`), 64.8 s; the
+canary (`check --from` the result against itself `--self-test-slowdown 3`)
+exits 1. A CI smoke job therefore stays well under its 15 min budget (the
+release build dominates).
+
+**WatDiv-like scale 10** (`run --profile reference --workload watdiv`:
+snapshot; disk with `GSTORE_DISK_QUERY_MODE=memory --label materialize`;
+disk with `=stream --label stream`; joined by `merge`, whose self-check
+passed — all 20 answers identical on the three runs). 85–87 s per run.
+
+| run | build s | dir MB | open warm ms | RSS after open MiB | query HWM MiB | geomean ms |
+|---|---:|---:|---:|---:|---:|---:|
+| snapshot | 5.81 | 44.3 | 154.6 | 61.4 | 79.8 | 0.46 |
+| disk@materialize | 4.39 | 83.2 | 289.9 | 66.6 | 88.9 | 1.05 |
+| disk@stream | 4.55 | 83.2 | 1.4 | 7.2 | 44.4 | 1.19 |
+
+| query | rows | snapshot ms | disk@materialize ms | disk@stream ms |
+|---|---:|---:|---:|---:|
+| L1 / L2 / L3 / L4 / L5 | 2 / 23 / 22 / 8 / 2 | 0.97 / 0.49 / 0.02 / 0.02 / 0.22 | 1.27 / 0.62 / 0.26 / 0.23 / 0.28 | 1.50 / 0.95 / 0.28 / 0.25 / 0.40 |
+| S1 / S2 / S3 / S4 | 9 / 8 / 55 / 2 | 1.97 / 0.06 / 0.12 / 0.26 | 2.01 / 0.36 / 0.28 / 0.52 | 2.11 / 0.40 / 0.38 / 0.55 |
+| S5 / S6 / S7 | 7 / 4 / 1 | 0.05 / 0.02 / 0.02 | 0.22 / 0.12 / 0.09 | 0.25 / 0.13 / 0.11 |
+| F1 / F2 / F3 / F4 / F5 | 1 / 1 / 51 / 8 / 37 | 0.16 / 1.20 / 9.13 / 4.05 / 1.51 | 0.38 / 1.36 / 13.41 / 6.81 / 1.66 | 0.42 / 1.43 / 14.27 / 6.66 / 1.83 |
+| C1 / C2 / C3 | 95 / 2,855 / 85,286 | 5.94 / 28.72 / 39.24 | 9.03 / 35.69 / 31.43 | 9.63 / 38.84 / 34.66 |
+
+So the templates bind to selective constants (as WatDiv's L/S/F mostly
+are) and finish in well under a second; the complex ones and F3/F4 carry
+the work. Further figures of the same runs (report-only):
+
+- gbuild summary (disk): `parse+encode` 3,983 / 4,129 ms of the ~4.4 s,
+  budget 1024 MiB with a 44.0 MiB peak, term map 8.3 MiB, 0 spills.
+- Mixed workload (8 readers of F5 + 1 writer / 100 ms, 5 s per point;
+  reader qps for /sparql cp-off, /sparql cp-on, /api cp-off, /api cp-on):
+  snapshot 1,409 / 55 / 934 / 34 (with check_point on each write saves
+  the whole snapshot: 212–276 ms per write, 20–25 writes instead of 51);
+  disk@materialize 1,826 / 1,802 / 1,161 / 1,080; **disk@stream 270 / 272
+  / 212 / 293** — under writes Stream-mode readers drop to ~0.2× of
+  Materialize (without writes, F5 at 8 clients: 1,182 vs 1,172 qps), a
+  finding for the closure stage / R4 owners (every acknowledged write
+  invalidates Stream's per-query caches and waits on the writer gate).
+- `/api begin` (20 samples, rolled back; the base's `/begin` copies the
+  store): median 52.0 ms and +35 MiB RSS (snapshot), 221 ms / +31 MiB
+  (disk@materialize), 307 ms / +48–59 MiB (disk@stream). R4-SNAP's O(1)
+  `/begin` should show here once merged.
+- Update: single INSERT median 0.01 ms (snapshot) and 12.0 ms (both disk
+  modes: the fsync per acknowledged write); chunk (6,631 triples) insert
+  63 / 1,157 / 1,229 ms.
+
+**Tests** (debug, `cargo test -p gstore-bench`, after compiling): 28 unit +
+8 end to end (1 ignored) + 14 gates + 8 golden + 3 report + 5 WatDiv tests,
+all passing, 15–33 s wall depending on the load (the WatDiv end-to-end run
+on snapshot and disk, mixed phase included, is the longest at ~12 s).
+
+**For the quiet measure / closure stage** (after R4-RECLAIM, R4-SNAP and
+R4-VS are merged; `B=target/release/gstore-bench`, `export
+GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache`, every run under `flock
+/tmp/gstore-bench.lock`, nothing else running):
+
+```text
+cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore -p gstore-bench --bin gbuild \
+    --bin gstore-bench --features gstore/rocksdb,gstore-bench/rocksdb
+# LUBM univ 8 and 38: snapshot, disk in both query modes (labelled), RocksDB; one file per scale
+for s in 8 38; do
+  $B run --profile reference --scale $s --extra none --backends snapshot --drop-caches --verify-data --out f$s-s.json
+  $B run --profile reference --scale $s --extra none --backends disk --env GSTORE_DISK_QUERY_MODE=stream \
+      --label stream --drop-caches --verify-data --out f$s-ds.json
+  $B run --profile reference --scale $s --extra none --backends disk --env GSTORE_DISK_QUERY_MODE=memory \
+      --label materialize --drop-caches --verify-data --out f$s-dm.json
+  target-rocks/release/gstore-bench run --profile reference --scale $s --extra none --backends rocksdb \
+      --bin-dir target-rocks/release --drop-caches --verify-data --out f$s-r.json
+  $B merge --out bench/results/phase6-final-lubm$s.json f$s-s.json f$s-ds.json f$s-dm.json f$s-r.json
+  $B compare bench/results/pre-phase6-lubm$s.json bench/results/phase6-final-lubm$s.json --markdown \
+      > bench/results/phase6-final-lubm$s-compare.md
+done
+# WatDiv-like scale 10, the same layouts
+$B run --profile reference --workload watdiv --backends snapshot --verify-data --out w-s.json
+$B run --profile reference --workload watdiv --backends disk --env GSTORE_DISK_QUERY_MODE=stream --label stream --out w-ds.json
+$B run --profile reference --workload watdiv --backends disk --env GSTORE_DISK_QUERY_MODE=memory --label materialize --out w-dm.json
+target-rocks/release/gstore-bench run --profile reference --workload watdiv --backends rocksdb \
+    --bin-dir target-rocks/release --out w-r.json
+$B merge --out bench/results/phase6-final-watdiv10.json w-s.json w-ds.json w-dm.json w-r.json
+# re-bless the smoke baseline (LUBM univ 1 + WatDiv-like 1, mixed phase), then check it
+$B bless --profile smoke --to bench/baselines/smoke.json
+$B ci --baseline bench/baselines/smoke.json        # PASS, no "new" entries any more
+# documentation tables: add markers to README.md / CHANGELOG.md / docs/BENCHMARKS.md, then
+$B report --update README.md CHANGELOG.md docs/BENCHMARKS.md && $B report --check README.md CHANGELOG.md
+```
+
+Delete the `f*.json` / `w*.json` intermediates and the databases (the
+harness removes its work directories) afterwards. Univ 82 (≈ lubm10M) on
+disk and snapshot is the same `run` with `--scale 82` if RAM allows.
 
 ## Requests/Not yet
 

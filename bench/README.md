@@ -68,7 +68,7 @@ workloads use their own defaults.
 |---|---|---|---|---|---|---|
 | `micro` | LUBM-like univ 1, one department (7.5K triples) | snapshot | 2 × 2 | 1, 2 clients × 0.25 s | 2 × 0.25 s, a write every 50 ms | the harness's own tests |
 | `smoke` | LUBM-like univ 1 (140K triples) **+ WatDiv-like scale 1** (106K) | snapshot, disk | 3 × 3 | 1, 2 clients × 1 s (report-only) | 2 × 1 s | CI gate |
-| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) **+ WatDiv-like scale 10** (1.06M) | snapshot, disk, rocksdb if compiled | 5 × 5 | 1, 8 clients × 5 s | 8 × 5 s | Phase 6 measurements |
+| `reference` | LUBM-like univ 8 (`--scale 38` for 5.2M triples) **+ WatDiv-like scale 10** (995K) | snapshot, disk, rocksdb if compiled | 5 × 5 | 1, 8 clients × 5 s | 8 × 5 s | Phase 6 measurements |
 
 The extra workload is measured after the main one, on the same backends,
 into its own section of the result (`extra_workloads`). `--extra none`
@@ -200,10 +200,17 @@ triple, written subject by subject. The update chunk is 100 users after the
 last one (`User{n}`…), with references into the data: every chunk triple
 has a new subject.
 
-| scale | triples | data fnv64 |
-|---|---:|---|
-| 1 (`smoke`) | 105,620 | `70c039a88063c158` (golden) |
-| 10 (`reference`) | 1,056,… (see the fragment) | |
+| scale | triples | bytes | data fnv64 |
+|---|---:|---:|---|
+| 1 (`smoke`) | 105,620 | 14,399,328 | `70c039a88063c158` (golden) |
+| 10 (`reference`) | 995,333 | 137,160,546 | `19b2d2742cc622ad` |
+
+At scale 10 each class's triples are within 2% of the design (User
+785,617 of 790,000; Offer 60,915 of 60,750; Review 55,462 of 55,500;
+Product 43,908 of 43,625; Purchase 37,606 of 37,500), and 69.9% are social
+edges. Most bound L, S and F queries are selective (1–55 rows, under 2 ms
+on the snapshot layout at scale 10); F3, F4, C1, C2 and C3 do more work
+(C2 2,855 rows, C3 85,286).
 
 The 20 templates `queries/watdiv/{L1-5,S1-7,F1-5,C1-3}.rq` (linear, star,
 snowflake and complex shapes after WatDiv's basic testing set) start with a
