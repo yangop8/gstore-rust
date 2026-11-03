@@ -389,7 +389,18 @@ fn a_rocksdb_store_in_use_is_not_replaced() {
     assert!(!dir.join(bulk::STAGING_DIR).exists());
     assert_eq!(which(&dir, Prior::RocksDb), Some(false));
     drop(holder);
-    build_new(&dir).unwrap();
+    // Released. A child process another test of this binary spawns at this
+    // moment shares the descriptor (and so the lock) between its fork and
+    // its exec, which closes it: such a refusal is retried briefly.
+    let t0 = Instant::now();
+    while let Err(e) = build_new(&dir) {
+        let e = e.to_string();
+        assert!(
+            e.contains("in use") && t0.elapsed() < Duration::from_secs(20),
+            "{e}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(!dir.join("rocksdb").exists());
     assert_eq!(which(&dir, Prior::RocksDb), Some(true));
     let _ = fs::remove_dir_all(&base);
