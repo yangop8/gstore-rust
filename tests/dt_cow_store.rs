@@ -429,6 +429,46 @@ fn concurrent_db_snapshots_stay_exact_over_reused_spares() {
     assert_eq!(count(cdb.query(all).unwrap()), expected);
 }
 
+/// Warm latency of the LUBM queries on an opened database (an A/B driver
+/// for the copy-on-write store's read path; run with
+/// `GSTORE_COW_BENCH_DB=<db dir> cargo test --release --test dt_cow_store
+/// -- --ignored --nocapture memory_query_latency`). Prints each query's
+/// median of 60 runs (after 5 warm-up runs) in microseconds.
+#[test]
+#[ignore = "a timing driver: needs GSTORE_COW_BENCH_DB"]
+fn memory_query_latency() {
+    let Ok(dir) = std::env::var("GSTORE_COW_BENCH_DB") else {
+        eprintln!("GSTORE_COW_BENCH_DB not set: skipped");
+        return;
+    };
+    let mut db = Database::open(&dir).expect("open");
+    db.set_query_cache_size(0);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/lubm");
+    let mut line = String::new();
+    let only: Option<u32> = std::env::var("GSTORE_COW_BENCH_Q")
+        .ok()
+        .and_then(|q| q.parse().ok());
+    for q in 1..=14 {
+        if only.is_some_and(|o| o != q) {
+            continue;
+        }
+        let text = std::fs::read_to_string(root.join(format!("lubm_q{q}.rq"))).unwrap();
+        for _ in 0..5 {
+            db.query(&text).unwrap();
+        }
+        let mut samples: Vec<f64> = (0..60)
+            .map(|_| {
+                let t0 = Instant::now();
+                db.query(&text).unwrap();
+                t0.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        line.push_str(&format!(" q{q}={:.1}", samples[samples.len() / 2]));
+    }
+    println!("memory_query_latency (us):{line}");
+}
+
 /// Latency of a `ConcurrentDb` one-triple update whose terms all exist
 /// (the R4-SNAP acceptance driver; run with
 /// `GSTORE_COW_BENCH_NT=<file.nt> cargo test --release --test dt_cow_store

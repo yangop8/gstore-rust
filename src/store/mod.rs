@@ -432,7 +432,9 @@ impl Serialize for TripleStore {
 
 impl<'de> Deserialize<'de> for TripleStore {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        StoreData::deserialize(deserializer).map(TripleStore::from_data)
+        // The serialized form directly (as the derive of before read it).
+        TripleStoreData::deserialize(deserializer)
+            .map(|d| TripleStore::from_data(StoreData::from(d)))
     }
 }
 
