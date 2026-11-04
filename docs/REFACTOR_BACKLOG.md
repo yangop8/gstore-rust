@@ -134,7 +134,6 @@ Stream 已满足 G1b / G1c / G1d,但 R3-STREAM 自己的翻转条件仍不满足
 
 - `GSTORE_VS_POLICY` 只有环境变量,没有 `conf.ini` 键(可加 `[query] vs_policy`,R4-VS 请求3)。
 - `gadd`、`gsub`、`gquery` 等工具不读 `conf.ini`:`[system] id_reclaim` 与 RocksDB 调优键对它们只经环境变量(`GSTORE_ID_RECLAIM`、`GSTORE_ROCKS_BLOCK_CACHE_MB`)生效;gserver 与 gbuild 会读。
-- 测试 `http_api::tests::a_commit_that_frees_terms_copies_no_interner` 每次运行在 `/tmp` 留下 `gstore_api_unit_commit_no_copy_<pid>_1/m.db`(R4-CLOSURE 请求3)。
 - 没有测试端到端地服务一个"只有 staging 区没删掉"的 REST 批量构建(需要注入 I/O 故障;`BulkReport::opens_as_built` 有单元测试)。
 - 没有 CI 作业在 MSRV(1.89)上构建,只有 Docker 镜像用 MSRV;依赖升级可能悄悄抬高实际 MSRV(CI 工具链固定在 1.99.1,升级要连同新版本的 clippy / rustfmt 修正一起提交)。
 - 基准:计时闸门未收紧(空闲机上的波动达 1.42),等有 CI runner 的数据再看;WatDiv-like 模板只有 uniform 映射,未移植 WatDiv 的 zipfian / normal 映射与压力测试查询生成器;混合负载的写者插入的是查询不用的谓词,`/begin` 点测的是 harness 进程自己的 RSS。
