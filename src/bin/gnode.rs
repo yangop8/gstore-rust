@@ -1,7 +1,14 @@
 //! `gnode` — a single distributed **shard node**: it owns one local
-//! [`TripleStore`](gstore::store::TripleStore) and serves per-shard RPCs over
+//! [`TripleStore`] and serves per-shard RPCs over
 //! TCP for a [`NetworkShardedStore`](gstore::cluster::NetworkShardedStore)
 //! coordinator (see [`gstore::cluster::ShardNode`] / [`gstore::rpc`]).
+//!
+//! **Experimental.** `gnode` exercises the experimental [`gstore::cluster`]
+//! layer: nothing written to it is persisted (a restarted node starts from its
+//! optional `data_file` only, a cluster replica from nothing), the RPC
+//! protocol is unauthenticated and may change between releases, and it is
+//! not connected to `gserver` or the HTTP API. It has no counterpart in
+//! upstream gStore 1.4. Do not use it for data you need to keep.
 //!
 //! Usage:
 //!
@@ -43,7 +50,7 @@ fn main() -> ExitCode {
     for arg in &args[1..] {
         if arg == "-h" || arg == "--help" {
             eprintln!(
-                "usage:\n  gnode [bind_addr] [data_file]\n  gnode cluster <id> <bind_addr> [peer_id@addr ...]"
+                "usage (experimental, in-memory only):\n  gnode [bind_addr] [data_file]\n  gnode cluster <id> <bind_addr> [peer_id@addr ...]"
             );
             return ExitCode::SUCCESS;
         }
@@ -80,8 +87,8 @@ fn main() -> ExitCode {
         }
     };
     match node.local_addr() {
-        Ok(a) => println!("gnode shard listening on {a} (length-prefixed binary RPC)"),
-        Err(_) => println!("gnode shard listening on {bind_addr}"),
+        Ok(a) => gstore::outln!("gnode shard listening on {a} (length-prefixed binary RPC)"),
+        Err(_) => gstore::outln!("gnode shard listening on {bind_addr}"),
     }
     node.serve_forever();
     ExitCode::SUCCESS
@@ -133,8 +140,13 @@ fn run_cluster(args: &[&str]) -> ExitCode {
     }
 
     let peer_ids: Vec<NodeId> = peers.iter().map(|(p, _)| *p).collect();
-    let node = match ClusterNode::bind(id, peer_ids, TripleStore::new(), bind_addr, RaftConfig::default())
-    {
+    let node = match ClusterNode::bind(
+        id,
+        peer_ids,
+        TripleStore::new(),
+        bind_addr,
+        RaftConfig::default(),
+    ) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("gnode cluster: failed to bind '{bind_addr}': {e}");
@@ -145,11 +157,11 @@ fn run_cluster(args: &[&str]) -> ExitCode {
         node.set_peer_addr(*pid, *addr);
     }
     match node.local_addr() {
-        Ok(a) => println!(
+        Ok(a) => gstore::outln!(
             "gnode cluster node {id} listening on {a} with {} peer(s) (Raft replication)",
             peers.len()
         ),
-        Err(_) => println!("gnode cluster node {id} listening on {bind_addr}"),
+        Err(_) => gstore::outln!("gnode cluster node {id} listening on {bind_addr}"),
     }
     let handles = node.start();
     for h in handles {

@@ -193,9 +193,9 @@ fn heuristic_order(
     let first = *nodes
         .iter()
         .max_by(|&&a, &&b| {
+            // `total_cmp`: a NaN score must not panic the planner.
             node_score(graph, a, &placed, store, var_num)
-                .partial_cmp(&node_score(graph, b, &placed, store, var_num))
-                .unwrap()
+                .total_cmp(&node_score(graph, b, &placed, store, var_num))
         })
         .unwrap();
     order.push(first);
@@ -208,8 +208,7 @@ fn heuristic_order(
             .copied()
             .max_by(|&a, &b| {
                 node_score(graph, a, &placed, store, var_num)
-                    .partial_cmp(&node_score(graph, b, &placed, store, var_num))
-                    .unwrap()
+                    .total_cmp(&node_score(graph, b, &placed, store, var_num))
             })
             // disconnected component: take any remaining node
             .or_else(|| nodes.iter().copied().find(|v| !placed.contains(v)));
@@ -260,7 +259,7 @@ fn sampling_order(
                 let new_card = (card * sel).max(1.0);
                 (w, new_card)
             })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            .min_by(|a, b| a.1.total_cmp(&b.1));
         let (next, new_card) = match pick {
             Some(p) => p,
             None => match nodes.iter().copied().find(|v| !placed.contains(v)) {
@@ -314,6 +313,22 @@ fn best_edge_selectivity(
         let mut pass = 0usize;
         let w_cand = candidates.get(&w);
         for &drv in sample {
+            let Some(c) = w_cand else {
+                // No candidate set to test against: only the fan-out counts
+                // (counted, not materialized: contract C1).
+                pass += if e.is_subject {
+                    match e.pred {
+                        Slot::Const(p) => store.count_s_by_po(p, drv),
+                        Slot::Var(_) => store.count_ps_by_o(drv),
+                    }
+                } else {
+                    match e.pred {
+                        Slot::Const(p) => store.count_o_by_sp(drv, p),
+                        Slot::Var(_) => store.count_po_by_s(drv),
+                    }
+                } as usize;
+                continue;
+            };
             let reached: Vec<u32> = if e.is_subject {
                 // w is subject, neighbour is object ⇒ subjects of (pred?, drv)
                 match e.pred {
@@ -327,13 +342,10 @@ fn best_edge_selectivity(
                     Slot::Var(_) => store.po_by_s(drv).iter().map(|&(_, o)| o).collect(),
                 }
             };
-            pass += match w_cand {
-                Some(c) => reached
-                    .iter()
-                    .filter(|x| c.binary_search(x).is_ok())
-                    .count(),
-                None => reached.len(),
-            };
+            pass += reached
+                .iter()
+                .filter(|x| c.binary_search(x).is_ok())
+                .count();
         }
         let sel = (pass as f64 / sample.len() as f64).max(0.0001);
         best = best.min(sel);
@@ -445,16 +457,17 @@ fn bridge_to_pattern_order(
 
 /// The index-scan size a pattern would fetch (used to order patterns that
 /// become ready at the same step — fetch the smallest index first; the
-/// candidate filter then prunes the results).
+/// candidate filter then prunes the results). Counted, not materialized
+/// (contract C1).
 fn pattern_cost(plan: &PatPlan, store: &impl TripleSource, _candidates: &Candidates) -> u64 {
     match (plan.s, plan.p, plan.o) {
         (Slot::Const(_), Slot::Const(_), Slot::Const(_)) => 1,
-        (Slot::Const(s), Slot::Const(p), Slot::Var(_)) => store.o_by_sp(s, p).len() as u64,
-        (Slot::Var(_), Slot::Const(p), Slot::Const(o)) => store.s_by_po(p, o).len() as u64,
-        (Slot::Const(s), Slot::Var(_), Slot::Const(o)) => store.p_by_so(s, o).len() as u64,
-        (Slot::Const(s), Slot::Var(_), Slot::Var(_)) => store.po_by_s(s).len() as u64,
-        (Slot::Var(_), Slot::Const(p), Slot::Var(_)) => store.so_by_p(p).len() as u64,
-        (Slot::Var(_), Slot::Var(_), Slot::Const(o)) => store.ps_by_o(o).len() as u64,
+        (Slot::Const(s), Slot::Const(p), Slot::Var(_)) => store.count_o_by_sp(s, p),
+        (Slot::Var(_), Slot::Const(p), Slot::Const(o)) => store.count_s_by_po(p, o),
+        (Slot::Const(s), Slot::Var(_), Slot::Const(o)) => store.count_p_by_so(s, o),
+        (Slot::Const(s), Slot::Var(_), Slot::Var(_)) => store.count_po_by_s(s),
+        (Slot::Var(_), Slot::Const(p), Slot::Var(_)) => store.count_so_by_p(p),
+        (Slot::Var(_), Slot::Var(_), Slot::Const(o)) => store.count_ps_by_o(o),
         (Slot::Var(_), Slot::Var(_), Slot::Var(_)) => store.triple_count(),
     }
     .max(1)

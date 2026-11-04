@@ -1,14 +1,26 @@
-//! On-disk storage: a paged file with an LRU cache and B+ trees over it,
-//! plus a disk-backed triple store and dictionary.
+//! On-disk storage: a paged file with a CLOCK page cache, a write-ahead log
+//! and per-operation brackets, B+ trees over it, plus a disk-backed triple
+//! store and dictionary.
 //!
 //! This is the faithful counterpart to gStore's `KVstore` (fixed-block B+ tree
 //! files + buffer cache + VLists). See `docs/REFACTOR_BACKLOG.md` item A.
 //!
-//! Layout: [`pager::Pager`] gives fixed [`pager::PAGE_SIZE`] pages; [`bptree::BTree`]
-//! builds ordered B+ trees on them; [`store::DiskStore`] composes those into the
-//! six-way triple index (three SPO/POS/OSP orderings) plus the string↔id
-//! dictionary — enough to build, persist, reopen, and query a database entirely
-//! from disk.
+//! Layout: [`pager::Pager`] gives fixed [`pager::PAGE_SIZE`] pages (shared,
+//! copy-on-write cache buffers; header layout, version markers and feature
+//! bits in the [`format`](mod@format) registry); [`bptree::BTree`] builds ordered B+ trees
+//! on them, read through zero-copy [`bptree::NodeView`]s; [`store::DiskStore`]
+//! composes those into the six-way triple index (three SPO/POS/OSP orderings),
+//! a GSPO quad index for named graphs, plus the string↔id dictionary — enough
+//! to build, persist, reopen, update, and query a database entirely from disk.
+//! Every logical write is one atomic pager operation. The `Database` facade
+//! writes its committed updates through to this store by dictionary key (see
+//! `DiskStore::insert_keys`).
+//!
+//! [`disk_triples::DiskTriples`] wraps a writable `DiskStore` for Stream-mode
+//! evaluation (contract C5): reads that report errors to the statement's read
+//! scope, a transaction overlay (no triple reaches the pager before commit),
+//! a drain-and-cancel writer gate with epochs for [`DiskReadView`] snapshot
+//! readers, and a broken state after any write or flush error.
 //!
 //! Space/compaction features layered on top:
 //! * [`disk_dict::DiskDict`] backs an *out-of-core* dictionary: a disk query
@@ -49,6 +61,8 @@
 
 pub mod bptree;
 pub mod disk_dict;
+pub mod disk_triples;
+pub mod format;
 pub mod isarray;
 pub mod ivarray;
 pub mod overflow;
@@ -58,8 +72,9 @@ pub mod string_index;
 pub mod vlist;
 
 pub use disk_dict::DiskDict;
+pub use disk_triples::{DiskReadView, DiskSource, DiskTriples, ViewError};
 pub use isarray::IsArray;
 pub use ivarray::IvArray;
-pub use pager::{PageId, Pager, PAGE_SIZE};
+pub use pager::{PageId, Pager, PagerOp, PAGE_SIZE};
 pub use store::DiskStore;
 pub use string_index::StringIndex;

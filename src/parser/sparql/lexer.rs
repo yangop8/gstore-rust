@@ -6,6 +6,8 @@
 //! (read up to a closing `>` with no whitespace/illegal chars); on failure we
 //! fall back to the comparison operator.
 
+use std::ops::Range;
+
 use crate::error::{GStoreError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,11 +71,27 @@ pub enum Token {
 
 /// Tokenize an entire SPARQL string.
 pub fn tokenize(input: &str) -> Result<Vec<Token>> {
-    Lexer {
-        chars: input.chars().collect(),
-        pos: 0,
-    }
-    .run()
+    tokenize_with_spans(input).map(|(tokens, _)| tokens)
+}
+
+/// Tokenize an entire SPARQL string, also returning each token's source span
+/// as a byte range into `input` (`spans[i]` belongs to `tokens[i]`; the
+/// trailing [`Token::Eof`] gets the empty span at `input.len()`).
+///
+/// The parser needs the raw lexemes where a construct is passed through
+/// verbatim rather than interpreted, e.g. the `jsonVars` argument text of an
+/// upstream `PFN.name({…})` call.
+pub fn tokenize_with_spans(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>)> {
+    let chars: Vec<char> = input.chars().collect();
+    // byte_at[i] = byte offset of chars[i]; byte_at[chars.len()] = input.len().
+    let mut byte_at: Vec<usize> = input.char_indices().map(|(b, _)| b).collect();
+    byte_at.push(input.len());
+    let (tokens, char_spans) = Lexer { chars, pos: 0 }.run()?;
+    let spans = char_spans
+        .into_iter()
+        .map(|(a, b)| byte_at[a]..byte_at[b])
+        .collect();
+    Ok((tokens, spans))
 }
 
 struct Lexer {
@@ -100,13 +118,18 @@ impl Lexer {
         c
     }
 
-    fn run(mut self) -> Result<Vec<Token>> {
+    /// Lex the whole input into tokens plus their `[start, end)` char spans.
+    #[allow(clippy::type_complexity)]
+    fn run(mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
         let mut out = Vec::new();
+        let mut spans = Vec::new();
         loop {
             self.skip_ws_and_comments();
+            let start = self.pos;
             let Some(c) = self.peek() else {
                 out.push(Token::Eof);
-                return Ok(out);
+                spans.push((start, start));
+                return Ok((out, spans));
             };
             let tok = match c {
                 '{' => self.single(Token::LBrace),
@@ -176,6 +199,7 @@ impl Lexer {
                 other => return Err(self.err(format!("unexpected character '{other}'"))),
             };
             out.push(tok);
+            spans.push((start, self.pos));
         }
     }
 
@@ -282,6 +306,15 @@ impl Lexer {
                 } else {
                     break;
                 }
+            }
+            // BLANK_NODE_LABEL cannot end with '.': a trailing '.' is the
+            // statement terminator (`?s ?p _:b.`).
+            while label.ends_with('.') {
+                label.pop();
+                self.pos -= 1;
+            }
+            if label.is_empty() {
+                return Err(self.err("empty blank node label after '_:'"));
             }
             Ok(Token::Blank(label))
         } else {
@@ -412,11 +445,19 @@ impl Lexer {
                 } else {
                     break;
                 }
-            } else if c == 'e' || c == 'E' {
+            } else if (c == 'e' || c == 'E') && !is_double {
+                // EXPONENT ::= [eE] [+-]? [0-9]+ — the digits are required.
+                let signed = matches!(self.peek2(), Some('+') | Some('-'));
+                let digit_at = self.pos + 1 + usize::from(signed);
+                if !self.chars.get(digit_at).is_some_and(|d| d.is_ascii_digit()) {
+                    return Err(self.err(format!(
+                        "malformed number '{s}{c}…': an exponent needs digits, e.g. {s}e3"
+                    )));
+                }
                 is_double = true;
                 s.push(c);
                 self.pos += 1;
-                if matches!(self.peek(), Some('+') | Some('-')) {
+                if signed {
                     s.push(self.bump().unwrap());
                 }
             } else {
@@ -433,34 +474,87 @@ impl Lexer {
     }
 
     /// A bareword keyword/function, or a prefixed name `pfx:local`.
+    ///
+    /// The prefix (`PN_PREFIX`) may contain `-` and `.` (not as its last
+    /// character), e.g. `my-ns.v2:x`. The local part follows `PN_LOCAL`: name
+    /// characters, `-`, `.` and `:` (so `ex:a:b` has the local name `a:b`),
+    /// `%XX` percent-encodings (kept verbatim, as the grammar requires), and
+    /// `\`-escapes of `_~.-!$&'()*+,;=/?#@%` (the backslash is dropped:
+    /// `ex:a\-b` is `ex:` + `a-b`). An unescaped trailing `.` is the
+    /// statement terminator, not part of the name.
     fn lex_word_or_pname(&mut self) -> Result<Token> {
         let mut head = String::new();
-        while let Some(c) = self.peek() {
-            if is_name_char(c) {
-                head.push(c);
-                self.pos += 1;
-            } else {
-                break;
-            }
+        // A PN_PREFIX with '-' / '.' inside is only a prefix when ':' follows.
+        let mut end = self.pos;
+        while self
+            .chars
+            .get(end)
+            .is_some_and(|&c| is_pn_char(c) || c == '.')
+        {
+            end += 1;
         }
-        if self.peek() == Some(':') {
-            self.bump();
-            let mut local = String::new();
+        if end > self.pos && self.chars.get(end) == Some(&':') && self.chars[end - 1] != '.' {
+            head.extend(&self.chars[self.pos..end]);
+            self.pos = end;
+        } else {
             while let Some(c) = self.peek() {
-                // PN_LOCAL: letters, digits, '_', '-', '.', '%' (we keep it simple).
-                if is_name_char(c) || c == '-' || c == '.' || c == '%' {
-                    local.push(c);
+                if is_name_char(c) {
+                    head.push(c);
                     self.pos += 1;
                 } else {
                     break;
                 }
             }
-            // A trailing '.' belongs to the statement, not the local name.
-            while local.ends_with('.') {
-                local.pop();
-                self.pos -= 1;
+        }
+        if self.peek() == Some(':') {
+            self.bump();
+            // (char, consumed source chars, came from an escape)
+            let mut local: Vec<(char, usize, bool)> = Vec::new();
+            loop {
+                match self.peek() {
+                    Some(c) if is_pn_char(c) || c == '.' || c == ':' => {
+                        local.push((c, 1, false));
+                        self.pos += 1;
+                    }
+                    Some('%') => {
+                        let hex = |i: usize| {
+                            self.chars
+                                .get(self.pos + i)
+                                .copied()
+                                .filter(char::is_ascii_hexdigit)
+                        };
+                        let (Some(h1), Some(h2)) = (hex(1), hex(2)) else {
+                            return Err(self.err(format!(
+                                "invalid percent-encoding in prefixed name '{head}:{}…': '%' \
+                                 must be followed by two hex digits",
+                                local.iter().map(|x| x.0).collect::<String>()
+                            )));
+                        };
+                        // The whole `%XX` is kept verbatim (never decoded).
+                        local.extend([('%', 1, true), (h1, 1, true), (h2, 1, true)]);
+                        self.pos += 3;
+                    }
+                    Some('\\') => {
+                        let Some(c) = self.peek2().filter(|c| PN_LOCAL_ESC.contains(*c)) else {
+                            let shown = self.peek2().map(String::from).unwrap_or_default();
+                            return Err(self.err(format!(
+                                "invalid escape '\\{shown}' in prefixed name '{head}:{}…': \
+                                 only \\ followed by one of {PN_LOCAL_ESC} is allowed",
+                                local.iter().map(|x| x.0).collect::<String>()
+                            )));
+                        };
+                        local.push((c, 2, true));
+                        self.pos += 2;
+                    }
+                    _ => break,
+                }
             }
-            Ok(Token::PName(head, local))
+            // A trailing unescaped '.' belongs to the statement.
+            while let Some(&('.', n, false)) = local.last() {
+                local.pop();
+                self.pos -= n;
+            }
+            Ok(Token::PName(head, local.into_iter().map(|x| x.0).collect()))
         } else {
             if head.is_empty() {
                 return Err(self.err("expected a name"));
@@ -477,6 +571,18 @@ fn is_name_start(c: char) -> bool {
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
+
+/// `PN_CHARS`: name characters plus `-`, `·` and the combining ranges.
+fn is_pn_char(c: char) -> bool {
+    is_name_char(c)
+        || c == '-'
+        || c == '\u{00B7}'
+        || ('\u{0300}'..='\u{036F}').contains(&c)
+        || ('\u{203F}'..='\u{2040}').contains(&c)
+}
+
+/// The characters `PN_LOCAL_ESC` may escape with a backslash.
+const PN_LOCAL_ESC: &str = "_~.-!$&'()*+,;=/?#@%";
 
 #[cfg(test)]
 mod tests {
@@ -521,6 +627,39 @@ mod tests {
         let t = lex("foaf:knows .");
         assert_eq!(t[0], Token::PName("foaf".into(), "knows".into()));
         assert_eq!(t[1], Token::Dot);
+    }
+
+    #[test]
+    fn pname_local_escapes_colons_and_percent() {
+        let pn = |p: &str, l: &str| Token::PName(p.into(), l.into());
+        assert_eq!(lex("ex:a\\-b\\~c")[0], pn("ex", "a-b~c"));
+        assert_eq!(lex("ex:a:b:")[0], pn("ex", "a:b:"));
+        assert_eq!(lex("ex:x%20y")[0], pn("ex", "x%20y"));
+        // An escaped trailing '.' stays; an unescaped one is the next token.
+        assert_eq!(lex("ex:o\\.")[0], pn("ex", "o."));
+        let t = lex("ex:a.b.");
+        assert_eq!(t[0], pn("ex", "a.b"));
+        assert_eq!(t[1], Token::Dot);
+        // '-' and '.' inside a prefix, only when ':' follows.
+        assert_eq!(lex("my-ns.v2:x")[0], pn("my-ns.v2", "x"));
+        let t = lex("true.");
+        assert_eq!(t[0], Token::Word("true".into()));
+        assert_eq!(t[1], Token::Dot);
+        assert!(tokenize("ex:a%2").is_err());
+        assert!(tokenize("ex:a\\q").is_err());
+    }
+
+    #[test]
+    fn exponent_needs_digits_and_blank_labels_drop_a_trailing_dot() {
+        assert_eq!(lex("1e-3")[0], Token::Double("1e-3".into()));
+        assert_eq!(lex(".5E+2")[0], Token::Double(".5E+2".into()));
+        let e = tokenize("1e").unwrap_err().to_string();
+        assert!(e.contains("exponent needs digits"), "{e}");
+        assert!(tokenize("2e+x").is_err());
+        let t = lex("_:b1.");
+        assert_eq!(t[0], Token::Blank("b1".into()));
+        assert_eq!(t[1], Token::Dot);
+        assert_eq!(lex("_:a.b")[0], Token::Blank("a.b".into()));
     }
 
     #[test]
@@ -573,6 +712,27 @@ mod tests {
         assert_eq!(t[0], Token::Word("SELECT".into()));
         assert_eq!(t[1], Token::Word("DISTINCT".into()));
         assert_eq!(t[2], Token::Word("WHERE".into()));
+    }
+
+    #[test]
+    fn spans_cover_raw_lexemes() {
+        let src = "{ \"k\\n\" : [\"<é>\"] } # c\n?x";
+        let (toks, spans) = tokenize_with_spans(src).unwrap();
+        assert_eq!(toks.len(), spans.len());
+        let raw: Vec<&str> = spans.iter().map(|r| &src[r.clone()]).collect();
+        assert_eq!(
+            raw,
+            vec!["{", "\"k\\n\"", ":", "[", "\"<é>\"", "]", "}", "?x", ""]
+        );
+        assert_eq!(
+            toks[1],
+            Token::Str {
+                value: "k\n".into(),
+                lang: None,
+                datatype: None
+            }
+        );
+        assert_eq!(*toks.last().unwrap(), Token::Eof);
     }
 
     #[test]

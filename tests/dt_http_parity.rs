@@ -14,16 +14,40 @@ use std::sync::Arc;
 use std::thread;
 
 use gstore::http_api::ApiServer;
+use gstore::Database;
 
 const DATA: &str = "@prefix : <http://ex/> .\n:a :p :b .\n:a :name \"Alice\" .\n";
 
-/// A unique temp directory for one server's databases + logs + user store.
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// A unique, empty temp directory for one server's databases + logs + user
+/// store. A directory left at the same path by an earlier run whose process
+/// had the same id (pids are reused) is removed, so its users and databases
+/// never leak into this run.
 fn tmp_root(tag: &str) -> PathBuf {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let mut p = std::env::temp_dir();
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     p.push(format!("gstore_api_{tag}_{pid}_{n}"));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
+    let _ = std::fs::remove_dir_all(&p);
     p
 }
 
@@ -128,9 +152,17 @@ fn login_and_privilege_enforcement() {
     assert_eq!(s, 401, "bad login must be 401");
 
     // root can log in and receives a session token.
-    let (s, body) = request(&addr, "POST", "/login?username=root&password=root", None, "");
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/login?username=root&password=root",
+        None,
+        "",
+    );
     assert_eq!(s, 200);
-    let token = json_field(&body, "session").expect("session token").to_string();
+    let token = json_field(&body, "session")
+        .expect("session token")
+        .to_string();
     assert!(!token.is_empty());
 
     // root builds a database (RDF in the body).
@@ -203,7 +235,13 @@ fn http_transaction_commit_and_rollback() {
         "INSERT DATA { <http://ex/s1> <http://ex/p> <http://ex/o1> }",
     );
     assert_eq!(s, 200);
-    let (s, _) = request(&addr, "POST", &format!("/commit?txn={tid}"), Some(&root), "");
+    let (s, _) = request(
+        &addr,
+        "POST",
+        &format!("/commit?txn={tid}"),
+        Some(&root),
+        "",
+    );
     assert_eq!(s, 200);
 
     let (s, body) = request(
@@ -259,16 +297,27 @@ fn http_transaction_commit_and_rollback() {
 fn backup_and_restore_roundtrip() {
     let (_srv, addr, root_dir) = start("bk");
     let root = basic("root", "root");
-    let backup_path = root_dir.join("bk_snapshot");
+    // Backups live in the server's backup directory (`<root>/backups`); a
+    // relative path is taken relative to it.
+    let backup_path = root_dir.join("backups").join("bk_snapshot");
 
     // Build with the original triple :a :p :b .
     let (s, _) = request(&addr, "POST", "/build?db_name=bk", Some(&root), DATA);
     assert_eq!(s, 200);
 
     // Backup the original state.
-    let target = format!("/backup?db_name=bk&path={}", backup_path.display());
-    let (s, body) = request(&addr, "POST", &target, Some(&root), "");
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/backup?db_name=bk&path=bk_snapshot",
+        Some(&root),
+        "",
+    );
     assert_eq!(s, 200, "backup: {body}");
+    assert!(
+        Database::storage_kind(&backup_path).is_some(),
+        "backup written to {backup_path:?}: {body}"
+    );
 
     // Mutate after the backup: add :c :p :d .
     let (s, _) = request(
@@ -331,9 +380,18 @@ fn batch_insert_reflected_in_query() {
     let triples = "<http://ex/p1> <http://ex/k> <http://ex/v1> . \
                    <http://ex/p2> <http://ex/k> <http://ex/v2> . \
                    <http://ex/p3> <http://ex/k> <http://ex/v3> .";
-    let (s, body) = request(&addr, "POST", "/batchInsert?db_name=batch", Some(&root), triples);
+    let (s, body) = request(
+        &addr,
+        "POST",
+        "/batchInsert?db_name=batch",
+        Some(&root),
+        triples,
+    );
     assert_eq!(s, 200, "batchInsert: {body}");
-    assert!(body.contains("\"changed\":3"), "three triples added: {body}");
+    assert!(
+        body.contains("\"changed\":3"),
+        "three triples added: {body}"
+    );
 
     let (s, body) = request(
         &addr,
@@ -344,7 +402,10 @@ fn batch_insert_reflected_in_query() {
     );
     assert_eq!(s, 200);
     for s in ["http://ex/p1", "http://ex/p2", "http://ex/p3"] {
-        assert!(body.contains(s), "batch triple {s} must be queryable: {body}");
+        assert!(
+            body.contains(s),
+            "batch triple {s} must be queryable: {body}"
+        );
     }
 
     // batchRemove takes some away again.
@@ -399,9 +460,18 @@ fn export_returns_ntriples() {
 
     let (s, body) = request(&addr, "GET", "/export?db_name=ex", Some(&root), "");
     assert_eq!(s, 200);
-    assert!(body.contains("<http://ex/a>"), "export contains subjects: {body}");
-    assert!(body.contains("<http://ex/p>"), "export contains predicates: {body}");
-    assert!(body.trim_end().ends_with('.'), "N-Triples lines end with a dot");
+    assert!(
+        body.contains("<http://ex/a>"),
+        "export contains subjects: {body}"
+    );
+    assert!(
+        body.contains("<http://ex/p>"),
+        "export contains predicates: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with('.'),
+        "N-Triples lines end with a dot"
+    );
 }
 
 #[test]
@@ -420,7 +490,10 @@ fn monitor_and_logs_are_admin_gated() {
     // The access log (admin-only) records the requests we just made.
     let (s, body) = request(&addr, "GET", "/accesslog", Some(&root), "");
     assert_eq!(s, 200);
-    assert!(body.contains("/monitor"), "access log captured /monitor: {body}");
+    assert!(
+        body.contains("/monitor"),
+        "access log captured /monitor: {body}"
+    );
 
     // A non-admin user cannot read logs.
     let (s, _) = request(

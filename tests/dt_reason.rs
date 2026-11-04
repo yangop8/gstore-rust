@@ -75,7 +75,10 @@ fn subproperty_propagates() {
     let mut db = db();
     db.materialize_rdfs();
     assert_eq!(
-        col0(&mut db, "SELECT ?x WHERE { ?x <http://ex/parent> <http://ex/eve> }"),
+        col0(
+            &mut db,
+            "SELECT ?x WHERE { ?x <http://ex/parent> <http://ex/eve> }"
+        ),
         vec!["<http://ex/dave>"] // mother ⊑ₚ parent
     );
 }
@@ -83,15 +86,25 @@ fn subproperty_propagates() {
 #[test]
 fn materialize_inside_transaction_rolls_back() {
     let mut db = db();
-    let before = db.select("SELECT ?x WHERE { ?x a <http://ex/Person> }").unwrap().row_count();
+    let before = db
+        .select("SELECT ?x WHERE { ?x a <http://ex/Person> }")
+        .unwrap()
+        .row_count();
     db.begin().unwrap();
     let added = db.materialize_rdfs();
     assert!(added > 0);
-    assert!(db.select("SELECT ?x WHERE { ?x a <http://ex/Person> }").unwrap().row_count() > before);
+    assert!(
+        db.select("SELECT ?x WHERE { ?x a <http://ex/Person> }")
+            .unwrap()
+            .row_count()
+            > before
+    );
     db.rollback().unwrap();
     // Inferred triples are undone.
     assert_eq!(
-        db.select("SELECT ?x WHERE { ?x a <http://ex/Person> }").unwrap().row_count(),
+        db.select("SELECT ?x WHERE { ?x a <http://ex/Person> }")
+            .unwrap()
+            .row_count(),
         before
     );
 }

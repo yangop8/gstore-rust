@@ -26,16 +26,32 @@ pub struct Metrics {
 /// exactly one empty ⇒ zero; otherwise overlap-based.
 pub fn prf1(pred: &HashSet<String>, gold: &HashSet<String>) -> Metrics {
     if gold.is_empty() && pred.is_empty() {
-        return Metrics { precision: 1.0, recall: 1.0, f1: 1.0 };
+        return Metrics {
+            precision: 1.0,
+            recall: 1.0,
+            f1: 1.0,
+        };
     }
     if gold.is_empty() || pred.is_empty() {
-        return Metrics { precision: 0.0, recall: 0.0, f1: 0.0 };
+        return Metrics {
+            precision: 0.0,
+            recall: 0.0,
+            f1: 0.0,
+        };
     }
     let tp = pred.iter().filter(|x| gold.contains(*x)).count() as f64;
     let p = tp / pred.len() as f64;
     let r = tp / gold.len() as f64;
-    let f1 = if p + r == 0.0 { 0.0 } else { 2.0 * p * r / (p + r) };
-    Metrics { precision: p, recall: r, f1 }
+    let f1 = if p + r == 0.0 {
+        0.0
+    } else {
+        2.0 * p * r / (p + r)
+    };
+    Metrics {
+        precision: p,
+        recall: r,
+        f1,
+    }
 }
 
 /// One benchmark question with its gold answer(s) and/or gold query.
@@ -83,9 +99,17 @@ pub fn load_qald(json: &str) -> Result<Vec<EvalQuestion>> {
             continue; // no usable English string
         }
         let id = q.get("id").map(value_to_string).unwrap_or_default();
-        let gold_sparql = q.pointer("/query/sparql").and_then(Value::as_str).map(str::to_string);
+        let gold_sparql = q
+            .pointer("/query/sparql")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let gold_answers = qald_answers(q);
-        out.push(EvalQuestion { id, question, gold_answers, gold_sparql });
+        out.push(EvalQuestion {
+            id,
+            question,
+            gold_answers,
+            gold_sparql,
+        });
     }
     Ok(out)
 }
@@ -119,7 +143,12 @@ pub fn load_lcquad(json: &str) -> Result<Vec<EvalQuestion>> {
             .or_else(|| q.get("sparql"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        out.push(EvalQuestion { id, question, gold_answers: None, gold_sparql });
+        out.push(EvalQuestion {
+            id,
+            question,
+            gold_answers: None,
+            gold_sparql,
+        });
     }
     Ok(out)
 }
@@ -129,10 +158,14 @@ pub fn load_lcquad(json: &str) -> Result<Vec<EvalQuestion>> {
 fn qald_question_text(q: &Value) -> Option<String> {
     let arr = q.get("question").and_then(Value::as_array)?;
     let pick = |lang: &str| {
-        arr.iter().find(|e| e.get("language").and_then(Value::as_str) == Some(lang))
+        arr.iter()
+            .find(|e| e.get("language").and_then(Value::as_str) == Some(lang))
     };
     let entry = pick("en").or_else(|| arr.first())?;
-    entry.get("string").and_then(Value::as_str).map(str::to_string)
+    entry
+        .get("string")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// The gold answer set embedded in a QALD question (`None` if absent/empty).
@@ -212,7 +245,11 @@ impl EvalReport {
 }
 
 /// Resolve the gold answer set for a question, or `None` if unavailable.
-fn resolve_gold(engine: &SolveEngine, q: &EvalQuestion, opts: &EvalOptions) -> Option<HashSet<String>> {
+fn resolve_gold(
+    engine: &SolveEngine,
+    q: &EvalQuestion,
+    opts: &EvalOptions,
+) -> Option<HashSet<String>> {
     if let Some(g) = &q.gold_answers {
         return Some(g.iter().map(|v| normalize_answer(v)).collect());
     }
@@ -246,7 +283,11 @@ fn resolve_gold(engine: &SolveEngine, q: &EvalQuestion, opts: &EvalOptions) -> O
 
 /// Run gnlqa over `questions` and score it. Questions without a resolvable gold
 /// set are skipped (counted in the report), not scored as failures.
-pub fn run_eval(engine: &SolveEngine, questions: &[EvalQuestion], opts: &EvalOptions) -> EvalReport {
+pub fn run_eval(
+    engine: &SolveEngine,
+    questions: &[EvalQuestion],
+    opts: &EvalOptions,
+) -> EvalReport {
     let take = opts.limit.unwrap_or(questions.len());
     let mut per_question = Vec::new();
     let mut skipped = 0usize;
@@ -264,14 +305,25 @@ pub fn run_eval(engine: &SolveEngine, questions: &[EvalQuestion], opts: &EvalOpt
         sp += m.precision;
         sr += m.recall;
         sf += m.f1;
-        per_question.push(QuestionScore { id: q.id.clone(), metrics: m });
+        per_question.push(QuestionScore {
+            id: q.id.clone(),
+            metrics: m,
+        });
     }
     let n = per_question.len();
     let macro_metrics = if n == 0 {
-        Metrics { precision: 0.0, recall: 0.0, f1: 0.0 }
+        Metrics {
+            precision: 0.0,
+            recall: 0.0,
+            f1: 0.0,
+        }
     } else {
         let d = n as f64;
-        Metrics { precision: sp / d, recall: sr / d, f1: sf / d }
+        Metrics {
+            precision: sp / d,
+            recall: sr / d,
+            f1: sf / d,
+        }
     };
     EvalReport {
         total: take.min(questions.len()),
@@ -333,7 +385,11 @@ mod tests {
         assert_eq!(qs[0].id, "7");
         assert_eq!(qs[0].question, "Who directed Alien?"); // en preferred
         assert!(qs[0].gold_sparql.as_deref().unwrap().contains("SELECT"));
-        assert!(qs[0].gold_answers.as_ref().unwrap().contains("http://dbpedia.org/resource/Ridley_Scott"));
+        assert!(qs[0]
+            .gold_answers
+            .as_ref()
+            .unwrap()
+            .contains("http://dbpedia.org/resource/Ridley_Scott"));
     }
 
     #[test]
@@ -379,7 +435,12 @@ mod tests {
         ]);
         let kb = MockKb::new(vec![SparqlAnswer::Select {
             vars: vec!["x".into()],
-            rows: vec![vec![Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/a".into(), datatype: None, lang: None })]],
+            rows: vec![vec![Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: "http://ex/a".into(),
+                datatype: None,
+                lang: None,
+            })]],
         }]);
         SolveEngine::new(Box::new(llm), Box::new(kb)).with_citations(false)
     }
@@ -418,7 +479,10 @@ mod tests {
     fn kb_resolved_empty_gold_is_skipped_not_perfect() {
         // gold SPARQL executes but matches nothing → skip, NOT a spurious 1.0.
         let llm = MockLlm::fixed("unused"); // ask never runs for a skipped question
-        let kb = MockKb::new(vec![SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![] }]);
+        let kb = MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![],
+        }]);
         let engine = SolveEngine::new(Box::new(llm), Box::new(kb));
         let questions = vec![EvalQuestion {
             id: "q1".into(),
@@ -426,8 +490,14 @@ mod tests {
             gold_answers: None,
             gold_sparql: Some("SELECT ?x WHERE { ?x <http://ex/p> ?o }".into()),
         }];
-        let report =
-            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        let report = run_eval(
+            &engine,
+            &questions,
+            &EvalOptions {
+                limit: None,
+                resolve_gold_via_kb: true,
+            },
+        );
         assert_eq!(report.evaluated, 0);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.macro_metrics.f1, 0.0); // not inflated
@@ -445,11 +515,21 @@ mod tests {
             gold_answers: None,
             gold_sparql: Some("DELETE WHERE { ?s ?p ?o }".into()),
         }];
-        let report =
-            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        let report = run_eval(
+            &engine,
+            &questions,
+            &EvalOptions {
+                limit: None,
+                resolve_gold_via_kb: true,
+            },
+        );
         assert_eq!(report.skipped, 1);
         assert_eq!(report.evaluated, 0);
-        assert_eq!(kb.query_count(), 0, "a mutating gold query must never reach the store");
+        assert_eq!(
+            kb.query_count(),
+            0,
+            "a mutating gold query must never reach the store"
+        );
     }
 
     #[test]
@@ -461,8 +541,14 @@ mod tests {
             gold_answers: None,
             gold_sparql: Some("SELECT ?x WHERE { ?x <http://ex/p> ?o }".into()),
         }];
-        let report =
-            run_eval(&engine, &questions, &EvalOptions { limit: None, resolve_gold_via_kb: true });
+        let report = run_eval(
+            &engine,
+            &questions,
+            &EvalOptions {
+                limit: None,
+                resolve_gold_via_kb: true,
+            },
+        );
         assert_eq!(report.evaluated, 1);
         assert!((report.macro_metrics.f1 - 1.0).abs() < 1e-9);
     }

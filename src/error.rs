@@ -49,6 +49,26 @@ impl fmt::Display for GStoreError {
     }
 }
 
+impl GStoreError {
+    /// A copy of this error (an I/O error keeps its kind and message) — for
+    /// an error recorded once and reported wherever evaluation stops.
+    pub(crate) fn duplicate(&self) -> GStoreError {
+        match self {
+            GStoreError::Io(e) => GStoreError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            GStoreError::RdfParse { line, msg } => GStoreError::RdfParse {
+                line: *line,
+                msg: msg.clone(),
+            },
+            GStoreError::SparqlParse(m) => GStoreError::SparqlParse(m.clone()),
+            GStoreError::Query(m) => GStoreError::Query(m.clone()),
+            GStoreError::Serialize(m) => GStoreError::Serialize(m.clone()),
+            GStoreError::Database(m) => GStoreError::Database(m.clone()),
+            GStoreError::Conflict(m) => GStoreError::Conflict(m.clone()),
+            GStoreError::Cancelled => GStoreError::Cancelled,
+        }
+    }
+}
+
 impl std::error::Error for GStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

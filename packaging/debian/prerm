@@ -1,0 +1,11 @@
+#!/bin/sh
+# prerm of the gstore .deb: stop the server (gracefully: SIGTERM saves unsaved
+# changes) before its files are removed.
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl stop gserver.service >/dev/null 2>&1 || true
+    systemctl disable gserver.service >/dev/null 2>&1 || true
+fi
+
+exit 0

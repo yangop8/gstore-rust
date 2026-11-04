@@ -1,0 +1,187 @@
+name: bench
+
+# gstore-bench (bench/README.md):
+# * smoke — every push / PR: the `smoke` profile (LUBM-like univ 1 and
+#   WatDiv-like scale 1, snapshot and disk layouts, with the concurrency and
+#   mixed-workload phases) gated against bench/baselines/smoke.json — a
+#   workload or query the baseline does not have yet is reported as new, not
+#   gated — plus the canary (a 3x slowdown of the same result must fail) and
+#   a check that the tables generated from committed results into README.md
+#   and CHANGELOG.md are current (ci.yml's test job runs that check too, on
+#   every push and PR: this workflow skips the ones changing only docs);
+# * rocksdb-correctness — every push / PR: the harness's tests with RocksDB
+#   (every backend must answer alike), sharing ci.yml's RocksDB build cache;
+# * reference — manual or weekly, report-only: the `reference` profile
+#   (LUBM-like univ 8 by default, plus WatDiv-like scale 10) on every
+#   layout, compared with bench/results/pre-phase6-lubm<scale>.json when it
+#   exists (which has no WatDiv-like section: reported as new).
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "changelog.d/**"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "changelog.d/**"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "LUBM-like universities of the reference run (8 or 38)"
+        required: false
+        default: "8"
+  schedule:
+    # Weekly, Monday 03:23 UTC.
+    - cron: "23 3 * * 1"
+
+# A newer push to the same branch / PR supersedes an in-flight run. The
+# event is part of the group, so a push to main never cancels the scheduled
+# or dispatched reference run (nor the other way round), and those queue
+# instead of cancelling each other.
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The Rust toolchain, pinned like ci.yml's (keep the two equal: the
+  # rocksdb-correctness job shares ci.yml's RocksDB cache, whose key hashes
+  # the rustc version). Bump together with ci.yml's RUST_TOOLCHAIN.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  smoke:
+    name: smoke gate (gstore-bench ci)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-smoke
+      - name: release build (gbuild, gstore-bench)
+        run: cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+      # The tables between `<!-- gstore-bench report … -->` markers must be
+      # what `gstore-bench report` makes of the committed results (fix with
+      # `gstore-bench report --update README.md CHANGELOG.md`).
+      - name: generated documentation tables are current
+        run: target/release/gstore-bench report --check README.md CHANGELOG.md
+      - name: gstore-bench ci
+        run: >
+          target/release/gstore-bench ci
+          --baseline bench/baselines/smoke.json
+          --summary "$GITHUB_STEP_SUMMARY"
+          --out target/gstore-bench/smoke.json
+      # The result against itself, so the canary tests the gates, not how far
+      # the tree has moved from the blessed baseline.
+      - name: canary (the same result slowed down 3x must fail with exit 1)
+        run: |
+          set +e
+          target/release/gstore-bench check --baseline target/gstore-bench/smoke.json \
+            --from target/gstore-bench/smoke.json --self-test-slowdown 3 \
+            > target/gstore-bench/canary.md
+          code=$?
+          set -e
+          if [ "$code" != 1 ]; then
+            echo "the canary exited $code, expected 1"
+            cat target/gstore-bench/canary.md
+            exit 1
+          fi
+      - name: upload the results and phase logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstore-bench-smoke
+          path: |
+            target/gstore-bench/*.json
+            target/gstore-bench/*.md
+            target/gstore-bench/work/*/logs/
+          if-no-files-found: ignore
+
+  rocksdb-correctness:
+    name: gstore-bench tests (--features rocksdb)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # The bundled librocksdb C++ build dominates; allow for a cold cache.
+    timeout-minutes: 90
+    # ci.yml's debuginfo settings (workflow env there): the shared cache's key
+    # hashes every CARGO*/RUST* variable, and the cached build must match.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang (librocksdb-sys bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The same cache as ci.yml's rocksdb job (both build the test profile
+      # with RocksDB, on the same toolchain and debuginfo settings).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rocksdb
+      # The end-to-end tests run the real gbuild next to the harness, so
+      # build it with RocksDB first (the test profile writes target/debug).
+      - name: build gbuild with RocksDB
+        run: cargo build --profile test --locked -p gstore --bin gbuild --features rocksdb
+      - name: test
+        run: cargo test -p gstore-bench --features rocksdb
+
+  reference:
+    name: reference run (report-only)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # univ 38 builds the disk layout for about 25 minutes before Phase 6.
+    timeout-minutes: 300
+    env:
+      SCALE: ${{ github.event.inputs.scale || '8' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang (librocksdb-sys bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-reference
+      - name: release build with RocksDB (gbuild, gstore-bench)
+        run: >
+          cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+          --features gstore/rocksdb,gstore-bench/rocksdb
+      - name: gstore-bench run --profile reference
+        run: >
+          target/release/gstore-bench run --profile reference --scale "$SCALE"
+          --out "target/gstore-bench/reference-lubm$SCALE.json"
+      - name: report
+        if: always()
+        run: |
+          r="target/gstore-bench/reference-lubm$SCALE.json"
+          base="bench/results/pre-phase6-lubm$SCALE.json"
+          [ -f "$r" ] || exit 0
+          if [ -f "$base" ]; then
+            target/release/gstore-bench report "$r" --markdown --compare "$base" >> "$GITHUB_STEP_SUMMARY"
+          else
+            target/release/gstore-bench report "$r" --markdown >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: upload the result and phase logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstore-bench-reference
+          path: |
+            target/gstore-bench/*.json
+            target/gstore-bench/work/*/logs/
+          if-no-files-found: ignore

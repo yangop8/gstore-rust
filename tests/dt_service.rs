@@ -144,7 +144,10 @@ fn service_silent_join_dead_endpoint_preserves_outer_rows() {
     friends.sort();
     assert_eq!(
         friends,
-        vec!["<http://ex/bob>".to_string(), "<http://ex/carol>".to_string()],
+        vec![
+            "<http://ex/bob>".to_string(),
+            "<http://ex/carol>".to_string()
+        ],
         "outer rows must survive a SILENT SERVICE failure"
     );
 }

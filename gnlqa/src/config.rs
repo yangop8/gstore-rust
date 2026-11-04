@@ -172,7 +172,10 @@ fn load_config_file() -> HashMap<String, String> {
             let map = parse_config(&content);
             if !map.is_empty() {
                 if from_env_var {
-                    eprintln!("gnlqa: loaded {} setting(s) from {path} (GNLQA_CONFIG)", map.len());
+                    eprintln!(
+                        "gnlqa: loaded {} setting(s) from {path} (GNLQA_CONFIG)",
+                        map.len()
+                    );
                 } else {
                     eprintln!(
                         "gnlqa: loaded {} setting(s) from ./{path} in the current directory \
@@ -223,7 +226,10 @@ mod tests {
             no_equals_line\n";
         let m = parse_config(body);
         assert_eq!(m.get("GNLQA_LLM_PROVIDER").unwrap(), "openai");
-        assert_eq!(m.get("OPENAI_BASE_URL").unwrap(), "https://api.deepseek.com"); // trimmed
+        assert_eq!(
+            m.get("OPENAI_BASE_URL").unwrap(),
+            "https://api.deepseek.com"
+        ); // trimmed
         assert_eq!(m.get("OPENAI_API_KEY").unwrap(), "sk-abc"); // quotes stripped
         assert_eq!(m.get("GNLQA_MODEL").unwrap(), "deepseek-v4-pro");
         assert!(!m.contains_key("no_equals_line"));

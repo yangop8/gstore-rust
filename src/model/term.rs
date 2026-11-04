@@ -71,6 +71,68 @@ impl Term {
     pub fn dict_key(&self) -> String {
         self.to_string()
     }
+
+    /// The term a dictionary key names — the exact inverse of
+    /// [`dict_key`](Self::dict_key), for every term a reader may have let
+    /// in. Unlike the N-Triples reader it takes an IRI's text verbatim (one
+    /// holding `>`, `\` or a space, which the lenient readers accept, reads
+    /// back as itself; `\u` is not an escape there) and an empty language
+    /// tag. `None` for a string that is not a key.
+    pub fn from_dict_key(key: &str) -> Option<Term> {
+        if let Some(iri) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) {
+            return Some(Term::Iri(iri.to_string()));
+        }
+        if let Some(label) = key.strip_prefix("_:") {
+            return Some(Term::Blank(label.to_string()));
+        }
+        let body = key.strip_prefix('"')?;
+        // The lexical form, escaped as `escape_literal` escapes it.
+        let mut value = String::with_capacity(body.len());
+        let mut chars = body.char_indices();
+        let rest = loop {
+            match chars.next()? {
+                (i, '"') => break &body[i + 1..],
+                (_, '\\') => value.push(match chars.next()?.1 {
+                    '\\' => '\\',
+                    '"' => '"',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => return None,
+                }),
+                (_, c) => value.push(c),
+            }
+        };
+        let (datatype, lang) = if rest.is_empty() {
+            (None, None)
+        } else if let Some(dt) = rest.strip_prefix("^^<").and_then(|r| r.strip_suffix('>')) {
+            (Some(dt.to_string()), None)
+        } else {
+            (None, Some(rest.strip_prefix('@')?.to_string()))
+        };
+        Some(Term::Literal {
+            value,
+            datatype,
+            lang,
+        })
+    }
+
+    /// The bytes this term's strings hold (what a parsed statement costs in
+    /// memory, short of the fixed size of the term itself).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Term::Iri(s) | Term::Blank(s) => s.len(),
+            Term::Literal {
+                value,
+                datatype,
+                lang,
+            } => {
+                value.len()
+                    + datatype.as_ref().map_or(0, String::len)
+                    + lang.as_ref().map_or(0, String::len)
+            }
+        }
+    }
 }
 
 impl fmt::Display for Term {
@@ -97,7 +159,7 @@ impl fmt::Display for Term {
 }
 
 /// Escape a literal's lexical value for N-Triples output (`"`, `\`, newlines…).
-fn escape_literal(s: &str) -> String {
+pub(crate) fn escape_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -110,6 +172,56 @@ fn escape_literal(s: &str) -> String {
         }
     }
     out
+}
+
+/// A character IRIREF excludes (`[^#x00-#x20<>"{}|^`\\]`).
+fn excluded_from_iriref(c: char) -> bool {
+    c <= ' ' || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+}
+
+/// A dictionary key (a term in N-Triples form, see [`Term::dict_key`]) as the
+/// N-Triples / Turtle / N-Quads readers accept it back: in an IRI, or a
+/// literal's datatype IRI, every character IRIREF excludes (a space, a
+/// control character, `<>"{}|^`\`) becomes a `\uXXXX` escape, which the
+/// readers decode. The lenient readers let such IRIs into a database, so the
+/// exporters write keys through this to keep an export loadable. Any other
+/// key is returned as is.
+pub fn export_key(key: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let (head, iri) = if let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) {
+        ("<", inner)
+    } else if key.starts_with('"') && key.ends_with('>') {
+        match key.rfind("\"^^<") {
+            Some(i) => (&key[..i + 4], &key[i + 4..key.len() - 1]),
+            None => return Cow::Borrowed(key),
+        }
+    } else {
+        return Cow::Borrowed(key);
+    };
+    if !iri.chars().any(excluded_from_iriref) {
+        return Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 16);
+    out.push_str(head);
+    escape_iriref(iri, &mut out);
+    out.push('>');
+    Cow::Owned(out)
+}
+
+/// Append `iri` (an IRI's text, without its brackets) to `out` as IRIREF
+/// holds it: every character IRIREF excludes (a space, a control character,
+/// `<>"{}|^`\`) as a `\uXXXX` escape, which the readers decode — so what
+/// is appended holds no ASCII space or control character, and no `\` but
+/// those escapes.
+pub(crate) fn escape_iriref(iri: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    for c in iri.chars() {
+        if excluded_from_iriref(c) {
+            let _ = write!(out, "\\u{:04X}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
 }
 
 /// Whether an object position holds an entity or a literal (gStore:
@@ -158,6 +270,35 @@ impl fmt::Display for Triple {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_keys_read_back_as_the_terms_they_name() {
+        for t in [
+            Term::iri("http://ex/a"),
+            Term::iri("http://ex/a>b c\\u0041\\d"),
+            Term::iri(""),
+            Term::blank("b1_x-y"),
+            Term::plain_literal("a \"q\"\nb\\c\t\r\\u0041"),
+            Term::typed_literal("1", "http://www.w3.org/2001/XMLSchema#integer"),
+            Term::typed_literal("x", "http://ex/dt>odd"),
+            Term::Literal {
+                value: "x".into(),
+                datatype: None,
+                lang: Some("en-GB".into()),
+            },
+            Term::Literal {
+                value: "x".into(),
+                datatype: None,
+                lang: Some(String::new()),
+            },
+            Term::plain_literal(""),
+        ] {
+            assert_eq!(Term::from_dict_key(&t.dict_key()), Some(t.clone()), "{t}");
+        }
+        for not_a_key in ["", "x", "\"open", "\"x\"junk", "\"\\q\""] {
+            assert_eq!(Term::from_dict_key(not_a_key), None, "{not_a_key}");
+        }
+    }
 
     #[test]
     fn iri_roundtrips_through_display() {

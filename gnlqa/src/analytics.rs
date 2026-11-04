@@ -45,8 +45,11 @@ pub fn classify_op(question: &str) -> AnalyticsOp {
     // Peel off the graph-wide ops FIRST so their keywords ("connected component",
     // "most connected") are never misread as a two-entity path below.
     let component_q = has("communit") || has("cluster") || has("component");
-    let centrality_q =
-        has("central") || has("most connected") || has("highly connected") || has("highest degree") || has("hub");
+    let centrality_q = has("central")
+        || has("most connected")
+        || has("highly connected")
+        || has("highest degree")
+        || has("hub");
     // Path/connection phrasings between two entities. Broad on purpose: an
     // unmatched path question would otherwise fall to the PageRank default and
     // silently answer with an unrelated ranking. ShortestPath self-guards in
@@ -54,11 +57,21 @@ pub fn classify_op(question: &str) -> AnalyticsOp {
     // so over-triggering here degrades safely to Text-to-SPARQL, never to a wrong
     // confident answer.
     let path_phrase = has("shortest path")
-        || has("path between") || has("path from") || has("path to") || has("path connecting")
-        || has("connected") || has("connection")
-        || has("related") || has("relationship") || has("relate")
-        || has("linked") || has("link between")
-        || has("route") || has("hops") || has("reachable") || has("reach");
+        || has("path between")
+        || has("path from")
+        || has("path to")
+        || has("path connecting")
+        || has("connected")
+        || has("connection")
+        || has("related")
+        || has("relationship")
+        || has("relate")
+        || has("linked")
+        || has("link between")
+        || has("route")
+        || has("hops")
+        || has("reachable")
+        || has("reach");
     if component_q {
         AnalyticsOp::Components
     } else if has("triangle") {
@@ -92,7 +105,11 @@ pub struct AnalyticsCfg {
 
 impl Default for AnalyticsCfg {
     fn default() -> Self {
-        AnalyticsCfg { max_edges: 50_000, top_k: 10, path_hops: 3 }
+        AnalyticsCfg {
+            max_edges: 50_000,
+            top_k: 10,
+            path_hops: 3,
+        }
     }
 }
 
@@ -149,7 +166,11 @@ struct ProjectedGraph {
 }
 
 /// Intern a surface form into a dense id (stable insertion order → `term_of`).
-fn intern(id_of: &mut HashMap<String, EntityLiteralId>, term_of: &mut Vec<String>, key: String) -> EntityLiteralId {
+fn intern(
+    id_of: &mut HashMap<String, EntityLiteralId>,
+    term_of: &mut Vec<String>,
+    key: String,
+) -> EntityLiteralId {
     if let Some(&id) = id_of.get(&key) {
         return id;
     }
@@ -173,12 +194,17 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     // Ask for one extra row so `rows > limit` means "there was more".
     let ans = kb.query(&edge_query(limit + 1))?;
     let SparqlAnswer::Select { vars, rows } = &ans else {
-        return Err(Error::GStore("analytics edge query did not return a SELECT".into()));
+        return Err(Error::GStore(
+            "analytics edge query did not return a SELECT".into(),
+        ));
     };
-    let (Some(si), Some(oi)) =
-        (vars.iter().position(|v| v == "s"), vars.iter().position(|v| v == "o"))
-    else {
-        return Err(Error::GStore("analytics edge query must bind ?s and ?o".into()));
+    let (Some(si), Some(oi)) = (
+        vars.iter().position(|v| v == "s"),
+        vars.iter().position(|v| v == "o"),
+    ) else {
+        return Err(Error::GStore(
+            "analytics edge query must bind ?s and ?o".into(),
+        ));
     };
     let truncated = rows.len() > limit;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
@@ -193,7 +219,12 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     }
     let src = EdgeListSource { triples };
     let view = GraphView::from_source(&src);
-    Ok(ProjectedGraph { view, id_of, term_of, truncated })
+    Ok(ProjectedGraph {
+        view,
+        id_of,
+        term_of,
+        truncated,
+    })
 }
 
 /// Build a projected graph anchored on the seed entities (a bounded k-hop
@@ -205,7 +236,11 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
 fn project_seeded(kb: &dyn KbClient, seeds: &[String], cfg: AnalyticsCfg) -> ProjectedGraph {
     use crate::graphrag::{retrieve_subgraph, RetrievalCfg};
     let total = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
-    let rcfg = RetrievalCfg { hops: cfg.path_hops.max(1), per_node: 128, total };
+    let rcfg = RetrievalCfg {
+        hops: cfg.path_hops.max(1),
+        per_node: 128,
+        total,
+    };
     let subgraph = retrieve_subgraph(kb, seeds, rcfg);
     let truncated = subgraph.len() >= total;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
@@ -219,13 +254,27 @@ fn project_seeded(kb: &dyn KbClient, seeds: &[String], cfg: AnalyticsCfg) -> Pro
     }
     let src = EdgeListSource { triples };
     let view = GraphView::from_source(&src);
-    ProjectedGraph { view, id_of, term_of, truncated }
+    ProjectedGraph {
+        view,
+        id_of,
+        term_of,
+        truncated,
+    }
 }
 
 /// Render a `(id, score)` ranking as a top-k list of surface forms.
-fn render_ranking(mut scored: Vec<(EntityLiteralId, f64)>, term_of: &[String], label: &str, k: usize) -> String {
+fn render_ranking(
+    mut scored: Vec<(EntityLiteralId, f64)>,
+    term_of: &[String],
+    label: &str,
+    k: usize,
+) -> String {
     // Highest score first; break ties by id for determinism.
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     if scored.is_empty() {
         return format!("No nodes to rank by {label}.");
     }
@@ -251,8 +300,10 @@ fn shortest_path_answer(g: &ProjectedGraph, seeds: &[String]) -> String {
     };
     match g.view.shortest_path(a, b) {
         Some(path) => {
-            let steps: Vec<&str> =
-                path.iter().map(|id| g.term_of[*id as usize].as_str()).collect();
+            let steps: Vec<&str> = path
+                .iter()
+                .map(|id| g.term_of[*id as usize].as_str())
+                .collect();
             format!(
                 "Shortest path ({} hop(s)): {}",
                 path.len().saturating_sub(1),
@@ -268,7 +319,8 @@ fn degree_centrality_answer(g: &ProjectedGraph, k: usize) -> String {
     for (id, d) in g.view.all_in_degrees() {
         *tot.entry(id).or_insert(0) += d;
     }
-    let scored: Vec<(EntityLiteralId, f64)> = tot.into_iter().map(|(id, d)| (id, d as f64)).collect();
+    let scored: Vec<(EntityLiteralId, f64)> =
+        tot.into_iter().map(|(id, d)| (id, d as f64)).collect();
     render_ranking(scored, &g.term_of, "degree centrality", k)
 }
 
@@ -335,7 +387,10 @@ pub fn run_analytics(
         AnalyticsOp::Centrality => degree_centrality_answer(&g, k),
         AnalyticsOp::Components => components_answer(&g),
         AnalyticsOp::Triangles => {
-            format!("The graph sample contains {} triangle(s).", g.view.triangle_count())
+            format!(
+                "The graph sample contains {} triangle(s).",
+                g.view.triangle_count()
+            )
         }
     };
     Ok(AnalyticsResult {
@@ -353,7 +408,12 @@ mod tests {
     use crate::kb::{MockKb, RdfTerm, TermKind};
 
     fn t_uri(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
 
     /// A directed chain A → B → C plus A → C, as a single ?s ?o SELECT answer
@@ -364,7 +424,10 @@ mod tests {
             vec![Some(t_uri("http://ex/B")), Some(t_uri("http://ex/C"))],
             vec![Some(t_uri("http://ex/A")), Some(t_uri("http://ex/C"))],
         ];
-        MockKb::new(vec![SparqlAnswer::Select { vars: vec!["s".into(), "o".into()], rows }])
+        MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["s".into(), "o".into()],
+            rows,
+        }])
     }
 
     /// Seed-anchored retrieval issues graphrag out-queries (`?p ?o`); this canned
@@ -373,7 +436,10 @@ mod tests {
     fn out_to_c_kb() -> MockKb {
         MockKb::new(vec![SparqlAnswer::Select {
             vars: vec!["p".into(), "o".into()],
-            rows: vec![vec![Some(t_uri("http://ex/directed")), Some(t_uri("http://ex/C"))]],
+            rows: vec![vec![
+                Some(t_uri("http://ex/directed")),
+                Some(t_uri("http://ex/C")),
+            ]],
         }])
     }
 
@@ -389,16 +455,37 @@ mod tests {
     fn classify_covers_each_op() {
         // Path phrasing → ShortestPath regardless of seed count (run_analytics
         // decides whether it can be satisfied).
-        assert_eq!(classify_op("shortest path from A to B"), AnalyticsOp::ShortestPath);
-        assert_eq!(classify_op("how many triangles are there?"), AnalyticsOp::Triangles);
-        assert_eq!(classify_op("what communities exist?"), AnalyticsOp::Components);
-        assert_eq!(classify_op("who is the most influential person?"), AnalyticsOp::PageRank);
-        assert_eq!(classify_op("which node is most central?"), AnalyticsOp::Centrality);
+        assert_eq!(
+            classify_op("shortest path from A to B"),
+            AnalyticsOp::ShortestPath
+        );
+        assert_eq!(
+            classify_op("how many triangles are there?"),
+            AnalyticsOp::Triangles
+        );
+        assert_eq!(
+            classify_op("what communities exist?"),
+            AnalyticsOp::Components
+        );
+        assert_eq!(
+            classify_op("who is the most influential person?"),
+            AnalyticsOp::PageRank
+        );
+        assert_eq!(
+            classify_op("which node is most central?"),
+            AnalyticsOp::Centrality
+        );
         assert_eq!(classify_op("rank the nodes"), AnalyticsOp::PageRank); // default
-        // a component question must NOT be read as a path even with path wording
-        assert_eq!(classify_op("what components is X related to?"), AnalyticsOp::Components);
+                                                                          // a component question must NOT be read as a path even with path wording
+        assert_eq!(
+            classify_op("what components is X related to?"),
+            AnalyticsOp::Components
+        );
         // "most connected" with no path phrase is centrality, not a path
-        assert_eq!(classify_op("which node is most connected?"), AnalyticsOp::Centrality);
+        assert_eq!(
+            classify_op("which node is most connected?"),
+            AnalyticsOp::Centrality
+        );
     }
 
     #[test]
@@ -416,9 +503,18 @@ mod tests {
             assert_eq!(classify_op(q), AnalyticsOp::ShortestPath, "misrouted: {q}");
         }
         // ranking/centrality/component questions are still classified correctly
-        assert_eq!(classify_op("who is the most influential node?"), AnalyticsOp::PageRank);
-        assert_eq!(classify_op("which node is most connected?"), AnalyticsOp::Centrality);
-        assert_eq!(classify_op("how many communities are there?"), AnalyticsOp::Components);
+        assert_eq!(
+            classify_op("who is the most influential node?"),
+            AnalyticsOp::PageRank
+        );
+        assert_eq!(
+            classify_op("which node is most connected?"),
+            AnalyticsOp::Centrality
+        );
+        assert_eq!(
+            classify_op("how many communities are there?"),
+            AnalyticsOp::Components
+        );
     }
 
     #[test]
@@ -456,8 +552,16 @@ mod tests {
         // The C17-regression fix: a path question with <2 linked entities must
         // Err (→ fall through), NOT silently become a PageRank answer.
         let kb = out_to_c_kb();
-        let res = run_analytics(&kb, "shortest path from A to B", &[], AnalyticsCfg::default());
-        assert!(res.is_err(), "path question with no seeds must not degrade to PageRank");
+        let res = run_analytics(
+            &kb,
+            "shortest path from A to B",
+            &[],
+            AnalyticsCfg::default(),
+        );
+        assert!(
+            res.is_err(),
+            "path question with no seeds must not degrade to PageRank"
+        );
     }
 
     #[test]
@@ -469,8 +573,13 @@ mod tests {
         // C has the highest in-degree (from A and B) → should top PageRank.
         assert!(pr.text.contains("<http://ex/C>"));
 
-        let cen =
-            run_analytics(&kb, "which node is most central?", &[], AnalyticsCfg::default()).unwrap();
+        let cen = run_analytics(
+            &kb,
+            "which node is most central?",
+            &[],
+            AnalyticsCfg::default(),
+        )
+        .unwrap();
         assert_eq!(cen.op, AnalyticsOp::Centrality);
         assert!(cen.text.contains("degree centrality"));
     }
@@ -478,9 +587,13 @@ mod tests {
     #[test]
     fn components_and_triangles() {
         let kb = chain_kb();
-        let comp =
-            run_analytics(&kb, "how many connected components?", &[], AnalyticsCfg::default())
-                .unwrap();
+        let comp = run_analytics(
+            &kb,
+            "how many connected components?",
+            &[],
+            AnalyticsCfg::default(),
+        )
+        .unwrap();
         assert_eq!(comp.op, AnalyticsOp::Components);
         assert!(comp.text.contains("1 weakly-connected component"));
 
@@ -493,14 +606,26 @@ mod tests {
     fn truncated_flag_when_sample_hits_cap() {
         // 4 edges available, cap of 3 → project fetches LIMIT 4, sees > 3 → flags.
         let rows: Vec<_> = (0..4)
-            .map(|i| vec![Some(t_uri(&format!("http://ex/s{i}"))), Some(t_uri("http://ex/o"))])
+            .map(|i| {
+                vec![
+                    Some(t_uri(&format!("http://ex/s{i}"))),
+                    Some(t_uri("http://ex/o")),
+                ]
+            })
             .collect();
-        let kb = MockKb::new(vec![SparqlAnswer::Select { vars: vec!["s".into(), "o".into()], rows }]);
+        let kb = MockKb::new(vec![SparqlAnswer::Select {
+            vars: vec!["s".into(), "o".into()],
+            rows,
+        }]);
         let res = run_analytics(
             &kb,
             "rank nodes",
             &[],
-            AnalyticsCfg { max_edges: 3, top_k: 10, path_hops: 3 },
+            AnalyticsCfg {
+                max_edges: 3,
+                top_k: 10,
+                path_hops: 3,
+            },
         )
         .unwrap();
         assert!(res.truncated);

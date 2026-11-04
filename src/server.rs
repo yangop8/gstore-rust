@@ -1,9 +1,9 @@
 //! A minimal HTTP SPARQL endpoint over a [`Database`] — the analogue of gStore's
 //! `src/Server` / `ghttp`.
 //!
-//! This is a dependency-free, blocking HTTP/1.1 server (one request per
-//! connection, each connection handled on its own worker thread) implementing a
-//! useful subset of the SPARQL 1.1 Protocol:
+//! This is a dependency-free, blocking HTTP/1.1 server (connections are served
+//! by a bounded worker pool, with keep-alive — see *Connections* below)
+//! implementing a useful subset of the SPARQL 1.1 Protocol:
 //!
 //! | route | does |
 //! |-------|------|
@@ -14,13 +14,72 @@
 //! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
 //! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
 //! query parameter; CONSTRUCT/DESCRIBE return N-Triples. Connections run
-//! concurrently (a worker thread each), but the [`Database`] is shared behind a
-//! [`Mutex`] so the actual query/update execution is serialized (correctness
-//! over throughput); everything up to and after that — parsing, auth,
+//! concurrently (on the worker pool), and so do reads: the [`Database`] is
+//! shared behind a [`RwLock`] (see *Locking* below), so any number of
+//! SELECT/ASK/CONSTRUCT/DESCRIBE requests evaluate at once while an UPDATE
+//! runs alone. Everything around the statement itself — parsing it, auth,
 //! serialization, response compression — runs off the lock.
+//!
+//! **Locking** (contract C8 of the Phase 6 plan):
+//!
+//! * A request is parsed into a [`Statement`] **before** any lock is taken
+//!   (a syntax error is answered `400` without touching the database). A read
+//!   then takes a **shared** guard and runs through [`Database::read_as`]; an
+//!   UPDATE takes the **exclusive** guard and runs through
+//!   [`Database::execute_as`], and its check_point save happens before that
+//!   guard is released. Everything a read reaches inside the database is
+//!   `&self` and synchronized there (the query cache, the CSR cache, the
+//!   string-index cache, the PFN registry; the settings change only under
+//!   the exclusive guard).
+//! * `/status` never takes the database lock: it reads counters the server
+//!   publishes after every write (`DbCounters`), so it answers while a long
+//!   query or an update runs.
+//! * Lock order: this server's `RwLock` → the database's internals (its
+//!   query / CSR / string-index caches; `persist_lock` → disk sink →
+//!   `persist_error` → the pager) → the `DiskTriples` gate → the pager. Never
+//!   the reverse: nothing inside the database ever waits for the server's
+//!   lock.
+//! * No thread ever holds two database guards, takes a guard it already
+//!   holds, or upgrades a shared guard to an exclusive one without dropping
+//!   the shared guard first. The guards are poison-tolerant
+//!   (`read_locked` / `write_locked`): a request that panicked while
+//!   holding one does not wedge the server.
+//!
+//! **Connections** (shared with [`ApiServer`](crate::http_api::ApiServer), tuned
+//! by [`HttpOptions`] — gStore's `thread_num` and friends, see
+//! [`crate::config`]):
+//!
+//! * a **bounded worker pool** of [`HttpOptions::threads`] threads serves the
+//!   accepted connections; up to [`HttpOptions::queue_len`] more wait for a free
+//!   worker, and beyond that the accept loop stops accepting (backpressure into
+//!   the kernel's listen backlog) instead of spawning without bound;
+//! * **HTTP/1.1 keep-alive**: a connection serves up to
+//!   [`HttpOptions::keep_alive_max`] requests and is closed after
+//!   [`HttpOptions::keep_alive_timeout`] idle (honouring a client's
+//!   `Connection: close`, HTTP/1.0 semantics and `Keep-Alive: timeout=, max=`).
+//!   An idle connection gives its worker up early when other connections are
+//!   waiting for one, and closes at once when a shutdown begins;
+//! * **CORS**: with [`HttpOptions::cors`] (the default) every response carries
+//!   `Access-Control-Allow-Origin: *` and `OPTIONS` preflights are answered
+//!   directly (as upstream does for `/file/upload` and `/file/download`);
+//! * a **request body cap** ([`HttpOptions::max_body`]): a larger
+//!   `Content-Length` is refused with `413` before anything is allocated, and
+//!   `Expect: 100-continue` is honoured.
 //!
 //! Beyond the base protocol this endpoint adds:
 //!
+//! * **Durability** — a server that knows its database directory
+//!   ([`Server::with_db_dir`]) saves after every successful update (gStore's
+//!   `check_point` policy, on by default; [`Server::with_check_point`] turns it
+//!   off) and saves any remaining change on graceful shutdown.
+//! * **Graceful shutdown** — [`Server::shutdown`] / a [`ShutdownHandle`] (and,
+//!   on unix, `SIGINT`/`SIGTERM` via [`shutdown_on_signals`]) stops accepting,
+//!   lets in-flight requests finish (bounded by a grace period), saves, and makes
+//!   `serve_forever` return a [`ShutdownReport`]. The same machinery drives
+//!   [`ApiServer`](crate::http_api::ApiServer).
+//! * **Panic isolation** — each request is routed under `catch_unwind`: a
+//!   panicking handler answers `500` with a JSON error, and a poisoned
+//!   database lock is recovered so later requests keep working.
 //! * **HTTP Basic auth** — optional, via [`Server::with_basic_auth`]. When
 //!   configured, every request must carry a valid `Authorization: Basic` header
 //!   or it is answered `401` with `WWW-Authenticate: Basic`. With no credentials
@@ -35,10 +94,10 @@
 //!   Without the feature the default build stays dependency-free and sends
 //!   bodies verbatim. Streamed (`chunked`) responses are never compressed.
 //!
-//! **HTTPS:** with the optional `tls` feature, [`Server::serve_forever_tls`]
+//! **HTTPS:** with the optional `tls` feature, `Server::serve_forever_tls`
 //! (and its [`ApiServer`](crate::http_api::ApiServer) counterpart) terminate
-//! TLS in-process via `rustls` — build a [`rustls::ServerConfig`] from a
-//! cert+key PEM with [`load_tls_config`]. The default (zero-dependency) build
+//! TLS in-process via `rustls` — build a `rustls::ServerConfig` from a
+//! cert+key PEM with `load_tls_config`. The default (zero-dependency) build
 //! omits TLS: terminate HTTPS in front of the endpoint with a reverse proxy
 //! (nginx, Caddy, stunnel, …) instead, and do not send credentials over plain
 //! `http://` in production without such termination.
@@ -46,23 +105,83 @@
 //! Still deferred (see `docs/REFACTOR_BACKLOG.md` F): gRPC and
 //! clustering/sharding.
 
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::db::Database;
+use crate::db::{Database, LoadPolicy, Statement};
 use crate::query::{QueryResult, ResultSet};
 use crate::sparql_results::{self, json_str, ResultFormat};
 
 const SPARQL_JSON: &str = "application/sparql-results+json";
 
-/// Maximum accepted request-body size (`Content-Length`). Bounds the pre-auth
-/// allocation in [`Request::parse`] so a single header can't make the server
-/// reserve arbitrary memory or panic on capacity overflow. Shared by the simple
-/// server and the multi-DB `http_api` server (which reuses `Request::parse`).
-const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024; // 256 MiB
+/// Default maximum accepted request-body size (`Content-Length`) — the default
+/// of [`HttpOptions::max_body`]. Bounds the pre-auth allocation in request
+/// parsing so a single header can't make the server reserve arbitrary memory or
+/// panic on capacity overflow. Shared by the simple server and the multi-DB
+/// `http_api` server. (`gserver` raises it to `conf.ini`'s
+/// `upload_max_body_size`, 1 GiB by default.)
+pub const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024; // 256 MiB
+
+/// Connection-handling settings shared by [`Server`] and
+/// [`ApiServer`](crate::http_api::ApiServer): the worker pool, keep-alive,
+/// CORS, timeouts and the request body cap. [`GStoreConfig::http_options`]
+/// derives them from `conf.ini`.
+///
+/// [`GStoreConfig::http_options`]: crate::config::GStoreConfig::http_options
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpOptions {
+    /// Worker threads serving connections (gStore's `thread_num`, default
+    /// 30). At least one is always started.
+    pub threads: usize,
+    /// Accepted connections that may wait for a free worker (default 128).
+    /// When that many are waiting, the accept loop stops accepting until a
+    /// worker frees up — the kernel listen backlog absorbs the rest.
+    pub queue_len: usize,
+    /// How long a kept-alive connection may sit idle between requests
+    /// (default 60 s, upstream workflow's default). `Duration::ZERO` turns
+    /// keep-alive off: every response then carries `Connection: close`.
+    pub keep_alive_timeout: Duration,
+    /// Maximum number of requests served on one connection (default 100).
+    pub keep_alive_max: usize,
+    /// Read timeout while a request is being received (default 30 s): a
+    /// client that stalls mid-request (a slowloris) is dropped.
+    pub read_timeout: Duration,
+    /// Write timeout for responses (default 30 s): a client that stops reading
+    /// cannot pin a worker forever.
+    pub write_timeout: Duration,
+    /// Maximum request body in bytes (default [`MAX_REQUEST_BODY`]); larger
+    /// requests are answered `413` without reading the body.
+    pub max_body: usize,
+    /// Add `Access-Control-Allow-Origin: *` to every response and answer
+    /// `OPTIONS` preflight requests (default on).
+    pub cors: bool,
+}
+
+/// The default worker-pool size (gStore's `thread_num` default).
+pub const DEFAULT_THREADS: usize = 30;
+
+impl Default for HttpOptions {
+    fn default() -> Self {
+        HttpOptions {
+            threads: DEFAULT_THREADS,
+            queue_len: 128,
+            keep_alive_timeout: Duration::from_secs(60),
+            keep_alive_max: 100,
+            read_timeout: CONN_READ_TIMEOUT,
+            write_timeout: CONN_READ_TIMEOUT,
+            max_body: MAX_REQUEST_BODY,
+            cors: true,
+        }
+    }
+}
 
 /// A minimal, self-contained (inline CSS/JS, no external assets) single-page
 /// web console served at `GET /` and `GET /console`: a textarea to run
@@ -135,34 +254,163 @@ document.getElementById('run').addEventListener('click', function () {
 "##;
 
 /// An HTTP SPARQL server wrapping a [`Database`].
+///
+/// **Durability.** When the server knows its database directory (see
+/// [`with_db_dir`](Self::with_db_dir)), every successful UPDATE that changed
+/// data is saved back to that directory straight away (the gStore
+/// `check_point` policy, on by default — turn it off with
+/// [`with_check_point(false)`](Self::with_check_point)), and any still-unsaved
+/// change is saved during a graceful [`shutdown`](Self::shutdown). A server
+/// built with plain [`bind`](Self::bind) has no directory and stays purely
+/// in-memory, exactly as before.
+///
+/// **`LOAD`.** The served database gets [`LoadPolicy::restricted`]: a client's
+/// SPARQL `LOAD` cannot make the server read local files (or anything else).
+/// Re-allow a directory with [`with_load_policy`](Self::with_load_policy).
 pub struct Server {
     /// The shared, thread-safe part handed to each connection's worker thread.
     inner: Arc<ServerInner>,
-    listener: TcpListener,
+    /// The listening socket; taken (closed) once the server has shut down.
+    listener: Mutex<Option<TcpListener>>,
+    addr: SocketAddr,
+    life: Arc<Lifecycle>,
+    /// Upper bound on how long a graceful shutdown waits for in-flight requests.
+    grace: Duration,
+    /// Worker pool, keep-alive, CORS and body-size settings.
+    http: HttpOptions,
 }
 
 /// The part of a [`Server`] shared across connection worker threads (behind an
-/// `Arc`): the [`Database`] (serialized by its `Mutex`) and the optional Basic
-/// credentials. Kept separate from the non-`Send` bookkeeping so a worker only
-/// needs to clone this `Arc`.
+/// `Arc`): the [`Database`] (shared by readers, exclusive to an UPDATE — see
+/// the module's *Locking*) and the optional Basic credentials. Kept separate
+/// from the non-`Send` bookkeeping so a worker only needs to clone this `Arc`.
 struct ServerInner {
-    db: Mutex<Database>,
+    db: RwLock<Database>,
+    /// The served database's name (fixed: the server never renames it).
+    name: String,
+    /// The database's figures as of its last write, for `/status` (read
+    /// without the database lock).
+    counters: DbCounters,
+    /// Set (under the `db` lock) when the in-memory database has changes that
+    /// are not yet saved to [`dir`](Self::dir); cleared by a successful save.
+    dirty: AtomicBool,
     /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
     auth: Option<(String, String)>,
+    /// The directory the database was loaded from / is persisted to. `None` ⇒
+    /// in-memory only (nothing is ever saved).
+    dir: Option<PathBuf>,
+    /// gStore's `check_point` policy: save after every successful update.
+    check_point: bool,
+    /// Set when a graceful shutdown begins: from then on every update saves
+    /// itself before it is acknowledged, whatever the check_point policy — so
+    /// an update still in flight when the shutdown's final save runs (or that
+    /// only gets the lock afterwards) is never acknowledged and then lost.
+    closing: AtomicBool,
+    /// Raised when a graceful shutdown's grace period ends with requests
+    /// still running: every statement runs under it
+    /// ([`Database::query_cancellable`]), so one still running then — a
+    /// graph function may run for as long as its `maxIter` says — stops at
+    /// its next check and releases the database for the final save.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Server {
     /// Bind to `addr` (e.g. `"127.0.0.1:7000"` or `"127.0.0.1:0"` for an
-    /// ephemeral port), taking ownership of `db`.
-    pub fn bind<A: ToSocketAddrs>(db: Database, addr: A) -> std::io::Result<Server> {
+    /// ephemeral port), taking ownership of `db`. The server is in-memory only
+    /// until a directory is attached with [`with_db_dir`](Self::with_db_dir).
+    /// The database's `LOAD` policy is set to [`LoadPolicy::restricted`].
+    pub fn bind<A: ToSocketAddrs>(mut db: Database, addr: A) -> std::io::Result<Server> {
+        db.set_load_policy(LoadPolicy::restricted());
         let listener = TcpListener::bind(addr)?;
+        let addr = listener.local_addr()?;
+        let counters = DbCounters::default();
+        counters.publish(&db);
         Ok(Server {
             inner: Arc::new(ServerInner {
-                db: Mutex::new(db),
+                name: db.name().to_string(),
+                db: RwLock::new(db),
+                counters,
+                dirty: AtomicBool::new(false),
                 auth: None,
+                dir: None,
+                check_point: true,
+                closing: AtomicBool::new(false),
+                cancel: Arc::new(AtomicBool::new(false)),
             }),
-            listener,
+            listener: Mutex::new(Some(listener)),
+            addr,
+            life: Lifecycle::new(addr),
+            grace: DEFAULT_SHUTDOWN_GRACE,
+            http: HttpOptions::default(),
         })
+    }
+
+    /// Replace the connection settings (worker-pool size, keep-alive, CORS,
+    /// timeouts, body cap; default [`HttpOptions::default`]).
+    pub fn with_http_options(mut self, opts: HttpOptions) -> Server {
+        self.http = opts;
+        self
+    }
+
+    /// The connection settings in effect.
+    pub fn http_options(&self) -> &HttpOptions {
+        &self.http
+    }
+
+    /// Persist the database to `dir` (normally the directory it was loaded
+    /// from): saved after each successful update while the `check_point` policy
+    /// is on (the default), and on graceful shutdown in any case.
+    ///
+    /// ```no_run
+    /// # use gstore::{Database, server::Server};
+    /// let db = Database::load("lubm.db").unwrap();
+    /// let server = Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir("lubm.db");
+    /// ```
+    pub fn with_db_dir(mut self, dir: impl Into<PathBuf>) -> Server {
+        // Builders run right after `bind`, before the inner `Arc` is shared with
+        // any worker thread, so `get_mut` succeeds (see `with_basic_auth`).
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.dir = Some(dir.into());
+        }
+        self
+    }
+
+    /// Replace the SPARQL `LOAD` policy of the served database (the default is
+    /// [`LoadPolicy::restricted`]), e.g. to let `LOAD` read one directory with
+    /// `LoadPolicy::restricted().with_allowed_dir(dir)`. Its `allow_remote`
+    /// also decides whether federated `SERVICE` patterns may contact remote
+    /// endpoints (not by default).
+    pub fn with_load_policy(self, policy: LoadPolicy) -> Server {
+        write_locked(&self.inner.db).set_load_policy(policy);
+        self
+    }
+
+    /// Apply query-evaluation settings to the served database: the
+    /// integer-division mode, the query-cache budget, the Top-K /
+    /// early-termination options and the graph-function output bound
+    /// ([`Database::apply_query_settings`]). `gserver` passes `conf.ini`'s
+    /// `[query]` section ([`crate::config::GStoreConfig::query_settings`]);
+    /// without this call the database keeps the settings it was given.
+    pub fn with_query_settings(self, settings: crate::db::QuerySettings) -> Server {
+        write_locked(&self.inner.db).apply_query_settings(&settings);
+        self
+    }
+
+    /// Turn gStore's `check_point` policy on (the default) or off. When off,
+    /// updates stay in memory and are saved only on graceful shutdown (an
+    /// on-disk / RocksDB database still commits each update it writes through).
+    pub fn with_check_point(mut self, on: bool) -> Server {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.check_point = on;
+        }
+        self
+    }
+
+    /// Bound the time a graceful shutdown waits for in-flight requests to
+    /// finish before saving and returning (default [`DEFAULT_SHUTDOWN_GRACE`]).
+    pub fn with_shutdown_grace(mut self, grace: Duration) -> Server {
+        self.grace = grace;
+        self
     }
 
     /// Require HTTP Basic auth with these credentials on every request.
@@ -185,52 +433,1121 @@ impl Server {
 
     /// The actual bound address (useful after binding to port 0).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        Ok(self.addr)
     }
 
-    /// Accept connections forever, handling each on its own worker thread so a
-    /// slow query on one connection does not block the others (the [`Database`]
-    /// itself is still serialized behind its `Mutex`).
-    pub fn serve_forever(&self) {
-        for stream in self.listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+    /// The directory the database is persisted to, if any.
+    pub fn db_dir(&self) -> Option<&Path> {
+        self.inner.dir.as_deref()
+    }
+
+    /// Whether the check_point policy (save after every update) is on.
+    pub fn check_point(&self) -> bool {
+        self.inner.check_point
+    }
+
+    /// A cloneable handle that can stop this server from any thread (or from a
+    /// signal watcher, see [`shutdown_on_signals`]).
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle::new(Arc::clone(&self.life))
+    }
+
+    /// Request a graceful shutdown: stop accepting connections, let in-flight
+    /// requests finish (bounded by the grace period), save the database if it
+    /// has unsaved changes, and return from [`serve_forever`](Self::serve_forever).
+    /// Returns immediately; join the serving thread to wait for completion.
+    pub fn shutdown(&self) {
+        self.life.request_plain_stop();
+    }
+
+    /// Accept connections until [`shutdown`](Self::shutdown), serving them on
+    /// the bounded worker pool (see [`HttpOptions`]) so a slow query on one
+    /// connection does not block the others (reads share the [`Database`],
+    /// an UPDATE has it to itself — see the module's *Locking*). On shutdown the listener is closed, idle
+    /// kept-alive connections are closed, in-flight requests are given up to the
+    /// grace period to finish (statements still running then are cancelled),
+    /// unsaved changes are saved, and a [`ShutdownReport`] is returned.
+    pub fn serve_forever(&self) -> ShutdownReport {
+        let drained = run_accept_loop(&self.listener, &self.life, self.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
-            spawn_worker(move || {
-                let _ = inner.handle(stream);
-            });
-        }
+            Box::new(move || {
+                let ctl = acc.stream.try_clone().ok();
+                serve_connection(
+                    acc.stream,
+                    ctl.as_ref(),
+                    Some(acc.peer),
+                    acc.guard,
+                    &acc.env,
+                    |s, req, meta| inner.handle(s, req, meta),
+                );
+            })
+        });
+        self.finish_shutdown(drained)
     }
 
     /// Like [`serve_forever`](Self::serve_forever) but terminates TLS
     /// in-process, wrapping every accepted connection in a `rustls` stream built
     /// from `config` (see [`load_tls_config`]). Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) {
-        for stream in self.listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+    pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
+        let drained = run_accept_loop(&self.listener, &self.life, self.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
-            spawn_worker(move || {
-                if let Ok(conn) = rustls::ServerConnection::new(config) {
-                    let _ = inner.handle(rustls::StreamOwned::new(conn, stream));
+            Box::new(move || {
+                let Ok(conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let ctl = acc.stream.try_clone().ok();
+                let tls = rustls::StreamOwned::new(conn, acc.stream);
+                serve_connection(
+                    tls,
+                    ctl.as_ref(),
+                    Some(acc.peer),
+                    acc.guard,
+                    &acc.env,
+                    |s, req, meta| inner.handle(s, req, meta),
+                );
+            })
+        });
+        self.finish_shutdown(drained)
+    }
+
+    /// The tail of a graceful shutdown: save unsaved changes (if a directory is
+    /// attached) and report what happened.
+    ///
+    /// The `closing` flag is raised first. An update that applies its change
+    /// after that saves it itself (see [`ServerInner::execute`]); one that
+    /// applied it before has set `dirty` first. Both are sequentially
+    /// consistent, so at least one side sees the other: either this save or
+    /// the update's own covers every change — while a shutdown with nothing
+    /// unsaved still never waits for the database lock.
+    fn finish_shutdown(&self, drained: bool) -> ShutdownReport {
+        let mut report = ShutdownReport {
+            drained,
+            ..ShutdownReport::default()
+        };
+        self.inner.closing.store(true, Ordering::SeqCst);
+        if !drained {
+            // Past the grace period: stop the statements still running, so
+            // the save below does not wait for them (see `cancel`).
+            self.inner.cancel.store(true, Ordering::SeqCst);
+        }
+        if self.inner.dirty.load(Ordering::SeqCst) {
+            // Exclusive: no update runs while the final save does.
+            let db = write_locked(&self.inner.db);
+            // Re-checked under the lock: the update may have saved itself.
+            if self.inner.dirty.load(Ordering::SeqCst) {
+                match self.inner.save_locked(&db) {
+                    Ok(Some(dir)) => report.saved.push(dir),
+                    Ok(None) => {}
+                    Err((dir, e)) => report.failed.push((dir, e)),
                 }
-            });
+            }
+        }
+        report
+    }
+}
+
+/// The default upper bound on how long a graceful shutdown waits for in-flight
+/// requests before it saves and returns anyway.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// What a graceful shutdown did; returned by `serve_forever` on both
+/// [`Server`] and [`ApiServer`](crate::http_api::ApiServer).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// `true` when every in-flight request finished within the grace period.
+    pub drained: bool,
+    /// Database directories saved during shutdown (only databases with unsaved
+    /// changes are written).
+    pub saved: Vec<PathBuf>,
+    /// Saves that failed, as `(directory, error message)`.
+    pub failed: Vec<(PathBuf, String)>,
+    /// Open HTTP transactions rolled back because the server stopped
+    /// ([`ApiServer`](crate::http_api::ApiServer) only).
+    pub rolled_back: usize,
+}
+
+/// A cloneable, thread-safe handle that gracefully stops a running [`Server`]
+/// or [`ApiServer`](crate::http_api::ApiServer) — from a test, another thread,
+/// or a signal watcher ([`shutdown_on_signals`]).
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    life: Arc<Lifecycle>,
+}
+
+impl ShutdownHandle {
+    pub(crate) fn new(life: Arc<Lifecycle>) -> ShutdownHandle {
+        ShutdownHandle { life }
+    }
+
+    /// Request a graceful shutdown (idempotent, non-blocking). It also calls
+    /// off a [`restart`](Self::restart) requested earlier.
+    pub fn shutdown(&self) {
+        self.life.request_plain_stop();
+    }
+
+    /// Whether a shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        self.life.stopping()
+    }
+
+    /// Request a graceful shutdown that the embedding program should follow
+    /// with a restart (what the HTTP `/restart` route does): the server stops
+    /// exactly as for [`shutdown`](Self::shutdown), and
+    /// [`restart_requested`](Self::restart_requested) turns `true`. `gserver`
+    /// then re-executes itself.
+    pub fn restart(&self) {
+        self.life.request_restart();
+    }
+
+    /// Whether the shutdown was requested as a restart (see [`restart`](Self::restart)).
+    pub fn restart_requested(&self) -> bool {
+        self.life.restart_requested()
+    }
+}
+
+impl std::fmt::Debug for ShutdownHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownHandle")
+            .field("addr", &self.life.wake)
+            .field("shutdown", &self.is_shutdown())
+            .finish()
+    }
+}
+
+/// Stop/in-flight bookkeeping shared by a server's accept loop, its workers,
+/// and every [`ShutdownHandle`].
+pub(crate) struct Lifecycle {
+    stop: AtomicBool,
+    /// Set (before `stop`) when the shutdown is a restart.
+    restart: AtomicBool,
+    in_flight: AtomicUsize,
+    /// A connectable form of the bound address, used to wake a blocked
+    /// `accept()` when a shutdown is requested.
+    wake: SocketAddr,
+}
+
+impl Lifecycle {
+    pub(crate) fn new(bound: SocketAddr) -> Arc<Lifecycle> {
+        // An unspecified bind address (0.0.0.0 / ::) is not connectable on every
+        // platform; wake through the loopback address of the same family.
+        let ip = match bound.ip() {
+            IpAddr::V4(v) if v.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v) if v.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        Arc::new(Lifecycle {
+            stop: AtomicBool::new(false),
+            restart: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            wake: SocketAddr::new(ip, bound.port()),
+        })
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// [`request_stop`](Self::request_stop), flagged as a restart. A shutdown
+    /// already under way stays a plain shutdown.
+    pub(crate) fn request_restart(&self) {
+        if !self.stopping() {
+            self.restart.store(true, Ordering::SeqCst);
+        }
+        self.request_stop();
+    }
+
+    pub(crate) fn restart_requested(&self) -> bool {
+        self.restart.load(Ordering::SeqCst)
+    }
+
+    /// An explicit stop ([`ShutdownHandle::shutdown`], a signal, `/shutdown`):
+    /// [`request_stop`](Self::request_stop), and a restart requested earlier
+    /// is called off — the latest request wins, so an operator stopping the
+    /// server while a `/restart` is still shutting it down gets a stop.
+    pub(crate) fn request_plain_stop(&self) {
+        self.restart.store(false, Ordering::SeqCst);
+        self.request_stop();
+    }
+
+    /// Flag the shutdown and wake the accept loop with a throwaway
+    /// self-connection (the loop re-checks the flag after every `accept`).
+    pub(crate) fn request_stop(&self) {
+        if !self.stop.swap(true, Ordering::SeqCst) {
+            let _ = TcpStream::connect_timeout(&self.wake, Duration::from_secs(1));
+        }
+    }
+
+    /// Count one in-flight connection until the returned guard drops.
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Wait until no connection is in flight, at most `grace`. Returns whether
+    /// the server drained.
+    pub(crate) fn wait_idle(&self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-/// Idle read timeout applied to every accepted connection: a client that opens a
-/// socket and then sends nothing (a slowloris) times out in `Request::parse`
-/// instead of pinning its worker thread and fd forever.
-pub(crate) const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Marks one connection as in flight; dropping it (normally, on a panic, or
+/// when a worker thread could not be spawned) releases the count.
+pub(crate) struct InFlightGuard(Arc<Lifecycle>);
 
-/// Spawn a per-connection worker that can never take down the accept loop: a
-/// failed spawn (e.g. the OS thread limit under a connection flood) drops just
-/// this connection instead of panicking the accepting thread and exiting the
-/// process.
-pub(crate) fn spawn_worker<F: FnOnce() + Send + 'static>(f: F) {
-    let _ = thread::Builder::new().spawn(f);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
+
+/// One unit of work for the [`WorkerPool`]: serving one accepted connection.
+pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// What the accept loop hands to a server's job factory for each accepted
+/// connection.
+pub(crate) struct Accepted {
+    pub(crate) stream: TcpStream,
+    pub(crate) peer: SocketAddr,
+    /// Counts the connection's first request as in flight from the moment it
+    /// was accepted (so a shutdown waits for it, bounded by the grace period).
+    pub(crate) guard: InFlightGuard,
+    pub(crate) env: ConnEnv,
+}
+
+/// The shared, per-`serve_forever` context every connection needs.
+#[derive(Clone)]
+pub(crate) struct ConnEnv {
+    life: Arc<Lifecycle>,
+    opts: Arc<HttpOptions>,
+    /// Connections accepted but not yet picked up by a worker.
+    waiting: Arc<AtomicUsize>,
+}
+
+/// Stack size of the connection worker threads. Request handling recurses
+/// over client-supplied structure (a SPARQL request's syntax tree, nested
+/// RDF), bounded by the parsers' limits (e.g.
+/// [`MAX_NESTING_DEPTH`](crate::parser::sparql::MAX_NESTING_DEPTH)); this stack
+/// covers the deepest request they accept with a wide margin — a stack
+/// overflow would abort the whole server. Rust's 2 MiB thread default is
+/// enough for an optimized build but not for an unoptimized one, whose frames
+/// are several times larger. (8 MiB is also what C/C++ threads get by
+/// default on Linux; untouched stack pages cost no memory.)
+pub(crate) const WORKER_STACK_SIZE: usize = if cfg!(debug_assertions) {
+    16 << 20
+} else {
+    8 << 20
+};
+
+/// A fixed set of worker threads fed through a bounded queue. Dropping the
+/// pool closes the queue: the workers finish what is queued, then exit.
+struct WorkerPool {
+    /// `None` when not a single worker thread could be started — jobs then run
+    /// inline on the accepting thread (degraded, but still serving).
+    tx: Option<SyncSender<Job>>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl WorkerPool {
+    fn start(threads: usize, queue_len: usize, waiting: Arc<AtomicUsize>) -> WorkerPool {
+        let (tx, rx) = mpsc::sync_channel::<Job>(queue_len);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut started = 0;
+        for i in 0..threads.max(1) {
+            let rx = Arc::clone(&rx);
+            let waiting = Arc::clone(&waiting);
+            let spawned = thread::Builder::new()
+                .name(format!("gstore-http-{i}"))
+                .stack_size(WORKER_STACK_SIZE)
+                .spawn(move || worker_loop(&rx, &waiting));
+            if spawned.is_ok() {
+                started += 1;
+            }
+        }
+        WorkerPool {
+            tx: (started > 0).then_some(tx),
+            waiting,
+        }
+    }
+
+    /// Queue `job` for a worker. While the queue is full the caller (the
+    /// accept loop) waits here — it accepts nothing meanwhile, which is the
+    /// backpressure — unless a shutdown begins, in which case the job (an
+    /// unserved connection) is dropped.
+    fn submit(&self, job: Job, life: &Lifecycle) {
+        let Some(tx) = &self.tx else {
+            job();
+            return;
+        };
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut job = job;
+        loop {
+            match tx.try_send(job) {
+                Ok(()) => return,
+                Err(TrySendError::Full(j)) if !life.stopping() => {
+                    job = j;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    self.waiting.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn worker_loop(rx: &Mutex<Receiver<Job>>, waiting: &AtomicUsize) {
+    loop {
+        let job = locked(rx).recv();
+        let Ok(job) = job else {
+            return; // the pool was dropped and the queue is drained
+        };
+        waiting.fetch_sub(1, Ordering::SeqCst);
+        // A panic is contained to this connection; the worker keeps serving.
+        if catch_unwind(AssertUnwindSafe(job)).is_err() {
+            crate::gs_error!("a connection handler panicked; the connection was dropped");
+        }
+    }
+}
+
+/// The shared accept loop: turn every accepted connection (with its timeouts
+/// set and an [`InFlightGuard`]) into a job with `make_job` and run it on a
+/// bounded [`WorkerPool`] (sized by `opts`), until a shutdown is requested;
+/// then close the listener and wait — at most `grace` — for the in-flight
+/// requests to finish. Returns whether they all did.
+pub(crate) fn run_accept_loop(
+    listener: &Mutex<Option<TcpListener>>,
+    life: &Arc<Lifecycle>,
+    grace: Duration,
+    opts: &HttpOptions,
+    mut make_job: impl FnMut(Accepted) -> Job,
+) -> bool {
+    // Accept on a clone of the socket so the `Mutex` is not held while blocked.
+    let sock = locked(listener).as_ref().and_then(|l| l.try_clone().ok());
+    if let Some(sock) = sock {
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let env = ConnEnv {
+            life: Arc::clone(life),
+            opts: Arc::new(opts.clone()),
+            waiting: Arc::clone(&waiting),
+        };
+        let pool = WorkerPool::start(opts.threads, opts.queue_len, waiting);
+        // When `accept` failures were last logged (at most once a second).
+        let mut accept_error_logged: Option<std::time::Instant> = None;
+        while !life.stopping() {
+            match sock.accept() {
+                Ok((stream, peer)) => {
+                    if life.stopping() {
+                        break; // the wake-up self-connection (or a late client)
+                    }
+                    let _ = stream.set_read_timeout(Some(opts.read_timeout));
+                    let _ = stream.set_write_timeout(Some(opts.write_timeout));
+                    // Responses go out as one write; don't let Nagle hold back
+                    // a kept-alive connection's next response.
+                    let _ = stream.set_nodelay(true);
+                    let job = make_job(Accepted {
+                        stream,
+                        peer,
+                        guard: life.enter(),
+                        env: env.clone(),
+                    });
+                    pool.submit(job, life);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // E.g. EMFILE under a connection flood: back off instead of
+                // spinning on the failing accept.
+                Err(e) => {
+                    if accept_error_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                        crate::gs_warn!("accepting a connection failed: {e}; backing off");
+                        accept_error_logged = Some(std::time::Instant::now());
+                    }
+                    thread::sleep(Duration::from_millis(10))
+                }
+            }
+        }
+        // Queued connections are still served (they hold in-flight guards);
+        // the workers exit once the queue is drained.
+        drop(pool);
+    }
+    // Close both descriptors so new connections are refused from now on.
+    locked(listener).take();
+    life.wait_idle(grace)
+}
+
+// --- per-connection loop: keep-alive, CORS, body cap -------------------------
+
+/// How often an idle kept-alive connection re-checks for a shutdown or for
+/// connections waiting for its worker.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// Longest accepted request line / header line, and most header lines.
+const MAX_HEADER_LINE: u64 = 64 * 1024;
+const MAX_HEADERS: usize = 256;
+
+/// Why no request could be read from a connection (answered, then closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BadRequest {
+    pub(crate) status: u16,
+    pub(crate) message: &'static str,
+}
+
+impl BadRequest {
+    const MALFORMED: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request",
+    };
+    const TOO_LARGE: BadRequest = BadRequest {
+        status: 413,
+        message: "request body exceeds the maximum size",
+    };
+}
+
+/// Per-response connection facts a request handler must honour: the headers
+/// to add to its response (`Connection`/`Keep-Alive`, CORS). The client's
+/// address is available through [`current_peer`].
+pub(crate) struct ConnMeta {
+    headers: Vec<(&'static str, String)>,
+    /// `Access-Control-Allow-Origin: *` is part of `headers`.
+    cors: bool,
+}
+
+impl ConnMeta {
+    fn new(keep_alive: bool, idle: Duration, remaining: usize, cors: bool) -> ConnMeta {
+        let mut headers: Vec<(&'static str, String)> = Vec::new();
+        if keep_alive {
+            headers.push(("Connection", "keep-alive".to_string()));
+            headers.push((
+                "Keep-Alive",
+                format!("timeout={}, max={remaining}", idle.as_secs().max(1)),
+            ));
+        } else {
+            headers.push(("Connection", "close".to_string()));
+        }
+        if cors {
+            headers.push(("Access-Control-Allow-Origin", "*".to_string()));
+        }
+        ConnMeta { headers, cors }
+    }
+
+    /// `extra` followed by this connection's headers, ready for
+    /// [`write_response_ext`] / [`write_response_maybe_gzip`].
+    pub(crate) fn headers<'a>(&'a self, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut out = extra.to_vec();
+        out.extend(self.headers.iter().map(|(k, v)| (*k, v.as_str())));
+        out
+    }
+
+    /// The CORS header alone (for a streamed response, which always closes).
+    fn cors_headers(&self) -> Vec<(&'static str, &'static str)> {
+        if self.cors {
+            vec![("Access-Control-Allow-Origin", "*")]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+thread_local! {
+    /// The peer of the connection the current worker thread is serving.
+    static CURRENT_PEER: Cell<Option<SocketAddr>> = const { Cell::new(None) };
+}
+
+/// The TCP peer address of the request being handled on this thread (set by
+/// the connection loop for the duration of a connection; `None` outside one).
+/// Lets request-handling code (e.g. the upstream-compatible API's IP checks
+/// and access log) learn the client IP without threading it through every
+/// signature.
+#[allow(dead_code)]
+pub(crate) fn current_peer() -> Option<SocketAddr> {
+    CURRENT_PEER.with(Cell::get)
+}
+
+/// Serve one connection: read requests and hand each to `handle` — which
+/// writes the response, adding [`ConnMeta::headers`], and returns whether it
+/// honoured keep-alive (`false` e.g. after a streamed response) — until the
+/// client closes, keep-alive ends (idle timeout, request limit, `Connection:
+/// close`, HTTP/1.0), the request is malformed, or a shutdown begins. `ctl` is
+/// the underlying socket (for timeouts; for TLS, `stream` wraps it); without it
+/// keep-alive is off. `first` counts the first request as in flight; later
+/// requests count only once their first byte has arrived, and a request that
+/// arrives after a shutdown began is not served (the connection is closed, as a
+/// new connection would be refused).
+pub(crate) fn serve_connection<S: Read + Write>(
+    stream: S,
+    ctl: Option<&TcpStream>,
+    peer: Option<SocketAddr>,
+    first: InFlightGuard,
+    env: &ConnEnv,
+    mut handle: impl FnMut(
+        &mut ResponseSink<S>,
+        Result<Request, BadRequest>,
+        &ConnMeta,
+    ) -> io::Result<bool>,
+) {
+    struct PeerScope;
+    impl Drop for PeerScope {
+        fn drop(&mut self) {
+            CURRENT_PEER.with(|p| p.set(None));
+        }
+    }
+    CURRENT_PEER.with(|p| p.set(peer));
+    let _scope = PeerScope;
+
+    let opts = &*env.opts;
+    let life = &env.life;
+    let mut reader = BufReader::new(Timed {
+        inner: ResponseSink::new(stream),
+        ctl,
+        deadline: None,
+    });
+    let mut first = Some(first);
+    let mut served = 0usize;
+    let mut idle = opts.keep_alive_timeout;
+    let mut max_requests = opts.keep_alive_max.max(1);
+    loop {
+        // Held until this request's response is written (end of the iteration).
+        let _in_flight = match first.take() {
+            Some(g) => g,
+            None => {
+                let Some(ctl) = ctl else { return };
+                if !wait_for_request(&mut reader, ctl, life, idle, &env.waiting) {
+                    return;
+                }
+                let g = life.enter();
+                if life.stopping() {
+                    return; // arrived after the shutdown began: not served
+                }
+                let _ = ctl.set_read_timeout(Some(opts.read_timeout));
+                g
+            }
+        };
+        let (req, info) = match read_request(&mut reader, opts.max_body, opts.read_timeout) {
+            Ok(None) => return, // closed before sending anything
+            Ok(Some(r)) => r,
+            Err(bad) => {
+                let meta = ConnMeta::new(false, idle, 0, opts.cors);
+                let stream = &mut reader.get_mut().inner;
+                stream.start_response(false);
+                let _ = handle(stream, Err(bad), &meta);
+                return;
+            }
+        };
+        served += 1;
+        // The client's own `Keep-Alive: timeout=N, max=M` hints can only
+        // shorten what the server allows.
+        let (hint_timeout, hint_max) = keep_alive_hints(&req);
+        if let Some(t) = hint_timeout {
+            idle = idle.min(t);
+        }
+        if let Some(m) = hint_max {
+            max_requests = max_requests.min(m.max(1));
+        }
+        let keep = ctl.is_some()
+            && !idle.is_zero()
+            && served < max_requests
+            && wants_keep_alive(&req, info.http10)
+            && !life.stopping();
+        let meta = ConnMeta::new(keep, idle, max_requests.saturating_sub(served), opts.cors);
+        let stream = &mut reader.get_mut().inner;
+        // A response to HEAD is written like any other, minus its body.
+        stream.start_response(req.method.eq_ignore_ascii_case("HEAD"));
+        let kept = if opts.cors && req.method == "OPTIONS" {
+            write_preflight(stream, &req, &meta).is_ok()
+        } else {
+            matches!(handle(stream, Ok(req), &meta), Ok(true))
+        };
+        if !(kept && keep) || life.stopping() {
+            return;
+        }
+    }
+}
+
+/// A connection's transport as the response writers see it: everything
+/// passes through, except that while the response to a `HEAD` request is
+/// written ([`start_response`](Self::start_response)) its body — whatever
+/// follows the empty line that ends the header block — is dropped. Every
+/// route can then answer `HEAD` exactly like `GET` (same status and headers,
+/// `Content-Length` included, RFC 9110 §9.3.2), and a client reusing the
+/// connection never misreads a body it does not expect as the start of the
+/// next response.
+pub(crate) struct ResponseSink<S> {
+    inner: S,
+    /// Drop the body of the response being written.
+    head_only: bool,
+    /// How much of the header terminator `\r\n\r\n` the bytes written so
+    /// far end with (`4`: the header block is complete).
+    matched: u8,
+}
+
+impl<S> ResponseSink<S> {
+    fn new(inner: S) -> ResponseSink<S> {
+        ResponseSink {
+            inner,
+            head_only: false,
+            matched: 0,
+        }
+    }
+
+    /// A new response begins; `head_only` for the response to a `HEAD`.
+    fn start_response(&mut self, head_only: bool) {
+        self.head_only = head_only;
+        self.matched = 0;
+    }
+}
+
+impl<S: Read> Read for ResponseSink<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for ResponseSink<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.head_only {
+            return self.inner.write(buf);
+        }
+        // Pass the header block through, up to and including its end.
+        let mut n = 0;
+        while n < buf.len() && self.matched < 4 {
+            self.matched = match (self.matched, buf[n]) {
+                (0 | 2, b'\r') => self.matched + 1,
+                (1 | 3, b'\n') => self.matched + 1,
+                (_, b'\r') => 1,
+                _ => 0,
+            };
+            n += 1;
+        }
+        self.inner.write_all(&buf[..n])?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The connection's transport plus an optional deadline: while one is set,
+/// every read first narrows the socket's read timeout to the time left (and
+/// fails once it has passed), so a request head must arrive *in full* within
+/// [`HttpOptions::read_timeout`] — a client dripping one byte at a time cannot
+/// hold a worker of the bounded pool indefinitely.
+struct Timed<'a, S> {
+    inner: S,
+    ctl: Option<&'a TcpStream>,
+    deadline: Option<Instant>,
+}
+
+impl<S: Read> Read for Timed<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let (Some(deadline), Some(ctl)) = (self.deadline, self.ctl) {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let _ = ctl.set_read_timeout(Some(deadline - now));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Wait (at most `idle`) for the next request on a kept-alive connection.
+/// `false` — close the connection — on EOF, timeout, a shutdown, or when other
+/// connections are waiting for a worker (an idle connection yields its worker).
+fn wait_for_request<S: Read>(
+    reader: &mut BufReader<S>,
+    ctl: &TcpStream,
+    life: &Lifecycle,
+    idle: Duration,
+    waiting: &AtomicUsize,
+) -> bool {
+    if !reader.buffer().is_empty() {
+        return true; // a pipelined request is already buffered
+    }
+    let deadline = Instant::now() + idle;
+    loop {
+        if life.stopping() || waiting.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let _ = ctl.set_read_timeout(Some((deadline - now).min(IDLE_POLL)));
+        match reader.fill_buf() {
+            Ok(buf) => return !buf.is_empty(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Whether the client allows the connection to stay open: HTTP/1.1 unless it
+/// sent `Connection: close`; HTTP/1.0 only with `Connection: keep-alive`.
+fn wants_keep_alive(req: &Request, http10: bool) -> bool {
+    let tokens = |name: &str| {
+        req.header("connection")
+            .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(name)))
+    };
+    if tokens("close") {
+        return false;
+    }
+    !http10 || tokens("keep-alive")
+}
+
+/// The `timeout=` (seconds) and `max=` parameters of a `Keep-Alive` header.
+fn keep_alive_hints(req: &Request) -> (Option<Duration>, Option<usize>) {
+    let mut timeout = None;
+    let mut max = None;
+    if let Some(h) = req.header("keep-alive") {
+        for part in h.split(',') {
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            let v = v.trim();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "timeout" => timeout = v.parse::<u64>().ok().map(Duration::from_secs),
+                "max" => max = v.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+    }
+    (timeout, max)
+}
+
+/// Answer a CORS preflight (`OPTIONS`) like upstream's `/file/upload` and
+/// `/file/download` routes: `200 ok` with `Access-Control-Allow-*` headers.
+fn write_preflight<W: Write>(stream: &mut W, req: &Request, meta: &ConnMeta) -> io::Result<()> {
+    let methods = if req.path == "/file/upload" {
+        "POST"
+    } else if req.path == "/file/download" || req.path.starts_with("/file/download/") {
+        "GET, POST"
+    } else {
+        "GET, POST, OPTIONS"
+    };
+    let allow_headers = req
+        .header("access-control-request-headers")
+        .unwrap_or("Content-Type, Authorization, X-Session-Token")
+        .to_string();
+    let extra = [
+        ("Access-Control-Allow-Methods", methods),
+        ("Access-Control-Allow-Headers", allow_headers.as_str()),
+        ("Access-Control-Max-Age", "86400"),
+    ];
+    write_response_ext(stream, 200, "text/plain", &meta.headers(&extra), b"ok")
+}
+
+/// Facts about a parsed request that matter to the connection, not the handler.
+struct RequestInfo {
+    http10: bool,
+}
+
+/// The request line and headers of a request.
+struct Head {
+    method: String,
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, String)>,
+    content_length: usize,
+    /// `Transfer-Encoding: chunked` body (then `content_length` is ignored).
+    chunked: bool,
+    info: RequestInfo,
+    expect_continue: bool,
+}
+
+/// Read one request from a connection, answering `Expect: 100-continue`
+/// before the body is read. The request line and headers must arrive within
+/// `read_timeout` in total; the body only must not stall for longer than that
+/// between reads (a large upload may take longer overall). `Ok(None)` when the
+/// client closed the connection before sending anything.
+fn read_request<S: Read + Write>(
+    reader: &mut BufReader<Timed<'_, S>>,
+    max_body: usize,
+    read_timeout: Duration,
+) -> Result<Option<(Request, RequestInfo)>, BadRequest> {
+    reader.get_mut().deadline = Some(Instant::now() + read_timeout);
+    let head = read_head(reader, max_body);
+    reader.get_mut().deadline = None;
+    if let Some(ctl) = reader.get_ref().ctl {
+        let _ = ctl.set_read_timeout(Some(read_timeout));
+    }
+    let Some(head) = head? else {
+        return Ok(None);
+    };
+    if head.expect_continue && (head.chunked || head.content_length > 0) {
+        let w = &mut reader.get_mut().inner;
+        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .and_then(|_| w.flush())
+            .map_err(|_| BadRequest::MALFORMED)?;
+    }
+    let body = if head.chunked {
+        read_chunked_body(reader, max_body)?
+    } else {
+        read_body(reader, head.content_length)?
+    };
+    Ok(Some((
+        Request {
+            method: head.method,
+            path: head.path,
+            query: head.query,
+            headers: head.headers,
+            body,
+        },
+        head.info,
+    )))
+}
+
+/// Read one bounded CRLF/LF-terminated line (without the terminator).
+/// `Ok(None)` at EOF before any byte.
+fn read_line_bounded<R: BufRead>(r: &mut R) -> Result<Option<String>, BadRequest> {
+    let mut buf = Vec::new();
+    let n = r
+        .by_ref()
+        .take(MAX_HEADER_LINE)
+        .read_until(b'\n', &mut buf)
+        .map_err(|_| BadRequest::MALFORMED)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') {
+        return Err(BadRequest::MALFORMED); // over-long line, or EOF mid-line
+    }
+    let line = String::from_utf8(buf).map_err(|_| BadRequest::MALFORMED)?;
+    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, BadRequest> {
+    let Some(line) = read_line_bounded(r)? else {
+        return Ok(None);
+    };
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1");
+    let http10 = version.eq_ignore_ascii_case("HTTP/1.0");
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (target, None),
+    };
+
+    let mut content_length = 0usize;
+    let mut chunked = false;
+    let mut expect_continue = false;
+    let mut headers = Vec::new();
+    // EOF also ends the headers.
+    while let Some(h) = read_line_bounded(r)? {
+        if h.is_empty() {
+            break; // end of headers
+        }
+        if headers.len() >= MAX_HEADERS {
+            return Err(BadRequest::MALFORMED);
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                // An absurd value (e.g. u64::MAX) overflows: refuse it as too
+                // large; anything else unparsable is malformed.
+                content_length = v.parse().map_err(|e: std::num::ParseIntError| {
+                    if *e.kind() == std::num::IntErrorKind::PosOverflow {
+                        BadRequest::TOO_LARGE
+                    } else {
+                        BadRequest::MALFORMED
+                    }
+                })?;
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = !v.eq_ignore_ascii_case("identity");
+            } else if k.eq_ignore_ascii_case("expect") {
+                expect_continue = v.eq_ignore_ascii_case("100-continue");
+            }
+            headers.push((k.to_ascii_lowercase(), v.to_string()));
+        }
+    }
+
+    // Refuse an oversized Content-Length BEFORE allocating, so a client cannot
+    // make the server reserve arbitrary memory with a single header — this runs
+    // before authentication, so the cap is the only guard. Large RDF ingests
+    // should use file-based tools (gbuild/gadd) or the server-side `/load` path.
+    if content_length > max_body {
+        return Err(BadRequest::TOO_LARGE);
+    }
+    Ok(Some(Head {
+        method,
+        path,
+        query,
+        headers,
+        content_length,
+        chunked,
+        info: RequestInfo { http10 },
+        expect_continue,
+    }))
+}
+
+fn read_body<R: BufRead>(r: &mut R, len: usize) -> Result<Vec<u8>, BadRequest> {
+    // Grow as the bytes actually arrive instead of trusting the header.
+    let mut body = Vec::with_capacity(len.min(1 << 20));
+    if len > 0 {
+        r.by_ref()
+            .take(len as u64)
+            .read_to_end(&mut body)
+            .map_err(|_| BadRequest::MALFORMED)?;
+        if body.len() != len {
+            return Err(BadRequest::MALFORMED); // truncated (or timed out)
+        }
+    }
+    Ok(body)
+}
+
+/// Decode a `Transfer-Encoding: chunked` request body (RFC 9112 §7.1), at most
+/// `max_body` bytes in total; chunk extensions and trailers are ignored.
+fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, BadRequest> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_line_bounded(r)?.ok_or(BadRequest::MALFORMED)?;
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| BadRequest::MALFORMED)?;
+        if size == 0 {
+            break;
+        }
+        if body.len().saturating_add(size) > max_body {
+            return Err(BadRequest::TOO_LARGE);
+        }
+        let start = body.len();
+        r.by_ref()
+            .take(size as u64)
+            .read_to_end(&mut body)
+            .map_err(|_| BadRequest::MALFORMED)?;
+        if body.len() - start != size {
+            return Err(BadRequest::MALFORMED);
+        }
+        // The CRLF after the chunk data.
+        if read_line_bounded(r)?.is_none_or(|l| !l.is_empty()) {
+            return Err(BadRequest::MALFORMED);
+        }
+    }
+    // Trailer fields, up to the empty line that ends the message.
+    for _ in 0..MAX_HEADERS {
+        match read_line_bounded(r)? {
+            Some(l) if !l.is_empty() => {}
+            _ => return Ok(body),
+        }
+    }
+    Err(BadRequest::MALFORMED)
+}
+
+/// Arrange for `SIGINT`/`SIGTERM` to trigger `handle.shutdown()` (unix only;
+/// returns `false` — and does nothing — elsewhere or if the handlers could not
+/// be installed). A tiny watcher thread polls the flag the async-signal-safe
+/// handler sets. After the first signal `SIGINT` gets its default disposition
+/// back, so a second Ctrl-C terminates the process immediately; a repeated
+/// `SIGTERM` is ignored (see [`on_termination_signal`]).
+pub fn shutdown_on_signals(handle: ShutdownHandle) -> bool {
+    on_termination_signal(move || handle.shutdown())
+}
+
+/// Run `f` once, on a watcher thread, when the process first receives
+/// `SIGINT` or `SIGTERM` (unix only; returns `false` — and does nothing —
+/// elsewhere or if the handlers could not be installed). After that first
+/// signal `SIGINT` gets its default disposition back, so a second Ctrl-C
+/// terminates the process immediately, while further `SIGTERM`s are ignored:
+/// one often arrives twice — a service manager signals the whole process
+/// group, `gserver`'s supervisor forwards the one it got, `gserver -t` is
+/// run again — and must not kill a graceful shutdown half-way through its
+/// final save (`gserver -k` sends `SIGKILL`). [`shutdown_on_signals`] is this
+/// with a graceful shutdown; `gserver`'s supervisor uses it to forward the
+/// signal to the server it watches.
+pub fn on_termination_signal(f: impl FnOnce() + Send + 'static) -> bool {
+    #[cfg(unix)]
+    {
+        if !signals::install() {
+            return false;
+        }
+        thread::Builder::new()
+            .name("gstore-signals".into())
+            .spawn(move || loop {
+                if signals::received() {
+                    signals::restore_default_sigint();
+                    f();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            })
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        false
+    }
+}
+
+/// Minimal `signal(2)` binding (no extra crates): the handler only stores to an
+/// `AtomicBool`, which is async-signal-safe.
+#[cfg(unix)]
+mod signals {
+    use std::os::raw::c_int;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RECEIVED: AtomicBool = AtomicBool::new(false);
+
+    const SIGINT: c_int = 2;
+    const SIGTERM: c_int = 15;
+    /// `SIG_DFL` / `SIG_ERR` as the pointer-sized `sighandler_t` values.
+    const SIG_DFL: usize = 0;
+    const SIG_ERR: usize = usize::MAX;
+
+    extern "C" {
+        /// `sighandler_t signal(int signum, sighandler_t handler)` from libc;
+        /// `sighandler_t` is passed as a pointer-sized integer so that
+        /// `SIG_DFL` can be expressed.
+        fn signal(signum: c_int, handler: usize) -> usize;
+    }
+
+    extern "C" fn on_signal(_signum: c_int) {
+        RECEIVED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn install() -> bool {
+        let handler = on_signal as extern "C" fn(c_int) as usize;
+        // SAFETY: `signal` is the C library's; `on_signal` has the C handler
+        // signature and only performs a lock-free atomic store.
+        unsafe { signal(SIGINT, handler) != SIG_ERR && signal(SIGTERM, handler) != SIG_ERR }
+    }
+
+    /// `SIGINT` back to its default disposition (`SIGTERM` keeps the
+    /// handler, which only sets the flag again).
+    pub(super) fn restore_default_sigint() {
+        // SAFETY: restoring the default disposition is always valid.
+        unsafe {
+            signal(SIGINT, SIG_DFL);
+        }
+    }
+
+    pub(super) fn received() -> bool {
+        RECEIVED.load(Ordering::SeqCst)
+    }
+}
+
+/// Default read timeout while a request is received (and write timeout for its
+/// response): a client that opens a socket and then sends nothing (a
+/// slowloris) times out instead of pinning its worker thread and fd forever.
+pub(crate) const CONN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lock a mutex, tolerating poisoning: if a previous worker panicked while
 /// holding it, recover the guard rather than cascading the panic (which would
@@ -238,142 +1555,427 @@ pub(crate) fn spawn_worker<F: FnOnce() + Send + 'static>(f: F) {
 /// none). Reads/writes after a recovered panic may see partial state, but the
 /// server stays available.
 pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A shared guard of `l`, tolerating poisoning as [`locked`] does (a writer
+/// that panicked while holding it does not make every later reader panic).
+pub(crate) fn read_locked<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The exclusive guard of `l`, tolerating poisoning as [`locked`] does.
+pub(crate) fn write_locked<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One database's figures as of its last write — triples, entities,
+/// literals, predicates, its [`mutation_count`](Database::mutation_count)
+/// (the *generation*), when it was last saved and a few flags — published by
+/// whoever holds the database exclusively (after a load and at the end of
+/// every write section) and read by monitoring (`/status`, `/monitor`,
+/// `show`) **without the database lock**, so monitoring answers while a long
+/// query or an update holds it.
+///
+/// Publishing is a sequence lock: the (single) publisher makes the sequence
+/// odd, stores the figures, and makes it even again; a reader retries until
+/// it read the same even sequence on both sides, so it never sees half of
+/// one write and half of the next. Only the holder of the database's
+/// exclusive guard publishes, which is what keeps the publisher single.
+#[derive(Debug, Default)]
+pub(crate) struct DbCounters {
+    seq: AtomicU64,
+    triples: AtomicU64,
+    entities: AtomicU64,
+    literals: AtomicU64,
+    predicates: AtomicU64,
+    generation: AtomicU64,
+    last_save: AtomicU64,
+    index_valid: AtomicBool,
+    in_transaction: AtomicBool,
+    dirty: AtomicBool,
+    live: AtomicBool,
+}
+
+/// The figures [`DbCounters::read`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CounterSnapshot {
+    /// Triples (the committed ones while a transaction is open, when the
+    /// publisher says so).
+    pub(crate) triples: u64,
+    pub(crate) entities: u64,
+    pub(crate) literals: u64,
+    pub(crate) predicates: u64,
+    /// The database's [`mutation_count`](Database::mutation_count).
+    pub(crate) generation: u64,
+    /// Unix milliseconds of the last successful save; `0` = none yet.
+    pub(crate) last_save: u64,
+    pub(crate) index_valid: bool,
+    pub(crate) in_transaction: bool,
+    pub(crate) dirty: bool,
+    /// Published from a served database (`false` before the first publish
+    /// and once it is retired: the other figures are then zero).
+    pub(crate) live: bool,
+}
+
+impl DbCounters {
+    /// Publish `db`'s current figures (the caller holds `db` exclusively);
+    /// the last save time and the dirty flag are kept.
+    pub(crate) fn publish(&self, db: &Database) {
+        let s = db.stats();
+        let prev = self.read();
+        self.store(CounterSnapshot {
+            triples: s.triple_num,
+            entities: s.entity_num as u64,
+            literals: s.literal_num as u64,
+            predicates: s.predicate_num as u64,
+            generation: db.mutation_count(),
+            index_valid: s.index_valid,
+            in_transaction: s.in_transaction,
+            live: true,
+            ..prev
+        });
+    }
+
+    /// Publish `snap` (the caller is the single publisher, see the type docs).
+    pub(crate) fn store(&self, snap: CounterSnapshot) {
+        self.seq.fetch_add(1, Ordering::SeqCst);
+        self.triples.store(snap.triples, Ordering::SeqCst);
+        self.entities.store(snap.entities, Ordering::SeqCst);
+        self.literals.store(snap.literals, Ordering::SeqCst);
+        self.predicates.store(snap.predicates, Ordering::SeqCst);
+        self.generation.store(snap.generation, Ordering::SeqCst);
+        self.last_save.store(snap.last_save, Ordering::SeqCst);
+        self.index_valid.store(snap.index_valid, Ordering::SeqCst);
+        self.in_transaction
+            .store(snap.in_transaction, Ordering::SeqCst);
+        self.dirty.store(snap.dirty, Ordering::SeqCst);
+        self.live.store(snap.live, Ordering::SeqCst);
+        self.seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record a successful save, now (the caller is the single publisher).
+    pub(crate) fn note_saved(&self) {
+        let snap = self.read();
+        self.store(CounterSnapshot {
+            last_save: unix_millis(),
+            ..snap
+        });
+    }
+
+    /// The figures last published. Never waits for the database (only, very
+    /// briefly, for a publish in progress).
+    pub(crate) fn read(&self) -> CounterSnapshot {
+        let mut spins = 0u32;
+        loop {
+            let before = self.seq.load(Ordering::SeqCst);
+            if before.is_multiple_of(2) {
+                let snap = CounterSnapshot {
+                    triples: self.triples.load(Ordering::SeqCst),
+                    entities: self.entities.load(Ordering::SeqCst),
+                    literals: self.literals.load(Ordering::SeqCst),
+                    predicates: self.predicates.load(Ordering::SeqCst),
+                    generation: self.generation.load(Ordering::SeqCst),
+                    last_save: self.last_save.load(Ordering::SeqCst),
+                    index_valid: self.index_valid.load(Ordering::SeqCst),
+                    in_transaction: self.in_transaction.load(Ordering::SeqCst),
+                    dirty: self.dirty.load(Ordering::SeqCst),
+                    live: self.live.load(Ordering::SeqCst),
+                };
+                if self.seq.load(Ordering::SeqCst) == before {
+                    return snap;
+                }
+            }
+            // A publish is a handful of stores: spin briefly, then yield.
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch (`0` if the clock is before it).
+pub(crate) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The message returned (as HTTP 500) when a request handler panics; the panic
+/// itself is caught per request so the worker, the locks and the server survive.
+pub(crate) const PANIC_MSG: &str = "internal server error: the request handler panicked";
+
+/// A response computed by [`ServerInner::route`], written after the (panic-
+/// isolated) routing step.
+enum Reply {
+    /// A buffered body. `compress` allows gzip/deflate (feature `gzip`).
+    Buffered {
+        status: u16,
+        ctype: String,
+        body: Vec<u8>,
+        compress: bool,
+    },
+    /// A SELECT streamed with `Transfer-Encoding: chunked`.
+    Stream(ResultFormat, ResultSet),
+}
+
+impl Reply {
+    fn buffered(status: u16, ctype: &str, body: Vec<u8>) -> Reply {
+        Reply::Buffered {
+            status,
+            ctype: ctype.to_string(),
+            body,
+            compress: true,
+        }
+    }
+
+    fn plain(status: u16, ctype: &str, body: &[u8]) -> Reply {
+        Reply::Buffered {
+            status,
+            ctype: ctype.to_string(),
+            body: body.to_vec(),
+            compress: false,
+        }
+    }
 }
 
 impl ServerInner {
-    /// Handle one connection (one request). Generic over the transport so the
-    /// same code path serves plain [`TcpStream`]s and `rustls` TLS streams.
-    fn handle<S: Read + Write>(&self, mut stream: S) -> std::io::Result<()> {
-        let req = match Request::parse(&mut stream) {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(()), // connection closed with no request
-            Err(_) => return write_response(&mut stream, 400, "text/plain", b"bad request"),
+    /// Handle one request read by [`serve_connection`] and write its response
+    /// (with the connection's [`ConnMeta`] headers). Generic over the transport
+    /// so the same code path serves plain [`TcpStream`]s and `rustls` TLS
+    /// streams. Routing runs under `catch_unwind`: a panicking handler answers
+    /// `500` and leaves the server (and its recovered locks) serving. Returns
+    /// whether the response honoured keep-alive (a streamed one does not).
+    fn handle<S: Read + Write>(
+        &self,
+        stream: &mut S,
+        req: Result<Request, BadRequest>,
+        meta: &ConnMeta,
+    ) -> std::io::Result<bool> {
+        let req = match req {
+            Ok(r) => r,
+            Err(bad) => {
+                let body = bad.message.as_bytes();
+                write_response_ext(stream, bad.status, "text/plain", &meta.headers(&[]), body)?;
+                return Ok(false);
+            }
         };
         // Auth gate: when credentials are configured every request must present
         // a matching `Authorization: Basic` header.
         if let Some((user, pass)) = &self.auth {
             if !req.authorized(user, pass) {
-                return write_response_ext(
-                    &mut stream,
+                write_response_ext(
+                    stream,
                     401,
                     "text/plain",
-                    &[("WWW-Authenticate", "Basic realm=\"gStore\"")],
+                    &meta.headers(&[("WWW-Authenticate", "Basic realm=\"gStore\"")]),
                     b"unauthorized",
-                );
+                )?;
+                return Ok(true);
             }
         }
+        let reply = catch_unwind(AssertUnwindSafe(|| self.route(&req))).unwrap_or_else(|_| {
+            crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
+            Reply::plain(500, "application/json", &err_json(PANIC_MSG))
+        });
         // The client's `Accept-Encoding` (used to optionally compress buffered
         // bodies under the `gzip` feature; ignored without it).
         let enc = req.header("accept-encoding");
+        match reply {
+            Reply::Buffered {
+                status,
+                ctype,
+                body,
+                compress: true,
+            } => write_response_maybe_gzip(stream, status, &ctype, &meta.headers(&[]), &body, enc)
+                .map(|()| true),
+            Reply::Buffered {
+                status,
+                ctype,
+                body,
+                ..
+            } => {
+                write_response_ext(stream, status, &ctype, &meta.headers(&[]), &body).map(|()| true)
+            }
+            Reply::Stream(fmt, rs) => {
+                stream_select(stream, fmt, &rs, &meta.cors_headers()).map(|()| false)
+            }
+        }
+    }
+
+    /// Route a parsed, authorized request to its handler.
+    fn route(&self, req: &Request) -> Reply {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET" | "POST", "/sparql") => self.handle_sparql(&mut stream, &req),
-            ("POST", "/update") => {
-                let (s, c, b) = self.run_update(&req.body_string());
-                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
-            }
-            ("GET", "/status") => {
-                let (s, c, b) = self.status_json();
-                write_response_maybe_gzip(&mut stream, s, &c, &[], &b, enc)
-            }
-            ("GET", "/" | "/console") => write_response_maybe_gzip(
-                &mut stream,
+            ("GET" | "POST", "/sparql") => self.handle_sparql(req),
+            ("POST", "/update") => self.run_update(&req.body_string()),
+            ("GET", "/status") => self.status_json(),
+            ("GET", "/" | "/console") => Reply::buffered(
                 200,
                 "text/html; charset=utf-8",
-                &[],
-                CONSOLE_HTML.as_bytes(),
-                enc,
+                CONSOLE_HTML.as_bytes().to_vec(),
             ),
-            ("GET" | "POST", _) => write_response(&mut stream, 404, "text/plain", b"not found"),
-            _ => write_response(&mut stream, 405, "text/plain", b"method not allowed"),
+            // Test-only trigger for the panic-isolation tests: panics while
+            // holding the database's exclusive guard (poisoning it).
+            #[cfg(test)]
+            ("GET", "/__test/panic") => {
+                let _db = write_locked(&self.db);
+                panic!("test-triggered handler panic");
+            }
+            ("GET" | "POST", _) => Reply::plain(404, "text/plain", b"not found"),
+            _ => Reply::plain(405, "text/plain", b"method not allowed"),
         }
     }
 
     /// Run a `/sparql` request: negotiate a result format, then answer with a
     /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
-    /// The [`Database`] lock is released before any serialization or network
-    /// write, so it is held only for the query itself.
-    fn handle_sparql<S: Read + Write>(
-        &self,
-        stream: &mut S,
-        req: &Request,
-    ) -> std::io::Result<()> {
+    /// The [`Database`] guard is released before any serialization or network
+    /// write, so it is held only for the statement itself.
+    fn handle_sparql(&self, req: &Request) -> Reply {
         let q = match req.query_string() {
             Some(q) => q,
-            None => return write_response(stream, 400, SPARQL_JSON, &err_json("missing query")),
+            None => return Reply::plain(400, SPARQL_JSON, &err_json("missing query")),
         };
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
-        let enc = req.header("accept-encoding");
-        let result = {
-            let mut db = locked(&self.db);
-            db.query(&q)
-        };
+        let (result, warning) = self.execute(&q);
         match result {
             Ok(QueryResult::Select(rs)) => {
                 if req.wants_stream() {
-                    stream_select(stream, fmt, &rs)
+                    Reply::Stream(fmt, rs)
                 } else {
                     let mut buf = Vec::new();
                     let _ = sparql_results::write_select(fmt, &rs, &mut buf);
-                    write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
+                    Reply::buffered(200, fmt.content_type(), buf)
                 }
             }
             Ok(QueryResult::Ask(b)) => {
                 let mut buf = Vec::new();
                 let _ = sparql_results::write_ask(fmt, b, &mut buf);
-                write_response_maybe_gzip(stream, 200, fmt.content_type(), &[], &buf, enc)
+                Reply::buffered(200, fmt.content_type(), buf)
             }
-            Ok(QueryResult::Construct(ts)) => write_response_maybe_gzip(
-                stream,
-                200,
-                "application/n-triples",
-                &[],
-                &ntriples_body(&ts),
-                enc,
-            ),
-            Ok(QueryResult::Update { changed }) => write_response_maybe_gzip(
-                stream,
-                200,
-                "application/json",
-                &[],
-                format!("{{\"changed\":{changed}}}").as_bytes(),
-                enc,
-            ),
-            Err(e) => write_response(stream, 400, SPARQL_JSON, &err_json(&e.to_string())),
+            Ok(QueryResult::Construct(ts)) => {
+                Reply::buffered(200, "application/n-triples", ntriples_body(&ts))
+            }
+            Ok(QueryResult::Update { changed }) => {
+                Reply::buffered(200, "application/json", changed_json(changed, warning))
+            }
+            Err(e) => Reply::plain(400, SPARQL_JSON, &err_json(&e.to_string())),
         }
     }
 
-    fn run_update(&self, u: &str) -> (u16, String, Vec<u8>) {
-        let mut db = locked(&self.db);
-        match db.query(u) {
-            Ok(QueryResult::Update { changed }) => (
-                200,
-                "application/json".into(),
-                format!("{{\"changed\":{changed}}}").into_bytes(),
-            ),
-            Ok(_) => (
+    fn run_update(&self, u: &str) -> Reply {
+        let (result, warning) = self.execute(u);
+        match result {
+            Ok(QueryResult::Update { changed }) => {
+                Reply::buffered(200, "application/json", changed_json(changed, warning))
+            }
+            Ok(_) => Reply::buffered(
                 400,
-                "application/json".into(),
+                "application/json",
                 err_json("/update expects a SPARQL UPDATE request"),
             ),
-            Err(e) => (400, "application/json".into(), err_json(&e.to_string())),
+            Err(e) => Reply::buffered(400, "application/json", err_json(&e.to_string())),
         }
     }
 
-    fn status_json(&self) -> (u16, String, Vec<u8>) {
-        let db = locked(&self.db);
-        let s = db.stats();
+    /// Run `sparql`: parsed first, with no lock held (a syntax error is
+    /// answered without touching the database). A read then runs on a shared
+    /// guard ([`Database::read_as`]), concurrently with other reads. An
+    /// UPDATE takes the exclusive guard ([`Database::execute_as`]); one that
+    /// changed data marks the database dirty and — under the check_point
+    /// policy, or once a shutdown has begun — saves it before the guard is
+    /// released, so the on-disk copy never lags an acknowledged write. That
+    /// includes an UPDATE that failed part-way: its operations before the
+    /// failing one stay applied (and visible), so they are saved too. A
+    /// failed save does not undo the (applied) update: it is reported as a
+    /// warning and the database stays dirty, to be retried on shutdown.
+    fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
+        let stmt = match Statement::parse(sparql) {
+            Ok(stmt) => stmt,
+            Err(e) => return (Err(e), None),
+        };
+        let cancel = Some(Arc::clone(&self.cancel));
+        if !stmt.is_update() {
+            let db = read_locked(&self.db);
+            return (db.read_as(&stmt, cancel, None), None);
+        }
+        let mut db = write_locked(&self.db);
+        let before = db.mutation_count();
+        let mut result = db.execute_as(stmt, cancel, None);
+        let mut warning = None;
+        if db.mutation_count() != before {
+            self.dirty.store(true, Ordering::SeqCst);
+            if self.check_point || self.closing.load(Ordering::SeqCst) {
+                if let Err((dir, e)) = self.save_locked(&db) {
+                    let msg = format!(
+                        "update applied in memory but saving to '{}' failed: {e}",
+                        dir.display()
+                    );
+                    crate::gs_error!("{msg}");
+                    warning = Some(msg);
+                }
+            }
+            if let Err(e) = &result {
+                let note = match &warning {
+                    Some(w) => format!("operations before the failing one were applied; {w}"),
+                    None => "operations before the failing one were applied".to_string(),
+                };
+                result = Err(crate::GStoreError::Query(format!("{e} ({note})")));
+            }
+            self.counters.publish(&db);
+        }
+        (result, warning)
+    }
+
+    /// Save `db` (whose exclusive guard the caller holds) to the attached
+    /// directory and clear the dirty flag. `Ok(None)` when no directory is
+    /// attached.
+    fn save_locked(&self, db: &Database) -> Result<Option<PathBuf>, (PathBuf, String)> {
+        let Some(dir) = &self.dir else {
+            return Ok(None);
+        };
+        match db.save(dir) {
+            Ok(()) => {
+                self.dirty.store(false, Ordering::SeqCst);
+                self.counters.note_saved();
+                Ok(Some(dir.clone()))
+            }
+            Err(e) => Err((dir.clone(), e.to_string())),
+        }
+    }
+
+    /// `/status`: the figures published after the last write
+    /// ([`DbCounters`]). It never waits for the database lock, so it answers
+    /// while a long query or an update runs.
+    fn status_json(&self) -> Reply {
+        let s = self.counters.read();
+        let dir = match &self.dir {
+            Some(d) => json_str(&d.to_string_lossy()),
+            None => "null".to_string(),
+        };
         let body = format!(
-            "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{}}}",
-            json_str(&s.name),
-            s.triple_num,
-            s.entity_num,
-            s.literal_num,
-            s.predicate_num,
+            "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{},\"db_dir\":{dir},\"check_point\":{},\"dirty\":{}}}",
+            json_str(&self.name),
+            s.triples,
+            s.entities,
+            s.literals,
+            s.predicates,
             s.index_valid,
             s.in_transaction,
+            self.check_point,
+            self.dirty.load(Ordering::SeqCst),
         );
-        (200, "application/json".into(), body.into_bytes())
+        Reply::buffered(200, "application/json", body.into_bytes())
+    }
+}
+
+/// `{"changed":N}` plus an optional `"warning"` (e.g. a failed check_point save).
+fn changed_json(changed: usize, warning: Option<String>) -> Vec<u8> {
+    match warning {
+        Some(w) => format!("{{\"changed\":{changed},\"warning\":{}}}", json_str(&w)).into_bytes(),
+        None => format!("{{\"changed\":{changed}}}").into_bytes(),
     }
 }
 
@@ -391,61 +1993,28 @@ pub(crate) struct Request {
 }
 
 impl Request {
+    /// Parse one request from a byte stream with the default body cap
+    /// ([`MAX_REQUEST_BODY`]) — the same parser the connection loop uses, minus
+    /// keep-alive and `Expect: 100-continue` handling. Kept for callers (and
+    /// tests) that parse a request from raw bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn parse<R: Read>(stream: &mut R) -> std::io::Result<Option<Request>> {
         let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let bad = |b: BadRequest| io::Error::new(io::ErrorKind::InvalidData, b.message);
+        let Some(head) = read_head(&mut reader, MAX_REQUEST_BODY).map_err(bad)? else {
             return Ok(None);
-        }
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let target = parts.next().unwrap_or_default().to_string();
-        let (path, query) = match target.split_once('?') {
-            Some((p, q)) => (p.to_string(), Some(q.to_string())),
-            None => (target, None),
         };
-
-        let mut content_length = 0usize;
-        let mut headers = Vec::new();
-        loop {
-            let mut h = String::new();
-            if reader.read_line(&mut h)? == 0 {
-                break;
-            }
-            let h = h.trim_end();
-            if h.is_empty() {
-                break; // end of headers
-            }
-            if let Some((k, v)) = h.split_once(':') {
-                let k = k.trim();
-                let v = v.trim();
-                if k.eq_ignore_ascii_case("content-length") {
-                    content_length = v.parse().unwrap_or(0);
-                }
-                headers.push((k.to_ascii_lowercase(), v.to_string()));
-            }
+        let body = if head.chunked {
+            read_chunked_body(&mut reader, MAX_REQUEST_BODY)
+        } else {
+            read_body(&mut reader, head.content_length)
         }
-
-        // Refuse an oversized (or absurd, e.g. u64::MAX) Content-Length BEFORE
-        // allocating, so a client cannot make the server reserve arbitrary memory
-        // (or panic on capacity overflow) with a single header — this runs before
-        // authentication, so the cap is the only guard. Large RDF ingests should
-        // use file-based tools (gbuild/gadd) or the server-side `/load` path.
-        if content_length > MAX_REQUEST_BODY {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request body exceeds the maximum size",
-            ));
-        }
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut body)?;
-        }
+        .map_err(bad)?;
         Ok(Some(Request {
-            method,
-            path,
-            query,
-            headers,
+            method: head.method,
+            path: head.path,
+            query: head.query,
+            headers: head.headers,
             body,
         }))
     }
@@ -523,7 +2092,11 @@ impl Request {
     pub(crate) fn bearer_or_session_token(&self) -> Option<String> {
         if let Some(h) = self.header("authorization") {
             let h = h.trim_start();
-            if h.len() >= 7 && h[..7].eq_ignore_ascii_case("bearer ") {
+            // `get` (not byte slicing): a multi-byte character across the
+            // prefix boundary must not panic.
+            if h.get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+            {
                 return Some(h[7..].trim().to_string());
             }
         }
@@ -561,6 +2134,8 @@ impl Request {
 
 // --- response helpers --------------------------------------------------------
 
+/// Write a buffered response that closes the connection (no extra headers).
+#[allow(dead_code)]
 pub(crate) fn write_response<W: Write>(
     stream: &mut W,
     status: u16,
@@ -617,33 +2192,51 @@ pub(crate) fn write_response_ext<W: Write>(
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     };
-    let mut header = format!(
+    let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
         body.len()
+    );
+    let mut has_connection = false;
+    for &(k, v) in extra {
+        has_connection |= k.eq_ignore_ascii_case("connection");
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    // Without an explicit `Connection` header (the connection loop supplies one
+    // through `ConnMeta::headers`) the connection closes after this response.
+    if !has_connection {
+        head.push_str("Connection: close\r\n");
+    }
+    head.push_str("\r\n");
+    // One write for head + body, so a kept-alive connection never waits on
+    // Nagle between them.
+    let mut buf = head.into_bytes();
+    buf.extend_from_slice(body);
+    stream.write_all(&buf)?;
+    stream.flush()
+}
+
+/// Stream a SELECT result with `Transfer-Encoding: chunked`, framing each
+/// serializer `write_all` (one per row) as its own HTTP chunk. The connection
+/// always closes afterwards; `extra` adds headers (CORS).
+fn stream_select<W: Write>(
+    stream: &mut W,
+    fmt: ResultFormat,
+    rs: &ResultSet,
+    extra: &[(&str, &str)],
+) -> std::io::Result<()> {
+    let mut header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\n",
+        fmt.content_type()
     );
     for &(k, v) in extra {
         header.push_str(&format!("{k}: {v}\r\n"));
     }
     header.push_str("Connection: close\r\n\r\n");
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()
-}
-
-/// Stream a SELECT result with `Transfer-Encoding: chunked`, framing each
-/// serializer `write_all` (one per row) as its own HTTP chunk.
-fn stream_select<W: Write>(
-    stream: &mut W,
-    fmt: ResultFormat,
-    rs: &ResultSet,
-) -> std::io::Result<()> {
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-        fmt.content_type()
-    );
     stream.write_all(header.as_bytes())?;
     let mut cw = ChunkedWriter { inner: stream };
     sparql_results::write_select(fmt, rs, &mut cw)?;
@@ -770,7 +2363,10 @@ pub fn load_tls_config(
     }
     let mut kr = BufReader::new(File::open(key_pem)?);
     let key = rustls_pemfile::private_key(&mut kr)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "no private key found in the key PEM")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no private key found in the key PEM",
+        )
     })?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
@@ -814,7 +2410,9 @@ pub(crate) fn parse_basic_auth(req: &Request) -> Option<(String, String)> {
 /// header value, returning the credentials token.
 fn strip_basic_prefix(h: &str) -> Option<&str> {
     let h = h.trim_start();
-    if h.len() >= 6 && h[..6].eq_ignore_ascii_case("basic ") {
+    // `get` (not byte slicing): a multi-byte character across the prefix
+    // boundary must not panic.
+    if h.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("basic ")) {
         Some(&h[6..])
     } else {
         None
@@ -851,7 +2449,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// Length-checked, byte-by-byte equality that does not short-circuit on the
 /// first differing byte (mitigates timing side channels on the credential
 /// compare; the length itself is not hidden).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -977,10 +2575,304 @@ mod tests {
         http(addr, &raw)
     }
 
+    /// Two `/sparql` reads each call a function that waits for a second
+    /// caller (15 s at most): both answer `1` only if they ran at the same
+    /// time (one exclusive lock would make the first time out with `0`).
+    #[test]
+    fn two_sparql_reads_run_at_once() {
+        #[derive(Default)]
+        struct Latch {
+            n: Mutex<usize>,
+            cv: std::sync::Condvar,
+        }
+        let latch = Arc::new(Latch::default());
+        let l2 = Arc::clone(&latch);
+        let mut db = Database::build_from_str("latch", DATA).unwrap();
+        db.register_function("http://ex/latch", move |_| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut n = l2.n.lock().unwrap();
+            *n += 1;
+            l2.cv.notify_all();
+            while *n < 2 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Some(crate::query::Value::Int(0));
+                }
+                n = l2.cv.wait_timeout(n, left).unwrap().0;
+            }
+            Some(crate::query::Value::Int(1))
+        });
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        thread::spawn(move || s2.serve_forever());
+        let reads: Vec<_> = (0..2)
+            .map(|_| {
+                thread::spawn(move || {
+                    post(
+                        &addr,
+                        "/sparql",
+                        "SELECT (<http://ex/latch>(1) AS ?x) WHERE {}",
+                    )
+                })
+            })
+            .collect();
+        for r in reads {
+            let resp = r.join().unwrap();
+            assert!(resp.contains("200 OK"), "{resp}");
+            assert!(resp.contains("\"value\":\"1\""), "{resp}");
+        }
+        server.shutdown();
+    }
+
+    /// `/status` answers at once while a statement holds the database —
+    /// shared or exclusive — with the figures of the last write; a
+    /// statement that does not parse is answered `400` without the lock.
+    #[test]
+    fn status_and_syntax_errors_do_not_wait_for_the_database() {
+        let (srv, addr) = start();
+        let upd = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        );
+        assert!(upd.contains("\"changed\":1"), "{upd}");
+        let within = |raw: String| {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(http(&addr, &raw));
+            });
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("answered within a second")
+        };
+        let status = || within("GET /status HTTP/1.1\r\nConnection: close\r\n\r\n".into());
+        let bad = || {
+            let body = "SELEKT nothing";
+            within(format!(
+                "POST /sparql HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+        };
+        {
+            let _shared = read_locked(&srv.inner.db);
+            let s = status();
+            assert!(
+                s.contains("\"triples\":3") && s.contains("\"name\":\"srv\""),
+                "{s}"
+            );
+            assert!(bad().contains("400 Bad Request"));
+        }
+        {
+            let _excl = write_locked(&srv.inner.db);
+            let s = status();
+            assert!(s.contains("\"triples\":3"), "{s}");
+            assert!(bad().contains("400 Bad Request"));
+        }
+        srv.shutdown();
+    }
+
+    /// The counters' sequence lock never shows half of one publish and half
+    /// of the next.
+    #[test]
+    fn counters_are_read_whole() {
+        let c = Arc::new(DbCounters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (c, stop) = (Arc::clone(&c), Arc::clone(&stop));
+                thread::spawn(move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::SeqCst) {
+                        let s = c.read();
+                        // Every publish stores the same value everywhere.
+                        assert_eq!(s.triples, s.entities);
+                        assert_eq!(s.triples, s.literals);
+                        assert_eq!(s.triples, s.predicates);
+                        assert_eq!(s.triples, s.generation);
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        // Publish for a while, with every reader running meanwhile.
+        let t0 = Instant::now();
+        let mut v = 0u64;
+        while t0.elapsed() < Duration::from_millis(150) {
+            v += 1;
+            c.store(CounterSnapshot {
+                triples: v,
+                entities: v,
+                literals: v,
+                predicates: v,
+                generation: v,
+                live: true,
+                ..CounterSnapshot::default()
+            });
+        }
+        stop.store(true, Ordering::SeqCst);
+        for r in readers {
+            assert!(r.join().unwrap() > 0);
+        }
+        assert_eq!(c.read().generation, v);
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn ask(dir: &std::path::Path, q: &str) -> bool {
+        Database::open(dir).unwrap().query(q).unwrap() == QueryResult::Ask(true)
+    }
+
+    /// An UPDATE that fails part-way leaves its earlier operations applied, so
+    /// the database is dirty and saved under check_point like after any write.
+    #[test]
+    fn a_partially_applied_update_is_saved() {
+        let dir = tmp_dir("partial");
+        let db = Database::build_from_str("srv", DATA).unwrap();
+        db.save(&dir).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir(&dir));
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        let resp = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> } ; LOAD <file:///nonexistent/x.ttl>",
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("were applied"), "the client is told: {resp}");
+        assert!(
+            ask(&dir, "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }"),
+            "the applied part was saved"
+        );
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With check_point off, an update still in flight when the graceful
+    /// shutdown's final save ran (here: its body arrives only afterwards) is
+    /// saved before it is acknowledged — never acknowledged and then lost.
+    #[test]
+    fn an_update_finishing_after_shutdown_is_saved_before_it_is_acked() {
+        let dir = tmp_dir("late_update");
+        let db = Database::build_from_str("srv", DATA).unwrap();
+        db.save(&dir).unwrap();
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_db_dir(&dir)
+                .with_check_point(false)
+                .with_shutdown_grace(Duration::from_millis(50)),
+        );
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+
+        let update = "INSERT DATA { <http://ex/late> <http://ex/p> <http://ex/x> }";
+        let mut late = TcpStream::connect(addr).unwrap();
+        late.write_all(
+            format!(
+                "POST /update HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                update.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(!report.drained && report.saved.is_empty(), "{report:?}");
+
+        late.write_all(update.as_bytes()).unwrap();
+        let mut resp = String::new();
+        late.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            ask(&dir, "ASK { <http://ex/late> <http://ex/p> <http://ex/x> }"),
+            "an acknowledged update is durable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handler_panic_returns_500_and_the_server_keeps_serving() {
+        let (_srv, addr) = start();
+        // The test-only route panics while holding the database lock.
+        let resp = http(
+            &addr,
+            "GET /__test/panic HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.contains("500 Internal Server Error"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        assert!(
+            resp.contains("\"error\"") && resp.contains("panicked"),
+            "{resp}"
+        );
+        // The poisoned database lock is recovered: reads and writes still work.
+        let ok = post(&addr, "/sparql", SELECT_O);
+        assert!(ok.contains("200 OK") && ok.contains("http://ex/b"), "{ok}");
+        let upd = post(
+            &addr,
+            "/update",
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }",
+        );
+        assert!(upd.contains("\"changed\":1"), "{upd}");
+        let status = http(&addr, "GET /status HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(status.contains("\"triples\":3"), "{status}");
+    }
+
+    #[test]
+    fn shutdown_returns_from_serve_forever_and_closes_the_listener() {
+        let db = Database::build_from_str("sd", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        assert!(post(&addr, "/sparql", SELECT_O).contains("200 OK"));
+        let handle = server.shutdown_handle();
+        assert!(!handle.is_shutdown());
+        handle.shutdown();
+        handle.shutdown(); // idempotent
+        assert!(handle.is_shutdown());
+        let report = serving.join().unwrap();
+        assert!(report.drained);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        // serve_forever after a shutdown returns immediately.
+        assert_eq!(
+            server.serve_forever(),
+            ShutdownReport {
+                drained: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn wake_address_maps_unspecified_to_loopback() {
+        let v4: SocketAddr = "0.0.0.0:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v4).wake, "127.0.0.1:7000".parse().unwrap());
+        let v6: SocketAddr = "[::]:7000".parse().unwrap();
+        assert_eq!(Lifecycle::new(v6).wake, "[::1]:7000".parse().unwrap());
+        let specific: SocketAddr = "10.1.2.3:80".parse().unwrap();
+        assert_eq!(Lifecycle::new(specific).wake, specific);
+    }
+
     #[test]
     fn select_returns_sparql_json() {
         let (_srv, addr) = start();
-        let resp = post(&addr, "/sparql", "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }");
+        let resp = post(
+            &addr,
+            "/sparql",
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }",
+        );
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("application/sparql-results+json"));
         assert!(resp.contains("\"vars\":[\"o\"]"));
@@ -997,7 +2889,11 @@ mod tests {
             "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
         );
         assert!(resp.contains("\"changed\":1"));
-        let resp2 = post(&addr, "/sparql", "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/d> }");
+        let resp2 = post(
+            &addr,
+            "/sparql",
+            "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/d> }",
+        );
         assert!(resp2.contains("http://ex/c"));
     }
 
@@ -1050,8 +2946,11 @@ mod tests {
     /// Like [`start`], but the server requires HTTP Basic `user:pass`.
     fn start_auth() -> (Arc<Server>, SocketAddr) {
         let db = Database::build_from_str("srv_auth", DATA).unwrap();
-        let server =
-            Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_basic_auth("user", "pass"));
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_basic_auth("user", "pass"),
+        );
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         thread::spawn(move || s2.serve_forever());
@@ -1204,7 +3103,12 @@ mod tests {
     fn format_param_overrides_accept_and_default_is_json() {
         let (_srv, addr) = start();
         // `format=` wins over an Accept that asks for XML.
-        let csv = post_accept(&addr, "/sparql?format=csv", SELECT_O, "application/sparql-results+xml");
+        let csv = post_accept(
+            &addr,
+            "/sparql?format=csv",
+            SELECT_O,
+            "application/sparql-results+xml",
+        );
         assert!(csv.contains("text/csv"));
         // `*/*` (and no format param) falls back to JSON.
         let json = post_accept(&addr, "/sparql", SELECT_O, "*/*");
@@ -1299,8 +3203,484 @@ mod tests {
             SELECT_O
         );
         let resp = http(&addr, &raw);
-        assert!(!resp.contains("Content-Encoding"), "must not compress: {resp}");
+        assert!(
+            !resp.contains("Content-Encoding"),
+            "must not compress: {resp}"
+        );
         assert!(resp.contains("http://ex/b"), "{resp}");
+    }
+
+    // --- connection handling: keep-alive, worker pool, CORS, body cap ---------
+
+    /// Start a server with custom connection settings; returns the serving
+    /// thread too so a test can shut down and join it.
+    fn start_with(
+        opts: HttpOptions,
+    ) -> (Arc<Server>, SocketAddr, thread::JoinHandle<ShutdownReport>) {
+        let db = Database::build_from_str("conn", DATA).unwrap();
+        let server = Arc::new(
+            Server::bind(db, "127.0.0.1:0")
+                .unwrap()
+                .with_http_options(opts),
+        );
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        let serving = thread::spawn(move || s2.serve_forever());
+        (server, addr, serving)
+    }
+
+    /// Read exactly one `Content-Length`-framed response from a connection
+    /// that may stay open; returns (head, body).
+    fn read_one<R: BufRead>(r: &mut R) -> (String, String) {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line);
+        }
+        let len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .map(|v| v.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body).unwrap();
+        (head, String::from_utf8(body).unwrap())
+    }
+
+    fn get_status(conn_header: &str) -> String {
+        format!("GET /status HTTP/1.1\r\nHost: x\r\n{conn_header}\r\n")
+    }
+
+    #[test]
+    fn keep_alive_serves_two_requests_on_one_connection() {
+        let (_srv, addr) = start();
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+
+        // HTTP/1.1 without `Connection: close` keeps the connection open.
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut r);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        assert!(head.contains("Keep-Alive: timeout=60, max=99"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+
+        // A second request — with a body — on the same connection.
+        let raw = format!(
+            "POST /sparql HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{SELECT_O}",
+            SELECT_O.len()
+        );
+        w.write_all(raw.as_bytes()).unwrap();
+        let (head, body) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(body.contains("http://ex/b"), "{body}");
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "the server closed after `Connection: close`"
+        );
+    }
+
+    #[test]
+    fn pipelined_requests_are_answered_in_order() {
+        let (_srv, addr) = start();
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let both = format!(
+            "{}POST /update HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            get_status(""),
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }".len(),
+            "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }"
+        );
+        w.write_all(both.as_bytes()).unwrap();
+        let (_, first) = read_one(&mut r);
+        assert!(first.contains("\"triples\":2"), "{first}");
+        let (head, second) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(second.contains("\"changed\":1"), "{second}");
+    }
+
+    #[test]
+    fn keep_alive_limits_http10_and_opt_out() {
+        let opts = HttpOptions {
+            keep_alive_max: 2,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Keep-Alive: timeout=60, max=1"), "{head}");
+        // The request limit closes the connection after the second response.
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+
+        // HTTP/1.0 closes by default and keeps alive only when asked to.
+        let resp = http(&addr, "GET /status HTTP/1.0\r\n\r\n");
+        assert!(resp.contains("Connection: close"), "{resp}");
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(b"GET /status HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+
+        // A client `Keep-Alive: max=1` hint ends it after one response.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("Keep-Alive: timeout=5, max=1\r\n").as_bytes())
+            .unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: close"), "{head}");
+    }
+
+    #[test]
+    fn keep_alive_can_be_turned_off() {
+        let opts = HttpOptions {
+            keep_alive_timeout: Duration::ZERO,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let resp = http(&addr, &get_status(""));
+        assert!(resp.contains("Connection: close"), "{resp}");
+        assert!(!resp.contains("Keep-Alive"), "{resp}");
+    }
+
+    #[test]
+    fn an_idle_connection_times_out_and_never_delays_shutdown() {
+        let opts = HttpOptions {
+            keep_alive_timeout: Duration::from_millis(300),
+            ..HttpOptions::default()
+        };
+        let (server, addr, serving) = start_with(opts);
+        // Idle timeout: the server closes a quiet kept-alive connection.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        let t0 = Instant::now();
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "closed after the idle timeout"
+        );
+
+        // An idle connection does not hold up a graceful shutdown.
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(get_status("").as_bytes()).unwrap();
+        let _ = read_one(&mut r);
+        let t0 = Instant::now();
+        server.shutdown();
+        let report = serving.join().unwrap();
+        assert!(report.drained, "{report:?}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    #[test]
+    fn the_worker_pool_bounds_concurrent_connections() {
+        let opts = HttpOptions {
+            threads: 2,
+            queue_len: 8,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // Two slow clients occupy both workers: they send half a request.
+        let mut slow: Vec<TcpStream> = (0..2)
+            .map(|_| {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n").unwrap();
+                s
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+        // The third (N+1-th) connection is accepted but must wait for a worker.
+        let mut third = TcpStream::connect(addr).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        third
+            .write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let early = third.read(&mut buf);
+        assert!(
+            matches!(&early, Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "with both workers busy the third connection is not served yet: {early:?}"
+        );
+        // Finishing one slow request frees its worker for the third connection.
+        slow[0].write_all(b"Connection: close\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        slow[0]
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        slow[0].read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        third
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut resp = String::new();
+        third.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("\"triples\":2"), "{resp}");
+        drop(slow);
+    }
+
+    #[test]
+    fn an_idle_keep_alive_connection_yields_its_worker() {
+        let opts = HttpOptions {
+            threads: 1,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // A kept-alive connection holds the only worker while idle …
+        let a = TcpStream::connect(addr).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut aw = a.try_clone().unwrap();
+        let mut ar = BufReader::new(a);
+        aw.write_all(get_status("").as_bytes()).unwrap();
+        let (head, _) = read_one(&mut ar);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        // … until another connection needs it: then it closes, far sooner
+        // than its 60 s idle timeout.
+        let t0 = Instant::now();
+        let mut b = TcpStream::connect(addr).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        b.write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
+        let mut resp = String::new();
+        b.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let mut rest = Vec::new();
+        ar.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    #[test]
+    fn a_dripping_client_cannot_hold_a_worker() {
+        let opts = HttpOptions {
+            threads: 1,
+            read_timeout: Duration::from_millis(500),
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        // One byte of request head every 100 ms: each read is well within the
+        // read timeout, but the head as a whole is not.
+        let mut drip = TcpStream::connect(addr).unwrap();
+        let dripper = thread::spawn(move || {
+            for b in b"GET /status HTTP/1.1\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+                if drip.write_all(&[*b]).is_err() {
+                    return true; // the server hung up
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let mut buf = [0u8; 256];
+            drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // A response, EOF or a reset all mean the server let go; only a
+            // timeout would mean it still holds the connection.
+            !matches!(
+                drip.read(&mut buf),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            )
+        });
+        thread::sleep(Duration::from_millis(150));
+        let t0 = Instant::now();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(get_status("Connection: close\r\n").as_bytes())
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert!(
+            dripper.join().unwrap(),
+            "the dripping connection was dropped"
+        );
+    }
+
+    #[test]
+    fn options_preflight_and_cors_headers() {
+        let (_srv, addr) = start();
+        let resp = http(
+            &addr,
+            "OPTIONS /file/upload HTTP/1.1\r\nOrigin: http://w\r\nConnection: close\r\n\r\n",
+        );
+        let (head, body) = split_resp(&resp);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Access-Control-Allow-Origin: *"), "{head}");
+        assert!(
+            head.contains("Access-Control-Allow-Methods: POST"),
+            "{head}"
+        );
+        assert_eq!(body, "ok");
+        let resp = http(
+            &addr,
+            "OPTIONS /file/download/x.nt HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.contains("Access-Control-Allow-Methods: GET"), "{resp}");
+        let resp = http(
+            &addr,
+            "OPTIONS /sparql HTTP/1.1\r\nAccess-Control-Request-Headers: X-Foo, Content-Type\r\n\
+             Connection: close\r\n\r\n",
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Headers: X-Foo, Content-Type"),
+            "{resp}"
+        );
+        // Ordinary responses carry the allow-origin header too.
+        let resp = http(&addr, &get_status("Connection: close\r\n"));
+        assert!(resp.contains("Access-Control-Allow-Origin: *"), "{resp}");
+
+        // With CORS off: no header, and OPTIONS reaches the router (405 here).
+        let opts = HttpOptions {
+            cors: false,
+            ..HttpOptions::default()
+        };
+        let (_srv2, addr2, _serving) = start_with(opts);
+        let resp = http(&addr2, &get_status("Connection: close\r\n"));
+        assert!(!resp.contains("Access-Control"), "{resp}");
+        let resp = http(
+            &addr2,
+            "OPTIONS /sparql HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
+    }
+
+    #[test]
+    fn the_body_cap_answers_413_before_reading() {
+        let opts = HttpOptions {
+            max_body: 16,
+            ..HttpOptions::default()
+        };
+        let (_srv, addr, _serving) = start_with(opts);
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"), "{resp}");
+        // An absurd Content-Length is refused the same way.
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        // A malformed one is a plain 400.
+        let resp = http(
+            &addr,
+            "POST /update HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        // Within the cap, requests work.
+        let resp = http(&addr, &get_status("Connection: close\r\n"));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    }
+
+    #[test]
+    fn chunked_request_bodies_and_expect_continue() {
+        let (_srv, addr) = start();
+        let update = "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }";
+        let (a, b) = update.split_at(10);
+        let raw = format!(
+            "POST /update HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             {:x}\r\n{a}\r\n{:x};ext=1\r\n{b}\r\n0\r\nX-Trailer: t\r\n\r\n",
+            a.len(),
+            b.len()
+        );
+        let resp = http(&addr, &raw);
+        assert!(resp.contains("\"changed\":1"), "{resp}");
+
+        // `Expect: 100-continue`: the interim response comes before the body.
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(
+            format!(
+                "POST /sparql HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                SELECT_O.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        s.write_all(SELECT_O.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200") && resp.contains("http://ex/b"),
+            "{resp}"
+        );
+    }
+
+    #[test]
+    fn request_parse_reads_raw_bytes() {
+        let raw = b"POST /x?a=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc";
+        let req = Request::parse(&mut &raw[..]).unwrap().unwrap();
+        assert_eq!((req.method.as_str(), req.path.as_str()), ("POST", "/x"));
+        assert_eq!(req.query.as_deref(), Some("a=1"));
+        assert_eq!(req.header("HOST"), Some("h"));
+        assert_eq!(req.body, b"abc");
+        assert!(Request::parse(&mut &b""[..]).unwrap().is_none());
+        let truncated = b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\nab";
+        assert!(Request::parse(&mut &truncated[..]).is_err());
+    }
+
+    #[test]
+    fn a_non_ascii_authorization_header_is_rejected_without_a_panic() {
+        // A multi-byte character straddling the `Basic ` / `Bearer ` prefix
+        // boundary must not make the byte-indexed prefix check panic.
+        for value in [
+            "abcde\u{e9}xyz",
+            "abcdef\u{e9}xyz",
+            "\u{e9}",
+            "Basic\u{e9}",
+            "Bearer\u{e9}x",
+        ] {
+            let raw = format!("GET / HTTP/1.1\r\nAuthorization: {value}\r\n\r\n");
+            let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+            assert_eq!(parse_basic_auth(&req), None, "{value:?}");
+            assert_eq!(req.bearer_or_session_token(), None, "{value:?}");
+            assert!(!req.authorized("u", "p"), "{value:?}");
+        }
+        // Well-formed headers still work, with the scheme in any case.
+        let raw = "GET / HTTP/1.1\r\nAuthorization: bAsIc dTpw\r\n\r\n";
+        let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(parse_basic_auth(&req), Some(("u".into(), "p".into())));
+        assert!(req.authorized("u", "p"));
+        let raw = "GET / HTTP/1.1\r\nAuthorization: BEARER tok\u{e9}n\r\n\r\n";
+        let req = Request::parse(&mut raw.as_bytes()).unwrap().unwrap();
+        assert_eq!(req.bearer_or_session_token().as_deref(), Some("tok\u{e9}n"));
     }
 
     // --- TLS (feature `tls`) -------------------------------------------------
@@ -1391,5 +3771,106 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         assert!(text.contains("http://ex/b"), "TLS response: {text}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keep-alive works over TLS too: two requests on one TLS connection.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_keep_alive_serves_two_requests() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("gstore_tls_ka_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        std::fs::write(&key, KEY_PEM).unwrap();
+        let config = load_tls_config(&cert, &key).unwrap();
+        let db = Database::build_from_str("tls_ka", DATA).unwrap();
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+        let addr = server.local_addr().unwrap();
+        let s2 = Arc::clone(&server);
+        thread::spawn(move || s2.serve_forever_tls(config));
+
+        let mut roots = rustls::RootCertStore::empty();
+        let cert_der = rustls_pemfile::certs(&mut std::io::BufReader::new(CERT_PEM.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(cert_der).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client_config), name).unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut tls = BufReader::new(rustls::StreamOwned::new(conn, sock));
+        tls.get_mut().write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut tls);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+        tls.get_mut().write_all(get_status("").as_bytes()).unwrap();
+        let (head, body) = read_one(&mut tls);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(body.contains("\"triples\":2"), "{body}");
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HEAD` response keeps its headers (`Content-Length` included) but
+    /// sends no body, so the next response on a kept-alive connection is
+    /// read as a response.
+    #[test]
+    fn head_responses_carry_no_body_on_a_kept_alive_connection() {
+        let (_srv, addr) = start();
+        let resp = http(
+            &addr,
+            "HEAD /status HTTP/1.1\r\nHost: x\r\n\r\n\
+             GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        let (first, rest) = resp.split_once("\r\n\r\n").unwrap();
+        assert!(first.starts_with("HTTP/1.1 405"), "{resp}");
+        assert!(first.contains("Content-Length: 18"), "{first}");
+        assert!(first.contains("Connection: keep-alive"), "{first}");
+        assert!(rest.starts_with("HTTP/1.1 200"), "the body leaked: {rest}");
+        assert!(rest.contains("\"triples\":2"), "{rest}");
+    }
+
+    #[test]
+    fn response_sink_drops_only_the_body_of_a_head_response() {
+        let mut sink = ResponseSink::new(Vec::new());
+        sink.start_response(true);
+        // The header terminator split across writes.
+        for part in [
+            &b"HTTP/1.1 200 OK\r\nA: b\r"[..],
+            b"\n\r",
+            b"\nbody",
+            b"more",
+        ] {
+            assert_eq!(sink.write(part).unwrap(), part.len());
+        }
+        assert_eq!(sink.inner, b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n");
+        sink.start_response(false);
+        sink.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody").unwrap();
+        assert!(sink.inner.ends_with(b"\r\n\r\nbody"));
+    }
+
+    /// The latest request wins: stopping the server while a restart is under
+    /// way (a signal, `gserver -t`) stops it.
+    #[test]
+    fn an_explicit_stop_calls_off_a_pending_restart() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let life = Lifecycle::new(listener.local_addr().unwrap());
+        let handle = ShutdownHandle::new(Arc::clone(&life));
+        handle.restart();
+        assert!(handle.restart_requested() && handle.is_shutdown());
+        handle.shutdown();
+        assert!(!handle.restart_requested() && handle.is_shutdown());
+        // A restart asked for once the shutdown is under way stays a shutdown.
+        handle.restart();
+        assert!(!handle.restart_requested());
     }
 }
