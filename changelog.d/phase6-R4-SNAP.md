@@ -195,6 +195,438 @@ R4-SNAP: copy-on-write TripleStore (O(1) clones, bytes and Debug unchanged), O(1
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `8264302`; part 2 of 3: R4-SNAP, gate G4)
+
+Reference VM (4 vCPU Intel Xeon @ 2.10GHz, 16 GB), nothing else running, one
+session (2026-11-04, 03:31–05:30 UTC). CPU busy and load average logged
+every 10 s from `/proc/stat`: mean 33% busy (0–99%), 1-minute load average
+0.2–7.4 — the measured processes themselves (the 8-client concurrency points
+saturate the 4 vCPUs; the harness records the 1-minute load average left by
+its previous point). Toolchain 1.99.1, `CARGO_PROFILE_DEV_DEBUG=0
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`; every heavy command under
+`flock /tmp/gstore-bench.lock`, base and head alternating. **Head** =
+release builds of `8264302` (`cargo build --release -p gstore -p
+gstore-bench --bins`, `--examples`, `cargo test --release -p gstore --test
+dt_cow_store --no-run`). **Base** = the tree before this round, `d702463`:
+the prebuilt release binaries `/tmp/gstore-base-d702463/bin` (its own
+`gstore-bench`: the harness runs the servers, the opens and the queries in
+its own children, so the base harness measures base code), plus scratch
+drivers built at `d702463` in a throwaway worktree with its own target
+directory: the latency drivers of `dt_cow_store` in a scratch test file, and
+R3-SRV's `examples/srv_mixed_load.rs` (removed from the head by the Round-4
+merge) with a scratch `--prebuilt DIR` option. Data from
+`/tmp/gstore-bench-cache` (univ 8 `ed44da2e7b3bbb98`, 1,029,275 triples;
+univ 38 `fcd6493725f3c66a`, 5,181,103 triples). "pre" =
+`bench/results/pre-phase6-lubm{8,38}.json`. This stage changed no code (no
+regression of this round needed a fix; see the acceptance table); the two
+scratch drivers and every database it built were deleted.
+
+#### `ConcurrentDb` one-triple update, terms existing (`dt_cow_store`'s `concurrent_update_latency`)
+
+```sh
+GSTORE_COW_BENCH_NT=/tmp/gstore-bench-cache/lubm-like1-u{8,38}-s0.nt flock /tmp/gstore-bench.lock \
+  <test binary> --ignored --nocapture --exact concurrent_update_latency
+```
+
+Base: the same function without its `hold` loop, in a scratch test file of a
+`d702463` worktree (release, own target directory); head:
+`target/release/deps/dt_cow_store-*`. 80 updates (an `INSERT DATA` and its
+`DELETE DATA`, 40 rounds) after 4 warm-up ones; order base, head, base, head
+per scale; the two runs per side:
+
+| univ | side | median ms | mean ms | p90 ms |
+|---|---|---:|---:|---:|
+| 8 | base | 48.29 / 48.85 | 51.59 / 52.50 | 63.68 / 67.37 |
+| 8 | head | **0.084 / 0.109** | 0.091 / 0.122 | 0.119 / 0.169 |
+| 8 | head, a reader holds the last two snapshots (the copy fallback) | 14.65 / 14.46 | 15.44 / 15.28 | 17.73 / 17.83 |
+| 38 | base | 209.4 / 221.2 | 216.3 / 228.3 | 249.5 / 262.9 |
+| 38 | head | **0.510 / 0.541** | 0.519 / 0.545 | 0.570 / 0.599 |
+| 38 | head, copy fallback | 70.8 / 68.2 | 73.9 / 71.5 | 87.0 / 85.1 |
+
+Lower latency than the base: **443–581× at univ 8, 387–434× at univ 38**
+(the copy fallback 3.3–3.4× and 3.0–3.2×); acceptance ≥ 1.7×: **met**. The
+head update at univ 38 is 0.5 ms because the triple (`University0 ub:name
+…`) has the lowest subject id, so each sorted insert moves the tail of the
+`ub:name` lists (O(list), not O(store)).
+
+#### Batched `TripleStore` writes (`dt_cow_store`'s `batch_of_low_ids_latency`)
+
+```sh
+GSTORE_COW_BENCH_NT=/tmp/gstore-bench-cache/lubm-like1-u{8,38}-s0.nt GSTORE_COW_BENCH_BATCH={5330,130000} \
+  flock /tmp/gstore-bench.lock target/release/deps/dt_cow_store-* --ignored --nocapture --exact batch_of_low_ids_latency
+```
+
+One binary; median of 5 of each column (one `insert` / `remove` per triple,
+the per-triple path, against `insert_many` / `remove_many`); the batch is
+the triples of the lowest subject ids:
+
+| store | batch | insert one by one | `insert_many` | remove one by one | `remove_many` |
+|---|---:|---:|---:|---:|---:|
+| univ 8 (1,029,275 triples) | 5,330 | 268.7 ms | **2.84 ms** (95×) | 268.4 ms | **3.23 ms** (83×) |
+| univ 8 | 130,000 | 5,551 ms | **22.3 ms** (249×) | 5,970 ms | **45.3 ms** (132×) |
+| univ 38 (5,181,103 triples) | 5,330 | 1,634 ms | **21.9 ms** (75×) | 1,518 ms | **7.29 ms** (208×) |
+| univ 38 | 130,000 | 35,611 ms | **138 ms** (258×) | 35,545 ms | **58.7 ms** (605×) |
+
+End to end the integrator wired the batches into the database's write paths
+(`phase6-R4-merge.md`); part 1 of this stage measured the effect in
+R4-RECLAIM's churn on the memory layout: insert time with reclamation on /
+off 0.99 and 1.04 (4.7× with the per-triple path, in R4-RECLAIM's
+implementer run). Met.
+
+#### Memory layout (snapshot): `gstore-bench run --profile reference --backends snapshot --no-conc`
+
+```sh
+flock /tmp/gstore-bench.lock /tmp/gstore-base-d702463/bin/gstore-bench run --profile reference --scale {8,38} \
+  --backends snapshot --no-conc --bin-dir /tmp/gstore-base-d702463/bin --work-dir /tmp/r4snap-work --out base-u{s}-{i}.json
+flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale {8,38} --extra none \
+  --backends snapshot --no-conc --bin-dir target/release --work-dir /tmp/r4snap-work --out head-u{s}-{i}.json
+```
+
+Each side runs its own harness (the children do the opens and queries).
+Three pairs per scale, order base, head, head, base, base, head; means of
+the runs [range]; query = the minimum over the 5 query processes of the warm
+median, as the harness records it:
+
+| univ | | build s | open warm ms | RSS after open MiB | Q1–Q14 geomean ms | chunk insert (5,330) ms | chunk delete ms | single insert median ms | checkpoint ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | base | 4.92 [4.74–5.06] | 174 [173–175] | 102.0 | 3.13 [3.10–3.17] | 41.6 [41.0–42.5] | 24.4 | 0.050 | 251 [244–257] |
+| 8 | head | 5.14 [4.91–5.36] | 182 [175–188] | 102.4 | **2.17** [2.13–2.19] | **34.8** [34.0–36.1] | 23.3 | 0.051 | 267 [249–280] |
+| 8 | head / base | **1.043** | 1.045 | 1.004 | **0.693** (pairs 0.682, 0.690, 0.707) | **0.837** | 0.953 | 1.03 | 1.065 |
+| 38 | base | 27.53 [27.06–27.90] | 1,355 [1,113–1,492] | 489.1 | 17.49 [16.98–18.03] | 54.6 [53.5–55.7] | 35.7 | 0.016 | 2,878 [2,769–2,993] |
+| 38 | head | 27.10 [26.47–27.60] | 1,395 [1,126–1,703] | 489.6 | **9.96** [9.83–10.12] | **44.3** [36.6–50.7] | 32.8 | 0.015 | 3,307 [2,973–3,654] |
+| 38 | head / base | **0.984** | 1.030 | 1.001 | **0.569** (pairs 0.545, 0.579, 0.585) | **0.812** | 0.917 | 0.99 | 1.149 |
+
+Per query, head / base of the means — univ 8: q1 0.43, q2 0.96, q3 0.21, q4
+0.89, q5 0.73, q6 0.66, q7 0.81, q8 0.84, q9 0.84, q10 0.68, **q11 1.021**,
+q12 0.997, q13 0.61, q14 0.66; univ 38: q1 0.14, q2 0.94, q3 0.03, q4 0.57,
+q5 0.84, q6 0.69, q7 0.79, q8 0.93, q9 0.87, q10 0.85, q11 0.98, q12 0.95,
+q13 0.67, q14 0.72. Rows and row hashes are identical in all 12 runs; the
+update round trip is `ok` in every run.
+
+- **Q1–Q14 within ±5%: met** — no query is slower than +2.1% (q11 at univ 8,
+  0.223 → 0.228 ms); the geomean is 0.69× / 0.57× (R4-VS's VS-tree policy
+  and the rest of the round). The implementer's +4.7% (three sub-0.2 ms
+  queries) and part 1's q11 / q12 +20% / +15% at univ 38 do not reproduce on
+  the quiet VM (q11 1.303 → 1.278 ms, q12 0.477 → 0.455 ms).
+- **Build within ±5%: met** — +4.3% at univ 8 (pairs +3.6%, +7.9%, +1.4%;
+  ranges overlap), −1.6% at univ 38 (part 1: +2.2% / −0.3%).
+- **Insert throughput within ±5%: met** — chunk insert 0.84× / 0.81× the
+  base's time, single inserts 1.03× / 0.99×.
+- Not gated here, seen on the way: the update phase's snapshot **checkpoint
+  is +6.5% / +15%** (part 1: +12% at univ 38) — see the save profile below;
+  single deletes 0.0036 → 0.0046 ms / 0.0043 → 0.0058 ms (R4-RECLAIM's
+  candidate check, as part 1 found).
+
+#### The snapshot save (the update phase's checkpoint +6.5% / +15%, and check_point on)
+
+The update phase's checkpoint (a full snapshot save at the database's home)
+was +6.5% at univ 8 and +15% at univ 38 above (base 2,769–2,993 ms, head
+2,973–3,654 ms; part 1: +12%), so the save path was profiled, outside the
+harness, on databases opened fresh (a scratch test driver, the same function
+at `d702463` and at the head: `Database::open`, then 3 timed `save(dir)`
+into a new directory, wall and process CPU time):
+
+| univ | side | save, 9 per side (3 processes alternating) | median | CPU per save |
+|---|---|---|---:|---:|
+| 8 | base | 190–251 ms | 222 ms | 82–115 ms |
+| 8 | head | 180–228 ms | 212 ms | 82–128 ms |
+| 38 | base | 779–958 ms | 838 ms | 401–522 ms (mean 438) |
+| 38 | head | 806–1,176 ms | 863 ms | 415–538 ms (mean 453) |
+
+callgrind of one save at univ 8 (`--toggle-collect='*save_locked*'`):
+**181,069,336 instructions on the base, 181,070,044 on the head**
+(+0.0004%). The save does the same work; the snapshot files `gbuild` writes
+are byte for byte the same (`cmp` of `dict.bin`, `store.bin`, `named.bin`,
+`vstree.bin`, `meta.bin` from the base's and the head's `gbuild` at univ 8;
+the database sizes are equal in all 12 memory-layout runs above), and
+`dt_cow_store`'s golden and legacy-mirror tests pass (9 passed, 3 timing
+drivers ignored). The checkpoint difference in the harness is the time of
+writing and fsyncing 85 / 431 MB (its spread on one side is 5–23%), not the
+copy-on-write store: not a regression of this round.
+
+**check_point on, snapshot layout (R3-SRV request 2): unchanged** — each
+acknowledged update still saves the whole snapshot under the exclusive guard
+(1.2–1.4 s, median, at univ 38 through `gserver`), as on the base; the mixed
+workload with `check_point` on stays below pre on this layout (table above),
+and the head equals the base there. Not implemented in this round (the
+implementer's investigation stands: `Database::save` writes from a live
+`&Database` and the VS-tree is not copy-on-write, both in `db/persist.rs`);
+the follow-up is R4-SNAP request 2. A disk-layout database, whose commit
+point is incremental, meets every mixed target with `check_point` on
+(20,644–21,801 `/sparql`, 9,407–10,178 `/api` reader qps, writes
+acknowledged in 4–8 ms) and is buildable from the servers (`layout=disk`).
+
+#### `/begin` through `gserver` at univ 38
+
+Real `gserver --api <home> --db-home <home> --thread-num 8` processes (base
+`/tmp/gstore-base-d702463/bin`, head `target/release`), one fresh process
+per side and layout, two sessions per side in the order base, head, head,
+base. Memory = a snapshot-layout database (`GSTORE_DISK_QUERY_MODE=memory`;
+one database built by the base's `gbuild`, served to both sides: the
+snapshot files are byte-identical); Stream = `GSTORE_DISK_QUERY_MODE=stream`
+on each side's own `gbuild --disk` database (base V1, head V2). `POST
+/load`, one warm-up `COUNT(*)` read, then six rounds of `POST /begin` (`curl
+-w %{time_total}`; VmRSS of the gserver pid from `/proc/<pid>/status` right
+before and after), one `/tquery` `INSERT DATA`, one non-transactional
+`/sparql` `COUNT(*)`, `/rollback`:
+
+| database | side | `/begin` (12 rounds) | RSS growth at `/begin`, first round of a fresh process | all rounds | first tquery write | snapshot `COUNT(*)` read | rollback |
+|---|---|---:|---:|---:|---:|---:|---:|
+| memory (snapshot layout) | base | 91–927 ms (first two rounds 207–927 ms) | +222.4 MiB (227,656–227,760 KiB) | 0–222.4 MiB | 0.7–137 ms | 0.52–2.23 s | 117–155 ms |
+| memory | head | **0.66–1.08 ms** (median 0.71) | **+20 KiB** | 0–20 KiB | 98–977 ms (copies the store once; +243 MiB in the first rounds) | 0.51–1.48 s | 127–198 ms |
+| disk, Stream | base | 1,118–1,355 ms (median 1,224) | +200.7 MiB (205,500–205,540 KiB) | 0–200.7 MiB | 0.7–1.1 ms | 0.52–0.81 s | 48–77 ms |
+| disk, Stream | head | **0.52–0.94 ms** (median 0.72) | **+20 KiB** | 0–20 KiB | 0.7–1.1 ms | 0.62–0.83 s (through the view) | 0.8–61 ms |
+
+Acceptance (`/begin` ≤ 5 ms with RSS growth ≤ 4 MiB on memory, ≤ 50 ms with
+≤ 16 MiB on a Stream disk database; G4 the same): **met at univ 38** on both
+(the base copied the store: 0.1–0.9 s and 1.1–1.4 s, 200–222 MiB). The
+harness's in-process `/api begin` point (20 samples per layout, head only:
+the base harness has none) agrees: median 0.28–0.47 ms, max 0.53–2.33 ms,
+RSS growth ≤ 0.11 MiB, on snapshot, Stream and Materialize at univ 8 and 38.
+
+#### Concurrency and mixed workload through the bundled servers (G4)
+
+```sh
+flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale {8,38} --extra none \
+  --backends snapshot | --backends disk --env GSTORE_DISK_QUERY_MODE=stream --label stream \
+                      | --backends disk --env GSTORE_DISK_QUERY_MODE=memory --label materialize \
+  --reps 1 --query-procs 1 --open-reps 1 --no-update --conc-clients 1,8 --conc-secs 5 \
+  --conc-queries q1,q4 --conc-endpoints sparql,api --mixed-secs 10 --bin-dir target/release
+# base: /tmp/gstore-base-d702463/bin/gstore-bench with the same options but the
+# --extra / --label / --mixed-* ones (its harness has no mixed phase);
+# base mixed workload: R3-SRV's examples/srv_mixed_load.rs built at d702463
+# (--secs 10 --readers 8 --write-ms 100 --query q4), on a snapshot it builds and,
+# with a scratch --prebuilt option, on a `gbuild --disk` database served in Stream mode.
+```
+
+Two pairs per scale (order base, head, head, base; each base run followed by
+its two mixed-load runs). The servers run in the harness's process (`Server`
+for `/sparql`, `ApiServer` for `/api`), closed-loop keep-alive clients,
+query cache off, 5 s per point; every point answered with one distinct body,
+the same on both sides and in every layout, with no HTTP error. The first
+head run of each scale is committed as
+`bench/results/phase6-r4-conc-lubm{8,38}.json`, with
+`phase6-r4-conc-lubm{8,38}-compare.md` (the report against the first base
+run: **gates PASS, 281 checked, 0 failed**, at both scales; and the
+concurrency table against pre).
+
+**Q4, 1 → 8 clients** (qps, means of the two runs; the ratio of each run):
+
+| univ | layout | endpoint | base | base 8 / 1 | head | **head 8 / 1** | head 1-client mean ms (base) |
+|---|---|---|---|---|---|---|---|
+| 8 | snapshot | /sparql | 5,774 → 32,907 | 5.54×, 5.86× | 6,283 → 29,664 | **4.39×, 5.08×** | 0.157 (0.170) |
+| 8 | snapshot | /api | 2,667 → 11,147 | 4.23×, 4.13× | 2,620 → 11,273 | **4.06×, 4.58×** | 0.343 (0.336) |
+| 8 | disk, Stream | /sparql | 2,040 → 6,322 | 3.22×, 3.00× | 4,676 → 22,002 | **4.57×, 4.85×** | 0.211 (0.488) |
+| 8 | disk, Stream | /api | 1,426 → 4,339 | 3.31×, 2.80× | 2,399 → 10,574 | **4.23×, 4.59×** | 0.376 (0.657) |
+| 8 | disk, Materialize | /sparql | 2,196 → 6,220 | 2.80×, 2.87× | 5,626 → 32,383 | **5.49×, 6.02×** | 0.175 (0.452) |
+| 8 | disk, Materialize | /api | 1,469 → 4,443 | 2.92×, 3.13× | 2,506 → 11,048 | **4.12×, 4.71×** | 0.357 (0.635) |
+| 38 | snapshot | /sparql | 3,788 → 23,345 | 6.16×, 6.17× | 6,320 → 33,223 | **5.00×, 5.53×** | 0.156 (0.261) |
+| 38 | snapshot | /api | 2,007 → 8,448 | 4.13×, 4.30× | 2,345 → 9,896 | **3.90×, 4.60×** | 0.386 (0.453) |
+| 38 | disk, Stream | /sparql | 363 → 624 | 1.70×, 1.74× | 4,793 → 20,269 | **4.35×, 4.11×** | 0.205 (2.757) |
+| 38 | disk, Stream | /api | 328 → 598 | 1.86×, 1.79× | 2,301 → 9,609 | **3.92×, 4.50×** | 0.396 (3.004) |
+| 38 | disk, Materialize | /sparql | 360 → 624 | 1.72×, 1.75× | 5,859 → 33,445 | **5.75×, 5.66×** | 0.168 (2.775) |
+| 38 | disk, Materialize | /api | 341 → 613 | 1.87×, 1.72× | 2,817 → 10,873 | **3.81×, 3.92×** | 0.316 (2.878) |
+
+Acceptance "a disk database through gserver: Q4 qps at 8 clients ≥ 2.5 × 1
+client" (R4-SNAP) and G4's "≥ 2.5× via /sparql and /api, on memory and
+Stream-disk databases": **met** on every layout, endpoint and run at both
+scales (lowest 3.81×, Materialize `/api` at univ 38). The base's disk
+layouts scaled 1.7–3.3× (their single-client Q4 took 0.45–3.0 ms; the head's
+0.17–0.40 ms — R4-VS's VS-tree policy).
+
+**Mixed workload**: 8 readers (Q4) and one writer (a single-triple `INSERT
+DATA` every 100 ms), 10 s per point; reader qps per run (head: the harness's
+mixed phase; base: `srv_mixed_load`). Targets as in R3: with `check_point`
+off ≥ 2 × pre's read-only 8-client Q4 qps, with it on ≥ pre's (pre snapshot:
+univ 8 76.3 `/sparql`, 76.5 `/api`; univ 38 13.4 / 15.4; pre disk: univ 8
+79.3 / 76.4; univ 38 11.7 / 11.5):
+
+| univ | layout | endpoint | check_point | target | base | head | head writes acknowledged, mean ms |
+|---|---|---|---|---:|---:|---:|---|
+| 8 | snapshot | /sparql | off | ≥ 152.6 | 32,378.2 / 31,781.5 | **32,953.2 / 32,645.1** | 101 / 0.7, 101 / 0.7 |
+| 8 | snapshot | /sparql | on | ≥ 76.3 | 60.7 / 43.6 | 67.7 / 45.8 | 37 / 277.8, 37 / 280.8 |
+| 8 | snapshot | /api | off | ≥ 153 | 13,235.6 / 12,003.9 | **12,038.1 / 11,067.2** | 101 / 1.1, 101 / 1.2 |
+| 8 | snapshot | /api | on | ≥ 76.5 | 34.5 / 43.9 | 34.5 / 39.4 | 39 / 277.6, 38 / 271.8 |
+| 8 | disk, Stream | /sparql | off | ≥ 158.6 | 20,469.1 / 19,496.8 | **22,766.7 / 23,689.6** | 101 / 3.8, 101 / 3.4 |
+| 8 | disk, Stream | /sparql | on | ≥ 79.3 | 20,718.0 / 19,552.3 | **21,801.4 / 21,231.5** | 101 / 7.5, 101 / 6.2 |
+| 8 | disk, Stream | /api | off | ≥ 152.8 | 11,089.6 / 10,433.8 | **10,171.7 / 10,131.9** | 101 / 4.3, 101 / 4.1 |
+| 8 | disk, Stream | /api | on | ≥ 76.4 | 11,016.4 / 10,342.3 | **10,177.6 / 9,924.1** | 101 / 4.0, 101 / 4.2 |
+| 38 | snapshot | /sparql | off | ≥ 26.8 | 23,334.2 / 23,649.5 | **29,837.0 / 31,566.7** | 101 / 0.9, 101 / 1.0 |
+| 38 | snapshot | /sparql | on | ≥ 13.4 | 10.2 / 12.9 | 19.5 / 10.1 | 9 / 1313.6, 9 / 1259.2 |
+| 38 | snapshot | /api | off | ≥ 30.8 | 10,129.5 / 10,377.7 | **9,341.5 / 9,908.7** | 101 / 2.2, 101 / 2.3 |
+| 38 | snapshot | /api | on | ≥ 15.4 | 5.8 / 7.5 | 7.7 / 6.0 | 9 / 1334.5, 7 / 1663.9 |
+| 38 | disk, Stream | /sparql | off | ≥ 23.4 | 17,621.5 / 17,822.6 | **20,838.3 / 22,284.6** | 101 / 3.9, 101 / 3.7 |
+| 38 | disk, Stream | /sparql | on | ≥ 11.7 | 16,887.9 / 18,178.6 | **21,122.9 / 20,644.1** | 101 / 6.2, 101 / 5.9 |
+| 38 | disk, Stream | /api | off | ≥ 23 | 10,122.0 / 10,468.6 | **9,676.5 / 9,856.8** | 101 / 5.8, 101 / 4.2 |
+| 38 | disk, Stream | /api | on | ≥ 11.5 | 9,586.4 / 10,534.8 | **9,407.4 / 9,418.1** | 101 / 4.1, 101 / 4.3 |
+
+With `check_point` off every point is far above its target on both layouts
+(**met**); head / base: snapshot `/sparql` +2% / +31%, `/api` −8% / −6%
+(univ 8 / 38), Stream `/sparql` +16% / +22%, `/api` −6% / −5% (the base side
+is a different client program, `srv_mixed_load`; the harness's own read-only
+8-client snapshot `/api` points above have the head 1% and 17% ahead). With
+`check_point` on, the **Stream** database meets its targets by two to three
+orders of magnitude (**met**): a write is a commit point (4–8 ms) and
+readers keep reading. On the **snapshot layout** each acknowledged write
+saves the whole snapshot under the exclusive guard (278–281 ms at univ 8,
+1.26–1.66 s at univ 38), the writer runs back to back and readers get in
+between saves only: below pre at univ 8 and at univ 38 except one `/sparql`
+run (19.5 ≥ 13.4), the same as the base (60.7 / 43.6, 34.5 / 43.9; 10.2 /
+12.9, 5.8 / 7.5) — **not met**, unchanged from R3 (R4-SNAP request 2,
+below). The base's Stream reader rate without a writer (`srv_mixed_load`'s
+read-only mode: 6,200–7,190 `/sparql` qps at univ 8, 570–607 at univ 38) is
+lower than with one: before R4-VS its out-of-core VS-tree probe dominated
+Q4, and an insert invalidates that tree (its `db/mod.rs`), so the reads
+after the first write skip the probe.
+
+#### Monitoring endpoints at univ 38 (G4; R3-SRV request 6)
+
+Real `gserver --api` processes as for `/begin` (`check_point` on, the
+default), a Python client (`http.client`, a fresh connection per request,
+Basic credentials for the REST routes). Per session: `/api load`; every
+endpoint once (the first `/api monitor` of a loaded database computes its
+statistics); 5 idle rounds; **after a change**: for each endpoint three
+times, one `/api` `query` with a single-triple `INSERT DATA` (acknowledged
+after its check_point save), then the endpoint at once; **during a save**:
+an `INSERT DATA` in a thread and the endpoint sent 0.15, 0.6, 0.9, 1.1 and
+1.3 s into it (only the samples sent while the update was still running
+count), plus three updates per endpoint during which the endpoint is
+requested back to back (every 5 ms) until the update is acknowledged — the
+save's fsync tail included; **during a long query**: one more change, then
+the never-ending `ASK { ?a ub:advisor ?x . ?b ub:advisor ?y
+FILTER(STRLEN(STR(?x)) + STRLEN(STR(?y)) < 0) }` through `/api`, then `/api
+monitor` (the first call after that change) and 5 rounds of every endpoint;
+the server is killed afterwards (the query never ends). Snapshot layout:
+four sessions (base, head, head, base) on the shared snapshot database (each
+session inserts triples of its own; a check_point update took 1.2–1.4 s,
+median, up to 2.9 s); Stream: one session per side on its own `gbuild
+--disk` database (a commit point, 5 ms per update). Maximum latency per
+case, ms (single samples: 6–10 per case, endpoint and side; back to back:
+150–1,430 samples per endpoint and side, `/api stat` 35–36):
+
+| layout | endpoint | idle | right after a change | sent during a save | back to back through a save | long query: first call after a change | long query: later calls |
+|---|---|---:|---:|---:|---:|---:|---:|
+| snapshot | `GET /status` | 1.5 / 2.0 | 1.1 / 1.8 | 1.6 / 5.4 | 10.2 / 9.3 | | 1.5 / 1.6 |
+| snapshot | REST `GET /monitor` | 1.1 / 0.9 | 1.4 / 2.7 | 1.7 / 1.2 | 47.6 / 3.1 | | 1.6 / 3.0 |
+| snapshot | REST `GET /show` | 1.0 / 0.9 | 1.1 / 1.5 | 1.8 / 3.2 | 8.8 / 8.0 | | 1.6 / 1.7 |
+| snapshot | `/api show` | 1.0 / 0.9 | 1.3 / 1.3 | 2.0 / 2.5 | 3.8 / 7.8 | | 1.6 / 2.0 |
+| snapshot | `/api monitor` | 1.8 / 1.1 | **667.7 / 44.1** | 8.1 / 43.5 | **193.1 / 48.4** | **703.4 / 42.8** | 1.7 / 43.6 |
+| snapshot | `/api stat` | 202.4 / 202.6 | 202.1 / 202.2 | 206.0 / 202.2 | 203.6 / 219.8 | | 202.1 / 205.2 |
+| Stream | `GET /status`, REST `/monitor`, `/show`, `/api show` | ≤ 1.1 / ≤ 1.6 | ≤ 1.6 / ≤ 1.3 | (a commit takes 5 ms) | | | ≤ 3.4 / ≤ 1.5 |
+| Stream | `/api monitor` | 1.6 / 1.2 | **2,986.6 / 42.3** | | | **2,687.2 / 43.0** | 2.4 / 43.4 |
+| Stream | `/api stat` | 202.1 / 201.9 | 204.6 / 202.1 | | | | 202.2 / 202.2 |
+
+(base / head.) No request failed. The head's `/api monitor` waits at most 40
+ms for the background statistics refresh, then answers with the statistics
+of the data before the change and the current counts (median 42 ms whenever
+a refresh is pending — during a save it cannot run, the save holds the
+database); the base recomputes them on the request path after every change:
+0.59–0.70 s on the snapshot layout, 2.3–3.0 s out of core on Stream, also
+while the long query runs, and up to 193 ms when it lands in a save. The
+first `/api monitor` of a freshly loaded database computes the statistics on
+both sides (snapshot 0.66–0.73 s; Stream 2.40 s) — not one of G4's three
+cases. A first pass of this probe (same procedure, offsets up to 2.9 s, no
+back-to-back loop) agrees: head ≤ 43.9 ms in every case, base 0.60–0.76 s
+after a change and 199 ms 1.1 s into a save; its second session per side
+re-inserted the first session's triples (no change, no save) and was
+replaced by the pass above.
+
+- `/status`, REST `/monitor` and `/show`, `/api show`, `/api monitor` ≤ 100
+  ms while a long query runs, right after a change and during a check_point
+  save: **met** (head max 48.4 ms; base `/api monitor` 0.19–3.0 s, and once
+  REST `/monitor` 47.6 ms in a save).
+- `/api stat`: **not met as written** — 201.6–219.8 ms on both sides in
+  every case, idle included (the first call after the load 202–246 ms): it
+  samples the CPU usage over 200 ms by design (upstream's semantics; R3
+  measured the same); what it adds beyond that sample is ≤ 18 ms in every
+  case.
+
+#### Acceptance (R4-SNAP and G4), quiet
+
+| item | target | measured (head; base) | verdict |
+|---|---|---|---|
+| `/begin` on a memory database (univ 38) | ≤ 5 ms, RSS growth ≤ 4 MiB | 0.66–1.08 ms, +20 KiB (base 91–927 ms, +222 MiB) | **met** |
+| `/begin` on a Stream disk database (univ 38) | ≤ 50 ms, ≤ 16 MiB | 0.52–0.94 ms, +20 KiB (base 1.12–1.36 s, +201 MiB) | **met** |
+| `ConcurrentDb` 1-triple update, terms existing | ≥ 1.7× lower latency than the base | univ 8 0.084 / 0.109 ms vs 48.3 / 48.8 ms (443–581×); univ 38 0.510 / 0.541 ms vs 209 / 221 ms (387–434×); copy fallback 3.0–3.4× | **met** |
+| A disk database through the servers: Q4 qps 8 / 1 clients (Stream and Materialize, `/sparql` and `/api`) | ≥ 2.5× | Stream 4.57 / 4.85, 4.23 / 4.59 (univ 8), 4.35 / 4.11, 3.92 / 4.50 (univ 38); Materialize 5.49 / 6.02, 4.12 / 4.71, 5.75 / 5.66, 3.81 / 3.92 (base 1.70–3.31×) | **met** |
+| G4: the same on a memory database | ≥ 2.5× | 4.39 / 5.08, 4.06 / 4.58 (univ 8); 5.00 / 5.53, 3.90 / 4.60 (univ 38) | **met** |
+| Memory layout Q1–Q14 | within ±5% of the base | geomean 0.693× / 0.569×; slowest query q11 +2.1% (univ 8), at univ 38 q11 0.98×, q12 0.95× | **met** |
+| Memory layout build | within ±5% | +4.3% (univ 8), −1.6% (univ 38) | **met** |
+| Memory layout insert throughput | within ±5% | chunk insert 0.837× / 0.812× the base's time; single inserts 1.03× / 0.99× | **met** |
+| Batched `TripleStore` inserts / removes (R4-RECLAIM request) | — | 5,330 / 130,000 low-id triples: insert 95× / 249× (univ 8), 75× / 258× (univ 38) faster than one by one, remove 83× / 132×, 208× / 605×; wired: churn insert on / off 0.99× / 1.04× (part 1) | **met** |
+| `store.bin` / `named.bin` bytes, `Debug` | unchanged | `gbuild` output byte-identical to the base's; golden / legacy-mirror tests pass | **met** |
+| G4 monitoring: `/status`, REST `/monitor` and `/show`, `/api show`, `/api monitor` while a long query runs, right after a change, during a check_point save (univ 38) | ≤ 100 ms | ≤ 48.4 ms on the snapshot layout, ≤ 43.4 ms on Stream (base `/api monitor` 0.6–0.7 s after a change and during the long query, 193 ms in a save; 2.3–3.0 s on Stream) | **met** |
+| G4 monitoring: `/api stat` | ≤ 100 ms | 201.6–219.8 ms, idle included, both sides (a 200 ms CPU sample by design; ≤ 18 ms beyond it) | **not met** as written (by design; follow-up 2) |
+| G4 mixed, check_point off: reader qps (snapshot, Stream) | ≥ 2 × pre's read-only 8-client Q4 | snapshot 32,953 / 32,645, 12,038 / 11,067 (univ 8), 29,837 / 31,567, 9,342 / 9,909 (univ 38); Stream 22,767 / 23,690, 10,172 / 10,132, 20,838 / 22,285, 9,677 / 9,857 (targets 23–159) | **met** |
+| G4 mixed, check_point on, Stream | ≥ pre | 21,801 / 21,231, 10,178 / 9,924 (univ 8); 21,123 / 20,644, 9,407 / 9,418 (univ 38) (targets 11.5–79.3) | **met** |
+| G4 mixed, check_point on, snapshot layout | ≥ pre | univ 8 67.7 / 45.8 (`/sparql`, ≥ 76.3), 34.5 / 39.4 (`/api`, ≥ 76.5); univ 38 19.5 / 10.1 (≥ 13.4), 7.7 / 6.0 (≥ 15.4); base 60.7 / 43.6, 34.5 / 43.9, 10.2 / 12.9, 5.8 / 7.5 | **not met** (= base; full snapshot save per update; follow-up 1) |
+| check_point on with the snapshot layout (R3-SRV request 2) | saves off the exclusive guard | not implemented (investigated; request 2) | **not met** (follow-up 1) |
+| Identical answers | — | every concurrency and mixed point one distinct body, equal to the base's and across layouts; Q1–Q14 rows and hashes equal in every run | **met** |
+
+**G4 (concurrency): partly met** — Q4 scaling ≥ 2.5× via `/sparql` and
+`/api` on memory, Stream and Materialize databases at univ 8 and 38;
+`/begin` O(1) in time and memory; monitoring within 100 ms in every case
+except `/api stat`'s fixed 200 ms sample; mixed workload met everywhere but
+on the snapshot layout with `check_point` on (unchanged from R3 and equal to
+the base).
+
+Follow-ups (plan §5.7; recorded for R4-CLOSURE):
+
+1. **check_point on, snapshot layout** (R4-SNAP request 2; owner of
+   `db/persist.rs`): save from a captured copy-on-write image
+   (`Database::save_image`: dictionary, store and named graphs are O(1)
+   clones now; the VS-tree needs a copy-on-write form or is rebuilt from the
+   captured store), so the HTTP layer releases the exclusive guard after
+   capturing it and serves non-transactional reads the pre-update snapshot
+   until the save is durable. Until then the advice for write-heavy serving
+   with check_point on is the disk layout (`layout=disk`), which meets every
+   mixed target.
+2. **`/api stat`** (`gapi/ops_sys.rs`): its CPU figure is a blocking 200 ms
+   sample per request; a background sampler (the last 200 ms window,
+   refreshed by a small thread or on demand at most every 200 ms) would
+   answer in ~1 ms with the same semantics.
+3. **The first `/api monitor` of a freshly loaded database** computes the
+   statistics on the request path (0.66–0.73 s on the snapshot layout, 2.4 s
+   on Stream at univ 38, both sides): starting the background refresh at
+   load would make every call ≤ 40 ms. (Not one of G4's cases.)
+
+Commands (this stage; base = `/tmp/gstore-base-d702463/bin`, `S` = the
+scratch directory):
+
+```sh
+cargo build --release -p gstore -p gstore-bench --bins && cargo build --release -p gstore --examples
+cargo test --release -p gstore --test dt_cow_store --no-run
+export GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache
+# 1. ConcurrentDb update latency / batched writes (dt_cow_store drivers; base: scratch test at d702463)
+GSTORE_COW_BENCH_NT=$GSTORE_BENCH_CACHE/lubm-like1-u38-s0.nt flock /tmp/gstore-bench.lock \
+    target/release/deps/dt_cow_store-* --ignored --nocapture --exact concurrent_update_latency
+GSTORE_COW_BENCH_NT=… GSTORE_COW_BENCH_BATCH=130000 flock /tmp/gstore-bench.lock \
+    target/release/deps/dt_cow_store-* --ignored --nocapture --exact batch_of_low_ids_latency
+# 2. memory layout, 3 pairs per scale (base: its own harness, without --extra)
+flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale 38 --extra none \
+    --backends snapshot --no-conc --bin-dir target/release --work-dir /tmp/r4snap-work --out head.json
+# 3. concurrency + mixed, 2 pairs per scale and layout (base: no --extra/--label/--mixed-*)
+flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale 38 --extra none \
+    --backends disk --env GSTORE_DISK_QUERY_MODE=stream --label stream --reps 1 --query-procs 1 \
+    --open-reps 1 --no-update --conc-clients 1,8 --conc-secs 5 --conc-queries q1,q4 \
+    --conc-endpoints sparql,api --mixed-secs 10 --bin-dir target/release --out head-stream.json
+target/release/gstore-bench merge --out bench/results/phase6-r4-conc-lubm38.json head-snapshot.json head-stream.json head-materialize.json
+target/release/gstore-bench report bench/results/phase6-r4-conc-lubm38.json --markdown --compare base-merged.json
+# base mixed: srv_mixed_load built at d702463 (+ a scratch --prebuilt DIR option for the gbuild --disk database)
+flock /tmp/gstore-bench.lock $S/srv_mixed_load --data $GSTORE_BENCH_CACHE/lubm-like1-u38-s0.nt --secs 10 \
+    --readers 8 --write-ms 100 --query q4 --scratch /tmp/r4snap-mixed
+# 4. /begin and monitoring: gserver --api H --db-home H --port 9311 --thread-num 8
+#    (GSTORE_DISK_QUERY_MODE=memory|stream), curl -w %{time_total} + /proc/<pid>/status VmRSS;
+#    monitoring: a Python client (http.client), cases as described above
+# 5. save: a scratch test driver (open, save x3) on both sides; callgrind --toggle-collect='*save_locked*'
+```
+
+Every database this stage built was deleted (the work directories, the
+`/begin` and monitoring homes, the save drivers' copies); the base worktree,
+its target directory and the scratch drivers were removed.
+
+### Implementer run (noisy)
+
 All numbers: **implementer run, noisy** (4 vCPU VM shared with another
 implementer; load average 3–4 during the runs), univ 8 (`lubm-like1-u8-s0`,
 1,029,275 triples), every heavy command under `flock
@@ -349,7 +781,7 @@ batched-operation change (the spare's journal replay): base 67.8 ms median
 0.089–0.096 ms (p90 0.11–0.16 ms), the copy fallback 19.3–20.9 ms.
 Acceptance (≥ 1.7× lower): **met**.
 
-### Measure-stage commands
+#### Measure-stage commands
 
 Base binaries: `/tmp/gstore-base-d702463/bin`; branch: `cargo build
 --release -p gstore -p gstore-bench --bin gbuild --bin gserver --bin
