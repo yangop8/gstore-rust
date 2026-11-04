@@ -13,7 +13,7 @@
 3. **gStore 标志性能力只做到"同名"**:24 个图分析函数在上游语法下**无一能解析**,语义和输出也不同;推理引擎和 PFN 自定义函数没有对外入口(§3)。
 4. **规模与运维**:没有真正的磁盘原生查询路径,导入不流式、不容错,没有 conf.ini、日志体系、打包和 CI(§4、§5)。
 
-**进度(截至 Phase 4 与 Phase 5 合并)**:Phase 0–5 已完成并合入主线(各阶段状态见下文各节的"状态"段与 §8 表格,逐项变更见 `CHANGELOG.md`);Phase 6(规模与性能,§8 第 6 行)正在实施,其执行计划(12 个工作包、4 轮、退出闸门 G1–G7)见 `docs/PHASE6_PLAN.md`。
+**进度(截至 Phase 6 结束)**:Phase 0–6 都已完成(各阶段状态见下文各节的"状态"段、§8 表格与 §9 状态表,逐项变更见 `CHANGELOG.md`)。Phase 6(规模与性能,§8 第 6 行)按 `docs/PHASE6_PLAN.md` 分 4 轮实施,退出闸门 G1–G7 中 G1a–G1d、G3、G6、G7 通过,G2、G4、G5 各有一部分未达(实测值、原因与后续见 §9 与 `docs/BENCHMARKS.md`);仍未补齐的上游差距见 §9.3。
 
 ---
 
@@ -236,4 +236,42 @@
 | 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 2–3 周 | parser_test 50 组通过 | 已完成 |
 | 4 | §3.2 推理 + §3.3 PFN | 3 周 | reasonManage 走完全生命周期,PFN 示例可跑 | 已完成(含 gconsole 对接,见 §3.2/§3.3) |
 | 5 | §4.2 导入导出 + §5 gconsole/日志/打包 | 3 周 | README 中 `gconsole -u root` 的流程能照做;Docker 镜像可用 | 已完成 |
-| 6 | 规模与性能(长期):`Backend::Disk` 流式查询直接穿透 `Database`、字典与 VS-tree 留在磁盘、持久化 StringIndex、批量建索引(B+ 树 bulk load / RocksDB SST ingest)、读写锁或廉价快照替代 `Mutex<Database>`、删除时即时回收 ID | 持续 | LUBM/WatDiv 的规模和延迟与上游同量级 | 待开始 |
+| 6 | 规模与性能(长期):`Backend::Disk` 流式查询直接穿透 `Database`、字典与 VS-tree 留在磁盘、持久化 StringIndex、批量建索引(B+ 树 bulk load / RocksDB SST ingest)、读写锁或廉价快照替代 `Mutex<Database>`、删除时即时回收 ID | 持续 | LUBM/WatDiv 的规模和延迟与上游同量级 | 已完成(G7 达成;G2、G4、G5 部分未达,见 §9) |
+
+## 9. 状态表与 Phase 6 结论
+
+> 截至 Phase 6 结束(phase6 分支)。除非注明,数字出自提交的 `bench/results/phase6-final-*.json`(LUBM-like univ 38,5,181,103 个三元组;与 `bench/results/pre-phase6-lubm38.json` 即 Phase 6 之前的代码比较),其余注明出处的数字来自某个工作包的安静测量阶段(空闲的参考机,4 vCPU / 16 GB)。测量方法、全部表格、每个闸门的原因与后续见 `docs/BENCHMARKS.md`;Phase 6 的逐项变更见 `CHANGELOG.md` 的 Phase 6 一节。
+
+### 9.1 各阶段状态
+
+| # | 阶段 / 领域 | 状态 | 验收 / 关键实测 |
+|---|---|---|---|
+| 0 | §1 P0:数据安全与正确性、CI、修正文档 | 已完成 | 回归用例(磁盘库 gadd→gquery、RocksDB 更新后重开、batch 注入、`STR()`)与 CI 全绿 |
+| 1 | §2 `/api` 兼容层、`conf.ini`、`gserver` 生命周期、移植上游测试 | 已完成 | 上游 `basic` / `update` / `transaction` / `api_test` 与 Python SDK 对本仓 `gserver` 通过(`scripts/conformance.sh`;Phase 6 最终运行 6 / 6 组) |
+| 2 | §3.1 高级图函数 + CSR | 已完成 | `SPARQL_QUERY.md` 全部示例与 bfs_test 输出与上游一致 |
+| 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 已完成 | parser_test 50 组在优化开 / 关两种设置下通过 |
+| 4 | §3.2 推理 + §3.3 PFN | 已完成 | `reasonManage` 走完全生命周期;PFN 示例可跑(`pfn-wasm`) |
+| 5 | §4.2 导入导出 + §5 gconsole / 日志 / 打包 | 已完成 | README 的 `gconsole -u root` 流程可照做;Docker 镜像可用 |
+| 6a | `Backend::Disk` 流式查询直通 `Database`(Stream 模式) | 已完成;可选模式,默认仍是 Materialize | G1b、G1c、G1d 通过:热打开 0.92 ms、冷 7.5 ms,打开后 RSS 6.1 MiB,Q1–Q14 几何均值 11.55 ms = pre 磁盘布局的 0.079 倍、同一提交快照布局的 1.14 倍。R3-STREAM 自己的翻转条件(每条查询 ≤ 2.0 × Materialize、几何均值 ≤ 1.4 ×)仍不满足(Q14 2.15 倍、几何均值 1.47 倍),所以默认模式没有改 |
+| 6b | 字典与 VS-tree 留在磁盘 | 已完成 | out-of-core 字典 `DiskDict`(有界的 `TermCache` / `KeyCache`,结果按排序批量解析);`vstree.kv` 不在打开时重建,`VsPolicy::Auto` 下查询从 store 精确算出树给出的候选集、不读它的页(R4-VS 安静阶段,univ 38 Stream:几何均值 11.66 ms,强制旧的逐页遍历 `GSTORE_VS_POLICY=tree` 时 47.70 ms) |
+| 6c | 持久化 StringIndex | 已完成上游含义;trigram 索引持久化延后 | 上游含义(持久化 id → 串、按偏移排序的批量访问)= `id2*` IvArray + `Dictionary::prefetch` / `resolve_many`;内存字典的 trigram 子串索引按字典 generation 缓存(R2-DICT 安静阶段 univ 8:重复的子串查询 11.7–16.9 ms,首次 2,073.6–2,888.5 ms);持久化 `lexindex.kv` 按计划延后(`docs/PHASE6_PLAN.md` §8 D5) |
+| 6d | 批量建索引(B+ 树 bulk load / RocksDB SST ingest) | 已完成 | G1a、G3 通过:`gbuild --disk` 18.38–21.06 s(pre 1,627.59 s),1,024 MiB 预算下峰值 ≤ 400 MiB,`kvstore.kv` 是 pre 的 0.697 倍;`gbuild --rocksdb` 19.50 s(pre 277.76 s);崩溃安全安装,id 与内存构建相同 |
+| 6e | 读写锁 / 廉价快照替代 `Mutex<Database>` | 已完成;G4 未全达 | 8 / 1 客户端的 Q4 吞吐比:快照布局 5.33(`/sparql`)/ 4.63(`/api`),Stream 4.06 / 4.73(pre 0.78 / 0.86);`/begin` 中位数 0.38 / 0.44 ms、RSS +0.07 / +0.06 MiB;未达:`/api stat` 每请求阻塞采样 200 ms CPU(201.6–219.8 ms,R4-SNAP 安静阶段;其余监控端点 ≤ 48.4 ms) |
+| 6f | 删除时即时回收 id | 已完成(所有布局,默认开);G5 未全达 | live 计数恰等于被引用的词、高水位 1.000(R4-RECLAIM 安静阶段,10 轮 churn,四种布局);未达:相对第 0 轮 +5.20%(churn 数据本身 +5.23%),内存与 Materialize 的删除开销 1.13 / 1.14(目标 ≤ 1.10) |
+| 6g | 基准、CI、文档(gstore-bench、WatDiv-like 负载、最终测量、文档收尾) | 已完成 | G6、G7 通过;smoke 基线重新 bless(含 WatDiv-like 与混合读写负载),库大小闸门收紧到 1.10;`docs/BENCHMARKS.md` |
+
+### 9.2 Phase 6 结论:按数字判定 G1–G7
+
+Phase 6 的目标是"LUBM/WatDiv 的规模和延迟与上游同量级"(§8 第 6 行),以 `gstore-bench` 测量。按数字看这个目标达到了。**G7**:在 univ 82(11,135,159 个三元组,约等于上游的 lubm10M,实测而非外推;`phase6-final-lubm82.json`)上,快照布局 / 默认模式的磁盘布局每三元组构建 6.27 / 4.45 µs、占 83.2 / 126.2 字节,Q2 85.3 / 71.2 ms、Q14 141.3 / 165.3 ms,每项都不超过上游 gStore 0.5.0 的正式实验(23 µs、264 字节、144 ms、223 ms);数据生成器、硬件和 harness 都不同,Q1、Q3、Q4 在本仓是亚毫秒级,它们的比值主要量的是上游约 23 ms 的 harness 下限。**G1**:磁盘布局的构建从 1,627.59 s 降到约 20 s(G1a);Stream 模式的打开从 7,673.5 ms 热 / 12,387.4 ms 冷降到 0.9 / 7.5 ms,打开后 RSS 从 544.0 MiB 降到 6.1 MiB,查询高水位 207.3 MiB(G1b、G1c);Q1–Q14 几何均值从 146.92 ms 降到 11.55 ms(Stream)、7.83 ms(Materialize)(G1d)。**G3**:RocksDB 的打开从约 60 s 降到 0.74 s(打开时不再重建 VS-tree),构建 0.070 倍,几何均值 0.080 倍。**G6**:每种布局、每种模式在 univ 8 / 38 / 82 与 WatDiv-like 规模 10 上的答案行数与行哈希都相同,并等于 Phase 6 之前的;完整测试矩阵(工作区两种磁盘模式各 2,375 个、RocksDB 2,202 个、特性组合 2,192 个)、`conformance.sh` 与崩溃测试全绿。**未达的三项**都记录了实测值、原因与后续(计划 §5.7),也都不是第 4 轮的退化:**G2** 的构建 0.385 倍、RSS 0.820 倍、几何均值 0.218 倍、Q4 0.049 ms(pre 53.63 ms)都达标,但 Q11 / Q12 的 univ 38 / univ 8 比值是 5.58 / 4.91(目标 ≤ 2.0)——亚毫秒查询,内存 VS-tree 的 probe 随数据增长,同会话对基线 A/B 时间相同,基线的比值是 6.02 / 4.99;**G4** 的吞吐扩展与 `/begin` 都达标,只有 `/api stat` 按设计(上游语义)每请求阻塞 200 ms;**G5** 的精确性与高水位达标,±5% 差 0.20 个百分点(churn 数据本身变了 5.23%),内存与 Materialize 的删除开销(1.12–1.13、1.14)比目标 1.10 高 2–4 个百分点。默认磁盘查询模式保持 Materialize:Stream 满足 G1 的全部闸门,但没满足它自己的翻转条件,而且大结果在 univ 82 扩展得更差(Q6 / Q13 / Q14 是快照布局的 4.65 / 5.10 / 6.20 倍)。
+
+### 9.3 仍未补齐的上游差距
+
+与上游 gStore 1.4 相比仍然开放的项(本仓自己的后续与计划 §8 的延后项 D1–D15 另见 `docs/REFACTOR_BACKLOG.md` §I):
+
+- **并发事务**:上游允许一个库上并发事务;本仓每个库单写者——第二个 `begin` 答 `1008`,事务打开期间其它写答 `1004`(§2 的已知差异;多写者 MVCC 是 D14)。
+- **默认磁盘查询模式仍载入工作集**:上游 `Database::load` 不把三元组全量读入内存;本仓的 Stream 模式做到了这一点,但仍是可选模式(§9.2),默认的 Materialize 打开时把字典、默认图和命名图载入内存(univ 38 热打开 1,720.8 ms、打开后 351.0 MiB)。Stream 模式下命名图仍留在内存(D11)。
+- **磁盘布局的容量上限**:每个 id 空间至多 33,554,432 项(IvArray),字典键至多 2,038 字节(B+ 树半页);超出时明确报错,feature bit 1 / 2 为此保留(D7)。计划估计 LUBM-1000 约 22M 个实体,仍在上限内。
+- **空间回收与大事务原子性**:`kvstore.kv` 只增不减(没有 vacuum,D9;R4-RECLAIM 的 churn 里 Stream 文件涨到第 0 轮的 1.474 倍);大于页缓存的磁盘事务持久但不整体原子(D12)。
+- **快照布局在 `check_point` on 时每次写重写整个快照**(univ 38 每次约 1.1 s,混合负载读者 12.5 / 10.1 qps);需要逐次增量落盘时用磁盘布局(与上游 KVstore 的方式一致)。
+- **Top-K 与 SPARQL 细节**:DP-B 只处理树形 BGP 与整数排序键(上游还会切断一条环边);Phase 3 记下的其余已知差异(带标签空节点的语义、`FROM` / `FROM NAMED` 被跳过、部分字符串函数的参数兼容性检查等)见 `CHANGELOG.md` 的 Phase 3 "Known gaps"。
+- **刻意的偏离**(不计划补):PFN 函数体是 WebAssembly 文本而非上游的 C++(`docs/PFN.md`);推理规则精确撤回;id 复用取最低空闲 id(上游 LIFO);上游不开源的分布式版本没有对应物,本仓的 `cluster` / `rpc` 仍是实验特性(§7 第 4 项)。

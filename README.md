@@ -25,12 +25,17 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 1,960 tests pass** across the workspace (incl. 159 for gNLQA), among them
-  ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`, `gzip`,
-  `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
-  --workspace --all-targets -- -D warnings` is clean. Progress toward gStore 1.4 parity is
+* **About 2,375 tests pass** across the workspace (incl. 159 for gNLQA; the
+  Phase 6 closure run, once with on-disk databases in each query mode), among
+  them ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`,
+  `gzip`, `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
+  --workspace --all-targets -- -D warnings` is clean on the toolchain CI pins
+  (Rust 1.99.1, `RUST_TOOLCHAIN` in `.github/workflows/ci.yml`; a newer local
+  clippy may report lints CI does not see until the pin is bumped), and CI
+  checks `cargo fmt --all -- --check`. Progress toward gStore 1.4 parity is
   planned in [`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) and recorded per phase in
-  [`CHANGELOG.md`](CHANGELOG.md).
+  [`CHANGELOG.md`](CHANGELOG.md); measurements are in
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ---
 
@@ -150,9 +155,18 @@ optimizer and a VS-tree signature filter.
   functions, written in WebAssembly text and run sandboxed over the graph
   (feature `pfn-wasm`; see [PFN](#pfn-user-graph-functions) and
   [`docs/PFN.md`](docs/PFN.md)).
-* **On-disk B+ tree KVstore** (`gbuild --disk`) and an optional **RocksDB backend**
-  (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver --rocksdb`)
-  — see [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
+* **Three storage layouts** — the in-memory snapshot, an **on-disk B+ tree
+  KVstore** (`gbuild --disk`) that answers queries from an in-memory working
+  set (Materialize, the default) or straight off the B+ trees with an
+  out-of-core dictionary (**Stream**: it opens in milliseconds with a few MiB
+  of memory whatever the data's size), and an optional **RocksDB backend**
+  (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver
+  --rocksdb`). `gbuild --disk` / `--rocksdb` build in bulk (external sort,
+  bottom-up B+ tree pages or SST ingest, a crash-safe install), and the ids
+  of deleted terms are reclaimed on every layout — see [Storage layouts and
+  query modes](#storage-layouts-and-query-modes),
+  [Performance](#performance) and
+  [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
 * **HTTP server** speaking upstream gStore's **`/api` protocol** (the upstream
   SDKs work unchanged) and a REST/SPARQL-protocol API: content negotiation,
   users with per-database privileges, IP lists, query/access/transaction logs,
@@ -163,14 +177,18 @@ optimizer and a VS-tree signature filter.
   server's `/api`: all 43 commands of upstream's table (databases, users and
   privileges, backups, reasoning rules, PFN functions) and SPARQL typed at
   the prompt, printed as upstream prints them (see [gconsole](#gconsole)).
-* **Operations** — upstream's `conf.ini` (plus `[query]`, `[pfn]`, `[log]`
-  and zip-limit extension keys, re-read by `refreshconf`), a daily-rolling
+* **Operations** — upstream's `conf.ini` (plus `[query]`, `[pfn]`, `[log]`,
+  `[storage]` and zip-limit extension keys, re-read by `refreshconf`), a daily-rolling
   diagnostic log configured like upstream's log4cplus, JSON query / access
   logs, zip packages and zipped backups (feature `zip`), upstream 1.3's
   command-line spellings, and a container image, a systemd unit and deb /
   rpm packages ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
 * **Transactions** — commit/rollback, per-key MVCC + snapshot isolation, four
-  named isolation levels, and full + **incremental** backup/restore.
+  named isolation levels, and full + **incremental** backup/restore. Reads of
+  one database run in parallel on both HTTP servers (writes are exclusive),
+  and an HTTP transaction's begin-time snapshot copies no triple on
+  in-memory and on-disk databases (copy-on-write stores, disk read views;
+  RocksDB still copies).
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
@@ -188,12 +206,20 @@ Remaining large-refactor items are tracked in
 ### CLI tools
 
 A database is a `<name>.db` directory. Main tools (there are more — `gadd`,
-`gsub`, `gdrop`, `gshow`, `gbackup`, `grestore`, `gexport`, `gmonitor`, `gnode`;
-the [command-line tools section of `docs/DEPLOY.md`](docs/DEPLOY.md#command-line-tools)
-lists them in upstream 1.3's spelling):
+`gsub`, `gdrop`, `gshow`, `gbackup`, `grestore`, `gexport`, `gmonitor`,
+`gcompact`, `gnode`; the [command-line tools section of
+`docs/DEPLOY.md`](docs/DEPLOY.md#command-line-tools) lists them in upstream
+1.3's spelling):
 
 ```bash
-gbuild mydb data.nt          # build a DB from RDF (add --disk for the on-disk B+ tree)
+gbuild mydb data.nt          # build a DB from RDF (the snapshot layout, or conf.ini's
+                             # [storage] default_layout)
+gbuild --disk mydb data.nt   # the on-disk B+ tree, built in bulk (--layout disk;
+                             # --memory MB, --threads N, --tmp-dir DIR, --fill PCT)
+gbuild --rocksdb mydb data.nt  # RocksDB, built in bulk by SST ingest (feature rocksdb)
+gcompact mydb                # show the id spaces; --reclaim frees every unused id,
+                             # --enable-reclaim turns reclamation on for an older
+                             # kvstore.kv, --check verifies them
 gquery mydb query.rq         # run a SPARQL query (or -e "…" inline)
 gconsole -u root             # upstream's console, a client of a running gserver
 gconsole --local mydb        # the embedded REPL on mydb.db (no server)
@@ -221,12 +247,17 @@ The tools also take upstream 1.3's options (`-db NAME`, `-f FILE`, `-p PATH`,
 empty database and refuses to overwrite an existing one unless `--force`;
 `gbuild x.zip` reads a zip package (feature `zip`); `gshow` with no argument
 lists every database in the current directory. *Changed:* `grestore` used
-to take the backup first.
+to take the backup first. `gbuild --disk` / `--rocksdb` print the counts and a
+summary of the bulk build (phases, memory budget and peak, term map, spilled
+runs) instead of reopening the database; `--incremental` builds them the
+previous way, one insert at a time.
 
 Every tool opens a database directory whatever its layout (snapshot, on-disk
 `--disk`, RocksDB), and updates are persisted back to it. `gserver` saves each
 write before acknowledging it (gStore's `check_point`; `--no-checkpoint` defers
 saving to `/checkpoint`, `/unload` and the graceful shutdown on Ctrl-C/SIGTERM).
+That save is the whole snapshot on the snapshot layout; the on-disk and
+RocksDB layouts commit each acknowledged write incrementally either way.
 SPARQL `LOAD` (and `/build?db_path=`) sent to a server reads nothing unless
 `--load-dir DIR` allows it, `/backup` and `/restore` stay inside the server's
 backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
@@ -236,14 +267,116 @@ which also lets `/api` `build` / `batchInsert` / `batchRemove` with
 link-local or other host-local address).
 
 A database directory is open in **one process at a time**: opening it takes an
-operating-system lock on `<name>.db/LOCK` (snapshot and `--disk` layouts;
-RocksDB locks itself), held for as long as the database is open. So while a
+operating-system lock on `<name>.db/LOCK` (every layout; a RocksDB database
+also holds RocksDB's own `rocksdb/LOCK`), held for as long as the database is
+open; builds, saves, restores, `gbackup` and `gdrop` take it too. So while a
 `gserver` has a database loaded, `gquery`, `gadd`, `gconsole --local`, `gbackup`, … on
 the same directory fail with "… is locked by another process (pid N)" instead
 of racing it — unload it there (or use the server's API) first. The server's
 `drop`, `rename`, `restore` and rebuilding `/build` refuse a directory another
 process holds, too. `Database::read_copy` reads a detached copy of a snapshot
 database without the lock.
+
+### Storage layouts and query modes
+
+Every tool and both servers detect a directory's layout (`rocksdb/` first,
+then `kvstore.kv`, then the snapshot's `meta.bin`):
+
+| layout | built by | queries run on | writes |
+|---|---|---|---|
+| snapshot | `gbuild` (`--layout snapshot`) | the in-memory store, loaded whole at open | a save rewrites the snapshot files |
+| disk | `gbuild --disk` (`--layout disk`) | **Materialize** (default): an in-memory working set; **Stream**: the B+ trees and an out-of-core dictionary | written to `kvstore.kv` incrementally, at WAL-protected commit points |
+| RocksDB | `gbuild --rocksdb` (`--layout rocksdb`, feature `rocksdb`) | RocksDB's column families, read by bounded scans | RocksDB write batches |
+
+* **Which layout a build makes.** `gbuild` without `--layout` / `--disk` /
+  `--rocksdb`, REST `/build` and `/api build` without `layout=` use
+  `conf.ini`'s `[storage] default_layout`, else the snapshot layout.
+* **Disk query mode.** `[storage] disk_query_mode=memory|stream`,
+  `GSTORE_DISK_QUERY_MODE=stream|memory`, or
+  `Database::open_with(dir, &OpenOptions::stream())`. Stream opens in
+  milliseconds and keeps only the named graphs, the per-predicate statistics
+  and bounded caches in memory; Materialize stays the default because Stream
+  is still slower on queries with large results (see
+  [Performance](#performance)). Both modes read and write the same
+  `kvstore.kv`, so a directory can be opened in either, in turn.
+* **Id reclamation** (`[system] id_reclaim=on`, the default): after a delete,
+  every term no triple or quad references any more leaves the dictionary and
+  its id is reused by the next new term, lowest first, on every layout; the
+  entity / literal / predicate counts count live terms. A transaction frees
+  at `commit`. Applications must not cache ids across a delete.
+* **Formats.** Snapshot files and RocksDB stores keep their formats, and
+  older binaries open them. A **new** `kvstore.kv` is created in version 2
+  (magic `GSTOREK2`, with a free-id list) unless `id_reclaim=off`; binaries
+  older than Phase 6 refuse it. An existing version-1 `kvstore.kv` is never
+  upgraded implicitly: reclamation stays off on it until `gcompact
+  --enable-reclaim`. To go back, `gexport` with the new binary and `gbuild`
+  with the old one.
+
+Details: [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
+
+### Performance
+
+Measured with `gstore-bench`, the workspace's benchmark harness
+([`bench/README.md`](bench/README.md)), on the 4 vCPU / 16 GB reference VM
+with nothing else running: LUBM-like univ 38 (5,181,103 triples), each layout
+built by `gbuild` and opened, queried and updated through the public API in
+fresh processes; "vs base" is the ratio to the code before Phase 6
+(`bench/results/pre-phase6-lubm38.json`). Generated by `gstore-bench report`
+from the committed `bench/results/phase6-final-lubm38.json`:
+
+<!-- gstore-bench report --table overview bench/results/phase6-final-lubm38.json --compare bench/results/pre-phase6-lubm38.json -->
+| workload | backend | build s | build peak MiB | dir MB | open first ms | open warm ms | RSS after open MiB | query HWM MiB | geomean ms | build vs base | open vs base | geomean vs base |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| lubm-like univ 38 | snapshot | 29.60 | 550.1 | 430.8 | 1184.8 (cold) | 1033.0 | 489.1 | 601.0 | 10.15 | 0.39× | 0.71× | 0.22× |
+| lubm-like univ 38 | disk@materialize | 21.06 | 400.3 | 654.0 | 1817.3 (cold) | 1720.8 | 351.0 | 457.1 | 7.83 | 0.01× | 0.22× | 0.05× |
+| lubm-like univ 38 | disk@stream | 18.38 | 398.2 | 654.0 | 7.5 (cold) | 0.9 | 6.1 | 207.3 | 11.55 | 0.01× | 0.00× | 0.08× |
+| lubm-like univ 38 | rocksdb | 19.50 | 401.6 | 155.7 | 738.9 (cold) | 678.0 | 270.8 | 436.2 | 25.00 | 0.07× | 0.01× | 0.08× |
+<!-- /gstore-bench report -->
+
+At univ 82 (11,135,159 triples, about the size of upstream's lubm10M;
+`bench/results/phase6-final-lubm82.json`):
+
+<!-- gstore-bench report --table overview bench/results/phase6-final-lubm82.json -->
+| workload | backend | build s | build peak MiB | dir MB | open first ms | open warm ms | RSS after open MiB | query HWM MiB | geomean ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| lubm-like univ 82 | snapshot | 69.79 | 1175.4 | 926.5 | 2715.3 (cold) | 2395.9 | 1046.0 | 1245.0 | 21.94 |
+| lubm-like univ 82 | disk@materialize | 49.53 | 645.1 | 1405.5 | 4412.0 (cold) | 3404.1 | 734.4 | 939.5 | 16.09 |
+| lubm-like univ 82 | disk@stream | 45.88 | 610.0 | 1405.5 | 4.8 (cold) | 0.9 | 6.4 | 380.8 | 30.18 |
+<!-- /gstore-bench report -->
+
+Upstream gStore 0.5.0's published lubm10M run built its index in 23 µs per
+triple, into 264 bytes per triple, and answered LUBM Q2 in 144 ms and Q14 in
+223 ms; at univ 82 the snapshot / disk (Materialize) layouts build in 6.27 /
+4.45 µs per triple, into 83.2 / 126.2 bytes per triple, and answer Q2 in
+85.3 / 71.2 ms and Q14 in 141.3 / 165.3 ms — with a different data
+generator, hardware and harness. The per-query
+tables, the WatDiv-like workload, the concurrency and mixed read/write
+figures, the comparison's caveats and the Phase 6 exit gates are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+To reproduce the univ 38 file and the tables (from the workspace root;
+`--drop-caches` needs root):
+
+```sh
+cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
+CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore -p gstore-bench --bin gbuild --bin gstore-bench \
+    --features gstore/rocksdb,gstore-bench/rocksdb
+export GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache B=target/release/gstore-bench
+s=38
+$B run --profile reference --scale $s --extra none --backends snapshot --drop-caches --verify-data --out f$s-s.json
+$B run --profile reference --scale $s --extra none --backends disk --env GSTORE_DISK_QUERY_MODE=stream \
+    --label stream --drop-caches --verify-data --out f$s-ds.json
+$B run --profile reference --scale $s --extra none --backends disk --env GSTORE_DISK_QUERY_MODE=memory \
+    --label materialize --drop-caches --verify-data --out f$s-dm.json
+target-rocks/release/gstore-bench run --profile reference --scale $s --extra none --backends rocksdb \
+    --bin-dir target-rocks/release --drop-caches --verify-data --out f$s-r.json
+$B merge --out bench/results/phase6-final-lubm$s.json f$s-s.json f$s-ds.json f$s-dm.json f$s-r.json
+$B report --update README.md CHANGELOG.md docs/BENCHMARKS.md
+```
+
+`target/release/gstore-bench ci` runs the smaller smoke profile (LUBM-like
+univ 1 and WatDiv-like scale 1) and gates it against
+`bench/baselines/smoke.json`, as the `bench` CI workflow does.
 
 ### Importing RDF
 
@@ -360,6 +493,36 @@ default 10^9, `0` = unlimited), `pfn_max_memory_pages` (default 1024 =
 64 MiB), `pfn_max_module_bytes` (default 1 MiB) and `pfn_max_functions` (per
 user, default 100). Upstream's `[system] pfn_base_path` (default here:
 `<db_home>/pfn`) is where the functions are stored; it is read at startup.
+
+A `[storage]` section (gstore-rust only) sets how databases are opened and
+built ([Storage layouts](#storage-layouts-and-query-modes)). `gserver`
+installs it as the process's defaults at startup and `refreshconf` installs
+it again: databases loaded afterwards use it, a loaded database keeps the
+query mode it was opened in.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `disk_query_mode` | `memory` | how an on-disk database answers queries: `memory` (Materialize) or `stream` |
+| `disk_cache_mb` | `16` | MiB of page cache per on-disk database |
+| `dict_cache_mb` | `80` | MiB a Stream-mode database's dictionary may cache (four fifths id → term, one fifth term → id) |
+| `vstree_on_open` | `off` | build the VS-tree when a database is opened without a fresh one (RocksDB; a Stream-mode database whose `vstree.kv` is stale) instead of querying without it until `rebuild_index` |
+| `default_layout` | unset (`snapshot`) | the layout `gbuild`, REST `/build` and `/api build` create when the request names none: `snapshot`, `disk` or `rocksdb` |
+| `rocksdb_block_cache_mb` | `256` | MiB of the block cache a RocksDB database shares across its column families; `0` = RocksDB's own default (32 MiB per column family) |
+| `rocksdb_bloom` | `10` | bloom-filter bits per key on RocksDB's point-lookup column families; `on` (= 10) or `off` |
+
+`[system]` gains `id_reclaim` (`on`, the default, or `off`: ids are then only
+freed by `gcompact --reclaim`; read by `gserver` and `gbuild`, the other
+command-line tools follow `GSTORE_ID_RECLAIM` only) and the bulk-build keys
+`gbuild` reads from `./conf/conf.ini`: `build_memory_mb` (1024, the sort
+budget; the dictionary under construction comes on top), `build_threads` (`0`
+= every core; `build_multi_thread=off` means one), `build_tmp_dir` (where
+sorted runs spill; default inside the database directory) and
+`build_fill_factor` (90, percent B+ tree node fill). Environment variables
+win over the file: `GSTORE_DISK_QUERY_MODE=stream|memory`,
+`GSTORE_DISK_CACHE_MB`, `GSTORE_VSTREE_ON_OPEN`, `GSTORE_ID_RECLAIM=on|off`,
+`GSTORE_ROCKS_BLOCK_CACHE_MB`; `GSTORE_VS_POLICY=auto|tree|off` (no file
+key) selects how queries use the VS-tree (`auto`, the default, computes the
+tree's candidate sets from the store on disk databases).
 
 [Reasoning rules](#reasoning-reasonmanage) have no `conf.ini` keys: their
 limits are fixed (1000 rules per database, 1 MiB per rule file, 64
@@ -708,7 +871,14 @@ db.query("INSERT DATA { <a> <p> <b> }")?;
 let rs = db.select("SELECT ?o WHERE { <a> <p> ?o }")?;
 println!("{}", rs.to_table_string());
 db.save("demo.db")?;                 // persist
-let db = Database::load("demo.db")?; // reload
+let db = Database::load("demo.db")?; // reload (any layout)
+
+// an on-disk database, built in bulk, opened in Stream mode; `&Database`
+// reads may run on several threads at once (`Database` is Send + Sync)
+use gstore::OpenOptions;
+Database::build_disk("big.db", &["data.nt"])?;
+let big = Database::open_with("big.db", &OpenOptions::stream())?;
+let r = big.query_read("SELECT ?o WHERE { <a> <p> ?o }", None, None)?;
 ```
 
 ### Experimental: cluster
@@ -749,9 +919,9 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | module        | role                                                    |
 |---------------|--------------------------------------------------------|
 | `model`       | RDF terms, triples, id conventions                     |
-| `dict`        | bidirectional string↔id dictionaries                   |
-| `store`       | in-memory `s2xx`/`o2xx`/`p2xx` six-way index           |
-| `kvstore` / `backend` | on-disk pager + B+ trees; RocksDB backend      |
+| `dict`        | bidirectional string↔id dictionaries (copy-on-write in memory; `TermStr`, bounded caches for out-of-core backends) |
+| `store`       | in-memory `s2xx`/`o2xx`/`p2xx` six-way index (copy-on-write); the `TripleSource` seam, `Backend`, per-statement read errors, the transaction overlay |
+| `kvstore` / `backend` | on-disk pager + B+ trees, the format registry, `DiskTriples` / `DiskDict` (Stream mode); RocksDB backend |
 | `signature`   | signatures + VS-tree candidate filter                  |
 | `parser`      | N-Triples/Turtle/N-Quads/TriG/RDF-XML/JSON-LD/RDFa; SPARQL (query + update) |
 | `query`       | algebra eval, joins, optimizer, FILTER, aggregates, Top-K |
@@ -764,8 +934,10 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
 | `reason`      | upstream inference rules (`reasonManage`), RDFS, textual rules |
 | `pfn`         | PFN user graph functions: per-user registry, `GraphCtx`, sandboxed WebAssembly runtime (`pfn-wasm`) |
-| `db`          | `Database` facade + persistence (mem & disk)           |
+| `bulk`        | bulk builds (`gbuild --disk` / `--rocksdb`): external sort, page images / SST ingest, crash-safe install |
+| `db`          | `Database` facade + persistence (every layout), open options, id reclamation, directory locks |
 | `gnlqa/`      | LLM natural-language QA layer (separate crate)          |
+| `bench/`      | `gstore-bench`, the benchmark harness and CI gates (separate crate; [`bench/README.md`](bench/README.md)) |
 | `bin/`        | `gbuild`, `gquery`, `gconsole`, `gserver`, …            |
 | `packaging/`, `Dockerfile` | systemd unit, deb/rpm scripts, container image ([`docs/DEPLOY.md`](docs/DEPLOY.md)) |
 

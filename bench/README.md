@@ -250,6 +250,10 @@ hashes 16 hex digits. A baseline is the same document with `"kind":
   makes things ≥ 1.5× faster, or after an intended format change).
 * `bench/results/pre-phase6-lubm8.json`, `pre-phase6-lubm38.json` — the
   pre-Phase-6 reference every Phase 6 acceptance ratio is measured against.
+* `bench/results/phase6-final-lubm{8,38,82}.json`,
+  `phase6-final-watdiv10.json` — the Phase 6 closure's reference results
+  (with their `-compare*.md` reports); `docs/BENCHMARKS.md` and the README
+  embed tables generated from them.
 
 ## Gates (`bench/thresholds.json`, `gstore-bench-gates/1`)
 
@@ -325,9 +329,9 @@ one is stale (the smoke CI job runs it).
 
 * `smoke` (push, PR): release build, the documentation-table check
   (`report --check README.md CHANGELOG.md`), `gstore-bench ci` (LUBM-like
-  univ 1 and WatDiv-like scale 1; the WatDiv-like workload is reported as
-  new until `smoke.json` is re-blessed with it), the canary, results and
-  phase logs as an artifact.
+  univ 1 and WatDiv-like scale 1, both gated since the Phase 6 closure
+  re-blessed `smoke.json` with them), the canary, results and phase logs as
+  an artifact.
 * `rocksdb-correctness` (push, PR): `cargo test -p gstore-bench --features
   rocksdb` after building `gbuild` with RocksDB; the RocksDB build cache is
   shared with ci.yml's rocksdb job.

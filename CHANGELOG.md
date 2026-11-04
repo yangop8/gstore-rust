@@ -10,9 +10,670 @@ server) and Phases 2 and 3 (graph functions; SPARQL 1.1 and Top-K) were
 developed in parallel from the same base and merged; Phase 5 (RDF import,
 gconsole, zip, logging and packaging) was developed from the Phase 1 head
 and merged after them; Phase 4 (reasoning rules and PFN functions) was
-developed from the Phases 0–3 head and merged last. The integration
-sections record what joining them changed, newest first; the following
-ones each phase, newest first (Phase 5, then Phase 4, …).
+developed from the Phases 0–3 head and merged after Phase 5; Phase 6 (scale
+and performance) was developed on the merged Phases 0–5 and comes first
+below, followed by the CI notes. Then the integration sections record what
+joining the earlier phases changed, newest first, and the remaining ones
+each phase, newest first (Phase 5, then Phase 4, …).
+
+### Phase 6: scale and performance (GAP_PLAN §8 stage 6, `docs/PHASE6_PLAN.md`)
+
+Phase 6 was developed on the merged Phases 0–5 in four rounds of parallel
+work packages; each round was merged, reviewed and measured on the idle
+reference VM (4 vCPU / 16 GB) before the next was cut. Round 1: the storage
+seam and a shared read path (R1-CORE), the kvstore read path and format
+registry (R1-KV), the benchmark harness (R1-BENCH). Round 2: the transaction
+overlay and `DiskTriples` (R2-DISKLIB), the out-of-core dictionary API
+(R2-DICT), the bulk build (R2-BULK). Round 3: Stream mode in `Database`
+(R3-STREAM), parallel readers in both servers (R3-SRV), RocksDB (R3-ROCKS).
+Round 4: id reclamation (R4-RECLAIM), copy-on-write snapshots and disk
+databases from the servers (R4-SNAP), the VS-tree policy (R4-VS), and the
+closure (R4-CLOSURE: the WatDiv-like workload, the final measurements, these
+docs). The per-package `changelog.d/` fragments are folded into this
+section. Numbers come from the committed `bench/results/*.json` (tables made
+by `gstore-bench report`) or from a package's quiet measurement stage (the
+idle VM, base and branch in one session), named where used;
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has the method, every table and
+the exit-gate verdicts.
+
+#### Behaviour changes
+
+- **The ids of deleted terms are reused** (`[system] id_reclaim=on`, the
+  default). After every applied delete — `DELETE DATA` / `DELETE … WHERE`,
+  quad deletes, `CLEAR` / `DROP` / `MOVE` / `COPY`, `gsub` / `/api
+  batchRemove`, the undo of a failed `LOAD`, the rollback of a
+  transaction's inserts — every subject, predicate, object and graph IRI no
+  triple or quad references any more leaves the dictionary, and the next new
+  term takes its id, **lowest free id first**, on every layout. The
+  entity / literal / predicate counts now count exactly the referenced terms
+  (they drop with deletes; `DiskStore::entity_num` counts live terms). A
+  transaction frees at `commit` and frees the terms it minted at `rollback`.
+  An application that cached ids across a delete must not.
+  `id_reclaim=off` (or `GSTORE_ID_RECLAIM=off`) keeps the former behaviour
+  (ids freed only by `gcompact --reclaim`).
+- **New on-disk databases are `kvstore.kv` version 2** (magic `GSTOREK2`,
+  feature bit `FREE_IDS`), which binaries older than Phase 6 refuse ("not a
+  gStore KV file"). Existing version-1 files are never upgraded implicitly;
+  see *Formats and compatibility* below.
+- **`gbuild --disk` and `gbuild --rocksdb` build in bulk** (sorted,
+  bottom-up, installed crash-safely) and print the counts and a build
+  summary instead of reopening the database; `--incremental` keeps the
+  previous path. The ids equal the in-memory build's.
+  `Database::build_disk` / `build_disk_from_sources` are the bulk build too
+  and refuse a directory a database of the process has open.
+- **Deletes keep the VS-tree valid.** Signatures only lose bits, so the
+  stored entries stay a sound superset (`Database::vs_shrink_debt()` counts
+  such deletes until `rebuild_index()`); queries after a delete keep the
+  tree's pruning instead of running without it until the next save. Same
+  answers; without `ORDER BY` the row order can differ from a
+  tree-less evaluation. `CLEAR` and inference still invalidate the tree.
+- **A RocksDB database opens without rebuilding its VS-tree**
+  (`stats().index_valid == false`, shown as stale by `gshow`, `gmonitor`
+  and the monitor endpoints) and evaluates without it until
+  `rebuild_index()`; `[storage] vstree_on_open` / `GSTORE_VSTREE_ON_OPEN`
+  restore the rebuild at open. RocksDB `iter_all` returns `(p, s, o)` order
+  (it returned SPO order).
+- **A read error fails the statement** (contract C2): a backend read error
+  (on-disk B+ trees in Stream mode, the out-of-core dictionary, RocksDB) is
+  recorded in the running statement's `ReadScope` and fails that query,
+  update, CSR build, export (`gexport`, `/api export`,
+  `Database::export_ntriples`), snapshot query or REST `/batchRemove`
+  instead of answering from a shortened list, and the result is never
+  cached.
+- **The legacy `&str` dictionary API serves in-memory dictionaries only.**
+  `Dictionary::id_to_string` / `predicate_to_string` answer `None` and
+  record a read error on an out-of-core dictionary; use `term()` / `pred()`
+  (`TermStr`). PFN's `GraphCtx::term_str` / `pred_str` now return
+  `Option<TermStr<'_>>` (it derefs to `str`).
+- **`dict.bin` is reproducible**: its format is unchanged, but the forward
+  map is written in id order, so two builds of the same data write the same
+  bytes; older binaries read the new files and the reverse. A file whose two
+  halves disagree is refused.
+- **Every layout locks its directory**, RocksDB included (`<dir>/LOCK`
+  beside `rocksdb/`), and so do saves into another directory, the
+  incremental disk build, `grestore` (before it stages anything), `gdrop`
+  and `gbackup` (for the whole backup); repairs of an interrupted swap or
+  restore run only under the lock. A restore that creates its database holds
+  `<dir>.restore-lock` until the swap.
+- **Monitoring never waits for a database.** `/status`, REST `/monitor` and
+  `/show`, `/api show` / `stat` report the figures as of the last completed
+  write; `/api monitor` / `schema` recompute their statistics in the
+  background after a change (the request waits at most 40 ms, else answers
+  with the earlier data's statistics and current counts), report the
+  committed state while a transaction is open, and `diskUsed` is measured
+  after a write or save. `show` / `monitor` report `layout` and, for a
+  loaded on-disk database, `queryMode`.
+- **With `check_point` off, `ApiServer` still makes every acknowledged write
+  to an on-disk or RocksDB database durable at once** (a commit point after
+  `/batchInsert`, `/batchRemove` and `/upload` too, whose writes were
+  already written through); the snapshot layout keeps deferring to the
+  save.
+- **`CLEAR`, `DROP`, `MOVE` and `COPY` are in `redo.log`** (`C` for one
+  graph, `N` for all named graphs; a RocksDB clear refused part-way is
+  logged per removed triple), so `replay_redo_log` and `restore_incremental`
+  reproduce them. A binary older than this one cannot restore an
+  incremental backup that holds them ("unknown redo.log op 'C'").
+- **Command-line tools no longer panic on a closed pipe** (`gquery … |
+  head`): the first broken-pipe write closes standard output for the rest of
+  the process, which finishes its work and exits with its usual status.
+- API: `Database::reclaim_unused()` returns `Result<usize>` (refused inside
+  a transaction and on a version-1 `kvstore.kv`); `Database::store()`
+  panics for a Stream-mode database (use `backend()`).
+
+#### Formats and compatibility
+
+`src/kvstore/format.rs` is the one registry of the `kvstore.kv` /
+`vstree.kv` header: magics `GSTOREKV` (V1) and `GSTOREK2` (V2), 32 root slots
+(24 before; older files read the new ones as 0), slot 21 the feature mask,
+slot 22 the `FREE_IDS` B+ tree (keys `E|L|P ‖ be32(index)`), slots 23–25 the
+free counts; feature bit 0 `FREE_IDS`, bits 1 (`IVARRAY_WIDE`) and 2
+(`LONG_KEYS`) reserved. Every open checks the header: unknown bits, and V2
+without bits, are refused; `vstree.kv` must have no feature bit. Node,
+IvArray, overflow and WAL formats are unchanged. A V1 header written by this
+version is byte-identical to a pre-Phase-6 one.
+
+| directory | this version | binaries before Phase 6 |
+|---|---|---|
+| snapshot (`dict.bin`, `store.bin`, `named.bin`, `vstree.bin`, `meta.bin`) | read-write; bytes unchanged in format (`dict.bin` now reproducible) | read-write |
+| `kvstore.kv` V1 (built before Phase 6, or with `id_reclaim=off`) | read-write in either query mode; reclamation off until `gcompact --enable-reclaim` | read-write |
+| `kvstore.kv` V2 (new databases, bulk images, `gcompact --enable-reclaim`) | read-write | **refused** |
+| RocksDB layout `"1"` (also when bulk-built) | read-write; no VS-tree rebuild at open | read-write |
+
+To go back from V2: `gexport` with this version, `gbuild` with the old one.
+
+#### On-disk databases: Stream and Materialize modes
+
+- **Two query modes for `kvstore.kv` databases** (`DiskQueryMode`).
+  **Materialize** stays the default (the single constant
+  `gstore::db::DEFAULT_DISK_QUERY_MODE`): the pre-Phase-6 in-memory working
+  set with write-through by dictionary key. **Stream** (opt-in:
+  `[storage] disk_query_mode=stream`, `GSTORE_DISK_QUERY_MODE=stream`,
+  `OpenOptions::stream()`) evaluates over the B+ trees
+  (`Backend::Disk(DiskTriples)`) with an out-of-core dictionary (`DiskDict`
+  on the same pager, opened once per database). Opening reads only the
+  named graphs (kept in memory) and the O(P) predicate statistics. Both
+  modes read and write the same `kvstore.kv`, so a directory can be opened
+  in either, in turn. At univ 38 (`bench/results/phase6-final-lubm38.json`)
+  Stream opens in 7.5 ms cold / 0.9 ms warm (Materialize 1,817.3 / 1,720.8
+  ms) with 6.1 MiB RSS after open (351.0) and a 207.3 MiB high-water mark
+  through Q1–Q14 (457.1), at a Q1–Q14 geomean of 11.55 ms (7.83). It stays
+  opt-in because R3-STREAM's own conditions for making it the default still
+  fail there (geomean 1.47× Materialize; Q14 2.15×, Q6 2.12×, Q12 2.07×), and
+  its large results scale worse at univ 82 (*Known limitations*).
+- **Open options (contract C7)**: `OpenOptions { disk_query_mode,
+  disk_cache_pages, dict_cache_bytes, vstree_on_open, default_layout }`,
+  `Database::open_with(dir, &options)` (as given), `Database::open` (the
+  built-in defaults < those installed by `set_default_open_options`, which
+  `gserver` does from `conf.ini`'s `[storage]` at startup and on
+  `refreshconf` < the environment), `Database::disk_query_mode()`,
+  `ApiServer::with_open_options` (embedded servers).
+- **Writes in Stream mode go by id**: a new term is interned first
+  (`DiskDict::intern`, one pager operation; an orphan term if its triple
+  never comes), then the triple through `DiskTriples`. A transaction is the
+  store's overlay: no triple reaches `kvstore.kv` before `commit`, `rollback`
+  never touches it. A write or flush error **breaks** the store: every later
+  statement — reads, dictionary writes and the CSR included — is refused
+  until the database is reopened. `CLEAR DEFAULT` reads the default graph's
+  ids in a read scope and removes them under one drain of the writer gate.
+  The in-memory substring index is never built over an out-of-core
+  dictionary (substring filters scan; answers are exact).
+- **`vstree.kv`** is used while fresh and never rebuilt at open unless
+  `vstree_on_open`; `rebuild_index()` rewrites it in one streaming pass over
+  SPO/OSP after a commit point (the data is durable before the tree is
+  signed) and marks it fresh. Under the default VS-tree policy queries no
+  longer read its pages (*Query engine* below).
+- **Library pieces** (R2-DISKLIB): `store::{Overlay, OverlayView,
+  OverlayChanges}` — an exact transaction overlay implementing the whole
+  `TripleSource` over `(base − removed) ∪ added`;
+  `kvstore::DiskTriples` — `TripleSource + MutableStore` over a writable
+  `DiskStore`, with transactions in the overlay, a **writer gate** (a writer
+  marks it draining, cancels the snapshot readers inside it, waits for them,
+  applies its change and moves the epoch only when data changed), snapshot
+  views (`read_view()` → `DiskReadView::with_base(..) -> Result<R,
+  ViewError>`: `Expired`, `Closed`, `Io`), the broken state and
+  `commit_point()`; `kvstore::DiskSource` wraps any `&DiskStore` and reports
+  its read errors.
+- **Faster Stream reads** (same results and order): radix sorts of
+  re-sorted index ranges; a 32 MiB cache of the committed store's long
+  posting lists (2,048 entries and more), dropped at every write; a
+  per-thread forward SPO cursor for the engine's sorted point probes.
+- Restore validation of an on-disk backup reads the staged copy once,
+  streamed, in Stream mode, so a server can restore a database larger than
+  its memory.
+
+#### Bulk build
+
+- **`gstore::bulk::build`** (contract C6; `gbuild --disk`, `gbuild
+  --rocksdb`, `Database::build_disk*`, REST `/build` and `/api build` with
+  `layout=disk|rocksdb`): parse the sources on up to `--threads` parser
+  threads (replayed in source order, with the sequential import's report,
+  `parse_error.log` lines and strict-mode first error at every thread
+  count), encode into term maps with first-seen ids (subject, predicate,
+  object, graph: the memory build's ids), sort externally under a memory
+  budget, then write:
+  - **disk**: the SPO / POS / OSP / GSPO B+ trees, the dictionary trees, the
+    `id2*` IvArrays and the statistics as page images, bottom-up at a 90%
+    fill, plus `vstree.kv` streamed from the sorted signatures (byte-identical
+    to the incremental build's); the output is byte-identical whatever the
+    thread count or budget;
+  - **RocksDB** (R3-ROCKS): one set of SST files per column family (cut at
+    256 MiB), ingested into a fresh store; every key and value equals the
+    per-triple build's (layout `"1"`; older binaries open it).
+- **Crash-safe install.** The build holds the directory's lock and an
+  in-process claim, writes into `<db>/.bulk-tmp/`, and refuses a directory
+  whose RocksDB store is open anywhere (Linux: `rocksdb/LOCK` in
+  `/proc/locks`, checked at the start and again before the swap). The commit
+  point is the rename of the new `kvstore.kv` (disk) or of the staged
+  `rocksdb.new` into `rocksdb/` (RocksDB); a crash at any step leaves the
+  old or the new database, which an unmodified binary opens, and a failed
+  build leaves the old one untouched. A failure after the commit point is reported as "built (the new
+  database is in place), but its install did not finish: …" (exit status 1,
+  `BulkReport::warnings`). The replaced database's reasoning rules are
+  removed by the install, under the rule-directory lock.
+- **Memory.** The budget (`--memory MB`, `[system] build_memory_mb`, default
+  1024) covers the sort buffers, spools and their I/O buffers; sorted runs
+  spill to `--tmp-dir` (default: the staging area) beyond it, in scratch
+  directories that are locked while in use and swept once dead. The term
+  maps (about `L + 26` bytes per term of `L` bytes) come on top and are
+  reported. `--fill PCT` (50–100) is a disk-only knob.
+- **Limits**: a dictionary key longer than 2,038 bytes (half a B+ tree page,
+  `bptree::MAX_KEY_LEN`) fails a disk build or insert with an error, as does
+  an IvArray past 33,554,432 terms per space; RocksDB has neither limit.
+  The library helpers `Database::build_rocksdb_*` stay per-triple small-data
+  builds (plan D15).
+- At univ 38 (`phase6-final-lubm38.json`) the disk build takes 18.38–21.06 s
+  (pre-Phase-6: 1,627.59 s) with a 398–400 MiB peak and writes a 542,609,408
+  byte `kvstore.kv` (0.697× pre); the RocksDB build 19.50 s (277.76 s).
+
+#### Dictionary
+
+- **A leaner in-memory dictionary**: each string stored once as an
+  `Arc<str>`, the string → id side an open-addressing table of ids; the
+  interners are `Arc<InternerData>`, so a clone (a `ConcurrentDb` snapshot,
+  a transaction's begin-time copy) is O(1) and the first write copies only
+  the interner it changes. R2-DICT's quiet stage: snapshot RSS after open
+  0.80× the base at univ 8 and 38.
+- **Dictionary API (contract C4)**, `gstore::dict`: `TermStr` (borrowed in
+  memory, `Arc<str>` from a backend); `Dictionary::term` / `pred` /
+  `try_term` / `try_pred` / `try_*_id`, `prefetch`, `resolve_sorted` /
+  `resolve_many`, `for_each_term`, `materialize`, `id_limit`, `backing`,
+  `generation`, `cache_stats`; `DiskTermSource` is a fallible, `Send +
+  Sync` backend (`lookup`, `resolve`, `intern` / `free`, `prefetch`,
+  `for_each`, `count`, `id_limit`, `generation`, `sync`). Bounded caches:
+  `TermCache` (id → term, 64 MiB by default) and `KeyCache` (term → id,
+  16 MiB), CLOCK eviction, emptied when the backend's generation changes.
+  `DiskDict` implements it over the shared pager without leaking strings.
+- **Engine**: SELECT results are materialized in chunks of 4,096 rows, each
+  resolving its distinct ids in one sorted batch on an out-of-core
+  dictionary; a per-query id → term / value memo (at most 8 MiB) serves
+  out-of-core dictionaries only.
+- **The substring index is cached per dictionary generation**
+  (`Database::string_index()`): a repeated `CONTAINS` / `STRSTARTS` /
+  `STRENDS` / plain `REGEX` query no longer rebuilds it — R2-DICT's quiet
+  stage at univ 8: 11.7–16.9 ms for the second identical query against
+  2,073.6–2,888.5 ms for the first. The cached index stays resident (87.4 MB
+  at univ 8, 431.0 MB at univ 38 in that stage).
+
+#### Query engine and the VS-tree
+
+- **VS-tree policy** (`gstore::query::VsPolicy`, R4-VS): `Auto` (the
+  default) computes exactly the candidate sets the tree gives, more cheaply
+  where that is provably exact — on an on-disk tree (`vstree.kv`, both disk
+  query modes) it tests the remaining predicate bits against the store and
+  **never reads `vstree.kv`'s pages**; `Tree` is the previous behaviour;
+  `Off` ignores the tree. Switches: `Evaluator::with_vs_policy`,
+  `query::scoped_vs_policy`, `query::set_default_vs_policy`,
+  `GSTORE_VS_POLICY=auto|tree|off`; counters `query::vs_stats()`. Plans,
+  answers and their order are unchanged on a tree consistent with the
+  store. R4-VS's quiet stage (univ 38, Stream): Q1–Q14 geomean 11.66 ms
+  under `Auto`, 47.70 ms with `GSTORE_VS_POLICY=tree`.
+- **The in-memory VS-tree**: an entity → leaf locator (O(height) updates,
+  per-entity probes), probe refinement for small candidate sets, an insert
+  ORs the new edge's bits up the parent chain (`VsTree::union_into`), an
+  entity with no edge before (a new term, a reused id) gets its exact
+  signature; the build sorts once on the raw limbs. `vstree.bin` /
+  `vstree.kv` bytes are unchanged.
+- **Cheaper planning, same plans**: the cost model counts instead of
+  materializing (the C1 `count_*` / `distinct_p_of_*` methods, answered
+  exactly by every backend), `TripleStore` maintains each predicate's
+  distinct subject / object counts, hash joins use a fast deterministic
+  hasher, candidate sets are generated shortest list first with member tests
+  for long lists, one count memo per BGP, constant-star BGPs skip the plan
+  search, and a pattern with few candidates looks them up instead of
+  scanning the predicate. LUBM Q4 no longer grows with the data (0.049 ms on
+  the snapshot layout at univ 38, pre-Phase-6 53.63 ms).
+- **Storage seam (contract C1)**: `Backend` and `backend_dispatch!` live in
+  `src/store/backend.rs`; `TripleSource` documents its ordering contract
+  (pairs sorted, id lists ascending, `iter_all` in `(p, s, o)` order) and
+  gains the count methods and `has_subject` / `has_object` /
+  `has_predicate`, which answer `true` on a read error.
+- **Per-statement read errors (contract C2)**: `store::read_scope`
+  (`ReadScope::enter()`, `take_error()`, `note_read_error(msg)`,
+  `unscoped_read_errors()`).
+
+#### kvstore
+
+- **Pager**: shared copy-on-write `Arc` pages, CLOCK eviction, `pread`;
+  **operation brackets** — every logical write (a term, a triple or quad
+  and its keys) is one pager operation, never committed in part and rolled
+  back entirely on an error or a panic (which no longer poisons the store).
+- **B+ trees**: zero-copy, bounds-checked node views (a malformed page is an
+  error, never a panic), binary search in fixed-shape trees, prefix runs
+  bounded by two binary searches; nodes split by bytes, so no node outgrows
+  a page, and keys are limited to 2,038 bytes.
+- **`DiskStore`** reads come in the C1 contract order, with exact
+  allocation-free counts and a per-predicate statistics mirror; a damaged
+  header fails the open with an error instead of aborting the process.
+
+#### Concurrency and the servers
+
+- **`Database` is `Send + Sync`** (contract C8) with a `&self` read path:
+  `gstore::Statement` (parse once), `Database::read_as`, `query_read`,
+  `execute_as`. Query-cache entries are shared (`Arc`); `persist_lock`
+  serializes saves, checkpoints and backups (lock order `persist_lock` →
+  disk → `persist_error` → pager).
+- **Both HTTP servers share a database between readers**: the single-db
+  `Server` holds a `RwLock<Database>`, `ApiServer` a `DbCell` per database;
+  reads (and export, backup, `loadcsr`) take the shared guard, writes and
+  the transaction operations the exclusive one. A thread taking a second
+  guard of the same database gets an error instead of deadlocking. The
+  transaction contract is unchanged (single writer, `409`, begin-time
+  snapshot reads). Q4 at univ 38 (`phase6-final-lubm38.json`), 8 clients
+  against 1: 5.33× via `/sparql` and 4.63× via `/api` on the snapshot
+  layout, 4.06× / 4.73× on a Stream-mode disk database (pre-Phase-6: 0.78× /
+  0.86×).
+- **Copy-on-write `TripleStore`**: the indexes live in one `Arc`'d
+  `StoreData`; a clone is O(1), the first write copies once, a write that
+  changes nothing never copies; `store.bin` / `named.bin` bytes and `Debug`
+  are unchanged. `TripleStore::insert_many` / `remove_many` merge a batch
+  into each touched list in one pass, and the in-memory write paths now hand
+  each statement's default-graph triples over as one batch (with
+  lowest-first id reuse, per-triple inserts at the front of long lists had
+  made memory-layout inserts 4.7× slower in R4-RECLAIM's churn).
+- **`/begin` copies no triple** on in-memory and on-disk databases: the
+  snapshot is a copy-on-write clone of the in-memory store (also of a
+  Materialize-mode working set) or a Stream database's `DiskReadView`,
+  sharing the dictionary and named graphs (RocksDB still materializes, plan
+  §8 D4). At univ 38 its median is 0.38 ms with +0.07 MiB RSS (snapshot),
+  0.38 ms with +0.00 MiB (Materialize) and 0.44 ms with +0.06 MiB (Stream);
+  RocksDB 2,132.55 ms. Snapshot reads of a Stream database run under the
+  writer gate with its cancel flag; a commit cancels them and they re-run on
+  the committed state, so `/commit` no longer waits for long snapshot
+  reads.
+- **`ConcurrentDb` publishes in O(1)** for an in-memory database (the
+  authoritative store keeps a spare copy, so an update after a publish costs
+  about two inserts — R4-SNAP's quiet stage: 387–581× lower one-triple
+  update latency than the base); Stream-mode and RocksDB databases are still
+  materialized per publish. Its snapshot queries run in a read scope.
+- **REST `/build` and `/api build` take `layout=snapshot|disk|rocksdb`**
+  (also `memory`, `kvstore`, `rocks`; default `[storage] default_layout`,
+  else `snapshot`); `gbuild --layout` likewise. REST `/build` saves a loaded
+  database's unsaved writes before it retires it and serves it again when
+  the build fails.
+- PFN metadata is cached per user and modules load single-flight. Same-
+  second `/api backup`s and concurrent REST `/backup`s of one database run
+  one after the other. The CSR of a Stream transaction snapshot is built
+  cancellably (`CsrGraph::build_cancellable`).
+
+#### RocksDB
+
+- Reads are bounded raw-iterator scans (`iterate_upper_bound`, keys decoded
+  in place); a read error fails the statement, and a write that cannot read
+  fails instead of treating the key as absent.
+- Exact C1 counts from the maintained counters (one point read each), an
+  in-memory mirror of the per-predicate counters, `subs_by_p` / `objs_by_p`
+  without sorts, `iter_all` in contract order.
+- `RocksTuning`: one LRU block cache shared by every column family and store
+  of the process (`[storage] rocksdb_block_cache_mb`, default 256,
+  `GSTORE_ROCKS_BLOCK_CACHE_MB`; `0` = RocksDB's per-column-family default)
+  and bloom filters on the point-lookup column families
+  (`rocksdb_bloom`, default 10 bits per key); options only, files open either
+  way. `RocksStore::open_with`.
+- Id reclamation: frees delete the `dict` entries after the triple batch or
+  inside the commit's journal batch; terms a journal replay left
+  unreferenced are freed.
+- At univ 38 (`phase6-final-lubm38.json`): open 0.74 s cold / 0.68 s warm
+  (pre-Phase-6 60.8 / 59.4 s), Q1–Q14 geomean 25.00 ms (311.50 ms), 155.7 MB
+  (206.3 MB).
+
+#### Id reclamation
+
+- **Policy** `db::IdReclaim { Immediate, Off }` (`[system] id_reclaim`,
+  `GSTORE_ID_RECLAIM`, `Database::set_id_reclaim`). "Referenced" means used
+  by the default graph (the C1 `has_*` probes, `true` on a read error) or by
+  a named graph (`db::named::NamedGraphs` counts every term's uses, graph
+  IRIs included, and serializes exactly as the former map). A candidate
+  whose reference probe fails waits for the next check and is given up after
+  4 failed checks, left for `gcompact --reclaim`.
+- **Persistence per layout**: snapshot at the next save (`dict.bin`'s free
+  list is the same sequence of `u32`, now ascending); Materialize as a
+  key-level free written through; Stream by id inside the store under the
+  writer gate (`DiskTriples::free_ids`, which re-checks the indexes and
+  refuses — breaking the store — rather than corrupt it); RocksDB as above.
+  Freeing the highest id lowers the high-water mark.
+- **Pins**: a removed id is retired, then released once no `DictPin` older
+  than the removal lives. A clone of an out-of-core dictionary pins it, so a
+  Stream database defers its frees while such a clone (a `ConcurrentDb`
+  snapshot) is alive; a disk `/begin` snapshot reads inside its view and
+  takes an unpinned clone; in-memory clones need no pin. Frees still
+  deferred at a restart are lost (orphans that `gcompact --reclaim` finds).
+- **VS-tree**: freed entities stay in the tree (a sound superset); a reused
+  id gets its exact signature.
+- API: `TermId`, `retire` / `release` / `free_id`, `pin` /
+  `clone_unpinned`, `from_slots` (exact ids with holes), `id_limits`,
+  `Database::reclaim_unused`, `verify_integrity`, `id_space_stats`,
+  `enable_id_reclaim`; `DiskStore::open_with(path, cache,
+  free_ids_if_new)`, `RocksStore::delete_terms`, `commit_journal_with`,
+  `take_replayed`.
+- R4-RECLAIM's quiet stage (`examples/reclaim_churn.rs --base 8 --rounds
+  10`: eight LUBM-like universities, then ten rounds that each delete the
+  oldest university and insert a new one): live counts equal the referenced
+  terms in every round on memory, Stream, Materialize and RocksDB, the
+  high-water mark is 1.000× the peak live count, and the dictionary stays
+  within +5.20% of round 0 where `Off` grows to 2.27×.
+
+#### Configuration and tools
+
+| key / variable | default | effect |
+|---|---|---|
+| `[storage] disk_query_mode` / `GSTORE_DISK_QUERY_MODE` | `memory` | `memory` (Materialize) or `stream` |
+| `[storage] disk_cache_mb` / `GSTORE_DISK_CACHE_MB` | 16 | MiB of page cache per on-disk database |
+| `[storage] dict_cache_mb` | 80 | MiB of a Stream database's dictionary caches |
+| `[storage] vstree_on_open` / `GSTORE_VSTREE_ON_OPEN` | off | build a missing or stale VS-tree at open |
+| `[storage] default_layout` | unset (snapshot) | the layout of `gbuild`, REST `/build` and `/api build` when none is named |
+| `[storage] rocksdb_block_cache_mb` / `GSTORE_ROCKS_BLOCK_CACHE_MB` | 256 | the shared RocksDB block cache, MiB |
+| `[storage] rocksdb_bloom` | 10 | bloom-filter bits per key (`on`, `off`) |
+| `[system] id_reclaim` / `GSTORE_ID_RECLAIM` | on | id reclamation (gserver and gbuild read the key; the other tools the variable only) |
+| `[system] build_memory_mb` | 1024 | the bulk build's sort budget |
+| `[system] build_threads` | 0 (every core) | bulk build threads; `build_multi_thread=off` means 1 |
+| `[system] build_tmp_dir` | unset (the staging area) | where sorted runs spill |
+| `[system] build_fill_factor` | 90 | B+ tree node fill of the disk bulk build |
+| `GSTORE_VS_POLICY` | `auto` | `auto`, `tree` or `off` |
+
+`gserver` installs `[storage]`, `id_reclaim` and the RocksDB keys at
+startup and again on `refreshconf` (a loaded database keeps its query mode);
+`gbuild` reads `./conf/conf.ini` when it exists; `conf/conf.ini.example`
+documents every key.
+
+- **`gbuild`**: `--layout snapshot|disk|rocksdb`; `--disk` / `--rocksdb` take
+  `--memory MB`, `--threads N`, `--tmp-dir DIR`, `--incremental`, and
+  `--disk` also `--fill PCT` (refused, exit 2, without them).
+- **`gcompact <db> [--reclaim] [--enable-reclaim] [--check]`** (new; in the
+  Docker image and the deb / rpm packages): show the id spaces, free every
+  unreferenced id and save, turn reclamation on for a pre-Phase-6
+  `kvstore.kv` (it becomes V2), verify the id spaces.
+- **`gmonitor`** shows `id_reclaim` and live / free / id-limit per id space.
+- **Examples**: `examples/kv_bench.rs` (kvstore and dictionary
+  micro-benchmarks), `examples/disk_stream_probe.rs` (Q1–Q14 over
+  `DiskTriples`, a view and the materialized store),
+  `examples/reclaim_churn.rs` (gate G5). R3-SRV's `examples/srv_mixed_load.rs` is gone: gstore-bench's
+  mixed phase covers it on every layout.
+
+#### gstore-bench and CI
+
+- **`gstore-bench`** (new workspace member `bench/`, `publish = false`, no
+  new crates; [`bench/README.md`](bench/README.md)): deterministic
+  LUBM-like (`lubm-like/1`, a port of the design-stage `gen_lubm.py`
+  prototype) and WatDiv-like (`watdiv-like/1`: WatDiv's vocabulary and query
+  shapes, its own data; 20 templates bound by a deterministic ASK walk)
+  generators; a runner that measures every layout through the real `gbuild`
+  and the public API, each phase in a fresh child process (build, open,
+  query, concurrency, update, and a mixed read/write phase with an `/api
+  begin` point); results in `gstore-bench/2` JSON (`--label` keys a run
+  `backend@label`, `merge` joins files); exact, timing, memory and size
+  gates (`bench/thresholds.json`) that report new workloads, runs and queries
+  instead of failing them; and `report --table KIND` tables that `report
+  --update` / `--check` keep current between `<!-- gstore-bench report ARGS
+  -->` markers in documents. Commands `gen`, `queries`, `run`, `check`,
+  `ci`, `compare`, `report`, `bless`, `merge`, `calibrate`; exit codes 0 /
+  1 (a gate failed) / 2 (usage, crash, timeout).
+- **Results**: `bench/results/pre-phase6-lubm{8,38}.json` (the pre-Phase-6
+  reference every Phase 6 ratio is taken against), each round's results and
+  compare reports, and the final `phase6-final-lubm{8,38,82}.json` and
+  `phase6-final-watdiv10.json`. `bench/baselines/smoke.json` was re-blessed
+  at the closure (gstore-bench/2: LUBM-like univ 1 and WatDiv-like scale 1,
+  with the mixed phase); the database-size gate is 1.10× (was 1.25×).
+- **CI**: `.github/workflows/bench.yml` — `smoke` (release build, the
+  documentation-table check, `gstore-bench ci`, a canary that must fail at
+  3×), `rocksdb-correctness`, `reference` (weekly or on demand,
+  report-only). `ci.yml` gained a `fmt` job (`rustfmt.toml`; the one
+  formatting commit is in `.git-blame-ignore-revs`), runs the workspace
+  tests twice (`GSTORE_DISK_QUERY_MODE=memory` and `=stream`), checks the
+  generated tables (`report --check README.md CHANGELOG.md`) and the
+  rustdoc intra-doc links (`RUSTDOCFLAGS="-D warnings" cargo doc -p gstore
+  --no-deps`).
+
+#### Performance
+
+LUBM-like univ 38 (5,181,103 triples) against the code before Phase 6,
+generated from `bench/results/phase6-final-lubm38.json` (warm figures: the
+minimum over 5 processes of the median of 5 runs; "open first" is the first
+open after the page cache was dropped):
+
+<!-- gstore-bench report --table overview bench/results/phase6-final-lubm38.json --compare bench/results/pre-phase6-lubm38.json -->
+| workload | backend | build s | build peak MiB | dir MB | open first ms | open warm ms | RSS after open MiB | query HWM MiB | geomean ms | build vs base | open vs base | geomean vs base |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| lubm-like univ 38 | snapshot | 29.60 | 550.1 | 430.8 | 1184.8 (cold) | 1033.0 | 489.1 | 601.0 | 10.15 | 0.39× | 0.71× | 0.22× |
+| lubm-like univ 38 | disk@materialize | 21.06 | 400.3 | 654.0 | 1817.3 (cold) | 1720.8 | 351.0 | 457.1 | 7.83 | 0.01× | 0.22× | 0.05× |
+| lubm-like univ 38 | disk@stream | 18.38 | 398.2 | 654.0 | 7.5 (cold) | 0.9 | 6.1 | 207.3 | 11.55 | 0.01× | 0.00× | 0.08× |
+| lubm-like univ 38 | rocksdb | 19.50 | 401.6 | 155.7 | 738.9 (cold) | 678.0 | 270.8 | 436.2 | 25.00 | 0.07× | 0.01× | 0.08× |
+<!-- /gstore-bench report -->
+
+Exit gates (plan §2), univ 38 unless stated; the measured values come from
+`bench/results/phase6-final-*.json`, except G4's monitoring endpoints and
+G5's churn, which come from the R4-SNAP and R4-RECLAIM quiet stages of the
+same gstore code (`b9e8dc0`). Reasons and follow-ups in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §7.
+
+| gate | target | measured | verdict |
+|---|---|---|---|
+| G1a disk build | ≤ 0.04× pre (≤ 65.1 s); peak ≤ 1.25 GiB with `--memory 1024`; `kvstore.kv` ≤ 0.75× pre | 18.38 / 21.06 s (0.011× / 0.013× of 1,627.6 s); peak 398 / 400 MiB, no spilled run; `kvstore.kv` 0.697× | met |
+| G1b disk open (Stream) | warm ≤ 0.5 s, cold ≤ 2.0 s; univ 38 / univ 8 ≤ 1.5 | warm 0.92 ms, cold 7.5 ms; ratio warm 1.13, cold 1.82 in the reference pair and 1.43 by the medians of four pairs (single ms-scale samples whose ranges overlap) | met |
+| G1c disk memory (Stream) | RSS after open ≤ 120 MiB; HWM ≤ 400 MiB; RSS ratio ≤ 1.5 | 6.1 MiB; 207.3 MiB; 1.01 (univ 82: 6.4 / 380.8 MiB) | met |
+| G1d disk latency (Stream) | geomean ≤ 0.6× pre disk and ≤ 1.5× snapshot; no query > 3× snapshot | 0.079× pre, 1.14× snapshot; worst Q14 2.51×, Q6 2.41×, Q13 2.25× (Materialize 0.053×, 0.77×) | met |
+| G2 snapshot layout | build ≤ 0.5×, RSS ≤ 0.9×, geomean ≤ 0.9× pre; Q4 ≤ 25 ms; Q1/Q3/Q4/Q11/Q12 univ 38 / univ 8 ≤ 2.0 | 0.385×, 0.820×, 0.218×; Q4 0.049 ms; Q1 1.03, Q3 1.04, Q4 0.97, **Q11 5.58, Q12 4.91** | not met |
+| G3 RocksDB | build ≤ 0.25× pre; open ≤ 10 s; geomean ≤ 0.8× pre | 19.50 s (0.070×); 0.74 s cold / 0.68 s warm; 25.00 ms (0.080×) | met |
+| G4 concurrency | Q4 8 / 1 clients ≥ 2.5× (memory, Stream; `/sparql`, `/api`); `/begin` ≤ 5 / 50 ms, RSS ≤ 4 / 16 MiB; monitoring ≤ 100 ms | 5.33 / 4.63 (snapshot), 4.06 / 4.73 (Stream); `/begin` 0.38 / 0.44 ms, +0.07 / +0.06 MiB; monitoring ≤ 48.4 ms, **`/api stat` 201.6–219.8 ms** | not met |
+| G5 id reclamation | live = referenced; ±5% of round 0; high-water ≤ 1.05; delete overhead ≤ 10% memory / disk, ≤ 20% RocksDB | live = referenced in every round; high-water 1.000; **+5.20%**; overhead memory **1.13 / 1.12**, Stream 0.63, **Materialize 1.14**, RocksDB 0.98 | not met |
+| G6 correctness | identical answers everywhere; test matrix, `conformance.sh`, crash suites green | identical rows and hashes on every layout and mode, equal to pre; tests below, 0 failures | met |
+| G7 vs upstream lubm10M (univ 82) | each metric ≤ 10× upstream; ≤ 3× met | snapshot / disk: build 6.27 / 4.45 µs per triple (0.27× / 0.19× of 23), 83.2 / 126.2 bytes per triple (0.32× / 0.48× of 264), Q2 85.3 / 71.2 ms (0.59× / 0.49× of 144), Q14 141.3 / 165.3 ms (0.63× / 0.74× of 223); Q1, Q3, Q4 below 0.01× | met |
+
+None of the misses is a regression of Round 4: G2's Q11 / Q12 (the
+in-memory VS-tree's probes grow with the data; the base's ratios were 6.02 /
+4.99) and G4's `/api stat` (a blocking 200 ms CPU sample per request, by
+design) equal the base in same-session comparisons; G5's misses are costs of
+the reclamation design that R4-RECLAIM profiled (the churn's own data grows
++5.23%; each Materialize free is two B+ tree writes).
+
+#### Review fixes
+
+Each round's merged tree was reviewed, and the confirmed findings were
+fixed with regression tests. The main ones:
+
+- **Round 1**: B+ tree nodes split by bytes, never past a page (a node of
+  long entries could be written over a page and panic, poisoning the shared
+  pager); read-only views see VList invalidation at once; a damaged header
+  is an error; VS-tree maintenance no longer re-signs hub entities from all
+  their edges (it had become quadratic once deletes kept the tree); the
+  bench CI canary checks a run against itself slowed 3×, retried phases
+  rebuild the database, phase children die with the harness.
+- **Round 2**: graph functions and PFN read labels through `term()` /
+  `pred()` (they failed on an out-of-core dictionary); a dictionary batch
+  decodes only the ids asked for; the per-query memo is bounded by bytes;
+  `DiskTriples` refuses its raw store once broken, keeps a transaction a
+  self-deadlocking commit would have dropped, and reports `vstree_stale()`
+  while a transaction adds triples; the bulk build closes spilled runs (it
+  ran out of descriptors with `--memory 1`), charges its I/O buffers, names
+  scratch directories exclusively, keeps the sequential import's batches at
+  every thread count, never replaces an open RocksDB store, and stops on a
+  failed WAL replay of the old store.
+- **Round 3**: RocksDB `so_by_p` no longer loses a read error to the next
+  seek and `iter_all` no longer trusts a damaged counter; bulk installs
+  re-check the RocksDB lock before the swap; the directory lock precedes
+  every repair of an interrupted swap or restore, and every writer of a
+  directory takes it (`gbuild --force`, `--incremental`, `grestore`,
+  `gdrop`, `gbackup`); a broken Stream store refuses dictionary writes;
+  deletes look terms up in a read scope; `VersionView` queries and the
+  version GC handle read errors; the CSR checks the broken state;
+  `rebuild_index` commits before signing; Stream statistics rebuilt at open
+  are persisted; the per-thread SPO cursor follows the pager's write
+  generation; `/api monitor` / `schema` never wait for a busy database;
+  same-second `/api backup`s and concurrent REST `/backup`s are serialized;
+  REST `/batchRemove` fails on a read error.
+- **Round 4**: a pinned Stream database no longer re-probes its whole free
+  backlog at every statement; a read error during the reference check
+  defers only that candidate; `ConcurrentDb` over a Stream database frees
+  its deferred ids when dropped; a partly refused RocksDB `CLEAR` is logged
+  per triple; RocksDB journal replays hand over their terms once and leave
+  no orphans; `gbuild` applies `conf.ini`'s `id_reclaim`; REST `/build` in
+  every layout saves and re-serves a database whose build fails, keeps a
+  body's blank-node labels, answers `500` for an unfinished install and no
+  longer holds the rule-directory lock through a build; `/api monitor`
+  during a transaction reports the committed state; `/commit` and
+  `/rollback` drop the begin-time snapshot first (a freeing commit copied
+  the whole interner); `report --update` / `--check` ignore markers in
+  fenced code.
+
+#### Tests
+
+New suites: `dt_count_methods`, `dt_read_scope`, `dt_overlay`,
+`dt_dict_backends`, `dt_r2_integration`, `dt_bulk_disk`, `dt_bulk_import`,
+`dt_bulk_crash`, `dt_bulk_rocks`, `dt_disk_stream`, `dt_disk_stream_txn`,
+`dt_disk_stream_crash`, `dt_rw_server_stress`, `dt_rw_crash`,
+`dt_r3_integration`, `dt_reclaim`, `dt_reclaim_crash`,
+`dt_reclaim_concurrency`, `dt_cow_store`, `dt_snapshot_disk`,
+`dt_vs_policy`, `dt_r4_merge`; `dt_http_durability` and
+`upstream_transaction` also run over the disk layout. Every test helper
+that makes a temporary directory removes it when the test ends, failed or
+not. The final run (R4-CLOSURE's quiet stage, on `85686e5`): `cargo test
+--workspace` 2,375 passed with on-disk databases in Materialize and again in
+Stream mode (crash suites included); `--features rocksdb` 2,202;
+`--features "gzip tls zip readline pfn-wasm"` 2,192; gstore-bench 69 (and 69
+with RocksDB); `scripts/conformance.sh` 6 / 6 suites; 0 failures.
+
+#### Known limitations
+
+- **Stream mode is opt-in.** Besides the univ 38 gaps above, its large
+  results grow faster than the data: at univ 82
+  (`phase6-final-lubm82.json`) Q6 / Q13 / Q14 take 984.84 / 1,303.58 /
+  876.09 ms, 4.65 / 5.10 / 6.20× the snapshot layout (2.41 / 2.25 / 2.51×
+  at univ 38) — each result id is resolved through the dictionary's
+  64 MiB `TermCache`, which those results outgrow. Under a steady write
+  load its readers lose the long-list cache at every commit: WatDiv-like F5
+  with a write every 100 ms reaches 191.6 qps on Stream against 2,550.3 on
+  Materialize (`phase6-final-watdiv10.json`).
+- **The snapshot layout with `check_point` on** saves the whole snapshot
+  under the exclusive guard at every acknowledged write: at univ 38 the
+  mixed workload's readers get 12.5 / 10.1 qps (`/sparql` / `/api`).
+- `/api stat` takes a blocking 200 ms CPU sample per request (G4).
+- Sub-millisecond queries on the snapshot layout (LUBM Q11, Q12) slow down
+  with the data (G2).
+- RocksDB still loads its dictionary at open and materializes the store for
+  `/begin` and `ConcurrentDb` (plan §8 D4); its LUBM Q2 scales worst (5.49
+  ms at univ 8, 585.74 ms at univ 38).
+- Files only grow (plan §8 D9): R4-RECLAIM's churn left a Stream
+  `kvstore.kv` at 1.474× round 0. Disk transactions larger than the page
+  cache are durable but not atomic (D12). Named graphs stay in memory in
+  Stream mode (D11). The cached substring index of an in-memory dictionary
+  stays resident.
+- Frees a pin still holds at a restart are lost (orphans until `gcompact
+  --reclaim`); a `ConcurrentDb` over a Stream database frees no id while it
+  lives.
+- The other deferred items (plan §8 D1–D15) and every follow-up are in
+  `docs/REFACTOR_BACKLOG.md` §I.
+
+### CI notes
+
+- **CI pins its Rust toolchain.** `.github/workflows/ci.yml` and
+  `.github/workflows/bench.yml` set `RUST_TOOLCHAIN: "1.99.1"` and install it
+  with `dtolnay/rust-toolchain@master` instead of
+  `dtolnay/rust-toolchain@stable`. When `@stable` moved to 1.99.1
+  (2026-10-31), its clippy brought new lints, so every `-D warnings` clippy
+  step failed — and in the feature matrix, where clippy runs before the
+  tests, the `gzip`, `tls`, `zip`, `readline`, `pfn-wasm`, `zip pfn-wasm
+  readline` and `rocksdb` tests stopped running. A new stable release no
+  longer changes CI without a commit; bumping the pin means fixing the new
+  version's clippy and rustfmt findings in the same commit. Both workflows
+  must name the same version: bench.yml's `rocksdb-correctness` job shares
+  ci.yml's RocksDB cache (`shared-key: rocksdb`), and rust-cache hashes the
+  rustc version and every `CARGO*` / `RUST*` variable into the key.
+- **Dev and test builds in CI keep line tables only**
+  (`CARGO_PROFILE_DEV_DEBUG` / `CARGO_PROFILE_TEST_DEBUG` =
+  `line-tables-only`, also in bench.yml's `rocksdb-correctness`); backtraces
+  still show file:line. With full debuginfo, linking the about 95
+  executables of the `zip pfn-wasm readline` job filled the runner's disk
+  and rust-lld died with SIGBUS. Release builds are unaffected.
+- **The feature-matrix jobs build each target once**: their build step uses
+  the test profile (`cargo build --locked --profile test -p gstore
+  --all-targets`), the one `cargo test` uses, so the test step compiles
+  nothing and the job holds one set of builds instead of two.
+- **Clippy 1.99 fixes, behaviour unchanged**: `src/query/hash.rs` and the
+  rule parser in `src/reason/mod.rs` iterate `as_chunks::<N>()` (stable
+  since Rust 1.88, within the MSRV 1.89) instead of `chunks_exact(N)`;
+  `Parser::parse_gfn_args` passes its error-context closure by value. No
+  `#[allow]` was added.
+- No CI job builds on the MSRV (1.89); the Docker image (`rust:1.89`) is the
+  only MSRV build.
 
 ### Integrating Phase 4 with Phases 0–3 and 5
 

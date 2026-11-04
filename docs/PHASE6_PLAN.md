@@ -6,6 +6,7 @@
 > - **Implementation base:** `main` once phases 0–5 and phase 4 (reasoning/PFN) are merged. Code moves during those merges, so locate it **by symbol**, not by line. The phase5 branch provides the streaming import (`src/parser/import.rs`, `src/parser/stream.rs`, `Database::build_from_sources` / `insert_sources` / `remove_sources`, `DiskStore::import_sources`) and is the base for every bulk-loading package.
 > - **Inputs:** the five subsystem maps, the measured baseline, nine design proposals (two angles each for disk streaming and concurrency) and the critique. This plan resolves the critique; §1 records each decision.
 > - **Shape:** 4 rounds of at most 3 packages each (12 packages). Each package runs in its own git worktree. Within a round no two packages own the same file. Everything that did not fit is in §8 "Deferred", with a reason.
+> - **Closure:** R4-CLOSURE folded every package's change fragment (contract C10) into `CHANGELOG.md` (the Phase 6 section), `README.md` and `docs/*.md`, and removed the fragments; the measured outcome of each gate is in `docs/GAP_PLAN.md` §9 and `docs/BENCHMARKS.md` §7.
 
 ---
 
@@ -197,7 +198,7 @@ Downgrading from V2 means `gexport` with the new binary, then `gbuild` with the 
 - RocksDB writes a term before any triple that uses it, and journal replay is unchanged.
 
 **C10 Change fragments (all).**
-- Each package writes `changelog.d/phase6-<ID>.md` with sections: Changelog, GAP_PLAN status line, Docs notes, Measured numbers, Requests/Not yet.
+- Each package writes one change fragment, `phase6-<ID>.md` in `changelog.d/` (folded into `CHANGELOG.md` and removed by R4-CLOSURE), with sections: Changelog, GAP_PLAN status line, Docs notes, Measured numbers, Requests/Not yet.
 - No package except R4-CLOSURE edits README.md, CHANGELOG.md or docs/*.md.
 
 ---
@@ -315,7 +316,7 @@ Round order follows the dependency chain:
 - CI smoke job takes ≤ 15 min with a warm cache.
 - `pre-phase6-lubm8.json` and `pre-phase6-lubm38.json` are committed, and the default `cargo test -p gstore-bench` takes ≤ 60 s.
 
-**Files:** `bench/**` (new), `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `.github/workflows/ci.yml`, `.github/workflows/bench.yml` (new), `rustfmt.toml` (new), `src/query/hash.rs`, `changelog.d/README.md` (new), `changelog.d/phase6-R1-BENCH.md`.
+**Files:** `bench/**` (new), `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `.github/workflows/ci.yml`, `.github/workflows/bench.yml` (new), `rustfmt.toml` (new), `src/query/hash.rs`, `changelog.d/README.md` (new), its change fragment (`R1-BENCH`, folded into `CHANGELOG.md`).
 
 #### R1-CORE — seam contracts, Sync `&self` read path, per-query read errors, VS-tree fixes
 **Brief.**
@@ -376,7 +377,7 @@ Round order follows the dependency chain:
 - Single-client latency is within ±5%: Sync costs nothing.
 - The full suite and the rocksdb suite pass.
 
-**Files:** `src/store/mod.rs`, `src/store/backend.rs` (new), `src/store/read_scope.rs` (new), `src/db/mod.rs`, `src/db/persist.rs`, `src/db/query_cache.rs`, `src/db/statement.rs` (new), `src/db/concurrency_tests.rs` (new), `src/query/engine.rs`, `src/query/optimizer.rs`, `src/query/planner.rs`, `src/query/candidates.rs`, `src/signature/vstree.rs`, `src/signature/disk_vstree.rs`, `src/signature/mod.rs`, `src/lib.rs`, `tests/dt_count_methods.rs` (new), `tests/dt_read_scope.rs` (new), `tests/dt_rocksdb.rs`, `tests/dt_persist_backends.rs`, `tests/dt_phase0_review.rs`, `tests/dt_optimizer.rs`, `tests/dt_lubm.rs`, `changelog.d/phase6-R1-CORE.md`.
+**Files:** `src/store/mod.rs`, `src/store/backend.rs` (new), `src/store/read_scope.rs` (new), `src/db/mod.rs`, `src/db/persist.rs`, `src/db/query_cache.rs`, `src/db/statement.rs` (new), `src/db/concurrency_tests.rs` (new), `src/query/engine.rs`, `src/query/optimizer.rs`, `src/query/planner.rs`, `src/query/candidates.rs`, `src/signature/vstree.rs`, `src/signature/disk_vstree.rs`, `src/signature/mod.rs`, `src/lib.rs`, `tests/dt_count_methods.rs` (new), `tests/dt_read_scope.rs` (new), `tests/dt_rocksdb.rs`, `tests/dt_persist_backends.rs`, `tests/dt_phase0_review.rs`, `tests/dt_optimizer.rs`, `tests/dt_lubm.rs`, its change fragment (`R1-CORE`, folded into `CHANGELOG.md`).
 
 #### R1-KV — kvstore read path, per-operation atomicity, format registry (no format change)
 **Brief.**
@@ -438,7 +439,7 @@ Round order follows the dependency chain:
 - An incremental `gbuild --disk` at univ 8 is no slower than base: op brackets add no cost.
 - The full suite passes.
 
-**Files:** `src/kvstore/format.rs` (new), `src/kvstore/pager.rs`, `src/kvstore/bptree.rs`, `src/kvstore/ivarray.rs`, `src/kvstore/store.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/mod.rs`, `src/kvstore/overflow.rs`, `src/kvstore/vlist.rs`, `src/kvstore/isarray.rs`, `examples/kv_bench.rs` (new), `tests/dt_disk.rs`, `changelog.d/phase6-R1-KV.md`.
+**Files:** `src/kvstore/format.rs` (new), `src/kvstore/pager.rs`, `src/kvstore/bptree.rs`, `src/kvstore/ivarray.rs`, `src/kvstore/store.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/mod.rs`, `src/kvstore/overflow.rs`, `src/kvstore/vlist.rs`, `src/kvstore/isarray.rs`, `examples/kv_bench.rs` (new), `tests/dt_disk.rs`, its change fragment (`R1-KV`, folded into `CHANGELOG.md`).
 
 ### Round 2 — dictionary API, DiskTriples, bulk loader (merge order: R2-DISKLIB, R2-DICT, R2-BULK)
 
@@ -500,7 +501,7 @@ Round order follows the dependency chain:
 - A second identical CONTAINS query (univ 8 snapshot) ≤ 0.25 × the first.
 - The `dict.bin` hash is identical to pre-Phase-6 for the same input.
 
-**Files:** `src/dict/mod.rs`, `src/dict/cache.rs` (new), `src/dict/prefix.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/string_index.rs`, `src/query/engine.rs`, `src/query/results.rs`, `src/query/functions.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/admin.rs`, `src/zipio.rs`, `src/reason/mod.rs`, `src/analytics/csr.rs`, `src/pfn/graph.rs`, `src/bin/gexport.rs`, `examples/kv_bench.rs`, `tests/dt_dict_backends.rs` (new), `tests/string_index_planner.rs`, `tests/dt_csr.rs`, `tests/dt_gfun_e2e.rs`, `tests/dt_gfun_metric.rs`, `changelog.d/phase6-R2-DICT.md`.
+**Files:** `src/dict/mod.rs`, `src/dict/cache.rs` (new), `src/dict/prefix.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/string_index.rs`, `src/query/engine.rs`, `src/query/results.rs`, `src/query/functions.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/admin.rs`, `src/zipio.rs`, `src/reason/mod.rs`, `src/analytics/csr.rs`, `src/pfn/graph.rs`, `src/bin/gexport.rs`, `examples/kv_bench.rs`, `tests/dt_dict_backends.rs` (new), `tests/string_index_planner.rs`, `tests/dt_csr.rs`, `tests/dt_gfun_e2e.rs`, `tests/dt_gfun_metric.rs`, its change fragment (`R2-DICT`, folded into `CHANGELOG.md`).
 
 #### R2-DISKLIB — exact transaction overlay + DiskTriples (the `Backend::Disk` payload), library level
 **Brief.**
@@ -552,7 +553,7 @@ Round order follows the dependency chain:
 - `disk_stream_probe` at univ 8 and univ 38: answers identical to memory; warm Q1–Q14 geomean ≤ 1.5 × the materialized path. If it is above that, list the hot spots in the fragment, since R3's default-mode decision depends on it.
 - Overlay reads on untouched keys ≤ 1.1 × base cost.
 
-**Files:** `src/store/overlay.rs` (new), `src/store/mod.rs` (mod and re-export lines only), `src/kvstore/disk_triples.rs` (new), `src/kvstore/mod.rs`, `src/kvstore/store.rs`, `examples/disk_stream_probe.rs` (new), `tests/dt_overlay.rs` (new), `changelog.d/phase6-R2-DISKLIB.md`.
+**Files:** `src/store/overlay.rs` (new), `src/store/mod.rs` (mod and re-export lines only), `src/kvstore/disk_triples.rs` (new), `src/kvstore/mod.rs`, `src/kvstore/store.rs`, `examples/disk_stream_probe.rs` (new), `tests/dt_overlay.rs` (new), its change fragment (`R2-DISKLIB`, folded into `CHANGELOG.md`).
 
 #### R2-BULK — bulk index build for kvstore.kv (sorted, bottom-up, bounded memory, crash-safe install)
 **Brief.** New module `src/bulk/`, std only, contract C6.
@@ -618,7 +619,7 @@ Round order follows the dependency chain:
 - Open and Q1–Q14 of a bulk-built database within ±10% of an incrementally built one.
 - Identical answers.
 
-**Files:** `src/bulk/**` (new), `src/signature/disk_vstree.rs`, `src/bin/gbuild.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/lib.rs`, `src/db/dirlock.rs`, `tests/dt_bulk_disk.rs`, `tests/dt_bulk_import.rs`, `tests/dt_bulk_crash.rs` (new), `changelog.d/phase6-R2-BULK.md`.
+**Files:** `src/bulk/**` (new), `src/signature/disk_vstree.rs`, `src/bin/gbuild.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/lib.rs`, `src/db/dirlock.rs`, `tests/dt_bulk_disk.rs`, `tests/dt_bulk_import.rs`, `tests/dt_bulk_crash.rs` (new), its change fragment (`R2-BULK`, folded into `CHANGELOG.md`).
 
 ### Round 3 — wiring and servers (merge order: R3-ROCKS, R3-SRV, R3-STREAM)
 
@@ -684,7 +685,7 @@ Round order follows the dependency chain:
 - Identical answers.
 - **Flip the default to Stream only if every gate passes.** Otherwise keep Materialize as the default and record the numbers.
 
-**Files:** `src/store/backend.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/disk_triples.rs`, `src/kvstore/store.rs`, `src/kvstore/mod.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/open_options.rs` (new), `src/db/admin.rs`, `src/lib.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/bin/gserver.rs`, `.github/workflows/ci.yml`, `tests/dt_disk_stream.rs`, `tests/dt_disk_stream_txn.rs`, `tests/dt_disk_stream_crash.rs` (new), `tests/dt_disk.rs`, `tests/dt_persist_backends.rs`, `tests/dt_phase0_review.rs`, `tests/dt_phase0_wiring.rs`, `tests/dt_persist.rs`, `changelog.d/phase6-R3-STREAM.md`.
+**Files:** `src/store/backend.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/disk_triples.rs`, `src/kvstore/store.rs`, `src/kvstore/mod.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/open_options.rs` (new), `src/db/admin.rs`, `src/lib.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/bin/gserver.rs`, `.github/workflows/ci.yml`, `tests/dt_disk_stream.rs`, `tests/dt_disk_stream_txn.rs`, `tests/dt_disk_stream_crash.rs` (new), `tests/dt_disk.rs`, `tests/dt_persist_backends.rs`, `tests/dt_phase0_review.rs`, `tests/dt_phase0_wiring.rs`, `tests/dt_persist.rs`, its change fragment (`R3-STREAM`, folded into `CHANGELOG.md`).
 
 #### R3-SRV — parallel readers: RwLock servers, PFN metadata cache, lock-free monitoring
 **Brief.**
@@ -728,7 +729,7 @@ Round order follows the dependency chain:
 - Single-client latency within +5%.
 - Mixed workload (8 readers plus 1 writer every 100 ms, check_point off): reader throughput ≥ 2.0 × the pre-Phase-6 read-only 8-client throughput. With check_point on, reader throughput ≥ pre.
 
-**Files:** `src/server.rs`, `src/http_api.rs`, `src/gapi/mod.rs`, `src/gapi/ops_db.rs`, `src/gapi/ops_query.rs`, `src/gapi/ops_reason.rs`, `src/gapi/ops_lifecycle.rs`, `src/gapi/ops_sys.rs`, `src/gapi/tasks.rs`, `src/pfn/registry.rs`, `src/concurrent.rs`, `tests/dt_rw_server_stress.rs`, `tests/dt_rw_crash.rs` (new), `tests/dt_http_durability.rs`, `tests/upstream_transaction.rs`, `tests/dt_gapi_db.rs`, `tests/dt_gserver_lifecycle.rs`, `changelog.d/phase6-R3-SRV.md`.
+**Files:** `src/server.rs`, `src/http_api.rs`, `src/gapi/mod.rs`, `src/gapi/ops_db.rs`, `src/gapi/ops_query.rs`, `src/gapi/ops_reason.rs`, `src/gapi/ops_lifecycle.rs`, `src/gapi/ops_sys.rs`, `src/gapi/tasks.rs`, `src/pfn/registry.rs`, `src/concurrent.rs`, `tests/dt_rw_server_stress.rs`, `tests/dt_rw_crash.rs` (new), `tests/dt_http_durability.rs`, `tests/upstream_transaction.rs`, `tests/dt_gapi_db.rs`, `tests/dt_gserver_lifecycle.rs`, its change fragment (`R3-SRV`, folded into `CHANGELOG.md`).
 
 #### R3-ROCKS — RocksDB: SST-ingest bulk build, bounded streaming reads, exact stats
 **Brief.**
@@ -771,7 +772,7 @@ Round order follows the dependency chain:
 - Open ≤ 10 s at univ 38.
 - Identical answers.
 
-**Files:** `src/backend/rocks.rs`, `src/bulk/mod.rs`, `src/bulk/types.rs`, `src/bulk/rocks_sink.rs` (new), `src/bin/gbuild.rs`, `tests/dt_rocksdb.rs`, `tests/dt_bulk_rocks.rs` (new), `changelog.d/phase6-R3-ROCKS.md`.
+**Files:** `src/backend/rocks.rs`, `src/bulk/mod.rs`, `src/bulk/types.rs`, `src/bulk/rocks_sink.rs` (new), `src/bin/gbuild.rs`, `tests/dt_rocksdb.rs`, `tests/dt_bulk_rocks.rs` (new), its change fragment (`R3-ROCKS`, folded into `CHANGELOG.md`).
 
 ### Round 4 — reclamation, cheap snapshots, closure (merge order: R4-RECLAIM, R4-SNAP, then R4-CLOSURE rebased and measured)
 
@@ -843,7 +844,7 @@ Round order follows the dependency chain:
 - Fresh builds: build, open and Q1–Q14 within ±5%.
 - Identical answers.
 
-**Files:** `src/dict/mod.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/reclaim.rs` (new), `src/db/named.rs` (new), `src/kvstore/store.rs`, `src/kvstore/disk_triples.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/format.rs`, `src/backend/rocks.rs`, `src/bulk/kvimage.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/bin/gcompact.rs` (new), `src/bin/gmonitor.rs`, `Cargo.toml`, `src/lib.rs`, `examples/reclaim_churn.rs` (new), `tests/dt_reclaim.rs`, `tests/dt_reclaim_crash.rs`, `tests/dt_reclaim_concurrency.rs` (new), **all other pre-existing `tests/*.rs` except `tests/dt_http_durability.rs` and `tests/upstream_transaction.rs`**, `changelog.d/phase6-R4-RECLAIM.md`.
+**Files:** `src/dict/mod.rs`, `src/db/mod.rs`, `src/db/persist.rs`, `src/db/reclaim.rs` (new), `src/db/named.rs` (new), `src/kvstore/store.rs`, `src/kvstore/disk_triples.rs`, `src/kvstore/disk_dict.rs`, `src/kvstore/format.rs`, `src/backend/rocks.rs`, `src/bulk/kvimage.rs`, `src/config.rs`, `conf/conf.ini.example`, `src/bin/gcompact.rs` (new), `src/bin/gmonitor.rs`, `Cargo.toml`, `src/lib.rs`, `examples/reclaim_churn.rs` (new), `tests/dt_reclaim.rs`, `tests/dt_reclaim_crash.rs`, `tests/dt_reclaim_concurrency.rs` (new), **all other pre-existing `tests/*.rs` except `tests/dt_http_durability.rs` and `tests/upstream_transaction.rs`**, its change fragment (`R4-RECLAIM`, folded into `CHANGELOG.md`).
 
 #### R4-SNAP — O(1) snapshots and serving disk databases
 **Brief.**
@@ -887,7 +888,7 @@ Round order follows the dependency chain:
 - A disk database through gserver: Q4 qps at 8 clients ≥ 2.5 × 1 client.
 - Memory Q1–Q14, build and insert throughput within ±5%.
 
-**Files:** `src/store/mod.rs`, `src/http_api.rs`, `src/gapi/ops_db.rs`, `src/gapi/mod.rs`, `src/concurrent.rs`, `src/server.rs`, `src/bin/gbuild.rs`, `tests/dt_http_durability.rs`, `tests/upstream_transaction.rs`, `tests/dt_snapshot_disk.rs` (new), `tests/dt_cow_store.rs` (new), `changelog.d/phase6-R4-SNAP.md`.
+**Files:** `src/store/mod.rs`, `src/http_api.rs`, `src/gapi/ops_db.rs`, `src/gapi/mod.rs`, `src/concurrent.rs`, `src/server.rs`, `src/bin/gbuild.rs`, `tests/dt_http_durability.rs`, `tests/upstream_transaction.rs`, `tests/dt_snapshot_disk.rs` (new), `tests/dt_cow_store.rs` (new), its change fragment (`R4-SNAP`, folded into `CHANGELOG.md`).
 
 #### R4-CLOSURE — WatDiv-like workload, final measurements, docs closure
 **Brief.**
@@ -918,7 +919,7 @@ Round order follows the dependency chain:
 - The bench smoke CI job is green with the re-blessed baseline.
 - The WatDiv-like tests pass.
 
-**Files:** `bench/**`, `.github/workflows/bench.yml`, `docs/**`, `README.md`, `CHANGELOG.md`, `changelog.d/README.md`, `changelog.d/phase6-R4-CLOSURE.md`.
+**Files:** `bench/**`, `.github/workflows/bench.yml`, `docs/**`, `README.md`, `CHANGELOG.md`, `changelog.d/README.md`, its change fragment (`R4-CLOSURE`, folded into `CHANGELOG.md`).
 
 ---
 
