@@ -8679,8 +8679,19 @@ mod tests {
 
     // ---- Round 4 review ---------------------------------------------------
 
-    /// Start an `ApiServer` with the check_point policy `check_point`.
-    fn start_cp(tag: &str, check_point: bool) -> (Arc<ApiServer>, SocketAddr) {
+    /// Start an `ApiServer` with the check_point policy `check_point`. Stop
+    /// it with [`stop_cp`]: with check_point off, the shutdown saves the
+    /// dirty databases on the serving thread, after [`ApiServer::shutdown`]
+    /// returned — a test that ended then would remove its temp root first,
+    /// and the save would create the database's directory again (a leak).
+    fn start_cp(
+        tag: &str,
+        check_point: bool,
+    ) -> (
+        Arc<ApiServer>,
+        SocketAddr,
+        std::thread::JoinHandle<ShutdownReport>,
+    ) {
         let root = tmp_root(tag);
         let server = Arc::new(
             ApiServer::bind(&root, "root", "127.0.0.1:0")
@@ -8689,8 +8700,15 @@ mod tests {
         );
         let addr = server.local_addr().expect("addr");
         let s2 = Arc::clone(&server);
-        std::thread::spawn(move || s2.serve_forever());
-        (server, addr)
+        let serving = std::thread::spawn(move || s2.serve_forever());
+        (server, addr, serving)
+    }
+
+    /// Shut down a server [`start_cp`] started and wait until it has saved
+    /// its databases and stopped.
+    fn stop_cp(server: &ApiServer, serving: std::thread::JoinHandle<ShutdownReport>) {
+        server.shutdown();
+        serving.join().expect("the serving thread");
     }
 
     /// A REST `/build` in the disk or RocksDB layout that fails (a body that
@@ -8700,7 +8718,7 @@ mod tests {
     /// A failed build of a new name leaves no directory behind.
     #[test]
     fn a_failed_rest_bulk_build_keeps_the_acknowledged_writes() {
-        let (server, addr) = start_cp("bulk_build_keeps", false);
+        let (server, addr, serving) = start_cp("bulk_build_keeps", false);
         let auth = basic("root", "root");
         let post = |target: &str, body: &str| {
             split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
@@ -8732,7 +8750,7 @@ mod tests {
             !server.root_dir().join("fresh.db").exists(),
             "a failed build of a new name leaves no directory"
         );
-        server.shutdown();
+        stop_cp(&server, serving);
     }
 
     /// A REST `/build` from a request body stores its blank-node labels as
@@ -8797,7 +8815,7 @@ mod tests {
     /// The writes used to be lost, and the database left unloaded.
     #[test]
     fn a_failed_snapshot_rebuild_keeps_the_acknowledged_writes() {
-        let (server, addr) = start_cp("snap_build_keeps", false);
+        let (server, addr, serving) = start_cp("snap_build_keeps", false);
         let auth = basic("root", "root");
         let post = |target: &str, body: &str| {
             split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
@@ -8821,7 +8839,7 @@ mod tests {
         let (s, b) = post("/sparql?db_name=x", ask);
         assert_eq!(s, 200, "served again: {b}");
         assert!(b.contains("true"), "the acknowledged insert survived: {b}");
-        server.shutdown();
+        stop_cp(&server, serving);
     }
 
     /// A REST bulk build does not hold the rule directory's lock while it
@@ -9028,7 +9046,7 @@ mod tests {
     /// used to copy the whole entity interner, then drop the snapshot).
     #[test]
     fn a_commit_that_frees_terms_copies_no_interner() {
-        let (server, addr) = start_cp("commit_no_copy", false);
+        let (server, addr, serving) = start_cp("commit_no_copy", false);
         let auth = basic("root", "root");
         let post = |target: &str, body: &str| {
             split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
@@ -9054,7 +9072,7 @@ mod tests {
             "the entity interner was not copied"
         );
         drop(slot);
-        server.shutdown();
+        stop_cp(&server, serving);
     }
 
     /// An exclusive section that changed nothing does not walk the
