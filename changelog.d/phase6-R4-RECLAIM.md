@@ -154,6 +154,368 @@ only through `gcompact --enable-reclaim`), CLEAR/DROP/MOVE/COPY redo records,
 
 ## Measured numbers
 
+### Quiet post-merge stage (phase6 `7538dfa` + this stage's `16a94cf`, `b9e8dc0`; part 1 of 3: R4-RECLAIM, gate G5)
+
+Reference VM (4 vCPU, 16 GB), nothing else running, in two sessions: 11-03
+(cut off by a usage limit near its end) and 11-04 (its resumption: the
+Materialize pairs on `b9e8dc0`, four more memory pairs and the Materialize
+diagnostics below). CPU busy 24–26 % on average while measuring (the one
+measured process; at most 36 % while a bulk build's index tasks run in
+parallel; 11-04: mean 24.9 %, max 28 %), sampled every 10 s from
+`/proc/stat`; 1-minute load average 1.0–1.1 (up to 2.7 in the first minute
+after a build; 11-04: 0.7–1.4). **The VM ran about 1.75× faster on 11-04**
+(same binaries: memory delete totals 6.8 s against 11.8 s, Materialize
+`off` 387–397 s against 796 s), so ratios are only formed between runs of
+one session. Toolchain 1.99.1, `CARGO_PROFILE_DEV_DEBUG=0
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`, every heavy command under
+`flock /tmp/gstore-bench.lock`. Base = the release binaries of `d702463`
+(the tree before this round: `/tmp/gstore-base-d702463/bin`, and `bin-rocks`
+for RocksDB), measured in the same session as the branch (11-03, the
+fresh builds and the CLI churn). Branch = release builds of
+this tree: `target/release` (`-p gstore --bins --example reclaim_churn -p
+gstore-bench`) and `target-rocks/release` (`--features
+gstore/rocksdb,gstore-bench/rocksdb`, a release build this time — the
+implementer's RocksDB churn ran an opt-level 1 build).
+
+This stage changed two things (both committed, see the commits):
+
+- `16a94cf` — `examples/reclaim_churn.rs` gets `--layout materialize`
+  (`build_disk`, then `OpenOptions::materialize()`): the plan's G5 churn
+  covers Materialize-mode disk too.
+- `b9e8dc0` — **a fix of the memory-layout delete overhead** (below):
+  `db::reclaim::Candidates` keeps packed `u64` keys (space rank above the
+  id, so they sort like `TermId`) and skips a term equal to the one the
+  previous removed triple had in the same position. Same candidate set
+  (new unit tests compare it with the sorted set of every noted `TermId`
+  over random triples, and check the key order); `cargo clippy -p gstore
+  --lib --tests --examples -D warnings` clean; `cargo test -p gstore --lib`
+  1,215 passed; `dt_reclaim` / `dt_reclaim_crash` /
+  `dt_reclaim_concurrency` / `dt_r4_merge` 15 / 4 / 2 / 3 passed, and the
+  first three 16 / 5 / 2 with `--features rocksdb` (11-03); on 11-04
+  `cargo test -p gstore --lib db::reclaim` 4 passed and the clippy run
+  above clean again.
+
+Which build measured what: the memory churn on both (`7538dfa`, and
+`b9e8dc0` in both sessions); the Stream, the first Materialize pair and the
+RocksDB churn on `7538dfa` (the fix only makes the `on` side's candidate
+bookkeeping cheaper, by about 0.2 s over the ten rounds, against 441–878 s
+of disk deletes: it can only lower those ratios); two more Materialize
+pairs (11-04), the CLI churn, the fresh builds and the compatibility
+checks on `b9e8dc0`.
+
+#### G5 churn: `examples/reclaim_churn.rs --base 8 --rounds 10`
+
+Data: the first 18 universities of
+`/tmp/gstore-bench-cache/lubm-like1-u38-s0.nt`, split by the subject's
+`University<n>`; round r deletes university r − 1 (`remove_sources` +
+`sync`) and inserts university 7 + r; one process per layout and policy.
+1,315,190 triples are deleted and as many inserted over the ten rounds.
+
+The counts are the same on every layout (memory, Stream, Materialize,
+RocksDB) and build:
+
+| policy | live = referenced, all 11 rounds | live: round 0 → max → round 10 | triples: round 0 → round 4 → round 10 | limit / peak live |
+|---|---|---|---|---:|
+| on (Immediate) | **yes** | 255,061 → 268,332 (round 4) → 254,440 | 1,028,283 → 1,082,102 → 1,025,981 | **1.000** (268,332 / 268,332) |
+| off (control) | no | 255,061 → 578,244 (round 10; referenced 254,440: **2.27×**) | same | 1.000 (578,244) |
+
+The largest deviation of the live count from round 0 is **+5.20 %**
+(round 4), the data's own: the triple count is +5.23 % in that round and
+live / triples is 0.2480 in round 0 and in round 4 (the universities differ
+in size). The Off control grows to 2.27× (plan: about 2.2×).
+
+Delete and insert time (sums over the ten rounds, means over the runs; a
+pair = one `on` and one `off` process, the order alternated):
+
+| layout (build, session) | pairs | delete on | delete off | **on / off** | insert on | insert off | on / off |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| memory (`b9e8dc0`, 11-03) | 4 | 11.84 s | 10.46 s | **1.132** (pairs 1.114–1.151) | 12.13 s | 12.24 s | 0.99 |
+| memory (`b9e8dc0`, 11-04) | 4 | 6.79 s | 6.09 s | **1.115** (pairs 1.087–1.154) | 7.29 s | 7.02 s | 1.04 |
+| memory (the same fix before its commit, 11-03) | 4 | 11.98 s | 10.79 s | 1.110 (pairs 1.044–1.153) | 12.23 s | 12.52 s | 0.98 |
+| memory (`7538dfa`, 11-03) | 4 | 12.10 s | 10.22 s | 1.184 | 12.33 s | 11.88 s | 1.04 |
+| Stream disk (`7538dfa`, 11-03) | 1 | 441.0 s | 695.9 s | **0.634** | 277.8 s | 476.5 s | 0.58 |
+| Materialize disk (`7538dfa`, 11-03) | 1 | 877.7 s | 796.0 s | 1.103 | 561.5 s | 521.7 s | 1.08 |
+| Materialize disk (`b9e8dc0`, 11-04) | 2 | 446.2 s | 391.8 s | **1.139** (pairs 1.188, 1.092) | 302.0 s | 286.9 s | 1.05 |
+| RocksDB (`7538dfa`, release, 11-03) | 1 | 61.25 s | 62.82 s | **0.975** | 57.98 s | 55.50 s | 1.04 |
+
+Absolute disk times move a lot between sessions (Materialize `off`
+796.0 s on 11-03, 386.6 / 396.9 s on 11-04; the implementer's Stream on /
+off was 264 / 335 s against 441 / 696 s here), on both policies alike: the
+ratios within a session are what G5 gates.
+
+Sizes (round 0 is the fresh bulk build):
+
+| layout | policy | round 0 | round 1 | max (round) | **max / round 0** | max / round 1 |
+|---|---|---:|---:|---:|---:|---:|
+| memory, RSS MiB | on | 96.8 | 131.0 | 148.3 (10) | **1.53** | 1.13 |
+| memory, RSS MiB | off | 96.8 | 136.2 | 214.8 (10) | 2.22 | 1.58 |
+| Stream, `kvstore.kv` bytes | on | 107,819,008 | 114,954,240 | 158,949,376 (8–10, flat) | **1.474** | 1.383 |
+| Stream, `kvstore.kv` bytes | off | 107,819,008 | 125,808,640 | 227,700,736 (10, growing) | 2.112 | 1.810 |
+| Materialize, `kvstore.kv` | on / off | the same bytes as Stream in every round | | | 1.474 / 2.112 | |
+| Stream, RSS MiB | on / off | 59.5 / 57.5 | 112.9 / 116.7 | 122.4 / 172.4 | 2.06 / 3.00 | |
+| Materialize, RSS MiB | on / off | 129.3 / 126.0 | 181.2 / 166.3 | 195.1 / 227.4 | 1.51 / 1.80 | |
+| RocksDB, RSS MiB | on / off | 125.4 / 130.9 | 256.5 / 264.2 | 501.9 / 520.9 | 4.00 / 3.98 (block cache) | |
+
+**What the memory RSS is made of** (one diagnostic run per policy with a
+temporary, uncommitted build of the example that prints glibc's
+`mallinfo2` and the RSS after `malloc_trim(0)` after every round): with
+reclamation on, the heap in use goes 90.8 MiB (round 0) → 104.6 (round 1)
+→ 115.5 MiB (round 10, 1.27×) while the triple count is back at round 0's
+(−0.2 %), and malloc keeps 5.0 → 31.3 → 37.3 MiB of freed memory; the RSS
+after a trim is 92.0 → 124.2 MiB (1.35×). Off: heap in use 90.8 → 188.6
+MiB (2.08×, the dictionary). So about half of the growth is freed memory
+the allocator keeps after the first round's deletes, the rest the
+adjacency vectors growing past the bulk load's exact sizes. Neither is
+new in this round (Off is the former behaviour: 2.22×).
+
+**The memory delete overhead, profiled.** callgrind of the churn at univ
+8, two rounds, collecting inside `remove_sources`: 2.600 G instructions
+with reclamation on against 2.296 G off (+13.2 %); `flush_reclaim` is
+275 M of the 304 M difference, and half of that (152 M) was
+`Candidates::take` sorting one `TermId` per subject, predicate and object
+of every removed triple. `b9e8dc0` removes that (packed keys, repeats
+skipped). After it, a temporary build timing `flush_reclaim` puts the whole
+reclaim step at 0.40 s of a 12.0 s delete total over the ten rounds
+(3.4 %: freeing 323,804 terms 0.32 s, the reference probes 0.04 s, the
+candidates 0.03 s). The rest of the gap (~0.9 s) is the same,
+policy-independent delete code (`known_ids` lookups, `remove_many`'s list
+passes; a delete does not touch the VS-tree) running slower on the state
+reuse leaves (freed strings returned to malloc and reused, reused low ids
+at the front of the per-predicate and per-object lists, so the deletes of
+universities inserted with reused ids pass over longer list tails): in
+round 1, whose state is identical for both policies, the median delete
+after the fix is 989 ms on against 983 ms off (1.006, four runs each,
+11-03), and the per-round ratio then grows to 1.07–1.34 in rounds 3–10.
+Measured on / off: 1.18 before the fix; **1.13 / 1.12** after it (11-03 /
+11-04, eight pairs on the committed build).
+
+**The Materialize delete overhead, profiled (11-04).** One-round runs
+(`--rounds 1`, univ 8, both layouts, two plain timed runs each): delete
+on / off 1.14 and 1.05 on Materialize, 1.17 and 1.11 on Stream (the two
+Materialize churn pairs' round 1: 1.12 and 1.16). So the frees cost about
+the same in both disk modes, +1–3 s on an 18–21 s delete for the ~32 K
+terms round 1 frees. Stream's ten-round ratio is below 1 because Off's
+growing file (2.1×) slows its later deletes (rounds 6–10: off 74–112 s, on
+40–46 s, 11-03), which Materialize's in-memory working set does not feel
+(11-04: on / off 1.09–1.22 in rounds 1–9 of both pairs; round 10 1.35 and
+0.81). All CPU: user time
+equals the wall time, sys < 1 s; `strace -c` of round 1: 33.6 K against
+25.4 K page reads and 27 against 23 `fsync`s, ~1 s of syscalls in all.
+callgrind (Materialize, universities 0–2 cut to departments 0–1, `--base 2
+--rounds 1`, collecting inside `remove_sources`): 13.07 G instructions on
+against 11.92 G off (+9.6 %), and the difference is `flush_reclaim`
+(1.143 G for 3,673 freed terms, ~311 K instructions each): the `*2id`
+B+ tree delete 149 K and the free-list B+ tree insert (`release_index`)
+133 K per term; the defensive reference probes are 0.13 % of the phase and
+the operation brackets 0.02 %. A deleted triple costs ~820 K (its index
+deletes). Every B+ tree write parses the whole node into per-entry
+allocations and serializes it back (`Node::parse` 52 %, malloc + free
+~60 % of the delete phase): the R1-KV B+ tree, which reclamation's two
+writes per freed term use like every other write. So the overhead is the
+work of the free itself at the kvstore's per-write cost, not a defect of
+this round's code; the follow-up is in the B+ tree (below).
+
+**Memory-layout inserts** (the implementer's 4.7× slowdown with reuse,
+fixed by the integration's batched `insert_many`): in the churn on the
+committed build, inserts total 12.13 s on against 12.24 s off (0.99×,
+11-03) and 7.29 / 7.02 s (1.04×, 11-04); the implementer measured
+40.66 / 8.67 s. The first university (round 1, medians) takes 1.10 /
+1.35 s (11-03) and 0.76 / 0.75 s (11-04) on / off; the implementer: 6.7 s
+against 0.87 s. Against the base binary, through the
+command-line tools on the snapshot layout (no in-process churn exists in
+`d702463`): `gbuild` of universities 0–7, then ten rounds of `gsub
+university r` and `gadd university 8 + r`, each tool a fresh process (open,
+apply, save); two runs per side in the order base, on, off, off, on, base;
+sums over the ten rounds:
+
+| side | `gbuild` | `gsub` total | `gadd` total | snapshot dir after round 10 |
+|---|---:|---:|---:|---:|
+| base `d702463` | 8.34 s | 99.07 s | 23.15 s | 158,929,970 B |
+| HEAD, `id_reclaim=on` | 8.41 s | **17.17 s** (0.17× base) | **18.28 s** (0.79× base) | 86,928,588 B (entity live 167,544, free 9,226) |
+| HEAD, `id_reclaim=off` | 8.76 s | 19.31 s (0.19×) | 21.59 s (0.93×) | 158,929,970 B (entity live 381,804) |
+
+Memory-layout inserts with reuse are faster than the base's inserts, and
+than HEAD's without reuse.
+
+#### Fresh builds: `gstore-bench run --profile reference --scale {8,38} --no-conc --drop-caches`
+
+Each side runs **its own harness** with its own `--bin-dir`
+(`/tmp/gstore-base-d702463/bin/gstore-bench --bin-dir
+/tmp/gstore-base-d702463/bin`, `target/release/gstore-bench --extra none
+--bin-dir target/release`; RocksDB from `bin-rocks` / `target-rocks`): the
+harness's child processes do the opens and the queries, so the
+implementer's `target/release/gstore-bench … --bin-dir <base-bin>` measured
+the branch's open and queries with only the base's `gbuild`. Stream =
+`--backends snapshot,disk --env GSTORE_DISK_QUERY_MODE=stream`,
+Materialize = `--backends disk --env GSTORE_DISK_QUERY_MODE=memory`,
+RocksDB = `--backends rocksdb`. Univ 8: three pairs of each; univ 38:
+three pairs snapshot + Stream, two of Materialize and of RocksDB; order
+base, head, head, base, base, head; means of the raw runs (warm open =
+median of the fresh-process re-opens, query = minimum over the 5 query
+processes of the warm median, as the harness records them):
+
+| univ | layout | build s | open first (cold) ms | open warm ms | Q1–Q14 geomean ms | slowest query vs base |
+|---|---|---|---|---|---|---|
+| 8 | snapshot | 8.18 → 8.36 (1.022) | 385 → 317 (0.822) | 277 → 270 (0.975) | 5.15 → 3.80 (0.739) | q12 0.150 → 0.162 (1.075) |
+| 8 | Stream | 6.86 → 6.56 (0.957) | 6.5 → 8.7 (1.340) | 0.88 → 1.01 (1.147) | 12.29 → 4.91 (0.400) | q10 0.731 (all faster) |
+| 8 | Materialize | 6.54 → 6.43 (0.983) | 420 → 432 (1.030) | 380 → 360 (0.948) | 9.60 → 3.34 (0.348) | q5 0.679 (all faster) |
+| 8 | RocksDB | 7.15 → 6.54 (0.915) | 384 → 273 (0.711) | 296 → 225 (0.760) | 17.16 → 8.47 (0.494) | q12 0.270 → 0.275 (1.020) |
+| 38 | snapshot | 46.62 → 46.49 (0.997) | 1779 → 1776 (0.998) | 1529 → 1564 (1.023) | 26.14 → 16.05 (0.614) | q11 1.397 → 1.673 (1.198), q12 0.565 → 0.649 (1.148) |
+| 38 | Stream | 34.71 → 36.17 (1.042) | 7.4 → 8.0 (1.087) | 0.91 → 0.95 (1.050) | 84.67 → 18.70 (0.221) | q10 0.872 (all faster) |
+| 38 | Materialize | 34.70 → 35.26 (1.016) | 2345 → 2199 (0.938) | 2088 → 2076 (0.994) | 68.91 → 12.66 (0.184) | q10 0.813 (all faster) |
+| 38 | RocksDB | 36.93 → 35.42 (0.959) | 1385 → 1279 (0.923) | 1146 → 1060 (0.925) | 100.98 → 38.31 (0.379) | q5 1.019 |
+
+Database sizes: snapshot byte-identical (85,480,180 / 430,848,180 B);
+disk 130,150,405 → 130,150,400 and 653,959,174 → 653,959,168 B; RocksDB
+0.993× / 0.999×. Build peak RSS within ±3.5 %. `gstore-bench compare
+<base> <head>` of every pair: **PASS** (175 gates for snapshot + Stream,
+96 for Materialize and for RocksDB; 0 failed in 16 pairs).
+
+Most queries are much faster than the base (R4-VS's VS-tree policy and the
+other Round-4 work); what is above +5 %:
+
+- **Stream warm / cold open** (+0.13 / +2.2 ms at univ 8, +0.05 / +0.6 ms
+  at univ 38). callgrind of a whole `gquery` ASK on a Stream database:
+  830,770 instructions (base) against 838,284 (HEAD, a V2 file) and 840,878
+  (HEAD, a V1 file built with `id_reclaim=off`): +0.9 %, the same without
+  the free list; 20 fresh `gquery` processes take 5.57 / 5.87 / 5.17 ms
+  each (base / V2 / V1). Process-level noise at the 1 ms scale, not the
+  reclamation.
+- **Snapshot q11 / q12 at univ 38** (+0.28 / +0.08 ms; q11 is 1.007× at
+  univ 8). callgrind: `Evaluator::evaluate` 5.455 M → 5.390 M (q11) and
+  2.872 M → 2.870 M instructions (q12); a whole `gquery q11`, everything
+  after the open: 687.1 M → 687.0 M. The same work: the difference is in
+  memory access on the 490 MiB univ 38 store (not at univ 8), not in
+  reclamation code. Follow-up for the other parts of this measure stage
+  (R4-SNAP's copy-on-write store layout is the candidate).
+- The snapshot open's dictionary load costs +30 M instructions
+  (`Interner::assemble`'s duplicate check, R4-RECLAIM's normalization):
+  +2.3 % warm open at univ 38, within the bound.
+
+**Identical answers:** rows and `rows_fnv64` of all 14 queries equal the
+base's in every run, on every layout, at both scales; the update round trip
+is `ok` on both sides (singles, chunk delta, answers unchanged, reopen
+count). After it the base's dictionary has grown (univ 8: entities 168,432
+→ 169,456, literals 86,612 → 87,120; univ 38: 842,657 → 843,783, 433,389 →
+434,033), HEAD's is back to its fresh counts.
+
+Update phase (report-only, means): single delete median snapshot 0.005 →
+0.009 ms (univ 8), Stream 1.84 → 2.64 ms (univ 8) and 1.96 → 2.41 ms
+(univ 38), Materialize 2.00 → 2.62 / 2.13 → 2.71 ms, RocksDB 0.34 → 0.37
+ms (univ 8): a delete that leaves its terms unreferenced frees them. Chunk
+delete Stream univ 38 1,422 → 1,761 ms (head runs 1,402 / 1,979 / 1,903).
+Disk checkpoint 0.04–0.07 → 0.5–0.7 ms; snapshot univ 38 checkpoint 1,755 → 1,965
+ms and in-process reopen 1,176 → 1,349 ms.
+
+#### Format compatibility, by hand (univ 1, 139,905 triples)
+
+- `d702463`'s `gbuild --disk v1` writes `GSTOREKV`. HEAD's `gsub` (400
+  triples) and `gadd` (200 new triples) with `GSTORE_ID_RECLAIM=off` keep
+  it `GSTOREKV` (so does a HEAD `gsub` with the default policy: a V1 file
+  is never upgraded implicitly). **`d702463`'s `gquery` reads it** and
+  answers Q1–Q14 (3 to 11,489 rows) exactly as it answers on a copy the
+  base tools updated the same way, and as HEAD's `gquery` answers (sorted
+  output md5 per query); triple count 139,705 everywhere.
+- `gcompact v1 --enable-reclaim`: exit 0, "kvstore.kv is now version 2",
+  magic **`GSTOREK2`**; `gcompact --reclaim --check` frees the 101 terms
+  the reclaim-off delete left (entity free 50, literal free 51) and reports
+  `integrity ok`; HEAD's answers unchanged.
+- **`d702463`'s and `0fb8842`'s `gquery` and `gadd` refuse the upgraded
+  file loudly**: exit 1, "this gStore KV file uses feature bits 0x1 that
+  this binary does not support (written by a newer gStore); open it with
+  that version"; `kvstore.kv` unchanged by the refused opens (md5).
+- New HEAD databases are V2: `gbuild --disk` and `gbuild --layout disk` →
+  `GSTOREK2` (`GSTORE_ID_RECLAIM=off gbuild --disk` → `GSTOREKV`), refused
+  by both old `gquery`s the same way; a HEAD `gsub` of 400 triples on it
+  frees 101 ids at once (`gmonitor`: entity live 23,543 free 50, literal
+  live 12,421 free 51).
+
+#### Acceptance (R4-RECLAIM and G5), quiet
+
+| item | verdict | measured |
+|---|---|---|
+| Live counts equal the referenced terms exactly, every round (univ 8) | **met** | all 11 rounds on memory, Stream, Materialize and RocksDB |
+| … and within ±5 % of round 0 (Off grows ~2.2×) | **not met** (+5.20 %) | 268,332 / 255,061 at round 4; the data itself is +5.23 % (live / triples 0.2480 in both rounds). Off: 2.27× |
+| High-water mark ≤ 1.05 × peak live | **met** | 1.000 on every layout |
+| RSS ≤ 1.15 × round 0 (memory) | **not met** (1.53×) | 96.8 → 148.3 MiB; 1.13× round 1; heap in use 1.27×, freed memory malloc keeps 37 MiB; Off 2.22× |
+| `kvstore.kv` ≤ 1.2 × round 0 (Stream) | **not met** (1.474×) | 107.8 → 158.9 MB, flat from round 8; Off 2.112× and growing |
+| Delete Immediate / Off ≤ 1.10, memory | **not met** (1.13 / 1.12) | 8 pairs on `b9e8dc0`: 11.84 / 10.46 s (1.132, 11-03) and 6.79 / 6.09 s (1.115, 11-04); 1.184 before the fix; the reclaim step itself 3.4 %, round 1 (same state) 1.006 |
+| … ≤ 1.10, disk | Stream **met** (0.634); Materialize **not met** (1.139) | Stream 441.0 / 695.9 s (`7538dfa`); Materialize two pairs on `b9e8dc0` 446.2 / 391.8 s (1.188, 1.092), and 877.7 / 796.0 s (1.103) on `7538dfa`: two B+ tree writes per freed term |
+| … ≤ 1.20, RocksDB | **met** (0.975) | 61.25 / 62.82 s, release build |
+| Fresh builds: build, open, Q1–Q14 within ±5 % (univ 8 and 38) | **not met as written** | builds 0.915–1.042 (none more than +5 %; RocksDB univ 8 8.5 % faster); open and queries mostly far faster (R4-VS); above +5 %: Stream open (+0.13 ms warm at univ 8, cold ms-scale), snapshot q12 (univ 8, +12 µs), q11 / q12 (univ 38, +0.28 / +0.08 ms) — same instruction counts as the base, not reclamation code |
+| Identical answers | **met** | rows and row hashes of Q1–Q14 equal the base's on 4 layouts × 2 scales, every run |
+| Old binary reads V1 (written with reclaim off) and refuses V2 | **met** | above; also after `gcompact --enable-reclaim` |
+| Memory-layout inserts (report) | — | on / off 0.99× / 1.04× in the churn (11-03 / 11-04); CLI `gadd` 0.79× the base |
+
+**G5 (id reclamation): FAIL** — met: live = referenced in every round,
+high-water 1.000, delete overhead Stream 0.63×, RocksDB 0.98×; not met:
+within ±5 % of round 0 (+5.20 %, the data's own size change), delete
+overhead on memory (+12–13 %) and on Materialize disk (+14 %).
+
+Follow-ups (plan §5.7; recorded for R4-CLOSURE):
+
+1. **±5 % of round 0**: unattainable with this churn while live =
+   referenced exactly — the referenced terms themselves move +5.2 %. Use
+   universities of equal size, or state the bound per triple (live /
+   triples: 0.2480 in every round here).
+2. **Memory delete overhead** (+12 %; the reclaim step itself 3.4 % after
+   `b9e8dc0`): profile the deletes after reuse with a cache simulation
+   (`callgrind --cache-sim=yes`, or `perf` on a box that has it); options:
+   one retire / release pass per interner per statement instead of per
+   term, a bitset instead of the `BTreeSet` free list, freeing the strings
+   of a statement in one batch.
+3. **RSS ≤ 1.15 × round 0**: round 0 is a bulk load with exactly sized
+   lists and an untouched heap; exact-size growth for batched merges
+   (`reserve_exact`) and a `malloc_trim` after large deletes would close
+   most of it, or bound it against a steady-state round (1.13× of round 1
+   here).
+4. **`kvstore.kv` ≤ 1.2 × round 0**: the bulk image packs every page; a
+   fill factor below 100 % in `bulk::kvimage`, or a bound against round 1
+   (1.38× here, flat from round 8).
+5. **Materialize delete overhead** (+14 %; Materialize is the default
+   disk query mode): a free is two B+ tree writes (`*2id` delete,
+   free-list insert) at ~140 K instructions each, because every
+   `bptree` write parses the whole node into per-entry allocations and
+   serializes it back. Options: a batched, sorted update path in
+   `kvstore::bptree` (one parse and one serialize per touched leaf per
+   statement) used by `free_term_in` / `release_index` and by
+   `delete_keys` — it would cut both sides; or an allocation-free,
+   in-place leaf edit. Stream pays the same per free but is net faster
+   than Off over the churn (0.63×).
+6. Snapshot q11 / q12 at univ 38 (+20 % / +15 %, same instructions): for
+   the R4-SNAP part of this measure stage.
+
+Commands (this stage):
+
+```sh
+cargo build --release -p gstore --bins --example reclaim_churn -p gstore-bench
+CARGO_TARGET_DIR=target-rocks cargo build --release -p gstore -p gstore-bench --bins \
+    --example reclaim_churn --features gstore/rocksdb,gstore-bench/rocksdb
+D=/tmp/gstore-bench-cache/lubm-like1-u38-s0.nt
+for layout in memory stream materialize; do for policy in on off; do
+  flock /tmp/gstore-bench.lock target/release/examples/reclaim_churn --data "$D" \
+      --layout $layout --policy $policy --base 8 --rounds 10 --scratch /tmp/r4reclaim-churn
+done; done   # rocksdb: target-rocks/release/examples/reclaim_churn --layout rocksdb
+export GSTORE_BENCH_CACHE=/tmp/gstore-bench-cache
+B=/tmp/gstore-base-d702463/bin   # bin-rocks with target-rocks for --backends rocksdb
+flock /tmp/gstore-bench.lock $B/gstore-bench run --profile reference --scale 8 \
+    --backends snapshot,disk --env GSTORE_DISK_QUERY_MODE=stream --no-conc --drop-caches \
+    --bin-dir $B --out base.json
+flock /tmp/gstore-bench.lock target/release/gstore-bench run --profile reference --scale 8 \
+    --extra none --backends snapshot,disk --env GSTORE_DISK_QUERY_MODE=stream --no-conc \
+    --drop-caches --bin-dir target/release --out head.json
+target/release/gstore-bench compare base.json head.json
+# the Materialize free-path profile (data: universities 0-2 cut to the
+# subjects of departments 0-1, 39,468 triples):
+valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*remove_sources*' \
+    target/release/examples/reclaim_churn --data small.nt --layout materialize \
+    --policy on --base 2 --rounds 1 --scratch /tmp/r4prof/scratch-on   # and --policy off
+```
+
+Every database this stage built was deleted.
+
+### Implementer run (noisy)
+
 All numbers: **implementer run, noisy** — this machine (4 vCPUs, 16 GiB),
 shared with other agents (load average 1–8 during the runs), every heavy
 command under `flock /tmp/gstore-bench.lock`. Release build of `31b4b52`
@@ -161,7 +523,7 @@ command under `flock /tmp/gstore-bench.lock`. Release build of `31b4b52`
 gstore-bench`); base = `/tmp/gstore-base-d702463/bin`. The quiet measure
 stage should re-run the commands at the end of this section.
 
-### G5 churn: `examples/reclaim_churn.rs`, univ 8 live, 10 rounds
+#### G5 churn: `examples/reclaim_churn.rs`, univ 8 live, 10 rounds
 
 Data: the first 18 universities of
 `/tmp/gstore-bench-cache/lubm-like1-u38-s0.nt` (split by the subject's
@@ -231,7 +593,7 @@ Reading the misses:
   university either way). The fix belongs in `src/store/mod.rs` (see
   Requests); Stream and RocksDB inserts are unaffected (0.72× / 1.06×).
 
-### Fresh builds: `gstore-bench run --profile reference --scale 8`
+#### Fresh builds: `gstore-bench run --profile reference --scale 8`
 
 `--backends snapshot,disk --no-conc`, three A/B pairs in one session
 (base→branch, branch→base, base→branch); means of the three raw runs per
@@ -267,7 +629,7 @@ frees them (the `has_*` probes, the writer-gate re-check and one pager
 operation per freed term): +0.6 ms. Chunk deletes pay ~1.3 µs (snapshot) /
 ~13 µs (disk) per triple for the reference checks.
 
-### Old-binary compatibility (proved by hand, `compat.sh`)
+#### Old-binary compatibility (proved by hand, `compat.sh`)
 
 40-triple data set, `del.nt` (4 triples), `add.nt` (2 triples):
 
@@ -286,7 +648,7 @@ operation per freed term): +0.6 ms. Chunk deletes pay ~1.3 µs (snapshot) /
   `gadd` adds to it (reusing the freed ids its own LIFO way), and the new
   `gcompact snap --check` reports `integrity ok`.
 
-### Tests (this machine, debug/optimized test profile)
+#### Tests (this machine, debug/optimized test profile)
 
 `tests/dt_reclaim.rs` 15 tests (16 with `--features rocksdb`) 9–12 s;
 `tests/dt_reclaim_crash.rs` 4 tests (5 with RocksDB; 20 SIGKILL iterations
