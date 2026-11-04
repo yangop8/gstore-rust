@@ -15,14 +15,14 @@
 //!   separated by `,`.
 //! * `‹u›` = the printed form of a vertex ([`GFunCtx::gnode_str`]), e.g.
 //!   `<http://ex/Alice>`; `‹p›` = a predicate's printed form.
-//! * "path entry" = [`push_path_json`](super::fmt::push_path_json) of a
-//!   [`GPath`](super::fmt::GPath); "empty-path entry" = the same with
+//! * "path entry" = [`push_path_json`] of a
+//!   [`GPath`]; "empty-path entry" = the same with
 //!   [`GPath::empty`](super::fmt::GPath::empty), i.e.
 //!   `{"src":"‹u›","dst":"‹u›","edges":[],"nodes":[]}`.
 //! * The upstream loops are ported **literally** (same predicate / direction
 //!   interleaving — see [`traverse::NbrOrder`](super::traverse::NbrOrder) —,
 //!   same queue discipline, same `std::set` / `std::map` (ascending) and
-//!   `unordered_map` ([`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder))
+//!   `unordered_map` ([`CxxUnorderedOrder`])
 //!   iteration orders): they decide which of several equal paths is printed.
 //!   Predicates without an edge at the expanded vertex are skipped, which is
 //!   invisible (every upstream loop over them is empty).
@@ -62,7 +62,7 @@
 //! `PathQueryHandler::shortestPath(uid, vid, directed, preds)`
 //! (shortestPath.cpp:22-276) is used by `shortestPath`, `shortestPathLen`,
 //! `kHopReachablePath` and directed `cyclePath` / `cycleBoolean`; it is
-//! ported once ([`shortest_path_primitive`]):
+//! ported once (`shortest_path_primitive`):
 //!
 //! 1. `uid < 0 || vid < 0` (missing) → empty. (An isolated endpoint can never
 //!    be met, so it yields empty as well.)
@@ -2012,7 +2012,7 @@ fn k_hop_enumerate_pair(
 /// written order). The docs list each path's `nodes` as `3,2,0,1`; the
 /// `pathVec2JSON` map order for the insertion sequence `0,1,2,3` is
 /// `3,2,1,0` under libstdc++ (see
-/// [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder)), which also matches
+/// [`CxxUnorderedOrder`]), which also matches
 /// the docs' other examples — the docs' order here is stale.
 pub fn k_hop_enumerate(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     k_hop_enumerate_guarded(ctx, a, &mut OutputGuard::new(ctx, GFnKind::KHopEnumerate))
@@ -2469,7 +2469,7 @@ fn unordered_order(keys: &[i64]) -> Vec<usize> {
 ///   so it prints forward (`fromNode` = earlier node) — reproduced.
 /// * Order: the result is an `unordered_map<int, vector<int>>` filled in
 ///   discovery order (`u` first); iterate it in
-///   [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder) order of the
+///   [`CxxUnorderedOrder`] order of the
 ///   discovered entity ids.
 /// * Missing / isolated `u`: only its own single-node path (a missing one
 ///   prints `"src":"","dst":""` and `{"nodeIndex":-1,"nodeIRI":""}`).
@@ -2526,7 +2526,7 @@ pub fn sssp(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// **Per source** (sources separated by `,`): one
 /// `{"src":"‹u›","dst":"‹t›","length":L}` per reachable vertex `t` (`u`
 /// itself with length 0), comma-separated, in the
-/// [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder) order of the
+/// [`CxxUnorderedOrder`] order of the
 /// entity ids in BFS discovery order (same BFS as [`sssp`]). Missing /
 /// isolated `u` → only its own `length 0` entry.
 pub fn sssp_len(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {

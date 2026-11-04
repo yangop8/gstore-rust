@@ -64,7 +64,7 @@ fn is_control(c: char) -> bool {
     u < 0x20 || (0x7f..0xa0).contains(&u)
 }
 
-/// `s` as text to print: every control character ([`is_control`]) written
+/// `s` as text to print: every control character (`is_control`) written
 /// as an escape — `\n` / `\r` / `\t`, else `\uXXXX` — so what a query
 /// answer holds cannot drive the operator's terminal. With `keep_layout`, a
 /// line break and a tab stay as they are (multi-line text).
@@ -155,7 +155,7 @@ fn cell_literal(value: &str) -> Cow<'_, str> {
 /// A SPARQL-JSON binding (`{"type","value"[,"datatype"][,"xml:lang"|"lang"]}`)
 /// as upstream's console shows it (its `format=n-triple` cells): `<iri>`,
 /// `_:b`, `"lex"`, `"lex"@lang`, `"lex"^^<datatype>`, the lexical form
-/// unescaped ([`cell_literal`]).
+/// unescaped (`cell_literal`).
 pub fn binding_term(b: &Json) -> String {
     let value = b.get("value").and_then(Json::as_str).unwrap_or_default();
     let kind = b.get("type").and_then(Json::as_str).unwrap_or_default();

@@ -13,7 +13,7 @@
 //!
 //! # Routing
 //!
-//! [`wants`] claims, for this layer:
+//! `wants` claims, for this layer:
 //!
 //! * `GET|POST /api` — the upstream endpoint (also `/grpc/api` and
 //!   `/ghttp/api`, the paths older upstream docs use);
@@ -27,7 +27,7 @@
 //!
 //! # Request flow
 //!
-//! [`serve`] mirrors upstream `checkRequest` (`grpc.cpp` ~188-330):
+//! `serve` mirrors upstream `checkRequest` (`grpc.cpp` ~188-330):
 //!
 //! 1. the IP access check ([`auth::check_ip`]) — blocked → `1101`;
 //! 2. parse the parameters ([`params::Params`]: URL query + JSON / form /
@@ -535,7 +535,7 @@ pub const SYSTEM_DB: &str = "system";
 /// Validate a `db_name` like upstream's `check_param_value("db_name", …)`
 /// (non-empty, not the system database, at least 3 characters, no `.db`
 /// suffix), plus this server's rule that it be a safe single path component
-/// ([`crate::http_api::valid_db_name`]: letters and digits — any script —,
+/// (`crate::http_api::valid_db_name`: letters and digits — any script —,
 /// `_`, `-` and inner `.`s, at most 64 characters). The error is the message
 /// for a `1003` answer.
 pub fn check_db_name(name: &str) -> Result<(), String> {

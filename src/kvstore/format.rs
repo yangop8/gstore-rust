@@ -37,8 +37,8 @@
 //! |---|---|
 //! | 0–20 | SPO/POS/OSP, the six dictionary structures, counters, SP2O_VLIST, COMPACTED, PRED_STATS, distinct counts, GSPO, quad count, VSTREE_STALE |
 //! | 21 | [`FEATURES`] bitmask |
-//! | 22 | [`FREE_IDS`] B+tree root (R4) |
-//! | 23–25 | [`FREE_COUNT_E`] / [`FREE_COUNT_L`] / [`FREE_COUNT_P`] (R4) |
+//! | 22 | `FREE_IDS` B+tree root (R4) |
+//! | 23–25 | `FREE_COUNT_E` / `FREE_COUNT_L` / `FREE_COUNT_P` (R4) |
 //! | 26–31 | reserved |
 //!
 //! ## Feature bits
@@ -122,7 +122,7 @@ pub(crate) const FREE_COUNT_P: usize = 25;
 
 // ---- feature bits -----------------------------------------------------------
 
-/// Bit 0: free-id list in [`FREE_IDS`] / `FREE_COUNT_*` (R4-RECLAIM).
+/// Bit 0: free-id list in `FREE_IDS` / `FREE_COUNT_*` (R4-RECLAIM).
 pub const FEATURE_FREE_IDS: u64 = 1 << 0;
 /// Bit 1 (reserved, deferred): wider IvArray page tables.
 pub const FEATURE_IVARRAY_WIDE: u64 = 1 << 1;

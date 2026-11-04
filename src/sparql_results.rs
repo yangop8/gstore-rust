@@ -498,7 +498,7 @@ pub fn upstream_select_json(rs: &ResultSet, limit: Option<usize>) -> Json {
 /// cells as upstream stores terms (upstream skips unbound cells within a
 /// row; so does this): IRIs and blank nodes in N-Triples form, a literal
 /// as its lexical form between `"` **unescaped**, then its `@lang` or
-/// `^^<datatype>` ([`upstream_term_text`]) — so a client strips the quotes
+/// `^^<datatype>` (`upstream_term_text`) — so a client strips the quotes
 /// off a graph function's value to get its JSON. At most `limit` rows.
 pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
     let head: Vec<Json> = rs

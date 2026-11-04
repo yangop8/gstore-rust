@@ -83,7 +83,7 @@
 //!
 //! * **Shared** guards (`DbCell::read`): statement reads (a read statement
 //!   by the transaction's owner included; a read of a transaction's
-//!   snapshot takes it only to find the snapshot, see [`ReadSnapshot`]),
+//!   snapshot takes it only to find the snapshot, see `ReadSnapshot`),
 //!   export, backup, `loadcsr`, `monitor` / `schema` of a database whose
 //!   statistics were never computed (later ones are refreshed by a
 //!   background thread on a shared guard, off the request path, see
@@ -115,7 +115,7 @@
 //!   read of a transaction's on-disk snapshot takes the database's guard
 //!   only to find the snapshot and releases it before it enters the gate
 //!   (so a `/commit` — exclusive guard, then the gate's drain — never waits
-//!   for it: the drain cancels it, see [`ReadSnapshot`]).
+//!   for it: the drain cancels it, see `ReadSnapshot`).
 //! * Leaf locks, held for a few instructions with nothing called under
 //!   them: the cancel bridge's registry (forwarding a request's cancel flag
 //!   to an on-disk snapshot read's gate flag) and `gapi::ops_db`'s registry
@@ -142,7 +142,7 @@
 //! than silently joining the transaction, and every non-transactional read is
 //! answered from a snapshot of the committed state taken at `/begin`, so no
 //! client ever observes uncommitted data. `/begin` copies no triple (see
-//! [`ReadSnapshot`]): an in-memory database's snapshot shares its
+//! `ReadSnapshot`): an in-memory database's snapshot shares its
 //! copy-on-write indexes, which the transaction's first write copies once
 //! (an open transaction that wrote holds the begin-time copy until it ends);
 //! a Stream-mode on-disk database's snapshot is a read view of its store,
@@ -2620,7 +2620,7 @@ impl ApiServer {
 
     /// The live cancel flag for an in-flight task, if it still exists. The
     /// engine's cooperative-cancellation hook ([`Database::query_cancellable`])
-    /// already consults this flag: `prepare_query` clones it into the [`QueryJob`]
+    /// already consults this flag: `prepare_query` clones it into the `QueryJob`
     /// that runs the query, `POST /cancel` sets it, and `/tasklist` reports it.
     /// This accessor lets an embedder reach the same flag directly.
     pub fn task_cancel_flag(&self, task_id: u64) -> Option<Arc<AtomicBool>> {

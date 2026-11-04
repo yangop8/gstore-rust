@@ -37,7 +37,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{GStoreError, Result};
 
-/// Which sources a SPARQL `LOAD` may read. See the [module docs](self).
+/// Which sources a SPARQL `LOAD` may read. See the module docs of
+/// `src/db/load_policy.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadPolicy {
     /// Whether local files (`file:` IRIs and bare paths) may be loaded at all.

@@ -94,10 +94,10 @@
 //!   Without the feature the default build stays dependency-free and sends
 //!   bodies verbatim. Streamed (`chunked`) responses are never compressed.
 //!
-//! **HTTPS:** with the optional `tls` feature, [`Server::serve_forever_tls`]
+//! **HTTPS:** with the optional `tls` feature, `Server::serve_forever_tls`
 //! (and its [`ApiServer`](crate::http_api::ApiServer) counterpart) terminate
-//! TLS in-process via `rustls` — build a [`rustls::ServerConfig`] from a
-//! cert+key PEM with [`load_tls_config`]. The default (zero-dependency) build
+//! TLS in-process via `rustls` — build a `rustls::ServerConfig` from a
+//! cert+key PEM with `load_tls_config`. The default (zero-dependency) build
 //! omits TLS: terminate HTTPS in front of the endpoint with a reverse proxy
 //! (nginx, Caddy, stunnel, …) instead, and do not send credentials over plain
 //! `http://` in production without such termination.

@@ -1,5 +1,5 @@
 //! Immediate id reclamation: the policy, and the candidate set a
-//! [`Database`](super::Database) frees after an applied delete.
+//! [`Database`] frees after an applied delete.
 //!
 //! **When.** After every applied delete — `DELETE DATA` / `DELETE … WHERE`,
 //! quad deletes, `CLEAR` / `DROP` / `MOVE` / `COPY`, `remove_sources`, the
@@ -16,7 +16,7 @@
 //!   IRIs); a predicate while `has_predicate` or `NamedGraphs::pred_refs`.
 //!   Each candidate is decided on its own probes: one a read error left in
 //!   doubt is neither freed nor dropped but checked again at the next
-//!   statement, up to [`CHECK_ATTEMPTS`] checks (then `gcompact --reclaim`
+//!   statement, up to `CHECK_ATTEMPTS` checks (then `gcompact --reclaim`
 //!   finds it), and holds back no other candidate's free.
 //! * **Sequence.** The free is persisted first (Materialize: a key-level
 //!   `DiskOp::Free`; Stream: `DiskTriples::free_ids` under the writer gate;
@@ -34,7 +34,7 @@
 //! an explicit [`Database::reclaim_unused`](super::Database::reclaim_unused)
 //! (`gcompact --reclaim`).
 //!
-//! The policy of a new [`Database`](super::Database) is the process default
+//! The policy of a new [`Database`] is the process default
 //! ([`default_id_reclaim`]): [`IdReclaim::Immediate`] unless
 //! [`set_default_id_reclaim`] installed another (servers install `conf.ini`'s
 //! `[system] id_reclaim`), with the environment variable [`ENV_ID_RECLAIM`]

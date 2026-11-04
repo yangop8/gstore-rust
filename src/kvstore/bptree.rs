@@ -1,7 +1,7 @@
 //! A disk-backed B+ tree (variable-length byte key → variable-length byte value).
 //!
 //! Corresponds to gStore's `SITree`/`Tree` B+ trees. Nodes live in [`Pager`]
-//! pages. Writes parse a page into an in-memory [`Node`], mutate it, and write
+//! pages. Writes parse a page into an in-memory `Node`, mutate it, and write
 //! it back (correctness-first). Reads never materialize a node: they walk the
 //! shared cached page through a zero-copy, bounds-checked [`NodeView`] (a
 //! malformed page is an `Err`, never a panic), so a lookup or a range scan
@@ -1107,7 +1107,7 @@ impl BTree {
     /// copies. Read-only (`&Pager`) so it can run concurrently with other
     /// readers. Prefer [`scan_prefix_with`](Self::scan_prefix_with), which
     /// allocates nothing per entry; this materializing form parses whole
-    /// [`Node`]s and is kept as the reference the zero-copy path is tested
+    /// `Node`s and is kept as the reference the zero-copy path is tested
     /// against.
     pub fn scan_prefix(&self, pager: &Pager, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();

@@ -209,7 +209,7 @@ pub(super) fn sort_entries(entries: &mut [(EntityLiteralId, Signature)]) {
 /// docs), and `bincode`-serializes to `vstree.bin` for the in-memory database
 /// path. It can instead be **out-of-core** (`disk`): the nodes then live in a
 /// dedicated paged file and a candidate scan reads only the nodes it traverses
-/// (see [`DiskTree`]). The `disk` backing is not serialized, so the serialized
+/// (see `DiskTree`). The `disk` backing is not serialized, so the serialized
 /// form is the in-memory tree's — `save`/`load` are unaffected — and is
 /// reconstructed from its own file via [`open_disk`](Self::open_disk).
 #[derive(Debug, Default)]
@@ -379,7 +379,7 @@ impl VsTree {
     }
 
     /// Insert one `(entity_id, signature)` after the tree exists, splitting any
-    /// node that overflows [`FANOUT`] and growing a new root on a root split.
+    /// node that overflows `FANOUT` and growing a new root on a root split.
     /// Equivalent in effect to having included the entity in [`build`](Self::build):
     /// the candidate filter stays sound (see the module docs). Callers must use
     /// unique ids (as [`build`](Self::build) assumes); re-inserting an id leaves a

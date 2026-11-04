@@ -4,9 +4,11 @@
 //!
 //! Dependency-free: five [levels](Level) (`error`, `warn`, `info`, `debug`,
 //! `trace`), two sinks — standard error and a log file that rolls over daily
-//! and keeps a bounded number of days — and the [`gs_error!`], [`gs_warn!`],
-//! [`gs_info!`], [`gs_debug!`] and [`gs_trace!`] macros, which format their
-//! arguments only when some sink records the level.
+//! and keeps a bounded number of days — and the
+//! [`gs_error!`](crate::gs_error), [`gs_warn!`](crate::gs_warn),
+//! [`gs_info!`](crate::gs_info), [`gs_debug!`](crate::gs_debug) and
+//! [`gs_trace!`](crate::gs_trace) macros, which format their arguments only
+//! when some sink records the level.
 //!
 //! # Configuration
 //!

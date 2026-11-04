@@ -18,11 +18,11 @@
 //! entity ids are dense, see [`csr`](crate::analytics::csr) "Node ids").
 //! Per-source functions loop over [`GArgs::distinct_srcs`].
 //!
-//! Numbers: `ss << double` → [`cxx_g`](super::fmt::cxx_g),
-//! `to_string(double)` → [`cxx_to_string`](super::fmt::cxx_to_string),
-//! `float` → [`cxx_g_f32`](super::fmt::cxx_g_f32). Parameters upstream reads
+//! Numbers: `ss << double` → [`cxx_g`],
+//! `to_string(double)` → [`cxx_to_string`],
+//! `float` → [`cxx_g_f32`]. Parameters upstream reads
 //! with `stof` (`alpha`, `tol`, `increase`, `maxIter`) go through
-//! [`f32_round`](super::fmt::f32_round). C `int` accumulators wrap like `i32`.
+//! [`f32_round`]. C `int` accumulators wrap like `i32`.
 //!
 //! # Cost bounds
 //!
@@ -223,7 +223,7 @@ fn nbr_set(g: &CsrGraph, v: Node, f: &PredFilter) -> Vec<Node> {
 ///
 /// **Top-k extraction** (SSPPR.cpp:178-190): `topk.resize(retNum)`, then
 /// `partial_sort_copy` of the `unordered_map<int,double>` `v2ppr` (iterated
-/// in [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder) order of its
+/// in [`CxxUnorderedOrder`] order of its
 /// insertion sequence, keyed by entity id) by value descending into `topk`
 /// ([`cxx_partial_sort_copy_by`](super::cxx::cxx_partial_sort_copy_by));
 /// unfilled slots stay `(0, 0.0)`; then trailing entries with value `0` are
@@ -306,7 +306,7 @@ pub fn ppr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// **Selection:** `retNum > n` is clamped to `n`. If `retNum == -1` or
 /// `retNum >= n`: all vertices in node order (unsorted). Otherwise
 /// (`0 <= retNum < n`): libstdc++ `std::sort` by value descending —
-/// [`cxx_sort_by`](super::cxx::cxx_sort_by), which reproduces its order for
+/// [`cxx_sort_by`], which reproduces its order for
 /// ties — and keep the first `retNum`. `retNum < -1` is UB upstream; treated
 /// as `-1`. Empty graph → `{"paths":[]}`.
 pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
@@ -882,7 +882,7 @@ fn local_cluster_coeff(g: &CsrGraph, f: &PredFilter, u: Option<Node>, directed: 
 /// **Upstream:** GE:1872-1888 / GE:2938-2954; labelProp.cpp:13-198.
 ///
 /// **Output (once):** the communities as `vertVec2JSON` arrays
-/// ([`push_vert_list_json`](super::fmt::push_vert_list_json)),
+/// ([`push_vert_list_json`]),
 /// comma-separated: `{"paths":[["<Alice>","<Bob>"],["<Carol>"]]}`.
 ///
 /// **Algorithm** (literal port of class `LPA`): `maxIter = f32_round(m) as i32`;
@@ -1049,7 +1049,7 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// (discovery). Members: upstream inserts every vertex into one global
 /// `unordered_map<int,int> vid2wccid` in discovery order and then appends
 /// each map element to its component **in map iteration order** — the
-/// global [`CxxUnorderedOrder`](super::cxx::CxxUnorderedOrder) order of all
+/// global [`CxxUnorderedOrder`] order of all
 /// discovered entity ids, bucketed by component.
 pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let g = ctx.csr;
@@ -1353,7 +1353,7 @@ fn louvain_communities(
 /// `r = if retNum < 0 { 10 } else { retNum }`; entries
 /// `{"dst":‹d›, "value":v}` — the IRI is **not quoted** (as in upstream code
 /// and docs), a space after the comma, `v` a C `float` printed with
-/// [`cxx_g_f32`](super::fmt::cxx_g_f32); comma-separated (upstream adds no
+/// [`cxx_g_f32`]; comma-separated (upstream adds no
 /// `,` between consecutive sources; we do).
 ///
 /// **Algorithm:** `N(x)` = distinct in ∪ out neighbours over `preds`
@@ -1737,7 +1737,7 @@ pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// **Output:** [`GFunValue::ResultsJson`] with the `nlohmann::json` dump of
 /// `[[‹v›, x], …]` for every vertex in node order, e.g.
 /// `[["<Alice>",0.5],["<Bob>",1.0]]` — strings escaped like nlohmann
-/// ([`push_json_quoted`](super::fmt::push_json_quoted)), numbers via
+/// ([`push_json_quoted`]), numbers via
 /// [`nlohmann_dump_f64`] (an exact Grisu2 port, which
 /// [`fmt::nlohmann_f64`](super::fmt::nlohmann_f64) delegates to: nlohmann's
 /// digits are not always the shortest round-trip form, e.g.

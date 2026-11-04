@@ -7,7 +7,7 @@
 //!
 //! Layout: [`pager::Pager`] gives fixed [`pager::PAGE_SIZE`] pages (shared,
 //! copy-on-write cache buffers; header layout, version markers and feature
-//! bits in the [`format`] registry); [`bptree::BTree`] builds ordered B+ trees
+//! bits in the [`format`](mod@format) registry); [`bptree::BTree`] builds ordered B+ trees
 //! on them, read through zero-copy [`bptree::NodeView`]s; [`store::DiskStore`]
 //! composes those into the six-way triple index (three SPO/POS/OSP orderings),
 //! a GSPO quad index for named graphs, plus the string↔id dictionary — enough

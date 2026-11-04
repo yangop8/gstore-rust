@@ -1571,7 +1571,7 @@ impl Database {
     ///
     /// On a RocksDB database the transaction's writes are journaled so that it
     /// stays atomic across a crash: uncommitted writes are undone on the next
-    /// open (see [`crate::backend::rocks`]). On a Stream-mode on-disk database
+    /// open (see `crate::backend::rocks`). On a Stream-mode on-disk database
     /// its default-graph writes collect in the store's overlay (no triple
     /// reaches the pager before [`commit`](Self::commit)) and its named-graph
     /// quads are queued there too.
@@ -3918,7 +3918,8 @@ impl Database {
     }
 
     /// Parallel-parse an in-memory N-Triples document with `threads` threads,
-    /// then intern + index serially. See [`build_from_ntriples_parallel`].
+    /// then intern + index serially. See
+    /// [`build_from_ntriples_parallel`](Self::build_from_ntriples_parallel).
     pub fn build_from_ntriples_str_parallel(
         name: impl Into<String>,
         content: &str,

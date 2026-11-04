@@ -15,7 +15,7 @@
 //!   raw control characters inside strings are accepted as-is. Nesting deeper
 //!   than [`MAX_DEPTH`] is refused (guards the recursive reader and the
 //!   recursive drop against stack exhaustion on adversarial input).
-//! * [`Json::to_string`] / [`Display`](std::fmt::Display) serialize compactly
+//! * `Json::to_string` / [`Display`](std::fmt::Display) serialize compactly
 //!   (no whitespace, like `nlohmann::json::dump()`), escaping `"`, `\` and the
 //!   control characters (`\b \f \n \r \t`, others as `\u00XX`); everything else
 //!   — including non-ASCII text — is written as UTF-8.

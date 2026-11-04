@@ -18,7 +18,7 @@
 //! scans an array can't provide).
 //!
 //! ## Layout
-//! The "entry array" is a set of **directory pages** of fixed-size [`SLOT_SIZE`]
+//! The "entry array" is a set of **directory pages** of fixed-size `SLOT_SIZE`
 //! slots; key `k` lives in slot `k % SLOTS_PER_DIR` of directory `k / SLOTS_PER_DIR`.
 //! Directories are located through a two-level **page table** rooted at a pager
 //! header slot (L0 → L1 → directory page id), so a lookup is a constant few page
@@ -26,7 +26,7 @@
 //! ```text
 //! [tag: u8][len: u32 LE][payload …]
 //! ```
-//! A value up to [`INLINE_CAP`] bytes is stored inline in the slot; a larger one
+//! A value up to `INLINE_CAP` bytes is stored inline in the slot; a larger one
 //! spills into an [`overflow`] page chain (the block-managed value file) and the
 //! slot keeps only the chain head + length — exactly gStore's entry → block model.
 //!
@@ -177,10 +177,10 @@ impl IvArray {
 
     /// Visit every key in `from..to` that has a value, in ascending key order:
     /// `f(key, value)`, which may stop the walk with [`ControlFlow::Break`].
-    /// Sequential: one directory page serves [`SLOTS_PER_DIR`] consecutive
+    /// Sequential: one directory page serves `SLOTS_PER_DIR` consecutive
     /// keys, page-table pages are read once per span they cover, unallocated
     /// spans are skipped whole, and overflow values are read from their chains.
-    /// Keys at or past [`CAPACITY`] hold nothing. Read-only.
+    /// Keys at or past `CAPACITY` hold nothing. Read-only.
     pub fn for_each_range(
         &self,
         pager: &Pager,
@@ -238,7 +238,7 @@ impl IvArray {
     /// requested slots are decoded — an overflow chain is read for a requested
     /// key only, and an unrequested neighbour (damaged or not) is never
     /// touched — while each page-table and directory page is read once per
-    /// run of keys it serves, in file order. Keys at or past [`CAPACITY`]
+    /// run of keys it serves, in file order. Keys at or past `CAPACITY`
     /// hold nothing. Read-only.
     pub fn for_each_key(
         &self,

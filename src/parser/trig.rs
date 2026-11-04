@@ -12,7 +12,7 @@
 //! GRAPH :g2 { :d :e :f }     # the named graph :g2 (GRAPH keyword)
 //! ```
 //!
-//! The reader is the streaming [`turtle`](crate::parser::turtle) reader in its
+//! The reader is the streaming [`turtle`] reader in its
 //! TriG mode ([`turtle::parse_reader_trig`]): directives apply from where
 //! they appear, statements come out in document order — inside a block one
 //! statement at a time, so a huge graph block is never buffered — and every

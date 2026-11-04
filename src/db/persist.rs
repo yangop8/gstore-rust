@@ -454,7 +454,7 @@ impl Database {
     /// a clear error rather than misreading the directory). The returned
     /// database remembers `dir` as its [`home`](Self::home): for the persistent
     /// layouts every committed update is written back there. Uses the
-    /// process's [`default_open_options`](super::default_open_options) (an
+    /// process's [`default_open_options`] (an
     /// on-disk database opens in their [`DiskQueryMode`]); see
     /// [`open_with`](Self::open_with).
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Database> {
@@ -1021,7 +1021,7 @@ impl Database {
 
     /// Open an on-disk database without taking the directory lock (see
     /// [`open`](Self::open), which does), in the mode of the process's
-    /// [`default_open_options`](super::default_open_options); see
+    /// [`default_open_options`]; see
     /// [`load_disk_with`](Self::load_disk_with).
     pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
         Database::load_disk_with(dir, &default_open_options())

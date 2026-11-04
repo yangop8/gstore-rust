@@ -251,7 +251,7 @@ impl Signature {
     /// `bit` ([`predicate_bit`](Self::predicate_bit)), ascending: the
     /// predicates an entity's signature can have that bit from. Empty for a
     /// bit that is not a predicate bit of `dir`. Visits a tenth of the ids
-    /// (the bit fixes the id modulo [`EDGE_SIG_INTERVAL_NUM_HALF`]).
+    /// (the bit fixes the id modulo `EDGE_SIG_INTERVAL_NUM_HALF`).
     pub fn predicates_with_bit(bit: usize, dir: EdgeDir, limit: PredId) -> Vec<PredId> {
         let half = EDGE_SIG_INTERVAL_BASE * EDGE_SIG_INTERVAL_NUM_HALF;
         let base = match dir {

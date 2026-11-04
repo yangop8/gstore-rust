@@ -62,6 +62,13 @@ jobs:
         with:
           key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Broken, ambiguous, redundant and private intra-doc links in the gstore
+      # crate's documentation (library and binaries, default features) fail
+      # the job, as clippy's findings do.
+      - name: rustdoc (intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p gstore --no-deps --locked
 
   # The suite runs twice: once with on-disk (kvstore.kv) databases opened in
   # Materialize mode, once in Stream mode (GSTORE_DISK_QUERY_MODE, which

@@ -3073,7 +3073,7 @@ impl WeightedGraphView {
 
     /// Top-k subgraph matches scored by the **sum of matched edge weights**,
     /// computed with a **memoized spanning-tree search** (gStore's
-    /// `TopKSearchPlan` / [`TopKTreeNode`] approach).
+    /// `TopKSearchPlan` / `TopKTreeNode` approach).
     ///
     /// Functionally identical to [`topk_subgraph`](Self::topk_subgraph) — same
     /// matches, same scores, same deterministic ordering (score descending, then

@@ -37,7 +37,7 @@
 //! Note the id-space subtlety: a property used as the *subject* of a schema
 //! triple (`p rdfs:subPropertyOf q`) is interned as an **entity**, while the same
 //! property in data (`x p y`) is a **predicate** — two different id spaces sharing
-//! the dictionary key. [`ent_to_pred`] bridges them through the dictionary.
+//! the dictionary key. `ent_to_pred` bridges them through the dictionary.
 
 pub mod compile;
 pub mod manage;

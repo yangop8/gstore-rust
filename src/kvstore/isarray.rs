@@ -14,7 +14,7 @@
 //! with byte-compact storage.
 //!
 //! ## Layout
-//! The array is a fixed set of [`NUM_BUCKETS`] hash buckets. A key hashes
+//! The array is a fixed set of `NUM_BUCKETS` hash buckets. A key hashes
 //! (FNV-1a) to a bucket; each **bucket's whole entry list is one value** stored
 //! in an internal [`IvArray`] keyed by the bucket index. That reuse is the point:
 //! [`IvArray`] already does the block management — a small bucket lives inline in
@@ -31,7 +31,7 @@
 //! and duplicate-key overwrites are always correct.
 //!
 //! ## Sizing (no rehash)
-//! [`NUM_BUCKETS`] is fixed, so there is **no resize/rehash** — a design choice
+//! `NUM_BUCKETS` is fixed, so there is **no resize/rehash** — a design choice
 //! that keeps the structure simple and unconditionally correct: an oversubscribed
 //! bucket merely holds a longer entry list (still handled by [`IvArray`]'s
 //! overflow chains), degrading lookup speed but never behaviour. Pick a bucket

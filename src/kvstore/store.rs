@@ -1286,7 +1286,7 @@ impl DiskStore {
         self.write_op(|st, pg| st.delete_ids_in(pg, t))
     }
 
-    /// Delete one triple given its terms (see [`delete_ids`](Self::delete_ids)).
+    /// Delete one triple given its terms (see `delete_ids`).
     /// Returns `false` (no change) if any term is unknown or the triple is
     /// absent.
     pub fn delete_triple(&mut self, t: &Triple) -> Result<bool> {
@@ -2054,9 +2054,9 @@ impl DiskStore {
     /// Build (or rebuild) the VList-compressed `(sub, pred) → objects` index from
     /// the authoritative SPO index, then mark the store compacted so `o_by_sp`
     /// reads it. Each group's sorted object list is delta+varint encoded (see
-    /// [`vlist`](super::vlist)), trading many tiny per-triple keys for one compact
+    /// [`vlist`]), trading many tiny per-triple keys for one compact
     /// value per `(sub, pred)`. A group whose encoding fits in
-    /// [`MAX_INLINE_VLIST_BYTES`] is stored inline; a larger one spills into an
+    /// `MAX_INLINE_VLIST_BYTES` is stored inline; a larger one spills into an
     /// [`overflow`] page chain (gStore's VList large-block file), so arbitrarily
     /// long posting lists — e.g. a hub subject or a dense predicate — compress and
     /// round-trip on disk rather than being skipped.
@@ -2158,7 +2158,7 @@ impl DiskStore {
     }
 
     /// Whether the stored VList value for `(s, p)` uses an [`overflow`] page
-    /// chain (i.e. its encoding exceeded [`MAX_INLINE_VLIST_BYTES`]). `None` if
+    /// chain (i.e. its encoding exceeded `MAX_INLINE_VLIST_BYTES`). `None` if
     /// the group is absent from the compressed index. Exposes the inline/overflow
     /// decision for tests.
     pub fn compact_value_is_overflow(&self, s: EntityLiteralId, p: PredId) -> Result<Option<bool>> {
@@ -2274,7 +2274,7 @@ impl DiskStore {
     /// VS-tree filter are not available on this read-only streaming path.
     ///
     /// The query runs in its own read scope (contract C2) over a
-    /// [`DiskSource`](super::disk_triples::DiskSource): a read error of the
+    /// [`DiskSource`]: a read error of the
     /// triple indexes or of the out-of-core dictionary fails it, instead of
     /// answering partially.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
@@ -2297,7 +2297,7 @@ impl DiskStore {
 /// materializing the whole graph in memory. Every method delegates to the
 /// matching `try_*` (so answers come in the trait's contract order); a read
 /// error degrades to an empty answer here and is *not* reported. Evaluate over
-/// [`DiskSource`](super::disk_triples::DiskSource) (as [`DiskStore::query`]
+/// [`DiskSource`] (as [`DiskStore::query`]
 /// does) or `DiskTriples` to have read errors fail the statement (C2).
 impl TripleSource for DiskStore {
     fn exists(&self, s: u32, p: u32, o: u32) -> bool {

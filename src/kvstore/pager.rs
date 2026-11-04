@@ -4,7 +4,7 @@
 //! Corresponds to the storage substrate beneath gStore's `KVstore`
 //! (fixed-size disk blocks + buffer cache). The file is a sequence of
 //! [`PAGE_SIZE`]-byte pages; page 0 is the header (its layout and every
-//! version marker live in the [`format`](super::format) registry). Higher
+//! version marker live in the [`format`](mod@super::format) registry). Higher
 //! layers (the B+ tree, the IvArray) address data by [`PageId`] and read or
 //! write whole pages through the cache.
 //!

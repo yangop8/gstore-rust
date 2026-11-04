@@ -128,7 +128,7 @@ impl StringIndex {
     }
 
     /// A **sound superset** of the ids whose string contains `needle`, via
-    /// trigram-posting intersection. For a `needle` shorter than [`GRAM`], the
+    /// trigram-posting intersection. For a `needle` shorter than `GRAM`, the
     /// trigram index cannot prune, so every id is returned (still a superset).
     /// The result is sorted and de-duplicated. Use this when a caller wants to
     /// intersect candidates into a join and verify later; for verified results

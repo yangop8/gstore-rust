@@ -372,7 +372,7 @@ impl PfnRegistry {
 
     /// Check the definition `info` a client sends (create, update,
     /// `funreview`) and return its generated source: `funDesc` at most
-    /// [`MAX_DESC_BYTES`], also as stored (JSON-escaped); `funBody` and
+    /// `MAX_DESC_BYTES`, also as stored (JSON-escaped); `funBody` and
     /// `funSubs` together, URL-decoded and as sent (whitespace included), and
     /// the generated source each at most `pfn_max_module_bytes`, and
     /// `funBody` and `funSubs` as stored at most 3 × `pfn_max_module_bytes`;

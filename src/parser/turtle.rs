@@ -18,7 +18,7 @@
 //! # Streaming
 //!
 //! The reader pulls characters from a [`BufRead`] through a
-//! [`CharSource`](crate::parser::stream::CharSource): memory holds the
+//! [`CharSource`]: memory holds the
 //! reader's buffer, a few characters of lookahead and the statement being
 //! parsed — never the document. Each completed statement's triples go to a
 //! [`StatementSink`] (inside a TriG block too, so one huge graph block is not

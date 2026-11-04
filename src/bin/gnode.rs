@@ -1,5 +1,5 @@
 //! `gnode` — a single distributed **shard node**: it owns one local
-//! [`TripleStore`](gstore::store::TripleStore) and serves per-shard RPCs over
+//! [`TripleStore`] and serves per-shard RPCs over
 //! TCP for a [`NetworkShardedStore`](gstore::cluster::NetworkShardedStore)
 //! coordinator (see [`gstore::cluster::ShardNode`] / [`gstore::rpc`]).
 //!

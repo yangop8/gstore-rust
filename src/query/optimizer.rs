@@ -5,23 +5,23 @@
 //! enumeration** over subsets of the BGP's triple patterns, exactly as gStore's
 //! optimizer does:
 //!
-//! * **Left-deep DP** ([`dp_left_deep`]) finds the optimal *pipelined* join
+//! * **Left-deep DP** (`dp_left_deep`) finds the optimal *pipelined* join
 //!   order — `dp[S]` = the cheapest way to materialise the patterns in `S`, built
 //!   by appending one connected pattern at a time. This drop-in replaces the
 //!   greedy order for the executor's existing left-deep pipeline.
-//! * **Bushy DP** ([`dp_bushy`], gStore's `ConsiderBinaryJoin`) additionally
+//! * **Bushy DP** (`dp_bushy`, gStore's `ConsiderBinaryJoin`) additionally
 //!   enumerates every partition of `S` into two connected halves, so a query
 //!   shaped like *two stars joined by a bridge* can be evaluated as a **binary
 //!   join** of two independently-built sub-results — often far cheaper than any
 //!   left-deep order. When the optimal plan is genuinely bushy it is returned as
-//!   a [`JoinTree`] the executor runs with hash joins.
+//!   a `JoinTree` the executor runs with hash joins.
 //!
 //! The **cost model** is the textbook System-R estimator: a pattern's
 //! cardinality comes from the index it would scan, and a join's output
 //! cardinality is `|A|·|B| / max(NDV_A(v), NDV_B(v))` over the shared join
 //! variables `v`, where the *number of distinct values* `NDV` is read from the
-//! predicate statistics (`pre2sub`/`pre2obj` ⇒ [`TripleStore::pred_distinct_subj`]
-//! /[`pred_distinct_obj`](TripleStore::pred_distinct_obj)) and tightened by the
+//! predicate statistics (`pre2sub`/`pre2obj` ⇒ [`TripleSource::pred_distinct_subj`]
+//! /[`pred_distinct_obj`](TripleSource::pred_distinct_obj)) and tightened by the
 //! exact candidate sets. The DP tables themselves are the *plan cache*: every
 //! sub-plan's optimal cost is memoised once and reused across all supersets.
 

@@ -146,7 +146,7 @@ pub fn compile(def: &RuleDef) -> Result<CompiledRule, String> {
 
 /// Upstream's retraction statement (`delete_sparql`) of rule file `doc`,
 /// built from its validated type, label and value alone (see
-/// [`super::rules::retraction_target`]) — the same text [`compile`] produces
+/// `super::rules::retraction_target`) — the same text [`compile`] produces
 /// — and its shape checked. Used to retract a rule that upstream gStore
 /// executed, whose conditions this implementation may refuse.
 pub fn retraction_statement(doc: &crate::json::Json) -> Result<String, String> {
