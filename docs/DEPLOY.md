@@ -220,7 +220,10 @@ triples it inferred. `drop` with `is_backup=true` (the default) keeps the
 directory, rules included, as `<db>.db.bak`. `export` / `gexport` write the
 data only, as upstream's export: the inferred `<Rule:…>` triples are in it
 as ordinary triples, the rules are not (a database rebuilt from an export
-holds those triples as asserted ones, owned by no rule).
+holds those triples as asserted ones, owned by no rule). `gbackup` holds the
+database's directory lock for the whole copy, so it refuses a database
+another process has open — back up a served database through the server
+(`/api` `backup`, REST `/backup`, `gconsole`'s `backup`).
 
 **PFN functions** belong to users, not to databases: they live under
 `pfn_base_path` (by default `<db_home>/pfn` — `/var/lib/gstore/dbhome/pfn`
@@ -271,6 +274,32 @@ along, see [Backups](#backups)). Compiling and calling functions needs a
 build with the `pfn-wasm` feature (the container image has it, see
 [Docker](#docker)); without it they can still be listed, created, updated
 and deleted. Reasoning rules (`reasonManage`) have no keys.
+
+**Storage, builds and id reclamation** (gstore-rust keys; the README's
+*Configuration* and *Storage layouts and query modes* sections have the
+details). `[storage]`: `disk_query_mode` (`memory`, the default, loads an
+on-disk database's working set at open; `stream` queries its B+ trees
+directly), `disk_cache_mb` (16), `dict_cache_mb` (80), `vstree_on_open`
+(off), `default_layout` (the layout of `gbuild`, REST `/build` and `/api
+build` when none is named: `snapshot` — the default — `disk` or
+`rocksdb`), `rocksdb_block_cache_mb` (256) and `rocksdb_bloom` (10).
+`gserver` installs them at startup and again on `refreshconf` (a loaded
+database keeps the query mode it was opened in). `[system] id_reclaim`
+(`on`, the default) reuses the ids of deleted terms; with it on, a new
+on-disk database is created in `kvstore.kv` version 2, which binaries older
+than Phase 6 refuse (`id_reclaim=off` keeps creating version 1).
+`[system] build_memory_mb` (1024), `build_threads` (0 = every core),
+`build_tmp_dir` and `build_fill_factor` (90) bound the bulk build of
+`gbuild --disk` / `--rocksdb` and of server builds with `layout=disk` /
+`rocksdb`. `gbuild` reads `./conf/conf.ini` when it exists
+(`default_layout`, `id_reclaim`, the build and RocksDB keys); `gquery`,
+`gadd`, `gsub` and the other tools that open a database follow the
+environment only. Environment variables win over the file:
+`GSTORE_DISK_QUERY_MODE=stream|memory`, `GSTORE_DISK_CACHE_MB`,
+`GSTORE_VSTREE_ON_OPEN`, `GSTORE_ID_RECLAIM=on|off` and
+`GSTORE_ROCKS_BLOCK_CACHE_MB` (a plain number of MiB, the block cache a
+server's RocksDB databases share; `0` = RocksDB's own per-column-family
+caches; another value is logged and ignored).
 
 **Zip packages** (a build with the `zip` feature): `build`, `batchInsert`
 and `batchRemove` read a `.zip` of RDF files (each entry needs an extension
@@ -370,6 +399,10 @@ grestore -l lubm                   # lists those backups, zipped ones included
 grestore -db lubm -p ./backups/lubm.db_<timestamp>   # = grestore lubm <backup>; a .zip too
 gbuild -db lubm2 -f lubm.zip       # the RDF files of a zip package (feature zip)
 gdrop -db lubm --yes               # the confirmation is required (upstream asks none)
+gbuild --disk -db lubm -f lubm.nt  # the on-disk layout, built in bulk (--rocksdb: RocksDB)
+gcompact -db lubm                  # the id spaces; --reclaim frees unused ids, --check
+                                   # verifies them, --enable-reclaim upgrades an older
+                                   # kvstore.kv (older binaries then refuse it)
 ```
 
 `grestore` takes the database first and the backup second, as upstream
