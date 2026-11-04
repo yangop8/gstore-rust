@@ -93,7 +93,7 @@ Phase 6(`docs/PHASE6_PLAN.md`)的12个工作包都已合并;退出闸门 G1a、G
 
 ### I.3 Stream 模式(默认查询模式翻转的前提)
 
-Stream 已满足 G1b / G1c / G1d,但 R3-STREAM 自己的翻转条件仍不满足(每条查询 ≤ 2.0 × Materialize:Q14 2.15 倍、Q6 2.12 倍、Q12 2.07 倍;几何均值 ≤ 1.4 倍:1.47 倍;单条插入中位数 ≤ Materialize:1.98 对 1.70 ms;`bench/results/phase6-final-lubm38.json`)。做完下面几项后重新测量,再改 `DEFAULT_DISK_QUERY_MODE`(`src/db/open_options.rs`):
+Stream 已满足 G1b / G1c / G1d,但 R3-STREAM 自己的翻转条件仍不满足(每条查询 ≤ 2.0 × Materialize:Q14 2.15 倍、Q6 2.12 倍、Q12 2.07 倍;几何均值 ≤ 1.4 倍:1.48 倍;单条插入中位数 ≤ Materialize:1.98 对 1.70 ms;`bench/results/phase6-final-lubm38.json`)。做完下面几项后重新测量,再改 `DEFAULT_DISK_QUERY_MODE`(`src/db/open_options.rs`):
 
 - 大结果集的词解析(`src/kvstore/disk_dict.rs`、`src/dict`):按 id 稠密索引的解码词缓存,或不逐词分配的批量 `id2*` 读取;`TermCache` 的大小随字典伸缩(默认 64 MiB 在 univ 82 已装不下:Q6 / Q13 / Q14 分别 984.84 / 1303.58 / 876.09 ms,Materialize 220.72 / 282.09 / 165.29 ms,`bench/results/phase6-final-lubm82.json`)。
 - `SpoWalk::collect` 先用 `LeafCursor::seek_in_leaf(key)`(已有,未接线)再逐项步进(`src/kvstore/store.rs`;R3-STREAM 请求6、R4-VS 请求2),针对 Q2 的 `o_by_sp` probe。

@@ -143,7 +143,7 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 | Q14 / Q6 / Q12 / Q13 ms | 155.96 / 194.76 / 0.165 / 215.91 | 72.48 / 91.93 / 0.080 / 107.74 |
 | 单条 `INSERT DATA` 中位数 ms | 1.98 | 1.70 |
 
-即 Stream 的几何均值是 Materialize 的 1.47 倍,Q14、Q6、Q12、Q13 各是 2.15、2.12、2.07、2.00 倍,插入也更慢。差距在大结果集上:Stream 用 out-of-core 字典(`TermCache`,未命中时读 `id2*`)解析每个结果 id,Materialize 用内存 interner。规模越大越明显:`bench/results/phase6-final-lubm82.json`(univ 82,11,135,159 个三元组)里 Stream 的几何均值 30.18 ms、Materialize 16.09 ms,Q6 / Q13 / Q14 分别是 984.84 / 1303.58 / 876.09 ms 对 220.72 / 282.09 / 165.29 ms。持续写入时还有一个差别:`bench/results/phase6-final-watdiv10.json` 的混合负载(8 个读 F5 的客户端 + 每 100 ms 一次单条插入,`/sparql`,check_point off)里 Stream 读者 191.6 qps、Materialize 2550.3 qps——每次提交都推进 `DiskTriples` 的 epoch,长 posting list 缓存在新 epoch 的第一次读取时被整体清空。反过来,Stream 的打开时间和内存与数据量无关(univ 82:热打开 0.9 ms、打开后 6.4 MiB),所以超出内存的库或频繁打开的库应选 Stream。
+即 Stream 的几何均值是 Materialize 的 1.48 倍,Q14、Q6、Q12、Q13 各是 2.15、2.12、2.07、2.00 倍,插入也更慢。差距在大结果集上:Stream 用 out-of-core 字典(`TermCache`,未命中时读 `id2*`)解析每个结果 id,Materialize 用内存 interner。规模越大越明显:`bench/results/phase6-final-lubm82.json`(univ 82,11,135,159 个三元组)里 Stream 的几何均值 30.18 ms、Materialize 16.09 ms,Q6 / Q13 / Q14 分别是 984.84 / 1303.58 / 876.09 ms 对 220.72 / 282.09 / 165.29 ms。持续写入时还有一个差别:`bench/results/phase6-final-watdiv10.json` 的混合负载(8 个读 F5 的客户端 + 每 100 ms 一次单条插入,`/sparql`,check_point off)里 Stream 读者 191.6 qps、Materialize 2550.3 qps——每次提交都推进 `DiskTriples` 的 epoch,长 posting list 缓存在新 epoch 的第一次读取时被整体清空。反过来,Stream 的打开时间和内存与数据量无关(univ 82:热打开 0.9 ms、打开后 6.4 MiB),所以超出内存的库或频繁打开的库应选 Stream。
 
 **选择模式**(契约 C7):
 

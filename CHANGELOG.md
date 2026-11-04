@@ -158,7 +158,7 @@ To go back from V2: `gexport` with this version, `gbuild` with the old one.
   ms) with 6.1 MiB RSS after open (351.0) and a 207.3 MiB high-water mark
   through Q1–Q14 (457.1), at a Q1–Q14 geomean of 11.55 ms (7.83). It stays
   opt-in because R3-STREAM's own conditions for making it the default still
-  fail there (geomean 1.47× Materialize; Q14 2.15×, Q6 2.12×, Q12 2.07×), and
+  fail there (geomean 1.48× Materialize; Q14 2.15×, Q6 2.12×, Q12 2.07×), and
   its large results scale worse at univ 82 (*Known limitations*).
 - **Open options (contract C7)**: `OpenOptions { disk_query_mode,
   disk_cache_pages, dict_cache_bytes, vstree_on_open, default_layout }`,
@@ -522,7 +522,9 @@ open after the page cache was dropped):
 Exit gates (plan §2), univ 38 unless stated; the measured values come from
 `bench/results/phase6-final-*.json`, except G4's monitoring endpoints and
 G5's churn, which come from the R4-SNAP and R4-RECLAIM quiet stages of the
-same gstore code (`b9e8dc0`). Reasons and follow-ups in
+same gstore code (`b9e8dc0`), and G1b's three extra open pairs and G6's test
+counts, from R4-CLOSURE's quiet stage itself (not committed as result
+files). Reasons and follow-ups in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §7.
 
 | gate | target | measured | verdict |

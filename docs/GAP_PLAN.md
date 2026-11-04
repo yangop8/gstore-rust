@@ -252,10 +252,10 @@
 | 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 已完成 | parser_test 50 组在优化开 / 关两种设置下通过 |
 | 4 | §3.2 推理 + §3.3 PFN | 已完成 | `reasonManage` 走完全生命周期;PFN 示例可跑(`pfn-wasm`) |
 | 5 | §4.2 导入导出 + §5 gconsole / 日志 / 打包 | 已完成 | README 的 `gconsole -u root` 流程可照做;Docker 镜像可用 |
-| 6a | `Backend::Disk` 流式查询直通 `Database`(Stream 模式) | 已完成;可选模式,默认仍是 Materialize | G1b、G1c、G1d 通过:热打开 0.92 ms、冷 7.5 ms,打开后 RSS 6.1 MiB,Q1–Q14 几何均值 11.55 ms = pre 磁盘布局的 0.079 倍、同一提交快照布局的 1.14 倍。R3-STREAM 自己的翻转条件(每条查询 ≤ 2.0 × Materialize、几何均值 ≤ 1.4 ×)仍不满足(Q14 2.15 倍、几何均值 1.47 倍),所以默认模式没有改 |
+| 6a | `Backend::Disk` 流式查询直通 `Database`(Stream 模式) | 已完成;可选模式,默认仍是 Materialize | G1b、G1c、G1d 通过:热打开 0.92 ms、冷 7.5 ms,打开后 RSS 6.1 MiB,Q1–Q14 几何均值 11.55 ms = pre 磁盘布局的 0.079 倍、同一提交快照布局的 1.14 倍。R3-STREAM 自己的翻转条件(每条查询 ≤ 2.0 × Materialize、几何均值 ≤ 1.4 ×)仍不满足(Q14 2.15 倍、几何均值 1.48 倍),所以默认模式没有改 |
 | 6b | 字典与 VS-tree 留在磁盘 | 已完成 | out-of-core 字典 `DiskDict`(有界的 `TermCache` / `KeyCache`,结果按排序批量解析);`vstree.kv` 不在打开时重建,`VsPolicy::Auto` 下查询从 store 精确算出树给出的候选集、不读它的页(R4-VS 安静阶段,univ 38 Stream:几何均值 11.66 ms,强制旧的逐页遍历 `GSTORE_VS_POLICY=tree` 时 47.70 ms) |
 | 6c | 持久化 StringIndex | 已完成上游含义;trigram 索引持久化延后 | 上游含义(持久化 id → 串、按偏移排序的批量访问)= `id2*` IvArray + `Dictionary::prefetch` / `resolve_many`;内存字典的 trigram 子串索引按字典 generation 缓存(R2-DICT 安静阶段 univ 8:重复的子串查询 11.7–16.9 ms,首次 2,073.6–2,888.5 ms);持久化 `lexindex.kv` 按计划延后(`docs/PHASE6_PLAN.md` §8 D5) |
-| 6d | 批量建索引(B+ 树 bulk load / RocksDB SST ingest) | 已完成 | G1a、G3 通过:`gbuild --disk` 18.38–21.06 s(pre 1,627.59 s),1,024 MiB 预算下峰值 ≤ 400 MiB,`kvstore.kv` 是 pre 的 0.697 倍;`gbuild --rocksdb` 19.50 s(pre 277.76 s);崩溃安全安装,id 与内存构建相同 |
+| 6d | 批量建索引(B+ 树 bulk load / RocksDB SST ingest) | 已完成 | G1a、G3 通过:`gbuild --disk` 18.38–21.06 s(pre 1,627.59 s),1,024 MiB 预算下峰值 398–400 MiB,`kvstore.kv` 是 pre 的 0.697 倍;`gbuild --rocksdb` 19.50 s(pre 277.76 s);崩溃安全安装,id 与内存构建相同 |
 | 6e | 读写锁 / 廉价快照替代 `Mutex<Database>` | 已完成;G4 未全达 | 8 / 1 客户端的 Q4 吞吐比:快照布局 5.33(`/sparql`)/ 4.63(`/api`),Stream 4.06 / 4.73(pre 0.78 / 0.86);`/begin` 中位数 0.38 / 0.44 ms、RSS +0.07 / +0.06 MiB;未达:`/api stat` 每请求阻塞采样 200 ms CPU(201.6–219.8 ms,R4-SNAP 安静阶段;其余监控端点 ≤ 48.4 ms) |
 | 6f | 删除时即时回收 id | 已完成(所有布局,默认开);G5 未全达 | live 计数恰等于被引用的词、高水位 1.000(R4-RECLAIM 安静阶段,10 轮 churn,四种布局);未达:相对第 0 轮 +5.20%(churn 数据本身 +5.23%),内存与 Materialize 的删除开销 1.13 / 1.14(目标 ≤ 1.10) |
 | 6g | 基准、CI、文档(gstore-bench、WatDiv-like 负载、最终测量、文档收尾) | 已完成 | G6、G7 通过;smoke 基线重新 bless(含 WatDiv-like 与混合读写负载),库大小闸门收紧到 1.10;`docs/BENCHMARKS.md` |
