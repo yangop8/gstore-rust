@@ -108,11 +108,12 @@ Rounds 1–3 merged). Files: `src/query/{engine,candidates,mod}.rs`,
 tree's candidate sets from the store on disk databases, never reading
 `vstree.kv`; skips refinements the candidate sets already satisfy),
 shortest-first candidate generation with member tests, per-BGP count memo,
-constant-star plans; implementer run (noisy) at univ 38: Stream Q1–Q14
-geomean 17.8 ms = 1.19× the snapshot layout of the same commit (worst
-query Q14 2.31×) and 0.12× pre disk — G1d met in that run, left to the
-quiet measure stage; snapshot geomean 0.60× the base, Materialize 0.19×,
-RocksDB 0.39×.
+constant-star plans; quiet measure stage at univ 38: Stream Q1–Q14
+geomean 11.7 ms = 1.11× the snapshot layout of the same commit (worst
+query Q6 2.39×) and 0.08× pre disk — **G1d met** (Materialize 0.72×);
+against the base: snapshot 0.58×, Stream 0.23×, Materialize 0.19×,
+RocksDB 0.39×; the default disk query mode stays Materialize (Stream
+1.54× Materialize, Q6/Q13/Q14 > 2×: R3-STREAM's flip conditions).
 
 ## Docs notes
 
@@ -134,6 +135,233 @@ RocksDB 0.39×.
   has them.
 
 ## Measured numbers
+
+### Quiet post-merge stage (phase6 `20cdc06`; part 3 of 3: R4-VS, gate G1d, the default disk query mode)
+
+Reference VM (4 vCPU, 16 GB), nothing else running, 11-04 05:37–06:23 UTC
+for the timing runs (CPU busy 25.0 % on average, at most 35 %, sampled every
+10 s from `/proc/stat`; steal ≤ 1 %; 1-minute load average ≤ 1.30; ≥ 7.8
+GiB disk free), the callgrind profiles after them (06:24–07:11), and two
+base / new single-insert pairs at 07:12–07:15 (busy 24.6 %, load ≤ 0.94). Toolchain 1.99.1,
+`CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`;
+every heavy command under `flock /tmp/gstore-bench.lock`; data from
+`/tmp/gstore-bench-cache` (univ 8 `ed44da2e7b3bbb98`, univ 38
+`fcd6493725f3c66a`). **New** = release builds of `20cdc06` (code of
+`b9e8dc0`; `cargo build --release -p gstore --bins -p gstore-bench`, and
+`CARGO_TARGET_DIR=target-rocks … --features gstore/rocksdb,gstore-bench/rocksdb`);
+**base** = the release binaries of `d702463` (the tree before this round:
+`/tmp/gstore-base-d702463/bin`, `bin-rocks` for RocksDB), each side with its
+own `gstore-bench` and `gbuild`, measured in this session. Per scale, in
+this order (base and new interleaved, each run bulk-builds its own database
+and deletes it):
+
+```sh
+<bin>/gstore-bench run --profile reference --scale {8,38} --no-conc --drop-caches \
+    --backends snapshot | disk --env GSTORE_DISK_QUERY_MODE={stream,memory} | rocksdb \
+    [--extra none: new side only, the base harness has no WatDiv-like workload] \
+    --bin-dir <bin> --out /tmp/r4vs-u<s>-<base|new>-<snapshot|stream|memory|rocksdb>.json
+```
+
+(base snapshot, new snapshot, new Stream, base Stream, base Materialize,
+new Materialize, new RocksDB, base RocksDB), then extra samples: RocksDB at
+univ 8 three more pairs and at univ 38 two more (`--no-update`, order
+alternated), three alternating Materialize/Stream pairs of 500 single
+inserts at univ 38 (`--singles 500 --query-procs 1 --reps 1 --open-reps 1`),
+the policy control (`--env GSTORE_VS_POLICY=tree`, Stream, univ 38,
+`--no-update`) and a second new Stream / Materialize / snapshot sample at
+univ 38 (`--no-update`, "run b"). Warm ms = the minimum over 5 processes of
+the median of 5 runs. **Rows and row hashes of Q1–Q14 are identical in all
+36 result files of this stage and equal to pre-Phase-6's** (every layout
+and mode, base and new, stable in every process); every update round trip
+`ok` (22 runs with the update phase). `gstore-bench
+compare` base → new: PASS (96 gates) for snapshot, Stream, Materialize and
+RocksDB at both scales; pre-Phase-6 disk → new Stream / Materialize: every
+gate passes but `exact.phase disk/conc` (this stage ran `--no-conc`).
+
+#### Univ 38 (5,181,103 triples), warm ms
+
+| query | rows | snapshot base | snapshot new | Stream base | Stream new | Materialize base | Materialize new | RocksDB base | RocksDB new | Stream new, `GSTORE_VS_POLICY=tree` | Stream / snapshot (new) | Stream / Materialize (new) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 | 3 | 0.094 | 0.013 | 5.443 | 0.017 | 4.130 | 0.014 | 7.602 | 0.038 | 4.622 | 1.39 | 1.28 |
+| Q2 | 115 | 37.48 | 34.26 | 76.99 | 55.86 | 46.05 | 27.13 | 508.1 | 498.0 | 65.20 | 1.63 | 2.06 |
+| Q3 | 10 | 0.383 | 0.015 | 6.365 | 0.016 | 5.467 | 0.013 | 24.36 | 0.066 | 3.927 | 1.05 | 1.25 |
+| Q4 | 9 | 0.084 | 0.051 | 2.179 | 0.071 | 2.164 | 0.050 | 1.269 | 0.255 | 2.041 | 1.41 | 1.43 |
+| Q5 | 576 | 274.0 | 258.7 | 321.2 | 296.2 | 271.3 | 224.2 | 366.0 | 376.5 | 353.4 | 1.15 | 1.32 |
+| Q6 | 404,399 | 123.2 | 79.82 | 238.1 | 191.2 | 152.9 | 92.74 | 234.5 | 223.1 | 247.6 | 2.39 | **2.06** |
+| Q7 | 23 | 339.1 | 302.6 | 438.7 | 298.7 | 382.4 | 250.4 | 413.7 | 440.0 | 384.9 | 0.99 | 1.19 |
+| Q8 | 10,778 | 317.3 | 243.8 | 377.3 | 272.0 | 341.2 | 241.9 | 444.3 | 392.3 | 383.4 | 1.12 | 1.12 |
+| Q9 | 5,507 | 390.9 | 344.6 | 643.0 | 456.9 | 474.0 | 338.8 | 716.0 | 691.9 | 657.1 | 1.33 | 1.35 |
+| Q10 | 3 | 269.2 | 252.5 | 345.2 | 256.5 | 277.6 | 206.7 | 400.8 | 423.6 | 312.7 | 1.02 | 1.24 |
+| Q11 | 325 | 1.407 | 1.409 | 1.271 | 0.282 | 0.937 | 0.171 | 1.867 | 1.966 | 1.145 | 0.20 | 1.64 |
+| Q12 | 21 | 0.495 | 0.519 | 0.683 | 0.158 | 0.513 | 0.079 | 0.275 | 0.227 | 0.700 | 0.31 | 2.02 |
+| Q13 | 432,512 | 151.5 | 96.47 | 320.3 | 223.7 | 219.2 | 104.9 | 249.7 | 248.8 | 340.6 | 2.32 | **2.13** |
+| Q14 | 305,503 | 85.57 | 63.84 | 176.0 | 147.4 | 106.1 | 67.82 | 184.1 | 178.8 | 180.2 | 2.31 | **2.17** |
+| geomean | | 18.06 | 10.48 | 50.97 | 11.66 | 38.86 | 7.55 | 62.13 | 24.44 | 47.70 | **1.11** | **1.54** |
+
+New / base geomean: snapshot 0.58, Stream 0.23, Materialize 0.19, RocksDB
+0.39. Pre-Phase-6 disk geomean 146.92 ms: Stream 0.079×, Materialize
+0.051×. Run b (queries only): Stream 11.03, Materialize 7.69, snapshot 9.84
+ms — Stream / snapshot **1.12** (worst Q14 2.47, Q6 2.40, Q13 2.24),
+Materialize / snapshot 0.78, Stream / Materialize **1.43** (Q6 2.24, Q13
+2.16, Q14 2.02, Q2 1.78, Q12 1.80). The control — the new binary with
+`GSTORE_VS_POLICY=tree` — gives the old disk numbers back (geomean 47.70
+against base Stream 50.97 ms; Q1 4.62, Q3 3.93, Q4 2.04 ms): the VS-tree
+policy is what removed the `vstree.kv` walks.
+
+#### Univ 8 (1,029,275 triples), warm ms
+
+| query | rows | snapshot base | snapshot new | Stream base | Stream new | Materialize base | Materialize new | RocksDB base | RocksDB new | Stream / snapshot (new) | Stream / Materialize (new) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q1 | 3 | 0.029 | 0.013 | 0.404 | 0.019 | 0.361 | 0.013 | 1.609 | 0.034 | 1.44 | 1.48 |
+| Q2 | 25 | 6.441 | 6.183 | 11.39 | 6.960 | 8.509 | 4.409 | 7.440 | 5.169 | 1.13 | 1.58 |
+| Q3 | 10 | 0.063 | 0.014 | 0.485 | 0.018 | 0.400 | 0.013 | 4.826 | 0.051 | 1.31 | 1.34 |
+| Q4 | 9 | 0.056 | 0.050 | 0.215 | 0.075 | 0.165 | 0.051 | 0.439 | 0.162 | 1.50 | 1.48 |
+| Q5 | 576 | 30.32 | 22.24 | 41.25 | 23.77 | 38.85 | 23.99 | 44.29 | 46.22 | 1.07 | 0.99 |
+| Q6 | 80,056 | 20.65 | 14.51 | 44.05 | 32.37 | 29.11 | 16.58 | 35.41 | 34.38 | 2.23 | 1.95 |
+| Q7 | 23 | 37.95 | 31.09 | 59.00 | 30.54 | 59.57 | 28.28 | 49.78 | 53.26 | 0.98 | 1.08 |
+| Q8 | 10,778 | 39.82 | 33.41 | 69.63 | 44.91 | 52.16 | 30.82 | 89.26 | 100.3 | 1.34 | 1.46 |
+| Q9 | 1,081 | 53.67 | 42.85 | 100.4 | 64.82 | 71.37 | 45.29 | 103.0 | 108.6 | 1.51 | 1.43 |
+| Q10 | 3 | 30.98 | 21.24 | 43.42 | 27.56 | 38.91 | 21.95 | 43.90 | 43.73 | 1.30 | 1.26 |
+| Q11 | 325 | 0.234 | 0.235 | 0.395 | 0.187 | 0.310 | 0.128 | 0.948 | 0.999 | 0.79 | 1.47 |
+| Q12 | 21 | 0.099 | 0.101 | 0.141 | 0.090 | 0.102 | 0.047 | 0.162 | 0.165 | 0.89 | 1.92 |
+| Q13 | 85,670 | 25.25 | 17.48 | 53.95 | 34.21 | 41.23 | 18.35 | 41.99 | 40.38 | 1.96 | 1.86 |
+| Q14 | 60,576 | 15.63 | 10.51 | 30.00 | 22.95 | 20.30 | 12.00 | 28.93 | 28.42 | 2.18 | 1.91 |
+| geomean | | 3.15 | 2.23 | 7.37 | 2.98 | 5.83 | 2.01 | 10.29 | 5.22 | **1.34** | 1.49 |
+
+New / base geomean: snapshot 0.71, Stream 0.40, Materialize 0.34, RocksDB
+0.51; Stream / pre-Phase-6 disk (18.99 ms) 0.157×.
+
+#### Open, memory and updates (Stream / Materialize, new and base)
+
+| metric | univ 38 Stream new | univ 38 Materialize new | univ 38 Stream base | univ 8 Stream new | univ 8 Materialize new | univ 8 Stream base |
+|---|---:|---:|---:|---:|---:|---:|
+| open first, page cache dropped (cold) / warm ms | **5.2 / 1.11** (warm samples 0.90, 1.14, 1.11; run b 0.85) | 1392.6 / 1365.8 | 6.3 / 0.83 | 15.2 / 1.07 | 331.1 / 249.6 | 5.5 / 0.86 |
+| RSS after open MiB | **6.1** | 351.1 | 5.7 | 6.0 | 89.1 | 5.7 |
+| query high-water mark MiB (5 processes) | **207.4** (run b 207.6) | 469.0 | 210.6 | 65.7 | 115.7 | 69.1 |
+| single INSERT DATA median / p95 ms (100) | 2.155 / 3.547 | 1.778 / 2.987 | 1.452 / 2.438 | 1.628 / 2.315 | 1.680 / 2.261 | 1.826 / 3.645 |
+| single DELETE DATA median / p95 ms | 1.842 / 2.874 | 2.107 / 2.940 | 1.268 / 1.727 | 2.001 / 3.156 | 2.090 / 2.958 | 1.405 / 2.666 |
+| chunk insert / delete ms | 1070 / 1105 | 930 / 987 | 879 / 930 | 541 / 690 | 702 / 695 | 695 / 706 |
+| `gbuild --disk` s | 20.06 | 18.80 | 18.98 | 4.29 | 4.10 | 3.84 |
+
+Base Materialize: univ 38 open 1603.1 / 1503.5 ms, RSS 350.6 MiB, single
+insert 1.654 ms; univ 8 open 365.1 / 296.5 ms. After the update round trip
+the new databases are back at their fresh term counts (univ 38 842,657
+entities / 433,389 literals; the base's grew to 843,783 / 434,033):
+R4-RECLAIM, part 1 of this stage.
+
+**Single-triple INSERT DATA, more samples** (univ 38, new, three
+alternating pairs of 500, Materialize first): Materialize 1.866 / 1.384 /
+1.835 ms, Stream 1.717 / 1.783 / 1.761 ms — mean of the medians **1.754
+against 1.695 ms (+3.5 %)**, pair by pair −8.0 %, +28.8 %, −4.0 %; with the
+100-insert reference pair (+21 %) Stream is at or below Materialize in two
+of four pairs. Fsync-bound (calibration fsync 1.0 ms) and inside the
+Materialize spread (1.38–1.87 ms); R3's quiet stage had −3.8 %. Not a
+regression of Stream inserts: two more alternating base / new Stream pairs
+of 500 (07:12–07:15 UTC; base, new, new, base) give base 1.821 / 1.969 ms
+against new 1.641 / 1.753 ms (−10 %); single deletes 2.07 / 2.18 against
+2.68 / 2.35 ms (R4-RECLAIM's immediate frees, part 1 of this stage).
+
+#### RocksDB against the base, repeated
+
+Univ 8, four pairs (min over the four runs, new / base): every query ≤
+1.036 (Q7; Q12 1.030 on 0.16 ms, Q8 1.001, the others ≤ 1.004 or faster;
+medians of the runs ≤ 1.043, Q5) — the first pair's Q8 +12 % (100.3 ms
+against 88.0–93.2 in the other new runs) was one slow process set.
+Univ 38, three pairs: min-of-runs Q11 1.097 (1.95–2.31 against 1.78–1.97
+ms), Q10 1.062, Q5 1.029, Q7 1.025, the others ≤ 0.992; medians Q7 1.064,
+Q11 1.053, Q2 1.025, the others ≤ 1.009. The spread between runs of one
+binary is as large (base Q10 353.7 / 400.8 / 458.4 ms, Q8 400.1–479.4;
+new Q2 498.0–592.5), so the deterministic counts decide (below): the
+query work is unchanged, these are not a regression.
+
+#### Profiles (callgrind, deterministic)
+
+- **Why Stream misses R3-STREAM's ratios to Materialize.** Univ 8 database
+  built by the new `gbuild --disk`, the new `gconsole --local` running the
+  query once and three times (differing comment lines, so no query-cache
+  hits), counted inside `Evaluator::evaluate`. Warm run (the three-run
+  count minus the one-run count, halved), Stream / Materialize: Q14 141.9M
+  / 121.0M instructions (1.17×), Q6 186.8M / 160.3M (1.17×), Q13 205.3M /
+  172.4M (1.19×) — against timings of 1.91×, 1.95×, 1.86× at univ 8. With
+  `--cache-sim=yes`, Q14's warm run has 903K against 509K L1 data read
+  misses (1.77×): Stream resolves its 60,576 result ids through the
+  dictionary's `TermCache` (a hash lookup per id, one `Arc<str>` each),
+  where Materialize indexes the in-memory interner in id order. A first run
+  also reads the terms from `id2*` (`DiskDict::resolve_sorted` →
+  `IvArray::for_each_key`: 74.0M of Q14's 210.3M, about 1,220 instructions
+  per term) and the posting list from the B+ tree (9.1M). Q2's Stream cost
+  is the `o_by_sp` probes (39.8M of 102.5M; Materialize's whole evaluate is
+  42.4M) — Request 2. None of that code changed in this round: Stream got
+  faster on every query (0.23× geomean); the ratio grew because the
+  removed `vstree.kv` walk was a cost both modes paid alike (Q14 −28.6 ms
+  Stream, −38.3 ms Materialize at univ 38; `tree` puts it back, 180.2 ms),
+  so what remains of Stream is its out-of-core dictionary and posting
+  lists. A target out of reach for this package, not a regression.
+- **RocksDB Q7 / Q10 / Q11 at univ 38** (database built by the base
+  `gbuild --rocksdb`, both `gquery`/`gconsole` binaries on it,
+  `--cache-sim=yes --toggle-collect=…Evaluator…::evaluate`). First run:
+  Q7 1,858.0M → 1,951.7M (+5.0 %), Q10 1,519.2M → 1,608.8M (+5.9 %), Q11
+  19.30M → 19.19M; all of the Q7 / Q10 difference is glibc's
+  `malloc_consolidate` + `unlink_chunk` inside a `free` (Q7 19.9M → 113.8M,
+  Q10 0.17M → 94.0M; the L1 read misses +3.1M / +3.0M are the same
+  functions'): the heap the open leaves (R4-RECLAIM's `from_slots`
+  dictionary load replaced per-term interning) puts the fastbin
+  consolidation into the first query instead of a later one. **Warm runs**
+  (three runs minus one, halved): Q10 1,591.1M → 1,588.6M (−0.16 %; L1
+  read misses 7.44M → 7.37M; both binaries consolidate ~94M per warm run),
+  Q11 18.15M → 18.06M (−0.5 %; L1 read misses 12.4K → 12.9K). Univ 8,
+  first run: Q5 323.72M → 323.79M, Q7 389.49M → 389.17M, Q10 319.99M →
+  320.09M, Q11 8.74M → 8.63M; L1 read misses within ±0.3 % (Q11 9,659 →
+  9,278). The query work is
+  unchanged; the timing deltas above are run-to-run noise.
+
+#### Acceptance and gates, quiet (univ 38 unless stated)
+
+| item | target | measured | verdict |
+|---|---|---|---|
+| G1d Stream geomean / snapshot of the same commit | ≤ 1.5× | 11.66 / 10.48 = **1.11×** (run b 1.12×; univ 8 1.34×; base 2.82×) | **met** |
+| G1d no query > 3× memory (Stream) | ≤ 3× | worst Q6 2.39×, Q13 2.32×, Q14 2.31× (run b Q14 2.47×; base Q1 58×, Q4 26×, Q3 17×) | **met** |
+| G1d Stream geomean / pre disk | ≤ 0.6× | 11.66 / 146.92 = **0.079×** (univ 8 0.157×) | **met** |
+| G1d on Materialize | ≤ 1.5×, ≤ 3×, ≤ 0.6× pre | 0.72× (run b 0.78×), worst Q6 1.16×; 0.051× pre | **met** |
+| Q2 at or below the base's disk numbers | ≤ base | Stream 76.99 → 55.86 ms, Materialize 46.05 → 27.13 ms (univ 8 11.39 → 6.96, 8.51 → 4.41) | **met** |
+| G1b open warm / cold (Stream) | ≤ 0.5 s / ≤ 2.0 s | 1.11 ms / 5.2 ms (`--drop-caches`) | **met** |
+| G1b open univ 38 / univ 8 | ≤ 1.5 | warm 1.04, cold 0.34 (15.2 ms at univ 8) | **met** |
+| G1c RSS after open; ratio univ 38 / univ 8 | ≤ 120 MiB; ≤ 1.5 | 6.1 MiB; 1.02 | **met** |
+| G1c VmHWM through Q1–Q14 | ≤ 400 MiB | 207.4 MiB (Materialize 469.0) | **met** |
+| R3-STREAM: each Q ≤ 2.0× Materialize, same directory | ≤ 2.0× | **Q14 2.17×, Q13 2.13×, Q6 2.06×, Q2 2.06×, Q12 2.02×** (run b Q6 2.24×, Q13 2.16×, Q14 2.02×) | **not met** |
+| R3-STREAM: geomean vs Materialize | ≤ 1.4× | **1.54×** (run b 1.43×; univ 8 1.49×; base 1.31×) | **not met** |
+| R3-STREAM: Q1, Q3, Q4, Q11, Q12 | ≤ Materialize + 5 ms | +0.004, +0.003, +0.022, +0.110, +0.080 ms | **met** |
+| R3-STREAM: single INSERT DATA median | ≤ Materialize | 1.754 vs 1.695 ms (3 × 500, +3.5 %); 2.155 vs 1.778 (100) | **not met** (inside the spread; 2 of 4 pairs at or below) |
+| R3-STREAM / G6: identical answers | identical | rows and row hashes equal in all 36 files and to pre | **met** |
+| Snapshot Q1–Q14 within ±5 % of the base | ±5 % | geomean 0.58× (univ 8 0.71×); worst Q12 +4.8 % (0.495 → 0.519 ms; univ 8 +1.8 %), Q11 +0.1 %, all others faster | **met** |
+| RocksDB Q1–Q14 within ±5 % of the base | ±5 % | geomean 0.39× (univ 8 0.51×); univ 8 every query ≤ +3.6 % (min of 4 runs); univ 38 Q11 +9.7 %, Q10 +6.2 % (min of 3), Q7 +6.4 % (median), the others ≤ +2.9 %; warm-run instructions and cache misses equal (Q10 −0.16 %, Q11 −0.5 %) | **met** by the counts; the univ 38 timing deltas are within the run-to-run spread |
+| G2 Q1 / Q3 / Q4 / Q11 / Q12 univ 38 / univ 8 (snapshot) | ≤ 2.0 | 0.96 / 1.08 / 1.01 / **5.99 / 5.14** (base 3.20 / 6.11 / 1.51 / 6.02 / 4.99) | Q1/Q3/Q4 met; Q11/Q12 **not met** (unchanged; Request 4) |
+| G2 ratios, other layouts (new) | (report) | Stream 0.93 / 0.87 / 0.95 / 1.51 / 1.76; Materialize 1.08 / 0.93 / 0.98 / 1.34 / 1.67; RocksDB 1.12 / 1.29 / 1.58 / 1.97 / 1.37 | report |
+| RocksDB Q2 scaling univ 38 / univ 8 | (report) | 498.0 / 5.17 = 96× (base 508.1 / 7.44 = 68×) | not improved (Request 6) |
+
+#### Default disk query mode: Materialize stays the default
+
+G1b, G1c and G1d pass at univ 38, on Stream and on Materialize, but three
+R3-STREAM acceptance items do not: each query ≤ 2.0× Materialize (Q14
+2.17× / 2.02×, Q13 2.13× / 2.16×, Q6 2.06× / 2.24× in the two samples, also
+Q2 2.06× and Q12 2.02× in the first), the geomean ≤ 1.4× (1.54× / 1.43×),
+and the single-insert
+median ≤ Materialize (+3.5 %, inside the spread). The flip needs every one
+of them (plan §6 R3-STREAM, Request 3), so `DEFAULT_DISK_QUERY_MODE` stays
+`Materialize` and nothing in the code changed at this stage (plan §5.7:
+recorded here, R4-CLOSURE reports it). What blocks it is the gap between
+Stream's out-of-core dictionary and Materialize's in-memory interner on
+results of 300–430K rows (above), which this round made the larger share
+by removing the VS-tree walk from both. Follow-ups: cheaper Stream term
+resolution for large results (a dense id-indexed decoded-term cache, or
+batched `id2*` reads without per-term allocation, in
+`src/kvstore/disk_dict.rs` / `src/dict`), Request 2 (`seek_in_leaf` in
+`SpoWalk`) for Q2, Request 1 (range-count cache) for the optimizer's
+counts; then re-measure the flip (Stream is already faster than the
+snapshot layout on Q7, Q11 and Q12, within 1.5× of it on ten of the 14
+queries, and opens in about 1 ms with 6 MiB).
+
+### Implementer run (noisy)
 
 **Implementer run, noisy**: 4 vCPU, another implementer compiling and
 benchmarking at the same time (load average 1.0–8.5 during the runs);
