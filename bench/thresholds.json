@@ -8,6 +8,6 @@
   "build": { "floor_ms": 100.0, "max_ratio": 2.0, "max_ratio_disk": 2.5 },
   "open": { "floor_ms": 20.0, "max_ratio": 2.5 },
   "rss": { "floor_mib": 32.0, "max_ratio": 1.5 },
-  "disk_bytes": { "max_ratio": 1.25 },
+  "disk_bytes": { "max_ratio": 1.10 },
   "retries": 2
 }

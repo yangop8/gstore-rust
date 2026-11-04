@@ -266,7 +266,10 @@ hashes 16 hex digits. A baseline is the same document with `"kind":
   would dominate it, and the per-query gate covers those); build `> 2.0` (`> 2.5` for disk, 100 ms floor);
   warm open `> 2.5` (20 ms floor).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
-  open, query high-water mark). **Size**: database bytes `> 1.25×` fails.
+  open, query high-water mark). **Size**: database bytes `> 1.10×` fails
+  (1.25× until the Phase 6 closure; the bytes are deterministic, so the
+  tighter bound needs no noise margin — re-bless after an intended size
+  change).
 * Concurrency and mixed-workload throughput, `/begin` latency and update
   times are report-only (`info.*`); the mixed phase's identical answers and
   acknowledged writes are exact.

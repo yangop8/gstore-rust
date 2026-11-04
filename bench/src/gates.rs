@@ -12,7 +12,8 @@
 //!   medians `> 1.5` fails (over the queries whose baseline median is at
 //!   least `min_base_ms`), build `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
 //! * **Memory**: `(m+32 MiB)/(b+32 MiB) > 1.5` fails (build peak, after open,
-//!   query high-water mark). **Size**: directory bytes `> 1.25` fails.
+//!   query high-water mark). **Size**: directory bytes `> 1.10` fails (sizes
+//!   are deterministic: identical data and code give identical bytes).
 //! * **Report-only** (`info.*`, never fail): concurrency and mixed-workload
 //!   throughput, and what the result has that the baseline lacks — a whole
 //!   extra workload (the WatDiv-like section before a baseline has one), a
