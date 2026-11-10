@@ -1,0 +1,271 @@
+# gStore server configuration (conf.ini) -- example shipped with gstore-rust.
+#
+# This mirrors upstream gStore 1.4's conf/conf.ini key for key and value for
+# value. Copy it to conf/conf.ini (gserver reads ./conf/conf.ini when it exists)
+# or pass it explicitly:  gserver -c conf/conf.ini
+#
+# Syntax: [section] headers, key=value lines; whitespace around keys and values
+# is trimmed and double quotes are removed from values. Lines starting with '#'
+# or ';' are comments, and so is the rest of an unquoted value after
+# whitespace + '#' or ';'. An empty value (key=) means "use the built-in
+# default". If a key appears twice, the first one wins. Unknown keys are
+# reported as warnings and ignored.
+#
+# Precedence: command-line flag (e.g. -p/--port, --password, --no-checkpoint,
+# --addr, or a database directory argument) > this file > built-in default.
+# Relative paths are relative to the directory gserver is started from.
+
+[server]
+# the http api port
+port=9000
+# the socket api port (upstream's socket API is not built in 1.4; parsed only)
+tcp_port=9100
+# worker threads serving HTTP requests
+thread_num=30
+max_database_num=100
+max_user_num=1000
+# use deamon thread to run the server, values: on or off
+# (on: a supervisor process restarts gserver if it crashes; spelled "deamon"
+# as upstream, "daemon" is accepted too)
+deamon=off
+# the maximum output result, default 100000
+# max_output_size=100000
+# ip_allow_path first if both path are configured
+ip_allow_path=
+ip_deny_path="./conf/ipDeny.config"
+
+# ---- gstore-rust extensions (not in upstream conf.ini) ----
+# address the HTTP listener binds; upstream listens on every interface,
+# set 0.0.0.0 to do the same (default 127.0.0.1)
+# listen_addr=127.0.0.1
+# keep-alive idle timeout in seconds, 0 turns keep-alive off (default 60)
+# keep_alive_timeout=60
+# maximum requests served on one connection (default 100)
+# keep_alive_max=100
+# accepted connections that may wait for a free worker thread before the
+# server stops accepting more (default 128)
+# queue_size=128
+# send CORS headers (Access-Control-Allow-Origin: *) and answer OPTIONS
+# preflight requests, values: on or off (default on)
+# cors=on
+
+[system]
+# unit MB
+min_memory=1024
+min_million_disk=200
+min_million_memory=200
+resource_check=off
+# the directory do you want to place your database in
+# NOTICE:the position is ideally in the root of system directory
+# (gserver also keeps its pid file, gserver.pid, and the log of a background
+# start, gserver.log, in this directory)
+# db_home="./dbhome/"
+
+# which suffix do you want to add to your database name? please set it here
+# NOTICE:all database name ends with ".db" by default, but you shouldn't add ".db" to the name you pass to system
+# db_suffix=".db"
+
+# root username
+root_username="root"
+# root default password (used when the user store is first created)
+root_password="123456"
+# system username for shutdown (its password is generated at every start and
+# written to the second line of the pid file)
+system_username="system"
+# auto check point, default on
+check_point=on
+# build use multi thread increase efficiency
+build_multi_thread=off
+# gbuild --disk builds the indexes in bulk (sorted, bottom-up). Its sort
+# buffers stay within this many MiB, spilling sorted runs to disk beyond it;
+# the dictionary under construction (about 26 bytes plus the term per term)
+# comes on top (Rust extension)
+# build_memory_mb=1024
+# threads of that bulk build, 0 = every core; build_multi_thread=off means 1
+# (Rust extension)
+# build_threads=0
+# where it spills sorted runs (default: inside the database directory)
+# (Rust extension)
+# build_tmp_dir="/tmp"
+# how full it packs B+ tree nodes, 50-100 percent; the slack takes later
+# inserts without splitting nodes (Rust extension)
+# build_fill_factor=90
+# free the ids of terms a delete leaves unused (no triple or quad refers to
+# them any more) so new terms reuse them, lowest first: on (default) or off
+# (ids are only freed by gcompact --reclaim). A kvstore.kv written before
+# Phase 6 keeps reclamation off until gcompact --enable-reclaim, which makes
+# the file unreadable for older binaries; new on-disk databases are created
+# with it unless this is off. gserver and gbuild read it; the other
+# command-line tools (gadd, gsub, gquery, ...) follow GSTORE_ID_RECLAIM only.
+# GSTORE_ID_RECLAIM=on|off overrides it (Rust extension)
+# id_reclaim=on
+# the license type login / testConnect / getCoreVersion report: an upstream
+# key upstream's default conf.ini leaves out (default "opensource")
+# licensetype="opensource"
+# where PFN user functions (funcudb / funquery / funreview) are stored: an
+# upstream key upstream's default conf.ini leaves out (upstream default
+# "./pfn/"; gstore-rust's: <db_home>/pfn). Read when gserver starts:
+# refreshconf does not move the functions. They belong to users, not to
+# databases, so no database backup holds them: back up this directory
+# (docs/DEPLOY.md, "Backups"). See [pfn] below and docs/PFN.md.
+# pfn_base_path="./pfn/"
+[log]
+# choose the system core log output model
+# config/slog.stdout.properties for console
+# config/slog.properties for file
+log_mode="./conf/slog.properties"
+# save the query log
+# 0: not save
+# 1: save the log
+# (gstore-rust: a relative querylog_path / accesslog_path is taken relative to
+# db_home, not to the working directory; the plain-text <db_home>/query.log
+# and access.log follow the *_mode switches too and roll over daily, keeping
+# *_days days)
+querylog_mode=1
+querylog_path="logs/endpoint/"
+querylog_days=30
+# you can choose whether to record the operation log, by default it is opened.
+# If it is closed(that is, the option is uncommented and set to 0), then system will run fatser but maybe not safe and recoverable
+accesslog_mode=1
+accesslog_path="logs/ipaccess/"
+accesslog_days=30
+
+# ---- gstore-rust extensions (not in upstream conf.ini) ----
+# The diagnostic log (gserver's errors, warnings and lifecycle events) is
+# configured like upstream's: log_mode names a log4cplus properties file (see
+# conf/slog.properties.example: root level, a console appender and a
+# DailyRollingFileAppender with File, which keeps every rolled file as
+# upstream's log4cplus does); when that file does
+# not exist the log goes to standard error at level info. These keys override
+# the properties file; the GSTORE_LOG environment variable (a level) overrides
+# log_level. /api refreshconf re-reads log_mode's file and these keys and
+# reconfigures the log, as upstream's refreshconf re-runs log4cplus (the
+# querylog_* / accesslog_* keys above take effect at once too).
+# level: trace, debug, info, warn, error or off
+# log_level=info
+# log file, rolled daily into <file>.YYYY-MM-DD; off for none
+# log_file=logs/all.log
+# days of rolled log files to keep, 0 keeps them all (default: all with a
+# properties file, as upstream; 30 when log_file sets the file)
+# log_days=30
+# also write the log to standard error, values: on or off (default on)
+# log_stderr=on
+
+[backup]
+# backup database path. The HTTP API's /backup and /restore only write and read
+# backups inside it (when this key is not set: <db_home>/backups).
+backup_path="./backups/"
+# max backups file, if the number of backup files more than the value, system will remove the old backup files.
+max_backups=3
+
+[upload]
+upload_path = "./upload/"
+# max body size, 1 GB = 1024 MB = 1048576 KB(1M=1024KB) = 1073741824 B(1KB=1024B)
+# (gstore-rust also caps every HTTP request body at this size; refreshconf
+# applies a new value to the upload operation, the HTTP cap needs a restart)
+upload_max_body_size = 1073741824
+# allow extensions (also of build / batchInsert / batchRemove sources; with
+# the `gzip` feature `x.nt.gz` counts as `nt`). gstore-rust adds the quad
+# formats to upstream's "nt|ttl|n3|rdf|txt": export writes N-Quads (.nq) for
+# a database with named graphs, and must be able to build it again.
+upload_allow_extensions = "nt|ttl|n3|rdf|txt|nq|trig"
+# allow compress package
+upload_allow_compress_packages = "zip"
+# (gstore-rust extension, feature `zip`) limits a zip package must stay within
+# to be unpacked by build / batchInsert / batchRemove / restore: its number of
+# entries, and the bytes its files unpack to in all (zip-bomb guard).
+unzip_max_entries = 10000
+unzip_max_size = 10737418240
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# How every database the server serves evaluates queries. gserver applies
+# these to each database it loads, builds, creates or restores (and re-applies
+# them to the loaded ones on /api refreshconf). Upstream has no keys for
+# them: its query cache budget (100 MB) is a constant and its integer division
+# always truncates. The values shown are the defaults.
+[query]
+# how '/' divides two integers: decimal (SPARQL 1.1: 7/2 = 3.5) or truncate
+# (upstream gStore: 7/2 = 3, AVG over integers truncates too)
+# integer_division=decimal
+# per-database read-query cache budget in bytes (0 turns the cache off);
+# results of deterministic read queries are cached until the data changes
+# query_cache_size=67108864
+# stop LIMIT (no ORDER BY), ASK and EXISTS evaluations as soon as enough
+# solutions are found
+# early_termination=on
+# answer ORDER BY ... LIMIT with a bounded heap instead of a full sort
+# topk_bounded_heap=on
+# DP-B Top-K for ORDER BY <linear expression> LIMIT over a tree-shaped BGP:
+# auto (when the statistics predict it pays off), always or off
+# topk_dpb=auto
+# the most bytes of JSON one graph-function call (shortestPaths, kHopEnumerate,
+# PR, ...) may produce before the query fails with an error (default 64 MiB;
+# an embedded Database allows 256 MiB)
+# gfun_max_output_bytes=67108864
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# Sandbox limits of PFN user functions (funcudb / funquery / funreview, and
+# SELECT (PFN.name({...}) AS ?v) in queries). gstore-rust runs PFN functions as
+# WebAssembly in an interpreter (cargo feature pfn-wasm) instead of compiling
+# C++ with g++ and dlopen()ing it like upstream; see docs/PFN.md. They live
+# under [system]'s pfn_base_path (upstream's key; when it is not set:
+# <db_home>/pfn). The output of one call is bounded by [query]'s
+# gfun_max_output_bytes. Like [query], these apply to every database the
+# server serves and /api refreshconf re-applies them (to the loaded databases
+# and to the function registry). The values shown are the defaults.
+[pfn]
+# the most WebAssembly instructions one function call may run (0 = unlimited;
+# a call is also stopped when its query is cancelled)
+# pfn_fuel_per_call=1000000000
+# the most 64 KiB pages a function's memory may grow to (1024 = 64 MiB)
+# pfn_max_memory_pages=1024
+# the largest function module, source text and compiled binary, in bytes
+# pfn_max_module_bytes=1048576
+# the most functions one user may own
+# pfn_max_functions=100
+
+# ---- gstore-rust extension (not in upstream conf.ini) ----
+# How databases are opened. gserver installs these as the defaults when it
+# starts and again on /api refreshconf (databases loaded from then on use
+# them; loaded ones keep the mode they were opened in); the environment
+# overrides them (GSTORE_DISK_QUERY_MODE=stream|memory,
+# GSTORE_DISK_CACHE_MB). Every mode reads and writes the same files: a
+# directory may be opened in either mode, and by older binaries, in turn.
+# The values shown are the defaults (default_layout is unset by default).
+[storage]
+# how an on-disk (kvstore.kv, gbuild --disk) database answers queries:
+# memory = load its dictionary and triples into memory when it is opened
+# (fast queries, memory and open time grow with the data); stream = read the
+# B+ trees and the dictionary from disk on demand (opens in well under a
+# second whatever the size, memory bounded by the caches below)
+# disk_query_mode=memory
+# MiB of page cache per on-disk database
+# disk_cache_mb=16
+# MiB a stream-mode database's dictionary may cache (four fifths id -> term,
+# one fifth term -> id)
+# dict_cache_mb=80
+# build the VS-tree index when a database is opened without a fresh one
+# (RocksDB databases, which persist none; a stream-mode database whose
+# vstree.kv was made stale by updates) instead of querying without it until
+# it is rebuilt. Off: opening stays fast; the first queries may be slower
+# vstree_on_open=off
+# the layout a build that names none creates (snapshot, disk or rocksdb;
+# unset = snapshot): REST /build and /api build (their layout parameter
+# overrides it) and gbuild (--layout, --disk, --rocksdb override it). A new
+# disk database keeps a free-id list (id_reclaim above) unless id_reclaim=off
+# default_layout=disk
+# MiB of the block cache a RocksDB database shares across its column
+# families, 0 = RocksDB's own default (32 MiB per column family);
+# GSTORE_ROCKS_BLOCK_CACHE_MB overrides it
+# rocksdb_block_cache_mb=256
+# bloom filters of RocksDB's point-lookup column families: bits per key,
+# on (= 10) or off; options only, files open either way
+# rocksdb_bloom=10
+
+# Reasoning rules (/api reasonManage, stored per database in
+# <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --
+# at most 1000 rules per database, 1 MiB per rule file, 64 conditions per rule,
+# 256 patterns and 64 filters per condition, 4 KiB per term and 16 KiB per
+# filter, rule names of at most 128 characters (240 bytes). Executing a rule
+# is an update like any other: it obeys check_point and empties the [query]
+# cache.

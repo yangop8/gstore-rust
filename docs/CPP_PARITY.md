@@ -12,18 +12,20 @@
 | parser SPARQL `Parser/SPARQL` | ✅ | SELECT/ASK/CONSTRUCT/**DESCRIBE**、BGP/UNION/OPTIONAL/MINUS/FILTER/BIND/VALUES/子查询/聚合/**EXISTS·NOT EXISTS**/属性路径(`/ ^ \| * + ?`)、**命名图GRAPH**、**完整UPDATE**(INSERT/DELETE DATA、DELETE/INSERT WHERE、DELETE WHERE、LOAD、CLEAR/DROP/CREATE、`;`序列、WITH/USING)、**SERVICE联邦**(`eval_service`+HTTP客户端) | 30+图算法聚合(gpstore专有扩展);GRAPH出现在DELETE/INSERT WHERE模板内 |
 | query engine+value `Executor`/`EvalMultitypeValue` | ✅ | BGP连接、FILTER求值、合并连接、合成id、EXISTS(变量代入)、GRAPH(常量/变量图)、**xsd:dateTime/date比较**(解析为UTC瞬时,跨时区按时序;含闰年/日域校验) | 完整数值类型层级(int/long/float/decimal分别建模,现归并为Int(i64)/Double(f64),比较/排序已正确) |
 | query planner+candidates+optimizer `Optimizer`/`PlanGenerator` | ✅ | 精确候选生成(常量边求交+传播)、NodeScore启发式、采样基数估计、卫星点延后;**真·DP多计划枚举**(左深`n·2ⁿ` DP得最优pattern序)、**二元(bushy)连接**(`3ⁿ`子集划分DP=`ConsiderBinaryJoin`,选出二元连接树由hash-join执行器跑)、**显式System-R代价模型**(NDV取自`pre2sub`/`pre2obj`谓语统计、再用精确候选集收紧)、**plan_cache**(结构同构BGP复用DP结果)。LUBM部分查询已实际走bushy计划且计数正确 | 12种命名物理join method(本引擎每pattern直接选最紧索引,等价);跨查询持久化plan cache(现为单查询evaluator内缓存) |
-| signature `Signature` | ✅ | 944位EntityBitSet三段编码(逐位对齐) | VSTree原版疑似增量插入+分裂(我用bulk聚类构建);**注**:此版本C++主路径其实不用VS-tree |
-| db `Database` | ✅ | build/save/load/query/**完整UPDATE**、磁盘后端、VS-tree重建、**命名图**(持久化)、**事务**(begin/commit/rollback)、**QueryCache**、**RDFS推理**、**Schema抽取**、**监控stats** | 见下"系统级"剩余项(并发/集群/服务化等) |
+| signature `Signature` | ✅ | 944位EntityBitSet三段编码(逐位对齐) | VSTree原版疑似增量插入+分裂(我用bulk聚类构建);**注**:上游1.4主路径不用VS-tree(源码树无`VSTree`目录,`Strategy.cpp`里`vstree->retrieve`已注释),较早的gStore(注释所述"filter by vstree and then verified by join")每条查询先用VS-tree取候选。Phase 6 的VS-tree对齐见下表"VS-tree候选过滤" |
+| db `Database` | ✅ | build/save/load/query/**完整UPDATE**、磁盘后端、VS-tree重建、**命名图**(持久化)、**事务**(begin/commit/rollback)、**QueryCache**、**RDFS推理**、**Schema抽取**、**监控stats** | 见下"系统级"剩余项(并发/集群/服务化等)。Phase 6:**载入不再物化store**——磁盘库以Stream模式打开时只读命名图与O(P)谓词统计,查询直接走B+树与out-of-core字典(默认的Materialize模式仍把工作集载入内存,见`docs/STORAGE_BACKEND.md`);RocksDB库打开时不再重建VS-tree。上游`Database::load`打开KVstore各索引(`IVArray`在打开时读入每个键的块指针,值按需经缓存读取),也不把三元组全量读入内存 |
 
 ## 存储引擎 kvstore vs `KVstore/SITree/IVArray/ISArray/VList`
 
 | 项 | 状态 | 说明 |
 |----|------|------|
-| 分页文件+LRU页缓存+B+树 | ✅ | 4KB块、分裂、前缀扫描、持久化/重开 |
+| 分页文件+页缓存+B+树 | ✅ | 4KB块、分裂(按字节,永不超页;键最长2038字节)、前缀扫描、持久化/重开。Phase 6:页缓存是共享写时复制页(`Arc<[u8; 4096]>`)上的CLOCK(取代O(容量)扫描的LRU),脏页只经提交离开缓存;头部32个根槽+feature位掩码(`kvstore/format.rs`,V1/V2);每个逻辑写(intern一个词、增删一个三元组/四元组)是一个原子pager操作(no-steal,出错或panic整体回滚);B+树读经零拷贝`NodeView`,定长键节点二分查找 |
 | VList紧凑值编码 | ✅ | `kvstore/vlist.rs`:有序id列表delta+varint变长编码,接入磁盘值(反)序列化(round-trip+size测试) |
 | SITree/IVArray/ISArray分化 | ❌ | C++按用途分化(块管理器);我用单一通用BTree(纯内存微优化,合理推迟) |
 | **删除+下溢合并/再平衡** | ✅ | `BTree::delete`:借位(redistribute,叶/内部节点经父分隔键旋转)+ 合并(merge,回收页入free-list)+ 根收缩(空叶清树、单孩内部节点降级);投影大小精确校验,节点永不溢页。`DiskStore::delete_triple` 三索引(SPO/POS/OSP)同步删除并递减计数 |
-| 流式磁盘查询 + out-of-core字典 | ✅ | `TripleSource` trait抽象访问模式,内存/磁盘统一;`Evaluator<S>`+优化器/候选/planner泛型化。`DiskStore::query` 三元组索引按需经页缓存流式读取(不全量物化);**字典也留盘**(`kvstore/disk_dict.rs`:str→id/id→str按需走页缓存B+树,查询常量解析与结果物化均不全量载词典)。**剩余**:流式路径上的VS-tree过滤 |
+| 流式磁盘查询 + out-of-core字典 | ✅ | `TripleSource` trait抽象访问模式,内存/磁盘统一;`Evaluator<S>`+优化器/候选/planner泛型化。`DiskStore::query` 三元组索引按需经页缓存流式读取(不全量物化);**字典也留盘**(`kvstore/disk_dict.rs`:str→id/id→str按需走页缓存B+树,查询常量解析与结果物化均不全量载词典)。Phase 6:接入`Database`(Stream模式,`Backend::Disk(DiskTriples)`,读错误按语句上报,写按id、事务进overlay);字典有界缓存(`TermCache`/`KeyCache`),结果按排序批量解析(相当于上游`trySequenceAccess`)。原"剩余:流式路径上的VS-tree过滤"已由VS-tree策略`Auto`解决(见下表) |
+| VS-tree候选过滤 | ✅ | 上游1.4不用VS-tree(见signature行);较早的gStore每条查询先遍历VS-tree取候选再join。本版保留VS-tree(944位签名逐位对齐)作为候选集的可靠超集过滤器。Phase 6:删除不再使树失效(签名只会少位,存储条目仍是超集;`Database::vs_shrink_debt()`计数,`rebuild_index()`收紧);插入经`VsTree::union_into`按O(树高)更新;内存树对小候选集逐个probe;**VS-tree策略**(`VsPolicy::Auto`默认、`Tree`、`Off`,环境变量`GSTORE_VS_POLICY`):在与store一致的树上得到与遍历整棵树完全相同的候选集(计划、答案、顺序都不变),但跳过不可能剔除候选的细化,对out-of-core树(`vstree.kv`)从store精确算出,查询不再读它的页;RocksDB库打开时不再建树 |
+| 批量建库 | ✅ | `gbuild --disk` / `--rocksdb`(及`/api build`、REST `/build`的`layout=disk\|rocksdb`)是外部排序+自底向上写页镜像(RocksDB:SST ingest),有内存预算、多个源可并行解析、分阶段崩溃安全安装;id与内存构建相同。见`docs/STORAGE_BACKEND.md`"批量构建" |
 | WAL/崩溃一致性 | ✅ | `flush`为原子提交:头页+脏页先写带CRC+commit标记的`<file>.wal`并fsync,再落主文件fsync,再清日志;`open`时重放完整committed日志(redo)、丢弃残缺日志。脏页只经提交落盘(evict优先清干净页,全脏则先提交) |
 
 ## 系统级子系统
@@ -31,8 +33,10 @@
 | 项 | 状态 | 对应C++ | 判断/说明 |
 |----|------|---------|------|
 | 事务(commit/rollback) | ✅ | `Txn_manager` | `begin/commit/rollback`经undo日志实现原子性+回滚(单写者),覆盖所有UPDATE与命名图 |
-| 并发(快照隔离 + 每键版本链MVCC) | ✅ | `GraphLock`/`Latch`/KVstore MVCC | `concurrent::ConcurrentDb`:多读并发(无锁评估immutable `Arc<Snapshot>`)+ OCC多写者(first-committer-wins、写键集历史)+ **每键版本链MVCC**(每triple-key版本表,读者按snapshot选可见版本/墓碑,版本GC回收最老活跃snapshot以下);读者不被阻塞。**并行加载**:`Database::build_from_ntriples_parallel`(行对齐分块多线程解析)。缺:OpenMP级排序细节 |
-| RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range;`Database::materialize_rdfs` |
+| 并发(快照隔离 + 每键版本链MVCC) | ✅ | `GraphLock`/`Latch`/KVstore MVCC | `concurrent::ConcurrentDb`:多读并发(无锁评估immutable `Arc<Snapshot>`)+ OCC多写者(first-committer-wins、写键集历史)+ **每键版本链MVCC**(每triple-key版本表,读者按snapshot选可见版本/墓碑,版本GC回收最老活跃snapshot以下);读者不被阻塞。**并行加载**:`Database::build_from_ntriples_parallel`(行对齐分块多线程解析)。缺:OpenMP级排序细节。Phase 6:`Database: Send + Sync`,读语句走`&self`路径(`read_as`/`query_read`);两个HTTP服务器对每个库读共享、写独占(`RwLock`/`DbCell`),监控端点不等库锁;内存`TripleStore`与字典写时复制,`ConcurrentDb`发布与HTTP `/begin`对内存库为O(1),Stream磁盘库的`/begin`是`DiskReadView`(提交时取消并重跑在途快照读);RocksDB库的`/begin`仍物化(D4)。见`docs/DESIGN.md` §11 |
+| RDFS/OWL推理 | ✅ | `src/Reason` | `src/reason`前向链物化:子类/子属性传递、type传播、domain/range(range不再给字面量加类型);`Database::materialize_rdfs` |
+| 推理规则 `reasonManage` | ✅ | `src/Reason`、`ApiReasonOperation.cpp` | Phase 4:上游JSON规则的新增/列表/编译/执行/失效/查看/删除/校验(type 1–8),编译结果逐字节一致,规则存`<db>.db/reason_rule_files/`;偏离:精确撤回(账本)、规则校验防SPARQL注入、已执行规则不可重编译(见README「Reasoning」) |
+| PFN 用户图函数 | ✅ | `ApiPFNOperation.cpp`、`GeneralEvaluation` pfn | Phase 4:`funquery`/`funcudb`/`funreview`按用户管理,`PFN.name({…})`求值并按上游返回`{"results":…}`;偏离:函数体为WebAssembly文本,在`wasmi`沙箱中运行(feature `pfn-wasm`),非g++编译+dlopen(见[`docs/PFN.md`](PFN.md)) |
 | Schema抽取 | ✅ | `Database::getSchemaInfo` | `Database::schema()` 抽类与属性 |
 | QueryCache | ✅ | `Database`/`QueryCache` | 读查询按SPARQL串缓存,任何写入即失效 |
 | 监控/统计API | ✅ | `getDBMonitorInfo` | `Database::stats()`→`DbStats`(计数+索引/事务状态) |
@@ -42,7 +46,7 @@
 | 服务化:HTTP | ✅ | `src/Server`/`Api`/`ghttp` | `src/server`(`gserver`bin):HTTP/1.1 SPARQL端点(GET/POST /sparql、POST /update、GET /status),零依赖;**HTTP Basic鉴权**(可选凭据,401+WWW-Authenticate)、**内容协商**(SPARQL Results JSON/XML/CSV/TSV,`sparql_results.rs`)、**chunked流式**响应。缺:HTTPS(记为TLS反代/未来feature范围外)、gRPC |
 | 集群/分布式分片 | ✅ | `src/Cluster` | `src/cluster`:进程内`ShardedStore` + **网络`NetworkShardedStore`**(`rpc.rs`长度前缀TCP RPC、`gnode`分片节点bin、`RemoteShard`客户端),跨本地/远程分片的scatter-gather查询 + **路由插入**。缺:副本/容错、gRPC线格式(序列化可换) |
 | SERVICE联邦查询 | ✅ | — | `eval_service` + `http_client`:对远程SPARQL端点发HTTP查询并join本地解;SILENT语义(§18.5 join-identity)。缺:VALUES下推等优化 |
-| ID freelist复用(BlockInfo链) | N/A | `Database::allocEntityID`等 | 仅在删除字典项时才有意义;gStore与本版删除三元组时均保留字典项(id不回收),故不适用 |
+| ID freelist复用(BlockInfo链) | ✅ | `Database::allocEntityID`/`freeEntityID`/`freeLiteralID`/`freePredicateID` | 上游在非事务删除(`txn == nullptr`)后检查度数:实体、字面量、谓词的度数降到0即删字典项并把id放进`BlockInfo`空闲链(LIFO,后放先用;释放最高id时只把上限减一)。Phase 6(R4-RECLAIM)起本版同样释放:每条删除语句结束时(事务内在`commit`时)释放所有不再被三元组/四元组引用的实体、字面量、谓词(含图IRI),所有布局(快照、磁盘Stream/Materialize、RocksDB)都持久化;差异:复用**最低空闲id优先**(上游LIFO),释放最高id时连带下调(trim cascade),事务删除也释放(在提交时),`[system] id_reclaim=off`可关。早期本行写"gStore删除三元组时保留字典项、不适用",与上游源码不符,已更正 |
 | RDFParser分批 + 并行加载 + 数值范围校验 | ✅ | `Parser/RDFParser` | `build_from_ntriples_batched`(有界内存分批flush)+ `build_from_ntriples_parallel`(多线程并行解析);dateTime日域/时域已校验 |
 
 ## 代码检视结果
@@ -125,3 +129,17 @@
 > - 测试:默认workspace **689全过**;`--features rocksdb` 编译+lib全过;`--features gzip`/`tls` 各自编译+测试(含 `gzip_compresses_when_accepted`/`tls_https_round_trip`)+ clippy `--all-targets` 零告警(默认/gzip/tls/rocksdb 四组合)。
 >
 > **至此原"深度/子集项"仅剩**:RDFa/JSON-LD的完整1.1语义(仍common-subset);Decimal为i128界(非任意精度,刻意零依赖界)、÷与SUM走f64;StringIndex惰性按查询构建(未做持久化Database级索引)。**刻意偏离仍不补**:gRPC线格式、多语言客户端SDK、.so热加载UDF、发行工程。
+>
+> 更新(Phase 4,**推理规则 + PFN**):`reasonManage`(type 1–8,上游JSON规则全生命周期,精确撤回)与 PFN 用户图函数(`funquery`/`funcudb`/`funreview` + `PFN.name({…})`)已接入 `/api`。上文"PFN .so动态插件:改为安全的Rust进程内函数注册表"的偏离据此更新:PFN 现以**沙箱化 WebAssembly**(feature `pfn-wasm`,`wasmi` 解释器)实现上游的按用户函数管理与调用协议,仍不做 dlopen;上游 C++ 函数体需改写为 WAT。详见 [`docs/PFN.md`](PFN.md) 与 README 的 Reasoning / PFN 两节。
+>
+> 更新(Phase 5 集成,GAP_PLAN §4.2 + §5):**zip**(feature `zip`,默认关):`/api` build/batchInsert/batchRemove 读 zip 包、`backup compress=true` / `restore` zip 备份、`export compress=true` 与 `format=nt|nq`(含命名图时默认 N-Quads),`gbuild`/`gexport`/`gbackup`/`grestore` 同步支持;**日志**:`src/logging.rs` 按上游 `log_mode` 属性文件 + 扩展键分级、按天滚动与保留,REST 查询写 JSON 查询日志,访问日志带 IP;**老工具**:上游 1.3 参数拼写、`grestore` 参数顺序与上游一致、`gshow` 列出全部库、`gbuild` 建空库与防覆盖;**发行工程**:Dockerfile、systemd unit、deb/rpm 元数据(见 `docs/DEPLOY.md`)——此前"刻意偏离"中的 Docker/RPM/DEB 已补齐(loongarch 仍未做)。
+>
+> 更新(Phase 4 与 Phase 5 合并):两阶段在同一主线上衔接——`gconsole` 的 reason 系列(`addreason` … `deletereason`)与 pfn 系列(`showpfn`/`addpfn`/`mdfpfn`/`delpfn`/`buildpfn`)命令对真实服务端走完全生命周期,PFN 查询的 `{"results": …}` 按上游 `pfn_type` 方式打印;推理规则与其账本随 zip 备份、`gbackup -z`/`grestore x.zip`、`drop` 的 `.bak` 保留(`export` 与上游一样只导出数据);导入流水线分域铸造的空节点上推出的三元组可精确撤回;PFN 函数按用户存于 `pfn_base_path`(打包与容器布局 `/var/lib/gstore/dbhome/pfn`,备份见 `docs/DEPLOY.md`);推理与 PFN 事件写入诊断日志,其操作进入 `/api` 访问与查询日志;Docker 镜像默认开启 `pfn-wasm`,CI 特性矩阵含 `gzip`/`tls`/`zip`/`readline`/`pfn-wasm`。上文"刻意偏离仍不补"中的".so热加载UDF"由沙箱化 WASM PFN 取代,"发行工程"已在 Phase 5 补齐。
+>
+> 更新(Phase 6,**规模与性能**,`docs/PHASE6_PLAN.md`):本阶段对标的是上游的规模表现,对照表中改动的行:
+> - **ID回收**("ID freelist复用"行):此前本doc写"gStore删除三元组时保留字典项",与上游源码不符——上游在非事务删除后把度数降为0的实体、字面量、谓词的id放回`BlockInfo`空闲链。本版现在所有布局都释放这些id,最低id优先复用(上游LIFO),事务删除在提交时释放;`gcompact --reclaim`补收孤儿词。细节见`docs/STORAGE_BACKEND.md`"id回收"。
+> - **VS-tree**("VS-tree候选过滤"行):上游1.4不用VS-tree;本版保留,并让磁盘库在默认策略下由store精确算出与树相同的候选集,不再读`vstree.kv`。
+> - **存储与载入**(db行、"分页文件+页缓存+B+树"行、"流式磁盘查询"行):磁盘库Stream模式打开时不物化store;页缓存CLOCK+共享写时复制页;逻辑写原子;格式注册表(`kvstore.kv` V1/V2,`FREE_IDS`);批量建库。
+> - **并发**("并发"行):读共享/写独占的服务器,写时复制快照,`DiskReadView`。
+> - **与上游lubm10M同量级**(计划§2 G7):univ 82(11,135,159个三元组,`bench/results/phase6-final-lubm82.json`)对上游gStore 0.5.0在lubm10M上的数字(`formal_experiment.tex`:23 µs/三元组、264 B/三元组,q1≈Q2 144 ms,q13≈Q14 223 ms):快照布局 / 磁盘布局(默认Materialize模式)建库6.27 / 4.45 µs/三元组,库大小83.2 / 126.2 B/三元组,Q2 85.26 / 71.19 ms,Q14 141.28 / 165.29 ms,每项都不高于上游。注意:生成器不同(LUBM-like而非UBA)、硬件不同、上游测试框架每条查询约23 ms的下限,本版数字是进程内的热中位数(5个进程各5次的中位数取最小)。Stream模式(可选)的Q14为876.09 ms,是上游的3.93倍。
+> - **仍属差异/未做**:RocksDB库打开时仍把字典读入内存、无原生快照、`/begin`物化(D4);段布局/磁盘格式v2(D1)等延后项见`docs/REFACTOR_BACKLOG.md` §I。

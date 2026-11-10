@@ -4,30 +4,82 @@
 //! triple store, builds from RDF files, applies updates, answers SPARQL, and
 //! persists to / loads from a database directory.
 //!
-//! Persistence (DESIGN §7): a database is a directory holding four
-//! bincode-serialized files — `dict.bin`, `store.bin`, `meta.bin`, and
-//! `vstree.bin` (the signature index). This is the deliberately-simple stand-in
-//! for gStore's on-disk B+ tree KVstore (backlog item A).
+//! Persistence (DESIGN §7): a database is a directory in one of three layouts
+//! (see [`StorageKind`] and the `persist` submodule) — a bincode snapshot
+//! (`dict.bin`, `store.bin`, `named.bin`, `meta.bin`, `vstree.bin`, written as
+//! one crash-atomic set), the on-disk B+ tree KVstore (`kvstore.kv`, updated by
+//! write-through), or a RocksDB store (`rocksdb/`, feature `rocksdb`).
+//! [`Database::open`] detects the layout.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::dict::Dictionary;
+use crate::analytics::csr::{CsrCache, CsrGraph};
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
-use crate::kvstore::DiskStore;
-use crate::model::id::{is_entity_id, EntityLiteralId, PredId};
+use crate::kvstore::StringIndex;
+use crate::model::id::{is_entity_id, EntityLiteralId};
+use crate::model::term::export_key;
 use crate::model::{IdTriple, Term, Triple};
-use crate::parser::sparql::ast::{GraphTarget, GroundTriple, Query, UpdateOp, RDF_TYPE};
-use crate::parser::{sparql, turtle};
-use crate::query::{Evaluator, FunctionRegistry, QueryResult};
+use crate::parser::import;
+use crate::parser::nquads::Quad;
+use crate::parser::sparql;
+use crate::parser::sparql::ast::{
+    GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
+};
+use crate::query::engine::dictionary_string_index;
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
+use crate::store::read_scope::ReadScope;
 use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
+
+mod admin;
+pub mod dirlock;
+pub(crate) mod fsutil;
+mod open_options;
+pub(crate) mod persist;
+mod statement;
+pub use open_options::{
+    default_open_options, set_default_open_options, DiskQueryMode, OpenOptions,
+    DEFAULT_DICT_CACHE_BYTES, DEFAULT_DISK_CACHE_PAGES, DEFAULT_DISK_QUERY_MODE, ENV_DISK_CACHE_MB,
+    ENV_DISK_QUERY_MODE, ENV_VSTREE_ON_OPEN,
+};
+pub use statement::Statement;
+
+#[cfg(test)]
+mod concurrency_tests;
+
+pub(crate) use admin::{class_stats_of, ClassStats};
+pub use admin::{SchemaEdge, SchemaGraph, SchemaNode};
+pub use persist::StorageKind;
+
+#[cfg(test)]
+mod hardening_tests;
+mod load_policy;
+pub mod named;
+#[cfg(test)]
+mod r4_review_tests;
+pub mod reclaim;
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod stream_review_tests;
+pub use load_policy::{LoadPolicy, LoadSource};
+mod query_cache;
+use named::NamedGraphs;
+use query_cache::QueryCache;
+pub use query_cache::DEFAULT_QUERY_CACHE_BYTES;
+pub use reclaim::{
+    default_id_reclaim, set_default_id_reclaim, IdReclaim, IdSpaceStats, ENV_ID_RECLAIM,
+};
+use reclaim::{Candidates, Deferred};
 
 const RDFS_SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 const RDFS_SUBPROP: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
@@ -55,16 +107,14 @@ const INCREMENTAL_LOG_FILE: &str = "incr.log";
 /// every *committed* mutation so it can be re-applied on recovery (the redo half
 /// of gStore's WAL; the undo half is the per-transaction [`UndoOp`] log).
 const REDO_LOG_FILE: &str = "redo.log";
-/// Default upper bound on cached read-query results before LRU eviction kicks in.
-const DEFAULT_QUERY_CACHE_CAP: usize = 256;
 /// The on-disk B+ tree KVstore file inside a database directory.
 const KV_FILE: &str = "kvstore.kv";
 /// The on-disk (out-of-core) VS-tree node file inside a disk database directory.
 /// Distinct from the in-memory snapshot's `vstree.bin`: this is the paged node
 /// file a disk database filters through without loading the whole tree.
 const VSTREE_KV_FILE: &str = "vstree.kv";
-/// Sub-directory holding the RocksDB store of a RocksDB-backed database.
-#[cfg(feature = "rocksdb")]
+/// Sub-directory holding the RocksDB store of a RocksDB-backed database
+/// (detected with or without the `rocksdb` feature).
 const ROCKS_SUBDIR: &str = "rocksdb";
 /// Page-cache size for the disk store (4096 × 4 KiB = 16 MiB).
 const DISK_CACHE_PAGES: usize = 4096;
@@ -94,9 +144,91 @@ fn vstree_entries<S: TripleSource>(store: &S) -> Vec<(EntityLiteralId, Signature
         .collect()
 }
 
+/// [`vstree_entries`] for the in-memory store, from one merged walk of its
+/// subject and object maps (no per-entity lookup or copy). Equal to the
+/// generic version.
+fn memory_vstree_entries(store: &TripleStore) -> Vec<(EntityLiteralId, Signature)> {
+    let mut out = Vec::new();
+    store.for_each_entity_adjacency(|e, outgoing, incoming| {
+        let mut sig = Signature::new();
+        for &(p, o) in outgoing {
+            sig.encode_edge(p, o, EdgeDir::Out);
+        }
+        for &(p, s) in incoming {
+            sig.encode_edge(p, s, EdgeDir::In);
+        }
+        out.push((e, sig));
+    });
+    out
+}
+
+/// [`vstree_entries`] for the on-disk store, from one streaming pass over its
+/// SPO and OSP trees ([`DiskStore::for_each_entity_adjacency`]) instead of
+/// two range reads and copies per entity. Equal to the generic version; a
+/// read error fails the build instead of signing an entity with missing edges.
+///
+/// [`DiskStore::for_each_entity_adjacency`]: crate::kvstore::DiskStore::for_each_entity_adjacency
+fn disk_vstree_entries(
+    store: &crate::kvstore::DiskStore,
+) -> Result<Vec<(EntityLiteralId, Signature)>> {
+    let mut out = Vec::new();
+    store.for_each_entity_adjacency(|e, outgoing, incoming| {
+        let mut sig = Signature::new();
+        for &(p, o) in outgoing {
+            sig.encode_edge(p, o, EdgeDir::Out);
+        }
+        for &(p, s) in incoming {
+            sig.encode_edge(p, s, EdgeDir::In);
+        }
+        out.push((e, sig));
+        std::ops::ControlFlow::Continue(())
+    })?;
+    Ok(out)
+}
+
+/// [`vstree_entries`] of a [`Backend`], through the in-memory fast path when
+/// it holds a [`TripleStore`], and the streaming pass over the committed
+/// on-disk store when it holds a [`DiskTriples`](crate::kvstore::DiskTriples)
+/// without an open transaction (a read error there is reported to the
+/// thread's read scope and the generic signing runs instead).
+fn backend_vstree_entries(store: &Backend) -> Vec<(EntityLiteralId, Signature)> {
+    if let Some(mem) = store.as_memory() {
+        return memory_vstree_entries(mem);
+    }
+    if let Some(dt) = store.as_disk().filter(|dt| !dt.in_transaction()) {
+        match dt.disk_store().and_then(disk_vstree_entries) {
+            Ok(entries) => return entries,
+            Err(e) => crate::store::read_scope::note_read_error(format_args!(
+                "signing the on-disk store's entities: {e}"
+            )),
+        }
+    }
+    vstree_entries(store)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Edges read to re-sign entities from the store on this thread (tests
+    /// bound the incremental maintenance's work with it).
+    static RESIGNED_EDGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Build an in-memory VS-tree over every entity (see [`vstree_entries`]).
-fn build_vstree<S: TripleSource>(store: &S) -> VsTree {
-    VsTree::build(vstree_entries(store))
+fn build_vstree(store: &Backend) -> VsTree {
+    VsTree::build(backend_vstree_entries(store))
+}
+
+/// [`backend_vstree_entries`] in a read scope (C2): a read error fails it
+/// instead of signing an entity with missing edges — a tree built from such
+/// entries is not a superset, and queries filtering through it would
+/// silently lose rows.
+fn checked_vstree_entries(store: &Backend) -> Result<Vec<(EntityLiteralId, Signature)>> {
+    let scope = ReadScope::enter();
+    let entries = backend_vstree_entries(store);
+    match scope.take_error() {
+        Some(e) => Err(read_failure("signing the entities for the VS-tree", e)),
+        None => Ok(entries),
+    }
 }
 
 /// On-disk metadata (kept tiny and human-meaningful).
@@ -109,80 +241,24 @@ struct Meta {
     predicate_num: u64,
 }
 
-/// A bounded LRU cache of read-query results, keyed by the SPARQL string
-/// (gStore's `QueryCache`, but with a capacity bound). Each entry carries a
-/// monotonically-increasing access tick; when the cache is full, the entry with
-/// the smallest tick (least-recently used) is evicted to make room. The whole
-/// cache is still cleared on any store mutation (writes invalidate reads).
-#[derive(Debug)]
-struct LruCache {
-    map: HashMap<String, (QueryResult, u64)>,
-    cap: usize,
-    tick: u64,
-}
-
-impl LruCache {
-    fn new(cap: usize) -> LruCache {
-        LruCache {
-            map: HashMap::new(),
-            cap,
-            tick: 0,
-        }
-    }
-
-    /// Look up `key`, refreshing its recency and returning a clone on hit.
-    fn get(&mut self, key: &str) -> Option<QueryResult> {
-        self.tick += 1;
-        let tk = self.tick;
-        let entry = self.map.get_mut(key)?;
-        entry.1 = tk;
-        Some(entry.0.clone())
-    }
-
-    /// Insert `key → value`, evicting the least-recently-used entry if inserting
-    /// a new key would exceed the capacity. A zero capacity disables caching.
-    fn put(&mut self, key: String, value: QueryResult) {
-        if self.cap == 0 {
-            return;
-        }
-        self.tick += 1;
-        let tk = self.tick;
-        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
-            if let Some(lru) = self
-                .map
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&lru);
-            }
-        }
-        self.map.insert(key, (value, tk));
-    }
-
-    fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    #[cfg(test)]
-    fn contains(&self, key: &str) -> bool {
-        self.map.contains_key(key)
-    }
-}
-
 /// One pending/serialized redo-log record: an applied mutation in surface form.
-/// `op` is `b'I'` (insert) or `b'D'` (delete); `graph` is the named-graph IRI
-/// (`None` ⇒ default graph); `triple` is the N-Triples `s p o .` text.
+/// `op` is `b'I'` (insert), `b'D'` (delete), `b'C'` (clear the graph:
+/// `DEFAULT` without a graph, else the named graph) or `b'N'` (clear every
+/// named graph); `graph` is the named-graph IRI (`None` ⇒ default graph);
+/// `triple` is the N-Triples `s p o .` text (empty for the clears).
 #[derive(Debug, Clone)]
 struct RedoRec {
     op: u8,
     graph: Option<String>,
     triple: String,
+}
+
+/// What a `CLEAR` redo record clears (see [`RedoRec`]).
+#[derive(Debug, Clone, Copy)]
+enum RedoClear {
+    Default,
+    Named(u32),
+    AllNamed,
 }
 
 /// An RDF database: a dictionary, the six-way triple index, and a VS-tree.
@@ -191,14 +267,15 @@ pub struct Database {
     name: String,
     dict: Dictionary,
     /// The live default-graph store, selected at construction: in-memory
-    /// ([`Backend::Memory`], the default) or persistent RocksDB
+    /// ([`Backend::Memory`], the default), the on-disk B+ trees of a
+    /// Stream-mode database ([`Backend::Disk`]) or persistent RocksDB
     /// ([`Backend::Rocks`], feature `rocksdb`). All reads/writes go through the
     /// [`TripleSource`]/[`MutableStore`] seam, so the engine is backend-agnostic.
     store: Backend,
     /// Named graphs: graph-IRI entity id → its triple store. The default graph
     /// is `store`; `GRAPH` patterns and quad updates target this map. Named
     /// graphs stay in-memory (DESIGN §"Phase 2").
-    named: BTreeMap<u32, TripleStore>,
+    named: NamedGraphs,
     /// Signature index for query-time candidate pruning.
     vstree: VsTree,
     /// Whether `vstree` is consistent with `store`. Cleared on update; the
@@ -206,12 +283,36 @@ pub struct Database {
     /// or `rebuild_index`. (A stale tree is never used, preserving correctness.)
     index_valid: bool,
     /// Active transaction's undo log (`None` ⇒ auto-commit mode). Each entry is
-    /// the inverse of a triple mutation, applied in reverse on rollback.
+    /// the inverse of a triple mutation, applied in reverse on rollback. A
+    /// Stream-mode database records only its named-graph changes here: its
+    /// default graph's transaction is the on-disk store's overlay.
     txn: Option<Vec<UndoOp>>,
-    /// Bounded LRU cache of read-query results keyed by the SPARQL string
-    /// (gStore `QueryCache`), cleared on any store mutation. Interior mutability
-    /// so a `&self`/`&mut self` query path can read and populate it.
-    query_cache: RefCell<LruCache>,
+    /// Stream mode: [`rebuild_index`](Self::rebuild_index) was called inside a
+    /// transaction; the rebuild runs when the transaction ends.
+    vstree_rebuild_pending: bool,
+    /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
+    /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
+    /// any store mutation. Behind a lock so concurrent `&self` reads
+    /// ([`read_as`](Self::read_as)) can look up and populate it; its entries
+    /// are shared (`Arc`), so a hit is copied out after the lock is released.
+    query_cache: Mutex<QueryCache>,
+    /// How `/` divides two integers in this database's queries (see
+    /// [`set_integer_division`](Self::set_integer_division)).
+    integer_division: IntegerDivision,
+    /// Which `LIMIT` / `ORDER BY` / `ASK` optimizations (Top-K, early
+    /// termination, DP-B) this database's queries may use (see
+    /// [`set_topk_options`](Self::set_topk_options)); all on by default.
+    topk: TopKOptions,
+    /// How many bytes of JSON one graph-function call may produce (see
+    /// [`set_gfun_max_output_bytes`](Self::set_gfun_max_output_bytes)).
+    gfun_max_output_bytes: usize,
+    /// Whose PFN functions this database's queries call, from which registry
+    /// (see [`set_pfn_caller`](Self::set_pfn_caller)); a server passes the
+    /// caller per query instead ([`query_as`](Self::query_as)).
+    pfn: Option<crate::pfn::PfnCaller>,
+    /// The sandbox limits PFN calls run under (see
+    /// [`set_pfn_limits`](Self::set_pfn_limits)).
+    pfn_limits: crate::pfn::PfnLimits,
     /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
     /// `update.log`), so the write history can be replayed or audited. `None`
     /// disables logging (the default).
@@ -227,15 +328,95 @@ pub struct Database {
     /// full ([`backup`](Self::backup)) or incremental
     /// ([`backup_incremental`](Self::backup_incremental)) backup ended at. The
     /// next incremental captures update-log records from here onward, so
-    /// successive incrementals chain contiguously. Interior-mutable because both
-    /// backup methods take `&self`.
-    backup_offset: Cell<u64>,
-    /// User-defined forward-chaining reasoning rules (gStore's `ReasonHelper`).
+    /// successive incrementals chain contiguously. Atomic because both backup
+    /// methods take `&self` (they run under [`persist_lock`](Self::persist_lock)).
+    backup_offset: AtomicU64,
+    /// User-defined forward-chaining reasoning rules (the crate's textual
+    /// `body => head` rules, see [`crate::reason::RuleSet`]).
     rules: crate::reason::RuleSet,
+    /// Where upstream-format reasoning rules (`reasonManage`, see
+    /// [`reason_add`](Self::reason_add)) are kept: a directory override, or
+    /// memory for a database without a directory.
+    reason_home: crate::reason::store::RuleHome,
     /// User-defined scalar SPARQL functions (gStore's PFN, as a safe in-process
     /// registry rather than dlopen `.so` plugins). Passed to every read-query
     /// evaluator; consulted for any function name that is not a built-in.
     functions: FunctionRegistry,
+    /// The directory this database was opened from / built into (`None` for a
+    /// database that only ever lived in memory). Persistent layouts write their
+    /// committed updates here.
+    home: Option<PathBuf>,
+    /// Write-through state of an on-disk (`kvstore.kv`) database: every
+    /// committed mutation of the in-memory working set is mirrored to the
+    /// [`DiskStore`](crate::kvstore::DiskStore). Behind a lock so
+    /// `save(&self)` / `sync(&self)` can commit it.
+    disk: Mutex<Option<persist::DiskSink>>,
+    /// The first persistence failure (RocksDB dictionary / named-graph write)
+    /// since the last commit point, reported by the next one.
+    persist_error: Mutex<Option<String>>,
+    /// Serializes the `&self` persistence entry points — [`save`](Self::save),
+    /// [`checkpoint`](Self::checkpoint), [`sync`](Self::sync),
+    /// [`backup`](Self::backup) and
+    /// [`backup_incremental`](Self::backup_incremental) — which may now run
+    /// concurrently with each other and with reads. Lock order (C8):
+    /// `persist_lock` → `disk` → `persist_error` → the pager. Each entry point
+    /// takes it once and delegates to internals that never take it again.
+    persist_lock: Mutex<()>,
+    /// Which sources SPARQL `LOAD` may read (see [`LoadPolicy`]). Permissive by
+    /// default; network-facing servers install [`LoadPolicy::restricted`].
+    load_policy: LoadPolicy,
+    /// Advances on every applied data mutation (see
+    /// [`mutation_count`](Self::mutation_count)).
+    mutations: u64,
+    /// Default-graph deletes applied since the VS-tree was last built, while
+    /// it stayed valid (see [`vs_shrink_debt`](Self::vs_shrink_debt)).
+    vs_shrink_debt: u64,
+    /// When deleted terms' ids are freed (see the `reclaim` module).
+    id_reclaim: IdReclaim,
+    /// Reclamation candidates of the running statement, or of the open
+    /// transaction (freed at its commit).
+    reclaim: Candidates,
+    /// Candidates whose free waits: Stream mode, for the dictionary's pins
+    /// (a clone sharing the on-disk dictionary is alive); any layout, after
+    /// a read error stopped their check (see [`Deferred`]).
+    reclaim_deferred: Deferred,
+    /// The per-predicate CSR of the default graph used by the advanced graph
+    /// functions (upstream `GeneralEvaluation::csr`), built lazily and keyed
+    /// by [`mutations`](Self::mutations) so any data change invalidates it
+    /// (see [`csr`](Self::csr)).
+    csr_cache: CsrCache,
+    /// The dictionary substring index the evaluator prunes `CONTAINS` /
+    /// `STRSTARTS` / `STRENDS` / plain `REGEX` candidates with, built on
+    /// first use and kept for the dictionary [`generation`](Dictionary::generation)
+    /// it was built from (see [`string_index`](Self::string_index)); a
+    /// change that adds or frees a term drops it. In-memory dictionaries only.
+    string_index: StringIndexCache,
+    /// RocksDB: dictionary terms known in memory whose write to the `dict` CF
+    /// failed (e.g. interned by a reasoner run whose term write failed). The
+    /// next insert that uses one writes it first, so no persisted triple ever
+    /// references an id RocksDB has no dictionary entry for.
+    #[cfg(feature = "rocksdb")]
+    unpersisted_terms: HashSet<(crate::backend::rocks::TermSpace, u32)>,
+    /// The inter-process lock on the directory this database is open from
+    /// (see [`dirlock`]); declared last so it is released only after every
+    /// other field (the on-disk store included) has been dropped.
+    dir_lock: Option<dirlock::DirLock>,
+}
+
+/// The cached dictionary substring index of a [`Database`] (see
+/// [`Database::string_index`]): `(dictionary generation, index)`. Its `Debug`
+/// shows only the generation and the index size.
+#[derive(Default)]
+struct StringIndexCache(Mutex<Option<(u64, Arc<StringIndex>)>>);
+
+impl std::fmt::Debug for StringIndexCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.try_lock().as_deref() {
+            Ok(Some((g, idx))) => write!(f, "StringIndex(generation {g}, {} terms)", idx.len()),
+            Ok(None) => f.write_str("None"),
+            Err(_) => f.write_str("<locked>"),
+        }
+    }
 }
 
 /// Build-pipeline stage, reported through the progress callback of
@@ -286,6 +467,62 @@ enum UndoOp {
     Del(Option<u32>, IdTriple),
 }
 
+/// The graph-to-graph UPDATE operations (SPARQL 1.1 Update §3.2.3-3.2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphTransfer {
+    Add,
+    Move,
+    Copy,
+}
+
+impl GraphTransfer {
+    fn keyword(self) -> &'static str {
+        match self {
+            GraphTransfer::Add => "ADD",
+            GraphTransfer::Move => "MOVE",
+            GraphTransfer::Copy => "COPY",
+        }
+    }
+}
+
+/// The query-evaluation settings a server applies to every database it opens,
+/// builds, creates or restores ([`Database::apply_query_settings`]); `gserver`
+/// reads them from `conf.ini`'s `[query]` section
+/// ([`GStoreConfig::query_settings`](crate::config::GStoreConfig::query_settings)).
+/// [`Default`] is what a database built in-process starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySettings {
+    /// How `/` divides two integers ([`Database::set_integer_division`];
+    /// `integer_division`).
+    pub integer_division: IntegerDivision,
+    /// The read-query cache's budget in bytes, 0 = off
+    /// ([`Database::set_query_cache_size`]; `query_cache_size`).
+    pub query_cache_bytes: usize,
+    /// The `LIMIT` / `ORDER BY` / `ASK` optimizations
+    /// ([`Database::set_topk_options`]; `early_termination`,
+    /// `topk_bounded_heap`, `topk_dpb`).
+    pub topk: TopKOptions,
+    /// The most bytes of JSON one graph-function call may produce
+    /// ([`Database::set_gfun_max_output_bytes`]; `gfun_max_output_bytes`).
+    /// Also bounds what one PFN call may emit.
+    pub gfun_max_output_bytes: usize,
+    /// The sandbox limits of PFN functions ([`Database::set_pfn_limits`];
+    /// `conf.ini`'s `[pfn]` section).
+    pub pfn: crate::pfn::PfnLimits,
+}
+
+impl Default for QuerySettings {
+    fn default() -> QuerySettings {
+        QuerySettings {
+            integer_division: IntegerDivision::default(),
+            query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: crate::pfn::PfnLimits::default(),
+        }
+    }
+}
+
 impl Database {
     /// Create an empty, named database.
     pub fn new(name: impl Into<String>) -> Database {
@@ -293,24 +530,306 @@ impl Database {
             name: name.into(),
             dict: Dictionary::new(),
             store: Backend::Memory(TripleStore::new()),
-            named: BTreeMap::new(),
+            named: NamedGraphs::new(),
             vstree: VsTree::new(),
             index_valid: true, // empty store ⇔ empty tree, trivially consistent
             txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
+            vstree_rebuild_pending: false,
+            query_cache: Mutex::new(QueryCache::new(DEFAULT_QUERY_CACHE_BYTES)),
+            integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            pfn: None,
+            pfn_limits: crate::pfn::PfnLimits::default(),
             update_log: None,
             redo_log: None,
             redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
+            backup_offset: AtomicU64::new(0),
             rules: crate::reason::RuleSet::new(),
+            reason_home: crate::reason::store::RuleHome::default(),
             functions: FunctionRegistry::new(),
+            home: None,
+            disk: Mutex::new(None),
+            persist_error: Mutex::new(None),
+            persist_lock: Mutex::new(()),
+            load_policy: LoadPolicy::default(),
+            mutations: 0,
+            vs_shrink_debt: 0,
+            id_reclaim: reclaim::default_id_reclaim(),
+            reclaim: Candidates::default(),
+            reclaim_deferred: Deferred::default(),
+            csr_cache: CsrCache::new(),
+            string_index: StringIndexCache::default(),
+            #[cfg(feature = "rocksdb")]
+            unpersisted_terms: HashSet::new(),
+            dir_lock: None,
         }
     }
 
+    /// A counter that advances whenever this database's data changes — every
+    /// applied insert, delete, clear, inference and rollback; reads never move
+    /// it. Comparing it before and after a request tells whether the request
+    /// changed anything, *including* an UPDATE that failed part-way: its
+    /// operations before the failing one stay applied (see
+    /// [`query`](Self::query)), so a caller tracking unsaved changes must
+    /// treat the database as modified.
+    pub fn mutation_count(&self) -> u64 {
+        self.mutations
+    }
+
+    /// The per-predicate CSR of the **default graph** (named graphs are not
+    /// part of it — upstream has none) that gStore's advanced graph functions
+    /// run on; see [`CsrGraph`].
+    ///
+    /// Built on first use and cached; the cache is keyed by
+    /// [`mutation_count`](Self::mutation_count), so the next call after any
+    /// applied insert, delete, `CLEAR`/`DROP`, `LOAD`, inference or rollback
+    /// rebuilds it (upstream rebuilds in `prepPathQuery` when the KVstore's
+    /// CSR-dirty flag is set, GeneralEvaluation.cpp:262-271). A named-graph
+    /// mutation also advances the counter and so triggers a (redundant but
+    /// harmless) rebuild. Thread-safe: concurrent callers share one build.
+    ///
+    /// A Stream-mode database whose on-disk store is broken (C5) refuses,
+    /// also a CSR cached before the failure (it may hold a failed
+    /// transaction's triples).
+    pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
+        self.check_store_readable()?;
+        self.csr_cache.get_or_build(self.mutations, || {
+            // A read error while building fails the build (nothing is cached).
+            let scope = ReadScope::enter();
+            let graph = CsrGraph::build(&self.store);
+            match scope.take_error() {
+                Some(e) => Err(read_failure("building the CSR", e)),
+                None => graph,
+            }
+        })
+    }
+
+    /// Build the CSR now instead of on the first graph-function query —
+    /// upstream's `loadcsr` operation and `load` with `csr=1` / `gserver -c 1`.
+    pub fn preload_csr(&self) -> Result<()> {
+        self.csr().map(|_| ())
+    }
+
+    /// Whether a CSR for the current data is cached (no rebuild needed).
+    pub fn csr_is_cached(&self) -> bool {
+        self.check_store_readable().is_ok() && self.csr_cache.peek(self.mutations).is_some()
+    }
+
+    /// A view of [`csr_is_cached`](Self::csr_is_cached) that can be read
+    /// without access to the database — so without waiting for whoever
+    /// holds it (a server's `show` reads it while a statement runs). A write
+    /// clears it; it reads `false` once the database is dropped.
+    pub fn csr_status(&self) -> crate::analytics::csr::CsrStatus {
+        self.csr_cache.status()
+    }
+
+    /// The cached CSR if it is current for the data (never builds) — lets a
+    /// read snapshot of this database share it instead of rebuilding.
+    pub fn cached_csr(&self) -> Option<std::sync::Arc<CsrGraph>> {
+        self.check_store_readable().ok()?;
+        self.csr_cache.peek(self.mutations)
+    }
+
+    /// Record an applied data mutation: invalidate cached query results,
+    /// drop the now stale CSR (so it is not kept alive until the next graph
+    /// function query) and advance [`mutation_count`](Self::mutation_count).
+    fn touched(&mut self) {
+        self.query_cache_mut().clear();
+        self.csr_cache.clear();
+        self.mutations += 1;
+        // The substring index covers the dictionary: keep it while the
+        // dictionary is unchanged, drop it as soon as a term came or went.
+        let generation = self.dict.generation();
+        let index = self
+            .string_index
+            .0
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        if index.as_ref().is_some_and(|(g, _)| *g != generation) {
+            *index = None;
+        }
+    }
+
+    /// The dictionary substring index for the current dictionary (see
+    /// [`dictionary_string_index`]): built on first use and cached until a
+    /// term is added or freed, so a second query with a substring `FILTER`
+    /// does not rebuild it. `None` for an out-of-core or a small dictionary,
+    /// where substring filters run without the prefilter (still exact).
+    pub fn string_index(&self) -> Option<Arc<StringIndex>> {
+        if self.dict.is_disk_backed() {
+            return None;
+        }
+        let generation = self.dict.generation();
+        // Built under the lock: concurrent readers wait for one build
+        // instead of each building its own.
+        let mut slot = match self.string_index.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.string_index.0.clear_poison();
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if let Some((g, idx)) = slot.as_ref() {
+            if *g == generation {
+                return Some(Arc::clone(idx));
+            }
+        }
+        let idx = dictionary_string_index(&self.dict)?;
+        *slot = Some((generation, Arc::clone(&idx)));
+        Some(idx)
+    }
+
+    /// The cached substring index, if one is cached for the current
+    /// dictionary (never builds). For tests and monitoring.
+    pub fn cached_string_index(&self) -> Option<Arc<StringIndex>> {
+        let generation = self.dict.generation();
+        let slot = self.string_index.0.lock().ok()?;
+        slot.as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, idx)| Arc::clone(idx))
+    }
+
+    /// The query cache, through its lock. A lock poisoned by a panic is
+    /// recovered with the cache emptied (it only holds copies of answers).
+    fn query_cache(&self) -> MutexGuard<'_, QueryCache> {
+        match self.query_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                self.query_cache.clear_poison();
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                cache
+            }
+        }
+    }
+
+    /// The query cache, exclusively (no locking needed).
+    fn query_cache_mut(&mut self) -> &mut QueryCache {
+        let poisoned = self.query_cache.is_poisoned();
+        self.query_cache.clear_poison();
+        let cache = self
+            .query_cache
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        if poisoned {
+            cache.clear();
+        }
+        cache
+    }
+
+    /// Serialize a `&self` persistence entry point (see
+    /// [`persist_lock`](Self::persist_lock)); it guards no data, so a poisoned
+    /// lock is simply taken over.
+    fn persist_guard(&self) -> MutexGuard<'_, ()> {
+        self.persist_lock.lock().unwrap_or_else(|e| {
+            self.persist_lock.clear_poison();
+            e.into_inner()
+        })
+    }
+
+    /// How many default-graph deletes (including a rollback's removal of the
+    /// transaction's inserts) were applied while the VS-tree stayed valid
+    /// since it was last built. Deletes leave the tree in place — an entity's
+    /// signature only loses bits, so its stored signature stays a sound
+    /// superset — at the price of some pruning power; this counts that debt.
+    /// [`rebuild_index`](Self::rebuild_index) clears it.
+    pub fn vs_shrink_debt(&self) -> u64 {
+        self.vs_shrink_debt
+    }
+
     /// Rebuild the VS-tree from the current store and mark the index valid.
+    /// A Stream-mode database rewrites its `vstree.kv` (see
+    /// [`try_rebuild_index`](Self::try_rebuild_index)); a failure there is
+    /// logged and leaves the index unused.
     pub fn rebuild_index(&mut self) {
-        self.vstree = build_vstree(&self.store);
+        if let Err(e) = self.try_rebuild_index() {
+            crate::gs_warn!("rebuilding the VS-tree of '{}' failed: {e}", self.name);
+        }
+    }
+
+    /// [`rebuild_index`](Self::rebuild_index), reporting a failure. A
+    /// Stream-mode database signs every entity in one streaming pass over its
+    /// committed store ([`DiskStore::for_each_entity_adjacency`](crate::kvstore::DiskStore::for_each_entity_adjacency)),
+    /// writes `vstree.kv` beside it (built under a temporary name, then renamed
+    /// over the old one), marks it fresh in the store's header and makes that
+    /// durable; inside a transaction the rebuild is deferred until the
+    /// transaction ends. Any other database builds its in-memory tree.
+    pub fn try_rebuild_index(&mut self) -> Result<()> {
+        if self.store.as_disk().is_none() {
+            // A RocksDB store can fail a read: the old tree is dropped then
+            // and none is used until a rebuild succeeds.
+            let entries = checked_vstree_entries(&self.store).inspect_err(|_| {
+                self.index_valid = false;
+                self.vstree = VsTree::new();
+            })?;
+            self.vstree = VsTree::build(entries);
+            self.index_valid = true;
+            self.vs_shrink_debt = 0;
+            return Ok(());
+        }
+        if self.txn.is_some() {
+            self.vstree_rebuild_pending = true;
+            return Ok(());
+        }
+        self.vstree_rebuild_pending = false;
+        let Some(home) = self.home.clone() else {
+            return Err(GStoreError::Database(
+                "an on-disk database without a home directory cannot rebuild vstree.kv".into(),
+            ));
+        };
+        // Never filter through the old tree again, whatever happens below.
+        self.index_valid = false;
+        self.vstree = VsTree::new();
+        let Some(dt) = self.store.as_disk_mut() else {
+            return Ok(());
+        };
+        // The pages the tree is signed from must be durable before it
+        // replaces `vstree.kv`: direct writes not yet at a commit point sit
+        // in the page cache only, and a crash after the rename would leave
+        // a tree of data the store does not hold (deleted edges missing from
+        // it while the store still has them — not a superset, C9) under a
+        // header that says the tree is fresh.
+        dt.commit_point()?;
+        let entries = disk_vstree_entries(dt.disk_store()?)?;
+        self.vstree = persist::write_vstree_kv(&home.join(VSTREE_KV_FILE), entries)?;
+        dt.mark_vstree_fresh();
+        dt.commit_point()?;
         self.index_valid = true;
+        self.vs_shrink_debt = 0;
+        self.query_cache_mut().clear();
+        Ok(())
+    }
+
+    /// Stream mode: run a [`rebuild_index`](Self::rebuild_index) deferred by
+    /// the transaction that just ended.
+    fn run_deferred_rebuild(&mut self) {
+        if self.vstree_rebuild_pending && self.txn.is_none() {
+            self.rebuild_index();
+        }
+    }
+
+    /// Whether queries may filter through the VS-tree now: it is consistent
+    /// with the store ([`index_valid`](Self::index_valid)) and, on a
+    /// Stream-mode database, no open transaction adds triples the tree (built
+    /// from committed data) lacks (C9; `DiskTriples::vstree_stale`).
+    fn vstree_usable(&self) -> bool {
+        self.index_valid && self.store.as_disk().is_none_or(|dt| !dt.transaction_adds())
+    }
+
+    /// Fail a statement up front when the on-disk store of a Stream-mode
+    /// database is broken by an earlier write error (C5): it must be reopened.
+    /// (Reads report the same error through the read scope; this also covers
+    /// a statement that would read nothing from the store.)
+    fn check_store_readable(&self) -> Result<()> {
+        match self.store.as_disk().and_then(|dt| dt.broken()) {
+            Some(e) => Err(GStoreError::Database(format!(
+                "the on-disk store is broken by an earlier write error ({e}); reopen the database"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Opt this database into an **out-of-core** (streaming) VS-tree, even while
@@ -337,11 +856,15 @@ impl Database {
                 fs::create_dir_all(parent)?;
             }
         }
+        // Signed first, in a read scope: a read error fails the call and
+        // leaves the current tree (and its file) as they were.
+        let entries = checked_vstree_entries(&self.store)?;
         // Fresh build: drop any prior node file (and its WAL) at this path.
         remove_file_and_wal(path);
-        self.vstree = VsTree::build_disk(path, vstree_entries(&self.store))?;
+        self.vstree = VsTree::build_disk(path, entries)?;
         self.index_valid = true;
-        self.query_cache.get_mut().clear();
+        self.vs_shrink_debt = 0;
+        self.query_cache_mut().clear();
         Ok(())
     }
 
@@ -355,7 +878,7 @@ impl Database {
         F: Fn(&[crate::query::Value]) -> Option<crate::query::Value> + Send + Sync + 'static,
     {
         self.functions.register(name, f);
-        self.query_cache.get_mut().clear();
+        self.query_cache_mut().clear();
         self
     }
 
@@ -364,23 +887,69 @@ impl Database {
         self.functions.len()
     }
 
-    /// Build a database by importing one or more RDF files. The format of each
-    /// file is detected by extension (N-Triples/Turtle/N-Quads/TriG/RDF-XML/
-    /// JSON-LD/RDFa; unknown → Turtle) via [`parser::parse_file_by_ext`].
+    /// The user-defined functions registered on this database (a clone is
+    /// cheap and shares the closures). Read snapshots of the database hand
+    /// them to their evaluators, so a query sees the same functions there as
+    /// through [`query`](Self::query).
+    pub fn functions(&self) -> &FunctionRegistry {
+        &self.functions
+    }
+
+    /// Set which sources SPARQL `LOAD` may read. The default,
+    /// [`LoadPolicy::permissive`], reads any local path (CLI behaviour); a
+    /// server exposing updates to clients should install
+    /// [`LoadPolicy::restricted`] (optionally re-allowing an upload directory
+    /// with [`LoadPolicy::with_allowed_dir`]). Not persisted with the database.
+    pub fn set_load_policy(&mut self, policy: LoadPolicy) {
+        self.load_policy = policy;
+    }
+
+    /// The active `LOAD` policy.
+    pub fn load_policy(&self) -> &LoadPolicy {
+        &self.load_policy
+    }
+
+    /// Build a database by importing RDF sources: files (format by extension —
+    /// N-Triples/Turtle/N-Quads/TriG/RDF-XML/JSON-LD/RDFa, unknown → Turtle;
+    /// see [`import::RdfFormat`]), directories (every RDF file below them,
+    /// sorted) and `http(s)://` URLs. Streaming formats are read with bounded
+    /// memory; N-Quads / TriG statements keep their named graph; every source
+    /// gets its own blank-node scope. Strict: the first statement that fails
+    /// is the error (see [`build_from_sources`](Self::build_from_sources) for
+    /// a tolerant build).
     pub fn build_from_files<P: AsRef<Path>>(
         name: impl Into<String>,
         files: &[P],
     ) -> Result<Database> {
-        let mut db = Database::new(name);
-        let mut id_triples: Vec<IdTriple> = Vec::new();
-        for f in files {
-            for t in crate::parser::parse_file_by_ext(f)? {
-                id_triples.push(db.encode_triple(&t));
-            }
-        }
-        db.store.bulk_load(id_triples);
-        db.rebuild_index();
+        let sources = import::sources_from_paths(files)?;
+        let (db, _) = Database::build_from_sources(
+            name,
+            &sources,
+            &import::ImportOptions::strict(),
+            &mut (),
+        )?;
         Ok(db)
+    }
+
+    /// Build a database from `sources` with explicit [`import::ImportOptions`]
+    /// (strict or tolerant, blank-node scoping, limits), reporting skipped
+    /// statements to `log` (e.g. an [`import::ParseErrorLog`]). Quads are
+    /// encoded batch by batch as they stream in; the default graph is indexed
+    /// once at the end. Returns the database and the import counts.
+    pub fn build_from_sources(
+        name: impl Into<String>,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+    ) -> Result<(Database, import::ImportReport)> {
+        let mut db = Database::new(name);
+        let mut acc = BuildAccumulator::default();
+        let report =
+            import::import_sources(sources, "build", opts, log, &mut |batch: &mut Vec<Quad>| {
+                acc.add(&mut db, batch)
+            })?;
+        acc.finish(&mut db);
+        Ok((db, report))
     }
 
     /// Build a database from an in-memory RDF document (Turtle / N-Triples).
@@ -393,6 +962,8 @@ impl Database {
     /// through `progress` as it moves through the stages (gStore's
     /// `DatabaseProgressStatus`): RDF parse → dictionary build → index build →
     /// done. Useful for a progress bar / status endpoint on large loads.
+    /// Parsing and dictionary encoding overlap (the document streams in
+    /// batches). Strict; blank-node labels are kept as written.
     pub fn build_from_str_with_progress<F: FnMut(BuildProgress)>(
         name: impl Into<String>,
         content: &str,
@@ -400,127 +971,106 @@ impl Database {
     ) -> Result<Database> {
         let mut db = Database::new(name);
         progress(BuildProgress::RdfParse);
-        let triples = turtle::parse_str(content)?;
-        progress(BuildProgress::Dictionary);
-        let mut id_triples: Vec<IdTriple> = Vec::with_capacity(triples.len());
-        for t in &triples {
-            id_triples.push(db.encode_triple(t));
+        let opts = import::ImportOptions {
+            blank_nodes: import::BlankNodes::Keep,
+            ..import::ImportOptions::strict()
+        };
+        let mut acc = BuildAccumulator::default();
+        let mut announced = false;
+        import::import_reader(
+            content.as_bytes(),
+            import::RdfFormat::Turtle,
+            "<string>",
+            &opts,
+            &mut (),
+            &mut |batch: &mut Vec<Quad>| {
+                if !announced {
+                    progress(BuildProgress::Dictionary);
+                    announced = true;
+                }
+                acc.add(&mut db, batch)
+            },
+        )?;
+        if !announced {
+            progress(BuildProgress::Dictionary);
         }
-        db.store.bulk_load(id_triples);
         progress(BuildProgress::Index);
-        db.rebuild_index();
+        acc.finish(&mut db);
         progress(BuildProgress::Done);
         Ok(db)
     }
 
-    // ---- RocksDB-backed database (feature `rocksdb`) ----------------------
-
-    /// Build a **persistent**, RocksDB-backed database in directory `dir` from an
-    /// in-memory RDF document. The triples live in a RocksDB store under
-    /// `dir/rocksdb`; the dictionary and metadata are snapshotted next to it so
-    /// the database can be reopened with [`open_rocksdb`](Self::open_rocksdb).
-    /// The full query engine (optimizer, VS-tree, analytics) runs over it
-    /// unchanged via the [`Backend`] seam.
-    #[cfg(feature = "rocksdb")]
-    pub fn build_rocksdb_from_str<P: AsRef<Path>>(
-        name: impl Into<String>,
-        dir: P,
-        content: &str,
-    ) -> Result<Database> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        let mut dict = Dictionary::new();
-        let mut ids: Vec<IdTriple> = Vec::new();
-        for t in turtle::parse_str(content)? {
-            let sub = dict.intern_entity(&t.subject.dict_key());
-            let pred = dict.intern_predicate(&t.predicate.dict_key());
-            let obj = dict.intern_term(&t.object);
-            ids.push(IdTriple::new(sub, pred, obj));
-        }
-        let mut rocks = crate::backend::rocks::RocksStore::open(dir.join(ROCKS_SUBDIR))?;
-        rocks.bulk_load(ids);
-        rocks.flush()?;
-        let store = Backend::Rocks(rocks);
-
-        let name = name.into();
-        write_bincode(&dir.join(DICT_FILE), &dict)?;
-        let meta = Meta {
-            name: name.clone(),
-            triple_num: store.triple_count(),
-            entity_num: dict.entity_num() as u64,
-            literal_num: dict.literal_num() as u64,
-            predicate_num: dict.predicate_num() as u64,
-        };
-        write_bincode(&dir.join(META_FILE), &meta)?;
-
-        let vstree = build_vstree(&store);
-        Ok(Database {
-            name,
-            dict,
-            store,
-            named: BTreeMap::new(),
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
+    /// Insert the statements of RDF `sources` into this database (`gadd`,
+    /// `/api` `batchInsert`): like [`build_from_sources`](Self::build_from_sources)
+    /// but through the ordinary insert path (transaction log, redo log,
+    /// write-through to a persistent layout, incremental index). N-Quads /
+    /// TriG statements go to their named graph. `applied` counts the
+    /// statements that were new (duplicates are not), and stays accurate when
+    /// an error stops the import part-way.
+    pub fn insert_sources(
+        &mut self,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+        applied: &mut u64,
+    ) -> Result<import::ImportReport> {
+        import::import_sources(
+            sources,
+            "batch insert",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                let mut added = Vec::new();
+                let quads = batch.drain(..).map(|q| {
+                    let graph = graph_iri(&q.graph);
+                    (q.into_triple(), graph)
+                });
+                let result = self.insert_statements(quads, &mut added);
+                *applied += added.len() as u64;
+                result
+            },
+        )
     }
 
-    /// Whether directory `dir` holds a RocksDB-backed database.
-    #[cfg(feature = "rocksdb")]
-    pub fn is_rocksdb<P: AsRef<Path>>(dir: P) -> bool {
-        dir.as_ref().join(ROCKS_SUBDIR).is_dir()
+    /// Remove the statements of RDF `sources` from this database (`gsub`,
+    /// `/api` `batchRemove`); `applied` counts the statements that existed.
+    /// Pass options [`for_removal`](import::ImportOptions::for_removal) so
+    /// blank-node labels are read verbatim: a statement can only name a
+    /// stored blank node by its stored label (as an export writes it).
+    pub fn remove_sources(
+        &mut self,
+        sources: &[import::Source],
+        opts: &import::ImportOptions,
+        log: &mut dyn import::ErrorLog,
+        applied: &mut u64,
+    ) -> Result<import::ImportReport> {
+        import::import_sources(
+            sources,
+            "batch remove",
+            opts,
+            log,
+            &mut |batch: &mut Vec<Quad>| {
+                // In a read scope (C2): a term that cannot be looked up must
+                // fail the removal, not read as absent.
+                let scope = ReadScope::enter();
+                let quads = batch.drain(..).map(|q| {
+                    let graph = graph_iri(&q.graph);
+                    (q.into_triple(), graph)
+                });
+                let (removed, err) = self.remove_statements(quads, Some(&scope));
+                *applied += removed as u64;
+                if let Some(e) = err {
+                    self.flush_reclaim();
+                    return Err(read_failure("removing statements", e));
+                }
+                // Each batch frees the ids it left unreferenced.
+                self.flush_reclaim();
+                self.check_store_readable()
+            },
+        )
     }
 
-    /// Reopen a RocksDB-backed database created by
-    /// [`build_rocksdb_from_str`](Self::build_rocksdb_from_str). The triples are
-    /// read from the RocksDB store on demand; the dictionary is loaded from its
-    /// snapshot and the VS-tree is rebuilt.
-    #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        let rocks_dir = dir.join(ROCKS_SUBDIR);
-        if !rocks_dir.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "no RocksDB store at '{}'",
-                rocks_dir.display()
-            )));
-        }
-        let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
-        let meta: Meta = read_bincode(&dir.join(META_FILE))?;
-        let rocks = crate::backend::rocks::RocksStore::open(rocks_dir)?;
-        let store = Backend::Rocks(rocks);
-        if store.triple_count() != meta.triple_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} triples but RocksDB has {}",
-                meta.triple_num,
-                store.triple_count()
-            )));
-        }
-        let vstree = build_vstree(&store);
-        Ok(Database {
-            name: meta.name,
-            dict,
-            store,
-            named: BTreeMap::new(),
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
-    }
+    // (RocksDB / on-disk / snapshot persistence lives in `persist.rs`.)
 
     // ---- accessors --------------------------------------------------------
 
@@ -543,9 +1093,15 @@ impl Database {
         &self.dict
     }
     /// The in-memory default-graph store. Available for the default
-    /// [`Backend::Memory`] backend (used by snapshot MVCC and tests); panics for
-    /// a RocksDB-backed database, which has no in-RAM store — query it through
-    /// [`query`](Self::query)/[`select`](Self::select) instead.
+    /// [`Backend::Memory`] backend — which an on-disk database opened in
+    /// Materialize mode also uses for its working set (used by snapshot MVCC
+    /// and tests).
+    ///
+    /// # Panics
+    /// For a database with no in-RAM store: a Stream-mode on-disk database
+    /// ([`Backend::Disk`]) or a RocksDB-backed one. Query those through
+    /// [`query`](Self::query)/[`select`](Self::select) or read
+    /// [`backend`](Self::backend) instead.
     pub fn store(&self) -> &TripleStore {
         self.store
             .as_memory()
@@ -598,7 +1154,7 @@ impl Database {
         }
         let mut classes: Vec<String> = class_ids
             .iter()
-            .filter_map(|&id| self.dict.id_to_string(id).map(str::to_owned))
+            .filter_map(|&id| self.dict.term(id).map(TermStr::into_string))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -609,13 +1165,13 @@ impl Database {
             .store
             .predicates()
             .into_iter()
-            .filter_map(|p| self.dict.predicate_to_string(p).map(str::to_owned))
+            .filter_map(|p| self.dict.pred(p).map(TermStr::into_string))
             .collect();
         for iri in [RDFS_SUBPROP, RDFS_DOMAIN, RDFS_RANGE] {
             if let Some(p) = pid(iri) {
                 for &(s, _o) in &self.store.so_by_p(p) {
-                    if let Some(name) = self.dict.id_to_string(s) {
-                        props.insert(name.to_owned());
+                    if let Some(name) = self.dict.term(s) {
+                        props.insert(name.into_string());
                     }
                 }
             }
@@ -631,18 +1187,46 @@ impl Database {
 
     // ---- updates ----------------------------------------------------------
 
-    /// Encode a triple to ids, interning any new terms.
-    fn encode_triple(&mut self, t: &Triple) -> IdTriple {
-        let sub = self.dict.intern_entity(&t.subject.dict_key());
-        let pred = self.dict.intern_predicate(&t.predicate.dict_key());
-        let obj = self.dict.intern_term(&t.object);
-        IdTriple::new(sub, pred, obj)
+    /// Encode a triple to ids, interning any new terms. Errs (interning
+    /// nothing further) once a dictionary id space is exhausted.
+    fn encode_triple(&mut self, t: &Triple) -> Result<IdTriple> {
+        let sub = self.dict.try_intern_entity(&t.subject.dict_key())?;
+        let pred = self.dict.try_intern_predicate(&t.predicate.dict_key())?;
+        let obj = self.dict.try_intern_term(&t.object)?;
+        Ok(IdTriple::new(sub, pred, obj))
     }
 
-    /// Insert one triple. Returns `true` if it was newly added.
+    /// Insert one triple. Returns `true` if it was newly added; `false` if it
+    /// was already present **or** could not be encoded because a dictionary id
+    /// space is exhausted — use [`try_insert_triple`](Self::try_insert_triple)
+    /// to tell those apart. On a persistent layout the insert is also written
+    /// through to disk (see [`StorageKind`]); a persistence failure is reported
+    /// by the next commit point (an auto-commit UPDATE,
+    /// [`commit`](Self::commit), [`save`](Self::save)).
     pub fn insert_triple(&mut self, t: &Triple) -> bool {
-        let id = self.encode_triple(t);
-        let changed = self.store.insert(id);
+        self.try_insert_triple(t).unwrap_or(false)
+    }
+
+    /// Insert one triple, reporting id-space exhaustion as an error. `Ok(true)`
+    /// if it was newly added, `Ok(false)` if it was already present (or a
+    /// persistence write failed; that failure is reported by the next commit
+    /// point).
+    pub fn try_insert_triple(&mut self, t: &Triple) -> Result<bool> {
+        Ok(self.try_insert_triple_id(t)?.is_some())
+    }
+
+    /// [`try_insert_triple`](Self::try_insert_triple), returning the ids of a
+    /// newly added triple.
+    fn try_insert_triple_id(&mut self, t: &Triple) -> Result<Option<IdTriple>> {
+        let Some((_, id)) = self.intern_for_insert(t, None)? else {
+            return Ok(None);
+        };
+        // Stream mode: by id, into the open transaction's overlay or at once;
+        // a write error breaks the store and fails this insert.
+        let (changed, disk) = match self.store.as_disk_mut() {
+            Some(dt) => (dt.insert_triple(id)?, true),
+            None => (self.store.insert(id), false),
+        };
         if changed {
             // While the index is consistent, keep it consistent *incrementally*:
             // the inserted edge only changes the signatures of its subject (and
@@ -660,40 +1244,181 @@ impl Database {
                     self.vstree_index_insert(id);
                 }
             }
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Del(None, id)); // rollback removes what we added
-            }
-            self.record_redo(b'I', None, id);
+            self.inserted_default(id, disk);
         }
-        changed
+        Ok(changed.then_some(id))
+    }
+
+    /// The book-keeping of a newly added default-graph triple, the VS-tree
+    /// aside: caches, the undo log (Stream mode: the store's overlay undoes
+    /// it), the redo log and the write-through.
+    fn inserted_default(&mut self, id: IdTriple, disk: bool) {
+        self.touched();
+        if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
+            log.push(UndoOp::Del(None, id)); // rollback removes what we added
+        }
+        self.record_redo(b'I', None, id);
+        self.persist_mutation(true, None, id);
+    }
+
+    /// Insert statements (`None` graph = the default graph), as
+    /// [`insert_quad_id`](Self::insert_quad_id) of each in order would,
+    /// pushing each newly added one to `applied`. On an in-memory store the
+    /// default-graph triples are interned first (terms before triples, as
+    /// one by one) and merged into the store as one batch
+    /// ([`MutableStore::insert_many`]): a new term reusing a low id lands
+    /// near the front of long adjacency lists, which one insert per triple
+    /// would move once per triple. Their book-keeping then runs per added
+    /// triple, in input order; they are pushed to `applied` after the batch
+    /// (the named-graph ones as they are applied — the graphs are
+    /// independent, so only the order within one graph matters). On an
+    /// error (an id space exhausted) the statements before the failing one
+    /// stay inserted, as one by one, and the error is returned.
+    fn insert_statements<T, G>(
+        &mut self,
+        items: impl IntoIterator<Item = (T, Option<G>)>,
+        applied: &mut Vec<(Option<u32>, IdTriple)>,
+    ) -> Result<()>
+    where
+        T: std::borrow::Borrow<Triple>,
+        G: AsRef<str>,
+    {
+        let batched = self.store.as_memory().is_some();
+        let mut pending: Vec<IdTriple> = Vec::new();
+        let mut result = Ok(());
+        for (t, g) in items {
+            let (t, g) = (t.borrow(), g.as_ref().map(AsRef::as_ref));
+            let step = if batched && g.is_none() {
+                self.intern_for_insert(t, None)
+                    .map(|r| pending.extend(r.map(|(_, id)| id)))
+            } else {
+                self.insert_quad_id(t, g).map(|r| applied.extend(r))
+            };
+            if let Err(e) = step {
+                result = Err(e);
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            let added = self.insert_default_batch(&pending);
+            applied.extend(added.into_iter().map(|id| (None, id)));
+        }
+        result
+    }
+
+    /// Insert the interned default-graph triples `ids` into the in-memory
+    /// store as one batch and run each added triple's book-keeping, in input
+    /// order. Returns the added triples. The VS-tree is kept incrementally
+    /// as one by one would ([`vstree_index_insert`](Self::vstree_index_insert)),
+    /// reading no edge from the store for an entity with no default-graph
+    /// edge before the batch (a new term, or a reclaimed id reused for one):
+    /// its exact signature is the union of its batch edges, so its entry —
+    /// possibly the stale one of the term its id named before — is replaced
+    /// by its first batch edge's signature and the later ones are ORed in.
+    fn insert_default_batch(&mut self, ids: &[IdTriple]) -> Vec<IdTriple> {
+        // Entity -> FRESH (no edge before the batch, entry not yet replaced),
+        // SIGNED (fresh, entry replaced), or OLD (had edges: its entry is
+        // folded into, as one by one).
+        const OLD: u8 = 0;
+        const FRESH: u8 = 1;
+        const SIGNED: u8 = 2;
+        let fold = self.index_valid && !self.vstree.is_disk_backed();
+        let mut state: HashMap<u32, u8> = HashMap::new();
+        if fold {
+            for id in ids {
+                let obj = is_entity_id(id.obj).then_some(id.obj);
+                for e in std::iter::once(id.sub).chain(obj) {
+                    if let std::collections::hash_map::Entry::Vacant(v) = state.entry(e) {
+                        let edges = self.store.count_po_by_s(e) + self.store.count_ps_by_o(e);
+                        v.insert(if edges == 0 { FRESH } else { OLD });
+                    }
+                }
+            }
+        }
+        let results = self.store.insert_many(ids);
+        let mut added = Vec::new();
+        for (&id, new) in ids.iter().zip(results) {
+            if !new {
+                continue;
+            }
+            if self.index_valid {
+                if self.vstree.is_disk_backed() {
+                    self.index_valid = false;
+                } else {
+                    let mut out = Signature::new();
+                    out.encode_edge(id.pred, id.obj, EdgeDir::Out);
+                    // Literal objects are not VS-tree entities.
+                    let inc = is_entity_id(id.obj).then(|| {
+                        let mut inc = Signature::new();
+                        inc.encode_edge(id.pred, id.sub, EdgeDir::In);
+                        (id.obj, inc)
+                    });
+                    for (e, sig) in std::iter::once((id.sub, out)).chain(inc) {
+                        if state.get(&e) == Some(&FRESH) {
+                            state.insert(e, SIGNED);
+                            if !self.vstree.update(e, sig) {
+                                self.vstree.insert(e, sig);
+                            }
+                        } else if !self.vstree.union_into(e, &sig) {
+                            self.upsert_entity_signature(e);
+                        }
+                    }
+                }
+            }
+            self.inserted_default(id, false);
+            added.push(id);
+        }
+        added
     }
 
     /// Fold a just-inserted default-graph triple into the VS-tree incrementally
     /// (called only while the index is valid). The subject — and the object when
-    /// it is an entity — gained an incident edge, so each is re-signed from the
-    /// current store and its tree entry updated (or inserted, if new to the
-    /// tree). Mirrors [`build_vstree`]'s per-entity signing, so the
-    /// incrementally-maintained tree stays equivalent to a freshly-rebuilt one
-    /// and the candidate filter remains a sound superset.
+    /// it is an entity — gained an incident edge. That edge only adds bits, so
+    /// its signature is ORed into the entity's tree entry and up its path
+    /// ([`VsTree::union_into`], O(height)): the entry becomes what re-signing
+    /// the entity would give (a superset of it after deletes), without reading
+    /// the entity's other edges — a class with a million members costs no
+    /// more than a leaf entity. An entity new to the tree is signed from the
+    /// store and inserted. Mirrors [`build_vstree`]'s per-entity signing, so
+    /// the candidate filter remains a sound superset.
     fn vstree_index_insert(&mut self, id: IdTriple) {
-        self.upsert_entity_signature(id.sub);
+        let mut out = Signature::new();
+        out.encode_edge(id.pred, id.obj, EdgeDir::Out);
+        // An entity whose first edge this is — new, or a reclaimed id reused
+        // for a new term — gets its exact signature: the tree may still hold
+        // the stale entry of the term its id named before.
+        if self.is_first_edge(id.sub) || !self.vstree.union_into(id.sub, &out) {
+            self.upsert_entity_signature(id.sub);
+        }
         // Literal objects are not VS-tree entities (see `build_vstree`).
         if is_entity_id(id.obj) {
-            self.upsert_entity_signature(id.obj);
+            let mut inc = Signature::new();
+            inc.encode_edge(id.pred, id.sub, EdgeDir::In);
+            if self.is_first_edge(id.obj) || !self.vstree.union_into(id.obj, &inc) {
+                self.upsert_entity_signature(id.obj);
+            }
         }
+    }
+
+    /// Whether entity `e` has exactly one edge in the default graph (O(1)
+    /// on the in-memory store, the only one whose tree is updated in place).
+    fn is_first_edge(&self, e: u32) -> bool {
+        self.store.count_po_by_s(e) + self.store.count_ps_by_o(e) == 1
     }
 
     /// Recompute entity `e`'s full signature from its current in/out edges and
     /// update its VS-tree entry in place, inserting it if it is not yet indexed.
     fn upsert_entity_signature(&mut self, e: u32) {
         let mut sig = Signature::new();
-        for &(p, o) in &self.store.po_by_s(e) {
+        let (out, inc) = (self.store.po_by_s(e), self.store.ps_by_o(e));
+        for &(p, o) in &out {
             sig.encode_edge(p, o, EdgeDir::Out);
         }
-        for &(p, s) in &self.store.ps_by_o(e) {
+        for &(p, s) in &inc {
             sig.encode_edge(p, s, EdgeDir::In);
         }
+        #[cfg(test)]
+        RESIGNED_EDGES.with(|c| c.set(c.get() + (out.len() + inc.len()) as u64));
         if !self.vstree.update(e, sig) {
             self.vstree.insert(e, sig);
         }
@@ -702,32 +1427,138 @@ impl Database {
     /// Remove one triple. Returns `true` if it existed. Does not intern: if any
     /// term is unknown, the triple cannot exist.
     pub fn remove_triple(&mut self, t: &Triple) -> bool {
-        let (Some(sub), Some(pred), Some(obj)) = (
-            self.dict.entity_id(&t.subject.dict_key()),
-            self.dict.predicate_id(&t.predicate.dict_key()),
-            self.dict.term_id(&t.object),
-        ) else {
-            return false;
-        };
-        let id = IdTriple::new(sub, pred, obj);
+        let removed = self.remove_triple_quiet(t);
+        // Outside a transaction, a delete frees the ids it left unreferenced.
+        self.flush_reclaim();
+        removed
+    }
+
+    /// [`remove_triple`](Self::remove_triple) without the reclamation at its
+    /// end (the statement that calls it reclaims once, when it is done).
+    fn remove_triple_quiet(&mut self, t: &Triple) -> bool {
+        match self.known_ids(t) {
+            Some(id) => self.remove_default_id(id),
+            None => false,
+        }
+    }
+
+    /// The ids of a default-graph triple whose terms are all known (looked
+    /// up, never interned: with an unknown term the triple cannot exist).
+    fn known_ids(&self, t: &Triple) -> Option<IdTriple> {
+        Some(IdTriple::new(
+            self.dict.entity_id(&t.subject.dict_key())?,
+            self.dict.predicate_id(&t.predicate.dict_key())?,
+            self.dict.term_id(&t.object)?,
+        ))
+    }
+
+    /// [`remove_triple`](Self::remove_triple), failing when the removal cannot
+    /// be read through (REST `/batchRemove`): it runs in a read scope (C2), so
+    /// a term whose lookup failed (an out-of-core dictionary's read error) is
+    /// an error rather than "no such term" — which reads as an absent
+    /// triple — and so is a store broken by a write error. `Ok(true)` if the
+    /// triple existed.
+    pub fn try_remove_triple(&mut self, t: &Triple) -> Result<bool> {
+        let scope = ReadScope::enter();
+        let removed = self.remove_triple(t);
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("removing a triple", e));
+        }
+        drop(scope);
+        self.check_store_readable()?;
+        Ok(removed)
+    }
+
+    /// Remove the default-graph triple `id`; `true` if it existed. (Stream
+    /// mode: a write error breaks the store, answers `false` and is reported
+    /// by the next commit point.)
+    fn remove_default_id(&mut self, id: IdTriple) -> bool {
+        let disk = self.store.as_disk().is_some();
         let changed = self.store.remove(id);
         if changed {
-            // Deletes deliberately invalidate (full rebuild on next save / query)
-            // rather than updating incrementally. A removed edge *shrinks* the
-            // subject/object signatures, and while `VsTree::update` stays sound
-            // under a shrink, a delete can also leave an entity with no edges at
-            // all (a phantom tree entry) and can be followed by `reclaim_unused`,
-            // which reuses freed dictionary ids for unrelated terms. Cleanly
-            // handling those would need entry removal + rebalancing the bulk-built
-            // tree, so we keep the simple, always-correct rebuild for deletes.
-            self.index_valid = false;
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
-            }
-            self.record_redo(b'D', None, id);
+            self.removed_default(id, disk);
         }
         changed
+    }
+
+    /// The book-keeping of a removed default-graph triple.
+    fn removed_default(&mut self, id: IdTriple, disk: bool) {
+        // A delete leaves the VS-tree alone, valid: the removed edge only
+        // *shrinks* the subject/object signatures, so their stored entries
+        // stay sound supersets (an entity left with no edge at all is a
+        // harmless phantom — the joins check every candidate against the
+        // store). A freed id that `reclaim_unused` later reuses is either
+        // re-signed exactly by the insert that uses it, or has no
+        // default-graph edge, so its entry is a superset too. This holds
+        // for the read-only out-of-core tree as well. The cost is some
+        // pruning power, counted in `vs_shrink_debt`.
+        if self.index_valid {
+            self.vs_shrink_debt += 1;
+        }
+        self.touched();
+        if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
+            log.push(UndoOp::Add(None, id)); // rollback re-adds what we removed
+        }
+        self.record_redo(b'D', None, id);
+        self.persist_mutation(false, None, id);
+        self.note_removed(None, id);
+    }
+
+    /// Remove statements (`None` graph = the default graph), as
+    /// [`delete_quad`](Self::delete_quad) of each in order would; returns
+    /// how many existed. On an in-memory store the default-graph triples
+    /// are removed as one batch ([`MutableStore::remove_many`]) after the
+    /// lookups, then their book-keeping runs per removed triple in input
+    /// order (see [`insert_statements`](Self::insert_statements)). With
+    /// `scope`, a read error it notes stops the removal after the statement
+    /// that hit it (the ones before it stay removed) and is returned. Frees
+    /// nothing: the caller reclaims at the end of its statement.
+    fn remove_statements<T, G>(
+        &mut self,
+        items: impl IntoIterator<Item = (T, Option<G>)>,
+        scope: Option<&ReadScope>,
+    ) -> (usize, Option<String>)
+    where
+        T: std::borrow::Borrow<Triple>,
+        G: AsRef<str>,
+    {
+        let batched = self.store.as_memory().is_some();
+        let mut pending: Vec<IdTriple> = Vec::new();
+        let mut n = 0;
+        let mut err = None;
+        for (t, g) in items {
+            let (t, g) = (t.borrow(), g.as_ref().map(AsRef::as_ref));
+            if batched && g.is_none() {
+                pending.extend(self.known_ids(t));
+            } else if self.delete_quad(t, g) {
+                n += 1;
+            }
+            if let Some(e) = scope.and_then(ReadScope::take_error) {
+                err = Some(e);
+                break;
+            }
+        }
+        n += self.remove_default_batch(&pending);
+        let err = err.or_else(|| scope.and_then(ReadScope::take_error));
+        (n, err)
+    }
+
+    /// Remove the default-graph triples `ids` from the in-memory store as
+    /// one batch and run each removed triple's book-keeping, in input order.
+    /// Returns how many existed.
+    fn remove_default_batch(&mut self, ids: &[IdTriple]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let results = self.store.remove_many(ids);
+        let mut n = 0;
+        for (&id, gone) in ids.iter().zip(results) {
+            if gone {
+                self.removed_default(id, false);
+                n += 1;
+            }
+        }
+        n
     }
 
     // ---- transactions -----------------------------------------------------
@@ -737,25 +1568,81 @@ impl Database {
     /// makes them permanent. Returns an error if a transaction is already active
     /// (nesting is not supported). Provides atomicity + rollback; full MVCC
     /// (version chains, locking, GC) is a separate concern (see REFACTOR_BACKLOG).
+    ///
+    /// On a RocksDB database the transaction's writes are journaled so that it
+    /// stays atomic across a crash: uncommitted writes are undone on the next
+    /// open (see `crate::backend::rocks`). On a Stream-mode on-disk database
+    /// its default-graph writes collect in the store's overlay (no triple
+    /// reaches the pager before [`commit`](Self::commit)) and its named-graph
+    /// quads are queued there too.
     pub fn begin(&mut self) -> Result<()> {
         if self.txn.is_some() {
             return Err(GStoreError::Database(
                 "a transaction is already active".into(),
             ));
         }
+        self.rocks_begin_journal()?;
+        if let Some(dt) = self.store.as_disk_mut() {
+            dt.begin()?;
+        }
         self.txn = Some(Vec::new());
+        // The terms this transaction interns new are freed again if it rolls
+        // back (see the `reclaim` module).
+        if self.id_reclaim == IdReclaim::Immediate {
+            self.dict.track_allocations(true);
+        }
         Ok(())
     }
 
     /// Commit the active transaction, discarding its undo log. Buffered redo
     /// records (this transaction's mutations) are flushed to the redo log, since
     /// the transaction is now durable.
+    ///
+    /// On a persistent layout this is a commit point: the transaction's queued
+    /// write-through reaches the store and is made durable (see [`StorageKind`]).
     pub fn commit(&mut self) -> Result<()> {
-        if self.txn.take().is_none() {
+        if self.txn.is_none() {
             return Err(GStoreError::Database("no active transaction".into()));
         }
-        self.flush_redo()?;
-        Ok(())
+        // Stream mode: apply the overlay (named-graph operations, removals,
+        // additions) under the store's writer gate.
+        if let Some(dt) = self.store.as_disk_mut() {
+            if let Err(e) = dt.commit() {
+                if dt.in_transaction() {
+                    // Refused before anything was taken (from inside one of
+                    // the store's own snapshot reads): still open.
+                    return Err(e);
+                }
+                // The store is broken: the transaction is gone, and so are
+                // its redo records (nothing of it is acknowledged), and the
+                // cached answers and CSR built from its overlay.
+                self.txn = None;
+                self.redo_pending.clear();
+                self.query_cache_mut().clear();
+                self.csr_cache.clear();
+                self.dict.track_allocations(false);
+                self.reclaim.clear();
+                self.run_deferred_rebuild();
+                return Err(e);
+            }
+        }
+        self.txn = None;
+        self.dict.track_allocations(false);
+        self.disk_commit_pending();
+        let redo = self.flush_redo();
+        // The transaction's frees, as one batch, after its writes and redo
+        // records: the ids its deletes left unreferenced in the committed
+        // state.
+        let dead = self.committed_dead();
+        // RocksDB: deleting the undo journal is what commits the transaction;
+        // the freed terms leave the `dict` CF in the same atomic batch.
+        let journal = self.rocks_commit_journal_with(&dead);
+        if journal.is_ok() {
+            self.free_dead(dead, true);
+        }
+        let point = self.commit_point();
+        self.run_deferred_rebuild();
+        redo.and(journal).and(point)
     }
 
     /// Roll back the active transaction, undoing every triple mutation made
@@ -764,30 +1651,111 @@ impl Database {
         let Some(log) = self.txn.take() else {
             return Err(GStoreError::Database("no active transaction".into()));
         };
+        // Its deletes are undone (nothing to free); the terms it minted are
+        // freed once its inserts are gone.
+        let minted = self.dict.take_allocations();
+        self.dict.track_allocations(false);
+        self.reclaim.clear();
         // The transaction's mutations are being undone, so its buffered redo
-        // records must never reach the log.
+        // records must never reach the log, nor its queued write-through the
+        // on-disk store (which never saw them).
         self.redo_pending.clear();
-        for op in log.into_iter().rev() {
+        self.disk_discard_pending();
+        // Stream mode: the overlay (default graph and queued quads) is just
+        // dropped; only the in-memory named graphs are undone below.
+        if let Some(dt) = self.store.as_disk_mut() {
+            dt.rollback();
+        }
+        // A RocksDB store is rolled back by replaying its undo journal (which
+        // also covers the named-graph quads in RocksDB); only the in-memory
+        // named-graph map is undone here.
+        let journaled = self.rocks_journaling();
+        // Default-graph triples the rollback puts back: their edges are folded
+        // into the tree once the store holds them again (below), O(height)
+        // each.
+        let mut readded: Vec<IdTriple> = Vec::new();
+        // An in-memory store undoes each run of consecutive default-graph
+        // re-adds (or removals) as one batch: same result as one by one.
+        let batched = !journaled && self.store.as_memory().is_some();
+        let mut ops = log.into_iter().rev().peekable();
+        while let Some(op) = ops.next() {
             match op {
+                UndoOp::Add(None, id) if batched => {
+                    let mut run = vec![id];
+                    while let Some(&UndoOp::Add(None, next)) = ops.peek() {
+                        run.push(next);
+                        ops.next();
+                    }
+                    let added = self.store.insert_many(&run);
+                    readded.extend(
+                        run.into_iter()
+                            .zip(added)
+                            .filter_map(|(t, a)| a.then_some(t)),
+                    );
+                }
+                UndoOp::Del(None, id) if batched => {
+                    let mut run = vec![id];
+                    while let Some(&UndoOp::Del(None, next)) = ops.peek() {
+                        run.push(next);
+                        ops.next();
+                    }
+                    let gone = self
+                        .store
+                        .remove_many(&run)
+                        .into_iter()
+                        .filter(|&g| g)
+                        .count();
+                    if self.index_valid {
+                        self.vs_shrink_debt += gone as u64;
+                    }
+                }
                 UndoOp::Add(None, id) => {
-                    self.store.insert(id);
+                    if journaled || self.store.insert(id) {
+                        readded.push(id);
+                    }
                 }
                 UndoOp::Del(None, id) => {
-                    self.store.remove(id);
+                    // Removing the transaction's insert shrinks signatures:
+                    // the tree stays a sound superset (see `remove_default_id`).
+                    if (journaled || self.store.remove(id)) && self.index_valid {
+                        self.vs_shrink_debt += 1;
+                    }
                 }
                 UndoOp::Add(Some(gid), id) => {
-                    self.named.entry(gid).or_default().insert(id);
+                    if self.named.insert(gid, id) && !journaled {
+                        self.persist_named_quad(true, gid, id);
+                    }
                 }
                 UndoOp::Del(Some(gid), id) => {
-                    if let Some(s) = self.named.get_mut(&gid) {
-                        s.remove(id);
+                    if self.named.remove(gid, id) && !journaled {
+                        self.persist_named_quad(false, gid, id);
                     }
                 }
             }
         }
-        self.index_valid = false;
-        self.query_cache.get_mut().clear();
-        Ok(())
+        let replayed = self.rocks_rollback_journal();
+        if replayed.is_err() {
+            // The store's state is not known: never filter through the tree.
+            self.index_valid = false;
+        } else if self.index_valid && !readded.is_empty() {
+            if self.vstree.is_disk_backed() {
+                // A read-only tree cannot take the grown signatures.
+                self.index_valid = false;
+            } else {
+                for id in readded {
+                    self.vstree_index_insert(id);
+                }
+            }
+        }
+        self.touched();
+        if replayed.is_ok() && self.id_reclaim == IdReclaim::Immediate {
+            for t in minted {
+                self.reclaim.note(t);
+            }
+            self.flush_reclaim();
+        }
+        self.run_deferred_rebuild();
+        replayed
     }
 
     /// Whether a transaction is currently active.
@@ -801,28 +1769,48 @@ impl Database {
 
     /// Insert a triple into a named graph (`None` ⇒ default graph). Returns
     /// `true` if newly added.
-    fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
+    fn insert_quad(&mut self, t: &Triple, graph: Option<&str>) -> Result<bool> {
+        Ok(self.insert_quad_id(t, graph)?.is_some())
+    }
+
+    /// [`insert_quad`](Self::insert_quad), returning the graph (`None` =
+    /// default) and ids of a newly added statement.
+    fn insert_quad_id(
+        &mut self,
+        t: &Triple,
+        graph: Option<&str>,
+    ) -> Result<Option<(Option<u32>, IdTriple)>> {
         let Some(g) = graph else {
-            return self.insert_triple(t);
+            return Ok(self.try_insert_triple_id(t)?.map(|id| (None, id)));
         };
-        let gid = self.dict.intern_entity(&Term::iri(g).dict_key());
-        let id = self.encode_triple(t);
-        let changed = self.named.entry(gid).or_default().insert(id);
-        if changed {
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Del(Some(gid), id));
-            }
-            self.record_redo(b'I', Some(gid), id);
+        let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
+            return Ok(None);
+        };
+        let present = self
+            .named
+            .get(&gid)
+            .is_some_and(|s| s.exists(id.sub, id.pred, id.obj));
+        // RocksDB first: if the quad cannot be persisted it is not applied at
+        // all (so a retry writes it again), and the error is reported at the
+        // next commit point.
+        if present || !self.persist_named_quad(true, gid, id) {
+            return Ok(None);
         }
-        changed
+        self.named.insert(gid, id);
+        self.touched();
+        if let Some(log) = self.txn.as_mut() {
+            log.push(UndoOp::Del(Some(gid), id));
+        }
+        self.record_redo(b'I', Some(gid), id);
+        self.persist_mutation(true, Some(gid), id);
+        Ok(Some((Some(gid), id)))
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
     /// `true` if it existed.
     fn delete_quad(&mut self, t: &Triple, graph: Option<&str>) -> bool {
         let Some(g) = graph else {
-            return self.remove_triple(t);
+            return self.remove_triple_quiet(t);
         };
         let (Some(gid), Some(sub), Some(pred), Some(obj)) = (
             self.dict.entity_id(&Term::iri(g).dict_key()),
@@ -832,32 +1820,65 @@ impl Database {
         ) else {
             return false;
         };
-        let id = IdTriple::new(sub, pred, obj);
-        let changed = self.named.get_mut(&gid).is_some_and(|s| s.remove(id));
-        if changed {
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                log.push(UndoOp::Add(Some(gid), id));
-            }
-            self.record_redo(b'D', Some(gid), id);
-        }
-        changed
+        self.remove_named_id(gid, IdTriple::new(sub, pred, obj))
     }
 
-    /// Apply `INSERT DATA`. Returns the number of triples newly added.
+    /// Remove statement `id` from named graph `gid`; `true` if it existed.
+    fn remove_named_id(&mut self, gid: u32, id: IdTriple) -> bool {
+        let present = self
+            .named
+            .get(&gid)
+            .is_some_and(|s| s.exists(id.sub, id.pred, id.obj));
+        // RocksDB first (see `insert_quad`).
+        if !present || !self.persist_named_quad(false, gid, id) {
+            return false;
+        }
+        // An emptied graph is dropped: this store keeps no empty named
+        // graphs (`GRAPH ?g` never finds one, and none survives a reopen).
+        self.named.remove(gid, id);
+        self.touched();
+        if let Some(log) = self.txn.as_mut() {
+            log.push(UndoOp::Add(Some(gid), id));
+        }
+        self.record_redo(b'D', Some(gid), id);
+        self.persist_mutation(false, Some(gid), id);
+        self.note_removed(Some(gid), id);
+        true
+    }
+
+    /// Apply `INSERT DATA`. Returns the number of triples newly added. A triple
+    /// that cannot be encoded (dictionary id space exhausted) is skipped; see
+    /// [`try_insert_data`](Self::try_insert_data) to surface that as an error.
     pub fn insert_data(&mut self, triples: &[GroundTriple]) -> usize {
         triples
             .iter()
-            .filter(|g| self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
+            .filter(|g| {
+                self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())
+                    .unwrap_or(false)
+            })
             .count()
+    }
+
+    /// Apply `INSERT DATA`, stopping with an error if a dictionary id space is
+    /// exhausted (triples before the failing one stay inserted, as with any
+    /// mid-update failure; wrap in a transaction to make it atomic).
+    pub fn try_insert_data(&mut self, triples: &[GroundTriple]) -> Result<usize> {
+        let mut added = Vec::new();
+        let quads = triples
+            .iter()
+            .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
+        self.insert_statements(quads, &mut added)?;
+        Ok(added.len())
     }
 
     /// Apply `DELETE DATA`. Returns the number of triples actually removed.
     pub fn delete_data(&mut self, triples: &[GroundTriple]) -> usize {
-        triples
+        let quads = triples
             .iter()
-            .filter(|g| self.delete_quad(&Self::ground_to_triple(g), g.graph.as_deref()))
-            .count()
+            .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
+        let (n, _) = self.remove_statements(quads, None);
+        self.flush_reclaim();
+        n
     }
 
     /// Materialize the RDFS closure over the current data (gStore `src/Reason`):
@@ -865,17 +1886,28 @@ impl Database {
     /// typing. Returns the number of inferred triples added; the VS-tree is
     /// invalidated (and rebuilt lazily on save / next consistent query).
     pub fn materialize_rdfs(&mut self) -> usize {
-        let added = crate::reason::materialize(&mut self.dict, &mut self.store);
+        let added =
+            self.infer(|dict, store, insert| crate::reason::materialize_with(dict, store, insert));
+        self.record_inferred(added)
+    }
+
+    /// Book-keeping after reasoning inserted `added` into the default graph:
+    /// invalidate the index and cache, log them for rollback, and write them
+    /// through (on-disk). Returns how many there were.
+    fn record_inferred(&mut self, added: Vec<IdTriple>) -> usize {
         let n = added.len();
         if n > 0 {
             self.index_valid = false;
-            self.query_cache.get_mut().clear();
-            // Record inferred triples so reasoning inside a transaction rolls back.
-            if let Some(log) = self.txn.as_mut() {
+            self.touched();
+            // Record inferred triples so reasoning inside a transaction rolls
+            // back (Stream mode: they are in the store's overlay).
+            let disk = self.store.as_disk().is_some();
+            if let Some(log) = self.txn.as_mut().filter(|_| !disk) {
                 for t in &added {
                     log.push(UndoOp::Del(None, *t));
                 }
             }
+            self.persist_inferred(&added);
         }
         n
     }
@@ -884,156 +1916,535 @@ impl Database {
 
     /// Parse and run a SPARQL request. SELECT/ASK read; INSERT/DELETE DATA write.
     pub fn query(&mut self, sparql: &str) -> Result<QueryResult> {
-        self.query_inner(sparql, None)
+        self.query_inner(sparql, None, None)
     }
 
     /// Like [`query`](Self::query) but cooperatively cancellable: when `cancel`
     /// flips to `true` (from another thread), an in-flight read aborts at the next
-    /// pattern/phase boundary with [`GStoreError::Cancelled`]. Updates ignore the
-    /// flag. Mirrors gStore's task cancellation.
+    /// pattern/phase boundary with [`GStoreError::Cancelled`]. So does the
+    /// WHERE clause of an UPDATE's `DELETE`/`INSERT … WHERE` (which may call a
+    /// graph function in a sub-SELECT): it is evaluated before anything is
+    /// applied, so a cancelled operation changes nothing — operations of the
+    /// same request before it stay applied, as after any failure. A `LOAD`
+    /// checks the flag between import batches and undoes what it inserted.
+    /// Mirrors gStore's task cancellation.
     ///
-    /// Note: the bundled single-threaded HTTP server (`src/http_api.rs`,
-    /// `src/server.rs`) processes requests sequentially and holds its state lock
-    /// for the whole request, so it cannot deliver a `/cancel` while a query it is
-    /// running occupies that single thread — cancellation is effective for library
-    /// embedders that run queries on their own threads (and for a future
-    /// multi-threaded front-end). See the note at the `/cancel` handler.
+    /// The multi-database [`ApiServer`](crate::http_api::ApiServer) runs each
+    /// connection on its own worker thread and executes queries without its
+    /// state lock held, so `POST /cancel` (and a graceful shutdown past its grace
+    /// period) reaches a running query through this flag.
     pub fn query_cancellable(
         &mut self,
         sparql: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<QueryResult> {
-        self.query_inner(sparql, Some(cancel))
+        self.query_inner(sparql, Some(cancel), None)
+    }
+
+    /// [`query`](Self::query) / [`query_cancellable`](Self::query_cancellable)
+    /// on behalf of `pfn`: `PFN.name({…})` calls reach `pfn`'s functions (a
+    /// server passes the authenticated user, see [`crate::pfn::PfnCaller`])
+    /// instead of the [installed caller](Self::set_pfn_caller), under this
+    /// database's PFN limits.
+    pub fn query_as(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        self.query_inner(sparql, cancel, pfn)
     }
 
     fn query_inner(
         &mut self,
         sparql: &str,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<QueryResult> {
-        let q = sparql::parse(sparql)?;
-        match q {
-            Query::Select(_) | Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
-                // Serve from the query cache when the same request was already
-                // answered against the current (unchanged) store.
-                if let Some(cached) = self.query_cache.borrow_mut().get(sparql) {
-                    return Ok(cached);
-                }
-                // Use the VS-tree as a candidate filter only while it is
-                // consistent with the store; otherwise evaluate without it.
-                let mut eval = if self.index_valid {
-                    Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
-                } else {
-                    Evaluator::new(&self.dict, &self.store)
-                };
-                if !self.named.is_empty() {
-                    eval = eval.with_named(&self.named);
-                }
-                // Make user-defined functions (PFN) visible to this query.
-                if !self.functions.is_empty() {
-                    eval = eval.with_functions(self.functions.clone());
-                }
-                if let Some(c) = cancel {
-                    eval = eval.with_cancel(c);
-                }
-                let result = eval.evaluate(&q)?;
-                self.query_cache
-                    .borrow_mut()
-                    .put(sparql.to_string(), result.clone());
-                Ok(result)
+        let stmt = Statement::parse(sparql)?;
+        self.execute_as(stmt, cancel, pfn)
+    }
+
+    /// Run a parsed [`Statement`]: a read through [`read_as`](Self::read_as),
+    /// an UPDATE through the write path (the update log records its text).
+    /// What [`query_as`](Self::query_as) does after parsing — a server that
+    /// parsed the request to route it (shared reads, exclusive writes) runs
+    /// it with this without parsing it again.
+    pub fn execute_as(
+        &mut self,
+        stmt: Statement,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        if !stmt.is_update() {
+            return self.read_as(&stmt, cancel, pfn);
+        }
+        let (text, query) = stmt.into_parts();
+        match query {
+            // An UPDATE's WHERE clause calls the same caller's functions.
+            Query::Update(ops) => self.run_update(&text, ops, cancel, pfn),
+            _ => Err(GStoreError::Query("not an update".into())),
+        }
+    }
+
+    /// Parse and run a **read** request — SELECT, ASK, CONSTRUCT or DESCRIBE —
+    /// on a shared `&Database`, so several threads may query one database at
+    /// once (`Database` is `Send + Sync`). An UPDATE is refused with an error
+    /// before anything happens; run it through [`query`](Self::query) /
+    /// [`execute_as`](Self::execute_as). Otherwise exactly
+    /// [`query_as`](Self::query_as): the same cache, VS-tree, named graphs,
+    /// functions, PFN caller and limits, `SERVICE` policy and cancellation.
+    pub fn query_read(
+        &self,
+        sparql: &str,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        let stmt = Statement::parse(sparql)?;
+        self.read_as(&stmt, cancel, pfn)
+    }
+
+    /// Run the parsed read request `stmt` on a shared `&Database` (see
+    /// [`query_read`](Self::query_read)); an UPDATE is refused with no side
+    /// effect. The evaluation runs inside a [`ReadScope`]: a read error a
+    /// backend reports fails the query (and its result is not cached).
+    pub fn read_as(
+        &self,
+        stmt: &Statement,
+        cancel: Option<Arc<AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        if stmt.is_update() {
+            return Err(GStoreError::Query(
+                "an UPDATE cannot run on the shared read path; run it through query / \
+                 execute_as"
+                    .into(),
+            ));
+        }
+        self.check_store_readable()?;
+        let (sparql, q) = (stmt.text(), stmt.query());
+        // Serve from the query cache when the same request was already
+        // answered against the current (unchanged) store. Only
+        // deterministic queries are cached (no NOW()/RAND()/UUID()/
+        // STRUUID()/BNODE(), SERVICE or user functions).
+        let cacheable = query_cache::is_cacheable(q);
+        if cacheable {
+            // The guard is released at the end of this statement; the hit is
+            // copied out of its `Arc` after that.
+            let hit = self.query_cache().get(sparql, self.mutations);
+            if let Some(cached) = hit {
+                return Ok(Arc::unwrap_or_clone(cached));
             }
-            Query::Update(ops) => {
-                let mut changed = 0;
-                for op in ops {
-                    changed += self.exec_update_op(op)?;
-                }
-                // Append the applied statement to the update log, if enabled.
-                if let Some(path) = self.update_log.clone() {
-                    append_update_log(&path, sparql, changed)?;
-                }
-                Ok(QueryResult::Update { changed })
+        }
+        // The advanced graph functions run on this database's cached
+        // CSR (see `csr`), built only when a query needs it; substring
+        // filters on its cached dictionary index (see `string_index`).
+        let csr = || self.csr();
+        let string_index = || self.string_index();
+        // Use the VS-tree as a candidate filter only while it is
+        // consistent with the store; otherwise evaluate without it.
+        let mut eval = if self.vstree_usable() {
+            Evaluator::with_vstree(&self.dict, &self.store, &self.vstree)
+        } else {
+            Evaluator::new(&self.dict, &self.store)
+        };
+        if !self.named.is_empty() {
+            eval = eval.with_named(&self.named);
+        }
+        // Make user-defined functions (PFN) visible to this query.
+        if !self.functions.is_empty() {
+            eval = eval.with_functions(self.functions.clone());
+        }
+        // gStore's PFN functions: the caller's, under this database's
+        // limits (never cached, see `query_cache::is_cacheable`).
+        if let Some(caller) = pfn.or(self.pfn.as_ref()) {
+            eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
+        }
+        if let Some(c) = cancel {
+            eval = eval.with_cancel(c);
+        }
+        // `SERVICE` makes outbound requests: only where remote sources
+        // are allowed (not on a server's restricted policy).
+        eval = eval
+            .with_service_allowed(self.load_policy.allow_remote)
+            .with_csr_provider(&csr)
+            .with_string_index_provider(&string_index)
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk)
+            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
+        // A read error a backend reports fails the query (C2).
+        let scope = ReadScope::enter();
+        let evaluated = eval.evaluate(q);
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("evaluating the query", e));
+        }
+        drop(scope);
+        let result = evaluated?;
+        if cacheable && self.query_cache().budget() > 0 {
+            // Size the entry before taking the lock; the cache shares the
+            // result, so it is copied (once) only if it was cached.
+            let bytes = query_cache::entry_cost(sparql, &result);
+            if !self.query_cache().admits(bytes) {
+                return Ok(result);
             }
+            let shared = Arc::new(result);
+            self.query_cache().put_sized(
+                sparql.to_string(),
+                Arc::clone(&shared),
+                self.mutations,
+                bytes,
+            );
+            return Ok(Arc::unwrap_or_clone(shared));
+        }
+        Ok(result)
+    }
+
+    /// Apply the parsed operations `ops` of UPDATE request `sparql` (the
+    /// text the update log records): the write path of
+    /// [`query`](Self::query), shared with the reasoning rules
+    /// ([`reason_execute`](Self::reason_execute) /
+    /// [`reason_disable`](Self::reason_disable)). A `PFN.name({…})` call in a
+    /// WHERE clause reaches `pfn`'s functions, else the
+    /// [installed caller](Self::set_pfn_caller)'s.
+    fn run_update(
+        &mut self,
+        sparql: &str,
+        ops: Vec<UpdateOp>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<QueryResult> {
+        // A broken on-disk store refuses every statement until reopened.
+        self.check_store_readable()?;
+        // Reject a statically invalid request (an unknown IRI
+        // function, a graph function in FILTER/BIND, …) before any of
+        // its operations is applied.
+        if ops.iter().any(|op| matches!(op, UpdateOp::Modify { .. })) {
+            let mut eval = Evaluator::new(&self.dict, &self.store);
+            if !self.functions.is_empty() {
+                eval = eval.with_functions(self.functions.clone());
+            }
+            eval.check_update_calls(&ops)?;
+        }
+        let before = self.mutations;
+        let mut changed = 0;
+        for op in ops {
+            // Each operation is applied inside a read scope (C2): an
+            // out-of-core dictionary's read error while a DELETE, CLEAR or
+            // DROP looks up its terms would otherwise read as "no such
+            // term" and the statement succeed with nothing removed. A store
+            // that broke during the operation (a write error inside a
+            // transaction, reported as "not applied") fails it as well.
+            let scope = ReadScope::enter();
+            let applied = self.exec_update_op(op, cancel.as_ref(), pfn);
+            let applied = match scope.take_error() {
+                Some(e) => Err(read_failure("applying the update", e)),
+                None => applied.and_then(|n| self.check_store_readable().map(|()| n)),
+            };
+            drop(scope);
+            // The ids the operation's deletes left unreferenced are freed
+            // after its redo records and write-through (deferred to the
+            // commit inside a transaction) — also when it failed part-way.
+            self.flush_reclaim();
+            match applied {
+                Ok(n) => changed += n,
+                Err(e) => return Err(self.failed_update(e, before)),
+            }
+        }
+        // Append the applied statement to the update log, if enabled.
+        if let Some(path) = self.update_log.clone() {
+            append_update_log(&path, sparql, changed)?;
+        }
+        // Outside a transaction each UPDATE request is a commit point:
+        // its write-through is made durable before it is acknowledged.
+        if self.txn.is_none() {
+            self.commit_point()?;
+        }
+        Ok(QueryResult::Update { changed })
+    }
+
+    /// An UPDATE failed with `e` after its earlier operations (or part of the
+    /// failing one) may already have been applied — they stay applied, as
+    /// documented on [`try_insert_data`](Self::try_insert_data). Outside a
+    /// transaction the applied part is still made durable (this is the
+    /// request's commit point), so the persistent store never lags what
+    /// readers see; `before` is the [`mutation_count`](Self::mutation_count)
+    /// the update started at.
+    fn failed_update(&mut self, e: GStoreError, before: u64) -> GStoreError {
+        if self.txn.is_some() || self.mutations == before {
+            return e;
+        }
+        match self.commit_point() {
+            Ok(()) => e,
+            Err(pe) => GStoreError::Database(format!(
+                "{e}; in addition, the part of the update applied before the failure could not \
+                 be persisted: {pe}"
+            )),
         }
     }
 
     /// Apply one UPDATE operation, returning the number of triples it changed.
-    fn exec_update_op(&mut self, op: UpdateOp) -> Result<usize> {
+    /// A `DELETE`/`INSERT … WHERE` evaluates its WHERE clause under `cancel`,
+    /// a `LOAD` reads its document under it.
+    fn exec_update_op(
+        &mut self,
+        op: UpdateOp,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<usize> {
         match op {
-            UpdateOp::InsertData(triples) => Ok(self.insert_data(&triples)),
+            UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
             UpdateOp::Modify {
+                with,
                 delete,
                 insert,
+                using,
+                using_named,
                 pattern,
             } => {
-                // Compute the ground delete/insert sets against the *current*
+                // Compute the ground delete/insert quads against the *current*
                 // data, then apply deletes before inserts (SPARQL semantics).
-                let (dels, ins) = {
-                    let eval = Evaluator::new(&self.dict, &self.store);
-                    eval.eval_update_modify(&delete, &insert, &pattern)
-                };
-                let mut changed = 0;
-                for t in &dels {
-                    if self.remove_triple(t) {
-                        changed += 1;
-                    }
-                }
-                for t in &ins {
-                    if self.insert_triple(t) {
-                        changed += 1;
-                    }
-                }
-                Ok(changed)
+                // `modify_changes` evaluates the WHERE clause under this
+                // database's `SERVICE` policy and the request's cancel flag:
+                // a refused `SERVICE` or a cancel fails the update before
+                // anything is applied.
+                let (dels, ins) = self.modify_changes(
+                    &delete,
+                    &insert,
+                    &pattern,
+                    with.as_deref(),
+                    &using,
+                    &using_named,
+                    cancel,
+                    pfn,
+                )?;
+                // A template triple outside `GRAPH { … }` targets the WITH
+                // graph, else the default graph.
+                let target = |g: &Option<String>| g.clone().or_else(|| with.clone());
+                let (removed, _) =
+                    self.remove_statements(dels.iter().map(|(g, t)| (t, target(g))), None);
+                let mut added = Vec::new();
+                self.insert_statements(ins.iter().map(|(g, t)| (t, target(g))), &mut added)?;
+                Ok(removed + added.len())
             }
-            UpdateOp::Load { source, silent } => match self.load_rdf_source(&source) {
+            UpdateOp::Load {
+                source,
+                silent,
+                into,
+            } => match self.load_rdf_source(&source, into.as_deref(), cancel) {
                 Ok(n) => Ok(n),
-                Err(e) => {
-                    if silent {
-                        Ok(0)
-                    } else {
-                        Err(e)
-                    }
-                }
+                // `SILENT` hides the failure of the load (which applied
+                // nothing), not a cancel of the request.
+                Err(e) if silent && !matches!(e, GStoreError::Cancelled) => Ok(0),
+                Err(e) => Err(e),
             },
             UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
-                GraphTarget::Default => Ok(self.clear_default()),
-                GraphTarget::All => Ok(self.clear_default() + self.clear_all_named()),
-                // NAMED keyword (an empty name) ⇒ all named graphs.
-                GraphTarget::Named(g) if g.is_empty() => Ok(self.clear_all_named()),
+                GraphTarget::Default => self.clear_default(),
+                GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
+                GraphTarget::AllNamed => Ok(self.clear_all_named()),
                 GraphTarget::Named(g) => Ok(self.clear_named(&g)),
             },
             // CREATE GRAPH only declares an (empty) graph; data ops create it.
             UpdateOp::Create { .. } => Ok(0),
+            UpdateOp::Add { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Add, from, to, silent)
+            }
+            UpdateOp::Move { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Move, from, to, silent)
+            }
+            UpdateOp::Copy { from, to, silent } => {
+                self.transfer_graph(GraphTransfer::Copy, from, to, silent)
+            }
         }
     }
 
-    /// Clear the default graph, returning the count cleared.
-    fn clear_default(&mut self) -> usize {
+    /// `ADD` / `MOVE` / `COPY [SILENT] from TO to` (SPARQL 1.1 Update
+    /// §3.2.3-3.2.5; a graph is `None` for `DEFAULT`). Returns the number of
+    /// triples changed: those cleared from the destination (COPY/MOVE), added
+    /// to it, and dropped from the source (MOVE).
+    ///
+    /// * The same graph on both sides is a no-op, whatever the operation.
+    /// * The destination is created as needed.
+    /// * A named source graph that holds no triples does not exist — this
+    ///   store keeps no empty named graphs (CREATE GRAPH declares nothing) —
+    ///   and the operation fails, as the spec allows, unless SILENT, which
+    ///   makes it a successful no-op. The default graph always exists.
+    fn transfer_graph(
+        &mut self,
+        op: GraphTransfer,
+        from: Option<String>,
+        to: Option<String>,
+        silent: bool,
+    ) -> Result<usize> {
+        if from == to {
+            return Ok(0);
+        }
+        let Some(triples) = self.graph_triples(from.as_deref())? else {
+            if silent {
+                return Ok(0);
+            }
+            return Err(GStoreError::Query(format!(
+                "{} failed: the source graph <{}> does not exist (it holds no triples); use {} \
+                 SILENT to ignore a missing source",
+                op.keyword(),
+                from.as_deref().unwrap_or_default(),
+                op.keyword()
+            )));
+        };
+        let mut changed = 0;
+        if matches!(op, GraphTransfer::Copy | GraphTransfer::Move) {
+            changed += match to.as_deref() {
+                None => self.clear_default()?,
+                Some(g) => self.clear_named(g),
+            };
+        }
+        let mut added = Vec::new();
+        self.insert_statements(triples.iter().map(|t| (t, to.as_deref())), &mut added)?;
+        changed += added.len();
+        if op == GraphTransfer::Move {
+            changed += match from.as_deref() {
+                None => self.clear_default()?,
+                Some(g) => self.clear_named(g),
+            };
+        }
+        Ok(changed)
+    }
+
+    /// Every triple of the default graph (`None`) or of a named graph, as
+    /// terms; `Ok(None)` for a named graph that holds no triples. Reads in a
+    /// read scope: a store or dictionary read error fails it (C2).
+    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<Triple>>> {
+        let scope = ReadScope::enter();
+        let triples = self.graph_triples_unscoped(graph);
+        match scope.take_error() {
+            Some(e) => Err(read_failure("reading the source graph", e)),
+            None => Ok(triples),
+        }
+    }
+
+    /// [`graph_triples`](Self::graph_triples) without the read scope.
+    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
+        let ids = match graph {
+            None => self.store.iter_all(),
+            Some(g) => {
+                let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
+                let ids: Vec<IdTriple> = self.named.get(&gid)?.iter_all().collect();
+                if ids.is_empty() {
+                    return None;
+                }
+                ids
+            }
+        };
+        let term = |s: Option<TermStr<'_>>| s.and_then(|s| Term::from_dict_key(&s));
+        Some(
+            ids.into_iter()
+                .filter_map(|id| {
+                    Some(Triple::new(
+                        term(self.dict.term(id.sub))?,
+                        term(self.dict.pred(id.pred))?,
+                        term(self.dict.term(id.obj))?,
+                    ))
+                })
+                .collect(),
+        )
+    }
+
+    /// Clear the default graph, returning the count cleared. Stream mode:
+    /// every triple is read (in a read scope: a read error fails the clear
+    /// before anything is removed) and removed by id — under one drain of the
+    /// store's writer gate, or into the open transaction's overlay.
+    fn clear_default(&mut self) -> Result<usize> {
+        if self.store.as_disk().is_some() {
+            return self.clear_default_disk();
+        }
         let n = self.store.triple_count() as usize;
         if n > 0 {
             // Snapshot the triples once: needed for undo, and (for a persistent
             // backend) to delete them so the on-disk store is actually cleared.
             let removed = self.store.iter_all();
+            let total = removed.len();
             if let Some(log) = self.txn.as_mut() {
                 for t in &removed {
                     log.push(UndoOp::Add(None, *t));
                 }
             }
-            if self.store.as_memory().is_some() {
+            // The triples the store no longer holds (all of them unless a
+            // persistent backend refused a delete).
+            let gone = if self.store.as_memory().is_some() {
                 // In-memory: discard and replace (cheaper than per-triple delete).
                 self.store = Backend::Memory(TripleStore::new());
+                // An on-disk database must still delete them from its store.
+                if self.has_disk_sink() {
+                    for &t in &removed {
+                        self.persist_mutation(false, None, t);
+                    }
+                }
+                removed
             } else {
                 // Persistent backend: delete every triple through the seam so the
                 // change is durable (don't swap in a Memory store, which would
-                // strand the data on disk).
-                for t in removed {
-                    self.store.remove(t);
+                // strand the data on disk). A refused delete (RocksDB: reported
+                // at the next commit point) leaves its triple stored.
+                let mut gone = Vec::with_capacity(removed.len());
+                for &t in &removed {
+                    if self.store.remove(t) {
+                        gone.push(t);
+                    }
+                }
+                gone
+            };
+            self.index_valid = false;
+            self.touched();
+            if gone.len() == total {
+                self.record_redo_clear(RedoClear::Default);
+            } else {
+                // Part of the graph stays: the log names exactly what went, so
+                // replaying it reproduces this state (not an empty graph).
+                for &t in &gone {
+                    self.record_redo(b'D', None, t);
                 }
             }
-            self.index_valid = false;
-            self.query_cache.get_mut().clear();
+            for &t in &gone {
+                self.note_removed(None, t);
+            }
         }
-        n
+        Ok(n)
+    }
+
+    /// [`clear_default`](Self::clear_default) of a Stream-mode database.
+    fn clear_default_disk(&mut self) -> Result<usize> {
+        let scope = ReadScope::enter();
+        let removed = self.store.iter_all();
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("reading the default graph to clear it", e));
+        }
+        drop(scope);
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let Some(dt) = self.store.as_disk_mut() else {
+            return Ok(0);
+        };
+        let result = dt.remove_many(removed.iter().copied());
+        // Whatever happened, the tree may name deleted edges: rebuild before
+        // filtering through it again (as for the other layouts).
+        self.index_valid = false;
+        let n = match result {
+            Ok(n) => n as usize,
+            Err(e) => {
+                // Part of it may be applied (the store is broken now).
+                self.touched();
+                return Err(e);
+            }
+        };
+        if n > 0 {
+            self.touched();
+            self.record_redo_clear(RedoClear::Default);
+            for &t in &removed {
+                self.note_removed(None, t);
+            }
+        }
+        Ok(n)
     }
 
     /// Clear one named graph, returning the count cleared.
@@ -1041,7 +2452,10 @@ impl Database {
         let Some(gid) = self.dict.entity_id(&Term::iri(graph).dict_key()) else {
             return 0;
         };
-        let n = self.named.get(&gid).map_or(0, |s| s.triple_count() as usize);
+        let n = self
+            .named
+            .get(&gid)
+            .map_or(0, |s| s.triple_count() as usize);
         if n > 0 {
             if let Some(log) = self.txn.as_mut() {
                 if let Some(s) = self.named.get(&gid) {
@@ -1050,8 +2464,14 @@ impl Database {
                     }
                 }
             }
-            self.named.remove(&gid);
-            self.query_cache.get_mut().clear();
+            let complete = match self.named.remove_graph(gid) {
+                Some(removed) => self.persist_cleared_graph(gid, removed),
+                None => true,
+            };
+            self.touched();
+            if complete {
+                self.record_redo_clear(RedoClear::Named(gid));
+            }
         }
         n
     }
@@ -1061,31 +2481,349 @@ impl Database {
         let total: usize = self.named.values().map(|s| s.triple_count() as usize).sum();
         if total > 0 {
             if let Some(log) = self.txn.as_mut() {
-                for (&gid, s) in &self.named {
+                for (&gid, s) in self.named.iter() {
                     for t in s.iter_all() {
                         log.push(UndoOp::Add(Some(gid), t));
                     }
                 }
             }
-            self.named.clear();
-            self.query_cache.get_mut().clear();
+            // Each graph's clear is logged by itself when RocksDB refused a
+            // quad delete (the graph keeps that quad): then the log may not
+            // claim that every named graph was emptied.
+            let mut cleared = Vec::new();
+            let mut complete = true;
+            for (gid, removed) in self.named.take_all() {
+                if self.persist_cleared_graph(gid, removed) {
+                    cleared.push(gid);
+                } else {
+                    complete = false;
+                }
+            }
+            self.touched();
+            if complete {
+                self.record_redo_clear(RedoClear::AllNamed);
+            } else {
+                for gid in cleared {
+                    self.record_redo_clear(RedoClear::Named(gid));
+                }
+            }
         }
         total
     }
 
-    /// `LOAD <iri>`: read an RDF (Turtle/N-Triples) document into the default
-    /// graph. Only local sources are fetched — a `file://` IRI or a bare path;
-    /// remote `http(s)://` sources are not retrieved (no network) and error.
-    fn load_rdf_source(&mut self, source: &str) -> Result<usize> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            return Err(GStoreError::Query(format!(
-                "LOAD of remote source '{source}' is not supported (no network); \
-                 use a local file path or file:// IRI"
-            )));
+    /// Persist the removal of named graph `gid` (already taken out of
+    /// [`named`](Self::named)) whose quads were `removed`. A quad RocksDB could
+    /// not delete is put back into the in-memory graph, so memory never claims
+    /// a deletion the store did not make (the error is reported at the next
+    /// commit point). The terms of the quads removed are reclamation
+    /// candidates. `true` when every quad went; otherwise each quad that
+    /// did is logged by itself (redo `D`), and the caller logs no clear of
+    /// the graph.
+    fn persist_cleared_graph(&mut self, gid: u32, removed: TripleStore) -> bool {
+        let mut kept = Vec::new();
+        let mut gone = Vec::new();
+        for t in removed.iter_all() {
+            self.persist_mutation(false, Some(gid), t);
+            if self.persist_named_quad(false, gid, t) {
+                self.note_removed(Some(gid), t);
+                gone.push(t);
+            } else {
+                kept.push(t);
+            }
         }
-        let path = source.strip_prefix("file://").unwrap_or(source);
-        let triples = turtle::parse_file(path)?;
-        Ok(triples.iter().filter(|t| self.insert_triple(t)).count())
+        if kept.is_empty() {
+            return true;
+        }
+        self.named.bulk_load(gid, kept);
+        for t in gone {
+            self.record_redo(b'D', Some(gid), t);
+        }
+        false
+    }
+
+    /// Record a `CLEAR` (also `DROP`, and the clears of `MOVE` / `COPY`) in
+    /// the redo log, so replaying the log reproduces it: one record per
+    /// cleared target, not one per triple.
+    fn record_redo_clear(&mut self, target: RedoClear) {
+        if self.redo_log.is_none() {
+            return;
+        }
+        let (op, graph) = match target {
+            RedoClear::Default => (b'C', None),
+            RedoClear::Named(gid) => match self.dict.term(gid) {
+                Some(g) => (b'C', Some(strip_angle(&g).to_owned())),
+                None => return,
+            },
+            RedoClear::AllNamed => (b'N', None),
+        };
+        self.redo_pending.push(RedoRec {
+            op,
+            graph,
+            triple: String::new(),
+        });
+        if self.txn.is_none() {
+            let _ = self.flush_redo();
+        }
+    }
+
+    /// The ground quads a `DELETE … INSERT … WHERE` removes and adds (see
+    /// [`Evaluator::eval_update_modify`]; `None` = the operation's default
+    /// graph). The WHERE clause matches against the request's dataset
+    /// (SPARQL 1.1 Update §3.1.3):
+    ///
+    /// * with `USING`/`USING NAMED` clauses: the default graph is the merge
+    ///   of the `USING` graphs (empty when there are none) and the named
+    ///   graphs are exactly the `USING NAMED` ones;
+    /// * otherwise with `WITH <g>`: the default graph is `<g>` (empty if it
+    ///   does not exist) and every named graph is visible to `GRAPH`;
+    /// * otherwise the store's default graph and all named graphs.
+    ///
+    /// The WHERE clause runs under `cancel` (the request's cancel flag), as
+    /// a read query does, and inside a [`ReadScope`]: a read error a backend
+    /// reports fails the operation before anything is applied.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn modify_changes(
+        &self,
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
+        pattern: &GraphPattern,
+        with: Option<&str>,
+        using: &[String],
+        using_named: &[String],
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        let scope = ReadScope::enter();
+        let changes = self.eval_modify_changes(
+            delete,
+            insert,
+            pattern,
+            with,
+            using,
+            using_named,
+            cancel,
+            pfn,
+        );
+        match scope.take_error() {
+            Some(e) => Err(read_failure("evaluating the update's WHERE clause", e)),
+            None => changes,
+        }
+    }
+
+    /// [`modify_changes`](Self::modify_changes) without the read scope.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn eval_modify_changes(
+        &self,
+        delete: &[QuadPattern],
+        insert: &[QuadPattern],
+        pattern: &GraphPattern,
+        with: Option<&str>,
+        using: &[String],
+        using_named: &[String],
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        let graph = |iri: &str| {
+            self.dict
+                .entity_id(&Term::iri(iri).dict_key())
+                .and_then(|gid| self.named.get(&gid).map(|s| (gid, s)))
+        };
+        fn prepare<'e, S: TripleSource>(
+            db: &Database,
+            eval: Evaluator<'e, S>,
+            cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+            pfn: Option<&crate::pfn::PfnCaller>,
+        ) -> Evaluator<'e, S> {
+            // IRI function calls in the WHERE clause reach the user-defined
+            // functions, as in read queries; `SERVICE` follows the load
+            // policy (refused on a server's restricted policy), as in reads;
+            // and the request's cancel flag stops it (a graph function in a
+            // sub-SELECT included), as in reads.
+            let mut eval = eval
+                .with_service_allowed(db.load_policy.allow_remote)
+                .with_integer_division(db.integer_division)
+                .with_topk_options(db.topk)
+                .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
+            if let Some(c) = cancel {
+                eval = eval.with_cancel(std::sync::Arc::clone(c));
+            }
+            // PFN calls: the request's caller (a server passes the
+            // authenticated user), else the installed one — under this
+            // database's limits, as in reads.
+            let caller = pfn
+                .map(|c| c.clone().with_limits(db.pfn_limits))
+                .or_else(|| db.pfn_caller());
+            if let Some(caller) = caller {
+                eval = eval.with_pfn(caller);
+            }
+            if db.functions.is_empty() {
+                eval
+            } else {
+                eval.with_functions(db.functions.clone())
+            }
+        }
+        if !using.is_empty() || !using_named.is_empty() {
+            let mut merged = TripleStore::new();
+            for iri in using {
+                if let Some((_, s)) = graph(iri) {
+                    for t in s.iter_all() {
+                        merged.insert(t);
+                    }
+                }
+            }
+            let named: BTreeMap<u32, TripleStore> = using_named
+                .iter()
+                .filter_map(|iri| graph(iri).map(|(gid, s)| (gid, s.clone())))
+                .collect();
+            let eval =
+                prepare(self, Evaluator::new(&self.dict, &merged), cancel, pfn).with_named(&named);
+            return eval.eval_update_modify(delete, insert, pattern);
+        }
+        if let Some(w) = with {
+            let empty = TripleStore::new();
+            let store = graph(w).map_or(&empty, |(_, s)| s);
+            let eval = prepare(self, Evaluator::new(&self.dict, store), cancel, pfn)
+                .with_named(&self.named);
+            return eval.eval_update_modify(delete, insert, pattern);
+        }
+        let csr = || self.csr();
+        let string_index = || self.string_index();
+        let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
+            .with_named(&self.named)
+            .with_csr_provider(&csr)
+            .with_string_index_provider(&string_index);
+        eval.eval_update_modify(delete, insert, pattern)
+    }
+
+    /// `LOAD <iri> [INTO GRAPH <g>]`: read an RDF document into the store,
+    /// subject to the [`LoadPolicy`]. Only local sources are read — a `file:`
+    /// IRI or a bare path; remote (`http(s)://`, …) sources are never
+    /// retrieved by SPARQL (no network) and error. The document goes through
+    /// the bulk loaders' import pipeline: its format follows the extension
+    /// (see [`import::RdfFormat`]), it streams in, and its blank nodes get a
+    /// scope of their own (two `LOAD`s of one file never share a blank node).
+    ///
+    /// * Without `into`, the document is a dataset: its default-graph triples
+    ///   go to the default graph, and the statements of an N-Quads / TriG
+    ///   named graph to that graph.
+    /// * With `into` (SPARQL 1.1 Update §3.1.4: the operation inserts the
+    ///   document's triples into the graph it names, and changes no other):
+    ///   the document's default graph goes to named graph `into`, and the
+    ///   statements of its own named graphs are not loaded (counted, and
+    ///   reported in the diagnostic log) — as Jena reads a quad document
+    ///   into one graph. `LOAD <src>` without `INTO` loads them.
+    ///
+    /// Strict and atomic: a statement that does not parse, a cancel (checked
+    /// between batches) or any other failure fails the `LOAD` and undoes what
+    /// it had inserted, so a failed `LOAD` — `SILENT` or not — changes no
+    /// graph. The undo list holds 16 bytes per inserted statement. Once the
+    /// undo is complete the data is what it was, so the `LOAD` is no change
+    /// at all: [`mutation_count`](Self::mutation_count) is put back (servers
+    /// neither report a partial update nor save) and so is a CSR built for
+    /// the data before it. Returns the number of statements inserted.
+    fn load_rdf_source(
+        &mut self,
+        source: &str,
+        into: Option<&str>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
+        let path = match self.load_policy.resolve(source)? {
+            LoadSource::Local(path) => path,
+            LoadSource::Remote(_) => {
+                return Err(GStoreError::Query(format!(
+                    "LOAD of remote source '{source}' is not supported (no network); \
+                     use a local file path or file:// IRI"
+                )))
+            }
+        };
+        let mutations = self.mutations;
+        let csr = self.csr_cache.peek(mutations);
+        let mut applied: Vec<(Option<u32>, IdTriple)> = Vec::new();
+        let mut skipped = 0u64;
+        let result = import::import_sources(
+            &[import::Source::File(path)],
+            "LOAD",
+            &import::ImportOptions::strict(),
+            &mut (),
+            &mut |batch: &mut Vec<Quad>| {
+                if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                    return Err(GStoreError::Cancelled);
+                }
+                let quads = batch.drain(..).filter_map(|q| {
+                    let graph = match (into, graph_iri(&q.graph)) {
+                        (None, g) => g,
+                        (Some(target), None) => Some(target.to_string()),
+                        (Some(_), Some(_)) => {
+                            skipped += 1;
+                            return None;
+                        }
+                    };
+                    Some((q.into_triple(), graph))
+                });
+                self.insert_statements(quads, &mut applied)
+            },
+        );
+        if let Err(e) = result {
+            let inserted = !applied.is_empty();
+            if !self.undo_inserts(applied) {
+                // Not all of it could be undone (a persistence failure): the
+                // data did change.
+                return Err(e);
+            }
+            // The terms the LOAD minted are unreferenced again: free them
+            // now (outside a transaction; inside one at its commit), so the
+            // dictionary is back where it was too — part of the no-change.
+            self.flush_reclaim();
+            // Nothing changed. No cached answer can be keyed by the counts
+            // the inserts and their undo went through: the database was not
+            // readable in between.
+            self.mutations = mutations;
+            if let Some(g) = csr {
+                self.csr_cache.restore(mutations, g);
+            }
+            // The inserts and their undo reached a persistent store: make
+            // both durable together, as at any commit point.
+            if inserted && self.txn.is_none() {
+                if let Err(pe) = self.commit_point() {
+                    return Err(GStoreError::Database(format!(
+                        "{e}; in addition, undoing the failed LOAD could not be persisted: {pe}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+        drop(csr);
+        if skipped > 0 {
+            crate::gs_warn!(
+                "LOAD <{source}> INTO GRAPH <{}>: {skipped} statement(s) of the document's own \
+                 named graphs were not loaded (LOAD without INTO loads them)",
+                into.unwrap_or_default()
+            );
+        }
+        Ok(applied.len())
+    }
+
+    /// Undo inserts reported by [`insert_quad_id`](Self::insert_quad_id), in
+    /// reverse order, through the ordinary delete paths (so the transaction
+    /// undo log, the redo log and a persistent store see them too). `false`
+    /// when a statement could not be removed (a persistence failure).
+    fn undo_inserts(&mut self, applied: Vec<(Option<u32>, IdTriple)>) -> bool {
+        let mut all = true;
+        // An in-memory store removes the default-graph ones as one batch
+        // (the graphs are independent: only the order within one matters).
+        let batched = self.store.as_memory().is_some();
+        let mut default: Vec<IdTriple> = Vec::new();
+        for (graph, id) in applied.into_iter().rev() {
+            all &= match graph {
+                None if batched => {
+                    default.push(id);
+                    true
+                }
+                None => self.remove_default_id(id),
+                Some(gid) => self.remove_named_id(gid, id),
+            };
+        }
+        all && self.remove_default_batch(&default) == default.len()
     }
 
     /// Convenience: parse + ensure a SELECT result.
@@ -1096,181 +2834,6 @@ impl Database {
                 "expected a SELECT query, got {other:?}"
             ))),
         }
-    }
-
-    // ---- persistence ------------------------------------------------------
-
-    /// Save the database into directory `dir` (created if necessary).
-    ///
-    /// For the in-memory backend this writes the bincode snapshot exactly as
-    /// before. For a persistent backend the triples already live in their own
-    /// store (e.g. the RocksDB directory), so only the dictionary, named graphs,
-    /// metadata, and VS-tree are snapshotted here.
-    pub fn save<P: AsRef<Path>>(&self, dir: P) -> Result<()> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        write_bincode(&dir.join(DICT_FILE), &self.dict)?;
-        if let Some(mem) = self.store.as_memory() {
-            write_bincode(&dir.join(STORE_FILE), mem)?;
-        }
-        write_bincode(&dir.join(NAMED_FILE), &self.named)?;
-        let meta = Meta {
-            name: self.name.clone(),
-            triple_num: self.store.triple_count(),
-            entity_num: self.dict.entity_num() as u64,
-            literal_num: self.dict.literal_num() as u64,
-            predicate_num: self.dict.predicate_num() as u64,
-        };
-        write_bincode(&dir.join(META_FILE), &meta)?;
-        // Persist a fresh in-memory VS-tree snapshot. Rebuild it from the store
-        // when the live tree is stale *or* out-of-core (a disk-backed tree holds
-        // no in-memory nodes, so serializing it directly would write an empty
-        // tree — rebuild from the store instead so the snapshot is complete).
-        if self.index_valid && !self.vstree.is_disk_backed() {
-            write_bincode(&dir.join(VSTREE_FILE), &self.vstree)?;
-        } else {
-            write_bincode(&dir.join(VSTREE_FILE), &build_vstree(&self.store))?;
-        }
-        Ok(())
-    }
-
-    // ---- on-disk B+ tree KVstore (backlog item A) -------------------------
-
-    /// Build an on-disk database (B+ tree KVstore) in directory `dir` from RDF
-    /// files. The triples and dictionary are written to `kvstore.kv` through the
-    /// page cache and persisted; nothing is kept in memory.
-    pub fn build_disk<P: AsRef<Path>, Q: AsRef<Path>>(dir: P, files: &[Q]) -> Result<()> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-        // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
-        // leftover WAL from a crashed earlier build can't replay into the new file.
-        let kv = dir.join(KV_FILE);
-        remove_file_and_wal(&kv);
-        let ds = DiskStore::build_files(&kv, DISK_CACHE_PAGES, files)?;
-        // Build the out-of-core VS-tree alongside the store, so a later
-        // `load_disk` filters through it on disk instead of materializing it.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        remove_file_and_wal(&vskv);
-        VsTree::build_disk(&vskv, vstree_entries(&ds))?;
-        Ok(())
-    }
-
-    /// Whether directory `dir` holds an on-disk KVstore database.
-    pub fn is_disk<P: AsRef<Path>>(dir: P) -> bool {
-        dir.as_ref().join(KV_FILE).is_file()
-    }
-
-    /// Open an on-disk database and materialize it into the in-memory engine for
-    /// querying. (The disk B+ trees are the source of truth; this loads the
-    /// working set through the page cache — streaming evaluation directly off
-    /// disk is a further optimization, see REFACTOR_BACKLOG item A.)
-    pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        let kv = dir.join(KV_FILE);
-        if !kv.is_file() {
-            return Err(GStoreError::Database(format!(
-                "no on-disk KVstore at '{}'",
-                kv.display()
-            )));
-        }
-        let ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
-        let (dict, store) = ds.to_memory()?;
-        let name = dir
-            .file_name()
-            .map(|s| s.to_string_lossy().trim_end_matches(".db").to_string())
-            .unwrap_or_else(|| "disk".to_string());
-        // Out-of-core VS-tree: open the persisted paged node file (built by
-        // `build_disk`), or build+persist it now if this disk database predates
-        // it. Either way the candidate filter reads only the nodes a query
-        // traverses on disk — the whole tree is never materialized in RAM.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        let vstree = if vskv.is_file() {
-            VsTree::open_disk(&vskv)?
-        } else {
-            VsTree::build_disk(&vskv, vstree_entries(&ds))?
-        };
-        Ok(Database {
-            name,
-            dict,
-            store: Backend::Memory(store),
-            named: BTreeMap::new(),
-            vstree,
-            // The disk-backed tree is consistent with the just-loaded store, so
-            // the query path may use it as a candidate filter.
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
-    }
-
-    /// Load a database from directory `dir`.
-    pub fn load<P: AsRef<Path>>(dir: P) -> Result<Database> {
-        let dir = dir.as_ref();
-        if !dir.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "database directory '{}' does not exist",
-                dir.display()
-            )));
-        }
-        let meta: Meta = read_bincode(&dir.join(META_FILE))?;
-        let dict: Dictionary = read_bincode(&dir.join(DICT_FILE))?;
-        let store: TripleStore = read_bincode(&dir.join(STORE_FILE))?;
-        // Named graphs are optional (older databases / no GRAPH data).
-        let named: BTreeMap<u32, TripleStore> =
-            read_bincode(&dir.join(NAMED_FILE)).unwrap_or_default();
-        // Sanity check that the snapshot is internally consistent.
-        if store.triple_count() != meta.triple_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} triples but store has {}",
-                meta.triple_num,
-                store.triple_count()
-            )));
-        }
-        if dict.entity_num() as u64 != meta.entity_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} entities but dict has {}",
-                meta.entity_num,
-                dict.entity_num()
-            )));
-        }
-        if dict.literal_num() as u64 != meta.literal_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} literals but dict has {}",
-                meta.literal_num,
-                dict.literal_num()
-            )));
-        }
-        if dict.predicate_num() as u64 != meta.predicate_num {
-            return Err(GStoreError::Database(format!(
-                "corrupt database: meta says {} predicates but dict has {}",
-                meta.predicate_num,
-                dict.predicate_num()
-            )));
-        }
-        // The VS-tree is rebuilt from the store if absent or unreadable.
-        let vstree = read_bincode(&dir.join(VSTREE_FILE)).unwrap_or_else(|_| build_vstree(&store));
-        Ok(Database {
-            name: meta.name,
-            dict,
-            store: Backend::Memory(store),
-            named,
-            vstree,
-            index_valid: true,
-            txn: None,
-            query_cache: RefCell::new(LruCache::new(DEFAULT_QUERY_CACHE_CAP)),
-            update_log: None,
-            redo_log: None,
-            redo_pending: Vec::new(),
-            backup_offset: Cell::new(0),
-            rules: crate::reason::RuleSet::new(),
-            functions: FunctionRegistry::new(),
-        })
     }
 
     // ---- backup / restore -------------------------------------------------
@@ -1294,23 +2857,31 @@ impl Database {
     /// increments. See [`enable_redo_log_in`](Self::enable_redo_log_in).)
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
-        self.save(backup_dir)?;
+        let _persist = self.persist_guard();
+        self.save_locked(backup_dir)?;
+        self.backup_reason_rules(backup_dir)?;
         let off = self.redo_log_len();
-        self.backup_offset.set(off);
+        self.backup_offset.store(off, Ordering::SeqCst);
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
         Ok(())
     }
 
     /// Restore a database from a full backup directory created by
-    /// [`backup`](Self::backup) (gStore `Database::restore`).
+    /// [`backup`](Self::backup) (gStore `Database::restore`), whatever its layout.
+    ///
+    /// A snapshot backup is loaded into memory (the backup directory is never
+    /// written). An on-disk or RocksDB backup is *opened in place*, so later
+    /// updates would be written into the backup itself — to restore one into a
+    /// database directory, use [`restore_into`](Self::restore_into) and open the
+    /// target instead.
     pub fn restore<P: AsRef<Path>>(backup_dir: P) -> Result<Database> {
-        Database::load(backup_dir)
+        Database::open(backup_dir)
     }
 
     /// The current incremental-backup checkpoint: the redo-log byte offset that
     /// the most recent full/incremental backup ended at (0 before any backup).
     pub fn backup_checkpoint(&self) -> u64 {
-        self.backup_offset.get()
+        self.backup_offset.load(Ordering::SeqCst)
     }
 
     /// Byte length of the redo log, or 0 when logging is disabled or the file
@@ -1348,8 +2919,12 @@ impl Database {
     ///   length-prefixed `REDO <op> <graph_len> <triple_len>\n…` record format, so
     ///   it replays through the ordinary redo-log machinery.
     /// * `INCREMENTAL` — a UTF-8 marker: `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
+    /// * `reason_rule_files/` — the database's reasoning rules and their
+    ///   ledgers at the time of the increment (empty when it has none): the
+    ///   rules the replayed inferred triples belong to.
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
+        let _persist = self.persist_guard();
         let Some(log_path) = self.redo_log.clone() else {
             return Err(GStoreError::Database(
                 "backup_incremental requires redo logging to be enabled \
@@ -1357,7 +2932,7 @@ impl Database {
                     .into(),
             ));
         };
-        let base = self.backup_offset.get();
+        let base = self.backup_offset.load(Ordering::SeqCst);
         // Missing log ⇒ no records yet (treat as empty), so an incremental taken
         // before any logged mutation is simply an empty (but valid) delta.
         let data = fs::read(&log_path).unwrap_or_default();
@@ -1370,9 +2945,13 @@ impl Database {
         }
         fs::create_dir_all(out_dir)?;
         let slice = &data[base as usize..end as usize];
-        fs::write(out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        // The reasoning rules and ledgers as they are now, which the replayed
+        // triples go with (an empty rule directory: none).
+        self.backup_reason_rules(out_dir)?;
+        fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
-        self.backup_offset.set(end);
+        self.backup_offset.store(end, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1383,16 +2962,22 @@ impl Database {
     /// `base_dir` is a directory produced by [`backup`](Self::backup); each entry
     /// of `incr_dirs` is a directory produced by
     /// [`backup_incremental`](Self::backup_incremental), in chronological order.
-    /// The base snapshot is loaded, then each delta's `incr.log` is replayed onto
-    /// it. Deltas are checked for contiguity: each must begin exactly where the
-    /// previous one ended (starting from the base's recorded checkpoint), so an
-    /// out-of-order or gapped chain is rejected rather than silently misapplied.
+    /// The base (any layout) is loaded and detached into memory — the backup
+    /// directories are never modified — then each delta's `incr.log` is replayed
+    /// onto it. Deltas are checked for contiguity: each must begin exactly where
+    /// the previous one ended (starting from the base's recorded checkpoint), so
+    /// an out-of-order or gapped chain is rejected rather than silently
+    /// misapplied. The reasoning rules (and ledgers) of the last increment
+    /// that carries them (one taken by an earlier version does not) — else
+    /// the base's — come with it, held in memory (see
+    /// [`into_memory`](Self::into_memory)). Persist the result with
+    /// [`save`](Self::save), which writes those rules too.
     pub fn restore_incremental<P: AsRef<Path>, Q: AsRef<Path>>(
         base_dir: P,
         incr_dirs: &[Q],
     ) -> Result<Database> {
         let base_dir = base_dir.as_ref();
-        let mut db = Database::load(base_dir)?;
+        let mut db = Database::open(base_dir)?.into_memory()?;
         // The base's checkpoint is where the first increment must begin. A missing
         // marker (a backup taken without logging) legitimately means offset 0, but
         // a marker that exists yet cannot be read is a corrupt base — surface that
@@ -1408,8 +2993,7 @@ impl Database {
         let outcome = (|| {
             for dir in incr_dirs {
                 let dir = dir.as_ref();
-                let (base, end) =
-                    read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE))?;
+                let (base, end) = read_incremental_marker(&dir.join(INCREMENTAL_MARKER_FILE))?;
                 if base != expected {
                     return Err(GStoreError::Database(format!(
                         "incremental backup '{}' starts at offset {base} but {expected} \
@@ -1421,42 +3005,20 @@ impl Database {
                 db.apply_redo_records(&bytes)?;
                 expected = end;
             }
+            // The rules the last increment carries replace the base's.
+            if let Some(dir) = incr_dirs
+                .iter()
+                .map(AsRef::as_ref)
+                .rev()
+                .find(|d| d.join(crate::reason::rules::RULE_DIR).is_dir())
+            {
+                db.reason_home.mem = crate::reason::store::read_rule_dir(dir)?;
+            }
             Ok(())
         })();
         db.redo_log = saved;
-        db.backup_offset.set(expected);
+        db.backup_offset.store(expected, Ordering::SeqCst);
         outcome.map(|()| db)
-    }
-
-    /// File-level backup of a *persisted* database directory `src` into `dst`,
-    /// copying every database file present (the bincode snapshot, the on-disk
-    /// KVstore, and the update log) without loading anything into memory. Use
-    /// this to back up an on-disk (`build_disk`) database.
-    pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
-        let (src, dst) = (src.as_ref(), dst.as_ref());
-        if !src.is_dir() {
-            return Err(GStoreError::Database(format!(
-                "backup source '{}' is not a directory",
-                src.display()
-            )));
-        }
-        fs::create_dir_all(dst)?;
-        for name in [
-            DICT_FILE,
-            STORE_FILE,
-            NAMED_FILE,
-            META_FILE,
-            VSTREE_FILE,
-            KV_FILE,
-            VSTREE_KV_FILE,
-            UPDATE_LOG_FILE,
-        ] {
-            let s = src.join(name);
-            if s.is_file() {
-                fs::copy(&s, dst.join(name))?;
-            }
-        }
-        Ok(())
     }
 
     // ---- update log -------------------------------------------------------
@@ -1520,10 +3082,9 @@ impl Database {
             }
             let _millis = it.next();
             let _changed = it.next();
-            let len: usize = it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database("missing length in update.log record".into()))?;
+            let len: usize = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                GStoreError::Database("missing length in update.log record".into())
+            })?;
             let start = nl + 1;
             let end = start + len;
             if end > bytes.len() {
@@ -1580,16 +3141,18 @@ impl Database {
             return;
         }
         let (Some(s), Some(p), Some(o)) = (
-            self.dict.id_to_string(id.sub),
-            self.dict.predicate_to_string(id.pred),
-            self.dict.id_to_string(id.obj),
+            self.dict.term(id.sub),
+            self.dict.pred(id.pred),
+            self.dict.term(id.obj),
         ) else {
             return;
         };
-        let triple = format!("{s} {p} {o} .");
+        // Each term as the N-Triples reader reads it back: an IRI the
+        // lenient readers let in (holding `>`, `\`, a space…) is escaped.
+        let triple = format!("{} {} {} .", export_key(&s), export_key(&p), export_key(&o));
         let graph = graph
-            .and_then(|g| self.dict.id_to_string(g))
-            .map(|g| strip_angle(g).to_owned());
+            .and_then(|g| self.dict.term(g))
+            .map(|g| strip_angle(&g).to_owned());
         self.redo_pending.push(RedoRec { op, graph, triple });
         if self.txn.is_none() {
             // Auto-commit: the mutation is already durable, so flush now.
@@ -1652,6 +3215,7 @@ impl Database {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| GStoreError::Database("missing triple length in redo.log".into()))?;
+            let named = it.next() == Some("G");
             let gstart = nl + 1;
             let gend = gstart + glen;
             let tend = gend + tlen;
@@ -1662,11 +3226,43 @@ impl Database {
                 .map_err(|_| GStoreError::Database("non-UTF-8 redo.log graph".into()))?;
             let triple_str = std::str::from_utf8(&bytes[gend..tend])
                 .map_err(|_| GStoreError::Database("non-UTF-8 redo.log triple".into()))?;
-            let graph_opt = if graph.is_empty() { None } else { Some(graph) };
-            for t in turtle::parse_str(triple_str)? {
+            // A named-graph record is flagged `G`; without the flag (a log
+            // written before it existed) a non-empty graph is named.
+            let graph_opt = if named || !graph.is_empty() {
+                Some(graph)
+            } else {
+                None
+            };
+            match op {
+                // CLEAR / DROP (and the clears of MOVE / COPY).
+                'C' => {
+                    match graph_opt {
+                        None => {
+                            self.clear_default()?;
+                        }
+                        Some(g) => {
+                            self.clear_named(g);
+                        }
+                    }
+                    self.flush_reclaim();
+                    applied += 1;
+                    pos = (tend + 1).min(bytes.len());
+                    continue;
+                }
+                'N' => {
+                    self.clear_all_named();
+                    self.flush_reclaim();
+                    applied += 1;
+                    pos = (tend + 1).min(bytes.len());
+                    continue;
+                }
+                _ => {}
+            }
+            // N-Triples (verbatim blank labels: the record names stored nodes).
+            for t in crate::parser::ntriples::parse_str(triple_str)? {
                 match op {
                     'I' => {
-                        self.insert_quad(&t, graph_opt);
+                        self.insert_quad(&t, graph_opt)?;
                     }
                     'D' => {
                         self.delete_quad(&t, graph_opt);
@@ -1678,46 +3274,14 @@ impl Database {
                     }
                 }
             }
+            self.flush_reclaim();
             applied += 1;
             pos = (tend + 1).min(bytes.len());
         }
         Ok(applied)
     }
 
-    // ---- id freelist reclamation (gStore freeEntityID etc.) ----------------
-
-    /// Conservative id-reclamation pass (gStore's `freelist` rebuild): free the
-    /// dictionary id of every term that no longer appears anywhere — neither in
-    /// the default graph nor any named graph — so those ids can be reused by
-    /// future interns. Returns the number of ids reclaimed.
-    ///
-    /// "Referenced" means: an id used as a subject or object (entity/literal
-    /// space), as a predicate (predicate space), or as a named-graph IRI. Only
-    /// truly-unreferenced ids are freed, so the store stays consistent.
-    pub fn reclaim_unused(&mut self) -> usize {
-        let mut ent_lit: HashSet<EntityLiteralId> = HashSet::new();
-        let mut preds: HashSet<PredId> = HashSet::new();
-
-        // Default graph.
-        for id in self.store.subject_keys() {
-            ent_lit.insert(id);
-        }
-        for id in self.store.object_keys() {
-            ent_lit.insert(id);
-        }
-        for p in self.store.predicates() {
-            preds.insert(p);
-        }
-        // Named graphs, plus their graph-IRI entity ids.
-        for (&gid, s) in &self.named {
-            ent_lit.insert(gid);
-            ent_lit.extend(s.subject_keys());
-            ent_lit.extend(s.object_keys());
-            preds.extend(s.predicates());
-        }
-
-        self.dict.reclaim_unused(&ent_lit, &preds)
-    }
+    // (Id reclamation lives in the `reclaim` module.)
 
     // ---- user-defined reasoning rules (gStore ReasonHelper) ----------------
 
@@ -1758,38 +3322,492 @@ impl Database {
     /// inferred triples are recorded for transaction rollback like
     /// [`materialize_rdfs`](Self::materialize_rdfs).
     pub fn run_rules(&mut self) -> usize {
-        let added = self.rules.apply(&mut self.dict, &mut self.store);
-        let n = added.len();
-        if n > 0 {
-            self.index_valid = false;
-            self.query_cache.get_mut().clear();
-            if let Some(log) = self.txn.as_mut() {
-                for t in &added {
-                    log.push(UndoOp::Del(None, *t));
+        let mut rules = std::mem::take(&mut self.rules);
+        let added = self.infer(|dict, store, insert| rules.apply_with(dict, store, insert));
+        self.rules = rules;
+        self.record_inferred(added)
+    }
+
+    // ---- upstream reasoning rules (`reasonManage`) --------------------------
+    //
+    // The lifecycle of upstream gStore's JSON rules — add, list, compile,
+    // execute, disable, show, delete, check — implemented in
+    // `crate::reason::manage` (see its docs for the states, the `Rule:`
+    // predicates and the ledger that makes retraction exact). Rules live in
+    // `<dir>/reason_rule_files/` for a database with a directory, else in
+    // memory (see `reason_db_dir`).
+
+    /// The directory whose `reason_rule_files/` holds this database's
+    /// upstream-format reasoning rules: the one set with
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), else the database's
+    /// [`home`](Self::home). `None`: the rules are kept in memory and live as
+    /// long as this value — [`backup`](Self::backup) writes them into the
+    /// backup, and [`save`](Self::save) into the saved directory when there
+    /// are any (open the saved directory, or
+    /// [`set_reason_db_dir`](Self::set_reason_db_dir), to keep managing them
+    /// there).
+    pub fn reason_db_dir(&self) -> Option<PathBuf> {
+        self.reason_home.dir.clone().or_else(|| self.home.clone())
+    }
+
+    /// Keep this database's reasoning rules in `<dir>/reason_rule_files/`
+    /// (a server sets it to the directory it serves the database from, which
+    /// a database built in memory and saved there does not know as its
+    /// [`home`](Self::home)). Rules held in memory until now are not moved.
+    pub fn set_reason_db_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.reason_home.dir = Some(dir.into());
+    }
+
+    /// Run `f` with this database and its rule store.
+    fn with_rule_store<R>(
+        &mut self,
+        f: impl FnOnce(&mut Database, &mut crate::reason::store::RuleStore<'_>) -> R,
+    ) -> R {
+        use crate::reason::store::RuleStore;
+        match self.reason_db_dir() {
+            Some(dir) => f(self, &mut RuleStore::dir(dir)),
+            None => {
+                let mut mem = std::mem::take(&mut self.reason_home.mem);
+                let out = f(self, &mut RuleStore::Memory(&mut mem));
+                self.reason_home.mem = mem;
+                out
+            }
+        }
+    }
+
+    /// Add an upstream reasoning rule (`reasonManage` type 1) from its JSON
+    /// object (`rulename`, `type`, `logic`, `conditions`, `return`, …; see
+    /// [`crate::reason::rules`]). It is validated — so that it can never
+    /// inject SPARQL — and stored with status `新建`.
+    pub fn reason_add(
+        &mut self,
+        ruleinfo: &crate::json::Json,
+    ) -> std::result::Result<crate::reason::manage::Added, crate::reason::ReasonError> {
+        let now = crate::sysdb::clock::now().datetime();
+        self.with_rule_store(|_, store| crate::reason::manage::add(store, ruleinfo, &now))
+    }
+
+    /// Every reasoning rule's JSON, by name (type 2).
+    pub fn reason_list(
+        &mut self,
+    ) -> std::result::Result<Vec<crate::json::Json>, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::list(store))
+    }
+
+    /// Compile a rule to its SPARQL statements (type 3; status `已编译`).
+    pub fn reason_compile(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::CompiledRule, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::compile(store, name))
+    }
+
+    /// Execute a compiled rule (type 4; status `已执行`): its `INSERT … WHERE`
+    /// runs through the normal update path, and the triples it infers are
+    /// recorded so that [`reason_disable`](Self::reason_disable) retracts
+    /// exactly them. Refused inside a transaction.
+    pub fn reason_execute(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Executed, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| crate::reason::manage::execute(db, store, name, None))
+    }
+
+    /// Disable a compiled rule (type 5; status `已失效`), retracting the
+    /// triples it inferred that no other rule also inferred. Refused inside
+    /// a transaction.
+    pub fn reason_disable(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Disabled, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| {
+            crate::reason::manage::disable(db, store, name, None, |db| db.persist_for_rules())
+        })
+    }
+
+    /// A rule's JSON (type 6).
+    pub fn reason_show(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::json::Json, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::show(store, name))
+    }
+
+    /// Delete a rule that is not executed (type 7); returns upstream's
+    /// message.
+    pub fn reason_delete(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<String, crate::reason::ReasonError> {
+        self.with_rule_store(|_, store| crate::reason::manage::delete(store, name))
+    }
+
+    /// Count a compiled rule's matches (type 8; `effectNum`, status
+    /// `已校验` unless executed).
+    pub fn reason_check(
+        &mut self,
+        name: &str,
+    ) -> std::result::Result<crate::reason::manage::Checked, crate::reason::ReasonError> {
+        self.with_rule_store(|db, store| {
+            crate::reason::manage::check(store, name, |sparql| db.query(sparql))
+        })
+    }
+
+    /// Make the data durable where this database's rules (and their
+    /// ledgers) live, before a disable empties a ledger: a snapshot database
+    /// whose rules are kept in its [`home`](Self::home) is saved there; the
+    /// persistent layouts are at a commit point already ([`sync`](Self::sync)).
+    fn persist_for_rules(&self) -> Result<()> {
+        if self.storage() == crate::StorageKind::Snapshot {
+            if let Some(home) = self.home.clone() {
+                if self
+                    .reason_db_dir()
+                    .is_some_and(|d| fsutil::same_dir(&d, &home))
+                {
+                    return self.save(&home);
                 }
             }
         }
-        n
+        self.sync()
     }
 
-    // ---- query-cache capacity --------------------------------------------
-
-    /// Resize the read-query LRU cache, clearing it. A capacity of 0 disables
-    /// caching entirely.
-    pub fn set_query_cache_capacity(&mut self, cap: usize) {
-        *self.query_cache.get_mut() = LruCache::new(cap);
+    /// Whether the default graph holds `t` (no interning).
+    pub(crate) fn contains_triple(&self, t: &Triple) -> bool {
+        let (Some(sub), Some(pred), Some(obj)) = (
+            self.dict.entity_id(&t.subject.dict_key()),
+            self.dict.predicate_id(&t.predicate.dict_key()),
+            self.dict.term_id(&t.object),
+        ) else {
+            return false;
+        };
+        self.store.exists(sub, pred, obj)
     }
 
-    /// Number of entries currently in the read-query cache (tests).
-    #[cfg(test)]
-    fn query_cache_len(&self) -> usize {
-        self.query_cache.borrow().len()
+    /// Run a rule's compiled `INSERT … WHERE` (one operation, default graph)
+    /// through the update path, reporting which triples it derived, which
+    /// of them existed before, and which it added. The WHERE clause is
+    /// evaluated **once** and exactly the triples that evaluation derived are
+    /// inserted (as `INSERT DATA`; the update log records `sparql`), so a
+    /// filter that is not deterministic (`RAND()`, `NOW()`, …) can never
+    /// insert a triple the ledger does not record. An error before anything
+    /// was applied (parse, WHERE evaluation, cancellation) is `Err`; the
+    /// insert's own outcome is the report's `result`.
+    ///
+    /// `record` is called with every derived triple's ledger line and
+    /// whether it exists, after the evaluation and before anything is
+    /// inserted (the rule records what it is about to insert — see
+    /// [`crate::reason::manage::execute`]); when it fails nothing is
+    /// inserted and its message is the error.
+    pub(crate) fn reason_infer(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        record: impl FnOnce(&[(String, bool)]) -> std::result::Result<(), String>,
+    ) -> Result<crate::reason::manage::InferReport> {
+        use crate::reason::manage::{ledger_line, InferReport};
+        let Query::Update(ops) = sparql::parse(sparql)? else {
+            return Err(GStoreError::Query(
+                "a reasoning rule must compile to an update".into(),
+            ));
+        };
+        let [UpdateOp::Modify {
+            with: None,
+            delete,
+            insert,
+            using,
+            using_named,
+            pattern,
+        }] = ops.as_slice()
+        else {
+            return Err(GStoreError::Query(
+                "a reasoning rule must compile to one INSERT … WHERE".into(),
+            ));
+        };
+        // The static checks the update path runs before applying anything.
+        {
+            let mut eval = Evaluator::new(&self.dict, &self.store);
+            if !self.functions.is_empty() {
+                eval = eval.with_functions(self.functions.clone());
+            }
+            eval.check_update_calls(&ops)?;
+        }
+        let (_, ins) = self.modify_changes(
+            delete,
+            insert,
+            pattern,
+            None,
+            using,
+            using_named,
+            cancel.as_ref(),
+            None,
+        )?;
+        let mut seen = HashSet::new();
+        let mut derived: Vec<(String, bool, Triple)> = Vec::new();
+        for (g, t) in &ins {
+            if g.is_some() {
+                continue;
+            }
+            let line = ledger_line(t);
+            if seen.insert(line.clone()) {
+                let existed = self.contains_triple(t);
+                derived.push((line, existed, t.clone()));
+            }
+        }
+        let lines: Vec<(String, bool)> = derived.iter().map(|(l, e, _)| (l.clone(), *e)).collect();
+        record(&lines).map_err(GStoreError::Database)?;
+        let ground = ins
+            .into_iter()
+            .map(|(graph, t)| GroundTriple {
+                subject: t.subject,
+                predicate: t.predicate,
+                object: t.object,
+                graph,
+            })
+            .collect();
+        let result = match self.run_update(sparql, vec![UpdateOp::InsertData(ground)], cancel, None)
+        {
+            Ok(QueryResult::Update { changed }) => Ok(changed),
+            Ok(_) => Ok(0),
+            Err(e) => Err(e.to_string()),
+        };
+        let inserted = derived
+            .iter()
+            .filter(|(_, existed, t)| !existed && self.contains_triple(t))
+            .map(|(line, _, _)| line.clone())
+            .collect();
+        Ok(InferReport {
+            derived: lines,
+            inserted,
+            result,
+        })
+    }
+
+    /// Retract the triples of ledger `lines` (see
+    /// [`crate::reason::manage`]) as one `DELETE DATA` through the update
+    /// path. Returns how many were removed; fails, removing nothing, when a
+    /// line cannot be read back. The opt-in statement log
+    /// (`update.log`) records that `DELETE DATA` text; a blank node in it is
+    /// written as its stored label, which SPARQL does not accept in `DELETE
+    /// DATA`, so replaying such a record fails (the triple-level redo log is
+    /// unaffected).
+    pub(crate) fn reason_retract(
+        &mut self,
+        lines: &[String],
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
+        let mut ground = Vec::with_capacity(lines.len());
+        let mut text = String::from("DELETE DATA {");
+        for line in lines {
+            // A line that cannot be read back fails the whole retraction
+            // (nothing is deleted, the ledger stays): skipping it would
+            // leave its triple behind with no rule owning it.
+            let Some(t) = crate::reason::manage::parse_ledger_line(line) else {
+                let shown: String = line.escape_debug().take(200).collect();
+                return Err(GStoreError::Database(format!(
+                    "the rule's ledger holds a line that cannot be read back (\"{shown}\"); \
+                     nothing was retracted"
+                )));
+            };
+            text.push_str(&format!(" {} {} {} .", t.subject, t.predicate, t.object));
+            ground.push(GroundTriple {
+                subject: t.subject,
+                predicate: t.predicate,
+                object: t.object,
+                graph: None,
+            });
+        }
+        text.push_str(" }");
+        if ground.is_empty() {
+            return Ok(0);
+        }
+        match self.run_update(&text, vec![UpdateOp::DeleteData(ground)], cancel, None)? {
+            QueryResult::Update { changed } => Ok(changed),
+            _ => Ok(0),
+        }
+    }
+
+    /// Run SPARQL UPDATE `sparql` (a rule's compiled statement) through the
+    /// update path; the number of triples changed.
+    pub(crate) fn reason_update(
+        &mut self,
+        sparql: &str,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<usize> {
+        let Query::Update(ops) = sparql::parse(sparql)? else {
+            return Err(GStoreError::Query("not an update".into()));
+        };
+        match self.run_update(sparql, ops, cancel, None)? {
+            QueryResult::Update { changed } => Ok(changed),
+            _ => Ok(0),
+        }
+    }
+
+    /// Carry this database's reasoning rules into backup directory `dst`
+    /// (upstream's backup copies the whole database directory).
+    fn backup_reason_rules(&self, dst: &Path) -> Result<()> {
+        match self.reason_db_dir() {
+            Some(src) => crate::reason::store::copy_rule_dir(&src, dst),
+            None => crate::reason::store::write_memory_rules(&self.reason_home.mem, dst),
+        }
+    }
+
+    // ---- query cache / evaluation options ---------------------------------
+
+    /// Set the read-query cache's memory budget in (approximate) bytes,
+    /// clearing it; 0 disables caching. The default is
+    /// [`DEFAULT_QUERY_CACHE_BYTES`] (64 MiB). A single result larger than
+    /// an eighth of the budget is never cached; least-recently-used results
+    /// are evicted to make room. Only deterministic read queries are cached
+    /// (none calling `NOW()`, `RAND()`, `UUID()`, `STRUUID()`, `BNODE()`, a
+    /// user function, or using `SERVICE`), and every data change empties the
+    /// cache. Upstream gStore hard-codes its budget (100 MB); the servers set
+    /// this from `conf.ini`'s `[query] query_cache_size` (bytes, see
+    /// [`QuerySettings`]).
+    pub fn set_query_cache_size(&mut self, bytes: usize) {
+        *self.query_cache_mut() = QueryCache::new(bytes);
+    }
+
+    /// The read-query cache's budget in bytes (see
+    /// [`set_query_cache_size`](Self::set_query_cache_size)).
+    pub fn query_cache_size(&self) -> usize {
+        self.query_cache().budget()
+    }
+
+    /// Number of results currently in the read-query cache.
+    pub fn query_cache_len(&self) -> usize {
+        self.query_cache().len()
+    }
+
+    /// Approximate bytes the read-query cache currently holds.
+    pub fn query_cache_bytes(&self) -> usize {
+        self.query_cache().bytes()
+    }
+
+    /// Choose how `/` divides two integers in this database's queries and
+    /// updates: [`IntegerDivision::Decimal`] (the default, SPARQL 1.1:
+    /// `7/2` = `3.5`) or [`IntegerDivision::Truncate`] (upstream gStore
+    /// compatibility: `7/2` = `3`, and `AVG` over integers truncates).
+    /// Clears the query cache. The servers set this from `conf.ini`'s
+    /// `[query] integer_division` (`decimal` | `truncate`, see
+    /// [`IntegerDivision::parse`] and [`QuerySettings`]).
+    pub fn set_integer_division(&mut self, mode: IntegerDivision) {
+        if self.integer_division != mode {
+            self.integer_division = mode;
+            self.query_cache_mut().clear();
+        }
+    }
+
+    /// The current integer-division mode (see
+    /// [`set_integer_division`](Self::set_integer_division)).
+    pub fn integer_division(&self) -> IntegerDivision {
+        self.integer_division
+    }
+
+    /// Choose which `LIMIT` / `ORDER BY` / `ASK` / `EXISTS` optimizations
+    /// this database's queries may use: early termination, the bounded-heap
+    /// Top-K and DP-B (see [`TopKOptions`]; all on by default). Every one
+    /// returns exactly the rows the full evaluation returns, so this only
+    /// changes how much work a query does — it exists for testing and
+    /// benchmarking ([`TopKOptions::NONE`] evaluates every query in full).
+    /// Clears the query cache, so the next query really runs with the new
+    /// options. The servers set this from `conf.ini`'s `[query]` keys
+    /// `early_termination`, `topk_bounded_heap` and `topk_dpb` (see
+    /// [`QuerySettings`]).
+    pub fn set_topk_options(&mut self, options: TopKOptions) {
+        if self.topk != options {
+            self.topk = options;
+            self.query_cache_mut().clear();
+        }
+    }
+
+    /// The current Top-K / early-termination options (see
+    /// [`set_topk_options`](Self::set_topk_options)).
+    pub fn topk_options(&self) -> TopKOptions {
+        self.topk
+    }
+
+    /// Bound the JSON one call of a gStore advanced graph function
+    /// (`shortestPaths(…)`, `kHopEnumerate(…)`, `PR(…)`, …) may produce in
+    /// this database's queries: a call that would exceed it fails with a
+    /// query error instead of building an unbounded result (upstream has no
+    /// bound). The default is
+    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES)
+    /// (256 MiB); the servers apply `conf.ini`'s `gfun_max_output_bytes`
+    /// (64 MiB by default, see [`crate::config`]). Clears the query cache.
+    pub fn set_gfun_max_output_bytes(&mut self, bytes: usize) {
+        if self.gfun_max_output_bytes != bytes {
+            self.gfun_max_output_bytes = bytes;
+            self.query_cache_mut().clear();
+        }
+    }
+
+    /// The graph-function output bound (see
+    /// [`set_gfun_max_output_bytes`](Self::set_gfun_max_output_bytes)).
+    pub fn gfun_max_output_bytes(&self) -> usize {
+        self.gfun_max_output_bytes
+    }
+
+    /// Let this database's queries call `caller`'s PFN functions
+    /// (`PFN.name({…})`, see [`crate::pfn`]); `None` (the default) makes a PFN
+    /// call a query error. For an embedded database this is the one caller
+    /// every query runs as; a server leaves it unset and passes the
+    /// authenticated user with each query ([`query_as`](Self::query_as)).
+    /// [`ConcurrentDb`](crate::ConcurrentDb) snapshots carry it. The caller's
+    /// limits are replaced by this database's
+    /// ([`set_pfn_limits`](Self::set_pfn_limits)) when a query runs.
+    pub fn set_pfn_caller(&mut self, caller: Option<crate::pfn::PfnCaller>) {
+        self.pfn = caller;
+    }
+
+    /// The installed PFN caller (see [`set_pfn_caller`](Self::set_pfn_caller)),
+    /// with this database's PFN limits.
+    pub fn pfn_caller(&self) -> Option<crate::pfn::PfnCaller> {
+        self.pfn.clone().map(|c| c.with_limits(self.pfn_limits))
+    }
+
+    /// The sandbox limits PFN calls of this database's queries run under
+    /// (instruction budget, memory; `conf.ini`'s `[pfn]` section). PFN results
+    /// are never cached, so no cache needs clearing.
+    pub fn set_pfn_limits(&mut self, limits: crate::pfn::PfnLimits) {
+        self.pfn_limits = limits;
+    }
+
+    /// The PFN limits (see [`set_pfn_limits`](Self::set_pfn_limits)).
+    pub fn pfn_limits(&self) -> crate::pfn::PfnLimits {
+        self.pfn_limits
+    }
+
+    /// Apply a server's query-evaluation settings ([`QuerySettings`], from
+    /// `conf.ini`'s `[query]` and `[pfn]` sections): integer-division mode,
+    /// query-cache budget, Top-K / early-termination options, graph-function
+    /// output bound and PFN limits. Each setter clears the query cache only
+    /// when its value changes.
+    pub fn apply_query_settings(&mut self, settings: &QuerySettings) {
+        self.set_integer_division(settings.integer_division);
+        if self.query_cache_size() != settings.query_cache_bytes {
+            self.set_query_cache_size(settings.query_cache_bytes);
+        }
+        self.set_topk_options(settings.topk);
+        self.set_gfun_max_output_bytes(settings.gfun_max_output_bytes);
+        self.set_pfn_limits(settings.pfn);
+    }
+
+    /// This database's current query-evaluation settings (see
+    /// [`apply_query_settings`](Self::apply_query_settings)).
+    pub fn query_settings(&self) -> QuerySettings {
+        QuerySettings {
+            integer_division: self.integer_division,
+            query_cache_bytes: self.query_cache_size(),
+            topk: self.topk,
+            gfun_max_output_bytes: self.gfun_max_output_bytes,
+            pfn: self.pfn_limits,
+        }
     }
 
     /// Whether a given SPARQL string is currently cached (tests).
     #[cfg(test)]
     fn query_cache_contains(&self, sparql: &str) -> bool {
-        self.query_cache.borrow().contains(sparql)
+        self.query_cache().contains(sparql)
     }
 
     // ---- bulk / parallel loaders -----------------------------------------
@@ -1810,7 +3828,7 @@ impl Database {
         let mut db = Database::new(name);
         let mut buf: Vec<IdTriple> = Vec::with_capacity(batch.min(1 << 20));
         crate::parser::ntriples::for_each_triple_file(path, |t| {
-            let id = db.encode_triple(&t);
+            let id = db.encode_triple(&t)?;
             buf.push(id);
             if buf.len() >= batch {
                 db.store.bulk_load(buf.drain(..).collect());
@@ -1825,20 +3843,83 @@ impl Database {
     }
 
     /// Build a database from an N-Triples file using `threads` parser threads
-    /// (gStore's multi-threaded load). The file is split into line-aligned
-    /// chunks parsed in parallel; interning + indexing run serially afterward
-    /// (the dictionary is the single synchronization point).
+    /// (gStore's multi-threaded load). The file streams in rounds of
+    /// `threads` line-aligned chunks of about 1 MiB, each round parsed in
+    /// parallel and then interned serially (the dictionary is the single
+    /// synchronization point) — memory holds one round of text, not the file.
+    /// Indexing runs once at the end.
     pub fn build_from_ntriples_parallel<P: AsRef<Path>>(
         name: impl Into<String>,
         path: P,
         threads: usize,
     ) -> Result<Database> {
-        let content = fs::read_to_string(path)?;
-        Database::build_from_ntriples_str_parallel(name, &content, threads)
+        use std::io::BufRead;
+        const CHUNK_BYTES: usize = 1 << 20;
+        let threads = threads.max(1);
+        let mut reader = std::io::BufReader::with_capacity(
+            crate::parser::stream::DEFAULT_WINDOW,
+            fs::File::open(path)?,
+        );
+        let mut db = Database::new(name);
+        let mut ids: Vec<IdTriple> = Vec::new();
+        let mut lines_before = 0usize;
+        loop {
+            // One round: up to `threads` chunks, each ending at a line break,
+            // with the number of lines that precede it (for error lines).
+            let mut chunks: Vec<(usize, String)> = Vec::with_capacity(threads);
+            for _ in 0..threads {
+                let mut buf = Vec::new();
+                let mut lines = 0usize;
+                while buf.len() < CHUNK_BYTES && reader.read_until(b'\n', &mut buf)? > 0 {
+                    lines += 1;
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let text = String::from_utf8(buf).map_err(|_| GStoreError::RdfParse {
+                    line: lines_before + 1,
+                    msg: "invalid UTF-8 in this chunk of the file".into(),
+                })?;
+                chunks.push((lines_before, text));
+                lines_before += lines;
+            }
+            if chunks.is_empty() {
+                break;
+            }
+            let parsed: Vec<Result<Vec<Triple>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|(before, text)| {
+                        scope.spawn(move || {
+                            crate::parser::ntriples::parse_str(text).map_err(|e| match e {
+                                GStoreError::RdfParse { line, msg } => GStoreError::RdfParse {
+                                    line: line + before,
+                                    msg,
+                                },
+                                other => other,
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("parser thread panicked"))
+                    .collect()
+            });
+            for chunk in parsed {
+                for t in chunk? {
+                    ids.push(db.encode_triple(&t)?);
+                }
+            }
+        }
+        db.store.bulk_load(ids);
+        db.rebuild_index();
+        Ok(db)
     }
 
     /// Parallel-parse an in-memory N-Triples document with `threads` threads,
-    /// then intern + index serially. See [`build_from_ntriples_parallel`].
+    /// then intern + index serially. See
+    /// [`build_from_ntriples_parallel`](Self::build_from_ntriples_parallel).
     pub fn build_from_ntriples_str_parallel(
         name: impl Into<String>,
         content: &str,
@@ -1862,7 +3943,7 @@ impl Database {
         let mut ids: Vec<IdTriple> = Vec::new();
         for chunk in parsed {
             for t in chunk? {
-                ids.push(db.encode_triple(&t));
+                ids.push(db.encode_triple(&t)?);
             }
         }
         db.store.bulk_load(ids);
@@ -1871,12 +3952,74 @@ impl Database {
     }
 }
 
+/// `Database` may be shared by reference across threads: its `&self` methods
+/// (reads, `save`, `sync`, backups) may run concurrently, its `&mut self`
+/// methods need exclusive access (contract C8).
+#[allow(dead_code)]
+fn assert_send_sync<T: Send + Sync>() {}
+const _: fn() = || assert_send_sync::<Database>();
+
+/// The error a statement fails with when a read inside it reported `msg`
+/// through [`note_read_error`](crate::store::read_scope::note_read_error).
+fn read_failure(what: &str, msg: String) -> GStoreError {
+    GStoreError::Database(format!("a read from the store failed while {what}: {msg}"))
+}
+
+/// The named-graph IRI of an imported quad (`None` = the default graph). The
+/// import pipeline has already turned a blank-node label into an IRI.
+fn graph_iri(graph: &Option<Term>) -> Option<String> {
+    match graph {
+        Some(Term::Iri(g)) => Some(g.clone()),
+        Some(Term::Blank(l)) => Some(format!("{}{l}", import::BNODE_GRAPH_PREFIX)),
+        Some(Term::Literal { .. }) | None => None,
+    }
+}
+
+/// Collects a streaming build: quads are encoded batch by batch; the default
+/// graph's ids (12 bytes a triple) are bulk-loaded once at the end, named
+/// graphs per graph.
+#[derive(Default)]
+pub(crate) struct BuildAccumulator {
+    default: Vec<IdTriple>,
+    named: HashMap<u32, Vec<IdTriple>>,
+}
+
+impl BuildAccumulator {
+    /// Encode a batch of quads into `db`'s dictionary.
+    pub(crate) fn add(&mut self, db: &mut Database, batch: &mut Vec<Quad>) -> Result<()> {
+        for q in batch.drain(..) {
+            let graph = graph_iri(&q.graph);
+            let id = db.encode_triple(&q.into_triple())?;
+            match graph {
+                None => self.default.push(id),
+                Some(g) => {
+                    let gid = db.dict.try_intern_entity(&Term::iri(g).dict_key())?;
+                    self.named.entry(gid).or_default().push(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load the collected ids into `db` and build its index.
+    pub(crate) fn finish(self, db: &mut Database) {
+        db.store.bulk_load(self.default);
+        for (gid, ids) in self.named {
+            db.named.bulk_load(gid, ids);
+        }
+        db.rebuild_index();
+    }
+}
+
 /// Append one UPDATE statement to the update log as a length-prefixed record:
 /// `REC <unix_millis> <changed> <byte_len>\n<sparql bytes>\n`. The length prefix
 /// makes the body opaque, so a statement may contain any bytes (including the
 /// record-delimiter text) without corrupting the log.
 fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1888,13 +4031,25 @@ fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
 }
 
 /// Append redo records to the redo log. Each record is length-prefixed:
-/// `REDO <op> <graph_len> <triple_len>\n<graph bytes><triple bytes>\n`. The
-/// lengths make the graph/triple bodies opaque, so they may hold any bytes.
+/// `REDO <op> <graph_len> <triple_len>[ G]\n<graph bytes><triple bytes>\n`,
+/// `G` marking a named-graph record (so a graph whose IRI is empty is not
+/// taken for the default graph). The lengths make the graph/triple bodies
+/// opaque, so they may hold any bytes.
 fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     for r in recs {
         let g = r.graph.as_deref().unwrap_or("");
-        writeln!(f, "REDO {} {} {}", r.op as char, g.len(), r.triple.len())?;
+        let flag = if r.graph.is_some() { " G" } else { "" };
+        writeln!(
+            f,
+            "REDO {} {} {}{flag}",
+            r.op as char,
+            g.len(),
+            r.triple.len()
+        )?;
         f.write_all(g.as_bytes())?;
         f.write_all(r.triple.as_bytes())?;
         f.write_all(b"\n")?;
@@ -1915,10 +4070,9 @@ fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
     for line in lines {
         let mut it = line.split_whitespace();
         if it.next() == Some(key) {
-            return it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database(format!("marker field '{key}' is not a u64")));
+            return it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                GStoreError::Database(format!("marker field '{key}' is not a u64"))
+            });
         }
     }
     Err(GStoreError::Database(format!(
@@ -1928,8 +4082,10 @@ fn marker_field(text: &str, magic: &str, key: &str) -> Result<u64> {
 
 /// Write a full-backup checkpoint marker: `GSTORE-BACKUP 1\noffset <N>\n`.
 fn write_backup_offset(path: &Path, offset: u64) -> Result<()> {
-    fs::write(path, format!("GSTORE-BACKUP 1\noffset {offset}\n"))?;
-    Ok(())
+    fsutil::atomic_write(
+        path,
+        format!("GSTORE-BACKUP 1\noffset {offset}\n").as_bytes(),
+    )
 }
 
 /// Read a full-backup checkpoint marker's `offset`.
@@ -1941,11 +4097,10 @@ fn read_backup_offset(path: &Path) -> Result<u64> {
 /// Write an incremental-backup marker:
 /// `GSTORE-INCREMENTAL 1\nbase_offset <B>\nend_offset <E>\n`.
 fn write_incremental_marker(path: &Path, base: u64, end: u64) -> Result<()> {
-    fs::write(
+    fsutil::atomic_write(
         path,
-        format!("GSTORE-INCREMENTAL 1\nbase_offset {base}\nend_offset {end}\n"),
-    )?;
-    Ok(())
+        format!("GSTORE-INCREMENTAL 1\nbase_offset {base}\nend_offset {end}\n").as_bytes(),
+    )
 }
 
 /// Read an incremental-backup marker's `(base_offset, end_offset)`.
@@ -2000,19 +4155,6 @@ fn split_lines(content: &str, n: usize) -> Vec<&str> {
     chunks
 }
 
-fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let file = fs::File::create(path)?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, value)?;
-    Ok(())
-}
-
-fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let file = fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    Ok(bincode::deserialize_from(reader)?)
-}
-
 /// Remove a pager-backed file and its sibling `<path>.wal`, ignoring absence.
 /// Used before a fresh disk build so a stale WAL from a crashed prior build can
 /// never replay into the new file (see [`crate::kvstore::pager`] recovery).
@@ -2041,6 +4183,64 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gstore_ut_{tag}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// An UPDATE's WHERE clause runs under the request's cancel flag, like a
+    /// read: a graph function in a sub-SELECT there (which may run for as
+    /// long as its `maxIter` says) is stopped by it, and a cancelled update
+    /// applies nothing — whichever dataset (`WITH`, `USING`, default) the
+    /// WHERE clause matches.
+    #[test]
+    fn updates_honour_the_cancel_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut db = Database::build_from_str("t", "").unwrap();
+        db.query(
+            "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> . \
+             <http://ex/b> <http://ex/p> <http://ex/c> . <http://ex/c> <http://ex/p> <http://ex/a> . \
+             GRAPH <http://ex/g> { <http://ex/a> <http://ex/p> <http://ex/b> } }",
+        )
+        .unwrap();
+        let before = db.mutation_count();
+        let sub = |iters: &str| {
+            format!(
+                "{{ SELECT (PR(true, {{}}, 3, alpha=0.85, maxIter={iters}, tol=-1) AS ?r) WHERE {{}} }}"
+            )
+        };
+        let forms = |iters: &str| {
+            let s = sub(iters);
+            [
+                format!("INSERT {{ <http://ex/x> <http://ex/pr> ?r }} WHERE {{ {s} }}"),
+                format!("WITH <http://ex/g> INSERT {{ <http://ex/x> <http://ex/pr> ?r }} WHERE {{ {s} }}"),
+                format!(
+                    "INSERT {{ <http://ex/x> <http://ex/pr> ?r }} USING <http://ex/g> WHERE {{ {s} }}"
+                ),
+                format!("DELETE {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o {s} }}"),
+            ]
+        };
+        // Flag already up: refused before anything is applied.
+        for u in forms("5") {
+            let r = db.query_cancellable(&u, Arc::new(AtomicBool::new(true)));
+            assert!(matches!(r, Err(GStoreError::Cancelled)), "{u}: {r:?}");
+            assert_eq!(db.mutation_count(), before, "{u}");
+        }
+        // Raised while a never-converging PageRank runs in the WHERE clause.
+        let u = &forms("2000000000")[0];
+        let flag = Arc::new(AtomicBool::new(false));
+        let raise = Arc::clone(&flag);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            raise.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let r = db.query_cancellable(u, flag);
+        stopper.join().unwrap();
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert_eq!(db.mutation_count(), before);
+        // Without a cancel the same statements run.
+        let r = db.query(&forms("5")[0]).unwrap();
+        assert!(matches!(r, QueryResult::Update { changed: 1 }), "{r:?}");
     }
 
     #[test]
@@ -2192,11 +4392,7 @@ mod tests {
 
         let mut accumulated = SMALL.to_string();
         for (s, p, o) in extra {
-            assert!(inc.insert_triple(&Triple::new(
-                Term::iri(s),
-                Term::iri(p),
-                Term::iri(o)
-            )));
+            assert!(inc.insert_triple(&Triple::new(Term::iri(s), Term::iri(p), Term::iri(o))));
             // The whole point of task 1: the index is *not* invalidated.
             assert!(
                 inc.stats().index_valid,
@@ -2235,11 +4431,7 @@ mod tests {
         for i in 0..n {
             let s = format!("e{i}");
             let o = format!("t{}", i % 23);
-            assert!(inc.insert_triple(&Triple::new(
-                Term::iri(&s),
-                Term::iri("p"),
-                Term::iri(&o)
-            )));
+            assert!(inc.insert_triple(&Triple::new(Term::iri(&s), Term::iri("p"), Term::iri(&o))));
             accumulated.push_str(&format!("<{s}> <p> <{o}> .\n"));
         }
         assert!(
@@ -2262,11 +4454,12 @@ mod tests {
         }
     }
 
-    /// A delete invalidates the index (documented behaviour); a subsequent query
-    /// still returns correct results (it evaluates without the stale tree, or
-    /// after a rebuild on save), and inserts after the delete leave it stale.
+    /// A delete leaves the index valid (its entries stay sound supersets) and
+    /// counts one unit of shrink debt; queries return the correct results
+    /// through the tree, and a rebuild clears the debt. (Before Phase 6 a
+    /// delete invalidated the index.)
     #[test]
-    fn delete_invalidates_then_results_stay_correct() {
+    fn delete_keeps_the_index_valid_and_results_correct() {
         let mut db = Database::build_from_str("d", SMALL).unwrap();
         assert!(db.stats().index_valid);
         assert!(db.remove_triple(&Triple::new(
@@ -2274,17 +4467,260 @@ mod tests {
             Term::iri("own"),
             Term::iri("point0")
         )));
-        assert!(!db.stats().index_valid, "a delete invalidates the index");
+        assert!(db.stats().index_valid, "a delete keeps the index valid");
+        assert_eq!(db.vs_shrink_debt(), 1);
 
         let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
         let got: Vec<_> = rs.rows.iter().map(|r| r[0].clone().unwrap()).collect();
         assert_eq!(got, vec!["<point1>".to_string()], "point0 was deleted");
 
-        // Rebuilding restores a valid index and the same answer.
+        // Rebuilding clears the debt and gives the same answer.
         db.rebuild_index();
         assert!(db.stats().index_valid);
+        assert_eq!(db.vs_shrink_debt(), 0);
         let rs = db.select("SELECT ?o WHERE { <node1> <own> ?o }").unwrap();
         assert_eq!(rs.row_count(), 1);
+    }
+
+    /// Deletes (and a rollback's removal of inserts) leave the VS-tree valid
+    /// as a sound superset, and a rollback that re-adds deleted triples
+    /// re-signs their entities: after every step, each entity whose current
+    /// signature contains a query is among the tree's candidates, and the
+    /// answers equal those of a fresh build.
+    #[test]
+    fn vstree_stays_a_sound_superset_under_deletes_and_rollbacks() {
+        let mut seed = 0x5EED_u64;
+        let mut next = move |n: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        let triple = |s: u32, p: u32, o: u32| {
+            Triple::new(
+                Term::iri(format!("http://ex/e{s}")),
+                Term::iri(format!("http://ex/p{p}")),
+                Term::iri(format!("http://ex/e{o}")),
+            )
+        };
+        let mut text = String::new();
+        for _ in 0..1500 {
+            let (s, p, o) = (next(300), next(6), next(300));
+            text.push_str(&format!(
+                "<http://ex/e{s}> <http://ex/p{p}> <http://ex/e{o}> .\n"
+            ));
+        }
+        let mut db = Database::build_from_str("vs", &text).unwrap();
+        let check = |db: &mut Database, step: usize| {
+            assert!(db.stats().index_valid, "step {step}: the index stays valid");
+            let truth = vstree_entries(&db.store);
+            assert_eq!(
+                truth,
+                backend_vstree_entries(&db.store),
+                "step {step}: fast path"
+            );
+            for &(e, sig) in truth.iter().step_by(7) {
+                // A query made of each real edge of `e` must find `e`.
+                for &(p, o) in &db.store.po_by_s(e) {
+                    let mut q = Signature::new();
+                    q.encode_query_edge(Some(p), Some(o), EdgeDir::Out);
+                    assert!(sig.contains(&q));
+                    let cands = db.vstree.candidates(&q).unwrap();
+                    assert!(cands.contains(&e), "step {step}: entity {e} pruned");
+                    assert!(db.vstree.probe(e, &q), "step {step}: probe misses {e}");
+                }
+            }
+            let q = "SELECT ?s ?o WHERE { ?s <http://ex/p1> ?o . ?o <http://ex/p2> ?x }";
+            let mut a = db.select(q).unwrap().rows;
+            let saved = db.index_valid;
+            db.index_valid = false;
+            let mut b = db.select(q).unwrap().rows;
+            db.index_valid = saved;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "step {step}: the tree changed an answer");
+        };
+        for step in 0..60 {
+            match step % 4 {
+                // Plain deletes and inserts.
+                0 | 1 => {
+                    for _ in 0..40 {
+                        db.remove_triple(&triple(next(300), next(6), next(300)));
+                    }
+                    for (s, p, o) in db
+                        .store
+                        .iter_all()
+                        .into_iter()
+                        .take(30)
+                        .map(|t| (t.sub, t.pred, t.obj))
+                    {
+                        db.remove_default_id(IdTriple::new(s, p, o));
+                    }
+                    for _ in 0..20 {
+                        db.insert_triple(&triple(next(300), next(6), next(300)));
+                    }
+                }
+                // A transaction deleting edges of an entity, then growing it
+                // (its entry is re-signed without the deleted edges), rolled
+                // back: the deleted edges come back and must be re-signed.
+                _ => {
+                    db.begin().unwrap();
+                    let victims: Vec<IdTriple> = db
+                        .store
+                        .iter_all()
+                        .into_iter()
+                        .step_by(17)
+                        .take(25)
+                        .collect();
+                    for t in &victims {
+                        assert!(db.remove_default_id(*t));
+                    }
+                    for t in &victims {
+                        let subject = db.dict.id_to_string(t.sub).unwrap().to_owned();
+                        let grown = Triple::new(
+                            Term::from_dict_key(&subject).unwrap(),
+                            Term::iri(format!("http://ex/p{}", next(6))),
+                            Term::iri(format!("http://ex/e{}", next(300))),
+                        );
+                        db.insert_triple(&grown);
+                    }
+                    db.rollback().unwrap();
+                }
+            }
+            check(&mut db, step);
+        }
+        assert!(db.vs_shrink_debt() > 0);
+    }
+
+    /// Phase 6 R1 review: an insert into a valid index re-signed its subject
+    /// and object from every edge they have, so after a delete (which keeps
+    /// the index valid) each insert typing an entity into a large class read
+    /// the whole class, and a rollback re-adding a deleted class did so once
+    /// per triple — quadratic. An added edge only adds bits: it is ORed into
+    /// the entries in O(height), and only a new entity is signed from the
+    /// store. The answers stay those of an index-free evaluation.
+    #[test]
+    fn incremental_vstree_maintenance_does_not_rescan_hubs() {
+        let n = 3000;
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!(
+                "<http://ex/e{i}> <http://ex/type> <http://ex/Class> .\n"
+            ));
+        }
+        text.push_str("<http://ex/e0> <http://ex/knows> <http://ex/e1> .\n");
+        let mut db = Database::build_from_str("hub", &text).unwrap();
+        let resigned = || RESIGNED_EDGES.with(|c| c.replace(0));
+        let agree = |db: &mut Database, q: &str| {
+            let mut a = db.select(q).unwrap().rows;
+            let saved = db.index_valid;
+            db.index_valid = false;
+            let mut b = db.select(q).unwrap().rows;
+            db.index_valid = saved;
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "the tree changed the answer of {q}");
+            a.len()
+        };
+        resigned();
+        // A delete keeps the index valid; then 200 typings into the class.
+        db.query("DELETE DATA { <http://ex/e5> <http://ex/type> <http://ex/Class> }")
+            .unwrap();
+        let mut ins = String::from("INSERT DATA {\n");
+        for i in 0..200 {
+            ins.push_str(&format!(
+                "<http://ex/new{i}> <http://ex/type> <http://ex/Class> .\n"
+            ));
+        }
+        ins.push('}');
+        db.query(&ins).unwrap();
+        assert!(db.stats().index_valid);
+        let work = resigned();
+        assert!(
+            work <= 2 * 200,
+            "inserts re-read {work} edges (the class has {n})"
+        );
+        let q = "SELECT ?s WHERE { ?s <http://ex/type> <http://ex/Class> }";
+        assert_eq!(agree(&mut db, q), n - 1 + 200);
+        // Delete the whole class in a transaction and roll it back.
+        db.begin().unwrap();
+        db.query("DELETE WHERE { ?s <http://ex/type> <http://ex/Class> }")
+            .unwrap();
+        assert_eq!(agree(&mut db, q), 0);
+        db.rollback().unwrap();
+        assert!(db.stats().index_valid);
+        let work = resigned();
+        assert!(work <= 2 * n as u64, "the rollback re-read {work} edges");
+        assert_eq!(agree(&mut db, q), n - 1 + 200);
+        // A retyping (DELETE … INSERT … WHERE) moves the class wholesale.
+        db.query(
+            "DELETE { ?s <http://ex/type> <http://ex/Class> } \
+             INSERT { ?s <http://ex/type> <http://ex/Other> } \
+             WHERE { ?s <http://ex/type> <http://ex/Class> }",
+        )
+        .unwrap();
+        let work = resigned();
+        assert!(work <= 2 * n as u64, "the retyping re-read {work} edges");
+        let other = "SELECT ?s WHERE { ?s <http://ex/type> <http://ex/Other> }";
+        assert_eq!(agree(&mut db, other), n - 1 + 200);
+        assert_eq!(
+            agree(
+                &mut db,
+                "SELECT ?o WHERE { <http://ex/e0> <http://ex/knows> ?o }"
+            ),
+            1
+        );
+    }
+
+    /// The disk build signs entities from one streaming SPO+OSP pass; the
+    /// entries (and so the `vstree.kv` written from them) equal the generic
+    /// per-entity signing over the same store — with literal objects, ids
+    /// that are both subject and object, entities that are only objects,
+    /// and deleted triples.
+    #[test]
+    fn disk_vstree_entries_equal_the_generic_signing() {
+        let dir = temp_dir("disk_vstree_entries");
+        fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0xD15C_u64;
+        let mut next = move |n: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(n)) as u32
+        };
+        let mut lines = Vec::new();
+        for _ in 0..1200 {
+            let (s, p, o) = (next(200), next(5), next(320));
+            let line = if next(4) == 0 {
+                (
+                    format!("<http://ex/e{s}>"),
+                    format!("<http://ex/p{p}>"),
+                    format!("\"v{o}\""),
+                    true,
+                )
+            } else {
+                (
+                    format!("<http://ex/e{s}>"),
+                    format!("<http://ex/p{p}>"),
+                    format!("<http://ex/e{o}>"),
+                    false,
+                )
+            };
+            lines.push(line);
+        }
+        let text: String = lines
+            .iter()
+            .map(|(s, p, o, _)| format!("{s} {p} {o} .\n"))
+            .collect();
+        let mut ds = crate::kvstore::DiskStore::build_str(dir.join(KV_FILE), 64, &text).unwrap();
+        for (s, p, o, lit) in lines.iter().step_by(4) {
+            ds.delete_keys(s, p, o, *lit).unwrap();
+        }
+        let truth = vstree_entries(&ds);
+        assert!(truth.len() > 200, "subjects plus object-only entities");
+        assert_eq!(disk_vstree_entries(&ds).unwrap(), truth);
+        drop(ds);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- redo log --------------------------------------------------------
@@ -2297,7 +4733,8 @@ mod tests {
         assert!(db.redo_log_enabled());
 
         // A mix of auto-commit mutations.
-        db.query("INSERT DATA { <root> <contain> <nodeX> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <nodeX> }")
+            .unwrap();
         db.insert_triple(&Triple::new(
             Term::iri("nodeX"),
             Term::iri("own"),
@@ -2391,7 +4828,8 @@ mod tests {
         db.enable_redo_log_in(&db_dir).unwrap();
 
         // An update BEFORE the full backup: captured by the base snapshot itself.
-        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <n_pre> }")
+            .unwrap();
 
         // Full backup: base snapshot + checkpoint at the current redo-log length.
         db.backup(&base_dir).unwrap();
@@ -2401,7 +4839,8 @@ mod tests {
         // Updates AFTER the full backup ⇒ first increment (insert + delete).
         db.query("INSERT DATA { <root> <contain> <n1> . <n1> <own> <p1> }")
             .unwrap();
-        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
         db.backup_incremental(&incr1_dir).unwrap();
         let ck1 = db.backup_checkpoint();
         assert!(ck1 > base_ck, "checkpoint advanced past the base");
@@ -2444,7 +4883,10 @@ mod tests {
 
         // Restoring ONLY the base reproduces the pre-increment state.
         let mut base_only = Database::restore(&base_dir).unwrap();
-        assert!(base_only.triple_num() < live_count, "base predates the increments");
+        assert!(
+            base_only.triple_num() < live_count,
+            "base predates the increments"
+        );
         assert_eq!(
             base_only
                 .select("SELECT ?o WHERE { <n1> <own> ?o }")
@@ -2489,7 +4931,8 @@ mod tests {
 
         let mut db = Database::build_from_str("bk", SMALL).unwrap();
         db.enable_redo_log_in(&db_dir).unwrap();
-        db.query("INSERT DATA { <root> <contain> <n_pre> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <n_pre> }")
+            .unwrap();
         db.backup(&base_dir).unwrap();
         db.query("INSERT DATA { <root> <contain> <n1> }").unwrap();
         db.backup_incremental(&incr_dir).unwrap();
@@ -2521,22 +4964,33 @@ mod tests {
         db.backup(&base_dir).unwrap();
 
         // (a) direct-API insert (bypasses the SPARQL update path entirely)
-        db.insert_triple(&Triple::new(Term::iri("root"), Term::iri("contain"), Term::iri("api_node")));
+        db.insert_triple(&Triple::new(
+            Term::iri("root"),
+            Term::iri("contain"),
+            Term::iri("api_node"),
+        ));
         // (b) a transaction that is rolled back — must leave no trace
         db.begin().unwrap();
-        db.query("INSERT DATA { <root> <contain> <ghost> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <ghost> }")
+            .unwrap();
         db.rollback().unwrap();
 
         db.backup_incremental(&incr_dir).unwrap();
         let mut restored = Database::restore_incremental(&base_dir, &[&incr_dir]).unwrap();
 
         assert_eq!(
-            restored.select("SELECT ?s WHERE { ?s <contain> <api_node> }").unwrap().row_count(),
+            restored
+                .select("SELECT ?s WHERE { ?s <contain> <api_node> }")
+                .unwrap()
+                .row_count(),
             1,
             "direct-API insert must be captured by the redo-based increment"
         );
         assert_eq!(
-            restored.select("SELECT ?s WHERE { ?s <contain> <ghost> }").unwrap().row_count(),
+            restored
+                .select("SELECT ?s WHERE { ?s <contain> <ghost> }")
+                .unwrap()
+                .row_count(),
             0,
             "a rolled-back transaction must NOT be resurrected by restore"
         );
@@ -2591,22 +5045,29 @@ mod tests {
     #[test]
     fn query_cache_lru_evicts_least_recently_used() {
         let mut db = Database::build_from_str("lru", SMALL).unwrap();
-        db.set_query_cache_capacity(2);
-        let q1 = "SELECT ?o WHERE { <root> <contain> ?o }";
-        let q2 = "SELECT ?n WHERE { <root> <name> ?n }";
-        let q3 = "SELECT ?o WHERE { <node1> <own> ?o }";
-
-        db.query(q1).unwrap();
-        db.query(q2).unwrap();
-        assert_eq!(db.query_cache_len(), 2);
-        // Touch q1 so q2 is now the least-recently used.
-        db.query(q1).unwrap();
-        // Inserting q3 evicts q2.
-        db.query(q3).unwrap();
-        assert_eq!(db.query_cache_len(), 2, "cache stays at capacity");
-        assert!(db.query_cache_contains(q1));
-        assert!(db.query_cache_contains(q3));
-        assert!(!db.query_cache_contains(q2), "q2 was least-recently used");
+        // Queries q(10)..q(19) have results of exactly the same size.
+        let q = |i: usize| format!("SELECT ?o{i} WHERE {{ <root> <contain> ?o{i} }}");
+        db.query(&q(10)).unwrap();
+        let one = db.query_cache_bytes();
+        // The cache is bounded by memory: room for exactly eight results.
+        db.set_query_cache_size(8 * one);
+        assert_eq!(db.query_cache_len(), 0, "resizing clears the cache");
+        for i in 10..18 {
+            db.query(&q(i)).unwrap();
+        }
+        assert_eq!(db.query_cache_len(), 8);
+        // Touch q(10) so q(11) is now the least-recently used.
+        db.query(&q(10)).unwrap();
+        // Inserting q(18) evicts q(11).
+        db.query(&q(18)).unwrap();
+        assert_eq!(db.query_cache_len(), 8, "cache stays within its budget");
+        assert!(db.query_cache_bytes() <= db.query_cache_size());
+        assert!(db.query_cache_contains(&q(10)));
+        assert!(db.query_cache_contains(&q(18)));
+        assert!(
+            !db.query_cache_contains(&q(11)),
+            "q(11) was least-recently used"
+        );
     }
 
     #[test]
@@ -2614,7 +5075,8 @@ mod tests {
         let mut db = Database::build_from_str("inv", SMALL).unwrap();
         db.query("SELECT ?o WHERE { <root> <contain> ?o }").unwrap();
         assert_eq!(db.query_cache_len(), 1);
-        db.query("INSERT DATA { <root> <contain> <nodeZ> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <nodeZ> }")
+            .unwrap();
         assert_eq!(db.query_cache_len(), 0, "any write clears the cache");
     }
 
@@ -2623,27 +5085,62 @@ mod tests {
     #[test]
     fn reclaim_unused_reuses_deleted_term_ids() {
         let mut db = Database::build_from_str("rc", SMALL).unwrap();
+        // The explicit pass: with immediate reclamation off (R4) nothing is
+        // freed by the delete itself.
+        db.set_id_reclaim(IdReclaim::Off);
         let before_entities = db.entity_num();
         let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
 
         // Delete the only triple using <node0>; its id is not auto-freed.
-        db.query("DELETE DATA { <root> <contain> <node0> }").unwrap();
-        assert!(db.dict().entity_id(&Term::iri("node0").dict_key()).is_some());
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
+        assert!(db
+            .dict()
+            .entity_id(&Term::iri("node0").dict_key())
+            .is_some());
 
-        let freed = db.reclaim_unused();
+        let freed = db.reclaim_unused().unwrap();
         assert_eq!(freed, 1, "only <node0> became unreferenced");
         assert_eq!(db.entity_num(), before_entities - 1);
         assert!(
-            db.dict().entity_id(&Term::iri("node0").dict_key()).is_none(),
+            db.dict()
+                .entity_id(&Term::iri("node0").dict_key())
+                .is_none(),
             "node0 was reclaimed"
         );
 
         // A brand-new term reuses node0's freed id.
-        db.query("INSERT DATA { <root> <contain> <fresh> }").unwrap();
+        db.query("INSERT DATA { <root> <contain> <fresh> }")
+            .unwrap();
         assert_eq!(
             db.dict().entity_id(&Term::iri("fresh").dict_key()),
             Some(node0_id),
             "the freed id is reused"
+        );
+    }
+
+    #[test]
+    fn a_delete_frees_its_unreferenced_ids_immediately() {
+        let mut db = Database::build_from_str("rci", SMALL).unwrap();
+        assert_eq!(db.id_reclaim(), IdReclaim::Immediate);
+        let before_entities = db.entity_num();
+        let node0_id = db.dict().entity_id(&Term::iri("node0").dict_key()).unwrap();
+        db.query("DELETE DATA { <root> <contain> <node0> }")
+            .unwrap();
+        assert_eq!(
+            db.dict().entity_id(&Term::iri("node0").dict_key()),
+            None,
+            "freed by the delete"
+        );
+        assert_eq!(db.entity_num(), before_entities - 1);
+        // <root> and <contain> are still used: kept.
+        assert!(db.dict().entity_id(&Term::iri("root").dict_key()).is_some());
+        assert_eq!(db.reclaim_unused().unwrap(), 0, "nothing left to free");
+        db.query("INSERT DATA { <root> <contain> <fresh> }")
+            .unwrap();
+        assert_eq!(
+            db.dict().entity_id(&Term::iri("fresh").dict_key()),
+            Some(node0_id)
         );
     }
 
@@ -2685,7 +5182,9 @@ mod tests {
         // Enough entities to force a multi-node VS-tree, plus a distinctive edge.
         let mut content = String::new();
         for i in 0..400u32 {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
         let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree.nt");
@@ -2694,37 +5193,69 @@ mod tests {
         Database::build_disk(&dir, &[&rdf]).unwrap();
         assert!(Database::is_disk(&dir));
         // The dedicated on-disk VS-tree node file was produced.
-        assert!(dir.join(VSTREE_KV_FILE).is_file(), "build_disk must write the VS-tree node file");
+        assert!(
+            dir.join(VSTREE_KV_FILE).is_file(),
+            "build_disk must write the VS-tree node file"
+        );
 
         let mut db = Database::load_disk(&dir).unwrap();
-        assert!(db.vstree.is_disk_backed(), "loaded disk db must use the on-disk VS-tree");
-        assert!(db.stats().index_valid, "the disk-backed index is valid for filtering");
+        assert!(
+            db.vstree.is_disk_backed(),
+            "loaded disk db must use the on-disk VS-tree"
+        );
+        assert!(
+            db.stats().index_valid,
+            "the disk-backed index is valid for filtering"
+        );
 
         // In-memory baseline over the same data (full VS-tree rebuild).
         let mut base = Database::build_from_str("base", &content).unwrap();
-        for q in [
+        let queries = [
             "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
             "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
             "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
             "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
-        ] {
-            let mut a = db.select(q).unwrap().rows;
-            let mut b = base.select(q).unwrap().rows;
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "disk-vstree query {q:?} diverged from in-memory baseline");
-        }
+        ];
+        let mut expected = Vec::new();
+        {
+            // The tree's own walk (the `Tree` policy pages its nodes; `Auto`,
+            // the default, computes an out-of-core tree's sets from the store).
+            let _tree = crate::query::scoped_vs_policy(crate::query::VsPolicy::Tree);
+            for q in queries {
+                let mut a = db.select(q).unwrap().rows;
+                let mut b = base.select(q).unwrap().rows;
+                a.sort();
+                b.sort();
+                assert_eq!(
+                    a, b,
+                    "disk-vstree query {q:?} diverged from in-memory baseline"
+                );
+                expected.push(b);
+            }
 
-        // The distinctive marker query returns exactly the special subject — and
-        // the candidate filter that produced it ran against on-disk nodes.
-        let rs = db
-            .select("SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }")
-            .unwrap();
-        assert_eq!(rs.row_count(), 1);
-        assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
-        // Running the query touched only some VS-tree node pages, not the whole
-        // tree — proving it need not be fully resident.
-        assert!(db.vstree.disk_pages_read() > 0, "the disk VS-tree was actually traversed");
+            // The distinctive marker query returns exactly the special subject —
+            // and the candidate filter that produced it ran against on-disk nodes.
+            let rs = db
+                .select("SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }")
+                .unwrap();
+            assert_eq!(rs.row_count(), 1);
+            assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/special>"));
+            // Running the query touched only some VS-tree node pages, not the
+            // whole tree — proving it need not be fully resident.
+            assert!(
+                db.vstree.disk_pages_read() > 0,
+                "the disk VS-tree was actually traversed"
+            );
+        }
+        // Under the default policy the answers are the same, and no page of
+        // the tree is read.
+        let pages = db.vstree.disk_pages_read();
+        for (q, b) in queries.into_iter().zip(&expected) {
+            let mut a = db.select(q).unwrap().rows;
+            a.sort();
+            assert_eq!(&a, b, "query {q:?} under the default policy");
+        }
+        assert_eq!(db.vstree.disk_pages_read(), pages);
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(&rdf);
@@ -2732,30 +5263,52 @@ mod tests {
 
     /// Mutating a disk-loaded database invalidates the out-of-core index (it
     /// can't be updated in place), and queries stay correct afterwards.
+    /// (A rebuild gives a Materialize-mode database an in-memory tree and a
+    /// Stream-mode one a rewritten `vstree.kv`, fresh in the store's header,
+    /// so the next open uses it.)
     #[test]
     fn disk_database_mutation_invalidates_then_stays_correct() {
-        let dir = temp_dir("disk_vstree_mut");
-        let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
-        let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
-        fs::write(&rdf, content).unwrap();
-        Database::build_disk(&dir, &[&rdf]).unwrap();
-        let mut db = Database::load_disk(&dir).unwrap();
-        assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
+        for mode in [DiskQueryMode::Materialize, DiskQueryMode::Stream] {
+            let dir = temp_dir(&format!("disk_vstree_mut_{mode}"));
+            let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
+            let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
+            fs::write(&rdf, content).unwrap();
+            Database::build_disk(&dir, &[&rdf]).unwrap();
+            let options = OpenOptions::new().with_disk_query_mode(mode);
+            let mut db = Database::load_disk_with(&dir, &options).unwrap();
+            assert_eq!(db.disk_query_mode(), Some(mode));
+            assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
 
-        // An insert can't update the on-disk tree in place ⇒ index invalidates.
-        assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
-        assert!(!db.stats().index_valid, "mutation invalidates the disk-backed index");
+            // An insert can't update the on-disk tree in place ⇒ index invalidates.
+            assert!(db.insert_triple(&Triple::new(Term::iri("c"), Term::iri("p"), Term::iri("d"))));
+            assert!(
+                !db.stats().index_valid,
+                "mutation invalidates the disk-backed index"
+            );
 
-        // Query still correct (evaluates without the stale tree).
-        let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
-        got.sort();
-        assert_eq!(got, vec![vec![Some("<d>".to_string())]]);
+            // Query still correct (evaluates without the stale tree).
+            let mut got = db.select("SELECT ?o WHERE { <c> <p> ?o }").unwrap().rows;
+            got.sort();
+            assert_eq!(got, vec![vec![Some("<d>".to_string())]]);
 
-        // A rebuild restores a valid (now in-memory) index.
-        db.rebuild_index();
-        assert!(db.stats().index_valid && !db.vstree.is_disk_backed());
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_file(&rdf);
+            db.rebuild_index();
+            assert!(db.stats().index_valid);
+            match mode {
+                // A rebuild restores a valid (now in-memory) index.
+                DiskQueryMode::Materialize => assert!(!db.vstree.is_disk_backed()),
+                // A rebuild rewrites vstree.kv; a reopen trusts it again.
+                DiskQueryMode::Stream => {
+                    assert!(db.vstree.is_disk_backed());
+                    let rows = db.select("SELECT ?s WHERE { ?s <p> <d> }").unwrap().rows;
+                    assert_eq!(rows, vec![vec![Some("<c>".to_string())]]);
+                    drop(db);
+                    let db = Database::load_disk_with(&dir, &options).unwrap();
+                    assert!(db.vstree.is_disk_backed() && db.stats().index_valid);
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_file(&rdf);
+        }
     }
 
     /// An **in-memory** database can opt into an out-of-core (streaming) VS-tree
@@ -2766,7 +5319,9 @@ mod tests {
     fn streaming_vstree_matches_in_memory_path() {
         let mut content = String::new();
         for i in 0..400u32 {
-            content.push_str(&format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"));
+            content.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+            ));
         }
         content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
 
@@ -2779,28 +5334,49 @@ mod tests {
         let dir = temp_dir("stream_vstree");
         let path = dir.join(VSTREE_KV_FILE);
         streamed.use_streaming_vstree(&path).unwrap();
-        assert!(streamed.vstree.is_disk_backed(), "opted into out-of-core VS-tree");
-        assert!(streamed.stats().index_valid, "streaming index is valid for filtering");
+        assert!(
+            streamed.vstree.is_disk_backed(),
+            "opted into out-of-core VS-tree"
+        );
+        assert!(
+            streamed.stats().index_valid,
+            "streaming index is valid for filtering"
+        );
         // The store stayed in memory; only the filter went out-of-core.
         assert!(matches!(streamed.store, Backend::Memory(_)));
 
-        for q in [
+        let queries = [
             "SELECT ?s WHERE { ?s <http://ex/marker> <http://ex/target> }",
             "SELECT ?o WHERE { <http://ex/s5> <http://ex/p> ?o }",
             "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }",
             "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/o42> }",
-        ] {
-            let mut a = streamed.select(q).unwrap().rows;
-            let mut b = base.select(q).unwrap().rows;
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "streaming-vstree query {q:?} diverged from in-memory");
+        ];
+        let mut expected = Vec::new();
+        {
+            // The tree's own walk (see `disk_database_filters_via_on_disk_vstree`).
+            let _tree = crate::query::scoped_vs_policy(crate::query::VsPolicy::Tree);
+            for q in queries {
+                let mut a = streamed.select(q).unwrap().rows;
+                let mut b = base.select(q).unwrap().rows;
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "streaming-vstree query {q:?} diverged from in-memory");
+                expected.push(b);
+            }
+            // The candidate filter actually paged VS-tree nodes off disk.
+            assert!(
+                streamed.vstree.disk_pages_read() > 0,
+                "streaming VS-tree was traversed on disk"
+            );
         }
-        // The candidate filter actually paged VS-tree nodes off disk.
-        assert!(
-            streamed.vstree.disk_pages_read() > 0,
-            "streaming VS-tree was traversed on disk"
-        );
+        // The default policy: the same answers, no page of the tree read.
+        let pages = streamed.vstree.disk_pages_read();
+        for (q, b) in queries.into_iter().zip(&expected) {
+            let mut a = streamed.select(q).unwrap().rows;
+            a.sort();
+            assert_eq!(&a, b, "query {q:?} under the default policy");
+        }
+        assert_eq!(streamed.vstree.disk_pages_read(), pages);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2808,11 +5384,10 @@ mod tests {
 
     #[test]
     fn build_reports_progress_stages() {
-        let stages = RefCell::new(Vec::new());
-        let db = Database::build_from_str_with_progress("p", SMALL, |s| {
-            stages.borrow_mut().push(s)
-        })
-        .unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let db =
+            Database::build_from_str_with_progress("p", SMALL, |s| stages.borrow_mut().push(s))
+                .unwrap();
         assert_eq!(db.triple_num(), 5);
         assert_eq!(
             stages.into_inner(),

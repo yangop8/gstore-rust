@@ -4,6 +4,29 @@
 use gstore::{Database, QueryResult};
 use std::io::Write;
 
+/// The temp directories (or files) the current test thread made, removed
+/// when the thread ends — also when the test fails (a thread-local's
+/// destructor runs after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
+/// Remove `p` when the current test thread ends.
+fn remove_when_done(p: impl Into<std::path::PathBuf>) {
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
+}
+
 const DATA: &str = r#"
 @prefix : <http://ex/> .
 :alice :age 30 ; :city :paris .
@@ -34,14 +57,20 @@ fn insert_and_delete_data() {
         "INSERT DATA { <http://ex/dave> <http://ex/age> 50 }",
     );
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
 
     let n = changed(
         &mut db,
         "DELETE DATA { <http://ex/dave> <http://ex/age> 50 }",
     );
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        0
+    );
 }
 
 #[test]
@@ -50,9 +79,15 @@ fn delete_where_removes_matches() {
     // Remove everyone's city edge.
     let n = changed(&mut db, "DELETE WHERE { ?s <http://ex/city> ?c }");
     assert_eq!(n, 3);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
     // age edges untouched
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> ?a }"), 3);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> ?a }"),
+        3
+    );
 }
 
 #[test]
@@ -92,10 +127,7 @@ fn insert_where_derives_new_triples() {
     );
     assert_eq!(n, 3);
     assert_eq!(
-        count(
-            &mut db,
-            "SELECT ?s WHERE { ?s a <http://ex/Person> }"
-        ),
+        count(&mut db, "SELECT ?s WHERE { ?s a <http://ex/Person> }"),
         3
     );
 }
@@ -120,7 +152,10 @@ fn update_sequence_applies_in_order() {
     );
     assert_eq!(n, 1 + 3);
     assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }"), 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
 }
 
 #[test]
@@ -128,6 +163,7 @@ fn load_reads_local_turtle_file() {
     let mut db = db();
     let dir = std::env::temp_dir();
     let path = dir.join("gstore_load_test.ttl");
+    remove_when_done(path.clone());
     {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "@prefix : <http://ex/> .\n:eve :age 22 .").unwrap();
@@ -135,7 +171,10 @@ fn load_reads_local_turtle_file() {
     let q = format!("LOAD <file://{}>", path.display());
     let n = changed(&mut db, &q);
     assert_eq!(n, 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 22 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 22 }"),
+        1
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -144,7 +183,10 @@ fn load_remote_errors_unless_silent() {
     let mut db = db();
     assert!(db.query("LOAD <http://example.org/x.ttl>").is_err());
     // SILENT swallows the failure.
-    assert_eq!(changed(&mut db, "LOAD SILENT <http://example.org/x.ttl>"), 0);
+    assert_eq!(
+        changed(&mut db, "LOAD SILENT <http://example.org/x.ttl>"),
+        0
+    );
 }
 
 #[test]
@@ -152,15 +194,28 @@ fn transaction_rollback_reverts_updates() {
     let mut db = db();
     let before = count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }");
     db.begin().unwrap();
-    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }")
+        .unwrap();
     db.query("DELETE WHERE { ?s <http://ex/city> ?c }").unwrap();
     // changes are visible inside the transaction
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 0);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        0
+    );
     db.rollback().unwrap();
     // everything is restored
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 0);
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"), 3);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        0
+    );
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/city> ?c }"),
+        3
+    );
     assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s ?p ?o }"), before);
 }
 
@@ -168,10 +223,14 @@ fn transaction_rollback_reverts_updates() {
 fn transaction_commit_persists_updates() {
     let mut db = db();
     db.begin().unwrap();
-    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }").unwrap();
+    db.query("INSERT DATA { <http://ex/dave> <http://ex/age> 50 }")
+        .unwrap();
     db.commit().unwrap();
     db.rollback().unwrap_err(); // nothing to roll back after commit
-    assert_eq!(count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"), 1);
+    assert_eq!(
+        count(&mut db, "SELECT ?s WHERE { ?s <http://ex/age> 50 }"),
+        1
+    );
 }
 
 #[test]

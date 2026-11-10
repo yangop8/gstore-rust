@@ -9,8 +9,28 @@ fn small_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/small/small.nt")
 }
 
+/// The temp directories the current test thread made, removed when the
+/// thread ends — also when the test fails (a thread-local's destructor runs
+/// after the unwinding).
+struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for TmpDirs {
+    fn drop(&mut self) {
+        for p in self.0.borrow().iter() {
+            // A directory, or a file (a store path).
+            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+        }
+    }
+}
+
+thread_local! {
+    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
+}
+
 fn tmp(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("gstore_dt_parity_{tag}"))
+    let p = std::env::temp_dir().join(format!("gstore_dt_parity_{tag}"));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
+    p
 }
 
 fn run(bin: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
@@ -56,7 +76,11 @@ fn full_cli_lifecycle() {
 
     // gadd: insert two new triples from an N-Triples file.
     let add_file = tmp("add.nt");
-    std::fs::write(&add_file, "<root> <contain> <nodeADD> .\n<nodeADD> <own> <pZ> .\n").unwrap();
+    std::fs::write(
+        &add_file,
+        "<root> <contain> <nodeADD> .\n<nodeADD> <own> <pZ> .\n",
+    )
+    .unwrap();
     let add = run(
         env!("CARGO_BIN_EXE_gadd"),
         &[name.as_os_str(), add_file.as_os_str()],
@@ -88,7 +112,10 @@ fn full_cli_lifecycle() {
     assert!(exp.status.success(), "gexport failed: {exp:?}");
     let dumped = std::fs::read_to_string(&export).unwrap();
     assert_eq!(dumped.lines().count(), 25, "export line count");
-    assert!(dumped.contains("<root> <contain> <node0> ."), "export: {dumped}");
+    assert!(
+        dumped.contains("<root> <contain> <node0> ."),
+        "export: {dumped}"
+    );
 
     // gbackup then grestore into a new db, which must hold the same 25 triples.
     let backup = tmp("backup_dir");
@@ -102,18 +129,25 @@ fn full_cli_lifecycle() {
     let restored = tmp("restored");
     let restored_dir = format!("{}.db", restored.display());
     let _ = std::fs::remove_dir_all(&restored_dir);
+    // grestore <db_name> <backup_dir> (upstream's order, `-db` then `-p`).
     let rs = run(
         env!("CARGO_BIN_EXE_grestore"),
-        &[backup.as_os_str(), restored.as_os_str()],
+        &[restored.as_os_str(), backup.as_os_str()],
     );
     assert!(rs.status.success(), "grestore failed: {rs:?}");
     let show3 = run(env!("CARGO_BIN_EXE_gshow"), &[restored.as_os_str()]);
     let show3_out = String::from_utf8_lossy(&show3.stdout);
-    assert!(show3_out.contains("triples   : 25"), "restored: {show3_out}");
+    assert!(
+        show3_out.contains("triples   : 25"),
+        "restored: {show3_out}"
+    );
 
     // gdrop without confirmation refuses; with --yes it deletes.
     let nodrop = run(env!("CARGO_BIN_EXE_gdrop"), &[name.as_os_str()]);
-    assert!(!nodrop.status.success(), "gdrop should refuse without --yes");
+    assert!(
+        !nodrop.status.success(),
+        "gdrop should refuse without --yes"
+    );
     assert!(std::path::Path::new(&dir).is_dir(), "db must still exist");
 
     let drop = run(
@@ -139,7 +173,8 @@ fn gadd_reads_each_new_format() {
     let base = run(env!("CARGO_BIN_EXE_gshow"), &[name.as_os_str()]);
     assert!(String::from_utf8_lossy(&base.stdout).contains("triples   : 25"));
 
-    // N-Quads (graph term is flattened into the default graph).
+    // N-Quads: the statement with a graph term goes to that named graph (it
+    // was flattened into the default graph before named graphs were kept).
     let nq = tmp("d.nq");
     std::fs::write(&nq, "<nqs> <nqp> <nqo> <g1> .\n<nqs> <nqp> \"lit\" .\n").unwrap();
     let a1 = run(
@@ -179,10 +214,16 @@ fn gadd_reads_each_new_format() {
     assert!(a3.status.success(), "gadd rdf: {a3:?}");
     assert!(String::from_utf8_lossy(&a3.stdout).contains("Added 1 new triple(s)"));
 
-    // 25 + 2 + 2 + 1 = 30.
+    // Default graph: 25 + 1 (N-Quads) + 1 (TriG) + 1 (RDF/XML) = 28; the
+    // N-Quads <g1> and TriG :g statements are in two named graphs.
     let show = run(env!("CARGO_BIN_EXE_gshow"), &[name.as_os_str()]);
     assert!(
-        String::from_utf8_lossy(&show.stdout).contains("triples   : 30"),
+        String::from_utf8_lossy(&show.stdout).contains("named_graphs: 2"),
+        "final show: {}",
+        String::from_utf8_lossy(&show.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("triples   : 28"),
         "final show: {}",
         String::from_utf8_lossy(&show.stdout)
     );
@@ -195,10 +236,11 @@ fn gadd_reads_each_new_format() {
 
 #[test]
 fn wrong_args_exit_nonzero() {
+    // (`gshow` is not here: without arguments it lists every database, as
+    // upstream's — see tests/dt_cli_compat.rs.)
     for bin in [
         env!("CARGO_BIN_EXE_gadd"),
         env!("CARGO_BIN_EXE_gsub"),
-        env!("CARGO_BIN_EXE_gshow"),
         env!("CARGO_BIN_EXE_gexport"),
         env!("CARGO_BIN_EXE_gbackup"),
         env!("CARGO_BIN_EXE_grestore"),

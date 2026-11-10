@@ -1,6 +1,26 @@
-//! RDFS entailment by forward-chaining materialization.
+//! Reasoning: upstream gStore's rule management (`reasonManage`), RDFS
+//! entailment, and the crate's own textual rules.
 //!
-//! Corresponds to gStore's `src/Reason`. Given a store that mixes data and an
+//! # Upstream rules (`reasonManage`)
+//!
+//! The JSON rules of upstream gStore's `src/Reason` (`ReasonHelper`) and its
+//! `/api` operation `reasonManage` (types 1-8):
+//!
+//! * [`rules`] — the rule JSON model and its validation (no rule can inject
+//!   SPARQL);
+//! * [`compile`] — rule → upstream's `INSERT … WHERE`, `DELETE WHERE`,
+//!   count and select statements, byte for byte;
+//! * [`store`] — where rules live (`<db>/reason_rule_files/`, or memory);
+//! * [`manage`] — the lifecycle (add, list, compile, execute, disable, show,
+//!   delete, check), with exact retraction of inferred triples.
+//!
+//! The [`Database`](crate::Database) methods `reason_add` … `reason_check`
+//! expose it to embedders; the `/api` server answers `reasonManage` with it
+//! (`crate::gapi`).
+//!
+//! # RDFS entailment
+//!
+//! Given a store that mixes data and an
 //! RDFS schema, [`materialize`] computes the RDFS closure and inserts every
 //! entailed triple, iterating to a fixpoint. It implements the core
 //! schema-driven rules (the ones that actually change query answers):
@@ -12,18 +32,26 @@
 //! | subproperty transitivity | `p ⊑ₚ q`, `q ⊑ₚ r` | `p ⊑ₚ r` |
 //! | subproperty propagation  | `p ⊑ₚ q`, `x p y` | `x q y` |
 //! | domain | `p domain c`, `x p y` | `x a c` |
-//! | range  | `p range c`,  `x p y` | `y a c` |
+//! | range  | `p range c`,  `x p y` | `y a c` (only for an entity `y`: a literal is never typed) |
 //!
 //! Note the id-space subtlety: a property used as the *subject* of a schema
 //! triple (`p rdfs:subPropertyOf q`) is interned as an **entity**, while the same
 //! property in data (`x p y`) is a **predicate** — two different id spaces sharing
-//! the dictionary key. [`ent_to_pred`] bridges them through the dictionary.
+//! the dictionary key. `ent_to_pred` bridges them through the dictionary.
+
+pub mod compile;
+pub mod manage;
+pub mod rules;
+pub mod store;
+
+pub use compile::CompiledRule;
+pub use manage::{ReasonError, ReasonErrorKind};
 
 use std::collections::HashMap;
 
-use crate::dict::Dictionary;
+use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
-use crate::model::id::PredId;
+use crate::model::id::{is_entity_id, PredId};
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
 use crate::store::{MutableStore, TripleSource};
@@ -40,6 +68,18 @@ pub fn materialize<S: TripleSource + MutableStore>(
     dict: &mut Dictionary,
     store: &mut S,
 ) -> Vec<IdTriple> {
+    materialize_with(dict, store, |_, store: &mut S, t| store.insert(t))
+}
+
+/// [`materialize`], inserting every inferred triple through `insert` (given the
+/// dictionary as it is at that moment) instead of a plain `store.insert` —
+/// e.g. to persist the terms a triple uses before the triple itself. `insert`
+/// returns whether the triple was newly added.
+pub fn materialize_with<S, F>(dict: &mut Dictionary, store: &mut S, mut insert: F) -> Vec<IdTriple>
+where
+    S: TripleSource + MutableStore,
+    F: FnMut(&Dictionary, &mut S, IdTriple) -> bool,
+{
     let key = |iri: &str| Term::iri(iri).dict_key();
     let sco_p = dict.predicate_id(&key(RDFS_SUBCLASS));
     let spo_p = dict.predicate_id(&key(RDFS_SUBPROP));
@@ -53,8 +93,10 @@ pub fn materialize<S: TripleSource + MutableStore>(
     // Subclass/domain/range rules assert `rdf:type` triples, so the type
     // predicate must exist (intern it if the data never used it directly).
     let needs_type = sco_p.is_some() || dom_p.is_some() || rng_p.is_some();
+    // (An exhausted predicate id space leaves `rdf:type` unresolved: the
+    // type-asserting rules then simply infer nothing, rather than panicking.)
     let type_p = if needs_type {
-        Some(dict.intern_predicate(&key(RDF_TYPE)))
+        dict.try_intern_predicate(&key(RDF_TYPE)).ok()
     } else {
         dict.predicate_id(&key(RDF_TYPE))
     };
@@ -71,10 +113,12 @@ pub fn materialize<S: TripleSource + MutableStore>(
             .collect();
         let keys: Vec<String> = prop_ents
             .iter()
-            .filter_map(|&e| dict.id_to_string(e).map(str::to_owned))
+            .filter_map(|&e| dict.term(e).map(TermStr::into_string))
             .collect();
         for k in keys {
-            dict.intern_predicate(&k);
+            // Best effort: a property that cannot get a predicate id (id space
+            // exhausted) is just never resolved as a subproperty target.
+            let _ = dict.try_intern_predicate(&k);
         }
     }
 
@@ -84,7 +128,7 @@ pub fn materialize<S: TripleSource + MutableStore>(
         gather(dict, store, type_p, sco_p, spo_p, dom_p, rng_p, &mut new);
         let mut added = 0usize;
         for t in new {
-            if store.insert(t) {
+            if insert(dict, store, t) {
                 added_all.push(t);
                 added += 1;
             }
@@ -154,8 +198,7 @@ fn gather<S: TripleSource>(
             }
         }
         for &(p_ent, q_ent) in &pairs {
-            let (Some(p_pred), Some(q_pred)) =
-                (ent_to_pred(dict, p_ent), ent_to_pred(dict, q_ent))
+            let (Some(p_pred), Some(q_pred)) = (ent_to_pred(dict, p_ent), ent_to_pred(dict, q_ent))
             else {
                 continue;
             };
@@ -180,11 +223,17 @@ fn gather<S: TripleSource>(
     }
 
     // --- range: (p range c), (x p y) ⇒ (y a c) ---
+    // Only for an entity `y`: a literal object (`x p "lit"`) cannot be the
+    // subject of a triple, so `"lit" a c` is never inferred (RDFS leaves that
+    // entailment to a generalized-RDF reasoner; an RDF store has no such
+    // triple).
     if let (Some(rng), Some(tp)) = (rng_p, type_p) {
         for (p_ent, c) in store.so_by_p(rng) {
             if let Some(p_pred) = ent_to_pred(dict, p_ent) {
                 for (_x, y) in store.so_by_p(p_pred) {
-                    new.push(IdTriple::new(y, tp, c));
+                    if is_entity_id(y) {
+                        new.push(IdTriple::new(y, tp, c));
+                    }
                 }
             }
         }
@@ -195,8 +244,8 @@ fn gather<S: TripleSource>(
 /// predicate id, via the shared dictionary key. `None` if that IRI is never used
 /// as a predicate in the data.
 fn ent_to_pred(dict: &Dictionary, ent: u32) -> Option<PredId> {
-    let key = dict.id_to_string(ent)?;
-    dict.predicate_id(key)
+    let key = dict.term(ent)?;
+    dict.predicate_id(&key)
 }
 
 // ===========================================================================
@@ -330,11 +379,10 @@ impl Rule {
                 let req_s = pat.subject.required(b);
                 let req_o = pat.object.required(b);
                 for &(s_id, o_id) in &pairs {
-                    let (Some(s_str), Some(o_str)) =
-                        (dict.id_to_string(s_id), dict.id_to_string(o_id))
-                    else {
+                    let (Some(s_str), Some(o_str)) = (dict.term(s_id), dict.term(o_id)) else {
                         continue;
                     };
+                    let (s_str, o_str) = (s_str.as_str(), o_str.as_str());
                     if req_s.as_deref().is_some_and(|r| r != s_str) {
                         continue;
                     }
@@ -488,6 +536,23 @@ impl RuleSet {
         dict: &mut Dictionary,
         store: &mut S,
     ) -> Vec<IdTriple> {
+        self.apply_with(dict, store, |_, store: &mut S, t| store.insert(t))
+    }
+
+    /// [`apply`](Self::apply), inserting every inferred triple through `insert`
+    /// (given the dictionary after the triple's terms were interned) instead of
+    /// a plain `store.insert` — e.g. to persist those terms before the triple.
+    /// `insert` returns whether the triple was newly added.
+    pub fn apply_with<S, F>(
+        &mut self,
+        dict: &mut Dictionary,
+        store: &mut S,
+        mut insert: F,
+    ) -> Vec<IdTriple>
+    where
+        S: TripleSource + MutableStore,
+        F: FnMut(&Dictionary, &mut S, IdTriple) -> bool,
+    {
         for r in &mut self.rules {
             r.effect_count = 0;
         }
@@ -503,12 +568,17 @@ impl RuleSet {
                 let derived = self.rules[i].derive(dict, store);
                 // Write phase: intern + insert; count only genuinely-new triples.
                 for t in derived {
-                    let id = IdTriple::new(
-                        dict.intern_entity(&t.subject.dict_key()),
-                        dict.intern_predicate(&t.predicate.dict_key()),
-                        dict.intern_term(&t.object),
-                    );
-                    if store.insert(id) {
+                    // A head triple whose terms cannot be interned (a
+                    // dictionary id space is exhausted) is not materialized.
+                    let (Ok(s), Ok(p), Ok(o)) = (
+                        dict.try_intern_entity(&t.subject.dict_key()),
+                        dict.try_intern_predicate(&t.predicate.dict_key()),
+                        dict.try_intern_term(&t.object),
+                    ) else {
+                        continue;
+                    };
+                    let id = IdTriple::new(s, p, o);
+                    if insert(dict, store, id) {
                         added_all.push(id);
                         self.rules[i].effect_count += 1;
                         round_added += 1;
@@ -533,7 +603,7 @@ fn parse_patterns(s: &str) -> Result<Vec<TriplePattern>> {
         )));
     }
     let mut patterns = Vec::with_capacity(toks.len() / 3);
-    for chunk in toks.chunks_exact(3) {
+    for chunk in toks.as_chunks::<3>().0 {
         patterns.push(TriplePattern {
             subject: chunk[0].clone(),
             predicate: chunk[1].clone(),
@@ -766,6 +836,35 @@ mod tests {
         assert!(s.exists(alice, parent_p, bob)); // mother ⊑ₚ parent
     }
 
+    /// Regression: `p range c` with `x p "lit"` used to infer `"lit" a c` — a
+    /// triple whose subject is a literal. Only entity objects are typed.
+    #[test]
+    fn range_never_types_a_literal_object() {
+        let mut d = Dictionary::new();
+        let typ = pred(&mut d, RDF_TYPE);
+        let rng = pred(&mut d, RDFS_RANGE);
+        let name_p = pred(&mut d, "name");
+        let name_e = ent(&mut d, "name");
+        let label = ent(&mut d, "Label");
+        let alice = ent(&mut d, "alice");
+        let bob = ent(&mut d, "bob");
+        let lit = d.intern_literal(&Term::plain_literal("Alice").dict_key());
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(name_e, rng, label));
+        s.insert(IdTriple::new(alice, name_p, lit));
+        s.insert(IdTriple::new(alice, name_p, bob));
+
+        let added = materialize(&mut d, &mut s);
+        assert!(!s.exists(lit, typ, label), "a literal was typed");
+        assert!(
+            added.iter().all(|t| is_entity_id(t.sub)),
+            "inferred a literal subject: {added:?}"
+        );
+        // The entity object is still typed.
+        assert!(s.exists(bob, typ, label));
+        assert_eq!(added.len(), 1);
+    }
+
     #[test]
     fn domain_and_range_assign_types() {
         let mut d = Dictionary::new();
@@ -920,7 +1019,8 @@ mod tests {
             "variable predicate"
         );
         assert!(
-            rs.add_rule("c", "?x <p> ?y => ?x <q> ?y . ?a <r> ?b").is_err(),
+            rs.add_rule("c", "?x <p> ?y => ?x <q> ?y . ?a <r> ?b")
+                .is_err(),
             "multi-pattern head"
         );
         assert!(

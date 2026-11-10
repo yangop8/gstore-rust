@@ -1,0 +1,4 @@
+# Pure-format commits to skip in `git blame` (Phase 6 plan §5.6(e)).
+# Enable locally with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+# style: cargo fmt --all (no functional change)
+fe5de76726480f8a3fb8500808665871f4486640

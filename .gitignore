@@ -16,3 +16,10 @@ gnlqa.conf
 
 # CCB control-plane runtime state
 /.ccb/
+
+# macOS Finder metadata
+.DS_Store
+
+# Python bytecode (scripts/conformance.sh runs upstream's Python SDK)
+__pycache__/
+*.pyc

@@ -40,23 +40,57 @@ use std::path::Path;
 use crate::error::Result;
 use crate::model::{Term, Triple};
 use crate::parser::sparql::ast::RDF_TYPE;
+use crate::parser::stream::{BlankLabeler, TermBudget};
 
 /// Parse an (X)HTML document containing RDFa into triples.
 pub fn parse_str(content: &str) -> Result<Vec<Triple>> {
+    parse_str_with(content, &mut BlankLabeler::keep())
+}
+
+/// Parse an (X)HTML document containing RDFa, naming blank nodes (author
+/// `_:` CURIEs and minted nodes) with `labels`. The document is parsed whole;
+/// the bulk loaders refuse one larger than
+/// [`ImportOptions::max_document_bytes`](crate::parser::import::ImportOptions).
+pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Triple>> {
     let tokens = Lexer::new(content).tokenize();
     let root = build_tree(tokens);
-    let mut ex = Extractor::default();
+    let mut ex = Extractor {
+        triples: Vec::new(),
+        labels: std::mem::take(labels),
+        budget: TermBudget::for_input(content.len()),
+    };
     let base = find_base(&root).unwrap_or_default();
     let ctx = EvalContext::root(base);
     for child in root.element_children() {
         ex.process(child, &ctx, true);
     }
-    Ok(ex.triples)
+    if let Err(e) = ex.budget.check() {
+        *labels = ex.labels;
+        return Err(e);
+    }
+    // Author labels go through the labeler now; minted ones carry a marker
+    // no `_:` CURIE can contain, so the two never meet.
+    let mut triples = std::mem::take(&mut ex.triples);
+    for t in &mut triples {
+        for term in [&mut t.subject, &mut t.object] {
+            if let Term::Blank(l) = term {
+                *l = match l.strip_prefix(MINTED) {
+                    Some(m) => m.to_string(),
+                    None => ex.labels.explicit(l),
+                };
+            }
+        }
+    }
+    *labels = ex.labels;
+    Ok(triples)
 }
+
+/// Marks a minted blank label until [`parse_str_with`] finishes.
+const MINTED: char = '\u{0}';
 
 /// Parse an (X)HTML file containing RDFa into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::parser::import::read_document(path.as_ref())?;
     parse_str(&content)
 }
 
@@ -103,7 +137,9 @@ impl Lexer {
         c
     }
     fn starts_with(&self, s: &str) -> bool {
-        s.chars().enumerate().all(|(i, c)| self.peek_at(i) == Some(c))
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| self.peek_at(i) == Some(c))
     }
     fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(c) if c.is_whitespace()) {
@@ -431,14 +467,22 @@ fn build_tree(tokens: Vec<Token>) -> Node {
                     children: Vec::new(),
                 };
                 if self_closing || is_void_element(&name) {
-                    stack.last_mut().unwrap().children.push(Child::Element(node));
+                    stack
+                        .last_mut()
+                        .unwrap()
+                        .children
+                        .push(Child::Element(node));
                 } else if stack.len() >= MAX_TREE_DEPTH {
                     // Bound nesting: past the cap, attach the element (childless) to
                     // the current parent instead of descending, so pathological
                     // input (e.g. a megabyte of `<div>`) cannot grow an unbounded
                     // tree that overflows the recursive walks (find_base/process/
                     // collect_text) or the recursive `Node` drop.
-                    stack.last_mut().unwrap().children.push(Child::Element(node));
+                    stack
+                        .last_mut()
+                        .unwrap()
+                        .children
+                        .push(Child::Element(node));
                 } else {
                     stack.push(node);
                 }
@@ -515,25 +559,28 @@ impl EvalContext {
     }
 }
 
-#[derive(Default)]
 struct Extractor {
     triples: Vec<Triple>,
-    bnode: usize,
+    labels: BlankLabeler,
+    /// Bounds what `triples` holds.
+    budget: TermBudget,
 }
 
 impl Extractor {
     /// Mint a fresh, document-unique blank node for a `@typeof`/`@rel` chain.
-    /// The `~` cannot appear in a parsed `_:` CURIE reference (an NCName), so a
-    /// minted label can never collide with an author-written `_:` blank node —
-    /// mirrors the Turtle (`g~`) and JSON-LD (`jld~`) parsers.
+    /// Its label comes from the [`BlankLabeler`] (round-trippable, never equal
+    /// to an author-written `_:` label); it carries the [`MINTED`] marker
+    /// until the parse finishes.
     fn fresh_blank(&mut self) -> Term {
-        let t = Term::Blank(format!("rdfa~{}", self.bnode));
-        self.bnode += 1;
-        t
+        Term::Blank(format!("{MINTED}{}", self.labels.fresh()))
     }
 
     fn push(&mut self, s: Term, p: Term, o: Term) {
-        self.triples.push(Triple::new(s, p, o));
+        if self.budget.admit([&s, &p, &o]) {
+            self.triples.push(Triple::new(s, p, o));
+        } else {
+            self.triples = Vec::new();
+        }
     }
 
     /// The RDFa Core processing sequence for one element (subset).
@@ -602,7 +649,9 @@ impl Extractor {
                 } else if is_root {
                     Some(Term::Iri(base.clone()))
                 } else {
-                    ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                    ctx.parent_object
+                        .clone()
+                        .or(Some(ctx.parent_subject.clone()))
                 };
                 if has_typeof {
                     typed_resource = if let Some(a) = el.attr("about") {
@@ -636,7 +685,9 @@ impl Extractor {
                     if !has_property {
                         skip = true;
                     }
-                    ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                    ctx.parent_object
+                        .clone()
+                        .or(Some(ctx.parent_subject.clone()))
                 };
                 if has_typeof {
                     typed_resource = new_subject.clone();
@@ -649,7 +700,9 @@ impl Extractor {
             } else if is_root {
                 Some(Term::Iri(base.clone()))
             } else {
-                ctx.parent_object.clone().or(Some(ctx.parent_subject.clone()))
+                ctx.parent_object
+                    .clone()
+                    .or(Some(ctx.parent_subject.clone()))
             };
             // The current object resource comes from @resource/@href/@src.
             current_object_resource = el
@@ -745,7 +798,8 @@ impl Extractor {
         // Step 11: @property literals / resources.
         if has_property {
             if let Some(subj) = &new_subject {
-                let obj = self.property_object(el, &local, &lang, &typed_resource, has_rel || has_rev);
+                let obj =
+                    self.property_object(el, &local, &lang, &typed_resource, has_rel || has_rev);
                 if let (Some(obj), Some(prop)) = (obj, el.attr("property")) {
                     for tok in prop.split_whitespace() {
                         if let Some(p) = resolve_term_or_curie(tok, &local) {
@@ -1002,7 +1056,10 @@ fn resolve_iri(base: &str, reference: &str) -> String {
         // Replace path from the authority onward (best-effort).
         if let Some(scheme_end) = base.find("://") {
             let after = &base[scheme_end + 3..];
-            let auth_end = after.find('/').map(|i| scheme_end + 3 + i).unwrap_or(base.len());
+            let auth_end = after
+                .find('/')
+                .map(|i| scheme_end + 3 + i)
+                .unwrap_or(base.len());
             return format!("{}{}", &base[..auth_end], reference);
         }
         return reference.to_string();
@@ -1136,15 +1193,21 @@ mod tests {
         assert_eq!(knows[0].object, Term::iri("http://ex/b"));
         let types = find(&ts, RDF_TYPE);
         assert_eq!(types.len(), 1);
-        assert_eq!(types[0].subject, Term::iri("http://ex/b"), "type must be on the rel object");
+        assert_eq!(
+            types[0].subject,
+            Term::iri("http://ex/b"),
+            "type must be on the rel object"
+        );
         assert_eq!(types[0].object, Term::iri("http://ex/Person"));
     }
 
     #[test]
     fn minted_blank_never_collides_with_author_blank() {
         // #1 (LOW): an author-written `_:rdfa0` must stay distinct from a blank the
-        // parser mints. The minted label carries a `~` (not a valid `_:` CURIE
-        // char), so the two can never be unified into one node.
+        // parser mints. Minted labels come from the BlankLabeler (`genid-<n>`;
+        // an author label starting `genid-` is escaped), so the two can never be
+        // unified into one node — and, unlike the earlier `rdfa~<n>`, the minted
+        // label round-trips through `ntriples::parse_term`.
         let doc = r#"
         <div>
           <span about="_:rdfa0" property="http://ex/p">authored</span>
@@ -1152,14 +1215,26 @@ mod tests {
         </div>"#;
         let ts = parse_str(doc).unwrap();
         let authored = find(&ts, "http://ex/p");
-        assert_eq!(authored[0].subject, Term::Blank("rdfa0".into()), "author label preserved");
+        assert_eq!(
+            authored[0].subject,
+            Term::Blank("rdfa0".into()),
+            "author label preserved"
+        );
         let types = find(&ts, RDF_TYPE);
         assert_eq!(types.len(), 1);
         let Term::Blank(minted) = &types[0].subject else {
             panic!("bare @typeof must mint a blank subject");
         };
-        assert!(minted.starts_with("rdfa~"), "minted label must use the ~ separator: {minted}");
-        assert_ne!(&types[0].subject, &authored[0].subject, "minted must not equal author blank");
+        assert!(minted.starts_with("genid-"), "minted label: {minted}");
+        assert_eq!(
+            crate::parser::ntriples::parse_term(&format!("_:{minted}")).unwrap(),
+            types[0].subject,
+            "minted label must round-trip"
+        );
+        assert_ne!(
+            &types[0].subject, &authored[0].subject,
+            "minted must not equal author blank"
+        );
     }
 
     #[test]
@@ -1169,10 +1244,18 @@ mod tests {
         let doc = r#"<a about="http://ex/a" rel="http://ex/next" property="http://ex/ref" href="http://ex/y">text</a>"#;
         let ts = parse_str(doc).unwrap();
         let next = find(&ts, "http://ex/next");
-        assert_eq!(next[0].object, Term::iri("http://ex/y"), "rel object is the href target");
+        assert_eq!(
+            next[0].object,
+            Term::iri("http://ex/y"),
+            "rel object is the href target"
+        );
         let refs = find(&ts, "http://ex/ref");
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].object, Term::plain_literal("text"), "property value is the text literal");
+        assert_eq!(
+            refs[0].object,
+            Term::plain_literal("text"),
+            "property value is the text literal"
+        );
     }
 
     #[test]
@@ -1207,7 +1290,11 @@ mod tests {
         let ts = parse_str(doc).unwrap();
         assert_eq!(
             find(&ts, "http://ex/label")[0].object,
-            Term::Literal { value: "chat".into(), datatype: None, lang: Some("fr".into()) }
+            Term::Literal {
+                value: "chat".into(),
+                datatype: None,
+                lang: Some("fr".into())
+            }
         );
     }
 
@@ -1295,14 +1382,20 @@ mod tests {
           </body>
         </html>"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/name")[0].subject, Term::iri("http://ex/alice"));
+        assert_eq!(
+            find(&ts, "http://ex/name")[0].subject,
+            Term::iri("http://ex/alice")
+        );
     }
 
     #[test]
     fn entities_in_text() {
         let doc = r#"<div about="http://ex/a"><span property="http://ex/n">a &lt; b &amp; c</span></div>"#;
         let ts = parse_str(doc).unwrap();
-        assert_eq!(find(&ts, "http://ex/n")[0].object, Term::plain_literal("a < b & c"));
+        assert_eq!(
+            find(&ts, "http://ex/n")[0].object,
+            Term::plain_literal("a < b & c")
+        );
     }
 
     #[test]

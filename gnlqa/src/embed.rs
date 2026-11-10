@@ -25,7 +25,8 @@ pub trait Embedder: Send + Sync {
     /// Convenience: embed a single text.
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut v = self.embed(std::slice::from_ref(&text.to_string()))?;
-        v.pop().ok_or_else(|| Error::Llm("embedder returned no vector".into()))
+        v.pop()
+            .ok_or_else(|| Error::Llm("embedder returned no vector".into()))
     }
 }
 
@@ -102,7 +103,12 @@ pub struct HttpEmbedder {
 }
 
 impl HttpEmbedder {
-    pub fn new(url: impl Into<String>, api_key: impl Into<String>, model: impl Into<String>, dim: usize) -> HttpEmbedder {
+    pub fn new(
+        url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        dim: usize,
+    ) -> HttpEmbedder {
         HttpEmbedder {
             url: url.into(),
             api_key: Secret::new(api_key),
@@ -122,9 +128,12 @@ impl HttpEmbedder {
     /// guarantee ordering); errors on non-numeric/non-finite components, missing
     /// embeddings, and duplicate/out-of-range indices. (Also used by tests.)
     pub fn parse_response(v: &Value) -> Result<Vec<Vec<f32>>> {
-        let data = v["data"]
-            .as_array()
-            .ok_or_else(|| Error::Llm(format!("embeddings response has no data array: {}", snippet(v))))?;
+        let data = v["data"].as_array().ok_or_else(|| {
+            Error::Llm(format!(
+                "embeddings response has no data array: {}",
+                snippet(v)
+            ))
+        })?;
         let n = data.len();
         let mut slots: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None).take(n).collect();
         for (pos, d) in data.iter().enumerate() {
@@ -146,7 +155,9 @@ impl HttpEmbedder {
                 None => pos,
             };
             if idx >= n {
-                return Err(Error::Llm(format!("embedding index {idx} out of range (n={n})")));
+                return Err(Error::Llm(format!(
+                    "embedding index {idx} out of range (n={n})"
+                )));
             }
             if slots[idx].is_some() {
                 return Err(Error::Llm(format!("duplicate embedding index {idx}")));
@@ -167,14 +178,18 @@ impl Embedder for HttpEmbedder {
             return Ok(Vec::new());
         }
         let resp = ureq::post(&self.url)
-            .set("Authorization", &format!("Bearer {}", self.api_key.expose()))
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.api_key.expose()),
+            )
             .set("content-type", "application/json")
             .timeout(self.timeout)
             .send_json(self.request_body(texts))
             .map_err(|e| match e {
-                ureq::Error::Status(code, r) => {
-                    Error::Http(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
-                }
+                ureq::Error::Status(code, r) => Error::Http(format!(
+                    "HTTP {code}: {}",
+                    r.into_string().unwrap_or_default()
+                )),
                 other => Error::Http(other.to_string()),
             })?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
@@ -223,7 +238,12 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     pub fn new(dim: usize) -> VectorIndex {
-        VectorIndex { dim, ids: Vec::new(), texts: Vec::new(), data: Vec::new() }
+        VectorIndex {
+            dim,
+            ids: Vec::new(),
+            texts: Vec::new(),
+            data: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -239,9 +259,18 @@ impl VectorIndex {
     }
 
     /// Add one already-embedded item (the vector is normalized on insert).
-    pub fn add(&mut self, id: impl Into<String>, text: impl Into<String>, mut vec: Vec<f32>) -> Result<()> {
+    pub fn add(
+        &mut self,
+        id: impl Into<String>,
+        text: impl Into<String>,
+        mut vec: Vec<f32>,
+    ) -> Result<()> {
         if vec.len() != self.dim {
-            return Err(Error::Llm(format!("vector dim {} != index dim {}", vec.len(), self.dim)));
+            return Err(Error::Llm(format!(
+                "vector dim {} != index dim {}",
+                vec.len(),
+                self.dim
+            )));
         }
         normalize(&mut vec);
         self.ids.push(id.into());
@@ -304,12 +333,21 @@ impl VectorIndex {
         scored.sort_by(cmp);
         scored
             .into_iter()
-            .map(|(score, i)| Scored { id: self.ids[i].clone(), text: self.texts[i].clone(), score })
+            .map(|(score, i)| Scored {
+                id: self.ids[i].clone(),
+                text: self.texts[i].clone(),
+                score,
+            })
             .collect()
     }
 
     /// Embed `query` with `embedder`, then [`search`](Self::search).
-    pub fn search_text(&self, embedder: &dyn Embedder, query: &str, k: usize) -> Result<Vec<Scored>> {
+    pub fn search_text(
+        &self,
+        embedder: &dyn Embedder,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Scored>> {
         let q = embedder.embed_one(query)?;
         Ok(self.search(&q, k))
     }
@@ -380,7 +418,8 @@ mod tests {
         let body = h.request_body(&["a".to_string(), "b".to_string()]);
         assert_eq!(body["model"], "voyage-3");
         assert_eq!(body["input"][1], "b");
-        let resp = json!({"data": [{"embedding": [0.1, 0.2, 0.3]}, {"embedding": [1.0, 0.0, 0.0]}]});
+        let resp =
+            json!({"data": [{"embedding": [0.1, 0.2, 0.3]}, {"embedding": [1.0, 0.0, 0.0]}]});
         let vecs = HttpEmbedder::parse_response(&resp).unwrap();
         assert_eq!(vecs.len(), 2);
         assert_eq!(vecs[0], vec![0.1f32, 0.2, 0.3]);
@@ -390,10 +429,15 @@ mod tests {
     fn parse_response_honors_index_and_rejects_bad() {
         // out-of-order data carrying `index` is restored to input order
         let resp = json!({"data": [{"embedding":[2.0],"index":1}, {"embedding":[1.0],"index":0}]});
-        assert_eq!(HttpEmbedder::parse_response(&resp).unwrap(), vec![vec![1.0f32], vec![2.0f32]]);
+        assert_eq!(
+            HttpEmbedder::parse_response(&resp).unwrap(),
+            vec![vec![1.0f32], vec![2.0f32]]
+        );
         // non-numeric component, out-of-range index, non-finite → errors
         assert!(HttpEmbedder::parse_response(&json!({"data":[{"embedding":["x"]}]})).is_err());
-        assert!(HttpEmbedder::parse_response(&json!({"data":[{"embedding":[1.0],"index":5}]})).is_err());
+        assert!(
+            HttpEmbedder::parse_response(&json!({"data":[{"embedding":[1.0],"index":5}]})).is_err()
+        );
     }
 
     #[test]
@@ -407,15 +451,19 @@ mod tests {
                 2
             }
         }
-        let items = vec![("a".to_string(), "a".to_string()), ("b".to_string(), "b".to_string())];
+        let items = vec![
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "b".to_string()),
+        ];
         assert!(VectorIndex::build(&BadEmbedder, &items).is_err());
     }
 
     #[test]
     fn search_k_larger_than_len_and_topk_order() {
         let e = HashEmbedder::new(64);
-        let items: Vec<(String, String)> =
-            (0..5).map(|i| (format!("e{i}"), format!("token{i} shared"))).collect();
+        let items: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("e{i}"), format!("token{i} shared")))
+            .collect();
         let idx = VectorIndex::build(&e, &items).unwrap();
         let all = idx.search_text(&e, "token2 shared", 99).unwrap(); // k > len
         assert_eq!(all.len(), 5);

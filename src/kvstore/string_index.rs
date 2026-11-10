@@ -70,6 +70,13 @@ impl StringIndex {
             idx.ordered.push(id);
         }
         idx.sort_ordered();
+        // A built index is kept (a database caches it per dictionary
+        // generation): give back the growth slack of every list.
+        for list in idx.trigrams.values_mut() {
+            list.shrink_to_fit();
+        }
+        idx.trigrams.shrink_to_fit();
+        idx.by_id.shrink_to_fit();
         idx
     }
 
@@ -100,13 +107,28 @@ impl StringIndex {
         self.by_id.is_empty()
     }
 
+    /// An estimate of the heap bytes the index holds (map buckets at their
+    /// capacity, strings and posting lists at theirs).
+    pub fn heap_bytes(&self) -> usize {
+        let bucket = |entry: usize| entry + 1; // one control byte per bucket
+        self.by_id.capacity() * bucket(std::mem::size_of::<(u32, String)>())
+            + self.by_id.values().map(String::capacity).sum::<usize>()
+            + self.trigrams.capacity() * bucket(std::mem::size_of::<(u32, Vec<u32>)>())
+            + self
+                .trigrams
+                .values()
+                .map(|v| v.capacity() * 4)
+                .sum::<usize>()
+            + self.ordered.capacity() * 4
+    }
+
     /// The string for `id`, if indexed.
     pub fn string_of(&self, id: u32) -> Option<&str> {
         self.by_id.get(&id).map(String::as_str)
     }
 
     /// A **sound superset** of the ids whose string contains `needle`, via
-    /// trigram-posting intersection. For a `needle` shorter than [`GRAM`], the
+    /// trigram-posting intersection. For a `needle` shorter than `GRAM`, the
     /// trigram index cannot prune, so every id is returned (still a superset).
     /// The result is sorted and de-duplicated. Use this when a caller wants to
     /// intersect candidates into a join and verify later; for verified results
@@ -149,11 +171,7 @@ impl StringIndex {
     pub fn search_contains(&self, needle: &str) -> Vec<u32> {
         self.contains_candidates(needle)
             .into_iter()
-            .filter(|id| {
-                self.by_id
-                    .get(id)
-                    .is_some_and(|s| s.contains(needle))
-            })
+            .filter(|id| self.by_id.get(id).is_some_and(|s| s.contains(needle)))
             .collect()
     }
 
@@ -195,9 +213,8 @@ impl StringIndex {
     fn sort_ordered(&mut self) {
         // Sort ids by their string (then id) so the order is total and stable.
         let by_id = &self.by_id;
-        self.ordered.sort_by(|a, b| {
-            by_id[a].as_str().cmp(by_id[b].as_str()).then(a.cmp(b))
-        });
+        self.ordered
+            .sort_by(|a, b| by_id[a].as_str().cmp(by_id[b].as_str()).then(a.cmp(b)));
     }
 
     fn all_ids(&self) -> Vec<u32> {
@@ -327,7 +344,10 @@ mod tests {
             inc.insert(id, s);
         }
         assert_eq!(inc.search_contains("alic"), built.search_contains("alic"));
-        assert_eq!(inc.prefix("<http://example.org/"), built.prefix("<http://example.org/"));
+        assert_eq!(
+            inc.prefix("<http://example.org/"),
+            built.prefix("<http://example.org/")
+        );
     }
 
     #[test]
@@ -336,7 +356,10 @@ mod tests {
         let bytes = bincode::serialize(&idx).unwrap();
         let back: StringIndex = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back.search_contains("alic"), idx.search_contains("alic"));
-        assert_eq!(back.prefix("<http://example.org/"), idx.prefix("<http://example.org/"));
+        assert_eq!(
+            back.prefix("<http://example.org/"),
+            idx.prefix("<http://example.org/")
+        );
         assert_eq!(back.len(), idx.len());
     }
 

@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch / PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The Rust toolchain of every job, pinned so that a new stable release
+  # cannot turn CI red without a code change. Bumping the pin means fixing
+  # the new version's clippy and rustfmt findings in the same commit.
+  # bench.yml pins the same version: its rocksdb-correctness job shares the
+  # rocksdb job's cache, whose key hashes the rustc version.
+  RUST_TOOLCHAIN: "1.99.1"
+  # Dev and test builds keep line tables only (file:line in backtraces), not
+  # full debuginfo: about 70 integration-test binaries each link gstore, and
+  # with full debuginfo the build step of the `zip pfn-wasm readline` job
+  # filled the runner's disk, so rust-lld died with SIGBUS (signal 7) while
+  # writing one of them. Nothing in Cargo.toml sets `debug` for these
+  # profiles.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+# Benchmarks (gstore-bench smoke gate, RocksDB correctness through the
+# harness, the weekly reference run) are in bench.yml.
+jobs:
+  # rustfmt.toml pins style_edition 2021. The one-time `cargo fmt --all`
+  # commit that made the tree rustfmt-clean is listed in
+  # .git-blame-ignore-revs.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (workspace, all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Broken, ambiguous, redundant and private intra-doc links in the gstore
+      # crate's documentation (library and binaries, default features) fail
+      # the job, as clippy's findings do.
+      - name: rustdoc (intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p gstore --no-deps --locked
+
+  # The suite runs twice: once with on-disk (kvstore.kv) databases opened in
+  # Materialize mode, once in Stream mode (GSTORE_DISK_QUERY_MODE, which
+  # Database::open honours; tests that need one mode open with explicit
+  # OpenOptions). The variable changes no compilation, so the second step
+  # runs the binaries the first one built (same command, same profile).
+  test:
+    name: test (workspace, default features; disk databases in memory and stream mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+      - name: test (on-disk databases in Materialize mode)
+        env:
+          GSTORE_DISK_QUERY_MODE: memory
+        run: cargo test --workspace
+      - name: test (on-disk databases in Stream mode)
+        env:
+          GSTORE_DISK_QUERY_MODE: stream
+        run: cargo test --workspace
+      # The tables between `<!-- gstore-bench report … -->` markers must be
+      # what `gstore-bench report` makes of the committed results (fix with
+      # `gstore-bench report --update README.md CHANGELOG.md`). Here, with
+      # no paths-ignore, a docs-only change is checked too (bench.yml's
+      # smoke job skips those).
+      - name: generated documentation tables are current
+        run: cargo run --locked -q -p gstore-bench --bin gstore-bench -- report --check README.md CHANGELOG.md
+
+  # The feature matrix: one job per optional feature of the gstore crate,
+  # plus the console / zip / PFN features together (gconsole driving the PFN
+  # and backup paths of one server): build, clippy and test with it.
+  # (rocksdb has its own job below: its bundled C++ build needs clang and a
+  # longer timeout.)
+  features:
+    name: test (gstore, --features ${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # zip: zip packages, zipped backups and exports; readline: gconsole
+        # line editing; pfn-wasm: the sandboxed WebAssembly runtime of PFN
+        # user functions (its tests run the docs/PFN.md examples).
+        feature: [gzip, tls, zip, readline, pfn-wasm, "zip pfn-wasm readline"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-${{ strategy.job-index }}
+      - name: build
+        # --locked, as the Dockerfile builds: Cargo.lock covers every feature.
+        # --profile test, the profile `cargo test` uses: Cargo.toml's
+        # [profile.test] sets opt-level 1, so a dev-profile build here would
+        # give every unit a different hash, and the test step would compile
+        # and link gstore, its dependencies and about 95 executables a second
+        # time, about doubling the job's disk use. With the same profile the
+        # test step only runs what this step built.
+        run: cargo build --locked --profile test -p gstore --all-targets --features "${{ matrix.feature }}"
+      - name: clippy
+        run: cargo clippy -p gstore --all-targets --features "${{ matrix.feature }}" -- -D warnings
+      - name: test
+        run: cargo test -p gstore --features "${{ matrix.feature }}"
+
+  # Upstream gStore 1.4's own test scripts (scripts/test/*.sh) and Python SDK,
+  # run unmodified against the Rust gserver (see scripts/conformance.sh).
+  conformance:
+    name: conformance (upstream test scripts + Python SDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: install curl, wget, python3-requests
+        run: sudo apt-get update && sudo apt-get install -y curl wget python3 python3-requests
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance
+      - name: scripts/conformance.sh
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/conformance.sh
+      - name: upload the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs
+          path: |
+            ${{ runner.temp }}/gstore-conformance.*/conformance-logs
+            ${{ runner.temp }}/gstore-conformance.*/dbhome/gserver.log
+          if-no-files-found: ignore
+
+  rocksdb:
+    name: test (gstore, --features rocksdb)
+    runs-on: ubuntu-latest
+    # The bundled librocksdb C++ build dominates; allow for a cold cache.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang (librocksdb-sys bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      # One cache for every job that compiles librocksdb-sys (this one and
+      # bench.yml's rocksdb-correctness): the C++ build dominates both. The
+      # key hashes the rustc version and every CARGO*/RUST* variable, so
+      # bench.yml's job sets the same toolchain and debuginfo as this file.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rocksdb
+      - name: clippy
+        run: cargo clippy -p gstore --all-targets --features rocksdb -- -D warnings
+      - name: test
+        run: cargo test -p gstore --features rocksdb

@@ -23,7 +23,10 @@ struct MockState {
 impl MockLlm {
     /// A mock that returns `responses` in order, cycling when exhausted.
     pub fn new(responses: Vec<String>) -> MockLlm {
-        MockLlm { responses, state: Mutex::new(MockState::default()) }
+        MockLlm {
+            responses,
+            state: Mutex::new(MockState::default()),
+        }
     }
 
     /// A mock that always returns the same text.
@@ -38,7 +41,12 @@ impl MockLlm {
 
     /// The system prompt of the last request, if any.
     pub fn last_system(&self) -> Option<String> {
-        self.state.lock().unwrap().seen.last().and_then(|r| r.system.clone())
+        self.state
+            .lock()
+            .unwrap()
+            .seen
+            .last()
+            .and_then(|r| r.system.clone())
     }
 
     /// The last user message content, if any.
@@ -73,7 +81,10 @@ mod tests {
     fn cycles_responses_and_records_requests() {
         let m = MockLlm::new(vec!["a".into(), "b".into()]);
         assert_eq!(m.complete(&LlmRequest::prompt("q1")).unwrap(), "a");
-        assert_eq!(m.complete(&LlmRequest::prompt("q2").system("sys")).unwrap(), "b");
+        assert_eq!(
+            m.complete(&LlmRequest::prompt("q2").system("sys")).unwrap(),
+            "b"
+        );
         assert_eq!(m.complete(&LlmRequest::prompt("q3")).unwrap(), "a"); // cycles
         assert_eq!(m.call_count(), 3);
         assert_eq!(m.last_user().as_deref(), Some("q3"));

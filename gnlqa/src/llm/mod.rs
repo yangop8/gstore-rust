@@ -39,10 +39,16 @@ pub struct Message {
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Message {
-        Message { role: Role::User, content: content.into() }
+        Message {
+            role: Role::User,
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Message {
-        Message { role: Role::Assistant, content: content.into() }
+        Message {
+            role: Role::Assistant,
+            content: content.into(),
+        }
     }
 }
 

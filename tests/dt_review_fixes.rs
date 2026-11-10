@@ -6,7 +6,9 @@ use gstore::Database;
 
 /// SPARQL counts render as typed `xsd:integer` literals.
 fn int(n: i64) -> Option<String> {
-    Some(format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>"))
+    Some(format!(
+        "\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+    ))
 }
 
 /// bug_003: `COUNT(DISTINCT *)` must dedup whole solution mappings, not behave

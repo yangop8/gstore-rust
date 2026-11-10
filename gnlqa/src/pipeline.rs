@@ -85,7 +85,11 @@ pub struct AskEngine {
 
 impl AskEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> AskEngine {
-        AskEngine { llm, kb, model: None }
+        AskEngine {
+            llm,
+            kb,
+            model: None,
+        }
     }
 
     /// Pin a specific model for generation.
@@ -108,7 +112,11 @@ impl AskEngine {
         let answer = self.kb.query(&sparql)?;
         let values = answer_values(&answer);
         // Aligned with solve's score_outcome bands (empty 0.1, non-empty 1.0).
-        let confidence = if crate::repair::is_empty_answer(&answer) { 0.1 } else { 1.0 };
+        let confidence = if crate::repair::is_empty_answer(&answer) {
+            0.1
+        } else {
+            1.0
+        };
         Ok(Answer {
             text: render_answer(&answer, &values),
             values,
@@ -191,17 +199,28 @@ mod tests {
     use crate::llm::MockLlm;
 
     fn term(v: &str) -> RdfTerm {
-        RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None }
+        RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        }
     }
 
     #[test]
     fn extract_sparql_strips_fences() {
-        assert_eq!(extract_sparql("SELECT ?s WHERE { ?s ?p ?o }"), "SELECT ?s WHERE { ?s ?p ?o }");
+        assert_eq!(
+            extract_sparql("SELECT ?s WHERE { ?s ?p ?o }"),
+            "SELECT ?s WHERE { ?s ?p ?o }"
+        );
         assert_eq!(
             extract_sparql("```sparql\nSELECT ?s WHERE { ?s ?p ?o }\n```"),
             "SELECT ?s WHERE { ?s ?p ?o }"
         );
-        assert_eq!(extract_sparql("```\nASK { ?s ?p ?o }\n```"), "ASK { ?s ?p ?o }");
+        assert_eq!(
+            extract_sparql("```\nASK { ?s ?p ?o }\n```"),
+            "ASK { ?s ?p ?o }"
+        );
     }
 
     #[test]
@@ -217,15 +236,22 @@ mod tests {
             "SELECT ?s WHERE { ?s ?p ?o }"
         );
         // multiple blocks — first wins
-        assert_eq!(extract_sparql("```\nASK { ?s ?p ?o }\n```\n```\nSELECT ?x {}\n```"), "ASK { ?s ?p ?o }");
+        assert_eq!(
+            extract_sparql("```\nASK { ?s ?p ?o }\n```\n```\nSELECT ?x {}\n```"),
+            "ASK { ?s ?p ?o }"
+        );
     }
 
     #[test]
     fn direct_passthrough_select() {
-        let llm = MockLlm::fixed("```sparql\nSELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }\n```");
+        let llm =
+            MockLlm::fixed("```sparql\nSELECT ?x WHERE { ?x <http://ex/p> <http://ex/o> }\n```");
         let answer = SparqlAnswer::Select {
             vars: vec!["x".into()],
-            rows: vec![vec![Some(term("http://ex/a"))], vec![Some(term("http://ex/b"))]],
+            rows: vec![
+                vec![Some(term("http://ex/a"))],
+                vec![Some(term("http://ex/b"))],
+            ],
         };
         let kb = MockKb::new(vec![answer]);
         let engine = AskEngine::new(Box::new(llm), Box::new(kb));
@@ -253,6 +279,10 @@ mod tests {
         let err = engine.ask("q").unwrap_err();
         assert!(matches!(err, crate::error::Error::Sparql(_)));
         // Directly verify the invalid query never reached the KB.
-        assert_eq!(kb.query_count(), 0, "KB must not be queried with invalid SPARQL");
+        assert_eq!(
+            kb.query_count(),
+            0,
+            "KB must not be queried with invalid SPARQL"
+        );
     }
 }

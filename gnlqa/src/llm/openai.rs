@@ -81,7 +81,10 @@ impl OpenAiClient {
 
     /// Serialize a request into the Chat-Completions JSON body (also used by tests).
     pub fn request_body(&self, req: &LlmRequest) -> Value {
-        let model = req.model.clone().unwrap_or_else(|| self.default_model.clone());
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone());
         // The system prompt becomes a leading system message.
         let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
         if let Some(sys) = &req.system {
@@ -100,9 +103,13 @@ impl OpenAiClient {
 
     /// Extract the assistant text from a Chat-Completions response body.
     pub fn extract_text(resp: &Value) -> Result<String> {
-        let content = resp["choices"][0]["message"]["content"].as_str().ok_or_else(|| {
-            Error::Llm(format!("response has no choices[0].message.content: {resp}"))
-        })?;
+        let content = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| {
+                Error::Llm(format!(
+                    "response has no choices[0].message.content: {resp}"
+                ))
+            })?;
         if content.trim().is_empty() {
             // A reasoning model that exhausted its budget on reasoning returns an
             // empty content — treat as a failed completion so callers can degrade.
@@ -119,7 +126,10 @@ impl LlmClient for OpenAiClient {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = self.request_body(req);
         let resp = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key.expose()))
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.api_key.expose()),
+            )
             .set("content-type", "application/json")
             .timeout(self.timeout)
             .send_json(body)
@@ -156,7 +166,9 @@ mod tests {
     #[test]
     fn model_override_and_no_system() {
         let c = OpenAiClient::new("k", "u", "default");
-        let req = LlmRequest::prompt("x").model("deepseek-v4-flash").max_tokens(4096);
+        let req = LlmRequest::prompt("x")
+            .model("deepseek-v4-flash")
+            .max_tokens(4096);
         let b = c.request_body(&req);
         assert_eq!(b["model"], "deepseek-v4-flash");
         assert_eq!(b["messages"][0]["role"], "user"); // no system message prepended
@@ -167,12 +179,21 @@ mod tests {
     fn with_max_tokens_raises_the_floor() {
         // GNLQA_MAX_TOKENS wiring: a higher floor lifts small requests to it.
         let c = OpenAiClient::new("k", "u", "m").with_max_tokens(8192);
-        assert_eq!(c.request_body(&LlmRequest::prompt("x").max_tokens(64))["max_tokens"], 8192);
+        assert_eq!(
+            c.request_body(&LlmRequest::prompt("x").max_tokens(64))["max_tokens"],
+            8192
+        );
         // a request already above the floor is preserved
-        assert_eq!(c.request_body(&LlmRequest::prompt("x").max_tokens(9000))["max_tokens"], 9000);
+        assert_eq!(
+            c.request_body(&LlmRequest::prompt("x").max_tokens(9000))["max_tokens"],
+            9000
+        );
         // the floor can never drop below the reasoning-model minimum
         let low = OpenAiClient::new("k", "u", "m").with_max_tokens(10);
-        assert_eq!(low.request_body(&LlmRequest::prompt("x").max_tokens(1))["max_tokens"], MIN_MAX_TOKENS);
+        assert_eq!(
+            low.request_body(&LlmRequest::prompt("x").max_tokens(1))["max_tokens"],
+            MIN_MAX_TOKENS
+        );
     }
 
     #[test]

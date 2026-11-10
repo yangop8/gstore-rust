@@ -28,9 +28,26 @@
 //! older than the oldest live transaction's start version are garbage-collected
 //! on every commit/abort, so the history never grows unbounded.
 //!
-//! Cost model: publishing a [`Snapshot`] clones the dictionary + triple indexes
-//! (`O(store)` per commit). That keeps published snapshots immutable and the
-//! `query()`/`snapshot()` read path simple.
+//! Cost model: publishing a [`Snapshot`] of an in-memory database is O(1) in
+//! the data: the dictionary (an `Arc`'d interner), the default graph's
+//! [`TripleStore`] and the named graphs' stores are copy-on-write and shared
+//! with the authoritative [`Database`] until it changes them. The store of
+//! the authoritative database keeps a *spare* copy
+//! ([`TripleStore::keep_spare_copies`]): the first write after a publish
+//! must give the database indexes of its own, and it reuses the copy of the
+//! version before — no longer read once every reader of that older snapshot
+//! let it go — by replaying the changes made since (O(changes)), instead of
+//! copying the whole store (O(triples), the fallback when a reader still
+//! holds that older snapshot). A one-triple update therefore costs about
+//! two triple inserts, not a store copy. Memory: the database's indexes,
+//! the spare and the construction-time base snapshot's (see
+//! [`VersionView`]) — three copies at most, as when every publish cloned
+//! the store. A database with no in-RAM store — a Stream-mode on-disk one
+//! or RocksDB — is still materialized per publish (O(triples), inside a
+//! [`ReadScope`]): a snapshot is a long-lived versioned view (transactions
+//! read their begin-time snapshot, [`VersionView`] falls back to the base
+//! one), which an on-disk read view cannot be — it expires at the next
+//! write (`DiskReadView`, pager MVCC is deferred).
 //!
 //! On top of that clone-published snapshot, a **per-key version-chain** store
 //! provides finer-grained MVCC *without* a per-snapshot copy. Every transactional
@@ -76,6 +93,19 @@
 //! writer lock; finer-grained per-key write latching is left to a future MVCC
 //! pass.
 //!
+//! Read errors (contract C2): every snapshot and [`VersionView`] query runs
+//! inside a [`ReadScope`]; a read error a backend reports there fails the
+//! query (a snapshot never caches answers). Publishing a snapshot of a
+//! database with no in-RAM store (RocksDB) materializes it inside a scope
+//! too: a read error recorded while copying it makes every query of that
+//! snapshot fail with that error, rather than answer from a partial copy.
+//!
+//! Lock order (contract C8): `writer` → `occ` → `current` / `versioned`;
+//! inside the authoritative [`Database`], its own order (`persist_lock` →
+//! disk sink → `persist_error` → the pager). A reader holds `current` only
+//! long enough to clone the `Arc` and `versioned` only while materializing,
+//! never while evaluating.
+//!
 //! NOT done (see `docs/REFACTOR_BACKLOG.md` E): lock-free reads beyond the
 //! `Arc`-swap / `RwLock`, deadlock detection, and version-chaining the legacy
 //! `update()`/`write()` path.
@@ -83,13 +113,32 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::db::Database;
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
-use crate::query::{Evaluator, QueryResult};
-use crate::store::TripleStore;
+use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
+use crate::store::read_scope::ReadScope;
+use crate::store::{TripleSource, TripleStore};
+
+/// The error of a statement whose evaluation recorded a read error `msg`
+/// (contract C2): it fails, and nothing of it is answered.
+fn read_failure(what: &str, msg: String) -> GStoreError {
+    GStoreError::Database(format!("a read from the store failed while {what}: {msg}"))
+}
+
+/// Evaluate `eval` on `q` inside a [`ReadScope`]: a read error recorded
+/// there fails the query.
+fn evaluate_scoped(eval: Evaluator<'_>, q: &sparql::ast::Query) -> Result<QueryResult> {
+    let scope = ReadScope::enter();
+    let result = eval.evaluate(q);
+    if let Some(e) = scope.take_error() {
+        return Err(read_failure("evaluating the query", e));
+    }
+    result
+}
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
 /// form (which round-trips losslessly), used for write-write conflict detection.
@@ -182,20 +231,92 @@ impl IsolationLevel {
 }
 
 /// An immutable, consistent view of the data at one committed version.
+///
+/// Queries see the user-defined functions registered on the database when
+/// the snapshot was published, and gStore's advanced graph functions run on
+/// one CSR of the snapshot shared by all its readers (the database's cached
+/// CSR when it had one for this data, otherwise built on first use).
 pub struct Snapshot {
     dict: Dictionary,
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
     version: u64,
+    functions: FunctionRegistry,
+    /// The database's integer-division mode when the snapshot was published.
+    integer_division: IntegerDivision,
+    /// The database's Top-K / early-termination options when the snapshot
+    /// was published.
+    topk: TopKOptions,
+    csr: CsrCache,
+    /// Whether `SERVICE` may contact remote endpoints: the database's
+    /// [`LoadPolicy::allow_remote`](crate::db::LoadPolicy::allow_remote), so
+    /// snapshot reads follow the same policy as [`Database::query`].
+    allow_service: bool,
+    /// The database's graph-function output bound when the snapshot was
+    /// published.
+    gfun_max_output_bytes: usize,
+    /// The database's PFN caller (with its PFN limits) when the snapshot was
+    /// published ([`Database::set_pfn_caller`]): `PFN.name(…)` queries on the
+    /// snapshot call the same user's functions as the database's own.
+    pfn: Option<crate::pfn::PfnCaller>,
+    /// A read error recorded while the store was copied (a backend with no
+    /// in-RAM store): every query of this snapshot fails with it.
+    capture_error: Option<String>,
 }
 
 impl Snapshot {
+    /// Capture `db`'s committed state. An in-memory (or on-disk working-set)
+    /// store is shared (copy-on-write, O(1)); a store with no in-RAM copy
+    /// (Stream-mode disk, RocksDB) is materialized explicitly from its
+    /// triples — O(triples) per published version, but never a panic.
     fn from_db(db: &Database, version: u64) -> Snapshot {
+        let mut capture_error = None;
+        let store = match db.backend().as_memory() {
+            Some(mem) => mem.clone(),
+            None => {
+                // Materialized inside a read scope (C2): a read error makes
+                // this snapshot fail its queries instead of answering from a
+                // partial copy.
+                let scope = ReadScope::enter();
+                let mut mem = TripleStore::new();
+                mem.bulk_load(db.backend().iter_all());
+                capture_error = scope.take_error();
+                mem
+            }
+        };
         Snapshot {
+            // A Stream database's snapshot resolves the ids of its
+            // materialized store through the shared on-disk dictionary,
+            // after later writes and outside any read view: its clone must
+            // keep the ids it may read from being reused while it lives.
             dict: db.dict().clone(),
-            store: db.store().clone(),
-            named: db.named_graphs().clone(),
+            store,
+            // Each graph's store is shared (copy-on-write).
+            named: db
+                .named_graphs()
+                .iter()
+                .map(|(&g, s)| (g, s.clone()))
+                .collect(),
             version,
+            functions: db.functions().clone(),
+            integer_division: db.integer_division(),
+            topk: db.topk_options(),
+            csr: db
+                .cached_csr()
+                .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
+            allow_service: db.load_policy().allow_remote,
+            gfun_max_output_bytes: db.gfun_max_output_bytes(),
+            pfn: db.pfn_caller(),
+            capture_error,
+        }
+    }
+
+    /// Fail when the copy this snapshot was published from recorded a read
+    /// error (see [`from_db`](Self::from_db)).
+    fn check_captured(&self) -> Result<()> {
+        match &self.capture_error {
+            Some(e) => Err(read_failure("copying the store for a snapshot", e.clone())),
+            None => Ok(()),
         }
     }
 
@@ -217,14 +338,47 @@ impl Snapshot {
         self.store.exists(s, p, o)
     }
 
-    /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot.
+    /// [`contains`](Self::contains), or `None` when a term could not be
+    /// looked up (a read error of an out-of-core dictionary).
+    fn try_contains(&self, t: &Triple) -> Option<bool> {
+        let ids = (|| -> Result<_> {
+            Ok((
+                self.dict.try_entity_id(&t.subject.dict_key())?,
+                self.dict.try_predicate_id(&t.predicate.dict_key())?,
+                self.dict.try_term_id(&t.object)?,
+            ))
+        })()
+        .ok()?;
+        let (Some(s), Some(p), Some(o)) = ids else {
+            return Some(false);
+        };
+        Some(self.store.exists(s, p, o))
+    }
+
+    /// Run a read query (SELECT/ASK/CONSTRUCT/DESCRIBE) against this snapshot,
+    /// inside a [`ReadScope`]: a read error recorded during the evaluation
+    /// fails it.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        self.check_captured()?;
         let q = sparql::parse(sparql)?;
-        let mut eval = Evaluator::new(&self.dict, &self.store);
+        // The snapshot never changes: one CSR generation for its lifetime.
+        let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
+        let mut eval = Evaluator::new(&self.dict, &self.store)
+            .with_service_allowed(self.allow_service)
+            .with_csr_provider(&csr)
+            .with_integer_division(self.integer_division)
+            .with_topk_options(self.topk)
+            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
-        eval.evaluate(&q)
+        if !self.functions.is_empty() {
+            eval = eval.with_functions(self.functions.clone());
+        }
+        if let Some(caller) = &self.pfn {
+            eval = eval.with_pfn(caller.clone());
+        }
+        evaluate_scoped(eval, &q)
     }
 }
 
@@ -360,7 +514,18 @@ impl VersionedStore {
     /// Apply every chain's visible state at `version` onto a base `dict`/`store`
     /// (clones of the base snapshot): insert visible triples, remove tombstoned
     /// ones. Keys with no record `<= version` are left to the base untouched.
-    fn materialize_into(&self, version: u64, dict: &mut Dictionary, store: &mut TripleStore) {
+    ///
+    /// A dictionary that fails to intern or look up a term (an out-of-core
+    /// dictionary's read error; an exhausted id space, which the writer
+    /// database would have hit first) fails it: skipping the record would
+    /// answer from a state that never existed (a committed insert missing,
+    /// a deleted triple back).
+    fn materialize_into(
+        &self,
+        version: u64,
+        dict: &mut Dictionary,
+        store: &mut TripleStore,
+    ) -> Result<()> {
         for chain in self.chains.values() {
             let Some(rec) = chain.visible(version) else {
                 continue;
@@ -368,24 +533,23 @@ impl VersionedStore {
             let t = &chain.triple;
             match rec.op {
                 ChainOp::Insert => {
-                    let id = IdTriple::new(
-                        dict.intern_entity(&t.subject.dict_key()),
-                        dict.intern_predicate(&t.predicate.dict_key()),
-                        dict.intern_term(&t.object),
-                    );
-                    store.insert(id);
+                    let s = dict.try_intern_entity(&t.subject.dict_key())?;
+                    let p = dict.try_intern_predicate(&t.predicate.dict_key())?;
+                    let o = dict.try_intern_term(&t.object)?;
+                    store.insert(IdTriple::new(s, p, o));
                 }
                 ChainOp::Tombstone => {
                     if let (Some(s), Some(p), Some(o)) = (
-                        dict.entity_id(&t.subject.dict_key()),
-                        dict.predicate_id(&t.predicate.dict_key()),
-                        dict.term_id(&t.object),
+                        dict.try_entity_id(&t.subject.dict_key())?,
+                        dict.try_predicate_id(&t.predicate.dict_key())?,
+                        dict.try_term_id(&t.object)?,
                     ) {
                         store.remove(IdTriple::new(s, p, o));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Reclaim records no live reader can observe: for each chain keep the latest
@@ -408,7 +572,11 @@ impl VersionedStore {
                 // A single surviving record that agrees with the base snapshot is
                 // redundant (a base fallback yields the same present/absent
                 // answer) and every live reader is at/after it, so drop the entry.
-                [only] => (only.op == ChainOp::Insert) != base.contains(&chain.triple),
+                // A base that cannot be read (an out-of-core dictionary's
+                // read error) cannot tell: keep the record.
+                [only] => base
+                    .try_contains(&chain.triple)
+                    .is_none_or(|present| (only.op == ChainOp::Insert) != present),
                 // Multiple versions are still distinguishable by live readers.
                 _ => true,
             }
@@ -437,6 +605,7 @@ pub struct ConcurrentDb {
 impl ConcurrentDb {
     /// Wrap an existing [`Database`].
     pub fn new(db: Database) -> ConcurrentDb {
+        Self::keep_spares(&db);
         let snap = Arc::new(Snapshot::from_db(&db, 1));
         ConcurrentDb {
             base: Arc::clone(&snap),
@@ -493,6 +662,11 @@ impl ConcurrentDb {
     /// Run a closure that mutates the database under the writer lock, then
     /// publish a new snapshot. Lets callers batch several mutations into one
     /// atomically-published version.
+    ///
+    /// Direct-API mutations ([`Database::insert_triple`], …) of an on-disk /
+    /// RocksDB database become durable at the next commit point: call
+    /// [`Database::sync`] inside the closure (or [`sync`](Self::sync) after it)
+    /// to make them durable now and to see any persistence failure.
     pub fn write<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&mut Database) -> T,
@@ -505,13 +679,34 @@ impl ConcurrentDb {
         out
     }
 
+    /// A commit point on the authoritative database (see [`Database::sync`]):
+    /// makes every mutation applied so far durable on a persistent layout and
+    /// reports any persistence failure since the previous commit point. A no-op
+    /// for an in-memory database.
+    pub fn sync(&self) -> Result<()> {
+        self.writer.lock().unwrap().sync()
+    }
+
     /// Publish a fresh snapshot from the writer database (bumping the version),
-    /// returning the new version number.
+    /// returning the new version number. The snapshot it replaces is let go
+    /// after the `current` lock is released (when it was the last holder of
+    /// a materialized store, freeing that takes a while).
     fn publish(&self, db: &Database) -> u64 {
+        Self::keep_spares(db);
         let next = self.version() + 1;
         let snap = Arc::new(Snapshot::from_db(db, next));
-        *self.current.write().unwrap() = snap;
+        let old = std::mem::replace(&mut *self.current.write().unwrap(), snap);
+        drop(old);
         next
+    }
+
+    /// Make the writer database's in-memory store keep a spare copy for the
+    /// next publish (see the module's cost model). Idempotent; again at every
+    /// publish, because a `CLEAR` replaces the store.
+    fn keep_spares(db: &Database) {
+        if let Some(mem) = db.backend().as_memory() {
+            mem.keep_spare_copies();
+        }
     }
 
     // ---- optimistic multi-writer transactions -----------------------------
@@ -637,6 +832,35 @@ impl ConcurrentDb {
             .chains
             .get(key)
             .map_or(0, |c| c.records.len())
+    }
+}
+
+impl Drop for ConcurrentDb {
+    /// A Stream-mode database defers each free while a dictionary pin older
+    /// than its candidacy lives, and this wrapper's own snapshots (`base`
+    /// above all) pin it for the wrapper's whole life: let them go, then run
+    /// the frees nothing holds any more and make them durable. A snapshot a
+    /// reader still holds keeps its ids; their frees are then lost with the
+    /// database, as at a restart (`gcompact --reclaim` finds them).
+    fn drop(&mut self) {
+        let Ok(db) = self.writer.get_mut() else {
+            // A writer panicked mid-change: touch nothing more.
+            return;
+        };
+        if !db.has_deferred_frees() {
+            return;
+        }
+        let empty = Arc::new(Snapshot::from_db(&Database::new(db.name()), 0));
+        if let Ok(current) = self.current.get_mut() {
+            *current = Arc::clone(&empty);
+        }
+        self.base = empty;
+        if let Err(e) = db.retry_deferred_frees() {
+            crate::gs_warn!(
+                "database '{}': freeing deferred term ids failed: {e}",
+                db.name()
+            );
+        }
     }
 }
 
@@ -783,17 +1007,19 @@ impl Txn<'_> {
             )));
         }
 
-        // No conflict: apply the buffered writes to the authoritative database.
-        for op in &self.ops {
-            match op {
-                TxnOp::Insert(t) => {
-                    db.insert_triple(t);
-                }
-                TxnOp::Delete(t) => {
-                    db.remove_triple(t);
-                }
+        // No conflict: apply the buffered writes to the authoritative database,
+        // all or nothing (an insert can fail once a dictionary id space is
+        // exhausted; the ops applied before it are then undone).
+        let persist_failure = match apply_txn_ops(&mut db, &self.ops) {
+            Ok(failure) => failure,
+            Err(e) => {
+                occ.deregister(self.start_version);
+                occ.gc();
+                self.db.gc_versions(occ.gc_floor());
+                self.registered = false;
+                return Err(e);
             }
-        }
+        };
         let new_version = self.db.publish(&db);
 
         // Append this commit's per-key version records to the shared chains: one
@@ -825,13 +1051,61 @@ impl Txn<'_> {
         occ.gc();
         self.db.gc_versions(occ.gc_floor());
         self.registered = false;
-        Ok(new_version)
+        // The writes are committed and published either way; a persistence
+        // failure at the commit point is reported like an auto-commit UPDATE's.
+        match persist_failure {
+            Some(e) => Err(e),
+            None => Ok(new_version),
+        }
     }
 
     /// Abort explicitly, discarding all buffered writes. (Dropping a txn without
     /// committing has the same effect.)
     pub fn abort(self) {
         // `Drop` performs the deregistration + GC.
+    }
+}
+
+/// Apply a validated transaction's buffered writes to the authoritative `db`,
+/// all or nothing: inside a [`Database`] transaction (unless the caller already
+/// opened one through [`ConcurrentDb::write`]), so an insert that cannot be
+/// encoded — a dictionary id space is exhausted — undoes the ops applied before
+/// it and is returned as `Err`. Committing that transaction is a commit point
+/// (durable on an on-disk / RocksDB layout); a persistence failure there leaves
+/// the writes applied and is returned as `Ok(Some(error))`.
+fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>> {
+    let own_txn = !db.in_transaction();
+    if own_txn {
+        db.begin()?;
+    }
+    // In a read scope (C2): a delete whose terms cannot be looked up (an
+    // out-of-core dictionary's read error) fails the transaction instead of
+    // silently removing nothing.
+    let scope = ReadScope::enter();
+    let applied = ops.iter().try_for_each(|op| {
+        match op {
+            TxnOp::Insert(t) => {
+                db.try_insert_triple(t)?;
+            }
+            TxnOp::Delete(t) => {
+                db.remove_triple(t);
+            }
+        }
+        match scope.take_error() {
+            Some(e) => Err(read_failure("applying the transaction's writes", e)),
+            None => Ok(()),
+        }
+    });
+    drop(scope);
+    match applied {
+        Ok(()) if own_txn => Ok(db.commit().err()),
+        Ok(()) => Ok(None),
+        Err(e) => {
+            if own_txn {
+                db.rollback()?;
+            }
+            Err(e)
+        }
     }
 }
 
@@ -886,21 +1160,47 @@ impl VersionView<'_> {
 
     /// Run a read query as of this view's version. Materializes the visible
     /// default-graph state on demand — the base snapshot plus chain overrides
-    /// `<= version` — then evaluates against it.
+    /// `<= version` — then evaluates against it (so a graph-function query
+    /// builds its CSR from that state). User-defined functions are the ones
+    /// of the latest published snapshot: they are not versioned data. The
+    /// materialization and the evaluation run inside a [`ReadScope`]: a read
+    /// error fails the query.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
+        self.db.base.check_captured()?;
         let mut dict = self.db.base.dict.clone();
         let mut store = self.db.base.store.clone();
-        self.db
-            .versioned
-            .read()
-            .unwrap()
-            .materialize_into(self.version, &mut dict, &mut store);
+        {
+            let scope = ReadScope::enter();
+            let materialized = self.db.versioned.read().unwrap().materialize_into(
+                self.version,
+                &mut dict,
+                &mut store,
+            );
+            if let Some(e) = scope.take_error() {
+                return Err(read_failure("materializing the version", e));
+            }
+            materialized.map_err(|e| read_failure("materializing the version", e.to_string()))?;
+        }
         let q = sparql::parse(sparql)?;
-        let mut eval = Evaluator::new(&dict, &store);
+        let latest = self.db.snapshot();
+        let functions = latest.functions.clone();
+        let mut eval = Evaluator::new(&dict, &store)
+            .with_service_allowed(latest.allow_service)
+            .with_integer_division(latest.integer_division)
+            .with_topk_options(latest.topk)
+            .with_gfun_max_output_bytes(latest.gfun_max_output_bytes);
         if !self.db.base.named.is_empty() {
             eval = eval.with_named(&self.db.base.named);
         }
-        eval.evaluate(&q)
+        if !functions.is_empty() {
+            eval = eval.with_functions(functions);
+        }
+        // Like the user-defined functions, the PFN caller is the latest
+        // snapshot's (functions are not versioned data).
+        if let Some(caller) = &latest.pfn {
+            eval = eval.with_pfn(caller.clone());
+        }
+        evaluate_scoped(eval, &q)
     }
 }
 
@@ -937,6 +1237,39 @@ mod tests {
         }
     }
 
+    /// Snapshot and version-view reads follow the wrapped database's
+    /// `SERVICE` policy, like `Database::query`: a restricted policy refuses
+    /// `SERVICE` with an error before any request is made.
+    #[test]
+    fn snapshot_reads_follow_the_service_policy() {
+        let mut db = crate::Database::build_from_str("conc_svc", DATA).unwrap();
+        db.set_load_policy(crate::db::LoadPolicy::restricted());
+        let c = ConcurrentDb::new(db);
+        // Port 9 (discard) on loopback: never contacted when refused.
+        let q = "SELECT * WHERE { SERVICE <http://127.0.0.1:9/sparql> { ?s ?p ?o } }";
+        for r in [c.query(q), c.snapshot().query(q), c.version_view().query(q)] {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("SERVICE is disabled"), "{e}");
+        }
+    }
+
+    /// Snapshot, transaction and version-view reads apply the database's
+    /// query settings — here the graph-function output bound.
+    #[test]
+    fn snapshot_reads_follow_the_query_settings() {
+        let mut db = crate::Database::build_from_str("conc_qs", DATA).unwrap();
+        db.apply_query_settings(&crate::db::QuerySettings {
+            gfun_max_output_bytes: 16,
+            ..crate::db::QuerySettings::default()
+        });
+        let c = ConcurrentDb::new(db);
+        let q = "SELECT (shortestPath(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) WHERE {}";
+        for r in [c.query(q), c.begin().query(q), c.version_view().query(q)] {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("bytes"), "{e}");
+        }
+    }
+
     fn snap_count(s: &Snapshot, q: &str) -> usize {
         match s.query(q).unwrap() {
             QueryResult::Select(rs) => rs.row_count(),
@@ -951,6 +1284,81 @@ mod tests {
         }
     }
 
+    /// Snapshot, transaction and version-view reads see the user-defined
+    /// functions registered on the database (an unregistered IRI call is a
+    /// query error), and a snapshot's graph-function reads share one CSR — the
+    /// writer database's cached one when it had one.
+    #[test]
+    fn a_read_error_fails_snapshot_and_version_view_queries() {
+        // A user function that reports a read error, as a failing backend
+        // does (contract C2): the query fails instead of answering.
+        const Q: &str = "SELECT (<http://ex/fn/fail>(1) AS ?v) WHERE {}";
+        let c = cdb();
+        c.write(|db| {
+            db.register_function("http://ex/fn/fail", |_| {
+                crate::store::read_scope::note_read_error("injected: torn page");
+                Some(crate::query::Value::Int(1))
+            });
+        });
+        for e in [
+            c.query(Q).unwrap_err(),
+            c.snapshot().query(Q).unwrap_err(),
+            c.begin().query(Q).unwrap_err(),
+            c.version_view().query(Q).unwrap_err(),
+        ] {
+            let e = e.to_string();
+            assert!(
+                e.contains("torn page") && e.contains("read from the store"),
+                "{e}"
+            );
+        }
+        // Nothing leaks into the next statement.
+        assert!(count(&c, "SELECT ?s WHERE { ?s ?p ?o }") > 0);
+    }
+
+    #[test]
+    fn snapshots_see_user_functions_and_share_one_csr() {
+        const FN: &str = "SELECT (<http://ex/fn/double>(21) AS ?v) WHERE {}";
+        const SP: &str = "SELECT (shortestPathLen(<http://ex/a>, <http://ex/b>, true, {}) AS ?p) \
+                          WHERE {}";
+        const SP_JSON: &str =
+            r#""{\"paths\":[{\"src\":\"<http://ex/a>\",\"dst\":\"<http://ex/b>\",\"length\":1}]}""#;
+        fn cell(r: Result<QueryResult>) -> String {
+            match r.unwrap() {
+                QueryResult::Select(rs) => rs.rows[0][0].clone().unwrap_or_default(),
+                other => panic!("expected Select, got {other:?}"),
+            }
+        }
+        let c = cdb();
+        c.write(|db| {
+            db.register_function("http://ex/fn/double", |args| {
+                Some(crate::query::Value::Int(args.first()?.as_f64()? as i64 * 2))
+            });
+        });
+        assert!(cell(c.query(FN)).starts_with("\"42\""));
+        assert!(cell(c.begin().query(FN)).starts_with("\"42\""));
+        assert!(cell(c.version_view().query(FN)).starts_with("\"42\""));
+
+        // Built on the first graph-function read, then shared.
+        let snap = c.snapshot();
+        assert!(snap.csr.peek(0).is_none());
+        assert_eq!(cell(snap.query(SP)), SP_JSON);
+        let built = snap
+            .csr
+            .peek(0)
+            .expect("built by the first graph-function read");
+        assert_eq!(cell(c.query(SP)), SP_JSON);
+        assert!(Arc::ptr_eq(&built, &snap.csr.peek(0).unwrap()));
+        assert_eq!(cell(c.version_view().query(SP)), SP_JSON);
+
+        // A CSR the writer database cached seeds the next published snapshot.
+        c.write(|db| db.preload_csr().unwrap());
+        let snap = c.snapshot();
+        let cached = c.writer.lock().unwrap().cached_csr().unwrap();
+        assert!(Arc::ptr_eq(&snap.csr.peek(0).unwrap(), &cached));
+        assert_eq!(cell(snap.query(SP)), SP_JSON);
+    }
+
     fn triple(s: &str, p: &str, o: &str) -> Triple {
         Triple::new(Term::iri(s), Term::iri(p), Term::iri(o))
     }
@@ -959,7 +1367,7 @@ mod tests {
     fn legacy_write_during_txn_conflicts() {
         let c = cdb();
         let mut txn = c.begin(); // starts at version 1
-        // A legacy (non-transactional) update commits during the txn's lifetime.
+                                 // A legacy (non-transactional) update commits during the txn's lifetime.
         c.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/x> }")
             .unwrap();
         txn.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
@@ -969,8 +1377,14 @@ mod tests {
             "a legacy write during the txn must conflict, got {res:?}"
         );
         // The legacy write persisted; the aborted txn's buffered write did not.
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 2);
-        assert_eq!(count(&c, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/r> }"), 0);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            2
+        );
+        assert_eq!(
+            count(&c, "SELECT ?s WHERE { ?s <http://ex/p> <http://ex/r> }"),
+            0
+        );
     }
 
     #[test]
@@ -990,18 +1404,27 @@ mod tests {
     fn single_thread_read_write_roundtrip() {
         let c = cdb();
         assert_eq!(c.version(), 1);
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 1);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            1
+        );
 
         let n = c
             .update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(c.version(), 2);
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 2);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            2
+        );
 
         c.update("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
             .unwrap();
-        assert_eq!(count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"), 1);
+        assert_eq!(
+            count(&c, "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"),
+            1
+        );
     }
 
     #[test]
@@ -1059,7 +1482,11 @@ mod tests {
         let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(total > 0, "readers should have run");
         // 400 commits happened on top of the initial version.
-        assert!(c.version() >= 401, "version should advance per commit: {}", c.version());
+        assert!(
+            c.version() >= 401,
+            "version should advance per commit: {}",
+            c.version()
+        );
     }
 
     // ---- optimistic multi-writer transactions ----------------------------
@@ -1073,7 +1500,10 @@ mod tests {
         txn.insert(t.clone());
         assert!(txn.contains(&t)); // read-your-writes
                                    // ...but the snapshot query (version V) does not see the buffered write.
-        assert_eq!(snap_count(txn.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"), 1);
+        assert_eq!(
+            snap_count(txn.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"),
+            1
+        );
         let v = txn.commit().unwrap();
         assert_eq!(v, 2);
         assert_eq!(count(&c, "SELECT ?o WHERE { ?s ?p ?o }"), 2);
@@ -1117,7 +1547,11 @@ mod tests {
         }
 
         assert_eq!(commits.load(Ordering::SeqCst), 1, "exactly one must commit");
-        assert_eq!(conflicts.load(Ordering::SeqCst), 1, "the other must conflict");
+        assert_eq!(
+            conflicts.load(Ordering::SeqCst),
+            1,
+            "the other must conflict"
+        );
         assert_eq!(c.version(), 2, "only one commit advanced the version");
     }
 
@@ -1209,12 +1643,19 @@ mod tests {
         // Commit several new versions via independent write transactions.
         for i in 0..5 {
             let mut w = c.begin();
-            w.insert(triple(&format!("http://ex/n{i}"), "http://ex/p", "http://ex/o"));
+            w.insert(triple(
+                &format!("http://ex/n{i}"),
+                "http://ex/p",
+                "http://ex/o",
+            ));
             w.commit().unwrap();
         }
 
         // The reader's captured snapshot is unchanged...
-        assert_eq!(snap_count(reader.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"), 1);
+        assert_eq!(
+            snap_count(reader.snapshot(), "SELECT ?o WHERE { ?s ?p ?o }"),
+            1
+        );
         match reader.query("SELECT ?o WHERE { ?s ?p ?o }").unwrap() {
             QueryResult::Select(rs) => assert_eq!(rs.row_count(), 1),
             other => panic!("{other:?}"),
@@ -1286,7 +1727,11 @@ mod tests {
 
         for i in 0..5 {
             let mut w = c.begin();
-            w.insert(triple(&format!("http://ex/n{i}"), "http://ex/p", "http://ex/o"));
+            w.insert(triple(
+                &format!("http://ex/n{i}"),
+                "http://ex/p",
+                "http://ex/o",
+            ));
             w.commit().unwrap();
         }
 
@@ -1327,7 +1772,11 @@ mod tests {
         .unwrap(); // v4: insert again
 
         assert_eq!(c.version(), 4);
-        assert_eq!(c.chain_len(&k.to_string()), 3, "all three versions retained");
+        assert_eq!(
+            c.chain_len(&k.to_string()),
+            3,
+            "all three versions retained"
+        );
 
         assert!(!c.version_view_at(1).contains(&k), "v1: before any record");
         assert!(c.version_view_at(2).contains(&k), "v2: inserted");
@@ -1407,7 +1856,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(c.chain_len(&k.to_string()) > 0, "records retained while pinned");
+        assert!(
+            c.chain_len(&k.to_string()) > 0,
+            "records retained while pinned"
+        );
         drop(pin); // floor rises to u64::MAX; GC runs
         assert_eq!(
             c.chain_len(&k.to_string()),

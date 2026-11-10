@@ -12,7 +12,9 @@ fn db(triples: &str) -> Database {
 
 #[test]
 fn abs_over_decimal_evaluates_not_type_errors() {
-    let mut d = db(&format!("<http://ex/a> <http://ex/v> \"-2.5\"^^<{DEC}> .\n"));
+    let mut d = db(&format!(
+        "<http://ex/a> <http://ex/v> \"-2.5\"^^<{DEC}> .\n"
+    ));
     // ABS(-2.5) must evaluate; if it type-errored (pre-fix), the FILTER would
     // drop the row and the count would be 0.
     let n = d
@@ -37,5 +39,8 @@ fn sum_over_decimals_is_not_zero() {
         )
         .unwrap()
         .row_count();
-    assert_eq!(n, 2, "each decimal row's SUM must exceed 1.0 (was 0 pre-fix)");
+    assert_eq!(
+        n, 2,
+        "each decimal row's SUM must exceed 1.0 (was 0 pre-fix)"
+    );
 }

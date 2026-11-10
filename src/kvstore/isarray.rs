@@ -14,7 +14,7 @@
 //! with byte-compact storage.
 //!
 //! ## Layout
-//! The array is a fixed set of [`NUM_BUCKETS`] hash buckets. A key hashes
+//! The array is a fixed set of `NUM_BUCKETS` hash buckets. A key hashes
 //! (FNV-1a) to a bucket; each **bucket's whole entry list is one value** stored
 //! in an internal [`IvArray`] keyed by the bucket index. That reuse is the point:
 //! [`IvArray`] already does the block management — a small bucket lives inline in
@@ -31,7 +31,7 @@
 //! and duplicate-key overwrites are always correct.
 //!
 //! ## Sizing (no rehash)
-//! [`NUM_BUCKETS`] is fixed, so there is **no resize/rehash** — a design choice
+//! `NUM_BUCKETS` is fixed, so there is **no resize/rehash** — a design choice
 //! that keeps the structure simple and unconditionally correct: an oversubscribed
 //! bucket merely holds a longer entry list (still handled by [`IvArray`]'s
 //! overflow chains), degrading lookup speed but never behaviour. Pick a bucket
@@ -146,7 +146,9 @@ fn push_entry(out: &mut Vec<u8>, key: &[u8], val: &[u8]) {
 
 /// The value for `key` in a bucket payload, if present.
 fn find_entry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-    entries(payload).find(|&(k, _, _)| k == key).map(|(_, v, _)| v.to_vec())
+    entries(payload)
+        .find(|&(k, _, _)| k == key)
+        .map(|(_, v, _)| v.to_vec())
 }
 
 /// Rebuild a bucket payload with `key → val` inserted or overwritten, preserving
@@ -194,7 +196,8 @@ mod tests {
     use crate::kvstore::pager::Pager;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_isarray_{tag}.kv"));
+        let p =
+            std::env::temp_dir().join(format!("gstore_isarray_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("kv.wal"));
         p
@@ -207,7 +210,8 @@ mod tests {
         let a = IsArray::new(0);
         a.insert(&mut pg, b"<alice>", &1u32.to_le_bytes()).unwrap();
         a.insert(&mut pg, b"<bob>", &2u32.to_le_bytes()).unwrap();
-        a.insert(&mut pg, b"\"a literal\"", &3u32.to_le_bytes()).unwrap();
+        a.insert(&mut pg, b"\"a literal\"", &3u32.to_le_bytes())
+            .unwrap();
         assert_eq!(a.get(&pg, b"<alice>").unwrap().unwrap(), 1u32.to_le_bytes());
         assert_eq!(a.get(&pg, b"<bob>").unwrap().unwrap(), 2u32.to_le_bytes());
         assert_eq!(
@@ -257,8 +261,12 @@ mod tests {
         let a = IsArray::new(0);
         let n = 5000u32;
         for i in 0..n {
-            a.insert(&mut pg, format!("<http://ex/node{i}>").as_bytes(), &i.to_le_bytes())
-                .unwrap();
+            a.insert(
+                &mut pg,
+                format!("<http://ex/node{i}>").as_bytes(),
+                &i.to_le_bytes(),
+            )
+            .unwrap();
         }
         for i in 0..n {
             assert_eq!(

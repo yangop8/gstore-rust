@@ -47,7 +47,10 @@ impl McpServer {
         loop {
             let mut buf = Vec::new();
             // Read one message, bounded so a huge line (no newline) can't OOM us.
-            match (&mut reader).take(MAX_MSG_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
+            match (&mut reader)
+                .take(MAX_MSG_BYTES as u64 + 1)
+                .read_until(b'\n', &mut buf)
+            {
                 Ok(0) => break, // EOF
                 Ok(_) => consecutive_errors = 0,
                 Err(_) => {
@@ -65,7 +68,10 @@ impl McpServer {
             if buf.len() > MAX_MSG_BYTES && buf.last() != Some(&b'\n') {
                 loop {
                     let mut sink = Vec::new();
-                    match (&mut reader).take(MAX_MSG_BYTES as u64).read_until(b'\n', &mut sink) {
+                    match (&mut reader)
+                        .take(MAX_MSG_BYTES as u64)
+                        .read_until(b'\n', &mut sink)
+                    {
                         Ok(0) => break,
                         Ok(_) if sink.last() == Some(&b'\n') => break,
                         Ok(_) => continue,
@@ -98,13 +104,23 @@ impl McpServer {
     pub fn handle_message(&self, line: &str) -> Option<String> {
         let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(e) => return Some(err_response(&Value::Null, -32700, &format!("parse error: {e}"))),
+            Err(e) => {
+                return Some(err_response(
+                    &Value::Null,
+                    -32700,
+                    &format!("parse error: {e}"),
+                ))
+            }
         };
         // Valid JSON that isn't a request/notification object (a batch array, or
         // a bare scalar) is an Invalid Request — reply so a client isn't left
         // waiting on silence. (We don't implement JSON-RPC batching.)
         if !req.is_object() {
-            return Some(err_response(&Value::Null, -32600, "invalid request: expected a JSON-RPC object"));
+            return Some(err_response(
+                &Value::Null,
+                -32600,
+                "invalid request: expected a JSON-RPC object",
+            ));
         }
         // A message without `id` is a JSON-RPC notification — never respond, even
         // to a known method (`?` returns None here). A present-but-null id is
@@ -118,7 +134,11 @@ impl McpServer {
             "ping" => Some(ok_response(&id, json!({}))),
             "tools/list" => Some(ok_response(&id, tools_list())),
             "tools/call" => Some(self.tools_call(&id, req.get("params"))),
-            other => Some(err_response(&id, -32601, &format!("method not found: {other}"))),
+            other => Some(err_response(
+                &id,
+                -32601,
+                &format!("method not found: {other}"),
+            )),
         }
     }
 
@@ -136,12 +156,19 @@ impl McpServer {
         // *inside* a correctly-invoked tool, so a client can tell an integration
         // bug from a runtime tool error).
         let Some(params) = params.filter(|p| p.is_object()) else {
-            return err_response(id, -32602, "invalid params: expected an object with a 'name'");
+            return err_response(
+                id,
+                -32602,
+                "invalid params: expected an object with a 'name'",
+            );
         };
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return err_response(id, -32602, "invalid params: missing tool 'name'");
         };
-        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let result = match name {
             "ask_kg" => self.tool_ask_kg(&args),
             "run_sparql" => self.tool_run_sparql(&args),
@@ -170,7 +197,10 @@ impl McpServer {
             out.push_str(" [abstained]");
         }
         if !a.citations.is_empty() {
-            out.push_str(&format!("\n[citations] {} supporting triple(s):", a.citations.len()));
+            out.push_str(&format!(
+                "\n[citations] {} supporting triple(s):",
+                a.citations.len()
+            ));
             for c in a.citations.iter().take(10) {
                 out.push_str(&format!("\n  {} {} {}", c.subject, c.predicate, c.object));
             }
@@ -190,10 +220,20 @@ impl McpServer {
 
     fn tool_link_entity(&self, args: &Value) -> Result<String, String> {
         let mention = str_arg(args, "mention")?;
-        let kind = args.get("kind").and_then(Value::as_str).map(parse_kind).unwrap_or(MentionKind::Entity);
+        let kind = args
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(parse_kind)
+            .unwrap_or(MentionKind::Entity);
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(5).max(1) as usize;
-        let linker = self.engine.linker().ok_or("no entity linker is configured on this server")?;
-        let m = Mention { text: mention.to_string(), kind };
+        let linker = self
+            .engine
+            .linker()
+            .ok_or("no entity linker is configured on this server")?;
+        let m = Mention {
+            text: mention.to_string(),
+            kind,
+        };
         let cands = linker.link_mention(&m, k).map_err(|e| e.to_string())?;
         if cands.is_empty() {
             return Ok("(no candidates)".to_string());
@@ -210,17 +250,23 @@ impl McpServer {
         let seeds: Vec<String> = args
             .get("seeds")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let res =
-            run_analytics(self.engine.kb(), q, &seeds, self.engine.analytics_cfg()).map_err(|e| e.to_string())?;
+        let res = run_analytics(self.engine.kb(), q, &seeds, self.engine.analytics_cfg())
+            .map_err(|e| e.to_string())?;
         Ok(res.text)
     }
 }
 
 /// Extract a required string argument.
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| format!("missing string argument '{key}'"))
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string argument '{key}'"))
 }
 
 fn parse_kind(s: &str) -> MentionKind {
@@ -329,7 +375,12 @@ mod tests {
     fn nonempty() -> SparqlAnswer {
         SparqlAnswer::Select {
             vars: vec!["x".into()],
-            rows: vec![vec![Some(RdfTerm { kind: TermKind::Uri, value: "http://ex/a".into(), datatype: None, lang: None })]],
+            rows: vec![vec![Some(RdfTerm {
+                kind: TermKind::Uri,
+                value: "http://ex/a".into(),
+                datatype: None,
+                lang: None,
+            })]],
         }
     }
 
@@ -350,7 +401,9 @@ mod tests {
     #[test]
     fn initialize_reports_server_info() {
         let srv = McpServer::new(engine());
-        let resp = srv.handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap();
+        let resp = srv
+            .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+            .unwrap();
         let v = parse(&resp);
         assert_eq!(v["result"]["serverInfo"]["name"], "gnlqa");
         assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -360,16 +413,24 @@ mod tests {
     #[test]
     fn notifications_get_no_response() {
         let srv = McpServer::new(engine());
-        assert!(srv.handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(srv
+            .handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .is_none());
     }
 
     #[test]
     fn tools_list_has_all_four() {
         let srv = McpServer::new(engine());
-        let resp = srv.handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
+        let resp = srv
+            .handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .unwrap();
         let v = parse(&resp);
-        let names: Vec<&str> =
-            v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"ask_kg"));
         assert!(names.contains(&"run_sparql"));
         assert!(names.contains(&"link_entity"));
@@ -393,7 +454,10 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_sparql","arguments":{"query":"SELECT ?x WHERE { ?x ?y ?z }"}}}"#;
         let v = parse(&srv.handle_message(req).unwrap());
         assert_eq!(v["result"]["isError"], false);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("<http://ex/a>"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<http://ex/a>"));
     }
 
     #[test]
@@ -402,7 +466,10 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"link_entity","arguments":{"mention":"Alien"}}}"#;
         let v = parse(&srv.handle_message(req).unwrap());
         assert_eq!(v["result"]["isError"], true);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("no entity linker"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no entity linker"));
     }
 
     #[test]
@@ -431,13 +498,19 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_sparql","arguments":{"query":"DELETE WHERE { ?s ?p ?o }"}}}"#;
         let v = parse(&srv.handle_message(req).unwrap());
         assert_eq!(v["result"]["isError"], true);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().to_lowercase().contains("read-only"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("read-only"));
     }
 
     #[test]
     fn unknown_method_is_jsonrpc_error() {
         let srv = McpServer::new(engine());
-        let resp = srv.handle_message(r#"{"jsonrpc":"2.0","id":7,"method":"frobnicate"}"#).unwrap();
+        let resp = srv
+            .handle_message(r#"{"jsonrpc":"2.0","id":7,"method":"frobnicate"}"#)
+            .unwrap();
         let v = parse(&resp);
         assert_eq!(v["error"]["code"], -32601);
     }
@@ -453,10 +526,16 @@ mod tests {
     fn non_object_and_batch_are_invalid_request() {
         let srv = McpServer::new(engine());
         // bare scalar
-        assert_eq!(parse(&srv.handle_message("42").unwrap())["error"]["code"], -32600);
+        assert_eq!(
+            parse(&srv.handle_message("42").unwrap())["error"]["code"],
+            -32600
+        );
         // batch array (unsupported) → must reply, not hang
         let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
-        assert_eq!(parse(&srv.handle_message(batch).unwrap())["error"]["code"], -32600);
+        assert_eq!(
+            parse(&srv.handle_message(batch).unwrap())["error"]["code"],
+            -32600
+        );
     }
 
     #[test]
@@ -474,6 +553,9 @@ mod tests {
         let req = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"ask_kg","arguments":{}}}"#;
         let v = parse(&srv.handle_message(req).unwrap());
         assert_eq!(v["result"]["isError"], true);
-        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("question"));
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("question"));
     }
 }

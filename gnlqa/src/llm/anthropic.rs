@@ -68,7 +68,10 @@ impl AnthropicClient {
 
     /// Serialize a request into the Messages-API JSON body (also used by tests).
     pub fn request_body(&self, req: &LlmRequest) -> Value {
-        let model = req.model.clone().unwrap_or_else(|| self.default_model.clone());
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone());
         let messages: Vec<Value> = req
             .messages
             .iter()

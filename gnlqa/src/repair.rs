@@ -89,7 +89,11 @@ pub fn solve_with_repair(
         match kb.query(&current) {
             Ok(ans) => {
                 if !is_empty_answer(&ans) {
-                    return Ok(RepairOutcome { sparql: current, answer: ans, rounds: round });
+                    return Ok(RepairOutcome {
+                        sparql: current,
+                        answer: ans,
+                        rounds: round,
+                    });
                 }
                 last_ok = Some((current.clone(), ans, round));
                 last_err = Some("query returned no results".into());
@@ -122,7 +126,11 @@ pub fn solve_with_repair(
     }
 
     if let Some((sparql, answer, round)) = last_ok {
-        return Ok(RepairOutcome { sparql, answer, rounds: round });
+        return Ok(RepairOutcome {
+            sparql,
+            answer,
+            rounds: round,
+        });
     }
     Err(Error::Sparql(format!(
         "no valid, executable query after {max_rounds} repair round(s); last issue: {}",
@@ -146,7 +154,10 @@ pub fn repair(
         None => ("", ""),
     };
     let prior = if tried.len() > 1 {
-        let list: Vec<String> = tried[..tried.len() - 1].iter().map(|(q, _)| format!("- {q}")).collect();
+        let list: Vec<String> = tried[..tried.len() - 1]
+            .iter()
+            .map(|(q, _)| format!("- {q}"))
+            .collect();
         format!("Already tried (do NOT repeat):\n{}\n\n", list.join("\n"))
     } else {
         String::new()
@@ -154,15 +165,29 @@ pub fn repair(
     let user = format!(
         "Question: {question}\n\nLinked terms:\n{links}\n\nSchema:\n{schema}\n\n{prior}\
          Previous query:\n{bad}\n\nProblem: {issue}\n\nOutput the corrected SPARQL query.",
-        links = if links_block.is_empty() { "(none)" } else { links_block },
-        schema = if schema_block.is_empty() { "(none)" } else { schema_block },
+        links = if links_block.is_empty() {
+            "(none)"
+        } else {
+            links_block
+        },
+        schema = if schema_block.is_empty() {
+            "(none)"
+        } else {
+            schema_block
+        },
     );
-    let mut req = LlmRequest::prompt(user).system(SYS_REPAIR).max_tokens(1024).temperature(0.3);
+    let mut req = LlmRequest::prompt(user)
+        .system(SYS_REPAIR)
+        .max_tokens(1024)
+        .temperature(0.3);
     if let Some(m) = model {
         req = req.model(m);
     }
     let raw = llm.complete(&req)?;
-    Ok(parse_candidates(&raw).into_iter().next().unwrap_or_else(|| raw.trim().to_string()))
+    Ok(parse_candidates(&raw)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| raw.trim().to_string()))
 }
 
 #[cfg(test)]
@@ -172,20 +197,41 @@ mod tests {
     use crate::llm::MockLlm;
 
     fn row(v: &str) -> Vec<Option<RdfTerm>> {
-        vec![Some(RdfTerm { kind: TermKind::Uri, value: v.into(), datatype: None, lang: None })]
+        vec![Some(RdfTerm {
+            kind: TermKind::Uri,
+            value: v.into(),
+            datatype: None,
+            lang: None,
+        })]
     }
     fn nonempty() -> SparqlAnswer {
-        SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![row("http://ex/a")] }
+        SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![row("http://ex/a")],
+        }
     }
     fn empty() -> SparqlAnswer {
-        SparqlAnswer::Select { vars: vec!["x".into()], rows: vec![] }
+        SparqlAnswer::Select {
+            vars: vec!["x".into()],
+            rows: vec![],
+        }
     }
 
     #[test]
     fn initial_query_works_no_repair() {
         let llm = MockLlm::fixed("unused");
         let kb = MockKb::new(vec![nonempty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        let out = solve_with_repair(
+            &llm,
+            &kb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x ?p ?o }",
+            2,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.rounds, 0);
         assert_eq!(out.answer.row_count(), 1);
     }
@@ -205,7 +251,17 @@ mod tests {
         // valid initial → empty → repair → second query returns a row
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x <http://ex/p> ?o }");
         let kb = MockKb::new(vec![empty(), nonempty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        let out = solve_with_repair(
+            &llm,
+            &kb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x ?p ?o }",
+            2,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.rounds, 1);
         assert_eq!(out.answer.row_count(), 1);
     }
@@ -215,7 +271,17 @@ mod tests {
         // every attempt is valid but empty → after max_rounds, return last empty
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x ?p ?o }");
         let kb = MockKb::new(vec![empty()]); // cycles → always empty
-        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 1, None).unwrap();
+        let out = solve_with_repair(
+            &llm,
+            &kb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x ?p ?o }",
+            1,
+            None,
+        )
+        .unwrap();
         assert!(is_empty_answer(&out.answer));
     }
 
@@ -231,7 +297,17 @@ mod tests {
         // we must return the captured empty answer, not a hard error.
         let llm = MockLlm::new(vec![]); // complete() errors
         let kb = MockKb::new(vec![empty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 2, None).unwrap();
+        let out = solve_with_repair(
+            &llm,
+            &kb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x ?p ?o }",
+            2,
+            None,
+        )
+        .unwrap();
         assert!(is_empty_answer(&out.answer));
         assert_eq!(out.rounds, 0);
     }
@@ -256,7 +332,9 @@ mod tests {
         struct DeadKb;
         impl KbClient for DeadKb {
             fn query(&self, _sparql: &str) -> Result<SparqlAnswer> {
-                Err(Error::Http("gStore endpoint unreachable: Connection refused".into()))
+                Err(Error::Http(
+                    "gStore endpoint unreachable: Connection refused".into(),
+                ))
             }
         }
         let llm = Arc::new(MockLlm::fixed("SELECT ?x WHERE { ?x <http://ex/p> ?o }"));
@@ -272,7 +350,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Http(_)));
-        assert_eq!(llm.call_count(), 0, "no repair calls against an unreachable endpoint");
+        assert_eq!(
+            llm.call_count(),
+            0,
+            "no repair calls against an unreachable endpoint"
+        );
     }
 
     #[test]
@@ -281,7 +363,17 @@ mod tests {
         // stop and return the empty result rather than burning rounds.
         let llm = MockLlm::fixed("SELECT ?x WHERE { ?x ?p ?o }");
         let kb = MockKb::new(vec![empty()]);
-        let out = solve_with_repair(&llm, &kb, "q", "", "", "SELECT ?x WHERE { ?x ?p ?o }", 5, None).unwrap();
+        let out = solve_with_repair(
+            &llm,
+            &kb,
+            "q",
+            "",
+            "",
+            "SELECT ?x WHERE { ?x ?p ?o }",
+            5,
+            None,
+        )
+        .unwrap();
         assert_eq!(out.rounds, 0); // didn't loop 5 times
         assert!(is_empty_answer(&out.answer));
     }

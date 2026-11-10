@@ -5,6 +5,7 @@
 //! pipeline and `docs/DESIGN.md` §6.
 
 pub mod candidates;
+mod count_memo;
 pub mod engine;
 pub mod functions;
 pub mod hash;
@@ -12,11 +13,16 @@ pub mod optimizer;
 pub mod planner;
 pub mod results;
 pub mod value;
+pub mod vs_policy;
 
-pub use engine::Evaluator;
+pub use engine::{DpbMode, EvalStats, Evaluator, TopKOptions};
 pub use functions::{CustomFn, FunctionRegistry};
 pub use results::{QueryResult, ResultSet};
-pub use value::Value;
+pub use value::{IntegerDivision, NumericFn, Value};
+pub use vs_policy::{
+    current_vs_policy, default_vs_policy, reset_vs_stats, scoped_vs_policy, set_default_vs_policy,
+    vs_stats, VsPolicy, VsPolicyGuard, VsStats,
+};
 
 #[cfg(test)]
 mod tests {

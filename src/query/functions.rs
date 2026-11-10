@@ -11,17 +11,31 @@
 //! * Register a function by name with [`FunctionRegistry::register`] (or the
 //!   builder methods on [`Evaluator`](crate::query::Evaluator)).
 //! * The expression evaluator consults the registry for any function name it
-//!   does not recognise as a SPARQL built-in, *before* erroring (treating the
-//!   call as unbound). Built-ins always take precedence.
+//!   does not recognise as a SPARQL built-in (i.e. one not listed in
+//!   [`crate::parser::sparql::builtins::BUILTINS`]), *before* erroring
+//!   (treating the call as unbound). Built-ins always take precedence. Only
+//!   built-ins have their argument count checked by the parser; a custom
+//!   function receives whatever arguments the query passes.
 //!
 //! ## Naming and how it is called from SPARQL
 //!
 //! The SPARQL grammar parses a *bare-word* call `name(args…)` as a function
-//! application and **upper-cases** the name. (A prefixed name like `ns:fn` lexes
-//! as an IRI term, not a callable, so it is not reachable as a function call in
-//! this grammar.) Registration therefore key-folds names to upper case, and
-//! lookups are case-insensitive. Call a registered function `myDouble` from a
-//! query as `myDouble(?x)` / `MYDOUBLE(?x)` — both resolve to the same closure.
+//! application and **upper-cases** the name. Registration therefore key-folds
+//! names to upper case, and lookups are case-insensitive. Call a registered
+//! function `myDouble` from a query as `myDouble(?x)` / `MYDOUBLE(?x)` — both
+//! resolve to the same closure.
+//!
+//! An IRI call — `<http://ex/fn>(?x)` or, with `PREFIX ex: <http://ex/>`,
+//! `ex:fn(?x)` (SPARQL `iriOrFunction`) — is looked up by its fully expanded
+//! IRI (`"http://ex/fn"`, matched case-insensitively like every name), and
+//! failing that by its local name (`"fn"`, the part after the last `#`, `/`
+//! or `:`), so a function registered under a bare name is also reachable
+//! through any namespace. The predeclared `rs:` namespace
+//! ([`crate::parser::sparql::RS_NAMESPACE`]) is reserved for the legacy
+//! gstore-rust graph built-ins (`rs:SSSP(…)`) and the `xsd:` constructor
+//! names (`xsd:integer(…)`, …) are SPARQL casts; neither reaches the
+//! registry. An IRI call that matches none of these is a query error,
+//! reported before evaluation starts.
 //!
 //! ## Signature
 //!
@@ -122,7 +136,9 @@ mod tests {
     #[test]
     fn missing_arg_yields_none() {
         let mut r = FunctionRegistry::new();
-        r.register("needsnum", |args| Some(Value::Double(args.first()?.as_f64()? + 1.0)));
+        r.register("needsnum", |args| {
+            Some(Value::Double(args.first()?.as_f64()? + 1.0))
+        });
         let f = r.get("NEEDSNUM").unwrap();
         assert_eq!(f(&[Value::Iri("x".into())]), None);
     }

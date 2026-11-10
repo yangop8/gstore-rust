@@ -125,11 +125,17 @@ pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
     }
     let vars: Vec<String> = v["head"]["vars"]
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let bindings = v["results"]["bindings"].as_array().ok_or_else(|| {
         let snippet: String = v.to_string().chars().take(200).collect();
-        Error::GStore(format!("results JSON has neither boolean nor bindings: {snippet}"))
+        Error::GStore(format!(
+            "results JSON has neither boolean nor bindings: {snippet}"
+        ))
     })?;
     let mut rows = Vec::with_capacity(bindings.len().min(MAX_RESULT_ROWS));
     for b in bindings.iter().take(MAX_RESULT_ROWS) {
@@ -179,9 +185,9 @@ pub fn validate_readonly_sparql(sparql: &str) -> Result<()> {
     use gstore::parser::sparql::ast::Query;
     match gstore::parser::sparql::parse(sparql).map_err(|e| Error::Sparql(e.to_string()))? {
         Query::Select(_) | Query::Ask(_) => Ok(()),
-        Query::Construct(_) | Query::Describe(_) => {
-            Err(Error::Sparql("only SELECT/ASK queries are allowed for question answering".into()))
-        }
+        Query::Construct(_) | Query::Describe(_) => Err(Error::Sparql(
+            "only SELECT/ASK queries are allowed for question answering".into(),
+        )),
         Query::Update(_) => Err(Error::Sparql(
             "refusing to execute a SPARQL UPDATE — question answering is read-only".into(),
         )),
@@ -198,7 +204,11 @@ pub struct GStoreClient {
 
 impl GStoreClient {
     pub fn new(endpoint: impl Into<String>) -> GStoreClient {
-        GStoreClient { endpoint: endpoint.into(), auth_header: None, timeout: Duration::from_secs(60) }
+        GStoreClient {
+            endpoint: endpoint.into(),
+            auth_header: None,
+            timeout: Duration::from_secs(60),
+        }
     }
 
     pub fn with_timeout(mut self, t: Duration) -> GStoreClient {
@@ -238,9 +248,10 @@ impl GStoreClient {
             // TLS, timeout) means the endpoint is unreachable — a distinct
             // `Http` error so callers can fail fast instead of "repairing" a dead
             // socket (see solve::best_of / repair::solve_with_repair).
-            ureq::Error::Status(code, r) => {
-                Error::GStore(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
-            }
+            ureq::Error::Status(code, r) => Error::GStore(format!(
+                "HTTP {code}: {}",
+                r.into_string().unwrap_or_default()
+            )),
             other => Error::Http(format!("gStore endpoint unreachable: {other}")),
         })?;
         // SELECT/ASK come back as Results JSON; CONSTRUCT/DESCRIBE as an RDF
@@ -266,7 +277,9 @@ impl GStoreClient {
             let v: Value = serde_json::from_slice(&buf).map_err(|e| Error::Json(e.to_string()))?;
             parse_results(&v)
         } else {
-            Ok(SparqlAnswer::Graph(String::from_utf8_lossy(&buf).into_owned()))
+            Ok(SparqlAnswer::Graph(
+                String::from_utf8_lossy(&buf).into_owned(),
+            ))
         }
     }
 
@@ -314,7 +327,10 @@ struct MockKbState {
 
 impl MockKb {
     pub fn new(answers: Vec<SparqlAnswer>) -> MockKb {
-        MockKb { answers, state: Mutex::new(MockKbState::default()) }
+        MockKb {
+            answers,
+            state: Mutex::new(MockKbState::default()),
+        }
     }
     /// The most recent SPARQL query the pipeline sent.
     pub fn last_query(&self) -> Option<String> {
@@ -348,8 +364,16 @@ fn base64_encode(input: &[u8]) -> String {
         let b2 = *chunk.get(2).unwrap_or(&0);
         out.push(T[(b0 >> 2) as usize] as char);
         out.push(T[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(b2 & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -383,14 +407,27 @@ mod tests {
 
     #[test]
     fn parses_ask() {
-        assert_eq!(parse_results(&json!({"head":{}, "boolean": true})).unwrap(), SparqlAnswer::Boolean(true));
+        assert_eq!(
+            parse_results(&json!({"head":{}, "boolean": true})).unwrap(),
+            SparqlAnswer::Boolean(true)
+        );
     }
 
     #[test]
     fn term_render_roundtrips_shapes() {
-        let u = RdfTerm { kind: TermKind::Uri, value: "http://ex/x".into(), datatype: None, lang: None };
+        let u = RdfTerm {
+            kind: TermKind::Uri,
+            value: "http://ex/x".into(),
+            datatype: None,
+            lang: None,
+        };
         assert_eq!(u.to_term_string(), "<http://ex/x>");
-        let l = RdfTerm { kind: TermKind::Literal, value: "hi".into(), datatype: None, lang: Some("en".into()) };
+        let l = RdfTerm {
+            kind: TermKind::Literal,
+            value: "hi".into(),
+            datatype: None,
+            lang: Some("en".into()),
+        };
         assert_eq!(l.to_term_string(), "\"hi\"@en");
     }
 
@@ -411,7 +448,12 @@ mod tests {
     #[test]
     fn escape_literal_neutralizes_injection() {
         assert_eq!(sparql_escape_literal("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
-        let t = RdfTerm { kind: TermKind::Literal, value: "x\"y".into(), datatype: None, lang: None };
+        let t = RdfTerm {
+            kind: TermKind::Literal,
+            value: "x\"y".into(),
+            datatype: None,
+            lang: None,
+        };
         assert_eq!(t.to_term_string(), "\"x\\\"y\"");
     }
 
