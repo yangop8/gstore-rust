@@ -361,6 +361,79 @@ fn single_db_gserver_does_not_acknowledge_a_write_it_could_not_save() {
     assert_eq!(present(&dir, &["acked", "u1", "u2", "u3"]), ["acked"]);
 }
 
+/// `INSERT DATA` of `n` triples about `tag`: enough pages that its commit
+/// point writes past [`FSIZE_LIMIT`] in `kvstore.kv`.
+fn bulk_insert(tag: &str, n: usize) -> String {
+    let mut s = String::from("INSERT DATA {\n");
+    for i in 0..n {
+        s.push_str(&format!(
+            "<http://ex/{tag}/{i}> <http://ex/value> \"{tag} literal number {i} with some padding\" .\n"
+        ));
+    }
+    s.push('}');
+    s
+}
+
+/// With check_point off (`--no-checkpoint`) an on-disk database's write is
+/// made durable by its statement's own commit point; when that commit point
+/// fails, the write is not acknowledged either, and the answer says so: HTTP
+/// 500 `"applied in memory but not durable"`, as the REST endpoints answer
+/// (`DbSlot::wrote`) — not HTTP 400 `"query error"` (round-1 review: the
+/// single-database server skipped the durability check with check_point
+/// off).
+#[test]
+fn single_db_gserver_without_check_point_does_not_acknowledge_a_failed_commit_point() {
+    let tmp = TmpDir::new("nocheckpoint");
+    let src = tmp.0.join("base.nt");
+    std::fs::write(&src, base_nt()).unwrap();
+    // A fresh on-disk database per server: one whose last server was killed
+    // after a commit replays its write-ahead log at open, which the size
+    // limit would refuse.
+    let fresh = |tag: &str| {
+        let dir = tmp.0.join(format!("{tag}.db"));
+        Database::build_disk(&dir, &[&src]).unwrap();
+        let kv = std::fs::metadata(dir.join("kvstore.kv")).unwrap().len();
+        assert!(
+            kv > FSIZE_LIMIT,
+            "kvstore.kv ({kv} bytes) must exceed the limit"
+        );
+        (dir.clone(), dir.to_string_lossy().into_owned())
+    };
+
+    // A server without check_point acknowledges a committed write.
+    let (dir, dir_s) = fresh("acked");
+    let mut ok = Gserver::spawn(&tmp.0, &[&dir_s, "--port", "0", "--no-checkpoint"], None);
+    let (st, body) = ok.request("POST", "/update", None, &insert("acked"));
+    assert_eq!(st, 200, "{body}");
+    assert!(parse(&body).get("error").is_none(), "{body}");
+    ok.kill();
+    assert_eq!(present(&dir, &["acked"]), ["acked"]);
+
+    // The statement's commit point fails with EFBIG (what a full disk does):
+    // the answer is a persistence failure.
+    for (what, target, tag) in [
+        ("POST /update", "/update", "u"),
+        ("POST /sparql UPDATE", "/sparql", "s"),
+    ] {
+        let (_, dir_s) = fresh(tag);
+        let mut failing = Gserver::spawn(
+            &tmp.0,
+            &[&dir_s, "--port", "0", "--no-checkpoint"],
+            Some(FSIZE_LIMIT),
+        );
+        let (st, body) = failing.request("POST", target, None, &bulk_insert(tag, 400));
+        assert_eq!(
+            st, 500,
+            "{what}: a write whose commit point failed must fail as not durable: {body}"
+        );
+        let err = text(&parse(&body), "error").to_string();
+        assert!(err.contains(NOT_DURABLE), "{what}: {body}");
+        assert!(err.contains("commit point"), "{what}: {body}");
+        assert!(!err.contains("query error"), "{what}: {body}");
+        failing.kill();
+    }
+}
+
 #[test]
 fn api_mode_gserver_does_not_acknowledge_a_write_it_could_not_save() {
     let tmp = TmpDir::new("api");

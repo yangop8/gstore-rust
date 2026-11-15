@@ -2809,10 +2809,22 @@ impl ServerInner {
     /// failing one stay applied (and visible), so they are saved too. A
     /// failed save does not undo the (applied) update: it is returned as the
     /// warning `"applied in memory but not durable: <cause>"` and the
-    /// database stays dirty, to be retried on shutdown. The caller answers a
+    /// database stays dirty: an in-memory snapshot database retries the save
+    /// on shutdown, while an on-disk database whose commit point failed stays
+    /// broken until it is reopened, which discards the write
+    /// ([`Database::storage_failure`]). The caller answers a
     /// statement with a warning as a failure, HTTP 500 ([`update_reply`],
     /// [`failure_status`]) — never as an acknowledged write (review
     /// durability#2).
+    ///
+    /// With check_point off an on-disk / RocksDB database's statement is made
+    /// durable by its own commit point ([`Database::execute_as`]). A failed
+    /// statement that changed data gets one more commit point
+    /// ([`Database::sync`], as REST's `DbSlot::wrote` runs): it fails while
+    /// the commit failure persists (a broken on-disk store refuses every
+    /// commit until reopened), and that is the same not-durable warning — so
+    /// a statement whose commit point failed is answered HTTP 500, not as a
+    /// query error.
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let stmt = match Statement::parse(sparql) {
             Ok(stmt) => stmt,
@@ -2839,13 +2851,29 @@ impl ServerInner {
                     crate::gs_error!("{msg}");
                     warning = Some(msg);
                 }
+            } else if result.is_err() {
+                // The statement's own commit point, or the one that committed
+                // the part applied before a failing operation, may have failed.
+                if let Err(e) = db.sync() {
+                    let msg = format!(
+                        "{}: the commit point of '{}' failed: {e}",
+                        crate::http_api::NOT_DURABLE,
+                        self.dir
+                            .as_deref()
+                            .map_or_else(|| self.name.clone(), |d| d.display().to_string())
+                    );
+                    crate::gs_error!("{msg}");
+                    warning = Some(msg);
+                }
             }
             if let Err(e) = &result {
                 result = Err(match &warning {
                     // A persistence failure (answered 500), not a query error.
+                    // The failure may be the statement's commit point (then
+                    // every operation was applied) or one of its operations.
                     Some(w) => crate::GStoreError::Database(format!(
-                        "{w} (the update failed part-way: {e}; the operations before the \
-                         failing one were applied)"
+                        "{w} (the update failed: {e}; the operations before the failing one \
+                         were applied — all of them when the commit point failed)"
                     )),
                     None => crate::GStoreError::Query(format!(
                         "{e} (operations before the failing one were applied)"

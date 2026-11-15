@@ -56,9 +56,12 @@
 //! operations before the failing one stay applied (the error says so), so they
 //! are saved like any other change. A write whose save (or, with the policy
 //! off, whose commit point) fails is never acknowledged: it stays applied in
-//! memory (and is saved again on the next save) but is answered as a failure,
-//! `"applied in memory but not durable: <cause>"` — HTTP 500 on the REST
-//! endpoints, HTTP 200 with `StatusCode` 1005 on `/api`. With the policy off,
+//! memory but is answered as a failure, `"applied in memory but not durable:
+//! <cause>"` — HTTP 500 on the REST endpoints, HTTP 200 with `StatusCode` 1005
+//! on `/api`. An in-memory snapshot database saves it with its next successful
+//! save; an on-disk database whose commit point failed is broken until it is
+//! reopened (`/unload` + `/load`), which discards those writes
+//! ([`Database::storage_failure`]). With the policy off,
 //! changes stay in memory until `/checkpoint` (which always forces a save),
 //! `/unload` (which saves a dirty database before dropping it) or a graceful
 //! shutdown.
@@ -1453,9 +1456,11 @@ impl DbSlot {
 
     /// Record that a committed write changed data: mark dirty and, under the
     /// check_point policy, save now. Returns a warning when that save failed
-    /// (the write itself stays applied in memory and is retried on unload /
-    /// shutdown / `/checkpoint`): `"applied in memory but not durable:
-    /// <cause>"` ([`NOT_DURABLE`]). The caller must answer such a write as a
+    /// (the write itself stays applied in memory: an in-memory snapshot
+    /// database retries it on unload / shutdown / `/checkpoint`, while an
+    /// on-disk database whose commit point failed is broken until reopened,
+    /// which discards it): `"applied in memory but not durable: <cause>"`
+    /// ([`NOT_DURABLE`]). The caller must answer such a write as a
     /// failure — REST HTTP 500, `/api` `StatusCode` 1005 — never as a success
     /// carrying a warning (review durability#2).
     ///
