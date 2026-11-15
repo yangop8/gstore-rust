@@ -3878,23 +3878,36 @@ impl ApiInner {
         // write-ahead log), and the answer's warning names what is discarded.
         if let Some(h) = st.dbs.get(&name).map(Arc::clone) {
             let already = Resp::ok(&format!("database '{name}' already loaded"));
-            if st.db_txn.contains_key(&name) || st.claim(&name).is_err() {
+            if st.db_txn.contains_key(&name) || st.busy.contains(&name) {
                 return Dispatch::Done(already);
             }
-            let dir = st.db_dir(&name);
             return Dispatch::Deferred(Box::new(move |inner| {
+                // Whether it failed is checked without waiting and without
+                // reserving its name (and off the state lock: dropping the
+                // guard may measure the directory), so loading a healthy
+                // loaded database stays a no-op: it never waits behind a
+                // running statement and never makes the database busy for a
+                // concurrent begin / unload. A database busy right now is
+                // answered as loaded; a later load reopens it.
+                let failed_now = h.try_write().is_some_and(|slot| {
+                    !slot.retired && slot.txn.is_none() && slot.db.storage_failure().is_some()
+                });
+                if !failed_now {
+                    return already;
+                }
+                {
+                    let mut st = locked(&inner.state);
+                    if st.db_txn.contains_key(&name)
+                        || !st.dbs.get(&name).is_some_and(|x| Arc::ptr_eq(x, &h))
+                        || st.claim(&name).is_err()
+                    {
+                        return already;
+                    }
+                }
                 let _busy = BusyGuard {
                     inner,
                     name: name.clone(),
                 };
-                let failed = h
-                    .read()
-                    .ok()
-                    .filter(|slot| !slot.retired)
-                    .is_some_and(|slot| slot.db.storage_failure().is_some());
-                if !failed {
-                    return already;
-                }
                 let mut slot = match h.write() {
                     Ok(slot) => slot,
                     Err(e) => return e.rest(),
@@ -3905,6 +3918,8 @@ impl ApiInner {
                 let Some(failure) = failure else {
                     return already;
                 };
+                // The directory the served copy was opened from.
+                let dir = slot.dir.clone();
                 slot.retire();
                 {
                     let mut st = locked(&inner.state);

@@ -865,64 +865,71 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             // point — none can succeed — and opened again from its
             // directory, which its write-ahead log keeps consistent. Any
             // other loaded database stays as it is (upstream's answer).
-            let claimed = !st.db_txn.contains_key(&db) && st.busy.insert(db.clone());
+            // Whether it failed is checked without waiting and without
+            // reserving its name, so loading a healthy loaded database stays
+            // the no-op it is upstream: it never waits behind a running
+            // statement and never makes the database busy for a concurrent
+            // begin / unload. A database busy right now is answered as
+            // loaded; a later load reopens it.
             drop(st);
+            let failed_now = h.try_write().is_some_and(|slot| {
+                !slot.retired && slot.txn.is_none() && slot.db.storage_failure().is_some()
+            });
+            let claimed = failed_now && {
+                let mut st = ctx.state();
+                !st.db_txn.contains_key(&db)
+                    && st.dbs.get(&db).is_some_and(|x| Arc::ptr_eq(x, &h))
+                    && st.busy.insert(db.clone())
+            };
             let mut reopened = None;
             if claimed {
                 let _busy = BusyGuard {
                     inner: ctx.inner,
                     name: db.clone(),
                 };
-                let failed = h
-                    .read()
-                    .ok()
-                    .filter(|slot| !slot.retired)
-                    .is_some_and(|slot| slot.db.storage_failure().is_some());
-                if failed {
-                    let mut slot = match h.write() {
-                        Ok(slot) => slot,
-                        Err(e) => return lock_error(e),
-                    };
-                    let failure = (!slot.retired && slot.txn.is_none())
-                        .then(|| slot.db.storage_failure())
-                        .flatten();
-                    if let Some(failure) = failure {
-                        let dir = slot.dir.clone();
-                        slot.retire();
-                        {
-                            let mut st = ctx.state();
-                            if st.dbs.get(&db).is_some_and(|x| Arc::ptr_eq(x, &h)) {
-                                st.dbs.remove(&db);
-                            }
+                let mut slot = match h.write() {
+                    Ok(slot) => slot,
+                    Err(e) => return lock_error(e),
+                };
+                let failure = (!slot.retired && slot.txn.is_none())
+                    .then(|| slot.db.storage_failure())
+                    .flatten();
+                if let Some(failure) = failure {
+                    let dir = slot.dir.clone();
+                    slot.retire();
+                    {
+                        let mut st = ctx.state();
+                        if st.dbs.get(&db).is_some_and(|x| Arc::ptr_eq(x, &h)) {
+                            st.dbs.remove(&db);
                         }
-                        drop(slot);
-                        let warning = format!(
-                            "database[{db}] was reopened without a commit point: its on-disk \
-                             store had failed ({failure}); those changes are discarded (a commit \
-                             whose write-ahead log was complete is replayed by the reopen)"
-                        );
-                        crate::gs_warn!("{warning}");
-                        match ctx.inner.open_db(&dir) {
-                            Ok(opened) => {
-                                let mut st = ctx.state();
-                                let slot = DbSlot::handle(
-                                    opened,
-                                    dir,
-                                    false,
-                                    &st.load_policy,
-                                    &st.query_settings,
-                                );
-                                st.dbs.insert(db.clone(), slot);
-                            }
-                            Err(e) => {
-                                return GResp::error(
-                                    Status::OperationFailed,
-                                    format!("load failed: {e} ({warning}; it is unloaded now)"),
-                                );
-                            }
-                        }
-                        reopened = Some(warning);
                     }
+                    drop(slot);
+                    let warning = format!(
+                        "database[{db}] was reopened without a commit point: its on-disk \
+                         store had failed ({failure}); those changes are discarded (a commit \
+                         whose write-ahead log was complete is replayed by the reopen)"
+                    );
+                    crate::gs_warn!("{warning}");
+                    match ctx.inner.open_db(&dir) {
+                        Ok(opened) => {
+                            let mut st = ctx.state();
+                            let slot = DbSlot::handle(
+                                opened,
+                                dir,
+                                false,
+                                &st.load_policy,
+                                &st.query_settings,
+                            );
+                            st.dbs.insert(db.clone(), slot);
+                        }
+                        Err(e) => {
+                            return GResp::error(
+                                Status::OperationFailed,
+                                format!("load failed: {e} ({warning}; it is unloaded now)"),
+                            );
+                        }
+                    }
+                    reopened = Some(warning);
                 }
             }
             if csr {
