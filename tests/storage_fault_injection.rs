@@ -447,7 +447,11 @@ fn server_scenario(mode: &str) {
         let (ok, out) = tool(
             "gquery",
             &tmp.0,
-            &["t", "-e", "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex/p> ?o }"],
+            &[
+                "t",
+                "-e",
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex/p> ?o }",
+            ],
             m,
         );
         assert!(ok, "gquery must open the database ({m}): {out}");

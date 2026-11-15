@@ -2151,9 +2151,7 @@ impl ApiInner {
             Ok(slot) => slot,
             Err(e) => return Err(e.rest()),
         };
-        let failure = (!slot.retired)
-            .then(|| slot.db.storage_failure())
-            .flatten();
+        let failure = (!slot.retired).then(|| slot.db.storage_failure()).flatten();
         if let Some(failure) = failure {
             crate::gs_warn!(
                 "database '{name}' was retired without a commit point: its on-disk store had \

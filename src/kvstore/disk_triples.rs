@@ -1699,7 +1699,11 @@ mod tests {
         let file = std::fs::read(&p).unwrap();
         let log = std::fs::read(wal_of(&p)).unwrap();
         drop(dt);
-        assert_eq!(std::fs::read(&p).unwrap(), file, "a broken store's drop writes nothing");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            file,
+            "a broken store's drop writes nothing"
+        );
         assert_eq!(std::fs::read(wal_of(&p)).unwrap(), log);
         drop(pager);
         // The complete log is replayed: the failed batch whole.

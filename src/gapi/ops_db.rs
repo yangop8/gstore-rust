@@ -934,8 +934,9 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 Some(warning) => GResp::success("Database loaded successfully.")
                     .with("csr", csr_field(ctx))
                     .with("warning", warning),
-                None => GResp::success("The database already load yet.")
-                    .with("csr", csr_field(ctx)),
+                None => {
+                    GResp::success("The database already load yet.").with("csr", csr_field(ctx))
+                }
             };
         }
         let dir = st.db_dir(&db);

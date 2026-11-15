@@ -716,9 +716,11 @@ impl Pager {
     /// the log and make the removal durable.
     fn apply_committed(&mut self, batch: &[(PageId, Arc<Page>)]) -> Result<()> {
         sync_parent_dir(&self.wal_path)?;
-        for (_i, (id, data)) in batch.iter().enumerate() {
+        for (i, (id, data)) in batch.iter().enumerate() {
             #[cfg(test)]
-            failpoints::apply(_i)?;
+            failpoints::apply(i)?;
+            #[cfg(not(test))]
+            let _ = i;
             self.file
                 .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
             self.file.write_all(&data[..])?;
@@ -1110,7 +1112,9 @@ pub(crate) mod failpoints {
     }
 
     fn injected(what: &str) -> io::Error {
-        io::Error::other(format!("injected failure: {what} (No space left on device)"))
+        io::Error::other(format!(
+            "injected failure: {what} (No space left on device)"
+        ))
     }
 
     /// Clears every failpoint of this thread when dropped.
@@ -1939,7 +1943,11 @@ mod tests {
             }
             // Reads still answer batch N (its pages are resident and dirty).
             assert_eq!(tag_of(&pg.read_page(ids[59]).unwrap()), 1002);
-            assert_eq!(std::fs::read(&wal).unwrap(), log, "the log is never rewritten");
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                log,
+                "the log is never rewritten"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), file, "nor the file");
             drop(pg); // a clean drop writes nothing either
             assert_eq!(std::fs::read(&wal).unwrap(), log);
@@ -1979,7 +1987,8 @@ mod tests {
         let pg = Pager::open(&path, 16).unwrap();
         assert_batch_applied(&pg, &ids, &fresh);
         for id in 1..pg.page_count() {
-            pg.read_page(id).expect("every page below the page count reads");
+            pg.read_page(id)
+                .expect("every page below the page count reads");
         }
         cleanup(&path);
     }
@@ -2022,7 +2031,10 @@ mod tests {
             let r = pg.flush();
             assert!(matches!(r, Err(GStoreError::Io(_))), "{r:?}");
         }
-        assert!(pg.failure().is_none(), "nothing reached the file: retryable");
+        assert!(
+            pg.failure().is_none(),
+            "nothing reached the file: retryable"
+        );
         assert!(!wal.exists(), "no log got its name");
         assert!(!wal_tmp_path(&wal).exists(), "the staged log is removed");
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2055,9 +2067,8 @@ mod tests {
         let old = page_with(11);
         write_wal(&wal, &[(1, &old)]).unwrap();
         let complete = std::fs::read(&wal).unwrap();
-        let big: Vec<(PageId, Box<Page>)> = (1..40)
-            .map(|i| (i, Box::new(page_with(500 + i))))
-            .collect();
+        let big: Vec<(PageId, Box<Page>)> =
+            (1..40).map(|i| (i, Box::new(page_with(500 + i)))).collect();
         {
             let _fp = failpoints::fail_wal_write_after(3 * PAGE_SIZE);
             assert!(write_wal(&wal, &big).is_err());
@@ -2151,7 +2162,11 @@ mod tests {
         write_wal(&wal, &[(1, &page_with(6))]).unwrap();
         let before = failpoints::dir_syncs();
         let pg = Pager::open(&path, 16).unwrap();
-        assert_eq!(failpoints::dir_syncs() - before, 1, "the replayed log's removal");
+        assert_eq!(
+            failpoints::dir_syncs() - before,
+            1,
+            "the replayed log's removal"
+        );
         assert_eq!(tag_of(&pg.read_page(1).unwrap()), 6);
         cleanup(&path);
     }

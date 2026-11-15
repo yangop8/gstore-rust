@@ -121,7 +121,9 @@ impl Srv {
 
     /// `POST /api` as root with `pairs`: always HTTP 200 (upstream wire).
     fn api(&self, pairs: &[(&str, &str)]) -> Json {
-        let mut body = Json::obj().with("username", "root").with("password", "root");
+        let mut body = Json::obj()
+            .with("username", "root")
+            .with("password", "root");
         for (k, v) in pairs {
             body.set(*k, *v);
         }
@@ -199,7 +201,11 @@ fn broken(tag: &str, options: OpenOptions) -> Srv {
 /// After the reopen: the committed data, without the failed update, and a
 /// database that commits again.
 fn assert_serves_again(srv: &Srv) {
-    assert_eq!(srv.count(), Some(BASE as i64), "the failed update is discarded");
+    assert_eq!(
+        srv.count(),
+        Some(BASE as i64),
+        "the failed update is discarded"
+    );
     let j = srv.insert("after");
     assert_eq!(code(&j), 0, "it commits again: {j}");
     assert_eq!(srv.count(), Some(BASE as i64 + 1));

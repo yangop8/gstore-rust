@@ -295,7 +295,9 @@ fn fail_shared_pager(pager: &Pager, e: GStoreError) -> GStoreError {
     match e {
         e @ GStoreError::StorageFailed(_) => e,
         e => GStoreError::StorageFailed(
-            pager.failure().map_or_else(|| e.to_string(), str::to_string),
+            pager
+                .failure()
+                .map_or_else(|| e.to_string(), str::to_string),
         ),
     }
 }
