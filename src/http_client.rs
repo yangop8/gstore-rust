@@ -9,8 +9,10 @@
 //!
 //! Scope (mirroring `server.rs`): `http://` (and, for [`post_with`] with the
 //! optional `tls` feature, `https://`; `SERVICE` stays `http://` only),
-//! `Connection: close` one-shot requests, and a hand-rolled JSON reader
-//! covering the result shape SPARQL endpoints emit. The body is read to EOF
+//! `Connection: close` one-shot requests, and SPARQL-results JSON read with
+//! the crate's depth-limited [`crate::json`] parser (a hostile endpoint's
+//! reply is untrusted input: nesting it absurdly deep is a parse error, not
+//! a stack overflow that aborts the process). The body is read to EOF
 //! after the headers, so it assumes a `Content-Length` / connection-close
 //! response — `Transfer-Encoding: chunked` and `gzip` are NOT decoded (works
 //! against this crate's own `server.rs`; some public endpoints chunk). Auth
@@ -21,6 +23,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::json::Json;
 use crate::model::Term;
 
 /// A single returned solution: each bound variable mapped to its RDF term.
@@ -626,8 +629,14 @@ fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
 /// Expects the standard envelope
 /// `{"head":{"vars":[…]},"results":{"bindings":[ {var: {type,value,…}}, … ]}}`
 /// and decodes each binding object into an RDF [`Term`].
+///
+/// The body is untrusted (any endpoint a query names): it is read with the
+/// crate's [`crate::json::parse`] — byte-based, nesting limited to
+/// [`crate::json::MAX_DEPTH`], surrogate-pair escapes combined (a lone
+/// surrogate is malformed) — so a hostile reply is an
+/// [`InvalidData`](io::ErrorKind::InvalidData) error, never a stack overflow.
 pub fn parse_sparql_json(body: &str) -> io::Result<Vec<ServiceSolution>> {
-    let json = Json::parse(body)
+    let json = crate::json::parse(body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad JSON: {e}")))?;
     let bindings = json
         .get("results")
@@ -681,237 +690,6 @@ fn rdf_term_from_json(cell: &Json) -> io::Result<Term> {
             }
         }
     })
-}
-
-// --- a tiny JSON reader ------------------------------------------------------
-
-/// A minimal JSON value, sufficient to navigate SPARQL results.
-#[derive(Debug, Clone, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Num(f64),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn parse(s: &str) -> Result<Json, String> {
-        let mut p = JsonParser {
-            chars: s.chars().collect(),
-            pos: 0,
-        };
-        p.skip_ws();
-        let v = p.value()?;
-        p.skip_ws();
-        if p.pos != p.chars.len() {
-            return Err("trailing characters after JSON value".into());
-        }
-        Ok(v)
-    }
-
-    /// Object-field lookup (no-op for non-objects).
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Json::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    fn as_array(&self) -> Option<&[Json]> {
-        match self {
-            Json::Arr(a) => Some(a),
-            _ => None,
-        }
-    }
-
-    fn as_object(&self) -> Option<&[(String, Json)]> {
-        match self {
-            Json::Obj(o) => Some(o),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Json::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-struct JsonParser {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl JsonParser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Json, String> {
-        self.skip_ws();
-        match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
-            Some('"') => Ok(Json::Str(self.string()?)),
-            Some('t') | Some('f') => self.boolean(),
-            Some('n') => self.null(),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            other => Err(format!("unexpected token {other:?}")),
-        }
-    }
-
-    fn object(&mut self) -> Result<Json, String> {
-        self.expect('{')?;
-        let mut fields = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some('}') {
-            self.bump();
-            return Ok(Json::Obj(fields));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            self.expect(':')?;
-            let val = self.value()?;
-            fields.push((key, val));
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some('}') => break,
-                other => return Err(format!("expected ',' or '}}', found {other:?}")),
-            }
-        }
-        Ok(Json::Obj(fields))
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.expect('[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.bump();
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            let val = self.value()?;
-            items.push(val);
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some(']') => break,
-                other => return Err(format!("expected ',' or ']', found {other:?}")),
-            }
-        }
-        Ok(Json::Arr(items))
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
-        let mut out = String::new();
-        loop {
-            match self.bump() {
-                Some('"') => break,
-                Some('\\') => match self.bump() {
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some('/') => out.push('/'),
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('b') => out.push('\u{0008}'),
-                    Some('f') => out.push('\u{000C}'),
-                    Some('u') => {
-                        let mut code = 0u32;
-                        for _ in 0..4 {
-                            let c = self
-                                .bump()
-                                .ok_or_else(|| "unterminated \\u escape".to_string())?;
-                            let d = c
-                                .to_digit(16)
-                                .ok_or_else(|| format!("bad hex digit {c:?}"))?;
-                            code = code * 16 + d;
-                        }
-                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
-                    }
-                    other => return Err(format!("bad escape {other:?}")),
-                },
-                Some(c) => out.push(c),
-                None => return Err("unterminated string".into()),
-            }
-        }
-        Ok(out)
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || c.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| format!("bad number '{s}'"))
-    }
-
-    fn boolean(&mut self) -> Result<Json, String> {
-        if self.consume_word("true") {
-            Ok(Json::Bool(true))
-        } else if self.consume_word("false") {
-            Ok(Json::Bool(false))
-        } else {
-            Err("invalid literal".into())
-        }
-    }
-
-    fn null(&mut self) -> Result<Json, String> {
-        if self.consume_word("null") {
-            Ok(Json::Null)
-        } else {
-            Err("invalid literal".into())
-        }
-    }
-
-    fn consume_word(&mut self, word: &str) -> bool {
-        let end = self.pos + word.len();
-        if end <= self.chars.len() && self.chars[self.pos..end].iter().collect::<String>() == word {
-            self.pos = end;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn expect(&mut self, c: char) -> Result<(), String> {
-        if self.peek() == Some(c) {
-            self.pos += 1;
-            Ok(())
-        } else {
-            Err(format!("expected {c:?}, found {:?}", self.peek()))
-        }
-    }
 }
 
 #[cfg(test)]
