@@ -41,8 +41,13 @@ Behaviour changes first:
   loaded") at once: the failure is checked without waiting for the
   database and without reserving it, so such a load never waits behind a
   running statement nor makes the database busy for a concurrent begin or
-  unload. A broken database that is busy at that very moment is answered
-  "already loaded" too; load it again (or unload it). REST `/build` over a
+  unload (guard test `tests/load_of_a_busy_database_answers_at_once.rs`,
+  added by the round-1 review: an UPDATE parked on a held `SERVICE`
+  endpoint, `/api load` and REST `/load` answer while it holds the
+  database, and a `begin` issued meanwhile succeeds; it fails with
+  2007ec7's two hunks reverted). A broken database that is busy at that
+  very moment is answered "already loaded" too; load it again (or unload
+  it). REST `/build` over a
   loaded broken database now replaces it instead of failing on the save
   that could not succeed.
 - **The write-ahead log is never truncated or rewritten in place** (review
