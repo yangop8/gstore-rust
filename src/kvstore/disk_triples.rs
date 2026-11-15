@@ -1666,6 +1666,19 @@ mod tests {
     // ---- review C-1 (durability#1, disk#1): the broken state is the pager's
     // ---- failed state; nothing writes through a broken store
 
+    /// Removes a test's store file and its logs when dropped, also when the
+    /// test fails.
+    struct Files(std::path::PathBuf);
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            cleanup(&self.0);
+            let mut staged = wal_of(&self.0).into_os_string();
+            staged.push(".tmp");
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+
     fn wal_of(p: &Path) -> std::path::PathBuf {
         let mut wal = p.as_os_str().to_owned();
         wal.push(".wal");
@@ -1676,6 +1689,7 @@ mod tests {
     fn a_commit_point_that_fails_mid_apply_breaks_the_store_and_a_reopen_replays_it() {
         use super::super::pager::failpoints;
         let p = tmp("fail_apply_cp");
+        let _files = Files(p.clone());
         let mut dt = seeded(&p, 8);
         assert!(dt.insert_triple(IdTriple::new(0, 1, 2)).unwrap());
         dt.commit_point().unwrap();
@@ -1718,6 +1732,7 @@ mod tests {
     fn a_commit_point_whose_log_could_not_be_written_breaks_the_store_and_loses_the_batch() {
         use super::super::pager::failpoints;
         let p = tmp("fail_wal_cp");
+        let _files = Files(p.clone());
         let mut dt = seeded(&p, 8);
         assert!(dt.insert_triple(IdTriple::new(0, 1, 2)).unwrap());
         dt.commit_point().unwrap();
@@ -1748,6 +1763,7 @@ mod tests {
         use super::super::pager::failpoints;
         use crate::dict::DiskTermSource;
         let p = tmp("fail_dict_commit");
+        let _files = Files(p.clone());
         let mut ds = DiskStore::open(&p, 8).unwrap();
         ds.intern_entity("<e0>").unwrap();
         ds.flush().unwrap();

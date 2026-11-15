@@ -1879,6 +1879,17 @@ mod tests {
     // ---- review C-1 / M1 (durability#1, disk#1, disk#2, durability#7,
     // ---- robust#12, durability#8, disk#12, durability#16): the failed state
 
+    /// Removes a test's pager file, its log and a staged log when dropped,
+    /// also when the test fails.
+    struct Files(PathBuf);
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            cleanup(&self.0);
+            std::fs::remove_file(wal_tmp_path(&wal_path_for(&self.0))).ok();
+        }
+    }
+
     fn is_storage_failed(r: &Result<impl std::fmt::Debug>) -> bool {
         matches!(r, Err(GStoreError::StorageFailed(_)))
     }
@@ -1916,6 +1927,7 @@ mod tests {
     #[test]
     fn a_failed_apply_fails_the_pager_and_a_reopen_replays_the_whole_batch() {
         let path = tmp("fail_apply");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         let (ids, fresh) = {
             let mut pg = Pager::open(&path, 256).unwrap();
@@ -1970,6 +1982,7 @@ mod tests {
         // rewriting it, so the reopen found a torn log, a half-applied header
         // and missing pages.
         let path = tmp("fail_retry");
+        let _files = Files(path.clone());
         let (ids, fresh) = {
             let mut pg = Pager::open(&path, 256).unwrap();
             let ids = committed_pages(&mut pg, 100);
@@ -1996,6 +2009,7 @@ mod tests {
     #[test]
     fn a_failed_wal_removal_fails_the_pager_and_a_reopen_is_consistent() {
         let path = tmp("fail_wal_rm");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         let (ids, fresh) = {
             let mut pg = Pager::open(&path, 256).unwrap();
@@ -2020,6 +2034,7 @@ mod tests {
     #[test]
     fn a_failed_wal_write_changes_nothing_and_the_flush_can_be_retried() {
         let path = tmp("fail_wal_write");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         // A cache that holds the whole batch: no commit before the failpoint.
         let mut pg = Pager::open(&path, 256).unwrap();
@@ -2063,6 +2078,7 @@ mod tests {
         // O_TRUNC, so rewriting it destroyed the complete one first. Now a
         // log is staged and renamed: a failure leaves the old log intact.
         let path = tmp("wal_no_trunc");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         let old = page_with(11);
         write_wal(&wal, &[(1, &old)]).unwrap();
@@ -2087,6 +2103,7 @@ mod tests {
         // mean "no log", so the file opened half-applied and the next flush
         // overwrote the log for good.
         let path = tmp("wal_unreadable");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         {
             let mut pg = Pager::open(&path, 16).unwrap();
@@ -2117,6 +2134,7 @@ mod tests {
     #[test]
     fn a_leftover_staged_log_is_not_replayed_and_is_removed() {
         let path = tmp("wal_tmp_left");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         {
             let mut pg = Pager::open(&path, 16).unwrap();
@@ -2135,6 +2153,7 @@ mod tests {
     #[test]
     fn a_file_shorter_than_its_page_count_is_refused() {
         let path = tmp("short_file");
+        let _files = Files(path.clone());
         {
             let mut pg = Pager::open(&path, 16).unwrap();
             committed_pages(&mut pg, 10);
@@ -2151,6 +2170,7 @@ mod tests {
     fn every_commit_fsyncs_the_directory_after_naming_and_removing_the_log() {
         // Review durability#8 / robust#12.
         let path = tmp("dir_sync");
+        let _files = Files(path.clone());
         let wal = wal_path_for(&path);
         let mut pg = Pager::open(&path, 16).unwrap();
         let ids = committed_pages(&mut pg, 4);
@@ -2174,6 +2194,7 @@ mod tests {
     #[test]
     fn a_pager_marked_failed_refuses_writes_and_commits() {
         let path = tmp("mark_failed");
+        let _files = Files(path.clone());
         let mut pg = Pager::open(&path, 16).unwrap();
         let ids = committed_pages(&mut pg, 4);
         pg.write_page(ids[0], &page_with(5)).unwrap();
