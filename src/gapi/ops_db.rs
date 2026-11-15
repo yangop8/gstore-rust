@@ -697,7 +697,7 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
         let shown = entry.to_string_lossy();
         match ops_file::resolve_existing(&shown, roots.as_deref(), &[]) {
             Ok(file) => {
-                ops_file::check_source(ctx, &file, &shown, "file")?;
+                ops_file::check_dir_source(ctx, &file, requested)?;
                 files.push(file)
             }
             Err(refusal) => {

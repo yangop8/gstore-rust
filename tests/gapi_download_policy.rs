@@ -22,11 +22,12 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gstore::config::GStoreConfig;
+use gstore::gapi::tasks::{TaskConfig, TaskManager, TaskSpec};
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 
@@ -661,6 +662,11 @@ fn batch_insert_from_another_databases_export_is_refused() {
         ],
     );
     assert_eq!(code(&j), 1003, "{j}");
+    // The refusal names the directory, not the file in it: an export's
+    // random name must not leak to a user who may not read it (it is all
+    // that guards the file from anonymous readers under
+    // `anonymous_download=on`).
+    assert!(!j.to_string().contains(&file_name(&export)), "{j}");
     assert_eq!(count(a, "dbb"), before, "nothing of a reached b");
     // alice holds export on a: she may use it (into a, which she updates).
     let j = api_as(
@@ -1153,4 +1159,60 @@ fn expired_files_and_orphaned_task_results_are_removed() {
         &[("operation", "checkOperationState"), ("opt_id", &mine)],
     );
     ok(&j);
+}
+
+/// gapi#13: the orphan rule tells a previous run's spilled results from the
+/// manager's own — a finished task's result and a running task's file stay;
+/// only `<digits>.json` files no task owns go. (The server's sweep runs at
+/// most once a minute, so the end-to-end test above cannot show this.)
+#[test]
+fn orphaned_task_results_are_told_from_live_ones() {
+    let _g = serial();
+    let root = TempRoot::new("orphans");
+    let dir = root.0.join("tasks");
+    let m = TaskManager::new(TaskConfig::default());
+    let spec = || TaskSpec {
+        operation: "query".into(),
+        result_dir: Some(dir.clone()),
+        ..TaskSpec::default()
+    };
+    let done = m
+        .submit(spec(), Box::new(|_| Json::obj().with("AnsNum", 1)))
+        .unwrap();
+    assert!(m.wait_async_idle(Duration::from_secs(120)), "hang guard");
+    let finished = dir.join(format!("{done}.json"));
+    assert!(finished.is_file(), "the finished query spilled its result");
+    // A task that runs until released (its result file stands in for one
+    // being written).
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let running = m
+        .submit(
+            spec(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Json::obj()
+            }),
+        )
+        .unwrap();
+    started_rx.recv().unwrap();
+    let in_flight = dir.join(format!("{running}.json"));
+    fs::write(&in_flight, "{}").unwrap();
+    // A previous run's results, and files that are no task results at all.
+    let orphan = dir.join("123.json");
+    fs::write(&orphan, "{}").unwrap();
+    for other in ["notes.txt", "abc.json", ".json"] {
+        fs::write(dir.join(other), "x").unwrap();
+    }
+    assert_eq!(m.remove_orphan_results(&dir), 1);
+    assert!(!orphan.exists(), "the orphan is removed");
+    assert!(finished.is_file(), "a finished task's result stays");
+    assert!(in_flight.is_file(), "a running task's file stays");
+    for other in ["notes.txt", "abc.json", ".json"] {
+        assert!(dir.join(other).is_file(), "{other} is no task result");
+    }
+    release_tx.send(()).unwrap();
+    assert!(m.wait_async_idle(Duration::from_secs(120)), "hang guard");
+    assert_eq!(m.remove_orphan_results(&dir), 0, "nothing else is orphaned");
 }

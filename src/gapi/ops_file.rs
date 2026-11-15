@@ -602,28 +602,51 @@ pub(super) fn may_read_recorded(ctx: &Ctx<'_>, file: &Path) -> bool {
     }
 }
 
-/// Refuse an RDF source (`build`'s `db_path`, `batch*`'s `file` / a file
-/// of `dir`; `file` canonical) the caller may not read: one in the export
-/// or the upload directory must pass [`may_read_recorded`] — no `batchInsert`
-/// from another database's export or another user's upload (review sec#4,
-/// gapi#14). Sources in the load policy's directories are not affected.
+/// Whether the caller may use `file` (canonical) as an RDF source: one in
+/// the export or the upload directory must pass [`may_read_recorded`] — no
+/// `batchInsert` from another database's export or another user's upload
+/// (review sec#4, gapi#14). Sources in the load policy's directories are not
+/// affected.
+fn may_use_source(ctx: &Ctx<'_>, file: &Path) -> bool {
+    let inside = |root: PathBuf| fs::canonicalize(root).is_ok_and(|r| file.starts_with(&r));
+    let recorded_root = inside(ctx.export_dir()) || inside(upload_dir(ctx));
+    !recorded_root || may_read_recorded(ctx, file)
+}
+
+/// What a refused source may be (the tail of the refusal messages).
+const UNREADABLE: &str = "an export or query result of a database you lack the privilege on, \
+                          another user's upload, or a file only root may use";
+
+/// Refuse an RDF source the caller named (`build`'s `db_path`, `batch*`'s
+/// `file`; `file` canonical) that it may not read (see [`may_use_source`]).
 pub(super) fn check_source(
     ctx: &Ctx<'_>,
     file: &Path,
     requested: &str,
     param: &str,
 ) -> Result<(), GResp> {
-    let inside = |root: PathBuf| fs::canonicalize(root).is_ok_and(|r| file.starts_with(&r));
-    let recorded_root = inside(ctx.export_dir()) || inside(upload_dir(ctx));
-    if !recorded_root || may_read_recorded(ctx, file) {
+    if may_use_source(ctx, file) {
+        return Ok(());
+    }
+    Err(GResp::error(
+        Status::ParamIsIllegal,
+        format!("the {param} '{requested}' is refused: you may not read it ({UNREADABLE})"),
+    ))
+}
+
+/// Refuse a `batch*` `dir` (as `requested`) holding an RDF file (`file`,
+/// canonical) the caller may not read (see [`may_use_source`]). The answer
+/// names the directory only: the names of the files in it are not the
+/// caller's to learn — an export's random name is what keeps it from
+/// anonymous readers under `anonymous_download=on`.
+pub(super) fn check_dir_source(ctx: &Ctx<'_>, file: &Path, requested: &str) -> Result<(), GResp> {
+    if may_use_source(ctx, file) {
         return Ok(());
     }
     Err(GResp::error(
         Status::ParamIsIllegal,
         format!(
-            "the {param} '{requested}' is refused: you may not read it (an export or query \
-             result of a database you lack the privilege on, another user's upload, or a \
-             file only root may use)"
+            "the dir '{requested}' is refused: it holds a file you may not read ({UNREADABLE})"
         ),
     ))
 }
