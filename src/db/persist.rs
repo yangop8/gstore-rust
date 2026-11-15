@@ -1787,6 +1787,41 @@ impl Database {
         ended
     }
 
+    /// Run `body`, the work of an auto-commit statement that
+    /// [`rocks_begin_statement`](Self::rocks_begin_statement) journaled
+    /// (`journaled`), so that a panic inside it — a bug, which the servers
+    /// answer with a 500 while they keep serving the database — ends the
+    /// statement like a failed one before the unwind goes on: what it
+    /// applied stays applied (on the disk layout the next commit point
+    /// writes it too), and the journal is not left recording outside a
+    /// transaction, where it would refuse every later statement and
+    /// transaction ("already being journaled"), hold every freed id, and be
+    /// replayed by the next open — undoing writes acknowledged after the
+    /// panic. Just `body(self)` when nothing is journaled.
+    pub(super) fn rocks_statement_body<T>(
+        &mut self,
+        journaled: bool,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if !journaled {
+            return body(self);
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self))) {
+            Ok(done) => done,
+            Err(panic) => {
+                if self.txn.is_none() && self.rocks_journaling() {
+                    let ended = self.rocks_end_statement();
+                    if let Err(e) = ended.and_then(|()| self.commit_point()) {
+                        crate::gs_warn!(
+                            "the journal of a statement that panicked could not be deleted: {e}"
+                        );
+                    }
+                }
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
     /// Apply the queued write-through of a committing transaction.
     pub(super) fn disk_commit_pending(&mut self) {
         if let Some(sink) = sink_mut(&mut self.disk).as_mut() {

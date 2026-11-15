@@ -1017,22 +1017,24 @@ impl Database {
         // RocksDB: one journaled statement — a crash undoes all of it, never
         // a prefix; an error keeps what was applied (see `applied`).
         let journaled = self.rocks_begin_statement()?;
-        let report = import::import_sources(
-            sources,
-            "batch insert",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| {
-                let mut added = Vec::new();
-                let quads = batch.drain(..).map(|q| {
-                    let graph = graph_iri(&q.graph);
-                    (q.into_triple(), graph)
-                });
-                let result = self.insert_statements(quads, &mut added);
-                *applied += added.len() as u64;
-                result
-            },
-        );
+        let report = self.rocks_statement_body(journaled, |db| {
+            import::import_sources(
+                sources,
+                "batch insert",
+                opts,
+                log,
+                &mut |batch: &mut Vec<Quad>| {
+                    let mut added = Vec::new();
+                    let quads = batch.drain(..).map(|q| {
+                        let graph = graph_iri(&q.graph);
+                        (q.into_triple(), graph)
+                    });
+                    let result = db.insert_statements(quads, &mut added);
+                    *applied += added.len() as u64;
+                    result
+                },
+            )
+        });
         self.end_sources_statement(journaled, report)
     }
 
@@ -1068,32 +1070,34 @@ impl Database {
         // RocksDB: one journaled statement (see `insert_sources`); the
         // batches' frees wait for its end.
         let journaled = self.rocks_begin_statement()?;
-        let report = import::import_sources(
-            sources,
-            "batch remove",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| {
-                // In a read scope (C2): a term that cannot be looked up must
-                // fail the removal, not read as absent.
-                let scope = ReadScope::enter();
-                let quads = batch.drain(..).map(|q| {
-                    let graph = graph_iri(&q.graph);
-                    (q.into_triple(), graph)
-                });
-                let (removed, err) = self.remove_statements(quads, Some(&scope));
-                *applied += removed as u64;
-                if let Some(e) = err {
-                    self.flush_reclaim();
-                    return Err(read_failure("removing statements", e));
-                }
-                // Each batch frees the ids it left unreferenced (RocksDB:
-                // they wait for the statement's end; only those are kept).
-                self.flush_reclaim();
-                self.keep_dead_candidates();
-                self.check_store_readable()
-            },
-        );
+        let report = self.rocks_statement_body(journaled, |db| {
+            import::import_sources(
+                sources,
+                "batch remove",
+                opts,
+                log,
+                &mut |batch: &mut Vec<Quad>| {
+                    // In a read scope (C2): a term that cannot be looked up
+                    // must fail the removal, not read as absent.
+                    let scope = ReadScope::enter();
+                    let quads = batch.drain(..).map(|q| {
+                        let graph = graph_iri(&q.graph);
+                        (q.into_triple(), graph)
+                    });
+                    let (removed, err) = db.remove_statements(quads, Some(&scope));
+                    *applied += removed as u64;
+                    if let Some(e) = err {
+                        db.flush_reclaim();
+                        return Err(read_failure("removing statements", e));
+                    }
+                    // Each batch frees the ids it left unreferenced (RocksDB:
+                    // they wait for the statement's end; only those are kept).
+                    db.flush_reclaim();
+                    db.keep_dead_candidates();
+                    db.check_store_readable()
+                },
+            )
+        });
         self.end_sources_statement(journaled, report)
     }
 
@@ -2175,8 +2179,25 @@ impl Database {
         // RocksDB, outside a transaction: the request is journaled, so a
         // crash part-way undoes all of it (crash-atomic, as on the disk
         // layout, whose commit point writes it as one); the journal is
-        // deleted at its commit point below, or when it fails.
+        // deleted at its commit point (`apply_update_ops`), or when it fails
+        // or panics.
         let journaled = self.rocks_begin_statement()?;
+        self.rocks_statement_body(journaled, |db| {
+            db.apply_update_ops(sparql, ops, cancel, pfn, journaled)
+        })
+    }
+
+    /// The body of [`run_update`](Self::run_update): apply the request's
+    /// operations in order, then its update log line and commit point
+    /// (`journaled`: the end of its RocksDB statement first).
+    fn apply_update_ops(
+        &mut self,
+        sparql: &str,
+        ops: Vec<UpdateOp>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+        journaled: bool,
+    ) -> Result<QueryResult> {
         let before = self.mutations;
         let mut changed = 0;
         for op in ops {

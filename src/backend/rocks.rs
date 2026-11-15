@@ -71,7 +71,8 @@
 //! `batchRemove`) — so that a statement is crash-atomic like on the disk
 //! layout, whose commit point writes it as one: never a prefix of it (half
 //! of a DELETE/INSERT rename). A failed statement's journal is committed
-//! too: what it applied before failing stays applied, as documented.
+//! too, and so is a panicking one's: what it applied before failing stays
+//! applied, as documented.
 //!
 //! Commit deletes the whole journal in one batch, together with the
 //! dictionary terms the transaction or statement freed

@@ -483,3 +483,126 @@ fn a_killed_rollback_leaves_no_orphan_terms() {
     }
     battery("rollback");
 }
+
+// ---- a statement that panics ---------------------------------------------------
+
+/// An error log that panics at the first failed statement (a bug in a
+/// caller's log, standing in for any panic inside an import).
+struct PanickingLog;
+
+impl gstore::parser::import::ErrorLog for PanickingLog {
+    fn failed(&mut self, _source: &str, _err: &gstore::parser::stream::SyntaxError) {
+        panic!("a bug in the error log");
+    }
+}
+
+/// Every default-graph subject of `db`, as strings.
+fn subjects(db: &mut Database) -> BTreeSet<String> {
+    match db.query("SELECT DISTINCT ?s WHERE { ?s ?p ?o }").unwrap() {
+        QueryResult::Select(rs) => rs.rows.iter().filter_map(|r| r[0].clone()).collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A journaled statement that panics part-way — a bug; the servers answer
+/// it with a 500 and keep serving the database — is ended like a failed
+/// one: what it applied stays applied, and its journal is not left
+/// recording. (Left recording, every later statement and transaction was
+/// refused as "already being journaled", ids were never freed again, and
+/// the next open replayed the journal, undoing the acknowledged writes made
+/// after the panic.) Covers an UPDATE request, `insert_sources` and
+/// `remove_sources`.
+#[test]
+fn a_panicking_statement_is_ended_like_a_failed_one() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    let tmp = TempDir::new("panic");
+    let dir = tmp.0.join("db");
+    drop(Database::build_rocksdb_from_str("panic", &dir, &base_nt()).unwrap());
+    // Ten statements, read in batches of four, then one that fails.
+    let mut text = String::new();
+    for i in 0..10 {
+        text.push_str(&format!("<http://ex/f{i}> <http://ex/p> \"f{i}\" .\n"));
+    }
+    text.push_str("<http://ex/bad> <http://ex/p> \"unterminated .\n");
+    let file = tmp.0.join("panic.nt");
+    std::fs::write(&file, &text).unwrap();
+    let sources = gstore::parser::import::sources_from_paths(&[&file]).unwrap();
+    let tolerant = gstore::parser::import::ImportOptions {
+        batch_size: 4,
+        ..gstore::parser::import::ImportOptions::tolerant()
+    };
+    let mut db = Database::open(&dir).unwrap();
+    db.register_function("http://ex/boom", |_| panic!("a bug in a function"));
+    let mut expected = subjects(&mut db);
+
+    // An UPDATE request whose second operation panics after the first one
+    // inserted <http://ex/u0>.
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        db.query(
+            "INSERT DATA { <http://ex/u0> <http://ex/p> \"u0\" } ;\n\
+             INSERT { ?s <http://ex/q> ?v } WHERE { ?s <http://ex/name> ?n \
+             BIND(<http://ex/boom>(?n) AS ?v) }",
+        )
+    }));
+    assert!(panicked.is_err(), "the function panics");
+    expected.insert("<http://ex/u0>".into());
+    db.query("INSERT DATA { <http://ex/u1> <http://ex/p> \"u1\" }")
+        .expect("a statement after a panicking one");
+    expected.insert("<http://ex/u1>".into());
+
+    // insert_sources: two batches of four are in when the log panics.
+    let mut applied = 0;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        db.insert_sources(&sources, &tolerant, &mut PanickingLog, &mut applied)
+    }));
+    assert!(panicked.is_err(), "the log panics");
+    assert_eq!(applied, 8, "two batches were inserted before the panic");
+    expected.extend((0..8).map(|i| format!("<http://ex/f{i}>")));
+    db.begin()
+        .expect("a transaction after a panicking statement");
+    db.query("INSERT DATA { <http://ex/t0> <http://ex/p> \"t0\" }")
+        .unwrap();
+    db.commit().unwrap();
+    expected.insert("<http://ex/t0>".into());
+
+    // remove_sources: the same file; two batches are removed.
+    let mut removed = 0;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        db.remove_sources(
+            &sources,
+            &tolerant.clone().for_removal(),
+            &mut PanickingLog,
+            &mut removed,
+        )
+    }));
+    assert!(panicked.is_err(), "the log panics");
+    assert_eq!(removed, 8, "two batches were removed before the panic");
+    for i in 0..8 {
+        expected.remove(&format!("<http://ex/f{i}>"));
+    }
+    db.query("INSERT DATA { <http://ex/u2> <http://ex/p> \"u2\" }")
+        .expect("a statement after a panicking one");
+    expected.insert("<http://ex/u2>".into());
+    db.sync().unwrap();
+    assert_eq!(subjects(&mut db), expected);
+    db.verify_integrity().unwrap();
+    let got = contents(&mut db);
+    assert_eq!(
+        live_terms(&db),
+        referenced(&got),
+        "the removed statements' terms are freed"
+    );
+    drop(db);
+
+    // Reopened: every acknowledged write, and what the panicking
+    // statements applied, is there; nothing is replayed away.
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(subjects(&mut db), expected, "reopened");
+    db.verify_integrity().unwrap();
+    let got = contents(&mut db);
+    assert_eq!(live_terms(&db), referenced(&got), "reopened: orphan terms");
+}
