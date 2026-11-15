@@ -1363,6 +1363,12 @@ pub(crate) fn current_peer() -> Option<SocketAddr> {
     CURRENT_PEER.with(Cell::get)
 }
 
+/// The headers a reverse proxy forwards its client's address in (lowercase):
+/// a loopback peer sending one of them speaks for another client (see
+/// [`peer_is_trusted_local`]; the pre-body hook of [`crate::preauth`] applies
+/// the same rule to a request head).
+pub(crate) const FORWARDING_HEADERS: [&str; 3] = ["forwarded", "x-forwarded-for", "x-real-ip"];
+
 /// Whether the client of `req` counts as **local** — the one predicate
 /// behind the loopback privileges (the unauthenticated single-database
 /// mode, root's default password, the `/api` layer's
@@ -3094,11 +3100,10 @@ impl Request {
     }
 
     /// Whether the request was forwarded by a proxy: it carries a
-    /// `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header.
+    /// `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header
+    /// ([`FORWARDING_HEADERS`]).
     pub(crate) fn is_forwarded(&self) -> bool {
-        ["forwarded", "x-forwarded-for", "x-real-ip"]
-            .iter()
-            .any(|h| self.header(h).is_some())
+        FORWARDING_HEADERS.iter().any(|h| self.header(h).is_some())
     }
 
     /// Extract a session/bearer token from `Authorization: Bearer …`, the

@@ -51,7 +51,8 @@ use crate::gapi::auth::{self, PreAuth};
 use crate::gapi::params::parse_form;
 use crate::http_api::{peer_ip, ApiInner};
 use crate::server::{
-    base64_decode, ct_eq, current_peer, locked, strip_basic_prefix, BadRequest, HttpOptions,
+    base64_decode, ct_eq, current_peer, ip_is_loopback, locked, strip_basic_prefix, BadRequest,
+    HttpOptions, FORWARDING_HEADERS,
 };
 
 /// The default [`HttpOptions::preauth_max_body`]: 64 MiB.
@@ -432,7 +433,8 @@ pub(crate) fn api_ingest(
     inner: &Arc<ApiInner>,
     addr: SocketAddr,
 ) -> Arc<Ingest> {
-    let ingest = Arc::new(Ingest::new(opts, Some(api_hook(Arc::clone(inner)))));
+    let hook = api_hook(Arc::clone(inner), opts.trust_proxy_headers);
+    let ingest = Arc::new(Ingest::new(opts, Some(hook)));
     ingest.register(addr);
     ingest
 }
@@ -463,8 +465,21 @@ pub(crate) fn single_db_hook(auth: Option<(String, String)>) -> PreBodyHook {
 
 /// The multi-database server's hook (see the module docs): an upload route
 /// whose head carries valid credentials gets the upload cap.
-pub(crate) fn api_hook(inner: Arc<ApiInner>) -> PreBodyHook {
-    Box::new(move |head| api_admission(&inner, head))
+/// `trust_proxy_headers`: [`HttpOptions::trust_proxy_headers`], for whether
+/// the client counts as local (see [`client_is_local`]).
+pub(crate) fn api_hook(inner: Arc<ApiInner>, trust_proxy_headers: bool) -> PreBodyHook {
+    Box::new(move |head| api_admission(&inner, head, trust_proxy_headers))
+}
+
+/// Whether the client of `head` counts as local — the rule of
+/// [`peer_is_trusted_local`](crate::server::peer_is_trusted_local), applied
+/// to a head whose body has not been read: a loopback peer that forwards no
+/// proxy header (unless `trust_proxy_headers`). The full credential check
+/// after the body (`gapi::auth::verify`) grants the loopback privileges by
+/// the same rule, so the pre-body check never accepts what it would refuse.
+fn client_is_local(head: &HeadView<'_>, trust_proxy_headers: bool) -> bool {
+    current_peer().is_some_and(|p| ip_is_loopback(p.ip()))
+        && (trust_proxy_headers || !FORWARDING_HEADERS.iter().any(|h| head.header(h).is_some()))
 }
 
 /// Which credentials a payload route takes in its head.
@@ -500,11 +515,12 @@ fn payload_route(head: &HeadView<'_>) -> Option<PayloadRoute> {
     }
 }
 
-fn api_admission(inner: &ApiInner, head: &HeadView<'_>) -> Admission {
+fn api_admission(inner: &ApiInner, head: &HeadView<'_>, trust_proxy_headers: bool) -> Admission {
     let Some(route) = payload_route(head) else {
         return Admission::PreAuth;
     };
     let ip = peer_ip(current_peer());
+    let local = client_is_local(head, trust_proxy_headers);
     // A blocked or locked-out address is not checked at all (its handler
     // answers it `403`): the body is held to the pre-authentication cap,
     // whatever the head carries — a session token included.
@@ -513,7 +529,7 @@ fn api_admission(inner: &ApiInner, head: &HeadView<'_>) -> Admission {
     }
     let verdict = match route {
         PayloadRoute::Upstream => match auth::credentials_in_query(head.query) {
-            Some(creds) => auth::check_before_body(inner, &ip, &creds),
+            Some(creds) => auth::check_before_body(inner, &ip, local, &creds),
             None => PreAuth::Unchecked,
         },
         PayloadRoute::Rest => {
@@ -535,7 +551,7 @@ fn api_admission(inner: &ApiInner, head: &HeadView<'_>) -> Admission {
                             password,
                             ..auth::Credentials::default()
                         };
-                        auth::check_before_body(inner, &ip, &creds)
+                        auth::check_before_body(inner, &ip, local, &creds)
                     }
                     None => PreAuth::Unchecked,
                 }

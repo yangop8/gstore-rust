@@ -148,16 +148,23 @@ pub(crate) enum PreAuth {
 /// it again. An upstream *inner* request (`creds.inner`) is not checked
 /// either: whether its password is checked at all is [`verify`]'s decision
 /// (`trust_inner_localhost`), and a failure counted here could lock out the
-/// local tools that send it.
+/// local tools that send it. Root's default password from a client that is
+/// not local (`local_trusted`, the rule of [`Ctx::local_trusted`]) is not
+/// checked either: [`verify`] refuses it after the body without counting it,
+/// so it must not earn the upload cap before the body.
 pub(crate) fn check_before_body(
     inner: &crate::http_api::ApiInner,
     remote_ip: &str,
+    local_trusted: bool,
     creds: &Credentials,
 ) -> PreAuth {
     if creds.username.is_empty()
         || creds.inner
         || !inner.ipfilter.permits(remote_ip)
         || inner.ipfilter.locked_out(remote_ip)
+        || (!local_trusted
+            && creds.username == crate::http_users::ROOT_USER
+            && is_default_password(creds))
     {
         return PreAuth::Unchecked;
     }
