@@ -257,6 +257,8 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("system", "build_fill_factor"),
     ("server", "listen_addr"),
     ("server", "keep_alive_timeout"),
+    ("server", "min_body_rate"),
+    ("server", "max_conns_per_ip"),
     ("server", "keep_alive_max"),
     ("server", "queue_size"),
     ("server", "cors"),
@@ -341,6 +343,18 @@ pub struct GStoreConfig {
     /// *(Rust extension)* Keep-alive idle timeout in seconds; `0` turns
     /// keep-alive off (default `60`, upstream workflow's default).
     pub keep_alive_timeout: u64,
+    /// *(Rust extension)* Minimum average rate, in bytes per second, at which
+    /// a request body must arrive: one of `n` bytes must be in within 30 s
+    /// plus `n / min_body_rate` (a chunked one at this rate on average), so a
+    /// client trickling it in cannot hold a worker thread; `0` turns this
+    /// off (default `65536`, 64 KiB/s). See
+    /// [`HttpOptions::min_body_rate`].
+    pub min_body_rate: u64,
+    /// *(Rust extension)* Most connections one client IP address may have
+    /// open at once (waiting for a worker included); further ones are closed
+    /// at once. Clients behind one NAT or proxy share an address. `0`: no
+    /// limit (default `64`). See [`HttpOptions::max_conns_per_ip`].
+    pub max_conns_per_ip: usize,
     /// *(Rust extension)* Maximum requests served on one connection (default `100`).
     pub keep_alive_max: usize,
     /// *(Rust extension)* Accepted connections that may wait for a free worker
@@ -554,6 +568,8 @@ impl Default for GStoreConfig {
             ip_deny_path: Some(PathBuf::from("conf/ipDeny.config")),
             listen_addr: "127.0.0.1".to_string(),
             keep_alive_timeout: 60,
+            min_body_rate: crate::server::DEFAULT_MIN_BODY_RATE,
+            max_conns_per_ip: crate::server::DEFAULT_MAX_CONNS_PER_IP,
             keep_alive_max: 100,
             queue_size: 128,
             cors: true,
@@ -770,6 +786,14 @@ impl GStoreConfig {
             }
             "keep_alive_timeout" => {
                 self.keep_alive_timeout = parse_num(v).ok_or_else(|| bad("seconds (0 = off)"))?
+            }
+            "min_body_rate" => {
+                self.min_body_rate =
+                    parse_num(v).ok_or_else(|| bad("bytes per second (0 = off)"))?
+            }
+            "max_conns_per_ip" => {
+                self.max_conns_per_ip =
+                    parse_num(v).ok_or_else(|| bad("an integer (0 = no limit)"))?
             }
             "keep_alive_max" => {
                 self.keep_alive_max = v
@@ -991,6 +1015,8 @@ impl GStoreConfig {
             "ip_deny_path" => opt_path(&self.ip_deny_path),
             "listen_addr" => self.listen_addr.clone(),
             "keep_alive_timeout" => self.keep_alive_timeout.to_string(),
+            "min_body_rate" => self.min_body_rate.to_string(),
+            "max_conns_per_ip" => self.max_conns_per_ip.to_string(),
             "keep_alive_max" => self.keep_alive_max.to_string(),
             "queue_size" => self.queue_size.to_string(),
             "cors" => switch(self.cors),
@@ -1102,6 +1128,8 @@ impl GStoreConfig {
             queue_len: self.queue_size,
             keep_alive_timeout: Duration::from_secs(self.keep_alive_timeout),
             keep_alive_max: self.keep_alive_max.max(1),
+            min_body_rate: self.min_body_rate,
+            max_conns_per_ip: self.max_conns_per_ip,
             max_body: usize::try_from(self.upload_max_body_size).unwrap_or(usize::MAX),
             cors: self.cors,
             ..HttpOptions::default()
@@ -1600,6 +1628,7 @@ upload_allow_compress_packages = "zip"
     #[test]
     fn every_key_is_read_from_its_section() {
         let text = "[server]\nport=9100\ntcp_port=9200\nthread_num=4\nmax_database_num=5\n\
+                    min_body_rate=0\nmax_conns_per_ip=5\n\
                     max_user_num=6\ndeamon=on\nmax_output_size=7\nip_allow_path=allow.txt\n\
                     ip_deny_path=off\nlisten_addr=0.0.0.0\nkeep_alive_timeout=0\nkeep_alive_max=3\n\
                     queue_size=0\ncors=off\n\
@@ -1638,6 +1667,7 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.ip_allow_path, Some(PathBuf::from("allow.txt")));
         assert_eq!(c.ip_deny_path, None, "`off` disables the deny list");
         assert_eq!(c.listen_addr, "0.0.0.0");
+        assert_eq!((c.min_body_rate, c.max_conns_per_ip), (0, 5));
         assert_eq!(
             (c.keep_alive_timeout, c.keep_alive_max, c.queue_size),
             (0, 3, 0)
@@ -1733,6 +1763,7 @@ upload_allow_compress_packages = "zip"
         assert_eq!(h.queue_len, 0);
         assert_eq!(h.keep_alive_timeout, Duration::ZERO);
         assert_eq!(h.keep_alive_max, 3);
+        assert_eq!((h.min_body_rate, h.max_conns_per_ip), (0, 5));
         assert_eq!(h.max_body, 1024);
         assert!(!h.cors);
     }
