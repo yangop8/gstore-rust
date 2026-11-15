@@ -251,6 +251,10 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     // Rust-only extensions.
     ("upload", "unzip_max_entries"),
     ("upload", "unzip_max_size"),
+    ("upload", "anonymous_download"),
+    ("upload", "download_max_concurrent"),
+    ("upload", "file_retention_hours"),
+    ("upload", "upload_user_quota"),
     ("system", "build_memory_mb"),
     ("system", "build_threads"),
     ("system", "build_tmp_dir"),
@@ -451,6 +455,28 @@ pub struct GStoreConfig {
     /// *(Rust extension)* Bytes the files of a zip package may unpack to, in
     /// all (default 10 GiB) — the zip-bomb guard of `crate::zipio`.
     pub unzip_max_size: u64,
+    /// *(Rust extension; upstream-compat switch)* Serve `/file/download`
+    /// without credentials, as upstream does: the export directory (exports
+    /// and `format=file` query results) to anyone. Default **off**: a
+    /// download needs a valid user, who may read a file only when it holds
+    /// the matching privilege on the database the file came from (review
+    /// sec#4, gapi#2). `gserver` warns at startup while it is on.
+    pub anonymous_download: bool,
+    /// *(Rust extension)* `/file/download` responses streamed at once
+    /// (each holds a worker while it lasts); more are answered `503`
+    /// with `Retry-After`. `0` = no limit (default `8`).
+    pub download_max_concurrent: usize,
+    /// *(Rust extension)* Hours after which the files the server wrote for
+    /// clients — uploads, exports, `format=file` query results — are
+    /// removed (checked lazily on uploads, exports, downloads and
+    /// asynchronous submissions, at most once a minute). Files an operator
+    /// put there are never removed. `0` keeps them forever (default `168`,
+    /// one week).
+    pub file_retention_hours: u64,
+    /// *(Rust extension)* Bytes of uploads each user may keep in the
+    /// upload directory; an upload beyond it is refused (`1005`). `0` = no
+    /// quota (the default).
+    pub upload_user_quota: u64,
 
     // ---- [query] (Rust extension) ---------------------------------------
     /// *(Rust extension)* How `/` divides two integers: `decimal` (SPARQL
@@ -593,6 +619,10 @@ impl Default for GStoreConfig {
             upload_allow_compress_packages: split_list("zip"),
             unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
             unzip_max_size: crate::zipio::DEFAULT_MAX_SIZE,
+            anonymous_download: false,
+            download_max_concurrent: 8,
+            file_retention_hours: 168,
+            upload_user_quota: 0,
             integer_division: IntegerDivision::default(),
             query_cache_size: DEFAULT_QUERY_CACHE_BYTES,
             early_termination: true,
@@ -885,6 +915,19 @@ impl GStoreConfig {
             "unzip_max_size" => {
                 self.unzip_max_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
             }
+            "anonymous_download" => {
+                self.anonymous_download = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "download_max_concurrent" => {
+                self.download_max_concurrent =
+                    parse_num(v).ok_or_else(|| bad("a number of downloads"))?
+            }
+            "file_retention_hours" => {
+                self.file_retention_hours = parse_num(v).ok_or_else(|| bad("a number of hours"))?
+            }
+            "upload_user_quota" => {
+                self.upload_user_quota = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             "integer_division" => {
                 self.integer_division =
                     IntegerDivision::parse(v).ok_or_else(|| bad("decimal or truncate"))?
@@ -1030,6 +1073,10 @@ impl GStoreConfig {
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
             "unzip_max_entries" => self.unzip_max_entries.to_string(),
             "unzip_max_size" => self.unzip_max_size.to_string(),
+            "anonymous_download" => switch(self.anonymous_download),
+            "download_max_concurrent" => self.download_max_concurrent.to_string(),
+            "file_retention_hours" => self.file_retention_hours.to_string(),
+            "upload_user_quota" => self.upload_user_quota.to_string(),
             "integer_division" => match self.integer_division {
                 IntegerDivision::Decimal => "decimal",
                 IntegerDivision::Truncate => "truncate",
@@ -1615,6 +1662,8 @@ upload_allow_compress_packages = "zip"
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
                     unzip_max_entries=12\nunzip_max_size=4096\n\
+                    anonymous_download=on\ndownload_max_concurrent=2\nfile_retention_hours=5\n\
+                    upload_user_quota=77\n\
                     [query]\ninteger_division=truncate\nquery_cache_size=0\n\
                     early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
                     gfun_max_output_bytes=4096\n\
@@ -1686,6 +1735,16 @@ upload_allow_compress_packages = "zip"
             "zip|tar"
         );
         assert_eq!((c.unzip_max_entries, c.unzip_max_size), (12, 4096));
+        assert!(c.anonymous_download);
+        assert_eq!(c.value("anonymous_download").unwrap(), "on");
+        assert_eq!(
+            (
+                c.download_max_concurrent,
+                c.file_retention_hours,
+                c.upload_user_quota
+            ),
+            (2, 5, 77)
+        );
         assert_eq!(c.value("querylog_mode").unwrap(), "0");
         assert_eq!(c.value("deamon").unwrap(), "on");
         assert!(c.upload_allowed("data.TTL") && c.upload_allowed("x.tar"));
