@@ -617,6 +617,10 @@ impl Database {
     /// snapshot of an in-memory one. Errors if the database has no home (it was
     /// built in memory and never opened from a directory) or if an earlier
     /// update could not be persisted.
+    ///
+    /// For a RocksDB database it also flushes the memtables to table files
+    /// (a [`save`](Self::save) at home only syncs the WAL): no more durable,
+    /// but the next open has no log to replay.
     pub fn checkpoint(&self) -> Result<()> {
         let Some(home) = self.home.clone() else {
             return Err(GStoreError::Database(format!(
@@ -625,7 +629,12 @@ impl Database {
             )));
         };
         let _persist = self.persist_guard();
-        self.save_locked(&home)
+        self.save_locked(&home)?;
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks() {
+            rocks.flush()?;
+        }
+        Ok(())
     }
 
     /// A commit point without a full save: make every mutation applied so far
@@ -707,9 +716,11 @@ impl Database {
     /// * On-disk database: at its home directory, commits the write-through to
     ///   `kvstore.kv` — no shadow `store.bin` is written. Into another
     ///   directory, it commits and then copies the store files there.
-    /// * RocksDB database: at its home directory, commits (flushes) RocksDB.
-    ///   Into another directory, it writes a RocksDB checkpoint to
-    ///   `dir/rocksdb` — a consistent, openable copy of every column family.
+    /// * RocksDB database: at its home directory, a commit point (RocksDB's
+    ///   WAL is fsynced; memtables are flushed by [`checkpoint`](Self::checkpoint)
+    ///   and when the database is closed). Into another directory, it writes
+    ///   a RocksDB checkpoint to `dir/rocksdb` — a consistent, openable copy
+    ///   of every column family.
     ///
     /// Inside an open transaction, the persistent layouts save only what has
     /// been committed; an in-memory snapshot captures the live state.
@@ -747,7 +758,12 @@ impl Database {
         if let Some(rocks) = self.store.as_rocks() {
             self.commit_point()?;
             if at_home {
-                return rocks.flush();
+                // The commit point (a WAL fsync) is all the durability a save
+                // at home needs: a memtable flush per save — check_point's
+                // save after every write — would leave a few small table
+                // files (and descriptors) behind per write. Memtables are
+                // flushed by an explicit `checkpoint`, a backup and close.
+                return Ok(());
             }
             let target = dir.join(ROCKS_SUBDIR);
             let staged = fsutil::tmp_path(&target);
@@ -1345,7 +1361,12 @@ impl Database {
                 rocks_dir.display()
             )));
         }
-        let rocks = RocksStore::open(&rocks_dir)?;
+        // A journal a crash left behind is replayed but kept: it is deleted
+        // below, in one batch with the terms the replay left unreferenced.
+        let rocks = RocksStore::open_keeping_journal(
+            &rocks_dir,
+            &crate::backend::rocks::RocksTuning::default(),
+        )?;
         let (dict, named, name) = if rocks.get_meta(rocks_layout::LAYOUT_KEY)?.is_some() {
             let dict = rocks_layout::dictionary_from_terms(rocks.load_terms()?)?;
             let named = rocks_layout::named_from_quads(rocks.quads()?);
@@ -1363,13 +1384,16 @@ impl Database {
         db.named = named.into();
         db.home = Some(dir.to_path_buf());
         db.dir_lock = Some(lock);
-        // A transaction a crash interrupted was undone by the open: the terms
-        // of what it had inserted are reclamation candidates.
+        // A transaction or statement a crash interrupted was undone by the
+        // open: the terms of what it had inserted (and the terms it wrote
+        // new) are reclamation candidates. The unreferenced ones leave the
+        // `dict` CF in the batch that deletes the journal — a crash before
+        // it replays the journal again — so none is left as an orphan.
         db.note_rocks_replayed();
-        if !db.reclaim.is_empty() && db.reclaims_ids() {
-            db.flush_reclaim();
-            db.commit_point()?;
-        }
+        let dead = db.committed_dead();
+        db.rocks_commit_journal_with(&dead)?;
+        db.free_dead(dead, true);
+        db.commit_point()?;
         // The VS-tree is not rebuilt at open (it walks every entity's edges
         // in RocksDB): queries evaluate without it until `rebuild_index()`.
         // `vstree_on_open` (`[storage]`, or `GSTORE_VSTREE_ON_OPEN=1` through
@@ -1749,13 +1773,87 @@ impl Database {
         false
     }
 
-    /// Roll back the journaled transaction (replay its undo journal).
+    /// Roll back the journaled transaction: replay its undo journal, which
+    /// stays on disk until [`rocks_commit_journal_with`](Self::rocks_commit_journal_with)
+    /// deletes it with the terms the rollback frees.
     pub(super) fn rocks_rollback_journal(&mut self) -> Result<()> {
         #[cfg(feature = "rocksdb")]
         if let Some(rocks) = self.store.as_rocks_mut() {
-            return rocks.rollback_journal();
+            return rocks.rollback_keeping_journal();
         }
         Ok(())
+    }
+
+    /// RocksDB, outside a transaction: journal the auto-commit statement
+    /// about to run (a SPARQL UPDATE request, `insert_sources` /
+    /// `remove_sources`), so that it is crash-atomic like a statement on the
+    /// disk layout — a crash before [`rocks_end_statement`](Self::rocks_end_statement)
+    /// undoes all of it at the next open, never a prefix. While the journal
+    /// records, freed ids wait for the statement's end (as in a
+    /// transaction). `Ok(false)` (nothing to end) for the other layouts and
+    /// inside a transaction (whose own journal records the statement); an
+    /// error — a stale journal that cannot be cleaned up — before anything
+    /// is applied.
+    pub(super) fn rocks_begin_statement(&mut self) -> Result<bool> {
+        #[cfg(feature = "rocksdb")]
+        if self.txn.is_none() {
+            if let Some(rocks) = self.store.as_rocks_mut() {
+                rocks.begin_journal()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// End the auto-commit statement [`rocks_begin_statement`](Self::rocks_begin_statement)
+    /// journaled — also when it failed part-way: what it applied stays
+    /// applied, as documented for a failed statement — by deleting its
+    /// journal in one batch with the `dict` CF entries of the ids it left
+    /// unreferenced, then retiring those ids. Durable at the next commit
+    /// point. On error the journal stays stale (writes are refused until it
+    /// is deleted) and the ids stay allocated.
+    pub(super) fn rocks_end_statement(&mut self) -> Result<()> {
+        let dead = self.committed_dead();
+        let ended = self.rocks_commit_journal_with(&dead);
+        if ended.is_ok() {
+            self.free_dead(dead, true);
+        }
+        ended
+    }
+
+    /// Run `body`, the work of an auto-commit statement that
+    /// [`rocks_begin_statement`](Self::rocks_begin_statement) journaled
+    /// (`journaled`), so that a panic inside it — a bug, which the servers
+    /// answer with a 500 while they keep serving the database — ends the
+    /// statement like a failed one before the unwind goes on: what it
+    /// applied stays applied (on the disk layout the next commit point
+    /// writes it too), and the journal is not left recording outside a
+    /// transaction, where it would refuse every later statement and
+    /// transaction ("already being journaled"), hold every freed id, and be
+    /// replayed by the next open — undoing writes acknowledged after the
+    /// panic. Just `body(self)` when nothing is journaled.
+    pub(super) fn rocks_statement_body<T>(
+        &mut self,
+        journaled: bool,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if !journaled {
+            return body(self);
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self))) {
+            Ok(done) => done,
+            Err(panic) => {
+                if self.txn.is_none() && self.rocks_journaling() {
+                    let ended = self.rocks_end_statement();
+                    if let Err(e) = ended.and_then(|()| self.commit_point()) {
+                        crate::gs_warn!(
+                            "the journal of a statement that panicked could not be deleted: {e}"
+                        );
+                    }
+                }
+                std::panic::resume_unwind(panic)
+            }
+        }
     }
 
     /// Apply the queued write-through of a committing transaction.
@@ -1963,7 +2061,10 @@ impl Database {
                 .map(|(sp, id, k)| (*sp, *id, k.as_str()))
                 .collect();
             if let Some(rocks) = self.store.as_rocks() {
-                if let Err(e) = rocks.put_terms(&terms) {
+                // New to the store (fresh, or never written): journaled as
+                // such inside a transaction or statement, so a crash before
+                // the triple lets the next open free them.
+                if let Err(e) = rocks.put_new_terms(&terms) {
                     // Forget the terms again, so that a retry interns them
                     // afresh and persists them: a known-but-unpersisted term
                     // would let a later triple reference an id RocksDB has no
@@ -2180,9 +2281,11 @@ impl Database {
         }
     }
 
-    /// RocksDB: commit the journaled transaction, deleting the `dict` CF
-    /// entries of the terms it freed (`dead`) in the same atomic batch as the
-    /// journal. Other layouts: nothing to do.
+    /// RocksDB: commit the journaled transaction (or statement), deleting
+    /// the `dict` CF entries of the terms it freed (`dead`) in the same
+    /// atomic batch as the journal — or delete a journal that was replayed
+    /// and kept (a rollback, an open) with the terms the replay left
+    /// unreferenced. Other layouts: nothing to do.
     #[cfg_attr(not(feature = "rocksdb"), allow(unused_variables))]
     pub(super) fn rocks_commit_journal_with(&mut self, dead: &[crate::dict::TermId]) -> Result<()> {
         #[cfg(feature = "rocksdb")]

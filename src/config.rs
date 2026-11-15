@@ -281,6 +281,7 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("storage", "default_layout"),
     ("storage", "rocksdb_block_cache_mb"),
     ("storage", "rocksdb_bloom"),
+    ("storage", "rocksdb_max_open_files"),
     ("system", "id_reclaim"),
 ];
 
@@ -524,6 +525,11 @@ pub struct GStoreConfig {
     /// its point-lookup column families (default 10; `0` / `off` = none,
     /// `on` = 10). Options only: files open with or without them.
     pub rocksdb_bloom: u32,
+    /// *(Rust extension)* The most files a RocksDB database keeps open
+    /// (default 4096; `0` = unlimited, RocksDB's own default, which holds a
+    /// descriptor per table file for as long as the database is open).
+    /// Options only: files open with any value.
+    pub rocksdb_max_open_files: u32,
     /// *(Rust extension, `[system]`)* Free the ids of terms a delete leaves
     /// unreferenced, for reuse (`on`, the default), or keep them until an
     /// explicit `gcompact --reclaim` (`off`). The `GSTORE_ID_RECLAIM`
@@ -610,6 +616,7 @@ impl Default for GStoreConfig {
             default_layout: None,
             rocksdb_block_cache_mb: 256,
             rocksdb_bloom: 10,
+            rocksdb_max_open_files: 4096,
             id_reclaim: IdReclaim::Immediate,
             source: None,
             explicit: BTreeSet::new(),
@@ -960,6 +967,13 @@ impl GStoreConfig {
                         .ok_or_else(|| bad("on, off or bits per key (0..=64)"))?,
                 }
             }
+            "rocksdb_max_open_files" => {
+                self.rocksdb_max_open_files = v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n == 0 || (20..=1 << 20).contains(n))
+                    .ok_or_else(|| bad("a number of files (20..=1048576; 0 = unlimited)"))?
+            }
             "id_reclaim" => {
                 self.id_reclaim = v.parse::<IdReclaim>().map_err(|_| bad("on or off"))?
             }
@@ -1060,6 +1074,7 @@ impl GStoreConfig {
                 .to_string(),
             "rocksdb_block_cache_mb" => self.rocksdb_block_cache_mb.to_string(),
             "rocksdb_bloom" => self.rocksdb_bloom.to_string(),
+            "rocksdb_max_open_files" => self.rocksdb_max_open_files.to_string(),
             "id_reclaim" => self.id_reclaim.to_string(),
             _ => return None,
         })
@@ -1167,7 +1182,8 @@ impl GStoreConfig {
     /// not [`OpenOptions`]: the id-reclamation policy (`[system]
     /// id_reclaim`, [`crate::db::set_default_id_reclaim`]) and, with the
     /// `rocksdb` feature, the RocksDB tuning (`[storage]
-    /// rocksdb_block_cache_mb` / `rocksdb_bloom`). The environment
+    /// rocksdb_block_cache_mb` / `rocksdb_bloom` / `rocksdb_max_open_files`).
+    /// The environment
     /// (`GSTORE_ID_RECLAIM`, `GSTORE_ROCKS_BLOCK_CACHE_MB`) still overrides
     /// them. A server calls it where it installs
     /// [`open_options`](Self::open_options); databases opened afterwards use
@@ -1184,6 +1200,10 @@ impl GStoreConfig {
         crate::backend::rocks::RocksTuning {
             block_cache_bytes: self.rocksdb_block_cache_mb.saturating_mul(1 << 20),
             bloom_bits_per_key: f64::from(self.rocksdb_bloom),
+            max_open_files: match self.rocksdb_max_open_files {
+                0 => -1,
+                n => i32::try_from(n).unwrap_or(i32::MAX),
+            },
         }
     }
 
@@ -1622,7 +1642,7 @@ upload_allow_compress_packages = "zip"
                     pfn_max_module_bytes=5000\npfn_max_functions=3\n\
                     [storage]\ndisk_query_mode=stream\ndisk_cache_mb=64\ndict_cache_mb=32\n\
                     vstree_on_open=on\ndefault_layout=disk\nrocksdb_block_cache_mb=64\n\
-                    rocksdb_bloom=off\n";
+                    rocksdb_bloom=off\nrocksdb_max_open_files=512\n";
         let c = GStoreConfig::from_ini_str(text);
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         assert!(
@@ -1703,6 +1723,9 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.value("disk_query_mode").unwrap(), "stream");
         assert_eq!(c.id_reclaim, IdReclaim::Off);
         assert_eq!((c.rocksdb_block_cache_mb, c.rocksdb_bloom), (64, 0));
+        // review gap-rocksdb-exec#2: the new `[storage] rocksdb_max_open_files`
+        // key (in the text above too, so that every key is counted as set).
+        assert_eq!(c.rocksdb_max_open_files, 512);
         assert_eq!(c.value("id_reclaim").unwrap(), "off");
         assert_eq!(c.value("default_layout").unwrap(), "disk");
 

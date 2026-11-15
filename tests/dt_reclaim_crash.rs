@@ -2,12 +2,17 @@
 //!
 //! The test re-executes its own binary as a child that applies a churn of
 //! inserts and deletes (each delete frees ids; inserts reuse them) through
-//! auto-commit SPARQL updates and transactions, printing an acknowledgement
-//! after each one returned. The parent kills it with SIGKILL at a random
-//! moment, 20 times per layout, then reopens the database and checks that
-//! `verify_integrity` holds, every acknowledged operation is there (the one
-//! in flight may or may not be), at most 4 terms are orphans (interned or
-//! kept by an interrupted operation), and `reclaim_unused` removes them.
+//! auto-commit SPARQL updates — single-triple ones and requests of several
+//! operations — and transactions, committed or rolled back, printing an
+//! acknowledgement after each one returned. The parent kills it with
+//! SIGKILL at a random moment, 20 times per layout, then reopens the
+//! database and checks that `verify_integrity` holds, every acknowledged
+//! operation is there (the one in flight may or may not be, as a whole:
+//! never part of a request), at most 4 terms are orphans (interned or kept
+//! by an interrupted operation) — none on RocksDB, whose undo journal
+//! covers every statement and the terms it writes — and `reclaim_unused`
+//! removes them. (`tests/rocksdb_statement_atomicity.rs` kills RocksDB at
+//! exact write batches instead.)
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -65,34 +70,55 @@ fn triple(i: u64) -> String {
     format!("<http://ex/s{i}> <http://ex/p{}> \"o{i}\"", i % 7)
 }
 
-/// The operations, deterministic: `(insert?, i)` groups; each group is one
-/// acknowledged statement (a transaction for a group of several).
-fn ops(start: u64) -> impl Iterator<Item = Vec<(bool, u64)>> {
+/// How a group of operations is applied: one acknowledged statement each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    /// One auto-commit UPDATE request of all the group's operations
+    /// (review H-11: atomic on every layout, RocksDB included).
+    Request,
+    /// A committed transaction of one statement per operation.
+    Commit,
+    /// A transaction that is rolled back: it changes nothing.
+    Rollback,
+}
+
+/// The operations, deterministic: groups of `(insert?, i)`; each group is
+/// one acknowledged statement (see [`Kind`]).
+fn ops(start: u64) -> impl Iterator<Item = (Kind, Vec<(bool, u64)>)> {
     let mut rng = Rng(start.wrapping_mul(7919) + 1);
     let mut next = start;
     let mut live: Vec<u64> = Vec::new();
     std::iter::from_fn(move || {
-        let n = if rng.below(5) == 0 {
-            2 + rng.below(3)
-        } else {
-            1
+        let (kind, n) = match rng.below(10) {
+            0..=5 => (Kind::Request, 1),
+            6 | 7 => (Kind::Request, 2 + rng.below(4)),
+            8 => (Kind::Commit, 2 + rng.below(3)),
+            _ => (Kind::Rollback, 2 + rng.below(3)),
         };
         let mut group = Vec::new();
         for _ in 0..n {
             if !live.is_empty() && rng.below(2) == 0 {
                 let k = rng.below(live.len() as u64) as usize;
-                group.push((false, live.swap_remove(k)));
+                // A rolled-back delete leaves the triple live.
+                let i = if kind == Kind::Rollback {
+                    live[k]
+                } else {
+                    live.swap_remove(k)
+                };
+                group.push((false, i));
             } else {
                 group.push((true, next));
-                live.push(next);
+                if kind != Kind::Rollback {
+                    live.push(next);
+                }
                 next += 1;
             }
         }
-        Some(group)
+        Some((kind, group))
     })
 }
 
-fn apply(db: &mut Database, group: &[(bool, u64)]) {
+fn apply(db: &mut Database, kind: Kind, group: &[(bool, u64)]) {
     let stmt = |&(ins, i): &(bool, u64)| {
         format!(
             "{} DATA {{ {} }}",
@@ -100,14 +126,22 @@ fn apply(db: &mut Database, group: &[(bool, u64)]) {
             triple(i)
         )
     };
-    if group.len() == 1 {
-        db.query(&stmt(&group[0])).unwrap();
-    } else {
-        db.begin().unwrap();
-        for op in group {
-            db.query(&stmt(op)).unwrap();
+    match kind {
+        Kind::Request => {
+            let request: Vec<String> = group.iter().map(stmt).collect();
+            db.query(&request.join(" ;\n")).unwrap();
         }
-        db.commit().unwrap();
+        Kind::Commit | Kind::Rollback => {
+            db.begin().unwrap();
+            for op in group {
+                db.query(&stmt(op)).unwrap();
+            }
+            if kind == Kind::Commit {
+                db.commit().unwrap();
+            } else {
+                db.rollback().unwrap();
+            }
+        }
     }
 }
 
@@ -139,8 +173,8 @@ fn crash_child() {
     let start: u64 = std::env::var(START_ENV).unwrap().parse().unwrap();
     let mut db = open(&layout, Path::new(&dir));
     let out = std::io::stdout();
-    for (n, group) in ops(start).enumerate() {
-        apply(&mut db, &group);
+    for (n, (kind, group)) in ops(start).enumerate() {
+        apply(&mut db, kind, &group);
         let mut o = out.lock();
         writeln!(o, "ACK {n}").unwrap();
         o.flush().unwrap();
@@ -150,7 +184,10 @@ fn crash_child() {
 /// The model after the first `n` groups: the triples present.
 fn model(start: u64, n: usize) -> BTreeSet<u64> {
     let mut present = BTreeSet::new();
-    for group in ops(start).take(n) {
+    for (kind, group) in ops(start).take(n) {
+        if kind == Kind::Rollback {
+            continue;
+        }
         for (ins, i) in group {
             if ins {
                 present.insert(i);
@@ -269,8 +306,13 @@ fn crash_iterations(layout: &str, iterations: u64) {
         let base_terms = 3;
         let refs = referenced(&state) + base_terms - usize::from(state.iter().any(|i| i % 7 == 0));
         let orphans = live_terms(&db).saturating_sub(refs);
+        // review gap-rocksdb-exec#8: RocksDB journals every statement and
+        // the terms it writes new, and deletes the terms a rollback, a
+        // commit or the open's replay frees in the batch that deletes the
+        // journal: no kill leaves an orphan there.
+        let tolerated = if layout == "rocksdb" { 0 } else { 4 };
         assert!(
-            orphans <= 4,
+            orphans <= tolerated,
             "{layout} iteration {it}: {orphans} orphan terms ({} live, {refs} referenced)",
             live_terms(&db)
         );
@@ -323,8 +365,8 @@ fn the_workload_without_crashes_matches_the_model() {
         for it in 0..3u64 {
             let start = 1_000_000 * (it + 1);
             let mut db = open(layout, &dir);
-            for (n, group) in ops(start).take(120).enumerate() {
-                apply(&mut db, &group);
+            for (n, (kind, group)) in ops(start).take(120).enumerate() {
+                apply(&mut db, kind, &group);
                 let got: BTreeSet<u64> = present(&mut db)
                     .into_iter()
                     .filter(|&i| i >= start)

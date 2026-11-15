@@ -1014,22 +1014,45 @@ impl Database {
         log: &mut dyn import::ErrorLog,
         applied: &mut u64,
     ) -> Result<import::ImportReport> {
-        import::import_sources(
-            sources,
-            "batch insert",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| {
-                let mut added = Vec::new();
-                let quads = batch.drain(..).map(|q| {
-                    let graph = graph_iri(&q.graph);
-                    (q.into_triple(), graph)
-                });
-                let result = self.insert_statements(quads, &mut added);
-                *applied += added.len() as u64;
-                result
-            },
-        )
+        // RocksDB: one journaled statement — a crash undoes all of it, never
+        // a prefix; an error keeps what was applied (see `applied`).
+        let journaled = self.rocks_begin_statement()?;
+        let report = self.rocks_statement_body(journaled, |db| {
+            import::import_sources(
+                sources,
+                "batch insert",
+                opts,
+                log,
+                &mut |batch: &mut Vec<Quad>| {
+                    let mut added = Vec::new();
+                    let quads = batch.drain(..).map(|q| {
+                        let graph = graph_iri(&q.graph);
+                        (q.into_triple(), graph)
+                    });
+                    let result = db.insert_statements(quads, &mut added);
+                    *applied += added.len() as u64;
+                    result
+                },
+            )
+        });
+        self.end_sources_statement(journaled, report)
+    }
+
+    /// The end of an `insert_sources` / `remove_sources` statement on
+    /// RocksDB ([`rocks_end_statement`](Self::rocks_end_statement)); the
+    /// import's own error comes first (a failed journal deletion also fails
+    /// the next commit point).
+    fn end_sources_statement(
+        &mut self,
+        journaled: bool,
+        report: Result<import::ImportReport>,
+    ) -> Result<import::ImportReport> {
+        if !journaled {
+            return report;
+        }
+        let ended = self.rocks_end_statement();
+        let report = report?;
+        ended.map(|()| report)
     }
 
     /// Remove the statements of RDF `sources` from this database (`gsub`,
@@ -1044,30 +1067,38 @@ impl Database {
         log: &mut dyn import::ErrorLog,
         applied: &mut u64,
     ) -> Result<import::ImportReport> {
-        import::import_sources(
-            sources,
-            "batch remove",
-            opts,
-            log,
-            &mut |batch: &mut Vec<Quad>| {
-                // In a read scope (C2): a term that cannot be looked up must
-                // fail the removal, not read as absent.
-                let scope = ReadScope::enter();
-                let quads = batch.drain(..).map(|q| {
-                    let graph = graph_iri(&q.graph);
-                    (q.into_triple(), graph)
-                });
-                let (removed, err) = self.remove_statements(quads, Some(&scope));
-                *applied += removed as u64;
-                if let Some(e) = err {
-                    self.flush_reclaim();
-                    return Err(read_failure("removing statements", e));
-                }
-                // Each batch frees the ids it left unreferenced.
-                self.flush_reclaim();
-                self.check_store_readable()
-            },
-        )
+        // RocksDB: one journaled statement (see `insert_sources`); the
+        // batches' frees wait for its end.
+        let journaled = self.rocks_begin_statement()?;
+        let report = self.rocks_statement_body(journaled, |db| {
+            import::import_sources(
+                sources,
+                "batch remove",
+                opts,
+                log,
+                &mut |batch: &mut Vec<Quad>| {
+                    // In a read scope (C2): a term that cannot be looked up
+                    // must fail the removal, not read as absent.
+                    let scope = ReadScope::enter();
+                    let quads = batch.drain(..).map(|q| {
+                        let graph = graph_iri(&q.graph);
+                        (q.into_triple(), graph)
+                    });
+                    let (removed, err) = db.remove_statements(quads, Some(&scope));
+                    *applied += removed as u64;
+                    if let Some(e) = err {
+                        db.flush_reclaim();
+                        return Err(read_failure("removing statements", e));
+                    }
+                    // Each batch frees the ids it left unreferenced (RocksDB:
+                    // they wait for the statement's end; only those are kept).
+                    db.flush_reclaim();
+                    db.keep_dead_candidates();
+                    db.check_store_readable()
+                },
+            )
+        });
+        self.end_sources_statement(journaled, report)
     }
 
     // (RocksDB / on-disk / snapshot persistence lives in `persist.rs`.)
@@ -1752,8 +1783,28 @@ impl Database {
             for t in minted {
                 self.reclaim.note(t);
             }
-            self.flush_reclaim();
         }
+        // RocksDB: the replayed journal is still on disk; it is deleted in
+        // one batch with the minted and replayed terms nothing references
+        // any more, so a crash before that batch replays it again at the
+        // next open (which frees them then) — never an orphan term.
+        let replayed = match replayed {
+            Ok(()) if journaled => {
+                let dead = self.committed_dead();
+                let cleared = self.rocks_commit_journal_with(&dead);
+                if cleared.is_ok() {
+                    self.free_dead(dead, true);
+                }
+                cleared
+            }
+            Ok(()) => {
+                if self.id_reclaim == IdReclaim::Immediate {
+                    self.flush_reclaim();
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
         self.run_deferred_rebuild();
         replayed
     }
@@ -2125,6 +2176,28 @@ impl Database {
             }
             eval.check_update_calls(&ops)?;
         }
+        // RocksDB, outside a transaction: the request is journaled, so a
+        // crash part-way undoes all of it (crash-atomic, as on the disk
+        // layout, whose commit point writes it as one); the journal is
+        // deleted at its commit point (`apply_update_ops`), or when it fails
+        // or panics.
+        let journaled = self.rocks_begin_statement()?;
+        self.rocks_statement_body(journaled, |db| {
+            db.apply_update_ops(sparql, ops, cancel, pfn, journaled)
+        })
+    }
+
+    /// The body of [`run_update`](Self::run_update): apply the request's
+    /// operations in order, then its update log line and commit point
+    /// (`journaled`: the end of its RocksDB statement first).
+    fn apply_update_ops(
+        &mut self,
+        sparql: &str,
+        ops: Vec<UpdateOp>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        pfn: Option<&crate::pfn::PfnCaller>,
+        journaled: bool,
+    ) -> Result<QueryResult> {
         let before = self.mutations;
         let mut changed = 0;
         for op in ops {
@@ -2147,19 +2220,46 @@ impl Database {
             self.flush_reclaim();
             match applied {
                 Ok(n) => changed += n,
-                Err(e) => return Err(self.failed_update(e, before)),
+                Err(e) => return Err(self.failed_update(e, before, journaled)),
             }
         }
         // Append the applied statement to the update log, if enabled.
         if let Some(path) = self.update_log.clone() {
-            append_update_log(&path, sparql, changed)?;
+            if let Err(e) = append_update_log(&path, sparql, changed) {
+                return Err(self.failed_update(e, before, journaled));
+            }
         }
         // Outside a transaction each UPDATE request is a commit point:
-        // its write-through is made durable before it is acknowledged.
-        if self.txn.is_none() {
+        // its write-through is made durable before it is acknowledged
+        // (RocksDB: its journal is deleted first, with the ids it freed).
+        if journaled {
+            let ended = self.end_update_statement(before);
+            let point = self.commit_point();
+            ended.and(point)?;
+        } else if self.txn.is_none() {
             self.commit_point()?;
         }
         Ok(QueryResult::Update { changed })
+    }
+
+    /// End a journaled UPDATE request on RocksDB
+    /// ([`rocks_end_statement`](Self::rocks_end_statement)). When it changed
+    /// nothing — [`mutation_count`](Self::mutation_count) is still `before`,
+    /// e.g. a `LOAD` that failed and undid itself — the ids it frees (the
+    /// terms that `LOAD` minted) do not count as a change either: the count
+    /// and a CSR built before the request are put back, as
+    /// [`load_rdf_source`](Self::load_rdf_source) does for its own undo.
+    fn end_update_statement(&mut self, before: u64) -> Result<()> {
+        if self.mutations != before {
+            return self.rocks_end_statement();
+        }
+        let csr = self.csr_cache.peek(before);
+        let ended = self.rocks_end_statement();
+        self.mutations = before;
+        if let Some(g) = csr {
+            self.csr_cache.restore(before, g);
+        }
+        ended
     }
 
     /// An UPDATE failed with `e` after its earlier operations (or part of the
@@ -2168,12 +2268,19 @@ impl Database {
     /// transaction the applied part is still made durable (this is the
     /// request's commit point), so the persistent store never lags what
     /// readers see; `before` is the [`mutation_count`](Self::mutation_count)
-    /// the update started at.
-    fn failed_update(&mut self, e: GStoreError, before: u64) -> GStoreError {
-        if self.txn.is_some() || self.mutations == before {
+    /// the update started at. A RocksDB statement's journal (`journaled`) is
+    /// deleted first, with the ids the statement freed: from then on a crash
+    /// no longer undoes the applied part.
+    fn failed_update(&mut self, e: GStoreError, before: u64, journaled: bool) -> GStoreError {
+        let ended = if journaled {
+            self.end_update_statement(before)
+        } else {
+            Ok(())
+        };
+        if self.txn.is_some() || (self.mutations == before && !journaled) {
             return e;
         }
-        match self.commit_point() {
+        match ended.and_then(|()| self.commit_point()) {
             Ok(()) => e,
             Err(pe) => GStoreError::Database(format!(
                 "{e}; in addition, the part of the update applied before the failure could not \

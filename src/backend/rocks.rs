@@ -52,28 +52,75 @@
 //! CF holds every dictionary term (`E`/`L`/`P` space tag + 4-byte big-endian
 //! id → the term's dictionary key) and the `gspo` CF holds the named-graph
 //! quads. New terms are written *before* the first triple that references them
-//! (an orphan term is harmless; a triple whose term is missing is not), so the
-//! state RocksDB recovers after a crash is always self-consistent and nothing
-//! depends on a separately-saved `dict.bin`.
+//! (a triple whose term is missing would be damage), so the state RocksDB
+//! recovers after a crash is always self-consistent and nothing depends on a
+//! separately-saved `dict.bin`. While a journal records (below), the new
+//! terms are journaled too, so a crash between a term and its triple does
+//! not leave the term behind as an orphan.
 //!
-//! ## Transactions: the undo journal
+//! ## Transactions and statements: the undo journal
 //!
 //! A `Database` transaction writes straight through to RocksDB (queries inside
 //! it read their own writes), so to keep it crash-atomic every mutation made
 //! while one is open ([`begin_journal`](RocksStore::begin_journal)) carries, *in
 //! the same atomic write batch*, an undo record in the `meta` CF: the inverse
-//! operation, keyed by a sequence number. Commit deletes the whole journal in
-//! one batch; rollback replays it newest-first and then deletes it. If the
-//! process dies with a journal present (an uncommitted transaction, or a
-//! rollback cut short), [`RocksStore::open`] replays and deletes it before
-//! anything else — so after a crash no uncommitted write survives. Replaying is
-//! idempotent (each record sets one key present or absent), so a replay cut
-//! short is simply repeated. Dictionary terms written during the transaction
-//! are not journaled: a term without a triple is harmless.
+//! operation, keyed by a sequence number. The `Database` journals every
+//! auto-commit statement the same way — a SPARQL UPDATE request (`LOAD`,
+//! `CLEAR`, `DROP`, `COPY`, `MOVE`, `ADD` included) and an `insert_sources` /
+//! `remove_sources` import (`gadd`, `gsub`, `/api batchInsert` /
+//! `batchRemove`) — so that a statement is crash-atomic like on the disk
+//! layout, whose commit point writes it as one: never a prefix of it (half
+//! of a DELETE/INSERT rename). A failed statement's journal is committed
+//! too, and so is a panicking one's: what it applied before failing stays
+//! applied, as documented.
+//!
+//! Commit deletes the whole journal in one batch, together with the
+//! dictionary terms the transaction or statement freed
+//! ([`commit_journal_with`](RocksStore::commit_journal_with)); until then a
+//! freed id is neither deleted nor reused (the `Database` defers its frees),
+//! since the triples a replay restores may still name it. Rollback replays
+//! it newest-first and deletes it in one batch with the terms that are
+//! unreferenced afterwards ([`rollback_keeping_journal`](RocksStore::rollback_keeping_journal)).
+//! If the process dies with a journal present (an uncommitted transaction or
+//! statement, or a rollback cut short), the next open replays it before
+//! anything else — so after a crash no uncommitted write survives — and the
+//! `Database` deletes it with the terms the replay left unreferenced
+//! (`RocksStore::open_keeping_journal`; [`RocksStore::open`] alone deletes
+//! it at once). Replaying is idempotent
+//! (each record sets one key present or absent), so a replay cut short is
+//! simply repeated. Each step of a crash recovery is therefore complete or
+//! repeated: no window leaves an orphan term.
+//!
+//! A record is 18 bytes: the undo op (`+` re-insert, `-` remove), a kind
+//! byte, 4 bytes, then the triple's three ids. Kind `0` is a default-graph
+//! triple, `1` a quad of the graph whose id the 4 bytes hold, `2` a
+//! dictionary term written new (its space tag in the first of the 4 bytes,
+//! its id three times). A term record replays as nothing but a reclamation
+//! candidate ([`take_replayed`](RocksStore::take_replayed)); it is a `-`
+//! record, so a binary that predates term records replays it as the
+//! removal of the triple `(id, id, id)` — which cannot be stored at that
+//! point of the history, its term being new — and frees the term the same
+//! way: the journal format stays readable by every earlier binary.
 //!
 //! If the journal cannot be deleted or replayed (a write error), the store
 //! refuses further triple and quad writes until a retry succeeds — a stale
 //! journal replayed later would otherwise undo newer writes.
+//!
+//! ## Commit points and bounded resources
+//!
+//! The `Database`'s commit point fsyncs RocksDB's write-ahead log
+//! ([`sync_wal`](RocksStore::sync_wal)): every write acknowledged so far
+//! survives a crash or a power failure. That includes a save at the
+//! database's home — the servers' `check_point` save after every write — so
+//! memtables are flushed to table files only by an explicit
+//! `Database::checkpoint`, a backup (a RocksDB checkpoint) and when the
+//! store is closed, and RocksDB's own size limits (a full memtable, the WAL
+//! total of 256 MiB). A flush per write would add no
+//! durability, only a few small table files — and with them open
+//! descriptors and compaction work — per write. RocksDB keeps at most
+//! [`RocksTuning::max_open_files`] files open (`[storage]
+//! rocksdb_max_open_files`, default [`DEFAULT_MAX_OPEN_FILES`]) and
+//! four old info logs.
 //!
 //! ## Write errors
 //!
@@ -89,7 +136,10 @@
 //! prefix's successor, decoding each key in place (no allocation per key).
 //! An iterator or point-read error is reported through
 //! [`note_read_error`](crate::store::read_scope::note_read_error), so the
-//! statement reading it fails instead of seeing a silently shortened list.
+//! statement reading it fails instead of seeing a silently shortened list —
+//! and so is a key whose length is not the one its column family's
+//! decoder needs (a damaged store, or a key another tool wrote): it is
+//! never sliced into a panic.
 //! The contract-C1 counts come from the exact counters above
 //! (`count_po_by_s` = `s|s`, `count_ps_by_o` = `o|o`, `count_o_by_sp` =
 //! `x|p|s`, `count_s_by_po` = `y|p|o`, `count_so_by_p` = `c|p`) — one point
@@ -114,13 +164,14 @@
 //! every store of the process with the same capacity; default
 //! [`DEFAULT_BLOCK_CACHE_MB`] MiB, environment [`BLOCK_CACHE_ENV`]) and
 //! whole-key bloom filters on the column families read by point lookups
-//! (`spo`, `stats`, `gspo`). Neither changes a key, a value or the column
-//! family set: files written with or without them open either way.
+//! (`spo`, `stats`, `gspo`), and the bound on open files above. None
+//! changes a key, a value or the column family set: files written with or
+//! without them open either way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -161,6 +212,61 @@ const JOURNAL_END: &[u8] = b"\x00txn-undo\x01";
 /// Journal record op: undo by re-inserting / by removing.
 const UNDO_INSERT: u8 = b'+';
 const UNDO_REMOVE: u8 = b'-';
+/// The kind byte of a journal record: a default-graph triple, a named-graph
+/// quad, or a dictionary term written new (see the module docs).
+const REC_TRIPLE: u8 = 0;
+const REC_QUAD: u8 = 1;
+const REC_TERM: u8 = 2;
+/// Up to this many records, clearing a journal deletes them one by one
+/// (their keys are written again by the next journal, so the deletes
+/// collapse in the memtable); a longer one is cleared with one range delete.
+const POINT_CLEAR_MAX: u64 = 1024;
+
+/// The key of journal record `seq`.
+fn journal_key(seq: u64) -> Vec<u8> {
+    let mut key = JOURNAL_PREFIX.to_vec();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The length of a triple-ordering key (`spo`, `pos`, `osp`): three ids.
+const KEY3_LEN: usize = 12;
+/// The length of a quad key (`gspo`): four ids.
+const KEY4_LEN: usize = 16;
+/// The length of a single-id counter key (`c|`, `u|`, `v|`, `s|`, `o|`) and
+/// of a dictionary key (`dict`): a tag and one id.
+const TAG1_LEN: usize = 5;
+/// The length of a pair counter key (`x|`, `y|`): a tag and two ids.
+const TAG2_LEN: usize = 9;
+
+/// A key of column family `cf` that does not have the length `len` its
+/// decoder needs — a damaged store, or a key another tool wrote — as the
+/// read error reporting it (never a slice-index panic).
+fn check_len(cf: &str, k: &[u8], len: usize) -> std::result::Result<(), String> {
+    if k.len() == len {
+        return Ok(());
+    }
+    let shown = &k[..k.len().min(16)];
+    Err(format!(
+        "corrupt rocksdb key in column family '{cf}': {} byte(s) {shown:02x?}{}, expected {len}",
+        k.len(),
+        if k.len() > shown.len() { "…" } else { "" }
+    ))
+}
+
+/// The default bound on the files RocksDB keeps open (`[storage]
+/// rocksdb_max_open_files`). RocksDB's own default (unlimited) keeps a
+/// descriptor per table file for as long as the store is open.
+pub const DEFAULT_MAX_OPEN_FILES: i32 = 4096;
+/// How many old RocksDB info logs (`LOG.old.*`) are kept: each open starts
+/// a new one, and a backup copies them all.
+const KEEP_LOG_FILES: usize = 4;
+/// The write-ahead logs' total size at which RocksDB flushes the column
+/// families that still hold the oldest log. A commit point only syncs the
+/// WAL (a memtable flush adds no durability), so without a bound the logs a
+/// rarely written column family keeps alive would pile up until its
+/// memtable filled.
+const MAX_TOTAL_WAL_BYTES: u64 = 256 << 20;
 
 /// The environment variable setting the shared block cache, in MiB (`0`:
 /// RocksDB's own default, a 32 MiB cache per column family).
@@ -181,6 +287,10 @@ pub struct RocksTuning {
     /// Bits per key of the whole-key bloom filters written for the column
     /// families read by point lookups (`spo`, `stats`, `gspo`); `0` = none.
     pub bloom_bits_per_key: f64,
+    /// The most files RocksDB keeps open (table files beyond it are closed
+    /// and reopened through its table cache); `-1` = unlimited, RocksDB's
+    /// own default (one descriptor per table file).
+    pub max_open_files: i32,
 }
 
 impl Default for RocksTuning {
@@ -195,8 +305,9 @@ impl Default for RocksTuning {
 static INSTALLED_TUNING: Mutex<Option<RocksTuning>> = Mutex::new(None);
 
 /// Install the tuning stores of this process open with (a server installs
-/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`); the
-/// environment ([`BLOCK_CACHE_ENV`]) still overrides the block cache.
+/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom` /
+/// `rocksdb_max_open_files`); the environment ([`BLOCK_CACHE_ENV`]) still
+/// overrides the block cache.
 pub fn set_default_rocks_tuning(tuning: RocksTuning) {
     *INSTALLED_TUNING
         .lock()
@@ -205,7 +316,8 @@ pub fn set_default_rocks_tuning(tuning: RocksTuning) {
 
 impl RocksTuning {
     /// The defaults — the installed tuning ([`set_default_rocks_tuning`]),
-    /// else [`DEFAULT_BLOCK_CACHE_MB`] and [`DEFAULT_BLOOM_BITS`] — with the
+    /// else [`DEFAULT_BLOCK_CACHE_MB`], [`DEFAULT_BLOOM_BITS`] and
+    /// [`DEFAULT_MAX_OPEN_FILES`] — with the
     /// block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a number
     /// of MiB (the environment wins, as for the other storage settings). A
     /// value that is not one is logged (once per process) and ignored.
@@ -217,6 +329,7 @@ impl RocksTuning {
         let base = installed.unwrap_or(RocksTuning {
             block_cache_bytes: DEFAULT_BLOCK_CACHE_MB << 20,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+            max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
         let env = std::env::var(BLOCK_CACHE_ENV).ok();
         let (mb, warning) = block_cache_mb(env.as_deref());
@@ -236,15 +349,17 @@ impl RocksTuning {
                 base.block_cache_bytes
             },
             bloom_bits_per_key: base.bloom_bits_per_key,
+            max_open_files: base.max_open_files,
         }
     }
 
-    /// RocksDB's own defaults (per-column-family caches, no filters): the
-    /// options of stores before Phase 6.
+    /// RocksDB's own defaults (per-column-family caches, no filters, no
+    /// bound on open files): the options of stores before Phase 6.
     pub fn rocksdb_defaults() -> RocksTuning {
         RocksTuning {
             block_cache_bytes: 0,
             bloom_bits_per_key: 0.0,
+            max_open_files: -1,
         }
     }
 }
@@ -405,10 +520,19 @@ pub struct RocksStore {
     replayed: Mutex<Vec<(TermSpace, u32)>>,
     /// Every read fails (see [`RocksStore::debug_fail_reads`]).
     fail_reads: AtomicBool,
+    /// The write batches written since a write hook was installed, and the
+    /// hook (see [`RocksStore::debug_set_write_hook`]).
+    writes: AtomicU64,
+    write_hook: Mutex<Option<WriteHook>>,
     /// Test-only failpoints (see [`RocksStore::inject_failures`]).
     #[cfg(test)]
     failpoints: Failpoints,
 }
+
+/// A hook run after each write batch a store writes, with the number of
+/// batches written since it was installed (see
+/// [`RocksStore::debug_set_write_hook`]).
+pub type WriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Test-only write-failure injection, standing in for e.g. `ENOSPC`.
 #[cfg(test)]
@@ -493,11 +617,32 @@ impl RocksStore {
         RocksStore::open_with(path, &RocksTuning::default())
     }
 
-    /// [`open`](Self::open) with explicit read-side tuning.
+    /// [`open`](Self::open) with explicit tuning.
     pub fn open_with<P: AsRef<Path>>(path: P, tuning: &RocksTuning) -> Result<RocksStore> {
+        RocksStore::open_inner(path.as_ref(), tuning, false)
+    }
+
+    /// [`open_with`](Self::open_with), but a journal left behind (by a
+    /// process that died in a transaction or statement) is only replayed:
+    /// it stays on disk, to be deleted by
+    /// [`commit_journal_with`](Self::commit_journal_with) in the same batch
+    /// as the dictionary terms the replay left unreferenced — what a
+    /// `Database` does once it has checked them, so that no crash leaves
+    /// them behind as orphans. Triple and quad writes are refused until then.
+    pub(crate) fn open_keeping_journal(path: &Path, tuning: &RocksTuning) -> Result<RocksStore> {
+        RocksStore::open_inner(path, tuning, true)
+    }
+
+    fn open_inner(path: &Path, tuning: &RocksTuning, keep_journal: bool) -> Result<RocksStore> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // Bounded resources (options only, the files are the same): open
+        // table files, old info logs, and the WAL kept alive by column
+        // families that are written rarely (see the constants).
+        db_opts.set_max_open_files(tuning.max_open_files);
+        db_opts.set_keep_log_file_num(KEEP_LOG_FILES);
+        db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
 
         let cfs = ALL_CFS
             .iter()
@@ -517,14 +662,25 @@ impl RocksStore {
             journal: Mutex::new(Journal::Off),
             replayed: Mutex::new(Vec::new()),
             fail_reads: AtomicBool::new(false),
+            writes: AtomicU64::new(0),
+            write_hook: Mutex::new(None),
             #[cfg(test)]
             failpoints: Failpoints::default(),
         };
         store.load_counters()?;
-        // A journal left behind is an uncommitted transaction (or a rollback
-        // cut short) of a process that died: undo it before anything reads.
-        // The replay reloads the counters once it has run.
-        store.replay_journal()?;
+        // A journal left behind is an uncommitted transaction or statement
+        // (or a rollback cut short) of a process that died: undo it before
+        // anything reads. The replay reloads the counters once it has run.
+        if keep_journal {
+            if store.replay_records_on_disk()? {
+                *store.journal_state() = Journal::Stale {
+                    replay: false,
+                    why: "replayed at open; not deleted yet".into(),
+                };
+            }
+        } else {
+            store.replay_journal()?;
+        }
         store.sync_wal()?;
         Ok(store)
     }
@@ -658,15 +814,47 @@ impl RocksStore {
             .then(|| "injected read failure (Input/output error)".to_string())
     }
 
+    /// A test hook for crash tests: run `hook` after every write batch this
+    /// store writes from now on (each triple or quad change, dictionary
+    /// batch and journal deletion is one), with the number written since
+    /// the call — so a test child can stop at an exact point of a statement
+    /// (and be killed there). `None` removes it. Only the batch counter is
+    /// touched when no hook is installed.
+    #[doc(hidden)]
+    pub fn debug_set_write_hook(&self, hook: Option<WriteHook>) {
+        self.writes.store(0, Ordering::SeqCst);
+        *self
+            .write_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Write `wb` atomically (every write of this store goes through here),
+    /// then run the write hook, if one is installed.
+    fn write(&self, wb: WriteBatch) -> std::result::Result<(), rocksdb::Error> {
+        self.db.write(wb)?;
+        let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let hook = self
+            .write_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(n);
+        }
+        Ok(())
+    }
+
     // ---- transaction undo journal (meta CF) -----------------------------
 
     fn journal_state(&self) -> std::sync::MutexGuard<'_, Journal> {
         self.journal.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Start journaling mutations for a transaction (see the module docs).
-    /// Fails if one is already being journaled, or if the journal of an earlier
-    /// transaction is still stale and cannot be cleaned up now.
+    /// Start journaling mutations for a transaction or an auto-commit
+    /// statement (see the module docs). Fails if one is already being
+    /// journaled, or if the journal of an earlier one is still stale and
+    /// cannot be cleaned up now.
     pub fn begin_journal(&mut self) -> Result<()> {
         self.heal_journal()?;
         let mut j = self.journal_state();
@@ -696,48 +884,50 @@ impl RocksStore {
     /// as the journal: either the transaction is committed with its frees or
     /// (a crash before the batch) it is undone at the next open with its
     /// terms still stored. Without a journal the terms are deleted alone.
+    ///
+    /// The same call finishes a journal that was replayed but kept — by
+    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal) or an
+    /// `open_keeping_journal` — deleting it
+    /// with `frees`, the terms the replay left unreferenced.
     pub fn commit_journal_with(&mut self, frees: &[(TermSpace, u32)]) -> Result<()> {
-        if !self.journaling() {
-            return self.delete_terms(frees);
-        }
-        if !frees.is_empty() {
-            #[cfg(test)]
-            Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
-            let mut wb = WriteBatch::default();
-            wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
-            let cf = self.cf(CF_DICT);
-            for (space, id) in frees {
-                wb.delete_cf(cf, tag1(space.tag(), *id));
+        let records = match &*self.journal_state() {
+            Journal::Off => None,
+            Journal::Recording(n) => Some(Some(*n)),
+            Journal::Stale { replay: false, .. } => Some(None),
+            Journal::Stale { replay: true, why } => {
+                return Err(GStoreError::Database(format!(
+                    "rocksdb: a rolled-back transaction's undo journal must be replayed first \
+                     ({why})"
+                )))
             }
-            match self.db.write(wb) {
-                Ok(()) => {
-                    *self.journal_state() = Journal::Off;
-                    return Ok(());
-                }
-                Err(e) => {
-                    // As a failed journal clear: stale until a retry deletes
-                    // it (the frees are then not made; the terms stay as
-                    // orphans).
-                    *self.journal_state() = Journal::Stale {
-                        replay: false,
-                        why: e.to_string(),
-                    };
-                    return Err(GStoreError::Database(format!(
-                        "rocksdb: a transaction's undo journal could not be cleared: {e}"
-                    )));
-                }
-            }
-        }
-        *self.journal_state() = Journal::Stale {
-            replay: false,
-            why: String::new(),
         };
-        self.heal_journal()
+        let Some(records) = records else {
+            return self.delete_terms(frees);
+        };
+        match self.clear_journal_with(records, frees) {
+            Ok(()) => {
+                *self.journal_state() = Journal::Off;
+                Ok(())
+            }
+            Err(e) => {
+                // Stale until a retry deletes it (the frees are then not
+                // made; the terms stay as orphans).
+                let why = e.to_string();
+                *self.journal_state() = Journal::Stale {
+                    replay: false,
+                    why: why.clone(),
+                };
+                Err(GStoreError::Database(format!(
+                    "rocksdb: a transaction's undo journal could not be cleared: {why}"
+                )))
+            }
+        }
     }
 
     /// The dictionary ids completed journal replays left possibly
-    /// unreferenced — the terms of the triples and quads they removed — since
-    /// the last call: the replay at open (an interrupted transaction undone),
+    /// unreferenced — the terms of the triples and quads they removed, and
+    /// the terms the journal recorded as written new — since the last call:
+    /// the replay at open (an interrupted transaction or statement undone),
     /// a rollback, or the retry that finished a replay cut short. The
     /// database takes them at open, after every statement and at every
     /// commit, and frees the ones nothing references.
@@ -762,6 +952,50 @@ impl RocksStore {
         self.heal_journal()
     }
 
+    /// [`rollback_journal`](Self::rollback_journal), but the replayed
+    /// journal stays on disk until
+    /// [`commit_journal_with`](Self::commit_journal_with) deletes it in one
+    /// batch with the terms the rollback leaves unreferenced (its
+    /// [`take_replayed`](Self::take_replayed) terms that nothing references
+    /// any more): a crash before that batch replays the journal again at the
+    /// next open — which frees those terms then — so no crash leaves them
+    /// behind as orphans. Triple and quad writes are refused in between. If
+    /// the replay fails, the journal stays stale as after a failed
+    /// [`rollback_journal`](Self::rollback_journal).
+    pub fn rollback_keeping_journal(&mut self) -> Result<()> {
+        if !self.journaling() {
+            return Ok(());
+        }
+        // No longer recording while it replays: the replay's own writes
+        // must not append records to the journal they undo (a crash replays
+        // that journal again from its start anyway).
+        *self.journal_state() = Journal::Stale {
+            replay: true,
+            why: "being rolled back".into(),
+        };
+        let res = self.replay_records_on_disk();
+        let mut j = self.journal_state();
+        match res {
+            Ok(_) => {
+                *j = Journal::Stale {
+                    replay: false,
+                    why: "rolled back; not deleted yet".into(),
+                };
+                Ok(())
+            }
+            Err(e) => {
+                let why = e.to_string();
+                *j = Journal::Stale {
+                    replay: true,
+                    why: why.clone(),
+                };
+                Err(GStoreError::Database(format!(
+                    "rocksdb: a transaction's undo journal could not be replayed: {why}"
+                )))
+            }
+        }
+    }
+
     /// Retry the cleanup of a stale journal — one whose deletion (after a
     /// commit) or replay (after a rollback) failed; a no-op otherwise. Errs,
     /// keeping it stale, if the retry fails too.
@@ -773,7 +1007,7 @@ impl RocksStore {
         let res = if replay {
             self.replay_journal()
         } else {
-            self.clear_journal()
+            self.clear_journal_with(None, &[])
         };
         let mut j = self.journal_state();
         match res {
@@ -807,25 +1041,33 @@ impl RocksStore {
         }
     }
 
+    /// The next journal key while a journal is recording (advancing its
+    /// sequence number), else `None`.
+    fn next_journal_key(&self) -> Option<Vec<u8>> {
+        let mut j = self.journal_state();
+        let Journal::Recording(seq) = &mut *j else {
+            return None;
+        };
+        let key = journal_key(*seq);
+        *seq += 1;
+        Some(key)
+    }
+
     /// Append the undo record of a mutation to `wb` when a transaction is being
     /// journaled. `undo` is the op that reverses it.
     fn journal_into(&self, wb: &mut WriteBatch, undo: u8, graph: Option<u32>, t: IdTriple) {
-        let mut j = self.journal_state();
-        let Journal::Recording(seq) = &mut *j else {
+        let Some(key) = self.next_journal_key() else {
             return;
         };
-        let mut key = JOURNAL_PREFIX.to_vec();
-        key.extend_from_slice(&seq.to_be_bytes());
-        *seq += 1;
         let mut val = Vec::with_capacity(18);
         val.push(undo);
         match graph {
             Some(g) => {
-                val.push(1);
+                val.push(REC_QUAD);
                 val.extend_from_slice(&be(g));
             }
             None => {
-                val.push(0);
+                val.push(REC_TRIPLE);
                 val.extend_from_slice(&[0; 4]);
             }
         }
@@ -833,17 +1075,54 @@ impl RocksStore {
         wb.put_cf(self.cf(CF_META), key, val);
     }
 
-    /// Every journal record `(undo op, graph, triple)`, oldest first.
-    fn journal_records(&self) -> Result<Vec<(u8, Option<u32>, IdTriple)>> {
+    /// Append the record of a dictionary term written new to `wb` when a
+    /// journal is recording, so that a replay hands the term over as a
+    /// reclamation candidate (see the module docs). The record is an
+    /// `UNDO_REMOVE` of the triple `(id, id, id)` with kind [`REC_TERM`]: a
+    /// binary that predates term records replays it as the removal of a
+    /// triple that cannot be stored at that point of the history (its term
+    /// is new) — a no-op — and frees the term the same way.
+    fn journal_term_into(&self, wb: &mut WriteBatch, space: TermSpace, id: u32) {
+        let Some(key) = self.next_journal_key() else {
+            return;
+        };
+        let mut val = Vec::with_capacity(18);
+        val.push(UNDO_REMOVE);
+        val.push(REC_TERM);
+        val.extend_from_slice(&[space.tag(), 0, 0, 0]);
+        val.extend_from_slice(&key3(id, id, id));
+        wb.put_cf(self.cf(CF_META), key, val);
+    }
+
+    /// Every journal record `(undo op, kind, graph or term tag, triple)`,
+    /// oldest first.
+    #[allow(clippy::type_complexity)]
+    fn journal_records(&self) -> Result<Vec<(u8, u8, u32, IdTriple)>> {
         let mut out = Vec::new();
         self.try_scan(CF_META, JOURNAL_PREFIX, |_, v| {
-            if v.len() != 18 || !matches!(v[0], UNDO_INSERT | UNDO_REMOVE) {
+            let valid = v.len() == 18
+                && matches!(v[0], UNDO_INSERT | UNDO_REMOVE)
+                && match v[1] {
+                    REC_TERM => v[0] == UNDO_REMOVE && TermSpace::from_tag(v[2]).is_some(),
+                    _ => true,
+                };
+            if !valid {
                 return Err("corrupt rocksdb undo journal record".to_string());
             }
-            let graph = (v[1] == 1).then(|| de(&v[2..6]));
+            // Kind byte 1 is a quad; any other but a term record is a
+            // default-graph triple (as every earlier binary read it).
+            let kind = match v[1] {
+                REC_QUAD | REC_TERM => v[1],
+                _ => REC_TRIPLE,
+            };
+            let tag = match kind {
+                REC_TERM => u32::from(v[2]),
+                _ => de(&v[2..6]),
+            };
             out.push((
                 v[0],
-                graph,
+                kind,
+                tag,
                 IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18])),
             ));
             Ok(true)
@@ -857,24 +1136,41 @@ impl RocksStore {
     /// cached counters and the mirror are reloaded from the `stats` CF after
     /// the replay, whatever it got through.
     fn replay_journal(&mut self) -> Result<()> {
+        if self.replay_records_on_disk()? {
+            self.clear_journal_with(None, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Undo every journaled mutation (newest first), keeping the journal;
+    /// `Ok(false)` when there is none. The cached counters and the mirror
+    /// are reloaded from the `stats` CF after the replay, whatever it got
+    /// through.
+    fn replay_records_on_disk(&mut self) -> Result<bool> {
         let records = self.journal_records()?;
         if records.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let replayed = self.replay_records(records);
         let reloaded = self.load_counters();
         replayed?;
         reloaded?;
-        self.clear_journal()
+        Ok(true)
     }
 
-    fn replay_records(&mut self, records: Vec<(u8, Option<u32>, IdTriple)>) -> Result<()> {
-        // Undoing an insert may leave its terms unreferenced. They are handed
-        // over (`take_replayed`) only once the whole replay has run: a replay
-        // cut short adds nothing, and the retry that completes it adds them
-        // once.
+    fn replay_records(&mut self, records: Vec<(u8, u8, u32, IdTriple)>) -> Result<()> {
+        // Undoing an insert may leave its terms unreferenced, and so may
+        // a term written new. They are handed over (`take_replayed`) only
+        // once the whole replay has run: a replay cut short adds nothing,
+        // and the retry that completes it adds them once.
         let mut terms = Vec::new();
-        for (op, graph, t) in &records {
+        for (op, kind, tag, t) in &records {
+            if *kind == REC_TERM {
+                if let Some(space) = TermSpace::from_tag(*tag as u8) {
+                    terms.push((space, t.sub));
+                }
+                continue;
+            }
             if *op == UNDO_REMOVE {
                 let obj = if is_literal_id(t.obj) {
                     TermSpace::Literal
@@ -884,15 +1180,19 @@ impl RocksStore {
                 terms.push((TermSpace::Entity, t.sub));
                 terms.push((TermSpace::Predicate, t.pred));
                 terms.push((obj, t.obj));
-                if let Some(g) = graph {
-                    terms.push((TermSpace::Entity, *g));
+                if *kind == REC_QUAD {
+                    terms.push((TermSpace::Entity, *tag));
                 }
             }
         }
-        for (op, graph, t) in records.into_iter().rev() {
+        for (op, kind, tag, t) in records.into_iter().rev() {
             let insert = op == UNDO_INSERT;
-            match graph {
-                None => {
+            match kind {
+                REC_TERM => {}
+                REC_QUAD => {
+                    self.quad_write(tag, t, insert)?;
+                }
+                _ => {
                     let res = if insert {
                         self.write_insert(t)
                     } else {
@@ -901,9 +1201,6 @@ impl RocksStore {
                     res.map_err(|e| {
                         GStoreError::Database(format!("rocksdb write (journal replay): {e}"))
                     })?;
-                }
-                Some(g) => {
-                    self.quad_write(g, t, insert)?;
                 }
             }
         }
@@ -914,14 +1211,30 @@ impl RocksStore {
         Ok(())
     }
 
-    /// Delete the whole journal in one atomic batch.
-    fn clear_journal(&self) -> Result<()> {
+    /// Delete the journal — the `Some(n)` records a recording journal wrote,
+    /// or (`None`) whatever is on disk — and the dictionary terms `frees` in
+    /// one atomic batch. Nothing is written when there is nothing to delete.
+    fn clear_journal_with(&self, records: Option<u64>, frees: &[(TermSpace, u32)]) -> Result<()> {
         #[cfg(test)]
         Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
         let mut wb = WriteBatch::default();
-        wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
-        self.db
-            .write(wb)
+        let meta = self.cf(CF_META);
+        match records {
+            Some(n) if n <= POINT_CLEAR_MAX => {
+                for seq in 0..n {
+                    wb.delete_cf(meta, journal_key(seq));
+                }
+            }
+            _ => wb.delete_range_cf(meta, JOURNAL_PREFIX, JOURNAL_END),
+        }
+        let dict = self.cf(CF_DICT);
+        for (space, id) in frees {
+            wb.delete_cf(dict, tag1(space.tag(), *id));
+        }
+        if wb.is_empty() {
+            return Ok(());
+        }
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (journal): {e}")))
     }
 
@@ -939,6 +1252,20 @@ impl RocksStore {
     /// Persist dictionary terms `(space, id, key)` in one atomic batch
     /// (overwriting any previous term stored under the same id).
     pub fn put_terms(&self, terms: &[(TermSpace, u32, &str)]) -> Result<()> {
+        self.write_terms(terms, false)
+    }
+
+    /// [`put_terms`](Self::put_terms) for terms that are **new** to the
+    /// store — no stored triple or quad uses their ids — written before the
+    /// first triple that uses them. While a journal is recording, each one
+    /// is journaled in the same batch (see the module docs), so a crash
+    /// before the triple that would use it lets the next open free it
+    /// instead of leaving it behind as an orphan.
+    pub fn put_new_terms(&self, terms: &[(TermSpace, u32, &str)]) -> Result<()> {
+        self.write_terms(terms, true)
+    }
+
+    fn write_terms(&self, terms: &[(TermSpace, u32, &str)], new: bool) -> Result<()> {
         if terms.is_empty() {
             return Ok(());
         }
@@ -948,9 +1275,11 @@ impl RocksStore {
         let mut wb = WriteBatch::default();
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), *id), key.as_bytes());
+            if new {
+                self.journal_term_into(&mut wb, *space, *id);
+            }
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -969,8 +1298,7 @@ impl RocksStore {
         for (space, id) in terms {
             wb.delete_cf(cf, tag1(space.tag(), *id));
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -987,8 +1315,7 @@ impl RocksStore {
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), id), key.as_bytes());
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -996,7 +1323,7 @@ impl RocksStore {
     pub fn load_terms(&self) -> Result<Vec<(TermSpace, u32, String)>> {
         let mut out = Vec::new();
         self.try_scan(CF_DICT, &[], |k, v| {
-            let space = (k.len() == 5)
+            let space = (k.len() == TAG1_LEN)
                 .then(|| TermSpace::from_tag(k[0]))
                 .flatten()
                 .ok_or_else(|| "corrupt rocksdb dictionary key".to_string())?;
@@ -1052,8 +1379,7 @@ impl RocksStore {
             wb.delete_cf(cf, key);
             self.journal_into(&mut wb, UNDO_INSERT, Some(g), t);
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
         Ok(true)
     }
@@ -1062,7 +1388,7 @@ impl RocksStore {
     pub fn quads(&self) -> Result<Vec<(u32, IdTriple)>> {
         let mut out = Vec::new();
         self.try_scan(CF_GSPO, &[], |k, _| {
-            if k.len() != 16 {
+            if k.len() != KEY4_LEN {
                 return Err("corrupt rocksdb quad key".to_string());
             }
             out.push((
@@ -1203,10 +1529,13 @@ impl RocksStore {
     }
 
     /// Visit every key of `cf` starting with `prefix`, ascending, decoded in
-    /// place. A read error is reported through [`note_read_error`] and ends
-    /// the scan (the statement fails; see the module docs).
-    fn scan(&self, cf: &str, prefix: &[u8], mut f: impl FnMut(&[u8])) {
+    /// place; every one must be `len` bytes long (a key of another length —
+    /// a damaged store — ends the scan with a read error instead of reaching
+    /// the decoder). A read error is reported through [`note_read_error`]
+    /// and ends the scan (the statement fails; see the module docs).
+    fn scan(&self, cf: &str, prefix: &[u8], len: usize, mut f: impl FnMut(&[u8])) {
         let res = self.try_scan(cf, prefix, |k, _| {
+            check_len(cf, k, len)?;
             f(k);
             Ok(true)
         });
@@ -1215,10 +1544,10 @@ impl RocksStore {
         }
     }
 
-    /// The number of keys of `cf` starting with `prefix`.
-    fn count_keys(&self, cf: &str, prefix: &[u8]) -> u64 {
+    /// The number of keys of `cf` starting with `prefix` (each `len` bytes).
+    fn count_keys(&self, cf: &str, prefix: &[u8], len: usize) -> u64 {
         let mut n = 0u64;
-        self.scan(cf, prefix, |_| n += 1);
+        self.scan(cf, prefix, len, |_| n += 1);
         n
     }
 
@@ -1226,7 +1555,7 @@ impl RocksStore {
     /// counter key being `tag ‖ be(id)`: ascending.
     fn ids_under(&self, tag: u8) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_STATS, &[tag], |k| out.push(de(&k[1..5])));
+        self.scan(CF_STATS, &[tag], TAG1_LEN, |k| out.push(de(&k[1..5])));
         out
     }
 
@@ -1234,7 +1563,9 @@ impl RocksStore {
     /// `y|p` objects): ascending.
     fn ids_under_pred(&self, tag: u8, pred: PredId, hint: u64) -> Vec<EntityLiteralId> {
         let mut out = reserved(hint);
-        self.scan(CF_STATS, &tag1(tag, pred), |k| out.push(de(&k[5..9])));
+        self.scan(CF_STATS, &tag1(tag, pred), TAG2_LEN, |k| {
+            out.push(de(&k[5..9]))
+        });
         out
     }
 
@@ -1336,7 +1667,7 @@ impl RocksStore {
         }
         self.journal_into(&mut wb, UNDO_REMOVE, None, t);
 
-        self.db.write(wb).map_err(|e| e.into_string())?;
+        self.write(wb).map_err(|e| e.into_string())?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
@@ -1385,7 +1716,7 @@ impl RocksStore {
         }
         self.journal_into(&mut wb, UNDO_INSERT, None, t);
 
-        self.db.write(wb).map_err(|e| e.into_string())?;
+        self.write(wb).map_err(|e| e.into_string())?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
@@ -1418,7 +1749,7 @@ impl TripleSource for RocksStore {
     /// `s ? ?` → `(pred, obj)` pairs, sorted by `(pred, obj)` (SPO key order).
     fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
         let mut out = Vec::new();
-        self.scan(CF_SPO, &be(sub), |k| {
+        self.scan(CF_SPO, &be(sub), KEY3_LEN, |k| {
             out.push((de(&k[4..8]), de(&k[8..12])))
         });
         out
@@ -1427,7 +1758,9 @@ impl TripleSource for RocksStore {
     /// `s p ?` → objects, ascending (SPO key order).
     fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_SPO, &key2(sub, pred), |k| out.push(de(&k[8..12])));
+        self.scan(CF_SPO, &key2(sub, pred), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1435,7 +1768,9 @@ impl TripleSource for RocksStore {
     /// `o ‖ s ‖ p`, so the `(o, s)` prefix yields predicates in ascending order.
     fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
         let mut out = Vec::new();
-        self.scan(CF_OSP, &key2(obj, sub), |k| out.push(de(&k[8..12])));
+        self.scan(CF_OSP, &key2(obj, sub), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1445,7 +1780,7 @@ impl TripleSource for RocksStore {
     /// sorted.
     fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
         let mut out = Vec::new();
-        self.scan(CF_OSP, &be(obj), |k| {
+        self.scan(CF_OSP, &be(obj), KEY3_LEN, |k| {
             out.push((de(&k[8..12]), de(&k[4..8])))
         });
         out.sort_unstable();
@@ -1455,7 +1790,9 @@ impl TripleSource for RocksStore {
     /// `? p o` → subjects, ascending (POS `(p, o)` prefix).
     fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_POS, &key2(pred, obj), |k| out.push(de(&k[8..12])));
+        self.scan(CF_POS, &key2(pred, obj), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1469,7 +1806,7 @@ impl TripleSource for RocksStore {
             return self.so_by_p_seek(pred);
         }
         let mut out = reserved(c.card);
-        self.scan(CF_POS, &be(pred), |k| {
+        self.scan(CF_POS, &be(pred), KEY3_LEN, |k| {
             out.push((de(&k[8..12]), de(&k[4..8])))
         });
         out.sort_unstable();
@@ -1543,7 +1880,7 @@ impl TripleSource for RocksStore {
 
     /// No counter covers `(s, o)`: the OSP `(o, s)` keys are counted.
     fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
-        self.count_keys(CF_OSP, &key2(obj, sub))
+        self.count_keys(CF_OSP, &key2(obj, sub), KEY3_LEN)
     }
 
     fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
@@ -1573,7 +1910,7 @@ impl TripleSource for RocksStore {
         }
         if degree <= self.preds.len().max(16) as u64 {
             let mut ps = Vec::with_capacity(degree as usize);
-            self.scan(CF_OSP, &be(obj), |k| ps.push(de(&k[8..12])));
+            self.scan(CF_OSP, &be(obj), KEY3_LEN, |k| ps.push(de(&k[8..12])));
             ps.sort_unstable();
             ps.dedup();
             return ps.len() as u64;
@@ -1618,6 +1955,7 @@ impl RocksStore {
         }
         let mut spo = self.raw_iter(CF_SPO, None);
         let res = self.try_scan(CF_STATS, &tag1(T_PS, pred), |k, _| {
+            check_len(CF_STATS, k, TAG2_LEN)?;
             let s = de(&k[5..9]);
             let at = key2(s, pred);
             spo.seek(at);
@@ -1625,6 +1963,7 @@ impl RocksStore {
                 if !key.starts_with(&at) {
                     break;
                 }
+                check_len(CF_SPO, key, KEY3_LEN)?;
                 out.push((s, de(&key[8..12])));
                 spo.next();
             }
@@ -1666,7 +2005,7 @@ impl RocksStore {
         let mut out: Vec<IdTriple> = Vec::new();
         let Some(total) = total.filter(|&n| out.try_reserve_exact(n).is_ok()) else {
             let mut all: Vec<IdTriple> = reserved(self.triple_count);
-            self.scan(CF_SPO, &[], |k| {
+            self.scan(CF_SPO, &[], KEY3_LEN, |k| {
                 all.push(IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12])));
             });
             all.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
@@ -1687,7 +2026,7 @@ impl RocksStore {
         }
         out.resize(total, IdTriple::new(0, 0, 0));
         let mut spill: Vec<IdTriple> = Vec::new();
-        self.scan(CF_SPO, &[], |k| {
+        self.scan(CF_SPO, &[], KEY3_LEN, |k| {
             let t = IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
             match slots.binary_search_by_key(&t.pred, |s| s.pred) {
                 Ok(i) if slots[i].next < slots[i].end => {
@@ -1727,6 +2066,10 @@ impl RocksStore {
         while let Some(k) = it.key() {
             if !k.starts_with(&prefix) {
                 break;
+            }
+            if let Err(e) = check_len(CF_SPO, k, KEY3_LEN) {
+                note_read_error(format!("rocksdb read ({CF_SPO}): {e}"));
+                return n;
             }
             let p = de(&k[4..8]);
             if last != Some(p) {
@@ -1790,6 +2133,7 @@ impl RocksStore {
         let mut triples = 0u64;
         let mut spo: Vec<[u32; 3]> = Vec::new();
         self.try_scan(CF_SPO, &[], |k, _| {
+            check_len(CF_SPO, k, KEY3_LEN)?;
             let (s, p, o) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
             spo.push([s, p, o]);
             triples += 1;
@@ -1828,7 +2172,8 @@ impl RocksStore {
         want.extend(derived);
         let mut have: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         self.try_scan(CF_STATS, &[], |k, v| {
-            let n = counter_value(v).ok_or_else(|| format!("corrupt counter value at {k:?}"))?;
+            let n = counter_value(v)
+                .ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
             have.insert(k.to_vec(), n);
             Ok(true)
         })
@@ -1853,19 +2198,14 @@ impl RocksStore {
                 Some(m) if m == n => {}
                 other => {
                     return Err(format!(
-                        "counter {:?}{:?}: stored {other:?}, recounted {n}",
-                        key[0] as char,
-                        &key[1..]
+                        "counter {}: stored {other:?}, recounted {n}",
+                        show_key(key)
                     ))
                 }
             }
         }
         if let Some((key, n)) = have.iter().find(|(k, _)| !want.contains_key(*k)) {
-            return Err(format!(
-                "stray counter {:?}{:?} = {n}",
-                key[0] as char,
-                &key[1..]
-            ));
+            return Err(format!("stray counter {} = {n}", show_key(key)));
         }
         for (cf, perm) in [(CF_POS, [1usize, 2, 0]), (CF_OSP, [2, 0, 1])] {
             let mut expect: Vec<[u32; 3]> = spo
@@ -1875,6 +2215,7 @@ impl RocksStore {
             expect.sort_unstable();
             let mut got = Vec::with_capacity(expect.len());
             self.try_scan(cf, &[], |k, _| {
+                check_len(cf, k, KEY3_LEN)?;
                 got.push([de(&k[0..4]), de(&k[4..8]), de(&k[8..12])]);
                 Ok(true)
             })
@@ -1908,6 +2249,350 @@ impl RocksStore {
             return Err("the c|/u|/v| mirror differs from the stats CF".into());
         }
         Ok(())
+    }
+}
+
+/// A stats key for a message: its tag as a character, then the id bytes.
+fn show_key(k: &[u8]) -> String {
+    match k.split_first() {
+        Some((t, rest)) => format!("{:?}{rest:?}", *t as char),
+        None => "(an empty key)".into(),
+    }
+}
+
+/// A forward cursor over the stored counters of one `stats` tag, in key
+/// order, for the merges of [`RocksStore::verify_stats`].
+struct CounterCursor<'a> {
+    it: rocksdb::DBRawIterator<'a>,
+    len: usize,
+}
+
+impl<'a> CounterCursor<'a> {
+    /// The counters tagged `tag`, each key `len` bytes long.
+    fn new(store: &'a RocksStore, tag: u8, len: usize) -> CounterCursor<'a> {
+        let mut it = store.raw_iter(CF_STATS, prefix_end(&[tag]));
+        it.seek([tag]);
+        CounterCursor { it, len }
+    }
+
+    /// The next stored counter `(key, key length, value)`, `None` after the
+    /// last.
+    fn peek(&self) -> std::result::Result<Option<([u8; TAG2_LEN], usize, u64)>, String> {
+        let Some((k, v)) = self.it.item() else {
+            return self
+                .it
+                .status()
+                .map(|()| None)
+                .map_err(|e| format!("rocksdb read ({CF_STATS}): {}", e.into_string()));
+        };
+        check_len(CF_STATS, k, self.len)?;
+        let n =
+            counter_value(v).ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
+        let mut key = [0u8; TAG2_LEN];
+        key[..k.len()].copy_from_slice(k);
+        Ok(Some((key, k.len(), n)))
+    }
+
+    /// The counter `key` must be the next one stored, with the value `n`:
+    /// a stored counter before it is a stray.
+    fn expect(&mut self, key: &[u8], n: u64) -> std::result::Result<(), String> {
+        match self.peek()? {
+            Some((k, len, m)) if &k[..len] == key => {
+                if m != n {
+                    return Err(format!(
+                        "counter {}: stored {m}, recounted {n}",
+                        show_key(key)
+                    ));
+                }
+                self.it.next();
+                Ok(())
+            }
+            Some((k, len, m)) if &k[..len] < key => {
+                Err(format!("stray counter {} = {m}", show_key(&k[..len])))
+            }
+            _ => Err(format!("counter {}: missing, recounted {n}", show_key(key))),
+        }
+    }
+
+    /// The end of the merge: no stored counter may be left.
+    fn finish(&self) -> std::result::Result<(), String> {
+        match self.peek()? {
+            Some((k, len, m)) => Err(format!("stray counter {} = {m}", show_key(&k[..len]))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl RocksStore {
+    /// Check that the statistics are exact — what
+    /// [`check_stats`](Self::check_stats) checks — without holding them in
+    /// memory: each ordering and each counter prefix is read once in key
+    /// order and merged with the counts derived from the orderings (POS and
+    /// OSP keys are point-checked against SPO, each `x|p|s` counter against
+    /// the length of its SPO `(s, p)` run), so memory stays constant
+    /// whatever the size of the store. [`verify_integrity`] (`gcompact
+    /// --check`) runs it. `Err` names the first difference, or the first
+    /// malformed key or counter value.
+    ///
+    /// [`verify_integrity`]: crate::Database::verify_integrity
+    pub fn verify_stats(&self) -> std::result::Result<(), String> {
+        if let Some(e) = self.injected_read_failure() {
+            return Err(e);
+        }
+        let read = |e: ScanError| match e {
+            ScanError::Read(e) => format!("rocksdb read: {e}"),
+            ScanError::Visit(e) => e,
+        };
+        // Every stats key has a known tag, and that tag's length.
+        self.try_scan(CF_STATS, &[], |k, _| {
+            let len = match k.first() {
+                Some(b'T' | b'P' | b'S' | b'O') => 1,
+                Some(&(T_CARD | T_PSUBJ | T_POBJ | T_SUB | T_OBJ)) => TAG1_LEN,
+                Some(&(T_PS | T_PO)) => TAG2_LEN,
+                _ => return Err(format!("stray stats key {}", show_key(k))),
+            };
+            check_len(CF_STATS, k, len).map(|()| true)
+        })
+        .map_err(read)?;
+
+        // SPO: the triples; `s|s` is the length of the subject's run.
+        let mut s_cur = CounterCursor::new(self, T_SUB, TAG1_LEN);
+        let (mut triples, mut subjects) = (0u64, 0u64);
+        let mut run: Option<(u32, u64)> = None;
+        self.try_scan(CF_SPO, &[], |k, _| {
+            check_len(CF_SPO, k, KEY3_LEN)?;
+            let s = de(&k[0..4]);
+            triples += 1;
+            match &mut run {
+                Some((rs, n)) if *rs == s => *n += 1,
+                _ => {
+                    if let Some((rs, n)) = run.replace((s, 1)) {
+                        subjects += 1;
+                        s_cur.expect(&tag1(T_SUB, rs), n)?;
+                    }
+                }
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rs, n)) = run {
+            subjects += 1;
+            s_cur.expect(&tag1(T_SUB, rs), n)?;
+        }
+        s_cur.finish()?;
+
+        // POS: every key is an SPO triple; `c|p` is the length of the
+        // predicate's run, `v|p` its number of distinct objects, `y|p|o`
+        // the length of the `(p, o)` run.
+        let close_p = |c: &mut CounterCursor, v: &mut CounterCursor, p: u32, n: u64, d: u64| {
+            c.expect(&tag1(T_CARD, p), n)?;
+            v.expect(&tag1(T_POBJ, p), d)
+        };
+        let mut c_cur = CounterCursor::new(self, T_CARD, TAG1_LEN);
+        let mut v_cur = CounterCursor::new(self, T_POBJ, TAG1_LEN);
+        let mut y_cur = CounterCursor::new(self, T_PO, TAG2_LEN);
+        let (mut pos_triples, mut preds) = (0u64, 0u64);
+        // The predicate's run: (p, triples, distinct objects); the (p, o) run.
+        let mut p_run: Option<(u32, u64, u64)> = None;
+        let mut po_run: Option<(u32, u32, u64)> = None;
+        self.try_scan(CF_POS, &[], |k, _| {
+            check_len(CF_POS, k, KEY3_LEN)?;
+            let (p, o, s) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
+            self.spo_must_hold(CF_POS, s, p, o)?;
+            pos_triples += 1;
+            if p_run.is_none_or(|(rp, _, _)| rp != p) {
+                if let Some((rp, n, d)) = p_run.replace((p, 0, 0)) {
+                    preds += 1;
+                    close_p(&mut c_cur, &mut v_cur, rp, n, d)?;
+                }
+            }
+            if po_run.is_none_or(|(rp, ro, _)| (rp, ro) != (p, o)) {
+                if let Some((rp, ro, n)) = po_run.replace((p, o, 0)) {
+                    y_cur.expect(&tag2(T_PO, rp, ro), n)?;
+                }
+                if let Some((_, _, d)) = &mut p_run {
+                    *d += 1;
+                }
+            }
+            if let (Some((_, n, _)), Some((_, _, m))) = (&mut p_run, &mut po_run) {
+                *n += 1;
+                *m += 1;
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rp, ro, n)) = po_run {
+            y_cur.expect(&tag2(T_PO, rp, ro), n)?;
+        }
+        if let Some((rp, n, d)) = p_run {
+            preds += 1;
+            close_p(&mut c_cur, &mut v_cur, rp, n, d)?;
+        }
+        c_cur.finish()?;
+        v_cur.finish()?;
+        y_cur.finish()?;
+
+        // OSP: every key is an SPO triple; `o|o` is the length of the
+        // object's run.
+        let mut o_cur = CounterCursor::new(self, T_OBJ, TAG1_LEN);
+        let (mut osp_triples, mut objects) = (0u64, 0u64);
+        let mut run: Option<(u32, u64)> = None;
+        self.try_scan(CF_OSP, &[], |k, _| {
+            check_len(CF_OSP, k, KEY3_LEN)?;
+            let (o, s, p) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
+            self.spo_must_hold(CF_OSP, s, p, o)?;
+            osp_triples += 1;
+            match &mut run {
+                Some((ro, n)) if *ro == o => *n += 1,
+                _ => {
+                    if let Some((ro, n)) = run.replace((o, 1)) {
+                        objects += 1;
+                        o_cur.expect(&tag1(T_OBJ, ro), n)?;
+                    }
+                }
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((ro, n)) = run {
+            objects += 1;
+            o_cur.expect(&tag1(T_OBJ, ro), n)?;
+        }
+        o_cur.finish()?;
+        for (cf, n) in [(CF_POS, pos_triples), (CF_OSP, osp_triples)] {
+            if n != triples {
+                return Err(format!("{cf} holds {n} triples, spo {triples}"));
+            }
+        }
+
+        // `x|p|s` is the length of the SPO `(s, p)` run; per predicate they
+        // add up to `c|p` (checked against POS above), and `u|p` counts them.
+        let mut u_cur = CounterCursor::new(self, T_PSUBJ, TAG1_LEN);
+        let close_x = |u: &mut CounterCursor, p: u32, sum: u64, keys: u64| {
+            let card = self.get_counter(&tag1(T_CARD, p))?;
+            if card != sum {
+                return Err(format!(
+                    "the x| counters of predicate {p} add up to {sum}, its c| counter is {card}"
+                ));
+            }
+            u.expect(&tag1(T_PSUBJ, p), keys)
+        };
+        let mut spo = self.raw_iter(CF_SPO, None);
+        let mut x_run: Option<(u32, u64, u64)> = None;
+        let mut x_preds = 0u64;
+        self.try_scan(CF_STATS, &[T_PS], |k, v| {
+            check_len(CF_STATS, k, TAG2_LEN)?;
+            let n = counter_value(v)
+                .ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
+            let (p, s) = (de(&k[1..5]), de(&k[5..9]));
+            let at = key2(s, p);
+            spo.seek(at);
+            let mut len = 0u64;
+            while let Some(key) = spo.key() {
+                if !key.starts_with(&at) {
+                    break;
+                }
+                check_len(CF_SPO, key, KEY3_LEN)?;
+                len += 1;
+                spo.next();
+            }
+            spo.status()
+                .map_err(|e| format!("rocksdb read ({CF_SPO}): {}", e.into_string()))?;
+            if len != n || n == 0 {
+                return Err(format!(
+                    "counter {}: stored {n}, recounted {len}",
+                    show_key(k)
+                ));
+            }
+            if x_run.is_none_or(|(rp, _, _)| rp != p) {
+                if let Some((rp, sum, keys)) = x_run.replace((p, 0, 0)) {
+                    x_preds += 1;
+                    close_x(&mut u_cur, rp, sum, keys)?;
+                }
+            }
+            if let Some((_, sum, keys)) = &mut x_run {
+                *sum += n;
+                *keys += 1;
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rp, sum, keys)) = x_run {
+            x_preds += 1;
+            close_x(&mut u_cur, rp, sum, keys)?;
+        }
+        u_cur.finish()?;
+        if x_preds != preds {
+            return Err(format!(
+                "{preds} predicate(s) have triples, {x_preds} have x| counters"
+            ));
+        }
+
+        // The global counters (stored as 0 after deletes, or absent), the
+        // cached ones, and the c|/u|/v| mirror.
+        for (key, n) in [
+            (K_TRIPLES, triples),
+            (K_PREDS, preds),
+            (K_SUBJECTS, subjects),
+            (K_OBJECTS, objects),
+        ] {
+            let stored = self.get_counter(key)?;
+            if stored != n {
+                return Err(format!(
+                    "global counter {}: stored {stored}, recounted {n}",
+                    show_key(key)
+                ));
+            }
+        }
+        if (
+            self.triple_count,
+            self.num_predicates,
+            self.distinct_subjects,
+            self.distinct_objects,
+        ) != (triples, preds, subjects, objects)
+        {
+            return Err("the cached global counters differ from the stats CF".into());
+        }
+        if self.preds.len() as u64 != preds {
+            return Err("the c|/u|/v| mirror differs from the stats CF".into());
+        }
+        let mut mirror = self.preds.iter();
+        self.try_scan(CF_STATS, &[T_CARD], |k, v| {
+            let p = de(&k[1..5]);
+            let stored = PredCounts {
+                card: counter_value(v).unwrap_or(0),
+                subjects: self.get_counter(&tag1(T_PSUBJ, p))?,
+                objects: self.get_counter(&tag1(T_POBJ, p))?,
+            };
+            match mirror.next() {
+                Some((&mp, c)) if mp == p && *c == stored => Ok(true),
+                _ => Err("the c|/u|/v| mirror differs from the stats CF".into()),
+            }
+        })
+        .map_err(read)?;
+        Ok(())
+    }
+
+    /// The check of a `cf` key that names the triple `(s, p, o)`: SPO must
+    /// hold it.
+    fn spo_must_hold(&self, cf: &str, s: u32, p: u32, o: u32) -> std::result::Result<(), String> {
+        match self.db.get_pinned_cf(self.cf(CF_SPO), key3(s, p, o)) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!(
+                "{cf} holds the triple ({s}, {p}, {o}), which spo lacks"
+            )),
+            Err(e) => Err(format!("rocksdb read ({CF_SPO}): {}", e.into_string())),
+        }
+    }
+}
+
+impl Drop for RocksStore {
+    /// Closing flushes the memtables: a commit point only syncs the WAL
+    /// (see the module docs), so without this the next open would replay
+    /// the log written since the last flush. Not needed for durability; a
+    /// failure is ignored (the WAL still holds every write).
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -2031,6 +2716,58 @@ mod tests {
             let w = warning.unwrap_or_else(|| panic!("{bad} was taken silently"));
             assert!(w.contains(BLOCK_CACHE_ENV) && w.contains(bad), "{w}");
         }
+    }
+
+    /// A rollback that keeps its journal (for the batch that deletes it
+    /// with the terms it frees) does not journal its own replay: the journal
+    /// it leaves holds the transaction's records only — not one more record
+    /// per undone change, which doubled the journal and the work of the
+    /// next open's replay after a crash.
+    #[test]
+    fn a_rollback_keeping_its_journal_does_not_journal_its_replay() {
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Gone(scratch("rollback_keeping"));
+        let mut store = RocksStore::open_with(&dir.0, &RocksTuning::rocksdb_defaults()).unwrap();
+        let (kept, added, quad) = (
+            IdTriple::new(1, 1, 2),
+            IdTriple::new(3, 1, 4),
+            IdTriple::new(5, 1, 6),
+        );
+        assert!(store.insert(kept));
+        store.begin_journal().unwrap();
+        assert!(store.insert(added));
+        assert!(store.remove(kept));
+        assert!(store.insert_quad(9, quad).unwrap());
+        store
+            .put_new_terms(&[(TermSpace::Entity, 7, "<http://ex/t>")])
+            .unwrap();
+        assert_eq!(store.journal_records().unwrap().len(), 4);
+
+        store.rollback_keeping_journal().unwrap();
+        assert_eq!(
+            store.journal_records().unwrap().len(),
+            4,
+            "the rollback journaled its own replay"
+        );
+        assert_eq!(store.contains(kept), Ok(true));
+        assert_eq!(store.contains(added), Ok(false));
+        assert!(store.quads().unwrap().is_empty());
+        assert!(store.journal_error().is_some(), "kept until deleted");
+        let mut freed = store.take_replayed();
+        freed.sort_by_key(|(space, id)| (space.tag(), *id));
+        assert!(freed.contains(&(TermSpace::Entity, 7)), "{freed:?}");
+
+        store
+            .commit_journal_with(&[(TermSpace::Entity, 7)])
+            .unwrap();
+        assert!(store.journal_records().unwrap().is_empty());
+        assert!(store.journal_error().is_none());
+        assert!(store.load_terms().unwrap().is_empty());
     }
 
     /// A predicate on the seek path of `so_by_p` (many objects per subject)

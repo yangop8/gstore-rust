@@ -314,6 +314,10 @@ mod rocks {
         ));
     }
 
+    /// What the child prints once its uncommitted writes are applied, just
+    /// before it aborts.
+    const WROTE_MARKER: &str = "UNCOMMITTED WRITES APPLIED";
+
     /// Child half of the crash test: open a transaction, write, and die
     /// without committing (no destructors run).
     #[test]
@@ -325,25 +329,52 @@ mod rocks {
         let mut db = Database::open(&dir).unwrap();
         db.begin().unwrap();
         db.query(TXN_WRITES).unwrap();
+        // review tests-b#7: the parent checks that the writes were made
+        // before the crash (an early failure also exits non-zero).
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{WROTE_MARKER}").unwrap();
+        out.flush().unwrap();
         std::process::abort();
     }
 
     #[test]
     fn uncommitted_rocks_writes_do_not_survive_a_crash() {
         let dir = rocks_db("rocks_txn_crash");
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "rocks::child_crashes_inside_a_rocks_transaction",
                 "--exact",
                 "--ignored",
+                "--nocapture",
                 "--test-threads=1",
             ])
             .env("GSTORE_CRASH_DIR", &dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stdin(std::process::Stdio::null())
+            .output()
             .unwrap();
-        assert!(!status.success(), "the child must have crashed");
+        // review tests-b#7: a non-zero exit alone does not tell a crash
+        // inside the transaction from a failure before any write (open
+        // refused, a panic in begin or the update): the child must have
+        // applied its writes and then died of its abort.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(WROTE_MARKER),
+            "the child failed before writing: {}{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "the child must have crashed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                out.status.signal(),
+                Some(6),
+                "the child must have died of SIGABRT inside the transaction: {}",
+                out.status
+            );
+        }
         assert_only_committed(&dir);
     }
 }
