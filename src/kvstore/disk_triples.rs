@@ -1793,4 +1793,49 @@ mod tests {
         drop(ds);
         cleanup(&p);
     }
+
+    #[test]
+    fn a_dictionary_commit_whose_log_could_not_be_written_breaks_the_store_sharing_its_pager() {
+        // Review disk#1, the half the pager cannot see by itself: a
+        // dictionary commit that fails before its log got its name leaves
+        // the pager retryable, but the term's pages stay applied in the
+        // cache while the dictionary's roots and caches do not know them.
+        // Unless the dictionary fails the shared pager, the triple store
+        // stays healthy and its next commit point writes those pages.
+        use super::super::disk_dict::DiskDict;
+        use super::super::pager::failpoints;
+        use crate::dict::DiskTermSource;
+        let p = tmp("fail_dict_wal");
+        let _files = Files(p.clone());
+        let mut ds = DiskStore::open(&p, 8).unwrap();
+        ds.intern_entity("<e0>").unwrap();
+        ds.flush().unwrap();
+        let dt = DiskTriples::new(ds).unwrap();
+        let pager = dt.shared_pager().unwrap();
+        let dict = DiskDict::open_shared(Arc::clone(&pager))
+            .unwrap()
+            .with_write_check(dt.write_check())
+            .writable();
+        let failed = {
+            let _fp = failpoints::fail_wal_write_after(100);
+            (0..20_000)
+                .map(|i| dict.intern(Space::Entity, &format!("<http://ex/term/{i}>")))
+                .find_map(Result::err)
+                .expect("some term write commits the cache")
+        };
+        assert!(matches!(failed, GStoreError::StorageFailed(_)), "{failed}");
+        assert!(dt.broken().is_some(), "routed to the triple store");
+        assert!(pager.read().unwrap().failure().is_some());
+        assert!(dict.intern(Space::Entity, "<http://ex/after>").is_err());
+        assert!(dt.commit_point().is_err());
+        drop((dict, dt, pager));
+        // Nothing after the last commit reached the file, and no log exists.
+        assert!(!wal_of(&p).exists());
+        let ds = DiskStore::open(&p, 64).unwrap();
+        let eager = ds.dictionary().unwrap();
+        assert_eq!(eager.entity_id("<e0>"), Some(0));
+        assert_eq!(eager.entity_id("<http://ex/term/0>"), None);
+        drop(ds);
+        cleanup(&p);
+    }
 }
