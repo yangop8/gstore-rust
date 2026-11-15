@@ -4,7 +4,7 @@
 //! would accept too. Root's default password is a loopback privilege: from
 //! a client that is not local — a loopback proxy forwarding a remote one —
 //! it is refused after the body, so before the body it must not lift the
-//! pre-authentication cap (review C-2: sec#1, gapi#1; H-5: sec#8).
+//! pre-authentication cap (review C-2: sec#1, gapi#1; H-10: sec#8).
 //!
 //! Every refusal is answered before the client sends a body byte (`Expect:
 //! 100-continue`), so nothing waits for a timeout; socket timeouts are hang
