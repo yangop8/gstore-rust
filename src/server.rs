@@ -1858,25 +1858,29 @@ impl ServerInner {
             Ok(QueryResult::Construct(ts)) => {
                 Reply::buffered(200, "application/n-triples", ntriples_body(&ts))
             }
-            Ok(QueryResult::Update { changed }) => {
-                Reply::buffered(200, "application/json", changed_json(changed, warning))
-            }
-            Err(e) => Reply::plain(400, SPARQL_JSON, &err_json(&e.to_string())),
+            Ok(QueryResult::Update { changed }) => update_reply(changed, warning),
+            Err(e) => Reply::plain(
+                failure_status(&warning),
+                SPARQL_JSON,
+                &err_json(&e.to_string()),
+            ),
         }
     }
 
     fn run_update(&self, u: &str) -> Reply {
         let (result, warning) = self.execute(u);
         match result {
-            Ok(QueryResult::Update { changed }) => {
-                Reply::buffered(200, "application/json", changed_json(changed, warning))
-            }
+            Ok(QueryResult::Update { changed }) => update_reply(changed, warning),
             Ok(_) => Reply::buffered(
                 400,
                 "application/json",
                 err_json("/update expects a SPARQL UPDATE request"),
             ),
-            Err(e) => Reply::buffered(400, "application/json", err_json(&e.to_string())),
+            Err(e) => Reply::buffered(
+                failure_status(&warning),
+                "application/json",
+                err_json(&e.to_string()),
+            ),
         }
     }
 
@@ -1889,8 +1893,12 @@ impl ServerInner {
     /// released, so the on-disk copy never lags an acknowledged write. That
     /// includes an UPDATE that failed part-way: its operations before the
     /// failing one stay applied (and visible), so they are saved too. A
-    /// failed save does not undo the (applied) update: it is reported as a
-    /// warning and the database stays dirty, to be retried on shutdown.
+    /// failed save does not undo the (applied) update: it is returned as the
+    /// warning `"applied in memory but not durable: <cause>"` and the
+    /// database stays dirty, to be retried on shutdown. The caller answers a
+    /// statement with a warning as a failure, HTTP 500 ([`update_reply`],
+    /// [`failure_status`]) — never as an acknowledged write (review
+    /// durability#2).
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let stmt = match Statement::parse(sparql) {
             Ok(stmt) => stmt,
@@ -1910,7 +1918,8 @@ impl ServerInner {
             if self.check_point || self.closing.load(Ordering::SeqCst) {
                 if let Err((dir, e)) = self.save_locked(&db) {
                     let msg = format!(
-                        "update applied in memory but saving to '{}' failed: {e}",
+                        "{}: saving to '{}' failed: {e}",
+                        crate::http_api::NOT_DURABLE,
                         dir.display()
                     );
                     crate::gs_error!("{msg}");
@@ -1918,11 +1927,16 @@ impl ServerInner {
                 }
             }
             if let Err(e) = &result {
-                let note = match &warning {
-                    Some(w) => format!("operations before the failing one were applied; {w}"),
-                    None => "operations before the failing one were applied".to_string(),
-                };
-                result = Err(crate::GStoreError::Query(format!("{e} ({note})")));
+                result = Err(match &warning {
+                    // A persistence failure (answered 500), not a query error.
+                    Some(w) => crate::GStoreError::Database(format!(
+                        "{w} (the update failed part-way: {e}; the operations before the \
+                         failing one were applied)"
+                    )),
+                    None => crate::GStoreError::Query(format!(
+                        "{e} (operations before the failing one were applied)"
+                    )),
+                });
             }
             self.counters.publish(&db);
         }
@@ -1971,11 +1985,37 @@ impl ServerInner {
     }
 }
 
-/// `{"changed":N}` plus an optional `"warning"` (e.g. a failed check_point save).
+/// `{"changed":N}`, or — when persisting the change failed (`warning`, see
+/// [`ServerInner::execute`]) — `{"error":"applied in memory but not durable:
+/// <cause>","changed":N,"warning":…}`.
 fn changed_json(changed: usize, warning: Option<String>) -> Vec<u8> {
     match warning {
-        Some(w) => format!("{{\"changed\":{changed},\"warning\":{}}}", json_str(&w)).into_bytes(),
+        Some(w) => format!(
+            "{{\"error\":{},\"changed\":{changed},\"warning\":{}}}",
+            json_str(&w),
+            json_str(&w)
+        )
+        .into_bytes(),
         None => format!("{{\"changed\":{changed}}}").into_bytes(),
+    }
+}
+
+/// The reply to an applied UPDATE: HTTP 200 `{"changed":N}` when it is
+/// durable; HTTP 500 when its check_point save failed (`warning`) — a write
+/// applied in memory but not saved is not acknowledged (review durability#2).
+fn update_reply(changed: usize, warning: Option<String>) -> Reply {
+    let status = if warning.is_some() { 500 } else { 200 };
+    Reply::buffered(status, "application/json", changed_json(changed, warning))
+}
+
+/// The HTTP status of a failed statement: 500 when the save of what it
+/// applied failed (`warning`: the failure is the server's, and the change is
+/// not durable), else 400.
+fn failure_status(warning: &Option<String>) -> u16 {
+    if warning.is_some() {
+        500
+    } else {
+        400
     }
 }
 

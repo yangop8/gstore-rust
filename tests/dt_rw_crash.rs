@@ -2,9 +2,10 @@
 //! readers and writers hammer it — single-database and `--api` mode, on the
 //! snapshot and on-disk layouts (and RocksDB with the `rocksdb` feature).
 //!
-//! Every write the server acknowledged (`200`, one triple changed) must be in
-//! the database reopened after the kill, and nothing that was never sent
-//! may appear. Each test runs `GSTORE_RW_CRASH_SEEDS` seeds (default 10);
+//! Every write the server acknowledged (`200`, one triple changed, no
+//! persistence failure reported — see [`acknowledged`]) must be in the
+//! database reopened after the kill, and nothing that was never sent may
+//! appear. Each test runs `GSTORE_RW_CRASH_SEEDS` seeds (default 10);
 //! the seed picks how long the load runs before the kill and how the
 //! writers pace themselves.
 
@@ -139,6 +140,76 @@ fn request(
     Some((status, body.to_string()))
 }
 
+/// The acknowledgement rule (review durability#18): whether the reply to an
+/// `INSERT DATA` of one new triple acknowledges it as durable. `Ok(true)`:
+/// HTTP 200 with `"changed":1` and no persistence failure reported. `Ok(false)`:
+/// a persistence failure — HTTP 500 saying `"applied in memory but not
+/// durable"`, or a `"warning"` on any reply (how servers before the fix
+/// reported a failed save, with HTTP 200) — which is no acknowledgement: the
+/// write may or may not survive the kill. `Err`: any other reply.
+///
+/// review durability#18: the rule used to count every `200` with
+/// `"changed":1` as acknowledged, including a write whose save had failed.
+fn acknowledged(status: u16, body: &str) -> Result<bool, String> {
+    let j = gstore::json::parse(body).map_err(|e| format!("{status} not JSON ({e}): {body}"))?;
+    let says = |key: &str| j.get(key).and_then(gstore::json::Json::as_str);
+    let not_durable = |s: Option<&str>| s.is_some_and(|m| m.contains(NOT_DURABLE));
+    if j.get("warning").is_some()
+        || (status == 500 && (not_durable(says("error")) || not_durable(says("StatusMsg"))))
+    {
+        return Ok(false);
+    }
+    match (
+        status,
+        j.get("changed").and_then(gstore::json::Json::as_i64),
+    ) {
+        (200, Some(1)) => Ok(true),
+        _ => Err(format!("update answered {status}: {body}")),
+    }
+}
+
+const NOT_DURABLE: &str = "applied in memory but not durable";
+
+#[test]
+fn the_acknowledgement_rule_counts_only_durable_replies() {
+    assert_eq!(acknowledged(200, r#"{"changed":1}"#), Ok(true));
+    assert_eq!(
+        acknowledged(200, r#"{"StatusCode":0,"StatusMsg":"success","changed":1}"#),
+        Ok(true)
+    );
+    // A failed save is no acknowledgement, whatever the status says.
+    assert_eq!(
+        acknowledged(200, r#"{"changed":1,"warning":"saving to 'x' failed"}"#),
+        Ok(false)
+    );
+    assert_eq!(
+        acknowledged(
+            200,
+            r#"{"StatusCode":0,"StatusMsg":"success","changed":1,"warning":"w"}"#
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        acknowledged(
+            500,
+            r#"{"error":"applied in memory but not durable: saving to 'x' failed","changed":1}"#
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        acknowledged(
+            500,
+            r#"{"StatusCode":500,"StatusMsg":"applied in memory but not durable: e","changed":1}"#
+        ),
+        Ok(false)
+    );
+    // Anything else is a failure of the test.
+    assert!(acknowledged(200, r#"{"changed":0}"#).is_err());
+    assert!(acknowledged(400, r#"{"error":"query error: x"}"#).is_err());
+    assert!(acknowledged(500, r#"{"StatusCode":500,"StatusMsg":"boom"}"#).is_err());
+    assert!(acknowledged(200, "not json").is_err());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Layout {
     Snapshot,
@@ -244,11 +315,15 @@ fn run(mode: Mode, layout: Layout, seed: u64) -> usize {
                     sent.lock().unwrap().insert(s.clone());
                     let u = format!("INSERT DATA {{ {s} <{PRED}> \"{i}\" }}");
                     match request(&addr, "POST", &update, auth, &u) {
-                        Some((200, b)) => {
-                            assert!(b.contains("\"changed\":1"), "{b}");
-                            acked.lock().unwrap().insert(s);
-                        }
-                        Some((st, b)) => panic!("update answered {st}: {b}"),
+                        Some((st, b)) => match acknowledged(st, &b) {
+                            Ok(true) => {
+                                acked.lock().unwrap().insert(s);
+                            }
+                            // Sent but not acknowledged (a persistence
+                            // failure): it may or may not survive the kill.
+                            Ok(false) => {}
+                            Err(e) => panic!("{e}"),
+                        },
                         None => break,
                     }
                     if pause_ms > 0 {
