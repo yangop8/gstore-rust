@@ -125,6 +125,13 @@ none
     formats, so a huge result still costs its own size. Streaming rows from
     the evaluator into the file is a larger refactor of the query path.
     (gapi#11)
+  - Buffered responses (envelopes, query results) still go out as one
+    head-plus-body copy from `write_response_ext` (one write, so a
+    kept-alive connection never waits on Nagle between head and body), and
+    gzip still compresses into a further buffer. Their size is bounded by
+    `max_output_size`; only file downloads, which have no such bound, are
+    streamed. REST `/export` is r3-rest-parity's (it can use `Resp::stream`).
+    (sec#11)
   - A streamed download with `Accept-Encoding: gzip` is sent identity-encoded.
     On-the-fly compression would need chunked framing, which an HTTP/1.0
     client cannot take, and the request version is not kept in `Request`.
