@@ -2141,6 +2141,8 @@ impl ApiInner {
     /// when it holds writes not yet saved (check_point off): a rebuild that
     /// then fails serves it again, from its directory, with every write it
     /// acknowledged. A failed save keeps it loaded (and fails the request).
+    /// A copy whose on-disk store failed cannot be saved: it is retired
+    /// without a commit point (logged; review gap-txn-lifecycle#4).
     fn retire_loaded_saved(&self, name: &str) -> Result<bool, Resp> {
         let Some(h) = locked(&self.state).dbs.remove(name) else {
             return Ok(false);
@@ -2149,7 +2151,13 @@ impl ApiInner {
             Ok(slot) => slot,
             Err(e) => return Err(e.rest()),
         };
-        if slot.dirty && !slot.retired {
+        let failure = (!slot.retired).then(|| slot.db.storage_failure()).flatten();
+        if let Some(failure) = failure {
+            crate::gs_warn!(
+                "database '{name}' was retired without a commit point: its on-disk store had \
+                 failed ({failure}); those changes are discarded"
+            );
+        } else if slot.dirty && !slot.retired {
             if let Err(e) = slot.save() {
                 drop(slot);
                 locked(&self.state).dbs.insert(name.to_string(), h);
@@ -3863,9 +3871,83 @@ impl ApiInner {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
         // Re-loading an already-loaded database would silently discard its
-        // unsaved in-memory changes; it is a no-op instead (as in gStore).
-        if st.dbs.contains_key(&name) {
-            return Dispatch::Done(Resp::ok(&format!("database '{name}' already loaded")));
+        // unsaved in-memory changes; it is a no-op instead (as in gStore) —
+        // unless its on-disk store failed (review gap-txn-lifecycle#4): such
+        // a database can never reach a commit point, so it is reopened in
+        // place, without one, from its directory (consistent through its
+        // write-ahead log), and the answer's warning names what is discarded.
+        if let Some(h) = st.dbs.get(&name).map(Arc::clone) {
+            let already = Resp::ok(&format!("database '{name}' already loaded"));
+            if st.db_txn.contains_key(&name) || st.busy.contains(&name) {
+                return Dispatch::Done(already);
+            }
+            return Dispatch::Deferred(Box::new(move |inner| {
+                // Whether it failed is checked without waiting and without
+                // reserving its name (and off the state lock: dropping the
+                // guard may measure the directory), so loading a healthy
+                // loaded database stays a no-op: it never waits behind a
+                // running statement and never makes the database busy for a
+                // concurrent begin / unload. A database busy right now is
+                // answered as loaded; a later load reopens it.
+                let failed_now = h.try_write().is_some_and(|slot| {
+                    !slot.retired && slot.txn.is_none() && slot.db.storage_failure().is_some()
+                });
+                if !failed_now {
+                    return already;
+                }
+                {
+                    let mut st = locked(&inner.state);
+                    if st.db_txn.contains_key(&name)
+                        || !st.dbs.get(&name).is_some_and(|x| Arc::ptr_eq(x, &h))
+                        || st.claim(&name).is_err()
+                    {
+                        return already;
+                    }
+                }
+                let _busy = BusyGuard {
+                    inner,
+                    name: name.clone(),
+                };
+                let mut slot = match h.write() {
+                    Ok(slot) => slot,
+                    Err(e) => return e.rest(),
+                };
+                let failure = (!slot.retired && slot.txn.is_none())
+                    .then(|| slot.db.storage_failure())
+                    .flatten();
+                let Some(failure) = failure else {
+                    return already;
+                };
+                // The directory the served copy was opened from.
+                let dir = slot.dir.clone();
+                slot.retire();
+                {
+                    let mut st = locked(&inner.state);
+                    if st.dbs.get(&name).is_some_and(|x| Arc::ptr_eq(x, &h)) {
+                        st.dbs.remove(&name);
+                    }
+                }
+                drop(slot);
+                let warning = format!(
+                    "database '{name}' was reopened without a commit point: its on-disk store \
+                     had failed ({failure}); those changes are discarded (a commit whose \
+                     write-ahead log was complete is replayed by the reopen)"
+                );
+                crate::gs_warn!("{warning}");
+                match inner.open_db(&dir) {
+                    Ok(db) => {
+                        let mut st = locked(&inner.state);
+                        let slot =
+                            DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                        st.dbs.insert(name.clone(), slot);
+                        Resp::ok_warn(&format!("database '{name}' reopened"), &Some(warning))
+                    }
+                    Err(e) => Resp::fail(
+                        500,
+                        &format!("load failed: {e} ({warning}; it is unloaded now)"),
+                    ),
+                }
+            }));
         }
         if let Err(r) = st.claim(&name) {
             return Dispatch::Done(r);
@@ -4027,7 +4109,10 @@ impl ApiInner {
 
     /// `POST /unload?db_name=…` — save the database if it has unsaved changes,
     /// then drop it from memory. If the save fails it stays loaded (nothing is
-    /// lost) and the error is returned.
+    /// lost) and the error is returned — unless its on-disk store failed (no
+    /// commit point can succeed then): it is unloaded without one, and the
+    /// answer (`200`) carries a `warning` naming the discarded changes
+    /// (review gap-txn-lifecycle#4).
     fn handle_unload(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
@@ -4055,6 +4140,25 @@ impl ApiInner {
             }
             if let Some(open) = &slot.txn {
                 return unload_busy(&name, open.tid);
+            }
+            if let Some(failure) = slot.db.storage_failure() {
+                // Its file is consistent through its write-ahead log; what
+                // it could not commit was never acknowledged as durable.
+                let warning = format!(
+                    "database '{name}' was unloaded without a commit point: its on-disk store \
+                     had failed ({failure}); those changes are discarded (a commit whose \
+                     write-ahead log was complete is replayed when it is loaded again)"
+                );
+                crate::gs_warn!("{warning}");
+                slot.retire();
+                {
+                    let mut st = locked(&inner.state);
+                    if st.dbs.get(&name).is_some_and(|h| Arc::ptr_eq(h, &dbh)) {
+                        st.dbs.remove(&name);
+                    }
+                }
+                drop(slot);
+                return Resp::ok_warn(&format!("database '{name}' unloaded"), &Some(warning));
             }
             let saved = if slot.dirty {
                 if let Err(e) = slot.save() {
